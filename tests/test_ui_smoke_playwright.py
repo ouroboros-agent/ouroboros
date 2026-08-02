@@ -2848,3 +2848,134 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.fixture()
+def files_browser_root(tmp_path, monkeypatch):
+    """A deterministic root for the Files smoke to walk.
+
+    `gateway/files.py::_configured_root_text` reads OUROBOROS_FILE_BROWSER_DEFAULT
+    from the process environment, and the server fixtures snapshot `os.environ`
+    when they boot — so seeding it HERE works as long as this fixture is requested
+    before the server one (pytest resolves same-scope fixtures in signature
+    order). Without it the browser root falls back to the developer's home
+    directory, which no assertion could pin.
+    """
+    root = tmp_path / "files-root"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "loop.py").write_text(
+        "\n".join(
+            [
+                "def loop(state):",
+                '    """Run one supervisor pass over the pending queue."""',
+                "    pending = [task for task in state.tasks if not task.done]",
+                "    for task in pending:",
+                "        task.run(deadline=state.deadline, retries=3)",
+                "    return len(pending)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "README.md").write_text("# files smoke root\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_FILE_BROWSER_DEFAULT", str(root))
+    return root
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_files_selection_capture_lands_in_the_dock(files_browser_root, direct_server):
+    """Files read-only page: tree → viewer → selection → chip in its own dock.
+
+    Three drags, because the gutter is where the mapping can lie:
+
+      1. a drag STARTED over the line-number gutter selects nothing at all —
+         `user-select: none` means Chromium never begins a selection there — so no
+         capture is offered rather than a wrong one;
+      2. a plain two-row drag through the code must read exactly `name · 2 lines`;
+      3. a drag ENDING over a later row's gutter is the element-boundary case the
+         browser really produces (`endContainer` = the `.files-code-text` ELEMENT,
+         whose offset is a CHILD INDEX, not a character offset): the boundary
+         precedes every character of that row, so the row is excluded.
+
+    Nothing is sent — Enter is never pressed — so the page must still be Files
+    with both chips waiting in the dock.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_selector("#chat-input", timeout=30_000)
+                page.click('[data-nav-page="files"]')
+                page.wait_for_selector("#page-files.active", timeout=10_000)
+
+                # The rail lists the seeded root; expanding a dir is one lazy call.
+                page.wait_for_selector('.files-tree-row[data-path="pkg"]', timeout=10_000)
+                page.click('.files-tree-row[data-path="pkg"]')
+                file_row = page.locator('.files-tree-row[data-path="pkg/loop.py"]')
+                file_row.wait_for(state="visible", timeout=10_000)
+                file_row.click()
+
+                # Per-line rows are the capture substrate.
+                page.wait_for_selector('.files-code-row[data-line-number="6"]', timeout=10_000)
+                assert page.locator(".files-code-row").count() == 6
+                assert "6 lines" in page.locator("#files-viewer-meta").inner_text()
+
+                rows = {
+                    n: page.locator(f'.files-code-row[data-line-number="{n}"]').bounding_box()
+                    for n in (2, 3, 4, 5)
+                }
+
+                def drag(start_row, start_dx, end_row, end_dx):
+                    page.mouse.move(rows[start_row]["x"] + start_dx, rows[start_row]["y"] + 10)
+                    page.mouse.down()
+                    page.mouse.move(rows[end_row]["x"] + end_dx, rows[end_row]["y"] + 10, steps=10)
+                    page.mouse.up()
+
+                sticky = page.locator("#files-capture-selection")
+                chips = page.locator("#files-dock-parts .composer-part-chip")
+                labels = page.locator("#files-dock-parts .composer-part-chip-label")
+
+                # (1) Gutter-started drag: the digits are unselectable, so there is
+                # no selection and no capture affordance.
+                drag(3, 8, 4, 130)
+                assert sticky.is_hidden()
+                assert chips.count() == 0
+
+                # (2) Two rows through the code. The sticky button is the
+                # GUARANTEED capture path (decision 10).
+                drag(3, 60, 4, 130)
+                sticky.wait_for(state="visible", timeout=5_000)
+                sticky.click()
+                labels.first.wait_for(state="visible", timeout=5_000)
+                assert chips.count() == 1
+                assert labels.nth(0).inner_text().strip() == "loop.py · 2 lines"
+
+                # (3) Drag ending over row 5's gutter: the end boundary is the
+                # `.files-code-text` ELEMENT at child index 0, i.e. before line 5's
+                # first character — L2-L4, three lines, not four.
+                drag(2, 60, 5, 8)
+                sticky.wait_for(state="visible", timeout=5_000)
+                sticky.click()
+                page.wait_for_function(
+                    "() => document.querySelectorAll('#files-dock-parts .composer-part-chip').length === 2",
+                    timeout=5_000,
+                )
+                assert labels.nth(1).inner_text().strip() == "loop.py · 3 lines"
+
+                # Enter-less: the draft waits in the dock, nothing was handed to chat.
+                assert page.locator("#page-files.active").count() == 1
+                assert page.locator("#page-chat.active").count() == 0
+                assert page.locator("#page-chat .chat-bubble.user").count() == 0
+                assert page.locator("#files-dock-input").input_value() == ""
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise

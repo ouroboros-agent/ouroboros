@@ -706,253 +706,248 @@ body.resizing-panels { user-select: none; }
     overflow-wrap: anywhere;
 }
 
-/* ===== [stream C: files (tree rail, viewer, code highlighting)] ===== */
-
+/* ===== [stream C: files (tree rail, viewer, code highlighting)] =====
+   The files page is READ-ONLY (decision 18): a lazy tree rail, a per-line
+   highlighted viewer, and a context-capture dock. There is no editor surface,
+   no upload overlay and no context menu, so none of those rules exist here. */
 
 .files-layout {
     position: relative;
     display: grid;
-    grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
-    grid-template-areas: "sidebar preview";
+    grid-template-columns: 280px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+        "rail viewer"
+        "dock dock";
     flex: 1;
-    height: auto;
     min-height: 0;
     overflow: hidden;
 }
 
-.files-sidebar {
-    grid-area: sidebar;
+/* --- Tree rail ---------------------------------------------------------- */
+
+.files-rail {
+    grid-area: rail;
     display: flex;
     flex-direction: column;
     min-width: 0;
     min-height: 0;
     overflow: hidden;
+    background: var(--bg-panel);
     border-right: 1px solid var(--divider);
-    background: rgba(255, 255, 255, 0.02);
 }
 
-.files-toolbar {
-    display: flex;
-    gap: 8px;
-    padding: 12px 16px 10px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+.files-rail-head {
     flex-shrink: 0;
+    padding: var(--space-3) var(--space-3) 10px;
+    border-bottom: 1px solid var(--divider);
 }
 
-.files-toolbar input {
-    flex: 1;
+.files-filter {
+    width: 100%;
     min-width: 0;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--divider);
+    padding: 7px 10px;
+    background: var(--surface-control);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-7);
     color: var(--text-primary);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
-}
-
-.files-browser-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 10px;
-    padding: 12px 16px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-    flex-shrink: 0;
-}
-
-.files-breadcrumb {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    flex: 1 1 280px;
-    min-width: 0;
-    overflow: hidden;
-}
-
-.files-browser-actions {
-    display: inline-flex;
-    gap: 8px;
-    flex-shrink: 0;
-    margin-left: auto;
-}
-
-.files-crumb {
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
+    font-family: var(--font-mono);
     font-size: 12px;
-    max-width: min(360px, 70vw);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
 }
 
-.files-crumb:hover {
-    color: var(--text-primary);
+.files-filter:focus {
+    outline: none;
+    border-color: var(--focus-accent-border);
+    box-shadow: 0 0 0 3px var(--focus-accent-ring);
 }
 
-.files-crumb-sep {
+.files-rail-hint {
+    margin-top: var(--space-2);
+    font-size: 10.5px;
+    line-height: 1.45;
     color: var(--text-muted);
-    font-size: 12px;
 }
 
-.files-list {
+.files-tree {
     flex: 1;
     min-height: 0;
     overflow: auto;
     overscroll-behavior: contain;
-    padding: 8px;
+    padding: var(--space-2) 6px;
 }
 
-.files-entry {
+/* Nesting depth arrives as the `--files-indent` custom property (the documented
+   exception to "no element.style.* mutations in UI JS"), never as inline CSS. */
+.files-tree-row {
     width: 100%;
     display: grid;
-    grid-template-columns: 20px minmax(0, 1fr) auto;
-    gap: 10px;
+    grid-template-columns: 14px minmax(0, 1fr);
+    gap: var(--space-1);
     align-items: center;
-    border: none;
+    padding: 3px 6px;
+    padding-left: calc(6px + var(--files-indent, 0) * 12px);
+    border: 1px solid transparent;
+    border-radius: var(--radius-6);
     background: transparent;
-    color: var(--text-primary);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
-    cursor: pointer;
-    text-align: left;
-}
-
-.files-entry:hover {
-    background: rgba(255, 255, 255, 0.04);
-}
-
-.files-entry.parent-link {
-    opacity: 0.88;
-}
-
-.files-entry.selected {
-    background: var(--accent-10);
-    box-shadow: inset 0 0 0 1px var(--accent-22);
-}
-
-.files-entry-icon {
-    color: var(--accent);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
     font-size: 12px;
+    line-height: 1.6;
+    text-align: left;
+    cursor: pointer;
 }
 
-.files-entry-name {
-    min-width: 0;
+.files-tree-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+}
+
+.files-tree-row.is-active {
+    background: var(--accent-10);
+    border-color: var(--accent-22);
+    color: var(--text-primary);
+}
+
+.files-tree-twist {
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.files-tree-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.files-entry-meta {
+.files-tree-note {
+    padding: var(--space-2) 10px;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: 11.5px;
+    line-height: 1.45;
 }
 
-.files-empty {
-    padding: 18px 12px;
-    color: var(--text-muted);
-    font-size: 13px;
-}
+/* --- Viewer ------------------------------------------------------------- */
 
-.files-preview {
-    grid-area: preview;
-    min-width: 0;
-    min-height: 0;
+.files-viewer {
+    grid-area: viewer;
+    /* Positioning context for the sticky selection-capture button. */
+    position: relative;
     display: flex;
     flex-direction: column;
-    background:
-        linear-gradient(180deg, var(--accent-05), transparent 120px),
-        rgba(255, 255, 255, 0.015);
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--bg-primary);
 }
 
-.files-preview-header {
-    padding: 16px 20px 12px;
-    border-bottom: 1px solid var(--divider);
+.files-viewer-head {
+    flex-shrink: 0;
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 16px;
-    flex-shrink: 0;
+    gap: var(--space-4);
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--divider);
 }
 
-.files-preview-actions {
-    display: inline-flex;
-    gap: 8px;
-    flex-shrink: 0;
+.files-viewer-ident {
+    min-width: 0;
 }
 
-.files-preview-path {
-    font-size: 14px;
-    font-weight: 600;
+.files-viewer-path {
+    font-family: var(--font-mono);
+    font-size: 13px;
     color: var(--text-primary);
-    word-break: break-all;
+    overflow-wrap: anywhere;
 }
 
-.files-preview-meta {
-    margin-top: 4px;
-    font-size: 12px;
+.files-viewer-meta {
+    margin-top: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.files-viewer-actions {
+    display: inline-flex;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.files-kbd {
+    padding: 1px 5px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: var(--radius-4);
     color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 10px;
 }
 
-.files-preview-content {
+.files-viewer-body {
     flex: 1;
     min-height: 0;
     overflow: auto;
-    overflow-wrap: anywhere;
     overscroll-behavior: contain;
-    margin: 0;
-    padding: 20px;
-    color: #d9dee8;
-    font-size: 12px;
-    line-height: 1.55;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    white-space: pre-wrap;
-    word-break: break-word;
+    padding: 12px 0 24px;
 }
 
-.files-editor-shell {
-    display: flex;
-    flex-direction: column;
-    min-height: 100%;
+.files-viewer-placeholder {
+    padding: 18px 20px;
+    color: var(--text-muted);
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+
+/* One row per source line. `data-line-number` on the row is the substrate the
+   selection→range mapping resolves against, and the number cell is
+   `user-select: none` so a dragged selection never contains gutter digits. */
+.files-code {
+    min-width: 0;
+}
+
+.files-code-row {
+    display: grid;
+    grid-template-columns: 52px minmax(0, 1fr);
     gap: 12px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.7;
 }
 
-.files-editor-name {
-    width: 100%;
-    border: 1px solid var(--divider);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--text-primary);
-    font: inherit;
+.files-code-num {
+    text-align: right;
+    color: rgba(255, 255, 255, 0.22);
+    -webkit-user-select: none;
+    user-select: none;
 }
 
-.files-editor {
-    width: 100%;
-    flex: 1;
-    min-height: 320px;
-    border: 0;
-    outline: none;
-    resize: none;
-    margin: 0;
-    padding: 0;
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    line-height: inherit;
-    white-space: pre;
+.files-code-text {
+    min-width: 0;
+    padding-right: 20px;
+    color: var(--code-default);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     tab-size: 4;
 }
+
+/* Lexeme roles emitted by web/modules/code_highlight.js. The highlighter names
+   a ROLE; the hue lives only in the syntax tokens. */
+.tok-keyword { color: var(--code-keyword); }
+.tok-self { color: var(--code-self); }
+.tok-string { color: var(--code-string); }
+.tok-number { color: var(--code-number); }
+.tok-comment { color: var(--code-comment); }
+.tok-default { color: var(--code-default); }
 
 .files-preview-image {
     display: block;
     max-width: 100%;
-    max-height: 100%;
     margin: 0 auto;
     border-radius: var(--radius);
-    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+}
+
+.files-preview-frame-host {
+    padding: 0 20px;
 }
 
 .files-preview-frame {
@@ -960,70 +955,111 @@ body.resizing-panels { user-select: none; }
     min-height: 70vh;
     border: 1px solid var(--divider);
     border-radius: var(--radius);
-    background: #111827;
+    background: var(--bg-elevated);
 }
 
-.files-drop-overlay {
+/* Sticky capture affordance: the GUARANTEED path when the browser reserves ⌘L
+   (decision 10). It sits above the scrolling code, centered on the viewer. */
+.files-selection-btn {
     position: absolute;
-    inset: 0;
-    display: none;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 2;
+    display: inline-flex;
     align-items: center;
-    justify-content: center;
-    background: rgba(var(--bg-primary-rgb), 0.86);
-    z-index: 5;
-    pointer-events: none;
-}
-
-.files-layout.drag-active .files-drop-overlay {
-    display: flex;
-}
-
-.files-drop-card {
-    padding: 22px 28px;
-    border-radius: var(--radius-lg);
-    border: 1px dashed var(--accent-55);
-    background: var(--accent-10);
-    color: var(--text-primary);
-    font-size: 14px;
-    font-weight: 600;
-    letter-spacing: 0.01em;
-    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
-}
-
-.files-context-menu {
-    position: fixed;
-    min-width: 160px;
-    padding: 6px;
-    border-radius: var(--radius);
-    border: 1px solid var(--divider);
-    background: rgba(18, 20, 26, 0.96);
-    box-shadow: 0 20px 45px rgba(0, 0, 0, 0.35);
-    z-index: 20;
-}
-
-.files-context-item {
-    width: 100%;
-    border: none;
+    gap: 6px;
+    padding: 7px 14px;
+    border: 1px solid var(--accent-55);
     border-radius: var(--radius-sm);
-    padding: 10px 12px;
+    background: var(--bg-elevated);
+    color: var(--accent-chip-text);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.files-selection-btn:hover {
+    background: var(--accent-12);
+}
+
+/* --- Capture dock (a composer_parts instance) --------------------------- */
+
+.files-dock {
+    grid-area: dock;
+    padding: 10px 20px 14px;
+    border-top: 1px solid var(--divider);
+    background: var(--bg-primary);
+}
+
+.files-dock-field {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-2);
+    padding: 8px 8px 8px 12px;
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+}
+
+.files-dock-field:focus-within {
+    border-color: var(--focus-accent-border);
+}
+
+.files-dock-input {
+    max-height: 120px;
+    padding: 4px 0;
+    border: none;
     background: transparent;
     color: var(--text-primary);
-    text-align: left;
-    cursor: pointer;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+    resize: none;
 }
 
-.files-context-item:hover {
-    background: rgba(255, 255, 255, 0.06);
+.files-dock-input:focus {
+    outline: none;
 }
 
-.files-context-item-danger {
-    color: #fca5a5;
+.files-dock-send {
+    flex-shrink: 0;
 }
 
-.files-context-item-danger:hover {
-    background: rgba(239, 68, 68, 0.12);
-    color: #fecaca;
+@media (max-width: 980px) {
+    .files-layout {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: minmax(160px, 240px) minmax(0, 1fr) auto;
+        grid-template-areas:
+            "rail"
+            "viewer"
+            "dock";
+    }
+
+    .files-rail {
+        border-right: none;
+        border-bottom: 1px solid var(--divider);
+        max-height: none;
+    }
+
+    /* The path is the identity of what you are reading: give it the full width
+       and let the two actions sit on their own row rather than squeezing it. */
+    .files-viewer-head {
+        flex-direction: column;
+        align-items: stretch;
+        gap: var(--space-2);
+        padding: 10px 14px;
+    }
+
+    .files-code-row {
+        grid-template-columns: 36px minmax(0, 1fr);
+        gap: var(--space-2);
+    }
 }
+
+/* Shared dialog input (legacy `.files-*` name): confirm_dialog.js and
+   project_create.js render it, so it outlives the files-page editor. */
 
 .files-modal-input {
     width: 100%;
@@ -1438,23 +1474,6 @@ body.resizing-panels { user-select: none; }
     margin: 0 0 18px;
     color: var(--text-secondary);
     line-height: 1.5;
-}
-
-@media (max-width: 980px) {
-    .files-layout {
-        grid-template-columns: 1fr;
-        grid-template-rows: minmax(220px, 320px) minmax(0, 1fr);
-        grid-template-areas:
-            "sidebar"
-            "preview";
-    }
-
-    .files-sidebar {
-        border-right: none;
-        border-bottom: 1px solid var(--divider);
-        max-height: none;
-    }
-
 }
 
 #chat-messages,
