@@ -163,9 +163,9 @@ export function initTaskInspector(ctx = {}) {
             <button type="button" class="inspector-close" data-inspector-close
                 title="Close inspector" aria-label="Close task inspector">×</button>
         </div>
-        <div class="inspector-tabs" role="tablist" aria-label="Task inspector views">
-            <button type="button" class="inspector-tab active" data-inspector-tab="changes" role="tab" aria-selected="true">Changes</button>
-            <button type="button" class="inspector-tab" data-inspector-tab="cost" role="tab" aria-selected="false">Cost</button>
+        <div class="app-tab-strip inspector-tabs" role="tablist" aria-label="Task inspector views">
+            <button type="button" class="app-tab active" data-inspector-tab="changes" role="tab" aria-selected="true">Changes</button>
+            <button type="button" class="app-tab" data-inspector-tab="cost" role="tab" aria-selected="false">Cost</button>
         </div>
         <div class="inspector-body scroll-fade-y" data-inspector-body></div>
         <div class="inspector-footer" data-inspector-footer></div>

@@ -148,14 +148,16 @@
     --page-header-padding-bottom: 6px;
     /* Tab-strip dimensions. `.app-tab` is the SOLE consumer of these two, so the
        12px the design handoff specifies for an underline tab lives here rather
-       than as a per-page override. (`--pill-*` is a legacy name from the retired
-       pill strip; the unconsumed --pill-padding-x / --pill-radius /
-       --pill-strip-padding steps and the rename are a synthesis-pass cleanup.) */
+       than as a per-page override. The `--pill-*` prefix is a legacy name from the
+       retired pill strip; the two steps only that strip consumed
+       (`--pill-padding-x`, `--pill-strip-padding`) are DELETED rather than left as
+       dead tokens a later reader might consume by mistake. */
     --pill-padding-y: 7px;
-    --pill-padding-x: 14px;
     --pill-font-size: 12px;
+    /* The stadium radius, for the things that really are still pills: status-tone
+       pills, tone chips, runtime pills. Every rule that wants that shape reads this
+       instead of repeating the 999px literal. */
     --pill-radius: 999px;
-    --pill-strip-padding: 6px 0 8px;
     --button-padding-y: 8px;
     --button-padding-x: 16px;
     --button-font-size: 13px;
@@ -529,20 +531,10 @@ body.resizing-panels { user-select: none; }
     box-shadow: inset 0 0 0 2px rgba(96, 165, 250, 0.65);
 }
 
-/* CROSS-REGION: the flat-chat region overrides placement via
-   `.chat-live-card > .chat-live-actions` (line ~1952, 2 classes), so this base
-   keeps working no matter which region ends up first in the file. */
-.chat-live-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-2);
-    padding: 0 var(--space-3) var(--space-2);
-}
-
 .chat-live-project-btn {
     min-height: 30px;
     padding: 0 var(--space-3);
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     border: 1px solid var(--accent-18);
     background: var(--accent-04);
     color: var(--text-secondary);
@@ -561,18 +553,6 @@ body.resizing-panels { user-select: none; }
     cursor: default;
 }
 
-
-/* P3 — a converted card becomes a calm "project identity" chip. The whole card
-   recolors from the red task accent to the project fuchsia over ~250ms; the live
-   timeline is gone (the project panel owns it now), so the main chat is freed.
-   CROSS-REGION: the flat-chat region re-adds the surface via the doubled
-   `.chat-live-card.is-project.is-project` (line ~1941, 3 classes), so that
-   override wins on specificity rather than on which region comes later. */
-.chat-live-card.is-project {
-    border-color: var(--project-18);
-    background: var(--project-08);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(240, 171, 252, 0.05);
-}
 
 .chat-live-project-card-btn {
     display: flex;
@@ -1988,13 +1968,13 @@ button.chat-file:hover,
     display: none;
 }
 
-/* Restore the surface for a converted card: the run moved to its project panel,
-   so this is a project identity chip, not an agent turn (defined flat in the
-   shell region above; this deliberately re-adds the box the flat card dropped).
-   CROSS-REGION: the class is doubled so this outranks the shell region's
-   `.chat-live-card.is-project` (line ~566) by SPECIFICITY — the two regions are
-   independently owned and must not depend on their order in the file. */
-.chat-live-card.is-project.is-project {
+/* A converted card is a project identity chip, not an agent turn: the run moved to
+   its project panel, so this deliberately re-adds the box the flat card dropped —
+   flat, though, with no glass shadow. Owned HERE, in one definition: the multi-
+   project region used to carry a competing base that this had to outrank with a
+   doubled class, which made the chat's own card depend on a rule two thousand
+   lines away. */
+.chat-live-card.is-project {
     border: 1px solid var(--project-18);
     border-radius: var(--radius-md);
     background: var(--project-08);
@@ -2002,11 +1982,15 @@ button.chat-file:hover,
     opacity: 1;
 }
 
-/* Actions sit under the turn, left-aligned with the reading column.
-   CROSS-REGION: the child selector outranks the shell region's bare
-   `.chat-live-actions` (line ~530) by specificity, not by source order. */
-.chat-live-card > .chat-live-actions {
+/* Card actions ("Turn into project", "Inspect") sit under the turn, left-aligned
+   with the reading column. Every producer appends this element as a direct child
+   of the card root (`chat.js::ensureLiveActionsEl` and the project-action markup),
+   so ONE flat definition here replaces the base-plus-override pair the two regions
+   used to split it into. */
+.chat-live-actions {
+    display: flex;
     justify-content: flex-start;
+    gap: var(--space-2);
     padding: var(--space-1) 0 0;
 }
 
@@ -2099,32 +2083,9 @@ button.chat-file:hover,
     animation: thinking-pulse 1.5s ease-in-out infinite;
 }
 
-.chat-live-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
-.chat-live-line-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
-.log-entry .log-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
-.evo-runtime-pill.online {
-    color: var(--green);
-    border-color: rgba(34, 197, 94, 0.22);
-    background: rgba(34, 197, 94, 0.10);
-}
-
-.chat-live-phase:is(.warn, .alive, .empty, .cancelled),
-.chat-live-line-phase:is(.warn, .alive, .empty, .cancelled),
-.log-entry .log-phase:is(.warn, .alive, .empty, .cancelled),
-.evo-runtime-pill.starting {
-    color: var(--amber);
-    border-color: rgba(245, 158, 11, 0.25);
-    background: rgba(245, 158, 11, 0.10);
-}
-
-.chat-live-phase:is(.error, .timeout, .lifecycle_error),
-.chat-live-line-phase:is(.error, .timeout, .lifecycle_error),
-.log-entry .log-phase:is(.error, .timeout, .lifecycle_error),
-.evo-runtime-pill.error {
-    color: var(--red);
-    border-color: rgba(239, 68, 68, 0.25);
-    background: rgba(239, 68, 68, 0.10);
-}
+/* The done / warn / error tones for these pills are NOT owned here: they are the
+   shared status-tone ladder, which the chat, the Logs grid and the Evolution
+   runtime card all read. See the `[shared: status tone ladder]` region below. */
 
 /* Live-card typing dots. */
 .chat-live-typing {
@@ -2824,7 +2785,7 @@ button.chat-file:hover,
     border-radius: var(--radius-sm);
     border: none;
     background: transparent;
-    color: rgba(226, 232, 240, 0.45);
+    color: var(--text-secondary);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -2834,7 +2795,7 @@ button.chat-file:hover,
 }
 
 .chat-attach-btn:hover {
-    color: rgba(226, 232, 240, 0.85);
+    color: var(--text-primary);
     background: rgba(255, 255, 255, 0.06);
 }
 
@@ -2870,7 +2831,7 @@ button.chat-file:hover,
     border: 1px solid var(--accent-25);
     border-radius: var(--radius-sm);
     font-size: 12px;
-    color: rgba(226, 232, 240, 0.85);
+    color: var(--text-primary);
     max-width: 100%;
 }
 
@@ -2885,7 +2846,7 @@ button.chat-file:hover,
     flex-shrink: 0;
     border: none;
     background: none;
-    color: rgba(226, 232, 240, 0.5);
+    color: var(--text-secondary);
     cursor: pointer;
     font-size: 16px;
     line-height: 1;
@@ -2893,7 +2854,7 @@ button.chat-file:hover,
 }
 
 .attach-remove:hover {
-    color: rgba(226, 232, 240, 0.9);
+    color: var(--text-primary);
 }
 
 #chat-input,
@@ -2974,8 +2935,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .chat-swarm {
     height: var(--composer-control-height);
     padding: 0 12px;
-    border: 1px solid rgba(226, 232, 240, 0.12);
-    border-radius: 999px;
+    border: 1px solid var(--surface-border);
+    border-radius: var(--pill-radius);
     background: var(--surface-control);
     color: var(--text-secondary);
     box-shadow: var(--composer-control-shadow);
@@ -3004,8 +2965,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: inline-flex;
     align-items: center;
     height: var(--composer-control-height);
-    border: 1px solid rgba(226, 232, 240, 0.12);
-    border-radius: 999px;
+    border: 1px solid var(--surface-border);
+    border-radius: var(--pill-radius);
     overflow: hidden;
     background: var(--surface-control);
     box-shadow: var(--composer-control-shadow);
@@ -3022,7 +2983,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding: 0 12px;
     border: none;
     background: transparent;
-    color: rgba(226, 232, 240, 0.45);
+    color: var(--text-secondary);
     font: inherit;
     cursor: pointer;
     transition: color 0.15s, background 0.15s;
@@ -3180,7 +3141,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     white-space: nowrap;
 }
 
@@ -3544,7 +3505,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .log-entry .log-phase {
     padding: 0 7px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     font-size: 10.5px;
     border: 1px solid var(--surface-border);
     color: var(--text-secondary);
@@ -3579,7 +3540,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: inline-flex;
     align-items: center;
     padding: 0 7px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     background: var(--surface-control);
     color: var(--text-secondary);
     border: 1px solid var(--surface-border-soft);
@@ -3692,6 +3653,57 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: flex;
     flex-direction: column;
     gap: 4px;
+}
+
+/* ===== [shared: status tone ladder] =====
+   ONE place decides what "this finished", "this needs attention" and "this failed"
+   look like on a small status pill, for every surface that shows one: the chat's
+   turn/activity phase pills (chat region), the Logs grid's phase column (dashboard
+   region) and the Evolution runtime pills. The tones were a chat-region block that
+   the dashboard's selectors had quietly joined — one owner's region deciding
+   another's colours — so they are hoisted here instead, and neither region has to
+   reach into the other to keep a status readable.
+
+   Each rule is at least two classes, so it outranks the per-surface pill BASES
+   (`.log-entry .log-phase`, `.evo-runtime-pill`) on specificity and never on where
+   this region happens to sit in the file. Phase-name lists differ per surface
+   because the event vocabularies differ; the three tones do not.
+
+   The `.start/.calling/.progress` ACCENT tone stays with each surface: it is the
+   design's "work is happening" colour, and each region tunes its own alpha. */
+
+.chat-live-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
+.chat-live-line-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
+.log-entry .log-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
+.evo-runtime-pill.online {
+    color: var(--green);
+    border-color: rgba(34, 197, 94, 0.22);
+    background: rgba(34, 197, 94, 0.10);
+}
+
+.chat-live-phase:is(.warn, .alive, .empty, .cancelled),
+.chat-live-line-phase:is(.warn, .alive, .empty, .cancelled),
+.log-entry .log-phase:is(.warn, .alive, .empty, .cancelled),
+.evo-runtime-pill.starting {
+    color: var(--amber);
+    border-color: rgba(245, 158, 11, 0.25);
+    background: rgba(245, 158, 11, 0.10);
+}
+
+.chat-live-phase:is(.error, .timeout, .lifecycle_error),
+.chat-live-line-phase:is(.error, .timeout, .lifecycle_error),
+.log-entry .log-phase:is(.error, .timeout, .lifecycle_error),
+.evo-runtime-pill.error {
+    color: var(--red);
+    border-color: rgba(239, 68, 68, 0.25);
+    background: rgba(239, 68, 68, 0.10);
+}
+
+/* The fourth runtime state: an idle/disabled lane is deliberately toneless gray,
+   which is why it is a colour DECISION worth sitting beside the other three
+   rather than a leftover in the evolution card. */
+.evo-runtime-pill.offline {
+    color: var(--text-muted);
 }
 
 /* ===== [shared: scrollbars + reconnect overlay] ===== */
@@ -3843,11 +3855,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-size: 11.5px;
 }
 
-/* Runtime pills read as state: running is green (shared tone rules further up),
-   an idle/disabled lane stays deliberately gray. */
-.evo-runtime-pill.offline {
-    color: var(--text-muted);
-}
+/* The runtime pill's four states live together in the `[shared: status tone
+   ladder]` region — this card owns the pill's SHAPE, not its tones. */
 
 .evo-runtime-chip {
     font-family: var(--font-mono);
@@ -4150,7 +4159,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 6px;
     margin: 6px 8px;
     padding: 4px 10px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     border: 1px solid var(--amber-dim);
     background: var(--amber-dim);
     color: var(--accent-system);
@@ -4467,7 +4476,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: inline-block;
     width: 40px;
     height: 22px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     background: var(--bg-hover);
     transition: background 120ms ease;
 }
@@ -4544,7 +4553,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 8px;
     align-self: flex-start;
     padding: 5px 10px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     border: 1px solid var(--accent-25);
     background: var(--accent-08);
     color: var(--accent-chip-text);
@@ -4792,7 +4801,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: inline-block;
     margin-left: 6px;
     padding: 1px 8px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     font-size: 10.5px;
     font-weight: 500;
     text-transform: uppercase;
@@ -5673,7 +5682,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .widget-tab-btn {
     border: 1px solid var(--surface-border);
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     background: var(--surface-card);
     color: var(--text-secondary);
     cursor: pointer;
@@ -6481,33 +6490,25 @@ textarea.chat-input {
     border-color: var(--accent);
 }
 
-/* Equal-width underline tabs (design handoff §3), not the pill tab strip. */
+/* The inspector's tabs ARE the shared underline-tab control (`.app-tab-strip` +
+   `.app-tab`, see the page-chrome region); this class only re-solves the width
+   problem a 320px panel has and a page header does not. Two tabs in a fixed narrow
+   panel read as a segmented header when they split the width, so the strip becomes
+   an equal-columns grid and its tabs drop the horizontal padding they would
+   otherwise centre inside. Colour, weight, font size, the 2px accent underline,
+   the hover rule and the divider overlap are all INHERITED — a change to the tab
+   grammar reaches the inspector without a second edit. */
 .inspector-tabs {
     display: grid;
     grid-auto-flow: column;
     grid-auto-columns: 1fr;
     border-bottom: 1px solid var(--divider);
+    padding: 0;
 }
 
-.inspector-tab {
-    border: none;
-    border-bottom: 2px solid transparent;
-    background: transparent;
-    color: var(--text-secondary);
-    font: inherit;
-    font-size: 12px;
-    font-weight: 600;
-    padding: 8px 0;
-    cursor: pointer;
-}
-
-.inspector-tab:hover {
-    color: var(--text-primary);
-}
-
-.inspector-tab.active {
-    border-bottom-color: var(--accent);
-    color: var(--text-primary);
+.inspector-tabs > .app-tab {
+    padding-inline: 0;
+    text-align: center;
 }
 
 .inspector-body {
