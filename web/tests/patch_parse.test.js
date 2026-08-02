@@ -168,11 +168,20 @@ test('quoted and octal-escaped paths are decoded', () => {
     assert.equal(file.path, 'dir/with space.py');
 });
 
-test('--no-index sections (untracked new files) parse as additions', () => {
+test('the untracked --no-index section parses as an addition (REAL git bytes)', () => {
+    // Verbatim output of the command the server actually runs for an attributed
+    // untracked file:
+    //   git -c core.quotepath=off diff --no-ext-diff --no-textconv --no-color \
+    //       --no-index -- /dev/null new_file.py
+    // Note what git emits: an ordinary `diff --git a/<new> b/<new>` header, NOT a
+    // `diff --no-index` line. The parser had a branch for the latter, which no
+    // real patch can ever reach — this test is pinned to the real shape instead.
     const { files } = parsePatch([
-        'diff --no-index /dev/null new_file.py',
+        'diff --git a/new_file.py b/new_file.py',
+        'new file mode 100644',
+        'index 0000000..b864e36',
         '--- /dev/null',
-        '+++ new_file.py',
+        '+++ b/new_file.py',
         '@@ -0,0 +1,2 @@',
         '+fresh = True',
         '+more = 1',
@@ -181,6 +190,8 @@ test('--no-index sections (untracked new files) parse as additions', () => {
     assert.equal(files[0].path, 'new_file.py');
     assert.equal(fileStatusLetter(files[0]), 'A');
     assert.equal(files[0].added, 2);
+    assert.equal(files[0].removed, 0);
+    assert.equal(files[0].hunks[0].lines[0].newNumber, 1);
 });
 
 test('a deleted line that looks like a header stays a deletion', () => {

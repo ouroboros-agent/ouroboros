@@ -2862,8 +2862,12 @@ def test_ui_smoke_changes_screen_and_task_inspector(direct_server_with_data):
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
+    from ouroboros.projects_registry import create_project
+
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
+    # A project exists so the right-panel slot can be contested from BOTH sides.
+    create_project(data_dir, "alpha", name="Alpha project")
     artifacts = data_dir / "task_results" / "artifacts" / "diff-smoke"
     artifacts.mkdir(parents=True, exist_ok=True)
     patch_text = (
@@ -2941,6 +2945,44 @@ def test_ui_smoke_changes_screen_and_task_inspector(direct_server_with_data):
                 assert page.locator('[data-changes-request]').inner_text().strip() == "Request edits"
                 assert page.get_by_text("Approve", exact=False).count() == 0
 
+                # ⌘L capture: the dock IS the capture dock, and this page consumes
+                # the CANCELABLE `ouro:capture-selection` event — that consumption is
+                # what licenses the global handler to suppress the browser default.
+                assert page.locator('[data-changes-dock-field][data-capture-dock]').count() == 1
+                consumed = page.evaluate(
+                    """() => {
+                        const cells = [...document.querySelectorAll(
+                            '#page-changes .changes-unified [data-diff-row]')];
+                        const range = document.createRange();
+                        range.setStart(cells[2].firstChild, 0);
+                        range.setEnd(cells[3].firstChild, cells[3].textContent.length);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                        const event = new CustomEvent('ouro:capture-selection', {
+                            detail: {page: 'changes'}, cancelable: true});
+                        window.dispatchEvent(event);
+                        return event.defaultPrevented;
+                    }"""
+                )
+                assert consumed is True, "the Changes page must consume the capture event"
+                chip = page.locator('[data-changes-dock-field] .composer-part-chip')
+                chip_label = page.locator('[data-changes-dock-field] .composer-part-chip-label')
+                chip.first.wait_for(state="visible", timeout=10_000)
+                assert chip.first.get_attribute("title") == "ouroboros/loop.py"
+                # Rows 2..3 of the unified render are the ADDITION (new line 2) and
+                # the trailing context line (new line 3), so the chip is named by the
+                # NEW-side range and carries those two lines.
+                assert chip_label.first.inner_text().strip() == "loop.py · 2 lines"
+                # A capture with NO selection is the whole file: one bare marker.
+                page.evaluate("() => window.getSelection().removeAllRanges()")
+                page.evaluate(
+                    "() => window.dispatchEvent(new CustomEvent('ouro:capture-selection',"
+                    " { detail: { page: 'changes' }, cancelable: true }))"
+                )
+                assert chip.count() == 2
+                assert chip_label.nth(1).inner_text().strip() == "loop.py"
+
                 # The inspector opens on the card event and is a right panel.
                 page.evaluate(
                     "() => window.dispatchEvent(new CustomEvent('ouro:inspect-task',"
@@ -2969,6 +3011,24 @@ def test_ui_smoke_changes_screen_and_task_inspector(direct_server_with_data):
                     " { detail: { taskId: 'diff-smoke' } }))"
                 )
                 panel.wait_for(state="visible", timeout=15_000)
+
+                # The right side is ONE slot: a project panel opened while the
+                # inspector is up evicts it, and the inspector opened over a project
+                # panel evicts that. Asserting only the second direction would leave
+                # the shared slot half-tested.
+                project_panel = page.locator('#project-panel')
+                project_row = page.locator('.nav-project-row[data-project-id="alpha"]')
+                project_row.wait_for(state="visible", timeout=15_000)
+                project_row.click()
+                project_panel.wait_for(state="visible", timeout=15_000)
+                panel.wait_for(state="hidden", timeout=15_000)
+                page.evaluate(
+                    "() => window.dispatchEvent(new CustomEvent('ouro:inspect-task',"
+                    " { detail: { taskId: 'diff-smoke' } }))"
+                )
+                panel.wait_for(state="visible", timeout=15_000)
+                project_panel.wait_for(state="hidden", timeout=15_000)
+
                 page.click('[data-nav-page="settings"]')
                 panel.wait_for(state="hidden", timeout=15_000)
             finally:

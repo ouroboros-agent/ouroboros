@@ -18,16 +18,28 @@
  *
  * There is deliberately NO approve action here (owner-locked scope): the only
  * action is asking the agent for edits.
+ *
+ * ⌘L capture: the dock is a `[data-capture-dock]` composer-parts field, and this
+ * page owns the capture for `page === 'changes'`. The global handler only names
+ * the active page in one CANCELABLE `ouro:capture-selection` event; consuming it
+ * means calling `preventDefault()` (that is how the global handler learns it may
+ * suppress the browser default). A diff selection becomes a chip whose range is
+ * the NEW-side line numbers, because those are the lines that exist in the file
+ * the agent will edit.
  */
 
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
+import { showToast } from './toast.js';
 import { apiClient } from './api_client.js';
-import { createComposerParts, makeTextPart, normalizeParts } from './composer_parts.js';
+import { createComposerParts, makeChipPart, makeTextPart, normalizeParts } from './composer_parts.js';
 import { fileStatusLetter, parsePatch, splitRows, unifiedRows } from './patch_parse.js';
 
-const TASK_RAIL_LIMIT = 60;
+// The rail is a REVIEW surface, not a task log: 30 rows is what fits without
+// turning the newest-first list into a scroll hunt (the inspector and Chat own
+// the long history).
+const TASK_RAIL_LIMIT = 30;
 
 /** The one drift sentence (owner-locked wording). */
 export const HEAD_DRIFT_NOTICE = 'HEAD differs from the task baseline; showing the '
@@ -68,6 +80,23 @@ export function taskShortTitle(task) {
     return String(task?.task_id || task?.id || 'task');
 }
 
+/** The one neutral sentence for a task that simply has no recorded baseline. */
+export const NO_BASELINE_NOTICE = 'No diff baseline was recorded for this task';
+
+/**
+ * Is this `blocked` answer just "there was never a baseline to diff against"?
+ *
+ * `baseline_missing` (and a blocked answer carrying no blockers at all) is an
+ * ABSENCE of evidence, not a failure to trust: most tasks that never touched the
+ * repo land here. Dressing it up as "no trustworthy diff" teaches the owner to
+ * read alarm into the ordinary case, so it gets its own neutral wording.
+ */
+export function diffLacksBaselineOnly(diff) {
+    if (String(diff?.status || '') !== 'blocked') return false;
+    const blockers = Array.isArray(diff?.blockers) ? diff.blockers.filter(Boolean) : [];
+    return blockers.length === 0 || (blockers.length === 1 && blockers[0] === 'baseline_missing');
+}
+
 /**
  * The rail/header meta line for one loaded diff: `N files · +A −R`.
  * A diff that is not `ready` reports its lifecycle instead of a fake `0 files`.
@@ -75,7 +104,7 @@ export function taskShortTitle(task) {
 export function diffSummaryMeta(diff, parsed) {
     const status = String(diff?.status || '');
     if (status === 'pending') return 'waiting for the task to finalize its changes';
-    if (status === 'blocked') return 'diff unavailable';
+    if (status === 'blocked') return diffLacksBaselineOnly(diff) ? 'no diff baseline recorded' : 'diff unavailable';
     if (status === 'empty') return 'no changes';
     const files = parsed?.files?.length || 0;
     return `${files} file${files === 1 ? '' : 's'} · +${parsed?.added || 0} −${parsed?.removed || 0}`;
@@ -97,19 +126,67 @@ export function diffBanners(diff) {
         });
     }
     if (status === 'blocked') {
-        rows.push({
-            tone: 'blocked',
-            text: 'No trustworthy diff can be shown for this task.',
-            detail: blockers.join(', '),
-        });
+        // A missing baseline is an absence, not a broken read: it gets the neutral
+        // sentence and no blocker code, because `baseline_missing` is not an
+        // owner-actionable fault.
+        rows.push(diffLacksBaselineOnly(diff)
+            ? { tone: 'neutral', text: NO_BASELINE_NOTICE }
+            : {
+                tone: 'blocked',
+                text: 'No trustworthy diff can be shown for this task.',
+                detail: blockers.join(', '),
+            });
     }
-    if (diff?.head_advanced) {
+    // Drift is a LIVE-projection fact: it means the repo's HEAD moved away from the
+    // baseline the patch is taken against. A workspace task's patch is durable
+    // bytes captured at its own base, so `head_advanced` there would describe a
+    // repo this patch does not depend on — the sentence would be a non-sequitur.
+    if (diff?.head_advanced && String(diff?.source || '') === 'mutation_baseline') {
         rows.push({ tone: 'drift', text: HEAD_DRIFT_NOTICE });
     }
     if (status !== 'blocked' && blockers.length) {
         rows.push({ tone: 'evidence', text: 'Attribution notes', detail: blockers.join(', ') });
     }
     return rows;
+}
+
+/**
+ * Selected diff rows -> the chip a capture will build. PURE, because the rule is
+ * a DECISION about what the bytes may CLAIM, not a DOM fact.
+ *
+ * Rules, in order:
+ *   • no selection at all is the whole-file chip: `[context: <path>]`, no range,
+ *     no bytes — the agent opens the file itself;
+ *   • the range is the NEW-side line numbers, and only when BOTH boundary rows
+ *     have one. Those are the lines that exist in the file the agent will edit;
+ *     an old-side number would name a line that is no longer there;
+ *   • a selection whose boundary is a DELETION (no new-side number) therefore
+ *     omits the range and keeps only the content. The codec's own rule then
+ *     applies — bytes are inlined only under a range — so such a capture
+ *     degrades to the bare whole-file marker rather than to a range that points
+ *     at the wrong lines. Being unable to name deleted lines is the honest
+ *     outcome; naming them wrongly is not.
+ *
+ * @param {{path?: string, rows?: Array<{newNumber?: *, text?: string}>}} input
+ *        `rows` are the selected diff lines in document order, `text` verbatim.
+ */
+export function diffChipDecision({ path = '', rows = [] } = {}) {
+    const selected = (Array.isArray(rows) ? rows : []).filter(Boolean);
+    if (!selected.length) return { path, lineStart: null, lineEnd: null, content: null };
+    const content = selected.map((row) => String(row.text == null ? '' : row.text)).join('\n');
+    const newNumber = (row) => {
+        const num = Number(row?.newNumber);
+        return Number.isInteger(num) && num > 0 ? num : null;
+    };
+    const first = newNumber(selected[0]);
+    const last = newNumber(selected[selected.length - 1]);
+    if (first === null || last === null) return { path, lineStart: null, lineEnd: null, content };
+    return {
+        path,
+        lineStart: Math.min(first, last),
+        lineEnd: Math.max(first, last),
+        content,
+    };
 }
 
 /** The plain-text task line prepended to a "Request edits" handoff. */
@@ -162,8 +239,11 @@ function renderShell() {
                 </div>
                 <div class="changes-banners" data-changes-banners></div>
                 <div class="changes-diff scroll-fade-y" data-changes-diff></div>
+                <button type="button" class="changes-selection-btn" data-changes-capture-selection hidden>
+                    Add selection <kbd class="changes-kbd">⌘L</kbd>
+                </button>
                 <form class="changes-dock" data-changes-dock>
-                    <div class="changes-dock-field" data-changes-dock-field>
+                    <div class="changes-dock-field" data-changes-dock-field data-capture-dock>
                         <input
                             type="text"
                             class="changes-dock-input"
@@ -201,6 +281,7 @@ export function initChanges(ctx = {}) {
     const dockForm = page.querySelector('[data-changes-dock]');
     const dockField = page.querySelector('[data-changes-dock-field]');
     const dockInput = page.querySelector('[data-changes-dock-input]');
+    const selectionBtn = page.querySelector('[data-changes-capture-selection]');
 
     const view = {
         tasks: [],
@@ -215,6 +296,16 @@ export function initChanges(ctx = {}) {
         // The one /api/state snapshot (project names + post-hoc task bindings).
         projects: [],
         taskBindings: {},
+        // Capture state. `captureRows` is the CURRENT render's line list — one entry
+        // per canonical diff line, in document order — and every selectable text
+        // cell carries its index in `data-diff-row`. Reading the bytes from here
+        // rather than from the DOM keeps the captured content verbatim: the rendered
+        // cell may also hold the `⏎̸` no-newline marker, which is presentation.
+        captureRows: [],
+        // The last non-empty selection span, for the two callers allowed to read a
+        // collapsed selection (the sticky button, and ⌘L pressed inside the dock —
+        // focusing the dock is what collapsed it).
+        lastSelection: null,
     };
 
     const dock = createComposerParts({ container: dockField, input: dockInput });
@@ -330,6 +421,11 @@ export function initChanges(ctx = {}) {
 
     function paintDiff() {
         const file = activeFile();
+        // A repaint replaces every row element, so any remembered selection span
+        // points at rows that no longer exist. Both are rebuilt from this render.
+        view.captureRows = [];
+        view.lastSelection = null;
+        if (selectionBtn) selectionBtn.hidden = true;
         // With no file to name (empty / pending / blocked diff) the header keeps the
         // task's identity instead of going blank.
         pathEl.textContent = file
@@ -375,6 +471,16 @@ export function initChanges(ctx = {}) {
         return cell;
     }
 
+    /**
+     * Register one canonical diff line for capture and return its index.
+     * `text` is the VERBATIM diff line (its `+`/`-`/space prefix included, no
+     * presentation markers), and `newNumber` is its new-side number if it has one.
+     */
+    function pushCaptureRow(newNumber, text) {
+        view.captureRows.push({ newNumber, text });
+        return view.captureRows.length - 1;
+    }
+
     function renderUnified(file) {
         const grid = document.createElement('div');
         grid.className = 'changes-unified';
@@ -388,10 +494,13 @@ export function initChanges(ctx = {}) {
             }
             const line = document.createElement('div');
             line.className = `changes-row is-${row.kind}`;
+            if (row.newNumber) line.dataset.newLine = row.newNumber;
+            const text = lineCell('changes-text', row.noNewline ? `${row.text} ⏎̸` : row.text);
+            text.dataset.diffRow = String(pushCaptureRow(row.newNumber, row.text));
             line.append(
                 lineCell('changes-num', row.oldNumber),
                 lineCell('changes-num', row.newNumber),
-                lineCell('changes-text', row.noNewline ? `${row.text} ⏎̸` : row.text),
+                text,
             );
             grid.appendChild(line);
         }
@@ -411,7 +520,19 @@ export function initChanges(ctx = {}) {
             }
             const line = document.createElement('div');
             line.className = 'changes-row is-split';
-            const side = (cell, kind) => {
+            // A context row shows ONE canonical line on both sides, so both cells
+            // share a single capture index and a selection over it captures the line
+            // once. A change row shows two different lines, so each side is its own.
+            const ctx = row.kind === 'ctx';
+            const leftIndex = row.left
+                ? pushCaptureRow(ctx ? row.right?.number : '', `${ctx ? ' ' : '-'}${row.left.text}`)
+                : null;
+            const rightIndex = !row.right
+                ? null
+                : (ctx && leftIndex !== null
+                    ? leftIndex
+                    : pushCaptureRow(row.right.number, `+${row.right.text}`));
+            const side = (cell, kind, index) => {
                 const num = lineCell('changes-num', cell ? cell.number : '');
                 const text = lineCell(`changes-text is-${cell ? cell.kind : 'none'}`, cell ? cell.text : '');
                 if (!cell) {
@@ -420,9 +541,11 @@ export function initChanges(ctx = {}) {
                 }
                 num.classList.add(`is-${cell ? cell.kind : 'none'}`);
                 num.dataset.side = kind;
+                if (index !== null) text.dataset.diffRow = String(index);
+                if (cell && kind === 'new') text.dataset.newLine = cell.number;
                 return [num, text];
             };
-            line.append(...side(row.left, 'old'), ...side(row.right, 'new'));
+            line.append(...side(row.left, 'old', leftIndex), ...side(row.right, 'new', rightIndex));
             grid.appendChild(line);
         }
         return grid;
@@ -475,6 +598,115 @@ export function initChanges(ctx = {}) {
         const wanted = view.parsed.files.find((file) => file.path === filePath);
         view.filePath = (wanted || view.parsed.files[0] || {}).path || '';
         paintAll();
+    }
+
+    // -----------------------------------------------------------------------
+    // ⌘L capture (DOM layer over `diffChipDecision`)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Does a Range boundary sit BEFORE its cell's first character?
+     *
+     * An ELEMENT boundary carries a CHILD INDEX, not a character offset, so the
+     * two scales must never be compared. The question is answered positionally
+     * instead: a probe range from the cell's start to the boundary that stringifies
+     * to '' means nothing lies before it.
+     */
+    function boundaryAtCellStart(cell, container, offset) {
+        try {
+            const probe = document.createRange();
+            probe.setStart(cell, 0);
+            probe.setEnd(container, offset);
+            return probe.toString() === '';
+        } catch {
+            return false;
+        }
+    }
+
+    /** One Range boundary -> `{index, atStart}` of its diff line, or null. */
+    function resolveDiffBoundary(container, offset) {
+        const element = container instanceof Element ? container : (container?.parentElement || null);
+        if (!element || !diffEl.contains(element)) return null;
+        const cell = element.closest('[data-diff-row]');
+        if (!cell || !diffEl.contains(cell)) return null;
+        const index = Number(cell.dataset.diffRow);
+        if (!Number.isInteger(index) || index < 0 || index >= view.captureRows.length) return null;
+        return { index, atStart: boundaryAtCellStart(cell, container, offset) };
+    }
+
+    /**
+     * The current selection as an inclusive `captureRows` span, or null.
+     *
+     * BOTH boundaries must land on diff lines of THIS view: a selection that starts
+     * in the diff and ends in the dock, the file rail, or a hunk header names no
+     * range rather than a wrong one. An END boundary sitting before its row's first
+     * character (dragging just past a line break) excludes that row, so the capture
+     * is never silently one line wider than what the owner highlighted.
+     */
+    function readDiffSelection() {
+        const selection = typeof window !== 'undefined' && window.getSelection ? window.getSelection() : null;
+        if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+        const range = selection.getRangeAt(0);
+        const start = resolveDiffBoundary(range.startContainer, range.startOffset);
+        const end = resolveDiffBoundary(range.endContainer, range.endOffset);
+        if (!start || !end) return null;
+        const [first, last] = start.index <= end.index ? [start, end] : [end, start];
+        let endIndex = last.index;
+        if (endIndex > first.index && last.atStart) endIndex -= 1;
+        return { startIndex: first.index, endIndex };
+    }
+
+    /**
+     * Keep the sticky button in step with the live selection, and remember the
+     * span: the button and a dock-focused ⌘L are the only callers allowed to read a
+     * selection the browser has since collapsed.
+     */
+    function syncSelectionButton() {
+        const span = readDiffSelection();
+        if (span) view.lastSelection = span;
+        if (selectionBtn) selectionBtn.hidden = !span;
+    }
+
+    function clearWindowSelection() {
+        const selection = typeof window !== 'undefined' && window.getSelection ? window.getSelection() : null;
+        if (selection && typeof selection.removeAllRanges === 'function') selection.removeAllRanges();
+        view.lastSelection = null;
+        if (selectionBtn) selectionBtn.hidden = true;
+    }
+
+    /**
+     * Append a context chip for what the owner is looking at to the DOCK (never
+     * straight to chat): the dock is where they see exactly what will be sent.
+     * With no selection this is the whole active file.
+     */
+    function capture({ selectionOnly = false } = {}) {
+        const file = activeFile();
+        if (!file) {
+            if (!selectionOnly) {
+                showToast('Open a task with changes first — there is nothing to add to chat context yet.', 'warn');
+            }
+            return false;
+        }
+        const active = document.activeElement;
+        const focusInDock = Boolean(active instanceof Element && active.closest('[data-capture-dock]'));
+        const span = readDiffSelection() || (selectionOnly || focusInDock ? view.lastSelection : null);
+        if (!span && selectionOnly) return false;
+        const rows = span ? view.captureRows.slice(span.startIndex, span.endIndex + 1) : [];
+        const decision = diffChipDecision({ path: file.path, rows });
+        const chip = makeChipPart(decision);
+        if (!chip) {
+            showToast(`Nothing captured: "${file.path}" cannot be written as a context reference.`, 'warn');
+            return false;
+        }
+        if (rows.length && chip.lineStart === undefined) {
+            // The selection was deletion-bounded, so no NEW-side range could name
+            // it and the codec dropped the bytes with the range. Say so instead of
+            // letting a whole-file chip look like the selection was captured.
+            showToast('Deleted lines have no line numbers in the new file — added the whole file instead.', 'warn');
+        }
+        dock.addChip(chip);  // commits any typed draft first, then focuses the dock
+        clearWindowSelection();
+        return true;
     }
 
     async function requestEdits() {
@@ -531,6 +763,30 @@ export function initChanges(ctx = {}) {
         requestEdits();
     });
 
+    if (selectionBtn) {
+        // The button is the GUARANTEED capture path (⌘L is best-effort: some
+        // browsers keep it for the address bar), so it must not destroy the
+        // selection it is about to read — mousedown default = focus change =
+        // collapsed selection.
+        selectionBtn.addEventListener('mousedown', (event) => event.preventDefault());
+        selectionBtn.addEventListener('click', () => { capture({ selectionOnly: true }); });
+    }
+    diffEl.addEventListener('mouseup', () => syncSelectionButton());
+    document.addEventListener('selectionchange', () => syncSelectionButton());
+
+    // The global ⌘L handler (app.js `[anchor:phase-C]`) knows nothing about this
+    // module: it names the active page in one event and the owning page listens.
+    // The event is CANCELABLE, and calling preventDefault here is how this page
+    // says "I consumed the keystroke" — only then does the global handler suppress
+    // the browser default. Staying silent leaves ⌘L to the browser, which is more
+    // honest than swallowing the address-bar shortcut to do nothing.
+    window.addEventListener('ouro:capture-selection', (event) => {
+        if (event.detail?.page !== 'changes') return;
+        if (!page.classList.contains('active')) return;
+        event.preventDefault();
+        capture();
+    });
+
     if (typeof subscribeState === 'function') {
         // Badge inputs only. Repainting the rail on every poll would reset its
         // scroll position and hover state a few times a minute for nothing, so the
@@ -582,6 +838,8 @@ export function initChanges(ctx = {}) {
         addChip: (chip) => dock.addChip(chip),
         /** The file currently under review, for a capture that needs its path. */
         activeFilePath: () => view.filePath,
+        /** Capture the current diff selection (or the whole file) into the dock. */
+        capture: (options) => capture(options || {}),
         /** Test/inspection seam: the current view snapshot. */
         snapshot: () => ({ ...view }),
     };

@@ -126,15 +126,59 @@ test('the footer combines parsed counts, cost and elapsed honestly', () => {
     const parsed = { files: [{}, {}], added: 38, removed: 12 };
     const footer = inspectorFooter({
         cost_accounting_status: 'available', cost_final: true, cost_usd: 0.42, duration_sec: 95,
-    }, parsed);
+    }, parsed, { status: 'ready' });
     assert.deepEqual(footer, {
         added: 38, removed: 12, files: 2, cost: '$0.42', elapsed: '1m 35s',
     });
 
-    const unknown = inspectorFooter({ cost_accounting_status: 'unavailable' }, null);
+    const unknown = inspectorFooter({ cost_accounting_status: 'unavailable' }, null, null);
     assert.deepEqual(unknown, {
-        added: 0, removed: 0, files: 0, cost: 'Unavailable', elapsed: 'Unavailable',
+        added: null, removed: null, files: null, cost: 'Unavailable', elapsed: 'Unavailable',
     });
+});
+
+test('footer counts are NULL unless a ready diff licenses a number', () => {
+    // U2: `+0 −0` is the claim "this task changed nothing". For a diff that is
+    // pending, blocked, or simply not fetched yet the truth is "we do not know",
+    // and the two must never render as the same thing.
+    const task = { cost_accounting_status: 'available', cost_final: true, cost_usd: 1, duration_sec: 5 };
+    const empty = { files: [], added: 0, removed: 0 };
+    for (const diff of [null, { status: 'pending' }, { status: 'blocked' }, { status: '' }]) {
+        const footer = inspectorFooter(task, empty, diff);
+        assert.equal(footer.added, null, JSON.stringify(diff));
+        assert.equal(footer.removed, null);
+        assert.equal(footer.files, null);
+    }
+    // A READY diff that really is empty says so with real zeroes.
+    const ready = inspectorFooter(task, empty, { status: 'ready' });
+    assert.deepEqual([ready.added, ready.removed, ready.files], [0, 0, 0]);
+    // Parsed bytes with no status behind them cannot count either.
+    assert.equal(inspectorFooter(task, { files: [{}], added: 3, removed: 0 }).added, null);
+});
+
+test('the inspector fetches the diff on open/tab/terminal only, never per state tick', async () => {
+    // U3: the state poll runs every few seconds and the diff endpoint forks git on
+    // the server, so the tick refreshes the task RECORD only. Pinned in the source
+    // because the wiring is what carries the guarantee.
+    const source = await import('node:fs/promises')
+        .then((fs) => fs.readFile(new URL('../modules/task_inspector.js', import.meta.url), 'utf8'));
+    const diffLoads = source.match(/load\([^)]*\{ diff: true \}\)/g) || [];
+    // mount, the no-openRightPanel fallback, Changes-tab activation, terminal edge.
+    assert.equal(diffLoads.length, 4);
+    // The subscribeState callback's own load carries NO diff flag.
+    assert.match(source, /subscribeState\(\(\) => \{[\s\S]*?load\(view\.taskId\);\s*\}\);/);
+});
+
+test('drift and the missing-baseline sentence are read from the Changes module', async () => {
+    // C3/C5 are ONE owner-facing rule each; the inspector imports both rather than
+    // re-spelling them, so the two diff surfaces cannot drift apart.
+    const source = await import('node:fs/promises')
+        .then((fs) => fs.readFile(new URL('../modules/task_inspector.js', import.meta.url), 'utf8'));
+    assert.match(
+        source,
+        /import \{ HEAD_DRIFT_NOTICE, NO_BASELINE_NOTICE, diffLacksBaselineOnly \} from '\.\/changes\.js'/,
+    );
+    assert.match(source, /head_advanced && String\(view\.diff\.source \|\| ''\) === 'mutation_baseline'/);
 });
 
 test('both diff surfaces disclose drift with the SAME owner-facing sentence', async () => {
@@ -142,7 +186,7 @@ test('both diff surfaces disclose drift with the SAME owner-facing sentence', as
     const source = await import('node:fs/promises')
         .then((fs) => fs.readFile(new URL('../modules/task_inspector.js', import.meta.url), 'utf8'));
     // The inspector imports the wording instead of re-spelling it (one fact, one place).
-    assert.ok(source.includes("import { HEAD_DRIFT_NOTICE } from './changes.js'"));
+    assert.match(source, /^import \{ HEAD_DRIFT_NOTICE[^}]*\} from '\.\/changes\.js';$/m);
     assert.ok(!source.includes('HEAD differs from the task baseline;'));
     assert.equal(
         HEAD_DRIFT_NOTICE,

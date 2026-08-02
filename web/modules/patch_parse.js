@@ -9,9 +9,14 @@
  * patch the owner is looking at.
  *
  * It handles what git actually emits: quoted/escaped paths (`"a/with space.py"`,
- * octal escapes), `--no-index` headers (used for untracked new files), rename
- * and mode-only entries, `Binary files … differ` and `GIT binary patch`
- * notices, and `\ No newline at end of file` markers. Anything it cannot
+ * octal escapes), rename and mode-only entries, `Binary files … differ` and
+ * `GIT binary patch` notices, and `\ No newline at end of file` markers. Note
+ * that `git diff --no-index -- /dev/null <new>` — how the server projects an
+ * untracked file — still emits an ordinary `diff --git a/<new> b/<new>` header
+ * with `new file mode` and `--- /dev/null`, so there is deliberately NO
+ * `diff --no-index` branch here: that string never appears in a real patch, and
+ * a branch for it would be untested-by-construction code pretending otherwise.
+ * Anything it cannot
  * interpret is preserved rather than guessed at: an unrecognized preamble line
  * is ignored, and a file with no hunks still appears in the list with an honest
  * status, so nothing silently vanishes from the review surface.
@@ -174,12 +179,6 @@ export function parsePatch(patchText) {
         // 2. Structure.
         if (line.startsWith('diff --git ')) {
             const [left, right] = splitDiffHeaderPaths(line.slice('diff --git '.length));
-            openFile(newFile({ oldPath: decodePatchPath(left), path: decodePatchPath(right) }));
-            continue;
-        }
-        if (line.startsWith('diff --no-index ')) {
-            // Untracked new files are diffed against /dev/null with --no-index.
-            const [left, right] = splitDiffHeaderPaths(line.slice('diff --no-index '.length));
             openFile(newFile({ oldPath: decodePatchPath(left), path: decodePatchPath(right) }));
             continue;
         }
