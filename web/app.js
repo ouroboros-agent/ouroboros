@@ -255,12 +255,18 @@ function refreshProjectsNav() {
     return refreshState();
 }
 
+// The poll core owns its timer HANDLE (`createStatePoll` closes over it), so the
+// pause is `statePoll.stop()` — the seam the module exports for exactly this.
+// Consolidation moved that handle inside the core, which is why no module-scope
+// timer variable may be named here: it would be a ReferenceError on every tab
+// hide, not a dead line. The static pin in test_navigation_shell_static.py holds
+// the old identifier out of this file entirely.
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-        clearTimeout(statePollTimer);
-        statePollTimer = 0;
+        statePoll.stop();  // paused, not backed off: a hidden tab spends nothing
         return;
     }
+    // Catch up on what was missed; the read's SETTLE re-arms the timer itself.
     refreshState();
 });
 // Entering/leaving Chat changes the cadence, so re-arm on navigation.

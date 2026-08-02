@@ -737,11 +737,15 @@ export function initFiles({ showPage, getChatController } = {}) {
     // The event is CANCELABLE: calling preventDefault here is how this page tells
     // the global handler "I consumed the keystroke, suppress the browser default".
     // Staying silent leaves ⌘L to the browser rather than swallowing it.
+    //
+    // So the cancel is gated on the capture ACTUALLY happening. `capture()` is
+    // synchronous and returns whether a chip (or quote) reached the dock; when it
+    // only raised a "open a file first" toast, nothing was consumed, and ⌘L should
+    // fall through to the address bar rather than be eaten to no effect.
     window.addEventListener('ouro:capture-selection', (event) => {
         if (event.detail?.page !== 'files') return;
         if (!page.classList.contains('active')) return;
-        event.preventDefault();
-        capture();
+        if (capture()) event.preventDefault();
     });
 
     refreshBtn.addEventListener('click', () => { refreshAll().catch(reportError); });

@@ -216,6 +216,11 @@ def test_single_api_state_poll_owner():
         assert behaviour in core_test, behaviour
     # No second copy of the poll machinery in app.js.
     assert "statePollInFlight" not in app_js
+    # ...and no LEFTOVER reference to the deleted timer handle either: the visibility
+    # handler kept `clearTimeout(statePollTimer)` after the handle moved inside the
+    # core, which is a ReferenceError on every tab hide, not a dead line.
+    assert "statePollTimer" not in app_js
+    assert "statePoll.stop();" in app_js
     assert "function publishState(" not in app_js
     # The two old timers are gone.
     assert "setInterval(refreshProjectsNav" not in app_js

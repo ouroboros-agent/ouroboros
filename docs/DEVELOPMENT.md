@@ -1295,13 +1295,35 @@ blur, and do not copy it back into the SPA.
 ### Token families
 
 All of these live in ONE `:root` block in `web/style.css`. A component rule
-references a token; it never hardcodes a literal. Adding a visual dimension
-means adding a token first.
+references a token for every COLOR it paints; it never hardcodes a literal.
+Adding a visual dimension means adding a token first.
+
+**Two deliberate exceptions, both `rgba(0, 0, 0, …)`.** Neither is a palette
+color, and neither can be expressed as one:
+
+* **Drop shadows** (`box-shadow`) are a depth cue, not a hue. They must darken
+  whatever is behind them on any surface in the ladder, so they take true black at
+  a per-elevation alpha. `--bg-primary-rgb` would tint them toward the page
+  background and flatten the elevation they exist to signal.
+* **Overlay scrims** — the `position: fixed; inset: 0` backdrops behind modals,
+  the mobile nav drawer, the reconnect overlay and the panel dismiss layers —
+  darken the whole app so the layer above reads as separate. Routing them through
+  `rgba(var(--bg-primary-rgb), α)` does not work *arithmetically*: over
+  `--bg-primary` that composites to exactly `#131315` at **every** alpha, so the
+  scrim becomes invisible, and over `--bg-panel`/`--bg-elevated` it lands within a
+  few units of the page background. The dim is the whole point, so these stay
+  black.
+
+A new `rgba()` literal anywhere else — a text alpha, a surface tint, a border, an
+accent wash — is token debt. Take the nearest rung of the existing ladder and
+record the delta in a comment (see `.nav-budget-label` and `.app-tab`, both of
+which land a `0.45` handoff spec on `--text-secondary` at `0.55`) rather than
+introducing an off-ladder value in shared chrome.
 
 | Family | Tokens | Role |
 |---|---|---|
 | Backgrounds | `--bg-primary` `#131315`, `--bg-sidebar` `#0f0f11`, `--bg-panel` `#151517`, `--bg-elevated` `#1a1a1d` | page → sidebar → rails/panels → cards/controls |
-| Background channel | `--bg-primary-rgb` | the one hue every scrim/gradient interpolates |
+| Background channel | `--bg-primary-rgb` | the one hue every gradient/edge FADE interpolates (not the scrims — see above) |
 | Text | `--text-primary` `#e7e7ea`, `--text-secondary`, `--text-muted` | body / secondary / hint |
 | Lines | `--divider`, `--surface-border`, `--surface-border-soft` | separators and surface edges |
 | Accent | `--accent` `#c93545`, `--accent-hover` `#d4485a`, `--accent-light`, `--accent-chip-text`, `--accent-hover-rgb`, `--accent-04…55` alpha ladder | brand red: primary actions, active nav, task identity |

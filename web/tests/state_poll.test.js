@@ -154,6 +154,38 @@ test('a hidden document PAUSES the timer instead of backing it off', async () =>
     assert.equal(clock.pendingCount, 0);
 });
 
+test('the visibilitychange sequence a live tab performs: armed -> stop -> re-arm', async () => {
+    // The exact shape of app.js's `visibilitychange` handler. It matters as its own
+    // case because the handler used to reach for a module-scope timer variable that
+    // consolidation deleted: `stop()` is the seam the core exports, and it has to
+    // clear a timer that is ALREADY ARMED (hiding a tab mid-interval), not just
+    // decline to arm a new one.
+    const { poll, clock, env } = harness({ page: 'chat' });
+    poll.schedule();
+    const armed = clock.armed[clock.armed.length - 1];
+    assert.equal(clock.pendingCount, 1);
+    assert.equal(armed.ms, STATE_POLL_CHAT_MS);
+
+    // Tab hidden: the live handle is cleared, so the pending tick never fires.
+    env.hidden = true;
+    poll.stop();
+    assert.deepEqual(clock.cleared.includes(armed.id), true, 'the ARMED handle was cleared');
+    assert.equal(clock.pendingCount, 0);
+    assert.equal(env.reads, 0, 'a hidden tab spends nothing');
+
+    // Idempotent: a second hide event (or a stop with no timer) is a harmless noop.
+    poll.stop();
+    assert.equal(clock.pendingCount, 0);
+
+    // Tab visible again: the catch-up read re-arms on SETTLE, exactly as the
+    // handler's `refreshState()` relies on.
+    env.hidden = false;
+    await poll.refresh();
+    assert.equal(env.reads, 1);
+    assert.equal(clock.pendingCount, 1);
+    assert.equal(clock.lastMs(), STATE_POLL_CHAT_MS);
+});
+
 test('every subscriber sees the same snapshot, and a late one is replayed', async () => {
     const { poll } = harness();
     const early = [];

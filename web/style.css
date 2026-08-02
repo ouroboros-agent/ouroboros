@@ -5,6 +5,12 @@
    (web/onboarding.css) keeps its own blur formulas and only syncs the COLOR
    values below. Tokens are frozen after the redesign foundation phase: add a
    new one here, never a hardcoded literal in a component rule.
+
+   Two documented exceptions, both `rgba(0, 0, 0, …)` and neither a palette hue:
+   `box-shadow` depth cues, and the fixed `inset: 0` OVERLAY SCRIMS. A scrim
+   cannot use --bg-primary-rgb — over --bg-primary that composites to exactly
+   #131315 at every alpha, i.e. no dim at all. See docs/DEVELOPMENT.md
+   "Token families".
    ========================================================================= */
 :root {
     /* Background ladder: page → sidebar → rails/panels → cards/controls. */
@@ -12,7 +18,9 @@
     --bg-sidebar: #0f0f11;
     --bg-panel: #151517;
     --bg-elevated: #1a1a1d;
-    /* Channel form of --bg-primary so scrims/gradients derive from ONE hue. */
+    /* Channel form of --bg-primary so gradients and edge FADES derive from ONE
+       hue. Not for overlay scrims: those must actually darken the page, and this
+       hue cannot (see the exception note in the banner above). */
     --bg-primary-rgb: 19, 19, 21;
     --bg-card: rgba(255, 255, 255, 0.06);
     --bg-hover: rgba(255, 255, 255, 0.08);
@@ -373,7 +381,16 @@ body.resizing-panels { user-select: none; }
 
 .nav-budget-label {
     font-size: 11px;
-    color: rgba(255, 255, 255, 0.45);
+    /* Same decision as `.app-tab` below: the handoff spec is white @ 0.45, the
+       ladder has no 0.45 step, and its two neighbours are EQUIDISTANT
+       (--text-secondary 0.55, --text-muted 0.35), so the brighter one wins — the
+       whole `.nav-budget` row is a click target into the costs tab and its caption
+       has to stay readable at 11px. Delta: +0.10 alpha vs. the handoff, which also
+       levels the caption with `.nav-budget-amount` at rest; the amount keeps its own
+       emphasis on hover (--text-primary, above). A literal rgba(255,255,255,0.45)
+       here would be a new off-ladder value in shared sidebar chrome — the exact
+       debt the token system exists to prevent. */
+    color: var(--text-secondary);
 }
 
 .nav-budget-amount {

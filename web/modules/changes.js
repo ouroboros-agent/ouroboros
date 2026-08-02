@@ -863,11 +863,15 @@ export function initChanges(ctx = {}) {
     // says "I consumed the keystroke" — only then does the global handler suppress
     // the browser default. Staying silent leaves ⌘L to the browser, which is more
     // honest than swallowing the address-bar shortcut to do nothing.
+    //
+    // Which is why the cancel is gated on the capture ACTUALLY happening.
+    // `capture()` is synchronous and returns whether a chip (or a deletion quote)
+    // reached the dock; on the "open a task with changes first" path nothing was
+    // consumed, so ⌘L falls through instead of being eaten to no effect.
     window.addEventListener('ouro:capture-selection', (event) => {
         if (event.detail?.page !== 'changes') return;
         if (!page.classList.contains('active')) return;
-        event.preventDefault();
-        capture();
+        if (capture()) event.preventDefault();
     });
 
     if (typeof subscribeState === 'function') {

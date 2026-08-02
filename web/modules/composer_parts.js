@@ -46,9 +46,11 @@
  * content that spans FEWER lines than the range names is dropped, because there
  * the range would overclaim what the fence can show.
  *
- * What makes the FLOOR safe is that `chipLabel` counts the BYTES, never the
- * range: a chip folds its fence away behind "N lines" that is always provable
- * from the payload it hides, so no extra line can ride along unannounced.
+ * What makes the FLOOR safe is that `chipLabel` counts the bytes the chip really
+ * INLINES, never the range: a chip folds its fence away behind "N lines" that is
+ * always provable from the payload it hides, so no extra line can ride along
+ * unannounced. Over the cap there IS no fence to hide, so the label mirrors the
+ * serializer and counts the range — the one place where bytes are not the answer.
  *
  * This module is pure with respect to the network: no fetch, no transport, no
  * send logic. `createComposerParts` is a thin DOM mount over the same core.
@@ -129,20 +131,31 @@ export function makeTextPart(text) {
 /**
  * Human label for a chip: `name · N lines`, or `name` for a whole file.
  *
- * N counts the BYTES whenever the chip carries any, and only falls back to the
- * range span for a bare ranged marker (over-cap capture) that hides nothing. The
- * label is what a folded chip shows INSTEAD of its fence, so it must be provable
- * from that fence: a diff chip whose 2-line range inlines 3 verbatim rows says
- * "3 lines", never the range's 2.
+ * N counts whatever the chip actually HIDES, which means mirroring
+ * `serializeChip`'s cap decision rather than the raw byte count:
+ *
+ *   • bytes that INLINE (a range, and at most `MAX_CHIP_LINES` of them) are what
+ *     the fold conceals, so they are what the label counts — a diff chip whose
+ *     2-line range inlines 3 verbatim rows says "3 lines", never the range's 2;
+ *   • OVER the cap the serializer drops the fence and keeps the range, so the label
+ *     counts the RANGE too. Counting the dropped bytes there would put the dock
+ *     label at odds with the wire and with the transcript (which re-reads the bare
+ *     marker and has only the range) for exactly the >200-row Changes selection
+ *     that reaches this path;
+ *   • with no usable range nothing can locate bytes, the serializer emits the
+ *     whole-file marker, and the honest label is the bare name.
  */
 export function chipLabel(chip) {
     const path = String(chip?.path || '');
     const name = path.split('/').filter(Boolean).pop() || path;
-    const bytes = chipContentLines(chip?.content);
-    if (bytes > 0) return `${name} · ${bytes} line${bytes === 1 ? '' : 's'}`;
     const start = Number(chip?.lineStart);
     const end = Number(chip?.lineEnd);
-    if (!Number.isFinite(start) || !Number.isFinite(end)) return name;
+    const hasRange = Number.isFinite(start) && Number.isFinite(end);
+    const bytes = chipContentLines(chip?.content);
+    if (hasRange && bytes > 0 && bytes <= MAX_CHIP_LINES) {
+        return `${name} · ${bytes} line${bytes === 1 ? '' : 's'}`;
+    }
+    if (!hasRange) return name;
     const count = Math.max(1, end - start + 1);
     return `${name} · ${count} line${count === 1 ? '' : 's'}`;
 }

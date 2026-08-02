@@ -80,12 +80,17 @@ export function renderUserContent(raw) {
         }
         // A content-bearing chip HIDES its fenced bytes behind a line count, so
         // that count must be provable from the bytes themselves — and it is, by
-        // construction: `chipLabel` counts the CONTENT, and the codec's floor
+        // construction: `chipLabel` counts the INLINED CONTENT, and the codec's floor
         // refuses to keep a fence that spans fewer lines than its range names (a
         // marker claiming `L10-L12` over a five-line fence says "5 lines", and one
         // claiming `L10-L12` over a two-line fence loses the bytes and is caught by
         // the LOSSLESS-OR-RAW check above). So no line rides along unannounced, and
         // there is no per-part disagreement left for this projection to hide.
+        //
+        // A chip parsed back from an OVER-CAP marker carries no bytes at all, and
+        // `chipLabel` mirrors the serializer there by counting the range — which is
+        // why the dock's label for that same capture reads the same number as this
+        // one, rather than the fuller byte count the dock happened to still hold.
         //
         // The captured bytes stay in the payload the agent reads; the UI shows the
         // referent (path + the fence's own line count), with the full path on hover.

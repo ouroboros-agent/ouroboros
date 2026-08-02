@@ -154,6 +154,44 @@ test('content spanning MORE lines than its range rides along, and says so', () =
     assert.equal(chipLabel({ type: 'chip', path: 'a.py', lineStart: 1, lineEnd: 7 }), 'a.py · 7 lines');
 });
 
+test('an OVER-CAP label counts the range, so dock == wire == transcript', () => {
+    // The distinguishing case. A big Changes selection is over the inline cap AND
+    // carries more bytes than its new-side range names (interleaved `-` rows), so
+    // the two candidate counts DIFFER — unlike an over-cap file capture, where
+    // bytes and range span coincide and either rule would look correct.
+    const span = MAX_CHIP_LINES + 1;                    // range L10-L210 => 201 lines
+    const rows = MAX_CHIP_LINES + 50;                   // 250 verbatim selected rows
+    const content = Array.from({ length: rows }, (_, i) => `+row ${i}`).join('\n');
+    const chipPart = makeChipPart({
+        path: 'web/modules/changes.js', lineStart: 10, lineEnd: 9 + span, content,
+    });
+    assert.equal(chipPart.content.split('\n').length, rows);
+    assert.notEqual(rows, span, 'the fixture must distinguish the two counts');
+
+    // The wire drops the fence and keeps the range: 250 bytes go unsent.
+    const wire = serializeParts([chipPart]);
+    assert.equal(wire, `[context: web/modules/changes.js L10-L${9 + span}]`);
+
+    // So the dock label must announce the RANGE, not bytes the message never carries.
+    assert.equal(chipLabel(chipPart), `changes.js · ${span} lines`);
+    assert.notEqual(chipLabel(chipPart), `changes.js · ${rows} lines`);
+
+    // And the transcript, which only ever sees the marker, agrees with the dock.
+    const [replayed] = parseContent(wire);
+    assert.equal(chipLabel(replayed), chipLabel(chipPart));
+
+    // One line UNDER the cap the fence survives, and there the bytes are the answer
+    // again — the rule flips exactly where the serializer's cap is, not before it.
+    const inlined = makeChipPart({
+        path: 'web/modules/changes.js',
+        lineStart: 10,
+        lineEnd: 11,
+        content: Array.from({ length: MAX_CHIP_LINES }, (_, i) => `+row ${i}`).join('\n'),
+    });
+    assert.ok(serializeParts([inlined]).includes('```'));
+    assert.equal(chipLabel(inlined), `changes.js · ${MAX_CHIP_LINES} lines`);
+});
+
 test('a pre-built chip object cannot smuggle a range past the codec', () => {
     // `normalizeParts` accepts part objects from any caller, so it has to hold them
     // to the same gate as `makeChipPart` — an unusable range degrades the chip to

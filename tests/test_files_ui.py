@@ -358,7 +358,10 @@ def test_global_capture_hotkey_lives_in_the_phase_c_anchor():
     assert "if (event.detail?.page !== 'files') return;" in files_source
     handler = files_source.split("window.addEventListener('ouro:capture-selection'", 1)[1]
     handler = handler.split("});", 1)[0]
-    assert "event.preventDefault();" in handler
+    # ...and it claims it ONLY when the capture actually happened. An unconditional
+    # preventDefault makes the global handler's `defaultPrevented` gate above a
+    # tautology, swallowing ⌘L even on the "open a file first" no-op path.
+    assert "if (capture()) event.preventDefault();" in handler
 
 
 def test_files_page_exposes_no_dead_surface():
