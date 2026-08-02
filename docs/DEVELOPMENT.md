@@ -1074,11 +1074,11 @@ Before every commit, verify the following:
 - Primary page actions, including Refresh, live in the `renderPageHeader({ actionsHtml })` slot on the right. Do not add ad-hoc refresh rows inside scroll bodies.
 - Non-chat top-level pages use `.app-page-glass` for the shared dim/brand backdrop. Header padding should stay compact; if a page needs more space, simplify its copy rather than growing the chrome.
 - A new top-level page that scrolls its header together with content violates the architecture mirror: fix the layout, not the symptom.
-- Top-level tab/pill buttons are a single design-system control: `renderTabStrip` + `.app-tab-strip` + `.app-tab` + the `--pill-*` CSS variables in `web/style.css`. Do not redeclare per-page tab padding, font size, border radius, or active styling in page CSS files.
+- Top-level page tabs are a single design-system control: `renderTabStrip` + `.app-tab-strip` + `.app-tab` in `web/style.css`, consumed by Dashboard, Skills and Settings. They are **underline tabs, not pills** — a flat label row over one `--divider` rule, with a 2px `--accent` bottom border marking the active tab (`.active`, or the Skills strip's `is-active`). Dimensions come from `--pill-padding-y` and `--pill-font-size` (legacy names from the retired pill strip; `.app-tab` is their only consumer). Do not redeclare per-page tab padding, font size, border radius, or active styling in page CSS files — a page stylesheet may add extra class names to the shared strip, but the geometry, including any mobile variant, is restyled on the shared classes. Pinned by `tests/test_page_chrome_static.py::test_page_tabs_are_underline_tabs_not_pills`.
 - Scrollable page bodies use the shared `.scroll-fade-y` mask when content can pass under fixed page chrome. Do not copy/paste custom gradient masks into page modules; extend the shared class if the fade rhythm changes.
 - Masonry-style widget packing uses `web/modules/masonry.js::applyMasonry`. Do not reintroduce CSS Grid row packing (`align-items: start`) for unequal-height widget cards; it leaves row gaps under shorter cards.
 - Widget card ordering is a host UI preference. Persist it through `/api/ui/preferences` and `data/state/ui_preferences.json`; never rewrite extension manifests or widget declarations to store owner layout.
-- New visual dimensions should become CSS variables first (`--pill-*`, `--button-*`, `--page-header-*`, etc.) and then be consumed by shared classes. Hardcoded page-local dimensions are review debt unless the component is genuinely unique.
+- New visual dimensions should become CSS variables first (`--button-*`, `--page-header-*`, etc.) and then be consumed by shared classes. Hardcoded page-local dimensions are review debt unless the component is genuinely unique.
 
 #### Setup / Onboarding Layout
 - The first-run wizard is a compact multi-step flow. At the default desktop
@@ -1353,11 +1353,8 @@ dim", especially over short messages. One gradient, on the chrome element.
 - Composer, toolbar, segmented, and widget-reorder controls share one flat
   grammar: a solid background token, a subtle 1px border, and a bounded radius
   from the scale. Do not add transparent text-only pills for primary actions.
-- Top-level page tabs (`.app-tab-strip` / `.app-tab`: Dashboard, Skills,
-  Settings) are **underline tabs**, not pills — a flat label row over one
-  `--divider` rule, with a 2px `--accent` bottom border marking the active tab
-  (`.active` or the Skills strip's `is-active`). Dimensions still come from the
-  shared `--pill-*` variables; restyle the shared classes, never a per-page copy.
+- Top-level page tabs are **underline tabs**, not pills — see "Page Header
+  Layout" above for the full rule.
 - Chat-header controls are **ghost buttons** (`.chat-header-btn`: transparent
   background, `rgba(255,255,255,0.10)` border, `--radius-7`, hover
   `rgba(255,255,255,0.06)`) with exactly one danger variant

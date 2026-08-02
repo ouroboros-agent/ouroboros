@@ -1,12 +1,17 @@
 import { formatUsd4 } from './utils.js';
 
+// Label only. The per-category HUE lives in CSS (`.log-type.<category>` in
+// web/style.css) because the category key is also the class name — a `color`
+// field here would be a second, unread copy of that palette, and the values it
+// used to carry had already drifted from the stylesheet (llm was --accent here
+// and --user there). Nothing reads a category beyond `.label`.
 export const LOG_CATEGORIES = {
-    tools: { label: 'Tools', color: 'var(--blue)' },
-    llm: { label: 'LLM', color: 'var(--accent)' },
-    errors: { label: 'Errors', color: 'var(--red)' },
-    tasks: { label: 'Tasks', color: 'var(--amber)' },
-    system: { label: 'System', color: 'var(--text-muted)' },
-    consciousness: { label: 'Consciousness', color: 'var(--accent)' },
+    tools: { label: 'Tools' },
+    llm: { label: 'LLM' },
+    errors: { label: 'Errors' },
+    tasks: { label: 'Tasks' },
+    system: { label: 'System' },
+    consciousness: { label: 'Consciousness' },
 };
 
 export function categorizeLogEvent(evt) {

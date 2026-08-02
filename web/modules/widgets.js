@@ -10,8 +10,12 @@ import {
 } from './api_client.js';
 import {
     escapeHtmlAttr as escapeHtml,
+    readThemeTokens,
     renderMarkdownSafe,
 } from './utils.js';
+// The canvas alpha helper lives with the evolution chart (the other canvas
+// consumer); both charts share it rather than each rolling its own.
+import { chartColorAlpha } from './evolution.js';
 import {
     collectSafeFieldValues,
     downloadViaHostBridge,
@@ -331,16 +335,19 @@ function renderTableCell(row, column) {
 }
 
 // Widget series colours. Chart.js paints on a canvas and cannot resolve CSS
-// variables, so these MIRROR the design tokens by value — in token order
-// --accent-light, --user, --green, --amber — with the matching fill at 0.22.
-// Keep them in step with web/style.css :root; never invent a hue here.
-const CHART_GRID_COLOR = 'rgba(255, 255, 255, 0.06)';  // mirrors --surface-border-soft
-const CHART_PALETTE = [
-    ['#f07a86', 'rgba(240, 122, 134, 0.22)'],
-    ['#6e96d2', 'rgba(110, 150, 210, 0.22)'],
-    ['#22c55e', 'rgba(34, 197, 94, 0.22)'],
-    ['#f59e0b', 'rgba(245, 158, 11, 0.22)'],
-];
+// variables, so the palette is RESOLVED from the design tokens at chart-BUILD
+// time through the shared `readThemeTokens` seam (web/modules/utils.js). No hue
+// is copied here, so nothing can drift out of step with web/style.css :root.
+// Only LEAF token names belong in these lists.
+const CHART_SERIES_TOKENS = ['--accent-light', '--user', '--green', '--amber'];
+const CHART_GRID_TOKEN = '--surface-border-soft';
+const CHART_FILL_ALPHA = 0.22;
+
+/** `[borderColor, backgroundColor]` per series, live from `:root`. */
+function chartPalette() {
+    return readThemeTokens(CHART_SERIES_TOKENS)
+        .map((color) => [color, chartColorAlpha(color, CHART_FILL_ALPHA)]);
+}
 
 export function finiteChartValue(value) {
     if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -354,12 +361,14 @@ function chartConfig(component, data) {
     const labels = component.labels || getPath(data, component.labels_path || 'labels', []);
     const datasets = component.datasets || getPath(data, component.datasets_path || 'datasets', []);
     const unit = String(component.unit || '');
+    const palette = chartPalette();
+    const [gridColor] = readThemeTokens([CHART_GRID_TOKEN]);
     return {
         type,
         data: {
             labels: Array.isArray(labels) ? labels.map((item) => String(item ?? '')) : [],
             datasets: Array.isArray(datasets) ? datasets.map((dataset, idx) => {
-                const [borderColor, backgroundColor] = CHART_PALETTE[idx % CHART_PALETTE.length];
+                const [borderColor, backgroundColor] = palette[idx % palette.length];
                 return {
                     label: String(dataset?.label ?? 'Series'),
                     data: Array.isArray(dataset?.data) ? dataset.data.map(finiteChartValue) : [],
@@ -375,9 +384,9 @@ function chartConfig(component, data) {
             spanGaps: false,
             plugins: { legend: { display: true } },
             scales: {
-                x: { grid: { color: CHART_GRID_COLOR } },
+                x: { grid: { color: gridColor } },
                 y: {
-                    grid: { color: CHART_GRID_COLOR },
+                    grid: { color: gridColor },
                     title: { display: Boolean(unit), text: unit },
                 },
             },

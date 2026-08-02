@@ -61,8 +61,16 @@
     margin-top: 0;
 }
 
+/* Destructive zone. A 1px --red-dim edge alone made "Reset All Data" look like
+   any other section, so the tone also gets a 2px left rule at FULL --red — the
+   same "tone rides the edge" grammar as the grouped task card and the system
+   quote block, and the one channel loud enough to be unmissable at a glance.
+   Chosen over restoring the old rgba(239,68,68,0.05) wash: there is no 0.05 step
+   in the token ladder, and the nearest one (--red-dim, 0.15) reads as an active
+   error state on a section the owner merely scrolled past. */
 .settings-shell .form-section.danger {
     border-color: var(--red-dim);
+    border-left: 2px solid var(--red);
 }
 
 .settings-shell .form-section h3 {
@@ -87,7 +95,7 @@
 }
 
 .settings-provider-card:hover {
-    border-color: var(--bg-hover);
+    border-color: var(--surface-border);
 }
 
 .settings-provider-card[open] {
@@ -155,7 +163,7 @@
 }
 
 .settings-more-providers > summary:hover {
-    border-color: var(--bg-hover);
+    border-color: var(--surface-border);
 }
 
 .settings-more-providers > summary::-webkit-details-marker {
@@ -450,7 +458,7 @@
 }
 
 .settings-ghost-btn {
-    border: 1px solid var(--bg-hover);
+    border: 1px solid var(--surface-border);
     background: var(--surface-control);
     color: var(--text-secondary);
     border-radius: var(--radius-sm);
@@ -460,9 +468,11 @@
     font-size: 12.5px;
 }
 
+/* Hover is DECORATION, not focus: `--focus-accent-border` is reserved for the
+   real focus ring so a keyboard user can still tell the two apart. */
 .settings-ghost-btn:hover {
     color: var(--text-primary);
-    border-color: var(--focus-accent-border);
+    border-color: var(--accent-25);
 }
 
 .settings-secret-list {
@@ -611,10 +621,11 @@
     font-weight: 600;
 }
 
+/* Selected/hover is DECORATION: the accent alpha ladder, not the focus token. */
 .settings-effort-btn.active,
 .settings-effort-btn:hover {
     color: var(--text-primary);
-    border-color: var(--focus-accent-border);
+    border-color: var(--accent-25);
     background: var(--accent-12);
 }
 
@@ -646,17 +657,20 @@
 }
 
 
+/* Advisory review is a NOTICE, so it wears the amber status tone end to end —
+   `--system-border` is the Voices family (the system speaker's bubble edge) and
+   a segmented button is not a speaker. */
 [data-enforcement-group] .settings-effort-btn[data-effort-value="advisory"].active,
 [data-enforcement-group] .settings-effort-btn[data-effort-value="advisory"]:hover {
     color: var(--amber);
-    border-color: var(--system-border);
+    border-color: var(--amber-dim);
     background: var(--amber-dim);
 }
 
 [data-enforcement-group] .settings-effort-btn[data-effort-value="blocking"].active,
 [data-enforcement-group] .settings-effort-btn[data-effort-value="blocking"]:hover {
     color: var(--text-primary);
-    border-color: var(--focus-accent-border);
+    border-color: var(--accent-25);
     background: var(--accent-18);
 }
 
@@ -742,28 +756,12 @@
 }
 
 @media (max-width: 640px) {
-    /* Mobile settings keep horizontal tab pills; back element remains hidden compat. */
+    /* Settings declares NO tab shape at any width: `.settings-tabs` /
+       `.settings-tab` are only extra class names on the shared `.app-tab-strip` /
+       `.app-tab`, and the mobile touch target lives with that shared control in
+       style.css. The back element stays hidden for compat. */
     .settings-shell {
         padding: 0 10px 10px;
-    }
-
-    .settings-tabs-bar {
-        padding: 0;
-    }
-
-    /* Mobile keeps the same underline tabs, just a scrollable row. */
-    .settings-tabs {
-        flex-wrap: nowrap;
-        gap: 2px;
-        padding: 4px 0 0;
-        overflow-x: auto;
-    }
-
-    .settings-tab {
-        flex: 0 0 auto;
-        min-height: 36px;
-        padding: 8px 12px;
-        white-space: nowrap;
     }
 
     .settings-mobile-back {

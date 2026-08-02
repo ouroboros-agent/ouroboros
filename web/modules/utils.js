@@ -45,6 +45,27 @@ export function safeExternalHrefAttr(value) {
     return '';
 }
 
+/**
+ * Read design tokens off the live computed style — the ONE seam where CSS
+ * custom properties cross into JS.
+ *
+ * Chart.js paints on a canvas and cannot resolve `var(...)`, so every canvas
+ * palette resolves its colours THROUGH here at call time instead of keeping a
+ * hand-synced copy of the hexes next to the chart code. Only LEAF tokens
+ * resolve: a token whose value is itself a `var(...)` reference comes back
+ * unresolved from getPropertyValue, so name the leaf (`--amber`), never the
+ * alias (`--accent-system`).
+ *
+ * @param {string[]|string} names CSS custom-property names, in order.
+ * @param {Element} [root] Element to resolve against; defaults to `:root`.
+ * @returns {string[]} Trimmed values, positionally matching `names`.
+ */
+export function readThemeTokens(names, root = document.documentElement) {
+    const wanted = Array.isArray(names) ? names : [names];
+    const styles = getComputedStyle(root);
+    return wanted.map((name) => String(styles.getPropertyValue(name) || '').trim());
+}
+
 /** Bound untrusted text with a visible marker before it reaches DOM surfaces. */
 export function boundedText(value, maxLen = 1200) {
     const text = String(value ?? '');

@@ -35,22 +35,70 @@ def test_shared_page_header_helper_has_no_inline_styles():
     assert "app-tab-strip" in source
 
 
+def _css_rule_body(css: str, selector_list: str) -> str:
+    """Body of the first rule whose selector list matches, whitespace-tolerantly.
+
+    The old version split on a literal ``".app-tab.active,\\n.app-tab.is-active {"``,
+    so reformatting the selector list broke the test instead of the design.
+    """
+    pattern = r"\s*,\s*".join(re.escape(part.strip()) for part in selector_list.split(","))
+    match = re.search(pattern + r"\s*\{([^}]*)\}", css)
+    assert match, f"no rule found for selector list {selector_list!r}"
+    return match.group(1)
+
+
 def test_page_tabs_are_underline_tabs_not_pills():
     """Design pin (flat redesign, Phase D): the ONE shared tab strip is an
     underline strip — a flat label row over a divider with a 2px accent rule
     under the active tab — and no page stylesheet re-declares tab shape.
     Dashboard, Skills and Settings are its only consumers; Skills passes
-    activeClass 'is-active', so both selectors carry the marker."""
+    activeClass 'is-active', so both selectors carry the marker.
+
+    What is pinned is the underline GRAMMAR: the divider under the strip, the
+    accent rule under the active tab, and the absence of pill chrome. The
+    transparent background is inherited from the base `.app-tab` rule, so the
+    active rule must NOT be required to restate it — a redundant declaration is
+    not a design contract, and pinning it forbade the obvious cleanup.
+    """
     css = _read("web/style.css")
     settings_css = _read("web/settings.css")
 
-    active_rule = css.split(".app-tab.active,\n.app-tab.is-active {", 1)[1].split("}", 1)[0]
+    base_rule = _css_rule_body(css, ".app-tab")
+    assert "background: transparent;" in base_rule
+    assert "border-bottom: 2px solid transparent;" in base_rule
+    assert "border-radius: 0;" in base_rule
+
+    active_rule = _css_rule_body(css, ".app-tab.active, .app-tab.is-active")
     assert "border-bottom-color: var(--accent);" in active_rule
-    assert "background: transparent;" in active_rule
-    strip = css.split(".app-tab-strip {", 1)[1].split("}", 1)[0]
+    # No pill chrome creeps back in through the active state.
+    assert "border-radius" not in active_rule
+    assert "background:" not in active_rule
+
+    strip = _css_rule_body(css, ".app-tab-strip")
     assert "border-bottom: 1px solid var(--divider);" in strip
-    # No per-page tab shape (the old mobile pill override in settings is gone).
-    assert "border-radius: 999px" not in settings_css
+
+    # Settings really is a consumer of the shared control, so the negative sweep
+    # below is about something that exists.
+    settings_ui = _read("web/modules/settings_ui.js")
+    assert "stripClass: 'settings-tabs'" in settings_ui
+    assert "tabClass: 'settings-tab'" in settings_ui
+
+    # No per-page tab SHAPE: the settings stylesheet may add its own class names to
+    # the shared strip, but must not re-declare the control's geometry. The sweep is
+    # scoped to the settings TAB rules, so an unrelated 999px pill elsewhere in the
+    # file cannot fail this pin — and cannot pass it by being renamed either.
+    # Comments are stripped first (prose naming the classes is not a rule), and
+    # `(?![\w-])` keeps `.settings-tabs-bar` — the page-level wrapper DIV, not the
+    # strip — out of the sweep.
+    settings_rules = re.sub(r"/\*.*?\*/", "", settings_css, flags=re.DOTALL)
+    tab_blocks = re.findall(
+        r"\.settings-tabs?(?![\w-])[^{};]*\{([^}]*)\}", settings_rules
+    )
+    for block in tab_blocks:
+        for forbidden in ("border-radius", "font-size", "padding", "border-bottom"):
+            assert forbidden not in block, (
+                f"settings.css re-declares shared tab {forbidden}: {block!r}"
+            )
 
 
 def test_primary_pages_use_shared_header_helper():

@@ -1,24 +1,23 @@
-import { escapeHtmlText, formatUsd2 } from './utils.js';
+import { escapeHtmlText, formatUsd2, readThemeTokens } from './utils.js';
 import { apiFetch } from './api_client.js';
 
-// Chart.js paints on a canvas and cannot resolve CSS variables, so this is the
-// ONE place the palette crosses into canvas space: every colour and the mono
-// stack are READ from the :root design tokens (web/style.css) instead of being
-// pasted as hexes. Only LEAF tokens are read — a token whose value is itself a
-// `var(...)` reference would come back unresolved from getPropertyValue.
-// The series ramp is deliberately calm: the red accent family for the loudest
-// lanes, then the neutral text ladder, so six lines stay separable without
-// importing a second hue family into a gray + red theme.
+// Chart.js paints on a canvas and cannot resolve CSS variables, so every colour
+// and the mono stack are READ from the :root design tokens (web/style.css)
+// through the shared `readThemeTokens` seam (web/modules/utils.js) — never
+// pasted here as hexes. Only LEAF tokens are named: a token whose value is
+// itself a `var(...)` reference would come back unresolved.
+// Six series need six DISTINGUISHABLE lanes, so the ramp names ROLE tokens
+// (task red, owner blue, ok green, notice amber, project teal, accent) instead
+// of shades of one hue — a neutral text ladder collapses into "three grays" at
+// 2px stroke width on a canvas.
 const CHART_TOKENS = {
-    // Red and neutral alternate, so two neighbouring series in the legend are
-    // never two shades of the same hue.
     seriesRamp: [
         '--accent-light',
-        '--text-primary',
+        '--user',
+        '--green',
+        '--amber',
+        '--project',
         '--accent',
-        '--text-secondary',
-        '--accent-chip-text',
-        '--text-muted',
     ],
     axis: '--text-muted',
     axisTitle: '--text-secondary',
@@ -29,23 +28,32 @@ const CHART_TOKENS = {
     mono: '--font-mono',
 };
 
+const CHART_SCALAR_KEYS = ['axis', 'axisTitle', 'grid', 'surface', 'border', 'strong', 'mono'];
+
 /** Resolve the evolution chart theme from the live design tokens. */
 export function evolutionChartTheme(root = document.documentElement) {
-    const styles = getComputedStyle(root);
-    const read = (token) => String(styles.getPropertyValue(token) || '').trim();
-    return {
-        series: CHART_TOKENS.seriesRamp.map(read),
-        axis: read(CHART_TOKENS.axis),
-        axisTitle: read(CHART_TOKENS.axisTitle),
-        grid: read(CHART_TOKENS.grid),
-        surface: read(CHART_TOKENS.surface),
-        border: read(CHART_TOKENS.border),
-        strong: read(CHART_TOKENS.strong),
-        mono: read(CHART_TOKENS.mono),
-    };
+    const ramp = CHART_TOKENS.seriesRamp;
+    const values = readThemeTokens(
+        [...ramp, ...CHART_SCALAR_KEYS.map((key) => CHART_TOKENS[key])],
+        root,
+    );
+    const theme = { series: values.slice(0, ramp.length) };
+    CHART_SCALAR_KEYS.forEach((key, idx) => {
+        theme[key] = values[ramp.length + idx];
+    });
+    return theme;
 }
 
-/** Same colour at a lower alpha, for dataset fills (hex or rgb()/rgba() input). */
+/**
+ * Same colour at a lower alpha, for dataset fills.
+ *
+ * Accepts `#rgb`, `#rrggbb`, legacy `rgb()/rgba()` (comma-separated) and the
+ * modern space-separated `rgb(r g b / a)` syntax a browser may hand back. Any
+ * input whose first three channels are not plain numbers (percentages, `none`,
+ * `color-mix(...)`, an unresolved `var(...)`) falls back to the colour UNCHANGED
+ * — a fully opaque fill is a visible imperfection, a `rgba(NaN, …)` string is an
+ * invisible one Chart.js silently drops.
+ */
 export function chartColorAlpha(color, alpha) {
     const value = String(color || '').trim();
     const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(value);
@@ -58,9 +66,13 @@ export function chartColorAlpha(color, alpha) {
     }
     const channels = /^rgba?\(([^)]+)\)$/i.exec(value);
     if (channels) {
-        const parts = channels[1].split(/[,/]/).map((part) => part.trim()).filter(Boolean);
-        const [r, g, b] = parts;
-        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        // One splitter for both syntaxes: `1, 2, 3, .4` and `1 2 3 / .4`.
+        const parts = channels[1].split(/[\s,/]+/).map((part) => part.trim()).filter(Boolean);
+        const rgb = parts.slice(0, 3).map(Number);
+        if (rgb.length === 3 && rgb.every((channel) => Number.isFinite(channel))) {
+            const [r, g, b] = rgb;
+            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        }
     }
     return value;
 }
