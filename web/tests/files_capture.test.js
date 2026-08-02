@@ -111,11 +111,13 @@ test('an unrepresentable path yields no chip (the page discloses instead)', () =
 // ---------------------------------------------------------------------------
 
 test('a boundary before the row text reads as offset 0 whatever its child index', () => {
-    // Drag STARTED over the line-number gutter: the Range boundary lands on the
-    // row ELEMENT with child index 1 (after the gutter span, before the code
-    // text). Read as a character offset that would be "one char into line 4";
-    // read correctly it is the very start of line 4 — which for a START boundary
-    // changes nothing, so the range must still begin at 4.
+    // A START boundary on the row ELEMENT with child index 1 (after the gutter
+    // span, before the code text). Read as a character offset that would be "one
+    // char into line 4"; read correctly it is the very start of line 4 — which for
+    // a START boundary changes nothing, so the range must still begin at 4.
+    // SPEC-HARDENING, not a reproduced browser bug: probing Chromium and WebKit, a
+    // drag STARTED over the gutter never yielded a nonzero child index. This case
+    // pins that the flag is harmless where it cannot matter.
     assert.deepEqual(
         selectionLineRange({ startLine: 4, startOffset: 1, startBeforeText: true, endLine: 6, endOffset: 3 }),
         { lineStart: 4, lineEnd: 6 },

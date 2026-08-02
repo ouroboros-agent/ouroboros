@@ -224,9 +224,15 @@ def test_selection_capture_maps_boundaries_to_lines_of_the_active_viewer():
 
 
 def test_element_range_boundaries_are_not_read_as_character_offsets():
-    """DOM spec: a boundary on an ELEMENT carries a CHILD INDEX. A drag begun over
-    the line-number gutter therefore reports a nonzero offset while sitting before
-    the line's first character — it must read as offset 0, not "one char in"."""
+    """DOM spec: a boundary on an ELEMENT carries a CHILD INDEX, so a boundary that
+    sits before the line's first character must read as offset 0 rather than as "one
+    char in" — whatever index the engine reports.
+
+    This is SPEC-HARDENING, not a reproduced bug: probing Chromium and WebKit, a drag
+    STARTED over the line-number gutter never yielded a nonzero child index. The case
+    actually observed there is a drag whose END lands over the gutter, arriving as
+    element offset 0 on the row. The normalization makes the two readings agree so the
+    mapping does not depend on an engine's choice of index."""
     source = _read("web/modules/files.js")
 
     assert "function boundaryBeforeText(container, offset, row)" in source

@@ -38,6 +38,9 @@ import { highlightLine, languageForPath } from './code_highlight.js';
 /** Rows rendered by the "Go to file…" filter before it stops listing. */
 const FILTER_RESULT_LIMIT = 200;
 
+/** Paths spelled out in the refresh-failure toast before it says "…and N more". */
+const FAILURE_DETAIL_CAP = 2;
+
 function formatFileSize(size) {
     const num = Number(size);
     if (!Number.isFinite(num) || num < 0) return '';
@@ -348,6 +351,25 @@ export function initFiles({ showPage, getChatController } = {}) {
         return note;
     }
 
+    /**
+     * ONE place decides what an EXPANDED directory says about its own listing, so
+     * the flat filter results disclose exactly what the nested tree does.
+     *
+     * Returns whether the listing is trustworthy enough to render children under.
+     * A node that is `loaded` AND carries an `error` is STALE: a refresh failed and
+     * the previous entries are still on screen, which must be said out loud rather
+     * than presented as the current contents of the folder.
+     */
+    function appendDirNotes(child) {
+        if (!child?.expanded) return false;
+        if (!child.loaded) {
+            treeEl.appendChild(treeNote(child.error || 'Loading…'));
+            return false;
+        }
+        if (child.error) treeEl.appendChild(treeNote(`${child.error} — showing the last listing that succeeded.`));
+        return true;
+    }
+
     function appendChildren(dirPath, depth) {
         const node = state.dirs.get(dirPath || '.');
         if (!node) return;
@@ -362,10 +384,7 @@ export function initFiles({ showPage, getChatController } = {}) {
                 expanded: Boolean(child?.expanded),
                 active: !isDir && entry.path === state.activePath,
             }));
-            if (isDir && child?.expanded) {
-                if (child.loaded) appendChildren(entry.path, depth + 1);
-                else treeEl.appendChild(treeNote(child.error || 'Loading…'));
-            }
+            if (isDir && appendDirNotes(child)) appendChildren(entry.path, depth + 1);
         }
         if (node.truncated) treeEl.appendChild(treeNote('Listing truncated by the server.'));
     }
@@ -389,6 +408,11 @@ export function initFiles({ showPage, getChatController } = {}) {
                 expanded: Boolean(state.dirs.get(entry.path)?.expanded),
                 active: !isDir && entry.path === state.activePath,
             }));
+            // A directory expanded from the FILTER results reports its listing the
+            // same way it would in the tree (Loading… / the recorded error / a stale
+            // listing after a failed refresh). The results stay FLAT — the note is
+            // the disclosure, the children are not re-listed here.
+            if (isDir) appendDirNotes(state.dirs.get(entry.path));
         }
         if (!matches.length) treeEl.appendChild(treeNote('No matches in the folders opened so far.'));
         else if (matches.length > FILTER_RESULT_LIMIT) treeEl.appendChild(treeNote(`Showing the first ${FILTER_RESULT_LIMIT} of ${matches.length} matches.`));
@@ -545,7 +569,10 @@ export function initFiles({ showPage, getChatController } = {}) {
             const count = state.activeLines.length;
             const shown = `${count} line${count === 1 ? '' : 's'}${state.activeTruncated ? ' shown · preview truncated' : ''}`;
             setViewerHeader({ path: state.activeDisplayPath, meta: fileMeta(data, shown) });
-            renderCode(state.activeLines, languageForPath(state.activeDisplayPath));
+            // An empty file has zero rows to render; a blank body reads as "still
+            // loading" or "the viewer broke". Say which of the two it actually is.
+            if (!count) showPlaceholder('This file is empty.');
+            else renderCode(state.activeLines, languageForPath(state.activeDisplayPath));
         } else {
             setViewerHeader({ path: state.activeDisplayPath, meta: fileMeta(data, 'binary or unsupported preview') });
             showPlaceholder('No text preview for this file type. Download it, or add its path to chat context.');
@@ -727,6 +754,10 @@ export function initFiles({ showPage, getChatController } = {}) {
      * failures are disclosed as one summary instead of a toast storm. A folder the
      * server no longer has (404) is forgotten rather than kept as a ghost row that
      * fails again on every refresh.
+     *
+     * A failed re-read of the ACTIVE file DROPS it. The viewer must not keep showing
+     * bytes that no longer load: a later ⌘L would inline those stale bytes into chat
+     * as the file's current content. The placeholder names the path and the reason.
      */
     async function refreshAll() {
         const paths = [...state.dirs.entries()]
@@ -747,11 +778,21 @@ export function initFiles({ showPage, getChatController } = {}) {
             try {
                 await openFile(path);
             } catch (err) {
-                failures.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
+                const message = err instanceof Error ? err.message : String(err);
+                failures.push(`${path}: ${message}`);
+                resetActiveFile();
+                setViewerHeader({ path: state.rootPath || 'Files', meta: 'Read-only browser · pick a file in the tree' });
+                showPlaceholder(`${path} could not be re-read (${message}). Its previous contents were dropped so nothing stale can be captured.`);
+                renderTree();
             }
         }
         if (failures.length) {
-            showToast(`Files: ${failures.length} path${failures.length === 1 ? '' : 's'} failed to refresh — ${failures.join('; ')}`, 'danger');
+            // The COUNT is always exact; only the detail list is capped, so a broad
+            // outage stays one readable toast instead of an unreadable wall of text.
+            const hidden = failures.length - FAILURE_DETAIL_CAP;
+            const detail = failures.slice(0, FAILURE_DETAIL_CAP).join('; ')
+                + (hidden > 0 ? `; …and ${hidden} more` : '');
+            showToast(`Files: ${failures.length} path${failures.length === 1 ? '' : 's'} failed to refresh — ${detail}`, 'danger');
         }
     }
 
