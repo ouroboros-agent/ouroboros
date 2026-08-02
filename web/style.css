@@ -3477,7 +3477,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
    spreads ~80px. */
 .log-main {
     display: grid;
-    grid-template-columns: 62px minmax(84px, max-content) auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(62px, max-content) minmax(84px, max-content) auto minmax(0, 1fr) auto;
     gap: 8px;
     align-items: baseline;
 }
@@ -3492,6 +3492,13 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .log-entry .log-ts {
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
+    /* `normalizeLogTs` prepends the DATE for anything not from today ("Aug 2, 2026,
+       15:02:00"), which is most of a real stream the moment it crosses midnight. A
+       fixed 62px track sized for `HH:MM:SS` wrapped exactly those rows onto three
+       lines. Same trade the type column above already takes: nowrap plus a
+       max-content ceiling, so today's rows stay aligned at the 62px floor and a
+       dated row widens only itself. */
+    white-space: nowrap;
 }
 
 .log-entry .log-type {
@@ -6671,6 +6678,16 @@ textarea.chat-input {
 
     .inspector-panel.open {
         transform: translateY(0);
+    }
+
+    /* A full-screen panel PAINTS over the drawer toggle, which is not the same as
+       removing it: left in the layout the toggle stays tabbable, so a keyboard user
+       can focus and fire a control they cannot see. The project panel already does
+       this at its own breakpoint; the inspector only goes full-screen HERE, so its
+       rule belongs here rather than beside that one. This is also the one consumer
+       of `body.inspector-open`, which the panel has toggled all along. */
+    body.inspector-open .mobile-nav-toggle {
+        display: none;
     }
 
     .inspector-backdrop {

@@ -632,8 +632,32 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 callout = card.locator('.widget-callout')
                 assert metric.get_attribute("data-tone") == "ok"
                 assert callout.get_attribute("data-tone") == "warn"
-                assert metric.evaluate("element => getComputedStyle(element).borderLeftColor") == "rgb(52, 211, 153)"
-                assert callout.evaluate("element => getComputedStyle(element).borderLeftColor") == "rgb(251, 191, 36)"
+                # The tone EDGE is the contract: `data-tone` must resolve through the
+                # shared tone tokens. Compared against the tokens' own computed values
+                # rather than a hex literal — the flat redesign moved --green from
+                # emerald #34d399 to #22c55e (decision 28: pins follow the design), and
+                # a literal here just re-rots on the next palette decision.
+                tone_rgb = page.evaluate(
+                    """() => {
+                        const probe = document.createElement('span');
+                        document.body.appendChild(probe);
+                        const read = (token) => {
+                            probe.style.color = `var(${token})`;
+                            return getComputedStyle(probe).color;
+                        };
+                        const out = { ok: read('--tone-ok'), warn: read('--tone-warn') };
+                        probe.remove();
+                        return out;
+                    }"""
+                )
+                assert metric.evaluate(
+                    "element => getComputedStyle(element).borderLeftColor"
+                ) == tone_rgb["ok"]
+                assert callout.evaluate(
+                    "element => getComputedStyle(element).borderLeftColor"
+                ) == tone_rgb["warn"]
+                # ...and the tones stay DISTINGUISHABLE, which is the reason they exist.
+                assert tone_rgb["ok"] != tone_rgb["warn"]
 
                 emitted = page.evaluate(
                     """async (skill) => {
