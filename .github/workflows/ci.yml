@@ -24,6 +24,9 @@ on:
       - 'server.py'
       - 'tests/**'
       - 'web/**'
+      - 'site/**'
+      - 'docs/**'
+      - 'assets/**'
       - 'requirements.txt'
       - 'pyproject.toml'
       - '.github/workflows/**'
@@ -71,10 +74,25 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.9.0
+          run_install: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: site/pnpm-lock.yaml
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
           pip install pytest pytest-xdist pytest-timeout ruff
+      - name: Verify generated Pages output
+        run: |
+          pnpm --dir site install --frozen-lockfile
+          pnpm --dir site build
+          test -z "$(git status --porcelain --untracked-files=all -- docs/)"
+          git diff --exit-code -- docs/
       - name: Lint (deterministic F-rule gate — catches the NameError-under-except class)
         run: python -m ruff check . --select F
       # NOTE: a command-line `-m` REPLACES the pyproject `addopts` markexpr, so the default
@@ -404,51 +422,42 @@ jobs:
   build:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [full-test, release-preflight]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
             artifact: dmg
+            proof_id: macos-arm64
+            syft_archive: syft_1.50.0_darwin_arm64.tar.gz
+            syft_sha256: e32fdb9d47823fa633748a1efca2528fd77c37469ea93c9e40ab835da44e4cce
+            syft_binary: syft
           - os: ubuntu-latest
             artifact: tar.gz
+            proof_id: linux-x86_64
+            syft_archive: syft_1.50.0_linux_amd64.tar.gz
+            syft_sha256: bf7b29ff57f06da30918266a0e1c2885a8f99784798d1bdb1628886aa015d788
+            syft_binary: syft
           - os: windows-latest
             artifact: zip
+            proof_id: windows-x64
+            syft_archive: syft_1.50.0_windows_amd64.zip
+            syft_sha256: 815ee6973ec5dff6a671d7f41b0e78835a8c45b91d5a39f4743ea1cee833d3be
+            syft_binary: syft.exe
     runs-on: ${{ matrix.os }}
     env:
       OUROBOROS_MANAGED_SOURCE_BRANCH: ouroboros
       OUROBOROS_RELEASE_TAG: ${{ github.ref_name }}
-      # Apple signing secrets at JOB LEVEL with a per-matrix-shard guard.
-      #
-      # Step-level `if:` conditions can only read `env.*`, never `secrets.*`
-      # directly (GitHub Actions rejects the workflow with "Unrecognized
-      # named-value: 'secrets'"). See docs/DEVELOPMENT.md::"GitHub Actions:
-      # secrets in step-level if conditions".
-      #
-      # The `matrix.os == 'macos-latest' && ... || ''` GHA expression keeps
-      # the Apple signing/notarization values **scoped to the macOS shard
-      # only** — Linux and Windows shards (which run `build_linux.sh` and
-      # `build_windows.ps1` respectively, neither of which needs Apple
-      # creds) receive empty strings. This avoids exposing the signing
-      # material to non-macOS build subprocesses where it has no business
-      # being. When a secret is not configured even on macOS, the value
-      # is also empty string (not unset), and the gate `env.X != ''`
-      # evaluates false — the signing/notarization steps skip cleanly.
-      BUILD_CERTIFICATE_BASE64: ${{ matrix.os == 'macos-latest' && secrets.BUILD_CERTIFICATE_BASE64 || '' }}
-      P12_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.P12_PASSWORD || '' }}
-      KEYCHAIN_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.KEYCHAIN_PASSWORD || '' }}
-      APPLE_TEAM_ID: ${{ matrix.os == 'macos-latest' && secrets.APPLE_TEAM_ID || '' }}
-      APPLE_ID: ${{ matrix.os == 'macos-latest' && secrets.APPLE_ID || '' }}
-      APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
-      # SIGN_IDENTITY is a forks-friendly override: when a fork configures
-      # a Developer ID secret whose CN differs from the upstream default
-      # (e.g. "Developer ID Application: <Other Name> (<OtherTeamID>)"),
-      # they set `SIGN_IDENTITY` as a repository secret and codesign in
-      # build.sh picks it up via `${SIGN_IDENTITY:-...}`. Same matrix.os
-      # guard so Linux/Windows shards never see it.
-      SIGN_IDENTITY: ${{ matrix.os == 'macos-latest' && secrets.SIGN_IDENTITY || '' }}
+      # Only non-secret booleans are job-wide. Credential values are exposed
+      # to the exact first-party steps that import, sign, or notarize.
+      HAS_APPLE_SIGNING: ${{ matrix.os == 'macos-latest' && secrets.BUILD_CERTIFICATE_BASE64 != '' && secrets.P12_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' && 'true' || 'false' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Full history + tags so the build scripts' annotated-tag guard
           # (``git cat-file -t refs/tags/vX.Y.Z`` must return ``tag``) can
@@ -472,7 +481,7 @@ jobs:
         shell: bash
         run: git fetch origin --tags --force
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
           cache: 'pip'
@@ -491,10 +500,14 @@ jobs:
         shell: pwsh
         run: .\scripts\download_python_standalone.ps1
 
-      # —— macOS: import signing certificate (only when ALL four signing
-      #         secrets are present at job level — see env: block above)
+      # macOS: import signing certificate only when all signing inputs
+      #         are present. The values exist only inside this step.
       - name: Import Apple signing certificate
-        if: matrix.os == 'macos-latest' && env.BUILD_CERTIFICATE_BASE64 != '' && env.P12_PASSWORD != '' && env.KEYCHAIN_PASSWORD != '' && env.APPLE_TEAM_ID != ''
+        if: matrix.os == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
           CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
@@ -527,14 +540,19 @@ jobs:
       #          configured, so non-macOS shards and unconfigured runs are
       #          unaffected.
       - name: Extract signing identity from imported keychain
-        if: matrix.os == 'macos-latest' && env.BUILD_CERTIFICATE_BASE64 != '' && env.P12_PASSWORD != '' && env.KEYCHAIN_PASSWORD != '' && env.APPLE_TEAM_ID != ''
+        if: matrix.os == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'
+        env:
+          SIGN_IDENTITY_OVERRIDE: ${{ secrets.SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-          DETECTED="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-              | grep -E '"Developer ID Application' \
-              | head -1 \
-              | sed -E 's/^.*"([^"]+)".*$/\1/' || true)"
+          DETECTED="${SIGN_IDENTITY_OVERRIDE:-}"
+          if [ -z "$DETECTED" ]; then
+            DETECTED="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+                | grep -E '"Developer ID Application' \
+                | head -1 \
+                | sed -E 's/^.*"([^"]+)".*$/\1/' || true)"
+          fi
           if [ -z "${DETECTED:-}" ]; then
               # Fallback: ANY codesigning identity (not just Developer ID
               # Application). Forks may use Apple Development certs in
@@ -553,15 +571,19 @@ jobs:
           fi
 
       # —— macOS build (signed + optionally notarized when secrets are
-      #         present, otherwise unsigned). build.sh reads the same
-      #         env vars from the job-level env block above.
+      #         present, otherwise unsigned). Notarization values exist only
+      #         inside this first-party build step.
       - name: Build macOS app
         if: matrix.os == 'macos-latest'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           if [ "${{ needs.release-preflight.outputs.is_prerelease }}" = "true" ]; then
             echo "Pre-release tag detected — building unsigned DMG for artifact validation"
             OUROBOROS_SIGN=0 bash build.sh
-          elif [ -n "${BUILD_CERTIFICATE_BASE64:-}" ] && [ -n "${P12_PASSWORD:-}" ] && [ -n "${KEYCHAIN_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+          elif [ "$HAS_APPLE_SIGNING" = "true" ]; then
             echo "Signing certificate detected — building with codesign + (optional) notarization"
             bash build.sh
           else
@@ -572,7 +594,7 @@ jobs:
       # —— macOS: cleanup keychain (always, even on build failure) so the
       #         temporary signing material never persists across runs.
       - name: Cleanup keychain
-        if: always() && matrix.os == 'macos-latest' && env.BUILD_CERTIFICATE_BASE64 != ''
+        if: always() && matrix.os == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           security delete-keychain "$KEYCHAIN_PATH" || true
@@ -588,12 +610,151 @@ jobs:
         shell: pwsh
         run: .\build_windows.ps1
 
-      # —— Upload artifacts ——
+      # The proof chain begins at the final archive, after the build scripts
+      # have finished signing, notarizing, and packaging it.
+      - name: Locate final release archive
+        id: release_asset
+        shell: bash
+        run: python scripts/release_proof.py locate --directory dist --github-output "$GITHUB_OUTPUT"
+
+      - name: Smoke final macOS DMG
+        id: smoke_macos
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MOUNT="$RUNNER_TEMP/ouroboros-dmg-${GITHUB_RUN_ATTEMPT}"
+          HOME_DIR="$RUNNER_TEMP/ouroboros-smoke-home"
+          SBOM_ROOT="$RUNNER_TEMP/ouroboros-sbom-payload"
+          mkdir -p "$MOUNT" "$HOME_DIR"
+          hdiutil attach "${{ steps.release_asset.outputs.path }}" -nobrowse -readonly -mountpoint "$MOUNT"
+          trap 'hdiutil detach "$MOUNT" >/dev/null' EXIT
+          test "$(uname -m)" = "arm64"
+          test -f "$MOUNT/Ouroboros.app/Contents/Resources/repo.bundle"
+          test -f "$MOUNT/Ouroboros.app/Contents/Resources/repo_bundle_manifest.json"
+          test -x "$MOUNT/Install CLI.command"
+          APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$MOUNT/Ouroboros.app/Contents/Info.plist")"
+          lipo -archs "$MOUNT/Ouroboros.app/Contents/MacOS/$APP_EXECUTABLE" | tr ' ' '\n' | grep -qx arm64
+          HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
+            "$MOUNT/Ouroboros.app/Contents/Resources/bin/ouroboros" --help >/dev/null
+          if [ "${{ needs.release-preflight.outputs.is_prerelease }}" != "true" ] \
+              && [ "$HAS_APPLE_SIGNING" = "true" ]; then
+            codesign --verify --deep --strict "$MOUNT/Ouroboros.app"
+          fi
+          rm -rf "$SBOM_ROOT"
+          mkdir -p "$SBOM_ROOT"
+          ditto "$MOUNT" "$SBOM_ROOT"
+          echo "sbom_path=$SBOM_ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke final Linux archive
+        id: smoke_linux
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SMOKE_ROOT="$RUNNER_TEMP/ouroboros-linux-${GITHUB_RUN_ATTEMPT}"
+          HOME_DIR="$RUNNER_TEMP/ouroboros-smoke-home"
+          mkdir -p "$SMOKE_ROOT" "$HOME_DIR"
+          tar -xzf "${{ steps.release_asset.outputs.path }}" -C "$SMOKE_ROOT"
+          test -f "$SMOKE_ROOT/Ouroboros/repo.bundle"
+          test -f "$SMOKE_ROOT/Ouroboros/repo_bundle_manifest.json"
+          HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
+            "$SMOKE_ROOT/Ouroboros/bin/ouroboros" --help >/dev/null
+          echo "sbom_path=$SMOKE_ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke final Windows archive
+        id: smoke_windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $SmokeRoot = Join-Path $env:RUNNER_TEMP "ouroboros-windows-$env:GITHUB_RUN_ATTEMPT"
+          $HomeDir = Join-Path $env:RUNNER_TEMP "ouroboros-smoke-home"
+          New-Item -ItemType Directory -Force -Path $SmokeRoot, $HomeDir | Out-Null
+          Expand-Archive -Path "${{ steps.release_asset.outputs.path }}" -DestinationPath $SmokeRoot
+          if (-not (Test-Path "$SmokeRoot\Ouroboros\repo.bundle")) { throw "repo.bundle missing" }
+          if (-not (Test-Path "$SmokeRoot\Ouroboros\repo_bundle_manifest.json")) { throw "repo bundle manifest missing" }
+          $env:HOME = $HomeDir
+          $env:USERPROFILE = $HomeDir
+          $env:LOCALAPPDATA = Join-Path $HomeDir "AppData\Local"
+          $env:APPDATA = Join-Path $HomeDir "AppData\Roaming"
+          $env:HOMEDRIVE = Split-Path -Qualifier $HomeDir
+          $env:HOMEPATH = $HomeDir.Substring($env:HOMEDRIVE.Length)
+          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA, $env:APPDATA | Out-Null
+          & "$SmokeRoot\Ouroboros\bin\ouroboros.cmd" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged CLI smoke failed: $LASTEXITCODE" }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sbom_path=$SmokeRoot"
+
+      - name: Record packaged artifact smoke
+        shell: bash
+        run: |
+          EXTRA_CHECKS=()
+          if [ "${{ matrix.proof_id }}" = "macos-arm64" ]; then
+            EXTRA_CHECKS+=(--check install_cli_command --check arm64_main_executable)
+          fi
+          python scripts/release_proof.py record-smoke \
+            --proof-id "${{ matrix.proof_id }}" \
+            --artifact "${{ steps.release_asset.outputs.path }}" \
+            --output "dist/release-smoke-${{ matrix.proof_id }}.json" \
+            --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --check embedded_repo_bundle \
+            --check packaged_cli_help \
+            "${EXTRA_CHECKS[@]}"
+
+      - name: Install digest-pinned Syft
+        id: syft
+        shell: bash
+        env:
+          SYFT_VERSION: 1.50.0
+          SYFT_ARCHIVE: ${{ matrix.syft_archive }}
+          SYFT_SHA256: ${{ matrix.syft_sha256 }}
+          SYFT_BINARY: ${{ matrix.syft_binary }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/$SYFT_ARCHIVE"
+          TOOL_DIR="$RUNNER_TEMP/syft-$SYFT_VERSION"
+          curl --fail --location --silent --show-error \
+            "https://github.com/anchore/syft/releases/download/v$SYFT_VERSION/$SYFT_ARCHIVE" \
+            --output "$ARCHIVE"
+          python -c 'import hashlib,sys; p,e=sys.argv[1:]; a=hashlib.sha256(open(p,"rb").read()).hexdigest(); raise SystemExit(0 if a == e else f"Syft digest mismatch: {a} != {e}")' \
+            "$ARCHIVE" "$SYFT_SHA256"
+          mkdir -p "$TOOL_DIR"
+          python -c 'import shutil,sys; shutil.unpack_archive(sys.argv[1], sys.argv[2])' \
+            "$ARCHIVE" "$TOOL_DIR"
+          test -f "$TOOL_DIR/$SYFT_BINARY"
+          echo "path=$TOOL_DIR/$SYFT_BINARY" >> "$GITHUB_OUTPUT"
+
+      - name: Generate CycloneDX SBOM from packaged payload
+        shell: bash
+        env:
+          SBOM_PATH: ${{ steps.smoke_macos.outputs.sbom_path || steps.smoke_linux.outputs.sbom_path || steps.smoke_windows.outputs.sbom_path }}
+        run: |
+          set -euo pipefail
+          "${{ steps.syft.outputs.path }}" "dir:$SBOM_PATH" \
+            --output "cyclonedx-json=dist/sbom-${{ matrix.proof_id }}.cdx.json"
+
+      - name: Attest build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.release_asset.outputs.path }}
+
+      - name: Attest SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.release_asset.outputs.path }}
+          sbom-path: dist/sbom-${{ matrix.proof_id }}.cdx.json
+
+      # Upload the archive and its exact proof companions.
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ouroboros-${{ matrix.os }}
-          path: dist/Ouroboros-*
+          path: |
+            ${{ steps.release_asset.outputs.path }}
+            dist/release-smoke-${{ matrix.proof_id }}.json
+            dist/sbom-${{ matrix.proof_id }}.cdx.json
+          if-no-files-found: error
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────────────
@@ -603,21 +764,178 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, release-preflight, marker-guards, ui-smoke, docker-ui-smoke, docker-portable-test, skill-smoke]
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
+      attestations: read
+      artifact-metadata: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.10'
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-artifacts/
           merge-multiple: true
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Assemble release proof capsule and notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREVIOUS_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+          ARGS=()
+          if [ -n "$PREVIOUS_TAG" ]; then ARGS+=(--previous-tag "$PREVIOUS_TAG"); fi
+          python scripts/release_proof.py assemble \
+            --directory release-artifacts \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --notes-output release-notes.md \
+            "${ARGS[@]}"
+
+      - name: Verify artifact attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in release-artifacts/Ouroboros-*.dmg \
+                      release-artifacts/Ouroboros-*-linux-x86_64.tar.gz \
+                      release-artifacts/Ouroboros-*-windows-x64.zip; do
+            SOURCE_ARGS=(
+              --repo "$GITHUB_REPOSITORY"
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"
+              --source-digest "$GITHUB_SHA"
+              --source-ref "$GITHUB_REF"
+            )
+            gh attestation verify "$file" "${SOURCE_ARGS[@]}"
+            gh attestation verify "$file" "${SOURCE_ARGS[@]}" \
+              --predicate-type https://cyclonedx.org/bom
+          done
+
+      - name: Require an unpublished release slot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY="$RUNNER_TEMP/existing-release.json"
+          STATUS="$(curl --silent --show-error --output "$BODY" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")"
+          case "$STATUS" in
+            404)
+              echo "No release exists for $GITHUB_REF_NAME; a draft may be created."
+              ;;
+            200)
+              if ! jq -e '.draft == true' "$BODY" >/dev/null; then
+                echo "Refusing to modify the published release for $GITHUB_REF_NAME." >&2
+                exit 1
+              fi
+              echo "The existing release is still a draft and may be repaired."
+              ;;
+            *)
+              echo "GitHub release lookup failed with HTTP $STATUS." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Verify remote release tag before draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_REF="refs/tags/$GITHUB_REF_NAME"
+          PEELED_REF="${TAG_REF}^{}"
+          REMOTE_ROWS="$(git ls-remote --exit-code origin "$TAG_REF" "$PEELED_REF")"
+          TAG_OBJECT_SHA="$(printf '%s\n' "$REMOTE_ROWS" | awk -v ref="$TAG_REF" '$2 == ref {print $1}')"
+          PEELED_SHA="$(printf '%s\n' "$REMOTE_ROWS" | awk -v ref="$PEELED_REF" '$2 == ref {print $1}')"
+          if [ -z "$TAG_OBJECT_SHA" ] || [ -z "$PEELED_SHA" ]; then
+            echo "Remote tag $GITHUB_REF_NAME is missing or is not annotated." >&2
+            exit 1
+          fi
+          git fetch origin "$TAG_REF:$TAG_REF" --force
+          test "$(git cat-file -t "$TAG_REF")" = "tag"
+          LOCAL_PEELED="$(git rev-parse "$PEELED_REF")"
+          if [ "$LOCAL_PEELED" != "$GITHUB_SHA" ] || [ "$PEELED_SHA" != "$GITHUB_SHA" ]; then
+            echo "Remote tag $GITHUB_REF_NAME no longer targets $GITHUB_SHA." >&2
+            exit 1
+          fi
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: release-artifacts/*
-          generate_release_notes: true
-          draft: false
+          files: |
+            release-artifacts/Ouroboros-*.dmg
+            release-artifacts/Ouroboros-*-linux-x86_64.tar.gz
+            release-artifacts/Ouroboros-*-windows-x64.zip
+            release-artifacts/release-smoke-macos-arm64.json
+            release-artifacts/release-smoke-linux-x86_64.json
+            release-artifacts/release-smoke-windows-x64.json
+            release-artifacts/sbom-macos-arm64.cdx.json
+            release-artifacts/sbom-linux-x86_64.cdx.json
+            release-artifacts/sbom-windows-x64.cdx.json
+            release-artifacts/SHA256SUMS
+            release-artifacts/release-evidence.json
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          target_commitish: ${{ github.sha }}
+          draft: true
           prerelease: ${{ needs.release-preflight.outputs.is_prerelease == 'true' }}
+
+      - name: Verify uploaded draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          METADATA="$RUNNER_TEMP/uploaded-release-assets.json"
+          gh release view "$GITHUB_REF_NAME" --json assets \
+            --jq '{assets:[.assets[]|{name,size,digest}]}' > "$METADATA"
+          python scripts/release_proof.py verify-uploaded \
+            --directory release-artifacts \
+            --metadata "$METADATA"
+
+      - name: Verify remote release tag before publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_REF="refs/tags/$GITHUB_REF_NAME"
+          PEELED_REF="${TAG_REF}^{}"
+          REMOTE_ROWS="$(git ls-remote --exit-code origin "$TAG_REF" "$PEELED_REF")"
+          TAG_OBJECT_SHA="$(printf '%s\n' "$REMOTE_ROWS" | awk -v ref="$TAG_REF" '$2 == ref {print $1}')"
+          PEELED_SHA="$(printf '%s\n' "$REMOTE_ROWS" | awk -v ref="$PEELED_REF" '$2 == ref {print $1}')"
+          if [ -z "$TAG_OBJECT_SHA" ] || [ -z "$PEELED_SHA" ]; then
+            echo "Remote tag $GITHUB_REF_NAME is missing or is not annotated." >&2
+            exit 1
+          fi
+          git fetch origin "$TAG_REF:$TAG_REF" --force
+          test "$(git cat-file -t "$TAG_REF")" = "tag"
+          LOCAL_PEELED="$(git rev-parse "$PEELED_REF")"
+          if [ "$LOCAL_PEELED" != "$GITHUB_SHA" ] || [ "$PEELED_SHA" != "$GITHUB_SHA" ]; then
+            echo "Remote tag $GITHUB_REF_NAME no longer targets $GITHUB_SHA." >&2
+            exit 1
+          fi
+
+      - name: Publish verified GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.release-preflight.outputs.is_prerelease }}" = "true" ]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
+          else
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          fi

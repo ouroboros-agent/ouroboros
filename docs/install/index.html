@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install Ouroboros on Apple silicon macOS, x86_64 Linux, or x64 Windows, or run it from source with Python 3.10 or newer.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <link rel="canonical" href="https://ouroboros-agent.ai/install/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Ouroboros">
+  <meta property="og:title" content="Install Ouroboros">
+  <meta property="og:description" content="Desktop downloads, headless CLI setup, source installation, and verified release metadata for Ouroboros.">
+  <meta property="og:url" content="https://ouroboros-agent.ai/install/">
+  <meta property="og:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta property="og:image:alt" content="Ouroboros install and release downloads">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta name="twitter:image:alt" content="Ouroboros install and release downloads">
+  <title>Install Ouroboros</title>
+  <link rel="icon" href="/assets/icon_1024.png" type="image/png">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Ouroboros",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "macOS 12+ on Apple silicon, Linux x86_64, Windows x64",
+      "installUrl": "https://ouroboros-agent.ai/install/",
+      "downloadUrl": "https://github.com/razzant/ouroboros/releases/latest",
+      "codeRepository": "https://github.com/razzant/ouroboros",
+      "license": "https://github.com/razzant/ouroboros/blob/ouroboros/LICENSE",
+      "isAccessibleForFree": true
+    }
+  </script>
+  <link rel="stylesheet" crossorigin href="/assets/ouroboros-atiBXdkb.css">
+</head>
+<body class="text-page">
+  <div class="ambient" aria-hidden="true"></div>
+  <header class="text-nav"><a class="brand" href="/" aria-label="Ouroboros home"><img src="/assets/icon_1024.png" alt=""><span>Ouroboros</span></a><nav aria-label="Text pages"><a href="/about/">About</a><a href="/benchmarks/">Benchmarks</a><a href="https://github.com/razzant/ouroboros/releases/latest">Releases</a></nav></header>
+  <main class="text-document">
+    <p class="chapter-index">INSTALL / STABLE RELEASE</p>
+    <h1>Install Ouroboros.</h1>
+    <p class="text-lede">Use a packaged desktop build for the shortest setup. Each download contains the managed runtime and an optional user-local CLI installer.</p>
+
+    <div class="download-grid">
+      <article><h2>macOS</h2><p>macOS 12 or newer on Apple silicon.</p><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Open latest release</a><p>Download the <code>Ouroboros-&lt;version&gt;.dmg</code>, drag Ouroboros to Applications, then run <code>Install CLI.command</code> if you want the CLI.</p></article>
+      <article><h2>Linux</h2><p>x86_64 Linux.</p><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Open latest release</a><p>Download the Linux tarball, extract it, and run <code>./Ouroboros/Ouroboros</code>. The CLI installer is in <code>./Ouroboros/bin/</code>.</p></article>
+      <article><h2>Windows</h2><p>64-bit Windows.</p><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Open latest release</a><p>Download the Windows ZIP, extract it, and run <code>Ouroboros.exe</code>. The CLI installer is in <code>Ouroboros\bin\</code>.</p></article>
+    </div>
+
+    <h2>Run from source</h2>
+    <p>Source mode needs Python 3.10 or newer and Git.</p>
+    <pre><code>git clone https://github.com/razzant/ouroboros.git
+cd ouroboros
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps
+ouroboros server</code></pre>
+
+    <h2>Verify the download</h2>
+    <p>Proof files vary by release. Check the selected release for its checksums and evidence file, if present. Releases built by the current workflow also include CycloneDX SBOMs, packaged smoke receipts, and GitHub attestations. <a href="/install.json">install.json</a> gives machine-readable release discovery, artifact name templates, and accepted proof filenames.</p>
+  </main>
+  <footer class="text-footer"><a href="/">Home</a><a href="/about/">About</a><a href="/benchmarks/">Benchmarks</a><a href="/install.json">install.json</a></footer>
+</body>
+</html>

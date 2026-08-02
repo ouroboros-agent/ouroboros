@@ -576,7 +576,7 @@ class TestRepoBundleReleaseTagGuard:
 
 class TestMacOSSigning:
     """The CI build job and build.sh together implement optional macOS code
-    signing and notarization. Seven contracts are pinned here to prevent
+    signing and notarization. The contracts here prevent
     regression of the GitHub Actions `secrets.*`-in-step-`if:` pitfall, the
     build-script env override / optional-notarytool gate, the keychain
     cleanup guard, and the stapler-failure-as-soft-warning behaviour.
@@ -646,44 +646,26 @@ class TestMacOSSigning:
         if in_if and block:
             yield " ".join(block)
 
-    def test_ci_signing_secrets_at_job_level(self):
-        """All four required signing secrets MUST be mapped at the build job's
-        env: block (not at step level), so step-level `if:` conditions can
-        read `env.*`. Step-level env blocks are NOT visible to that step's
-        own `if:` — only job-level env is.
-
-        Each mapping must ALSO be guarded by `matrix.os == 'macos-latest'`
-        so the Apple credentials are scoped to the macOS matrix shard only;
-        Linux and Windows sibling shards receive empty strings. This avoids
-        exposing the signing material to `build_linux.sh` / `build_windows.ps1`
-        subprocesses that have no use for it.
-        """
+    def test_ci_keeps_signing_values_step_scoped(self):
+        """The build job exposes one non-secret gate globally and gives
+        credential values only to the first-party steps that need them."""
         src = _read(self._CI_PATH)
         header = self._build_job_header(src)
-        # Required form (per secret): `<NAME>: ${{ matrix.os == 'macos-latest' && secrets.<NAME> || '' }}`
+        assert "HAS_APPLE_SIGNING:" in header
+        assert "matrix.os == 'macos-latest'" in header
         for secret in self._SIGNING_SECRETS:
-            expected = (
-                f"{secret}: ${{{{ matrix.os == 'macos-latest' "
-                f"&& secrets.{secret} || '' }}}}"
-            )
-            assert expected in header, (
-                f"build job env: must map {secret} at job level with a "
-                f"matrix.os == 'macos-latest' guard so non-macOS shards "
-                f"receive empty strings. Expected line: {expected!r}"
-            )
-        # Optional notarization secrets must also be mapped at job level
-        # (so build.sh inherits them as env vars when it runs), with the
-        # same matrix-shard guard.
-        for secret in self._NOTARIZE_SECRETS:
-            expected = (
-                f"{secret}: ${{{{ matrix.os == 'macos-latest' "
-                f"&& secrets.{secret} || '' }}}}"
-            )
-            assert expected in header, (
-                f"build job env: must also map {secret} (with matrix.os "
-                f"guard) so build.sh can run `xcrun notarytool` when it is "
-                f"configured. Expected line: {expected!r}"
-            )
+            assert f"secrets.{secret} != ''" in header
+            assert not re.search(rf"^\s+{secret}:\s", header, re.MULTILINE)
+
+        import_idx = src.index("- name: Import Apple signing certificate")
+        import_region = src[import_idx : import_idx + 900]
+        for secret in ("BUILD_CERTIFICATE_BASE64", "P12_PASSWORD", "KEYCHAIN_PASSWORD"):
+            assert f"{secret}: ${{{{ secrets.{secret} }}}}" in import_region
+
+        build_idx = src.index("- name: Build macOS app")
+        build_region = src[build_idx : build_idx + 1000]
+        for secret in ("APPLE_TEAM_ID", *self._NOTARIZE_SECRETS):
+            assert f"{secret}: ${{{{ secrets.{secret} }}}}" in build_region
 
     def test_release_waits_for_non_provider_smoke_jobs(self):
         src = _read(self._CI_PATH)
@@ -715,7 +697,7 @@ class TestMacOSSigning:
 
         GitHub Actions rejects `secrets.*` in `if:` with
         `Unrecognized named-value: 'secrets'`. Always use `env.*` instead
-        (see the job-level env block test above). The parser used here
+        (see the non-secret job-level gate test above). The parser used here
         catches both step-level and job-level `if:` blocks deliberately —
         the rejection applies at every level, so a job-level violation
         would also break the workflow.
@@ -727,30 +709,25 @@ class TestMacOSSigning:
         ]
         assert not offending, (
             "secrets.* must not appear in any step-level if-condition "
-            "(promote to job-level env: and reference env.* instead). "
+            "(derive a non-secret job-level env gate and reference env.* instead). "
             f"Offenders: {offending}"
         )
 
     def test_ci_import_gates_on_full_secret_set(self):
-        """The Import-Apple-signing-certificate step MUST gate on ALL four
-        required signing secrets via env.*, not just the certificate."""
+        """The import step uses the non-secret gate derived from the full
+        required signing set."""
         src = _read(self._CI_PATH)
         import_idx = src.find("Import Apple signing certificate")
         assert import_idx != -1, (
             "Apple signing-certificate Import step not found in ci.yml — "
             "the macOS signing path is missing"
         )
-        # Take a generous slice around the Import step's `if:` line.
         region = src[import_idx:import_idx + 800]
-        for env_var in self._SIGNING_SECRETS:
-            assert f"env.{env_var}" in region, (
-                f"Import step if-condition must gate on env.{env_var} to "
-                f"prevent partial-secret runs from importing nothing"
-            )
+        assert "env.HAS_APPLE_SIGNING == 'true'" in region
 
     def test_ci_cleanup_keychain_step_present(self):
         """A `Cleanup keychain` step must run with `if: always() &&
-        matrix.os == 'macos-latest' && env.BUILD_CERTIFICATE_BASE64 != ''`
+        matrix.os == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'`
         so signing material never persists across runs even when the build
         itself fails, and the bash-only `security` invocation never fires
         on Linux/Windows shards."""
@@ -774,11 +751,10 @@ class TestMacOSSigning:
         assert "matrix.os == 'macos-latest'" in cleanup_region, (
             "Cleanup keychain must gate on matrix.os == 'macos-latest' so "
             "the bash-only `security delete-keychain` invocation does not "
-            "fire on Linux/Windows shards (where the secret env var would "
-            "still be set as job-level env)"
+            "fire on Linux/Windows shards"
         )
-        assert "env.BUILD_CERTIFICATE_BASE64 != ''" in cleanup_region, (
-            "Cleanup keychain must gate on env.BUILD_CERTIFICATE_BASE64 so "
+        assert "env.HAS_APPLE_SIGNING == 'true'" in cleanup_region, (
+            "Cleanup keychain must gate on env.HAS_APPLE_SIGNING so "
             "it does not try to delete a keychain that was never created"
         )
 
