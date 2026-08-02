@@ -201,7 +201,7 @@ navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
 hydrateNavIcons();
 
 // ---------------------------------------------------------------------------
-// Single /api/state poll owner (v6.88.0). Before this there were TWO timers —
+// Single /api/state poll owner. Before this there were TWO timers —
 // app.js polled every 20s for the projects nav and every chat instance polled
 // every 3s for the header controls — so an open project panel multiplied the
 // request rate. Now ONE app-owned fetch publishes the same snapshot to every
