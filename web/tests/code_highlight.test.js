@@ -4,7 +4,6 @@ import test from 'node:test';
 import {
     TOKEN_TYPES,
     highlightLine,
-    isSupportedLanguage,
     languageForPath,
     tokenizeLine,
 } from '../modules/code_highlight.js';
@@ -191,6 +190,7 @@ test('extensions map to languages, unknown ones to plain', () => {
     assert.equal(languageForPath('archive.tar.gz'), 'plain');
     assert.equal(languageForPath('.env'), 'plain');
     assert.equal(languageForPath(''), 'plain');
-    assert.ok(isSupportedLanguage('python'));
-    assert.ok(!isSupportedLanguage('plain'));
+    // An unknown language is not an error: it tokenizes as one escaped default
+    // lexeme, which is what `'plain'` means downstream.
+    assert.deepEqual(tokenizeLine('def f():', 'plain'), [{ type: 'default', text: 'def f():' }]);
 });

@@ -362,6 +362,36 @@ document.getElementById('content')?.appendChild(changesPage);
 
 initFiles(ctx);
 
+// "Is the user typing into this?" — ONE selector list and ONE disabled/readOnly
+// rule, shared by the mobile soft-keyboard geometry code (which needs to know
+// whether a viewport shrink belongs to a focused field) and by the ⌘L capture
+// handler (which must let a focused field keep the keystroke). Returns the
+// editable ELEMENT so callers can ask further questions about it — the capture
+// handler checks whether it lives inside a capture dock.
+const KEYBOARD_EDITABLE_SELECTOR = [
+    'textarea',
+    'select',
+    'input:not([type])',
+    'input[type="text"]',
+    'input[type="search"]',
+    'input[type="email"]',
+    'input[type="url"]',
+    'input[type="tel"]',
+    'input[type="password"]',
+    'input[type="number"]',
+    '[contenteditable]:not([contenteditable="false"])',
+].join(',');
+
+function isKeyboardEditable(node) {
+    if (!(node instanceof Element)) return null;
+    const editable = node.closest(KEYBOARD_EDITABLE_SELECTOR);
+    if (!editable) return null;
+    if (editable.matches('input, textarea, select') && (editable.disabled || editable.readOnly)) {
+        return null;
+    }
+    return editable;
+}
+
 /* [anchor:phase-B] right-panel registrations */
 
 /* [anchor:phase-C] global capture hotkey */
@@ -376,21 +406,29 @@ initFiles(ctx);
 // "Add selection" buttons remain the guaranteed path, not a convenience.
 //
 // Typing must win: while an editable other than a capture dock has focus, the
-// keystroke belongs to that editable. (The mobile-keyboard IIFE below keeps its
-// own copy of this selector in a closure; duplicating the four-line list here is
-// cheaper than exporting closure state across the anchor boundary.)
-const CAPTURE_EDITABLE_SELECTOR = 'input, textarea, select, [contenteditable]:not([contenteditable="false"])';
+// keystroke belongs to that editable. The test is the shared `isKeyboardEditable`
+// above — one selector list for the whole app, no second definition to drift.
+//
+// Suppressing the browser default is conditional on somebody actually CONSUMING
+// the capture: the event is dispatched cancelable, and only a listener that calls
+// preventDefault (i.e. the page owning the surface really captured) earns the
+// `event.preventDefault()` here. With no such listener ⌘L falls through to the
+// browser, which is the honest outcome — silently swallowing the address-bar
+// shortcut to do nothing would be worse than not handling it.
 const CAPTURE_PAGES = new Set(['files', 'changes']);
 
 document.addEventListener('keydown', (event) => {
     if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
     if (String(event.key).toLowerCase() !== 'l') return;
     if (!CAPTURE_PAGES.has(state.activePage)) return;
-    const active = document.activeElement;
-    const editable = active instanceof Element ? active.closest(CAPTURE_EDITABLE_SELECTOR) : null;
+    const editable = isKeyboardEditable(document.activeElement);
     if (editable && !editable.closest('[data-capture-dock]')) return;
-    event.preventDefault();
-    window.dispatchEvent(new CustomEvent('ouro:capture-selection', { detail: { page: state.activePage } }));
+    const request = new CustomEvent('ouro:capture-selection', {
+        detail: { page: state.activePage },
+        cancelable: true,
+    });
+    window.dispatchEvent(request);
+    if (request.defaultPrevented) event.preventDefault();
 });
 
 // ---------------------------------------------------------------------------
@@ -870,20 +908,6 @@ syncNavigationState();
     vvhStyle.id = 'runtime-vvh';
     document.head.appendChild(vvhStyle);
 
-    const keyboardEditableSelector = [
-        'textarea',
-        'select',
-        'input:not([type])',
-        'input[type="text"]',
-        'input[type="search"]',
-        'input[type="email"]',
-        'input[type="url"]',
-        'input[type="tel"]',
-        'input[type="password"]',
-        'input[type="number"]',
-        '[contenteditable]:not([contenteditable="false"])',
-    ].join(',');
-
     let keyboardOpen = false;
     let keyboardTouchStartY = 0;
     let stableViewportHeight = 0;
@@ -891,18 +915,10 @@ syncNavigationState();
     let focusRevision = 0;
     let baselineFrame = 0;
 
-    function keyboardEditable(node) {
-        if (!(node instanceof Element)) return null;
-        const editable = node.closest(keyboardEditableSelector);
-        if (!editable) return null;
-        if (editable.matches('input, textarea, select') && (editable.disabled || editable.readOnly)) {
-            return null;
-        }
-        return editable;
-    }
-
+    // The editable test is the module-scope `isKeyboardEditable` (shared with the
+    // ⌘L capture handler); this IIFE only asks the question about focus.
     function focusedKeyboardEditable() {
-        return keyboardEditable(document.activeElement);
+        return isKeyboardEditable(document.activeElement);
     }
 
     function viewportHeight() {
@@ -1000,14 +1016,14 @@ syncNavigationState();
     };
 
     document.addEventListener('focusin', (event) => {
-        if (!keyboardEditable(event.target)) return;
+        if (!isKeyboardEditable(event.target)) return;
         focusRevision += 1;
         cancelBaselineFrame();
         focusBaselineHeight = stableViewportHeight || viewportHeight();
         updateVvh();
     });
     document.addEventListener('focusout', (event) => {
-        if (!keyboardEditable(event.target)) return;
+        if (!isKeyboardEditable(event.target)) return;
         focusRevision += 1;
         const revision = focusRevision;
         cancelBaselineFrame();

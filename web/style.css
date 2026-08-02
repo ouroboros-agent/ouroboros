@@ -1001,10 +1001,6 @@ body.resizing-panels { user-select: none; }
     border-color: var(--focus-accent-border);
 }
 
-.files-dock-parts {
-    align-items: flex-end;
-}
-
 .files-dock-input {
     max-height: 120px;
     padding: 4px 0;

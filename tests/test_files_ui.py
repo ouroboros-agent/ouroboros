@@ -148,10 +148,36 @@ def test_files_viewer_renders_one_row_per_line_with_line_numbers():
 def test_files_viewer_never_claims_a_line_total_it_cannot_know():
     source = _read("web/modules/files.js")
 
-    assert "state.activeTruncated ? ' shown · preview truncated' : ''" in source
+    assert "${state.activeTruncated ? ' shown · preview truncated' : ''}" in source
+    # Pluralization matches the chip label: "1 line", "42 lines".
+    assert "${count} line${count === 1 ? '' : 's'}" in source
+    # An empty file renders ZERO rows, not a phantom line 1.
+    assert "if (text === '') return [];" in source
     # No mtime / "modified by task" fiction in the meta line.
     assert "modified" not in source
     assert "mtime" not in source
+
+
+def test_files_tree_says_why_a_listing_failed_instead_of_loading_forever():
+    """A failed expand/refresh must replace "Loading…" with the recorded reason."""
+    source = _read("web/modules/files.js")
+
+    # loadDir records the failure on the node before re-raising, status included.
+    assert "node.error = err instanceof Error ? err.message : String(err);" in source
+    assert "failure.status = resp.status;" in source
+    # The repaint after an expand is unconditional.
+    assert "            } finally {\n                renderTree();\n            }" in source
+    assert "treeNote(child.error || 'Loading…')" in source
+    assert "treeNote(root?.error || 'No files listed.')" in source
+
+    # Refresh: per-path isolation, always repaint + re-open, ONE summary toast,
+    # and a folder the server no longer has is forgotten rather than kept as a
+    # ghost row that fails again on every refresh.
+    refresh = source.split("async function refreshAll()", 1)[1].split("\n    }\n", 1)[0]
+    assert "failures.push(" in refresh
+    assert "if (err?.status === 404 && path !== '.') state.dirs.delete(path);" in refresh
+    assert refresh.index("renderTree();") < refresh.index("await openFile(path)")
+    assert "failed to refresh" in refresh
 
 
 def test_files_media_previews_stay_sandboxed_and_download_uses_the_bridge():
@@ -187,14 +213,54 @@ def test_selection_capture_maps_boundaries_to_lines_of_the_active_viewer():
         "!selection || selection.rangeCount === 0 || selection.isCollapsed" in source
     )
     # Both boundaries must resolve to rows of THIS viewer.
-    assert "const startLine = rowLineNumber(range.startContainer, root);" in source
-    assert "const endLine = rowLineNumber(range.endContainer, root);" in source
-    assert "if (startLine === null || endLine === null) return null;" in source
+    assert "const start = resolveBoundary(range.startContainer, range.startOffset, root);" in source
+    assert "const end = resolveBoundary(range.endContainer, range.endOffset, root);" in source
+    assert "if (start === null || end === null) return null;" in source
     assert "element.closest('[data-line-number]')" in source
     # Ordering, collapsed rejection, and the offset-zero exclusion.
     assert "[first, last] = [last, first];" in source
     assert "if (first.line === last.line && first.offset === last.offset) return null;" in source
     assert "if (lineEnd > first.line && last.offset === 0) lineEnd -= 1;" in source
+
+
+def test_element_range_boundaries_are_not_read_as_character_offsets():
+    """DOM spec: a boundary on an ELEMENT carries a CHILD INDEX. A drag begun over
+    the line-number gutter therefore reports a nonzero offset while sitting before
+    the line's first character — it must read as offset 0, not "one char in"."""
+    source = _read("web/modules/files.js")
+
+    assert "function boundaryBeforeText(container, offset, row)" in source
+    assert "if (!(container instanceof Element)) return false;" in source
+    # The question is answered positionally, against the row's own code text.
+    assert "row.querySelector('.files-code-text')" in source
+    assert "probe.setStart(text, 0);" in source
+    assert "probe.setEnd(container, offset);" in source
+    assert "return probe.toString() === '';" in source
+    # The pure mapper honors the flag over the numeric offset.
+    assert "const offsetOf = (value, beforeText) => {" in source
+    assert "if (beforeText === true) return 0;" in source
+    assert "offsetOf(boundaries.startOffset, boundaries.startBeforeText)" in source
+    assert "offsetOf(boundaries.endOffset, boundaries.endBeforeText)" in source
+    assert "startBeforeText: start.beforeText," in source
+    assert "endBeforeText: end.beforeText," in source
+
+
+def test_truncated_preview_capture_sends_the_range_without_inline_bytes():
+    """The LAST shown line of a prefix can be a fragment the server cut mid-line,
+    so a range touching it degrades to the ranged bare marker — and says so."""
+    source = _read("web/modules/files.js")
+
+    assert "export function captureInlinesContent(" in source
+    assert "if (!truncated) return true;" in source
+    assert "return end < shown;" in source
+    # The capture site consults it and drops the bytes, keeping the true range.
+    assert "shownLines: state.activeLines.length," in source
+    assert "content: inlineContent ? state.activeLines.slice(range.lineStart - 1, range.lineEnd).join('\\n') : null," in source
+    # Disclosed exactly once per opened file.
+    assert "if (range && !inlineContent && !state.truncatedNoticeShown) {" in source
+    assert "state.truncatedNoticeShown = true;" in source
+    assert "Preview is truncated — sending the line range without inline bytes." in source
+    assert "state.truncatedNoticeShown = false;" in source
 
 
 def test_capture_builds_a_chip_through_the_shared_codec_and_discloses_refusals():
@@ -223,10 +289,19 @@ def test_sticky_selection_button_survives_the_click_that_uses_it():
     assert "state.selectionRange = readViewerSelection(viewerBodyEl);" in source
     assert "capture({ selectionOnly: true })" in source
 
-    # The sticky mouseup cache belongs to the BUTTON only: ⌘L with nothing
-    # selected must fall back to a whole-file chip, never to a remembered range.
-    assert "const range = live || (selectionOnly ? state.lastSelectionRange : null);" in source
+    # The mouseup cache is readable by the BUTTON and by a ⌘L pressed with focus
+    # inside the dock ("select code, type a comment, then ⌘L" — focusing the dock
+    # is what collapsed the selection). A ⌘L anywhere else with nothing selected
+    # falls back to a whole-file chip, never to a remembered range.
+    assert "export function resolveCaptureRange(" in source
+    assert "if (live) return live;" in source
+    assert "if (selectionOnly || focusInDock) return cached || null;" in source
+    assert "return null;" in source
+    assert "cached: state.lastSelectionRange," in source
+    assert "focusInDock: Boolean(activeElement instanceof Element && activeElement.closest('[data-capture-dock]'))," in source
     assert "if (state.selectionRange) state.lastSelectionRange = state.selectionRange;" in source
+    # No stale-range fallback survives at the capture site.
+    assert "|| state.selectionRange" not in source
 
     assert ".files-selection-btn {" in css
     assert "transform: translateX(-50%);" in css
@@ -259,13 +334,41 @@ def test_global_capture_hotkey_lives_in_the_phase_c_anchor():
     assert "event.metaKey || event.ctrlKey" in anchor
     assert "String(event.key).toLowerCase() !== 'l'" in anchor
     assert "CAPTURE_PAGES = new Set(['files', 'changes'])" in anchor
-    assert "CAPTURE_EDITABLE_SELECTOR" in anchor
+    # ONE editable test for the whole app (shared with the mobile-keyboard code),
+    # not a second broader selector living inside the anchor.
+    assert "isKeyboardEditable(document.activeElement)" in anchor
+    assert "CAPTURE_EDITABLE_SELECTOR" not in app_source
+    assert "function isKeyboardEditable(node) {" in app_source
+    assert "const KEYBOARD_EDITABLE_SELECTOR = [" in app_source
+    assert app_source.count("[contenteditable]:not([contenteditable=\"false\"])") == 1
     assert "editable.closest('[data-capture-dock]')" in anchor
-    assert "event.preventDefault();" in anchor
+    # The keystroke is swallowed ONLY when a page actually consumed the capture:
+    # cancelable event, preventDefault gated on defaultPrevented.
+    assert "cancelable: true," in anchor
+    assert "if (request.defaultPrevented) event.preventDefault();" in anchor
     assert "new CustomEvent('ouro:capture-selection'" in anchor
-    # The page that owns the surface does the capture.
+    # The page that owns the surface does the capture and claims the keystroke.
     assert "window.addEventListener('ouro:capture-selection'" in files_source
     assert "if (event.detail?.page !== 'files') return;" in files_source
+    handler = files_source.split("window.addEventListener('ouro:capture-selection'", 1)[1]
+    handler = handler.split("});", 1)[0]
+    assert "event.preventDefault();" in handler
+
+
+def test_files_page_exposes_no_dead_surface():
+    """Every export/return the page does not actually use is a maintenance lie."""
+    files_source = _read("web/modules/files.js")
+    app_source = _read("web/app.js")
+    highlight_source = _read("web/modules/code_highlight.js")
+
+    # initFiles wires itself up; it hands nothing back and writes no app state.
+    assert "export function initFiles({ showPage, getChatController } = {}) {" in files_source
+    assert "return { capture, state };" not in files_source
+    assert "filesState" not in files_source
+    assert "filesState" not in app_source
+    # The highlighter exports only what the viewer and its tests consume.
+    assert "isSupportedLanguage" not in highlight_source
+    assert "isSupportedLanguage" not in files_source
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +430,10 @@ def test_files_dock_reuses_the_shared_composer_part_contract():
     # Chips themselves are the shared contract, not a files-local restyle.
     assert ".composer-part-chip {" in css
     assert ".files-dock-chip" not in css
+    # …and the dock does NOT try to re-align them: `.composer-parts` (declared
+    # later, same specificity) always won, so the override was dead weight
+    # pretending the dock's chip row differed from every other one.
+    assert ".files-dock-parts {" not in css
 
 
 # ---------------------------------------------------------------------------

@@ -113,10 +113,6 @@ export function languageForPath(path) {
     return EXTENSIONS[name.slice(dot + 1).toLowerCase()] || 'plain';
 }
 
-export function isSupportedLanguage(language) {
-    return Object.prototype.hasOwnProperty.call(RULES, String(language));
-}
-
 /**
  * Split ONE line of plain text into typed lexemes. Unmatched spans become
  * `default`, so concatenating `token.text` in order rebuilds the input exactly.

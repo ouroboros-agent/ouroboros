@@ -59,38 +59,76 @@ function formatFileSize(size) {
  *     caret is not a range;
  *   • an END boundary at offset 0 of a LATER line sits before that line's first
  *     character, so that line is excluded (dragging just past a line break must
- *     not silently widen the capture by one line).
+ *     not silently widen the capture by one line);
+ *   • `startBeforeText` / `endBeforeText` say the boundary sits BEFORE the row's
+ *     code text (the DOM layer resolves that — see `boundaryBeforeText`). Such a
+ *     boundary reads as offset 0 whatever its numeric offset is, because an
+ *     ELEMENT boundary carries a child index, not a character offset — the two
+ *     scales must never be confused.
  */
 export function selectionLineRange(boundaries = {}) {
     const startLine = Number(boundaries.startLine);
     const endLine = Number(boundaries.endLine);
     if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) return null;
     if (startLine < 1 || endLine < 1) return null;
-    const offsetOf = (value) => {
+    const offsetOf = (value, beforeText) => {
+        if (beforeText === true) return 0;
         const num = Number(value);
         return Number.isFinite(num) && num > 0 ? Math.floor(num) : 0;
     };
-    let first = { line: startLine, offset: offsetOf(boundaries.startOffset) };
-    let last = { line: endLine, offset: offsetOf(boundaries.endOffset) };
+    let first = { line: startLine, offset: offsetOf(boundaries.startOffset, boundaries.startBeforeText) };
+    let last = { line: endLine, offset: offsetOf(boundaries.endOffset, boundaries.endBeforeText) };
     if (last.line < first.line || (last.line === first.line && last.offset < first.offset)) {
         [first, last] = [last, first];
     }
     if (first.line === last.line && first.offset === last.offset) return null;
     let lineEnd = last.line;
+    // Excluding the boundary line can only bring `lineEnd` down to `first.line`
+    // (the branch runs only while it is strictly greater), so the result is
+    // always a valid inclusive range — no lower guard is reachable here.
     if (lineEnd > first.line && last.offset === 0) lineEnd -= 1;
-    if (lineEnd < first.line) return null;
     return { lineStart: first.line, lineEnd };
 }
 
-/** The `data-line-number` of the row owning `node`, or null when outside `root`. */
-function rowLineNumber(node, root) {
+/**
+ * Does a Range boundary sit BEFORE the row's code text?
+ *
+ * Per the DOM spec a boundary whose container is an ELEMENT uses a child index,
+ * not a character offset, so `offset` alone cannot answer this. Element
+ * boundaries are not hypothetical here: a drag that ENDS over a later row's
+ * (unselectable) gutter reports `endContainer` = that row's `.files-code-text`
+ * element in Chromium, and a child index sitting before the text would be read
+ * as "one character into the line" by a naive mapper.
+ *
+ * The question is answered positionally instead: build the span from the start of
+ * `.files-code-text` to the boundary and ask whether any character falls inside
+ * it. A boundary before that start collapses the probe range (spec behaviour of
+ * `setEnd`), which reads as the empty string, i.e. offset 0.
+ */
+function boundaryBeforeText(container, offset, row) {
+    if (!(container instanceof Element)) return false;
+    const text = row.querySelector('.files-code-text');
+    if (!text) return true;
+    try {
+        const probe = document.createRange();
+        probe.setStart(text, 0);
+        probe.setEnd(container, offset);
+        return probe.toString() === '';
+    } catch {
+        return false;
+    }
+}
+
+/** A Range boundary -> `{ line, offset, beforeText }` of its row, or null. */
+function resolveBoundary(container, offset, root) {
     if (!root) return null;
-    const element = node instanceof Element ? node : (node?.parentElement || null);
+    const element = container instanceof Element ? container : (container?.parentElement || null);
     if (!element || !root.contains(element)) return null;
     const row = element.closest('[data-line-number]');
     if (!row || !root.contains(row)) return null;
     const line = Number(row.dataset.lineNumber);
-    return Number.isInteger(line) && line > 0 ? line : null;
+    if (!Number.isInteger(line) || line < 1) return null;
+    return { line, offset, beforeText: boundaryBeforeText(container, offset, row) };
 }
 
 /**
@@ -101,23 +139,64 @@ function rowLineNumber(node, root) {
  * again so the contract holds for any caller. BOTH boundaries must resolve to
  * rows of THIS viewer — a selection that starts in the viewer and ends in the
  * dock, the rail, or another page captures nothing rather than a wrong range.
+ * Element boundaries are normalized first (`boundaryBeforeText`), so a child
+ * index is never read as a character offset.
  */
 export function readViewerSelection(root) {
     const selection = typeof window !== 'undefined' && window.getSelection ? window.getSelection() : null;
     if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
     const range = selection.getRangeAt(0);
-    const startLine = rowLineNumber(range.startContainer, root);
-    const endLine = rowLineNumber(range.endContainer, root);
-    if (startLine === null || endLine === null) return null;
+    const start = resolveBoundary(range.startContainer, range.startOffset, root);
+    const end = resolveBoundary(range.endContainer, range.endOffset, root);
+    if (start === null || end === null) return null;
     return selectionLineRange({
-        startLine,
-        startOffset: range.startOffset,
-        endLine,
-        endOffset: range.endOffset,
+        startLine: start.line,
+        startOffset: start.offset,
+        startBeforeText: start.beforeText,
+        endLine: end.line,
+        endOffset: end.offset,
+        endBeforeText: end.beforeText,
     });
 }
 
-export function initFiles({ state: appState, showPage, getChatController } = {}) {
+/**
+ * May a capture of `lineEnd` carry the preview's bytes inline? PURE.
+ *
+ * A truncated preview is a PREFIX the server cut at a byte budget, so the last
+ * shown line can be a mid-line fragment. Inlining it would hand the agent bytes
+ * that claim to be `L<start>-L<end>` while silently ending mid-statement, so a
+ * range touching the last shown line degrades to the ranged BARE marker and the
+ * agent reads those lines itself. Lines strictly before the cut are complete and
+ * inline normally.
+ */
+export function captureInlinesContent({ truncated = false, lineEnd = 0, shownLines = 0 } = {}) {
+    if (!truncated) return true;
+    const end = Number(lineEnd);
+    const shown = Number(shownLines);
+    if (!Number.isFinite(end) || !Number.isFinite(shown)) return false;
+    return end < shown;
+}
+
+/**
+ * Which range a capture uses. PURE, because the rule is a decision, not a DOM
+ * fact:
+ *
+ *   • a LIVE selection always wins;
+ *   • with nothing selected, only two callers may read the mouseup cache — the
+ *     sticky selection button (`selectionOnly`, reachable only while a selection
+ *     is visible) and a ⌘L pressed with focus INSIDE the capture dock (the
+ *     "select code, type a comment, then ⌘L" flow, where focusing the dock is
+ *     what collapsed the selection);
+ *   • everywhere else a remembered range would be a stale lie, so ⌘L means "the
+ *     whole file" instead.
+ */
+export function resolveCaptureRange({ live = null, cached = null, selectionOnly = false, focusInDock = false } = {}) {
+    if (live) return live;
+    if (selectionOnly || focusInDock) return cached || null;
+    return null;
+}
+
+export function initFiles({ showPage, getChatController } = {}) {
     const page = document.createElement('div');
     page.id = 'page-files';
     page.className = 'page app-page-glass';
@@ -177,7 +256,7 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
     const state = {
         rootPath: '',
         filter: '',
-        /** dirPath -> { entries, loaded, loading, expanded, truncated } */
+        /** dirPath -> { entries, loaded, loading, expanded, truncated, error } */
         dirs: new Map(),
         activePath: '',
         activeDisplayPath: '',
@@ -185,6 +264,8 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
         activeIsText: false,
         activeLines: [],
         activeTruncated: false,
+        /** Disclose the truncated-capture degradation ONCE per opened file. */
+        truncatedNoticeShown: false,
         selectionRange: null,
         lastSelectionRange: null,
     };
@@ -196,7 +277,7 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
     function dirNode(path) {
         const key = path || '.';
         if (!state.dirs.has(key)) {
-            state.dirs.set(key, { entries: [], loaded: false, loading: false, expanded: key === '.', truncated: false });
+            state.dirs.set(key, { entries: [], loaded: false, loading: false, expanded: key === '.', truncated: false, error: '' });
         }
         return state.dirs.get(key);
     }
@@ -206,6 +287,7 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
         const node = dirNode(key);
         if (node.loading) return node;
         node.loading = true;
+        node.error = '';
         try {
             const params = new URLSearchParams();
             // The root is requested WITHOUT a path so the backend picks its own
@@ -214,11 +296,20 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
             const query = params.toString();
             const resp = await apiFetch(`/api/files/list${query ? `?${query}` : ''}`);
             const data = await resp.json();
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+            if (!resp.ok) {
+                const failure = new Error(data.error || `HTTP ${resp.status}`);
+                failure.status = resp.status;
+                throw failure;
+            }
             state.rootPath = data.root_path || state.rootPath;
             node.entries = Array.isArray(data.entries) ? data.entries : [];
             node.truncated = Boolean(data.truncated);
             node.loaded = true;
+        } catch (err) {
+            // The rail must SAY what happened. A failed listing that keeps
+            // rendering "Loading…" is an eternal lie the owner cannot act on.
+            node.error = err instanceof Error ? err.message : String(err);
+            throw err;
         } finally {
             node.loading = false;
         }
@@ -273,7 +364,7 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
             }));
             if (isDir && child?.expanded) {
                 if (child.loaded) appendChildren(entry.path, depth + 1);
-                else treeEl.appendChild(treeNote('Loading…'));
+                else treeEl.appendChild(treeNote(child.error || 'Loading…'));
             }
         }
         if (node.truncated) treeEl.appendChild(treeNote('Listing truncated by the server.'));
@@ -312,7 +403,8 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
         }
         const root = state.dirs.get('.');
         if (!root?.loaded) {
-            treeEl.appendChild(treeNote(root?.loading ? 'Loading…' : 'No files listed.'));
+            if (root?.loading) treeEl.appendChild(treeNote('Loading…'));
+            else treeEl.appendChild(treeNote(root?.error || 'No files listed.'));
             return;
         }
         if (!root.entries.length) {
@@ -327,8 +419,13 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
         node.expanded = !node.expanded;
         renderTree();
         if (node.expanded && !node.loaded) {
-            await loadDir(path);
-            renderTree();
+            // The repaint is unconditional: a listing that FAILED must replace its
+            // "Loading…" note with the recorded error, not keep spinning forever.
+            try {
+                await loadDir(path);
+            } finally {
+                renderTree();
+            }
         }
     }
 
@@ -348,6 +445,7 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
         state.activeIsText = false;
         state.activeLines = [];
         state.activeTruncated = false;
+        state.truncatedNoticeShown = false;
         state.selectionRange = null;
         state.lastSelectionRange = null;
         downloadBtn.hidden = true;
@@ -371,9 +469,15 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
      * `content` is a PREFIX when `truncated` is true, so the row count describes
      * what is on screen ("N lines shown · preview truncated") and never claims a
      * total the client cannot know.
+     *
+     * An EMPTY file has zero lines, not one: `''.split('\n')` yields one empty
+     * element, and rendering it would put a phantom "line 1" under a header that
+     * says "1 line".
      */
     function previewLines(content) {
-        const lines = String(content ?? '').split('\n');
+        const text = String(content ?? '');
+        if (text === '') return [];
+        const lines = text.split('\n');
         // A trailing newline produces one empty tail element that is not a line.
         if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
         return lines;
@@ -436,7 +540,10 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
         } else if (data.is_text) {
             state.activeIsText = true;
             state.activeLines = previewLines(data.content);
-            const shown = `${state.activeLines.length} lines${state.activeTruncated ? ' shown · preview truncated' : ''}`;
+            // Pluralization matches the chip's own label (`composer_parts.chipLabel`),
+            // so "1 line" reads the same in the header and in the dock.
+            const count = state.activeLines.length;
+            const shown = `${count} line${count === 1 ? '' : 's'}${state.activeTruncated ? ' shown · preview truncated' : ''}`;
             setViewerHeader({ path: state.activeDisplayPath, meta: fileMeta(data, shown) });
             renderCode(state.activeLines, languageForPath(state.activeDisplayPath));
         } else {
@@ -464,15 +571,17 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
     /**
      * Two pieces of state, because the two capture intents differ:
      *
-     *   • `selectionRange` is the LIVE range. It drives the sticky button's
-     *     visibility, and it is what ⌘L / "Add to chat" read — those must fall
-     *     back to a whole-file chip when nothing is selected, so a remembered
-     *     range would be a lie.
-     *   • `lastSelectionRange` is the sticky mouseup cache the handoff asks for.
-     *     Clicking the button can collapse the selection before the click handler
-     *     runs (observed in Chromium even with `mousedown` default suppressed), so
-     *     the button — which is only reachable WHILE a selection is visible —
-     *     falls back to this. It is dropped after a capture and on file switch.
+     *   • `selectionRange` is the LIVE range, and it exists for ONE job: the
+     *     sticky button's visibility. Capture itself always re-reads the live
+     *     selection, so a stale copy can never widen a chip.
+     *   • `lastSelectionRange` is the sticky mouseup cache. Clicking the button
+     *     can collapse the selection before the click handler runs (observed in
+     *     Chromium even with `mousedown` default suppressed), and focusing the
+     *     dock to type a comment collapses it too. Exactly those two callers may
+     *     read it (`resolveCaptureRange`: `selectionOnly`, or ⌘L while focus is
+     *     inside `[data-capture-dock]`); for a ⌘L pressed anywhere else a
+     *     remembered range would be a lie, so that means "the whole file". The
+     *     cache is dropped after a capture and on file switch.
      */
     function syncSelectionButton() {
         if (!state.activeIsText || !page.classList.contains('active')) {
@@ -494,11 +603,30 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
             showToast('Open a file first — there is nothing to add to chat context yet.', 'warn');
             return false;
         }
-        const live = state.activeIsText ? (readViewerSelection(viewerBodyEl) || state.selectionRange) : null;
-        // Only the selection button may fall back to the sticky cache (see
-        // syncSelectionButton); ⌘L with nothing selected means "the whole file".
-        const range = live || (selectionOnly ? state.lastSelectionRange : null);
+        const activeElement = document.activeElement;
+        const range = state.activeIsText
+            ? resolveCaptureRange({
+                live: readViewerSelection(viewerBodyEl),
+                cached: state.lastSelectionRange,
+                selectionOnly,
+                focusInDock: Boolean(activeElement instanceof Element && activeElement.closest('[data-capture-dock]')),
+            })
+            : null;
         if (!range && selectionOnly) return false;
+        // A truncated preview's LAST shown line can be a fragment the server cut
+        // mid-line, so a range touching it ships as the ranged bare marker: the
+        // true line numbers, no bytes claiming to be those lines.
+        const inlineContent = range
+            ? captureInlinesContent({
+                truncated: state.activeTruncated,
+                lineEnd: range.lineEnd,
+                shownLines: state.activeLines.length,
+            })
+            : true;
+        if (range && !inlineContent && !state.truncatedNoticeShown) {
+            state.truncatedNoticeShown = true;
+            showToast('Preview is truncated — sending the line range without inline bytes.', 'warn');
+        }
         const chip = range
             ? makeChipPart({
                 path: state.activeDisplayPath,
@@ -507,7 +635,7 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
                 // Full lines, verbatim, from the payload the viewer rendered —
                 // the codec decides itself whether they inline (≤200 lines) or
                 // degrade to the bare marker.
-                content: state.activeLines.slice(range.lineStart - 1, range.lineEnd).join('\n'),
+                content: inlineContent ? state.activeLines.slice(range.lineStart - 1, range.lineEnd).join('\n') : null,
             })
             : makeChipPart({ path: state.activeDisplayPath });
         if (!chip) {
@@ -579,32 +707,62 @@ export function initFiles({ state: appState, showPage, getChatController } = {})
 
     // The global ⌘L handler (app.js `[anchor:phase-C]`) knows nothing about this
     // module: it names the active page in one event and the owning page listens.
+    // The event is CANCELABLE: calling preventDefault here is how this page tells
+    // the global handler "I consumed the keystroke, suppress the browser default".
+    // Staying silent leaves ⌘L to the browser rather than swallowing it.
     window.addEventListener('ouro:capture-selection', (event) => {
         if (event.detail?.page !== 'files') return;
         if (!page.classList.contains('active')) return;
+        event.preventDefault();
         capture();
     });
 
     refreshBtn.addEventListener('click', () => { refreshAll().catch(reportError); });
 
-    /** Re-list every folder already open (expansion is preserved) + the file. */
+    /**
+     * Re-list every folder already open (expansion is preserved) + the file.
+     *
+     * One failing folder must not abandon the refresh: each path is caught on its
+     * own, the tree is repainted and the active file re-opened ALWAYS, and the
+     * failures are disclosed as one summary instead of a toast storm. A folder the
+     * server no longer has (404) is forgotten rather than kept as a ghost row that
+     * fails again on every refresh.
+     */
     async function refreshAll() {
         const paths = [...state.dirs.entries()]
             .filter(([, node]) => node.loaded)
             .map(([path]) => path);
-        for (const path of paths) await loadDir(path);
+        const failures = [];
+        for (const path of paths) {
+            try {
+                await loadDir(path);
+            } catch (err) {
+                failures.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
+                if (err?.status === 404 && path !== '.') state.dirs.delete(path);
+            }
+        }
         renderTree();
-        if (state.activePath) await openFile(state.activePath);
+        if (state.activePath) {
+            const path = state.activePath;
+            try {
+                await openFile(path);
+            } catch (err) {
+                failures.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        if (failures.length) {
+            showToast(`Files: ${failures.length} path${failures.length === 1 ? '' : 's'} failed to refresh — ${failures.join('; ')}`, 'danger');
+        }
     }
-
-    if (appState) appState.filesState = state;
 
     renderTree();
     loadDir('.').then(() => {
         renderTree();
         setViewerHeader({ path: state.rootPath || 'Files', meta: 'Read-only browser · pick a file in the tree' });
         showPlaceholder('Open a file from the tree to read it, download it, or add lines to chat context with ⌘L.');
-    }).catch(reportError);
-
-    return { capture, state };
+    }).catch((err) => {
+        // The rail renders the recorded reason instead of "No files listed.".
+        renderTree();
+        reportError(err);
+    });
 }
