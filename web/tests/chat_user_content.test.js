@@ -4,9 +4,11 @@ import test from 'node:test';
 import {
     composerObjectiveText,
     modelChipPresentation,
+    recallFieldForEntry,
     renderUserContent,
 } from '../modules/chat.js';
-import { makeChipPart, serializeParts } from '../modules/composer_parts.js';
+import { MAX_CHIP_LINES, makeChipPart, serializeParts } from '../modules/composer_parts.js';
+import { escapeHtmlAttr } from '../modules/utils.js';
 
 const rangedChip = (over = {}) => makeChipPart({
     path: 'ouroboros/loop.py', lineStart: 10, lineEnd: 12, ...over,
@@ -94,6 +96,52 @@ test('a chip is earned by a PROVABLE line count, never claimed by the marker', (
     assert.match(renderUserContent(single), /class="chat-context-chip"/);
 });
 
+// A marker over a fence LONGER than the inline cap: the serializer legitimately
+// drops those bytes, so the parts projection is shorter than the message. The
+// only honest rendering is the owner's exact bytes.
+const OVER_CAP_LINES = MAX_CHIP_LINES + 53;
+const overCapBody = Array.from({ length: OVER_CAP_LINES }, (_, i) => `line ${i + 1}`).join('\n');
+
+test('a projection that is not byte-exact renders the WHOLE raw string instead', () => {
+    // 253 fenced lines under a 3-line claim. Both guards would once have folded
+    // this away: the chip label hides the fence, and the per-part "show the
+    // grammar" fallback re-serializes to a BARE marker over the cap — 255 lines of
+    // payload the agent receives, rendered as one line the owner can read.
+    const raw = `[context: ouroboros/loop.py L10-L12]\n\`\`\`\n${overCapBody}\n\`\`\``;
+    const html = renderUserContent(raw);
+    assert.doesNotMatch(html, /chat-context-chip/, html);
+    assert.doesNotMatch(html, /chat-user-parts/, html);
+    // Nothing is dropped and nothing is added: the escaped raw string, exactly
+    // (fence backticks are escaped, which renders as the same characters).
+    assert.equal(html, escapeHtmlAttr(raw));
+    assert.equal(html.split('\n').length, raw.split('\n').length);
+    for (const needle of ['[context: ouroboros/loop.py L10-L12]', 'line 1', `line ${OVER_CAP_LINES}`]) {
+        assert.ok(html.includes(needle), `${needle} missing`);
+    }
+});
+
+test('an over-cap capture whose range AGREES with its fence is also shown in full', () => {
+    // The consistent version of the same message: the range matches the fence, so
+    // the per-part provability check passes — and the projection is still lossy,
+    // because the serializer drops bytes over the cap. Consistency does not earn a
+    // chip when the round-trip is not byte-exact.
+    const raw = `[context: ouroboros/loop.py L1-L${OVER_CAP_LINES}]\n\`\`\`\n${overCapBody}\n\`\`\``;
+    const html = renderUserContent(raw);
+    assert.doesNotMatch(html, /chat-context-chip/, html);
+    assert.equal(html, escapeHtmlAttr(raw));
+});
+
+test('a capture AT the inline cap still chips — the guard is not a blanket refusal', () => {
+    const atCap = Array.from({ length: MAX_CHIP_LINES }, (_, i) => `line ${i + 1}`).join('\n');
+    const raw = serializeParts([makeChipPart({
+        path: 'ouroboros/loop.py', lineStart: 1, lineEnd: MAX_CHIP_LINES, content: atCap,
+    })]);
+    const html = renderUserContent(raw);
+    assert.match(html, /class="chat-context-chip"/, html);
+    assert.match(html, new RegExp(`loop\\.py · ${MAX_CHIP_LINES} lines`), html);
+    assert.doesNotMatch(html, /line 137/, html);
+});
+
 test('the newlines BETWEEN parts survive the projection', () => {
     // The renderer is the inverse of serializeParts, which joins parts with '\n'.
     // Dropping those separators would silently reflow the owner's message.
@@ -175,6 +223,57 @@ test('an ordinary message renders as one escaped string, exactly as before', () 
     assert.equal(renderUserContent(null), '');
     // Newlines survive (the .message surface renders them via white-space).
     assert.equal(renderUserContent('one\ntwo'), 'one\ntwo');
+});
+
+// --- recall: the field the entry refills, byte for byte ----------------------
+
+// What the composer will actually send back: committed parts plus the live input,
+// joined by the same '\n' `composerParts.serialize()` uses.
+const fieldBytes = (field) => serializeParts(
+    field.input ? [...field.parts, { type: 'text', text: field.input }] : field.parts,
+);
+
+test('recalling an entry the codec cannot round-trip is byte-exact on re-send', () => {
+    // A marker plus a 201-line fence: parsing it back and re-serializing DROPS the
+    // fenced bytes (over the inline cap), so committing it as parts would make
+    // ArrowUp-then-Enter send a message the owner never wrote.
+    const body = Array.from({ length: MAX_CHIP_LINES + 1 }, (_, i) => `line ${i + 1}`).join('\n');
+    const entry = `[context: ouroboros/loop.py L1-L${MAX_CHIP_LINES + 1}]\n\`\`\`\n${body}\n\`\`\``;
+
+    const field = recallFieldForEntry(entry);
+    assert.deepEqual(field.parts, [], 'nothing may be committed as parts');
+    assert.equal(field.input, entry, 'the whole entry lands in the live input');
+    // The property that matters: re-sending transmits the identical string.
+    assert.equal(fieldBytes(field), entry);
+});
+
+test('a genuine capture still recalls as CHIPS, with the words left editable', () => {
+    const chip = rangedChip({ content: 'one\ntwo\nthree' });
+    const entry = serializeParts([chip, { type: 'text', text: 'make this retry honest' }]);
+
+    const field = recallFieldForEntry(entry);
+    assert.deepEqual(field.parts, [chip], 'the capture comes back as a removable chip');
+    // The trailing words stay in the live input so the caret lands in them.
+    assert.equal(field.input, 'make this retry honest');
+    assert.equal(fieldBytes(field), entry);
+
+    // A chips-only entry recalls as chips with an empty input.
+    const chipsOnly = serializeParts([chip, makeChipPart({ path: 'README.md' })]);
+    const only = recallFieldForEntry(chipsOnly);
+    assert.deepEqual(only.parts.map((p) => p.type), ['chip', 'chip']);
+    assert.equal(only.input, '');
+    assert.equal(fieldBytes(only), chipsOnly);
+
+    // Plain prose recalls as plain prose in the input, unchanged.
+    const prose = recallFieldForEntry('just words\nover two lines');
+    assert.deepEqual(prose.parts, []);
+    assert.equal(prose.input, 'just words\nover two lines');
+    assert.equal(fieldBytes(prose), 'just words\nover two lines');
+
+    // Nothing to recall is an empty field, not a thrown error.
+    for (const empty of ['', null, undefined]) {
+        assert.deepEqual(recallFieldForEntry(empty), { parts: [], input: '' });
+    }
 });
 
 // --- _pendingCardObjective: human words only ---------------------------------
