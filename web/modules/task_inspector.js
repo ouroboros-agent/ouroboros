@@ -400,8 +400,14 @@ export function initTaskInspector(ctx = {}) {
             view.tab = next;
             paint();
             // Activating the Changes tab is an explicit ask for the diff, and the
-            // one place a missing diff is worth fetching outside open/terminal.
-            if (activated && next === 'changes' && view.taskId && !view.diff) {
+            // one place a missing diff is worth fetching outside open/terminal. A
+            // BLOCKED diff is retried too: `blocked` covers transient conditions (a
+            // request that failed, a projection that moved under the read, a
+            // snapshot not recorded yet), so a panel left open must not be stuck on
+            // the first refusal until it is closed and reopened. Still never per
+            // state tick — this fires only on an explicit owner gesture.
+            const retryable = !view.diff || String(view.diff.status || '') === 'blocked';
+            if (activated && next === 'changes' && view.taskId && retryable) {
                 load(view.taskId, { diff: true });
             }
             return;

@@ -20,12 +20,14 @@
  * action is asking the agent for edits.
  *
  * ⌘L capture: the dock is a `[data-capture-dock]` composer-parts field, and this
- * page owns the capture for `page === 'changes'`. The global handler only names
- * the active page in one CANCELABLE `ouro:capture-selection` event; consuming it
- * means calling `preventDefault()` (that is how the global handler learns it may
- * suppress the browser default). A diff selection becomes a chip whose range is
- * the NEW-side line numbers, because those are the lines that exist in the file
- * the agent will edit.
+ * page owns the capture for `page === 'changes'`. The CANCELABLE
+ * `ouro:capture-selection` event is the ONE seam — nothing outside this module
+ * holds a handle into it. The global handler names the active page in that event
+ * and this page consuming it (`preventDefault()`) is what licenses suppressing
+ * the browser default. A diff selection becomes a chip whose range is the
+ * NEW-side line numbers found anywhere in the selection, because those are the
+ * lines that exist in the file the agent will edit; a selection with no new-side
+ * number at all is quoted as text instead (see `diffChipDecision`).
  */
 
 import { renderPageHeader } from './page_header.js';
@@ -157,36 +159,77 @@ export function diffBanners(diff) {
  * Rules, in order:
  *   • no selection at all is the whole-file chip: `[context: <path>]`, no range,
  *     no bytes — the agent opens the file itself;
- *   • the range is the NEW-side line numbers, and only when BOTH boundary rows
- *     have one. Those are the lines that exist in the file the agent will edit;
- *     an old-side number would name a line that is no longer there;
- *   • a selection whose boundary is a DELETION (no new-side number) therefore
- *     omits the range and keeps only the content. The codec's own rule then
- *     applies — bytes are inlined only under a range — so such a capture
- *     degrades to the bare whole-file marker rather than to a range that points
- *     at the wrong lines. Being unable to name deleted lines is the honest
- *     outcome; naming them wrongly is not.
+ *   • a selection is CLAMPED to the hunk its START row belongs to. Two rows in
+ *     hunks hundreds of lines apart would otherwise be named `L18-L401`: a
+ *     384-line claim for a 4-line selection. The bytes are clamped with the
+ *     range (a chip must carry exactly what it names), and `clampedRows` reports
+ *     how many rows were dropped so the caller can disclose it.
+ *   • the range is min/max over every NEW-side line number present ANYWHERE in
+ *     the clamped selection — not the boundary rows. Those numbers are the lines
+ *     that exist in the file the agent will edit, and a selection that merely
+ *     STARTS or ENDS on a `-` row still has a TRUE new-side span; the deleted
+ *     lines ride verbatim (prefixes included) inside the fenced content, so the
+ *     agent sees exactly what was removed around the lines the range names.
+ *     Reading the range off the boundaries instead threw the whole selection
+ *     away whenever an owner highlighted from a deletion, which is the common
+ *     shape of "this removal is wrong".
+ *   • a selection with NO new-side number anywhere is a PURE deletion: nothing
+ *     in the new file can name it, so `lineStart`/`lineEnd` stay null and the
+ *     content is still returned. The caller quotes it as TEXT
+ *     (`deletionQuoteText`) rather than letting the codec's range-only-bytes
+ *     rule silently degrade it to a whole-file marker that lost the selection.
  *
- * @param {{path?: string, rows?: Array<{newNumber?: *, text?: string}>}} input
- *        `rows` are the selected diff lines in document order, `text` verbatim.
+ * @param {{path?: string, rows?: Array<{newNumber?: *, text?: string,
+ *          hunkIndex?: *}>}} input
+ *        `rows` are the selected diff lines in document order, `text` verbatim,
+ *        `hunkIndex` the render-order index of the hunk each row came from
+ *        (omitted by callers that do not track hunks — then nothing is clamped).
  */
 export function diffChipDecision({ path = '', rows = [] } = {}) {
-    const selected = (Array.isArray(rows) ? rows : []).filter(Boolean);
-    if (!selected.length) return { path, lineStart: null, lineEnd: null, content: null };
-    const content = selected.map((row) => String(row.text == null ? '' : row.text)).join('\n');
-    const newNumber = (row) => {
-        const num = Number(row?.newNumber);
-        return Number.isInteger(num) && num > 0 ? num : null;
+    const all = (Array.isArray(rows) ? rows : []).filter(Boolean);
+    if (!all.length) return { path, lineStart: null, lineEnd: null, content: null, clampedRows: 0 };
+    const hunkOf = (row) => {
+        const num = Number(row?.hunkIndex);
+        return Number.isInteger(num) && num >= 0 ? num : null;
     };
-    const first = newNumber(selected[0]);
-    const last = newNumber(selected[selected.length - 1]);
-    if (first === null || last === null) return { path, lineStart: null, lineEnd: null, content };
+    // The anchor is the START row's hunk. A caller that tracks no hunks at all
+    // clamps nothing — dropping every row would be worse than a wide range.
+    const anchor = hunkOf(all[0]);
+    const selected = anchor === null ? all : all.filter((row) => hunkOf(row) === anchor);
+    const clampedRows = all.length - selected.length;
+    const content = selected.map((row) => String(row.text == null ? '' : row.text)).join('\n');
+    const numbers = selected
+        .map((row) => Number(row?.newNumber))
+        .filter((num) => Number.isInteger(num) && num > 0);
+    if (!numbers.length) return { path, lineStart: null, lineEnd: null, content, clampedRows };
     return {
         path,
-        lineStart: Math.min(first, last),
-        lineEnd: Math.max(first, last),
+        lineStart: Math.min(...numbers),
+        lineEnd: Math.max(...numbers),
         content,
+        clampedRows,
     };
+}
+
+/**
+ * A pure-deletion selection as a path-bearing TEXT quote, or '' when there is
+ * nothing to quote.
+ *
+ * The bytes are exactly what the owner highlighted; what does not exist is a
+ * new-side line number to name them by. A text part keeps BOTH the bytes and the
+ * path, so the agent can locate the removal by content — strictly more than the
+ * bare whole-file marker the codec's range-only-bytes rule would have left.
+ *
+ * Round-trip safety is structural, not hopeful: every line here is a `-` diff
+ * line (a context or added line would have carried a new-side number), so no
+ * line can be read back as a `[context: …]` marker or as a bare ``` fence, and
+ * `parseContent(serializeParts(...))` returns the same single text part.
+ */
+export function deletionQuoteText({ path = '', content = '' } = {}) {
+    const label = String(path == null ? '' : path).trim();
+    const body = typeof content === 'string' ? content : '';
+    if (!label || !body) return '';
+    return `${label} — deleted lines (no new-side line numbers):\n${body}`;
 }
 
 /** The plain-text task line prepended to a "Request edits" handoff. */
@@ -474,18 +517,23 @@ export function initChanges(ctx = {}) {
     /**
      * Register one canonical diff line for capture and return its index.
      * `text` is the VERBATIM diff line (its `+`/`-`/space prefix included, no
-     * presentation markers), and `newNumber` is its new-side number if it has one.
+     * presentation markers), `newNumber` is its new-side number if it has one, and
+     * `hunkIndex` is the render-order index of the hunk it came from — hunk headers
+     * are not capture rows, so a selection could otherwise not tell that two of its
+     * rows sit hundreds of lines apart (`diffChipDecision` clamps on it).
      */
-    function pushCaptureRow(newNumber, text) {
-        view.captureRows.push({ newNumber, text });
+    function pushCaptureRow(newNumber, text, hunkIndex) {
+        view.captureRows.push({ newNumber, text, hunkIndex });
         return view.captureRows.length - 1;
     }
 
     function renderUnified(file) {
         const grid = document.createElement('div');
         grid.className = 'changes-unified';
+        let hunkIndex = -1;
         for (const row of unifiedRows(file)) {
             if (row.kind === 'hunk') {
+                hunkIndex += 1;
                 const header = document.createElement('div');
                 header.className = 'changes-hunk';
                 header.textContent = row.text;
@@ -496,7 +544,7 @@ export function initChanges(ctx = {}) {
             line.className = `changes-row is-${row.kind}`;
             if (row.newNumber) line.dataset.newLine = row.newNumber;
             const text = lineCell('changes-text', row.noNewline ? `${row.text} ⏎̸` : row.text);
-            text.dataset.diffRow = String(pushCaptureRow(row.newNumber, row.text));
+            text.dataset.diffRow = String(pushCaptureRow(row.newNumber, row.text, hunkIndex));
             line.append(
                 lineCell('changes-num', row.oldNumber),
                 lineCell('changes-num', row.newNumber),
@@ -510,8 +558,10 @@ export function initChanges(ctx = {}) {
     function renderSplit(file) {
         const grid = document.createElement('div');
         grid.className = 'changes-split';
+        let hunkIndex = -1;
         for (const row of splitRows(file)) {
             if (row.kind === 'hunk') {
+                hunkIndex += 1;
                 const header = document.createElement('div');
                 header.className = 'changes-hunk';
                 header.textContent = row.text;
@@ -525,13 +575,13 @@ export function initChanges(ctx = {}) {
             // once. A change row shows two different lines, so each side is its own.
             const ctx = row.kind === 'ctx';
             const leftIndex = row.left
-                ? pushCaptureRow(ctx ? row.right?.number : '', `${ctx ? ' ' : '-'}${row.left.text}`)
+                ? pushCaptureRow(ctx ? row.right?.number : '', `${ctx ? ' ' : '-'}${row.left.text}`, hunkIndex)
                 : null;
             const rightIndex = !row.right
                 ? null
                 : (ctx && leftIndex !== null
                     ? leftIndex
-                    : pushCaptureRow(row.right.number, `+${row.right.text}`));
+                    : pushCaptureRow(row.right.number, `+${row.right.text}`, hunkIndex));
             const side = (cell, kind, index) => {
                 const num = lineCell('changes-num', cell ? cell.number : '');
                 const text = lineCell(`changes-text is-${cell ? cell.kind : 'none'}`, cell ? cell.text : '');
@@ -675,6 +725,22 @@ export function initChanges(ctx = {}) {
     }
 
     /**
+     * Append a TEXT part to the dock, preserving dock order.
+     *
+     * `createComposerParts` exposes a chip append only, so the typed draft is
+     * committed first (exactly what `addChip` does) and the part is appended
+     * through `setParts`. Used for the one capture the marker codec has no chip
+     * form for: a pure-deletion selection.
+     */
+    function addDockText(text) {
+        const part = makeTextPart(text);
+        if (!part) return false;
+        dock.setParts([...dock.commitDraft(), part]);
+        dock.focus();
+        return true;
+    }
+
+    /**
      * Append a context chip for what the owner is looking at to the DOCK (never
      * straight to chat): the dock is where they see exactly what will be sent.
      * With no selection this is the whole active file.
@@ -693,16 +759,33 @@ export function initChanges(ctx = {}) {
         if (!span && selectionOnly) return false;
         const rows = span ? view.captureRows.slice(span.startIndex, span.endIndex + 1) : [];
         const decision = diffChipDecision({ path: file.path, rows });
+        if (rows.length && decision.lineStart === null) {
+            // A PURE-deletion selection: no new-side number anywhere, so no range
+            // could honestly name it and the codec would drop the bytes with the
+            // range. The lines are still the owner's ask, so they go into the dock
+            // as a path-bearing text QUOTE instead of a whole-file chip that lost
+            // them. Rare by construction (a single context or added row in the
+            // selection gives a real range) — which matters, because a text part
+            // has no remove button of its own.
+            if (!addDockText(deletionQuoteText(decision))) {
+                showToast(`Nothing captured: "${file.path}" has no lines to quote here.`, 'warn');
+                return false;
+            }
+            showToast('Deleted lines have no line number in the new file — added them to the '
+                + 'dock as a quoted excerpt instead of a chip.', 'info');
+            clearWindowSelection();
+            return true;
+        }
         const chip = makeChipPart(decision);
         if (!chip) {
             showToast(`Nothing captured: "${file.path}" cannot be written as a context reference.`, 'warn');
             return false;
         }
-        if (rows.length && chip.lineStart === undefined) {
-            // The selection was deletion-bounded, so no NEW-side range could name
-            // it and the codec dropped the bytes with the range. Say so instead of
-            // letting a whole-file chip look like the selection was captured.
-            showToast('Deleted lines have no line numbers in the new file — added the whole file instead.', 'warn');
+        if (decision.clampedRows) {
+            // The range and the bytes were clamped to the first hunk together, so
+            // the chip is accurate — but the owner highlighted more than it carries.
+            showToast(`Selection crossed a hunk boundary — captured the first hunk only `
+                + `(${decision.clampedRows} more selected line${decision.clampedRows === 1 ? '' : 's'} left out).`, 'warn');
         }
         dock.addChip(chip);  // commits any typed draft first, then focuses the dock
         clearWindowSelection();
@@ -830,14 +913,6 @@ export function initChanges(ctx = {}) {
         dock,
         selectTask,
         refresh: loadTasks,
-        /**
-         * Append a context chip to this page's dock. The seam the global ⌘L
-         * handler uses to route a diff selection here without reaching into the
-         * module's internals; the chip itself is built by `composer_parts`.
-         */
-        addChip: (chip) => dock.addChip(chip),
-        /** The file currently under review, for a capture that needs its path. */
-        activeFilePath: () => view.filePath,
         /** Capture the current diff selection (or the whole file) into the dock. */
         capture: (options) => capture(options || {}),
         /** Test/inspection seam: the current view snapshot. */

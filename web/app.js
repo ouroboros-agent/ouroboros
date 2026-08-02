@@ -372,9 +372,11 @@ initFiles(ctx);
 import { initChanges } from './modules/changes.js';
 import { initTaskInspector } from './modules/task_inspector.js';
 
-// `changesControls` is the seam the global ⌘L handler routes a diff selection
-// through (`addChip` / `activeFilePath`) instead of reaching into the module.
-ctx.changesControls = initChanges(ctx);
+// The Changes screen owns its own dock, and the CANCELABLE `ouro:capture-selection`
+// event (`[anchor:phase-C]`) is the ONE capture seam: the global handler names the
+// active page, the owning page consumes it. Nothing here holds a handle into the
+// module, so there is no second path into that dock that could silently diverge.
+initChanges(ctx);
 initTaskInspector(ctx);
 
 /* [anchor:phase-C] global capture hotkey */

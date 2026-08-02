@@ -406,7 +406,7 @@ def test_projection_race_retries_once_then_refuses(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(
         gateway_task_diff, "_projection_fingerprint",
-        lambda root, candidates: seen.append(1) or f"fp-{len(seen)}",
+        lambda root, candidates, index_path=None: seen.append(1) or f"fp-{len(seen)}",
     )
     with _client(drive_root, repo) as client:
         payload = client.get("/api/tasks/self-race/diff").json()
@@ -428,7 +428,7 @@ def test_projection_race_that_settles_on_the_retry_answers_ready(tmp_path, monke
     )
     values = iter(["fp-a", "fp-b", "fp-c", "fp-c"])
     monkeypatch.setattr(
-        gateway_task_diff, "_projection_fingerprint", lambda root, candidates: next(values),
+        gateway_task_diff, "_projection_fingerprint", lambda root, candidates, index_path=None: next(values),
     )
     with _client(drive_root, repo) as client:
         payload = client.get("/api/tasks/self-settle/diff").json()
@@ -754,8 +754,8 @@ def test_workspace_patch_digest_covers_the_served_text_after_replacement(tmp_pat
 def test_staging_a_candidate_changes_the_projection_fingerprint(tmp_path):
     """C6: `git add` moves work index-ward without touching HEAD or any mtime.
 
-    That DOES change what `git diff <base> -- <path>` reports, so the repo's own
-    `.git/index` stat belongs in the binding fingerprint — otherwise a read racing
+    That DOES change what `git diff <base> -- <path>` reports, so this worktree's
+    own index stat belongs in the binding fingerprint — otherwise a read racing
     a stage/unstage is silently accepted as unchanged.
     """
     repo = tmp_path / "repo"
@@ -764,6 +764,45 @@ def test_staging_a_candidate_changes_the_projection_fingerprint(tmp_path):
     before = gateway_task_diff._projection_fingerprint(repo, ["loop.py"])
     _git(repo, "add", "loop.py")
     assert gateway_task_diff._projection_fingerprint(repo, ["loop.py"]) != before
+
+
+def test_projection_fingerprint_tracks_a_linked_worktrees_own_index(tmp_path):
+    """C6, worktree leg: in a LINKED worktree `.git` is a FILE, not a directory.
+
+    `<root>/.git/index` therefore does not exist there, so a naive stat raised and
+    the index half of the fingerprint collapsed to the same "absent" constant on
+    every read — a guard that looked present while catching nothing. The path is
+    resolved through git (`rev-parse --git-path index`) instead.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", str(linked), "-b", "probe")
+    # The precondition the old code got wrong: `.git` here is a file.
+    assert (linked / ".git").is_file()
+    assert not (linked / ".git" / "index").exists()
+
+    index = gateway_task_diff._git_index_path(linked)
+    assert index is not None
+    assert index.exists()
+    assert index.resolve() != (linked / ".git" / "index")
+
+    (linked / "loop.py").write_text("a = 1\nb = 21\n", encoding="utf-8")
+    before = gateway_task_diff._projection_fingerprint(linked, ["loop.py"])
+    _git(linked, "add", "loop.py")
+    # The staging is invisible to HEAD and to the candidate's mtime; only the
+    # worktree's own index moved, and the fingerprint must see it.
+    assert gateway_task_diff._projection_fingerprint(linked, ["loop.py"]) != before
+
+
+def test_projection_fingerprint_keeps_the_absent_marker_outside_a_repo(tmp_path):
+    """An unresolvable index is the honest absent marker, never a crash."""
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    assert gateway_task_diff._git_index_path(outside) is None
+    # Still a stable digest: a non-repo root answers a fingerprint, not an error.
+    assert gateway_task_diff._projection_fingerprint(outside, ["loop.py"]) == \
+        gateway_task_diff._projection_fingerprint(outside, ["loop.py"])
 
 
 def test_git_invocations_pin_literal_pathspecs_and_readable_paths(tmp_path):

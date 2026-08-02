@@ -169,6 +169,20 @@ test('the inspector fetches the diff on open/tab/terminal only, never per state 
     assert.match(source, /subscribeState\(\(\) => \{[\s\S]*?load\(view\.taskId\);\s*\}\);/);
 });
 
+test('Changes-tab activation retries a BLOCKED diff, not only a missing one', async () => {
+    // `blocked` covers transient conditions (a failed request, a projection that
+    // moved under the read, a snapshot not recorded yet). Gating the refetch on
+    // `!view.diff` alone left an open panel stuck on the first refusal until it was
+    // closed and reopened; the never-per-state-tick rule above is unchanged.
+    const source = await import('node:fs/promises')
+        .then((fs) => fs.readFile(new URL('../modules/task_inspector.js', import.meta.url), 'utf8'));
+    assert.match(
+        source,
+        /const retryable = !view\.diff \|\| String\(view\.diff\.status \|\| ''\) === 'blocked';/,
+    );
+    assert.match(source, /if \(activated && next === 'changes' && view\.taskId && retryable\)/);
+});
+
 test('drift and the missing-baseline sentence are read from the Changes module', async () => {
     // C3/C5 are ONE owner-facing rule each; the inspector imports both rather than
     // re-spelling them, so the two diff surfaces cannot drift apart.

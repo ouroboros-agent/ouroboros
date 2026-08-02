@@ -5,6 +5,7 @@ import {
     HEAD_DRIFT_NOTICE,
     NO_BASELINE_NOTICE,
     diffBanners,
+    deletionQuoteText,
     diffChipDecision,
     diffLacksBaselineOnly,
     diffSummaryMeta,
@@ -13,7 +14,7 @@ import {
     taskProjectBadge,
     taskShortTitle,
 } from '../modules/changes.js';
-import { makeChipPart, serializeParts } from '../modules/composer_parts.js';
+import { makeChipPart, makeTextPart, parseContent, serializeParts } from '../modules/composer_parts.js';
 import { parsePatch } from '../modules/patch_parse.js';
 
 test('a task badge prefers its OWN project scope over a post-hoc binding', () => {
@@ -155,7 +156,7 @@ test('the task rail is capped at a reviewable length, not a task log', async () 
 test('no selection captures the whole file: no range, no bytes', () => {
     assert.deepEqual(
         diffChipDecision({ path: 'ouroboros/loop.py', rows: [] }),
-        { path: 'ouroboros/loop.py', lineStart: null, lineEnd: null, content: null },
+        { path: 'ouroboros/loop.py', lineStart: null, lineEnd: null, content: null, clampedRows: 0 },
     );
     assert.deepEqual(diffChipDecision({ path: 'a.py' }).lineStart, null);
     assert.deepEqual(diffChipDecision().content, null);
@@ -170,8 +171,8 @@ test('a selection is named by its NEW-side line numbers and keeps the lines verb
             { newNumber: '18', text: '+        window = self._window_for(provider)' },
         ],
     });
-    // The range spans the boundary rows' NEW numbers; the interior deletion has no
-    // new number of its own and does not narrow the range.
+    // The range is min/max over every NEW number in the selection; the interior
+    // deletion has none of its own and neither widens nor narrows it.
     assert.equal(decision.lineStart, 17);
     assert.equal(decision.lineEnd, 18);
     // Verbatim means verbatim: the +/-/space prefixes survive, nothing is trimmed.
@@ -182,23 +183,119 @@ test('a selection is named by its NEW-side line numbers and keeps the lines verb
     ].join('\n'));
 });
 
-test('a deletion-bounded selection omits the range rather than naming wrong lines', () => {
+test('a selection that STARTS on a deletion still gets its true new-side range', () => {
+    // The common shape of "this removal is wrong": the owner drags from the `-`
+    // row. Reading the range off the boundaries threw the whole selection away.
     const decision = diffChipDecision({
         path: 'ouroboros/loop.py',
         rows: [
-            { newNumber: '', text: '-        window = COOLDOWN_S' },
-            { newNumber: '', text: '-        return window' },
+            { newNumber: '', text: '-        window = COOLDOWN_S', hunkIndex: 0 },
+            { newNumber: '18', text: '+        window = self._window_for(provider)', hunkIndex: 0 },
+            { newNumber: '19', text: '         return window', hunkIndex: 0 },
         ],
     });
+    assert.equal(decision.lineStart, 18);
+    assert.equal(decision.lineEnd, 19);
+    // The deleted line rides verbatim INSIDE the fence, prefix included, so the
+    // agent sees what was removed around the lines the range names.
+    const chip = makeChipPart(decision);
+    assert.equal(serializeParts([chip]), [
+        '[context: ouroboros/loop.py L18-L19]',
+        '```',
+        '-        window = COOLDOWN_S',
+        '+        window = self._window_for(provider)',
+        '         return window',
+        '```',
+    ].join('\n'));
+});
+
+test('a selection that ENDS on a deletion keeps its range too', () => {
+    const decision = diffChipDecision({
+        path: 'a.py',
+        rows: [
+            { newNumber: '7', text: '+kept', hunkIndex: 0 },
+            { newNumber: '', text: '-gone', hunkIndex: 0 },
+        ],
+    });
+    assert.equal(decision.lineStart, 7);
+    assert.equal(decision.lineEnd, 7);
+    assert.equal(decision.content, '+kept\n-gone');
+});
+
+test('a PURE-deletion selection becomes a path-bearing text quote, not a lost chip', () => {
+    const decision = diffChipDecision({
+        path: 'ouroboros/loop.py',
+        rows: [
+            { newNumber: '', text: '-        window = COOLDOWN_S', hunkIndex: 0 },
+            { newNumber: '', text: '-        return window', hunkIndex: 0 },
+        ],
+    });
+    // No new-side number anywhere: no range can honestly name these lines.
     assert.equal(decision.lineStart, null);
     assert.equal(decision.lineEnd, null);
-    // The content is kept by the decision; the codec then applies its own rule
-    // (bytes only under a range), so the chip degrades to the bare marker instead
-    // of pointing at lines that no longer exist in the file.
     assert.equal(decision.content, '-        window = COOLDOWN_S\n-        return window');
-    const chip = makeChipPart(decision);
-    assert.deepEqual(chip, { type: 'chip', path: 'ouroboros/loop.py' });
-    assert.equal(serializeParts([chip]), '[context: ouroboros/loop.py]');
+    // The codec's own rule (bytes only under a range) would have dropped the
+    // bytes, so a chip here is strictly a LOSS...
+    assert.deepEqual(makeChipPart(decision), { type: 'chip', path: 'ouroboros/loop.py' });
+    // ...and the capture quotes them as text instead, path included.
+    const quote = deletionQuoteText(decision);
+    assert.equal(quote, [
+        'ouroboros/loop.py — deleted lines (no new-side line numbers):',
+        '-        window = COOLDOWN_S',
+        '-        return window',
+    ].join('\n'));
+    // Round-trip: every quoted line carries a `-` prefix, so none of it can be
+    // read back as a `[context: ...]` marker or a fence.
+    const parts = [makeTextPart(quote)];
+    const serialized = serializeParts(parts);
+    assert.deepEqual(parseContent(serialized), [{ type: 'text', text: quote }]);
+    assert.equal(serializeParts(parseContent(serialized)), serialized);
+});
+
+test('a deletion quote refuses to name nothing', () => {
+    assert.equal(deletionQuoteText({ path: '', content: '-gone' }), '');
+    assert.equal(deletionQuoteText({ path: 'a.py', content: '' }), '');
+    assert.equal(deletionQuoteText(), '');
+});
+
+test('a CROSS-HUNK selection is clamped to the hunk it starts in, bytes and all', () => {
+    const decision = diffChipDecision({
+        path: 'ouroboros/loop.py',
+        rows: [
+            { newNumber: '18', text: '+near', hunkIndex: 0 },
+            { newNumber: '19', text: '+also near', hunkIndex: 0 },
+            { newNumber: '400', text: '+far', hunkIndex: 1 },
+            { newNumber: '401', text: '+far too', hunkIndex: 1 },
+        ],
+    });
+    // NOT L18-L401: a 384-line claim for a 4-line selection.
+    assert.equal(decision.lineStart, 18);
+    assert.equal(decision.lineEnd, 19);
+    // The bytes are clamped WITH the range, so the chip carries what it names.
+    assert.equal(decision.content, '+near\n+also near');
+    assert.equal(decision.clampedRows, 2);
+});
+
+test('a selection starting in the LATER hunk clamps to that one', () => {
+    const decision = diffChipDecision({
+        path: 'a.py',
+        rows: [
+            { newNumber: '400', text: '+far', hunkIndex: 1 },
+            { newNumber: '18', text: '+near', hunkIndex: 0 },
+        ],
+    });
+    assert.equal(decision.lineStart, 400);
+    assert.equal(decision.lineEnd, 400);
+    assert.equal(decision.clampedRows, 1);
+});
+
+test('rows with no hunk identity clamp nothing (dropping everything would be worse)', () => {
+    const decision = diffChipDecision({
+        path: 'a.py',
+        rows: [{ newNumber: '4', text: '+a' }, { newNumber: '5', text: '+b' }],
+    });
+    assert.equal(decision.clampedRows, 0);
+    assert.equal(decision.lineEnd, 5);
 });
 
 test('a range serializes with the selected diff lines inlined verbatim', () => {
@@ -222,6 +319,20 @@ test('a single selected row is a one-line range, not a whole-file chip', () => {
     const decision = diffChipDecision({ path: 'x.py', rows: [{ newNumber: 9, text: '+only' }] });
     assert.equal(decision.lineStart, 9);
     assert.equal(decision.lineEnd, 9);
+});
+
+test('the capture-selection EVENT is the only seam into the Changes dock', async () => {
+    // F4: `ctx.changesControls.addChip/activeFilePath` was a second, never-read
+    // path into the same dock. Two seams for one job means one of them rots
+    // silently; the cancelable event is the contract the global handler dispatches.
+    const fs = await import('node:fs/promises');
+    const changes = await fs.readFile(new URL('../modules/changes.js', import.meta.url), 'utf8');
+    const app = await fs.readFile(new URL('../app.js', import.meta.url), 'utf8');
+    assert.ok(!app.includes('changesControls'), 'app.js must hold no handle into the module');
+    assert.match(app, /^initChanges\(ctx\);$/m);
+    assert.ok(!/addChip: \(chip\) =>/.test(changes), 'no addChip re-export');
+    assert.ok(!changes.includes('activeFilePath'), 'no activeFilePath re-export');
+    assert.match(changes, /window\.addEventListener\('ouro:capture-selection'/);
 });
 
 test('request edits prepends the task line and keeps the dock order', () => {

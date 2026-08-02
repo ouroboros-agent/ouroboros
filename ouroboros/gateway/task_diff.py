@@ -66,8 +66,10 @@ _DIFF_GIT_TIMEOUT_SEC = 30
 #: refused as `base_commit_unknown` rather than handed to the command line.
 _BASE_COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 #: Owner-facing diffs are never clipped, so a patch beyond this is refused with a
-#: reason. Generous on purpose: real review diffs are orders of magnitude smaller,
-#: and the cap exists to stop ONE request from materializing a repo-sized string.
+#: reason. Generous on purpose: real review diffs are orders of magnitude smaller.
+#: What the cap prevents is SERVING a repo-sized patch — JSON-encoding it into one
+#: response body and handing the browser a string it must re-parse and render.
+#: Materialization already happened in the subprocess buffer by the time we look.
 DIFF_MAX_PATCH_BYTES = 8 * 1024 * 1024
 #: A task that created thousands of files would otherwise mean thousands of git
 #: subprocesses in ONE browser read. Past this the untracked projection is refused
@@ -210,21 +212,57 @@ def _git_head(root: pathlib.Path) -> str:
     return head.strip() if rc == 0 else ""
 
 
-def _projection_fingerprint(root: pathlib.Path, candidates: List[str]) -> str:
+def _git_index_path(root: pathlib.Path) -> Optional[pathlib.Path]:
+    """Where THIS worktree's index actually lives, asked of git itself.
+
+    `<root>/.git/index` is only correct for a normal clone. In a LINKED worktree
+    `.git` is a FILE pointing at `<main>/.git/worktrees/<name>`, so stat-ing
+    `.git/index` raises `NotADirectoryError` and the index half of the fingerprint
+    silently collapses to the same "absent" constant on every read — the guard
+    looks present while catching nothing, which is exactly the stage/unstage race
+    it exists to catch (BIBLE P1: a guard that cannot fire must not claim to).
+
+    `git rev-parse --git-path index` is git's own answer and is worktree-correct;
+    it answers a RELATIVE path in a plain clone and an absolute one in a linked
+    worktree, so both forms are resolved against `root`. A failed resolution
+    returns None and the caller keeps the honest absent marker.
+    """
+    rc, out = _git_capture(root, ["rev-parse", "--git-path", "index"])
+    raw = out.strip()
+    if rc != 0 or not raw:
+        return None
+    path = pathlib.Path(raw)
+    return path if path.is_absolute() else (pathlib.Path(root) / path)
+
+
+def _projection_fingerprint(
+    root: pathlib.Path,
+    candidates: List[str],
+    index_path: Optional[pathlib.Path] = None,
+) -> str:
     """Bind a patch read to the exact repo state it was computed from.
 
     HEAD plus a per-candidate stat is not enough on its own: `git add`/`git rm`
     moves work between the index and the worktree WITHOUT touching HEAD or any
     candidate's mtime, and that changes what `git diff <base> -- <path>` reports.
-    The repo's own `.git/index` stat is therefore part of the fingerprint.
+    This worktree's own index stat is therefore part of the fingerprint, resolved
+    through `_git_index_path` so a LINKED worktree is covered too.
+
+    `index_path` is the per-read cache: one diff answer takes up to five
+    fingerprints, and the index location cannot move under them, so the caller
+    resolves it once instead of forking `rev-parse` five times.
     """
     head = _git_head(root)
     rows = [head or "head_unavailable"]
-    try:
-        index_stat = (pathlib.Path(root) / ".git" / "index").stat()
-        rows.append(f"\x00index\x1f{index_stat.st_size}\x1f{index_stat.st_mtime_ns}")
-    except OSError:
-        rows.append("\x00index\x1fabsent")
+    resolved = _git_index_path(root) if index_path is None else index_path
+    index_row = "\x00index\x1fabsent"
+    if resolved is not None:
+        try:
+            index_stat = resolved.stat()
+            index_row = f"\x00index\x1f{index_stat.st_size}\x1f{index_stat.st_mtime_ns}"
+        except OSError:
+            index_row = "\x00index\x1fabsent"
+    rows.append(index_row)
     for rel in candidates:
         try:
             stat = (root / rel).stat()
@@ -494,14 +532,17 @@ def _self_repo_diff_payload(
         # would happily write the patch over a file of the caller's choosing.
         envelope["blockers"] = blockers + ["base_commit_unknown"]
         return _diff_envelope(DIFF_STATUS_BLOCKED, **envelope)
-    before = _projection_fingerprint(root, candidates)
+    # Resolved ONCE for this read: the index location is a property of the
+    # worktree, not of the moment, so the fingerprints below share it.
+    index_path = _git_index_path(root)
+    before = _projection_fingerprint(root, candidates, index_path)
     patch, patch_blockers = _build_projection_patch(root, base_commit, candidates)
-    if before != _projection_fingerprint(root, candidates):
+    if before != _projection_fingerprint(root, candidates, index_path):
         # The repo moved under the read: retry ONCE, then refuse rather than
         # answer with a patch that does not belong to the disclosed baseline.
-        before = _projection_fingerprint(root, candidates)
+        before = _projection_fingerprint(root, candidates, index_path)
         patch, patch_blockers = _build_projection_patch(root, base_commit, candidates)
-        if before != _projection_fingerprint(root, candidates):
+        if before != _projection_fingerprint(root, candidates, index_path):
             envelope["blockers"] = blockers + ["projection_changed_during_read"]
             return _diff_envelope(DIFF_STATUS_BLOCKED, **envelope)
     envelope["blockers"] = blockers + patch_blockers
