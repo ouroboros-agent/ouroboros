@@ -393,6 +393,21 @@ function isKeyboardEditable(node) {
 }
 
 /* [anchor:phase-B] right-panel registrations */
+// The Changes screen fills the `page-changes` container created above; the task
+// inspector registers itself as the `inspector` right-panel kind (mutually
+// exclusive with the project panel) and opens on `ouro:inspect-task`.
+// The imports live in this region deliberately: ES module imports are hoisted, so
+// keeping them here makes the whole phase-B wiring one append-only block instead
+// of a second edit in the shared import header.
+import { initChanges } from './modules/changes.js';
+import { initTaskInspector } from './modules/task_inspector.js';
+
+// The Changes screen owns its own dock, and the CANCELABLE `ouro:capture-selection`
+// event (`[anchor:phase-C]`) is the ONE capture seam: the global handler names the
+// active page, the owning page consumes it. Nothing here holds a handle into the
+// module, so there is no second path into that dock that could silently diverge.
+initChanges(ctx);
+initTaskInspector(ctx);
 
 /* [anchor:phase-C] global capture hotkey */
 // ⌘L / Ctrl+L = "add what I'm looking at to chat context". This handler knows

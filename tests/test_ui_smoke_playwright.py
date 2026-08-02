@@ -2979,3 +2979,192 @@ def test_ui_smoke_files_selection_capture_lands_in_the_dock(files_browser_root, 
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_changes_screen_and_task_inspector(direct_server_with_data):
+    """Phase B: the Changes screen renders a real diff from the patch bytes, the
+    Unified/Split toggle re-renders the same hunks, and the task inspector opens
+    on `ouro:inspect-task` as a right panel that is MUTUALLY EXCLUSIVE with the
+    project panel. A seeded workspace task keeps the diff deterministic (its
+    durable patch artifact is the source), so this asserts presentation, not git.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import create_project
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    # A project exists so the right-panel slot can be contested from BOTH sides.
+    create_project(data_dir, "alpha", name="Alpha project")
+    artifacts = data_dir / "task_results" / "artifacts" / "diff-smoke"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    patch_text = (
+        "diff --git a/ouroboros/loop.py b/ouroboros/loop.py\n"
+        "--- a/ouroboros/loop.py\n"
+        "+++ b/ouroboros/loop.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " keep_me = 1\n"
+        "-window = COOLDOWN_S\n"
+        "+window = self._window_for(provider)\n"
+        " return window\n"
+        "diff --git a/tests/test_new_case.py b/tests/test_new_case.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_new_case.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+import pytest\n"
+        "+assert True\n"
+    )
+    (artifacts / "workspace.patch").write_text(patch_text, encoding="utf-8")
+    (artifacts / "workspace_patch.json").write_text(json.dumps({
+        "status": "ready_with_changes", "base_head": "beef", "current_head": "beef", "errors": [],
+    }) + "\n", encoding="utf-8")
+    (data_dir / "task_results" / "diff-smoke.json").write_text(json.dumps({
+        "task_id": "diff-smoke",
+        "status": "completed",
+        "description": "Tighten the retry window",
+        "workspace_root": str(data_dir / "ws"),
+        "artifact_status": "ready_with_changes",
+        "duration_sec": 95.0,
+        "cost_usd": 0.42,
+        "cost_accounting_status": "available",
+        "cost_final": True,
+        "total_rounds": 4,
+        "prompt_tokens": 1200,
+        "completion_tokens": 300,
+        "artifacts": [
+            {"kind": "workspace_patch", "name": "workspace.patch",
+             "path": str(artifacts / "workspace.patch")},
+            {"kind": "workspace_patch_manifest", "name": "workspace_patch.json",
+             "path": str(artifacts / "workspace_patch.json")},
+        ],
+    }) + "\n", encoding="utf-8")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                page.click('[data-nav-page="changes"]')
+                task_row = page.locator('[data-changes-task="diff-smoke"]')
+                task_row.wait_for(state="visible", timeout=30_000)
+                task_row.click()
+                # The file list is derived from the patch BYTES: two files, real
+                # statuses, real counts — no server-side stat source involved.
+                file_rows = page.locator('[data-changes-file]')
+                file_rows.first.wait_for(state="visible", timeout=30_000)
+                assert file_rows.count() == 2
+                assert page.locator('[data-changes-file="ouroboros/loop.py"] .changes-file-status')\
+                    .inner_text().strip() == "M"
+                assert page.locator('[data-changes-file="tests/test_new_case.py"] .changes-file-status')\
+                    .inner_text().strip() == "A"
+                assert "2 files · +3 −1" in page.locator('[data-changes-file-meta]').inner_text()
+                # Unified rows carry both number columns; Split renders paired sides.
+                unified = page.locator('.changes-unified .changes-row')
+                assert unified.count() == 4
+                page.click('[data-changes-mode="split"]')
+                page.locator('.changes-split .changes-row').first.wait_for(state="visible", timeout=10_000)
+                assert page.locator('.changes-unified').count() == 0
+                page.screenshot(path=str(data_dir.parent / "changes-split.png"), full_page=True)
+                page.click('[data-changes-mode="unified"]')
+                assert page.locator('.changes-unified .changes-row').count() == 4
+                # There is deliberately NO approve control on this screen.
+                assert page.locator('[data-changes-request]').inner_text().strip() == "Request edits"
+                assert page.get_by_text("Approve", exact=False).count() == 0
+
+                # ⌘L capture: the dock IS the capture dock, and this page consumes
+                # the CANCELABLE `ouro:capture-selection` event — that consumption is
+                # what licenses the global handler to suppress the browser default.
+                assert page.locator('[data-changes-dock-field][data-capture-dock]').count() == 1
+                consumed = page.evaluate(
+                    """() => {
+                        const cells = [...document.querySelectorAll(
+                            '#page-changes .changes-unified [data-diff-row]')];
+                        const range = document.createRange();
+                        range.setStart(cells[2].firstChild, 0);
+                        range.setEnd(cells[3].firstChild, cells[3].textContent.length);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                        const event = new CustomEvent('ouro:capture-selection', {
+                            detail: {page: 'changes'}, cancelable: true});
+                        window.dispatchEvent(event);
+                        return event.defaultPrevented;
+                    }"""
+                )
+                assert consumed is True, "the Changes page must consume the capture event"
+                chip = page.locator('[data-changes-dock-field] .composer-part-chip')
+                chip_label = page.locator('[data-changes-dock-field] .composer-part-chip-label')
+                chip.first.wait_for(state="visible", timeout=10_000)
+                assert chip.first.get_attribute("title") == "ouroboros/loop.py"
+                # Rows 2..3 of the unified render are the ADDITION (new line 2) and
+                # the trailing context line (new line 3), so the chip is named by the
+                # NEW-side range and carries those two lines.
+                assert chip_label.first.inner_text().strip() == "loop.py · 2 lines"
+                # A capture with NO selection is the whole file: one bare marker.
+                page.evaluate("() => window.getSelection().removeAllRanges()")
+                page.evaluate(
+                    "() => window.dispatchEvent(new CustomEvent('ouro:capture-selection',"
+                    " { detail: { page: 'changes' }, cancelable: true }))"
+                )
+                assert chip.count() == 2
+                assert chip_label.nth(1).inner_text().strip() == "loop.py"
+
+                # The inspector opens on the card event and is a right panel.
+                page.evaluate(
+                    "() => window.dispatchEvent(new CustomEvent('ouro:inspect-task',"
+                    " { detail: { taskId: 'diff-smoke' } }))"
+                )
+                panel = page.locator('#task-inspector')
+                panel.wait_for(state="visible", timeout=15_000)
+                panel.locator('[data-inspector-file="ouroboros/loop.py"]')\
+                    .wait_for(state="visible", timeout=15_000)
+                footer = panel.locator('.inspector-footer')
+                assert "+3" in footer.inner_text() and "−1" in footer.inner_text()
+                assert "$0.42" in footer.inner_text()
+                assert "1m 35s" in footer.inner_text()
+                panel.locator('[data-inspector-tab="cost"]').click()
+                cost_text = panel.locator('.inspector-body').inner_text()
+                assert "Task cost" in cost_text and "$0.42" in cost_text
+                assert "LLM rounds" in cost_text and "1200 / 300" in cost_text
+                page.screenshot(path=str(data_dir.parent / "inspector-cost.png"), full_page=True)
+
+                # Mutual exclusion: opening the inspector while a project panel is
+                # open closes that panel, and leaving Chat/Changes closes the
+                # inspector (it belongs to the chat surface).
+                page.click('[data-nav-page="chat"]')
+                page.evaluate(
+                    "() => window.dispatchEvent(new CustomEvent('ouro:inspect-task',"
+                    " { detail: { taskId: 'diff-smoke' } }))"
+                )
+                panel.wait_for(state="visible", timeout=15_000)
+
+                # The right side is ONE slot: a project panel opened while the
+                # inspector is up evicts it, and the inspector opened over a project
+                # panel evicts that. Asserting only the second direction would leave
+                # the shared slot half-tested.
+                project_panel = page.locator('#project-panel')
+                project_row = page.locator('.nav-project-row[data-project-id="alpha"]')
+                project_row.wait_for(state="visible", timeout=15_000)
+                project_row.click()
+                project_panel.wait_for(state="visible", timeout=15_000)
+                panel.wait_for(state="hidden", timeout=15_000)
+                page.evaluate(
+                    "() => window.dispatchEvent(new CustomEvent('ouro:inspect-task',"
+                    " { detail: { taskId: 'diff-smoke' } }))"
+                )
+                panel.wait_for(state="visible", timeout=15_000)
+                project_panel.wait_for(state="hidden", timeout=15_000)
+
+                page.click('[data-nav-page="settings"]')
+                panel.wait_for(state="hidden", timeout=15_000)
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise

@@ -113,6 +113,20 @@ export const apiClient = {
     projectDelete: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/delete`, {}),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
+    /**
+     * Recent task results (newest first, server-sorted by ts).
+     * @returns {Promise<import('./api_types.js').TaskListResponse>}
+     */
+    tasks: (limit = 50) => fetchJson(`/api/tasks?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
+    /** One task's durable/effective result record. */
+    task: (taskId) => fetchJson(`/api/tasks/${encodeURIComponent(taskId)}`, { cache: 'no-store' }),
+    /**
+     * One task's diff. The response carries the RAW patch: the client derives the
+     * file list, per-file status and +/- counts from those same bytes.
+     * @param {string} taskId
+     * @returns {Promise<import('./api_types.js').TaskDiffResponse>}
+     */
+    taskDiff: (taskId) => fetchJson(`/api/tasks/${encodeURIComponent(taskId)}/diff`, { cache: 'no-store' }),
     updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
     updatePreflight: () => jsonPost('/api/update/preflight', {}),
     updateApply: (strategy) => jsonPost('/api/update/apply', { strategy }),
