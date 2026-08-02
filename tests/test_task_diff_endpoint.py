@@ -11,6 +11,14 @@ The endpoint answers ONE typed lifecycle for both task shapes:
   blockers through, and refuses (typed ``projection_changed_during_read``)
   rather than serving a patch that does not belong to the disclosed baseline.
 
+The "adversarial regressions" section at the end pins the hostile reproductions an
+adversarial review landed against this endpoint: pathspec-magic candidate names,
+an option-shaped ``base_commit``, non-UTF-8 patch bytes, and a new file whose name
+git would C-quote. Each of those once produced a wrong answer (a leaked
+unattributed edit, a file written outside the repo, a 503, a silently missing
+file); the assertions below are written from the FIXED behaviour so a regression
+fails loudly instead of degrading quietly.
+
 Every test is hermetic: a tmp drive root, a tmp git repo, no supervisor.
 """
 
@@ -25,7 +33,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from ouroboros.gateway import tasks as gateway_tasks
+from ouroboros.gateway import task_diff as gateway_task_diff
 from ouroboros.gateway.tasks import api_task_diff
 from ouroboros.headless import task_artifacts_dir
 from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
@@ -397,7 +405,7 @@ def test_projection_race_retries_once_then_refuses(tmp_path, monkeypatch):
     )
     seen = []
     monkeypatch.setattr(
-        gateway_tasks, "_projection_fingerprint",
+        gateway_task_diff, "_projection_fingerprint",
         lambda root, candidates: seen.append(1) or f"fp-{len(seen)}",
     )
     with _client(drive_root, repo) as client:
@@ -420,7 +428,7 @@ def test_projection_race_that_settles_on_the_retry_answers_ready(tmp_path, monke
     )
     values = iter(["fp-a", "fp-b", "fp-c", "fp-c"])
     monkeypatch.setattr(
-        gateway_tasks, "_projection_fingerprint", lambda root, candidates: next(values),
+        gateway_task_diff, "_projection_fingerprint", lambda root, candidates: next(values),
     )
     with _client(drive_root, repo) as client:
         payload = client.get("/api/tasks/self-settle/diff").json()
@@ -455,3 +463,380 @@ def test_response_carries_exactly_the_declared_envelope(tmp_path):
     assert set(payload) == {
         "status", "source", "base_commit", "head_advanced", "blockers", "patch", "patch_sha256",
     }
+
+
+# --- adversarial regressions ------------------------------------------------
+# Ported from the reviewer's hostile reproductions. Every assertion here is the
+# FIXED behaviour; each test names the wrong answer it prevents.
+
+def _terminal_evidence(root: pathlib.Path, base_commit: str, candidates: list[str]) -> dict:
+    """Evidence for a TERMINAL self-repo task with a persisted candidate row."""
+    return _baseline_evidence(
+        root, base_commit,
+        effect_state="quiescent",
+        terminal_candidate_snapshot={
+            "captured_at": "now", "baseline_hash": "hash-1",
+            "surfaces": [{
+                "surface_type": "system_repo",
+                "canonical_root": str(root.resolve()),
+                "candidates": list(candidates),
+                "excluded_preexisting_dirty": [],
+                "blockers": [],
+            }],
+        },
+    )
+
+
+def test_pathspec_magic_candidate_name_cannot_widen_the_projection(tmp_path):
+    """A candidate literally named `:(top)` must stay a FILENAME, never magic.
+
+    Candidate paths are task-attributed filenames, so a task can choose them. Left
+    as ordinary pathspecs, `:(top)` widens `git diff -- <candidates>` to the whole
+    repository and the owner's OWN unattributed edit lands in a patch labelled as
+    the task's work — the single worst lie this screen could tell.
+    """
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    (repo / "owner_wip.py").write_text("owner = 'clean'\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "owner file")
+    base = _git(repo, "rev-parse", "HEAD")
+    # The owner's dirty edit: NOT attributed to the task.
+    (repo / "owner_wip.py").write_text("owner = 'SECRET-NOT-ATTRIBUTED'\n", encoding="utf-8")
+    (repo / ":(top)").write_text("x\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "magic", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, base, [":(top)"]),
+    )
+    with _client(drive_root, repo) as client:
+        payload = client.get("/api/tasks/magic/diff").json()
+    assert "SECRET-NOT-ATTRIBUTED" not in payload["patch"], payload["patch"]
+    assert "owner_wip.py" not in payload["patch"]
+    # The literal file the task did create is still projected honestly.
+    assert ":(top)" in payload["patch"]
+    assert payload["status"] == "ready"
+
+
+def test_pathspec_exclude_magic_candidate_cannot_invert_the_projection(tmp_path):
+    """The `:!x` form is the same hole from the other side (exclusion magic)."""
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    (repo / "loop.py").write_text("a = 1\nb = 42\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "magic-exclude", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, base, [":!loop.py"]),
+    )
+    with _client(drive_root, repo) as client:
+        payload = client.get("/api/tasks/magic-exclude/diff").json()
+    # As a literal, `:!loop.py` matches nothing — so the honest answer is "no
+    # attributed change", not "everything except loop.py".
+    assert "b = 42" not in payload["patch"]
+    assert payload["status"] == "empty"
+
+
+def test_option_shaped_base_commit_never_reaches_git_argv(tmp_path):
+    """`base_commit` sits BEFORE `--`, so an option-shaped value is a write hole.
+
+    `git diff --output=<path>` writes the patch to a file of the caller's choosing
+    and leaves stdout empty — the endpoint would then answer a reassuring "no
+    changes" for a request that just wrote outside the repo. A baseline that is not
+    a hex object name is refused before argv is built.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("PRECIOUS\n", encoding="utf-8")
+    (repo / "loop.py").write_text("a = 1\nb = 9\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "argv", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, f"--output={victim}", ["loop.py"]),
+    )
+    with _client(drive_root, repo) as client:
+        payload = client.get("/api/tasks/argv/diff").json()
+    assert victim.read_text(encoding="utf-8") == "PRECIOUS\n", "argv injection landed"
+    assert payload["status"] == "blocked"
+    assert "base_commit_unknown" in payload["blockers"]
+    assert payload["patch"] == ""
+
+
+def test_non_hex_base_commit_is_refused_rather_than_resolved_as_a_ref(tmp_path):
+    """Only hex object names are accepted; a ref expression is not a baseline."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "loop.py").write_text("a = 1\nb = 11\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "refname", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, "HEAD~1", ["loop.py"]),
+    )
+    with _client(drive_root, repo) as client:
+        payload = client.get("/api/tasks/refname/diff").json()
+    assert payload["status"] == "blocked"
+    assert "base_commit_unknown" in payload["blockers"]
+
+
+def test_non_utf8_patch_bytes_are_served_with_replacement_not_a_503(tmp_path):
+    """A latin-1 byte in a tracked file must not fail an owner-facing read.
+
+    git's stdout is bytes; decoding it as strict UTF-8 turned any repo holding
+    legacy-encoded content into a 503 for the whole Changes screen.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "latin.txt").write_bytes(b"caf\xe9 one\ntwo\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "latin")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "latin.txt").write_bytes(b"caf\xe9 one\nTWO\n")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "latin", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, base, ["latin.txt"]),
+    )
+    with _client(drive_root, repo) as client:
+        response = client.get("/api/tasks/latin/diff")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ready"
+    assert "latin.txt" in payload["patch"]
+    assert "+TWO" in payload["patch"] and "-two" in payload["patch"]
+    # The undecodable byte is a visible replacement character, not a crash.
+    assert "�" in payload["patch"]
+    # C7: the digest covers the SERVED text, so it still verifies after replacement.
+    assert payload["patch_sha256"] == hashlib.sha256(
+        payload["patch"].encode("utf-8"),
+    ).hexdigest()
+
+
+def test_untracked_file_needing_git_quoting_is_present_in_the_patch(tmp_path):
+    """A new file named `héllo.txt` must reach the patch, not vanish silently.
+
+    The newline-separated `ls-files` default hands back the C-quoted
+    `"h\\303\\251llo.txt"`, which is not a path on disk, so the per-file
+    `--no-index` diff produced nothing and the file disappeared with NO blocker.
+    """
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    (repo / "héllo.txt").write_text("fresh\n", encoding="utf-8")
+    (repo / "plain new.txt").write_text("fresh\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "quoted", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, base, ["héllo.txt", "plain new.txt"]),
+    )
+    with _client(drive_root, repo) as client:
+        payload = client.get("/api/tasks/quoted/diff").json()
+    assert payload["status"] == "ready"
+    assert "héllo.txt" in payload["patch"], payload["patch"]
+    assert "plain new.txt" in payload["patch"]
+    assert payload["blockers"] == []
+
+
+def test_an_untracked_candidate_that_yields_no_diff_is_disclosed(tmp_path):
+    """An omission is a blocker; "no output" must never read as "no change"."""
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    (repo / "ghost.py").write_text("new = True\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "ghost", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, base, ["ghost.py"]),
+    )
+    real_capture = gateway_task_diff._git_capture
+
+    def _blank_no_index(root, args):
+        if "--no-index" in args:
+            return 0, ""
+        return real_capture(root, args)
+
+    with _client(drive_root, repo) as client:
+        gateway_task_diff._git_capture = _blank_no_index
+        try:
+            payload = client.get("/api/tasks/ghost/diff").json()
+        finally:
+            gateway_task_diff._git_capture = real_capture
+    assert "untracked_patch_unavailable" in payload["blockers"]
+
+
+def test_untracked_projection_beyond_the_cap_is_refused_not_truncated(tmp_path):
+    """S3: a huge new-file set is refused as a whole, with a typed blocker.
+
+    One git subprocess per untracked file is the cost model here, so the count is
+    bounded. Truncating to the first N would render as a COMPLETE diff, so the
+    untracked projection is dropped entirely and named instead.
+    """
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    (repo / "loop.py").write_text("a = 1\nb = 3\n", encoding="utf-8")
+    names = [f"new_{i:04d}.py" for i in range(gateway_task_diff.DIFF_MAX_UNTRACKED_SECTIONS + 1)]
+    for name in names:
+        (repo / name).write_text("x = 1\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    write_task_result(
+        drive_root, "flood", STATUS_COMPLETED,
+        mutation_evidence=_terminal_evidence(repo, base, ["loop.py", *names]),
+    )
+    with _client(drive_root, repo) as client:
+        payload = client.get("/api/tasks/flood/diff").json()
+    assert "untracked_projection_capped" in payload["blockers"]
+    # The TRACKED half is real and complete, so it is still served.
+    assert "+b = 3" in payload["patch"]
+    assert "new_0000.py" not in payload["patch"]
+
+
+def test_patch_over_the_byte_cap_is_blocked_and_never_clipped(tmp_path):
+    """S4: too large to serve is a disclosed refusal, not a shortened patch."""
+    drive_root = tmp_path / "drive"
+    body = "diff --git a/big.txt b/big.txt\n" + ("+padding line\n" * 700_000)
+    assert len(body.encode("utf-8")) > gateway_task_diff.DIFF_MAX_PATCH_BYTES
+    patch_path = _write_artifact(drive_root, "ws-big", "workspace.patch", body)
+    write_task_result(
+        drive_root, "ws-big", STATUS_COMPLETED,
+        workspace_root=str(tmp_path / "ws"), artifact_status="ready_with_changes",
+        artifacts=[{"name": "workspace.patch", "path": str(patch_path)}],
+    )
+    with _client(drive_root, tmp_path / "repo") as client:
+        payload = client.get("/api/tasks/ws-big/diff").json()
+    assert payload["status"] == "blocked"
+    assert payload["blockers"] == ["patch_too_large"]
+    assert payload["patch"] == ""
+    assert payload["patch_sha256"] == ""
+
+
+def test_workspace_excluded_paths_are_disclosed_as_a_blocker(tmp_path):
+    """C4: the capture dropped paths, so the patch is not the whole story."""
+    drive_root = tmp_path / "drive"
+    patch_text = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"
+    patch_path = _write_artifact(drive_root, "ws-excl", "workspace.patch", patch_text)
+    manifest_path = _write_artifact(drive_root, "ws-excl", "workspace_patch.json", json.dumps({
+        "status": "ready_with_changes", "base_head": "aaa", "current_head": "aaa", "errors": [],
+        "counts": {"tracked_excluded": 1, "untracked_excluded": 2},
+    }))
+    write_task_result(
+        drive_root, "ws-excl", STATUS_COMPLETED,
+        workspace_root=str(tmp_path / "ws"), artifact_status="ready_with_changes",
+        artifacts=[
+            {"name": "workspace.patch", "path": str(patch_path)},
+            {"name": "workspace_patch.json", "path": str(manifest_path)},
+        ],
+    )
+    with _client(drive_root, tmp_path / "repo") as client:
+        payload = client.get("/api/tasks/ws-excl/diff").json()
+    assert payload["status"] == "ready"
+    assert payload["blockers"] == ["workspace_paths_excluded"]
+
+
+def test_workspace_patch_digest_covers_the_served_text_after_replacement(tmp_path):
+    """C7: one digest rule on BOTH sources — the bytes the owner received."""
+    drive_root = tmp_path / "drive"
+    raw = b"diff --git a/l.txt b/l.txt\n--- a/l.txt\n+++ b/l.txt\n@@ -1 +1 @@\n-caf\xe9\n+cafe\n"
+    path = task_artifacts_dir(drive_root, "ws-latin") / "workspace.patch"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    write_task_result(
+        drive_root, "ws-latin", STATUS_COMPLETED,
+        workspace_root=str(tmp_path / "ws"), artifact_status="ready_with_changes",
+        artifacts=[{"name": "workspace.patch", "path": str(path)}],
+    )
+    with _client(drive_root, tmp_path / "repo") as client:
+        payload = client.get("/api/tasks/ws-latin/diff").json()
+    assert payload["status"] == "ready"
+    assert "�" in payload["patch"]
+    assert payload["patch_sha256"] == hashlib.sha256(
+        payload["patch"].encode("utf-8"),
+    ).hexdigest()
+    assert payload["patch_sha256"] != hashlib.sha256(raw).hexdigest()
+
+
+def test_staging_a_candidate_changes_the_projection_fingerprint(tmp_path):
+    """C6: `git add` moves work index-ward without touching HEAD or any mtime.
+
+    That DOES change what `git diff <base> -- <path>` reports, so the repo's own
+    `.git/index` stat belongs in the binding fingerprint — otherwise a read racing
+    a stage/unstage is silently accepted as unchanged.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "loop.py").write_text("a = 1\nb = 21\n", encoding="utf-8")
+    before = gateway_task_diff._projection_fingerprint(repo, ["loop.py"])
+    _git(repo, "add", "loop.py")
+    assert gateway_task_diff._projection_fingerprint(repo, ["loop.py"]) != before
+
+
+def test_git_invocations_pin_literal_pathspecs_and_readable_paths(tmp_path):
+    """S1/C2 at the invocation level: the env and the `-c` policy are the fix."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    seen: dict = {}
+    real_run = gateway_task_diff.subprocess.run
+
+    def _record(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return real_run(argv, **kwargs)
+
+    gateway_task_diff.subprocess.run = _record
+    try:
+        rc, out = gateway_task_diff._git_capture(repo, ["rev-parse", "HEAD"])
+    finally:
+        gateway_task_diff.subprocess.run = real_run
+    env = seen["kwargs"]["env"]
+    assert env["GIT_LITERAL_PATHSPECS"] == "1"
+    assert env["LC_ALL"] == "C"
+    assert seen["argv"][:3] == ["git", "-c", "core.quotepath=off"]
+    # C1: git returns BYTES here; this module owns the (replacing) decode, so no
+    # `text=`/`encoding=` may be handed to subprocess.
+    assert not seen["kwargs"].get("text")
+    assert "encoding" not in seen["kwargs"] and "errors" not in seen["kwargs"]
+    assert rc == 0 and isinstance(out, str)
+
+
+def test_no_index_sections_use_the_literal_dev_null(tmp_path):
+    """C8: git understands the literal "/dev/null", not the host's os.devnull."""
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    (repo / "fresh.py").write_text("new = 1\n", encoding="utf-8")
+    calls: list = []
+    real_capture = gateway_task_diff._git_capture
+
+    def _record(root, args):
+        calls.append(list(args))
+        return real_capture(root, args)
+
+    gateway_task_diff._git_capture = _record
+    try:
+        patch, blockers = gateway_task_diff._build_projection_patch(repo, base, ["fresh.py"])
+    finally:
+        gateway_task_diff._git_capture = real_capture
+    no_index = [args for args in calls if "--no-index" in args]
+    assert no_index and no_index[0][-2:] == ["/dev/null", "fresh.py"]
+    assert blockers == []
+    assert "+new = 1" in patch
+
+
+def test_concurrent_diff_reads_are_gated_to_the_declared_slot_count(tmp_path):
+    """S3: the process-wide gate QUEUES concurrent reads instead of fanning out."""
+    import asyncio
+
+    async def _exercise():
+        gate = gateway_task_diff.diff_gate()
+        assert gate is gateway_task_diff.diff_gate(), "the gate must be process-wide"
+        live = 0
+        peak = 0
+
+        async def _worker():
+            nonlocal live, peak
+            async with gate:
+                live += 1
+                peak = max(peak, live)
+                await asyncio.sleep(0.01)
+                live -= 1
+
+        await asyncio.gather(*[_worker() for _ in range(8)])
+        return peak
+
+    peak = asyncio.run(_exercise())
+    assert peak == gateway_task_diff.DIFF_WORKER_SLOTS

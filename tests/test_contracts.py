@@ -517,7 +517,9 @@ def test_task_diff_response_is_frozen_additive_abi():
     stats source would be a second truth that can silently disagree (decision 13).
     """
     from ouroboros.gateway.contracts import HTTP_ENDPOINTS, TaskDiffResponse
-    from ouroboros.gateway import tasks as gateway_tasks
+    # The vocabularies live with the projection logic (`gateway/task_diff.py`);
+    # `gateway/tasks.py` is only the route over it.
+    from ouroboros.gateway import task_diff as gateway_task_diff
 
     assert TaskDiffResponse.__required_keys__ == frozenset()
     assert set(TaskDiffResponse.__annotations__) == {
@@ -526,14 +528,14 @@ def test_task_diff_response_is_frozen_additive_abi():
     }
     assert "GET /api/tasks/{task_id}/diff" in HTTP_ENDPOINTS
     assert {
-        gateway_tasks.DIFF_STATUS_PENDING,
-        gateway_tasks.DIFF_STATUS_READY,
-        gateway_tasks.DIFF_STATUS_EMPTY,
-        gateway_tasks.DIFF_STATUS_BLOCKED,
+        gateway_task_diff.DIFF_STATUS_PENDING,
+        gateway_task_diff.DIFF_STATUS_READY,
+        gateway_task_diff.DIFF_STATUS_EMPTY,
+        gateway_task_diff.DIFF_STATUS_BLOCKED,
     } == {"pending", "ready", "empty", "blocked"}
     assert {
-        gateway_tasks.DIFF_SOURCE_WORKSPACE,
-        gateway_tasks.DIFF_SOURCE_MUTATION_BASELINE,
+        gateway_task_diff.DIFF_SOURCE_WORKSPACE,
+        gateway_task_diff.DIFF_SOURCE_MUTATION_BASELINE,
     } == {"workspace_patch", "mutation_baseline"}
 
 

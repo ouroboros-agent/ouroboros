@@ -995,9 +995,8 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
     derived, already-receipt_absent-flagged outcome that also fed the task_eval /
     task_metrics event stream — so the persisted axes match the events exactly and we
     do not derive/flag a second time. It is only re-derived here when called without one.
-    ``duration_sec`` is the SAME value the ``task_metrics`` event carries, persisted as one flat scalar on both
-    terminal paths so an owner surface reads elapsed from the durable record; ``None`` omits the key instead of a
-    fabricated 0 (why: ARCHITECTURE.md §3, task inspector footer).
+    ``duration_sec`` (the SAME value ``task_metrics`` carries) is persisted by THIS terminal writer only —
+    completed and failed; cancel/crash writers omit it and the UI shows Unavailable, never a fabricated 0.
     """
     try:
         trace_summary = build_trace_summary(llm_trace)
