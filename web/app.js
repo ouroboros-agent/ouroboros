@@ -365,6 +365,33 @@ initFiles(ctx);
 /* [anchor:phase-B] right-panel registrations */
 
 /* [anchor:phase-C] global capture hotkey */
+// ⌘L / Ctrl+L = "add what I'm looking at to chat context". This handler knows
+// NOTHING about Files or Changes internals: it decides only WHETHER a capture is
+// wanted and names the active page in one `ouro:capture-selection` event; the
+// page that owns the surface listens and does the capture (files.js today, the
+// Changes dock next). With no listener the event is a harmless noop.
+//
+// The hotkey is best-effort by decision 10 — some browsers reserve ⌘L for the
+// address bar and never deliver it — so the always-visible "Add to chat" /
+// "Add selection" buttons remain the guaranteed path, not a convenience.
+//
+// Typing must win: while an editable other than a capture dock has focus, the
+// keystroke belongs to that editable. (The mobile-keyboard IIFE below keeps its
+// own copy of this selector in a closure; duplicating the four-line list here is
+// cheaper than exporting closure state across the anchor boundary.)
+const CAPTURE_EDITABLE_SELECTOR = 'input, textarea, select, [contenteditable]:not([contenteditable="false"])';
+const CAPTURE_PAGES = new Set(['files', 'changes']);
+
+document.addEventListener('keydown', (event) => {
+    if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+    if (String(event.key).toLowerCase() !== 'l') return;
+    if (!CAPTURE_PAGES.has(state.activePage)) return;
+    const active = document.activeElement;
+    const editable = active instanceof Element ? active.closest(CAPTURE_EDITABLE_SELECTOR) : null;
+    if (editable && !editable.closest('[data-capture-dock]')) return;
+    event.preventDefault();
+    window.dispatchEvent(new CustomEvent('ouro:capture-selection', { detail: { page: state.activePage } }));
+});
 
 // ---------------------------------------------------------------------------
 // Multi-project navigation + right thread panel (v6.32.0). Projects come from
