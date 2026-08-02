@@ -1260,7 +1260,7 @@ def test_store_task_result_persists_duration_sec_on_completed_and_failed(tmp_pat
         text="done",
         usage={"rounds": 1, "cost": 0.0},
         llm_trace={"tool_calls": [], "reasoning_notes": []},
-        duration_sec=12.5,
+        result_fields={"duration_sec": 12.5},
     )
     payload = json.loads((tmp_path / "task_results" / "task-duration-ok.json").read_text(encoding="utf-8"))
     assert payload["status"] == pipeline.STATUS_COMPLETED
@@ -1274,7 +1274,7 @@ def test_store_task_result_persists_duration_sec_on_completed_and_failed(tmp_pat
         text="broke",
         usage={"rounds": 1, "cost": 0.0},
         llm_trace={"tool_calls": [], "reasoning_notes": []},
-        duration_sec=3.25,
+        result_fields={"duration_sec": 3.25},
     )
     payload = json.loads((tmp_path / "task_results" / "task-duration-failed.json").read_text(encoding="utf-8"))
     assert payload["status"] == pipeline.STATUS_FAILED
@@ -1302,7 +1302,7 @@ def test_public_task_result_keeps_persisted_duration_sec(tmp_path):
         text="done",
         usage={"rounds": 1, "cost": 0.0},
         llm_trace={"tool_calls": [], "reasoning_notes": []},
-        duration_sec=7.0,
+        result_fields={"duration_sec": 7.0},
     )
     stored = pipeline.load_task_result(tmp_path, "task-duration-public")
     assert public_task_result(stored)["duration_sec"] == 7.0

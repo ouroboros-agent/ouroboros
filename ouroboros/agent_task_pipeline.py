@@ -746,14 +746,7 @@ def emit_task_results(
         )
     except Exception:
         log.error("Task cost authority unavailable at finalization", exc_info=True)
-        task_cost_fields = {
-            "cost_accounting_status": "unavailable", "cost_final": False,
-            "cost_accounting_error": "ledger_unavailable",
-            "cost_usd": None, "total_rounds": None,
-            "prompt_tokens": None, "completion_tokens": None,
-            "reserved_usd": None, "unresolved_upper_bound_usd": None,
-            "unknown_unmetered": None,
-        }
+        task_cost_fields = _unavailable_cost_fields("ledger_unavailable")
     if _is_root_post_task(task) and not _root_post_task_already_completed(env, task):
         task_cost_fields["cost_final"] = False
     if not _ephemeral:
@@ -803,7 +796,7 @@ def emit_task_results(
     if not _ephemeral:
         _store_task_result(
             env, task, text, usage, llm_trace, review_evidence=review_evidence,
-            loop_outcome=loop_outcome, cost_fields=task_cost_fields, duration_sec=duration_sec,
+            loop_outcome=loop_outcome, result_fields={**task_cost_fields, "duration_sec": duration_sec},
         )
         stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
     else:
@@ -984,30 +977,37 @@ def emit_task_results(
                 )
 
 
+def _unavailable_cost_fields(error: str) -> Dict[str, Any]:
+    """Fail-closed cost projection: ONE shape for both paths that can lose the ledger."""
+    return {
+        "cost_accounting_status": "unavailable", "cost_final": False,
+        "cost_accounting_error": error, "cost_usd": None, "total_rounds": None,
+        "prompt_tokens": None, "completion_tokens": None, "reserved_usd": None,
+        "unresolved_upper_bound_usd": None, "unknown_unmetered": None,
+    }
+
+
 def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                        usage: Dict[str, Any], llm_trace: Dict[str, Any],
                        review_evidence: Dict[str, Any] | None = None,
                        loop_outcome: Dict[str, Any] | None = None,
-                       cost_fields: Dict[str, Any] | None = None, duration_sec: float | None = None) -> None:
+                       result_fields: Dict[str, Any] | None = None) -> None:
     """Store task result for parent task retrieval.
 
     ``loop_outcome``, when supplied by ``emit_task_results``, is the SINGLE already-
     derived, already-receipt_absent-flagged outcome that also fed the task_eval /
     task_metrics event stream — so the persisted axes match the events exactly and we
     do not derive/flag a second time. It is only re-derived here when called without one.
-    ``duration_sec`` (the SAME value ``task_metrics`` carries) is persisted by THIS terminal writer only —
-    completed and failed; cancel/crash writers omit it and the UI shows Unavailable, never a fabricated 0.
+    ``result_fields`` carries the cost projection PLUS ``duration_sec`` as one flat
+    bundle, not a tenth parameter (the signature was already at the <8 limit). Elapsed
+    is written by THIS terminal writer only, so cancel/crash results honestly show
+    Unavailable instead of a fabricated 0.
     """
     try:
         trace_summary = build_trace_summary(llm_trace)
-        cost_fields = dict(cost_fields or {
-            "cost_accounting_status": "unavailable", "cost_final": False,
-            "cost_accounting_error": "ledger_projection_missing",
-            "cost_usd": None, "total_rounds": None,
-            "prompt_tokens": None, "completion_tokens": None,
-            "reserved_usd": None, "unresolved_upper_bound_usd": None,
-            "unknown_unmetered": None,
-        })
+        cost_fields = dict(result_fields or {})
+        duration_sec = cost_fields.pop("duration_sec", None)
+        cost_fields = cost_fields or _unavailable_cost_fields("ledger_projection_missing")
         existing = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
         if loop_outcome is None:
             loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)

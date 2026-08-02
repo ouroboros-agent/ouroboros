@@ -173,8 +173,14 @@ def test_task_diff_contract_declares_typed_lifecycle_in_both_mirrors():
     assert "GET /api/tasks/{task_id}/diff" in HTTP_ENDPOINTS
     assert '"pending"|"ready"|"empty"|"blocked"' in js_contract
     assert '"workspace_patch"|"mutation_baseline"' in js_contract
-    assert "@property {boolean} head_advanced" in js_contract
-    assert "@property {string[]} blockers" in js_contract
+    # REQUIREDNESS mirrors too, not just the field names and their vocabularies: the
+    # Python side is `total=False` (an additive frozen surface promises nothing as
+    # required), so the JSDoc marks the same fields optional with `=`. Pinned in this
+    # spelling because the two sides drifted here once — the contract said "assume
+    # nothing" while the browser mirror said "always present".
+    assert "@property {boolean=} head_advanced" in js_contract
+    assert "@property {string[]=} blockers" in js_contract
+    assert not TaskDiffResponse.__required_keys__
     declaration = python_contract.split("class TaskDiffResponse")[1].split("\nclass ")[0]
     for banned in ("files:", "diffstat:", "add:", "del:", "truncated:"):
         assert banned not in declaration, f"TaskDiffResponse must not carry server-side stats ({banned})"

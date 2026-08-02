@@ -44,6 +44,7 @@ import re
 import subprocess
 from typing import Any, Dict, List, NamedTuple, Optional
 
+from ouroboros.config import get_task_diff_git_timeout_sec
 from ouroboros.headless import (
     ARTIFACT_STATUS_FAILED,
     ARTIFACT_STATUS_FINALIZING,
@@ -60,7 +61,12 @@ DIFF_STATUS_BLOCKED = "blocked"
 DIFF_SOURCE_WORKSPACE = "workspace_patch"
 DIFF_SOURCE_MUTATION_BASELINE = "mutation_baseline"
 
-_DIFF_GIT_TIMEOUT_SEC = 30
+#: `git`'s own name for "the empty side" of a `--no-index` comparison. This is a GIT
+#: PROTOCOL SENTINEL, not a filesystem path: git matches the exact string "/dev/null"
+#: on every platform it runs on, Windows included. `os.devnull` would substitute "nul"
+#: there and git would look for a FILE by that name, so the portable-looking spelling
+#: is the one that actually breaks portability.
+_GIT_NULL_SENTINEL = "/dev/null"
 #: A baseline commit reaches git argv BEFORE `--`, so it is accepted only as a hex
 #: object name. Anything else (an option-looking string, a ref expression, junk) is
 #: refused as `base_commit_unknown` rather than handed to the command line.
@@ -200,7 +206,7 @@ def _git_capture(root: pathlib.Path, args: List[str]) -> tuple[int, str]:
             cwd=str(root),
             capture_output=True,
             env=env,
-            timeout=_DIFF_GIT_TIMEOUT_SEC,
+            timeout=get_task_diff_git_timeout_sec(),
         )
     except (subprocess.SubprocessError, OSError):
         return -1, ""
@@ -311,11 +317,9 @@ def _build_projection_patch(
         # exactly like a complete diff, and the owner would never know.
         return "".join(sections), blockers + ["untracked_projection_capped"]
     for rel in untracked:
-        # The literal "/dev/null" (not os.devnull) is what git itself understands
-        # as "the empty side" of a --no-index comparison on every platform.
         rc_new, added = _git_capture(root, [
             "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-index",
-            "--", "/dev/null", rel,
+            "--", _GIT_NULL_SENTINEL, rel,
         ])
         if added:
             sections.append(added)

@@ -164,6 +164,10 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC": SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
     "OUROBOROS_PACING_INTERVAL_SEC": PACING_INTERVAL_DEFAULT_SEC,
     "OUROBOROS_TOOL_TIMEOUT_SEC": 600,
+    # Wall clock for ONE `git` invocation behind GET /api/tasks/{id}/diff. It bounds an
+    # owner-facing READ, not a task: a repo whose git is wedged must fail the request
+    # with a blocker rather than hold the thread.
+    "OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC": 30,
     "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC": 90,
     "OUROBOROS_BG_MAX_ROUNDS": 10,
     "OUROBOROS_BG_WAKEUP_MIN": 30,
@@ -948,78 +952,70 @@ def get_safety_mode() -> str:
     return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default_val) or default_val)
 
 
+def _clamped_setting(key: str, low: Any, high: Any, cast: Any = float) -> Any:
+    """Read ONE numeric setting: environment, else its ``SETTINGS_DEFAULTS`` value,
+    always clamped into ``[low, high]``.
+
+    The clamp is the point. These become timeouts, token budgets and pass counts, so a
+    hand-edited or half-written value must not be able to produce an unbounded wait or
+    a nonsense cap. A malformed value falls back to the DEFAULT, never to zero — zero
+    reads as a deliberate "none" to every consumer downstream.
+    """
+    try:
+        val = cast(os.environ.get(key, "") or SETTINGS_DEFAULTS[key])
+    except (TypeError, ValueError):
+        val = cast(SETTINGS_DEFAULTS[key])
+    return max(low, min(val, high))
+
+
 def get_safety_max_tokens() -> int:
     """Output-token budget for safety-supervisor LLM calls (parse-bug fix)."""
-    try:
-        val = int(os.environ.get("OUROBOROS_SAFETY_MAX_TOKENS", "") or SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MAX_TOKENS"])
-    except (TypeError, ValueError):
-        val = int(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MAX_TOKENS"])
-    return max(256, min(val, 16384))
+    return _clamped_setting("OUROBOROS_SAFETY_MAX_TOKENS", 256, 16384, int)
 
 
 def get_safety_call_timeout_sec() -> float:
     """Transport timeout for safety-supervisor LLM calls (prevents indefinite hang)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_SAFETY_CALL_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_SAFETY_CALL_TIMEOUT_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_CALL_TIMEOUT_SEC"])
-    return max(5.0, min(val, 600.0))
+    return _clamped_setting("OUROBOROS_SAFETY_CALL_TIMEOUT_SEC", 5.0, 600.0)
+
+
+def get_task_diff_git_timeout_sec() -> float:
+    """Per-invocation `git` timeout for the task-diff endpoint (see SETTINGS_DEFAULTS).
+
+    Clamped, like its siblings, so a hand-edited setting cannot turn an owner-facing
+    read into an unbounded wait (or into a timeout too short for a large repo)."""
+    return _clamped_setting("OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC", 5.0, 300.0)
 
 
 def get_websearch_timeout_sec() -> float:
     """Transport timeout for the web_search OpenAI streaming call (v6.54.3, D)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_WEBSEARCH_TIMEOUT_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_WEBSEARCH_TIMEOUT_SEC"])
-    return max(30.0, min(val, 3600.0))
+    return _clamped_setting("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", 30.0, 3600.0)
 
 
 def get_llm_transport_read_timeout_sec() -> float:
     """Default httpx read/write timeout for no_proxy LLM clients (v6.54.3, D).
 
     The DEAD-SOCKET bound, not a latency target; explicit per-call timeouts win."""
-    try:
-        val = float(os.environ.get("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
-    return max(60.0, min(val, 7200.0))
+    return _clamped_setting("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", 60.0, 7200.0)
 
 
 def get_acceptance_review_est_sec() -> float:
     """Estimated duration of one acceptance review/improvement pass (v6.54.4)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC"])
-    return max(10.0, min(val, 3600.0))
+    return _clamped_setting("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", 10.0, 3600.0)
 
 
 def get_acceptance_max_improvement_passes() -> int:
     """Default COUNT cap for acceptance-review improvement passes (v6.54.4)."""
-    try:
-        val = int(os.environ.get("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"])
-    except (TypeError, ValueError):
-        val = int(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"])
-    return max(0, min(val, 20))
+    return _clamped_setting("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", 0, 20, int)
 
 
 def get_acceptance_reserve_pct() -> int:
     """Default finalization-reserve percentage of the total budget (v6.54.4)."""
-    try:
-        val = int(os.environ.get("OUROBOROS_ACCEPTANCE_RESERVE_PCT", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_RESERVE_PCT"])
-    except (TypeError, ValueError):
-        val = int(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_RESERVE_PCT"])
-    return max(0, min(val, 50))
+    return _clamped_setting("OUROBOROS_ACCEPTANCE_RESERVE_PCT", 0, 50, int)
 
 
 def get_plan_task_deadline_min_sec() -> float:
     """Minimum useful deadline-scaled planning-swarm window (v6.54.3, 1.5)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC"])
-    return max(30.0, min(val, 3600.0))
+    return _clamped_setting("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", 30.0, 3600.0)
 
 
 def normalize_context_mode(value: Any) -> str:
@@ -1529,7 +1525,8 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "TOTAL_BUDGET",
         "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO", "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
-        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC",
+        "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
         "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
         "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "OUROBOROS_MAX_ROUNDS",
         "OUROBOROS_TRANSIENT_RETRY_MAX", "OUROBOROS_IMAGE_INPUT_MODE", "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN",

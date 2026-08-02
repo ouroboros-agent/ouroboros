@@ -716,6 +716,14 @@ class TaskDiffResponse(TypedDict, total=False):
     as a boolean only — never commit counts, never an ownership claim. The patch
     is never truncated and carries no server-side file stats: the client parses
     the same bytes it renders.
+
+    ``total=False`` is deliberate and pinned (§11.1): this envelope is an ADDITIVE
+    frozen surface, so no field is ever declared required and the shape can never
+    become a hard break for an older client. The endpoint's one response builder
+    does in practice emit all seven on every 200 — a blocked or empty answer still
+    carries ``patch: ""`` and ``blockers: []`` — but consumers are held to the
+    weaker promise, and the JSDoc mirror in ``web/modules/api_types.js`` marks the
+    same optionality so the two never disagree about what may be assumed.
     """
 
     status: str

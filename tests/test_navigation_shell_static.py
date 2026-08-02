@@ -5,6 +5,7 @@ desktop sidebar + mobile drawer share one DOM/state model, project rows use
 explicit slots, and the old bottom icon rail does not come back.
 """
 
+import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -249,3 +250,28 @@ def test_chat_controller_is_kept_and_exposes_parts_adapters():
 def test_matrix_rain_is_gone():
     for rel in ("web/app.js", "web/modules/utils.js", "web/style.css", "web/index.html"):
         assert "matrix" not in _read(rel).lower(), rel
+
+
+def test_inline_nav_glyphs_byte_match_the_canonical_page_icons():
+    """Every sidebar row's inline SVG is a pre-hydration FALLBACK, not a second glyph.
+
+    `hydrateNavIcons` replaces these at boot from `PAGE_ICONS`, so the inline copy is
+    what the owner sees for one frame — and any drift between the two is a flicker
+    into a different icon, invisible to whoever edits only one of the files. The
+    fallback pattern itself is fine; two spellings of the same glyph is the defect.
+    """
+    icons = _read("web/modules/page_icons.js")
+    html = _read("web/index.html")
+    checked = 0
+    for key in ("changes", "files", "skills", "widgets", "dashboard", "settings"):
+        canonical = re.search(rf"{key}: icon\('(.*?)'\)", icons, re.S)
+        assert canonical, f"{key} missing from PAGE_ICONS"
+        inline = re.search(
+            rf'data-nav-page="{key}".*?<svg[^>]*>(.*?)</svg>', html, re.S,
+        )
+        assert inline, f"{key} nav row has no inline svg"
+        assert inline.group(1) == canonical.group(1), (
+            f"{key}: inline nav glyph diverged from PAGE_ICONS"
+        )
+        checked += 1
+    assert checked == 6
