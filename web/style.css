@@ -1,14 +1,32 @@
+/* =========================================================================
+   Ouroboros design tokens — FLAT gray + red (see docs/DEVELOPMENT.md
+   "Design System"). Surfaces are a solid background token plus a 1px border;
+   the main SPA carries NO `backdrop-filter`. The standalone onboarding wizard
+   (web/onboarding.css) keeps its own blur formulas and only syncs the COLOR
+   values below. Tokens are frozen after the redesign foundation phase: add a
+   new one here, never a hardcoded literal in a component rule.
+   ========================================================================= */
 :root {
-    --bg-primary: #0d0b0f;
-    --bg-secondary: #1a1520;
-    --bg-tertiary: #201828;
+    /* Background ladder: page → sidebar → rails/panels → cards/controls. */
+    --bg-primary: #131315;
+    --bg-sidebar: #0f0f11;
+    --bg-panel: #151517;
+    --bg-elevated: #1a1a1d;
+    /* Channel form of --bg-primary so scrims/gradients derive from ONE hue. */
+    --bg-primary-rgb: 19, 19, 21;
     --bg-card: rgba(255, 255, 255, 0.06);
     --bg-hover: rgba(255, 255, 255, 0.08);
-    --text-primary: #e2e8f0;
-    --text-secondary: rgba(255, 255, 255, 0.54);
-    --text-muted: rgba(255, 255, 255, 0.38);
+    --text-primary: #e7e7ea;
+    --text-secondary: rgba(255, 255, 255, 0.55);
+    --text-muted: rgba(255, 255, 255, 0.35);
     --accent: #c93545;
+    --accent-hover: #d4485a;
+    /* Channel form of --accent-hover: hover/focus rings interpolate the SAME
+       hue instead of the old raw rgba(var(--accent-hover-rgb), …) literals. */
+    --accent-hover-rgb: 212, 72, 90;
     --accent-light: #f07a86;
+    /* Text color for accent-tinted chips (context chips, capture pills). */
+    --accent-chip-text: #f0a3ab;
     --accent-dim: rgba(201, 53, 69, 0.15);
     --accent-glow: rgba(201, 53, 69, 0.08);
     /* Accent alpha tokens; keep future tweaks off hardcoded rgba literals. */
@@ -21,19 +39,20 @@
     --accent-22: rgba(201, 53, 69, 0.22);
     --accent-25: rgba(201, 53, 69, 0.25);
     --accent-55: rgba(201, 53, 69, 0.55);
-    /* Project identity (vivid fuchsia): a converted task card, its sidebar marker,
+    /* Project identity (muted teal): a converted task card, its sidebar marker,
        and the project panel header share this so "this is a project" reads as a
        deliberate state — never the red task accent (looked like an error, P3) and
-       never the blue owner voice. The old calm-indigo sat next to the user-message
-       blue and the two blurred together; fuchsia is unmistakably its own role.
-       Base is legible-on-dark fuchsia-400; every tint shares the SAME hue (C7.3). */
-    --project: #e879f9;
-    --project-light: #f0abfc;
-    --project-dim: rgba(232, 121, 249, 0.15);
-    --project-08: rgba(232, 121, 249, 0.08);
-    --project-12: rgba(232, 121, 249, 0.12);
-    --project-18: rgba(232, 121, 249, 0.18);
-    --project-25: rgba(232, 121, 249, 0.25);
+       never the blue owner voice. The flat gray+red theme retired the vivid
+       fuchsia (it fought the neutral grays); teal-400 keeps the role distinct
+       from both the red accent and the blue owner voice, and every tint shares
+       the SAME hue (C7.3). */
+    --project: #2dd4bf;
+    --project-light: #5eead4;
+    --project-dim: rgba(45, 212, 191, 0.15);
+    --project-08: rgba(45, 212, 191, 0.08);
+    --project-12: rgba(45, 212, 191, 0.12);
+    --project-18: rgba(45, 212, 191, 0.18);
+    --project-25: rgba(45, 212, 191, 0.25);
     /* User / owner voice: the owner's chat bubble + sender accents. Tokenized so
        the hue lives in one place and stays clear of the project fuchsia (C7.2). */
     --user: #6e96d2;
@@ -52,13 +71,33 @@
     --system-text: rgba(255, 240, 210, 0.78);
     --blue: #3b82f6;
     --blue-dim: rgba(30, 64, 175, 0.3);
+    --blue-08: rgba(59, 130, 246, 0.08);
     --amber: #f59e0b;
     --amber-dim: rgba(245, 158, 11, 0.15);
     --green: #22c55e;
     --green-dim: rgba(34, 197, 94, 0.15);
     --red: #ef4444;
     --red-dim: rgba(239, 68, 68, 0.15);
-    --divider: rgba(255, 255, 255, 0.06);
+    /* Diff surfaces (Changes screen + inline diffs): one pair of row tints plus
+       gutter/number and text colors, so unified and split render the same truth. */
+    --diff-del-bg: rgba(239, 68, 68, 0.09);
+    --diff-add-bg: rgba(34, 197, 94, 0.08);
+    --diff-del-num: rgba(239, 68, 68, 0.6);
+    --diff-add-num: rgba(34, 197, 94, 0.6);
+    --diff-del-text: rgba(255, 210, 210, 0.85);
+    --diff-add-text: rgba(210, 255, 225, 0.9);
+    --diff-ctx-num: rgba(255, 255, 255, 0.25);
+    --diff-ctx-text: rgba(255, 255, 255, 0.75);
+    --diff-hunk-bg: rgba(255, 255, 255, 0.03);
+    /* Syntax tokens for the in-house highlighter. Named by LEXEME ROLE so the
+       highlighter never hardcodes a hue. */
+    --code-keyword: var(--accent-light);
+    --code-self: var(--user);
+    --code-string: #e5b567;
+    --code-number: var(--amber);
+    --code-comment: var(--text-muted);
+    --code-default: rgba(255, 255, 255, 0.75);
+    --divider: rgba(255, 255, 255, 0.07);
     --surface-border: rgba(255, 255, 255, 0.08);
     --surface-border-soft: rgba(255, 255, 255, 0.06);
     --surface-card: rgba(255, 255, 255, 0.03);
@@ -83,15 +122,27 @@
     --tone-ok: var(--green);
     --tone-warn: var(--amber);
     --tone-danger: var(--red);
-    --focus-accent-border: rgba(232, 93, 111, 0.4);
-    --focus-accent-ring: rgba(232, 93, 111, 0.10);
+    --focus-accent-border: rgba(var(--accent-hover-rgb), 0.4);
+    --focus-accent-ring: rgba(var(--accent-hover-rgb), 0.10);
+    /* Radius scale. The named steps are historical; the numeric steps below were
+       added for the flat redesign (inline code, chips, nav rows, ghost buttons,
+       brand mark). Never hardcode a radius in a component rule — add the step
+       here first (see docs/DEVELOPMENT.md "Border radius scale"). */
     --radius-xs: 3px;
+    --radius-4: 4px;
+    --radius-5: 5px;
+    --radius-6: 6px;
+    --radius-7: 7px;
     --radius-sm: 8px;
+    --radius-9: 9px;
     /* In-between radius used by chips, counters, and fade rules. */
     --radius-md: 10px;
     --radius: 12px;
     --radius-lg: 16px;
     --radius-xl: 20px;
+    /* One mono stack for every code/number surface (transcripts, diffs, file
+       viewer, budget amount, log grids). */
+    --font-mono: ui-monospace, Menlo, monospace;
     --page-header-padding-y: 10px;
     --page-header-padding-x: 20px;
     --page-header-padding-bottom: 6px;
@@ -104,10 +155,14 @@
     --button-padding-x: 16px;
     --button-font-size: 13px;
     --button-min-height: 34px;
-    /* App shell: persistent desktop sidebar + optional project detail pane. */
-    --sidebar-width: 280px;
+    /* App shell: persistent desktop sidebar + optional right panel. The right
+       panel is ONE slot with mutually exclusive kinds (project | inspector):
+       the project panel keeps its persisted drag width, the task inspector is
+       fixed-width per the design handoff (no resize state). */
+    --sidebar-width: 224px;
     --project-panel-width: clamp(340px, 36vw, 440px);
-    --nav-item-radius: 10px;
+    --inspector-width: 320px;
+    --nav-item-radius: 8px;
     /* 8pt spacing scale (Apple HIG / common 8pt grid) — use these instead of
        ad-hoc pixel values so spacing stays consistent across components. */
     --space-1: 4px;
@@ -140,16 +195,7 @@ body {
     position: relative;
 }
 
-#matrix-rain {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    opacity: 0.12;
-    pointer-events: none;
-    z-index: 0;
-}
+/* ===== [stream 0: app shell, navigation sidebar, shared page chrome] ===== */
 
 /* App navigation shell: desktop persistent sidebar, mobile drawer below. */
 .mobile-nav-toggle {
@@ -165,10 +211,8 @@ body {
     display: flex;
     flex-direction: column;
     min-width: 0;
-    padding: var(--space-4) var(--space-3) var(--space-3);
-    background:
-        linear-gradient(180deg, rgba(13, 11, 15, 0.62), rgba(13, 11, 15, 0.32)),
-        radial-gradient(circle at 8% 0%, rgba(201, 53, 69, 0.08), transparent 260px);
+    padding: 14px 10px 10px;
+    background: var(--bg-sidebar);
     border-right: 1px solid var(--divider);
     z-index: 10;
     position: relative;  /* positioning context for the resize handle */
@@ -205,16 +249,154 @@ body.resizing-panels { user-select: none; }
     scrollbar-width: thin;
 }
 
-#nav-version {
-    display: block;
-    max-width: 100%;
-    text-align: left;
-    line-height: 1.15;
-    white-space: normal;
-    font-size: 8px;
+/* Brand row: app mark + name, with the runtime version and the live socket
+   state on one sub line. #nav-version is the SSOT span loadVersion() fills. */
+.nav-brand {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex: 0 0 auto;
+    padding: 0 var(--space-1) 10px;
+    min-width: 0;
+}
+
+.nav-brand-mark {
+    flex: 0 0 26px;
+    width: 26px;
+    height: 26px;
+    border-radius: var(--radius-7);
+    object-fit: cover;
+}
+
+.nav-brand-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+.nav-brand-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.2;
+}
+
+.nav-brand-sub {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
     color: var(--text-muted);
-    padding: var(--space-2) var(--space-2) 0;
-    opacity: 0.6;
+    line-height: 1.2;
+    min-width: 0;
+}
+
+#nav-version {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nav-brand-status {
+    white-space: nowrap;
+}
+
+.nav-status-dot {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.nav-brand[data-online="true"] .nav-status-dot {
+    background: var(--green);
+    box-shadow: 0 0 6px rgba(34, 197, 94, 0.6);
+}
+
+/* Budget meter, pinned to the sidebar bottom. The fill width is a DYNAMIC CSS
+   custom property (--budget-fill) written by app.js — the accepted exception to
+   the no-inline-styles rule; never a .style.width assignment. */
+/* Update-pill footer slot: an own row above the budget meter. */
+.nav-update-slot {
+    flex: 0 0 auto;
+    display: flex;
+    min-width: 0;
+}
+
+.nav-update-slot:empty {
+    display: none;
+}
+
+.nav-update-slot .update-pill {
+    margin: 6px 0 0;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.nav-budget {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    margin-top: var(--space-2);
+    padding: var(--space-2) var(--space-2) var(--space-1);
+    border: none;
+    border-top: 1px solid var(--divider);
+    border-radius: 0;
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.nav-budget:hover .nav-budget-amount {
+    color: var(--text-primary);
+}
+
+.nav-budget-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+    min-width: 0;
+}
+
+.nav-budget-label {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+.nav-budget-amount {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.nav-budget-bar {
+    height: 3px;
+    width: 100%;
+    border-radius: var(--radius-xs);
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+}
+
+.nav-budget-bar-fill {
+    display: block;
+    height: 100%;
+    width: var(--budget-fill, 0%);
+    background: var(--accent);
+    transition: width 0.4s ease;
+}
+
+.nav-budget-bar[data-budget-state="unavailable"] .nav-budget-bar-fill,
+.nav-budget-bar[data-budget-state="loading"] .nav-budget-bar-fill {
+    background: var(--text-muted);
 }
 
 .nav-row,
@@ -223,9 +405,9 @@ body.resizing-panels { user-select: none; }
     flex-direction: row;
     align-items: center;
     justify-content: flex-start;
-    gap: var(--space-3);
-    min-height: 44px;
-    padding: 0 var(--space-3);
+    gap: 10px;
+    min-height: 34px;
+    padding: 0 var(--space-2);
     width: 100%;
     border: 1px solid transparent;
     background: transparent;
@@ -242,8 +424,8 @@ body.resizing-panels { user-select: none; }
 .nav-row svg,
 .nav-section-toggle svg {
     flex: 0 0 auto;
-    width: 18px;
-    height: 18px;
+    width: 16px;
+    height: 16px;
 }
 
 .nav-row-icon {
@@ -323,7 +505,7 @@ body.resizing-panels { user-select: none; }
 .nav-section-toggle.active {
     background: var(--accent-12);
     border-color: transparent;
-    color: var(--accent);
+    color: var(--text-primary);
 }
 
 .nav-row:focus,
@@ -436,10 +618,11 @@ body.resizing-panels { user-select: none; }
 }
 
 .nav-section-label {
-    padding: var(--space-3) var(--space-3) var(--space-1);
-    color: var(--text-muted);
+    padding: 14px var(--space-2) 6px;
+    color: rgba(255, 255, 255, 0.3);
     font-size: 10px;
-    letter-spacing: 0.12em;
+    font-weight: 600;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
 }
 
@@ -480,9 +663,7 @@ body.resizing-panels { user-select: none; }
 .page.active { display: flex; }
 
 .app-page-glass {
-    background:
-        linear-gradient(180deg, rgba(13, 11, 15, 0.76) 0%, rgba(13, 11, 15, 0.34) 170px, rgba(13, 11, 15, 0.08) 100%),
-        radial-gradient(circle at 18% 0%, rgba(232, 93, 111, 0.10), transparent 300px);
+    background: var(--bg-primary);
 }
 
 /* Containment for narrow screens and unbroken runtime text. */
@@ -518,6 +699,9 @@ body.resizing-panels { user-select: none; }
 .widgets-card {
     overflow-wrap: anywhere;
 }
+
+/* ===== [stream C: files (tree rail, viewer, code highlighting)] ===== */
+
 
 .files-layout {
     position: relative;
@@ -779,8 +963,7 @@ body.resizing-panels { user-select: none; }
     display: none;
     align-items: center;
     justify-content: center;
-    background: rgba(12, 14, 18, 0.72);
-    backdrop-filter: blur(3px);
+    background: rgba(var(--bg-primary-rgb), 0.86);
     z-index: 5;
     pointer-events: none;
 }
@@ -858,7 +1041,6 @@ body.resizing-panels { user-select: none; }
     gap: var(--space-2) var(--space-3);
     padding: var(--page-header-padding-y) var(--page-header-padding-x) var(--page-header-padding-bottom);
     background: transparent;
-    backdrop-filter: none;
     flex-shrink: 0;
     border-bottom: none;
 }
@@ -969,7 +1151,7 @@ body.resizing-panels { user-select: none; }
 .app-tab.is-active {
     color: var(--text-primary);
     border-color: var(--focus-accent-border);
-    background: rgba(232, 93, 111, 0.12);
+    background: rgba(var(--accent-hover-rgb), 0.12);
 }
 
 .app-tab-pill {
@@ -1011,6 +1193,9 @@ body.resizing-panels { user-select: none; }
     align-items: center;
 }
 
+/* ===== [stream A: chat (header, transcript, live cards, composer)] ===== */
+
+
 .chat-page-header {
     position: absolute;
     top: 0;
@@ -1022,13 +1207,11 @@ body.resizing-panels { user-select: none; }
     /* Fade to transparent so the transcript scrolls under without a hard edge. */
     background: linear-gradient(
         180deg,
-        rgba(13, 11, 15, 0.92) 0%,
-        rgba(13, 11, 15, 0.78) 45%,
-        rgba(13, 11, 15, 0.38) 80%,
-        rgba(13, 11, 15, 0.00) 100%
+        rgba(var(--bg-primary-rgb), 0.92) 0%,
+        rgba(var(--bg-primary-rgb), 0.78) 45%,
+        rgba(var(--bg-primary-rgb), 0.38) 80%,
+        rgba(var(--bg-primary-rgb), 0.00) 100%
     );
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
     /* Dropdowns/menus must not fade under a header mask; the background
        gradient is enough to soften the transcript edge. */
     -webkit-mask-image: none;
@@ -1051,12 +1234,11 @@ body.resizing-panels { user-select: none; }
 }
 
 .chat-header-btn {
-    border: 1px solid rgba(255,255,255,0.12);
-    background: rgba(13, 11, 15, 0.55);
-    backdrop-filter: blur(8px);
-    color: var(--text-secondary);
-    border-radius: 999px;
-    padding: 7px 14px;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    background: transparent;
+    color: rgba(255, 255, 255, 0.65);
+    border-radius: var(--radius-7);
+    padding: 5px 12px;
     font-size: 12px;
     line-height: 1.2;
     font-weight: 600;
@@ -1066,24 +1248,27 @@ body.resizing-panels { user-select: none; }
 }
 
 .chat-header-btn:hover {
-    border-color: rgba(255,255,255,0.16);
+    border-color: rgba(255, 255, 255, 0.16);
+    background: rgba(255, 255, 255, 0.06);
     color: var(--text-primary);
 }
 
 .chat-header-btn.on {
-    border-color: rgba(201, 53, 69, 0.38);
-    background: rgba(201, 53, 69, 0.14);
+    border-color: var(--accent-25);
+    background: var(--accent-12);
     color: var(--accent-light);
 }
 
 .chat-header-btn.danger {
-    border-color: rgba(239, 68, 68, 0.22);
-    color: rgba(248, 113, 113, 0.95);
+    border-color: var(--accent-25);
+    background: var(--accent-10);
+    color: var(--accent-light);
+    font-weight: 600;
 }
 
 .chat-header-btn.danger:hover {
-    border-color: rgba(239, 68, 68, 0.40);
-    background: rgba(239, 68, 68, 0.08);
+    border-color: var(--accent-55);
+    background: var(--accent-18);
 }
 
 .chat-header-more {
@@ -1108,9 +1293,7 @@ body.resizing-panels { user-select: none; }
     padding: var(--space-2);
     border: 1px solid var(--surface-border);
     border-radius: var(--radius-md);
-    background: rgba(13, 11, 15, 0.92);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: var(--bg-elevated);
     box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
     display: flex;
     flex-direction: column;
@@ -1134,7 +1317,7 @@ body.resizing-panels { user-select: none; }
     background: var(--surface-control);
 }
 
-/* Evolve/Consciousness live in this menu now; show their on-state in place. */
+/* Consciousness lives in this menu; show its on-state in place. */
 .chat-header-menu-item.on {
     color: var(--accent-light);
     font-weight: 700;
@@ -1144,11 +1327,11 @@ body.resizing-panels { user-select: none; }
     color: rgba(248, 113, 113, 0.95);
 }
 
-/* When a mode inside More is active, mark the collapsed More pill with a dot. */
+/* When the mode inside More is active, mark the collapsed More pill with a dot. */
 .chat-header-more > summary.has-active {
     position: relative;
-    border-color: rgba(201, 53, 69, 0.38);
-    background: rgba(201, 53, 69, 0.14);
+    border-color: var(--accent-25);
+    background: var(--accent-12);
     color: var(--accent-light);
 }
 
@@ -1163,64 +1346,11 @@ body.resizing-panels { user-select: none; }
     background: var(--accent);
 }
 
-.chat-budget-pill {
-    appearance: none;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 3px;
-    padding: 4px 12px;
-    border-radius: 999px;
-    border: 1px solid rgba(245, 158, 11, 0.18);
-    background: rgba(13, 11, 15, 0.55);
-    backdrop-filter: blur(8px);
-    cursor: pointer;
-    min-width: 100px;
-    font: inherit;
-    transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
-}
-
-.chat-budget-pill:hover {
-    border-color: rgba(245, 158, 11, 0.34);
-    background: rgba(245, 158, 11, 0.08);
-    transform: scale(1.02);
-}
-
-.chat-budget-pill:active {
-    transform: scale(0.98);
-}
-
-.chat-budget-text {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--amber);
-    white-space: nowrap;
-    letter-spacing: 0.02em;
-}
-
-.chat-budget-bar {
-    width: 100%;
-    height: 2px;
-    border-radius: 1px;
-    background: rgba(245, 158, 11, 0.12);
-    overflow: hidden;
-}
-
-.chat-budget-bar-fill {
-    height: 100%;
-    border-radius: 1px;
-    background: var(--amber);
-    transition: width 0.4s ease;
-    width: 0;
-}
-
 .status-badge {
     padding: 4px 10px;
     font-size: 11px;
     font-weight: 500;
-    background: rgba(26, 21, 32, 0.78);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    background: var(--bg-elevated);
 }
 .status-badge.online { color: var(--green); }
 .status-badge.starting { color: var(--amber); }
@@ -1268,8 +1398,7 @@ body.resizing-panels { user-select: none; }
 .onboarding-overlay-backdrop {
     position: absolute;
     inset: 0;
-    background: rgba(6, 7, 10, 0.78);
-    backdrop-filter: blur(10px);
+    background: rgba(0, 0, 0, 0.72);
 }
 
 .onboarding-frame {
@@ -1289,7 +1418,7 @@ body.resizing-panels { user-select: none; }
     padding: 24px;
     border: 1px solid var(--divider);
     border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
+    background: var(--bg-elevated);
     color: var(--text-primary);
     box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
 }
@@ -1365,11 +1494,9 @@ body.resizing-panels { user-select: none; }
     justify-content: center;
     border-radius: 50%;
     color: var(--accent-light);
-    background: rgba(26, 21, 32, 0.72);
-    border: 1px solid rgba(201, 53, 69, 0.42);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    background: var(--bg-elevated);
+    border: 1px solid var(--accent-25);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
     cursor: pointer;
     opacity: 0;
     transform: translateY(8px) scale(0.9);
@@ -1384,12 +1511,12 @@ body.resizing-panels { user-select: none; }
 .chat-scroll-bottom-btn:hover {
     color: #fff;
     background: rgba(201, 53, 69, 0.16);
-    border-color: rgba(232, 93, 111, 0.6);
+    border-color: rgba(var(--accent-hover-rgb), 0.6);
     transform: translateY(0) scale(1.05);
 }
 .chat-scroll-bottom-btn:focus-visible {
     outline: none;
-    border-color: rgba(232, 93, 111, 0.6);
+    border-color: rgba(var(--accent-hover-rgb), 0.6);
     box-shadow: 0 0 0 3px rgba(201, 53, 69, 0.18);
 }
 .chat-scroll-bottom-btn svg { display: block; }
@@ -1472,7 +1599,7 @@ body.resizing-panels { user-select: none; }
 
 button.chat-file:hover,
 .chat-file:hover {
-    border-color: rgba(232, 93, 111, 0.4);
+    border-color: rgba(var(--accent-hover-rgb), 0.4);
 }
 
 .chat-file-empty {
@@ -1496,10 +1623,8 @@ button.chat-file:hover,
     justify-content: center;
     border-radius: 50%;
     color: var(--accent-light);
-    background: rgba(26, 21, 32, 0.72);
-    border: 1px solid rgba(201, 53, 69, 0.42);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+    background: var(--bg-elevated);
+    border: 1px solid var(--accent-25);
     font-size: 15px;
     line-height: 1;
     cursor: pointer;
@@ -1509,13 +1634,13 @@ button.chat-file:hover,
 .chat-file-download:hover {
     color: #fff;
     background: rgba(201, 53, 69, 0.16);
-    border-color: rgba(232, 93, 111, 0.6);
+    border-color: rgba(var(--accent-hover-rgb), 0.6);
     transform: scale(1.05);
 }
 
 .chat-file-download:focus-visible {
     outline: none;
-    border-color: rgba(232, 93, 111, 0.6);
+    border-color: rgba(var(--accent-hover-rgb), 0.6);
     box-shadow: 0 0 0 3px rgba(201, 53, 69, 0.18);
 }
 
@@ -1701,9 +1826,7 @@ button.chat-file:hover,
     padding: 0;
     border-radius: var(--radius-lg);
     border: 1px solid var(--accent-dim);
-    background: var(--accent-04);
-    backdrop-filter: blur(12px);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 200, 210, 0.03);
+    background: var(--bg-elevated);
     overflow: hidden;
     container-type: inline-size;
     container-name: livecard;
@@ -2038,7 +2161,7 @@ button.chat-file:hover,
 }
 
 .chat-live-line.expandable[data-expanded="1"] {
-    background: rgba(59, 130, 246, 0.08);
+    background: var(--blue-08);
 }
 
 .chat-live-line-toggle {
@@ -2244,10 +2367,8 @@ button.chat-file:hover,
         justify-content: center;
         border: 1px solid var(--surface-border);
         border-radius: var(--radius-md);
-        background: rgba(13, 11, 15, 0.76);
+        background: var(--bg-elevated);
         color: var(--text-primary);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
     }
 
     .nav-drawer-backdrop {
@@ -2255,9 +2376,7 @@ button.chat-file:hover,
         inset: 0;
         z-index: 68;
         display: block;
-        background: rgba(0, 0, 0, 0.48);
-        backdrop-filter: blur(2px);
-        -webkit-backdrop-filter: blur(2px);
+        background: rgba(0, 0, 0, 0.56);
     }
 
     .nav-drawer-backdrop[hidden] {
@@ -2274,9 +2393,7 @@ button.chat-file:hover,
         transition: transform 0.18s ease;
         box-shadow: 24px 0 60px rgba(0, 0, 0, 0.36);
         padding-top: calc(64px + env(safe-area-inset-top, 0px));
-        background:
-            linear-gradient(180deg, rgba(13, 11, 15, 0.94), rgba(13, 11, 15, 0.86)),
-            radial-gradient(circle at 8% 0%, rgba(201, 53, 69, 0.10), transparent 260px);
+        background: var(--bg-sidebar);
     }
 
     #primary-sidebar.open {
@@ -2291,7 +2408,6 @@ button.chat-file:hover,
         font-size: 9px;
     }
 
-    #nav-version,
     .nav-spacer {
         display: none;
     }
@@ -2303,7 +2419,7 @@ button.chat-file:hover,
 
     .chat-page-header {
         /* Keep the desktop overlay header (position:absolute + fade-to-transparent
-           gradient + blur): the transcript scrolls under it. Only restack the grid
+           gradient): the transcript scrolls under it. Only restack the grid
            for narrow widths — never switch to position:static / a flat background,
            which is what removed the gradient and made mobile look heavy. */
         row-gap: 6px;
@@ -2336,18 +2452,8 @@ button.chat-file:hover,
         gap: 6px;
     }
 
-    .chat-page-header .chat-budget-pill,
     .chat-page-header .status-badge {
         order: 0;
-    }
-
-    .chat-budget-pill {
-        min-width: 0;
-        padding: 3px 10px;
-    }
-
-    .chat-budget-text {
-        font-size: 10px;
     }
 
     .page-header,
@@ -2378,10 +2484,10 @@ button.chat-file:hover,
     pointer-events: none;
     background: linear-gradient(
         0deg,
-        rgba(13, 11, 15, 0.82) 0%,
-        rgba(13, 11, 15, 0.58) 48%,
-        rgba(13, 11, 15, 0.22) 78%,
-        rgba(13, 11, 15, 0.00) 100%
+        rgba(var(--bg-primary-rgb), 0.82) 0%,
+        rgba(var(--bg-primary-rgb), 0.58) 48%,
+        rgba(var(--bg-primary-rgb), 0.22) 78%,
+        rgba(var(--bg-primary-rgb), 0.00) 100%
     );
 }
 
@@ -2415,17 +2521,14 @@ button.chat-file:hover,
        earlier flex-end + 999px pushed them past the curve; centering fixes that). */
     border-radius: 999px;
     border: 1px solid rgba(255, 255, 255, 0.10);
-    background: rgba(26, 21, 32, 0.68);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    background: var(--bg-elevated);
     transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
 }
 
 .chat-text-row:focus-within {
     border-color: var(--focus-accent-border);
-    background: rgba(26, 21, 32, 0.86);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 0 0 3px var(--accent-10);
+    background: var(--bg-elevated);
+    box-shadow: 0 0 0 3px var(--accent-10);
 }
 
 /* "Chat freed" cue (P3): a brief fuchsia brighten when a task moves out to a
@@ -2449,7 +2552,7 @@ button.chat-file:hover,
 #chat-input-area.drag-active .chat-input-wrap,
 .chat-input-area.drag-active .chat-input-wrap {
     border-radius: 24px;
-    box-shadow: 0 0 0 1px rgba(232, 93, 111, 0.45), 0 0 0 4px var(--accent-10);
+    box-shadow: 0 0 0 1px rgba(var(--accent-hover-rgb), 0.45), 0 0 0 4px var(--accent-10);
 }
 
 /* Attach button: a flow item at the left of the text row (no absolute float). */
@@ -2503,10 +2606,8 @@ button.chat-file:hover,
     align-items: center;
     gap: 6px;
     padding: 4px 8px 4px 6px;
-    background: rgba(26, 21, 32, 0.78);
-    border: 1px solid rgba(201, 53, 69, 0.35);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    background: var(--bg-elevated);
+    border: 1px solid var(--accent-25);
     border-radius: var(--radius-sm);
     font-size: 12px;
     color: rgba(226, 232, 240, 0.85);
@@ -2573,10 +2674,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding: 0 12px;
     border: 1px solid rgba(226, 232, 240, 0.12);
     border-radius: 999px;
-    background: rgba(26, 21, 32, 0.38);
-    color: rgba(226, 232, 240, 0.68);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: var(--surface-control);
+    color: var(--text-secondary);
     box-shadow: var(--composer-control-shadow);
     font-size: var(--composer-control-font-size);
     font-weight: 700;
@@ -2588,13 +2687,13 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 .chat-swarm:hover {
     color: var(--accent);
-    border-color: rgba(232, 93, 111, 0.40);
+    border-color: rgba(var(--accent-hover-rgb), 0.40);
     background: rgba(38, 25, 34, 0.58);
 }
 .chat-swarm[data-armed="true"] {
     color: var(--accent);
-    border-color: rgba(232, 93, 111, 0.44);
-    background: rgba(232, 93, 111, 0.14);
+    border-color: rgba(var(--accent-hover-rgb), 0.44);
+    background: rgba(var(--accent-hover-rgb), 0.14);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 0 3px var(--accent-10);
 }
 
@@ -2606,9 +2705,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     border: 1px solid rgba(226, 232, 240, 0.12);
     border-radius: 999px;
     overflow: hidden;
-    background: rgba(26, 21, 32, 0.38);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: var(--surface-control);
     box-shadow: var(--composer-control-shadow);
     font-size: var(--composer-control-font-size);
     font-weight: 700;
@@ -2633,7 +2730,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 /* Active segment: Max glows accent (full context); Low glows amber (reduced). */
 .chat-context-mode[data-context-mode="max"] .chat-seg[data-mode="max"] {
-    background: rgba(232, 93, 111, 0.16);
+    background: rgba(var(--accent-hover-rgb), 0.16);
     color: var(--accent);
 }
 .chat-context-mode[data-context-mode="low"] .chat-seg[data-mode="low"] {
@@ -2658,8 +2755,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .chat-send-inline {
-    border: 1px solid rgba(232, 93, 111, 0.28);
-    background: rgba(232, 93, 111, 0.08);
+    border: 1px solid rgba(var(--accent-hover-rgb), 0.28);
+    background: rgba(var(--accent-hover-rgb), 0.08);
     color: var(--accent);
     font-size: var(--composer-control-font-size);
     font-weight: 700;
@@ -2669,8 +2766,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding: 0 13px;
     height: 100%;
     border-radius: 999px;
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
     box-shadow: var(--composer-control-shadow);
     transition: color 0.18s, background 0.18s, border-color 0.18s, opacity 0.18s;
     opacity: 0.88;
@@ -2680,11 +2775,78 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .chat-send-inline:hover {
     opacity: 1;
     background: var(--accent-18);
-    border-color: rgba(232, 93, 111, 0.48);
+    border-color: rgba(var(--accent-hover-rgb), 0.48);
 }
 .chat-send-inline:active {
     background: var(--accent-18);
     opacity: 1;
+}
+
+/* ===== [shared: composer parts] =====
+   The ordered chip/text parts area rendered INSIDE a composer field. One DOM
+   contract (web/modules/composer_parts.js) serves the chat composer and the
+   Changes / Files bottom docks, so a context chip looks identical everywhere.
+   Chips are mono because they name real paths and line ranges. */
+.composer-parts {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.composer-part-text {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-width: 100%;
+}
+
+.composer-part-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+    padding: 2px 6px;
+    border: 1px solid var(--accent-25);
+    border-radius: var(--radius-6);
+    background: var(--accent-10);
+    color: var(--accent-chip-text);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.composer-part-chip-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.composer-part-remove {
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1;
+    padding: 0 1px;
+    cursor: pointer;
+    opacity: 0.65;
+}
+
+.composer-part-remove:hover {
+    opacity: 1;
+}
+
+/* The live input keeps shrinking rather than pushing chips out of the field. */
+.composer-parts-host > textarea,
+.composer-parts-host > input {
+    flex: 1 1 60px;
+    min-width: 0;
 }
 
 /* Shared UI components. */
@@ -2746,12 +2908,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .stat-card {
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+    background: var(--bg-elevated);
     border-radius: var(--radius);
     padding: 16px 20px;
-    border: 1px solid var(--accent-08);
-    backdrop-filter: blur(14px);
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+    border: 1px solid var(--surface-border);
     transition: border-color 0.3s;
 }
 .stat-card:hover {
@@ -2822,7 +2982,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 .btn-primary:hover {
     background: var(--accent-25);
-    border-color: rgba(232, 93, 111, 0.35);
+    border-color: rgba(var(--accent-hover-rgb), 0.35);
 }
 .btn-secondary {
     background: rgba(255, 255, 255, 0.04);
@@ -2832,7 +2992,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .btn-secondary:hover {
     background: rgba(255, 255, 255, 0.07);
     color: var(--text-primary);
-    border-color: rgba(232, 93, 111, 0.28);
+    border-color: rgba(var(--accent-hover-rgb), 0.28);
 }
 .btn-ghost {
     background: transparent;
@@ -2902,7 +3062,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--divider);
-    background: var(--bg-secondary);
+    background: var(--bg-elevated);
     color: var(--text-primary);
     font-size: 14px;
     font-family: inherit;
@@ -3250,13 +3410,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .evo-runtime-card,
 .evo-chart-wrap {
-    background:
-        linear-gradient(180deg, var(--accent-05), rgba(255, 255, 255, 0.02)),
-        rgba(255, 255, 255, 0.02);
-    border: 1px solid var(--accent-12);
+    background: var(--bg-elevated);
+    border: 1px solid var(--surface-border);
     border-radius: var(--radius-lg);
-    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.18);
-    backdrop-filter: blur(14px);
 }
 
 .evo-runtime-card {
@@ -3368,7 +3524,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .costs-scroll { overflow-y: auto; flex: 1; padding: 16px 20px; }
 .costs-budget-card {
-    backdrop-filter: blur(12px);
     padding: 20px 24px;
     margin-bottom: 20px;
 }
@@ -3413,7 +3568,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .updates-card {
-    backdrop-filter: blur(12px);
     padding: 18px;
 }
 
@@ -3721,6 +3875,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .evo-empty-error {
     color: var(--red);
 }
+
+/* ===== [stream D: dashboard, skills, settings, widgets] ===== */
 
 /* Skills page. */
 #page-skills,
@@ -4133,7 +4289,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .skills-card-menu-trigger:hover {
-    border-color: rgba(232, 93, 111, 0.30);
+    border-color: rgba(var(--accent-hover-rgb), 0.30);
     color: var(--text-primary);
 }
 
@@ -4247,11 +4403,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding: 11px 14px;
     border-radius: var(--radius);
     border: 1px solid rgba(255, 255, 255, 0.10);
-    background: rgba(18, 20, 26, 0.94);
+    background: var(--bg-elevated);
     color: var(--text-primary);
     box-shadow: 0 18px 42px rgba(0, 0, 0, 0.34);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
     font-size: 13px;
     line-height: 1.45;
     pointer-events: auto;
@@ -4413,8 +4567,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-filter-toggle input[type="checkbox"]:checked + .marketplace-filter-track {
-    background: rgba(232, 93, 111, 0.55);
-    border-color: rgba(232, 93, 111, 0.65);
+    background: rgba(var(--accent-hover-rgb), 0.55);
+    border-color: rgba(var(--accent-hover-rgb), 0.65);
 }
 
 .marketplace-filter-toggle input[type="checkbox"]:checked + .marketplace-filter-track::after {
@@ -4423,7 +4577,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-filter-toggle input[type="checkbox"]:focus-visible + .marketplace-filter-track {
-    outline: 2px solid rgba(232, 93, 111, 0.45);
+    outline: 2px solid rgba(var(--accent-hover-rgb), 0.45);
     outline-offset: 2px;
 }
 
@@ -4638,7 +4792,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     left: 0;
     top: 0;
     padding: 14px;
-    backdrop-filter: blur(12px);
 }
 
 .widgets-card.dragging {
@@ -4646,7 +4799,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .widgets-card.drag-over {
-    border-color: rgba(232, 93, 111, 0.48);
+    border-color: rgba(var(--accent-hover-rgb), 0.48);
     box-shadow: 0 0 0 3px var(--accent-10);
 }
 
@@ -4682,10 +4835,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     height: 28px;
     border-radius: var(--radius-xs);
     border: 1px solid rgba(226, 232, 240, 0.14);
-    background: rgba(26, 21, 32, 0.48);
-    color: rgba(226, 232, 240, 0.54);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
+    background: var(--surface-control);
+    color: var(--text-secondary);
     cursor: grab;
     font: inherit;
     font-size: 14px;
@@ -4693,7 +4844,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .widgets-card-drag:hover {
-    border-color: rgba(232, 93, 111, 0.44);
+    border-color: rgba(var(--accent-hover-rgb), 0.44);
     color: var(--text-primary);
 }
 
@@ -4715,7 +4866,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     min-height: 320px;
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: var(--radius);
-    background: rgba(13, 11, 15, 0.88);
+    background: rgba(var(--bg-primary-rgb), 0.88);
 }
 
 .widget-form,
@@ -4792,7 +4943,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     min-width: 0;
     border: 1px solid rgba(255, 255, 255, 0.09);
     border-radius: var(--radius-sm);
-    background: rgba(13, 11, 15, 0.74);
+    background: rgba(var(--bg-primary-rgb), 0.74);
     color: var(--text-primary);
     padding: 8px 10px;
     font: inherit;
@@ -4948,8 +5099,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: flex;
     flex-direction: column;
     gap: 7px;
-    background: rgba(232, 93, 111, 0.12);
-    border: 1px solid rgba(232, 93, 111, 0.25);
+    background: rgba(var(--accent-hover-rgb), 0.12);
+    border: 1px solid rgba(var(--accent-hover-rgb), 0.25);
     border-radius: 6px;
     padding: 6px 8px;
     margin: 4px 0;
@@ -4972,7 +5123,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     max-width: 112px;
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 5px;
-    background: rgba(13, 11, 15, 0.82);
+    background: rgba(var(--bg-primary-rgb), 0.82);
     color: var(--text-primary);
     font: inherit;
     padding: 3px 5px;
@@ -5050,8 +5201,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .widget-tab-btn.active {
-    border-color: rgba(232, 93, 111, 0.4);
-    background: rgba(232, 93, 111, 0.12);
+    border-color: rgba(var(--accent-hover-rgb), 0.4);
+    background: rgba(var(--accent-hover-rgb), 0.12);
     color: var(--text-primary);
 }
 
@@ -5299,6 +5450,16 @@ textarea.chat-input {
     }
 
 }
+
+/* ===== [stream B: changes screen + task inspector] =====
+   Reserved region. The Changes screen (`#page-changes`), its diff renderers and
+   `web/modules/task_inspector.js` own everything added below this banner; the
+   inspector width is the `--inspector-width` token and the panel registers
+   against the app-level right-panel state machine (kinds project | inspector,
+   mutually exclusive). Keep additions inside this region so the stream merge
+   stays a append-only CSS diff. */
+
+/* ===== [stream 0: multi-project navigation + right panel state machine] ===== */
 
 /* ===========================================================================
    Multi-project sidebar + right thread panel (v6.32.0)
@@ -5623,11 +5784,7 @@ textarea.chat-input {
     width: var(--project-panel-width);
     z-index: 58;
     border-left: 1px solid var(--divider);
-    background:
-        linear-gradient(180deg, rgba(13, 11, 15, 0.74), rgba(13, 11, 15, 0.64)),
-        radial-gradient(circle at 15% 0%, var(--project-12), transparent 300px);
-    backdrop-filter: blur(22px) saturate(130%);
-    -webkit-backdrop-filter: blur(22px) saturate(130%);
+    background: var(--bg-panel);
     box-shadow: -24px 0 64px rgba(0, 0, 0, 0.34);
     transform: translateX(18px);
     opacity: 0;
@@ -5701,9 +5858,7 @@ textarea.chat-input {
     left: var(--sidebar-width);
     z-index: 55;
     cursor: default;
-    background: rgba(0, 0, 0, 0.18);
-    backdrop-filter: blur(1.5px);
-    -webkit-backdrop-filter: blur(1.5px);
+    background: rgba(0, 0, 0, 0.34);
     opacity: 0;
     pointer-events: none;
     transition: opacity 180ms ease;
@@ -5763,9 +5918,9 @@ textarea.chat-input {
 }
 
 /* Project threads hide the GLOBAL controls (evolution/consciousness/restart/
-   panic/budget belong to the one agent, not to a project thread). */
-.chat-instance-panel .chat-header-actions,
-.chat-instance-panel .chat-budget-pill {
+   panic belong to the one agent, not to a project thread; the budget meter
+   lives once in the sidebar). */
+.chat-instance-panel .chat-header-actions {
     display: none;
 }
 

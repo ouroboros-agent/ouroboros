@@ -202,7 +202,9 @@ def test_server_navigation_and_chat_static_contracts():
     assert "result?.status !== 'sent'" in chat_source
     assert "data-attachment-remove" in chat_source
     assert "Promise.allSettled" in chat_source
-    assert '>Loading…</span>' in chat_source
+    # The budget meter moved to the sidebar bottom, so its pre-first-read label
+    # is pinned in the shell markup now (chat.js no longer renders a pill).
+    assert '>Loading…</span>' in _read("web/index.html")
     assert "syncHeaderControlState({ accounting: { available: false } });" in chat_source
     assert "budget_text: 'Connecting...'" not in chat_source
     assert "send(msg, options = {})" in _read("web/modules/ws.js")
@@ -216,6 +218,13 @@ def test_server_navigation_and_chat_static_contracts():
     assert "currentSettings?.[field.settingKey]" in settings
     assert "window.addEventListener('ouro:settings-updated'" in settings
     assert "source: 'settings'" in settings
+    # Read-only consumers (e.g. the composer model chip) read the already-fetched
+    # snapshot through one getter and refresh on the event, which now fires after
+    # BOTH load and save — no second /api/settings fetch, no new /api/state field.
+    assert "export function getSettingsSnapshot()" in settings
+    assert "lastSettingsSnapshot = data;" in settings
+    assert "reason: 'settings loaded'" in settings
+    assert "reason: 'settings saved'" in settings
     assert "Budget values must be at least 0.01." in costs
     assert "COST_BUDGET_INPUTS" in costs
     assert "s?._meta?.setup_contract?.budgetFields" in costs

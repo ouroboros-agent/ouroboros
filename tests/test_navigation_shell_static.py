@@ -113,7 +113,11 @@ def test_project_panel_composer_and_welcome_contracts():
     assert ".chat-text-row {\n    order: 2;" in css
     assert "chat-header-more" in chat_js
     assert "chat-header-menu" in css
-    assert "backdrop-filter: blur(22px)" in css
+    # Flat redesign: the project panel is a solid rail surface, not a glass pane.
+    # The whole main SPA is blur-free (the standalone onboarding wizard keeps its
+    # own formulas in web/onboarding.css).
+    assert "backdrop-filter" not in css.split("*/", 1)[1]
+    assert "background: var(--bg-panel);" in css
     assert 'id="project-panel-backdrop" class="project-panel-backdrop"' in _read("web/index.html")
     assert ".project-panel-backdrop" in css
     assert "transition: transform 180ms ease, opacity 180ms ease;" in css
@@ -128,14 +132,106 @@ def test_project_panel_composer_and_welcome_contracts():
 
 def test_chat_header_controls_reorg_and_more_autodismiss():
     chat_js = _read("web/modules/chat.js")
-    # Restart + Panic are promoted to always-visible header buttons...
-    assert 'class="chat-header-btn" type="button" data-chat-command="restart"' in chat_js
+    # Evolve / Review / Restart are ghost buttons and Panic is the one danger
+    # button; all four are always visible in the header.
+    for command in ("evolve", "review", "restart"):
+        assert f'class="chat-header-btn" type="button" data-chat-command="{command}"' in chat_js
     assert 'class="chat-header-btn danger" type="button" data-chat-command="panic"' in chat_js
-    # ...and Consciousness / Evolve / Review move into the More overflow menu.
+    # More is a slim overflow holding ONLY Consciousness now.
     menu = chat_js.split('class="chat-header-menu"', 1)[1].split("</details>", 1)[0]
     assert 'data-chat-command="bg"' in menu
-    assert 'data-chat-command="evolve"' in menu
-    assert 'data-chat-command="review"' in menu
+    assert menu.count("chat-header-menu-item") == 1
+    assert 'data-chat-command="evolve"' not in menu
+    assert 'data-chat-command="review"' not in menu
     # The More <details> auto-collapses on an outside click or Escape (never sticks).
     assert "details.chat-header-more[open]" in chat_js
     assert "event.key === 'Escape'" in chat_js
+    # The budget meter left the chat header for the sidebar; chat.js keeps only
+    # the formatting projection, not a pill.
+    assert "chat-budget" not in chat_js
+    assert "headerBudgetPresentation" in chat_js
+
+
+def test_sidebar_brand_sections_and_budget_block():
+    html = _read("web/index.html")
+    css = _read("web/style.css")
+    app_js = _read("web/app.js")
+    # Brand row: 26px app mark, product name, version + liveness sub line.
+    assert 'class="nav-brand" id="nav-brand"' in html
+    assert 'src="/static/favicon.png"' in html
+    assert 'id="nav-version"' in html
+    assert 'class="nav-status-dot"' in html
+    assert "border-radius: var(--radius-7);" in css
+    # Sections: Main Chat, Projects (unchanged mechanics), Workspace, System.
+    assert '<div class="nav-section-label">Workspace</div>' in html
+    assert '<div class="nav-section-label">System</div>' in html
+    assert "Utilities" not in html
+    assert 'data-nav-page="changes"' in html
+    assert 'id="nav-projects-list" class="nav-projects-list"' in html
+    assert "changes: icon(" in _read("web/modules/page_icons.js")
+    # Budget block pinned at the sidebar bottom; the fill is a CSS custom
+    # property (the accepted dynamic-value exception), never a style.width write.
+    assert 'class="nav-budget" id="nav-budget"' in html
+    assert 'id="nav-budget-amount"' in html
+    assert 'id="nav-budget-bar"' in html
+    assert "width: var(--budget-fill, 0%);" in css
+    assert "navBudgetBar.style.setProperty('--budget-fill'" in app_js
+    assert ".style.width =" not in app_js
+    assert ".style.width=" not in app_js
+
+
+def test_single_api_state_poll_owner():
+    app_js = _read("web/app.js")
+    chat_js = _read("web/modules/chat.js")
+    # One app-owned reader + subscriber list + self-scheduling timer.
+    assert "async function refreshState()" in app_js
+    assert "function subscribeState(handler)" in app_js
+    assert "function scheduleStatePoll()" in app_js
+    assert "if (document.hidden) return;" in app_js
+    assert "state.activePage === 'chat' ? 3000 : 20000" in app_js
+    # The two old timers are gone.
+    assert "setInterval(refreshProjectsNav" not in app_js
+    assert "setInterval(refreshHeaderControlState" not in chat_js
+    assert "refreshHeaderControlState" not in chat_js
+    # Chat consumes the shared snapshot instead of polling.
+    assert "subscribeState(syncHeaderControlState)" in chat_js
+    # Preserved refresh entry points.
+    assert "refreshProjectsNav().finally(() => ws.connect());" in app_js
+    assert "if (cid) state.projectChatIds.add(cid);" in app_js
+
+
+def test_right_panel_state_machine_and_stream_anchors():
+    app_js = _read("web/app.js")
+    css = _read("web/style.css")
+    assert "panelKind" in app_js
+    assert "function registerRightPanel(kind, handlers)" in app_js
+    assert "async function openRightPanel(kind, opts = {})" in app_js
+    assert "function closeRightPanel({ sync = true } = {})" in app_js
+    assert "navState.panelKind = 'project';" in app_js
+    assert "--inspector-width: 320px;" in css
+    # Append-only ownership anchors for the parallel streams.
+    assert "/* [anchor:phase-B] right-panel registrations */" in app_js
+    assert "/* [anchor:phase-C] global capture hotkey */" in app_js
+    assert "[stream A: chat" in css
+    assert "[stream B: changes screen + task inspector]" in css
+    assert "[stream C: files" in css
+    assert "[stream D: dashboard, skills, settings, widgets]" in css
+    # Empty Changes container registered by the shell.
+    assert "changesPage.id = 'page-changes';" in app_js
+
+
+def test_chat_controller_is_kept_and_exposes_parts_adapters():
+    app_js = _read("web/app.js")
+    chat_js = _read("web/modules/chat.js")
+    assert "const chatController = initChat(ctx);" in app_js
+    assert "export function getChatController()" in app_js
+    assert "function setDraftParts(parts)" in chat_js
+    assert "function sendParts(parts" in chat_js
+    # The adapters ride the EXISTING textarea + sendMessage authority.
+    assert "const text = serializeParts(parts);" in chat_js
+    assert "input.value = text;" in chat_js
+
+
+def test_matrix_rain_is_gone():
+    for rel in ("web/app.js", "web/modules/utils.js", "web/style.css", "web/index.html"):
+        assert "matrix" not in _read(rel).lower(), rel

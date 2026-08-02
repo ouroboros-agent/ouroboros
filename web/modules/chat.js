@@ -15,6 +15,7 @@ import {
     taskTerminalPhase,
 } from './log_events.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { serializeParts } from './composer_parts.js';
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -381,9 +382,13 @@ export function initChat(ctx) {
 
 export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
+    subscribeState = null, refreshState = null,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
     asPanel = false, title = 'Chat',
 }) {
+    // The app owns the ONE /api/state poll; this instance only subscribes and,
+    // after an owner-control write, asks for a forced read.
+    const requestStateRefresh = typeof refreshState === 'function' ? refreshState : () => {};
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
     const isMain = chatId === 1;
@@ -396,8 +401,9 @@ export function createChatInstance({
     // A project panel reuses the lean `.project-panel-bar` (title + close) from
     // index.html, so it renders a minimal status-only header — NOT the overlay
     // page header (that would duplicate the title and drag in the GLOBAL
-    // Evolve/Restart/Panic/budget chrome, which belongs to the one agent, not a
-    // single project thread). The main chat keeps the full overlay header.
+    // Evolve/Review/Restart/Panic chrome, which belongs to the one agent, not a
+    // single project thread). The main chat keeps the full overlay header; the
+    // budget meter is not here at all — it lives once in the sidebar.
     const headerHtml = asPanel
         ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting...</span></div>`
         : renderPageHeader({
@@ -407,23 +413,17 @@ export function createChatInstance({
             className: 'chat-page-header',
             actionsHtml: `
                 <div class="chat-header-actions" id="chat-header-actions">
+                    <button class="chat-header-btn" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
+                    <button class="chat-header-btn" type="button" data-chat-command="review" title="Run review now">Review</button>
                     <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
                     <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
                     <details class="chat-header-more">
                         <summary class="chat-header-btn" title="More agent controls">More</summary>
                         <div class="chat-header-menu">
                             <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now">Review</button>
                         </div>
                     </details>
                 </div>
-                <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
-                    <span class="chat-budget-text" id="chat-budget-text">Loading…</span>
-                    <div class="chat-budget-bar">
-                        <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
-                    </div>
-                </button>
                 <span id="chat-status" class="status-badge offline">Connecting...</span>
             `,
         });
@@ -478,7 +478,6 @@ export function createChatInstance({
     const statusBadge = byId('status');
     const headerActions = byId('header-actions');
     const pageHeader = page.querySelector('.chat-page-header');
-    const budgetPill = byId('budget-pill');
     const attachBtn = byId('attach');
     const fileInput = byId('file-input');
     const attachmentPreview = byId('attachment-preview');
@@ -878,36 +877,16 @@ export function createChatInstance({
                 if (data?.bg_consciousness_state?.detail) button.title = data.bg_consciousness_state.detail;
             }
         });
-        // Evolve/Consciousness now live inside the More menu; surface a small dot
-        // on the More summary so an active mode stays visible without opening it.
+        // Consciousness is the only control inside the More menu; surface a small
+        // dot on the More summary so it stays visible without opening the menu.
         const moreSummary = headerActions?.querySelector('.chat-header-more > summary');
         if (moreSummary) {
-            const anyActive = !!data?.evolution_enabled || !!data?.bg_consciousness_enabled;
-            moreSummary.classList.toggle('has-active', anyActive);
+            moreSummary.classList.toggle('has-active', !!data?.bg_consciousness_enabled);
         }
         const ctxBtn = byId('context-mode');
         if (ctxBtn && typeof data?.context_mode === 'string') {
             ctxBtn.dataset.contextMode = data.context_mode === 'low' ? 'low' : 'max';
             ctxBtn.dataset.contextModeAutoLow = data.context_mode_auto_low ? 'true' : 'false';
-        }
-        const budget = headerBudgetPresentation(data);
-        const budgetText = byId('budget-text');
-        const budgetFill = byId('budget-bar-fill');
-        if (budgetText) budgetText.textContent = budget.label;
-        if (budgetFill) budgetFill.style.width = `${budget.fillPct}%`;
-    }
-
-    async function refreshHeaderControlState(force = false) {
-        if (!force && state.activePage !== 'chat') return;
-        try {
-            const resp = await apiFetch('/api/state', { cache: 'no-store' });
-            if (!resp.ok) {
-                syncHeaderControlState({ accounting: { available: false } });
-                return;
-            }
-            syncHeaderControlState(await resp.json());
-        } catch {
-            syncHeaderControlState({ accounting: { available: false } });
         }
     }
 
@@ -3344,7 +3323,7 @@ export function createChatInstance({
             /* leave the current value; /api/state refresh will resync */
         } finally {
             contextModeBtn.dataset.disabled = 'false';
-            refreshHeaderControlState(true);
+            requestStateRefresh();
         }
     });
 
@@ -3524,11 +3503,6 @@ export function createChatInstance({
         });
     }
 
-    budgetPill?.addEventListener('click', () => {
-        if (typeof openDashboardTab === 'function') openDashboardTab('costs');
-        else if (typeof openSettingsTab === 'function') openSettingsTab('costs');
-    });
-
     if (asPanel) {
         // The panel has no global controls/budget to poll; seed the status from
         // the live socket so a late-created panel never gets stuck on
@@ -3536,8 +3510,9 @@ export function createChatInstance({
         // future reconnects still update it via the shared `open` handler).
         if (ws.isConnected?.()) setStatus('online', 'Online');
     } else {
-        refreshHeaderControlState(true);
-        setInterval(refreshHeaderControlState, 3000);
+        // One app-owned /api/state poll feeds these controls (no chat-local timer).
+        if (typeof subscribeState === 'function') subscribeState(syncHeaderControlState);
+        requestStateRefresh();
     }
 
     const typingEl = document.createElement('div');
@@ -3889,7 +3864,7 @@ export function createChatInstance({
 
     ws.on('open', () => {
         setStatus('online', 'Online');
-        refreshHeaderControlState(true);
+        requestStateRefresh();
         const reconnectBanner =
             pendingReconnectBannerText
             || (wsHasConnectedOnce ? '♻️ Reconnected' : '');
@@ -3921,6 +3896,24 @@ export function createChatInstance({
         syncHeaderControlState({ accounting: { available: false } });
     });
 
+    // Ordered-parts entry points for other screens (Changes / Files docks and the
+    // ⌘L capture path). They go through the EXISTING textarea + sendMessage
+    // authority: the serialized marker string is the message identity everywhere
+    // (WS frame, history, dedup, recall), so nothing about transport changes.
+    function setDraftParts(parts) {
+        const text = serializeParts(parts);
+        input.value = text;
+        resizeChatInput({ preserveStickiness: false });
+        try { input.focus(); } catch {}
+        return text;
+    }
+
+    function sendParts(parts, { planMode = false } = {}) {
+        const text = setDraftParts(parts);
+        if (!text.trim()) return Promise.resolve(false);
+        return Promise.resolve(sendMessage(planMode || swarmArmed())).then(() => true);
+    }
+
     return {
         page,
         chatId,
@@ -3930,6 +3923,8 @@ export function createChatInstance({
         restoreScrollPosition,
         refreshHistory,
         cancelHistoryPaint,
+        setDraftParts,
+        sendParts,
         destroy() {
             cancelHistoryPaint();
             try { page.remove(); } catch {}

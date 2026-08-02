@@ -2,8 +2,8 @@
 
 import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
-import { loadVersion, initMatrixRain } from './modules/utils.js';
-import { initChat, createChatInstance } from './modules/chat.js';
+import { loadVersion } from './modules/utils.js';
+import { initChat, createChatInstance, headerBudgetPresentation } from './modules/chat.js';
 import { initFiles } from './modules/files.js';
 import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
@@ -47,7 +47,13 @@ const navState = {
     activeProjectId: null,
     projectsExpanded: true,
     mobileDrawerOpen: false,
+    // Right panel = ONE slot with mutually exclusive kinds. 'project' is the
+    // existing project thread; other kinds (e.g. 'inspector') register their
+    // mount/unmount against the state machine below.
+    panelKind: null,
 };
+// kind -> { mount(opts) => boolean|Promise<boolean>, unmount() }
+const rightPanelRegistry = {};
 const primarySidebar = document.getElementById('primary-sidebar');
 const navDrawerBackdrop = document.getElementById('nav-drawer-backdrop');
 const projectPanelBackdrop = document.getElementById('project-panel-backdrop');
@@ -58,6 +64,11 @@ const navProjects = document.getElementById('nav-projects');
 const navProjectsToggle = document.getElementById('nav-projects-toggle');
 const navProjectsCount = document.getElementById('nav-projects-count');
 const navProjectsList = document.getElementById('nav-projects-list');
+const navBrand = document.getElementById('nav-brand');
+const navBrandStatus = document.getElementById('nav-brand-status');
+const navBudget = document.getElementById('nav-budget');
+const navBudgetAmount = document.getElementById('nav-budget-amount');
+const navBudgetBar = document.getElementById('nav-budget-bar');
 const projectInstances = new Map();
 const projectPaintRequests = new Map();
 let knownProjectsJson = '';
@@ -188,6 +199,125 @@ document.addEventListener('click', (event) => {
 navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
 hydrateNavIcons();
 
+// ---------------------------------------------------------------------------
+// Single /api/state poll owner (v6.88.0). Before this there were TWO timers —
+// app.js polled every 20s for the projects nav and every chat instance polled
+// every 3s for the header controls — so an open project panel multiplied the
+// request rate. Now ONE app-owned fetch publishes the same snapshot to every
+// consumer through `subscribeState`, and ONE self-scheduling timer sets the
+// cadence: ~3s while the Chat page is visible (live budget/mode feedback),
+// ~20s elsewhere, and paused entirely while the document is hidden.
+//
+// This consolidates TIMERS ONLY. The refresh ENTRY POINTS are unchanged: the
+// startup barrier below still awaits `refreshProjectsNav()` before opening the
+// socket, `projects_changed` still adds its chat_id synchronously and then
+// refreshes, and create/delete still force an imperative refresh.
+// ---------------------------------------------------------------------------
+const stateSubscribers = [];
+let lastStateSnapshot = null;
+let statePollTimer = 0;
+let statePollInFlight = null;
+
+function subscribeState(handler) {
+    if (typeof handler !== 'function') return () => {};
+    stateSubscribers.push(handler);
+    // A late subscriber (e.g. a project panel created after startup) sees the
+    // snapshot immediately instead of waiting a full poll interval.
+    if (lastStateSnapshot) {
+        try { handler(lastStateSnapshot); } catch {}
+    }
+    return () => {
+        const idx = stateSubscribers.indexOf(handler);
+        if (idx >= 0) stateSubscribers.splice(idx, 1);
+    };
+}
+
+function publishState(data) {
+    lastStateSnapshot = data;
+    for (const handler of stateSubscribers.slice()) {
+        try { handler(data); } catch {}
+    }
+}
+
+function statePollIntervalMs() {
+    return state.activePage === 'chat' ? 3000 : 20000;
+}
+
+function scheduleStatePoll() {
+    clearTimeout(statePollTimer);
+    statePollTimer = 0;
+    if (document.hidden) return;  // paused, not backed off: no hidden-tab spend
+    statePollTimer = setTimeout(() => { refreshState(); }, statePollIntervalMs());
+}
+
+// The ONE /api/state reader. Coalesces concurrent callers, feeds the projects
+// nav plus every subscriber, and re-arms the timer when it settles. A failed
+// read publishes an explicitly unavailable accounting shape so money surfaces
+// render "Unavailable" instead of a convincing $0 (fail closed).
+async function refreshState() {
+    if (statePollInFlight) return statePollInFlight;
+    statePollInFlight = (async () => {
+        try {
+            const resp = await apiFetch('/api/state', { cache: 'no-store' });
+            if (!resp.ok) {
+                publishState({ accounting: { available: false } });
+                return;
+            }
+            const data = await resp.json();
+            renderProjectsNav(data.projects || [], data.project_chat_ids);
+            applyTaskBindings(data.task_bindings || {});
+            publishState(data);
+        } catch {
+            publishState({ accounting: { available: false } });
+        }
+    })();
+    try {
+        await statePollInFlight;
+    } finally {
+        statePollInFlight = null;
+        scheduleStatePoll();
+    }
+}
+
+// Historical name kept because it is the startup barrier's contract and the
+// imperative create/delete refresh call-site name.
+function refreshProjectsNav() {
+    return refreshState();
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearTimeout(statePollTimer);
+        statePollTimer = 0;
+        return;
+    }
+    refreshState();
+});
+// Entering/leaving Chat changes the cadence, so re-arm on navigation.
+window.addEventListener('ouro:page-shown', () => scheduleStatePoll());
+
+// Sidebar budget meter: `headerBudgetPresentation` stays the ONE budget
+// formatting projection (fail-closed "Unavailable", never a fake $0); the bar
+// fill is a dynamic CSS custom property, never a .style.width assignment.
+function renderSidebarBudget(data) {
+    const budget = headerBudgetPresentation(data);
+    if (navBudgetAmount) navBudgetAmount.textContent = budget.label;
+    if (navBudgetBar) {
+        navBudgetBar.dataset.budgetState = budget.state;
+        navBudgetBar.style.setProperty('--budget-fill', `${budget.fillPct}%`);
+    }
+}
+subscribeState(renderSidebarBudget);
+navBudget?.addEventListener('click', () => openDashboardTab('costs'));
+
+// Brand-row liveness: the green dot mirrors the ONE shared socket's state.
+function setBrandOnline(online) {
+    if (navBrand) navBrand.dataset.online = online ? 'true' : 'false';
+    if (navBrandStatus) navBrandStatus.textContent = online ? 'online' : 'offline';
+}
+ws.on('open', () => setBrandOnline(true));
+ws.on('close', () => setBrandOnline(false));
+
 const ctx = {
     ws,
     state,
@@ -203,10 +333,38 @@ const ctx = {
             if (idx >= 0) beforePageLeaveHandlers.splice(idx, 1);
         };
     },
+    // The ONE /api/state snapshot: subscribe for updates, or force a read after
+    // an owner control write. No module opens its own poll timer.
+    subscribeState,
+    refreshState: () => refreshState(),
+    // Right-panel state machine (kinds are mutually exclusive).
+    registerRightPanel,
+    openRightPanel: (kind, opts) => openRightPanel(kind, opts),
+    closeRightPanel: (opts) => closeRightPanel(opts),
 };
 
-initChat(ctx);
+// The main chat controller is KEPT (it used to be discarded): other screens
+// hand ordered composer parts to the chat through `setDraftParts`/`sendParts`
+// instead of reaching into chat.js internals.
+const chatController = initChat(ctx);
+
+export function getChatController() {
+    return chatController;
+}
+ctx.getChatController = getChatController;
+
+// Empty `changes` page container. The Changes screen module replaces its
+// contents; the nav row already routes here through the normal showPage path.
+const changesPage = document.createElement('section');
+changesPage.id = 'page-changes';
+changesPage.className = 'page';
+document.getElementById('content')?.appendChild(changesPage);
+
 initFiles(ctx);
+
+/* [anchor:phase-B] right-panel registrations */
+
+/* [anchor:phase-C] global capture hotkey */
 
 // ---------------------------------------------------------------------------
 // Multi-project navigation + right thread panel (v6.32.0). Projects come from
@@ -214,7 +372,43 @@ initFiles(ctx);
 // Navigation is one state machine now: page, project, and mobile drawer are
 // synchronized together so Utilities and Projects can't remain active at once.
 // ---------------------------------------------------------------------------
-function closeProjectPanel({ sync = true } = {}) {
+// The right panel is ONE slot. `openRightPanel`/`closeRightPanel` are the state
+// machine; a later module registers its own kind (e.g. the task inspector) via
+// `registerRightPanel` and gets mutual exclusion for free. The project kind
+// keeps its exact previous behaviour, including its persisted drag width.
+function registerRightPanel(kind, handlers) {
+    const name = String(kind || '').trim();
+    if (!name || name === 'project') return () => {};
+    rightPanelRegistry[name] = handlers || {};
+    return () => {
+        if (navState.panelKind === name) closeRightPanel();
+        delete rightPanelRegistry[name];
+    };
+}
+
+async function openRightPanel(kind, opts = {}) {
+    if (kind === 'project') return openProjectPanel(opts.project, opts);
+    const entry = rightPanelRegistry[kind];
+    if (!entry || typeof entry.mount !== 'function') return false;
+    if (navState.panelKind && navState.panelKind !== kind) closeRightPanel({ sync: false });
+    navState.panelKind = kind;
+    let mounted = true;
+    try {
+        mounted = (await entry.mount(opts)) !== false;
+    } catch {
+        mounted = false;
+    }
+    if (!mounted) navState.panelKind = null;
+    syncNavigationState();
+    return mounted;
+}
+
+function closeRightPanel({ sync = true } = {}) {
+    const kind = navState.panelKind;
+    if (kind && kind !== 'project') {
+        try { rightPanelRegistry[kind]?.unmount?.(); } catch {}
+    }
+    navState.panelKind = null;
     navState.activeProjectId = null;
     for (const inst of projectInstances.values()) {
         inst.page.hidden = true;
@@ -223,15 +417,22 @@ function closeProjectPanel({ sync = true } = {}) {
     if (sync) syncNavigationState();
 }
 
+function closeProjectPanel(options = {}) {
+    closeRightPanel(options);
+}
+
 async function openProjectPanel(project, { closeDrawer = true } = {}) {
     if (!project?.id || String(project.lifecycle || 'active') !== 'active') return;
     if (navState.activeProjectId === project.id) {
         closeProjectPanel();
         return;
     }
+    // Mutual exclusion: any other right-panel kind closes first.
+    if (navState.panelKind && navState.panelKind !== 'project') closeRightPanel({ sync: false });
     const movedToChat = await showPage('chat', { closeProject: false, closeDrawer: false });
     if (movedToChat === false) return;
     navState.activeProjectId = project.id;
+    navState.panelKind = 'project';
     projectPanelTitle.textContent = project.name || project.id;
     let inst = projectInstances.get(project.id);
     if (!inst) {
@@ -470,16 +671,6 @@ document.getElementById('nav-projects-add')?.addEventListener('click', async (ev
     }
 });
 
-async function refreshProjectsNav() {
-    try {
-        const resp = await apiFetch('/api/state', { cache: 'no-store' });
-        if (!resp.ok) return;
-        const data = await resp.json();
-        renderProjectsNav(data.projects || [], data.project_chat_ids);
-        applyTaskBindings(data.task_bindings || {});
-    } catch {}
-}
-
 // A task bound to a project (e.g. a project-chat follow-up) is ALREADY a project
 // task. Its main-chat card drops the stray "turn into project" affordance (P2)
 // and instead shows a calm pointer that opens the bound project's panel (F4).
@@ -628,7 +819,6 @@ ws.on('projects_changed', (msg) => {
     if (cid) state.projectChatIds.add(cid);
     refreshProjectsNav();
 });
-setInterval(refreshProjectsNav, 20000);
 settingsControls = initSettings(ctx);
 dashboardControls = initDashboard(ctx);
 initLogs({ ...ctx, mount: document.getElementById('dashboard-panel-logs') });
@@ -642,7 +832,6 @@ initUpdateStatus(ctx);
 
 initOnboardingOverlay();
 
-initMatrixRain();
 loadVersion();
 syncNavigationState();
 
