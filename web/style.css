@@ -5459,6 +5459,671 @@ textarea.chat-input {
    mutually exclusive). Keep additions inside this region so the stream merge
    stays a append-only CSS diff. */
 
+/* Changes screen: 260px task/file rail + diff pane + a sticky parts dock. */
+.changes-layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    flex: 1;
+    min-height: 0;
+}
+
+.changes-rail {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto minmax(0, 1.4fr);
+    min-height: 0;
+    min-width: 0;
+    background: var(--bg-panel);
+    border-right: 1px solid var(--divider);
+}
+
+.changes-rail-head,
+.changes-file-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: 10px 12px 6px;
+    border-bottom: 1px solid var(--divider);
+}
+
+.changes-file-head {
+    border-top: 1px solid var(--divider);
+}
+
+.changes-rail-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.changes-rail-meta {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.changes-task-list,
+.changes-file-list {
+    overflow-y: auto;
+    min-height: 0;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.changes-task-row,
+.changes-file-row {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 1px solid transparent;
+    border-radius: var(--radius-7);
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    padding: 6px 8px;
+    cursor: pointer;
+    min-width: 0;
+}
+
+.changes-task-row:hover,
+.changes-file-row:hover {
+    background: var(--surface-control);
+    color: var(--text-primary);
+}
+
+.changes-task-row.active,
+.changes-file-row.active {
+    background: var(--accent-10);
+    border-color: var(--accent-18);
+    color: var(--text-primary);
+}
+
+.changes-task-title {
+    display: block;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.changes-task-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 2px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    min-width: 0;
+}
+
+.changes-task-id {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 44%;
+}
+
+.changes-task-project {
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border: 1px solid var(--project-25);
+    border-radius: var(--radius-4);
+    background: var(--project-12);
+    color: var(--project-light);
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.changes-task-status {
+    margin-left: auto;
+    flex: 0 0 auto;
+}
+
+/* File rows are mono: they name real paths and real counts. */
+.changes-file-row {
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+
+.changes-file-status {
+    font-weight: 600;
+    text-align: center;
+}
+
+.changes-file-status.is-added { color: var(--green); }
+.changes-file-status.is-deleted { color: var(--red); }
+.changes-file-status.is-modified { color: var(--amber); }
+.changes-file-status.is-renamed { color: var(--user); }
+
+.changes-file-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+}
+
+.changes-file-counts {
+    display: inline-flex;
+    gap: 6px;
+    white-space: nowrap;
+    font-size: 10.5px;
+}
+
+.changes-add { color: var(--green); }
+.changes-del { color: var(--red); }
+.changes-file-binary { color: var(--text-muted); }
+
+.changes-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+.changes-main-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--divider);
+}
+
+.changes-path {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.changes-counts {
+    display: inline-flex;
+    gap: 8px;
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+/* Compact segmented control over the shared .ui-segment base look. */
+.changes-mode {
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-card);
+}
+
+.changes-mode .ui-segment {
+    min-height: 24px;
+    padding: 2px 10px;
+    border: none;
+    border-radius: var(--radius-6);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 11.5px;
+}
+
+.changes-mode .ui-segment.active {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}
+
+/* Disclosure banners. A diff the server could not produce is NEVER silent. */
+.changes-banners:empty {
+    display: none;
+}
+
+.changes-banner {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--divider);
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--surface-card-soft);
+}
+
+.changes-banner[data-tone='blocked'] {
+    background: var(--red-dim);
+    color: var(--text-primary);
+}
+
+.changes-banner[data-tone='drift'],
+.changes-banner[data-tone='pending'] {
+    background: var(--amber-dim);
+}
+
+.changes-banner-detail {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+.changes-diff {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.7;
+}
+
+.changes-empty {
+    padding: 10px 12px;
+    font-family: inherit;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.changes-diff-empty {
+    padding: var(--space-5) var(--space-4);
+}
+
+/* Unified: old№ / new№ / text. Split: old№ / old text / new№ / new text. */
+.changes-unified .changes-row {
+    display: grid;
+    grid-template-columns: 44px 44px minmax(0, 1fr);
+}
+
+.changes-split .changes-row {
+    display: grid;
+    grid-template-columns: 40px minmax(0, 1fr) 40px minmax(0, 1fr);
+}
+
+.changes-split .changes-row > .changes-text:nth-child(2) {
+    border-right: 1px solid var(--divider);
+}
+
+.changes-num {
+    padding: 0 6px;
+    text-align: right;
+    color: var(--diff-ctx-num);
+    user-select: none;
+}
+
+.changes-text {
+    padding: 0 8px;
+    color: var(--diff-ctx-text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.changes-row.is-del,
+.changes-text.is-del {
+    background: var(--diff-del-bg);
+    color: var(--diff-del-text);
+}
+
+.changes-row.is-add,
+.changes-text.is-add {
+    background: var(--diff-add-bg);
+    color: var(--diff-add-text);
+}
+
+.changes-row.is-del .changes-num,
+.changes-num.is-del {
+    color: var(--diff-del-num);
+}
+
+.changes-row.is-add .changes-num,
+.changes-num.is-add {
+    color: var(--diff-add-num);
+}
+
+.changes-text.is-empty-counterpart {
+    background: var(--surface-card-soft);
+}
+
+.changes-hunk {
+    padding: 2px 8px;
+    background: var(--diff-hunk-bg);
+    color: var(--text-muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* The dock is the ONE composer-parts field; "Request edits" is the only action. */
+.changes-dock {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4) var(--space-3);
+    border-top: 1px solid var(--divider);
+    background: var(--bg-primary);
+}
+
+.changes-dock-field {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 8px 12px;
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+}
+
+.changes-dock-field:focus-within {
+    border-color: var(--focus-accent-border);
+}
+
+.changes-dock-input {
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 13px;
+    outline: none;
+}
+
+/* Task inspector: fixed-width right panel (no resize state, per the handoff). */
+.inspector-panel {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: var(--inspector-width);
+    z-index: 58;
+    border-left: 1px solid var(--divider);
+    background: var(--bg-panel);
+    box-shadow: -24px 0 64px rgba(0, 0, 0, 0.34);
+    transform: translateX(18px);
+    opacity: 0;
+    pointer-events: none;
+    transition: transform 180ms ease, opacity 180ms ease;
+}
+
+.inspector-panel.open {
+    transform: translateX(0);
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.inspector-panel[hidden],
+.inspector-backdrop[hidden] {
+    display: none;
+}
+
+.inspector-backdrop {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: var(--sidebar-width);
+    z-index: 55;
+    background: rgba(0, 0, 0, 0.34);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 180ms ease;
+}
+
+.inspector-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.inspector-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--divider);
+}
+
+.inspector-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.inspector-close {
+    flex: 0 0 auto;
+    width: 24px;
+    height: 24px;
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-6);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.inspector-close:hover {
+    color: var(--text-primary);
+    border-color: var(--accent);
+}
+
+/* Equal-width underline tabs (design handoff §3), not the pill tab strip. */
+.inspector-tabs {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    border-bottom: 1px solid var(--divider);
+}
+
+.inspector-tab {
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 8px 0;
+    cursor: pointer;
+}
+
+.inspector-tab:hover {
+    color: var(--text-primary);
+}
+
+.inspector-tab.active {
+    border-bottom-color: var(--accent);
+    color: var(--text-primary);
+}
+
+.inspector-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.inspector-empty,
+.inspector-cost-note {
+    padding: 8px 6px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+}
+
+.inspector-blockers,
+.inspector-drift {
+    margin: 0 6px 6px;
+    padding: 6px 8px;
+    border-radius: var(--radius-6);
+    background: var(--amber-dim);
+    color: var(--text-secondary);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+
+.inspector-blockers {
+    font-family: var(--font-mono);
+    background: var(--red-dim);
+}
+
+.inspector-file-row {
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-7);
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.inspector-file-row:hover {
+    background: var(--surface-control);
+    color: var(--text-primary);
+}
+
+.inspector-file-status.is-a { color: var(--green); }
+.inspector-file-status.is-d { color: var(--red); }
+.inspector-file-status.is-m { color: var(--amber); }
+.inspector-file-status.is-r { color: var(--user); }
+
+.inspector-file-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+}
+
+.inspector-file-counts {
+    display: inline-flex;
+    gap: 6px;
+    white-space: nowrap;
+    font-size: 10.5px;
+}
+
+.inspector-file-binary {
+    color: var(--text-muted);
+}
+
+.inspector-open-full {
+    margin: 8px 6px 0;
+    border: none;
+    background: transparent;
+    color: var(--accent-light);
+    font: inherit;
+    font-size: 11.5px;
+    text-align: left;
+    padding: 4px 0;
+    cursor: pointer;
+}
+
+.inspector-cost-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: 5px 8px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+
+.inspector-cost-value {
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+}
+
+.inspector-cost-row[data-tone='unavailable'] .inspector-cost-value,
+.inspector-cost-row[data-tone='pending'] .inspector-cost-value {
+    color: var(--amber);
+}
+
+.inspector-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: 8px 12px;
+    border-top: 1px solid var(--divider);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.inspector-footer-files {
+    display: inline-flex;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+@media (max-width: 980px) {
+    /* Narrow: the rail collapses above the diff pane. */
+    .changes-layout {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: minmax(120px, 34vh) minmax(0, 1fr);
+    }
+
+    .changes-rail {
+        border-right: none;
+        border-bottom: 1px solid var(--divider);
+    }
+}
+
+@media (max-width: 900px) {
+    /* Mobile: the inspector overlays the content area, like the project panel. */
+    .inspector-panel {
+        inset: 0;
+        width: 100%;
+        z-index: 60;
+        border-left: none;
+        transform: translateY(14px);
+    }
+
+    .inspector-panel.open {
+        transform: translateY(0);
+    }
+
+    .inspector-backdrop {
+        left: 0;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .inspector-panel,
+    .inspector-backdrop {
+        transition: none;
+    }
+}
+
 /* ===== [stream 0: multi-project navigation + right panel state machine] ===== */
 
 /* ===========================================================================

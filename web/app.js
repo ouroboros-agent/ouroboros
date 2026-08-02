@@ -363,6 +363,19 @@ document.getElementById('content')?.appendChild(changesPage);
 initFiles(ctx);
 
 /* [anchor:phase-B] right-panel registrations */
+// The Changes screen fills the `page-changes` container created above; the task
+// inspector registers itself as the `inspector` right-panel kind (mutually
+// exclusive with the project panel) and opens on `ouro:inspect-task`.
+// The imports live in this region deliberately: ES module imports are hoisted, so
+// keeping them here makes the whole phase-B wiring one append-only block instead
+// of a second edit in the shared import header.
+import { initChanges } from './modules/changes.js';
+import { initTaskInspector } from './modules/task_inspector.js';
+
+// `changesControls` is the seam the global ⌘L handler routes a diff selection
+// through (`addChip` / `activeFilePath`) instead of reaching into the module.
+ctx.changesControls = initChanges(ctx);
+initTaskInspector(ctx);
 
 /* [anchor:phase-C] global capture hotkey */
 

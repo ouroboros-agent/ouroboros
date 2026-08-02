@@ -803,7 +803,7 @@ def emit_task_results(
     if not _ephemeral:
         _store_task_result(
             env, task, text, usage, llm_trace, review_evidence=review_evidence,
-            loop_outcome=loop_outcome, cost_fields=task_cost_fields,
+            loop_outcome=loop_outcome, cost_fields=task_cost_fields, duration_sec=duration_sec,
         )
         stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
     else:
@@ -988,13 +988,16 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                        usage: Dict[str, Any], llm_trace: Dict[str, Any],
                        review_evidence: Dict[str, Any] | None = None,
                        loop_outcome: Dict[str, Any] | None = None,
-                       cost_fields: Dict[str, Any] | None = None) -> None:
+                       cost_fields: Dict[str, Any] | None = None, duration_sec: float | None = None) -> None:
     """Store task result for parent task retrieval.
 
     ``loop_outcome``, when supplied by ``emit_task_results``, is the SINGLE already-
     derived, already-receipt_absent-flagged outcome that also fed the task_eval /
     task_metrics event stream — so the persisted axes match the events exactly and we
     do not derive/flag a second time. It is only re-derived here when called without one.
+    ``duration_sec`` is the SAME value the ``task_metrics`` event carries, persisted as one flat scalar on both
+    terminal paths so an owner surface reads elapsed from the durable record; ``None`` omits the key instead of a
+    fabricated 0 (why: ARCHITECTURE.md §3, task inspector footer).
     """
     try:
         trace_summary = build_trace_summary(llm_trace)
@@ -1162,6 +1165,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             final_answer=str(loop_outcome.get("final_answer") or ""),
             trace_summary=trace_summary,
             trace_refs=loop_outcome.get("trace_refs") or {},
+            **({"duration_sec": float(duration_sec)} if isinstance(duration_sec, (int, float)) and not isinstance(duration_sec, bool) else {}),
             **cost_fields,
             review_evidence=review_evidence or {},
             **({"review_projection": review_projection} if review_projection.get("panels") else {}),

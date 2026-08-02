@@ -704,6 +704,30 @@ class TaskCancelResponse(TypedDict, total=False):
     error: str
 
 
+class TaskDiffResponse(TypedDict, total=False):
+    """One task's owner-facing diff projection (GET /api/tasks/{id}/diff).
+
+    ``status`` is the typed lifecycle: ``pending`` (artifacts are not finalized
+    yet), ``ready`` (``patch`` carries the full unified diff), ``empty`` (the
+    task changed nothing), ``blocked`` (``blockers`` names why no trustworthy
+    patch can be shown). ``source`` is ``workspace_patch`` (durable artifact
+    bytes) or ``mutation_baseline`` (a LIVE self-repo projection over the paths
+    attributed to the task window). ``head_advanced`` discloses baseline drift
+    as a boolean only — never commit counts, never an ownership claim. The patch
+    is never truncated and carries no server-side file stats: the client parses
+    the same bytes it renders.
+    """
+
+    status: str
+    source: str
+    base_commit: str
+    head_advanced: bool
+    blockers: list[str]
+    patch: str
+    patch_sha256: str
+    error: str
+
+
 class LogTailResponse(TypedDict, total=False):
     name: str
     entries: list[Dict[str, Any]]
@@ -730,6 +754,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/tasks",
     "GET /api/tasks/{task_id}",
     "GET /api/tasks/{task_id}/artifacts/{name}",
+    "GET /api/tasks/{task_id}/diff",
     "GET /api/tasks/{task_id}/events",
     "POST /api/tasks/{task_id}/cancel",
     "POST /api/tasks/{task_id}/resume",
@@ -881,6 +906,7 @@ __all__ = [
     "TaskListResponse",
     "TaskEvent",
     "TaskCancelResponse",
+    "TaskDiffResponse",
     "LogTailResponse",
     "HTTP_ENDPOINTS",
     "WS_MESSAGE_TYPES",
