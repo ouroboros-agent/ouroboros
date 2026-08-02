@@ -524,6 +524,9 @@ body.resizing-panels { user-select: none; }
     box-shadow: inset 0 0 0 2px rgba(96, 165, 250, 0.65);
 }
 
+/* CROSS-REGION: the flat-chat region overrides placement via
+   `.chat-live-card > .chat-live-actions` (line ~1952, 2 classes), so this base
+   keeps working no matter which region ends up first in the file. */
 .chat-live-actions {
     display: flex;
     justify-content: flex-end;
@@ -556,7 +559,10 @@ body.resizing-panels { user-select: none; }
 
 /* P3 — a converted card becomes a calm "project identity" chip. The whole card
    recolors from the red task accent to the project fuchsia over ~250ms; the live
-   timeline is gone (the project panel owns it now), so the main chat is freed. */
+   timeline is gone (the project panel owns it now), so the main chat is freed.
+   CROSS-REGION: the flat-chat region re-adds the surface via the doubled
+   `.chat-live-card.is-project.is-project` (line ~1941, 3 classes), so that
+   override wins on specificity rather than on which region comes later. */
 .chat-live-card.is-project {
     border-color: var(--project-18);
     background: var(--project-08);
@@ -1585,32 +1591,26 @@ body.resizing-panels { user-select: none; }
 
 /* An owner message that carried ⌘L context markers renders them as the same
    chips the composer showed, in order, interleaved with the typed text. The RAW
-   serialized string stays the message identity (see chat.js renderUserContent). */
+   serialized string stays the message identity (see chat.js renderUserContent).
+
+   A BLOCK with `pre-wrap`, not a flex row: the renderer joins the segments with
+   the same `\n` that separates them in the serialized string, so the separators
+   are real owner bytes and must lay out as the line breaks they are. Chips stay
+   `inline-flex` boxes inside that text flow. */
 .chat-user-parts {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--space-1) 6px;
+    display: block;
+    white-space: pre-wrap;
 }
 
 .chat-user-part-text {
-    white-space: pre-wrap;
     overflow-wrap: anywhere;
-    min-width: 0;
 }
 
+/* Transcript delta over the shared chip box (`:is(.composer-part-chip,
+   .chat-context-chip)`, [shared: composer parts] region): no remove button here,
+   so the label itself is what ellipsizes. */
 .chat-context-chip {
-    display: inline-flex;
-    align-items: center;
-    max-width: 100%;
     padding: 1px 6px;
-    border: 1px solid var(--accent-25);
-    border-radius: var(--radius-6);
-    background: var(--accent-10);
-    color: var(--accent-chip-text);
-    font-family: var(--font-mono);
-    font-size: 11px;
-    line-height: 1.5;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1934,8 +1934,11 @@ button.chat-file:hover,
 
 /* Restore the surface for a converted card: the run moved to its project panel,
    so this is a project identity chip, not an agent turn (defined flat in the
-   shell region above; this deliberately re-adds the box the flat card dropped). */
-.chat-live-card.is-project {
+   shell region above; this deliberately re-adds the box the flat card dropped).
+   CROSS-REGION: the class is doubled so this outranks the shell region's
+   `.chat-live-card.is-project` (line ~566) by SPECIFICITY — the two regions are
+   independently owned and must not depend on their order in the file. */
+.chat-live-card.is-project.is-project {
     border: 1px solid var(--project-18);
     border-radius: var(--radius-md);
     background: var(--project-08);
@@ -1943,8 +1946,10 @@ button.chat-file:hover,
     opacity: 1;
 }
 
-/* Actions sit under the turn, left-aligned with the reading column. */
-.chat-live-actions {
+/* Actions sit under the turn, left-aligned with the reading column.
+   CROSS-REGION: the child selector outranks the shell region's bare
+   `.chat-live-actions` (line ~530) by specificity, not by source order. */
+.chat-live-card > .chat-live-actions {
     justify-content: flex-start;
     padding: var(--space-1) 0 0;
 }
@@ -2333,7 +2338,9 @@ button.chat-file:hover,
     min-width: 0;
 }
 
-.chat-live-line:hover {
+/* Only an EXPANDABLE row reacts to hover: a row with nothing behind it must not
+   advertise a disclosure it does not have. */
+.chat-live-line.expandable:hover {
     background: var(--surface-control);
 }
 
@@ -2662,11 +2669,14 @@ button.chat-file:hover,
     /* Flat darkening gradient (never a blur band) so the transcript fades out
        under the dock instead of hitting a hard line; the transcript reserves the
        dock's REAL height through --chat-input-reserve rather than sliding under it.
-       Side padding tracks the transcript's centred reading column. */
+       Side padding tracks the transcript's centred reading column: the horizontal
+       gutter is the SAME token as #chat-messages (--space-5), so the composer box
+       lines up with the messages above it at every width instead of sitting 8px
+       wider once the viewport drops below the 760px column. */
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-    padding: 32px max(var(--space-4), calc((100% - 760px) / 2)) var(--space-4);
+    padding: 32px max(var(--space-5), calc((100% - 760px) / 2)) var(--space-4);
     align-items: stretch;
     position: absolute;
     bottom: 0;
@@ -3042,12 +3052,15 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     max-width: 100%;
 }
 
-.composer-part-chip {
+/* A context chip is ONE visual object seen in two places — live in a composer
+   field and replayed in the transcript — so its box is declared ONCE here.
+   `:is()` takes the specificity of a single class, and the two per-site rules
+   below/above declare only DELTAS (no property appears in both), so the cascade
+   result does not depend on which rule the file happens to reach first. */
+:is(.composer-part-chip, .chat-context-chip) {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
     max-width: 100%;
-    padding: 2px 6px;
     border: 1px solid var(--accent-25);
     border-radius: var(--radius-6);
     background: var(--accent-10);
@@ -3055,6 +3068,13 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-family: var(--font-mono);
     font-size: 11px;
     line-height: 1.5;
+}
+
+/* Composer delta: a removal button rides beside the label, so the chip needs an
+   inner gap and a touch more padding than the read-only transcript chip. */
+.composer-part-chip {
+    gap: 5px;
+    padding: 2px 6px;
 }
 
 .composer-part-chip-label {

@@ -37,7 +37,9 @@ test('a captured context marker renders as a chip beside the typed text', () => 
 test('server replay of the same raw string renders the same chip', () => {
     // /api/chat/history returns the serialized string, never a parts array: the
     // raw text IS the identity, and the renderer is the only thing that re-reads it.
-    const raw = serializeParts([rangedChip({ content: 'x = 1' })]);
+    // The capture is CONSISTENT (L10-L12 carrying exactly three lines) — that is
+    // what earns it a chip; see the mismatch test below.
+    const raw = serializeParts([rangedChip({ content: 'x = 1\ny = 2\nz = 3' })]);
     assert.equal(renderUserContent(raw), renderUserContent(raw));
     assert.match(renderUserContent(raw), /class="chat-context-chip"/);
     // A whole-file marker (no range, no bytes) replays as a chip too.
@@ -62,6 +64,54 @@ test('chips and comments render in the ORDER the owner composed them', () => {
     assert.ok(at('compare') < at('a.py · 1 line'), html);
     assert.ok(at('a.py · 1 line') < at('against'), html);
     assert.ok(at('against') < at('b.py · 1 line'), html);
+});
+
+test('a chip is earned by a PROVABLE line count, never claimed by the marker', () => {
+    // A chip folds its fenced bytes away behind "N lines" read off the marker
+    // range. When the two disagree the label would conceal payload the agent still
+    // receives, so the part is shown as the exact grammar it is instead.
+    const lookalike = '[context: ouroboros/loop.py L10-L12]\n```\none\ntwo\nthree\nfour\nfive\n```';
+    const html = renderUserContent(lookalike);
+    assert.doesNotMatch(html, /chat-context-chip/, html);
+    assert.doesNotMatch(html, /3 lines/, html);
+    // Every concealed line is now VISIBLE text, and the marker with it.
+    for (const line of ['one', 'two', 'three', 'four', 'five', '[context: ouroboros/loop.py L10-L12]']) {
+        assert.ok(html.includes(line), `${line} missing from ${html}`);
+    }
+
+    // A genuine capture — range and payload agree — still renders as a chip with
+    // the bytes held back.
+    const genuine = serializeParts([rangedChip({ content: 'one\ntwo\nthree' })]);
+    const good = renderUserContent(genuine);
+    assert.match(good, /class="chat-context-chip"/);
+    assert.match(good, /loop\.py · 3 lines/);
+    assert.doesNotMatch(good, /two/);
+
+    // A one-line range with a one-line fence is the boundary case, and passes.
+    const single = serializeParts([makeChipPart({
+        path: 'a.py', lineStart: 7, lineEnd: 7, content: 'x = 1',
+    })]);
+    assert.match(renderUserContent(single), /class="chat-context-chip"/);
+});
+
+test('the newlines BETWEEN parts survive the projection', () => {
+    // The renderer is the inverse of serializeParts, which joins parts with '\n'.
+    // Dropping those separators would silently reflow the owner's message.
+    const raw = serializeParts([
+        { type: 'text', text: 'before' },
+        makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 1, content: 'a' }),
+        { type: 'text', text: 'after' },
+    ]);
+    const html = renderUserContent(raw);
+    assert.match(html, /<\/span>\n<span/, html);
+    // Exactly one separator per gap: two gaps for three parts.
+    assert.equal(html.split('\n').length - 1, 2, html);
+
+    // A single-text message never enters the parts path at all — it stays the one
+    // escaped string it always was (no wrapper, no per-segment spans).
+    const plain = renderUserContent('line one\nline two\n\nline four');
+    assert.equal(plain, 'line one\nline two\n\nline four');
+    assert.doesNotMatch(plain, /chat-user-parts/);
 });
 
 test('malformed marker-shaped lines stay plain text, never a chip', () => {

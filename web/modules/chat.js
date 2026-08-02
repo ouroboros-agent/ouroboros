@@ -64,12 +64,26 @@ export function renderUserContent(raw) {
         if (part.type !== 'chip') {
             return `<span class="chat-user-part-text">${escapeHtmlAttr(part.text)}</span>`;
         }
+        // A content-bearing chip HIDES its fenced bytes behind a line COUNT taken
+        // from the marker's range, so that count must be provable from the bytes
+        // themselves. A marker claiming `L10-L12` above a five-line fence — which
+        // this codec never emits, but arbitrary owner text can contain — would
+        // conceal two lines the agent still receives. When the claim and the
+        // payload disagree, the part is shown as the exact grammar it is: its own
+        // re-serialization, escaped, with nothing folded away behind a label.
+        if (typeof part.content === 'string'
+            && part.content.split('\n').length !== part.lineEnd - part.lineStart + 1) {
+            return `<span class="chat-user-part-text">${escapeHtmlAttr(serializeParts([part]))}</span>`;
+        }
         // The captured bytes stay in the payload the agent reads; the UI shows the
-        // referent (path + honest line count), with the full path on hover.
+        // referent (path + verified line count), with the full path on hover.
         const label = chipLabel(part);
         return `<span class="chat-context-chip" title="${escapeHtmlAttr(part.path)}">`
             + `${escapeHtmlAttr(label)}</span>`;
-    }).join('');
+    // Parts are joined by a NEWLINE because that is exactly what separates them in
+    // the serialized string (`serializeParts`): the separators are owner bytes too,
+    // and `.chat-user-parts` renders them with `white-space: pre-wrap`.
+    }).join('\n');
     return `<span class="chat-user-parts">${inner}</span>`;
 }
 
@@ -1417,10 +1431,16 @@ export function createChatInstance({
     // the inspector: it dispatches the `ouro:inspect-task` contract and whoever
     // registered that right-panel kind decides what to mount. No listener ⇒ the
     // click is a no-op, so the action can never point at a missing surface.
+    //
+    // MAIN chat only in v1: the inspector is a right panel that is mutually
+    // exclusive with the project panel, so offering the action from inside a
+    // project thread would advertise a surface that closes the thread it was
+    // clicked in. Project cards keep every other action.
     function syncInspectButton(record) {
         if (!record?.root) return;
         const groupId = String(record.groupId || '').trim();
         const eligible = Boolean(groupId)
+            && isMain
             && !record.isSubagent
             && !REUSABLE_TASK_IDS.has(groupId)
             && record.root.dataset.projectCreated !== '1'
@@ -3310,17 +3330,40 @@ export function createChatInstance({
         updateMessagesPadding({ preserveStickiness });
     }
 
+    /**
+     * Recall operates on the WHOLE FIELD, not on the live input alone.
+     *
+     * A history entry is the serialized string of everything that was sent
+     * (`rememberInput(text)` stores exactly the bytes that went out), so reading it
+     * back through the codec restores the chips the owner composed as CHIPS —
+     * removable, typed-between — instead of pasting raw `[context:]` grammar plus a
+     * fenced block into the textarea. `setParts` REPLACES the field (the draft is
+     * snapshotted as `composerParts.serialize()` first, so ArrowDown at the newest
+     * entry brings the chips back too), and nothing is committed twice.
+     *
+     * The entry's TRAILING text, if it has any, is handed to the live input rather
+     * than committed: recall has always put the caret in the recalled words so they
+     * can be edited, and a parts editor must not take that away. `serialize()`
+     * re-joins committed parts and the draft with the same `\n`, so the field's
+     * bytes are identical either way.
+     */
     function restoreInputHistory(step) {
         if (!inputHistory.length) return;
+        const applyEntry = (entry) => {
+            const parts = parseContent(entry);
+            const tail = parts.length && parts[parts.length - 1].type === 'text' ? parts.pop() : null;
+            composerParts.setParts(parts);
+            input.value = tail ? tail.text : '';
+        };
         if (step < 0) {
             if (input.selectionStart !== 0 || input.selectionEnd !== 0) return;
-            if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
+            if (inputHistoryIndex === inputHistory.length) inputDraft = composerParts.serialize();
             inputHistoryIndex = Math.max(0, inputHistoryIndex - 1);
-            input.value = inputHistory[inputHistoryIndex] || '';
+            applyEntry(inputHistory[inputHistoryIndex] || '');
         } else {
             if (input.selectionStart !== input.value.length || input.selectionEnd !== input.value.length) return;
             inputHistoryIndex = Math.min(inputHistory.length, inputHistoryIndex + 1);
-            input.value = inputHistoryIndex === inputHistory.length ? inputDraft : (inputHistory[inputHistoryIndex] || '');
+            applyEntry(inputHistoryIndex === inputHistory.length ? inputDraft : (inputHistory[inputHistoryIndex] || ''));
         }
         resizeChatInput({ preserveStickiness: false });
         const cursor = input.value.length;
@@ -3421,7 +3464,11 @@ export function createChatInstance({
         // One-shot: disarm Swarm now that the message is sent.
         if (planMode) setSwarm(false);
         // Hand the objective to the NEXT main-chat live card this message spawns.
-        if (isMain && objectiveText) _pendingCardObjective = objectiveText;
+        // The assignment is UNCONDITIONAL (an empty objective included): a
+        // chips-only message has no human words to name a project after, and
+        // leaving the previous message's objective armed would let the next card
+        // be titled from a request it did not come from.
+        if (isMain) _pendingCardObjective = objectiveText;
         if (hasAttachments) {
             pendingAttachments = [];
             updateAttachmentPreview();
@@ -3574,6 +3621,11 @@ export function createChatInstance({
     const isInstanceVisible = () =>
         Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
     messagesDiv?.addEventListener('scroll', () => {
+        // A rebuild empties and refills the column, so every scroll event it emits
+        // is our own DOM churn, not the reader. Saving those positions would
+        // overwrite the pre-rebuild anchor that the explicit decision at the end of
+        // syncHistory restores the reader from.
+        if (_historyRebuildActive) { updateScrollButton(); return; }
         // Ignore the spurious scrollTop=0 a browser emits while the column is
         // hidden — that would erase the real position we want to restore.
         if (!isInstanceVisible()) return;
@@ -3663,7 +3715,9 @@ export function createChatInstance({
     installChatResizeObservers();
 
     input.addEventListener('input', () => {
-        if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
+        // The recall snapshot is the WHOLE field (committed chips + typed draft),
+        // matching what an entry restores — see restoreInputHistory.
+        if (inputHistoryIndex === inputHistory.length) inputDraft = composerParts.serialize();
         resizeChatInput({ preserveStickiness: false });
     });
 
@@ -3741,7 +3795,9 @@ export function createChatInstance({
     function showTyping() {
         if (!hasActiveLiveCard()) {
             typingEl.style.display = '';
-            if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            // The rebuild owns scroll position while it runs: mid-rebuild
+            // `isNearBottom()` answers about a transiently near-empty column.
+            if (!_historyRebuildActive && isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
         setStatus('thinking', 'Thinking...');
     }
@@ -4154,6 +4210,12 @@ export function createChatInstance({
         sendParts,
         destroy() {
             cancelHistoryPaint();
+            // A destroyed instance must leave nothing behind on shared objects:
+            // the WINDOW-level settings listener would keep this closure (and its
+            // detached DOM) alive and write into a removed model chip, and the
+            // parts mount holds its own container/input listeners.
+            window.removeEventListener('ouro:settings-updated', syncModelChip);
+            composerParts.destroy();
             try { page.remove(); } catch {}
         },
     };
