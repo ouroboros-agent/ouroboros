@@ -182,14 +182,41 @@ def test_sidebar_brand_sections_and_budget_block():
 
 
 def test_single_api_state_poll_owner():
+    """ONE poll owner, and its RULES are covered by tests rather than by grepping.
+
+    The scheduling/coalescing core lives in `web/modules/state_poll.js` and is
+    exercised by `web/tests/state_poll.test.js` against a fake clock — single-flight
+    dedup, re-arm on settle (including a rejected read), the hidden-document pause,
+    subscriber fan-out, replay and unsubscribe. What is worth PINNING statically is
+    only what a node test cannot see: that app.js still wires that core to the real
+    fetch, live page/visibility getters, and the real timer functions, and that the
+    two timers it replaced have not grown back.
+    """
     app_js = _read("web/app.js")
     chat_js = _read("web/modules/chat.js")
-    # One app-owned reader + subscriber list + self-scheduling timer.
-    assert "async function refreshState()" in app_js
-    assert "function subscribeState(handler)" in app_js
-    assert "function scheduleStatePoll()" in app_js
-    assert "if (document.hidden) return;" in app_js
-    assert "state.activePage === 'chat' ? 3000 : 20000" in app_js
+    core_js = _read("web/modules/state_poll.js")
+    core_test = _read("web/tests/state_poll.test.js")
+
+    # The core is imported and wired, not reimplemented alongside.
+    assert "import { createStatePoll } from './modules/state_poll.js';" in app_js
+    assert "createStatePoll({" in app_js
+    assert "read: readStateSnapshot," in app_js
+    # Live GETTERS: the cadence must follow navigation and tab visibility, so a value
+    # captured once at startup would silently freeze the interval.
+    assert "activePage: () => state.activePage," in app_js
+    assert "hidden: () => document.hidden," in app_js
+    assert "async function readStateSnapshot()" in app_js
+    # The cadence and the pause are the CORE's decisions now — pinned where they live.
+    assert "activePage === 'chat' ? STATE_POLL_CHAT_MS : STATE_POLL_IDLE_MS" in core_js
+    assert "if (hidden()) return;" in core_js
+    assert "STATE_POLL_CHAT_MS = 3000" in core_js
+    assert "STATE_POLL_IDLE_MS = 20000" in core_js
+    # ...and those decisions are executably covered, not just spelled correctly.
+    for behaviour in ("ONE request, not three", "re-arms on SETTLE", "PAUSES the timer"):
+        assert behaviour in core_test, behaviour
+    # No second copy of the poll machinery in app.js.
+    assert "statePollInFlight" not in app_js
+    assert "function publishState(" not in app_js
     # The two old timers are gone.
     assert "setInterval(refreshProjectsNav" not in app_js
     assert "setInterval(refreshHeaderControlState" not in chat_js

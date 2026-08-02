@@ -3168,3 +3168,114 @@ def test_ui_smoke_changes_screen_and_task_inspector(direct_server_with_data):
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_composer_parts_chip_dom_behaviours(direct_server):
+    """The composer_parts DOM MOUNT, which the pure node tests cannot reach.
+
+    The reducer and the codec are node-tested; what needs a real browser is the four
+    mount interactions, each of which can only go wrong in the DOM:
+
+      1. a capture renders as a `.composer-part-chip` BEFORE the live input, so the
+         field previews what will be sent, in order, with the fenced bytes HIDDEN;
+      2. the chip's `×` removes that chip and nothing else, and hands focus back to
+         the input so typing continues uninterrupted;
+      3. Backspace pops the trailing part only when the input is EMPTY — with text in
+         it, Backspace is still ordinary text editing;
+      4. ArrowUp recall refills the WHOLE field, chips included, rather than letting a
+         recalled capture degrade into a marker's worth of plain text.
+
+    Recall is also how the chips get here: seeding the session history with the exact
+    bytes a capture sends drives the same path the owner's ArrowUp does, so no test-only
+    hook into the controller is needed. Nothing is sent, so the composer must survive.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    # Exactly what the composer serializes for "capture 3 lines, then type a question":
+    # marker + fence + a comment. `ouro_chat_input_history` is read at instance
+    # construction, so this must be in place BEFORE the page scripts run.
+    captured = (
+        "[context: ouroboros/loop.py L10-L12]\n"
+        "```\n"
+        "    window = COOLDOWN_S\n"
+        "    window += jitter\n"
+        "    return window\n"
+        "```\n"
+        "why this window?"
+    )
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.add_init_script(
+                    "sessionStorage.setItem('ouro_chat_input_history', %s);"
+                    % json.dumps(json.dumps([captured]))
+                )
+                page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_selector("#chat-input", timeout=30_000)
+                assert page.locator("#chat-parts").count() == 1
+
+                # (4 + 1) ArrowUp recalls the whole field: the capture comes back as a
+                # CHIP plus the typed comment, not as raw grammar.
+                page.click("#chat-input")
+                page.press("#chat-input", "ArrowUp")
+                page.wait_for_selector("#chat-parts .composer-part-chip", timeout=5_000)
+                label = page.locator("#chat-parts .composer-part-chip-label")
+                assert label.count() == 1
+                # The label counts the BYTES the chip carries and shows the basename.
+                assert label.first.inner_text() == "loop.py · 3 lines"
+                # The comment recalled as the live input, where the caret belongs.
+                assert page.input_value("#chat-input") == "why this window?"
+                # The fenced bytes ride the payload, never the visible field.
+                parts_text = page.locator("#chat-parts").inner_text()
+                assert "COOLDOWN_S" not in parts_text
+                assert "```" not in parts_text
+                # Order is the message: every committed part precedes the live input.
+                assert page.evaluate(
+                    """() => {
+                        const nodes = [...document.querySelectorAll('#chat-parts [data-composer-part]')];
+                        const input = document.getElementById('chat-input');
+                        return nodes.length > 0 && nodes.every((n) => Boolean(
+                            n.compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING));
+                    }"""
+                )
+
+                # (3) Backspace with text in the field edits TEXT, not the parts.
+                page.fill("#chat-input", "ab")
+                page.press("#chat-input", "Backspace")
+                assert page.input_value("#chat-input") == "a"
+                assert page.locator("#chat-parts .composer-part-chip").count() == 1
+                page.press("#chat-input", "Backspace")
+                assert page.input_value("#chat-input") == ""
+
+                # ...and only on an EMPTY input does it pop the trailing part.
+                page.press("#chat-input", "Backspace")
+                page.wait_for_function(
+                    "() => document.querySelectorAll('#chat-parts .composer-part-chip').length === 0"
+                )
+                assert page.input_value("#chat-input") == "", "popping a part must not type"
+
+                # (2) Recall again, then remove the chip with its own × control.
+                page.press("#chat-input", "ArrowUp")
+                page.wait_for_selector("#chat-parts .composer-part-chip", timeout=5_000)
+                page.locator("#chat-parts .composer-part-chip .composer-part-remove").first.click()
+                page.wait_for_function(
+                    "() => document.querySelectorAll('#chat-parts .composer-part-chip').length === 0"
+                )
+                # Focus returns to the input: removing a chip is mid-composition.
+                assert page.evaluate("() => document.activeElement.id") == "chat-input"
+
+                # Nothing was sent, and the composer is still the composer.
+                assert page.locator("#chat-input").count() == 1
+                assert page.locator("#chat-send").count() == 1
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise

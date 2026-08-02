@@ -19,6 +19,7 @@ import { initActivity } from './modules/activity.js';
 import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
+import { createStatePoll } from './modules/state_poll.js';
 
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 
@@ -213,71 +214,40 @@ hydrateNavIcons();
 // socket, `projects_changed` still adds its chat_id synchronously and then
 // refreshes, and create/delete still force an imperative refresh.
 // ---------------------------------------------------------------------------
-const stateSubscribers = [];
-let lastStateSnapshot = null;
-let statePollTimer = 0;
-let statePollInFlight = null;
+// The subscriber fan-out, the single-flight coalescing and the cadence decision are
+// the `state_poll.js` core (node-tested there against fake timers). What stays HERE is
+// the impure half: the fetch itself, plus the nav/bindings side effects only this
+// module can perform. `activePage` and `hidden` are passed as GETTERS, so each arming
+// decides the cadence from live state instead of a value captured at startup.
 
-function subscribeState(handler) {
-    if (typeof handler !== 'function') return () => {};
-    stateSubscribers.push(handler);
-    // A late subscriber (e.g. a project panel created after startup) sees the
-    // snapshot immediately instead of waiting a full poll interval.
-    if (lastStateSnapshot) {
-        try { handler(lastStateSnapshot); } catch {}
-    }
-    return () => {
-        const idx = stateSubscribers.indexOf(handler);
-        if (idx >= 0) stateSubscribers.splice(idx, 1);
-    };
-}
-
-function publishState(data) {
-    lastStateSnapshot = data;
-    for (const handler of stateSubscribers.slice()) {
-        try { handler(data); } catch {}
-    }
-}
-
-function statePollIntervalMs() {
-    return state.activePage === 'chat' ? 3000 : 20000;
-}
-
-function scheduleStatePoll() {
-    clearTimeout(statePollTimer);
-    statePollTimer = 0;
-    if (document.hidden) return;  // paused, not backed off: no hidden-tab spend
-    statePollTimer = setTimeout(() => { refreshState(); }, statePollIntervalMs());
-}
-
-// The ONE /api/state reader. Coalesces concurrent callers, feeds the projects
-// nav plus every subscriber, and re-arms the timer when it settles. A failed
-// read publishes an explicitly unavailable accounting shape so money surfaces
-// render "Unavailable" instead of a convincing $0 (fail closed).
-async function refreshState() {
-    if (statePollInFlight) return statePollInFlight;
-    statePollInFlight = (async () => {
-        try {
-            const resp = await apiFetch('/api/state', { cache: 'no-store' });
-            if (!resp.ok) {
-                publishState({ accounting: { available: false } });
-                return;
-            }
-            const data = await resp.json();
-            renderProjectsNav(data.projects || [], data.project_chat_ids);
-            applyTaskBindings(data.task_bindings || {});
-            publishState(data);
-        } catch {
-            publishState({ accounting: { available: false } });
-        }
-    })();
+// The ONE /api/state read. A failed read resolves to an explicitly unavailable
+// accounting shape so money surfaces render "Unavailable" rather than a convincing $0
+// (fail closed); it never REJECTS, because a transient network blip must not be
+// indistinguishable from "there is no budget".
+async function readStateSnapshot() {
     try {
-        await statePollInFlight;
-    } finally {
-        statePollInFlight = null;
-        scheduleStatePoll();
+        const resp = await apiFetch('/api/state', { cache: 'no-store' });
+        if (!resp.ok) return { accounting: { available: false } };
+        const data = await resp.json();
+        renderProjectsNav(data.projects || [], data.project_chat_ids);
+        applyTaskBindings(data.task_bindings || {});
+        return data;
+    } catch {
+        return { accounting: { available: false } };
     }
 }
+
+const statePoll = createStatePoll({
+    read: readStateSnapshot,
+    activePage: () => state.activePage,
+    hidden: () => document.hidden,
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: (handle) => clearTimeout(handle),
+});
+
+const subscribeState = statePoll.subscribe;
+const refreshState = () => statePoll.refresh();
+const scheduleStatePoll = () => statePoll.schedule();
 
 // Historical name kept because it is the startup barrier's contract and the
 // imperative create/delete refresh call-site name.
