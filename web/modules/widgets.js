@@ -9,13 +9,11 @@ import {
     extensionRoutePrefix,
 } from './api_client.js';
 import {
+    chartColorAlpha,
     escapeHtmlAttr as escapeHtml,
     readThemeTokens,
     renderMarkdownSafe,
 } from './utils.js';
-// The canvas alpha helper lives with the evolution chart (the other canvas
-// consumer); both charts share it rather than each rolling its own.
-import { chartColorAlpha } from './evolution.js';
 import {
     collectSafeFieldValues,
     downloadViaHostBridge,
@@ -338,15 +336,15 @@ function renderTableCell(row, column) {
 // variables, so the palette is RESOLVED from the design tokens at chart-BUILD
 // time through the shared `readThemeTokens` seam (web/modules/utils.js). No hue
 // is copied here, so nothing can drift out of step with web/style.css :root.
-// Only LEAF token names belong in these lists.
+// Every name in these lists must be DEFINED in `:root` — aliases resolve
+// through the seam fine, an UNDEFINED token resolves to `''` and drops a series.
 const CHART_SERIES_TOKENS = ['--accent-light', '--user', '--green', '--amber'];
 const CHART_GRID_TOKEN = '--surface-border-soft';
 const CHART_FILL_ALPHA = 0.22;
 
-/** `[borderColor, backgroundColor]` per series, live from `:root`. */
-function chartPalette() {
-    return readThemeTokens(CHART_SERIES_TOKENS)
-        .map((color) => [color, chartColorAlpha(color, CHART_FILL_ALPHA)]);
+/** `[borderColor, backgroundColor]` per series, from already-resolved tokens. */
+function chartPalette(series) {
+    return series.map((color) => [color, chartColorAlpha(color, CHART_FILL_ALPHA)]);
 }
 
 export function finiteChartValue(value) {
@@ -361,8 +359,10 @@ function chartConfig(component, data) {
     const labels = component.labels || getPath(data, component.labels_path || 'labels', []);
     const datasets = component.datasets || getPath(data, component.datasets_path || 'datasets', []);
     const unit = String(component.unit || '');
-    const palette = chartPalette();
-    const [gridColor] = readThemeTokens([CHART_GRID_TOKEN]);
+    // ONE `getComputedStyle` round-trip per chart build for every token this
+    // chart needs — grid first, then the series ramp, in list order.
+    const [gridColor, ...series] = readThemeTokens([CHART_GRID_TOKEN, ...CHART_SERIES_TOKENS]);
+    const palette = chartPalette(series);
     return {
         type,
         data: {

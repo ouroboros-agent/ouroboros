@@ -51,10 +51,14 @@ export function safeExternalHrefAttr(value) {
  *
  * Chart.js paints on a canvas and cannot resolve `var(...)`, so every canvas
  * palette resolves its colours THROUGH here at call time instead of keeping a
- * hand-synced copy of the hexes next to the chart code. Only LEAF tokens
- * resolve: a token whose value is itself a `var(...)` reference comes back
- * unresolved from getPropertyValue, so name the leaf (`--amber`), never the
- * alias (`--accent-system`).
+ * hand-synced copy of the hexes next to the chart code.
+ *
+ * `getPropertyValue` hands back the COMPUTED value, so an alias resolves
+ * THROUGH: `--accent-system: var(--amber)` reads as `#f59e0b`, same as naming
+ * `--amber` directly (verified in Chromium and WebKit). The single failure mode
+ * is a name that is not DEFINED in `:root` at all — that returns `''`, and a
+ * canvas handed `''` silently drops the series. So the invariant callers owe
+ * this seam is "every token you name exists in :root", not "name only leaves".
  *
  * @param {string[]|string} names CSS custom-property names, in order.
  * @param {Element} [root] Element to resolve against; defaults to `:root`.
@@ -64,6 +68,44 @@ export function readThemeTokens(names, root = document.documentElement) {
     const wanted = Array.isArray(names) ? names : [names];
     const styles = getComputedStyle(root);
     return wanted.map((name) => String(styles.getPropertyValue(name) || '').trim());
+}
+
+/**
+ * Same colour at a lower alpha, for dataset fills.
+ *
+ * Lives here, next to `readThemeTokens`: it is the other half of the same seam
+ * (token string in, canvas paint value out) and BOTH chart modules use it, so
+ * neither owns it — `widgets.js` importing it from `evolution.js` made Widgets
+ * depend on the Evolution page for a colour utility.
+ *
+ * Accepts `#rgb`, `#rrggbb`, legacy `rgb()/rgba()` (comma-separated) and the
+ * modern space-separated `rgb(r g b / a)` syntax a browser may hand back. Any
+ * input whose first three channels are not plain numbers (percentages, `none`,
+ * `color-mix(...)`, or the `''` of an undefined token) falls back to the colour
+ * UNCHANGED — a fully opaque fill is a visible imperfection, a `rgba(NaN, …)`
+ * string is an invisible one Chart.js silently drops.
+ */
+export function chartColorAlpha(color, alpha) {
+    const value = String(color || '').trim();
+    const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(value);
+    if (hex) {
+        const digits = hex[1].length === 3
+            ? hex[1].split('').map((ch) => ch + ch).join('')
+            : hex[1];
+        const [r, g, b] = [0, 2, 4].map((offset) => parseInt(digits.slice(offset, offset + 2), 16));
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    const channels = /^rgba?\(([^)]+)\)$/i.exec(value);
+    if (channels) {
+        // One splitter for both syntaxes: `1, 2, 3, .4` and `1 2 3 / .4`.
+        const parts = channels[1].split(/[\s,/]+/).map((part) => part.trim()).filter(Boolean);
+        const rgb = parts.slice(0, 3).map(Number);
+        if (rgb.length === 3 && rgb.every((channel) => Number.isFinite(channel))) {
+            const [r, g, b] = rgb;
+            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        }
+    }
+    return value;
 }
 
 /** Bound untrusted text with a visible marker before it reaches DOM surfaces. */

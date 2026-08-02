@@ -273,16 +273,18 @@ def test_widgets_forms_charts_and_kanban_keep_host_owned_contracts():
     assert "autocomplete=\"new-password\"" in helper
 
 
-def test_canvas_palettes_read_only_leaf_root_tokens():
+def test_canvas_palettes_read_only_defined_root_tokens():
     """Canvas token seam (flat redesign, Phase D).
 
     Chart.js paints on a canvas and cannot resolve `var(...)`, so both chart
     palettes resolve their colours through `readThemeTokens` at build time.
-    `getComputedStyle().getPropertyValue('--x')` returns the token's value
-    LITERALLY — an alias like `--accent-system: var(--amber)` comes back as the
-    string "var(--amber)", which Chart.js cannot paint and which silently drops
-    the series. So every token name these modules hand to the seam must be a LEAF
-    in :root: defined, and not itself a `var(` reference.
+    `getComputedStyle().getPropertyValue('--x')` returns the COMPUTED value, so an
+    alias like `--accent-system: var(--amber)` resolves THROUGH to the hex and is
+    perfectly paintable (verified in Chromium and WebKit). The real failure mode
+    is a token that is not DEFINED in :root: that comes back as the empty string,
+    and a canvas handed '' silently drops the series. So this pins EXISTENCE —
+    every token name these modules hand to the seam is defined in :root — and
+    deliberately says nothing about leaves vs aliases.
     """
     style = _read("web/style.css")
     root_block = style.split(":root {", 1)[1].split("\n}", 1)[0]
@@ -309,11 +311,9 @@ def test_canvas_palettes_read_only_leaf_root_tokens():
     assert "--accent-light" in named and "--font-mono" in named
 
     for token in sorted(named):
-        assert token in definitions, f"{token} is read by a chart but not defined in :root"
-        value = definitions[token]
-        assert "var(" not in value, (
-            f"{token} is an ALIAS ({value.strip()}), not a leaf: getPropertyValue "
-            f"would hand Chart.js the literal string 'var(...)'. Name the leaf."
+        assert token in definitions, (
+            f"{token} is read by a chart but not defined in :root: readThemeTokens "
+            f"would hand Chart.js '' and the series would vanish without an error."
         )
 
 

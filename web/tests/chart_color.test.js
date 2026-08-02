@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { chartColorAlpha, evolutionChartTheme } from '../modules/evolution.js';
+import { evolutionChartTheme } from '../modules/evolution.js';
+import { chartColorAlpha } from '../modules/utils.js';
 
 // `chartColorAlpha` is the ONE place a design token becomes a canvas fill, and it
 // is fed whatever `getComputedStyle().getPropertyValue()` hands back — which is
@@ -43,7 +44,8 @@ test('anything not three plain numeric channels falls back to the colour UNCHANG
         'rgb(50% 20% 30%)',            // percentage channels
         'rgb(none 20 30)',             // CSS Color 4 `none`
         'color-mix(in srgb, red, blue)',
-        'var(--not-a-leaf-token)',     // an alias token came back unresolved
+        'var(--some-token)',           // defensive: the seam resolves aliases, so
+                                       // a literal var() never actually arrives
         'transparent',
         'nonsense',
         '#12',                         // malformed hex

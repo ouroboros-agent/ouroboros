@@ -1,11 +1,12 @@
-import { escapeHtmlText, formatUsd2, readThemeTokens } from './utils.js';
+import { chartColorAlpha, escapeHtmlText, formatUsd2, readThemeTokens } from './utils.js';
 import { apiFetch } from './api_client.js';
 
 // Chart.js paints on a canvas and cannot resolve CSS variables, so every colour
 // and the mono stack are READ from the :root design tokens (web/style.css)
 // through the shared `readThemeTokens` seam (web/modules/utils.js) — never
-// pasted here as hexes. Only LEAF tokens are named: a token whose value is
-// itself a `var(...)` reference would come back unresolved.
+// pasted here as hexes. Every name below must be DEFINED in `:root`: the seam
+// returns computed values (an alias resolves through fine), but an undefined
+// token comes back as `''` and a canvas handed `''` drops the series silently.
 // Six series need six DISTINGUISHABLE lanes, so the ramp names ROLE tokens
 // (task red, owner blue, ok green, notice amber, project teal, accent) instead
 // of shades of one hue — a neutral text ladder collapses into "three grays" at
@@ -42,39 +43,6 @@ export function evolutionChartTheme(root = document.documentElement) {
         theme[key] = values[ramp.length + idx];
     });
     return theme;
-}
-
-/**
- * Same colour at a lower alpha, for dataset fills.
- *
- * Accepts `#rgb`, `#rrggbb`, legacy `rgb()/rgba()` (comma-separated) and the
- * modern space-separated `rgb(r g b / a)` syntax a browser may hand back. Any
- * input whose first three channels are not plain numbers (percentages, `none`,
- * `color-mix(...)`, an unresolved `var(...)`) falls back to the colour UNCHANGED
- * — a fully opaque fill is a visible imperfection, a `rgba(NaN, …)` string is an
- * invisible one Chart.js silently drops.
- */
-export function chartColorAlpha(color, alpha) {
-    const value = String(color || '').trim();
-    const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(value);
-    if (hex) {
-        const digits = hex[1].length === 3
-            ? hex[1].split('').map((ch) => ch + ch).join('')
-            : hex[1];
-        const [r, g, b] = [0, 2, 4].map((offset) => parseInt(digits.slice(offset, offset + 2), 16));
-        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-    }
-    const channels = /^rgba?\(([^)]+)\)$/i.exec(value);
-    if (channels) {
-        // One splitter for both syntaxes: `1, 2, 3, .4` and `1 2 3 / .4`.
-        const parts = channels[1].split(/[\s,/]+/).map((part) => part.trim()).filter(Boolean);
-        const rgb = parts.slice(0, 3).map(Number);
-        if (rgb.length === 3 && rgb.every((channel) => Number.isFinite(channel))) {
-            const [r, g, b] = rgb;
-            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-        }
-    }
-    return value;
 }
 
 export function initEvolution({ ws, state, mount }) {

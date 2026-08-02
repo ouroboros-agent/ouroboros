@@ -3219,19 +3219,28 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     background: var(--surface-control);
 }
 
-/* Real grid, so the time, type and phase columns all START at the same x down the
-   whole stream — the first two tracks are FIXED, so unlike a flex row with
-   `min-width` they keep lining up after a value outgrows its minimum.
+/* Real grid, so the time and type columns START at the same x down the whole
+   stream — track 1 is FIXED and track 2 has an 84px FLOOR, so unlike a flex row
+   with `min-width` short values still line up instead of collapsing.
+   Track 2 is `minmax(84px, max-content)` rather than a hard 84px because the
+   type cell is a whole PHRASE on grouped task cards (`task <8 hex>` → `TASK
+   A1B2C3D4`, ~91px uppercased with letter-spacing): a fixed 84px wrapped that
+   NORMAL case onto two lines on every task card, and a bare `CONSCIOUSNESS`
+   (one unwrappable word) overflowed into the phase pill. The floor keeps the
+   common short labels aligned; `white-space: nowrap` below keeps the long ones
+   on one line, at the cost of those rows pushing their own phase pill right.
    Every child is placed EXPLICITLY: task-timeline rows omit `.log-type`, and an
    implicitly-flowed grid would slide their phase pill into the type column.
    Honest limit: each row is its own grid (there is no shared parent to subgrid
    against), so the intrinsically-sized phase track still shifts the headline's
    start by the pill's own width. Pinning that track to a fixed width instead
-   would truncate the long phase labels (`lifecycle_error`), which is a worse
-   trade than a few px of headline wiggle. */
+   would truncate the long phase labels (`lifecycle_error`), which is the worse
+   trade — but the wiggle it buys is not "a few px": measured at 1280px over a
+   stream mixing `done` / `working` / `lifecycle_error`, the headline start
+   spreads ~80px. */
 .log-main {
     display: grid;
-    grid-template-columns: 62px 84px auto minmax(0, 1fr) auto;
+    grid-template-columns: 62px minmax(84px, max-content) auto minmax(0, 1fr) auto;
     gap: 8px;
     align-items: baseline;
 }
@@ -3253,6 +3262,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     text-transform: uppercase;
     letter-spacing: 0.04em;
     font-size: 10.5px;
+    /* `TASK A1B2C3D4` is one label, not two words to break apart. */
+    white-space: nowrap;
 }
 
 .log-entry .log-phase {
@@ -4604,8 +4615,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .toast-ok .toast-glyph { color: var(--tone-ok); }
 .toast-danger .toast-glyph { color: var(--tone-danger); }
 .toast-warn .toast-glyph { color: var(--tone-warn); }
-.toast-muted,
-.toast-info { color: var(--text-secondary); }
+/* `.toast-info` / `.toast-muted` deliberately carry NO colour rule: they keep
+   `.toast`'s --text-primary. Dimming them to --text-secondary made the neutral
+   toast the least legible one on screen, and neutrality is already signalled by
+   the absence of a `.toast-glyph` (TONE_GLYPHS in web/modules/toast.js only maps
+   ok/warn/danger). */
 
 @keyframes toast-in {
     from { opacity: 0; transform: translateY(8px); }
@@ -5591,13 +5605,15 @@ textarea.chat-input {
         padding-right: var(--space-2);
     }
 
-    /* Nor room for four content tracks: 62px + 84px + a phase pill leaves the
-       headline ~80px, which wraps mid-WORD. So the metadata keeps its one aligned
+    /* Nor room for four content tracks: 62px + the type track + a phase pill leaves
+       the headline ~80px, which wraps mid-WORD. So the metadata keeps its one aligned
        row and the headline drops to a full-width line beneath it — the same two-line
        shape the old `flex-wrap: wrap` produced here, now deliberate instead of
-       incidental. */
+       incidental. Track 2 mirrors the desktop rule (`minmax(84px, max-content)`):
+       the same `TASK A1B2C3D4` phrase must not wrap here either, and the headline
+       already has its own row to fall back to. */
     .log-main {
-        grid-template-columns: 62px 84px minmax(0, 1fr) auto;
+        grid-template-columns: 62px minmax(84px, max-content) minmax(0, 1fr) auto;
     }
 
     /* `grid-row: 1` is load-bearing: the headline spans the full width, so an
