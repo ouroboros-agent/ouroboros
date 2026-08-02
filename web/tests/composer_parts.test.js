@@ -122,20 +122,63 @@ test('ONE trailing newline on a capture is stripped, not counted as a line', () 
     );
 });
 
-test('content that still disagrees with its range is DROPPED, not shipped', () => {
+test('content that spans FEWER lines than its range is DROPPED, not shipped', () => {
     // The range came from the real selection, so it is the claim worth keeping;
-    // the bytes are what cannot be trusted. A ranged-bare chip sends the agent to
-    // read exactly that span instead of a fence contradicting its own label.
+    // bytes that cannot even fill it are what cannot be trusted. A ranged-bare chip
+    // sends the agent to read exactly that span instead of shipping a fence that
+    // shows less than the marker names.
     const short = makeChipPart({ path: 'a.py', lineStart: 10, lineEnd: 12, content: 'only one line' });
     assert.deepEqual(short, { type: 'chip', path: 'a.py', lineStart: 10, lineEnd: 12 });
     assert.equal(serializeParts([short]), '[context: a.py L10-L12]');
 
-    const long = makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 2, content: 'a\nb\nc\nd' });
-    assert.equal('content' in long, false);
-    assert.equal(serializeParts([long]), '[context: a.py L1-L2]');
-
     // A capture that is nothing but a newline normalizes to empty: no bytes.
     assert.equal('content' in makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 1, content: '\n' }), false);
+});
+
+test('content spanning MORE lines than its range rides along, and says so', () => {
+    // The floor, not an equality: a diff capture inlines the selected lines
+    // verbatim (decision 9), and an interleaved `-` row is real selected text that
+    // the new-side range cannot number. Refusing it would silently strip the bytes
+    // out of the most ordinary Changes-screen selection there is.
+    const diffish = makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 2, content: ' a\n-gone\n+b' });
+    assert.equal(diffish.content, ' a\n-gone\n+b');
+    assert.equal(serializeParts([diffish]), '[context: a.py L1-L2]\n```\n a\n-gone\n+b\n```');
+    // The label counts the FENCE, never the 2-line range: what the chip folds away
+    // is exactly what it announces.
+    assert.equal(chipLabel(diffish), 'a.py · 3 lines');
+    // A file capture meets the floor exactly and is labelled by the same rule.
+    assert.equal(chipLabel(makeChipPart({
+        path: 'a.py', lineStart: 1, lineEnd: 2, content: 'a\nb',
+    })), 'a.py · 2 lines');
+    // An over-cap chip carries no bytes, so there the range is all there is.
+    assert.equal(chipLabel({ type: 'chip', path: 'a.py', lineStart: 1, lineEnd: 7 }), 'a.py · 7 lines');
+});
+
+test('a pre-built chip object cannot smuggle a range past the codec', () => {
+    // `normalizeParts` accepts part objects from any caller, so it has to hold them
+    // to the same gate as `makeChipPart` — an unusable range degrades the chip to
+    // the whole-file form (still true) instead of serializing as `L5-L2`, which
+    // nothing could parse back.
+    const cases = [
+        { lineStart: 5, lineEnd: 2 },      // inverted
+        { lineStart: 0, lineEnd: 3 },      // zero
+        { lineStart: -4, lineEnd: -1 },    // negative
+        { lineStart: 1.5, lineEnd: 3 },    // fractional
+        { lineStart: '1', lineEnd: '3' },  // numeric strings
+        { lineStart: 2 },                  // half a range
+    ];
+    for (const range of cases) {
+        const parts = normalizeParts([{ type: 'chip', path: 'a.py', ...range, content: 'x\ny' }]);
+        assert.deepEqual(parts, [{ type: 'chip', path: 'a.py' }], JSON.stringify(range));
+        assert.equal(serializeParts(parts), '[context: a.py]', JSON.stringify(range));
+        // Round-trip is what the degradation buys: the string parses back to itself.
+        assert.equal(serializeParts(parseContent(serializeParts(parts))), '[context: a.py]');
+    }
+    // A valid pre-built chip is untouched, bytes included.
+    assert.deepEqual(
+        normalizeParts([{ type: 'chip', path: 'a.py', lineStart: 4, lineEnd: 5, content: 'x\ny' }]),
+        [{ type: 'chip', path: 'a.py', lineStart: 4, lineEnd: 5, content: 'x\ny' }],
+    );
 });
 
 test('malformed and lookalike markers stay plain text', () => {

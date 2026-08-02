@@ -58,8 +58,8 @@ export function liveLineRowToggleKey(target, selection = null) {
  * such a projection would collapse hundreds of lines the agent still receives
  * into a single marker line. When the round-trip is not exact, the WHOLE raw
  * string is rendered as escaped text: no chips, nothing folded, every byte on
- * screen. Per-part checks (a range disagreeing with its own fence) still apply to
- * projections that ARE lossless.
+ * screen. Inside a projection that IS lossless, every chip's label counts its own
+ * fenced bytes (`chipLabel`), so folding one conceals no line either.
  *
  * Escaping goes through `escapeHtmlAttr` rather than `escapeHtmlText`: it is a
  * PURE string escaper (the text variant round-trips through a real DOM element),
@@ -78,19 +78,17 @@ export function renderUserContent(raw) {
         if (part.type !== 'chip') {
             return `<span class="chat-user-part-text">${escapeHtmlAttr(part.text)}</span>`;
         }
-        // A content-bearing chip HIDES its fenced bytes behind a line COUNT taken
-        // from the marker's range, so that count must be provable from the bytes
-        // themselves. A marker claiming `L10-L12` above a five-line fence — which
-        // this codec never emits, but arbitrary owner text can contain — would
-        // conceal two lines the agent still receives. When the claim and the
-        // payload disagree, the part is shown as the exact grammar it is: its own
-        // re-serialization, escaped, with nothing folded away behind a label.
-        if (typeof part.content === 'string'
-            && part.content.split('\n').length !== part.lineEnd - part.lineStart + 1) {
-            return `<span class="chat-user-part-text">${escapeHtmlAttr(serializeParts([part]))}</span>`;
-        }
+        // A content-bearing chip HIDES its fenced bytes behind a line count, so
+        // that count must be provable from the bytes themselves — and it is, by
+        // construction: `chipLabel` counts the CONTENT, and the codec's floor
+        // refuses to keep a fence that spans fewer lines than its range names (a
+        // marker claiming `L10-L12` over a five-line fence says "5 lines", and one
+        // claiming `L10-L12` over a two-line fence loses the bytes and is caught by
+        // the LOSSLESS-OR-RAW check above). So no line rides along unannounced, and
+        // there is no per-part disagreement left for this projection to hide.
+        //
         // The captured bytes stay in the payload the agent reads; the UI shows the
-        // referent (path + verified line count), with the full path on hover.
+        // referent (path + the fence's own line count), with the full path on hover.
         const label = chipLabel(part);
         return `<span class="chat-context-chip" title="${escapeHtmlAttr(part.path)}">`
             + `${escapeHtmlAttr(label)}</span>`;

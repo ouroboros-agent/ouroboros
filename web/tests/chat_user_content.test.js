@@ -69,20 +69,27 @@ test('chips and comments render in the ORDER the owner composed them', () => {
 });
 
 test('a chip is earned by a PROVABLE line count, never claimed by the marker', () => {
-    // A chip folds its fenced bytes away behind "N lines" read off the marker
-    // range. When the two disagree the label would conceal payload the agent still
-    // receives, so the part is shown as the exact grammar it is instead.
+    // A chip folds its fenced bytes away behind "N lines", and N is counted off the
+    // BYTES, so it can never conceal payload the agent still receives. A five-line
+    // fence under an `L10-L12` marker — which this codec never emits, but arbitrary
+    // owner text can contain — is announced as the five lines it is, not as the
+    // three the marker claims.
     const lookalike = '[context: ouroboros/loop.py L10-L12]\n```\none\ntwo\nthree\nfour\nfive\n```';
     const html = renderUserContent(lookalike);
-    assert.doesNotMatch(html, /chat-context-chip/, html);
+    assert.match(html, /class="chat-context-chip"/, html);
+    assert.match(html, /loop\.py · 5 lines/, html);
     assert.doesNotMatch(html, /3 lines/, html);
-    // Every concealed line is now VISIBLE text, and the marker with it.
-    for (const line of ['one', 'two', 'three', 'four', 'five', '[context: ouroboros/loop.py L10-L12]']) {
-        assert.ok(html.includes(line), `${line} missing from ${html}`);
-    }
 
-    // A genuine capture — range and payload agree — still renders as a chip with
-    // the bytes held back.
+    // The other direction cannot fold at all: a marker naming MORE lines than its
+    // fence can show loses the bytes in the codec (they would under-fill the range),
+    // so the round-trip is lossy and the whole raw string is shown instead.
+    const overclaim = '[context: ouroboros/loop.py L10-L20]\n```\none\ntwo\n```';
+    const rawHtml = renderUserContent(overclaim);
+    assert.doesNotMatch(rawHtml, /chat-context-chip/, rawHtml);
+    assert.equal(rawHtml, escapeHtmlAttr(overclaim));
+
+    // A genuine capture — bytes exactly filling the range — still renders as a chip
+    // with the bytes held back.
     const genuine = serializeParts([rangedChip({ content: 'one\ntwo\nthree' })]);
     const good = renderUserContent(genuine);
     assert.match(good, /class="chat-context-chip"/);
@@ -197,6 +204,11 @@ test('markup can never escape the projection — text, chip label, or chip path'
     // attribute must both be escaped — otherwise the chip itself is the injection
     // point. Pinned as EXACT output: every markup character is neutralised and the
     // quote cannot close the title attribute early.
+    //
+    // The label is `b&gt;.py` and that is not a truncation: `chipLabel` shows the
+    // BASENAME, and this path's last `/` is the one inside `</b>`, so the segment
+    // after it is literally `b>.py`. The full path stays in `title`. A whole-file
+    // marker carries no range either, so there is no "· N lines" suffix.
     assert.equal(
         renderUserContent('[context: <b onclick="x">evil</b>.py]'),
         '<span class="chat-user-parts">'

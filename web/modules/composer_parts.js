@@ -32,15 +32,23 @@
  *
  * Producer contract (`makeChipPart` content)
  * ------------------------------------------
- * `content` is EXACTLY the lines the range names: LF separators, no trailing
- * newline, so `content.split('\n').length === lineEnd - lineStart + 1`. CRLF and
- * ONE trailing newline — what a raw editor selection or file slice usually hands
- * over — are normalized HERE so no producer has to repeat that arithmetic.
- * Content that still disagrees with the range after normalization is DROPPED and
- * the chip stays ranged-but-bare (the agent reads exactly that span itself),
- * because a marker whose claimed line count its own fence contradicts is refused
- * a compact chip by the renderer anyway: building it would only manufacture a
- * message that has to be shown as raw grammar.
+ * `content` is the selected text VERBATIM, LF-separated with no trailing newline;
+ * CRLF and ONE trailing newline — what a raw editor selection or file slice
+ * usually hands over — are normalized HERE so no producer repeats that
+ * arithmetic. The range and the bytes must not CONTRADICT each other, which is a
+ * FLOOR, not an equality: the fence must carry at least as many lines as the
+ * range names.
+ *
+ * A file capture meets it exactly (`slice(start-1, end)` of the line list). A
+ * DIFF capture legitimately carries MORE: decision 9 inlines the selected diff
+ * lines verbatim, and an interleaved `-` line is real selected text that the
+ * new-side range cannot number. Both are honest, so both are allowed — while
+ * content that spans FEWER lines than the range names is dropped, because there
+ * the range would overclaim what the fence can show.
+ *
+ * What makes the FLOOR safe is that `chipLabel` counts the BYTES, never the
+ * range: a chip folds its fence away behind "N lines" that is always provable
+ * from the payload it hides, so no extra line can ride along unannounced.
  *
  * This module is pure with respect to the network: no fetch, no transport, no
  * send logic. `createComposerParts` is a thin DOM mount over the same core.
@@ -69,36 +77,48 @@ export function chipPathIsRepresentable(path) {
     return !/ L\d+-L\d+$/.test(raw);
 }
 
+/** Line count of chip bytes — the ONE place a fence's size is measured. */
+export function chipContentLines(content) {
+    return typeof content === 'string' && content !== '' ? content.split('\n').length : 0;
+}
+
+/**
+ * Hold a chip's shape to the grammar, keeping only what round-trips. Shared by
+ * `makeChipPart` (which normalizes bytes first) and `normalizeParts` (which must
+ * not touch bytes, so a hand-written fence still re-serializes verbatim), so a
+ * pre-built chip object cannot smuggle a range past the same checks.
+ *
+ * An unusable range (inverted, zero, fractional, absent) does not discard the
+ * capture: the chip degrades to the whole-file form, which is still true. Bytes
+ * go with it, because only a range can locate them.
+ */
+function sanitizeChip(chip) {
+    if (!chipPathIsRepresentable(chip?.path)) return null;
+    const start = isPositiveInt(chip.lineStart) ? chip.lineStart : null;
+    const end = isPositiveInt(chip.lineEnd) ? chip.lineEnd : null;
+    const out = { type: 'chip', path: chip.path };
+    if (start === null || end === null || end < start) return out;
+    out.lineStart = start;
+    out.lineEnd = end;
+    // The FLOOR (see the producer contract above): a fence may carry more lines
+    // than the range names (a diff selection's `-` rows), never fewer.
+    if (chipContentLines(chip.content) >= end - start + 1) out.content = chip.content;
+    return out;
+}
+
 /**
  * Build a chip part, or return null when the path cannot round-trip. Callers
  * disclose the refusal to the owner instead of capturing a lossy marker.
  *
- * `content` is normalized and then held to the producer contract documented at
- * the top of this module: CRLF becomes LF, ONE trailing newline is stripped, and
- * bytes that still do not span exactly `lineStart..lineEnd` are dropped.
+ * `content` is normalized to the producer contract documented at the top of this
+ * module — CRLF becomes LF, ONE trailing newline is stripped — and then held to
+ * the same floor as any other chip.
  */
 export function makeChipPart({ path, lineStart = null, lineEnd = null, content = null } = {}) {
-    if (!chipPathIsRepresentable(path)) return null;
-    const start = isPositiveInt(lineStart) ? lineStart : null;
-    const end = isPositiveInt(lineEnd) ? lineEnd : null;
-    const hasRange = start !== null && end !== null && end >= start;
-    const chip = { type: 'chip', path };
-    if (hasRange) {
-        chip.lineStart = start;
-        chip.lineEnd = end;
-        // Content is only meaningful with a range to locate it; a whole-file chip
-        // never carries bytes (the agent reads the file).
-        if (typeof content === 'string' && content !== '') {
-            const normalized = content.replace(/\r\n/g, '\n').replace(/\n$/, '');
-            // The range is the CLAIM; these bytes are the evidence for it. When they
-            // disagree, keep the claim (it came from the real selection) and drop the
-            // bytes rather than emit a fence the renderer must refuse to fold.
-            if (normalized !== '' && normalized.split('\n').length === end - start + 1) {
-                chip.content = normalized;
-            }
-        }
-    }
-    return chip;
+    const bytes = typeof content === 'string' && content !== ''
+        ? content.replace(/\r\n/g, '\n').replace(/\n$/, '')
+        : null;
+    return sanitizeChip({ type: 'chip', path, lineStart, lineEnd, content: bytes });
 }
 
 export function makeTextPart(text) {
@@ -106,10 +126,20 @@ export function makeTextPart(text) {
     return value ? { type: 'text', text: value } : null;
 }
 
-/** Human label for a chip: `name · N lines`, or `name` for a whole file. */
+/**
+ * Human label for a chip: `name · N lines`, or `name` for a whole file.
+ *
+ * N counts the BYTES whenever the chip carries any, and only falls back to the
+ * range span for a bare ranged marker (over-cap capture) that hides nothing. The
+ * label is what a folded chip shows INSTEAD of its fence, so it must be provable
+ * from that fence: a diff chip whose 2-line range inlines 3 verbatim rows says
+ * "3 lines", never the range's 2.
+ */
 export function chipLabel(chip) {
     const path = String(chip?.path || '');
     const name = path.split('/').filter(Boolean).pop() || path;
+    const bytes = chipContentLines(chip?.content);
+    if (bytes > 0) return `${name} · ${bytes} line${bytes === 1 ? '' : 's'}`;
     const start = Number(chip?.lineStart);
     const end = Number(chip?.lineEnd);
     if (!Number.isFinite(start) || !Number.isFinite(end)) return name;
@@ -130,8 +160,11 @@ export function normalizeParts(parts) {
     for (const part of Array.isArray(parts) ? parts : []) {
         if (!part || (part.type !== 'text' && part.type !== 'chip')) continue;
         if (part.type === 'chip') {
-            if (!chipPathIsRepresentable(part.path)) continue;
-            out.push(part);
+            // Every chip goes through the same gate, however it was built: a
+            // hand-assembled `{type:'chip', lineStart:5, lineEnd:2}` would
+            // otherwise serialize as the un-parseable claim `L5-L2`.
+            const chip = sanitizeChip(part);
+            if (chip) out.push(chip);
             continue;
         }
         const text = typeof part.text === 'string' ? part.text : '';
