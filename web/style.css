@@ -1030,6 +1030,9 @@ body.resizing-panels { user-select: none; }
     font: inherit;
 }
 
+/* ===== [shared page chrome: page header + tab strip] =====
+   The tab strip's only consumers are the Dashboard, Skills and Settings pages
+   (stream D), so its look is defined ONCE here rather than overridden per page. */
 .page-header,
 .app-page-header {
     display: grid;
@@ -1118,12 +1121,15 @@ body.resizing-panels { user-select: none; }
     min-width: 0;
 }
 
+/* Underline tabs: a flat label row over one divider rule, with a 2px accent rule
+   under the active tab. No pill chrome (docs/DEVELOPMENT.md "Control rules"). */
 .app-tab-strip {
     display: flex;
     flex-wrap: nowrap;
-    gap: 10px;
+    gap: 2px;
     overflow-x: auto;
-    padding: var(--pill-strip-padding);
+    padding: 4px 0 0;
+    border-bottom: 1px solid var(--divider);
     scrollbar-width: none;
 }
 
@@ -1134,26 +1140,34 @@ body.resizing-panels { user-select: none; }
 .app-tab {
     flex: 0 0 auto;
     white-space: nowrap;
-    border: 1px solid var(--surface-border);
-    background: var(--surface-card);
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: transparent;
     color: var(--text-secondary);
-    border-radius: var(--pill-radius);
-    padding: var(--pill-padding-y) var(--pill-padding-x);
+    padding: var(--pill-padding-y) var(--space-3);
     font: inherit;
     font-size: var(--pill-font-size);
     font-weight: 600;
     cursor: pointer;
-    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+    transition: color 0.15s ease, border-color 0.15s ease;
 }
 
-.app-tab:hover,
+.app-tab:hover {
+    color: var(--text-primary);
+    background: transparent;
+    border-bottom-color: var(--surface-border);
+}
+
+/* The Skills strip passes activeClass 'is-active'; both markers mean active. */
 .app-tab.active,
 .app-tab.is-active {
     color: var(--text-primary);
-    border-color: var(--focus-accent-border);
-    background: rgba(var(--accent-hover-rgb), 0.12);
+    background: transparent;
+    border-bottom-color: var(--accent);
 }
 
+/* Counter pill inside a tab label (Skills tabs): mono, amber notice tone. */
 .app-tab-pill {
     display: inline-flex;
     align-items: center;
@@ -1162,11 +1176,11 @@ body.resizing-panels { user-select: none; }
     padding: 0 6px;
     min-width: 18px;
     height: 18px;
-    border-radius: 9px;
-    background: rgba(245, 158, 11, 0.15);
-    color: #f59e0b;
-    font-size: 11px;
-    font-family: 'JetBrains Mono', monospace;
+    border-radius: var(--radius-9);
+    background: var(--amber-dim);
+    color: var(--amber);
+    font-size: 10.5px;
+    font-family: var(--font-mono);
 }
 
 .scroll-fade-y {
@@ -3106,6 +3120,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding: 0;
 }
 
+/* ===== [stream D: dashboard — logs] =====
+   Dashboard CSS carried no ownership banner after the foundation phase; the
+   Logs / Evolution / Costs / Updates / Activity rules below (and the second
+   dashboard band further down) belong to the same stream as the Skills /
+   Settings / Widgets region at the bottom of this file. */
 .logs-filters {
     display: flex;
     flex-wrap: wrap;
@@ -3119,49 +3138,55 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .filter-chip {
-    padding: 4px 12px;
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--divider);
+    padding: 4px 10px;
+    border-radius: var(--radius-6);
+    border: 1px solid var(--surface-border);
     background: transparent;
     color: var(--text-secondary);
-    font-size: 12px;
-    font-family: inherit;
+    font-size: 11.5px;
+    font-family: var(--font-mono);
     cursor: pointer;
-    transition: all 0.15s;
+    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
+/* Most filters are on by default, so "on" is a calm tinted chip, not six loud
+   red pills: the accent only tints the surface, the label stays neutral. */
 .filter-chip.active {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-dim);
+    border-color: var(--accent-18);
+    color: var(--text-primary);
+    background: var(--accent-08);
 }
 
+/* Log stream: a mono log, not a stack of cards. Rows are flat lines on the page
+   background with fixed time/type columns (so the columns line up down the
+   stream) and a hover tint; only the grouped task card keeps a marker. */
 #log-entries {
     flex: 1;
     overflow-y: auto;
-    padding: 12px;
-    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    padding: 4px 8px 12px;
+    font-family: var(--font-mono);
     font-size: 12px;
-    line-height: 1.55;
-    background: rgba(255, 255, 255, 0.02);
+    line-height: 1.9;
+    background: transparent;
     margin: 0 12px 12px;
-    border-radius: var(--radius-sm);
+    border-radius: 0;
 }
 
 .log-entry {
-    padding: 10px 12px;
-    border-radius: var(--radius-sm);
+    position: relative;
+    padding: 2px 60px 2px 8px;
+    border-radius: var(--radius-6);
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    border: 1px solid rgba(255,255,255,0.04);
-    background: rgba(255,255,255,0.015);
-    margin-bottom: 8px;
+    gap: 4px;
+    border: 1px solid transparent;
+    background: transparent;
+    margin-bottom: 1px;
 }
 
 .log-entry:hover {
-    background: rgba(255, 255, 255, 0.03);
-    border-color: rgba(255,255,255,0.08);
+    background: var(--surface-control);
+    border-color: transparent;
 }
 
 .log-main {
@@ -3174,24 +3199,26 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .log-entry .log-ts {
     color: var(--text-muted);
     flex-shrink: 0;
+    min-width: 62px;
+    font-variant-numeric: tabular-nums;
 }
 
 .log-entry .log-type {
-    font-weight: 700;
+    font-weight: 600;
     flex-shrink: 0;
-    min-width: 78px;
+    min-width: 84px;
     text-transform: uppercase;
-    letter-spacing: 0.03em;
-    font-size: 11px;
+    letter-spacing: 0.04em;
+    font-size: 10.5px;
 }
 
 .log-entry .log-phase {
-    padding: 1px 8px;
+    padding: 0 7px;
     border-radius: 999px;
-    font-size: 11px;
-    border: 1px solid rgba(255,255,255,0.08);
+    font-size: 10.5px;
+    border: 1px solid var(--surface-border);
     color: var(--text-secondary);
-    background: rgba(255,255,255,0.04);
+    background: var(--surface-control);
 }
 
 .log-entry .log-phase:is(.start, .calling, .context, .progress, .thought, .boot, .working, .thinking) {
@@ -3202,14 +3229,14 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .log-entry .log-headline {
     color: var(--text-primary);
-    font-weight: 600;
+    font-weight: 500;
     word-break: break-word;
 }
 
 .log-entry .log-repeat {
     margin-left: auto;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: 10.5px;
 }
 
 .log-meta {
@@ -3221,12 +3248,12 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .log-pill {
     display: inline-flex;
     align-items: center;
-    padding: 1px 8px;
+    padding: 0 7px;
     border-radius: 999px;
-    background: rgba(255,255,255,0.05);
+    background: var(--surface-control);
     color: var(--text-secondary);
-    border: 1px solid rgba(255,255,255,0.05);
-    font-size: 11px;
+    border: 1px solid var(--surface-border-soft);
+    font-size: 10.5px;
 }
 
 .log-body {
@@ -3236,48 +3263,61 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .log-actions {
+    position: absolute;
+    top: 2px;
+    right: 8px;
     display: flex;
     justify-content: flex-end;
 }
 
 .log-raw-toggle {
-    border: 1px solid rgba(255,255,255,0.08);
+    border: 1px solid transparent;
     background: transparent;
     color: var(--text-muted);
-    border-radius: 6px;
-    padding: 3px 8px;
-    font-size: 11px;
+    border-radius: var(--radius-6);
+    padding: 1px 8px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
     cursor: pointer;
 }
 
-.log-raw-toggle:hover {
+.log-raw-toggle:hover,
+.log-raw-toggle:focus-visible {
     color: var(--text-primary);
-    border-color: rgba(255,255,255,0.14);
+    border-color: var(--surface-border);
 }
 
 .log-raw {
     margin: 0;
     padding: 10px;
-    border-radius: var(--radius-sm);
-    background: rgba(0, 0, 0, 0.25);
+    border-radius: var(--radius-6);
+    border: 1px solid var(--divider);
+    background: var(--bg-primary);
     color: var(--text-secondary);
     overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-word;
 }
 
-.log-type.tools { color: var(--blue); }
-.log-type.llm { color: var(--accent); }
+/* Event-type hues come from the ROLE palette (docs/DEVELOPMENT.md "Roles"):
+   task lane = the red task accent, LLM rounds = the owner-blue lane, background
+   consciousness + review notices = amber, tools/system = muted. The per-event
+   outcome (start / done / error) is carried by the phase pill above, which is
+   where the design handoff's task_start → accent-light and task_done → green
+   live — so a row never needs a JS-side hex. */
+.log-type.tools { color: var(--text-muted); }
+.log-type.llm { color: var(--user); }
 .log-type.errors { color: var(--red); }
-.log-type.tasks { color: var(--amber); }
+.log-type.tasks { color: var(--accent-light); }
 .log-type.system { color: var(--text-muted); }
-.log-type.consciousness { color: #d68cff; }
+.log-type.consciousness { color: var(--amber); }
 
 .log-task-card {
-    border-color: var(--accent-12);
-    background:
-        linear-gradient(135deg, rgba(201, 53, 69, 0.07), rgba(255,255,255,0.01)),
-        rgba(255,255,255,0.015);
+    border-color: transparent;
+    border-left: 2px solid var(--accent-25);
+    border-radius: 0 var(--radius-6) var(--radius-6) 0;
+    padding-left: 10px;
+    background: var(--accent-04);
 }
 
 .log-task-summary {
@@ -3289,20 +3329,20 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .log-task-review {
     margin-top: 8px;
     padding: 8px 10px;
-    border: 1px solid rgba(255,255,255,0.06);
-    border-radius: var(--radius-sm);
-    background: rgba(0,0,0,0.14);
+    border: 1px solid var(--surface-border-soft);
+    border-radius: var(--radius-6);
+    background: var(--bg-primary);
 }
 
 .log-task-details {
-    border-top: 1px solid rgba(255,255,255,0.05);
-    padding-top: 8px;
+    border-top: 1px solid var(--divider);
+    padding-top: 6px;
 }
 
 .log-task-details summary {
     cursor: pointer;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: 10.5px;
     user-select: none;
 }
 
@@ -3314,14 +3354,17 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .log-task-event {
-    padding: 8px 10px;
-    border-radius: var(--radius-sm);
-    background: rgba(0, 0, 0, 0.16);
-    border: 1px solid rgba(255,255,255,0.04);
+    position: relative;
+    padding: 4px 60px 4px 8px;
+    border-radius: var(--radius-6);
+    background: var(--surface-card-soft);
+    border: 1px solid var(--surface-border-soft);
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
 }
+
+/* ===== [shared: scrollbars + reconnect overlay] ===== */
 
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -3353,41 +3396,52 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ===== [stream D: dashboard — cost tables, evolution, costs, updates, activity] =====
+   `.btn-sm` / `.btn-xs` below are SHARED button sizes (every page uses them);
+   they live here only because that is where they were defined. */
+
 .cost-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 13px;
+    font-size: 12px;
+    font-family: var(--font-mono);
 }
 .cost-table th {
     text-align: left;
-    font-weight: 500;
+    font-weight: 600;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
     padding: 4px 8px;
     border-bottom: 1px solid var(--divider);
 }
 .cost-table td {
     padding: 5px 8px;
-    border-bottom: 1px solid rgba(255,255,255,0.04);
+    border-bottom: 1px solid var(--surface-border-soft);
     color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
 }
 .cost-table tbody tr:hover td {
-    background: rgba(255,255,255,0.03);
+    background: var(--surface-card);
 }
 
 /* Settings LAN reachability hint. */
 .settings-lan-hint {
     margin-top: 8px;
     padding: 8px 12px;
-    border-radius: var(--radius-sm);
-    font-size: 0.84em;
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
-    color: var(--text-secondary, rgba(255,255,255,0.65));
+    border-radius: var(--radius-6);
+    font-size: 12px;
+    line-height: 1.5;
+    background: var(--surface-control);
+    border: 1px solid var(--surface-border);
+    color: var(--text-secondary);
 }
-.settings-lan-hint[data-tone="ok"] { border-color: rgba(100,200,100,0.25); }
-.settings-lan-hint[data-tone="warn"] { border-color: rgba(220,180,50,0.35); }
-.settings-lan-hint[data-tone="info"] { border-color: rgba(100,150,220,0.25); }
+/* No mid-alpha status ladder exists in :root, so a tinted 1px edge references the
+   ROLE token directly (see the token-gap note in the stream report). */
+.settings-lan-hint[data-tone="ok"] { border-color: var(--tone-ok); }
+.settings-lan-hint[data-tone="warn"] { border-color: var(--tone-warn); }
+.settings-lan-hint[data-tone="info"] { border-color: var(--accent-user); }
 .settings-lan-hint a { color: inherit; text-decoration: underline; opacity: 0.9; }
 .btn-sm {
     padding: calc(var(--button-padding-y) - 4px) calc(var(--button-padding-x) - 4px);
@@ -3412,11 +3466,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .evo-chart-wrap {
     background: var(--bg-elevated);
     border: 1px solid var(--surface-border);
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius);
 }
 
 .evo-runtime-card {
-    padding: 16px 18px;
+    padding: var(--space-4);
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -3432,7 +3486,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .evo-runtime-detail {
     color: var(--text-secondary);
-    line-height: 1.6;
+    font-size: 12px;
+    line-height: 1.55;
     max-width: 880px;
 }
 
@@ -3450,16 +3505,27 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .evo-runtime-pill,
 .evo-runtime-chip {
-    padding: 6px 10px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.04);
+    padding: 5px 10px;
+    border: 1px solid var(--surface-border);
+    background: var(--surface-control);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 11.5px;
+}
+
+/* Runtime pills read as state: running is green (shared tone rules further up),
+   an idle/disabled lane stays deliberately gray. */
+.evo-runtime-pill.offline {
+    color: var(--text-muted);
+}
+
+.evo-runtime-chip {
+    font-family: var(--font-mono);
+    font-size: 11px;
 }
 
 .evo-runtime-chip strong {
     font-weight: 600;
-    color: var(--text-primary);
+    color: var(--text-secondary);
 }
 
 .evo-chart-wrap {
@@ -3480,10 +3546,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .evo-empty {
     padding: 18px;
-    border-radius: 14px;
-    border: 1px dashed rgba(255, 255, 255, 0.12);
-    background: rgba(255, 255, 255, 0.03);
+    border-radius: var(--radius);
+    border: 1px dashed var(--bg-hover);
+    background: var(--surface-card);
     color: var(--text-secondary);
+    font-size: 13px;
     line-height: 1.6;
 }
 
@@ -3524,10 +3591,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .costs-scroll { overflow-y: auto; flex: 1; padding: 16px 20px; }
 .costs-budget-card {
-    padding: 20px 24px;
+    padding: var(--space-4) var(--space-5);
     margin-bottom: 20px;
 }
-.costs-budget-title { font-size: 15px; font-weight: 600; margin: 0; color: var(--text-primary); }
+.costs-budget-title { font-size: 14px; font-weight: 600; margin: 0; color: var(--text-primary); }
 /* Budget card head row hosts title plus embedded Refresh. */
 .costs-budget-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
 .costs-budget-refresh { flex: 0 0 auto; }
@@ -3546,16 +3613,48 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     grid-template-columns: 1fr 1fr;
     gap: 20px;
 }
-.costs-table-label { font-size: 14px; color: var(--text-secondary); margin: 0 0 8px; }
+.costs-table-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 0 0 8px;
+}
 .cost-cell-name { font-size: 12px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cost-cell-right { text-align: right; }
 .cost-top-model { font-size: 12px; }
-.cost-bar-cell { width: 60px; }
-.cost-bar { width: 60px; height: 6px; border: 0; border-radius: var(--radius-xs); overflow: hidden; opacity: 0.7; }
-.cost-bar::-webkit-progress-bar { background: rgba(255, 255, 255, 0.08); }
+/* Share-of-total bar: a thin flat accent rule inside the row, no gloss. */
+.cost-bar-cell { width: 72px; }
+.cost-bar {
+    display: block;
+    width: 72px;
+    height: 6px;
+    border: 0;
+    border-radius: var(--radius-xs);
+    overflow: hidden;
+    background: var(--bg-hover);
+}
+.cost-bar::-webkit-progress-bar { background: var(--bg-hover); }
 .cost-bar::-webkit-progress-value { background: var(--accent); }
 .cost-bar::-moz-progress-bar { background: var(--accent); }
 .cost-empty-cell { color: var(--text-muted); text-align: center; }
+
+/* The Costs stat cards are the only .stat-card consumer: label 10.5px uppercase
+   muted, value 20px/600 mono (an amount is a number, so it is mono). */
+.stat-card .label {
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.stat-card .value {
+    font-family: var(--font-mono);
+    font-size: 20px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
 
 .updates-scroll {
     flex: 1;
@@ -3568,7 +3667,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .updates-card {
-    padding: 18px;
+    padding: var(--space-4);
 }
 
 .updates-card-head {
@@ -3593,7 +3692,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .updates-summary {
     color: var(--text-secondary);
-    line-height: 1.55;
+    font-size: 12px;
+    line-height: 1.5;
     overflow-wrap: break-word;
     word-break: normal;
 }
@@ -3604,6 +3704,14 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 12px;
+}
+
+/* Card title line for the Evolution runtime + Updates cards (its only two
+   consumers): the same 13px/600 heading the Skills cards use. */
+.section-title {
+    font-size: 13px;
+    color: var(--text-primary);
+    margin: 0 0 8px;
 }
 
 #page-dashboard {
@@ -3618,8 +3726,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding: 0 20px 18px;
     overflow: hidden;
 }
-
-/* Dashboard tabs inherit shared .app-tab* styling. */
 
 .dashboard-panels,
 .dashboard-panel {
@@ -3660,11 +3766,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .activity-h {
     margin: 0 0 8px;
-    font-size: 13px;
+    font-size: 10.5px;
     font-weight: 600;
-    color: rgba(226, 232, 240, 0.78);
+    color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.06em;
 }
 
 .activity-row {
@@ -3673,10 +3779,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     justify-content: space-between;
     gap: 12px;
     padding: 9px 12px;
-    border: 1px solid rgba(255, 255, 255, 0.07);
-    border-radius: 8px;
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
     margin-bottom: 6px;
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--bg-elevated);
 }
 
 .activity-row.off {
@@ -3690,16 +3796,17 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .activity-name {
-    font-size: 13px;
-    color: rgba(239, 246, 255, 0.9);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--text-primary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
 .activity-sub {
-    font-size: 12px;
-    color: rgba(148, 163, 184, 0.85);
+    font-size: 11.5px;
+    color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3713,42 +3820,43 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .activity-tag {
-    font-size: 11px;
-    color: rgba(148, 163, 184, 0.8);
-    font-style: italic;
+    font-size: 10.5px;
+    color: var(--text-muted);
 }
 
 .activity-empty,
 .activity-loading {
-    font-size: 13px;
-    color: rgba(148, 163, 184, 0.75);
+    font-size: 12px;
+    color: var(--text-muted);
     padding: 8px 2px;
 }
 
 /* P2: main-screen Update pill + staged choice dialog. */
+/* An available update is a NOTICE, not an error: the amber system voice. The old
+   sky-blue literals belonged to the retired palette. */
 .update-pill {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     margin: 6px 8px;
-    padding: 5px 11px;
+    padding: 4px 10px;
     border-radius: 999px;
-    border: 1px solid rgba(56, 189, 248, 0.5);
-    background: rgba(56, 189, 248, 0.14);
-    color: #bae6fd;
-    font-size: 12px;
+    border: 1px solid var(--system-border);
+    background: var(--system-bubble-bg);
+    color: var(--amber);
+    font-size: 11.5px;
     font-weight: 600;
     cursor: pointer;
 }
 
 .update-pill:hover {
-    background: rgba(56, 189, 248, 0.22);
+    background: var(--amber-dim);
 }
 
 .update-pill.has-local {
-    border-color: rgba(251, 191, 36, 0.55);
-    background: rgba(251, 191, 36, 0.14);
-    color: #fde68a;
+    border-color: var(--focus-accent-border);
+    background: var(--accent-12);
+    color: var(--accent-chip-text);
 }
 
 .update-dialog-overlay {
@@ -3758,28 +3866,28 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(2, 6, 23, 0.6);
+    background: rgba(0, 0, 0, 0.55);
 }
 
 .update-dialog {
     width: min(560px, calc(100vw - 32px));
     max-height: calc(100vh - 64px);
     overflow-y: auto;
-    background: #0f172a;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 12px;
+    background: var(--ui-modal-bg);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius);
     padding: 20px;
-    color: rgba(226, 232, 240, 0.92);
+    color: var(--text-primary);
 }
 
 .update-dialog-title {
     margin: 0 0 6px;
-    font-size: 16px;
+    font-size: 15px;
 }
 
 .update-dialog-meta {
-    font-size: 13px;
-    color: rgba(148, 163, 184, 0.9);
+    font-size: 12px;
+    color: var(--text-secondary);
     margin-bottom: 10px;
 }
 
@@ -3788,13 +3896,14 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     padding-left: 18px;
     max-height: 180px;
     overflow-y: auto;
-    font-size: 12px;
-    color: rgba(226, 232, 240, 0.78);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
 }
 
 .update-dialog-note {
     font-size: 12px;
-    color: rgba(148, 163, 184, 0.85);
+    color: var(--text-muted);
     margin-bottom: 14px;
     line-height: 1.5;
 }
@@ -3807,8 +3916,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .update-dialog-status {
     margin-top: 12px;
-    font-size: 13px;
-    color: rgba(148, 163, 184, 0.95);
+    font-size: 12px;
+    color: var(--text-secondary);
 }
 
 .settings-embedded-content {
@@ -3851,10 +3960,18 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     overflow-y: auto;
 }
 
+/* A version row is a ROW: these reuse .log-entry (a column) for the mono row
+   look, so the direction and the log stream's right gutter are reset here. */
 .evo-versions-row {
     display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
+    padding-right: var(--space-2);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.7;
 }
 
 .evo-versions-row-label {
@@ -3862,8 +3979,12 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     text-align: center;
 }
 
+/* In the narrow three-column recovery lists the message gets its own line under
+   the sha + date pair instead of being squeezed into a 60px column. */
 .evo-versions-row-msg {
-    flex: 1;
+    flex: 1 1 100%;
+    min-width: 0;
+    color: var(--text-secondary);
 }
 
 .btn-xs {
@@ -3910,8 +4031,12 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 12px;
 }
 
+/* Skill card (design handoff §8): a flat elevated card, radius 12, padding 16.
+   The name is mono because it is an identifier; the description is calm 12px
+   secondary text; the meta line under it is a 10.5px muted footnote. */
 .skills-card {
-    padding: 16px 18px;
+    padding: var(--space-4);
+    background: var(--bg-elevated);
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -3931,21 +4056,23 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .skills-card-title h3 {
     margin: 0;
-    font-size: 16px;
+    font-family: var(--font-mono);
+    font-size: 13px;
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
 }
 
 .skills-card-desc {
-    margin: 4px 0 0;
-    color: rgba(250, 250, 250, 0.65);
-    font-size: 13px;
-    line-height: 1.45;
+    margin: 6px 0 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.5;
 }
 
 .skills-card-installed {
-    margin-top: 5px;
-    font-size: 11.5px;
+    margin-top: 6px;
+    font-size: 10.5px;
+    color: var(--text-muted);
 }
 
 .skills-card-toggle {
@@ -3959,10 +4086,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .skills-status-chip {
-    padding: 4px 10px;
-    font-size: 12px;
-    font-weight: 500;
-    letter-spacing: 0.01em;
+    padding: 3px 9px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
     border: 1px solid transparent;
 }
 
@@ -3976,28 +4103,29 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     filter: brightness(1.12);
 }
 
+/* Status pills reuse the ONE tone system (ok / warn / danger / muted). */
 .skills-status-ok {
-    background: rgba(34, 197, 94, 0.12);
-    color: #4ade80;
-    border-color: rgba(34, 197, 94, 0.3);
+    background: var(--green-dim);
+    color: var(--tone-ok);
+    border-color: var(--green-dim);
 }
 
 .skills-status-warn {
-    background: rgba(245, 158, 11, 0.12);
-    color: #fbbf24;
-    border-color: rgba(245, 158, 11, 0.3);
+    background: var(--amber-dim);
+    color: var(--tone-warn);
+    border-color: var(--amber-dim);
 }
 
 .skills-status-danger {
-    background: rgba(239, 68, 68, 0.12);
-    color: #f87171;
-    border-color: rgba(239, 68, 68, 0.3);
+    background: var(--red-dim);
+    color: var(--tone-danger);
+    border-color: var(--red-dim);
 }
 
 .skills-status-muted {
-    background: rgba(250, 250, 250, 0.06);
-    color: rgba(250, 250, 250, 0.65);
-    border-color: rgba(250, 250, 250, 0.12);
+    background: var(--surface-control);
+    color: var(--text-secondary);
+    border-color: var(--surface-border);
 }
 
 .skills-switch {
@@ -4024,7 +4152,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     width: 40px;
     height: 22px;
     border-radius: 999px;
-    background: rgba(250, 250, 250, 0.12);
+    background: var(--bg-hover);
     transition: background 120ms ease;
 }
 
@@ -4035,13 +4163,13 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     width: 18px;
     height: 18px;
     border-radius: 50%;
-    background: #f8fafc;
+    background: var(--text-primary);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     transition: transform 140ms ease, background 120ms ease;
 }
 
 .skills-switch input:checked + .skills-switch-track {
-    background: #22c55e;
+    background: var(--green);
 }
 
 .skills-switch input:checked + .skills-switch-track .skills-switch-thumb {
@@ -4049,7 +4177,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .skills-switch input:focus-visible + .skills-switch-track {
-    outline: 2px solid rgba(34, 197, 94, 0.6);
+    outline: 2px solid var(--green);
     outline-offset: 2px;
 }
 
@@ -4060,19 +4188,19 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .skills-switch.is-locked .skills-switch-track,
 .skills-switch input:disabled + .skills-switch-track {
-    background: rgba(245, 158, 11, 0.18);
+    background: var(--amber-dim);
     opacity: 0.7;
 }
 
 .skills-switch.is-locked .skills-switch-thumb,
 .skills-switch input:disabled + .skills-switch-track .skills-switch-thumb {
-    background: rgba(245, 158, 11, 0.85);
+    background: var(--amber);
 }
 
 /* Inline hint for switches locked by review/grants. */
 .skills-lock-hint {
-    font-size: 12px;
-    color: #fbbf24;
+    font-size: 11.5px;
+    color: var(--amber);
     margin-left: 2px;
     display: flex;
     align-items: center;
@@ -4099,20 +4227,20 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     align-items: center;
     gap: 8px;
     align-self: flex-start;
-    padding: 6px 10px;
+    padding: 5px 10px;
     border-radius: 999px;
-    border: 1px solid rgba(201, 53, 69, 0.24);
+    border: 1px solid var(--accent-25);
     background: var(--accent-08);
-    color: rgba(255, 220, 226, 0.86);
-    font-size: 12px;
+    color: var(--accent-chip-text);
+    font-size: 11.5px;
 }
 
 .skills-review-spinner {
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    border: 2px solid rgba(255, 220, 226, 0.24);
-    border-top-color: rgba(255, 220, 226, 0.9);
+    border: 2px solid var(--accent-25);
+    border-top-color: var(--accent-chip-text);
     animation: skills-review-spin 900ms linear infinite;
 }
 
@@ -4128,31 +4256,31 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     height: 10px;
     margin-left: 8px;
     border-radius: 50%;
-    border: 2px solid rgba(250, 250, 250, 0.25);
-    border-top-color: rgba(250, 250, 250, 0.9);
+    border: 2px solid var(--surface-border);
+    border-top-color: var(--text-secondary);
     animation: skills-review-spin 900ms linear infinite;
     vertical-align: -1px;
 }
 
 .skills-access {
-    border: 1px solid rgba(250, 250, 250, 0.1);
-    border-radius: var(--radius-md);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-sm);
     padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--surface-card-soft);
     display: flex;
     flex-direction: column;
     gap: 6px;
-    font-size: 13px;
+    font-size: 12px;
 }
 
+/* Grant panels stay on the neutral card surface; only the edge carries the tone
+   (a full-panel status tint fought the flat grays). */
 .skills-access-warn {
-    border-color: rgba(245, 158, 11, 0.35);
-    background: rgba(245, 158, 11, 0.06);
+    border-color: var(--tone-warn);
 }
 
 .skills-access-ok {
-    border-color: rgba(34, 197, 94, 0.3);
-    background: rgba(34, 197, 94, 0.05);
+    border-color: var(--tone-ok);
 }
 
 .skills-access-row {
@@ -4163,15 +4291,15 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .skills-access-label {
-    color: rgba(250, 250, 250, 0.5);
-    font-size: 12px;
+    color: var(--text-muted);
+    font-size: 10.5px;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.06em;
     margin-right: 4px;
 }
 
 .skills-access-status {
-    color: rgba(250, 250, 250, 0.85);
+    color: var(--text-secondary);
 }
 
 .skills-access-actions {
@@ -4180,22 +4308,23 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .skills-access code {
     padding: 1px 6px;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.06);
-    font-size: 11.5px;
+    border-radius: var(--radius-4);
+    background: var(--bg-card);
+    font-family: var(--font-mono);
+    font-size: 11px;
 }
 
 .skills-details {
     margin-top: 4px;
-    border-top: 1px solid rgba(250, 250, 250, 0.06);
+    border-top: 1px solid var(--divider);
     padding-top: 10px;
 }
 
 .skills-details > summary {
     cursor: pointer;
     user-select: none;
-    color: rgba(250, 250, 250, 0.55);
-    font-size: 12px;
+    color: var(--text-secondary);
+    font-size: 11.5px;
     list-style: none;
     display: inline-flex;
     align-items: center;
@@ -4222,24 +4351,25 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     flex-wrap: wrap;
     gap: 6px;
     align-items: baseline;
-    font-size: 12.5px;
-    color: rgba(250, 250, 250, 0.7);
+    font-size: 12px;
+    color: var(--text-secondary);
     padding: 4px 0;
 }
 
 .skills-detail-label {
-    color: rgba(250, 250, 250, 0.5);
-    font-size: 11.5px;
+    color: var(--text-muted);
+    font-size: 10.5px;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.06em;
     min-width: 90px;
 }
 
 .skills-detail-row code {
     padding: 1px 6px;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.05);
-    font-size: 11.5px;
+    border-radius: var(--radius-4);
+    background: var(--surface-control);
+    font-family: var(--font-mono);
+    font-size: 11px;
 }
 
 .skills-card-actions {
@@ -4273,9 +4403,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .skills-card-menu-trigger {
     width: 32px;
     min-height: 32px;
-    border-radius: var(--radius-sm);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.04);
+    border-radius: var(--radius-7);
+    border: 1px solid var(--surface-border);
+    background: var(--surface-control);
     color: var(--text-secondary);
     display: inline-flex;
     align-items: center;
@@ -4302,9 +4432,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     margin: 0;
     min-width: 160px;
     padding: 6px;
-    border-radius: var(--radius);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(18, 20, 26, 0.96);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--surface-border);
+    background: var(--ui-modal-bg);
     color: var(--text-primary);
     box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
     z-index: 50;
@@ -4355,15 +4485,15 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .skills-source-warn {
-    background: rgba(245, 158, 11, 0.1);
-    color: #fbbf24;
-    border-color: rgba(245, 158, 11, 0.25);
+    background: var(--amber-dim);
+    color: var(--tone-warn);
+    border-color: var(--amber-dim);
 }
 
 .skills-source-muted {
-    background: rgba(250, 250, 250, 0.05);
-    color: rgba(250, 250, 250, 0.55);
-    border-color: rgba(250, 250, 250, 0.1);
+    background: var(--surface-control);
+    color: var(--text-secondary);
+    border-color: var(--surface-border);
 }
 
 .skills-load-error {
@@ -4374,17 +4504,17 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .skills-badge {
     padding: 2px 8px;
-    border-radius: var(--radius-xs);
-    font-size: 11px;
-    font-family: 'JetBrains Mono', monospace;
+    border-radius: var(--radius-4);
+    font-size: 10.5px;
+    font-family: var(--font-mono);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.06em;
 }
 
-.skills-badge-ok { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
-.skills-badge-danger { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
-.skills-badge-warn { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
-.skills-badge-muted { background: rgba(250, 250, 250, 0.06); color: rgba(250, 250, 250, 0.55); }
+.skills-badge-ok { background: var(--green-dim); color: var(--tone-ok); }
+.skills-badge-danger { background: var(--red-dim); color: var(--tone-danger); }
+.skills-badge-warn { background: var(--amber-dim); color: var(--tone-warn); }
+.skills-badge-muted { background: var(--surface-control); color: var(--text-secondary); }
 
 .toast-stack {
     position: fixed;
@@ -4401,8 +4531,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .toast {
     max-width: min(420px, calc(100vw - 112px));
     padding: 11px 14px;
-    border-radius: var(--radius);
-    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--bg-hover);
     background: var(--bg-elevated);
     color: var(--text-primary);
     box-shadow: 0 18px 42px rgba(0, 0, 0, 0.34);
@@ -4417,11 +4547,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     animation: toast-out 160ms ease-in forwards;
 }
 
-.toast-ok { border-color: rgba(34, 197, 94, 0.28); color: #bbf7d0; }
-.toast-danger { border-color: rgba(239, 68, 68, 0.35); color: #fecaca; }
-.toast-warn { border-color: rgba(245, 158, 11, 0.35); color: #fde68a; }
+.toast-ok { border-color: var(--tone-ok); color: var(--tone-ok); }
+.toast-danger { border-color: var(--tone-danger); color: var(--tone-danger); }
+.toast-warn { border-color: var(--tone-warn); color: var(--tone-warn); }
 .toast-muted,
-.toast-info { color: rgba(250, 250, 250, 0.78); }
+.toast-info { color: var(--text-secondary); }
 
 @keyframes toast-in {
     from { opacity: 0; transform: translateY(8px); }
@@ -4460,25 +4590,25 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     height: 36px;
     min-height: 36px;
     padding: 6px 10px;
-    border: 1px solid rgba(250, 250, 250, 0.1);
-    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--surface-border);
+    background: var(--surface-card);
     color: inherit;
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     font: inherit;
     font-size: 13px;
 }
 
 .marketplace-search:focus {
     outline: none;
-    border-color: rgba(250, 250, 250, 0.3);
-    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--bg-hover);
+    background: var(--bg-card);
 }
 
 .marketplace-checkbox {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    color: rgba(250, 250, 250, 0.7);
+    color: var(--text-secondary);
     font-size: 13px;
 }
 
@@ -4494,23 +4624,23 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-card {
-    padding: 14px;
+    padding: var(--space-4);
     display: flex;
     flex-direction: column;
     gap: 10px;
 }
 
+/* Long install/adapt/review/deps work pulses the card EDGE in the amber notice
+   tone; the surface stays flat (the old two-stop amber wash predated the flat
+   theme and could not be expressed in tokens). */
 .marketplace-card.is-working {
-    border-color: rgba(245, 158, 11, 0.35);
-    background: linear-gradient(135deg, rgba(245, 158, 11, 0.08), rgba(255, 255, 255, 0.02));
-    /* Pulse during long install/adapt/review/deps work. */
+    border-color: var(--system-border);
     animation: marketplace-card-pulse 2.4s ease-in-out infinite;
 }
 
 @keyframes marketplace-card-pulse {
-    0%   { background: linear-gradient(135deg, rgba(245, 158, 11, 0.06), rgba(255, 255, 255, 0.02)); }
-    50%  { background: linear-gradient(135deg, rgba(245, 158, 11, 0.14), rgba(255, 255, 255, 0.04)); }
-    100% { background: linear-gradient(135deg, rgba(245, 158, 11, 0.06), rgba(255, 255, 255, 0.02)); }
+    0%, 100% { border-color: var(--system-border); }
+    50%      { border-color: var(--amber-dim); }
 }
 
 /* Marketplace filter row; real input preserves keyboard/a11y. */
@@ -4547,8 +4677,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     width: 36px;
     height: 20px;
     border-radius: var(--radius-md);
-    background: rgba(255, 255, 255, 0.12);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    background: var(--bg-hover);
+    border: 1px solid var(--surface-border-soft);
     position: relative;
     flex-shrink: 0;
     transition: background 0.18s ease;
@@ -4562,7 +4692,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.85);
+    background: var(--text-primary);
     transition: transform 0.18s ease;
 }
 
@@ -4573,7 +4703,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .marketplace-filter-toggle input[type="checkbox"]:checked + .marketplace-filter-track::after {
     transform: translateX(16px);
-    background: #fff;
+    background: var(--text-primary);
 }
 
 .marketplace-filter-toggle input[type="checkbox"]:focus-visible + .marketplace-filter-track {
@@ -4589,14 +4719,15 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-card-title strong {
-    font-size: 14px;
+    font-family: var(--font-mono);
+    font-size: 13px;
     margin-right: 8px;
     display: block;
 }
 
 .marketplace-card-title .muted {
     font-size: 12px;
-    color: rgba(250, 250, 250, 0.55);
+    color: var(--text-secondary);
     word-break: break-all;
 }
 
@@ -4611,18 +4742,18 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-card-body {
-    color: rgba(250, 250, 250, 0.8);
-    font-size: 13px;
-    line-height: 1.45;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.5;
     min-height: 38px;
 }
 
 .marketplace-card-state {
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--surface-border);
     border-radius: var(--radius);
     padding: 10px 12px;
     font-size: 12px;
-    background: rgba(255, 255, 255, 0.035);
+    background: var(--surface-card);
 }
 
 .marketplace-card-state strong {
@@ -4642,7 +4773,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-card-state-hint {
-    color: rgba(250, 250, 250, 0.68);
+    color: var(--text-secondary);
     line-height: 1.45;
 }
 
@@ -4662,12 +4793,12 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
-    font-size: 12px;
-    color: rgba(250, 250, 250, 0.55);
+    font-size: 10.5px;
+    color: var(--text-muted);
 }
 
 .marketplace-card-meta a {
-    color: rgba(250, 250, 250, 0.75);
+    color: var(--text-secondary);
 }
 
 .marketplace-card-actions {
@@ -4742,7 +4873,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .marketplace-modal-body section h4 {
     margin: 0 0 4px 0;
     font-size: 13px;
-    color: rgba(250, 250, 250, 0.75);
+    color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
@@ -4753,23 +4884,24 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 8px;
 }
 
-.marketplace-block-list h4 { color: #ef4444; }
-.marketplace-block-list ul { margin: 4px 0 0 0; padding-left: 18px; color: #ef4444; font-size: 12px; }
-.marketplace-warn-list h4 { color: #f59e0b; }
-.marketplace-warn-list ul { margin: 4px 0 0 0; padding-left: 18px; color: #f59e0b; font-size: 12px; }
+.marketplace-block-list h4 { color: var(--tone-danger); }
+.marketplace-block-list ul { margin: 4px 0 0 0; padding-left: 18px; color: var(--tone-danger); font-size: 12px; }
+.marketplace-warn-list h4 { color: var(--tone-warn); }
+.marketplace-warn-list ul { margin: 4px 0 0 0; padding-left: 18px; color: var(--tone-warn); font-size: 12px; }
 
-/* Installed-card provenance and adapter warnings. */
+/* Installed-card provenance and adapter warnings: the card's footer meta line. */
 .skills-card-provenance {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px 14px;
+    gap: 6px 12px;
     align-items: center;
     margin-top: 4px;
-    font-size: 12px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
 }
 .skills-card-warnings {
     margin-top: 4px;
-    font-size: 12px;
+    font-size: 11.5px;
 }
 .skills-card-warnings summary {
     cursor: pointer;
@@ -4791,7 +4923,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     position: absolute;
     left: 0;
     top: 0;
-    padding: 14px;
+    padding: var(--space-4);
+    background: var(--bg-elevated);
 }
 
 .widgets-card.dragging {
@@ -4834,7 +4967,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     width: 28px;
     height: 28px;
     border-radius: var(--radius-xs);
-    border: 1px solid rgba(226, 232, 240, 0.14);
+    border: 1px solid var(--surface-border);
     background: var(--surface-control);
     color: var(--text-secondary);
     cursor: grab;
@@ -4853,8 +4986,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .widgets-card-source {
-    color: rgba(250, 250, 250, 0.5);
-    font-size: 12px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
 }
 
 .widgets-card-body > :first-child {
@@ -4864,9 +4998,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widgets-frame {
     width: 100%;
     min-height: 320px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--surface-border);
     border-radius: var(--radius);
-    background: rgba(var(--bg-primary-rgb), 0.88);
+    background: var(--bg-primary);
 }
 
 .widget-form,
@@ -4928,7 +5062,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: flex;
     flex-direction: column;
     gap: 5px;
-    color: rgba(250, 250, 250, 0.72);
+    color: var(--text-secondary);
     font-size: 13px;
 }
 
@@ -4941,7 +5075,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widget-field textarea,
 .widget-field select {
     min-width: 0;
-    border: 1px solid rgba(255, 255, 255, 0.09);
+    border: 1px solid var(--bg-hover);
     border-radius: var(--radius-sm);
     background: rgba(var(--bg-primary-rgb), 0.74);
     color: var(--text-primary);
@@ -4958,7 +5092,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .widget-group {
-    border: 1px solid rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--surface-border);
     border-radius: var(--radius-sm);
     padding: 10px;
 }
@@ -4991,7 +5125,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .widget-metric,
 .widget-callout {
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--surface-border);
     border-left-width: 3px;
     border-radius: var(--radius-sm);
     padding: 9px 10px;
@@ -4999,20 +5133,20 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .widget-metric { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .widget-metric > span { color: var(--text-secondary); font-size: 12px; }
-.widget-metric > strong { font-size: 18px; }
+.widget-metric > strong { font-family: var(--font-mono); font-size: 18px; font-weight: 600; }
 .widget-metric small { color: var(--text-secondary); font-size: 11px; font-weight: 500; }
-.widget-callout { font-size: 13px; line-height: 1.45; background: rgba(96, 165, 250, 0.06); }
-.widget-metric[data-tone="ok"], .widget-callout[data-tone="ok"] { border-left-color: #34d399; }
-.widget-metric[data-tone="warn"], .widget-callout[data-tone="warn"] { border-left-color: #fbbf24; }
-.widget-metric[data-tone="danger"], .widget-callout[data-tone="danger"] { border-left-color: #e85d6f; }
-.widget-metric[data-tone="info"], .widget-callout[data-tone="info"] { border-left-color: #60a5fa; }
+.widget-callout { font-size: 13px; line-height: 1.45; background: var(--blue-08); }
+.widget-metric[data-tone="ok"], .widget-callout[data-tone="ok"] { border-left-color: var(--tone-ok); }
+.widget-metric[data-tone="warn"], .widget-callout[data-tone="warn"] { border-left-color: var(--tone-warn); }
+.widget-metric[data-tone="danger"], .widget-callout[data-tone="danger"] { border-left-color: var(--tone-danger); }
+.widget-metric[data-tone="info"], .widget-callout[data-tone="info"] { border-left-color: var(--accent-user); }
 
 .widget-kv-row {
     display: flex;
     justify-content: space-between;
     gap: 12px;
     padding: 6px 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    border-bottom: 1px solid var(--surface-border-soft);
 }
 
 .widget-table-wrap {
@@ -5028,7 +5162,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widget-table th,
 .widget-table td {
     padding: 7px 8px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    border-bottom: 1px solid var(--surface-border-soft);
     text-align: left;
     overflow-wrap: break-word;
     word-break: normal;
@@ -5037,11 +5171,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widget-table th,
 .widget-table-status { white-space: nowrap; }
 
-.widget-table a { color: #93c5fd; overflow-wrap: anywhere; }
+.widget-table a { color: var(--user-light); overflow-wrap: anywhere; }
 .widget-table-status { font-weight: 600; }
-.widget-table-status[data-tone="ok"] { color: #6ee7b7; }
-.widget-table-status[data-tone="warn"] { color: #fcd34d; }
-.widget-table-status[data-tone="danger"] { color: #fb7185; }
+.widget-table-status[data-tone="ok"] { color: var(--tone-ok); }
+.widget-table-status[data-tone="warn"] { color: var(--tone-warn); }
+.widget-table-status[data-tone="danger"] { color: var(--tone-danger); }
 
 .widget-media img,
 .widget-media video {
@@ -5061,10 +5195,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 /* Host-owned map/calendar/kanban defaults without extra dependencies. */
 .widget-map {
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--surface-border-soft);
     border-radius: var(--radius-sm);
     padding: 10px;
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--surface-card-soft);
 }
 .widget-map-list { margin: 0; padding-left: 18px; font-size: 13px; }
 .widget-map-list li { padding: 2px 0; }
@@ -5076,7 +5210,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 8px;
     align-items: baseline;
     padding: 6px 8px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    border-bottom: 1px solid var(--surface-border-soft);
 }
 
 .widget-kanban {
@@ -5087,7 +5221,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 .widget-kanban-col {
     align-self: start;
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--surface-card);
     border-radius: var(--radius-sm);
     padding: 10px;
     min-height: 120px;
@@ -5101,7 +5235,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 7px;
     background: rgba(var(--accent-hover-rgb), 0.12);
     border: 1px solid rgba(var(--accent-hover-rgb), 0.25);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     padding: 6px 8px;
     margin: 4px 0;
     cursor: grab;
@@ -5121,8 +5255,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widget-kanban-move select {
     min-width: 0;
     max-width: 112px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 5px;
+    border: 1px solid var(--bg-hover);
+    border-radius: var(--radius-5);
     background: rgba(var(--bg-primary-rgb), 0.82);
     color: var(--text-primary);
     font: inherit;
@@ -5144,7 +5278,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .widget-code-label {
-    color: rgba(250, 250, 250, 0.65);
+    color: var(--text-secondary);
     font-size: 12px;
     margin-bottom: 6px;
 }
@@ -5175,7 +5309,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     bottom: -2px;
     height: 2px;
     border-radius: 1px;
-    background: var(--accent, #7c5cff);
+    background: var(--accent);
     opacity: 0.5;
     animation: widget-refresh-pulse 1.2s ease-in-out infinite;
 }
@@ -5192,9 +5326,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .widget-tab-btn {
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--surface-border);
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--surface-card);
     color: var(--text-secondary);
     cursor: pointer;
     padding: 5px 10px;
@@ -5243,7 +5377,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     .widget-table td { display: block; width: 100%; }
     .widget-table thead { display: none; }
     .widget-table tr {
-        border: 1px solid rgba(255, 255, 255, 0.07);
+        border: 1px solid var(--surface-border);
         border-radius: var(--radius-sm);
         margin-bottom: 8px;
         padding: 5px 8px;
@@ -5252,7 +5386,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
         display: grid;
         grid-template-columns: minmax(72px, 38%) minmax(0, 1fr);
         gap: 8px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        border-bottom: 1px solid var(--surface-border-soft);
         padding: 6px 0;
     }
     .widget-table td::before {
@@ -5392,6 +5526,18 @@ textarea.chat-input {
         margin: 0 8px 8px;
         min-width: 0;
         overflow-x: hidden;
+    }
+
+    /* No room for a right-edge gutter at this width: the Raw toggle returns to
+       the flow instead of overlapping a wrapped event type. */
+    .log-entry,
+    .log-task-event {
+        padding-right: var(--space-2);
+    }
+
+    .log-actions {
+        position: static;
+        justify-content: flex-start;
     }
 
     .evo-versions-cols {

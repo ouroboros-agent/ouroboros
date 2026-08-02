@@ -35,6 +35,24 @@ def test_shared_page_header_helper_has_no_inline_styles():
     assert "app-tab-strip" in source
 
 
+def test_page_tabs_are_underline_tabs_not_pills():
+    """Design pin (flat redesign, Phase D): the ONE shared tab strip is an
+    underline strip — a flat label row over a divider with a 2px accent rule
+    under the active tab — and no page stylesheet re-declares tab shape.
+    Dashboard, Skills and Settings are its only consumers; Skills passes
+    activeClass 'is-active', so both selectors carry the marker."""
+    css = _read("web/style.css")
+    settings_css = _read("web/settings.css")
+
+    active_rule = css.split(".app-tab.active,\n.app-tab.is-active {", 1)[1].split("}", 1)[0]
+    assert "border-bottom-color: var(--accent);" in active_rule
+    assert "background: transparent;" in active_rule
+    strip = css.split(".app-tab-strip {", 1)[1].split("}", 1)[0]
+    assert "border-bottom: 1px solid var(--divider);" in strip
+    # No per-page tab shape (the old mobile pill override in settings is gone).
+    assert "border-radius: 999px" not in settings_css
+
+
 def test_primary_pages_use_shared_header_helper():
     for rel in [
         "web/modules/settings_ui.js",

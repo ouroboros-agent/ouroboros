@@ -330,11 +330,16 @@ function renderTableCell(row, column) {
     return escapeHtml(raw ?? '');
 }
 
+// Widget series colours. Chart.js paints on a canvas and cannot resolve CSS
+// variables, so these MIRROR the design tokens by value — in token order
+// --accent-light, --user, --green, --amber — with the matching fill at 0.22.
+// Keep them in step with web/style.css :root; never invent a hue here.
+const CHART_GRID_COLOR = 'rgba(255, 255, 255, 0.06)';  // mirrors --surface-border-soft
 const CHART_PALETTE = [
-    ['#e85d6f', 'rgba(232, 93, 111, 0.22)'],
-    ['#60a5fa', 'rgba(96, 165, 250, 0.22)'],
-    ['#34d399', 'rgba(52, 211, 153, 0.22)'],
-    ['#fbbf24', 'rgba(251, 191, 36, 0.22)'],
+    ['#f07a86', 'rgba(240, 122, 134, 0.22)'],
+    ['#6e96d2', 'rgba(110, 150, 210, 0.22)'],
+    ['#22c55e', 'rgba(34, 197, 94, 0.22)'],
+    ['#f59e0b', 'rgba(245, 158, 11, 0.22)'],
 ];
 
 export function finiteChartValue(value) {
@@ -370,9 +375,9 @@ function chartConfig(component, data) {
             spanGaps: false,
             plugins: { legend: { display: true } },
             scales: {
-                x: { grid: { color: 'rgba(255, 255, 255, 0.06)' } },
+                x: { grid: { color: CHART_GRID_COLOR } },
                 y: {
-                    grid: { color: 'rgba(255, 255, 255, 0.06)' },
+                    grid: { color: CHART_GRID_COLOR },
                     title: { display: Boolean(unit), text: unit },
                 },
             },

@@ -1353,6 +1353,11 @@ dim", especially over short messages. One gradient, on the chrome element.
 - Composer, toolbar, segmented, and widget-reorder controls share one flat
   grammar: a solid background token, a subtle 1px border, and a bounded radius
   from the scale. Do not add transparent text-only pills for primary actions.
+- Top-level page tabs (`.app-tab-strip` / `.app-tab`: Dashboard, Skills,
+  Settings) are **underline tabs**, not pills — a flat label row over one
+  `--divider` rule, with a 2px `--accent` bottom border marking the active tab
+  (`.active` or the Skills strip's `is-active`). Dimensions still come from the
+  shared `--pill-*` variables; restyle the shared classes, never a per-page copy.
 - Chat-header controls are **ghost buttons** (`.chat-header-btn`: transparent
   background, `rgba(255,255,255,0.10)` border, `--radius-7`, hover
   `rgba(255,255,255,0.06)`) with exactly one danger variant
