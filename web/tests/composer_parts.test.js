@@ -17,17 +17,25 @@ import {
 } from '../modules/composer_parts.js';
 
 const chip = (over = {}) => makeChipPart({ path: 'ouroboros/loop.py', lineStart: 10, lineEnd: 12, ...over });
+// A capture whose bytes really are the lines its range names — the producer
+// contract every chip-with-content fixture below has to satisfy.
+const captured = (content, lineStart = 10) => makeChipPart({
+    path: 'ouroboros/loop.py',
+    lineStart,
+    lineEnd: lineStart + content.split('\n').length - 1,
+    content,
+});
 
 test('interleaved text and chips serialize in order and parse back exactly', () => {
     let parts = pushText([], 'look at this');
-    parts = pushChip(parts, chip({ content: 'a = 1\nb = 2' }));
+    parts = pushChip(parts, captured('a = 1\nb = 2'));
     parts = pushText(parts, 'then fix the retry');
     parts = pushChip(parts, makeChipPart({ path: 'README.md' }));
 
     const text = serializeParts(parts);
     assert.equal(text, [
         'look at this',
-        '[context: ouroboros/loop.py L10-L12]',
+        '[context: ouroboros/loop.py L10-L11]',
         '```',
         'a = 1',
         'b = 2',
@@ -53,9 +61,10 @@ test('fence length escalates past the longest backtick run in the content', () =
     assert.equal(fenceFor('a ``` b'), '````');
     assert.equal(fenceFor('~~~\n`````\n'), '``````');
 
-    const text = serializeParts([chip({ content: 'before\n```\nnested\n```\nafter' })]);
+    const nested = 'before\n```\nnested\n```\nafter';
+    const text = serializeParts([captured(nested)]);
     assert.equal(text, [
-        '[context: ouroboros/loop.py L10-L12]',
+        '[context: ouroboros/loop.py L10-L14]',
         '````',
         'before',
         '```',
@@ -64,18 +73,69 @@ test('fence length escalates past the longest backtick run in the content', () =
         'after',
         '````',
     ].join('\n'));
-    assert.deepEqual(parseContent(text), [chip({ content: 'before\n```\nnested\n```\nafter' })]);
+    assert.deepEqual(parseContent(text), [captured(nested)]);
 });
 
 test('a selection over the inline cap keeps its range but drops the bytes', () => {
     const under = 'x\n'.repeat(MAX_CHIP_LINES - 1) + 'x';
     assert.equal(under.split('\n').length, MAX_CHIP_LINES);
-    assert.ok(serializeParts([chip({ content: under })]).includes('```'));
+    assert.ok(serializeParts([captured(under)]).includes('```'));
 
     const over = 'x\n'.repeat(MAX_CHIP_LINES) + 'x';
     assert.equal(over.split('\n').length, MAX_CHIP_LINES + 1);
     // The range is true information: the agent reads exactly that span itself.
-    assert.equal(serializeParts([chip({ content: over })]), '[context: ouroboros/loop.py L10-L12]');
+    assert.equal(
+        serializeParts([captured(over)]),
+        `[context: ouroboros/loop.py L10-L${10 + MAX_CHIP_LINES}]`,
+    );
+});
+
+// --- producer contract: content must BE the range's lines --------------------
+
+test('a CRLF capture is normalized to LF and still chips', () => {
+    // A raw editor/file slice arrives with \r\n; the codec's grammar is LF, and
+    // making every producer strip \r would be four places to get it wrong.
+    const part = makeChipPart({
+        path: 'a.py', lineStart: 1, lineEnd: 3, content: 'one\r\ntwo\r\nthree',
+    });
+    assert.equal(part.content, 'one\ntwo\nthree');
+    const text = serializeParts([part]);
+    assert.equal(text, '[context: a.py L1-L3]\n```\none\ntwo\nthree\n```');
+    assert.equal(serializeParts(parseContent(text)), text);
+});
+
+test('ONE trailing newline on a capture is stripped, not counted as a line', () => {
+    // `lines.slice(a, b).join('\n') + '\n'` is the natural way to cut a file, and
+    // that trailing byte would otherwise make a 3-line capture claim 4 lines.
+    const part = makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 3, content: 'one\ntwo\nthree\n' });
+    assert.equal(part.content, 'one\ntwo\nthree');
+    assert.match(serializeParts([part]), /```\none\ntwo\nthree\n```$/);
+    // CRLF + trailing CRLF together, the Windows version of the same slice.
+    assert.equal(
+        makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 2, content: 'one\r\ntwo\r\n' }).content,
+        'one\ntwo',
+    );
+    // TWO trailing newlines are a real blank final line: it is kept and counted.
+    assert.equal(
+        makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 3, content: 'one\ntwo\n\n' }).content,
+        'one\ntwo\n',
+    );
+});
+
+test('content that still disagrees with its range is DROPPED, not shipped', () => {
+    // The range came from the real selection, so it is the claim worth keeping;
+    // the bytes are what cannot be trusted. A ranged-bare chip sends the agent to
+    // read exactly that span instead of a fence contradicting its own label.
+    const short = makeChipPart({ path: 'a.py', lineStart: 10, lineEnd: 12, content: 'only one line' });
+    assert.deepEqual(short, { type: 'chip', path: 'a.py', lineStart: 10, lineEnd: 12 });
+    assert.equal(serializeParts([short]), '[context: a.py L10-L12]');
+
+    const long = makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 2, content: 'a\nb\nc\nd' });
+    assert.equal('content' in long, false);
+    assert.equal(serializeParts([long]), '[context: a.py L1-L2]');
+
+    // A capture that is nothing but a newline normalizes to empty: no bytes.
+    assert.equal('content' in makeChipPart({ path: 'a.py', lineStart: 1, lineEnd: 1, content: '\n' }), false);
 });
 
 test('malformed and lookalike markers stay plain text', () => {

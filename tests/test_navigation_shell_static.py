@@ -227,9 +227,23 @@ def test_chat_controller_is_kept_and_exposes_parts_adapters():
     assert "export function getChatController()" in app_js
     assert "function setDraftParts(parts)" in chat_js
     assert "function sendParts(parts" in chat_js
-    # The adapters ride the EXISTING textarea + sendMessage authority.
+    # The adapters still ride the EXISTING sendMessage transport authority and the
+    # ONE codec, so the serialized string stays the message identity. Phase A
+    # swapped WHERE the parts land: the Phase-0 adapter wrote the serialized text
+    # into the bare textarea (`input.value = text`), the parts editor now takes the
+    # ordered parts themselves, so a handed-over chip arrives as a removable CHIP.
     assert "const text = serializeParts(parts);" in chat_js
-    assert "input.value = text;" in chat_js
+    assert "composerParts.setParts([...kept, ...normalizeParts(parts)]);" in chat_js
+    assert "createComposerParts({" in chat_js
+    # ...and the send path reads the whole field (parts + typed draft) through the
+    # shared serializer rather than the raw textarea value.
+    assert "let text = composerParts.serialize().trim();" in chat_js
+    # A handoff ADDS to the chat composer; it never wipes a draft already there.
+    assert "const kept = composerParts.commitDraft();" in chat_js
+    # sendParts reports the REAL dispatch outcome, so a source dock never clears the
+    # owner's draft after a refused or failed send.
+    assert ".then((ok) => ok === true)" in chat_js
+    assert ".then(() => true)" not in chat_js
 
 
 def test_matrix_rain_is_gone():

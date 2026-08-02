@@ -1359,9 +1359,13 @@ dim", especially over short messages. One gradient, on the chrome element.
   (`.chat-header-btn.danger`, accent-tinted) for Panic. Overflow lives in the
   slim `.chat-header-more` `<details>` menu, which must auto-dismiss on an
   outside click and on Escape.
-- Desktop chat composer controls stay inside the single text-entry surface. On
-  mobile, Swarm and Low/Max move above the textarea so text width remains
-  usable, while Send stays inside the field.
+- The chat composer is one flat 12px box: a control row (Swarm, Low/Max, and the
+  READ-ONLY model chip pushed to the end) sits above a text row holding the attach
+  button, the `composer_parts` mount, and Send. Send is the composer's one PRIMARY
+  action (solid `--accent`), not a ghost pill. The model chip rides the control row
+  rather than the field because at 390px a mono model id inside the text row eats
+  the usable input width; it is hidden entirely until the Settings snapshot names a
+  model (never a guessed default).
 - Button and segmented-control labels use `letter-spacing: 0` and stable
   dimensions. If a label does not fit on mobile, shrink the control group or
   move it to another row; do not reserve a large textarea padding gutter.
@@ -1370,7 +1374,22 @@ dim", especially over short messages. One gradient, on the chrome element.
 - Context-capture chips (⌘L) are one shared DOM contract in
   `web/modules/composer_parts.js` + the `.composer-part-*` classes. Every
   composer (chat, Changes dock, Files dock) mounts that module rather than
-  restyling its own chip.
+  restyling its own chip. The same chip appears again in the sent message as
+  `.chat-context-chip` — same mono/accent grammar, no second look for the same
+  thing.
+
+### Flat chat transcript
+
+The transcript is one centred reading column (max 760px, gutters via
+`padding-inline: max(…, calc((100% - 760px) / 2))` — no wrapper element, so every
+insertion path stays untouched). The owner's message is the ONLY bubble left; agent
+prose and task cards are plain rows with a sender line. Task activity is mono rows
+behind a 2px left rule, and the `✓`/`●`/`✕` status glyph is a `::before` keyed off
+the row's phase class — add a status by adding a phase rule, never by adding markup
+to the row (the `data-live-line-*` disclosure contract is pinned). Row titles wrap;
+do not ellipsize owner-facing narration. Only transient status events (awakened /
+reconnected, marked `.chat-status-event`) collapse into a centred pill — a rich
+system renderer keeps its full disclosure.
 
 ### CSS ownership anchors
 

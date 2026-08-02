@@ -30,6 +30,18 @@
  * parses back as prose. Anything that is not an exactly-formed marker line
  * (`[context:foo]`, leading spaces, trailing text) stays plain text.
  *
+ * Producer contract (`makeChipPart` content)
+ * ------------------------------------------
+ * `content` is EXACTLY the lines the range names: LF separators, no trailing
+ * newline, so `content.split('\n').length === lineEnd - lineStart + 1`. CRLF and
+ * ONE trailing newline — what a raw editor selection or file slice usually hands
+ * over — are normalized HERE so no producer has to repeat that arithmetic.
+ * Content that still disagrees with the range after normalization is DROPPED and
+ * the chip stays ranged-but-bare (the agent reads exactly that span itself),
+ * because a marker whose claimed line count its own fence contradicts is refused
+ * a compact chip by the renderer anyway: building it would only manufacture a
+ * message that has to be shown as raw grammar.
+ *
  * This module is pure with respect to the network: no fetch, no transport, no
  * send logic. `createComposerParts` is a thin DOM mount over the same core.
  */
@@ -60,6 +72,10 @@ export function chipPathIsRepresentable(path) {
 /**
  * Build a chip part, or return null when the path cannot round-trip. Callers
  * disclose the refusal to the owner instead of capturing a lossy marker.
+ *
+ * `content` is normalized and then held to the producer contract documented at
+ * the top of this module: CRLF becomes LF, ONE trailing newline is stripped, and
+ * bytes that still do not span exactly `lineStart..lineEnd` are dropped.
  */
 export function makeChipPart({ path, lineStart = null, lineEnd = null, content = null } = {}) {
     if (!chipPathIsRepresentable(path)) return null;
@@ -72,7 +88,15 @@ export function makeChipPart({ path, lineStart = null, lineEnd = null, content =
         chip.lineEnd = end;
         // Content is only meaningful with a range to locate it; a whole-file chip
         // never carries bytes (the agent reads the file).
-        if (typeof content === 'string' && content !== '') chip.content = content;
+        if (typeof content === 'string' && content !== '') {
+            const normalized = content.replace(/\r\n/g, '\n').replace(/\n$/, '');
+            // The range is the CLAIM; these bytes are the evidence for it. When they
+            // disagree, keep the claim (it came from the real selection) and drop the
+            // bytes rather than emit a fence the renderer must refuse to fold.
+            if (normalized !== '' && normalized.split('\n').length === end - start + 1) {
+                chip.content = normalized;
+            }
+        }
     }
     return chip;
 }
