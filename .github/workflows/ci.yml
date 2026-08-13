@@ -92,6 +92,10 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
           cache-dependency-path: site/pnpm-lock.yaml
+      - name: Run web unit tests (non-blocking)
+        working-directory: web
+        continue-on-error: true
+        run: npm test
       - name: Verify generated Pages output
         run: |
           pnpm --dir site install --frozen-lockfile
