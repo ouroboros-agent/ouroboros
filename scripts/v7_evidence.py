@@ -17,21 +17,17 @@ import tarfile
 import tempfile
 from typing import Any, Iterable
 def _load_migration_module() -> Any:
-    """Load the sibling migration-contract module, keyed by its resolved path.
+    """Execute the exact resolved sibling ``v7_migration.py`` directly.
 
-    The sys.modules key embeds the exact resolved sibling ``__file__``, so two
-    evidence checkouts loaded into one process never share a contract module
-    that belongs to a different checkout.
+    Every load builds a fresh module object from the sibling path and never
+    reads from or writes to ``sys.modules`` (the campaign forbids sys.modules
+    proxies/caches), so two evidence checkouts loaded into one process always
+    bind their own checkout's contract module.
     """
     target = pathlib.Path(__file__).resolve().with_name("v7_migration.py")
-    key = f"v7_migration:{target}"
-    cached = sys.modules.get(key)
-    if cached is not None and getattr(cached, "__file__", None) == str(target):
-        return cached
-    spec = importlib.util.spec_from_file_location(key, target)
+    spec = importlib.util.spec_from_file_location("v7_migration", target)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
     spec.loader.exec_module(module)
     return module
 _migration = _load_migration_module()

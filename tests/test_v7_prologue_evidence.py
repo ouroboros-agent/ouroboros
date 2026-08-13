@@ -6,6 +6,7 @@ import importlib.util
 import json
 import pathlib
 import subprocess
+import sys
 
 import pytest
 
@@ -931,6 +932,7 @@ def test_migration_module_binding_is_checkout_specific(tmp_path):
     scripts.mkdir(parents=True)
     for source in (SCRIPT_PATH, MIGRATION_SCRIPT_PATH):
         (scripts / source.name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    migration_keys_before = {key for key in sys.modules if key.startswith("v7_migration")}
     spec = importlib.util.spec_from_file_location("v7_evidence_alt_checkout", scripts / "v7_evidence.py")
     assert spec and spec.loader
     alt = importlib.util.module_from_spec(spec)
@@ -944,4 +946,7 @@ def test_migration_module_binding_is_checkout_specific(tmp_path):
     assert spec_again and spec_again.loader
     again = importlib.util.module_from_spec(spec_again)
     spec_again.loader.exec_module(again)
-    assert again._migration is v7_evidence._migration
+    assert pathlib.Path(again._migration.__file__) == MIGRATION_SCRIPT_PATH
+    assert again._migration.BASELINE_SHA == v7_evidence.BASELINE_SHA
+    migration_keys_after = {key for key in sys.modules if key.startswith("v7_migration")}
+    assert migration_keys_after == migration_keys_before  # spec 3.3: no sys.modules proxy/cache key
