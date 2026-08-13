@@ -69,7 +69,11 @@ class GatedFunction:
 
 @dataclass(frozen=True)
 class SizeRatchetManifest:
-    """Parsed data-only size ratchet manifest."""
+    """Parsed data-only size ratchet manifest.
+
+    ``module_debt_1500`` is the optional v7 layer: ``None`` means the layer is
+    not activated; any tuple (including an empty one) means it is active.
+    """
 
     baseline_source_sha: str
     giant_paths: frozenset[str]
@@ -78,6 +82,7 @@ class SizeRatchetManifest:
     band_paths: Mapping[str, str | None]
     byte_baseline_debt: Mapping[str, int]
     byte_debt: Mapping[str, int]
+    module_debt_1500: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +95,7 @@ class SizeRatchetInventory:
     function_debt: frozenset[tuple[str, str]]
     band_paths: frozenset[str]
     byte_debt: Mapping[str, int]
+    module_debt_1500: frozenset[str]
 
 
 def _exact_repo_relative_path(raw: str | pathlib.Path) -> str:
@@ -286,6 +292,7 @@ def collect_size_ratchet_inventory(
             item.path for item in modules if TARGET_MODULE_LINES < item.line_count <= BAND_MODULE_MAX_LINES
         ),
         byte_debt={item.path: item.utf8_bytes for item in modules if item.utf8_bytes > MAX_MODULE_BYTES},
+        module_debt_1500=frozenset(item.path for item in modules if item.line_count > BAND_MODULE_MAX_LINES),
     )
 
 
@@ -407,10 +414,12 @@ def parse_size_ratchet_manifest(text: str) -> SizeRatchetManifest:
         "BYTE_BASELINE_DEBT",
         "BYTE_DEBT",
     }
+    # Pre-v7 manifests omit the optional >1500 layer; absence means "not activated".
+    optional = {"MODULE_DEBT_1500"}
     missing = sorted(required - values.keys())
     if missing:
         raise ValueError(f"size manifest missing assignments: {', '.join(missing)}")
-    extra = sorted(values.keys() - required)
+    extra = sorted(values.keys() - required - optional)
     if extra:
         raise ValueError(f"size manifest has unexpected assignments: {', '.join(extra)}")
 
@@ -434,6 +443,13 @@ def parse_size_ratchet_manifest(text: str) -> SizeRatchetManifest:
         return frozenset(paths)
 
     giant_paths = exact_paths(values["GIANT_PATHS"], "GIANT_PATHS")
+    module_debt_1500 = (
+        exact_paths(values["MODULE_DEBT_1500"], "MODULE_DEBT_1500") if "MODULE_DEBT_1500" in values else None
+    )
+    if module_debt_1500 is not None:
+        missing_giants = sorted(giant_paths - module_debt_1500)
+        if missing_giants:
+            raise ValueError(f"MODULE_DEBT_1500 must contain every GIANT_PATHS entry: {', '.join(missing_giants)}")
     band_baseline_paths = exact_paths(values["BAND_BASELINE_PATHS"], "BAND_BASELINE_PATHS")
     raw_functions = values["FUNCTION_DEBT"]
     if not isinstance(raw_functions, tuple):
@@ -501,6 +517,7 @@ def parse_size_ratchet_manifest(text: str) -> SizeRatchetManifest:
         band_paths=band_paths,
         byte_baseline_debt=byte_map(values["BYTE_BASELINE_DEBT"], "BYTE_BASELINE_DEBT"),
         byte_debt=byte_map(values["BYTE_DEBT"], "BYTE_DEBT"),
+        module_debt_1500=module_debt_1500,
     )
 
 
@@ -510,6 +527,7 @@ def load_size_ratchet_manifest(path: pathlib.Path) -> SizeRatchetManifest:
 
 _CHECKED_IN_MANIFEST = load_size_ratchet_manifest(pathlib.Path(__file__).with_name("size_ratchet_manifest.py"))
 GIANT_PATHS = _CHECKED_IN_MANIFEST.giant_paths
+MODULE_DEBT_1500 = _CHECKED_IN_MANIFEST.module_debt_1500
 FUNCTION_DEBT = _CHECKED_IN_MANIFEST.function_debt
 # Compatibility names remain public during the v7 migration; their keys are now exact.
 GRANDFATHERED_OVERSIZED_MODULES = GIANT_PATHS
@@ -519,8 +537,15 @@ GRANDFATHERED_OVERSIZED_FUNCTIONS = FUNCTION_DEBT
 def validate_manifest_transition(
     current: SizeRatchetManifest,
     previous: SizeRatchetManifest,
+    *,
+    parent_inventory_1500: frozenset[str] | None = None,
 ) -> list[str]:
-    """Validate shrink-only debt and rationale authority against the parent tree."""
+    """Validate shrink-only debt and rationale authority against the parent tree.
+
+    ``parent_inventory_1500`` is the exact first-parent >1500-line census. It is
+    the only authority that may admit paths into ``MODULE_DEBT_1500`` at
+    activation; after activation the layer is shrink-only and irrevocable.
+    """
     errors: list[str] = []
     if current.baseline_source_sha != previous.baseline_source_sha:
         errors.append("BASELINE_SOURCE_SHA is immutable")
@@ -533,6 +558,22 @@ def validate_manifest_transition(
         errors.append(f"new module debt above {MAX_MODULE_LINES} lines: {path}")
     for path, qualname in sorted(current.function_debt - previous.function_debt):
         errors.append(f"new function debt above {MAX_FUNCTION_LINES} lines: {path}:{qualname}")
+
+    if previous.module_debt_1500 is None:
+        if current.module_debt_1500 is not None:
+            if parent_inventory_1500 is None:
+                errors.append(
+                    "MODULE_DEBT_1500 activation authority unavailable: "
+                    "exact first-parent >1500 inventory is required"
+                )
+            else:
+                for path in sorted(current.module_debt_1500 - parent_inventory_1500):
+                    errors.append(f"MODULE_DEBT_1500 activation exceeds first-parent authority: {path}")
+    elif current.module_debt_1500 is None:
+        errors.append("MODULE_DEBT_1500 deactivation is not allowed")
+    else:
+        for path in sorted(current.module_debt_1500 - previous.module_debt_1500):
+            errors.append(f"new module debt above {BAND_MODULE_MAX_LINES} lines: {path}")
 
     previous_band = set(previous.band_paths)
     for path in sorted(set(current.band_paths) - previous_band):
@@ -566,6 +607,8 @@ def _manifest_inventory_errors(
             errors.append(f"{label} contains stale entry: {item!r}")
 
     compare_set("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths)
+    if manifest.module_debt_1500 is not None:
+        compare_set("MODULE_DEBT_1500", inventory.module_debt_1500, manifest.module_debt_1500)
     compare_set("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt)
     compare_set("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths))
     if dict(inventory.byte_debt) != dict(manifest.byte_debt):
@@ -621,11 +664,11 @@ def _audit_committed_manifest_history(
     repo_dir: pathlib.Path,
     head: str,
     manifest_path: str,
-) -> tuple[list[str], SizeRatchetManifest | None, str | None]:
+) -> tuple[list[str], SizeRatchetManifest | None, str | None, SizeRatchetInventory | None]:
     errors: list[str] = []
     head_text = _git_show_manifest(repo_dir, head, manifest_path)
     if head_text is None:
-        return ["size-ratchet transition authority unavailable: HEAD manifest is inaccessible"], None, None
+        return ["size-ratchet transition authority unavailable: HEAD manifest is inaccessible"], None, None, None
     head_manifest = parse_size_ratchet_manifest(head_text)
     baseline = head_manifest.baseline_source_sha
     ancestor = subprocess.run(
@@ -639,10 +682,12 @@ def _audit_committed_manifest_history(
             ["size-ratchet transition authority unavailable: BASELINE_SOURCE_SHA ancestry is inaccessible"],
             None,
             None,
+            None,
         )
     if _git_show_manifest(repo_dir, baseline, manifest_path) is not None:
         return (
             ["size-ratchet transition authority invalid: BASELINE_SOURCE_SHA already contains the manifest"],
+            None,
             None,
             None,
         )
@@ -650,7 +695,7 @@ def _audit_committed_manifest_history(
         baseline_inventory = collect_size_ratchet_inventory_at_ref(repo_dir, baseline)
     except (OSError, ValueError, subprocess.CalledProcessError):
         errors.append("size-ratchet transition authority unavailable: BASELINE_SOURCE_SHA tree is not accessible")
-        return errors, None, None
+        return errors, None, None, None
 
     commits = subprocess.run(
         ["git", "rev-list", "--first-parent", "--reverse", f"{baseline}..{head}"],
@@ -661,10 +706,11 @@ def _audit_committed_manifest_history(
     ).stdout.splitlines()
     if not commits:
         errors.append("size-ratchet transition authority unavailable: incomplete first-parent manifest history")
-        return errors, None, None
+        return errors, None, None, None
 
     bootstrap_commit: str | None = None
     previous: SizeRatchetManifest | None = None
+    previous_inventory: SizeRatchetInventory | None = None
     latest_text: str | None = None
     for commit in commits:
         text = _git_show_manifest(repo_dir, commit, manifest_path)
@@ -686,7 +732,17 @@ def _audit_committed_manifest_history(
                 errors.append("committed manifest bootstrap must name its exact first parent SHA")
             errors.extend(f"bootstrap: {error}" for error in _bootstrap_inventory_errors(manifest, baseline_inventory))
         elif previous is not None:
-            errors.extend(f"{commit[:12]}: {error}" for error in validate_manifest_transition(manifest, previous))
+            errors.extend(
+                f"{commit[:12]}: {error}"
+                for error in validate_manifest_transition(
+                    manifest,
+                    previous,
+                    parent_inventory_1500=(
+                        None if previous_inventory is None else previous_inventory.module_debt_1500
+                    ),
+                )
+            )
+        inventory: SizeRatchetInventory | None = None
         try:
             inventory = collect_size_ratchet_inventory_at_ref(repo_dir, commit)
         except (OSError, ValueError, subprocess.CalledProcessError):
@@ -694,10 +750,11 @@ def _audit_committed_manifest_history(
         else:
             errors.extend(f"{commit[:12]}: {error}" for error in _manifest_inventory_errors(manifest, inventory))
         previous = manifest
+        previous_inventory = inventory
         latest_text = text
     if bootstrap_commit is None:
         errors.append("size-ratchet transition authority unavailable: manifest bootstrap commit is not accessible")
-    return errors, previous, latest_text
+    return errors, previous, latest_text, previous_inventory
 
 
 def validate_size_ratchet(
@@ -763,13 +820,18 @@ def validate_size_ratchet(
                     )
         return errors
 
-    history_errors, head_authority, latest_text = _audit_committed_manifest_history(root, head, manifest_path)
+    history_errors, head_authority, latest_text, head_inventory = _audit_committed_manifest_history(
+        root, head, manifest_path
+    )
     errors.extend(history_errors)
+    head_authority_1500 = None if head_inventory is None else head_inventory.module_debt_1500
     if head_authority is None or latest_text != head_text:
         if not history_errors:
             errors.append("size-ratchet transition authority unavailable: HEAD manifest is not in first-parent history")
     elif current_text != head_text:
-        errors.extend(validate_manifest_transition(current, head_authority))
+        errors.extend(
+            validate_manifest_transition(current, head_authority, parent_inventory_1500=head_authority_1500)
+        )
 
     if index_tree != head_tree:
         staged_text, staged, staged_inventory = _staged_manifest_inventory(
@@ -788,7 +850,10 @@ def validate_size_ratchet(
                     )
             elif staged_text != head_text:
                 errors.extend(
-                    f"staged: {error}" for error in validate_manifest_transition(staged, head_authority)
+                    f"staged: {error}"
+                    for error in validate_manifest_transition(
+                        staged, head_authority, parent_inventory_1500=head_authority_1500
+                    )
                 )
     return errors
 
@@ -799,7 +864,11 @@ def _metrics_from_inventory(inventory: SizeRatchetInventory) -> Dict[str, Any]:
     func_lens = [item.line_count for item in functions]
     py_files = [item for item in modules if item.path.endswith(".py")]
     js_files = [item for item in modules if item.path.endswith(".js")]
-    hard_modules = [item for item in modules if item.line_count > MAX_MODULE_LINES]
+    module_debt_1500_active = MODULE_DEBT_1500 is not None
+    module_hard_limit = BAND_MODULE_MAX_LINES if module_debt_1500_active else MAX_MODULE_LINES
+    module_debt_paths = MODULE_DEBT_1500 if MODULE_DEBT_1500 is not None else GIANT_PATHS
+    hard_modules = [item for item in modules if item.line_count > module_hard_limit]
+    legacy_hard_modules = [item for item in modules if item.line_count > MAX_MODULE_LINES]
     hard_functions = [item for item in functions if item.line_count > MAX_FUNCTION_LINES]
     return {
         "total_files": len(modules),
@@ -835,8 +904,20 @@ def _metrics_from_inventory(inventory: SizeRatchetInventory) -> Dict[str, Any]:
         "target_drift_modules": [
             (item.path, item.line_count) for item in modules if item.line_count > TARGET_MODULE_LINES
         ],
-        "grandfathered_modules": [(item.path, item.line_count) for item in hard_modules if item.path in GIANT_PATHS],
-        "oversized_modules": [(item.path, item.line_count) for item in hard_modules if item.path not in GIANT_PATHS],
+        "module_debt_1500_active": module_debt_1500_active,
+        "module_hard_limit": module_hard_limit,
+        "grandfathered_modules": [
+            (item.path, item.line_count) for item in hard_modules if item.path in module_debt_paths
+        ],
+        "oversized_modules": [
+            (item.path, item.line_count) for item in hard_modules if item.path not in module_debt_paths
+        ],
+        "legacy_grandfathered_modules": [
+            (item.path, item.line_count) for item in legacy_hard_modules if item.path in GIANT_PATHS
+        ],
+        "legacy_oversized_modules": [
+            (item.path, item.line_count) for item in legacy_hard_modules if item.path not in GIANT_PATHS
+        ],
     }
 
 
@@ -877,6 +958,7 @@ def compute_complexity_metrics(sections: List[Tuple[str, str]]) -> Dict[str, Any
             item.path for item in modules if TARGET_MODULE_LINES < item.line_count <= BAND_MODULE_MAX_LINES
         ),
         byte_debt={item.path: item.utf8_bytes for item in modules if item.utf8_bytes > MAX_MODULE_BYTES},
+        module_debt_1500=frozenset(item.path for item in modules if item.line_count > BAND_MODULE_MAX_LINES),
     )
     return _metrics_from_inventory(inventory)
 

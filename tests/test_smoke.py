@@ -417,16 +417,43 @@ def test_no_env_dumping():
 
 
 def test_no_oversized_modules():
-    """Principle 7: exact-path debt is the only exception to the hard gate."""
-    from ouroboros.review import GIANT_PATHS, MAX_MODULE_LINES, iter_gated_modules
+    """Principle 7: exact-path debt is the only exception to the hard gates.
 
-    max_lines = MAX_MODULE_LINES
-    violations = [
-        f"{module.path}: {module.line_count} lines"
-        for module in iter_gated_modules(REPO)
-        if module.line_count > max_lines and module.path not in GIANT_PATHS
-    ]
-    assert len(violations) == 0, f"Oversized modules (>{max_lines} lines):\n" + "\n".join(violations)
+    Both layers are enforced independently: >1600 requires legacy GIANT_PATHS
+    membership, and once MODULE_DEBT_1500 is active, >1500 requires membership
+    there too (new/non-debt paths are capped at 1500).
+    """
+    from ouroboros.review import (
+        BAND_MODULE_MAX_LINES,
+        GIANT_PATHS,
+        MAX_MODULE_LINES,
+        MODULE_DEBT_1500,
+        iter_gated_modules,
+    )
+
+    violations = []
+    for module in iter_gated_modules(REPO):
+        if module.line_count > MAX_MODULE_LINES and module.path not in GIANT_PATHS:
+            violations.append(f"{module.path}: {module.line_count} lines (>{MAX_MODULE_LINES})")
+        if (
+            MODULE_DEBT_1500 is not None
+            and module.line_count > BAND_MODULE_MAX_LINES
+            and module.path not in MODULE_DEBT_1500
+        ):
+            violations.append(f"{module.path}: {module.line_count} lines (>{BAND_MODULE_MAX_LINES})")
+    assert len(violations) == 0, "Oversized modules:\n" + "\n".join(violations)
+
+
+def test_size_ratchet_1500_layer_census_is_active_and_exact():
+    """The active v7 debt sets stay exact while legal paydown shrinks them."""
+    from ouroboros.review import GIANT_PATHS, MODULE_DEBT_1500, collect_size_ratchet_inventory
+
+    assert MODULE_DEBT_1500 is not None
+    assert GIANT_PATHS <= MODULE_DEBT_1500
+
+    inventory = collect_size_ratchet_inventory(REPO)
+    assert inventory.module_debt_1500 == MODULE_DEBT_1500
+    assert inventory.giant_paths == GIANT_PATHS
 
 
 def test_size_ratchet_manifest_matches_live_tree():

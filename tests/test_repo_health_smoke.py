@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.review import (
+    BAND_MODULE_MAX_LINES,
     MAX_MODULE_BYTES,
     MAX_MODULE_LINES,
     MAX_TOTAL_FUNCTIONS,
@@ -45,6 +46,7 @@ def _manifest(
     band_paths: dict[str, str | None] | None = None,
     byte_baseline_debt: dict[str, int] | None = None,
     byte_debt: dict[str, int] | None = None,
+    module_debt_1500: frozenset[str] | None = None,
     sha: str = "a" * 40,
 ) -> SizeRatchetManifest:
     return SizeRatchetManifest(
@@ -55,6 +57,7 @@ def _manifest(
         band_paths={} if band_paths is None else band_paths,
         byte_baseline_debt={} if byte_baseline_debt is None else byte_baseline_debt,
         byte_debt={} if byte_debt is None else byte_debt,
+        module_debt_1500=module_debt_1500,
     )
 
 
@@ -826,3 +829,278 @@ def test_health_metrics_use_the_same_inventory(tmp_path: Path) -> None:
     assert metrics["total_lines"] == sum(item.line_count for item in inventory.modules)
     assert f"**Analyzed:** {len(inventory.modules)} files" in report
     assert f"**Functions:** {len(inventory.functions)}" in report
+
+
+def test_health_metrics_report_active_and_legacy_module_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ouroboros import review
+
+    monkeypatch.setattr(
+        review,
+        "MODULE_DEBT_1500",
+        frozenset({"debt_1500.py", "legacy_giant.py"}),
+    )
+    monkeypatch.setattr(review, "GIANT_PATHS", frozenset({"legacy_giant.py"}))
+    _write_lines(tmp_path / "debt_1500.py", BAND_MODULE_MAX_LINES + 1)
+    _write_lines(tmp_path / "fresh_1500.py", BAND_MODULE_MAX_LINES + 1)
+    _write_lines(tmp_path / "legacy_giant.py", MAX_MODULE_LINES + 1)
+    _write_lines(tmp_path / "fresh_giant.py", MAX_MODULE_LINES + 1)
+
+    metrics = compute_repo_complexity_metrics(tmp_path)
+    report = _codebase_health(SimpleNamespace(repo_dir=tmp_path))
+
+    assert metrics["module_hard_limit"] == BAND_MODULE_MAX_LINES
+    assert {path for path, _lines in metrics["grandfathered_modules"]} == {
+        "debt_1500.py",
+        "legacy_giant.py",
+    }
+    assert {path for path, _lines in metrics["oversized_modules"]} == {
+        "fresh_1500.py",
+        "fresh_giant.py",
+    }
+    assert metrics["legacy_grandfathered_modules"] == [("legacy_giant.py", MAX_MODULE_LINES + 1)]
+    assert metrics["legacy_oversized_modules"] == [("fresh_giant.py", MAX_MODULE_LINES + 1)]
+    assert "Hard-limit modules > 1500 lines outside MODULE_DEBT_1500: 2" in report
+    assert "MODULE_DEBT_1500 modules still above 1500 lines: 2" in report
+    assert "Legacy hard-limit modules > 1600 lines outside GIANT_PATHS: 1" in report
+    assert "Legacy GIANT_PATHS modules still above 1600 lines: 1" in report
+
+
+def test_pre_v7_manifest_without_1500_layer_parses_and_renders_byte_identically() -> None:
+    legacy_text = regenerate._render(_manifest())
+    parsed = parse_size_ratchet_manifest(legacy_text)
+
+    assert "MODULE_DEBT_1500" not in legacy_text
+    assert parsed.module_debt_1500 is None
+    assert regenerate._render(parsed) == legacy_text
+
+
+def test_manifest_parser_types_the_optional_1500_layer() -> None:
+    active_text = regenerate._render(_manifest(module_debt_1500=frozenset()))
+    assert parse_size_ratchet_manifest(active_text).module_debt_1500 == frozenset()
+
+    wrong_shape = active_text.replace("MODULE_DEBT_1500 = (\n)", 'MODULE_DEBT_1500 = "a.py"')
+    with pytest.raises(ValueError, match="MODULE_DEBT_1500 must be a tuple"):
+        parse_size_ratchet_manifest(wrong_shape)
+
+    conflict = regenerate._render(_manifest(giant_paths=frozenset({"huge.py"}), module_debt_1500=frozenset()))
+    with pytest.raises(ValueError, match="MODULE_DEBT_1500 must contain every GIANT_PATHS entry"):
+        parse_size_ratchet_manifest(conflict)
+
+
+def test_1500_boundary_passes_inactive_layer_and_requires_active_debt(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    head = _bootstrap_repo(
+        repo,
+        files={
+            "at_band_max.py": "x\n" * BAND_MODULE_MAX_LINES,
+            "over_band_max.py": "x\n" * (BAND_MODULE_MAX_LINES + 1),
+        },
+    )
+    inventory = collect_size_ratchet_inventory(repo)
+    assert inventory.module_debt_1500 == frozenset({"over_band_max.py"})
+    assert inventory.giant_paths == frozenset()
+
+    band = {"at_band_max.py": None}
+    _write_manifest(repo, _manifest(sha=head, band_baseline_paths=frozenset(band), band_paths=band))
+    assert validate_size_ratchet(repo) == []
+
+    _write_manifest(
+        repo,
+        _manifest(sha=head, band_baseline_paths=frozenset(band), band_paths=band, module_debt_1500=frozenset()),
+    )
+    errors = validate_size_ratchet(repo)
+    assert "MODULE_DEBT_1500 missing live entry: 'over_band_max.py'" in errors
+
+    _write_manifest(
+        repo,
+        _manifest(
+            sha=head,
+            band_baseline_paths=frozenset(band),
+            band_paths=band,
+            module_debt_1500=frozenset({"over_band_max.py"}),
+        ),
+    )
+    assert validate_size_ratchet(repo) == []
+
+
+def test_activation_uses_first_parent_authority_and_permits_paydown() -> None:
+    inactive = _manifest()
+    parent_1500 = frozenset({"kept.py", "paid_down.py"})
+
+    paydown = _manifest(module_debt_1500=frozenset({"kept.py"}))
+    assert validate_manifest_transition(paydown, inactive, parent_inventory_1500=parent_1500) == []
+
+    fresh = _manifest(module_debt_1500=frozenset({"kept.py", "fresh.py"}))
+    assert validate_manifest_transition(fresh, inactive, parent_inventory_1500=parent_1500) == [
+        "MODULE_DEBT_1500 activation exceeds first-parent authority: fresh.py"
+    ]
+    assert validate_manifest_transition(paydown, inactive) == [
+        "MODULE_DEBT_1500 activation authority unavailable: exact first-parent >1500 inventory is required"
+    ]
+
+
+def test_active_1500_layer_is_shrink_only_and_irrevocable() -> None:
+    active = _manifest(module_debt_1500=frozenset({"kept.py"}))
+
+    grown = _manifest(module_debt_1500=frozenset({"kept.py", "added.py"}))
+    assert validate_manifest_transition(grown, active) == ["new module debt above 1500 lines: added.py"]
+
+    retired = _manifest(module_debt_1500=frozenset())
+    assert validate_manifest_transition(retired, active) == []
+    reentered = _manifest(module_debt_1500=frozenset({"kept.py"}))
+    assert validate_manifest_transition(reentered, retired) == ["new module debt above 1500 lines: kept.py"]
+
+    assert validate_manifest_transition(_manifest(), active) == ["MODULE_DEBT_1500 deactivation is not allowed"]
+
+
+def test_active_band_debt_cannot_use_giant_paths_to_cross_1600(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    head = _bootstrap_repo(repo, files={"legacy.py": "x\n" * (MAX_MODULE_LINES - 50)})
+    _write_manifest(repo, _manifest(sha=head, module_debt_1500=frozenset({"legacy.py"})))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap active ratchet")
+    assert validate_size_ratchet(repo) == []
+
+    _write_lines(repo / "legacy.py", MAX_MODULE_LINES + 1)
+    assert "GIANT_PATHS missing live entry: 'legacy.py'" in validate_size_ratchet(repo)
+
+    _write_manifest(
+        repo,
+        _manifest(sha=head, giant_paths=frozenset({"legacy.py"}), module_debt_1500=frozenset({"legacy.py"})),
+    )
+    assert "new module debt above 1600 lines: legacy.py" in validate_size_ratchet(repo)
+
+
+def test_tree_validation_projects_staged_and_live_1500_layer_independently(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo)
+    _write_manifest(repo, _manifest(sha=baseline, module_debt_1500=frozenset()))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap active ratchet")
+
+    _write_lines(repo / "staged_band.py", BAND_MODULE_MAX_LINES + 1)
+    _git(repo, "add", "staged_band.py")
+    _write_lines(repo / "staged_band.py", 1)
+
+    errors = validate_size_ratchet(repo)
+    assert "staged: MODULE_DEBT_1500 missing live entry: 'staged_band.py'" in errors
+    assert "MODULE_DEBT_1500 missing live entry: 'staged_band.py'" not in {
+        error for error in errors if not error.startswith("staged:")
+    }
+
+    _git(repo, "reset", "-q", "HEAD", "staged_band.py")
+    _write_lines(repo / "staged_band.py", BAND_MODULE_MAX_LINES + 1)
+    errors = validate_size_ratchet(repo)
+    assert "MODULE_DEBT_1500 missing live entry: 'staged_band.py'" in errors
+    assert not any(error.startswith("staged:") for error in errors)
+
+
+def test_full_history_rejects_1500_add_and_carry_bypass(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo)
+    _write_manifest(repo, _manifest(sha=baseline, module_debt_1500=frozenset()))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap active ratchet")
+
+    _write_lines(repo / "fresh.py", BAND_MODULE_MAX_LINES + 1)
+    _write_manifest(repo, _manifest(sha=baseline, module_debt_1500=frozenset({"fresh.py"})))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "self-authorize 1501 debt")
+    bad_commit = _git(repo, "rev-parse", "HEAD")
+    (repo / "README.md").write_text("carry\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "unrelated tip")
+
+    assert validate_size_ratchet(repo) == [f"{bad_commit[:12]}: new module debt above 1500 lines: fresh.py"]
+
+
+def test_full_history_activation_is_bound_to_its_first_parent_inventory(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo, files={"old.py": "x\n" * (BAND_MODULE_MAX_LINES + 1)})
+    _write_manifest(repo, _manifest(sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap inactive ratchet")
+
+    _write_lines(repo / "fresh.py", BAND_MODULE_MAX_LINES + 1)
+    _write_manifest(repo, _manifest(sha=baseline, module_debt_1500=frozenset({"old.py", "fresh.py"})))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "activation self-authorizes a fresh 1501 path")
+    bad_commit = _git(repo, "rev-parse", "HEAD")
+
+    assert validate_size_ratchet(repo) == [
+        f"{bad_commit[:12]}: MODULE_DEBT_1500 activation exceeds first-parent authority: fresh.py"
+    ]
+
+
+def test_full_history_accepts_authorized_activation_then_rejects_reentry(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo, files={"old.py": "x\n" * (BAND_MODULE_MAX_LINES + 1)})
+    _write_manifest(repo, _manifest(sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap inactive ratchet")
+
+    _write_manifest(repo, _manifest(sha=baseline, module_debt_1500=frozenset({"old.py"})))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "activate 1500 layer with same-commit paydown allowed")
+    assert validate_size_ratchet(repo) == []
+
+    _write_lines(repo / "old.py", 1)
+    _write_manifest(repo, _manifest(sha=baseline, module_debt_1500=frozenset()))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "pay down the last active path")
+    assert validate_size_ratchet(repo) == []
+
+    _write_lines(repo / "old.py", BAND_MODULE_MAX_LINES + 1)
+    _write_manifest(repo, _manifest(sha=baseline, module_debt_1500=frozenset({"old.py"})))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "re-enter retired 1500 debt")
+    reentry = _git(repo, "rev-parse", "HEAD")
+
+    assert validate_size_ratchet(repo) == [f"{reentry[:12]}: new module debt above 1500 lines: old.py"]
+
+
+def test_generator_activation_is_explicit_one_time_and_check_preserves_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo, files={"big.py": "x\n" * (BAND_MODULE_MAX_LINES + 1)})
+    _write_manifest(repo, _manifest(sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap inactive ratchet")
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+    manifest_path = repo / "ouroboros" / "size_ratchet_manifest.py"
+
+    assert regenerate.main([]) == 0
+    assert "MODULE_DEBT_1500" not in manifest_path.read_text(encoding="utf-8")
+
+    assert regenerate.main(["--activate-1500-layer"]) == 0
+    activated_text = manifest_path.read_text(encoding="utf-8")
+    assert parse_size_ratchet_manifest(activated_text).module_debt_1500 == frozenset({"big.py"})
+    assert regenerate.main(["--check"]) == 0
+    assert regenerate.main(["--activate-1500-layer"]) == 0
+    assert manifest_path.read_text(encoding="utf-8") == activated_text
+
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "commit activation")
+    assert regenerate.main(["--check"]) == 0
+    assert regenerate.main([]) == 0
+    assert manifest_path.read_text(encoding="utf-8") == activated_text
+    assert regenerate.main(["--activate-1500-layer"]) == 2
+    assert "already active" in capsys.readouterr().err
+
+
+def test_generator_activation_rejects_uncommitted_fresh_1501_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo)
+    _write_manifest(repo, _manifest(sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap inactive ratchet")
+    _write_lines(repo / "fresh.py", BAND_MODULE_MAX_LINES + 1)
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    with pytest.raises(ValueError, match="activation exceeds first-parent authority: fresh.py"):
+        regenerate._next_manifest({}, activate_1500_layer=True)

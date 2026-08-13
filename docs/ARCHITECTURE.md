@@ -1691,12 +1691,20 @@ function iterator preserves the narrower runtime scope and exact lexical qualnam
 through AST literals, never Python import execution. It records exact repo-relative
 module debt above 1600 lines, exact `(path, qualname)` function debt above 300 lines,
 the exact-current 1001-1500 band with rationale authority for new or re-entered paths,
-and exact byte debt above 200,000 UTF-8 bytes. `scripts/regenerate_size_ratchet.py`
+and exact byte debt above 200,000 UTF-8 bytes. The optional `MODULE_DEBT_1500` field is
+the v7 second module layer: absent on pre-v7 manifests, activated exactly once via the
+generator's `--activate-1500-layer` flag with the activation commit's exact first-parent
+>1500 inventory as the only admission authority (same-commit paydown allowed,
+self-authorization rejected), then shrink-only and irrevocable — while active, every
+path above 1500 lines must be listed, every path above 1600 additionally stays in the
+legacy set, and new/non-debt paths are capped at 1500. `scripts/regenerate_size_ratchet.py`
 bootstraps only from an exact Git source SHA and updates the live candidate. Validation
 proves bootstrap contents against that immutable tree, audits every first-parent
-candidate tree and manifest transition through `HEAD`, then compares the working tree;
-debt can shrink but cannot be swapped, re-entered without its required authority, grow
-on the byte axis, or survive as a stale record. `MAX_TOTAL_FUNCTIONS` remains the coarse
+candidate tree and manifest transition through `HEAD`, then compares the working tree,
+enforcing both module layers independently in every projection (live, staged index,
+bootstrap, history); debt can shrink but cannot be swapped, re-entered without its
+required authority, grow on the byte axis, or survive as a stale record.
+`MAX_TOTAL_FUNCTIONS` remains the coarse
 runtime ceiling and any raise requires its one-line campaign rationale.
 The same sprint added a deterministic hot-store growth health invariant:
 `agent_startup_checks.py::hot_store_growth_notes` (surfaced in every task

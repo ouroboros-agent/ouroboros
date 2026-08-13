@@ -323,6 +323,19 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   iterator drives smoke, health, census, and the 200,000-byte ratchet. Sources
   decode as strict UTF-8 and normalize line endings to canonical POSIX LF before
   line and UTF-8-byte counts, so checkout policy cannot change the inventory.
+- The v7 second module layer is the optional `MODULE_DEBT_1500` manifest field:
+  absent on pre-v7 manifests (absence means "not activated"; presence, even as
+  an empty tuple, means active). Once active, every exact path above 1500 lines
+  must be listed there, so new/non-debt paths are capped at 1500 while every
+  path above 1600 additionally stays in legacy `GIANT_PATHS`; both layers are
+  enforced independently for the live tree, the staged index, bootstrap, and
+  every audited first-parent transition. Activation happens exactly once via
+  `scripts/regenerate_size_ratchet.py --activate-1500-layer`; its only admission
+  authority is the activation commit's exact first-parent >1500 inventory, which
+  permits same-commit paydown and rejects same-commit self-authorization of a
+  fresh 1501-line path. Afterwards the set is shrink-only and irrevocable:
+  ordinary regeneration and `--check` preserve and enforce it without the flag,
+  and additions, retired-path re-entry, or deactivation fail validation.
 - The exact-current 1001-1500-line band lives in `BAND_PATHS`. A new or
   re-entered path requires a nonblank rationale. `BYTE_DEBT` stores exact counts
   above 200,000 UTF-8 bytes and is shrink-only; regenerate both with
@@ -763,7 +776,7 @@ Before every commit, verify the following:
 - [ ] **Tool** (`{verb}_{noun}`): thin LLM-callable wrapper. Validates input, formats output.
 
 #### Module Size & Complexity
-- [ ] Module stays near one context window (~1000 lines target; exact-path 1600 hard-gate debt is checked in, stale entries fail, and new/re-entered 1001-1500 paths carry a rationale)
+- [ ] Module stays near one context window (~1000 lines target; exact-path 1600 hard-gate debt is checked in, stale entries fail, and new/re-entered 1001-1500 paths carry a rationale; with the v7 `MODULE_DEBT_1500` layer active, non-debt paths are additionally capped at 1500 lines and the active set is shrink-only)
 - [ ] No non-grandfathered Python function or method exceeds the 300-line hard gate (`FUNCTION_DEBT` exact `(path, qualname)` keys are the exception SSOT); methods above 150 lines trigger decomposition review
 - [ ] Total Python function count stays under the current smoke hard gate (consult `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` for the active value; bump with a comment if a feature requires more headroom)
 - [ ] More than eight parameters is a decomposition signal; consider a typed context object, but do not claim a hard gate or mark existing baseline debt noncompliant
