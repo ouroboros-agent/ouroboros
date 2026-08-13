@@ -5,28 +5,41 @@ import argparse
 import ast
 import contextlib
 import hashlib
+import importlib.util
 import inspect
 import io
 import json
 import os
 import pathlib
-import re
 import subprocess
 import sys
 import tarfile
 import tempfile
 from typing import Any, Iterable
-BASELINE_SHA = "a191e1cc21a380176bcedc9b8edd86078fc87fa1"
+def _load_migration_module() -> Any:
+    """Load the sibling migration-contract module, keyed by its resolved path.
+
+    The sys.modules key embeds the exact resolved sibling ``__file__``, so two
+    evidence checkouts loaded into one process never share a contract module
+    that belongs to a different checkout.
+    """
+    target = pathlib.Path(__file__).resolve().with_name("v7_migration.py")
+    key = f"v7_migration:{target}"
+    cached = sys.modules.get(key)
+    if cached is not None and getattr(cached, "__file__", None) == str(target):
+        return cached
+    spec = importlib.util.spec_from_file_location(key, target)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
+    spec.loader.exec_module(module)
+    return module
+_migration = _load_migration_module()
+BASELINE_SHA = _migration.BASELINE_SHA
 OBSERVED_HEAD_SHA = "d30c560457d6de8cf36fb6339880d228fc740729"
 FIXTURE_PATH = pathlib.PurePosixPath("tests/fixtures/v7_prologue_baseline.json")
-MIGRATION_PATH = pathlib.PurePosixPath("MIGRATION_v7.md")
-MIGRATION_HEADERS = ("old path/symbol", "new owner/path", "facade/public contract", "semantic delta", "characterization test", "upstream-transfer status/note")
-SEMANTIC_DELTA_RE = re.compile(r"(?:none|D\d{2})\Z")
-UPSTREAM_STATUSES = frozenset({"not_applicable", "pending", "transferred", "retired"})
-APPROVED_PENDING_OWNERS = frozenset({
-    "ouroboros/tools/tool_context.py", "ouroboros/tools/tool_catalog.py", "ouroboros/tools/tool_result.py",
-    "ouroboros/tools/tool_resolution.py", "ouroboros/tools/registry_core.py", "ouroboros/tools/registry_guards.py", "ouroboros/tools/registry_guard_process.py",
-})
+MIGRATION_HEADERS = _migration.MIGRATION_HEADERS
+APPROVED_PENDING_OWNERS = _migration.APPROVED_PENDING_OWNERS
 HARD_STREAM_PATHS = {
     "T": "ouroboros/tools/registry.py ouroboros/tool_access.py ouroboros/tools/git.py ouroboros/tools/core.py ouroboros/tools/shell.py ouroboros/headless.py tests/test_tool_capabilities.py tests/test_headless_cli.py tests/test_git_review_pipeline.py".split(),
     "S": "ouroboros/config.py ouroboros/gateway/settings.py server.py supervisor/events.py supervisor/workers.py supervisor/queue.py supervisor/task_lifecycle.py ouroboros/extension_loader.py ouroboros/tools/control.py ouroboros/tools/delegate.py ouroboros/delegate_custody.py ouroboros/tools/subagent_integration.py tests/test_task_status_flow.py tests/test_cancel_intents_phase_a.py tests/test_evolution_state_integrity_v3.py tests/test_runtime_mode_elevation.py tests/test_runtime_mode_core.py tests/test_promote_chat_flow.py tests/test_workspace_executor.py tests/test_extension_loader.py tests/test_extensions_api.py tests/test_delivery_forced_finalization.py tests/test_delegated_subagent_transport.py tests/test_delegated_run_isolation.py tests/test_claudexor_owned_daemon.py tests/test_skill_exec.py tests/test_skill_loader.py tests/test_skill_review.py tests/test_context.py".split(),
@@ -40,8 +53,8 @@ def _repo_root(start: pathlib.Path | None = None) -> pathlib.Path:
         if (parent / ".git").exists() and (parent / "BIBLE.md").is_file():
             return parent
     raise RuntimeError("v7 evidence script must run inside an Ouroboros checkout")
-def _git(repo: pathlib.Path, *args: str, text: bool = True) -> str | bytes:
-    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=text).stdout
+_git = _migration._git
+_tracked_paths = _migration._tracked_paths
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 def _sha256_bytes(value: bytes) -> str:
@@ -52,8 +65,6 @@ def _source_bytes(repo: pathlib.Path, ref: str, path: str) -> bytes:
     return _git(repo, "show", f"{ref}:{path}", text=False)  # type: ignore[return-value]
 def _source_text(repo: pathlib.Path, ref: str, path: str) -> str:
     return _source_bytes(repo, ref, path).decode("utf-8", errors="strict")
-def _tracked_paths(repo: pathlib.Path, ref: str) -> list[str]:
-    return sorted(line for line in str(_git(repo, "ls-tree", "-r", "--name-only", ref)).splitlines() if line)
 def _band_owner_projection(path: str) -> str:
     lower = path.lower()
     if path.startswith(("web/", "devtools/", "skills/unix_computer_use/")) or any(token in lower for token in (
@@ -800,163 +811,11 @@ def generate_fixture(repo: pathlib.Path) -> dict[str, Any]:
     return fixture
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-def _parse_ref(cell: str) -> tuple[str, str]:
-    if "::" not in cell: return cell, ""
-    return tuple(cell.split("::", 1))  # type: ignore[return-value]
-def _symbol_exists(repo: pathlib.Path, path: str, symbol: str, ref: str = "") -> bool:
-    if not symbol: return True
-    try:
-        text = _source_text(repo, ref, path) if ref else (repo / path).read_text(encoding="utf-8")
-    except (OSError, subprocess.CalledProcessError, UnicodeDecodeError):
-        return False
-    if path.endswith(".py"):
-        try: tree = ast.parse(text)
-        except SyntaxError: return False
-        found = [alias.asname or alias.name for node in tree.body if isinstance(node, ast.ImportFrom)
-                 for alias in node.names if (alias.asname or alias.name) == symbol]
-        def walk(body: list[ast.stmt], scope: tuple[str, ...] = ()) -> None:
-            for node in body:
-                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                    qualname = ".".join((*scope, node.name))
-                    if qualname == symbol: found.append(qualname)
-                    walk(node.body, (*scope, node.name))
-        walk(tree.body)
-        return len(found) == 1
-    return False  # Qualified non-Python references require a structural parser.
-def _parse_migration(path: pathlib.Path) -> list[dict[str, str]]:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    table_lines = [line for line in lines if line.startswith("|")]
-    if len(table_lines) < 2:
-        raise ValueError("MIGRATION_v7.md has no canonical table")
-    header = tuple(cell.strip() for cell in table_lines[0].strip("|").split("|"))
-    if header != MIGRATION_HEADERS:
-        raise ValueError(f"migration header/order mismatch: {header!r}")
-    separator = tuple(cell.strip() for cell in table_lines[1].strip("|").split("|"))
-    if len(separator) != len(MIGRATION_HEADERS) or any(not re.fullmatch(r":?-{3,}:?", cell) for cell in separator):
-        raise ValueError("migration separator is malformed")
-    rows = []
-    for line in table_lines[2:]:
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) != len(MIGRATION_HEADERS):
-            raise ValueError(f"migration row has {len(cells)} cells: {line}")
-        rows.append(dict(zip(MIGRATION_HEADERS, cells)))
-    return rows
-def _migration_json(cell: str, keys: tuple[str, ...]) -> dict[str, str]:
-    value = json.loads(cell)
-    if not isinstance(value, dict) or tuple(value) != keys or not all(isinstance(item, str) for item in value.values()):
-        raise ValueError(f"expected ordered string object with keys {list(keys)}")
-    compact = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if compact != cell or any("|" in item for item in value.values()):
-        raise ValueError("cell must be canonical compact JSON without pipes")
-    return value
-def _facade_extractions(repo: pathlib.Path, ref: str, paths: Iterable[str]) -> dict[str, str]:
-    transitions: dict[str, str] = {}
-    for path in paths:
-        if not path.endswith(".py") or not (repo / path).is_file(): continue
-        try: base = ast.parse(_source_text(repo, ref, path)); candidate = ast.parse((repo / path).read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, subprocess.CalledProcessError, UnicodeDecodeError): continue
-        definitions = {node.name for node in base.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))}
-        package = list(pathlib.PurePosixPath(path).parent.parts)
-        final_bindings: dict[str, tuple[ast.stmt, ast.alias | None]] = {}
-        for node in candidate.body:
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)): final_bindings[node.name] = (node, None)
-            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-                for target in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets):
-                    if isinstance(target, ast.Name): final_bindings[target.id] = (node, None)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for alias in node.names: final_bindings[alias.asname or alias.name] = (node, alias)
-        for exported in definitions:
-            node, alias = final_bindings.get(exported, (None, None))
-            if not isinstance(node, ast.ImportFrom) or alias is None or not node.module: continue
-            parts = (package[:max(0, len(package) - node.level + 1)] if node.level else []) + node.module.split(".")
-            transitions[f"{path}::{exported}"] = "/".join(parts) + ".py"
-    return transitions
-def validate_migration(repo: pathlib.Path) -> list[str]:
-    errors: list[str] = []
-    path = repo / MIGRATION_PATH
-    try:
-        rows = _parse_migration(path)
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
-        return [str(exc)]
-    seen: set[str] = set()
-    baseline_paths = set(_tracked_paths(repo, BASELINE_SHA))
-    for index, row in enumerate(rows, start=1):
-        prefix = f"row {index}"
-        old = row[MIGRATION_HEADERS[0]]
-        owner = row[MIGRATION_HEADERS[1]]
-        facade = row[MIGRATION_HEADERS[2]]
-        delta_cell = row[MIGRATION_HEADERS[3]]
-        test_ref = row[MIGRATION_HEADERS[4]]
-        status_cell = row[MIGRATION_HEADERS[5]]
-        try: delta = _migration_json(delta_cell, ("id", "note"))
-        except (ValueError, json.JSONDecodeError) as exc:
-            errors.append(f"{prefix}: invalid semantic delta JSON: {exc}")
-            delta = {"id": "", "note": ""}
-        try: upstream = _migration_json(status_cell, ("status", "note"))
-        except (ValueError, json.JSONDecodeError) as exc:
-            errors.append(f"{prefix}: invalid upstream status JSON: {exc}")
-            upstream = {"status": "", "note": ""}
-        if not old or old in seen:
-            errors.append(f"{prefix}: old identity is empty or duplicated: {old!r}")
-        seen.add(old)
-        old_path, old_symbol = _parse_ref(old)
-        if old_path not in baseline_paths and not (repo / old_path).exists():
-            errors.append(f"{prefix}: old path does not exist at baseline/current: {old_path}")
-        elif old_symbol and not _symbol_exists(repo, old_path, old_symbol, BASELINE_SHA):
-            errors.append(f"{prefix}: old symbol does not resolve at baseline: {old}")
-        retired = owner.startswith("retired:")
-        if (not owner) or (retired and len(owner.split(":", 1)[1].strip()) == 0):
-            errors.append(f"{prefix}: exactly one owner path or retirement reason is required")
-        if not retired:
-            owner_path, owner_symbol = _parse_ref(owner)
-            pending_owner = upstream["status"] == "pending" and owner == owner_path and owner_path in APPROVED_PENDING_OWNERS
-            if not (repo / owner_path).exists() and not pending_owner:
-                errors.append(f"{prefix}: missing owner is not an approved spec 4.4 pending destination: {owner_path}")
-            elif not pending_owner and not _symbol_exists(repo, owner_path, owner_symbol):
-                errors.append(f"{prefix}: owner reference does not resolve: {owner}")
-        elif upstream["status"] != "retired":
-            errors.append(f"{prefix}: retired owner requires retired upstream status")
-        if facade != "-":
-            facade_path, facade_symbol = _parse_ref(facade)
-            if not (repo / facade_path).exists() or not _symbol_exists(repo, facade_path, facade_symbol):
-                errors.append(f"{prefix}: facade reference does not resolve: {facade}")
-            if test_ref == "-":
-                errors.append(f"{prefix}: facade requires an identity/signature characterization test")
-        if not SEMANTIC_DELTA_RE.fullmatch(delta["id"]):
-            errors.append(f"{prefix}: invalid semantic delta id: {delta['id']}")
-        if test_ref != "-":
-            test_path, test_symbol = _parse_ref(test_ref)
-            if not (repo / test_path).is_file() or not _symbol_exists(repo, test_path, test_symbol):
-                errors.append(f"{prefix}: characterization test does not resolve: {test_ref}")
-        if upstream["status"] not in UPSTREAM_STATUSES:
-            errors.append(f"{prefix}: invalid upstream-transfer status: {upstream['status']}")
-        if upstream["status"] == "pending" and not upstream["note"].strip():
-            errors.append(f"{prefix}: pending upstream status requires a note")
-        for header, cell in row.items():
-            if "\n" in cell or "\r" in cell or "|" in cell:
-                errors.append(f"{prefix}: {header} is not compact")
-    diffs = (
-        str(_git(repo, "diff", "--name-status", "-M", f"{BASELINE_SHA}..HEAD", "--")),
-        str(_git(repo, "diff", "--name-status", "-M", BASELINE_SHA, "--")),
-    )
-    candidates: set[str] = set(); modified: set[str] = set()
-    for line in "\n".join(diffs).splitlines():
-        fields = line.split("\t")
-        status = fields[0]
-        if status.startswith("R") and len(fields) >= 3:
-            candidates.add(fields[1])
-        elif status == "D" and len(fields) >= 2:
-            candidates.add(fields[1])
-        elif status == "M" and len(fields) >= 2: modified.add(fields[1])
-    for old_path in sorted(candidates):
-        if old_path not in seen and not any(identity.startswith(old_path + "::") for identity in seen):
-            errors.append(f"tracked migration missing for moved/removed path: {old_path}")
-    rows_by_old = {row[MIGRATION_HEADERS[0]]: row for row in rows}
-    for identity, owner_path in sorted(_facade_extractions(repo, BASELINE_SHA, modified).items()):
-        row = rows_by_old.get(identity)
-        if row is None: errors.append(f"tracked migration missing for extracted facade: {identity} -> {owner_path}")
-        elif _parse_ref(row[MIGRATION_HEADERS[1]])[0] != owner_path: errors.append(f"tracked migration owner mismatch for extracted facade: {identity} -> {owner_path}")
-    return errors
+_parse_ref = _migration._parse_ref
+_symbol_exists = _migration._symbol_exists
+_parse_migration = _migration._parse_migration
+_migration_json = _migration._migration_json
+validate_migration = _migration.validate_migration
 def command_write(repo: pathlib.Path) -> int:
     fixture = generate_fixture(repo)
     output = repo / FIXTURE_PATH
