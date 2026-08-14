@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import subprocess
 from types import SimpleNamespace
 
 import ouroboros.tools.registry as registry_module
@@ -26,6 +27,12 @@ _FUNCTION_SIGNATURES = {
     "_mentions_skill_owner_state": "(text_lower: 'str') -> 'bool'",
     "_mentions_detached_process": "(text_lower: 'str') -> 'bool'",
     "_run_shell_safety_check": "(self, args: 'Dict[str, Any]', runtime_mode: 'str', binding: 'Any' = None) -> 'ToolResult | None'",
+    "_light_repo_snapshot": "(repo_dir: 'pathlib.Path') -> 'Optional[Dict[str, Any]]'",
+    "_format_light_repo_write_block": "(before: 'Dict[str, Any]', after: 'Dict[str, Any]', result: 'str', tool_name: 'str' = 'run_command') -> 'str'",
+    "_git_ref_snapshot": "(repo_dir: 'pathlib.Path') -> 'Optional[Dict[str, str]]'",
+    "_snapshot_owner_files": "(self, state_drive_root: 'pathlib.Path | None' = None) -> 'Dict[pathlib.Path, Optional[str]]'",
+    "_restore_owner_files": "(self, before: 'Dict[pathlib.Path, Optional[str]]', state_drive_root: 'pathlib.Path | None' = None) -> 'bool'",
+    "_run_shell_post_checks": "(self, result: 'str', *, owner_snapshot: 'Dict[pathlib.Path, Optional[str]]', state_drive_root: 'pathlib.Path', light_repo_before: 'Optional[Dict[str, Any]]', workspace_refs_before: 'Optional[Dict[str, str]]', tool_name: 'str' = 'run_command') -> 'str'",
 }
 
 _CONSTANT_CARDINALITIES = {
@@ -44,12 +51,15 @@ _CONSTANT_CARDINALITIES = {
 
 _RETIRED_REGISTRY_DEPENDENCIES = frozenset({
     "LIGHT_SHELL_WRITER_COMMANDS",
+    "SKILL_OWNER_STATE_FILENAMES",
     "SKILL_OWNER_STATE_STEMS",
     "build_resolved_resource_binding",
     "interpreter_family",
     "light_shell_repo_mutation",
+    "parse_porcelain_paths",
     "protected_artifact_shell_block_reason",
     "runtime_data_guard_targets",
+    "safe_relpath",
     "shell_command_string",
     "strip_leading_env_assignments",
     "sudo_noninteractive_violation",
@@ -70,6 +80,9 @@ def test_process_guard_owner_surface_is_exact_and_retired_from_registry():
     ) | _RETIRED_REGISTRY_DEPENDENCIES
     assert all(not hasattr(registry_module, name) for name in moved_module_names)
     assert not hasattr(ToolRegistry, "_run_shell_safety_check")
+    assert not hasattr(ToolRegistry, "_snapshot_owner_files")
+    assert not hasattr(ToolRegistry, "_restore_owner_files")
+    assert not hasattr(ToolRegistry, "_run_shell_post_checks")
 
 
 class _RegistryStub:
@@ -104,6 +117,220 @@ class _RegistryStub:
 
     def _shell_git_and_runtime_block(self, *_args):
         return None
+
+
+def test_run_shell_restores_obfuscated_self_authored_state_marker(tmp_path, monkeypatch):
+    from ouroboros import config
+
+    state_root = tmp_path / "bound-drive"
+    skill_state = state_root / "state" / "skills" / "alpha"
+    skill_state.mkdir(parents=True)
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"owner":"before"}', encoding="utf-8")
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings_path)
+
+    existing = skill_state / "review.json"
+    existing.write_text('{"status":"clean"}', encoding="utf-8")
+    unrelated = skill_state / "payload.txt"
+    unrelated.write_text("before", encoding="utf-8")
+    marker = skill_state / "self_authored.json"
+    stub = _RegistryStub(tmp_path / "fallback-drive")
+
+    before = process_guard._snapshot_owner_files(stub, state_root)
+    settings_path.write_text('{"owner":"changed"}', encoding="utf-8")
+    existing.write_text('{"status":"changed"}', encoding="utf-8")
+    marker.write_text('{"origin":"self_authored"}', encoding="utf-8")
+    unrelated.write_text("changed", encoding="utf-8")
+
+    assert process_guard._restore_owner_files(stub, before, state_root) is True
+    assert settings_path.read_text(encoding="utf-8") == '{"owner":"before"}'
+    assert existing.read_text(encoding="utf-8") == '{"status":"clean"}'
+    assert not marker.exists()
+    assert unrelated.read_text(encoding="utf-8") == "changed"
+    assert process_guard._restore_owner_files(stub, before, state_root) is False
+
+
+def test_light_repo_formatter_preserves_sorted_bounded_path_disclosure():
+    result = process_guard._format_light_repo_write_block(
+        {"paths": ["z.py", "b.py"]},
+        {"paths": ["a.py", "b.py"]},
+        "handler output",
+        tool_name="run_script",
+    )
+    assert result == (
+        "⚠️ LIGHT_MODE_REPO_WRITE_BLOCKED: runtime_mode=light detected a mutation of the "
+        "Ouroboros repository after run_script. The command result is blocked and no "
+        "automatic rollback was attempted to avoid overwriting concurrent human edits. "
+        "Affected/dirty paths: a.py, b.py, z.py. Switch to advanced/pro for repo writes.\n\n"
+        "Original command output:\nhandler output"
+    )
+
+    crowded = process_guard._format_light_repo_write_block(
+        {"paths": [f"p{index:02d}" for index in range(31)]},
+        {"paths": []},
+        "out",
+    )
+    assert "p29, ... (+1 more)" in crowded
+    assert "p30" not in crowded
+    assert "Affected/dirty paths: (status changed; no paths parsed)." in (
+        process_guard._format_light_repo_write_block({}, {}, "out")
+    )
+
+
+def test_git_ref_snapshot_detects_a_ref_only_change(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("content\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-qm", "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+
+    before = process_guard._git_ref_snapshot(repo)
+    subprocess.run(["git", "tag", "fixture-tag"], cwd=repo, check=True)
+    after = process_guard._git_ref_snapshot(repo)
+
+    assert before is not None and after is not None
+    assert before["head"] == after["head"]
+    assert before["digest"] != after["digest"]
+
+
+def test_process_post_checks_preserve_polling_restore_and_wrapper_order(
+    tmp_path, monkeypatch,
+):
+    import time
+
+    stub = _RegistryStub(tmp_path)
+    events: list[str] = []
+    restore_results = iter((True, False, False, False))
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda seconds: events.append(f"sleep:{seconds}"),
+    )
+
+    def restore(owner, before, state_drive_root=None):
+        assert owner is stub
+        assert before == {tmp_path / "owner.json": "before"}
+        assert state_drive_root == tmp_path
+        events.append("restore")
+        return next(restore_results)
+
+    def light_snapshot(repo_dir):
+        assert repo_dir == tmp_path
+        events.append("light_snapshot")
+        return {"digest": "light-after", "paths": ["changed.py"]}
+
+    def ref_snapshot(repo_dir):
+        assert repo_dir == tmp_path
+        events.append("ref_snapshot")
+        return {"head": "same", "digest": "refs-after"}
+
+    monkeypatch.setattr(process_guard, "_restore_owner_files", restore)
+    monkeypatch.setattr(process_guard, "_light_repo_snapshot", light_snapshot)
+    monkeypatch.setattr(process_guard, "_git_ref_snapshot", ref_snapshot)
+    monkeypatch.setattr(process_guard, "system_repo_dir_for", lambda _ctx: tmp_path)
+    monkeypatch.setattr(process_guard, "active_repo_dir_for", lambda _ctx: tmp_path)
+
+    result = process_guard._run_shell_post_checks(
+        stub,
+        "handler output",
+        owner_snapshot={tmp_path / "owner.json": "before"},
+        state_drive_root=tmp_path,
+        light_repo_before={"digest": "light-before", "paths": []},
+        workspace_refs_before={"head": "same", "digest": "refs-before"},
+        tool_name="run_script",
+    )
+
+    assert events == [
+        "sleep:0.3", "restore",
+        "sleep:0.3", "restore",
+        "sleep:0.3", "restore",
+        "sleep:0.3", "restore",
+        "light_snapshot", "ref_snapshot",
+    ]
+    assert result == (
+        "⚠️ WORKSPACE_GIT_REF_CHANGED: run_command changed git HEAD or refs inside the "
+        "external workspace. External workspace runs must leave changes as files/patch "
+        "artifacts, not commits/tags/resets.\n\nOriginal command output:\n"
+        "⚠️ LIGHT_MODE_REPO_WRITE_BLOCKED: runtime_mode=light detected a mutation of the "
+        "Ouroboros repository after run_script. The command result is blocked and no "
+        "automatic rollback was attempted to avoid overwriting concurrent human edits. "
+        "Affected/dirty paths: changed.py. Switch to advanced/pro for repo writes.\n\n"
+        "Original command output:\nhandler output\n\n⚠️ OWNER_STATE_RESTORED: run_command "
+        "attempted to change owner-only settings or skill trust state; protected files "
+        "were restored."
+    )
+
+
+def test_registry_dispatch_calls_process_post_owner_once_after_handler(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import safety
+
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    registry.set_context(ToolContext(repo_dir=repo, drive_root=data, task_id="task-post-owner"))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    calls: list[str] = []
+
+    def pre_guard(*_args, **_kwargs):
+        calls.append("pre_guard")
+        return None
+
+    def check_safety(*_args, **_kwargs):
+        calls.append("safety")
+        return True, ""
+
+    def snapshot(owner, state_drive_root=None):
+        assert owner is registry
+        assert state_drive_root == data
+        calls.append("snapshot")
+        return {}
+
+    def handler(_ctx, cmd, _resolved_binding=None, **_kwargs):
+        assert cmd == ["echo", "ok"]
+        assert _resolved_binding is not None
+        calls.append("handler")
+        return "handler output"
+
+    def post(owner, result, **kwargs):
+        assert owner is registry
+        assert result == "handler output"
+        assert kwargs == {
+            "owner_snapshot": {},
+            "state_drive_root": data,
+            "light_repo_before": None,
+            "workspace_refs_before": None,
+            "tool_name": "run_command",
+        }
+        calls.append("post")
+        return result
+
+    original_adapter = LegacyTextResultAdapter.from_text
+
+    def adapt(tool_name, text):
+        calls.append("adapter")
+        return original_adapter(tool_name, text)
+
+    monkeypatch.setattr(process_guard, "_run_shell_safety_check", pre_guard)
+    monkeypatch.setattr(process_guard, "_snapshot_owner_files", snapshot)
+    monkeypatch.setattr(process_guard, "_run_shell_post_checks", post)
+    monkeypatch.setattr(safety, "check_safety", check_safety)
+    monkeypatch.setattr(LegacyTextResultAdapter, "from_text", adapt)
+    registry.override_handler("run_command", handler)
+
+    assert registry.execute("run_command", {"cmd": ["echo", "ok"]}) == "handler output"
+    assert calls == ["pre_guard", "safety", "snapshot", "handler", "post", "adapter"]
 
 
 def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):

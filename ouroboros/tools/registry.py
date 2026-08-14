@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import inspect
 import logging
 import os
 import pathlib
 import re
-import subprocess
 from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional
 
@@ -37,7 +35,6 @@ from ouroboros.shell_parse import (
 )
 from ouroboros.tools.shell_guards import (
     PROTECTED_RUNTIME_PATHS_LOWER,
-    parse_porcelain_paths,
     process_shell_guard_args,
     shell_has_write_indicator,
     shell_writer_targets_protected,
@@ -78,8 +75,8 @@ from ouroboros.tools.tool_resolution import (
     _coerce_real_path,  # noqa: F401 -- public compatibility re-export
     _normalize_dispatch_path_args,
     _target_binding_operation,
-    active_repo_dir_for,
-    system_repo_dir_for,
+    active_repo_dir_for,  # noqa: F401 -- public compatibility re-export
+    system_repo_dir_for,  # noqa: F401 -- public compatibility re-export
 )
 from ouroboros.tools.tool_result import (  # noqa: F401 -- public compatibility re-export
     LegacyTextResultAdapter,
@@ -103,10 +100,8 @@ from ouroboros.tools.registry_guards import (
     _task_constraint_path_allowed,  # noqa: F401 -- public compatibility re-export
 )
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
-from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
 from ouroboros.contracts.skill_payload_policy import (
-    SKILL_OWNER_STATE_FILENAMES,
     SKILL_PAYLOAD_CONTROL_DIRNAMES,
     SKILL_PAYLOAD_CONTROL_FILENAMES,
     constraint_bucket_skill,  # noqa: F401 -- public compatibility re-export
@@ -520,82 +515,6 @@ def _format_tool_arg_error(entry: "ToolEntry") -> str:
         f"⚠️ TOOL_ARG_ERROR ({entry.name}): invalid arguments for {entry.name}. "
         f"Accepted parameters: {accepted}."
     )
-
-
-def _light_repo_snapshot(repo_dir: pathlib.Path) -> Optional[Dict[str, Any]]:
-    """Worktree tripwire for light-mode shell writes, not rollback machinery."""
-    try:
-        repo = pathlib.Path(repo_dir)
-        status = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-            cwd=str(repo), capture_output=True, text=True, timeout=5,
-        )
-        if status.returncode != 0:
-            return None
-        unstaged = subprocess.run(
-            ["git", "diff", "--binary", "--no-ext-diff"],
-            cwd=str(repo), capture_output=True, text=True, timeout=10,
-        )
-        staged = subprocess.run(
-            ["git", "diff", "--cached", "--binary", "--no-ext-diff"],
-            cwd=str(repo), capture_output=True, text=True, timeout=10,
-        )
-        paths = parse_porcelain_paths(status.stdout)
-        digest = hashlib.sha256()
-        digest.update((status.stdout or "").encode("utf-8", errors="replace"))
-        digest.update((unstaged.stdout if unstaged.returncode == 0 else "").encode("utf-8", errors="replace"))
-        digest.update((staged.stdout if staged.returncode == 0 else "").encode("utf-8", errors="replace"))
-        for rel in paths:
-            try:
-                target = (repo / safe_relpath(rel)).resolve(strict=False)
-                target.relative_to(repo.resolve(strict=False))
-                if target.is_file() and rel in (status.stdout or ""):
-                    stat = target.stat()
-                    digest.update(f"{rel}\0{stat.st_size}\0{stat.st_mtime_ns}".encode("utf-8"))
-            except Exception:
-                continue
-        return {"digest": digest.hexdigest(), "paths": paths}
-    except Exception:
-        return None
-
-
-def _format_light_repo_write_block(before: Dict[str, Any], after: Dict[str, Any], result: str, tool_name: str = "run_command") -> str:
-    before_paths = set(before.get("paths") or [])
-    after_paths = set(after.get("paths") or [])
-    touched = sorted(after_paths | before_paths)
-    listed = ", ".join(touched[:30]) if touched else "(status changed; no paths parsed)"
-    if len(touched) > 30:
-        listed += f", ... (+{len(touched) - 30} more)"
-    return (
-        "⚠️ LIGHT_MODE_REPO_WRITE_BLOCKED: runtime_mode=light detected "
-        f"a mutation of the Ouroboros repository after {tool_name}. "
-        "The command result is blocked and no automatic rollback was attempted "
-        "to avoid overwriting concurrent human edits. "
-        f"Affected/dirty paths: {listed}. Switch to advanced/pro for repo writes.\n\n"
-        "Original command output:\n"
-        f"{result}"
-    )
-
-
-def _git_ref_snapshot(repo_dir: pathlib.Path) -> Optional[Dict[str, str]]:
-    try:
-        repo = pathlib.Path(repo_dir)
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo), capture_output=True, text=True, timeout=5,
-        )
-        refs = subprocess.run(
-            ["git", "show-ref", "--head", "--dereference"],
-            cwd=str(repo), capture_output=True, text=True, timeout=5,
-        )
-        if head.returncode != 0 or refs.returncode not in (0, 1):
-            return None
-        digest = hashlib.sha256()
-        digest.update((head.stdout or "").encode("utf-8", errors="replace"))
-        digest.update((refs.stdout or "").encode("utf-8", errors="replace"))
-        return {"head": (head.stdout or "").strip(), "digest": digest.hexdigest()}
-    except Exception:
-        return None
 
 
 def _extension_dispatch_candidate(
@@ -1864,111 +1783,6 @@ class ToolRegistry:
             ),
         )
 
-    def _snapshot_owner_files(
-        self, state_drive_root: pathlib.Path | None = None,
-    ) -> Dict[pathlib.Path, Optional[str]]:
-        from ouroboros import config as _cfg
-        out: Dict[pathlib.Path, Optional[str]] = {}
-        settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
-        try:
-            out[settings_path] = settings_path.read_text(encoding="utf-8") if settings_path.is_file() else None
-        except OSError:
-            out[settings_path] = None
-        root = pathlib.Path(state_drive_root or self._ctx.drive_root) / "state" / "skills"
-        if not root.is_dir():
-            return out
-        for path in root.glob("*/*"):
-            if path.name.lower() not in SKILL_OWNER_STATE_FILENAMES:
-                continue
-            try:
-                out[path] = path.read_text(encoding="utf-8")
-            except OSError:
-                out[path] = None
-        return out
-
-    def _restore_owner_files(
-        self,
-        before: Dict[pathlib.Path, Optional[str]],
-        state_drive_root: pathlib.Path | None = None,
-    ) -> bool:
-        from ouroboros import config as _cfg
-        root = pathlib.Path(state_drive_root or self._ctx.drive_root) / "state" / "skills"
-        current = set()
-        if root.is_dir():
-            current.update(
-                path for path in root.glob("*/*")
-                if path.name.lower() in SKILL_OWNER_STATE_FILENAMES
-            )
-        settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
-        current.add(settings_path)
-        changed = False
-        for path in current - set(before):
-            try:
-                path.unlink()
-                changed = True
-            except OSError:
-                pass
-        for path, content in before.items():
-            try:
-                if content is None:
-                    if path.exists():
-                        path.unlink()
-                        changed = True
-                    continue
-                if not path.exists() or path.read_text(encoding="utf-8") != content:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(content, encoding="utf-8")
-                    changed = True
-            except OSError:
-                pass
-        return changed
-
-    def _run_shell_post_checks(
-        self,
-        result: str,
-        *,
-        owner_snapshot: Dict[pathlib.Path, Optional[str]],
-        state_drive_root: pathlib.Path,
-        light_repo_before: Optional[Dict[str, Any]],
-        workspace_refs_before: Optional[Dict[str, str]],
-        tool_name: str = "run_command",
-    ) -> str:
-        import time
-
-        restored_owner_state = False
-        for _ in range(4):
-            time.sleep(0.3)
-            restored_owner_state = (
-                self._restore_owner_files(owner_snapshot, state_drive_root)
-                or restored_owner_state
-            )
-        if restored_owner_state:
-            result = (
-                f"{result}\n\n⚠️ OWNER_STATE_RESTORED: run_command attempted to "
-                "change owner-only settings or skill trust state; protected files were restored."
-            )
-        if light_repo_before is not None:
-            light_repo_after = _light_repo_snapshot(system_repo_dir_for(self._ctx))
-            if (
-                light_repo_after is not None
-                and light_repo_after.get("digest") != light_repo_before.get("digest")
-            ):
-                result = _format_light_repo_write_block(light_repo_before, light_repo_after, result, tool_name=tool_name)
-        if workspace_refs_before is not None:
-            workspace_refs_after = _git_ref_snapshot(active_repo_dir_for(self._ctx))
-            if (
-                workspace_refs_after is not None
-                and workspace_refs_after.get("digest") != workspace_refs_before.get("digest")
-            ):
-                result = (
-                    "⚠️ WORKSPACE_GIT_REF_CHANGED: run_command changed git HEAD or refs "
-                    "inside the external workspace. External workspace runs must leave "
-                    "changes as files/patch artifacts, not commits/tags/resets.\n\n"
-                    "Original command output:\n"
-                    f"{result}"
-                )
-        return result
-
     def _resolve_python_predispatch(
         self,
         name: str,
@@ -2328,11 +2142,11 @@ class ToolRegistry:
             return ToolResult(status="blocked", code="SAFETY_VIOLATION", text=safety_msg)
         state_drive_root = _binding_state_drive_root(self._ctx, resolved_binding)
         owner_snapshot = (
-            self._snapshot_owner_files(state_drive_root)
+            registry_guard_process._snapshot_owner_files(self, state_drive_root)
             if name in _PROCESS_COMMAND_TOOLS else {}
         )
         light_repo_before = (
-            _light_repo_snapshot(system_repo_dir_for(self._ctx))
+            registry_guard_process._light_repo_snapshot(system_repo_dir_for(self._ctx))
             if (
                 name in _PROCESS_COMMAND_TOOLS
                 and _runtime_mode == "light"
@@ -2344,7 +2158,7 @@ class ToolRegistry:
             else None
         )
         workspace_refs_before = (
-            _git_ref_snapshot(active_repo_dir_for(self._ctx))
+            registry_guard_process._git_ref_snapshot(active_repo_dir_for(self._ctx))
             if name in _PROCESS_COMMAND_TOOLS and workspace_mode and acting_self_worktree
             else None
         )
@@ -2357,7 +2171,8 @@ class ToolRegistry:
         if early_error is not None:
             return early_error
         if name in _PROCESS_COMMAND_TOOLS:
-            result = self._run_shell_post_checks(
+            result = registry_guard_process._run_shell_post_checks(
+                self,
                 result,
                 owner_snapshot=owner_snapshot,
                 state_drive_root=state_drive_root,

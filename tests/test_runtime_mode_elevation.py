@@ -889,7 +889,7 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
 
     # (module, function) -> why it may write settings.json without the prologue
     exempt = {
-        ("ouroboros/tools/registry.py", "_restore_owner_files"):
+        ("ouroboros/tools/registry_guard_process.py", "_restore_owner_files"):
             "immune-system ROLLBACK: rewrites the exact bytes snapshotted before an agent shell "
             "command. It authors no value, and filtering a restore would corrupt it — an "
             "owner-authored default would be dropped instead of restored.",

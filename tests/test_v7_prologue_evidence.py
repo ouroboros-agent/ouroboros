@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 97
+    assert len(rows) == 107
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -397,6 +397,26 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             "ouroboros/tools/registry_guard_process.py::_mentions_detached_process",
         "ouroboros/tools/registry.py::ToolRegistry._run_shell_safety_check":
             "ouroboros/tools/registry_guard_process.py::_run_shell_safety_check",
+        "ouroboros/tools/registry.py::_light_repo_snapshot":
+            "ouroboros/tools/registry_guard_process.py::_light_repo_snapshot",
+        "ouroboros/tools/registry.py::_format_light_repo_write_block":
+            "ouroboros/tools/registry_guard_process.py::_format_light_repo_write_block",
+        "ouroboros/tools/registry.py::_git_ref_snapshot":
+            "ouroboros/tools/registry_guard_process.py::_git_ref_snapshot",
+        "ouroboros/tools/registry.py::ToolRegistry._snapshot_owner_files":
+            "ouroboros/tools/registry_guard_process.py::_snapshot_owner_files",
+        "ouroboros/tools/registry.py::ToolRegistry._restore_owner_files":
+            "ouroboros/tools/registry_guard_process.py::_restore_owner_files",
+        "ouroboros/tools/registry.py::ToolRegistry._run_shell_post_checks":
+            "ouroboros/tools/registry_guard_process.py::_run_shell_post_checks",
+        "tests/test_skill_exec.py::test_run_shell_restores_obfuscated_self_authored_state_marker":
+            "tests/test_registry_guard_process.py::test_run_shell_restores_obfuscated_self_authored_state_marker",
+        "ouroboros/tools/registry.py::SKILL_OWNER_STATE_FILENAMES":
+            "ouroboros/contracts/skill_payload_policy.py::SKILL_OWNER_STATE_FILENAMES",
+        "ouroboros/tools/registry.py::parse_porcelain_paths":
+            "ouroboros/tools/shell_guards.py::parse_porcelain_paths",
+        "ouroboros/tools/registry.py::safe_relpath":
+            "ouroboros/utils.py::safe_relpath",
         "ouroboros/tools/registry.py::LIGHT_SHELL_WRITER_COMMANDS":
             "ouroboros/tools/shell_guards.py::LIGHT_SHELL_WRITER_COMMANDS",
         "ouroboros/tools/registry.py::SKILL_OWNER_STATE_STEMS":
@@ -451,6 +471,10 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             "ouroboros/tools/registry_guards.py::_heal_mode_guard_result",
     }
     existing_process_owner_rows = {
+        "tests/test_skill_exec.py::test_run_shell_restores_obfuscated_self_authored_state_marker",
+        "ouroboros/tools/registry.py::SKILL_OWNER_STATE_FILENAMES",
+        "ouroboros/tools/registry.py::parse_porcelain_paths",
+        "ouroboros/tools/registry.py::safe_relpath",
         "ouroboros/tools/registry.py::LIGHT_SHELL_WRITER_COMMANDS",
         "ouroboros/tools/registry.py::SKILL_OWNER_STATE_STEMS",
         "ouroboros/tools/registry.py::build_resolved_resource_binding",
@@ -585,6 +609,16 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
                     "ouroboros/tools/registry.py::ToolRegistry._subagent_and_update_gate",
                     "ouroboros/tools/registry.py::ToolRegistry._heal_mode_block",
                     "ouroboros/tools/registry.py::ToolRegistry._run_shell_safety_check",
+                    "ouroboros/tools/registry.py::_light_repo_snapshot",
+                    "ouroboros/tools/registry.py::_format_light_repo_write_block",
+                    "ouroboros/tools/registry.py::_git_ref_snapshot",
+                    "ouroboros/tools/registry.py::ToolRegistry._snapshot_owner_files",
+                    "ouroboros/tools/registry.py::ToolRegistry._restore_owner_files",
+                    "ouroboros/tools/registry.py::ToolRegistry._run_shell_post_checks",
+                    "tests/test_skill_exec.py::test_run_shell_restores_obfuscated_self_authored_state_marker",
+                    "ouroboros/tools/registry.py::SKILL_OWNER_STATE_FILENAMES",
+                    "ouroboros/tools/registry.py::parse_porcelain_paths",
+                    "ouroboros/tools/registry.py::safe_relpath",
                     "ouroboros/tools/registry.py::_detect_runtime_mode_elevation",
                     "ouroboros/tools/registry.py::_SUBAGENT_SHELL_SECRET_MARKERS",
                     "ouroboros/tools/registry.py::_subagent_shell_targets_secret",
@@ -645,7 +679,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 71
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 81
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 

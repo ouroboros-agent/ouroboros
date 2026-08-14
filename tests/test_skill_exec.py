@@ -346,22 +346,6 @@ def test_run_shell_blocks_self_authored_marker_writes(tmp_path, monkeypatch):
     assert ".self_authored.json" in result
 
 
-def test_run_shell_restores_obfuscated_self_authored_state_marker(tmp_path):
-    ctx = _make_ctx(tmp_path)
-    marker = ctx.drive_root / "state" / "skills" / "alpha" / "self_authored.json"
-    marker.parent.mkdir(parents=True)
-    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
-    registry._ctx = ctx
-
-    before = registry._snapshot_owner_files()
-    marker.write_text('{"origin":"self_authored"}', encoding="utf-8")
-
-    restored = registry._restore_owner_files(before)
-
-    assert restored is True
-    assert not marker.exists()
-
-
 def test_skill_exec_tools_have_policy_entries():
     """Every new tool must carry an explicit TOOL_POLICY entry."""
     from ouroboros.safety import TOOL_POLICY, POLICY_CHECK, POLICY_SKIP
