@@ -90,6 +90,113 @@ def test_schemas_include_mcp_tools(registry):
     assert "mcp_svc__echo" in names
 
 
+def test_slug_collision_is_first_wins_and_visible(registry, caplog):
+    fake = _FakeTransport([
+        {"name": "foo-bar", "description": "First", "input_schema": {}},
+        {"name": "foo_bar", "description": "Second", "input_schema": {}},
+        {"name": "foo bar", "description": "Third", "input_schema": {}},
+    ])
+    _wire_singleton(fake)
+    mcp_client.reconfigure_from_settings(_settings(_good_server(id="svc")))
+
+    with caplog.at_level("ERROR"):
+        outcome = mcp_client.get_manager().refresh_server("svc")
+
+    assert outcome["ok"] is True
+    assert outcome["tool_count"] == 1
+    assert outcome["tools"][0]["name"] == "foo-bar"
+    assert outcome["tool_name_collisions"] == [
+        {
+            "prefixed_name": "mcp_svc__foo_bar",
+            "kept_raw_name": "foo-bar",
+            "dropped_raw_name": "foo_bar",
+        },
+        {
+            "prefixed_name": "mcp_svc__foo_bar",
+            "kept_raw_name": "foo-bar",
+            "dropped_raw_name": "foo bar",
+        },
+    ]
+    assert "MCP tool name collision" in caplog.text
+    manager = mcp_client.get_manager()
+    result = manager.call_tool("mcp_svc__foo_bar", {})
+    assert "echo(svc/foo-bar)" in result
+    assert fake.call_calls[-1][1] == "foo-bar"
+    status = manager.status_payload()["servers"][0]
+    assert status["tool_name_collisions"] == outcome["tool_name_collisions"]
+    schema_names = {
+        schema["function"]["name"] for schema in registry.schemas()
+    }
+    assert "mcp_svc__foo_bar" in schema_names
+    assert any(
+        item.get("surface") == "mcp"
+        and item.get("kind") == "provider_slug"
+        and item.get("tools") == ["mcp_svc__foo_bar"]
+        for item in registry.capability_omissions()
+    )
+
+    fake.response = [{
+        "name": "unique",
+        "description": "Unique",
+        "input_schema": {},
+    }]
+    refreshed = manager.refresh_server("svc")
+    assert refreshed["tool_name_collisions"] == []
+    assert manager.tool_name_collisions() == []
+
+
+def test_slug_collision_omission_respects_allowed_tools_and_global_disable(
+    registry, monkeypatch,
+):
+    fake = _FakeTransport([
+        {"name": "foo-bar", "description": "First", "input_schema": {}},
+        {"name": "foo_bar", "description": "Second", "input_schema": {}},
+    ])
+    _wire_singleton(fake)
+    mcp_client.reconfigure_from_settings(
+        _settings(_good_server(id="svc", allowed_tools=["other"]))
+    )
+    mcp_client.get_manager().refresh_server("svc")
+
+    registry.schemas()
+    assert not any(
+        item.get("kind") == "provider_slug"
+        for item in registry.capability_omissions()
+    )
+
+    mcp_client.reconfigure_from_settings(
+        _settings(_good_server(id="svc", allowed_tools=["foo_bar"]))
+    )
+    mcp_client.get_manager().refresh_server("svc")
+    schema_names = {
+        schema["function"]["name"] for schema in registry.schemas()
+    }
+    assert "mcp_svc__foo_bar" not in schema_names
+    assert any(
+        item.get("kind") == "provider_slug"
+        and item.get("tools") == ["mcp_svc__foo_bar"]
+        for item in registry.capability_omissions()
+    )
+    import ouroboros.safety as safety_mod
+
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **kw: (True, ""))
+    result = registry.execute("mcp_svc__foo_bar", {})
+    assert "MCP_TOOL_DISALLOWED" in result or "MCP_TOOL_NOT_FOUND" in result
+    assert fake.call_calls == []
+
+    mcp_client.reconfigure_from_settings(
+        _settings(
+            _good_server(id="svc", allowed_tools=["foo_bar"]),
+            enabled=False,
+        )
+    )
+    registry.schemas()
+    assert not any(
+        item.get("kind") == "provider_slug"
+        for item in registry.capability_omissions()
+    )
+
+
 def test_schemas_cold_worker_loads_settings_and_refreshes_once(registry, monkeypatch):
     fake = _FakeTransport(
         [{"name": "ping", "description": "Ping", "input_schema": {"type": "object", "properties": {}}}]

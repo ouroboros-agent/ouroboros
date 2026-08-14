@@ -327,7 +327,7 @@ def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, 
 
     monkeypatch.setattr(registry_module, "process_shell_guard_args", capture_guard)
     monkeypatch.setattr(registry, "_run_shell_safety_check", lambda *args, **kwargs: "")
-    registry._entries["verify_and_record"].handler = capture_handler
+    registry.override_handler("verify_and_record", capture_handler)
 
     result = registry.execute(
         "verify_and_record",
@@ -364,7 +364,7 @@ def test_registry_uses_current_process_python_before_server_bootstrap(
         observed["cmd"] = cmd
         return "ok"
 
-    registry._entries["run_command"].handler = handler
+    registry.override_handler("run_command", handler)
 
     result = registry.execute("run_command", {"cmd": ["python", "-V"]})
 

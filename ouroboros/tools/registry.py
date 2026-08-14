@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import subprocess
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.runtime_mode_policy import (
@@ -65,7 +66,12 @@ from ouroboros.tool_access import (
     UserFilesPathBlockedError,
     workspace_mode_block_reason,
 )
-from ouroboros.tools.tool_catalog import ToolEntry
+from ouroboros.tools.tool_catalog import (
+    DuplicateToolNameError as _DuplicateToolNameError,
+    ToolCatalog as _ToolCatalog,
+    ToolEntry,
+    partition_shadowed_tools as _partition_shadowed_tools,
+)
 from ouroboros.tools.tool_context import BrowserState, ToolContext  # noqa: F401 -- public compatibility re-export
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
 from ouroboros.utils import safe_relpath
@@ -1339,7 +1345,11 @@ class ToolRegistry:
         self._entries: Dict[str, ToolEntry] = {}
         self._ctx = ToolContext(repo_dir=repo_dir, drive_root=drive_root)
         self._capability_omissions: List[Dict[str, Any]] = []
-        self._load_modules()
+        self._base_catalog = self._load_modules()
+        self._entries.update(self._base_catalog.entries)
+        self._entry_origins = dict(self._base_catalog.origins)
+        self._scoped_entries: Dict[str, ToolEntry] = {}
+        self._handler_overrides: Dict[str, Callable] = {}
 
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
@@ -1350,7 +1360,7 @@ class ToolRegistry:
         "skill_preflight", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
     ]
 
-    def _load_modules(self) -> None:
+    def _load_modules(self) -> _ToolCatalog:
         """Load frozen or package-discovered tool modules."""
         import importlib
         import logging
@@ -1366,22 +1376,47 @@ class ToolRegistry:
                 if not m.startswith("_") and m != "registry"
             ]
 
+        catalog_entries = []
         for modname in module_names:
             try:
                 mod = importlib.import_module(f"ouroboros.tools.{modname}")
                 if hasattr(mod, "get_tools"):
-                    for entry in mod.get_tools():
-                        self._entries[entry.name] = entry
+                    for index, entry in enumerate(mod.get_tools()):
+                        catalog_entries.append(
+                            (f"ouroboros.tools.{modname}.get_tools[{index}]", entry)
+                        )
             except Exception:
                 logging.getLogger(__name__).warning(
                     "Failed to load tool module %s", modname, exc_info=True)
+        # Duplicate detection deliberately happens outside the import-degrade
+        # boundary: a first-party name collision is a broken catalog, not an
+        # optional module import failure that startup may silently omit.
+        return _ToolCatalog(catalog_entries)
 
     def set_context(self, ctx: ToolContext) -> None:
         self._ctx = ctx
 
-    def register(self, entry: ToolEntry) -> None:
-        """Register a new tool entry."""
+    def register(self, entry: ToolEntry, *, origin: str = "") -> None:
+        """Register one task-scoped entry without mutating the base catalog."""
+        scoped_origin = str(origin or "").strip()
+        if not scoped_origin:
+            handler = entry.handler
+            handler_module = str(getattr(handler, "__module__", "") or "unknown")
+            handler_name = str(
+                getattr(handler, "__qualname__", "")
+                or getattr(handler, "__name__", "")
+                or type(handler).__qualname__
+            )
+            scoped_origin = f"{handler_module}.{handler_name}"
+        if entry.name in self._entries:
+            raise _DuplicateToolNameError(
+                entry.name,
+                self._entry_origins.get(entry.name, "unknown"),
+                scoped_origin,
+            )
+        self._scoped_entries[entry.name] = entry
         self._entries[entry.name] = entry
+        self._entry_origins[entry.name] = scoped_origin
 
     # Contract.
 
@@ -1503,6 +1538,59 @@ class ToolRegistry:
     def _schemas_for_entry(self, entry: ToolEntry) -> List[Dict[str, Any]]:
         return [self._schema_for_entry(entry)]
 
+    def _visible_dynamic_tools(
+        self, surface: str, tools: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        visible, shadowed = _partition_shadowed_tools(tools, self._entries)
+        if not shadowed:
+            return visible
+        collisions = []
+        for tool in shadowed:
+            name = str(tool.get("name") or "")
+            if surface == "extensions":
+                dynamic_origin = str(tool.get("skill") or "unknown extension")
+            else:
+                server_id = str(tool.get("server_id") or "unknown server")
+                raw_name = str(tool.get("raw_name") or "unknown tool")
+                dynamic_origin = f"{server_id}:{raw_name}"
+            collisions.append({
+                "name": name,
+                "authoritative_origin": self._entry_origins.get(name, "unknown"),
+                "dynamic_origin": dynamic_origin,
+            })
+        collisions.sort(key=lambda item: (item["name"], item["dynamic_origin"]))
+        names = sorted({item["name"] for item in collisions})
+        log.error(
+            "%s tool name collision omitted; authoritative catalog wins: %s",
+            surface,
+            ", ".join(names),
+        )
+        self._capability_omissions.append({
+            "surface": surface,
+            "reason": "name_collision",
+            "kind": "registry_shadow",
+            "tools": names,
+            "collisions": collisions,
+        })
+        return visible
+
+    def _record_mcp_slug_collisions(self, collisions: List[Dict[str, Any]]) -> None:
+        if not collisions:
+            return
+        rows = [dict(item) for item in collisions]
+        rows.sort(key=lambda item: (
+            str(item.get("prefixed_name") or ""),
+            str(item.get("dropped_raw_name") or ""),
+        ))
+        names = sorted({str(item.get("prefixed_name") or "") for item in rows})
+        self._capability_omissions.append({
+            "surface": "mcp",
+            "reason": "name_collision",
+            "kind": "provider_slug",
+            "tools": [name for name in names if name],
+            "collisions": rows,
+        })
+
     def schemas(self, core_only: bool = False) -> List[Dict[str, Any]]:
         acting_subagent = self._is_acting_subagent()
         acting_grants = self._acting_tool_grants() if acting_subagent else set()
@@ -1553,19 +1641,24 @@ class ToolRegistry:
                 meta = getattr(self._ctx, "task_metadata", {})
                 capability_root = pathlib.Path((meta.get("budget_drive_root") if isinstance(meta, dict) else "") or getattr(self._ctx, "budget_drive_root", "") or getattr(self._ctx, "drive_root", "") or ".").resolve(strict=False)
                 with _ext_lock:
-                    extension_schemas = [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": tool["name"],
-                                "description": tool.get("description", ""),
-                                "parameters": tool.get("schema", {"type": "object", "properties": {}}),
-                            },
-                        }
+                    extension_tools = [
+                        dict(tool)
                         for tool in _ext_tools.values()
                         if _ext_is_live(str(tool.get("skill") or ""), capability_root, repo_path=str(tool.get("skills_repo_path") or "") or None)
-                        and (not acting_subagent or tool["name"] in acting_grants)
+                        if not acting_subagent or tool["name"] in acting_grants
                     ]
+                extension_tools = self._visible_dynamic_tools("extensions", extension_tools)
+                extension_schemas = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get("schema", {"type": "object", "properties": {}}),
+                        },
+                    }
+                    for tool in extension_tools
+                ]
             except Exception as exc:
                 self._capability_omissions.append({"surface": "extensions", "reason": "discovery_error", "error": f"{type(exc).__name__}: {exc}"})
 
@@ -1581,14 +1674,33 @@ class ToolRegistry:
                     from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
                     _mcp_ensure_configured(refresh=True)
                     _mgr = _mcp_get_manager()
+                    mcp_tools = [
+                        tool
+                        for tool in _mgr.list_tools_for_registry()
+                        if not acting_subagent or tool["name"] in acting_grants
+                    ]
+                    mcp_tools = self._visible_dynamic_tools(
+                        "mcp", mcp_tools,
+                    )
                     mcp_schemas = [
                         {
                             "type": "function",
                             "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool.get("schema", {"type": "object", "properties": {}})},
                         }
-                        for tool in _mgr.list_tools_for_registry()
-                        if not acting_subagent or tool["name"] in acting_grants
+                        for tool in mcp_tools
                     ]
+                    slug_collisions = getattr(
+                        _mgr, "tool_name_collisions", lambda: []
+                    )()
+                    if acting_subagent:
+                        slug_collisions = [
+                            item
+                            for item in slug_collisions
+                            if str(item.get("prefixed_name") or "") in acting_grants
+                        ]
+                    self._record_mcp_slug_collisions(
+                        slug_collisions
+                    )
                     # D1: an enabled+configured server returning zero tools WITHOUT
                     # raising (unreachable/slow/auth-failed) is otherwise silent. Make
                     # the reason visible so the model/owner learns WHY an expected MCP
@@ -3265,14 +3377,11 @@ class ToolRegistry:
         """Override the handler for a registered tool (used for closure injection)."""
         entry = self._entries.get(name)
         if entry:
-            self._entries[name] = ToolEntry(
-                name=entry.name,
-                schema=entry.schema,
-                handler=handler,
-                is_code_tool=entry.is_code_tool,
-                timeout_sec=entry.timeout_sec,
-                mutates_worktree=entry.mutates_worktree,
-            )
+            projected = replace(entry, handler=handler)
+            self._handler_overrides[name] = handler
+            self._entries[name] = projected
+            if name in self._scoped_entries:
+                self._scoped_entries[name] = projected
 
     @property
     def CODE_TOOLS(self) -> frozenset:

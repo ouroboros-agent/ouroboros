@@ -108,6 +108,7 @@ class MCPServerRuntime:
 
     config: MCPServerConfig
     tools: List[MCPTool] = field(default_factory=list)
+    tool_name_collisions: List[Dict[str, str]] = field(default_factory=list)
     last_error: str = ""
     last_refreshed: str = ""
     last_attempted: str = ""
@@ -672,6 +673,24 @@ class MCPManager:
                     )
             return results
 
+    def tool_name_collisions(self) -> List[Dict[str, str]]:
+        """Return provider-name collisions omitted by first-wins normalization."""
+
+        with self._lock:
+            if not self._enabled:
+                return []
+            return [
+                dict(item, server_id=runtime.config.id)
+                for runtime in self._servers.values()
+                if runtime.config.enabled
+                for item in runtime.tool_name_collisions
+                if (
+                    not runtime.config.allowed_tools
+                    or item.get("kept_raw_name") in runtime.config.allowed_tools
+                    or item.get("dropped_raw_name") in runtime.config.allowed_tools
+                )
+            ]
+
     def get_tool(self, prefixed_name: str) -> Optional[Dict[str, Any]]:
         for tool in self.list_tools_for_registry():
             if tool["name"] == prefixed_name:
@@ -702,6 +721,9 @@ class MCPManager:
                                 "description": _redact_error_text(tool.description, cfg),
                             }
                             for tool in runtime.tools
+                        ],
+                        "tool_name_collisions": [
+                            dict(item) for item in runtime.tool_name_collisions
                         ],
                         "last_error": runtime.last_error,
                         "last_refreshed": runtime.last_refreshed,
@@ -743,6 +765,7 @@ class MCPManager:
                     target.last_error = err_text
                     target.last_attempted = attempted_at
                     target.tools = []
+                    target.tool_name_collisions = []
             return {"ok": False, "error": err_text}
 
         normalized = [
@@ -758,13 +781,26 @@ class MCPManager:
         ]
         normalized = [tool for tool in normalized if tool.prefixed_name]
         # Drop duplicates caused by slug collisions.
-        seen: set = set()
+        seen: Dict[str, MCPTool] = {}
         deduped: List[MCPTool] = []
+        collisions: List[Dict[str, str]] = []
         for tool in normalized:
             if tool.prefixed_name in seen:
+                kept = seen[tool.prefixed_name]
+                collisions.append({
+                    "prefixed_name": tool.prefixed_name,
+                    "kept_raw_name": kept.raw_name,
+                    "dropped_raw_name": tool.raw_name,
+                })
                 continue
-            seen.add(tool.prefixed_name)
+            seen[tool.prefixed_name] = tool
             deduped.append(tool)
+        if collisions:
+            log.error(
+                "MCP tool name collision on server %s; first descriptor wins: %s",
+                cfg.id,
+                ", ".join(sorted({item["prefixed_name"] for item in collisions})),
+            )
 
         finished_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -776,6 +812,7 @@ class MCPManager:
                 }
             if target is not None:
                 target.tools = deduped
+                target.tool_name_collisions = collisions
                 target.last_error = ""
                 target.last_attempted = attempted_at
                 target.last_refreshed = finished_at
@@ -783,6 +820,7 @@ class MCPManager:
             "ok": True,
             "server_id": cfg.id,
             "tool_count": len(deduped),
+            "tool_name_collisions": [dict(item) for item in collisions],
             "tools": [
                 {
                     "name": tool.raw_name,

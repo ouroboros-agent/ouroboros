@@ -317,23 +317,43 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     for row in rows:
         delta = v7_evidence._migration_json(row["semantic delta"], ("id", "note"))
         upstream = v7_evidence._migration_json(row["upstream-transfer status/note"], ("status", "note"))
-        assert upstream["status"] == "pending" and upstream["note"]
+        assert upstream["note"]
         assert row["characterization test"] != "-"
         if row["old path/symbol"] in realized:
+            assert upstream == {
+                "status": "transferred",
+                "note": (
+                    "landed upstream in release 6.101.0 merge "
+                    "05c30d175ce6269fa7b04b6199fef4a9e2c2ccda"
+                ),
+            }
             assert row["new owner/path"] == realized[row["old path/symbol"]]
             assert delta["id"] == "D01" and delta["note"]
             assert row["facade/public contract"] == "-"
         elif row["old path/symbol"] in implemented:
+            assert upstream["status"] == "pending"
             assert row["new owner/path"] == implemented[row["old path/symbol"]]
             assert row["new owner/path"].split("::", 1)[0] in v7_evidence.APPROVED_PENDING_OWNERS
-            assert delta["id"] == "none" and delta["note"]
+            expected_delta = (
+                "D02"
+                if row["old path/symbol"] == "ouroboros/tools/registry.py::ToolEntry"
+                else "none"
+            )
+            assert delta["id"] == expected_delta and delta["note"]
             assert row["facade/public contract"] == row["old path/symbol"]
         else:
-            assert delta["id"] == "none" and delta["note"]
+            assert upstream["status"] == "pending"
+            expected_delta = (
+                "D02"
+                if row["old path/symbol"] == "ouroboros/tools/registry.py::ToolRegistry"
+                else "none"
+            )
+            assert delta["id"] == expected_delta and delta["note"]
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
     assert sum(row["old path/symbol"] in implemented for row in rows) == 3
+    assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 
 
 def test_migration_rejects_unapproved_semantic_delta_ids(tmp_path, monkeypatch):
