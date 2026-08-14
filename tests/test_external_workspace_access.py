@@ -19,6 +19,7 @@ from ouroboros.tool_access import (
     user_files_path_block_reason,
 )
 from ouroboros.tools.registry import ToolContext, ToolRegistry, _command_mentions_protected_root
+from ouroboros.tools.registry_guard_process import _run_shell_safety_check
 
 
 @pytest.fixture(autouse=True)
@@ -174,18 +175,18 @@ def test_external_shell_read_cannot_reach_runtime_or_secrets(tmp_path):
     reg.set_context(ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace, workspace_mode="external"))
 
     # Runtime repo read -> blocked.
-    assert "WORKSPACE_SHELL_BLOCKED" in (reg._run_shell_safety_check({"cmd": ["cat", str(system / "BIBLE.md")]}, "advanced") or "")
+    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["cat", str(system / "BIBLE.md")]}, "advanced") or "")
     # Data drive read -> blocked.
-    assert "WORKSPACE_SHELL_BLOCKED" in (reg._run_shell_safety_check({"cmd": ["cat", str(data / "settings.json")]}, "advanced") or "")
+    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["cat", str(data / "settings.json")]}, "advanced") or "")
     # Credential path read -> blocked (secret markers).
-    assert "WORKSPACE_SHELL_BLOCKED" in (reg._run_shell_safety_check({"cmd": ["cat", str(pathlib.Path.home() / ".ssh" / "id_rsa")]}, "advanced") or "")
+    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["cat", str(pathlib.Path.home() / ".ssh" / "id_rsa")]}, "advanced") or "")
     # Embedded-string read of a secret -> blocked.
-    assert "WORKSPACE_SHELL_BLOCKED" in (reg._run_shell_safety_check({"cmd": ["python", "-c", f"open({str(data / 'settings.json')!r})"]}, "advanced") or "")
+    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["python", "-c", f"open({str(data / 'settings.json')!r})"]}, "advanced") or "")
     # A genuine host-scratch read -> allowed (None).
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     (scratch / "note.txt").write_text("hi", encoding="utf-8")
-    assert reg._run_shell_safety_check({"cmd": ["cat", str(scratch / "note.txt")]}, "advanced") is None
+    assert _run_shell_safety_check(reg, {"cmd": ["cat", str(scratch / "note.txt")]}, "advanced") is None
 
 
 def test_external_shell_write_protects_child_drive(tmp_path):
@@ -204,7 +205,7 @@ def test_external_shell_write_protects_child_drive(tmp_path):
     ))
     # pro mode would otherwise pass an absolute outside-workspace write; the child
     # drive control path must still be blocked.
-    out = reg._run_shell_safety_check({"cmd": ["touch", str(child / "memory" / "x")]}, "pro")
+    out = _run_shell_safety_check(reg, {"cmd": ["touch", str(child / "memory" / "x")]}, "pro")
     assert "WORKSPACE_SHELL_BLOCKED" in (out or "")
 
 
@@ -234,7 +235,7 @@ def test_external_shell_read_blocks_relative_and_symlink_traversal(tmp_path):
     reg.set_context(ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace, workspace_mode="external"))
 
     # Relative traversal from the workspace cwd into the sibling data drive.
-    rel = reg._run_shell_safety_check({"cmd": ["cat", "../data/settings.json"], "cwd": str(workspace)}, "advanced")
+    rel = _run_shell_safety_check(reg, {"cmd": ["cat", "../data/settings.json"], "cwd": str(workspace)}, "advanced")
     assert "WORKSPACE_SHELL_BLOCKED" in (rel or ""), rel
 
     # Intra-workspace symlink pointing at the data drive.
@@ -242,11 +243,11 @@ def test_external_shell_read_blocks_relative_and_symlink_traversal(tmp_path):
         (workspace / "evil").symlink_to(data, target_is_directory=True)
     except OSError:
         return  # platform without symlinks
-    sym = reg._run_shell_safety_check({"cmd": ["cat", "evil/settings.json"], "cwd": str(workspace)}, "advanced")
+    sym = _run_shell_safety_check(reg, {"cmd": ["cat", "evil/settings.json"], "cwd": str(workspace)}, "advanced")
     assert "WORKSPACE_SHELL_BLOCKED" in (sym or ""), sym
     # A legitimate relative read inside the workspace stays allowed.
     (workspace / "ok.txt").write_text("x", encoding="utf-8")
-    assert reg._run_shell_safety_check({"cmd": ["cat", "ok.txt"], "cwd": str(workspace)}, "advanced") is None
+    assert _run_shell_safety_check(reg, {"cmd": ["cat", "ok.txt"], "cwd": str(workspace)}, "advanced") is None
 
 
 def test_readonly_git_exemption_does_not_open_a_runtime_write_or_secret_read(tmp_path):
@@ -266,7 +267,7 @@ def test_readonly_git_exemption_does_not_open_a_runtime_write_or_secret_read(tmp
     reg.set_context(ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace, workspace_mode="external"))
 
     def _check(cmd):
-        return reg._run_shell_safety_check({"cmd": cmd, "cwd": str(workspace)}, "advanced") or ""
+        return _run_shell_safety_check(reg, {"cmd": cmd, "cwd": str(workspace)}, "advanced") or ""
 
     # WRITE via the diff `--output` option — glued, split, and through `-C`.
     assert _check(["git", "log", f"--output={data / 'settings.json'}"])

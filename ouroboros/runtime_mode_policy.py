@@ -19,6 +19,7 @@ SAFETY_CRITICAL_PATHS = frozenset({
     "ouroboros/runtime_mode_policy.py",
     "ouroboros/tools/extension_dispatch.py",
     "ouroboros/tools/registry.py",
+    "ouroboros/tools/registry_guard_process.py",
     "ouroboros/tools/registry_guards.py",
     "ouroboros/tools/tool_resolution.py",
     "ouroboros/tools/tool_catalog.py",

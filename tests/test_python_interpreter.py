@@ -298,6 +298,7 @@ def test_light_run_script_default_cwd_uses_active_workspace_agent_python(tmp_pat
 def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, monkeypatch):
     import ouroboros.safety as safety
     import ouroboros.tools.registry as registry_module
+    import ouroboros.tools.registry_guard_process as registry_guard_process
 
     ctx = _context(tmp_path)
     agent_python = _executable(tmp_path / "agent" / "bin" / "python")
@@ -313,6 +314,7 @@ def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, 
     registry.set_context(ctx)
     captured: dict[str, list[str]] = {}
     original_guard = registry_module.process_shell_guard_args
+    original_process_guard = registry_guard_process._run_shell_safety_check
 
     def capture_guard(name, args, **kwargs):
         guarded = original_guard(name, args, **kwargs)
@@ -325,8 +327,12 @@ def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, 
         captured["handler"] = list(check)
         return "ok"
 
+    def capture_process_guard(owner, guarded_args, runtime_mode, binding=None):
+        captured["process_guard"] = list(guarded_args["cmd"])
+        return original_process_guard(owner, guarded_args, runtime_mode, binding)
+
     monkeypatch.setattr(registry_module, "process_shell_guard_args", capture_guard)
-    monkeypatch.setattr(registry, "_run_shell_safety_check", lambda *args, **kwargs: "")
+    monkeypatch.setattr(registry_guard_process, "_run_shell_safety_check", capture_process_guard)
     registry.override_handler("verify_and_record", capture_handler)
 
     result = registry.execute(
@@ -336,7 +342,7 @@ def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, 
 
     expected = [str(agent_python), "-m", "pytest", "--version"]
     assert result == "ok"
-    assert captured == {"guard": expected, "handler": expected}
+    assert captured == {"guard": expected, "process_guard": expected, "handler": expected}
     events_path = ctx.drive_logs() / "events.jsonl"
     event = json.loads(events_path.read_text(encoding="utf-8").splitlines()[-1])
     assert event["type"] == "python_interpreter_resolution"
@@ -386,7 +392,6 @@ def test_run_script_accepts_registry_attested_versioned_agent_python(
 
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry.set_context(ctx)
-    monkeypatch.setattr(registry, "_run_shell_safety_check", lambda *args, **kwargs: "")
 
     result = registry.execute(
         "run_script",

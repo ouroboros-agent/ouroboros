@@ -146,7 +146,7 @@ def test_owner_floor_write_changes_no_scope_review_behaviour(monkeypatch, tmp_pa
 # --- CW1: the scope-review-floor self-lowering shell detector ---
 
 def test_scope_review_floor_self_lowering_detector():
-    from ouroboros.tools.registry import _detect_scope_review_floor_self_lowering as det
+    from ouroboros.tools.registry_guard_process import _detect_scope_review_floor_self_lowering as det
     from ouroboros.tools.shell_guards import shell_has_write_indicator
 
     def verdict(cmd: str) -> bool:
@@ -233,7 +233,7 @@ def test_read_exemption_is_option_aware_not_head_only():
     sufficient: options are validated per command, assignments are refused rather than
     stripped, and the executable must resolve to a bare name or a system bin.
     """
-    from ouroboros.tools.registry import _detect_scope_review_floor_self_lowering as det
+    from ouroboros.tools.registry_guard_process import _detect_scope_review_floor_self_lowering as det
     from ouroboros.tools.shell_guards import shell_has_write_indicator
 
     def verdict(cmd: str) -> bool:
@@ -281,7 +281,7 @@ def test_read_exemption_is_option_aware_not_head_only():
 
     # Pin the MECHANISM, not just the verdict: the classifier itself must refuse these,
     # so a future change to the write-shape fact cannot silently mask the exemption hole.
-    from ouroboros.tools.registry import _is_pure_read_inspection as pure
+    from ouroboros.tools.registry_guard_process import _is_pure_read_inspection as pure
 
     for hostile in (
         "find . -name '*.py' -exec sh -c ':' ;",
@@ -357,7 +357,7 @@ def test_non_ephemeral_turn_allows_durable_mutators(tmp_path, monkeypatch):
 # --- CW4: the external-shell secret guard catches relative interpreter paths ---
 
 def test_secret_guard_catches_relative_interpreter_path():
-    from ouroboros.tools.registry import _subagent_shell_targets_secret
+    from ouroboros.tools.registry_guard_process import _subagent_shell_targets_secret
 
     assert _subagent_shell_targets_secret("python -c \"open('data/settings.json')\"") is True
     assert _subagent_shell_targets_secret("node -e \"readfilesync('../../data/settings.json')\"") is True
@@ -843,8 +843,8 @@ def test_read_exemption_fails_closed_on_nested_execution_constructs():
     (`$()`, backticks, process substitution, subshells) rather than enumerated: the writer
     inside it need not be a shape anybody listed.
     """
-    from ouroboros.tools.registry import _detect_scope_review_floor_self_lowering as det
-    from ouroboros.tools.registry import _is_pure_read_inspection as pure
+    from ouroboros.tools.registry_guard_process import _detect_scope_review_floor_self_lowering as det
+    from ouroboros.tools.registry_guard_process import _is_pure_read_inspection as pure
     from ouroboros.tools.shell_guards import shell_has_write_indicator
 
     ep = "http://127.0.0.1:8765/api/owner/scope-review-floor"

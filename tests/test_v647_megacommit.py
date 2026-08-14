@@ -665,6 +665,7 @@ def test_verify_and_record_check_is_shell_guarded_against_subagent_secret_read()
     # shell guard as run_command.
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.registry_guard_process import _run_shell_safety_check
     from ouroboros.tools.shell_guards import process_shell_guard_args
 
     reg = ToolRegistry(repo_dir=".", drive_root=tempfile.mkdtemp())
@@ -672,7 +673,7 @@ def test_verify_and_record_check_is_shell_guarded_against_subagent_secret_read()
     mapped = process_shell_guard_args("verify_and_record", {"check": "cat data/settings.json", "cwd": ""})
     # v6.51.0: normalized via the SSOT (non-login `sh -c`); the guard still inspects the inner command.
     assert mapped["cmd"] == ["sh", "-c", "cat data/settings.json"]
-    block = reg._run_shell_safety_check(mapped, "advanced")
+    block = _run_shell_safety_check(reg, mapped, "advanced")
     assert block and "SECRET" in block.upper()
 
 

@@ -309,11 +309,13 @@ def test_build_materializes_exact_current_inventory(tmp_path):
     assert manifest.read_bytes() == render_frozen_tool_manifest(inventory.tool_modules)
     assert load_frozen_tool_modules(manifest) == inventory.tool_modules
     assert f"{TOOL_PACKAGE}.registry" in inventory.package_modules
+    assert f"{TOOL_PACKAGE}.registry_guard_process" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.tool_catalog" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.tool_resolution" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.tool_result" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.extension_dispatch" in inventory.package_modules
     assert "tool_result" not in inventory.tool_modules
+    assert "registry_guard_process" not in inventory.tool_modules
     assert "tool_resolution" not in inventory.tool_modules
 
 

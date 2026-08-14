@@ -128,20 +128,23 @@ def test_registry_heal_sidecar_wrapper_uses_shared_control_filenames():
 
 def test_registry_shell_guard_keeps_legacy_control_dir_subset(tmp_path):
     from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.registry_guard_process import _run_shell_safety_check
 
     repo = tmp_path / "repo"
     drive = tmp_path / "data"
     repo.mkdir()
     drive.mkdir()
     reg = ToolRegistry(repo_dir=repo, drive_root=drive)
-    blocked = reg._run_shell_safety_check(
+    blocked = _run_shell_safety_check(
+        reg,
         {"cmd": "rm data/skills/external/alpha/.self_authored.json"},
         "advanced",
     )
     assert blocked is not None
     assert "SAFETY_VIOLATION" in blocked
 
-    allowed = reg._run_shell_safety_check(
+    allowed = _run_shell_safety_check(
+        reg,
         {"cmd": "rm data/skills/external/alpha/__pycache__/plugin.pyc"},
         "advanced",
     )

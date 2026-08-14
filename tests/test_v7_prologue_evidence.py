@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 60
+    assert len(rows) == 97
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -347,6 +347,82 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             "ouroboros/tools/tool_resolution.py::_binding_set_is_light_restricted",
         "ouroboros/tools/registry.py::_binding_state_drive_root":
             "ouroboros/tools/tool_resolution.py::_binding_state_drive_root",
+        "ouroboros/tools/registry.py::_detect_runtime_mode_elevation":
+            "ouroboros/tools/registry_guard_process.py::_detect_runtime_mode_elevation",
+        "ouroboros/tools/registry.py::_SUBAGENT_SHELL_SECRET_MARKERS":
+            "ouroboros/tools/registry_guard_process.py::_SUBAGENT_SHELL_SECRET_MARKERS",
+        "ouroboros/tools/registry.py::_subagent_shell_targets_secret":
+            "ouroboros/tools/registry_guard_process.py::_subagent_shell_targets_secret",
+        "ouroboros/tools/registry.py::_detect_mutative_toggle_self_change":
+            "ouroboros/tools/registry_guard_process.py::_detect_mutative_toggle_self_change",
+        "ouroboros/tools/registry.py::_detect_evolution_owner_control_self_change":
+            "ouroboros/tools/registry_guard_process.py::_detect_evolution_owner_control_self_change",
+        "ouroboros/tools/registry.py::_detect_context_mode_self_lowering":
+            "ouroboros/tools/registry_guard_process.py::_detect_context_mode_self_lowering",
+        "ouroboros/tools/registry.py::_READ_ONLY_INSPECTION_COMMANDS":
+            "ouroboros/tools/registry_guard_process.py::_READ_ONLY_INSPECTION_COMMANDS",
+        "ouroboros/tools/registry.py::_COMMAND_HEAD_WRAPPERS":
+            "ouroboros/tools/registry_guard_process.py::_COMMAND_HEAD_WRAPPERS",
+        "ouroboros/tools/registry.py::_READ_ONLY_GIT_SUBCOMMANDS":
+            "ouroboros/tools/registry_guard_process.py::_READ_ONLY_GIT_SUBCOMMANDS",
+        "ouroboros/tools/registry.py::_SEARCH_TOOL_EXEC_OPTIONS":
+            "ouroboros/tools/registry_guard_process.py::_SEARCH_TOOL_EXEC_OPTIONS",
+        "ouroboros/tools/registry.py::_DENIED_READ_OPTIONS":
+            "ouroboros/tools/registry_guard_process.py::_DENIED_READ_OPTIONS",
+        "ouroboros/tools/registry.py::_TRUSTED_EXECUTABLE_DIRS":
+            "ouroboros/tools/registry_guard_process.py::_TRUSTED_EXECUTABLE_DIRS",
+        "ouroboros/tools/registry.py::_trusted_read_head":
+            "ouroboros/tools/registry_guard_process.py::_trusted_read_head",
+        "ouroboros/tools/registry.py::_denied_read_option":
+            "ouroboros/tools/registry_guard_process.py::_denied_read_option",
+        "ouroboros/tools/registry.py::_NESTED_EXECUTION_MARKERS":
+            "ouroboros/tools/registry_guard_process.py::_NESTED_EXECUTION_MARKERS",
+        "ouroboros/tools/registry.py::_NESTED_EXECUTION_TOKENS":
+            "ouroboros/tools/registry_guard_process.py::_NESTED_EXECUTION_TOKENS",
+        "ouroboros/tools/registry.py::_is_pure_read_inspection":
+            "ouroboros/tools/registry_guard_process.py::_is_pure_read_inspection",
+        "ouroboros/tools/registry.py::_detect_scope_review_floor_self_lowering":
+            "ouroboros/tools/registry_guard_process.py::_detect_scope_review_floor_self_lowering",
+        "ouroboros/tools/registry.py::_detect_safety_mode_self_lowering":
+            "ouroboros/tools/registry_guard_process.py::_detect_safety_mode_self_lowering",
+        "ouroboros/tools/registry.py::_detect_owner_skill_attest_self_call":
+            "ouroboros/tools/registry_guard_process.py::_detect_owner_skill_attest_self_call",
+        "ouroboros/tools/registry.py::_SKILL_OWNER_STATE_STEMS":
+            "ouroboros/tools/registry_guard_process.py::_SKILL_OWNER_STATE_STEMS",
+        "ouroboros/tools/registry.py::_DETACHED_PROCESS_MARKERS":
+            "ouroboros/tools/registry_guard_process.py::_DETACHED_PROCESS_MARKERS",
+        "ouroboros/tools/registry.py::_mentions_skill_owner_state":
+            "ouroboros/tools/registry_guard_process.py::_mentions_skill_owner_state",
+        "ouroboros/tools/registry.py::_mentions_detached_process":
+            "ouroboros/tools/registry_guard_process.py::_mentions_detached_process",
+        "ouroboros/tools/registry.py::ToolRegistry._run_shell_safety_check":
+            "ouroboros/tools/registry_guard_process.py::_run_shell_safety_check",
+        "ouroboros/tools/registry.py::LIGHT_SHELL_WRITER_COMMANDS":
+            "ouroboros/tools/shell_guards.py::LIGHT_SHELL_WRITER_COMMANDS",
+        "ouroboros/tools/registry.py::SKILL_OWNER_STATE_STEMS":
+            "ouroboros/contracts/skill_payload_policy.py::SKILL_OWNER_STATE_STEMS",
+        "ouroboros/tools/registry.py::build_resolved_resource_binding":
+            "ouroboros/tool_access.py::build_resolved_resource_binding",
+        "ouroboros/tools/registry.py::interpreter_family":
+            "ouroboros/tools/shell_guards.py::interpreter_family",
+        "ouroboros/tools/registry.py::light_shell_repo_mutation":
+            "ouroboros/tools/shell_guards.py::light_shell_repo_mutation",
+        "ouroboros/tools/registry.py::protected_artifact_shell_block_reason":
+            "ouroboros/protected_artifacts.py::shell_block_reason",
+        "ouroboros/tools/registry.py::runtime_data_guard_targets":
+            "ouroboros/tools/shell_guards.py::runtime_data_guard_targets",
+        "ouroboros/tools/registry.py::shell_command_string":
+            "ouroboros/shell_parse.py::shell_command_string",
+        "ouroboros/tools/registry.py::strip_leading_env_assignments":
+            "ouroboros/shell_parse.py::strip_leading_env_assignments",
+        "ouroboros/tools/registry.py::sudo_noninteractive_violation":
+            "ouroboros/shell_parse.py::sudo_noninteractive_violation",
+        "ouroboros/tools/registry.py::unwrap_env_argv":
+            "ouroboros/shell_parse.py::unwrap_env_argv",
+        "ouroboros/tools/registry.py::workspace_executor_state_write_block":
+            "ouroboros/tools/shell_guards.py::workspace_executor_state_write_block",
+        "ouroboros/tools/registry.py::writer_target_tokens":
+            "ouroboros/tools/shell_guards.py::writer_target_tokens",
         "ouroboros/tools/registry.py::_EPHEMERAL_ALLOWED_TOOLS":
             "ouroboros/tools/registry_guards.py::_EPHEMERAL_ALLOWED_TOOLS",
         "ouroboros/tools/registry.py::_WEB_TOOLS":
@@ -373,6 +449,21 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             "ouroboros/tools/registry_guards.py::_heal_protected_payload_sidecar",
         "ouroboros/tools/registry.py::ToolRegistry._heal_mode_block":
             "ouroboros/tools/registry_guards.py::_heal_mode_guard_result",
+    }
+    existing_process_owner_rows = {
+        "ouroboros/tools/registry.py::LIGHT_SHELL_WRITER_COMMANDS",
+        "ouroboros/tools/registry.py::SKILL_OWNER_STATE_STEMS",
+        "ouroboros/tools/registry.py::build_resolved_resource_binding",
+        "ouroboros/tools/registry.py::interpreter_family",
+        "ouroboros/tools/registry.py::light_shell_repo_mutation",
+        "ouroboros/tools/registry.py::protected_artifact_shell_block_reason",
+        "ouroboros/tools/registry.py::runtime_data_guard_targets",
+        "ouroboros/tools/registry.py::shell_command_string",
+        "ouroboros/tools/registry.py::strip_leading_env_assignments",
+        "ouroboros/tools/registry.py::sudo_noninteractive_violation",
+        "ouroboros/tools/registry.py::unwrap_env_argv",
+        "ouroboros/tools/registry.py::workspace_executor_state_write_block",
+        "ouroboros/tools/registry.py::writer_target_tokens",
     }
     inherited_managed = {
         "docs/assets/home-ZhS5_vhA.js": (
@@ -476,7 +567,11 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         elif row["old path/symbol"] in implemented:
             assert upstream["status"] == "pending"
             assert row["new owner/path"] == implemented[row["old path/symbol"]]
-            assert row["new owner/path"].split("::", 1)[0] in v7_evidence.APPROVED_PENDING_OWNERS
+            owner_path = row["new owner/path"].split("::", 1)[0]
+            if row["old path/symbol"] in existing_process_owner_rows:
+                assert (REPO / owner_path).is_file()
+            else:
+                assert owner_path in v7_evidence.APPROVED_PENDING_OWNERS
             expected_delta = (
                 "D02"
                 if row["old path/symbol"] == "ouroboros/tools/registry.py::ToolEntry"
@@ -489,6 +584,44 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
                     "ouroboros/tools/registry.py::ToolRegistry._ephemeral_block",
                     "ouroboros/tools/registry.py::ToolRegistry._subagent_and_update_gate",
                     "ouroboros/tools/registry.py::ToolRegistry._heal_mode_block",
+                    "ouroboros/tools/registry.py::ToolRegistry._run_shell_safety_check",
+                    "ouroboros/tools/registry.py::_detect_runtime_mode_elevation",
+                    "ouroboros/tools/registry.py::_SUBAGENT_SHELL_SECRET_MARKERS",
+                    "ouroboros/tools/registry.py::_subagent_shell_targets_secret",
+                    "ouroboros/tools/registry.py::_detect_mutative_toggle_self_change",
+                    "ouroboros/tools/registry.py::_detect_evolution_owner_control_self_change",
+                    "ouroboros/tools/registry.py::_detect_context_mode_self_lowering",
+                    "ouroboros/tools/registry.py::_READ_ONLY_INSPECTION_COMMANDS",
+                    "ouroboros/tools/registry.py::_COMMAND_HEAD_WRAPPERS",
+                    "ouroboros/tools/registry.py::_READ_ONLY_GIT_SUBCOMMANDS",
+                    "ouroboros/tools/registry.py::_SEARCH_TOOL_EXEC_OPTIONS",
+                    "ouroboros/tools/registry.py::_DENIED_READ_OPTIONS",
+                    "ouroboros/tools/registry.py::_TRUSTED_EXECUTABLE_DIRS",
+                    "ouroboros/tools/registry.py::_trusted_read_head",
+                    "ouroboros/tools/registry.py::_denied_read_option",
+                    "ouroboros/tools/registry.py::_NESTED_EXECUTION_MARKERS",
+                    "ouroboros/tools/registry.py::_NESTED_EXECUTION_TOKENS",
+                    "ouroboros/tools/registry.py::_is_pure_read_inspection",
+                    "ouroboros/tools/registry.py::_detect_scope_review_floor_self_lowering",
+                    "ouroboros/tools/registry.py::_detect_safety_mode_self_lowering",
+                    "ouroboros/tools/registry.py::_detect_owner_skill_attest_self_call",
+                    "ouroboros/tools/registry.py::_SKILL_OWNER_STATE_STEMS",
+                    "ouroboros/tools/registry.py::_DETACHED_PROCESS_MARKERS",
+                    "ouroboros/tools/registry.py::_mentions_skill_owner_state",
+                    "ouroboros/tools/registry.py::_mentions_detached_process",
+                    "ouroboros/tools/registry.py::LIGHT_SHELL_WRITER_COMMANDS",
+                    "ouroboros/tools/registry.py::SKILL_OWNER_STATE_STEMS",
+                    "ouroboros/tools/registry.py::build_resolved_resource_binding",
+                    "ouroboros/tools/registry.py::interpreter_family",
+                    "ouroboros/tools/registry.py::light_shell_repo_mutation",
+                    "ouroboros/tools/registry.py::protected_artifact_shell_block_reason",
+                    "ouroboros/tools/registry.py::runtime_data_guard_targets",
+                    "ouroboros/tools/registry.py::shell_command_string",
+                    "ouroboros/tools/registry.py::strip_leading_env_assignments",
+                    "ouroboros/tools/registry.py::sudo_noninteractive_violation",
+                    "ouroboros/tools/registry.py::unwrap_env_argv",
+                    "ouroboros/tools/registry.py::workspace_executor_state_write_block",
+                    "ouroboros/tools/registry.py::writer_target_tokens",
                 }
                 else row["old path/symbol"]
             )
@@ -512,7 +645,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 33
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 71
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 
