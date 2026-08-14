@@ -155,11 +155,14 @@ def test_parent_lifeline_requests_stop_then_cancels_hard_kill(
     asyncio.run(scenario())
 
 
-def test_core_health_retries_cold_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_core_health_retries_cold_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attempts = [0]
 
     class Bridge:
-        state_dir = Path("/tmp/nonexistent-telegram-test")
+        state_dir = tmp_path / "observer-state"
         def owner_chat_id(self) -> int:
             return 12345
 
