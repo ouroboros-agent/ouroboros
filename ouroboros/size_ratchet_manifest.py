@@ -245,6 +245,7 @@ BAND_PATHS = {
     "tests/test_commit_gate.py": None,
     "tests/test_contracts.py": None,
     "tests/test_evolution_redesign.py": None,
+    "tests/test_external_review_script.py": "v7 tool-owner trust-boundary coverage extends the upstream contributor-review regression suite",
     "tests/test_observability_outcomes_v2.py": None,
     "tests/test_onboarding_complete_endpoint.py": None,
     "tests/test_onboarding_wizard.py": None,

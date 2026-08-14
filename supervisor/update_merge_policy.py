@@ -19,6 +19,8 @@ HOT_CODE_PATHS = frozenset({
     "ouroboros/size_ratchet_manifest.py",
     "ouroboros/tools/control.py",
     "ouroboros/tools/registry.py",
+    "ouroboros/tools/tool_catalog.py",
+    "ouroboros/tools/tool_context.py",
     "ouroboros/config.py",
     "supervisor/queue.py",
     "supervisor/events.py",

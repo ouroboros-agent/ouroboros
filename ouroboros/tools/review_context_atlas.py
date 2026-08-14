@@ -47,6 +47,8 @@ _REVIEW_STACK_PATHS = frozenset({
     "ouroboros/size_ratchet_manifest.py",
     "ouroboros/tools/review.py",
     "ouroboros/tools/review_context_atlas.py",
+    "ouroboros/tools/tool_catalog.py",
+    "ouroboros/tools/tool_context.py",
     "ouroboros/tools/scope_review.py",
     "ouroboros/tools/parallel_review.py",
     "ouroboros/tools/review_helpers.py",

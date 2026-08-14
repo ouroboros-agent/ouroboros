@@ -66,6 +66,8 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         "ouroboros/utils.py",
         "ouroboros/tools/claude_advisory_review.py",
         "ouroboros/tools/registry.py",
+        "ouroboros/tools/tool_catalog.py",
+        "ouroboros/tools/tool_context.py",
         "ouroboros/tools/release_sync.py",
         "ouroboros/tools/review_synthesis.py",
         "ouroboros/tools/review_binary_context.py",

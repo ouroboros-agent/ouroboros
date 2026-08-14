@@ -83,3 +83,16 @@ def test_size_ratchet_manifest_is_protected_review_and_merge_authority():
     assert review_context_atlas._is_force_include(path)
     assert path in update_merge_policy.HOT_CODE_PATHS
     assert update_merge_policy.is_hot_code(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ("ouroboros/tools/tool_catalog.py", "ouroboros/tools/tool_context.py"),
+)
+def test_tool_descriptor_owners_are_protected_review_and_merge_authorities(path: str):
+    assert path in PROTECTED_RUNTIME_PATHS
+    assert is_protected_runtime_path(path)
+    assert path in review_context_atlas._REVIEW_STACK_PATHS
+    assert review_context_atlas._is_force_include(path)
+    assert path in update_merge_policy.HOT_CODE_PATHS
+    assert update_merge_policy.is_hot_code(path)
