@@ -584,15 +584,28 @@ def test_switch_model_fails_closed_when_capability_check_errors(monkeypatch, tmp
 
 def test_ephemeral_blocks_extension_and_mcp_tools(tmp_path):
     from ouroboros.tools.registry import ToolContext, ToolRegistry
+    from ouroboros.tools.registry_guards import _ephemeral_block_result
 
     reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=True))
     # an extension tool (resolved ext_tool) and an MCP tool both fail closed at execute()
-    assert "EPHEMERAL_TURN_RESTRICTED" in reg._ephemeral_block("skill__do", ext_tool={"name": "skill__do"})
-    assert "EPHEMERAL_TURN_RESTRICTED" in reg._ephemeral_block("mcp__srv__x", is_mcp=True)
+    assert "EPHEMERAL_TURN_RESTRICTED" in _ephemeral_block_result(
+        reg._ctx,
+        "skill__do",
+        ext_tool={"name": "skill__do"},
+    ).text
+    assert "EPHEMERAL_TURN_RESTRICTED" in _ephemeral_block_result(
+        reg._ctx,
+        "mcp__srv__x",
+        is_mcp=True,
+    ).text
     # a normal turn does not block external tools
     reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=False))
-    assert reg._ephemeral_block("skill__do", ext_tool={"name": "skill__do"}) == ""
+    assert _ephemeral_block_result(
+        reg._ctx,
+        "skill__do",
+        ext_tool={"name": "skill__do"},
+    ) is None
 
 
 def test_ephemeral_schemas_omit_extension_and_mcp_surfaces(tmp_path, monkeypatch):

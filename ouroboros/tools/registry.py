@@ -79,6 +79,12 @@ from ouroboros.tools.tool_result import (  # noqa: F401 -- public compatibility 
     ToolResult,
     _compose_execute_result,
 )
+from ouroboros.tools.registry_guards import (
+    _EPHEMERAL_ALLOWED_TOOLS,
+    _ephemeral_block_result,
+    _managed_update_code_tool_block as _managed_update_code_tool_block,
+    _subagent_and_update_guard_result,
+)
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
@@ -233,31 +239,6 @@ def _detect_mutative_toggle_self_change(text_lower: str) -> bool:
         or "ouroboros.cli" in text_lower
     )
     return has_key and has_write
-
-
-def _managed_update_code_tool_block(ctx: Any, name: str) -> str:
-    """Block a repo-mutating code tool while a managed-update assisted merge is staged for
-    ANOTHER task (P2/SC2). Returns a block message, or "" when allowed (this is the authorized
-    resolution task, or no managed tx is active). A corrupt tx marker fails closed."""
-    try:
-        from supervisor.update_merge import managed_assisted_tx_for
-
-        if managed_assisted_tx_for(
-            getattr(ctx, "task_id", ""),
-            getattr(ctx, "task_metadata", None),
-        )[1]:
-            return (
-                f"⚠️ MANAGED_UPDATE_IN_PROGRESS: {name!r} is blocked while a managed update merge "
-                "is being resolved (only its authorized resolution task may write the repo). "
-                "Retry after the update lands or is rolled back."
-            )
-    except Exception:
-        return (
-            f"⚠️ MANAGED_UPDATE_STATE_UNAVAILABLE: {name!r} is blocked because the managed "
-            "update transaction state could not be verified. Retry after the update state is "
-            "available or repaired."
-        )
-    return ""
 
 
 def _authorized_managed_update_resolver(ctx: Any) -> bool:
@@ -1301,35 +1282,6 @@ def _git_ref_snapshot(repo_dir: pathlib.Path) -> Optional[Dict[str, str]]:
         return {"head": (head.stdout or "").strip(), "digest": digest.hexdigest()}
     except Exception:
         return None
-
-
-# CW3 (v6.34.0): tools a SHORT-LIVED ephemeral same-route decision turn must NOT
-# call — durable cognitive memory, evolution/consciousness, model/timeout/settings
-# control, and the release/restart control-plane. The ephemeral turn may still
-# answer / steer_task / promote_chat_to_task / route_to_project and read freely;
-# An ephemeral decision turn DECIDES (answer / route / spawn / steer); it does NOT do
-# durable work — that is what the task it spawns is for. CW3 (v6.34.0) enforces this with
-# a DEFAULT-DENY ALLOWLIST, not a denylist: a denylist is whack-a-mole (it kept missing
-# review/skill/publish/control mutators — advisory_review, skill_review, submit_skill_to_hub,
-# skill_exec, toggle_skill, cancel_task, task_acceptance_review, ...). The decision turn may
-# only call the read-only INSPECTION tools (the LOCAL_READONLY_SUBAGENT_TOOL_NAMES SSOT —
-# read_file/query_code/search_code/web_search/vcs_diff/...) plus the route/spawn/steer/reply
-# tools below. Everything else — every repo/git/cognitive/control/review/skill/publish
-# mutator, run_command (shell is durable-capable), and all extension/MCP tools (blocked
-# separately) — is hidden from schemas()/get_schema_by_name() and fails closed in execute().
-# EXPLICIT curated allowlist (not derived from another set — deriving from
-# LOCAL_READONLY_SUBAGENT_TOOL_NAMES leaked subagent-only tools: schedule_subagent spawns
-# durable child tasks, wait_task/wait_tasks BLOCK a short turn, browser_action INTERACTS
-# with pages). A decision turn may only READ/INSPECT (no mutation, no spawning, no blocking
-# wait, no page interaction) and answer/route/spawn-owner-task/steer/reply.
-_EPHEMERAL_ALLOWED_TOOLS = frozenset({
-    # read / inspect
-    "read_file", "query_code", "search_code", "list_files", "web_search", "browse_page",
-    "chat_history", "recent_tasks", "get_task_result", "vcs_diff", "vcs_status",
-    "analyze_screenshot", "vlm_query",
-    # decide / route / spawn-owner-task / reply
-    "route_to_project", "promote_chat_to_task", "steer_task", "list_projects", "send_photo",
-})
 
 
 def _extension_dispatch_candidate(
@@ -2915,68 +2867,6 @@ class ToolRegistry:
             )
         return None
 
-    def _ephemeral_block(self, name: str, ext_tool: Any = None, is_mcp: bool = False) -> str:
-        """CW3: a short ephemeral decision turn may call ONLY the allowlisted read/decision
-        tools (_EPHEMERAL_ALLOWED_TOOLS); every other built-in (durable/control/review/skill
-        mutator, run_command) AND all extension/MCP tools fail closed. Default-deny, so a new
-        mutator can never silently become reachable. It answers inline or promote_chat_to_task's
-        the durable work into a supervised task."""
-        if not getattr(self._ctx, "is_ephemeral_turn", False):
-            return ""
-        if ext_tool or is_mcp:
-            return (
-                f"⚠️ EPHEMERAL_TURN_RESTRICTED: external tool '{name}' can have durable side "
-                "effects, which a short same-route decision turn must not do. Answer inline, "
-                "or promote_chat_to_task to do that work in a supervised task."
-            )
-        if name not in _EPHEMERAL_ALLOWED_TOOLS:
-            return (
-                f"⚠️ EPHEMERAL_TURN_RESTRICTED: '{name}' is not in the decision-turn allowlist "
-                "(read/inspect + answer/route/spawn/steer only) — a short same-route turn must "
-                "not do durable/control/review/skill work or run shell. Answer inline, or "
-                "promote_chat_to_task to do it in a supervised task."
-            )
-        return ""
-
-    def _subagent_and_update_gate(
-        self, name, entry, ext_tool, is_mcp, local_readonly_subagent, acting_subagent, acting_tool_grants
-    ) -> str:
-        """Early dispatch gates that return a block message (or "" to allow): the read-only and
-        acting subagent tool-name allowlists, and the managed-update merge write-exclusivity
-        (P2/SC2 — only the authorized resolution task may run code tools while a merge is staged)."""
-        if local_readonly_subagent and entry is not None and name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
-            return (
-                "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this subagent may inspect "
-                "local repo/data/history plus web/browser surfaces and enabled "
-                "external tools, but may not call first-party local tool "
-                f"{name!r}. Parent tasks must perform writes, commits, review "
-                "gates, tool expansion, runtime control, shell, and skills. "
-                "Nested readonly delegation is allowed only through schedule_subagent "
-                "within configured depth/cap limits."
-            )
-        if acting_subagent and entry is not None and name not in ACTING_SUBAGENT_TOOL_NAMES:
-            return (
-                "⚠️ ACTING_SUBAGENT_BLOCKED: this mutative subagent may read and "
-                "write inside its isolated write root and run shell/services "
-                f"there, but may not call first-party tool {name!r}. It cannot "
-                "commit the live body, run review/runtime/skills lifecycle, enable "
-                "tools, or write cognitive memory; the parent integrates the "
-                "returned patch and is the sole committer."
-            )
-        if acting_subagent and entry is None and (ext_tool or is_mcp) and name not in acting_tool_grants:
-            return (
-                "⚠️ ACTING_SUBAGENT_TOOL_NOT_GRANTED: extension/MCP tool "
-                f"{name!r} is not in this acting subagent's external_tool_grants. "
-                "The parent must grant dynamic tools explicitly per child."
-            )
-        # Cover the full repo-mutating surface explicitly (CODE_TOOLS ∪ _REPO_MUTATION_TOOLS):
-        # write_file/edit_text AND shell/process tools (run_command/run_script/
-        # start_service) are all is_code_tool=True, but gating on the union makes the
-        # "no OTHER task writes the repo while a merge is staged" contract robust to flag drift.
-        if entry is not None and (name in self.CODE_TOOLS or name in _REPO_MUTATION_TOOLS):
-            return _managed_update_code_tool_block(self._ctx, name)
-        return ""
-
     def _resolve_python_predispatch(
         self,
         name: str,
@@ -3103,8 +2993,8 @@ class ToolRegistry:
             except Exception:
                 _mcp_is_name = None
         is_mcp = bool(_mcp_is_name and _mcp_is_name(name))
-        _eph = self._ephemeral_block(name, ext_tool, is_mcp)  # CW3: built-in deny set + extension/MCP
-        if _eph:
+        _eph = _ephemeral_block_result(self._ctx, name, ext_tool, is_mcp)
+        if _eph is not None:
             return _eph
         if name in _disabled_tools(self._ctx):
             return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools withholds {name!r} for this task."
@@ -3122,10 +3012,12 @@ class ToolRegistry:
             return "⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false blocks 'vcs_pull_ff'."
         if (is_mcp or ext_tool) and not _resource_allowed(self._ctx, "network"):
             return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false blocks external tool {name!r}."
-        _gate = self._subagent_and_update_gate(
-            name, entry, ext_tool, is_mcp, local_readonly_subagent, acting_subagent, acting_tool_grants
+        _gate = _subagent_and_update_guard_result(
+            self._ctx, name, entry, ext_tool, is_mcp, local_readonly_subagent,
+            acting_subagent, acting_tool_grants,
+            entry is not None and (name in self.CODE_TOOLS or name in _REPO_MUTATION_TOOLS),
         )
-        if _gate:
+        if _gate is not None:
             return _gate
         workspace_block_reason = ""
         try:

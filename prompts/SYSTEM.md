@@ -446,6 +446,7 @@ The safety-critical set (matching
 - `prompts/SAFETY.md` -- Safety Supervisor prompt
 - `ouroboros/runtime_mode_policy.py` -- Shared protected-path policy
 - `ouroboros/tools/registry.py` -- Hardcoded sandbox (enforces the BIBLE.md / safety-file protection)
+- `ouroboros/tools/registry_guards.py` -- Host-owned pre-dispatch access and update guards
 - `ouroboros/tools/tool_catalog.py` -- Intrinsic tool descriptor authority
 - `ouroboros/tools/tool_context.py` -- Task-scoped tool execution context
 - `ouroboros/tools/tool_result.py` -- Typed tool-result vocabulary and legacy projection
