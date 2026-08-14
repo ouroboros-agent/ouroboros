@@ -1034,7 +1034,7 @@ def _payload_dispatch_constraint(
     args: dict[str, Any],
     task_constraint: Optional[TaskConstraint],
     workspace_mode: bool,
-) -> tuple[Optional[TaskConstraint], str]:
+) -> tuple[Optional[TaskConstraint], ToolResult | None]:
     """Preserve repair selectors without letting stray selectors retarget work."""
 
     raw_bucket = str(args.get("bucket", "") or "")
@@ -1078,14 +1078,22 @@ def _payload_dispatch_constraint(
             args.pop("skill_name", None)
             synthesized = None
         else:
-            return None, f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}"
+            return None, ToolResult(
+                status="error",
+                code="TOOL_ARG_ERROR",
+                text=f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}",
+            )
 
     redirect_err = cross_skill_redirect_error(task_constraint, synthesized)
     if redirect_err and name in {"write_file", "edit_text"}:
-        return None, f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}"
+        return None, ToolResult(
+            status="blocked",
+            code="HEAL_MODE_BLOCKED",
+            text=f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}",
+        )
     if task_constraint and task_constraint.mode == "skill_repair":
-        return task_constraint, ""
-    return synthesized or task_constraint, ""
+        return task_constraint, None
+    return synthesized or task_constraint, None
 
 
 def _format_tool_arg_error(entry: "ToolEntry") -> str:
@@ -2856,15 +2864,15 @@ class ToolRegistry:
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)())
         effective_constraint = task_constraint
         if entry is not None:
-            effective_constraint, payload_error = _payload_dispatch_constraint(
+            effective_constraint, payload_result = _payload_dispatch_constraint(
                 self._ctx,
                 name=name,
                 args=args,
                 task_constraint=task_constraint,
                 workspace_mode=workspace_mode,
             )
-            if payload_error:
-                return payload_error
+            if payload_result is not None:
+                return payload_result
         resolved_binding = None
         if entry is not None and _target_binding_operation(name, args) is not None:
             try:

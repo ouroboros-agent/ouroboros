@@ -360,6 +360,7 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
         return fail
 
     registry.override_handler("search_code", forbidden("builtin handler"))
+    registry.override_handler("write_file", forbidden("write handler"))
     monkeypatch.setattr(safety, "check_safety", forbidden("safety"))
     monkeypatch.setattr(
         registry_module.LegacyTextResultAdapter,
@@ -368,6 +369,11 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
     )
     monkeypatch.setattr(registry, "_dispatch_extension_tool", forbidden("extension dispatch"))
     monkeypatch.setattr(registry, "_dispatch_mcp_tool", forbidden("MCP dispatch"))
+    monkeypatch.setattr(
+        registry_module,
+        "_build_builtin_target_binding",
+        forbidden("target binding"),
+    )
 
     builtin = registry.execute_result("search_code", {"query": "ToolRegistry"})
     assert builtin.status == "blocked"
@@ -434,6 +440,42 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
     )
     assert isinstance(root_redirect, str)
     assert root_redirect.startswith("⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE")
+
+    payload_arg_error = registry.execute_result(
+        "write_file",
+        {"bucket": "external", "path": "SKILL.md"},
+    )
+    assert payload_arg_error == ToolResult(
+        status="error",
+        code="TOOL_ARG_ERROR",
+        text=(
+            "⚠️ SKILL_PAYLOAD_ARG_ERROR: bucket and skill_name must be supplied together; "
+            "bucket must be one of external/clawhub/ouroboroshub (native excluded); "
+            "skill_name must sanitize to a non-empty slug."
+        ),
+    )
+    assert registry.execute(
+        "write_file",
+        {"bucket": "external", "path": "SKILL.md"},
+    ) == payload_arg_error.text
+
+    short_redirect = registry.execute_result(
+        "write_file",
+        {"bucket": "external", "skill_name": "beta", "path": "SKILL.md"},
+    )
+    assert short_redirect == ToolResult(
+        status="blocked",
+        code="HEAL_MODE_BLOCKED",
+        text=(
+            "⚠️ SKILL_REDIRECT_BLOCKED: a skill_repair task is active for 'alpha'; "
+            "cannot use bucket+skill_name args to redirect this call to 'beta'. "
+            "Drop the bucket/skill_name args, or finish/cancel the active repair task first."
+        ),
+    )
+    assert registry.execute(
+        "write_file",
+        {"bucket": "external", "skill_name": "beta", "path": "SKILL.md"},
+    ) == short_redirect.text
     assert calls == []
 
 
@@ -453,12 +495,18 @@ def test_loop_preserves_legacy_heal_projection_with_native_code(tmp_path):
         "cannot use bucket+skill_name args to redirect this call to 'beta'. "
         "Drop the bucket/skill_name args, or finish/cancel the active repair task first."
     )
+    payload_arg_error = (
+        "⚠️ SKILL_PAYLOAD_ARG_ERROR: bucket and skill_name must be supplied together; "
+        "bucket must be one of external/clawhub/ouroboroshub (native excluded); "
+        "skill_name must sanitize to a non-empty slug."
+    )
     cases = [
         (
             "skill_review",
             {"skill": "beta"},
             "⚠️ HEAL_MODE_BLOCKED: Repair may only review the selected skill.",
             "heal_mode_blocked",
+            "blocked",
             "HEAL_MODE_BLOCKED",
         ),
         (
@@ -470,6 +518,7 @@ def test_loop_preserves_legacy_heal_projection_with_native_code(tmp_path):
             },
             "⚠️ SKILL_REDIRECT_BLOCKED: active skill_repair task is scoped to the selected skill payload.",
             "skill_payload_blocked",
+            "blocked",
             "HEAL_MODE_BLOCKED",
         ),
         (
@@ -481,10 +530,19 @@ def test_loop_preserves_legacy_heal_projection_with_native_code(tmp_path):
             },
             short_redirect,
             "skill_payload_blocked",
-            "LEGACY_BLOCKED",
+            "blocked",
+            "HEAL_MODE_BLOCKED",
+        ),
+        (
+            "write_file",
+            {"bucket": "external", "path": "SKILL.md"},
+            payload_arg_error,
+            "skill_payload_blocked",
+            "error",
+            "TOOL_ARG_ERROR",
         ),
     ]
-    for index, (name, args, text, legacy_status, typed_code) in enumerate(cases):
+    for index, (name, args, text, legacy_status, typed_status, typed_code) in enumerate(cases):
         row = _execute_single_tool(
             registry,
             {
@@ -496,7 +554,7 @@ def test_loop_preserves_legacy_heal_projection_with_native_code(tmp_path):
         assert row["result"] == text
         assert row["is_error"] is True
         assert row["result_meta"]["status"] == legacy_status
-        assert row["result_meta"]["tool_result_status"] == "blocked"
+        assert row["result_meta"]["tool_result_status"] == typed_status
         assert row["result_meta"]["tool_result_code"] == typed_code
         assert row["result_meta"]["tool_result_meta"] == {}
 
