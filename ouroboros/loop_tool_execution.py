@@ -581,7 +581,8 @@ def _execute_single_tool(
 
     tool_ok = True
     try:
-        result = tools.execute(fn_name, args)
+        tool_result = tools.execute_result(fn_name, args)
+        result = tool_result.text
     except UsageAccountingError:
         raise
     except Exception as e:
@@ -593,6 +594,8 @@ def _execute_single_tool(
             "tool": fn_name, "args": args_for_log, "error": safe_error,
         }, correlation, tool_call_id=tool_call_id))
 
+    # Producer metadata is incomplete; keep the text classifiers authoritative
+    # until extension, shell, artifact, and plan-control producers are typed.
     is_error = _is_tool_execution_failure(tool_ok, result)
     result_meta = _extract_result_metadata(fn_name, result, is_error)
 

@@ -67,6 +67,8 @@ def test_long_tool_args_log_as_placeholder_not_content_object():
 
 
 def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
+    from ouroboros.tools.tool_result import ToolResult
+
     calls = iter([
         ({"content": "done", "tool_calls": []}, {}),
         ({"content": "", "tool_calls": [{"id": "c1", "function": {"name": "noop", "arguments": "{}"}}]}, {}),
@@ -103,8 +105,8 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
         def get_timeout(self, _name):
             return 1
 
-        def execute(self, _name, _args):
-            return "OK"
+        def execute_result(self, _name, _args):
+            return ToolResult(status="ok", code="OK", text="OK")
 
         def override_handler(self, _name, _handler):
             return None
@@ -149,6 +151,8 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
 
 
 def test_skill_action_and_effect_round_cannot_erase_complete_candidate(monkeypatch, tmp_path):
+    from ouroboros.tools.tool_result import ToolResult
+
     original = "Complete skill delivery answer with all required details."
     responses = iter([
         ({"content": original, "tool_calls": []}, {}),
@@ -189,10 +193,10 @@ def test_skill_action_and_effect_round_cannot_erase_complete_candidate(monkeypat
         def get_timeout(self, _name):
             return 1
 
-        def execute(self, name, _args):
+        def execute_result(self, name, _args):
             assert name == "finalize_skill"
             finalized["value"] = True
-            return "OK"
+            return ToolResult(status="ok", code="OK", text="OK")
 
         def override_handler(self, _name, _handler):
             return None

@@ -308,3 +308,71 @@ def test_registry_composer_is_the_exact_owner_reexport() -> None:
     from ouroboros.tools.registry import _compose_execute_result as facade
 
     assert facade is _compose_execute_result
+
+
+def test_loop_consumer_dispatches_typed_result_once_and_keeps_legacy_fallback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import ouroboros.loop_tool_execution as execution
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    typed = LegacyTextResultAdapter.from_text(
+        "ext_fixture",
+        '{"ok":false,"error":"provider refused"}',
+    )
+
+    class FakeRegistry:
+        CODE_TOOLS = frozenset()
+        _ctx = None
+
+        def execute_result(self, name: str, args: dict[str, object]) -> ToolResult:
+            calls.append((name, args))
+            return typed
+
+        def execute(self, _name: str, _args: dict[str, object]) -> str:
+            raise AssertionError("the typed consumer must not dispatch twice")
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    monkeypatch.setattr(execution, "persist_call", lambda *_args, **_kwargs: {})
+
+    row = execution._execute_single_tool(
+        FakeRegistry(),
+        {
+            "id": "call-typed",
+            "function": {"name": "ext_fixture", "arguments": '{"value":1}'},
+        },
+        drive_logs,
+        "task-typed",
+    )
+
+    assert calls == [("ext_fixture", {"value": 1})]
+    assert (typed.status, typed.code) == ("ok", "LEGACY_UNTYPED")
+    assert row["result"] == typed.text
+    assert row["is_error"] is True
+    assert row["result_meta"]["status"] == "tool_reported_failure"
+
+    messages: list[dict[str, object]] = []
+    trace: dict[str, list[dict[str, object]]] = {"tool_calls": []}
+    errors = execution.process_tool_results(
+        [row],
+        messages,
+        trace,
+        lambda _text: None,
+    )
+
+    assert errors == 1
+    assert messages == [{
+        "role": "tool",
+        "tool_call_id": "call-typed",
+        "content": typed.text,
+    }]
+    assert trace["tool_calls"] == [{
+        "tool": "ext_fixture",
+        "args": {"value": 1},
+        "result": typed.text,
+        "is_error": True,
+        "trace_ref": {},
+        "status": "tool_reported_failure",
+    }]

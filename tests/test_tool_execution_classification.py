@@ -210,8 +210,10 @@ def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path, mon
     import pathlib
     import time
     from types import SimpleNamespace
+
     import ouroboros.loop_tool_execution as loop_tool_execution
     from ouroboros.loop_tool_execution import _execute_with_timeout
+    from ouroboros.tools.tool_result import ToolResult
 
     source = (pathlib.Path(__file__).resolve().parents[1] / "ouroboros" / "loop_tool_execution.py").read_text(encoding="utf-8")
 
@@ -230,7 +232,10 @@ def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path, mon
     tools = SimpleNamespace(
         CODE_TOOLS={"fake_code_tool"},
         _ctx=SimpleNamespace(event_queue=SimpleNamespace(put_nowait=lambda envelope: live_events.append(envelope))),
-        execute=lambda _name, _args: (time.sleep(0.05), "OK")[1],
+        execute_result=lambda _name, _args: (
+            time.sleep(0.05),
+            ToolResult(status="ok", code="OK", text="OK"),
+        )[1],
     )
     result = _execute_with_timeout(
         tools,
