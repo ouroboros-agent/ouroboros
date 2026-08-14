@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 41
+    assert len(rows) == 45
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -333,6 +333,14 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             "ouroboros/tools/registry_guards.py::_subagent_and_update_guard_result",
         "ouroboros/tools/registry.py::_managed_update_code_tool_block":
             "ouroboros/tools/registry_guards.py::_managed_update_code_tool_block",
+        "ouroboros/tools/registry.py::_HEAL_MODE_ALLOWED_TOOLS":
+            "ouroboros/tools/registry_guards.py::_HEAL_MODE_ALLOWED_TOOLS",
+        "ouroboros/tools/registry.py::_task_constraint_path_allowed":
+            "ouroboros/tools/registry_guards.py::_task_constraint_path_allowed",
+        "ouroboros/tools/registry.py::_heal_protected_payload_sidecar":
+            "ouroboros/tools/registry_guards.py::_heal_protected_payload_sidecar",
+        "ouroboros/tools/registry.py::ToolRegistry._heal_mode_block":
+            "ouroboros/tools/registry_guards.py::_heal_mode_guard_result",
     }
     inherited_managed = {
         "docs/assets/home-ZhS5_vhA.js": (
@@ -448,6 +456,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
                 if row["old path/symbol"] in {
                     "ouroboros/tools/registry.py::ToolRegistry._ephemeral_block",
                     "ouroboros/tools/registry.py::ToolRegistry._subagent_and_update_gate",
+                    "ouroboros/tools/registry.py::ToolRegistry._heal_mode_block",
                 }
                 else row["old path/symbol"]
             )
@@ -471,7 +480,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 13
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 17
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 
