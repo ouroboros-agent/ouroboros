@@ -1071,7 +1071,7 @@ class TestToolContextReviewState:
 class TestSandboxCoversRepoWrite:
     def test_sandbox_mentions_repo_write(self):
         registry = _get_registry_module()
-        source = inspect.getsource(registry.ToolRegistry.execute)
+        source = inspect.getsource(registry.ToolRegistry._execute_legacy_text)
         assert "_ROOT_ARG_REPO_WRITE_TOOLS" in source
         assert "write_file" in registry._ROOT_ARG_REPO_WRITE_TOOLS
 

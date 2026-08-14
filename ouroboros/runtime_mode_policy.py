@@ -21,6 +21,7 @@ SAFETY_CRITICAL_PATHS = frozenset({
     "ouroboros/tools/registry.py",
     "ouroboros/tools/tool_catalog.py",
     "ouroboros/tools/tool_context.py",
+    "ouroboros/tools/tool_result.py",
     "prompts/SAFETY.md",
 })
 

@@ -74,6 +74,11 @@ from ouroboros.tools.tool_catalog import (
     partition_shadowed_tools as _partition_shadowed_tools,
 )
 from ouroboros.tools.tool_context import BrowserState, ToolContext  # noqa: F401 -- public compatibility re-export
+from ouroboros.tools.tool_result import (  # noqa: F401 -- public compatibility re-export
+    LegacyTextResultAdapter,
+    ToolResult,
+    _compose_execute_result,
+)
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
@@ -493,21 +498,6 @@ def _detect_scope_review_floor_self_lowering(text_lower: str, *, writeish: bool 
     if not reaches_floor:
         return False
     return writeish or not _is_pure_read_inspection(text_lower)
-
-
-def _compose_execute_result(result: str, route_note: str, safety_msg: str) -> str:
-    """Assemble the final tool result.
-
-    The auto-route note TRAILS the result: failure classification
-    (loop_tool_execution) inspects the FIRST line, so a leading note would mask
-    an underlying tool error on the auto-routed read path (review round 3). The
-    safety warning keeps its historical leading position — its ``---`` separator
-    is an established transcript convention the metadata scan already handles."""
-    if route_note:
-        result = f"{result}\n\n{route_note}"
-    if safety_msg:
-        return f"{safety_msg}\n\n---\n{result}"
-    return result
 
 
 def _detect_safety_mode_self_lowering(text_lower: str) -> bool:
@@ -3042,7 +3032,7 @@ class ToolRegistry:
             if worktree_before is not None:
                 self._invalidate_advisory_if_worktree_changed(name, worktree_before)
 
-    def execute(self, name: str, args: Dict[str, Any]) -> str:
+    def _execute_legacy_text(self, name: str, args: Dict[str, Any]) -> str:
         name = str(name or "").strip()
         args = dict(args or {})
         _route_note = ""
@@ -3340,6 +3330,17 @@ class ToolRegistry:
             )
 
         return _compose_execute_result(result, _route_note, safety_msg)
+
+    def execute_result(self, name: str, args: Dict[str, Any]) -> ToolResult:
+        """Execute through the legacy dispatcher and add typed internal facts."""
+        return LegacyTextResultAdapter.from_text(
+            name,
+            self._execute_legacy_text(name, args),
+        )
+
+    def execute(self, name: str, args: Dict[str, Any]) -> str:
+        """Compatibility ABI: return the exact model-facing text projection."""
+        return self.execute_result(name, args).text
 
     def _worktree_status_snapshot(self) -> str:
         try:

@@ -310,7 +310,9 @@ def test_build_materializes_exact_current_inventory(tmp_path):
     assert load_frozen_tool_modules(manifest) == inventory.tool_modules
     assert f"{TOOL_PACKAGE}.registry" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.tool_catalog" in inventory.package_modules
+    assert f"{TOOL_PACKAGE}.tool_result" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.extension_dispatch" in inventory.package_modules
+    assert "tool_result" not in inventory.tool_modules
 
 
 def test_missing_frozen_manifest_fails_closed(tmp_path):

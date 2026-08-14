@@ -778,6 +778,9 @@ def test_safety_parse_failed_event_is_durable_without_queue(tmp_path):
 
 def test_route_note_trails_result_for_failure_classification():
     from ouroboros.tools.registry import _compose_execute_result
+    from ouroboros.tools.tool_result import _compose_execute_result as owner
+
+    assert _compose_execute_result is owner
 
     out = _compose_execute_result(
         "⚠️ TOOL_ERROR: File not found: x.py",

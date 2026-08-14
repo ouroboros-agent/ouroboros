@@ -70,6 +70,7 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         "ouroboros/tools/registry.py",
         "ouroboros/tools/tool_catalog.py",
         "ouroboros/tools/tool_context.py",
+        "ouroboros/tools/tool_result.py",
         "ouroboros/tools/release_sync.py",
         "ouroboros/tools/review_synthesis.py",
         "ouroboros/tools/review_binary_context.py",
@@ -433,6 +434,7 @@ def test_contributor_snapshot_checks_each_duplicate_installer_link(
         "ouroboros/utils.py",
         "ouroboros/tool_module_inventory.py",
         "ouroboros/tools/registry.py",
+        "ouroboros/tools/tool_result.py",
     ],
 )
 def test_contributor_snapshot_flags_transitive_review_substrate_changes(

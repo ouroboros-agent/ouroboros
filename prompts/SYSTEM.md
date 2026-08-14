@@ -448,6 +448,7 @@ The safety-critical set (matching
 - `ouroboros/tools/registry.py` -- Hardcoded sandbox (enforces the BIBLE.md / safety-file protection)
 - `ouroboros/tools/tool_catalog.py` -- Intrinsic tool descriptor authority
 - `ouroboros/tools/tool_context.py` -- Task-scoped tool execution context
+- `ouroboros/tools/tool_result.py` -- Typed tool-result vocabulary and legacy projection
 - `ouroboros/tools/extension_dispatch.py` -- Extension tool dispatch safety/liveness helper
 
 Advanced mode may modify the evolutionary layer, but it must not directly
