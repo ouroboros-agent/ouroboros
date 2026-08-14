@@ -63,6 +63,7 @@ _MANAGED_UNAVAILABLE_TEXT = (
     "update transaction state could not be verified. Retry after the update state is "
     "available or repaired."
 )
+_SAFETY_DENIAL_TEXT = "⚠️ SAFETY_VIOLATION: fixture denial"
 
 
 def _adapt(text: str) -> ToolResult:
@@ -551,6 +552,23 @@ def test_registry_native_guards_precede_safety_and_physical_dispatch(
     assert handler_calls == []
     assert extension_calls == []
 
+    denied = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    denied.override_handler(
+        "read_file", lambda _ctx, **_kwargs: handler_calls.append("handler") or "unreachable",
+    )
+    monkeypatch.setattr(
+        "ouroboros.safety.check_safety",
+        lambda *_args, **_kwargs: safety_calls.append("safety") or (False, _SAFETY_DENIAL_TEXT),
+    )
+    monkeypatch.setattr(
+        LegacyTextResultAdapter, "from_text", lambda *_args, **_kwargs: pytest.fail("legacy adapter used"),
+    )
+    assert denied.execute_result("read_file", {"path": "missing.txt"}) == ToolResult(
+        status="blocked", code="SAFETY_VIOLATION", text=_SAFETY_DENIAL_TEXT,
+    )
+    assert safety_calls == ["safety"]
+    assert handler_calls == []
+
 
 @pytest.mark.parametrize(
     ("typed", "legacy_error", "legacy_status"),
@@ -559,6 +577,8 @@ def test_registry_native_guards_precede_safety_and_physical_dispatch(
         (ToolResult(status="blocked", code="ACCESS_BLOCKED", text=_LOCAL_READONLY_TEXT), True, "blocked"),
         (ToolResult(status="blocked", code="ACCESS_BLOCKED", text=_ACTING_EXTERNAL_TEXT), False, "ok"),
         (ToolResult(status="blocked", code="ACCESS_BLOCKED", text=_MANAGED_ACTIVE_TEXT), False, "ok"),
+        (ToolResult(status="blocked", code="SAFETY_VIOLATION", text=_SAFETY_DENIAL_TEXT), True, "safety_violation"),
+        (ToolResult(status="blocked", code="SAFETY_VIOLATION", text=_SAFETY_DENIAL_TEXT, meta={"dynamic_provider": True}), True, "safety_violation"),
         (
             ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=_MANAGED_UNAVAILABLE_TEXT),
             True,
@@ -601,7 +621,7 @@ def test_loop_keeps_legacy_guard_outcomes_during_native_cutover(
         "status": legacy_status,
         "tool_result_status": typed.status,
         "tool_result_code": typed.code,
-        "tool_result_meta": {},
+        "tool_result_meta": dict(typed.meta),
     }
 
 

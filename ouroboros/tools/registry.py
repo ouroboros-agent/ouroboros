@@ -1783,13 +1783,13 @@ class ToolRegistry:
                 return 63
         return 360
 
-    def _dispatch_extension_tool(self, name: str, ext_tool: Dict[str, Any], args: Optional[Dict[str, Any]]) -> str | ToolResult:
+    def _dispatch_extension_tool(self, name: str, ext_tool: Dict[str, Any], args: Optional[Dict[str, Any]]) -> ToolResult:
         """Dispatch live extension tools through the registry's typed seam."""
         from ouroboros.tools.extension_dispatch import _dispatch_extension_tool_result
 
         return _dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
 
-    def _dispatch_mcp_tool(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
+    def _dispatch_mcp_tool(self, name: str, args: Dict[str, Any]) -> ToolResult:
         """Run one MCP tool while preserving provider-owned result facts."""
         from ouroboros.safety import check_safety as _mcp_check_safety
         is_safe, safety_msg = _mcp_check_safety(
@@ -1799,7 +1799,7 @@ class ToolRegistry:
             ctx=self._ctx,
         )
         if not is_safe:
-            return safety_msg
+            return ToolResult(status="blocked", code="SAFETY_VIOLATION", text=safety_msg)
         try:
             from ouroboros.mcp_client import _call_mcp_tool_result as _mcp_call
 
@@ -3122,7 +3122,7 @@ class ToolRegistry:
             python_resolution=python_resolution,
         )
         if not is_safe:
-            return safety_msg
+            return ToolResult(status="blocked", code="SAFETY_VIOLATION", text=safety_msg)
         state_drive_root = _binding_state_drive_root(self._ctx, resolved_binding)
         owner_snapshot = (
             self._snapshot_owner_files(state_drive_root)

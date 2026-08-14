@@ -491,7 +491,7 @@ def test_extension_native_success_preserves_untrusted_body_and_safety_warning(
     )
     monkeypatch.setattr(
         "ouroboros.safety.check_safety",
-        lambda *_args, **_kwargs: (is_safe, safety_msg),
+        lambda *_args, **_kwargs: calls.append("safety") or (is_safe, safety_msg),
     )
     monkeypatch.setattr(
         extension_runner,
@@ -502,8 +502,11 @@ def test_extension_native_success_preserves_untrusted_body_and_safety_warning(
     result = _dispatch_extension_tool_result(ctx, ext_tool["name"], ext_tool, {})
 
     if not is_safe:
-        assert result == safety_msg
-        assert calls == []
+        assert result == ToolResult(
+            status="blocked", code="SAFETY_VIOLATION", text=safety_msg,
+            meta={"dynamic_provider": True},
+        )
+        assert calls == ["safety"]
         return
     expected_text = f"{safety_msg}\n\n---\n{body}" if safety_msg else body
     expected_code = "SAFETY_WARNING" if safety_msg else "OK"
@@ -516,7 +519,7 @@ def test_extension_native_success_preserves_untrusted_body_and_safety_warning(
         text=expected_text,
         meta=expected_meta,
     )
-    assert calls == ["handler"]
+    assert calls == ["safety", "handler"]
 
 
 def test_extension_plugin_tool_result_remains_untrusted_text(tmp_path, monkeypatch):

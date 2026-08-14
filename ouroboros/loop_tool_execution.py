@@ -613,7 +613,7 @@ def _execute_single_tool(
         }, correlation, tool_call_id=tool_call_id))
 
     # Producer metadata is incomplete; keep the text classifiers authoritative
-    # until extension, shell, artifact, and plan-control producers are typed.
+    # until root, repair, process, shell, artifact, and plan-control producers are typed.
     is_error = _is_tool_execution_failure(tool_ok, result)
     result_meta = {
         **_extract_result_metadata(fn_name, result, is_error),

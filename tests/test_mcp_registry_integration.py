@@ -16,7 +16,7 @@ from ouroboros.contracts.task_constraint import TaskConstraint
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.tool_policy import list_non_core_tools
 from ouroboros.tools.registry import ToolContext, ToolRegistry
-from ouroboros.tools.tool_result import ToolResult
+from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
 
 
 @pytest.fixture(autouse=True)
@@ -430,9 +430,19 @@ def test_execute_blocks_mcp_when_safety_fails(registry, monkeypatch):
 
     import ouroboros.safety as safety_mod
 
-    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **kw: (False, "blocked"))
-    out = registry.execute("mcp_svc__echo", {"hello": "world"})
-    assert out == "blocked"
+    safety_calls = []
+    text = "⚠️ SAFETY_VIOLATION: fixture denial"
+    monkeypatch.setattr(
+        safety_mod,
+        "check_safety",
+        lambda *a, **kw: safety_calls.append("safety") or (False, text),
+    )
+    monkeypatch.setattr(
+        LegacyTextResultAdapter, "from_text", lambda *_a, **_kw: pytest.fail("legacy adapter used"),
+    )
+    result = registry.execute_result("mcp_svc__echo", {"hello": "world"})
+    assert result == ToolResult(status="blocked", code="SAFETY_VIOLATION", text=text)
+    assert safety_calls == ["safety"]
     assert fake.call_calls == []
 
 
@@ -451,10 +461,12 @@ def test_execute_blocks_mcp_in_skill_repair_context(registry, monkeypatch):
 
     import ouroboros.safety as safety_mod
 
-    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **kw: (True, ""))
+    safety_calls = []
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **kw: safety_calls.append("safety") or (True, ""))
     out = registry.execute("mcp_svc__echo", {"hello": "world"})
     assert "HEAL_MODE_BLOCKED" in out
     assert "MCP tools" in out
+    assert safety_calls == []
     assert fake.call_calls == []
 
 

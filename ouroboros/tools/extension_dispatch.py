@@ -44,7 +44,7 @@ def _dispatch_extension_tool_result(
     name: str,
     ext_tool: Dict[str, Any],
     args: Optional[Dict[str, Any]],
-) -> str | ToolResult:
+) -> ToolResult:
     """Dispatch once while retaining host-owned extension outcome facts."""
     try:
         from ouroboros.extension_loader import (
@@ -82,7 +82,7 @@ def _dispatch_extension_tool_result(
         ctx=ctx,
     )
     if not _ext_safe:
-        return _ext_safety_msg
+        return _extension_result("blocked", "SAFETY_VIOLATION", _ext_safety_msg)
 
     if ext_tool.get("out_of_process"):
         try:
