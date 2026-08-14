@@ -92,6 +92,7 @@ def test_size_ratchet_manifest_is_protected_review_and_merge_authority():
         "ouroboros/tools/tool_catalog.py",
         "ouroboros/tools/tool_context.py",
         "ouroboros/tools/registry_guards.py",
+        "ouroboros/tools/tool_resolution.py",
         "ouroboros/tools/tool_result.py",
     ),
 )

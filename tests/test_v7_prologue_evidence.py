@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 45
+    assert len(rows) == 60
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -315,6 +315,38 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         "ouroboros/tools/registry.py::ToolEntry": "ouroboros/tools/tool_catalog.py::ToolEntry",
         "ouroboros/tools/registry.py::_compose_execute_result":
             "ouroboros/tools/tool_result.py::_compose_execute_result",
+        "ouroboros/tools/registry.py::_coerce_real_path":
+            "ouroboros/tools/tool_resolution.py::_coerce_real_path",
+        "ouroboros/tools/registry.py::active_repo_dir_for":
+            "ouroboros/tools/tool_resolution.py::active_repo_dir_for",
+        "ouroboros/tools/registry.py::system_repo_dir_for":
+            "ouroboros/tools/tool_resolution.py::system_repo_dir_for",
+        "ouroboros/tools/registry.py::_PATH_NORMALIZED_TOOLS":
+            "ouroboros/tools/tool_resolution.py::_PATH_NORMALIZED_TOOLS",
+        "ouroboros/tools/registry.py::_normalize_dispatch_path_args":
+            "ouroboros/tools/tool_resolution.py::_normalize_dispatch_path_args",
+        "ouroboros/tools/registry.py::_GENERIC_VCS_TARGET_TOOLS":
+            "ouroboros/tools/tool_resolution.py::_GENERIC_VCS_TARGET_TOOLS",
+        "ouroboros/tools/registry.py::_TARGET_BINDING_OPERATIONS":
+            "ouroboros/tools/tool_resolution.py::_TARGET_BINDING_OPERATIONS",
+        "ouroboros/tools/registry.py::_SKILL_LIFECYCLE_TARGET_TOOLS":
+            "ouroboros/tools/tool_resolution.py::_SKILL_LIFECYCLE_TARGET_TOOLS",
+        "ouroboros/tools/registry.py::_PROCESS_TARGET_TOOLS":
+            "ouroboros/tools/tool_resolution.py::_PROCESS_TARGET_TOOLS",
+        "ouroboros/tools/registry.py::_VERIFY_RUN_KINDS":
+            "ouroboros/tools/tool_resolution.py::_VERIFY_RUN_KINDS",
+        "ouroboros/tools/registry.py::_target_binding_operation":
+            "ouroboros/tools/tool_resolution.py::_target_binding_operation",
+        "ouroboros/tools/registry.py::_build_builtin_target_binding":
+            "ouroboros/tools/tool_resolution.py::_build_builtin_target_binding",
+        "ouroboros/tools/registry.py::_binding_items":
+            "ouroboros/tools/tool_resolution.py::_binding_items",
+        "ouroboros/tools/registry.py::_binding_set_targets_system_repo":
+            "ouroboros/tools/tool_resolution.py::_binding_set_targets_system_repo",
+        "ouroboros/tools/registry.py::_binding_set_is_light_restricted":
+            "ouroboros/tools/tool_resolution.py::_binding_set_is_light_restricted",
+        "ouroboros/tools/registry.py::_binding_state_drive_root":
+            "ouroboros/tools/tool_resolution.py::_binding_state_drive_root",
         "ouroboros/tools/registry.py::_EPHEMERAL_ALLOWED_TOOLS":
             "ouroboros/tools/registry_guards.py::_EPHEMERAL_ALLOWED_TOOLS",
         "ouroboros/tools/registry.py::_WEB_TOOLS":
@@ -480,7 +512,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 17
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 33
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 

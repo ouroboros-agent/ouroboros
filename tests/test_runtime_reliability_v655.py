@@ -569,7 +569,7 @@ def test_resolve_user_file_path_rejects_absolute_outside_home(tmp_path, monkeypa
 
 
 def test_dispatch_auto_routes_user_files_read_under_workspace(tmp_path):
-    from ouroboros.tools.registry import _normalize_dispatch_path_args
+    from ouroboros.tools.tool_resolution import _normalize_dispatch_path_args
 
     ctx = _ctx(tmp_path)
     target = tmp_path / "system" / "src" / "x.py"
@@ -580,7 +580,7 @@ def test_dispatch_auto_routes_user_files_read_under_workspace(tmp_path):
 
 
 def test_dispatch_redirects_user_files_write_under_workspace(tmp_path):
-    from ouroboros.tools.registry import _normalize_dispatch_path_args
+    from ouroboros.tools.tool_resolution import _normalize_dispatch_path_args
 
     ctx = _ctx(tmp_path)
     target = tmp_path / "system" / "src" / "x.py"
@@ -591,7 +591,7 @@ def test_dispatch_redirects_user_files_write_under_workspace(tmp_path):
 
 
 def test_dispatch_leaves_query_code_and_true_user_files_alone(tmp_path, monkeypatch):
-    from ouroboros.tools.registry import _normalize_dispatch_path_args
+    from ouroboros.tools.tool_resolution import _normalize_dispatch_path_args
 
     ctx = _ctx(tmp_path)
     target = tmp_path / "system" / "src" / "x.py"

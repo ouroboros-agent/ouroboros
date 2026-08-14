@@ -346,6 +346,7 @@ def test_heal_guard_allow_paths_return_none(tmp_path):
 def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, monkeypatch):
     from ouroboros import mcp_client, safety
     from ouroboros.tools import registry as registry_module
+    from ouroboros.tools import tool_resolution as resolution_module
     from ouroboros.tools.registry import ToolRegistry
 
     ctx, _skill = _ctx(tmp_path)
@@ -370,8 +371,8 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
     monkeypatch.setattr(registry, "_dispatch_extension_tool", forbidden("extension dispatch"))
     monkeypatch.setattr(registry, "_dispatch_mcp_tool", forbidden("MCP dispatch"))
     monkeypatch.setattr(
-        registry_module,
-        "_build_builtin_target_binding",
+        resolution_module,
+        "build_resolved_resource_binding",
         forbidden("target binding"),
     )
 
