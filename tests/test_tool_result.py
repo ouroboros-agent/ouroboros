@@ -225,14 +225,42 @@ def test_raw_host_mcp_failures_remain_typed_before_the_server_envelope() -> None
     assert (denied.status, denied.code) == ("blocked", "ACCESS_BLOCKED")
 
 
-def test_extension_body_remains_untyped_until_the_producer_cutover() -> None:
+def test_extension_legacy_adapter_and_registry_liveness_are_distinct(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    name = "ext_4_demo_ping"
     result = LegacyTextResultAdapter.from_text(
-        "ext_4_demo_ping",
+        name,
         "⚠️ TOOL_ERROR: extension-controlled text",
     )
 
     assert (result.status, result.code) == ("ok", "LEGACY_UNTYPED")
     assert result.meta == {"dynamic_provider": True}
+
+    calls = []
+    ext_tool = {
+        "name": name,
+        "skill": "demo",
+        "handler": lambda: calls.append("handler") or "unreachable",
+    }
+    monkeypatch.setattr(
+        "ouroboros.extension_loader.get_tool",
+        lambda requested: ext_tool if requested == name else None,
+    )
+    monkeypatch.setattr(
+        "ouroboros.extension_loader.is_extension_live",
+        lambda *_args, **_kwargs: False,
+    )
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry_result = registry.execute_result(name, {})
+    assert registry_result == ToolResult(
+        status="unavailable",
+        code="EXTENSION_UNAVAILABLE",
+        text=f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(registry._entries))}",
+        meta={"dynamic_provider": True},
+    )
+    assert calls == []
 
 
 def test_legacy_adapter_is_total_for_pathologically_nested_json_and_wrappers() -> None:
@@ -319,9 +347,11 @@ def test_loop_consumer_dispatches_typed_result_once_and_keeps_legacy_fallback(
     import ouroboros.loop_tool_execution as execution
 
     calls: list[tuple[str, dict[str, object]]] = []
-    typed = LegacyTextResultAdapter.from_text(
-        "ext_fixture",
-        '{"ok":false,"error":"provider refused"}',
+    typed = ToolResult(
+        status="ok",
+        code="OK",
+        text='{"ok":false,"error":"provider refused"}',
+        meta={"dynamic_provider": True},
     )
 
     class FakeRegistry:
@@ -350,7 +380,7 @@ def test_loop_consumer_dispatches_typed_result_once_and_keeps_legacy_fallback(
     )
 
     assert calls == [("ext_fixture", {"value": 1})]
-    assert (typed.status, typed.code) == ("ok", "LEGACY_UNTYPED")
+    assert (typed.status, typed.code) == ("ok", "OK")
     assert row["result"] == typed.text
     assert row["is_error"] is True
     assert row["result_meta"]["status"] == "tool_reported_failure"
@@ -358,7 +388,7 @@ def test_loop_consumer_dispatches_typed_result_once_and_keeps_legacy_fallback(
     assert row["result_meta"] == {
         "status": "tool_reported_failure",
         "tool_result_status": "ok",
-        "tool_result_code": "LEGACY_UNTYPED",
+        "tool_result_code": "OK",
         "tool_result_meta": {"dynamic_provider": True},
     }
 
@@ -385,7 +415,7 @@ def test_loop_consumer_dispatches_typed_result_once_and_keeps_legacy_fallback(
         "trace_ref": {},
         "status": "tool_reported_failure",
         "tool_result_status": "ok",
-        "tool_result_code": "LEGACY_UNTYPED",
+        "tool_result_code": "OK",
         "tool_result_meta": {"dynamic_provider": True},
     }]
 

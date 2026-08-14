@@ -1332,6 +1332,42 @@ _EPHEMERAL_ALLOWED_TOOLS = frozenset({
 })
 
 
+def _extension_dispatch_candidate(
+    ctx: ToolContext,
+    name: str,
+) -> tuple[Optional[Dict[str, Any]], bool]:
+    """Return a live descriptor or a host-attested unavailable marker."""
+    try:
+        from ouroboros.extension_loader import (
+            get_tool as _ext_get_tool,
+            is_extension_live as _ext_is_live,
+            parse_extension_surface_name as _ext_parse_name,
+        )
+    except Exception:
+        return None, False
+    if not _ext_parse_name(name):
+        return None, False
+    try:
+        ext_tool = _ext_get_tool(name)
+        meta = getattr(ctx, "task_metadata", {})
+        budget_root = meta.get("budget_drive_root") if isinstance(meta, dict) else ""
+        capability_root = pathlib.Path(
+            budget_root
+            or getattr(ctx, "budget_drive_root", "")
+            or getattr(ctx, "drive_root", "")
+            or "."
+        ).resolve(strict=False)
+        if ext_tool and not _ext_is_live(
+            str(ext_tool.get("skill") or ""),
+            capability_root,
+            repo_path=str(ext_tool.get("skills_repo_path") or "") or None,
+        ):
+            return None, True
+        return ext_tool, False
+    except Exception:
+        return None, False
+
+
 class ToolRegistry:
     """Tool registry; modules export ``get_tools()``."""
 
@@ -1888,11 +1924,11 @@ class ToolRegistry:
                 return 63
         return 360
 
-    def _dispatch_extension_tool(self, name: str, ext_tool: Dict[str, Any], args: Optional[Dict[str, Any]]) -> str:
-        """Dispatch live extension tools through the registry's helper module."""
-        from ouroboros.tools.extension_dispatch import dispatch_extension_tool
+    def _dispatch_extension_tool(self, name: str, ext_tool: Dict[str, Any], args: Optional[Dict[str, Any]]) -> str | ToolResult:
+        """Dispatch live extension tools through the registry's typed seam."""
+        from ouroboros.tools.extension_dispatch import _dispatch_extension_tool_result
 
-        return dispatch_extension_tool(self._ctx, name, ext_tool, args)
+        return _dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
 
     def _dispatch_mcp_tool(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
         """Run one MCP tool while preserving provider-owned result facts."""
@@ -3051,20 +3087,10 @@ class ToolRegistry:
         acting_protected_grant = acting_subagent and bool(getattr(task_constraint, "protected_paths_grant", False))
         acting_tool_grants = set(getattr(task_constraint, "external_tool_grants", ()) or ()) if acting_subagent else set()
         entry = self._entries.get(name)
-        ext_tool = None
-        try:
-            from ouroboros.extension_loader import parse_extension_surface_name as _ext_parse_name
-        except Exception:
-            _ext_parse_name = None
-        if entry is None and _ext_parse_name and _ext_parse_name(name):
-            try:
-                from ouroboros.extension_loader import get_tool as _ext_get_tool, is_extension_live as _ext_is_live
-                ext_tool = _ext_get_tool(name)
-                capability_root = pathlib.Path(((getattr(self._ctx, "task_metadata", {}) or {}).get("budget_drive_root") if isinstance(getattr(self._ctx, "task_metadata", {}), dict) else "") or getattr(self._ctx, "budget_drive_root", "") or getattr(self._ctx, "drive_root", "") or ".").resolve(strict=False)
-                if ext_tool and not _ext_is_live(str(ext_tool.get("skill") or ""), capability_root, repo_path=str(ext_tool.get("skills_repo_path") or "") or None):
-                    ext_tool = None
-            except Exception:
-                ext_tool = None
+        ext_tool, extension_unavailable = _extension_dispatch_candidate(
+            self._ctx,
+            name,
+        ) if entry is None else (None, False)
 
         _mcp_is_name = None
         if entry is None and ext_tool is None:
@@ -3187,7 +3213,15 @@ class ToolRegistry:
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
                 return self._dispatch_extension_tool(name, ext_tool, args)
-            return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
+            text = f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
+            if extension_unavailable:
+                return ToolResult(
+                    status="unavailable",
+                    code="EXTENSION_UNAVAILABLE",
+                    text=text,
+                    meta={"dynamic_provider": True},
+                )
+            return text
         args, python_resolution, python_block = self._resolve_python_predispatch(
             name, args, _runtime_mode, effective_constraint, resolved_binding,
         )
