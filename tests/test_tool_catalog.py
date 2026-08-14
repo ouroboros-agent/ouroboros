@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-import pkgutil
 import typing
 from types import SimpleNamespace
 
 import pytest
 
 from ouroboros import extension_loader, mcp_client
-from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.contracts.task_constraint import TaskConstraint
+from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.tool_policy import format_capability_omissions
+from ouroboros.tools import registry as registry_module
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.tools.tool_catalog import (
     DuplicateToolNameError,
@@ -95,7 +95,11 @@ def test_registry_loader_does_not_degrade_a_first_party_duplicate(
     module = SimpleNamespace(get_tools=lambda: [_entry("same"), _entry("same")])
     real_import = importlib.import_module
 
-    monkeypatch.setattr(pkgutil, "iter_modules", lambda _paths: [(None, "duplicate", False)])
+    monkeypatch.setattr(
+        registry_module,
+        "tool_modules_for_runtime",
+        lambda *_args: (("duplicate",), ()),
+    )
     monkeypatch.setattr(
         importlib,
         "import_module",

@@ -373,10 +373,10 @@ def test_skill_exec_tools_have_policy_entries():
     assert TOOL_POLICY["skill_exec"] == POLICY_CHECK
 
 
-def test_skill_exec_in_frozen_modules():
+def test_skill_exec_in_frozen_modules(tmp_path):
     from ouroboros.tools.registry import ToolRegistry
 
-    assert "skill_exec" in ToolRegistry._FROZEN_TOOL_MODULES
+    assert "skill_exec" in ToolRegistry(tmp_path, tmp_path)._FROZEN_TOOL_MODULES
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ import pytest
 
 from scripts.contributor_review_evidence import finalize_contributor_outcome
 from scripts.run_external_review import (
+    _RELEASE_MACHINERY_PATHS,
     _REVIEW_SUBSTRATE_PATHS,
     _apply_contributor_landing_obligations,
     _apply_contributor_review_env,
@@ -62,6 +63,7 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         "ouroboros/review_substrate.py",
         "ouroboros/review_state.py",
         "ouroboros/runtime_mode_policy.py",
+        "ouroboros/tool_module_inventory.py",
         "ouroboros/usage_accounting.py",
         "ouroboros/utils.py",
         "ouroboros/tools/claude_advisory_review.py",
@@ -429,6 +431,7 @@ def test_contributor_snapshot_checks_each_duplicate_installer_link(
         "ouroboros/review_substrate.py",
         "ouroboros/review_execution.py",
         "ouroboros/utils.py",
+        "ouroboros/tool_module_inventory.py",
         "ouroboros/tools/registry.py",
     ],
 )
@@ -446,6 +449,45 @@ def test_contributor_snapshot_flags_transitive_review_substrate_changes(
     assert snapshot["review_substrate_changed"] == [relative_path]
     assert snapshot["review_substrate_matches_base"] is False
 
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["Ouroboros.spec", "ouroboros/tool_module_inventory.py"],
+)
+def test_contributor_snapshot_flags_frozen_inventory_release_machinery(
+    tmp_path, monkeypatch, relative_path
+):
+    assert relative_path in _RELEASE_MACHINERY_PATHS
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    path = repo / relative_path
+    path.write_text("# proposal changes release machinery\n", encoding="utf-8")
+    _git(repo, "add", str(path.relative_to(repo)))
+    _git(repo, "commit", "-m", "change release machinery")
+
+    snapshot = _contributor_snapshot("base", "HEAD")
+
+    assert snapshot["release_metadata_or_machinery_changed"] is True
+    assert snapshot["release_sensitive_changes"]["machinery_paths"] == [relative_path]
+
+
+def test_contributor_snapshot_flags_release_carrier_changes_without_version_file(
+    tmp_path, monkeypatch
+):
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    path = repo / "pyproject.toml"
+    path.write_text(
+        '[project]\nname = "test-project"\nversion = "1.2.4"\n',
+        encoding="utf-8",
+    )
+    _git(repo, "add", "pyproject.toml")
+    _git(repo, "commit", "-m", "change package carrier only")
+
+    snapshot = _contributor_snapshot("base", "HEAD")
+
+    assert snapshot["release_metadata_or_machinery_changed"] is True
+    assert snapshot["release_sensitive_changes"]["carrier_fields"] == [
+        "pyproject.project.version"
+    ]
 
 def test_contributor_landing_obligations_are_exact_typed_items_only():
     version_only = {

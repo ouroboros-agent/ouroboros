@@ -45,6 +45,7 @@ _CANONICAL_CONTEXT_DOCS = frozenset({
 
 _REVIEW_STACK_PATHS = frozenset({
     "ouroboros/size_ratchet_manifest.py",
+    "ouroboros/tool_module_inventory.py",
     "ouroboros/tools/review.py",
     "ouroboros/tools/review_context_atlas.py",
     "ouroboros/tools/tool_catalog.py",

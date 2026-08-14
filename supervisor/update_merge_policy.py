@@ -17,6 +17,7 @@ DOCUMENT_PREFIXES = ("docs/",)
 HOT_CODE_PATHS = frozenset({
     "ouroboros/loop.py",
     "ouroboros/size_ratchet_manifest.py",
+    "ouroboros/tool_module_inventory.py",
     "ouroboros/tools/control.py",
     "ouroboros/tools/registry.py",
     "ouroboros/tools/tool_catalog.py",

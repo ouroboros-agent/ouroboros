@@ -185,11 +185,10 @@ def test_top_level_contract_and_resource_filters_narrow_independently(
 
 
 def test_frozen_registry_includes_pr_integration_tools(tmp_path, monkeypatch):
-    import sys
-    from ouroboros.tools.registry import ToolRegistry
+    from tests._shared import configure_frozen_tool_registry
 
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    registry_cls = configure_frozen_tool_registry(monkeypatch, tmp_path)
+    registry = registry_cls(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     names = set(registry.available_tools())
     assert {
         "fetch_pr_ref",

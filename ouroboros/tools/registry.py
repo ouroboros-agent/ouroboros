@@ -27,6 +27,7 @@ from ouroboros.tool_capabilities import (
     LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     META_TOOL_NAMES,
 )
+from ouroboros.tool_module_inventory import tool_modules_for_runtime
 from ouroboros.shell_parse import (
     is_absolute_path_text,
     path_text_is_inside,
@@ -91,6 +92,9 @@ from ouroboros.contracts.skill_payload_policy import (
 )
 
 log = logging.getLogger(__name__)
+_FROZEN_TOOL_MANIFEST_PATH: pathlib.Path | None = None
+
+
 def _coerce_real_path(value: Any) -> pathlib.Path | None:
     if value is None or value.__class__.__module__.startswith("unittest.mock"):
         return None
@@ -1351,30 +1355,19 @@ class ToolRegistry:
         self._scoped_entries: Dict[str, ToolEntry] = {}
         self._handler_overrides: Dict[str, Callable] = {}
 
-    _FROZEN_TOOL_MODULES = [
-        "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "delegate", "edit_ops", "evolution_stats", "git", "git_pr", "git_rollback", "github",
-        "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
-        "recent_tasks",
-        "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
-        "skill_preflight", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
-    ]
+    _FROZEN_TOOL_MODULES: List[str] = []
 
     def _load_modules(self) -> _ToolCatalog:
         """Load frozen or package-discovered tool modules."""
         import importlib
         import logging
-        import sys
-
-        if getattr(sys, 'frozen', False):
-            module_names = self._FROZEN_TOOL_MODULES
-        else:
-            import pkgutil
-            import ouroboros.tools as tools_pkg
-            module_names = [
-                m for _, m, _ in pkgutil.iter_modules(tools_pkg.__path__)
-                if not m.startswith("_") and m != "registry"
-            ]
+        module_names, inventory_errors = tool_modules_for_runtime(
+            pathlib.Path(__file__).resolve().parent,
+            _FROZEN_TOOL_MANIFEST_PATH,
+        )
+        type(self)._FROZEN_TOOL_MODULES = list(module_names)
+        for error in inventory_errors:
+            logging.getLogger(__name__).warning("Failed to inspect tool module: %s", error)
 
         catalog_entries = []
         for modname in module_names:

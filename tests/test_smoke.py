@@ -13,7 +13,6 @@ Run: python -m pytest tests/test_smoke.py -v
 import os
 import pathlib
 import re
-import sys
 import tempfile
 
 import pytest
@@ -209,12 +208,12 @@ def test_tool_execute_basic(registry):
     assert "hello" in result.lower() or "⚠️" in result, "Should return output or error"
 
 
-def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
+def test_frozen_registry_includes_packaged_tool_modules(monkeypatch, tmp_path):
     """Frozen-mode registry must still load packaged tool modules."""
-    from ouroboros.tools.registry import ToolRegistry
-    tmp = pathlib.Path(tempfile.mkdtemp())
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    registry = ToolRegistry(repo_dir=tmp, drive_root=tmp)
+    from tests._shared import configure_frozen_tool_registry
+
+    registry_cls = configure_frozen_tool_registry(monkeypatch, tmp_path)
+    registry = registry_cls(repo_dir=tmp_path, drive_root=tmp_path)
     available = {t["function"]["name"] for t in registry.schemas()}
     expected_subset = {
         "memory_map",
@@ -224,7 +223,7 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "plan_task",
         "vcs_rollback",
         "run_ci_tests",
-        # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
+        # Build-derived frozen membership keeps PR inspection tools packaged.
         "list_github_prs",
         "get_github_pr",
         "comment_on_pr",

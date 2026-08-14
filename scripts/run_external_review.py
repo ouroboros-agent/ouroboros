@@ -92,7 +92,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/reviewer_window.py",
     "ouroboros/review_substrate.py",
     "ouroboros/review_state.py",
-    "ouroboros/runtime_mode_policy.py",
+    "ouroboros/runtime_mode_policy.py", "ouroboros/tool_module_inventory.py",
     "ouroboros/triad_review.py",
     "ouroboros/usage_accounting.py",
     "ouroboros/observability.py",
@@ -123,11 +123,10 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/subagents.py",
 })
 _RELEASE_MACHINERY_PATHS = frozenset({
-    ".github/workflows/ci.yml",
-    "build.sh",
+    ".github/workflows/ci.yml", "Ouroboros.spec", "build.sh",
     "build_linux.sh",
     "build_windows.ps1",
-    "ouroboros/tools/release_sync.py",
+    "ouroboros/tool_module_inventory.py", "ouroboros/tools/release_sync.py",
     "scripts/build_repo_bundle.py",
     "supervisor/git_ops.py",
 })

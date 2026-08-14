@@ -44,6 +44,7 @@ RELEASE_INVARIANT_PATHS = frozenset({
     "scripts/build_repo_bundle.py",
     "ouroboros/launcher_bootstrap.py",
     "ouroboros/repo_remotes.py",
+    "ouroboros/tool_module_inventory.py",
     "supervisor/git_ops.py",
     "supervisor/update_merge.py",
     "supervisor/update_merge_policy.py",
