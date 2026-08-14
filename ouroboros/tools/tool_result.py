@@ -415,7 +415,7 @@ def _classify_legacy_text(
                 inner,
                 wrapper_depth=wrapper_depth + 1,
             )
-            if status != "ok":
+            if code != "OK":
                 return status, code, {**meta, "safety_warning": True}
         return _classification("SAFETY_WARNING")
 
