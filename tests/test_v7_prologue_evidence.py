@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 12
+    assert len(rows) == 33
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -315,6 +315,89 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         "ouroboros/tools/registry.py::ToolEntry": "ouroboros/tools/tool_catalog.py::ToolEntry",
         "ouroboros/tools/registry.py::_compose_execute_result":
             "ouroboros/tools/tool_result.py::_compose_execute_result",
+    }
+    inherited_managed = {
+        "docs/assets/home-ZhS5_vhA.js": (
+            "docs/assets/home-sxLf4sZL.js", "transferred"
+        ),
+        "docs/assets/ouroboros-nV-KSBC2.css": (
+            "docs/assets/ouroboros-CMTHrJbp.css", "transferred"
+        ),
+        "scripts/run_external_review.py::_CONTRIBUTOR_DEFAULT_KEYS": (
+            "retired:target-base reviewer-default whitelist removed by route-neutral contributor review",
+            "retired",
+        ),
+        "scripts/run_external_review.py::_assert_contributor_openrouter_config": (
+            "scripts/run_external_review.py::_assert_contributor_review_config",
+            "transferred",
+        ),
+        "scripts/run_external_review.py::_git_file_at_ref": (
+            "scripts/contributor_review_evidence.py::_git_file_at_ref", "transferred"
+        ),
+        "scripts/run_external_review.py::_release_carrier_projection": (
+            "scripts/contributor_review_evidence.py::_release_carrier_projection",
+            "transferred",
+        ),
+        "scripts/run_external_review.py::_release_sensitive_changes": (
+            "scripts/contributor_review_evidence.py::release_sensitive_changes",
+            "transferred",
+        ),
+        "scripts/run_external_review.py::_settings_defaults_at_ref": (
+            "retired:target-base literal reviewer-default extraction removed by route-neutral contributor review",
+            "retired",
+        ),
+        "scripts/run_external_review.py::_split_models": (
+            "retired:target-base reviewer-list parsing removed with target-default routing",
+            "retired",
+        ),
+        "tests/test_context_layout.py::test_nav_map_is_fence_aware": (
+            "tests/test_context_layout.py::test_nav_map_is_fence_aware_at_every_supported_depth",
+            "transferred",
+        ),
+        "tests/test_context_layout.py::test_nav_map_lists_headings_with_line_ranges_and_omits_body": (
+            "tests/test_context_layout.py::test_nav_map_lists_h2_through_h4_as_inclusive_complete_subtrees",
+            "transferred",
+        ),
+        "tests/test_contributor_flow.py::test_public_contributor_flow_targets_working_branch_and_real_review_profile": (
+            "tests/test_contributor_flow.py::test_public_contributor_flow_is_agent_first_and_route_neutral",
+            "transferred",
+        ),
+        "tests/test_contributor_flow.py::test_pull_request_template_collects_fast_path_evidence_without_version_bump": (
+            "tests/test_contributor_flow.py::test_pull_request_template_has_one_universal_agent_review_block",
+            "transferred",
+        ),
+        "tests/test_external_review_script.py::_assert_contributor_openrouter_config": (
+            "scripts/run_external_review.py::_assert_contributor_review_config",
+            "transferred",
+        ),
+        "tests/test_external_review_script.py::_settings_defaults_at_ref": (
+            "retired:test-only target-default import removed with route-neutral contributor review",
+            "retired",
+        ),
+        "tests/test_external_review_script.py::test_contributor_defaults_reject_explicit_direct_provider_route": (
+            "tests/test_external_review_script.py::test_contributor_policy_preserves_configured_routes",
+            "transferred",
+        ),
+        "tests/test_external_review_script.py::test_contributor_resolved_config_rejects_direct_provider_actors": (
+            "tests/test_external_review_script.py::test_contributor_policy_preserves_configured_routes",
+            "transferred",
+        ),
+        "tests/test_external_review_script.py::test_contributor_snapshot_flags_release_carrier_changes_without_version_file": (
+            "tests/test_external_review_script.py::test_contributor_snapshot_rejects_release_carrier_changes_without_version_file",
+            "pending",
+        ),
+        "tests/test_external_review_script.py::test_contributor_snapshot_rejects_version_bump": (
+            "tests/test_external_review_script.py::test_contributor_snapshot_rejects_every_version_carrier",
+            "transferred",
+        ),
+        "tests/test_external_review_script.py::test_target_base_defaults_override_local_review_settings": (
+            "tests/test_external_review_script.py::test_contributor_policy_preserves_configured_routes",
+            "transferred",
+        ),
+        "tests/test_public_site_metadata.py::test_install_page_does_not_promise_native_packages_on_older_releases": (
+            "tests/test_public_site_metadata.py::test_install_page_has_version_bound_direct_downloads_before_advanced_setup",
+            "transferred",
+        ),
     }
     for row in rows:
         delta = v7_evidence._migration_json(row["semantic delta"], ("id", "note"))
@@ -343,6 +426,14 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             )
             assert delta["id"] == expected_delta and delta["note"]
             assert row["facade/public contract"] == row["old path/symbol"]
+        elif row["old path/symbol"] in inherited_managed:
+            owner, status = inherited_managed[row["old path/symbol"]]
+            assert row["new owner/path"] == owner
+            assert row["facade/public contract"] == "-"
+            assert delta["id"] == "none"
+            assert delta["note"].startswith("no v7-authored semantic delta;")
+            assert upstream["status"] == status
+            assert "upstream" in upstream["note"]
         else:
             assert upstream["status"] == "pending"
             expected_delta = (
@@ -355,6 +446,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
     assert sum(row["old path/symbol"] in implemented for row in rows) == 4
+    assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 
 

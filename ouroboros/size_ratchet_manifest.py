@@ -262,6 +262,7 @@ BAND_PATHS = {
     "tests/test_v647_megacommit.py": None,
     "tests/test_v6730_origin_invariant.py": None,
     "tests/test_v678_receipt_reconciliation.py": None,
+    "tests/test_v7_prologue_evidence.py": "inherited managed migration rows keep upstream symbol and generated-asset provenance explicit after tactical rebase",
     "web/modules/harness_accounts.js": None,
     "web/modules/harness_login_cards.js": None,
     "web/modules/log_events.js": None,

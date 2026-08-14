@@ -472,7 +472,7 @@ def test_contributor_snapshot_flags_frozen_inventory_release_machinery(
     assert snapshot["release_sensitive_changes"]["machinery_paths"] == [relative_path]
 
 
-def test_contributor_snapshot_flags_release_carrier_changes_without_version_file(
+def test_contributor_snapshot_rejects_release_carrier_changes_without_version_file(
     tmp_path, monkeypatch
 ):
     repo = _init_contributor_repo(tmp_path, monkeypatch)
@@ -484,12 +484,11 @@ def test_contributor_snapshot_flags_release_carrier_changes_without_version_file
     _git(repo, "add", "pyproject.toml")
     _git(repo, "commit", "-m", "change package carrier only")
 
-    snapshot = _contributor_snapshot("base", "HEAD")
-
-    assert snapshot["release_metadata_or_machinery_changed"] is True
-    assert snapshot["release_sensitive_changes"]["carrier_fields"] == [
-        "pyproject.project.version"
-    ]
+    with pytest.raises(
+        RuntimeError,
+        match=r"must not change release-version carriers \(pyproject\.project\.version\)",
+    ):
+        _contributor_snapshot("base", "HEAD")
 
 def test_contributor_landing_obligations_are_exact_typed_items_only():
     version_only = {
