@@ -1102,7 +1102,9 @@ def test_pro_acting_shell_write_outside_surface_blocked(tmp_path):
     reg = ToolRegistry(repo_dir=repo, drive_root=drive)
     reg._ctx = ctx
     block = _run_shell_safety_check(reg, {"cmd": "echo x > ../outside.txt"}, "pro")
-    assert block and "WORKSPACE_SHELL_BLOCKED" in block
+    assert block is not None
+    assert block.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_SHELL_BLOCKED" in block.text
 
 
 def test_subagent_shell_secret_markers_cover_relative_paths():
@@ -1135,7 +1137,9 @@ def test_acting_subagent_cannot_shell_read_secrets(tmp_path):
     reg = ToolRegistry(repo_dir=repo, drive_root=drive)
     reg._ctx = ctx
     block = _run_shell_safety_check(reg, {"cmd": "cat ~/Ouroboros/data/settings.json"}, "pro")
-    assert block and "SUBAGENT_SECRET_READ_BLOCKED" in block
+    assert block is not None
+    assert block.code == "LEGACY_BLOCKED"
+    assert "SUBAGENT_SECRET_READ_BLOCKED" in block.text
 
 
 def test_integrate_counts_as_reviewable_effect():

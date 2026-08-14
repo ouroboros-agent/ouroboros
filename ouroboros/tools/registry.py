@@ -1224,7 +1224,7 @@ class ToolRegistry:
 
     def _protected_shell_block(
         self, raw_cmd, cmd_path_lower, binding, acting_self_worktree,
-    ) -> Optional[str]:
+    ) -> ToolResult | None:
         """Apply payload/core write guards to the selected physical target."""
         items = _binding_items(binding)
         targets_skill = bool(items) and all(item.root == "skill_payload" for item in items)
@@ -1239,29 +1239,41 @@ class ToolRegistry:
                 *(SKILL_PAYLOAD_CONTROL_DIRNAMES - {"__pycache__"}),
             )
         ) and shell_has_write_indicator(raw_cmd):
-            return (
-                "⚠️ SAFETY_VIOLATION: Shell command would modify a skill "
-                "provenance / launcher seed / dependency marker (.clawhub.json, "
-                ".ouroboroshub.json, .self_authored.json, SKILL.openclaw.md, .seed-origin, "
-                ".ouroboros_env, node_modules). "
-                "Use marketplace lifecycle flows or edit user-authored "
-                "payload files instead."
+            return ToolResult(
+                status="blocked",
+                code="SAFETY_VIOLATION",
+                text=(
+                    "⚠️ SAFETY_VIOLATION: Shell command would modify a skill "
+                    "provenance / launcher seed / dependency marker (.clawhub.json, "
+                    ".ouroboroshub.json, .self_authored.json, SKILL.openclaw.md, .seed-origin, "
+                    ".ouroboros_env, node_modules). "
+                    "Use marketplace lifecycle flows or edit user-authored "
+                    "payload files instead."
+                ),
             )
         if _authorized_managed_update_resolver(self._ctx):
             return None
         if targets_system and shell_writer_targets_protected(raw_cmd):
-            return (
-                "⚠️ CRITICAL SAFETY_VIOLATION: Shell command would modify "
-                "a protected core/contract/release file. Protected: "
-                + ", ".join(sorted(PROTECTED_RUNTIME_PATHS))
+            return ToolResult(
+                status="blocked",
+                code="SAFETY_VIOLATION",
+                text=(
+                    "⚠️ CRITICAL SAFETY_VIOLATION: Shell command would modify "
+                    "a protected core/contract/release file. Protected: "
+                    + ", ".join(sorted(PROTECTED_RUNTIME_PATHS))
+                ),
             )
         if targets_system:
             for cf in PROTECTED_RUNTIME_PATHS_LOWER:
                 if cf in cmd_path_lower and shell_has_write_indicator(raw_cmd):
-                    return (
-                        "⚠️ CRITICAL SAFETY_VIOLATION: Shell command would modify "
-                        "a protected core/contract/release file. Protected: "
-                        + ", ".join(sorted(PROTECTED_RUNTIME_PATHS))
+                    return ToolResult(
+                        status="blocked",
+                        code="SAFETY_VIOLATION",
+                        text=(
+                            "⚠️ CRITICAL SAFETY_VIOLATION: Shell command would modify "
+                            "a protected core/contract/release file. Protected: "
+                            + ", ".join(sorted(PROTECTED_RUNTIME_PATHS))
+                        ),
                     )
         return None
 
@@ -1283,10 +1295,12 @@ class ToolRegistry:
                     git_protected_roots.append(pathlib.Path(str(_meta.get(_k))))
         return git_protected_roots
 
-    def _resolved_shell_cwd(self, args: Dict[str, Any], binding: Any = None) -> Any:
+    def _resolved_shell_cwd(
+        self, args: Dict[str, Any], binding: Any = None,
+    ) -> pathlib.Path | ToolResult:
         """The command's working directory, resolved ONCE through the cwd SSOT.
 
-        Returns a ``pathlib.Path``, or the typed cwd-block MESSAGE (a ``str``) when
+        Returns a ``pathlib.Path``, or a native cwd denial when
         resolution fails. Every guard downstream takes this canonical path instead
         of re-resolving — or, worse, string-joining the raw cwd label onto a root,
         which is the D1 regression class (v6.74.0)."""
@@ -1298,10 +1312,18 @@ class ToolRegistry:
         try:
             work_dir, _cwd_root, _allowed = resolve_shell_cwd(self._ctx, raw_cwd, operation=operation)
         except Exception as exc:
-            return shell_cwd_block_message(self._ctx, raw_cwd, operation=operation, error=exc)
+            return ToolResult(
+                status="blocked",
+                code="LEGACY_BLOCKED",
+                text=shell_cwd_block_message(
+                    self._ctx, raw_cwd, operation=operation, error=exc,
+                ),
+            )
         return pathlib.Path(work_dir)
 
-    def _external_workspace_git_block(self, raw_cmd: Any, work_dir: pathlib.Path) -> Optional[str]:
+    def _external_workspace_git_block(
+        self, raw_cmd: Any, work_dir: pathlib.Path,
+    ) -> ToolResult | None:
         from ouroboros.git_shell_policy import external_workspace_git_violation
 
         # External-workspace git is no longer confined to the active workspace
@@ -1320,8 +1342,16 @@ class ToolRegistry:
         if not git_violation:
             return None
         if git_violation.startswith("task_contract.allowed_resources"):
-            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
-        return f"⚠️ WORKSPACE_GIT_BLOCKED: {git_violation}."
+            return ToolResult(
+                status="blocked",
+                code="RESOURCE_BLOCKED",
+                text=f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}.",
+            )
+        return ToolResult(
+            status="blocked",
+            code="WORKSPACE_BLOCKED",
+            text=f"⚠️ WORKSPACE_GIT_BLOCKED: {git_violation}.",
+        )
 
     def _external_runtime_protected_paths(
         self, binding: Any = None,
@@ -1424,7 +1454,7 @@ class ToolRegistry:
         self, raw_cmd: Any, cmd_path_lower: str, args: Dict[str, Any],
         work_dir: Optional[pathlib.Path] = None,
         binding: Any = None,
-    ) -> Optional[str]:
+    ) -> ToolResult | None:
         """External-workspace shell guard for READ and write commands alike: block any
         command that targets the Ouroboros runtime (system repo / any data drive) or an
         owner credential path. read_file/user_files already enforce this; raw shell
@@ -1445,12 +1475,16 @@ class ToolRegistry:
         The PRIMARY control is the gated read_file/user_files path, which fully resolves
         and containment-checks every read against the protected drives, plus the LLM
         safety supervisor judging intent on each shell call."""
-        _BLOCK = (
-            "⚠️ WORKSPACE_SHELL_BLOCKED: shell command targets the Ouroboros runtime "
-            "(system repo / data drive) or an owner credential path. External-workspace "
-            "tasks may not read or write those; use the gated read_file tool for any "
-            "inspection you need. Run your command against the task's own surfaces "
-            "instead: the active workspace root (e.g. /app) or scratch such as /tmp."
+        block = ToolResult(
+            status="blocked",
+            code="WORKSPACE_BLOCKED",
+            text=(
+                "⚠️ WORKSPACE_SHELL_BLOCKED: shell command targets the Ouroboros runtime "
+                "(system repo / data drive) or an owner credential path. External-workspace "
+                "tasks may not read or write those; use the gated read_file tool for any "
+                "inspection you need. Run your command against the task's own surfaces "
+                "instead: the active workspace root (e.g. /app) or scratch such as /tmp."
+            ),
         )
         protected_texts, allowed_texts, protected_paths, allowed_paths = (
             self._external_runtime_protected_paths(binding)
@@ -1461,13 +1495,13 @@ class ToolRegistry:
             if _command_mentions_protected_root(cmd_path_lower, pt) and not any(
                 _command_mentions_protected_root(cmd_path_lower, t) for t in allowed_texts
             ):
-                return _BLOCK
+                return block
         # (2) path-token resolution (relative -> cwd, ~ -> home, symlinks canonicalized).
         # The cwd is resolved ONCE per safety check by the caller (D1); resolve here
         # only when this guard is used standalone.
         if work_dir is None:
             resolved_cwd = self._resolved_shell_cwd(args, binding)
-            if isinstance(resolved_cwd, str):
+            if isinstance(resolved_cwd, ToolResult):
                 return resolved_cwd
             work_dir = pathlib.Path(resolved_cwd)
         work_dir = pathlib.Path(work_dir)
@@ -1491,7 +1525,7 @@ class ToolRegistry:
             if any(_within(resolved, ap) for ap in allowed_paths):
                 continue
             if any(_within(resolved, pp) for pp in protected_paths):
-                return _BLOCK
+                return block
         return None
 
     def _workspace_shell_write_block(
@@ -1504,12 +1538,26 @@ class ToolRegistry:
         runtime_mode: str,
         acting_subagent: bool,
         binding: Any,
-    ) -> Optional[str]:
+    ) -> ToolResult | None:
         """Keep workspace writes inside the selected target plus task custody roots."""
 
         items = _binding_items(binding)
         if not items:
-            return "⚠️ WORKSPACE_SHELL_BLOCKED: process target was not resolved."
+            return ToolResult(
+                status="blocked",
+                code="WORKSPACE_BLOCKED",
+                text="⚠️ WORKSPACE_SHELL_BLOCKED: process target was not resolved.",
+            )
+        protected_block = ToolResult(
+            status="blocked",
+            code="WORKSPACE_BLOCKED",
+            text="⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths.",
+        )
+        outside_block = ToolResult(
+            status="blocked",
+            code="WORKSPACE_BLOCKED",
+            text="⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root.",
+        )
         selected = items[0]
         work_dir = pathlib.Path(selected.target_path).resolve(strict=False)
         selected_base = pathlib.Path(selected.base_path).resolve(strict=False)
@@ -1569,7 +1617,7 @@ class ToolRegistry:
                 _command_mentions_protected_root(cmd_path_lower, text)
                 for text in allowed_texts
             ):
-                return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                return protected_block
         path_tokens = list(shell_argv_with_path_tokens(raw_cmd))
         path_tokens.extend(
             token
@@ -1627,11 +1675,11 @@ class ToolRegistry:
                         for protected_path in protected_paths:
                             try:
                                 resolved.relative_to(protected_path)
-                                return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                                return protected_block
                             except Exception:
                                 pass
                         if not pro_workspace_passthrough:
-                            return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
+                            return outside_block
                         continue
                     if any(path_text_is_inside(candidate, root) for root in allowed_relative_roots):
                         continue
@@ -1639,9 +1687,9 @@ class ToolRegistry:
                         continue
                     for protected_path in protected_paths:
                         if path_text_is_inside(candidate, protected_path):
-                            return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                            return protected_block
                     if not pro_workspace_passthrough:
-                        return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
+                        return outside_block
                     continue
                 resolved = (work_dir / pathlib.Path(candidate)).resolve(strict=False)
                 if any(resolved.is_relative_to(root) for root in allowed_relative_roots):
@@ -1651,17 +1699,17 @@ class ToolRegistry:
                 for protected_path in protected_paths:
                     try:
                         resolved.relative_to(protected_path)
-                        return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                        return protected_block
                     except Exception:
                         pass
                 if not pro_workspace_passthrough:
-                    return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
+                    return outside_block
         return None
 
     def _shell_git_and_runtime_block(
         self, raw_cmd: Any, args: Dict[str, Any], cmd_path_lower: str,
         workspace_mode: bool, acting_self_worktree: bool, binding: Any,
-    ) -> Optional[str]:
+    ) -> ToolResult | None:
         """Direct-git-via-shell policy + the external-workspace runtime/secret read
         guard. External workspaces AND the default (non-workspace) lane get full
         task-local git through ONE target-aware resolver — only the Ouroboros
@@ -1674,7 +1722,7 @@ class ToolRegistry:
             return None
         if workspace_mode and not acting_self_worktree:
             work_dir = self._resolved_shell_cwd(args, binding)
-            if isinstance(work_dir, str):  # a cwd block message, not a path
+            if isinstance(work_dir, ToolResult):
                 return work_dir
             if git_block := self._external_workspace_git_block(raw_cmd, work_dir):
                 return git_block
@@ -1711,7 +1759,7 @@ class ToolRegistry:
             # workspace-escape check and the blanket mutating-git text classifier
             # keep running for this lane.
             work_dir = self._resolved_shell_cwd(args, binding)
-            if isinstance(work_dir, str):
+            if isinstance(work_dir, ToolResult):
                 return work_dir
             binding_item = _binding_items(binding)[0]
             active_root = pathlib.Path(binding_item.base_path)
@@ -1727,10 +1775,18 @@ class ToolRegistry:
             )
             if git_violation:
                 if git_violation.startswith("task_contract.allowed_resources"):
-                    return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
-                return (
-                    "⚠️ WORKSPACE_GIT_BLOCKED: run_command may only use read-only git "
-                    f"operations inside the active workspace; blocked {git_violation}."
+                    return ToolResult(
+                        status="blocked",
+                        code="RESOURCE_BLOCKED",
+                        text=f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}.",
+                    )
+                return ToolResult(
+                    status="blocked",
+                    code="WORKSPACE_BLOCKED",
+                    text=(
+                        "⚠️ WORKSPACE_GIT_BLOCKED: run_command may only use read-only git "
+                        f"operations inside the active workspace; blocked {git_violation}."
+                    ),
                 )
             git_violation = run_shell_git_block_reason(
                 raw_cmd,
@@ -1738,14 +1794,22 @@ class ToolRegistry:
             )
             if git_violation:
                 if git_violation.startswith("task_contract.allowed_resources"):
-                    return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
+                    return ToolResult(
+                        status="blocked",
+                        code="RESOURCE_BLOCKED",
+                        text=f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}.",
+                    )
                 subcmd = git_violation.removeprefix("git ").strip() or git_violation
-                return (
-                    f"⚠️ GIT_VIA_SHELL_BLOCKED: `git {subcmd}` is blocked for acting "
-                    "self_worktree children (no commits; the parent integrates the "
-                    "returned patch and is the sole committer). For read-only git: "
-                    "vcs_status, vcs_diff tools, or run_command with git "
-                    "log/show/diff/status/rev-list/show-ref/for-each-ref/listing branch-tag forms."
+                return ToolResult(
+                    status="blocked",
+                    code="LEGACY_BLOCKED",
+                    text=(
+                        f"⚠️ GIT_VIA_SHELL_BLOCKED: `git {subcmd}` is blocked for acting "
+                        "self_worktree children (no commits; the parent integrates the "
+                        "returned patch and is the sole committer). For read-only git: "
+                        "vcs_status, vcs_diff tools, or run_command with git "
+                        "log/show/diff/status/rev-list/show-ref/for-each-ref/listing branch-tag forms."
+                    ),
                 )
             return None
         # DEFAULT (non-workspace) lane — direct chat, light mode, self_modification-
@@ -1767,7 +1831,7 @@ class ToolRegistry:
         if "git" not in cmd_path_lower:
             return None
         work_dir = self._resolved_shell_cwd(args, binding)
-        if isinstance(work_dir, str):  # a cwd block message, not a path
+        if isinstance(work_dir, ToolResult):
             return work_dir
         from ouroboros.git_shell_policy import external_workspace_git_violation
 
@@ -1781,15 +1845,23 @@ class ToolRegistry:
         if not git_violation:
             return None
         if git_violation.startswith("task_contract.allowed_resources"):
-            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
-        return (
-            f"⚠️ GIT_VIA_SHELL_BLOCKED: {git_violation}. Mutating git may not target "
-            "the Ouroboros runtime (system repo / data drives): self-repo changes go "
-            "through commit_reviewed, which enforces pre-commit checks and review. "
-            "Read-only git (status/log/diff/show/rev-parse/branch- and tag-listing, "
-            "or the vcs_status/vcs_diff tools) works everywhere, and mutating git is "
-            "free in any tree OUTSIDE the runtime (e.g. ~/projects, /tmp, an attached "
-            "project folder)."
+            return ToolResult(
+                status="blocked",
+                code="RESOURCE_BLOCKED",
+                text=f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}.",
+            )
+        return ToolResult(
+            status="blocked",
+            code="LEGACY_BLOCKED",
+            text=(
+                f"⚠️ GIT_VIA_SHELL_BLOCKED: {git_violation}. Mutating git may not target "
+                "the Ouroboros runtime (system repo / data drives): self-repo changes go "
+                "through commit_reviewed, which enforces pre-commit checks and review. "
+                "Read-only git (status/log/diff/show/rev-parse/branch- and tag-listing, "
+                "or the vcs_status/vcs_diff tools) works everywhere, and mutating git is "
+                "free in any tree OUTSIDE the runtime (e.g. ~/projects, /tmp, an attached "
+                "project folder)."
+            ),
         )
 
     def _snapshot_owner_files(
@@ -2234,14 +2306,14 @@ class ToolRegistry:
                 )
             ):
                 return ("⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses start_service against the Ouroboros repository because long-running services can mutate after initial tool checks. For external services, set cwd under user_files, task_drive, or artifact_store; switch to advanced/pro only for reviewed Ouroboros self-modification.")
-            block_msg = registry_guard_process._run_shell_safety_check(
+            block_result = registry_guard_process._run_shell_safety_check(
                 self,
                 process_shell_guard_args(name, args, ctx=self._ctx, runtime_mode=_runtime_mode),
                 _runtime_mode,
                 resolved_binding,
             )
-            if block_msg:
-                return block_msg
+            if block_result is not None:
+                return block_result
 
         # LLM safety supervisor.
         from ouroboros.safety import check_safety

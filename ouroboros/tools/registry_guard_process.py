@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.contracts.skill_payload_policy import SKILL_OWNER_STATE_STEMS
@@ -27,6 +27,7 @@ from ouroboros.tools.shell_guards import (
     writer_target_tokens,
 )
 from ouroboros.tools.tool_resolution import _binding_items, system_repo_dir_for
+from ouroboros.tools.tool_result import ToolResult
 
 
 def _detect_runtime_mode_elevation(text_lower: str) -> bool:
@@ -360,8 +361,8 @@ def _mentions_detached_process(text_lower: str) -> bool:
 
 def _run_shell_safety_check(
     self, args: Dict[str, Any], runtime_mode: str, binding: Any = None,
-) -> Optional[str]:
-    """Pre-execution run_command filter; returns a block message or ``None``."""
+) -> ToolResult | None:
+    """Pre-execution run_command filter; returns a native denial or ``None``."""
     raw_cmd = args.get("cmd", args.get("command", ""))
     if binding is None:
         operation = (
@@ -378,11 +379,15 @@ def _run_shell_safety_check(
                 skill_name=str(args.get("skill_name") or ""),
             )
         except Exception as exc:
-            return shell_cwd_block_message(
-                self._ctx,
-                str(args.get("cwd") or ""),
-                operation=operation,
-                error=exc,
+            return ToolResult(
+                status="blocked",
+                code="LEGACY_BLOCKED",
+                text=shell_cwd_block_message(
+                    self._ctx,
+                    str(args.get("cwd") or ""),
+                    operation=operation,
+                    error=exc,
+                ),
             )
     workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)())
     # self_worktree is a checkout of the system repo, so protected shell-write
@@ -392,8 +397,10 @@ def _run_shell_safety_check(
     acting_subagent = self._is_acting_subagent()
     argv = strip_leading_env_assignments(unwrap_env_argv(shell_argv(raw_cmd)))
     if sudo_noninteractive_violation(argv):
-        return (
-            "⚠️ SUDO_INTERACTIVE_BLOCKED: sudo must be noninteractive. Use sudo -n for commands that can run without a password; if sudo -n fails, report validation/install blocked by environment."
+        return ToolResult(
+            status="blocked",
+            code="LEGACY_BLOCKED",
+            text="⚠️ SUDO_INTERACTIVE_BLOCKED: sudo must be noninteractive. Use sudo -n for commands that can run without a password; if sudo -n fails, report validation/install blocked by environment.",
         )
     cmd_lower = (" ".join(str(x) for x in raw_cmd) if isinstance(raw_cmd, list) else str(raw_cmd)).lower()
     cmd_path_lower = cmd_lower.replace("\\", "/")
@@ -401,10 +408,14 @@ def _run_shell_safety_check(
     # Subagents must not read owner secrets/credentials/control state via shell
     # (read_file already denies these). read_file is the gated inspection path.
     if (acting_subagent or self._is_local_readonly_subagent()) and _subagent_shell_targets_secret(cmd_path_lower):
-        return (
-            "⚠️ SUBAGENT_SECRET_READ_BLOCKED: subagents may not read Ouroboros secrets, "
-            "credentials, or owner-control state via shell. Use the gated read_file tool "
-            "(which denies secrets) for any inspection you actually need."
+        return ToolResult(
+            status="blocked",
+            code="LEGACY_BLOCKED",
+            text=(
+                "⚠️ SUBAGENT_SECRET_READ_BLOCKED: subagents may not read Ouroboros secrets, "
+                "credentials, or owner-control state via shell. Use the gated read_file tool "
+                "(which denies secrets) for any inspection you actually need."
+            ),
         )
     argv_for_write = argv
     argv_executable = pathlib.PurePath(argv_for_write[0]).name.lower().removesuffix(".exe") if argv_for_write else ""
@@ -423,7 +434,7 @@ def _run_shell_safety_check(
     # write-suspect as the unversioned one (XG-2R.2).
     writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and (interpreter_family(argv_executable) or argv_executable) in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
     work_dir = self._resolved_shell_cwd(args, binding)
-    if isinstance(work_dir, str):
+    if isinstance(work_dir, ToolResult):
         return work_dir
     if protected_artifact_block := protected_artifact_shell_block_reason(
         self._ctx,
@@ -432,14 +443,22 @@ def _run_shell_safety_check(
         default_cwd=pathlib.Path(work_dir),
         binding=_binding_items(binding)[0] if _binding_items(binding) else None,
     ):
-        return protected_artifact_block
+        return ToolResult(
+            status="blocked",
+            code="RESOURCE_BLOCKED",
+            text=protected_artifact_block,
+        )
     if writeish and (executor_state_block := workspace_executor_state_write_block(
         raw_cmd,
         drive_root=pathlib.Path(self._ctx.drive_root),
         cwd=str(work_dir),
         default_cwd=pathlib.Path(work_dir),
     )):
-        return executor_state_block
+        return ToolResult(
+            status="blocked",
+            code="WORKSPACE_BLOCKED",
+            text=executor_state_block,
+        )
     if workspace_mode and writeish:
         workspace_write_block = self._workspace_shell_write_block(
             args,
@@ -456,31 +475,39 @@ def _run_shell_safety_check(
 
     # Elevation pattern: blocked in all modes.
     if _detect_runtime_mode_elevation(cmd_lower):
-        return "⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart."
+        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart.")
     if _detect_context_mode_self_lowering(cmd_lower):
-        return "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped."
+        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped.")
     if _detect_scope_review_floor_self_lowering(cmd_lower, writeish=writeish):
-        return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or /api/owner/scope-review-floor from something other than a pure read. The floor is a deprecated, enforcement-inert owner setting (BIBLE P3 scope-review applicability follows the owner context mode) — it stays owner-only, and the agent must not write owner settings through any channel. Ask the owner to change it via the dedicated /api/owner/scope-review-floor endpoint, or stop the agent and edit settings.json directly. Pure source inspection (grep/rg/cat/jq/git grep) is allowed; an interpreter or HTTP client naming the endpoint is not, whatever verb it spells."
+        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or /api/owner/scope-review-floor from something other than a pure read. The floor is a deprecated, enforcement-inert owner setting (BIBLE P3 scope-review applicability follows the owner context mode) — it stays owner-only, and the agent must not write owner settings through any channel. Ask the owner to change it via the dedicated /api/owner/scope-review-floor endpoint, or stop the agent and edit settings.json directly. Pure source inspection (grep/rg/cat/jq/git grep) is allowed; an interpreter or HTTP client naming the endpoint is not, whatever verb it spells.")
     if _detect_safety_mode_self_lowering(cmd_lower):
-        return "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly."
+        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly.")
     if _detect_owner_skill_attest_self_call(cmd_lower):
-        return "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI."
+        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI.")
     if _detect_mutative_toggle_self_change(cmd_lower):
-        return "⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents."
+        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents.")
     if _detect_evolution_owner_control_self_change(cmd_lower):
-        return "⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or steer self-modification cycles. Change them via the owner Settings UI, or stop the agent and edit settings.json directly — the agent must not self-set evolution controls."
+        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or steer self-modification cycles. Change them via the owner Settings UI, or stop the agent and edit settings.json directly — the agent must not self-set evolution controls.")
     if _mentions_skill_owner_state(cmd_lower):
-        return (
-            "⚠️ SKILL_STATE_WRITE_BLOCKED: skill review, enablement, "
-            "grants, and marketplace provenance are owner/review "
-            "controlled state. Use skill_review, toggle_skill/the Skills "
-            "UI, or the desktop launcher confirmation flow."
+        return ToolResult(
+            status="blocked",
+            code="LEGACY_BLOCKED",
+            text=(
+                "⚠️ SKILL_STATE_WRITE_BLOCKED: skill review, enablement, "
+                "grants, and marketplace provenance are owner/review "
+                "controlled state. Use skill_review, toggle_skill/the Skills "
+                "UI, or the desktop launcher confirmation flow."
+            ),
         )
     if "state" in cmd_lower and "skills" in cmd_lower and _mentions_detached_process(cmd_lower):
-        return (
-            "⚠️ SKILL_STATE_WRITE_BLOCKED: detached shell processes must "
-            "not target skill state directories. Use the reviewed skill "
-            "lifecycle tools instead."
+        return ToolResult(
+            status="blocked",
+            code="LEGACY_BLOCKED",
+            text=(
+                "⚠️ SKILL_STATE_WRITE_BLOCKED: detached shell processes must "
+                "not target skill state directories. Use the reviewed skill "
+                "lifecycle tools instead."
+            ),
         )
 
     # Light-mode checks follow the selected physical target, not whether a
@@ -495,13 +522,17 @@ def _run_shell_safety_check(
             # (it defaults ON in the fence) — scoping it to `__tool_name ==
             # "run_script"` let run_command mutate the repo first (XG-7B3.1).
         ):
-            return (
-                "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses "
-                "shell commands that mutate the Ouroboros repository. "
-                "For external deliverables, run with cwd under user_files "
-                "(for example /Users/<you>/Desktop), root=artifact_store, "
-                "or root=task_drive. Switch to advanced/pro only for "
-                "reviewed Ouroboros self-modification."
+            return ToolResult(
+                status="blocked",
+                code="LIGHT_MODE_BLOCKED",
+                text=(
+                    "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses "
+                    "shell commands that mutate the Ouroboros repository. "
+                    "For external deliverables, run with cwd under user_files "
+                    "(for example /Users/<you>/Desktop), root=artifact_store, "
+                    "or root=task_drive. Switch to advanced/pro only for "
+                    "reviewed Ouroboros self-modification."
+                ),
             )
         runtime_data_executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
         # Versioned interpreter basenames (python3.11, ruby3.2, php8.3,
@@ -537,14 +568,18 @@ def _run_shell_safety_check(
                 action = "write under" if writeish else "write-indicating commands that mention"
                 # Name the REAL task roots: a mis-guessed absolute path used to
                 # produce this block with no way to self-correct (v6.54.3).
-                return (
-                    "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks process commands "
-                    f"that {action} runtime_data paths outside this task's own roots. "
-                    f"This task's real roots are: artifact_store={own_artifact_dir}, "
-                    f"task_drive={own_task_drive} — staged attachments live under "
-                    f"{own_artifact_dir / 'attachments'}. Use those absolute paths in scripts, "
-                    "or root=artifact_store / root=task_drive / root=user_files in file tools. "
-                    "Blocked paths: " + ", ".join(runtime_data_targets[:5])
+                return ToolResult(
+                    status="blocked",
+                    code="LIGHT_MODE_BLOCKED",
+                    text=(
+                        "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks process commands "
+                        f"that {action} runtime_data paths outside this task's own roots. "
+                        f"This task's real roots are: artifact_store={own_artifact_dir}, "
+                        f"task_drive={own_task_drive} — staged attachments live under "
+                        f"{own_artifact_dir / 'attachments'}. Use those absolute paths in scripts, "
+                        "or root=artifact_store / root=task_drive / root=user_files in file tools. "
+                        "Blocked paths: " + ", ".join(runtime_data_targets[:5])
+                    ),
                 )
 
     if protected_shell := self._protected_shell_block(
@@ -555,9 +590,9 @@ def _run_shell_safety_check(
     # GitHub repo create/delete/auth.
     cmd_words = re.sub(r"\s+", " ", cmd_lower)
     if "gh repo create" in cmd_words or "gh repo delete" in cmd_words:
-        return "⚠️ SAFETY_VIOLATION: Creating/deleting GitHub repositories requires admin approval."
+        return ToolResult(status="blocked", code="SAFETY_VIOLATION", text="⚠️ SAFETY_VIOLATION: Creating/deleting GitHub repositories requires admin approval.")
     if "gh auth" in cmd_words:
-        return "⚠️ SAFETY_VIOLATION: Modifying GitHub authentication is not permitted."
+        return ToolResult(status="blocked", code="SAFETY_VIOLATION", text="⚠️ SAFETY_VIOLATION: Modifying GitHub authentication is not permitted.")
 
     return self._shell_git_and_runtime_block(
         raw_cmd, args, cmd_path_lower, workspace_mode,

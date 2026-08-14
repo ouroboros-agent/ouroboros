@@ -141,7 +141,8 @@ def test_registry_shell_guard_keeps_legacy_control_dir_subset(tmp_path):
         "advanced",
     )
     assert blocked is not None
-    assert "SAFETY_VIOLATION" in blocked
+    assert blocked.code == "SAFETY_VIOLATION"
+    assert "SAFETY_VIOLATION" in blocked.text
 
     allowed = _run_shell_safety_check(
         reg,

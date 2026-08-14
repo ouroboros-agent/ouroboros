@@ -8,6 +8,7 @@ import ouroboros.tools.registry as registry_module
 import ouroboros.tools.registry_guard_process as process_guard
 from ouroboros.artifacts import task_artifact_dir_path
 from ouroboros.tools.registry import ToolContext, ToolRegistry
+from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
 
 
 _FUNCTION_SIGNATURES = {
@@ -24,7 +25,7 @@ _FUNCTION_SIGNATURES = {
     "_detect_owner_skill_attest_self_call": "(text_lower: 'str') -> 'bool'",
     "_mentions_skill_owner_state": "(text_lower: 'str') -> 'bool'",
     "_mentions_detached_process": "(text_lower: 'str') -> 'bool'",
-    "_run_shell_safety_check": "(self, args: 'Dict[str, Any]', runtime_mode: 'str', binding: 'Any' = None) -> 'Optional[str]'",
+    "_run_shell_safety_check": "(self, args: 'Dict[str, Any]', runtime_mode: 'str', binding: 'Any' = None) -> 'ToolResult | None'",
 }
 
 _CONSTANT_CARDINALITIES = {
@@ -111,16 +112,30 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
     monkeypatch.setattr(process_guard, "workspace_executor_state_write_block", lambda *args, **kwargs: None)
 
     def check(command, mode="advanced"):
-        return process_guard._run_shell_safety_check(stub, {"cmd": command}, mode, ())
+        result = process_guard._run_shell_safety_check(stub, {"cmd": command}, mode, ())
+        assert isinstance(result, ToolResult)
+        assert result.status == "blocked"
+        assert dict(result.meta) == {}
+        legacy = LegacyTextResultAdapter.from_text("run_command", result.text)
+        assert (result.status, result.code, dict(result.meta)) == (
+            legacy.status,
+            legacy.code,
+            dict(legacy.meta),
+        )
+        return result
 
-    assert check(["sudo", "true"]) == (
+    sudo = check(["sudo", "true"])
+    assert sudo.code == "LEGACY_BLOCKED"
+    assert sudo.text == (
         "⚠️ SUDO_INTERACTIVE_BLOCKED: sudo must be noninteractive. Use sudo -n for commands "
         "that can run without a password; if sudo -n fails, report validation/install blocked "
         "by environment."
     )
 
     stub.acting = True
-    assert check("cat data/settings.json") == (
+    secret = check("cat data/settings.json")
+    assert secret.code == "LEGACY_BLOCKED"
+    assert secret.text == (
         "⚠️ SUBAGENT_SECRET_READ_BLOCKED: subagents may not read Ouroboros secrets, "
         "credentials, or owner-control state via shell. Use the gated read_file tool "
         "(which denies secrets) for any inspection you actually need."
@@ -130,6 +145,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
     cases = (
         (
             'save_settings({"ouroboros_runtime_mode":"pro"})',
+            "LEGACY_BLOCKED",
             "⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE "
             "elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, "
             "or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is "
@@ -138,6 +154,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_context_mode":"low"})',
+            "LEGACY_BLOCKED",
             "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt "
             "to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. "
             "Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit "
@@ -145,6 +162,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             "python -c 'post /api/owner/scope-review-floor'",
+            "LEGACY_BLOCKED",
             "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches "
             "OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or "
             "/api/owner/scope-review-floor from something other than a pure read. The floor is a "
@@ -157,6 +175,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_safety_mode":"off"})',
+            "LEGACY_BLOCKED",
             "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to "
             "change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, "
             "/api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled "
@@ -166,6 +185,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             "curl -x post /api/owner/skills/alpha/attest-review",
+            "LEGACY_BLOCKED",
             "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an "
             "attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation "
             "skips the expensive LLM skill review and is OWNER-ONLY — the agent must not "
@@ -174,6 +194,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_allow_mutative_subagents":"true"})',
+            "LEGACY_BLOCKED",
             "⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it "
             "grants subagents write power against the live body). Change it by stopping the agent "
             "and editing settings.json directly, then restart — the agent must not self-enable "
@@ -181,6 +202,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_post_task_evolution":"true"})',
+            "LEGACY_BLOCKED",
             "⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and "
             "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or "
             "steer self-modification cycles. Change them via the owner Settings UI, or stop the "
@@ -188,29 +210,36 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             "echo state/skills/alpha/review.json",
+            "LEGACY_BLOCKED",
             "⚠️ SKILL_STATE_WRITE_BLOCKED: skill review, enablement, grants, and marketplace "
             "provenance are owner/review controlled state. Use skill_review, toggle_skill/the "
             "Skills UI, or the desktop launcher confirmation flow.",
         ),
         (
             "nohup echo state/skills/alpha/unknown.json",
+            "LEGACY_BLOCKED",
             "⚠️ SKILL_STATE_WRITE_BLOCKED: detached shell processes must not target skill state "
             "directories. Use the reviewed skill lifecycle tools instead.",
         ),
         (
             "gh repo create example",
+            "SAFETY_VIOLATION",
             "⚠️ SAFETY_VIOLATION: Creating/deleting GitHub repositories requires admin approval.",
         ),
         (
             "gh auth login",
+            "SAFETY_VIOLATION",
             "⚠️ SAFETY_VIOLATION: Modifying GitHub authentication is not permitted.",
         ),
     )
-    for command, expected in cases:
-        assert check(command) == expected
+    for command, code, expected in cases:
+        result = check(command)
+        assert (result.code, result.text) == (code, expected)
 
     monkeypatch.setattr(process_guard, "light_shell_repo_mutation", lambda *args, **kwargs: True)
-    assert check("echo ok", "light") == (
+    light_repo = check("echo ok", "light")
+    assert light_repo.code == "LIGHT_MODE_BLOCKED"
+    assert light_repo.text == (
         "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses shell commands that mutate the "
         "Ouroboros repository. For external deliverables, run with cwd under user_files "
         "(for example /Users/<you>/Desktop), root=artifact_store, or root=task_drive. Switch "
@@ -222,13 +251,38 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
     monkeypatch.setattr(process_guard, "runtime_data_guard_targets", lambda *args, **kwargs: ["/blocked"])
     task_drive = tmp_path / "task_drive"
     artifact_dir = task_artifact_dir_path(tmp_path, "task-process-guard", create=False)
-    assert check("echo ok", "light") == (
+    light_data = check("echo ok", "light")
+    assert light_data.code == "LIGHT_MODE_BLOCKED"
+    assert light_data.text == (
         "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks process commands that write under "
         "runtime_data paths outside this task's own roots. This task's real roots are: "
         f"artifact_store={artifact_dir}, task_drive={task_drive} — staged attachments live "
         f"under {artifact_dir / 'attachments'}. Use those absolute paths in scripts, or "
         "root=artifact_store / root=task_drive / root=user_files in file tools. Blocked paths: "
         "/blocked"
+    )
+
+    monkeypatch.setattr(
+        process_guard,
+        "protected_artifact_shell_block_reason",
+        lambda *args, **kwargs: "⚠️ RESOURCE_POLICY_BLOCKED: protected fixture.",
+    )
+    resource = check(["cat", "fixture"])
+    assert (resource.code, resource.text) == (
+        "RESOURCE_BLOCKED",
+        "⚠️ RESOURCE_POLICY_BLOCKED: protected fixture.",
+    )
+
+    monkeypatch.setattr(process_guard, "protected_artifact_shell_block_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        process_guard,
+        "workspace_executor_state_write_block",
+        lambda *args, **kwargs: "⚠️ WORKSPACE_EXECUTOR_STATE_WRITE_BLOCKED: fixture.",
+    )
+    workspace = check(["touch", "fixture"])
+    assert (workspace.code, workspace.text) == (
+        "WORKSPACE_BLOCKED",
+        "⚠️ WORKSPACE_EXECUTOR_STATE_WRITE_BLOCKED: fixture.",
     )
 
 
@@ -255,7 +309,13 @@ def test_registry_dispatch_calls_process_owner_once_before_safety_and_handler(
         assert runtime_mode == "advanced"
         assert binding is not None
         calls.append("guard")
-        return "⚠️ TEST_PROCESS_BLOCKED" if denied["value"] else None
+        if not denied["value"]:
+            return None
+        return ToolResult(
+            status="blocked",
+            code="LEGACY_BLOCKED",
+            text="⚠️ TEST_PROCESS_BLOCKED",
+        )
 
     def check_safety(*_args, **_kwargs):
         calls.append("safety")
@@ -268,15 +328,66 @@ def test_registry_dispatch_calls_process_owner_once_before_safety_and_handler(
         calls.append("handler")
         return "OK"
 
+    adapter_calls: list[str] = []
+    original_adapter = LegacyTextResultAdapter.from_text
+
+    def adapt(tool_name, text):
+        adapter_calls.append(text)
+        return original_adapter(tool_name, text)
+
     monkeypatch.setattr(process_guard, "_run_shell_safety_check", guard)
+    monkeypatch.setattr(LegacyTextResultAdapter, "from_text", adapt)
     monkeypatch.setattr(safety, "check_safety", check_safety)
     registry.override_handler("verify_and_record", handler)
     args = {"contract_kind": "explicit_command", "check": ["echo", "ok"]}
 
     assert registry.execute("verify_and_record", dict(args)) == "⚠️ TEST_PROCESS_BLOCKED"
     assert calls == ["guard"]
+    assert adapter_calls == []
 
     calls.clear()
     denied["value"] = False
     assert registry.execute("verify_and_record", dict(args)) == "OK"
     assert calls == ["guard", "safety", "handler"]
+    assert adapter_calls == ["OK"]
+
+
+def test_loop_preserves_legacy_process_fields_while_consuming_native_denial(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop_tool_execution as execution
+
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    logs = tmp_path / "logs"
+    repo.mkdir()
+    data.mkdir()
+    logs.mkdir()
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    registry.set_context(ToolContext(repo_dir=repo, drive_root=data, task_id="task-process-loop"))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setattr(execution, "persist_call", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        LegacyTextResultAdapter,
+        "from_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy adapter used")),
+    )
+
+    row = execution._execute_single_tool(
+        registry,
+        {
+            "id": "call-process-denial",
+            "function": {"name": "run_command", "arguments": '{"cmd":["sudo","true"]}'},
+        },
+        logs,
+        "task-process-loop",
+    )
+
+    assert row["result"].startswith("⚠️ SUDO_INTERACTIVE_BLOCKED:")
+    assert row["is_error"] is True
+    assert row["result_meta"] == {
+        "status": "blocked",
+        "tool_result_status": "blocked",
+        "tool_result_code": "LEGACY_BLOCKED",
+        "tool_result_meta": {},
+    }

@@ -877,7 +877,9 @@ def test_workspace_run_shell_cwd_allows_scratch_and_explicit_system(tmp_path, mo
         registry,
         {"cmd": ["git", "-C", str(system_repo), "commit", "-m", "x"]}, "advanced"
     )
-    assert git_escape and "WORKSPACE_GIT_BLOCKED" in git_escape
+    assert git_escape is not None
+    assert git_escape.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_GIT_BLOCKED" in git_escape.text
     git_chain = registry.execute("run_command", {"cmd": ["sh", "-c", "true && git --version; echo git binary OK"]})
     assert "WORKSPACE_GIT_BLOCKED" not in git_chain
     outside_write = registry.execute("run_command", {"cmd": ["touch", str(system_repo / "README.md")]})
@@ -1087,7 +1089,9 @@ def test_external_workspace_shell_allows_task_local_git(tmp_path, monkeypatch):
         ["sh", "-c", "git -C $OUROBOROS_TEST_RUNTIME_REPO commit -m x"],
     ):
         result = _run_shell_safety_check(registry, {"cmd": cmd}, "advanced")
-        assert result and "WORKSPACE_GIT_BLOCKED" in result, (cmd, result)
+        assert result is not None, cmd
+        assert result.code == "WORKSPACE_BLOCKED"
+        assert "WORKSPACE_GIT_BLOCKED" in result.text
 
     # The read-only exemption is ALL-or-NOTHING per segment: a compound that only
     # STARTS with git still meets the runtime/secret read guard in full.
@@ -1096,7 +1100,9 @@ def test_external_workspace_shell_allows_task_local_git(tmp_path, monkeypatch):
         {"cmd": ["sh", "-c", f"git status && cat {(data / 'settings.json').as_posix()}"]},
         "advanced",
     )
-    assert mixed and "WORKSPACE_SHELL_BLOCKED" in mixed, mixed
+    assert mixed is not None
+    assert mixed.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_SHELL_BLOCKED" in mixed.text
 
 
 def test_workspace_shell_git_ls_remote_requires_network_contract(tmp_path):
@@ -1126,7 +1132,9 @@ def test_workspace_shell_git_ls_remote_requires_network_contract(tmp_path):
         ["git", "submodule", "update", "--init", "--recursive"],
     ):
         result = _run_shell_safety_check(registry, {"cmd": cmd}, "advanced")
-        assert result and "RESOURCE_CONSTRAINT_BLOCKED" in result, (cmd, result)
+        assert result is not None, cmd
+        assert result.code == "RESOURCE_BLOCKED"
+        assert "RESOURCE_CONSTRAINT_BLOCKED" in result.text
 
 
 def test_workspace_run_shell_allows_absolute_cwd_under_workspace_and_child_drive(tmp_path):
@@ -1177,13 +1185,17 @@ def test_workspace_run_shell_allows_absolute_cwd_under_workspace_and_child_drive
         {"cmd": ["git", "-C", "..", "commit", "-m", "x"], "cwd": str(child_dir)},
         "advanced",
     )
-    assert git_escape and "WORKSPACE_GIT_BLOCKED" in git_escape, git_escape
+    assert git_escape is not None
+    assert git_escape.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_GIT_BLOCKED" in git_escape.text
     protected_escape = _run_shell_safety_check(
         registry,
         {"cmd": ["touch", "../data/state/state.json"]},
         "pro",
     )
-    assert "WORKSPACE_SHELL_BLOCKED" in protected_escape
+    assert protected_escape is not None
+    assert protected_escape.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_SHELL_BLOCKED" in protected_escape.text
     task_drive_write = registry.execute("run_command", {"cmd": ["touch", "output.txt"], "cwd": str(child_dir)})
     assert "WORKSPACE_SHELL_BLOCKED" not in task_drive_write
     assert (child_dir / "output.txt").is_file()
@@ -1225,16 +1237,22 @@ def test_workspace_shell_sudo_and_pro_passthrough_policy(tmp_path):
     registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
     registry.set_context(ctx)
 
-    assert "SUDO_INTERACTIVE_BLOCKED" in _run_shell_safety_check(registry, {"cmd": ["sudo", "true"]}, "pro")
-    assert "SUDO_INTERACTIVE_BLOCKED" in _run_shell_safety_check(registry, {"cmd": ["sh", "-c", "sudo true"]}, "pro")
-    assert "SUDO_INTERACTIVE_BLOCKED" in _run_shell_safety_check(registry, {"cmd": ["sudo", "-S", "true"]}, "pro")
-    assert "SUDO_INTERACTIVE_BLOCKED" in _run_shell_safety_check(registry, {"cmd": ["sudo", "-nS", "true"]}, "pro")
-    assert "SUDO_INTERACTIVE_BLOCKED" in _run_shell_safety_check(registry, {"cmd": ["sudoedit", "/etc/hosts"]}, "pro")
+    for command in (["sudo", "true"], ["sh", "-c", "sudo true"], ["sudo", "-S", "true"], ["sudo", "-nS", "true"], ["sudoedit", "/etc/hosts"]):
+        result = _run_shell_safety_check(registry, {"cmd": command}, "pro")
+        assert result is not None
+        assert result.code == "LEGACY_BLOCKED"
+        assert "SUDO_INTERACTIVE_BLOCKED" in result.text
     assert _run_shell_safety_check(registry, {"cmd": ["sudo", "-n", "python", "-S", "-c", "print(1)"]}, "pro") is None
-    assert "SAFETY_VIOLATION" in _run_shell_safety_check(registry, {"cmd": ["sh", "-c", "gh\nrepo\ncreate x"]}, "pro")
-    assert "SAFETY_VIOLATION" in _run_shell_safety_check(registry, {"cmd": ["sh", "-c", "gh\nauth\nlogin"]}, "pro")
+    for command in (["sh", "-c", "gh\nrepo\ncreate x"], ["sh", "-c", "gh\nauth\nlogin"]):
+        result = _run_shell_safety_check(registry, {"cmd": command}, "pro")
+        assert result is not None
+        assert result.code == "SAFETY_VIOLATION"
+        assert "SAFETY_VIOLATION" in result.text
     outside_write = {"cmd": ["python", "-c", "open('/tmp/ouroboros-pro.txt','w').write('x')"]}
-    assert "WORKSPACE_SHELL_BLOCKED" in _run_shell_safety_check(registry, outside_write, "advanced")
+    outside_block = _run_shell_safety_check(registry, outside_write, "advanced")
+    assert outside_block is not None
+    assert outside_block.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_SHELL_BLOCKED" in outside_block.text
     assert _run_shell_safety_check(registry, outside_write, "pro") is None
 
 

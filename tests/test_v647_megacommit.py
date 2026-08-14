@@ -674,7 +674,9 @@ def test_verify_and_record_check_is_shell_guarded_against_subagent_secret_read()
     # v6.51.0: normalized via the SSOT (non-login `sh -c`); the guard still inspects the inner command.
     assert mapped["cmd"] == ["sh", "-c", "cat data/settings.json"]
     block = _run_shell_safety_check(reg, mapped, "advanced")
-    assert block and "SECRET" in block.upper()
+    assert block is not None
+    assert block.code == "LEGACY_BLOCKED"
+    assert "SECRET" in block.text.upper()
 
 
 def test_verify_string_check_no_safe_subject_bypass(monkeypatch):

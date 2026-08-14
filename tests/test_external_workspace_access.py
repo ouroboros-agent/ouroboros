@@ -174,14 +174,17 @@ def test_external_shell_read_cannot_reach_runtime_or_secrets(tmp_path):
     reg = ToolRegistry(repo_dir=system, drive_root=data)
     reg.set_context(ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace, workspace_mode="external"))
 
-    # Runtime repo read -> blocked.
-    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["cat", str(system / "BIBLE.md")]}, "advanced") or "")
-    # Data drive read -> blocked.
-    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["cat", str(data / "settings.json")]}, "advanced") or "")
-    # Credential path read -> blocked (secret markers).
-    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["cat", str(pathlib.Path.home() / ".ssh" / "id_rsa")]}, "advanced") or "")
-    # Embedded-string read of a secret -> blocked.
-    assert "WORKSPACE_SHELL_BLOCKED" in (_run_shell_safety_check(reg, {"cmd": ["python", "-c", f"open({str(data / 'settings.json')!r})"]}, "advanced") or "")
+    blocked_commands = (
+        ["cat", str(system / "BIBLE.md")],
+        ["cat", str(data / "settings.json")],
+        ["cat", str(pathlib.Path.home() / ".ssh" / "id_rsa")],
+        ["python", "-c", f"open({str(data / 'settings.json')!r})"],
+    )
+    for command in blocked_commands:
+        result = _run_shell_safety_check(reg, {"cmd": command}, "advanced")
+        assert result is not None
+        assert result.code == "WORKSPACE_BLOCKED"
+        assert "WORKSPACE_SHELL_BLOCKED" in result.text
     # A genuine host-scratch read -> allowed (None).
     scratch = tmp_path / "scratch"
     scratch.mkdir()
@@ -206,7 +209,9 @@ def test_external_shell_write_protects_child_drive(tmp_path):
     # pro mode would otherwise pass an absolute outside-workspace write; the child
     # drive control path must still be blocked.
     out = _run_shell_safety_check(reg, {"cmd": ["touch", str(child / "memory" / "x")]}, "pro")
-    assert "WORKSPACE_SHELL_BLOCKED" in (out or "")
+    assert out is not None
+    assert out.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_SHELL_BLOCKED" in out.text
 
 
 def test_command_mentions_protected_root_is_boundary_aware():
@@ -236,7 +241,9 @@ def test_external_shell_read_blocks_relative_and_symlink_traversal(tmp_path):
 
     # Relative traversal from the workspace cwd into the sibling data drive.
     rel = _run_shell_safety_check(reg, {"cmd": ["cat", "../data/settings.json"], "cwd": str(workspace)}, "advanced")
-    assert "WORKSPACE_SHELL_BLOCKED" in (rel or ""), rel
+    assert rel is not None
+    assert rel.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_SHELL_BLOCKED" in rel.text
 
     # Intra-workspace symlink pointing at the data drive.
     try:
@@ -244,7 +251,9 @@ def test_external_shell_read_blocks_relative_and_symlink_traversal(tmp_path):
     except OSError:
         return  # platform without symlinks
     sym = _run_shell_safety_check(reg, {"cmd": ["cat", "evil/settings.json"], "cwd": str(workspace)}, "advanced")
-    assert "WORKSPACE_SHELL_BLOCKED" in (sym or ""), sym
+    assert sym is not None
+    assert sym.code == "WORKSPACE_BLOCKED"
+    assert "WORKSPACE_SHELL_BLOCKED" in sym.text
     # A legitimate relative read inside the workspace stays allowed.
     (workspace / "ok.txt").write_text("x", encoding="utf-8")
     assert _run_shell_safety_check(reg, {"cmd": ["cat", "ok.txt"], "cwd": str(workspace)}, "advanced") is None
@@ -267,7 +276,11 @@ def test_readonly_git_exemption_does_not_open_a_runtime_write_or_secret_read(tmp
     reg.set_context(ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace, workspace_mode="external"))
 
     def _check(cmd):
-        return _run_shell_safety_check(reg, {"cmd": cmd, "cwd": str(workspace)}, "advanced") or ""
+        result = _run_shell_safety_check(reg, {"cmd": cmd, "cwd": str(workspace)}, "advanced")
+        if result is None:
+            return ""
+        assert result.code == "WORKSPACE_BLOCKED"
+        return result.text
 
     # WRITE via the diff `--output` option — glued, split, and through `-C`.
     assert _check(["git", "log", f"--output={data / 'settings.json'}"])
