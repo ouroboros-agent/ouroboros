@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -14,6 +16,7 @@ from ouroboros.tools.tool_result import (
     ToolResult,
     _compose_execute_result,
 )
+from ouroboros.usage_accounting import UsageAccountingError
 
 
 def _adapt(text: str) -> ToolResult:
@@ -352,6 +355,13 @@ def test_loop_consumer_dispatches_typed_result_once_and_keeps_legacy_fallback(
     assert row["result"] == typed.text
     assert row["is_error"] is True
     assert row["result_meta"]["status"] == "tool_reported_failure"
+    assert row["tool_result"] is typed
+    assert row["result_meta"] == {
+        "status": "tool_reported_failure",
+        "tool_result_status": "ok",
+        "tool_result_code": "LEGACY_UNTYPED",
+        "tool_result_meta": {"dynamic_provider": True},
+    }
 
     messages: list[dict[str, object]] = []
     trace: dict[str, list[dict[str, object]]] = {"tool_calls": []}
@@ -375,4 +385,246 @@ def test_loop_consumer_dispatches_typed_result_once_and_keeps_legacy_fallback(
         "is_error": True,
         "trace_ref": {},
         "status": "tool_reported_failure",
+        "tool_result_status": "ok",
+        "tool_result_code": "LEGACY_UNTYPED",
+        "tool_result_meta": {"dynamic_provider": True},
     }]
+
+
+def test_loop_native_argument_error_preserves_legacy_projection(tmp_path, monkeypatch) -> None:
+    import ouroboros.loop_tool_execution as execution
+
+    calls: list[str] = []
+
+    class FakeRegistry:
+        CODE_TOOLS = frozenset()
+        _ctx = None
+
+        def execute_result(self, _name, _args):
+            calls.append("execute_result")
+            raise AssertionError("invalid arguments must not dispatch")
+
+        def execute(self, _name, _args):
+            calls.append("execute")
+            raise AssertionError("invalid arguments must not dispatch")
+
+    raw_arguments = "{"
+    try:
+        json.loads(raw_arguments)
+    except ValueError as exc:
+        expected = f"⚠️ TOOL_ARG_ERROR: Could not parse arguments for 'read_file': {exc}"
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    monkeypatch.setattr(execution, "persist_call", lambda *_args, **_kwargs: {})
+
+    row = execution._execute_single_tool(
+        FakeRegistry(),
+        {"id": "call-arg", "function": {"name": "read_file", "arguments": raw_arguments}},
+        drive_logs,
+        "task-arg",
+    )
+
+    assert calls == []
+    assert row["result"] == expected
+    assert row["is_error"] is True
+    assert row["tool_result"] == ToolResult(
+        status="error",
+        code="TOOL_ARG_ERROR",
+        text=expected,
+    )
+    assert row["result_meta"] == {
+        "status": "error",
+        "tool_result_status": "error",
+        "tool_result_code": "TOOL_ARG_ERROR",
+        "tool_result_meta": {},
+    }
+
+
+def test_loop_native_executor_error_dispatches_once_and_preserves_text(tmp_path, monkeypatch) -> None:
+    import ouroboros.loop_tool_execution as execution
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeRegistry:
+        CODE_TOOLS = frozenset()
+        _ctx = None
+
+        def execute_result(self, name, args):
+            calls.append((name, args))
+            raise RuntimeError("fixture boom")
+
+        def execute(self, _name, _args):
+            raise AssertionError("the exception path must not dispatch twice")
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    monkeypatch.setattr(execution, "persist_call", lambda *_args, **_kwargs: {})
+    args = {"path": "fixture.txt"}
+
+    row = execution._execute_single_tool(
+        FakeRegistry(),
+        {"id": "call-error", "function": {"name": "read_file", "arguments": json.dumps(args)}},
+        drive_logs,
+        "task-error",
+    )
+
+    expected = "⚠️ TOOL_ERROR (read_file): RuntimeError: fixture boom"
+    assert calls == [("read_file", args)]
+    assert row["result"] == expected
+    assert row["is_error"] is True
+    assert row["tool_result"] == ToolResult(
+        status="error",
+        code="EXECUTOR_ERROR",
+        text=expected,
+    )
+    assert row["result_meta"] == {
+        "status": "error",
+        "tool_result_status": "error",
+        "tool_result_code": "EXECUTOR_ERROR",
+        "tool_result_meta": {},
+    }
+
+
+def test_loop_usage_accounting_error_still_escapes_without_text_conversion(tmp_path) -> None:
+    import ouroboros.loop_tool_execution as execution
+
+    class FakeRegistry:
+        CODE_TOOLS = frozenset()
+        _ctx = None
+
+        def execute_result(self, _name, _args):
+            raise UsageAccountingError("ledger unavailable")
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+
+    with pytest.raises(UsageAccountingError, match="ledger unavailable"):
+        execution._execute_single_tool(
+            FakeRegistry(),
+            {"id": "call-usage", "function": {"name": "read_file", "arguments": "{}"}},
+            drive_logs,
+            "task-usage",
+        )
+
+
+def test_loop_outer_timeout_is_native_and_dispatches_once(tmp_path, monkeypatch) -> None:
+    import ouroboros.loop_tool_execution as execution
+
+    started = threading.Event()
+    release = threading.Event()
+    worker_done = threading.Event()
+    calls: list[tuple[str, object]] = []
+
+    class FakeRegistry:
+        CODE_TOOLS = frozenset()
+        _ctx = None
+
+        def execute_result(self, name, args):
+            calls.append((name, args))
+            started.set()
+            release.wait(timeout=5)
+            return ToolResult(status="ok", code="OK", text="late result")
+
+        def execute(self, _name, _args):
+            raise AssertionError("the timeout path must not dispatch twice")
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    monkeypatch.setattr(execution, "persist_call", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(execution, "_append_tool_log", lambda *_args, **_kwargs: worker_done.set())
+    args = {"path": "fixture.txt"}
+
+    try:
+        row = execution._execute_with_timeout(
+            FakeRegistry(),
+            {"id": "call-timeout", "function": {"name": "read_file", "arguments": json.dumps(args)}},
+            drive_logs,
+            1,
+            "task-timeout",
+        )
+    finally:
+        release.set()
+
+    assert started.is_set()
+    assert worker_done.wait(timeout=2)
+    expected = (
+        "⚠️ TOOL_TIMEOUT (read_file): exceeded 1s limit. "
+        "The tool is still running in background but control is returned to you. "
+        "Try a different approach or inform the user about the issue."
+    )
+    assert calls == [("read_file", args)]
+    assert row["result"] == expected
+    assert row["is_error"] is True
+    assert row["tool_result"] == ToolResult(
+        status="timeout",
+        code="TOOL_TIMEOUT",
+        text=expected,
+        meta={"timeout_sec": 1},
+    )
+    assert row["result_meta"] == {
+        "status": "timeout",
+        "tool_result_status": "timeout",
+        "tool_result_code": "TOOL_TIMEOUT",
+        "tool_result_meta": {"timeout_sec": 1},
+    }
+
+
+def test_loop_parallel_executor_crash_preserves_input_order_and_typed_trace(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import ouroboros.loop_tool_execution as execution
+
+    calls: list[str] = []
+
+    class FakeRegistry:
+        CODE_TOOLS = frozenset()
+        _ctx = None
+
+        @staticmethod
+        def get_timeout(_name):
+            return 1
+
+    def crash(_tools, tc, _drive_logs, _timeout_sec, _task_id, _stateful_executor):
+        call_id = tc["id"]
+        calls.append(call_id)
+        raise RuntimeError(f"boom-{call_id}")
+
+    monkeypatch.setattr(execution, "load_settings", lambda: {})
+    monkeypatch.setattr(execution, "_execute_with_timeout", crash)
+    tool_calls = [
+        {"id": "call-first", "function": {"name": "read_file", "arguments": "{}"}},
+        {"id": "call-second", "function": {"name": "list_files", "arguments": "{}"}},
+    ]
+    messages: list[dict[str, object]] = []
+    trace: dict[str, list[dict[str, object]]] = {"tool_calls": []}
+
+    errors = execution.handle_tool_calls(
+        tool_calls,
+        FakeRegistry(),
+        tmp_path,
+        "task-parallel",
+        object(),
+        messages,
+        trace,
+        lambda _text: None,
+    )
+
+    assert sorted(calls) == ["call-first", "call-second"]
+    assert errors == 2
+    assert [message["tool_call_id"] for message in messages] == ["call-first", "call-second"]
+    assert [row["tool"] for row in trace["tool_calls"]] == ["read_file", "list_files"]
+    for call_id, row in zip(("call-first", "call-second"), trace["tool_calls"]):
+        expected = f"⚠️ TOOL_ERROR: Unexpected error: boom-{call_id}"
+        assert row == {
+            "tool": "read_file" if call_id == "call-first" else "list_files",
+            "args": {},
+            "result": expected,
+            "is_error": True,
+            "trace_ref": None,
+            "status": "error",
+            "tool_result_status": "error",
+            "tool_result_code": "EXECUTOR_ERROR",
+            "tool_result_meta": {},
+        }

@@ -29,6 +29,7 @@ from ouroboros.tool_capabilities import (
 )
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.tools.review_synthesis import PLAN_REVIEW_CONTROL_PREFIX
+from ouroboros.tools.tool_result import ToolResult
 from ouroboros.usage_accounting import UsageAccountingError
 from ouroboros.utils import (
     append_jsonl,
@@ -517,6 +518,15 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
     return meta
 
 
+def _tool_result_fields(result: ToolResult) -> Dict[str, Any]:
+    """Return the JSON-safe typed projection without shadowing legacy fields."""
+    return {
+        "tool_result_status": result.status,
+        "tool_result_code": result.code,
+        "tool_result_meta": dict(result.meta),
+    }
+
+
 def _execute_single_tool(
     tools: ToolRegistry,
     tc: Dict[str, Any],
@@ -538,6 +548,11 @@ def _execute_single_tool(
         args = json.loads(tc["function"]["arguments"] or "{}")
     except (json.JSONDecodeError, ValueError) as e:
         result = f"⚠️ TOOL_ARG_ERROR: Could not parse arguments for '{requested_fn_name}': {e}"
+        tool_result = ToolResult(status="error", code="TOOL_ARG_ERROR", text=result)
+        result_meta = {
+            **_extract_result_metadata(fn_name, result, True),
+            **_tool_result_fields(tool_result),
+        }
         trace_ref = {}
         try:
             trace_ref = persist_call(
@@ -553,6 +568,7 @@ def _execute_single_tool(
                     "round_id": correlation.get("round_id"),
                     "raw_arguments": tc.get("function", {}).get("arguments"),
                     "result": result,
+                    "result_meta": result_meta,
                 },
                 manifest={
                     "execution_id": correlation.get("execution_id"),
@@ -574,7 +590,8 @@ def _execute_single_tool(
             "args_for_log": {},
             "is_code_tool": is_code_tool,
             "trace_ref": trace_ref,
-            "result_meta": _extract_result_metadata(fn_name, result, True),
+            "result_meta": result_meta,
+            "tool_result": tool_result,
         }
 
     args_for_log = sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {})
@@ -589,6 +606,7 @@ def _execute_single_tool(
         tool_ok = False
         safe_error = sanitize_tool_result_for_log(f"{type(e).__name__}: {e}")
         result = f"⚠️ TOOL_ERROR ({fn_name}): {safe_error}"
+        tool_result = ToolResult(status="error", code="EXECUTOR_ERROR", text=result)
         append_jsonl(drive_logs / "events.jsonl", _with_correlation({
             "ts": utc_now_iso(), "type": "tool_error", "task_id": task_id,
             "tool": fn_name, "args": args_for_log, "error": safe_error,
@@ -597,7 +615,10 @@ def _execute_single_tool(
     # Producer metadata is incomplete; keep the text classifiers authoritative
     # until extension, shell, artifact, and plan-control producers are typed.
     is_error = _is_tool_execution_failure(tool_ok, result)
-    result_meta = _extract_result_metadata(fn_name, result, is_error)
+    result_meta = {
+        **_extract_result_metadata(fn_name, result, is_error),
+        **_tool_result_fields(tool_result),
+    }
 
     trace_ref = {}
     try:
@@ -651,6 +672,7 @@ def _execute_single_tool(
         "is_code_tool": is_code_tool,
         "trace_ref": trace_ref,
         "result_meta": result_meta,
+        "tool_result": tool_result,
     }
 
 
@@ -705,6 +727,16 @@ def _make_timeout_result(
         f"The tool is still running in background but control is returned to you. "
         f"{reset_msg}Try a different approach or inform the user{' about the issue' if not reset_msg else ''}."
     )
+    tool_result = ToolResult(
+        status="timeout",
+        code="TOOL_TIMEOUT",
+        text=result,
+        meta={"timeout_sec": timeout_sec},
+    )
+    result_meta = {
+        **_extract_result_metadata(fn_name, result, True),
+        **_tool_result_fields(tool_result),
+    }
     trace_ref = {}
     corr = dict(correlation or {})
     try:
@@ -723,6 +755,7 @@ def _make_timeout_result(
                 "args": raw_args,
                 "args_redacted_preview": args_for_log,
                 "result": result,
+                "result_meta": result_meta,
             },
             manifest={
                 "execution_id": corr.get("execution_id"),
@@ -759,7 +792,8 @@ def _make_timeout_result(
         "args_for_log": args_for_log,
         "is_code_tool": is_code_tool,
         "trace_ref": trace_ref,
-        "result_meta": _extract_result_metadata(fn_name, result, True),
+        "result_meta": result_meta,
+        "tool_result": tool_result,
     }
 
 
@@ -1054,19 +1088,25 @@ def handle_tool_calls(
                     requested_fn_name = tc.get("function", {}).get("name", "unknown")
                     fn_name = str(requested_fn_name or "").strip()
                     safe_error = sanitize_tool_result_for_log(str(exc))
+                    result_text = f"⚠️ TOOL_ERROR: Unexpected error: {safe_error}"
+                    tool_result = ToolResult(
+                        status="error",
+                        code="EXECUTOR_ERROR",
+                        text=result_text,
+                    )
                     results[idx] = {
                         "tool_call_id": tc.get("id", ""),
                         "fn_name": fn_name,
-                        "result": f"⚠️ TOOL_ERROR: Unexpected error: {safe_error}",
+                        "result": result_text,
                         "is_error": True,
                         "tool_args": {},
                         "args_for_log": {},
                         "is_code_tool": fn_name in tools.CODE_TOOLS,
-                        "result_meta": _extract_result_metadata(
-                            fn_name,
-                            f"⚠️ TOOL_ERROR: Unexpected error: {safe_error}",
-                            True,
-                        ),
+                        "result_meta": {
+                            **_extract_result_metadata(fn_name, result_text, True),
+                            **_tool_result_fields(tool_result),
+                        },
+                        "tool_result": tool_result,
                     }
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
