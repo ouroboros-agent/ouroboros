@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 36
+    assert len(rows) == 41
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -317,6 +317,16 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             "ouroboros/tools/tool_result.py::_compose_execute_result",
         "ouroboros/tools/registry.py::_EPHEMERAL_ALLOWED_TOOLS":
             "ouroboros/tools/registry_guards.py::_EPHEMERAL_ALLOWED_TOOLS",
+        "ouroboros/tools/registry.py::_WEB_TOOLS":
+            "ouroboros/tools/registry_guards.py::_WEB_TOOLS",
+        "ouroboros/tools/registry.py::_resource_allowed":
+            "ouroboros/tools/registry_guards.py::_resource_allowed",
+        "ouroboros/tools/registry.py::_disabled_tools":
+            "ouroboros/tools/registry_guards.py::_disabled_tools",
+        "ouroboros/tools/registry.py::_GITHUB_TOKEN_TOOLS":
+            "ouroboros/tools/registry_guards.py::_GITHUB_TOKEN_TOOLS",
+        "ouroboros/tools/registry.py::_builtin_tool_availability":
+            "ouroboros/tools/registry_guards.py::_builtin_tool_availability",
         "ouroboros/tools/registry.py::ToolRegistry._ephemeral_block":
             "ouroboros/tools/registry_guards.py::_ephemeral_block_result",
         "ouroboros/tools/registry.py::ToolRegistry._subagent_and_update_gate":
@@ -461,7 +471,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 8
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 13
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 
