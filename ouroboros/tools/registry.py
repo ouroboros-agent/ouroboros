@@ -1894,8 +1894,8 @@ class ToolRegistry:
 
         return dispatch_extension_tool(self._ctx, name, ext_tool, args)
 
-    def _dispatch_mcp_tool(self, name: str, args: Dict[str, Any]) -> str:
-        """Run a provider-safe MCP tool after the normal safety supervisor."""
+    def _dispatch_mcp_tool(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
+        """Run one MCP tool while preserving provider-owned result facts."""
         from ouroboros.safety import check_safety as _mcp_check_safety
         is_safe, safety_msg = _mcp_check_safety(
             name,
@@ -1906,11 +1906,19 @@ class ToolRegistry:
         if not is_safe:
             return safety_msg
         try:
-            from ouroboros.mcp_client import call_mcp_tool as _mcp_call
+            from ouroboros.mcp_client import _call_mcp_tool_result as _mcp_call
+
             result = _mcp_call(name, args or {})
         except Exception as exc:
-            return f"⚠️ TOOL_ERROR ({name}): {exc}"
-        return f"{safety_msg}\n\n---\n{result}" if safety_msg else result
+            text = f"⚠️ TOOL_ERROR ({name}): {exc}"
+            return ToolResult(status="error", code="TOOL_ERROR", text=text)
+        if not safety_msg:
+            return result
+        text = _compose_execute_result(result.text, "", safety_msg)
+        meta = {**dict(result.meta), "safety_warning": True}
+        if result.code == "OK":
+            return ToolResult(status="ok", code="SAFETY_WARNING", text=text, meta=meta)
+        return ToolResult(status=result.status, code=result.code, text=text, meta=meta)
 
     def _protected_shell_block(
         self, raw_cmd, cmd_path_lower, binding, acting_self_worktree,
@@ -3032,7 +3040,7 @@ class ToolRegistry:
             if worktree_before is not None:
                 self._invalidate_advisory_if_worktree_changed(name, worktree_before)
 
-    def _execute_legacy_text(self, name: str, args: Dict[str, Any]) -> str:
+    def _execute_legacy_text(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
         name = str(name or "").strip()
         args = dict(args or {})
         _route_note = ""
@@ -3332,11 +3340,11 @@ class ToolRegistry:
         return _compose_execute_result(result, _route_note, safety_msg)
 
     def execute_result(self, name: str, args: Dict[str, Any]) -> ToolResult:
-        """Execute through the legacy dispatcher and add typed internal facts."""
-        return LegacyTextResultAdapter.from_text(
-            name,
-            self._execute_legacy_text(name, args),
-        )
+        """Dispatch once and adapt only producers that still return legacy text."""
+        result = self._execute_legacy_text(name, args)
+        if isinstance(result, ToolResult):
+            return result
+        return LegacyTextResultAdapter.from_text(name, result)
 
     def execute(self, name: str, args: Dict[str, Any]) -> str:
         """Compatibility ABI: return the exact model-facing text projection."""

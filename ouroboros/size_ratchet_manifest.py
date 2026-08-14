@@ -218,6 +218,7 @@ BAND_PATHS = {
     "ouroboros/launcher_bootstrap.py": None,
     "ouroboros/loop_llm_call.py": None,
     "ouroboros/loop_tool_execution.py": None,
+    "ouroboros/mcp_client.py": "native MCP ToolResult producer with exact public string compatibility",
     "ouroboros/outcomes.py": None,
     "ouroboros/platform_layer.py": None,
     "ouroboros/preflight_runner.py": None,

@@ -25,8 +25,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from ouroboros.secret_masking import (
     looks_masked_secret as looks_masked_secret,
+)
+from ouroboros.secret_masking import (
     mask_prefixed_secret,
 )
+from ouroboros.tools.tool_result import ToolResult
 
 log = logging.getLogger(__name__)
 
@@ -453,13 +456,13 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
 
 async def _call_tool_async(
     cfg: MCPServerConfig, tool_name: str, arguments: Dict[str, Any], *, timeout_sec: int
-) -> str:
-    """Open a fresh session, call one tool, and return a stringified result."""
+) -> ToolResult:
+    """Open a fresh session and preserve the SDK-owned error bit."""
     if not _MCP_SDK_AVAILABLE:
         raise RuntimeError(
             "MCP client SDK not installed. Add `mcp>=1.6` to the runtime."
         )
-    async def _do() -> str:
+    async def _do() -> ToolResult:
         async with _transport_factory(cfg) as transport_ctx:
             streams = transport_ctx
             if isinstance(streams, tuple):
@@ -469,7 +472,7 @@ async def _call_tool_async(
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments)
-                return _stringify_call_result(result)
+                return _tool_result_from_call_result(result)
 
     return await asyncio.wait_for(_do(), timeout=timeout_sec)
 
@@ -497,6 +500,20 @@ def _stringify_call_result(result: Any) -> str:
     if is_error:
         return f"⚠️ MCP_TOOL_ERROR: {body}"
     return body
+
+
+def _tool_result_from_call_result(result: Any) -> ToolResult:
+    """Preserve the SDK error bit without trusting result-body markers."""
+    is_error = bool(
+        getattr(result, "isError", False)
+        or getattr(result, "is_error", False)
+    )
+    return ToolResult(
+        status="error" if is_error else "ok",
+        code="MCP_ERROR" if is_error else "OK",
+        text=_stringify_call_result(result),
+        meta={"mcp_is_error": is_error},
+    )
 
 
 def _serialize_content_part(item: Any) -> Dict[str, Any]:
@@ -558,7 +575,7 @@ class MCPManager:
             lambda cfg, timeout: _list_tools_async(cfg, timeout_sec=timeout)
         )
         self._async_call_tool: Callable[
-            [MCPServerConfig, str, Dict[str, Any], int], Awaitable[str]
+            [MCPServerConfig, str, Dict[str, Any], int], Awaitable[ToolResult]
         ] = (
             lambda cfg, name, args, timeout: _call_tool_async(
                 cfg, name, args, timeout_sec=timeout
@@ -890,10 +907,13 @@ class MCPManager:
             ],
         }
 
-    def call_tool(self, prefixed_name: str, arguments: Dict[str, Any]) -> str:
-        """Synchronously invoke an MCP tool and return a model-facing string."""
+    def _call_tool_result(
+        self, prefixed_name: str, arguments: Dict[str, Any]
+    ) -> ToolResult:
+        """Invoke one MCP tool while retaining host-attested provider facts."""
         if not self.is_enabled():
-            return "⚠️ MCP_DISABLED: enable MCP in Settings → Advanced to use this tool."
+            text = "⚠️ MCP_DISABLED: enable MCP in Settings → Advanced to use this tool."
+            return ToolResult(status="unavailable", code="MCP_UNAVAILABLE", text=text)
         with self._lock:
             tool_descriptor = None
             for runtime in self._servers.values():
@@ -904,32 +924,57 @@ class MCPManager:
                 for tool in runtime.tools:
                     if tool.prefixed_name == prefixed_name:
                         if allowed and tool.raw_name not in allowed:
-                            return (
+                            text = (
                                 f"⚠️ MCP_TOOL_DISALLOWED: {tool.raw_name!r} is not on the "
                                 f"allowed_tools list for server {cfg.id!r}."
                             )
+                            return ToolResult(status="blocked", code="ACCESS_BLOCKED", text=text)
                         tool_descriptor = (cfg, tool)
                         break
                 if tool_descriptor:
                     break
             if not tool_descriptor:
-                return (
+                text = (
                     f"⚠️ MCP_TOOL_NOT_FOUND: {prefixed_name!r}. Refresh the server in "
                     "Settings → Advanced or check the allowed_tools allowlist."
                 )
+                return ToolResult(status="unavailable", code="MCP_UNAVAILABLE", text=text)
             cfg, tool = tool_descriptor
             timeout = self._tool_timeout_sec
         try:
-            text = _run_async(
+            result = _run_async(
                 lambda: self._async_call_tool(cfg, tool.raw_name, arguments or {}, timeout),
                 join_timeout=timeout + 3,
             )
+            if not isinstance(result, ToolResult):
+                raise TypeError("MCP transport returned a non-ToolResult outcome")
         except asyncio.TimeoutError:
-            return f"⚠️ MCP_TOOL_TIMEOUT: server {cfg.id!r} did not respond in {timeout}s"
+            text = f"⚠️ MCP_TOOL_TIMEOUT: server {cfg.id!r} did not respond in {timeout}s"
+            return ToolResult(status="timeout", code="MCP_TIMEOUT", text=text)
         except BaseException as exc:  # noqa: BLE001 - any failure is reported
             body = f"⚠️ MCP_TOOL_ERROR: {type(exc).__name__}: {_redact_error_text(exc, cfg)}"
-            return _model_facing_result(cfg, tool.raw_name, body)
-        return _model_facing_result(cfg, tool.raw_name, _redact_error_text(text, cfg))
+            text = _model_facing_result(cfg, tool.raw_name, body)
+            return ToolResult(
+                status="error",
+                code="MCP_ERROR",
+                text=text,
+                meta={"dynamic_provider": True},
+            )
+        text = _model_facing_result(
+            cfg,
+            tool.raw_name,
+            _redact_error_text(result.text, cfg),
+        )
+        return ToolResult(
+            status=result.status,
+            code=result.code,
+            text=text,
+            meta={**dict(result.meta), "dynamic_provider": True},
+        )
+
+    def call_tool(self, prefixed_name: str, arguments: Dict[str, Any]) -> str:
+        """Synchronously invoke an MCP tool and return its text projection."""
+        return self._call_tool_result(prefixed_name, arguments).text
 
 
 def _normalize_input_schema(value: Any) -> Dict[str, Any]:
@@ -993,3 +1038,8 @@ def refresh_all_background(*, reason: str = "settings") -> None:
 def call_mcp_tool(name: str, arguments: Dict[str, Any]) -> str:
     """ToolRegistry sync call helper."""
     return get_manager().call_tool(name, arguments or {})
+
+
+def _call_mcp_tool_result(name: str, arguments: Dict[str, Any]) -> ToolResult:
+    """Internal typed ToolRegistry call helper."""
+    return get_manager()._call_tool_result(name, arguments or {})

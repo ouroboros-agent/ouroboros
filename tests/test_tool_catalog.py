@@ -20,6 +20,7 @@ from ouroboros.tools.tool_catalog import (
     ToolCatalog,
     ToolEntry,
 )
+from ouroboros.tools.tool_result import ToolResult
 from tests.test_extension_loader import _prepare_extension
 
 
@@ -299,7 +300,12 @@ def test_mcp_collision_keeps_catalog_schema_and_timeout(
 
     async def call_tool(cfg, name, arguments, timeout):
         calls.append((cfg.id, name, arguments, timeout))
-        return "dynamic"
+        return ToolResult(
+            status="ok",
+            code="OK",
+            text="dynamic",
+            meta={"mcp_is_error": False},
+        )
 
     manager._async_list_tools = list_tools
     manager._async_call_tool = call_tool
