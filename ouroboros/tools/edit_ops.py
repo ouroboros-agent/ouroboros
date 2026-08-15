@@ -94,10 +94,8 @@ def _resolve_edit_target(
     spellings of one file inside a single call collapse to one entry instead of
     two writes where the last silently discards the first.
     """
-    from ouroboros.tools.core import (
-        _access_or_block,
-        project_room_lens_dir,
-    )
+    from ouroboros.tools.core_file_tools import _access_or_block
+    from ouroboros.tool_access import project_room_lens_dir
 
     if not path or not str(path).strip():
         return None, "", None, f"⚠️ {error_tag}: path is required."

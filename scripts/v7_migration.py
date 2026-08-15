@@ -72,6 +72,7 @@ UPSTREAM_STATUSES = frozenset({"not_applicable", "pending", "transferred", "reti
 APPROVED_PENDING_OWNERS = frozenset({
     "ouroboros/tools/tool_context.py", "ouroboros/tools/tool_catalog.py", "ouroboros/tools/tool_result.py",
     "ouroboros/tools/tool_resolution.py", "ouroboros/tools/registry_core.py", "ouroboros/tools/registry_guards.py", "ouroboros/tools/registry_guard_process.py", "ouroboros/tools/extension_dispatch.py",
+    "ouroboros/tools/core_artifacts.py", "ouroboros/tools/core_file_tools.py",
 })
 _PY_LOCAL_KINDS = frozenset({"class", "function", "assignment"})
 def _git(repo: pathlib.Path, *args: str, text: bool = True) -> str | bytes:

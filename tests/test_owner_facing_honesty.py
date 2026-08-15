@@ -154,7 +154,7 @@ def _ctx(tmp_path):
 
 
 def test_access_error_names_profile_visible_roots(tmp_path):
-    from ouroboros.tools.core import _access_or_block
+    from ouroboros.tools.core_file_tools import _access_or_block
 
     normalized, error = _access_or_block(_ctx(tmp_path), "definitely_not_a_root", "read")
     assert "TOOL_ARG_ERROR" in error
@@ -482,7 +482,7 @@ def test_tool_trace_arg_width_is_200():
 
 
 def test_not_found_error_self_locates_without_ancestor_hint(tmp_path):
-    from ouroboros.tools import core as tools_core
+    from ouroboros.tools import core_file_tools as tools_core
 
     ctx = _ctx(tmp_path)
     out = tools_core._read_file(ctx, path="definitely/missing/file.py", root="system_repo")
@@ -493,7 +493,7 @@ def test_not_found_error_self_locates_without_ancestor_hint(tmp_path):
 
 
 def test_access_blocked_message_has_single_period(tmp_path):
-    from ouroboros.tools.core import _access_or_block
+    from ouroboros.tools.core_file_tools import _access_or_block
 
     _, error = _access_or_block(_ctx(tmp_path), "deliverables", "write")
     assert "TOOL_ACCESS_BLOCKED" in error

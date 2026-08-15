@@ -39,7 +39,7 @@ from ouroboros.headless import (
     write_workspace_patch_artifacts,
 )
 from ouroboros.task_results import write_task_result
-from ouroboros.tools.core import _repo_read
+from ouroboros.tools import core_file_tools
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.tools.registry_guard_process import _run_shell_safety_check
 from ouroboros.utils import utc_now_iso
@@ -812,7 +812,7 @@ def test_workspace_context_routes_project_files_and_keeps_system_tools_reachable
         workspace_mode="external",
     )
 
-    assert "workspace" in _repo_read(ctx, "README.md")
+    assert "workspace" in core_file_tools._repo_read(ctx, "README.md")
     registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
     registry.set_context(ctx)
     commit_result = registry.execute("commit_reviewed", {"commit_message": "nope"})

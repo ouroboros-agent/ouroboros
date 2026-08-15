@@ -297,11 +297,10 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
     with pytest.raises(RuntimeError, match="updater import literals drifted"):
         v7_evidence.generate_fixture(REPO)
 
-
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 197
+    assert len(rows) == 259
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -579,16 +578,17 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         for owner, symbols in dependency_symbols_by_owner.items()
         for symbol in symbols.split()
     }
+    core_extraction_rows = {f"ouroboros/tools/core.py::{symbol}": f"ouroboros/tools/{'core_artifacts.py' if symbol in '_MAX_PHOTO_FILE_BYTES _detect_image_mime _send_photo _MAX_VIDEO_FILE_BYTES _detect_video_mime _send_video _MAX_DOCUMENT_FILE_BYTES _detect_document_mime _send_file'.split() else 'core_file_tools.py'}::{symbol}" for symbol in "_SKILL_OWNER_STATE_FILENAMES _direct_resource_binding _render_line_slice _coerce_start_char _coerce_line_window _is_cognitive_data_path _is_skill_owner_state_target _ListingFailure _list_dir _list_user_files_dir _SUBAGENT_SECRET_FILE_NAMES is_restricted_subagent_profile _is_subagent_secret_data_path _is_subagent_secret_repo_path _is_subagent_secret_repo_target _filter_subagent_secret_repo_listing _filter_subagent_secret_listing _MEMORY_AT_DRIVE_MEMORY _repo_read _repo_list _normalize_data_read_path _data_read _data_list _profile_roots_hint _access_or_block _local_readonly_resource_block _root_display_path _annotate_reread _read_file _list_files _MAX_PHOTO_FILE_BYTES _detect_image_mime _send_photo _MAX_VIDEO_FILE_BYTES _detect_video_mime _send_video _MAX_DOCUMENT_FILE_BYTES _detect_document_mime _send_file".split()} | {"ouroboros/tools/core.py::_code_search": "ouroboros/tools/core.py::_code_search"} | {"ouroboros/tools/core.py::_filter_out_project_store": "ouroboros/project_facts.py::filter_out_project_store", "ouroboros/tools/core.py::_policy_is_skill_owner_state_target": "ouroboros/contracts/skill_payload_policy.py::is_skill_owner_state_target", "ouroboros/tools/core.py::active_repo_dir_for": "ouroboros/tools/tool_resolution.py::active_repo_dir_for", "ouroboros/tools/core.py::active_tool_profile": "ouroboros/tool_access.py::active_tool_profile", "ouroboros/tools/core.py::build_resolved_resource_binding": "ouroboros/tool_access.py::build_resolved_resource_binding", "ouroboros/tools/core.py::decide_tool_access": "ouroboros/tool_access.py::decide_tool_access", "ouroboros/tools/core.py::normalize_root": "ouroboros/tool_access.py::normalize_root", "ouroboros/tools/core.py::normalize_runtime_data_path": "ouroboros/tool_access.py::normalize_runtime_data_path", "ouroboros/tools/core.py::read_text": "ouroboros/utils.py::read_text", "ouroboros/tools/core.py::SKILL_OWNER_STATE_FILENAMES": "ouroboros/contracts/skill_payload_policy.py::SKILL_OWNER_STATE_FILENAMES", "ouroboros/tools/browser.py::_readonly_subagent": "ouroboros/tools/core_file_tools.py::is_restricted_subagent_profile", "tests/test_filesystem_root_observability.py::_read_file": "ouroboros/tools/core_file_tools.py::_read_file", "tests/test_headless_cli.py::_repo_read": "ouroboros/tools/core_file_tools.py::_repo_read", "tests/test_send_file.py::_MAX_DOCUMENT_FILE_BYTES": "ouroboros/tools/core_artifacts.py::_MAX_DOCUMENT_FILE_BYTES", "tests/test_send_file.py::_detect_document_mime": "ouroboros/tools/core_artifacts.py::_detect_document_mime", "tests/test_send_file.py::_send_file": "ouroboros/tools/core_artifacts.py::_send_file", "tests/test_send_photo.py::_MAX_PHOTO_FILE_BYTES": "ouroboros/tools/core_artifacts.py::_MAX_PHOTO_FILE_BYTES", "tests/test_send_photo.py::_detect_image_mime": "ouroboros/tools/core_artifacts.py::_detect_image_mime", "tests/test_send_photo.py::_send_photo": "ouroboros/tools/core_artifacts.py::_send_photo", "tests/test_send_video.py::_MAX_VIDEO_FILE_BYTES": "ouroboros/tools/core_artifacts.py::_MAX_VIDEO_FILE_BYTES", "tests/test_send_video.py::_detect_video_mime": "ouroboros/tools/core_artifacts.py::_detect_video_mime", "tests/test_send_video.py::_send_video": "ouroboros/tools/core_artifacts.py::_send_video"}
     implemented.update(registry_core_rows)
     implemented.update(registry_resolution_rows)
     implemented.update(registry_guard_rows)
     implemented.update(registry_dispatch_method_rows)
-    implemented.update(registry_dependency_owners)
+    implemented.update(registry_dependency_owners | core_extraction_rows)
     registry_extraction_no_facade_rows = (
         set(registry_core_rows) - {"ouroboros/tools/registry.py::ToolRegistry"}
     ) | set(registry_resolution_rows) | set(registry_guard_rows) | set(
         registry_dispatch_method_rows
-    ) | set(registry_dependency_owners)
+    ) | set(registry_dependency_owners) | set(core_extraction_rows)
     retired_current = {
         "ouroboros/tools/registry.py::_HEAL_PROTECTED_PAYLOAD_FILENAMES":
             "retired:unused payload-control alias removed with registry core extraction",
@@ -633,7 +633,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         "ouroboros/tools/registry.py::resolve_skill_payload_target",
     }
     implemented.update({name: name for name in ("ouroboros/loop_tool_execution.py::_FAILURE_PREFIXES", "ouroboros/loop_tool_execution.py::_extract_result_metadata", "ouroboros/_outcome_tool_errors.py::_BLOCKING_TOOL_STATUSES", "ouroboros/reflection.py::_ERROR_MARKERS")})
-    existing_process_owner_rows.update({"ouroboros/loop_tool_execution.py::_FAILURE_PREFIXES", "ouroboros/loop_tool_execution.py::_extract_result_metadata", "ouroboros/_outcome_tool_errors.py::_BLOCKING_TOOL_STATUSES", "ouroboros/reflection.py::_ERROR_MARKERS"})
+    existing_process_owner_rows.update({"ouroboros/tools/core.py::_code_search", 'ouroboros/tools/core.py::_filter_out_project_store', 'ouroboros/tools/core.py::_policy_is_skill_owner_state_target', 'ouroboros/tools/core.py::active_repo_dir_for', 'ouroboros/tools/core.py::active_tool_profile', 'ouroboros/tools/core.py::build_resolved_resource_binding', 'ouroboros/tools/core.py::decide_tool_access', 'ouroboros/tools/core.py::normalize_root', 'ouroboros/tools/core.py::normalize_runtime_data_path', 'ouroboros/tools/core.py::read_text', 'ouroboros/tools/core.py::SKILL_OWNER_STATE_FILENAMES', "ouroboros/loop_tool_execution.py::_FAILURE_PREFIXES", "ouroboros/loop_tool_execution.py::_extract_result_metadata", "ouroboros/_outcome_tool_errors.py::_BLOCKING_TOOL_STATUSES", "ouroboros/reflection.py::_ERROR_MARKERS"})
     registry_extraction_no_facade_rows.update({"ouroboros/loop_tool_execution.py::_FAILURE_PREFIXES", "ouroboros/loop_tool_execution.py::_extract_result_metadata", "ouroboros/_outcome_tool_errors.py::_BLOCKING_TOOL_STATUSES", "ouroboros/reflection.py::_ERROR_MARKERS"})
     inherited_managed = {
         "docs/assets/home-ZhS5_vhA.js": (
@@ -867,7 +867,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 167
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 229
     assert sum(row["old path/symbol"] in retired_current for row in rows) == 5
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})

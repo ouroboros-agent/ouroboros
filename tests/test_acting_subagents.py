@@ -1190,7 +1190,7 @@ def test_no_workspace_acting_integrate_blocked(tmp_path):
 
 def test_acting_subagent_cannot_read_secrets(tmp_path):
     # Acting children may write their surface but must NOT read owner secrets.
-    from ouroboros.tools.core import _data_read
+    from ouroboros.tools.core_file_tools import _data_read
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
     (drive / "settings.json").write_text('{"OPENAI_API_KEY": "sk-secret-xyz"}', encoding="utf-8")
@@ -1204,7 +1204,7 @@ def test_acting_subagent_cannot_read_secrets(tmp_path):
 
 def test_acting_subagent_keeps_workspace_access(tmp_path):
     # The strict-readonly resource block must NOT restrict acting children's worktree.
-    from ouroboros.tools.core import _local_readonly_resource_block
+    from ouroboros.tools.core_file_tools import _local_readonly_resource_block
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
     ctx = ToolContext(

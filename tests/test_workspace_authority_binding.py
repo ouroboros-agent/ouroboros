@@ -438,7 +438,7 @@ def test_target_sensitive_override_without_private_keyword_fails_loudly(tmp_path
 
 
 def test_direct_handler_fallback_builds_once(tmp_path, monkeypatch):
-    import ouroboros.tools.core as core
+    import ouroboros.tools.core_file_tools as core
 
     repo = tmp_path / "repo"
     data = tmp_path / "data"

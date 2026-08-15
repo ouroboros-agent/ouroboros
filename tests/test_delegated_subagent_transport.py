@@ -22,6 +22,7 @@ from ouroboros.tool_capabilities import (
     ACTING_SUBAGENT_TOOL_NAMES,
     LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
 )
+from ouroboros.tools.core_file_tools import _read_file
 
 NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer"}
 
@@ -3807,7 +3808,6 @@ def test_a_large_delegated_result_is_delivered_whole_or_declared_partial(tmp_pat
     # file — and it works for the READ-ONLY nanny, which is the common caller and the
     # one whose access policy could have made the whole contract unreachable.
     from ouroboros.tool_access import LOCAL_READONLY_SUBAGENT_MODE
-    from ouroboros.tools.core import _read_file
     from ouroboros.contracts.task_constraint import TaskConstraint
 
     ctx.task_constraint = TaskConstraint(mode=LOCAL_READONLY_SUBAGENT_MODE)
@@ -3823,7 +3823,6 @@ def _read_artifact_whole(ctx, artifact, step=7):
     the start_char sub-line cursor for any line longer than the delivery budget (a cut
     window only credits the delivered prefix)."""
     from ouroboros.tool_capabilities import tool_result_limit
-    from ouroboros.tools.core import _read_file
 
     stride = tool_result_limit("read_file") - 5_000
     lines = pathlib.Path(artifact["abs_path"]).read_text(encoding="utf-8").splitlines(keepends=True)
@@ -3852,7 +3851,6 @@ def test_the_coverage_ack_binds_to_what_delivery_actually_hands_the_model(
     from ouroboros.gateways import claudexor as gw
     from ouroboros.loop_tool_execution import _truncate_tool_result
     from ouroboros.tool_capabilities import tool_result_limit
-    from ouroboros.tools.core import _read_file
 
     budget = tool_result_limit("read_file")
 
@@ -3935,7 +3933,6 @@ def test_reading_the_staged_artifact_whole_writes_the_canonical_acknowledgement(
     import ouroboros.delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
-    from ouroboros.tools.core import _read_file
 
     class _Stub(_LiveRunStub):
         def get_run(self, rid, **_kw):
@@ -4193,7 +4190,6 @@ def test_a_line_the_delivery_layer_cut_is_not_covered(tmp_path, monkeypatch):
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
     from ouroboros.tool_capabilities import UNTRUNCATED_TOOL_RESULTS, tool_result_limit
-    from ouroboros.tools.core import _read_file
 
     # The premise the whole test rests on: these reads ARE outer-truncated.
     assert "read_file" not in UNTRUNCATED_TOOL_RESULTS

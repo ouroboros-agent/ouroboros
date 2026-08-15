@@ -37,7 +37,7 @@ def test_resolve_payload_path_legacy_wrapper_matches_policy(tmp_path):
 def test_owner_state_policy_matches_legacy_wrappers(tmp_path, monkeypatch):
     from ouroboros import config as cfg
     from ouroboros.gateway import files as gateway_files
-    from ouroboros.tools import core
+    from ouroboros.tools import core_file_tools as core
 
     data_root = tmp_path / "data"
     monkeypatch.setattr(cfg, "DATA_DIR", data_root, raising=True)

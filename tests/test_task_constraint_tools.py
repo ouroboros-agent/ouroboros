@@ -64,7 +64,7 @@ def test_data_write_uses_payload_relative_path(tmp_path):
 
 
 def test_data_read_and_list_use_payload_relative_paths(tmp_path):
-    from ouroboros.tools.core import _data_list, _data_read
+    from ouroboros.tools.core_file_tools import _data_list, _data_read
     ctx, skill = _ctx(tmp_path)
     (skill / "plugin.py").write_text("VALUE = 1\n", encoding="utf-8")
     (ctx.drive_root / "memory").mkdir()
@@ -94,7 +94,7 @@ def test_registry_repair_mode_reads_lists_skill_payload_root_without_bucket(tmp_
 
 
 def test_payload_absolute_other_skill_path_is_blocked(tmp_path):
-    from ouroboros.tools.core import _data_read
+    from ouroboros.tools.core_file_tools import _data_read
     ctx, _skill = _ctx(tmp_path)
     assert "DATA_READ_BLOCKED" in _data_read(ctx, "skills/external/beta/plugin.py")
 

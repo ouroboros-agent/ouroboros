@@ -210,7 +210,7 @@ def test_data_write_blocks_skill_grants_json(tmp_path, monkeypatch):
 
 
 def test_data_read_supports_line_ranges(tmp_path):
-    from ouroboros.tools.core import _data_read
+    from ouroboros.tools.core_file_tools import _data_read
 
     ctx = _make_drive_ctx(tmp_path)
     target = ctx.drive_root / "skills" / "external" / "demo" / "notes.txt"
@@ -225,7 +225,7 @@ def test_data_read_supports_line_ranges(tmp_path):
 
 
 def test_data_read_does_not_slice_memory_by_default(tmp_path):
-    from ouroboros.tools.core import _data_read
+    from ouroboros.tools.core_file_tools import _data_read
 
     ctx = _make_drive_ctx(tmp_path)
     target = ctx.drive_root / "memory" / "identity.md"
@@ -240,7 +240,7 @@ def test_data_read_does_not_slice_memory_by_default(tmp_path):
 
 
 def test_data_read_cognitive_bad_line_args_are_tolerant(tmp_path):
-    from ouroboros.tools.core import _data_read
+    from ouroboros.tools.core_file_tools import _data_read
 
     ctx = _make_drive_ctx(tmp_path)
     target = ctx.drive_root / "memory" / "identity.md"
@@ -387,7 +387,7 @@ def test_data_write_blocks_skill_trust_state_json(filename, tmp_path, monkeypatc
 
 def test_data_read_allows_skill_review_json(tmp_path, monkeypatch):
     from ouroboros import config as cfg
-    from ouroboros.tools.core import _data_read
+    from ouroboros.tools.core_file_tools import _data_read
 
     drive_root = tmp_path / "data"
     review_path = drive_root / "state" / "skills" / "weather" / "review.json"

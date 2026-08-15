@@ -1268,7 +1268,7 @@ class TestSplitDriveCaptureRead:
         return ctx, canonical
 
     def test_capture_reads_through_the_tool_surface_across_drives(self, tmp_path, monkeypatch):
-        from ouroboros.tools.core import _read_file
+        from ouroboros.tools.core_file_tools import _read_file
         from ouroboros.tools.delegate import _capture_terminal_patch
 
         target = _seed_target(tmp_path)
@@ -1295,7 +1295,7 @@ class TestSplitDriveCaptureRead:
         custody._CUSTODY.clear()
 
     def test_ordinary_single_drive_reads_are_unchanged(self, tmp_path, monkeypatch):
-        from ouroboros.tools.core import _read_file
+        from ouroboros.tools.core_file_tools import _read_file
         from ouroboros.tools.delegate import _capture_terminal_patch
 
         target = _seed_target(tmp_path)
