@@ -301,7 +301,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 190
+    assert len(rows) == 197
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -592,11 +592,9 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     retired_current = {
         "ouroboros/tools/registry.py::_HEAL_PROTECTED_PAYLOAD_FILENAMES":
             "retired:unused payload-control alias removed with registry core extraction",
-        "tests/test_commit_gate.py::_get_registry_module": (
-            "retired:test-only registry import helper removed when CORE_TOOL_NAMES "
-            "characterization moved to its canonical owner"
-        ),
+        "tests/test_commit_gate.py::_get_registry_module": "retired:test-only registry import helper removed when CORE_TOOL_NAMES characterization moved to its canonical owner",
     }
+    retired_current.update({"ouroboros/loop_tool_execution.py::_parse_plan_review_control": "retired:native plan_task ToolResult metadata replaces textual control parsing", "ouroboros/loop_tool_execution.py::PLAN_REVIEW_CONTROL_PREFIX": "retired:loop no longer imports the display-only plan footer prefix", "ouroboros/loop_tool_execution.py::_PLAN_REVIEW_OUTCOMES": "retired:plan producer validates the closed outcome vocabulary before publication"})
     existing_process_owner_rows = {
         "tests/test_skill_exec.py::test_run_shell_restores_obfuscated_self_authored_state_marker",
         "ouroboros/tools/registry.py::SKILL_OWNER_STATE_FILENAMES",
@@ -634,6 +632,9 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         "ouroboros/tools/registry.py::is_skill_payload_path",
         "ouroboros/tools/registry.py::resolve_skill_payload_target",
     }
+    implemented.update({name: name for name in ("ouroboros/loop_tool_execution.py::_FAILURE_PREFIXES", "ouroboros/loop_tool_execution.py::_extract_result_metadata", "ouroboros/_outcome_tool_errors.py::_BLOCKING_TOOL_STATUSES", "ouroboros/reflection.py::_ERROR_MARKERS")})
+    existing_process_owner_rows.update({"ouroboros/loop_tool_execution.py::_FAILURE_PREFIXES", "ouroboros/loop_tool_execution.py::_extract_result_metadata", "ouroboros/_outcome_tool_errors.py::_BLOCKING_TOOL_STATUSES", "ouroboros/reflection.py::_ERROR_MARKERS"})
+    registry_extraction_no_facade_rows.update({"ouroboros/loop_tool_execution.py::_FAILURE_PREFIXES", "ouroboros/loop_tool_execution.py::_extract_result_metadata", "ouroboros/_outcome_tool_errors.py::_BLOCKING_TOOL_STATUSES", "ouroboros/reflection.py::_ERROR_MARKERS"})
     inherited_managed = {
         "docs/assets/home-ZhS5_vhA.js": (
             "docs/assets/home-sxLf4sZL.js", "transferred"
@@ -866,8 +867,8 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 163
-    assert sum(row["old path/symbol"] in retired_current for row in rows) == 2
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 167
+    assert sum(row["old path/symbol"] in retired_current for row in rows) == 5
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 

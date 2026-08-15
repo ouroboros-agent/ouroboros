@@ -23,7 +23,7 @@ from ouroboros.platform_layer import (
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tools.tool_result import (
     ToolResult,
-    _publish_process_tool_result,
+    _publish_tool_result,
 )
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -667,7 +667,7 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
         rendered = json.dumps(payload, ensure_ascii=False, indent=2)
         if artifact_failed:
             text = "⚠️ ARTIFACT_OUTPUT_ERROR (stop_service): declared service outputs were not finalized.\n\n" + rendered
-            return _publish_process_tool_result(
+            return _publish_tool_result(
                 ctx,
                 ToolResult(
                     status="error",
@@ -675,7 +675,7 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
                     text=text,
                 ),
             )
-        return _publish_process_tool_result(
+        return _publish_tool_result(
             ctx,
             ToolResult(
                 status="ok",
@@ -723,7 +723,7 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
         rendered = json.dumps(payload, ensure_ascii=False, indent=2)
         if artifact_failed:
             text = "⚠️ ARTIFACT_OUTPUT_ERROR (stop_service): declared executor service outputs were not finalized.\n\n" + rendered
-            return _publish_process_tool_result(
+            return _publish_tool_result(
                 ctx,
                 ToolResult(
                     status="error",
@@ -731,7 +731,7 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
                     text=text,
                 ),
             )
-        return _publish_process_tool_result(
+        return _publish_tool_result(
             ctx,
             ToolResult(
                 status="ok",

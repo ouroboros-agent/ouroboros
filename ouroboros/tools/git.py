@@ -46,6 +46,7 @@ from ouroboros.tools.commit_gate import (
     check_blocked_attempt_cap,
 )
 from ouroboros.tools.review_revalidation import handle_revalidation_failure
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 from ouroboros.utils import utc_now_iso, write_text, safe_relpath, run_cmd
 from ouroboros.tools.parallel_review import run_parallel_review as _run_parallel_review, aggregate_review_verdict as _aggregate_review_verdict
 from ouroboros.tools.review_helpers import (
@@ -83,6 +84,22 @@ def _protected_paths_block_message(paths, *, runtime_mode: str, action: str) -> 
 
 def _sanitize_git_error(msg: str) -> str:
     return re.sub(r"(https?://)([^@\s]+@)", r"\1<redacted>@", msg)
+
+
+def _publish_git_error(ctx: ToolContext, text: str) -> str:
+    """Publish one structurally known Git terminal without changing public text."""
+    return _publish_tool_result(
+        ctx,
+        ToolResult(status="ok", code="GIT_ERROR", text=text),
+    )
+
+
+def _publish_review_blocked(ctx: ToolContext, text: str) -> str:
+    """Publish one reviewer-finding rejection without relabelling other blocks."""
+    return _publish_tool_result(
+        ctx,
+        ToolResult(status="ok", code="REVIEW_BLOCKED", text=text),
+    )
 
 
 def _fingerprint_staged_diff(repo_dir: pathlib.Path) -> Dict[str, Any]:
@@ -431,7 +448,10 @@ def _stage_candidate_for_review(
             ctx,
             commit_message,
             commit_start,
-            f"⚠️ GIT_ERROR (add): {_sanitize_git_error(str(exc))}",
+            _publish_git_error(
+                ctx,
+                f"⚠️ GIT_ERROR (add): {_sanitize_git_error(str(exc))}",
+            ),
         )
         return [], None, error
     if not paths and not _authorized_managed_update_resolver(ctx):
@@ -445,7 +465,10 @@ def _stage_candidate_for_review(
             ctx,
             commit_message,
             commit_start,
-            f"⚠️ GIT_ERROR (status): {_sanitize_git_error(str(exc))}",
+            _publish_git_error(
+                ctx,
+                f"⚠️ GIT_ERROR (status): {_sanitize_git_error(str(exc))}",
+            ),
         )
         return [], None, error
     if not status.strip():
@@ -476,7 +499,10 @@ def _stage_candidate_for_review(
                 ctx,
                 commit_message,
                 commit_start,
-                f"⚠️ GIT_ERROR (staged-status): {_sanitize_git_error(str(exc))}",
+                _publish_git_error(
+                    ctx,
+                    f"⚠️ GIT_ERROR (staged-status): {_sanitize_git_error(str(exc))}",
+                ),
             )
             return [], None, error
         classification_paths = [
@@ -493,7 +519,10 @@ def _stage_candidate_for_review(
                 ctx,
                 commit_message,
                 commit_start,
-                f"⚠️ GIT_ERROR (staged-names): {_sanitize_git_error(str(exc))}",
+                _publish_git_error(
+                    ctx,
+                    f"⚠️ GIT_ERROR (staged-names): {_sanitize_git_error(str(exc))}",
+                ),
             )
             return [], None, error
         advisory_paths = [
@@ -767,18 +796,21 @@ def _run_reviewed_stage_cycle(
             "post_fingerprint": post_fingerprint,
         }
     if blocked:
+        blocked_message = _finalize_blocked_review(
+            ctx,
+            commit_message,
+            commit_start,
+            combined_msg=combined_msg,
+            block_reason=block_reason,
+            combined_findings=combined_findings,
+            pre_fingerprint=pre_fingerprint,
+            post_fingerprint=post_fingerprint,
+        )
+        if block_reason == "critical_findings":
+            blocked_message = _publish_review_blocked(ctx, blocked_message)
         return {
             "status": "blocked",
-            "message": _finalize_blocked_review(
-                ctx,
-                commit_message,
-                commit_start,
-                combined_msg=combined_msg,
-                block_reason=block_reason,
-                combined_findings=combined_findings,
-                pre_fingerprint=pre_fingerprint,
-                post_fingerprint=post_fingerprint,
-            ),
+            "message": blocked_message,
             "block_reason": block_reason,
             "pre_fingerprint": pre_fingerprint,
             "post_fingerprint": post_fingerprint,
@@ -844,7 +876,7 @@ def _run_non_committing_review_cycle(
             block_details=f"Git lock: {exc}",
             duration_sec=time.time() - commit_start,
         )
-        return {"status": "failed", "message": f"⚠️ GIT_ERROR (lock): {exc}"}
+        return {"status": "failed", "message": _publish_git_error(ctx, f"⚠️ GIT_ERROR (lock): {exc}")}
 
     unstage_warning = ""
     try:
@@ -1711,23 +1743,32 @@ def _prepare_review_commit_worktree(
         except Exception:
             pass
         if not already_on_target:
-            return came_from_detached_checkout, f"⚠️ GIT_ERROR (checkout): {error_message}"
+            return came_from_detached_checkout, _publish_git_error(
+                ctx,
+                f"⚠️ GIT_ERROR (checkout): {error_message}",
+            )
         try:
             unmerged = run_cmd(
                 ["git", "diff", "--name-only", "--diff-filter=U"], cwd=ctx.repo_dir
             ).strip()
         except Exception as status_exc:
-            return came_from_detached_checkout, (
-                "⚠️ GIT_ERROR (checkout): "
-                f"{error_message}\n\nCould not verify index state after checkout failure: "
-                f"{_sanitize_git_error(str(status_exc))}"
+            return came_from_detached_checkout, _publish_git_error(
+                ctx,
+                (
+                    "⚠️ GIT_ERROR (checkout): "
+                    f"{error_message}\n\nCould not verify index state after checkout failure: "
+                    f"{_sanitize_git_error(str(status_exc))}"
+                ),
             )
         if unmerged:
-            return came_from_detached_checkout, (
-                "⚠️ GIT_ERROR (checkout): "
-                f"{error_message}\n\nRepository has unmerged paths; refusing to treat "
-                "the checkout failure as an incidental dirty-tree no-op.\n"
-                f"{unmerged}"
+            return came_from_detached_checkout, _publish_git_error(
+                ctx,
+                (
+                    "⚠️ GIT_ERROR (checkout): "
+                    f"{error_message}\n\nRepository has unmerged paths; refusing to treat "
+                    "the checkout failure as an incidental dirty-tree no-op.\n"
+                    f"{unmerged}"
+                ),
             )
     if managed_tx:
         from supervisor.update_merge import managed_assisted_precommit_verify
@@ -2204,7 +2245,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                block_reason="infra_failure",
                                block_details=f"Git lock: {e}",
                                duration_sec=time.time() - _commit_start)
-        return f"⚠️ GIT_ERROR (lock): {e}"
+        return _publish_git_error(ctx, f"⚠️ GIT_ERROR (lock): {e}")
     test_warning_ref = [""]
     _fail = lambda msg: (_record_commit_attempt(ctx, commit_message, "failed",
         block_reason="infra_failure", block_details=msg,
@@ -2283,7 +2324,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                    triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
                                    scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
                                    degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
-            return err_msg
+            return _publish_git_error(ctx, err_msg)
         binding_ok, binding_detail = _verify_reviewed_commit_binding(
             pathlib.Path(ctx.repo_dir),
             commit_sha,
@@ -2491,7 +2532,10 @@ def _git_status(
             binding,
         )
     except Exception as e:
-        return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
+        return _publish_git_error(
+            ctx,
+            f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}",
+        )
 
 
 def _git_diff(
@@ -2525,7 +2569,10 @@ def _git_diff(
             return _vcs_result(protected_block, binding)
         return _vcs_result(_limit_git_output(run_cmd(cmd, cwd=repo_dir), max_chars), binding)
     except Exception as e:
-        return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
+        return _publish_git_error(
+            ctx,
+            f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}",
+        )
 
 
 def _ff_pull(repo_dir: pathlib.Path) -> str:

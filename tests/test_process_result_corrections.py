@@ -160,4 +160,4 @@ def test_direct_typed_override_survives_postchecks_and_composer(
         "⚠️ SAFETY_WARNING: reviewed\n\n---\ncustom output",
         {"exit_code": 93, "safety_warning": True},
     )
-    assert not hasattr(registry._ctx, "_active_process_tool_result")
+    assert not hasattr(registry._ctx, "_active_builtin_tool_result")

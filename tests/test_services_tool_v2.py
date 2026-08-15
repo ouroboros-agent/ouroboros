@@ -585,7 +585,7 @@ def test_executor_stop_service_publishes_actual_registration_only(
 
     ctx = SimpleNamespace(
         task_id="task-executor-stop",
-        _active_process_tool_result=object(),
+        _active_builtin_tool_result=object(),
     )
     monkeypatch.setattr(
         services_mod,
@@ -622,14 +622,14 @@ def test_executor_stop_service_publishes_actual_registration_only(
     )
 
     success_text = services_mod._stop_service(ctx, "fixture")
-    success = ctx._active_process_tool_result
+    success = ctx._active_builtin_tool_result
     assert isinstance(success, ToolResult)
     assert success.text == success_text
     assert (success.status, success.code) == ("ok", "OK")
     assert dict(success.meta) == {"artifact_registered": True}
     assert "exit_code" not in success.meta
 
-    ctx._active_process_tool_result = object()
+    ctx._active_builtin_tool_result = object()
     monkeypatch.setattr(
         shell_mod,
         "_register_process_outputs",
@@ -641,7 +641,7 @@ def test_executor_stop_service_publishes_actual_registration_only(
     )
 
     failed_text = services_mod._stop_service(ctx, "fixture")
-    failed = ctx._active_process_tool_result
+    failed = ctx._active_builtin_tool_result
     assert isinstance(failed, ToolResult)
     assert failed.text == failed_text
     assert (failed.status, failed.code) == (

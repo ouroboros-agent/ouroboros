@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import json
 import logging
 import pathlib
@@ -36,10 +37,12 @@ from ouroboros.task_status import FINAL_STATUSES, find_child_tasks, wait_for_eff
 from ouroboros.tools.plan_review_runtime import (
     PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS,
     PLAN_REVIEW_SLOT_TIMEOUT_SEC as _PLAN_REVIEW_SLOT_TIMEOUT_SEC,
+    append_plan_output_note as _append_plan_output_note,
     classify_reviewer_error as _classify_reviewer_error,  # noqa: F401 — test-compat re-export
     get_review_models as _get_review_models,
     load_plan_checklist as _load_plan_checklist,
     plan_deadline_skip as _plan_deadline_skip,
+    publish_plan_review_projection as _publish_plan_review_projection,
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     reviewed_handoff_hashes as _reviewed_handoff_hashes,
     resolve_plan_class as _resolve_plan_class,
@@ -338,10 +341,8 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
             asyncio.get_running_loop()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(
-                    asyncio.run,
-                    asyncio.wait_for(
-                        _run_plan_review_async(ctx, request), timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC,
-                    ),
+                    contextvars.copy_context().run, asyncio.run,
+                    asyncio.wait_for(_run_plan_review_async(ctx, request), timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC),
                 ).result(timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC + 5)
         except RuntimeError:
             result = asyncio.run(
@@ -350,9 +351,9 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
                 )
             )
         if isinstance(result, str) and vacuous_disposition:
-            result += _VACUOUS_DISPOSITION_NOTE
+            result = _append_plan_output_note(ctx, result, _VACUOUS_DISPOSITION_NOTE)
         if isinstance(result, str) and _vacuous_acceptance_claims(params.get("scope")):
-            result += _VACUOUS_CLAIMS_NOTE
+            result = _append_plan_output_note(ctx, result, _VACUOUS_CLAIMS_NOTE)
         return result
     except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
         return _plan_unavailable(
@@ -976,7 +977,7 @@ def _apply_review_disposition(
     if persisted.get("error"):
         return "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(persisted["error"])
     audit["artifact"] = persisted
-    return _planning_disposition_warning_note(audit) + _render_existing_plan_review(updated)
+    return _publish_plan_review_projection(ctx, updated, _planning_disposition_warning_note(audit) + _render_existing_plan_review(updated))
 
 
 def _planning_disposition_warning_note(handoffs: dict) -> str:
@@ -1093,14 +1094,12 @@ def _reuse_or_disposition_plan_review(
             replayed = _replay_closed_review_disposition(
                 review, fingerprint, review_disposition,
             )
-            return (
-                replayed
-                if replayed.startswith("ERROR:")
-                else _planning_disposition_warning_note(audit) + replayed
-            )
-        return _planning_disposition_warning_note(audit) + _render_existing_plan_review(
-            review, cached=True,
-        )
+            if replayed.startswith("ERROR:"):
+                return replayed
+            text = _planning_disposition_warning_note(audit) + replayed
+            return _publish_plan_review_projection(ctx, review, text)
+        text = _planning_disposition_warning_note(audit) + _render_existing_plan_review(review, cached=True)
+        return _publish_plan_review_projection(ctx, review, text)
     if review_disposition is not None:
         return _apply_review_disposition(ctx, audit, review, fingerprint, review_disposition)
     if str(state.get("latest_review_fingerprint") or "") != fingerprint:
@@ -1115,9 +1114,8 @@ def _reuse_or_disposition_plan_review(
             if isinstance(represented.get("review"), dict)
             else review
         )
-        return _planning_disposition_warning_note(audit) + _render_existing_plan_review(
-            represented_review, cached=True,
-        )
+        text = _planning_disposition_warning_note(audit) + _render_existing_plan_review(represented_review, cached=True)
+        return _publish_plan_review_projection(ctx, represented_review, text)
     return (
         "ERROR: PLAN_REVIEW_DISPOSITION_REQUIRED: this unchanged fingerprint already "
         "received REVIEW_REQUIRED. Re-call plan_task with review_disposition as the only "
@@ -1252,7 +1250,7 @@ def _finalize_plan_review_output(
         finalization.effective_context_level,
         finalization.context_degradation_reason,
     )
-    return (
+    rendered = (
         context_note
         + finalization.degraded_scout_note
         + availability_note
@@ -1268,6 +1266,7 @@ def _finalize_plan_review_output(
         + "\n\n"
         + footer
     )
+    return _publish_plan_review_projection(ctx, review_record, rendered)
 
 
 def _compile_plan_atlas(

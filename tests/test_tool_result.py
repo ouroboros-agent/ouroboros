@@ -381,9 +381,9 @@ def test_registry_execute_result_preserves_legacy_exceptions() -> None:
         raise LegacyFailure("legacy dispatch failed")
 
     registry._execute_legacy_text = fail  # type: ignore[method-assign]
-
     with pytest.raises(LegacyFailure, match="legacy dispatch failed"):
         registry.execute_result("fixture", {})
+
 
 def test_registry_composer_is_the_exact_owner_reexport() -> None:
     from ouroboros.tools.registry import _compose_execute_result as facade

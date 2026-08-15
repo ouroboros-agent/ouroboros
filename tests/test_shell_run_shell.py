@@ -44,12 +44,12 @@ def _ctx(tmp_path):
 
 def _typed_ctx(tmp_path):
     ctx = _ctx(tmp_path)
-    ctx._active_process_tool_result = object()
+    ctx._active_builtin_tool_result = object()
     return ctx
 
 
 def _published(ctx) -> ToolResult:
-    result = ctx._active_process_tool_result
+    result = ctx._active_builtin_tool_result
     assert isinstance(result, ToolResult)
     return result
 

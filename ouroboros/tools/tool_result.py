@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import signal
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
@@ -30,7 +31,20 @@ _HOST_META_KEYS = frozenset(
 # Producer metadata keeps its exact limits. Composition may add only these
 # closed, boolean host annotations, within a separately bounded byte reserve.
 _MAX_HOST_META_BYTES = 256
-_PROCESS_TOOL_RESULT_ATTR = "_active_process_tool_result"
+_TOOL_RESULT_ATTR = "_active_builtin_tool_result"
+
+
+@dataclass
+class _ToolResultSlot:
+    ctx: Any
+    sentinel: object
+    result: object
+
+
+_TOOL_RESULT_STATE: ContextVar[_ToolResultSlot | None] = ContextVar(
+    "ouroboros_builtin_tool_result",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -450,12 +464,42 @@ def _replace_tool_result(
     )
 
 
-def _publish_process_tool_result(ctx: Any, result: ToolResult) -> str:
-    """Publish one registry-scoped process result while keeping the string ABI."""
+def _publish_tool_result(ctx: Any, result: ToolResult) -> str:
+    """Publish one registry-scoped builtin result while keeping the string ABI."""
 
-    if hasattr(ctx, _PROCESS_TOOL_RESULT_ATTR):
-        setattr(ctx, _PROCESS_TOOL_RESULT_ATTR, result)
+    active = _TOOL_RESULT_STATE.get()
+    if active is not None and active.ctx is ctx:
+        active.result = result
+    elif hasattr(ctx, _TOOL_RESULT_ATTR):
+        setattr(ctx, _TOOL_RESULT_ATTR, result)
     return result.text
+
+
+def _install_tool_result_sidecar(
+    ctx: Any,
+    sentinel: object,
+) -> Token:
+    """Install one context-local builtin result sentinel."""
+    return _TOOL_RESULT_STATE.set(_ToolResultSlot(ctx, sentinel, sentinel))
+
+
+def _published_tool_result(ctx: Any, sentinel: object) -> object:
+    """Read the result published by the current builtin invocation."""
+    active = _TOOL_RESULT_STATE.get()
+    if active is not None:
+        if active.ctx is not ctx:
+            return sentinel
+        if sentinel is not None and active.sentinel is not sentinel:
+            return sentinel
+        if active.result is active.sentinel:
+            return sentinel
+        return active.result
+    return getattr(ctx, _TOOL_RESULT_ATTR, sentinel)
+
+
+def _restore_tool_result_sidecar(token: Token) -> None:
+    """Restore the enclosing invocation's context-local sidecar."""
+    _TOOL_RESULT_STATE.reset(token)
 
 
 def _publish_process_result(
@@ -486,7 +530,7 @@ def _publish_process_result(
         facts["artifact_registered"] = True
     if shell_regex_auto_corrected:
         facts["shell_regex_auto_corrected"] = True
-    return _publish_process_tool_result(
+    return _publish_tool_result(
         ctx,
         ToolResult(
             status=TOOL_CODE_SPECS[code].status,
@@ -512,10 +556,10 @@ def _wrap_run_script_process_result(
         wrapped = f"{audit_note}\n# script_path={script_path}"
     else:
         wrapped = f"# script_path={script_path}\n{result}"
-    base = getattr(ctx, _PROCESS_TOOL_RESULT_ATTR, None)
+    base = _published_tool_result(ctx, None)
     if isinstance(base, ToolResult) and base.text == result:
         code = "ARTIFACT_OUTPUT_UNDECLARED" if audit_note and base.status == "ok" else base.code
-        return _publish_process_tool_result(
+        return _publish_tool_result(
             ctx,
             _replace_tool_result(base, text=wrapped, code=code),
         )

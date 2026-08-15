@@ -15,6 +15,12 @@ from ouroboros.llm import LLMClient
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
 from ouroboros.tools.review_helpers import load_checklist_section
 from ouroboros.tools.review_synthesis import build_plan_review_messages, normalize_plan_scope
+from ouroboros.tools.tool_result import (
+    ToolResult,
+    _publish_tool_result,
+    _published_tool_result,
+    _replace_tool_result,
+)
 from ouroboros.utils import utc_now_iso
 
 
@@ -24,6 +30,47 @@ PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
 PLAN_CLASSES = ("self_mod", "external", "creative", "research")
 
 log = logging.getLogger(__name__)
+
+
+def append_plan_output_note(ctx: ToolContext, text: str, note: str) -> str:
+    """Keep native plan metadata bound when compatibility notes append."""
+    rendered = text + note
+    base = _published_tool_result(ctx, None)
+    if isinstance(base, ToolResult) and base.text == text:
+        return _publish_tool_result(ctx, _replace_tool_result(base, text=rendered))
+    return rendered
+
+
+def publish_plan_review_projection(
+    ctx: ToolContext,
+    review: dict,
+    text: str,
+) -> str:
+    """Publish control metadata only from validated structured review state."""
+    aggregate = review.get("aggregate_signal")
+    closed = review.get("closed")
+    if aggregate not in {"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN"}:
+        raise ValueError(f"invalid plan review aggregate signal: {aggregate!r}")
+    if type(closed) is not bool:
+        raise ValueError("plan review closed state must be boolean")
+    if (aggregate == "GREEN" and not closed) or (
+        aggregate == "REVISE_PLAN" and closed
+    ):
+        raise ValueError(
+            f"invalid plan review control state: outcome={aggregate}, closed={closed}"
+        )
+    return _publish_tool_result(
+        ctx,
+        ToolResult(
+            status="ok",
+            code="OK",
+            text=text,
+            meta={
+                "plan_review_outcome": aggregate,
+                "plan_review_closed": closed,
+            },
+        ),
+    )
 
 
 def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:

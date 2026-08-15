@@ -28,7 +28,6 @@ from ouroboros.tool_capabilities import (
     tool_result_limit as _tool_result_limit,
 )
 from ouroboros.tools.registry import ToolRegistry
-from ouroboros.tools.review_synthesis import PLAN_REVIEW_CONTROL_PREFIX
 from ouroboros.tools.tool_result import ToolResult
 from ouroboros.usage_accounting import UsageAccountingError
 from ouroboros.utils import (
@@ -47,7 +46,6 @@ _FAILURE_PREFIXES = (
     "⚠️ TOOL_",
     "⚠️ SHELL_",
     "⚠️ RUN_SCRIPT_",
-    "⚠️ CLAUDE_CODE_",
     "⚠️ VLM_",
     "⚠️ LIGHT_MODE_",
     "⚠️ WORKSPACE_",
@@ -74,41 +72,6 @@ _FAILURE_PREFIXES = (
     "⚠️ RESOURCE_POLICY_BLOCKED",
     "⚠️ INTEGRATE_",
 )
-
-_PLAN_REVIEW_OUTCOMES = frozenset({"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN"})
-
-
-def _parse_plan_review_control(text: str) -> tuple[str, bool] | None:
-    """Parse one exact host-owned plan-review control marker fail-closed."""
-    markers = [
-        line[len(PLAN_REVIEW_CONTROL_PREFIX):]
-        for line in str(text or "").splitlines()
-        if line.startswith(PLAN_REVIEW_CONTROL_PREFIX)
-    ]
-    if len(markers) != 1:
-        return None
-
-    def _unique_object(pairs: list[tuple[str, Any]]) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate key: {key}")
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(markers[0], object_pairs_hook=_unique_object)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or set(payload) != {"outcome", "closed"}:
-        return None
-    outcome = str(payload.get("outcome") or "")
-    closed = payload.get("closed")
-    if outcome not in _PLAN_REVIEW_OUTCOMES or type(closed) is not bool:
-        return None
-    if (outcome == "GREEN" and not closed) or (outcome == "REVISE_PLAN" and closed):
-        return None
-    return outcome, closed
 _FAILURE_MARKERS = (
     "_BLOCKED",
     "_ERROR",
@@ -378,10 +341,19 @@ def _structured_tool_failure(result: Any) -> bool:
     return isinstance(payload, dict) and payload.get("ok") is False
 
 
-def _is_tool_execution_failure(tool_ok: bool, result: Any) -> bool:
+def _is_tool_execution_failure(
+    tool_ok: bool,
+    result: Any,
+    tool_result: ToolResult | None = None,
+) -> bool:
     """Treat only executor/runtime failures as UI tool failures."""
     if not tool_ok:
         return True
+    if isinstance(tool_result, ToolResult) and tool_result.code in {
+        "REVIEW_BLOCKED",
+        "GIT_ERROR",
+    }:
+        return False
     if _structured_tool_failure(result):
         return True
     text = str(result or "")
@@ -407,7 +379,11 @@ def _extract_result_metadata(
     """Extract structured outcome facts for summaries and reflections."""
     text = str(result or "")
     status = "error" if is_error else "ok"
-    if _structured_tool_failure(result):
+    if isinstance(tool_result, ToolResult) and tool_result.code == "REVIEW_BLOCKED":
+        status = "blocked"
+    elif isinstance(tool_result, ToolResult) and tool_result.code == "GIT_ERROR":
+        status = "error"
+    elif _structured_tool_failure(result):
         # A typed status, not the generic "error": an extension tool that answered
         # honestly is a different fact from an executor crash, and the trace should
         # say which happened.
@@ -428,14 +404,6 @@ def _extract_result_metadata(
         status = "shell_error"
     elif text.startswith("⚠️ RUN_SCRIPT_BLOCKED"):
         status = "run_script_blocked"
-    elif text.startswith("⚠️ CLAUDE_CODE_TIMEOUT"):
-        status = "timeout"
-    elif text.startswith("⚠️ CLAUDE_CODE_INSTALL_ERROR"):
-        status = "install_error"
-    elif text.startswith("⚠️ CLAUDE_CODE_UNAVAILABLE"):
-        status = "unavailable"
-    elif text.startswith("⚠️ CLAUDE_CODE_"):
-        status = "claude_code_error"
     elif text.startswith("⚠️ VLM_"):
         status = "vlm_error"
     elif text.startswith("⚠️ CORE_PROTECTION_BLOCKED"):
@@ -508,12 +476,17 @@ def _extract_result_metadata(
         and "ARTIFACT_OUTPUTS" in text
     ):
         meta["artifact_registered"] = True
-    # Same full-result capture for the swarm force-plan gate.  Only the exact
-    # host-appended typed control closes force-plan; raw reviewer prose and the
-    # legacy AGGREGATE line are never treated as authority.
-    plan_control = _parse_plan_review_control(text) if fn_name == "plan_task" and not is_error else None
-    if plan_control is not None:
-        meta["plan_review_outcome"], meta["plan_review_closed"] = plan_control
+    if fn_name == "plan_task" and not is_error and isinstance(tool_result, ToolResult):
+        plan_outcome = tool_result.meta.get("plan_review_outcome")
+        plan_closed = tool_result.meta.get("plan_review_closed")
+        if (
+            plan_outcome in {"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN"}
+            and type(plan_closed) is bool
+            and not (plan_outcome == "GREEN" and not plan_closed)
+            and not (plan_outcome == "REVISE_PLAN" and plan_closed)
+        ):
+            meta["plan_review_outcome"] = plan_outcome
+            meta["plan_review_closed"] = plan_closed
     if fn_name in _PROCESS_RESULT_TOOLS and isinstance(tool_result, ToolResult):
         exit_code = tool_result.meta.get("exit_code")
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
@@ -628,7 +601,7 @@ def _execute_single_tool(
     # Transitional status/is_error stays text-compatible. Process exit, signal,
     # and artifact-registration facts below are already typed and never parsed
     # from producer-controlled stdout.
-    is_error = _is_tool_execution_failure(tool_ok, result)
+    is_error = _is_tool_execution_failure(tool_ok, result, tool_result)
     result_meta = {
         **_extract_result_metadata(fn_name, result, is_error, tool_result),
         **_tool_result_fields(tool_result),

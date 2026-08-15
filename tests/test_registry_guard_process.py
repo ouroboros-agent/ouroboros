@@ -562,10 +562,10 @@ def test_registry_dispatch_calls_process_post_owner_once_after_handler(
 
     assert registry.execute("run_command", {"cmd": ["echo", "ok"]}) == "handler output"
     assert calls == ["pre_guard", "safety", "snapshot", "handler", "post", "adapter"]
-    assert not hasattr(registry._ctx, "_active_process_tool_result")
+    assert not hasattr(registry._ctx, "_active_builtin_tool_result")
 
 
-def test_custom_process_handler_cannot_reuse_stale_sidecar(
+def test_custom_handler_cannot_reuse_stale_builtin_result_sidecar(
     tmp_path, monkeypatch,
 ):
     from ouroboros import safety
@@ -581,7 +581,7 @@ def test_custom_process_handler_cannot_reuse_stale_sidecar(
         text="custom output",
         meta={"exit_code": 93},
     )
-    registry._ctx._active_process_tool_result = stale
+    registry._ctx._active_builtin_tool_result = stale
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
     monkeypatch.setattr(process_guard, "_run_shell_safety_check", lambda *_args, **_kwargs: None)
@@ -604,10 +604,10 @@ def test_custom_process_handler_cannot_reuse_stale_sidecar(
         "custom output",
         {},
     )
-    assert registry._ctx._active_process_tool_result is stale
+    assert registry._ctx._active_builtin_tool_result is stale
 
     def mismatched(ctx, cmd, _resolved_binding=None, **_kwargs):
-        ctx._active_process_tool_result = ToolResult(
+        ctx._active_builtin_tool_result = ToolResult(
             status="error",
             code="SHELL_EXIT_ERROR",
             text="different output",
@@ -624,9 +624,9 @@ def test_custom_process_handler_cannot_reuse_stale_sidecar(
         "OK",
         {},
     )
-    assert registry._ctx._active_process_tool_result is stale
+    assert registry._ctx._active_builtin_tool_result is stale
 
-    delattr(registry._ctx, "_active_process_tool_result")
+    delattr(registry._ctx, "_active_builtin_tool_result")
     mismatch_without_prior = registry.execute_result(
         "run_command", {"cmd": ["echo", "ok"]},
     )
@@ -635,7 +635,7 @@ def test_custom_process_handler_cannot_reuse_stale_sidecar(
         mismatch_without_prior.code,
         dict(mismatch_without_prior.meta),
     ) == ("ok", "OK", {})
-    assert not hasattr(registry._ctx, "_active_process_tool_result")
+    assert not hasattr(registry._ctx, "_active_builtin_tool_result")
 
 
 def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
