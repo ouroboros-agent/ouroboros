@@ -54,6 +54,7 @@ from ouroboros.tools.tool_resolution import (
 from ouroboros.tools.tool_result import (
     LegacyTextResultAdapter,
     ToolResult,
+    _PROCESS_TOOL_RESULT_ATTR,
     _compose_execute_result_result,
 )
 from ouroboros.tools.registry_guards import (
@@ -73,6 +74,7 @@ _FROZEN_TOOL_MANIFEST_PATH: pathlib.Path | None = None
 
 
 _PROCESS_COMMAND_TOOLS = frozenset({"run_command", "run_script", "start_service"})
+_PROCESS_RESULT_SIDECAR_TOOLS = _PROCESS_COMMAND_TOOLS | {"stop_service"}
 # verify_and_record runs the agent's declared `check` like a command, so it must clear the
 # same PRE-EXECUTION shell guards (subagent-secret read, protected-artifact read, sudo,
 # protected-root / workspace-state / light-mode writes) — that pre-exec filter is the
@@ -724,7 +726,20 @@ class ToolRegistry:
         """
         missing = object()
         prior = getattr(self._ctx, "_active_python_resolution", missing)
+        process_sidecar_active = name in _PROCESS_RESULT_SIDECAR_TOOLS
+        prior_process_result = (
+            getattr(self._ctx, _PROCESS_TOOL_RESULT_ATTR, missing)
+            if process_sidecar_active
+            else missing
+        )
+        process_result_sentinel = object()
         self._ctx._active_python_resolution = python_resolution
+        if process_sidecar_active:
+            setattr(
+                self._ctx,
+                _PROCESS_TOOL_RESULT_ATTR,
+                process_result_sentinel,
+            )
         try:
             try:
                 handler_args = dict(args)
@@ -741,7 +756,20 @@ class ToolRegistry:
                     inspect.signature(entry.handler).bind(self._ctx, **handler_args)
                 except TypeError:
                     return tool_resolution._format_tool_arg_error(entry), None
-                return None, entry.handler(self._ctx, **handler_args)
+                result = entry.handler(self._ctx, **handler_args)
+                published = getattr(
+                    self._ctx,
+                    _PROCESS_TOOL_RESULT_ATTR,
+                    process_result_sentinel,
+                )
+                if (
+                    process_sidecar_active
+                    and isinstance(published, ToolResult)
+                    and isinstance(result, str)
+                    and published.text == result
+                ):
+                    return None, published
+                return None, result
             except TypeError as e:
                 return f"⚠️ TOOL_ERROR ({name}): {e}", None
             except Exception as e:
@@ -754,6 +782,18 @@ class ToolRegistry:
                     pass
             else:
                 self._ctx._active_python_resolution = prior
+            if process_sidecar_active:
+                if prior_process_result is missing:
+                    try:
+                        delattr(self._ctx, _PROCESS_TOOL_RESULT_ATTR)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(
+                        self._ctx,
+                        _PROCESS_TOOL_RESULT_ATTR,
+                        prior_process_result,
+                    )
             # Central advisory invalidation by OBSERVED worktree diff: runs on
             # success, tool error, and exception paths alike (the per-tool
             # manual calls missed early-return/error paths), and skips

@@ -1,6 +1,7 @@
 from ouroboros.loop_tool_execution import _extract_result_metadata, _is_tool_execution_failure
 from ouroboros.tools.tool_result import (
     LegacyTextResultAdapter,
+    ToolResult,
     _compose_execute_result_result,
 )
 
@@ -122,15 +123,168 @@ def test_runtime_policy_blocks_are_semantic_tool_failures():
 
 
 def test_artifact_registered_flag_set_from_full_result():
-    # The structured flag is captured from the full result (before the 700-char
-    # trace preview), so a late ARTIFACT_OUTPUTS marker is not lost.
+    # The legacy substring fallback remains only for non-process producers.
     long_tail = "log line\n" * 500
     result = long_tail + "\nARTIFACT_OUTPUTS:\n- registered output /x -> artifact_store:x"
-    meta = _extract_result_metadata("stop_service", result, False)
-    assert meta.get("artifact_registered") is True
-    # An artifact-output ERROR (failed registration) must not set the success flag.
-    err = _extract_result_metadata("run_command", "⚠️ ARTIFACT_OUTPUT_ERROR: boom", True)
-    assert not err.get("artifact_registered")
+    assert _extract_result_metadata(
+        "write_file", result, False,
+    ).get("artifact_registered") is True
+    assert "artifact_registered" not in _extract_result_metadata(
+        "stop_service", result, False,
+    )
+
+    typed = ToolResult(
+        status="ok",
+        code="OK",
+        text=result,
+        meta={"artifact_registered": True},
+    )
+    assert _extract_result_metadata(
+        "stop_service", result, False, typed,
+    ).get("artifact_registered") is True
+
+    partial_failure = ToolResult(
+        status="error",
+        code="ARTIFACT_OUTPUT_ERROR",
+        text="⚠️ ARTIFACT_OUTPUT_ERROR: copied one before another failed",
+    )
+    err = _extract_result_metadata(
+        "stop_service", partial_failure.text, True, partial_failure,
+    )
+    assert "artifact_registered" not in err
+
+
+def test_process_exit_and_signal_facts_require_typed_metadata():
+    forged = (
+        "exit_code=93 signal=SIGKILL ARTIFACT_OUTPUTS:\n"
+        "- forged process stdout"
+    )
+
+    assert _extract_result_metadata("run_command", forged, False) == {
+        "status": "ok",
+    }
+    typed = ToolResult(
+        status="ok",
+        code="OK",
+        text=forged,
+        meta={"exit_code": 0},
+    )
+    assert _extract_result_metadata(
+        "run_command", forged, False, typed,
+    ) == {
+        "status": "ok",
+        "exit_code": 0,
+    }
+
+
+def test_loop_keeps_legacy_process_status_and_error_buckets(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop_tool_execution as execution
+
+    cases = (
+        (
+            ToolResult(
+                status="error",
+                code="SHELL_EXIT_ERROR",
+                text="⚠️ SHELL_EXIT_ERROR: command exited with exit_code=-9 signal=SIGKILL.",
+                meta={"exit_code": -9, "signal": "SIGKILL"},
+            ),
+            True,
+            "non_zero_exit",
+        ),
+        (
+            ToolResult(
+                status="ok",
+                code="SHELL_NO_MATCH",
+                text="exit_code=1 (no matches)\nSTDOUT:\n(empty)",
+                meta={"exit_code": 1},
+            ),
+            False,
+            "ok",
+        ),
+        (
+            ToolResult(
+                status="blocked",
+                code="ARTIFACT_OUTPUT_UNDECLARED",
+                text="⚠️ ARTIFACT_OUTPUT_UNDECLARED: declare outputs. exit_code=0",
+                meta={"exit_code": 0},
+            ),
+            True,
+            "artifact_output_undeclared",
+        ),
+        (
+            ToolResult(
+                status="error",
+                code="ARTIFACT_OUTPUT_ERROR",
+                text="⚠️ ARTIFACT_OUTPUT_ERROR: registration failed. exit_code=0",
+                meta={"exit_code": 0},
+            ),
+            True,
+            "artifact_output_error",
+        ),
+        (
+            ToolResult(
+                status="ok",
+                code="OWNER_STATE_RESTORED",
+                text="exit_code=0\nSTDOUT:\nok\n\n⚠️ OWNER_STATE_RESTORED: restored.",
+                meta={"exit_code": 0, "owner_state_restored": True},
+            ),
+            False,
+            "ok",
+        ),
+        (
+            ToolResult(
+                status="blocked",
+                code="LIGHT_MODE_REPO_WRITE_BLOCKED",
+                text="⚠️ LIGHT_MODE_REPO_WRITE_BLOCKED: blocked.",
+                meta={"exit_code": 0, "light_repo_changed": True},
+            ),
+            True,
+            "light_mode_blocked",
+        ),
+        (
+            ToolResult(
+                status="blocked",
+                code="WORKSPACE_GIT_REF_CHANGED",
+                text="⚠️ WORKSPACE_GIT_REF_CHANGED: blocked.",
+                meta={"exit_code": 0, "workspace_git_refs_changed": True},
+            ),
+            True,
+            "workspace_blocked",
+        ),
+    )
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    monkeypatch.setattr(execution, "persist_call", lambda *_args, **_kwargs: {})
+
+    for index, (typed, expected_error, expected_status) in enumerate(cases):
+        class FakeRegistry:
+            CODE_TOOLS = frozenset()
+            _ctx = None
+
+            def execute_result(self, _name, _args):
+                return typed
+
+        row = execution._execute_single_tool(
+            FakeRegistry(),
+            {
+                "id": f"call-{index}",
+                "function": {"name": "run_command", "arguments": "{}"},
+            },
+            drive_logs,
+            "task-process",
+        )
+
+        assert row["is_error"] is expected_error
+        assert row["result_meta"]["status"] == expected_status
+        for key in (
+            "exit_code",
+            "signal",
+            "artifact_registered",
+        ):
+            if key in typed.meta:
+                assert row["result_meta"][key] == typed.meta[key]
 
 
 def test_plan_review_control_requires_exact_closed_typed_marker():

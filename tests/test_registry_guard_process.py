@@ -33,7 +33,7 @@ _FUNCTION_SIGNATURES = {
     "_git_ref_snapshot": "(repo_dir: 'pathlib.Path') -> 'Optional[Dict[str, str]]'",
     "_snapshot_owner_files": "(self, state_drive_root: 'pathlib.Path | None' = None) -> 'Dict[pathlib.Path, Optional[str]]'",
     "_restore_owner_files": "(self, before: 'Dict[pathlib.Path, Optional[str]]', state_drive_root: 'pathlib.Path | None' = None) -> 'bool'",
-    "_run_shell_post_checks": "(self, result: 'str', *, owner_snapshot: 'Dict[pathlib.Path, Optional[str]]', state_drive_root: 'pathlib.Path', light_repo_before: 'Optional[Dict[str, Any]]', workspace_refs_before: 'Optional[Dict[str, str]]', tool_name: 'str' = 'run_command') -> 'str'",
+    "_run_shell_post_checks": "(self, result: 'str | ToolResult', *, owner_snapshot: 'Dict[pathlib.Path, Optional[str]]', state_drive_root: 'pathlib.Path', light_repo_before: 'Optional[Dict[str, Any]]', workspace_refs_before: 'Optional[Dict[str, str]]', tool_name: 'str' = 'run_command') -> 'str | ToolResult'",
 }
 
 _REGISTRY_GUARD_SIGNATURES = {
@@ -404,7 +404,12 @@ def test_process_post_checks_preserve_polling_restore_and_wrapper_order(
 
     result = process_guard._run_shell_post_checks(
         stub,
-        "handler output",
+        ToolResult(
+            status="ok",
+            code="SHELL_NO_MATCH",
+            text="handler output",
+            meta={"exit_code": 1},
+        ),
         owner_snapshot={tmp_path / "owner.json": "before"},
         state_drive_root=tmp_path,
         light_repo_before={"digest": "light-before", "paths": []},
@@ -419,7 +424,8 @@ def test_process_post_checks_preserve_polling_restore_and_wrapper_order(
         "sleep:0.3", "restore",
         "light_snapshot", "ref_snapshot",
     ]
-    assert result == (
+    assert isinstance(result, ToolResult)
+    assert result.text == (
         "⚠️ WORKSPACE_GIT_REF_CHANGED: run_command changed git HEAD or refs inside the "
         "external workspace. External workspace runs must leave changes as files/patch "
         "artifacts, not commits/tags/resets.\n\nOriginal command output:\n"
@@ -431,6 +437,67 @@ def test_process_post_checks_preserve_polling_restore_and_wrapper_order(
         "attempted to change owner-only settings or skill trust state; protected files "
         "were restored."
     )
+    assert (result.status, result.code) == ("blocked", "WORKSPACE_GIT_REF_CHANGED")
+    assert dict(result.meta) == {
+        "exit_code": 1,
+        "owner_state_restored": True,
+        "light_repo_changed": True,
+        "workspace_git_refs_changed": True,
+    }
+
+
+def test_owner_restore_is_warning_primary_only_without_stronger_result(
+    tmp_path, monkeypatch,
+):
+    import time
+
+    stub = _RegistryStub(tmp_path)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        process_guard,
+        "_restore_owner_files",
+        lambda *_args, **_kwargs: True,
+    )
+
+    success = process_guard._run_shell_post_checks(
+        stub,
+        ToolResult(
+            status="ok",
+            code="OK",
+            text="exit_code=0\nSTDOUT:\nok",
+            meta={"exit_code": 0},
+        ),
+        owner_snapshot={},
+        state_drive_root=tmp_path,
+        light_repo_before=None,
+        workspace_refs_before=None,
+    )
+    failure = process_guard._run_shell_post_checks(
+        stub,
+        ToolResult(
+            status="error",
+            code="SHELL_EXIT_ERROR",
+            text="⚠️ SHELL_EXIT_ERROR: failed",
+            meta={"exit_code": 2},
+        ),
+        owner_snapshot={},
+        state_drive_root=tmp_path,
+        light_repo_before=None,
+        workspace_refs_before=None,
+    )
+
+    assert isinstance(success, ToolResult)
+    assert (success.status, success.code) == ("ok", "OWNER_STATE_RESTORED")
+    assert dict(success.meta) == {
+        "exit_code": 0,
+        "owner_state_restored": True,
+    }
+    assert isinstance(failure, ToolResult)
+    assert (failure.status, failure.code) == ("error", "SHELL_EXIT_ERROR")
+    assert dict(failure.meta) == {
+        "exit_code": 2,
+        "owner_state_restored": True,
+    }
 
 
 def test_registry_dispatch_calls_process_post_owner_once_after_handler(
@@ -495,6 +562,80 @@ def test_registry_dispatch_calls_process_post_owner_once_after_handler(
 
     assert registry.execute("run_command", {"cmd": ["echo", "ok"]}) == "handler output"
     assert calls == ["pre_guard", "safety", "snapshot", "handler", "post", "adapter"]
+    assert not hasattr(registry._ctx, "_active_process_tool_result")
+
+
+def test_custom_process_handler_cannot_reuse_stale_sidecar(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import safety
+
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    stale = ToolResult(
+        status="error",
+        code="SHELL_EXIT_ERROR",
+        text="custom output",
+        meta={"exit_code": 93},
+    )
+    registry._ctx._active_process_tool_result = stale
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
+    monkeypatch.setattr(process_guard, "_run_shell_safety_check", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(process_guard, "_snapshot_owner_files", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        process_guard,
+        "_run_shell_post_checks",
+        lambda _owner, result, **_kwargs: result,
+    )
+    registry.override_handler(
+        "run_command",
+        lambda _ctx, cmd, _resolved_binding=None, **_kwargs: "custom output",
+    )
+
+    result = registry.execute_result("run_command", {"cmd": ["echo", "ok"]})
+
+    assert (result.status, result.code, result.text, dict(result.meta)) == (
+        "ok",
+        "OK",
+        "custom output",
+        {},
+    )
+    assert registry._ctx._active_process_tool_result is stale
+
+    def mismatched(ctx, cmd, _resolved_binding=None, **_kwargs):
+        ctx._active_process_tool_result = ToolResult(
+            status="error",
+            code="SHELL_EXIT_ERROR",
+            text="different output",
+            meta={"exit_code": 93},
+        )
+        return "custom output"
+
+    registry.override_handler("run_command", mismatched)
+    mismatch = registry.execute_result(
+        "run_command", {"cmd": ["echo", "ok"]},
+    )
+    assert (mismatch.status, mismatch.code, dict(mismatch.meta)) == (
+        "ok",
+        "OK",
+        {},
+    )
+    assert registry._ctx._active_process_tool_result is stale
+
+    delattr(registry._ctx, "_active_process_tool_result")
+    mismatch_without_prior = registry.execute_result(
+        "run_command", {"cmd": ["echo", "ok"]},
+    )
+    assert (
+        mismatch_without_prior.status,
+        mismatch_without_prior.code,
+        dict(mismatch_without_prior.meta),
+    ) == ("ok", "OK", {})
+    assert not hasattr(registry._ctx, "_active_process_tool_result")
 
 
 def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):

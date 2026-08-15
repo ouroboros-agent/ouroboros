@@ -38,7 +38,7 @@ from ouroboros.tools.tool_resolution import (
     active_repo_dir_for,
     system_repo_dir_for,
 )
-from ouroboros.tools.tool_result import ToolResult
+from ouroboros.tools.tool_result import ToolResult, _replace_tool_result
 from ouroboros.utils import safe_relpath
 
 
@@ -752,15 +752,18 @@ def _restore_owner_files(
 
 def _run_shell_post_checks(
     self,
-    result: str,
+    result: str | ToolResult,
     *,
     owner_snapshot: Dict[pathlib.Path, Optional[str]],
     state_drive_root: pathlib.Path,
     light_repo_before: Optional[Dict[str, Any]],
     workspace_refs_before: Optional[Dict[str, str]],
     tool_name: str = "run_command",
-) -> str:
+) -> str | ToolResult:
     import time
+
+    text = result.text if isinstance(result, ToolResult) else result
+    typed = result if isinstance(result, ToolResult) else None
 
     restored_owner_state = False
     for _ in range(4):
@@ -770,28 +773,54 @@ def _run_shell_post_checks(
             or restored_owner_state
         )
     if restored_owner_state:
-        result = (
-            f"{result}\n\n⚠️ OWNER_STATE_RESTORED: run_command attempted to "
+        text = (
+            f"{text}\n\n⚠️ OWNER_STATE_RESTORED: run_command attempted to "
             "change owner-only settings or skill trust state; protected files were restored."
         )
+        if typed is not None:
+            typed = _replace_tool_result(
+                typed,
+                text=text,
+                code="OWNER_STATE_RESTORED" if typed.status == "ok" else typed.code,
+                meta_updates={"owner_state_restored": True},
+            )
     if light_repo_before is not None:
         light_repo_after = _light_repo_snapshot(system_repo_dir_for(self._ctx))
         if (
             light_repo_after is not None
             and light_repo_after.get("digest") != light_repo_before.get("digest")
         ):
-            result = _format_light_repo_write_block(light_repo_before, light_repo_after, result, tool_name=tool_name)
+            text = _format_light_repo_write_block(
+                light_repo_before,
+                light_repo_after,
+                text,
+                tool_name=tool_name,
+            )
+            if typed is not None:
+                typed = _replace_tool_result(
+                    typed,
+                    text=text,
+                    code="LIGHT_MODE_REPO_WRITE_BLOCKED",
+                    meta_updates={"light_repo_changed": True},
+                )
     if workspace_refs_before is not None:
         workspace_refs_after = _git_ref_snapshot(active_repo_dir_for(self._ctx))
         if (
             workspace_refs_after is not None
             and workspace_refs_after.get("digest") != workspace_refs_before.get("digest")
         ):
-            result = (
+            text = (
                 "⚠️ WORKSPACE_GIT_REF_CHANGED: run_command changed git HEAD or refs "
                 "inside the external workspace. External workspace runs must leave "
                 "changes as files/patch artifacts, not commits/tags/resets.\n\n"
                 "Original command output:\n"
-                f"{result}"
+                f"{text}"
             )
-    return result
+            if typed is not None:
+                typed = _replace_tool_result(
+                    typed,
+                    text=text,
+                    code="WORKSPACE_GIT_REF_CHANGED",
+                    meta_updates={"workspace_git_refs_changed": True},
+                )
+    return typed if typed is not None else text

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import signal
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
@@ -17,11 +18,19 @@ _MCP_RESULT_ENVELOPE_PREFIX = "External MCP tool result from "
 _MAX_META_ITEMS = 32
 _MAX_META_BYTES = 8192
 _HOST_META_KEYS = frozenset(
-    {"route_note", "safety_warning", "ambiguous_safety_wrapper"}
+    {
+        "route_note",
+        "safety_warning",
+        "ambiguous_safety_wrapper",
+        "owner_state_restored",
+        "light_repo_changed",
+        "workspace_git_refs_changed",
+    }
 )
 # Producer metadata keeps its exact limits. Composition may add only these
 # closed, boolean host annotations, within a separately bounded byte reserve.
-_MAX_HOST_META_BYTES = 128
+_MAX_HOST_META_BYTES = 256
+_PROCESS_TOOL_RESULT_ATTR = "_active_process_tool_result"
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,18 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "ok_autocorrected",
             "warning",
             "inspect the corrected command when relevant",
+        ),
+        "SHELL_NO_MATCH": _code_spec(
+            "ok",
+            "ok",
+            "info",
+            "none",
+        ),
+        "OWNER_STATE_RESTORED": _code_spec(
+            "ok",
+            "ok",
+            "warning",
+            "inspect the attempted owner-state mutation",
         ),
         "REVIEW_BLOCKED": _code_spec(
             "ok",
@@ -187,6 +208,18 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "light_mode_blocked",
             "warning",
             "use a permitted target or owner-selected mode",
+        ),
+        "LIGHT_MODE_REPO_WRITE_BLOCKED": _code_spec(
+            "blocked",
+            "light_mode_blocked",
+            "warning",
+            "use advanced or pro mode for repository writes",
+        ),
+        "WORKSPACE_GIT_REF_CHANGED": _code_spec(
+            "blocked",
+            "workspace_blocked",
+            "warning",
+            "leave external workspace changes as files or patch artifacts",
         ),
         "HEAL_MODE_BLOCKED": _code_spec(
             "blocked",
@@ -397,6 +430,98 @@ class ToolResult:
         object.__setattr__(self, "meta", MappingProxyType(json.loads(encoded)))
 
 
+def _replace_tool_result(
+    result: ToolResult,
+    *,
+    text: str | None = None,
+    code: str | None = None,
+    meta_updates: Mapping[str, Any] | None = None,
+) -> ToolResult:
+    """Replace immutable result fields without re-adapting its trusted facts."""
+
+    selected_code = code or result.code
+    meta = dict(result.meta)
+    meta.update(dict(meta_updates or {}))
+    return ToolResult(
+        status=TOOL_CODE_SPECS[selected_code].status,
+        code=selected_code,
+        text=result.text if text is None else text,
+        meta=meta,
+    )
+
+
+def _publish_process_tool_result(ctx: Any, result: ToolResult) -> str:
+    """Publish one registry-scoped process result while keeping the string ABI."""
+
+    if hasattr(ctx, _PROCESS_TOOL_RESULT_ATTR):
+        setattr(ctx, _PROCESS_TOOL_RESULT_ATTR, result)
+    return result.text
+
+
+def _publish_process_result(
+    ctx: Any,
+    code: str,
+    text: str,
+    *,
+    exit_code: int | None = None,
+    signal_name: str = "",
+    artifact_registered: bool = False,
+    shell_regex_auto_corrected: bool = False,
+    meta: Mapping[str, Any] | None = None,
+) -> str:
+    """Publish trusted process facts through the transient string-bound sidecar."""
+
+    facts = dict(meta or {})
+    if exit_code is not None:
+        facts["exit_code"] = int(exit_code)
+        if int(exit_code) < 0 and not signal_name:
+            signal_number = abs(int(exit_code))
+            try:
+                signal_name = signal.Signals(signal_number).name
+            except ValueError:
+                signal_name = f"SIG{signal_number}"
+    if signal_name:
+        facts["signal"] = signal_name
+    if artifact_registered:
+        facts["artifact_registered"] = True
+    if shell_regex_auto_corrected:
+        facts["shell_regex_auto_corrected"] = True
+    return _publish_process_tool_result(
+        ctx,
+        ToolResult(
+            status=TOOL_CODE_SPECS[code].status,
+            code=code,
+            text=text,
+            meta=facts,
+        ),
+    )
+
+
+def _wrap_run_script_process_result(
+    ctx: Any,
+    result: str,
+    audit_note: str,
+    script_path: Any,
+) -> str:
+    """Republish an inner shell result after the exact run-script text wrapper."""
+
+    if str(result).lstrip().startswith("⚠️"):
+        tail = f"\n{audit_note}" if audit_note else ""
+        wrapped = f"{result}{tail}\n# script_path={script_path}"
+    elif audit_note:
+        wrapped = f"{audit_note}\n# script_path={script_path}"
+    else:
+        wrapped = f"# script_path={script_path}\n{result}"
+    base = getattr(ctx, _PROCESS_TOOL_RESULT_ATTR, None)
+    if isinstance(base, ToolResult) and base.text == result:
+        code = "ARTIFACT_OUTPUT_UNDECLARED" if audit_note and base.status == "ok" else base.code
+        return _publish_process_tool_result(
+            ctx,
+            _replace_tool_result(base, text=wrapped, code=code),
+        )
+    return wrapped
+
+
 _EXACT_IDENTIFIER_CODES = MappingProxyType(
     {
         "ACCESS_DENIED": "ACCESS_BLOCKED",
@@ -416,7 +541,9 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "WORKSPACE_SHELL_BLOCKED": "WORKSPACE_BLOCKED",
         "WORKSPACE_EXECUTOR_STATE_WRITE_BLOCKED": "WORKSPACE_BLOCKED",
         "LIGHT_MODE_BLOCKED": "LIGHT_MODE_BLOCKED",
-        "LIGHT_MODE_REPO_WRITE_BLOCKED": "LIGHT_MODE_BLOCKED",
+        "LIGHT_MODE_REPO_WRITE_BLOCKED": "LIGHT_MODE_REPO_WRITE_BLOCKED",
+        "WORKSPACE_GIT_REF_CHANGED": "WORKSPACE_GIT_REF_CHANGED",
+        "OWNER_STATE_RESTORED": "OWNER_STATE_RESTORED",
         "HEAL_MODE_BLOCKED": "HEAL_MODE_BLOCKED",
         "ARTIFACT_OUTPUT_UNDECLARED": "ARTIFACT_OUTPUT_UNDECLARED",
         "ARTIFACT_OUTPUT_ERROR": "ARTIFACT_OUTPUT_ERROR",
@@ -434,6 +561,7 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "TOOL_INTERNAL_ERROR": "TOOL_INTERNAL_ERROR",
         "EXECUTOR_UNAVAILABLE": "LEGACY_UNAVAILABLE",
         "SHELL_EXIT_ERROR": "SHELL_EXIT_ERROR",
+        "SHELL_NO_MATCH": "SHELL_NO_MATCH",
         "SHELL_ERROR": "SHELL_ERROR",
         "SHELL_ARG_ERROR": "SHELL_ERROR",
         "SHELL_CMD_ERROR": "SHELL_ERROR",

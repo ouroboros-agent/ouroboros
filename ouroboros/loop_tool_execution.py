@@ -116,6 +116,11 @@ _FAILURE_MARKERS = (
     "_UNAVAILABLE",
     "_VIOLATION",
 )
+_PROCESS_RESULT_TOOLS = frozenset(
+    {"run_command", "run_script", "start_service", "stop_service"}
+)
+# Compatibility-only private identities retained for the v7 migration census.
+# Process fact extraction no longer consults either pattern.
 _EXIT_CODE_RE = re.compile(r"exit_code=(-?\d+)")
 _SIGNAL_RE = re.compile(r"signal=([A-Z0-9_]+)")
 
@@ -393,7 +398,12 @@ def _is_tool_execution_failure(tool_ok: bool, result: Any) -> bool:
     return bool(first_line and any(marker in first_line for marker in _FAILURE_MARKERS))
 
 
-def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[str, Any]:
+def _extract_result_metadata(
+    fn_name: str,
+    result: Any,
+    is_error: bool,
+    tool_result: ToolResult | None = None,
+) -> Dict[str, Any]:
     """Extract structured outcome facts for summaries and reflections."""
     text = str(result or "")
     status = "error" if is_error else "ok"
@@ -490,10 +500,13 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
         status = "error"
 
     meta: Dict[str, Any] = {"status": status}
-    # Structured deliverable signal captured from the FULL result (before the trace
-    # preview is truncated to 700 chars) so effect detection never misses a
-    # late ARTIFACT_OUTPUTS marker (e.g. a stopped service after a long log tail).
-    if not is_error and "ARTIFACT_OUTPUTS" in text:
+    # Legacy non-process deliverable fallback reads the FULL result before trace
+    # truncation. Process producers must supply the typed fact below.
+    if (
+        fn_name not in _PROCESS_RESULT_TOOLS
+        and not is_error
+        and "ARTIFACT_OUTPUTS" in text
+    ):
         meta["artifact_registered"] = True
     # Same full-result capture for the swarm force-plan gate.  Only the exact
     # host-appended typed control closes force-plan; raw reviewer prose and the
@@ -501,15 +514,15 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
     plan_control = _parse_plan_review_control(text) if fn_name == "plan_task" and not is_error else None
     if plan_control is not None:
         meta["plan_review_outcome"], meta["plan_review_closed"] = plan_control
-    exit_match = _EXIT_CODE_RE.search(text)
-    if exit_match:
-        try:
-            meta["exit_code"] = int(exit_match.group(1))
-        except ValueError:
-            pass
-    signal_match = _SIGNAL_RE.search(text)
-    if signal_match:
-        meta["signal"] = signal_match.group(1)
+    if fn_name in _PROCESS_RESULT_TOOLS and isinstance(tool_result, ToolResult):
+        exit_code = tool_result.meta.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            meta["exit_code"] = exit_code
+        signal_name = tool_result.meta.get("signal")
+        if isinstance(signal_name, str) and signal_name:
+            meta["signal"] = signal_name
+        if tool_result.meta.get("artifact_registered") is True:
+            meta["artifact_registered"] = True
     if fn_name == "run_command" and not is_error and meta.get("exit_code") == 0:
         if status == "ok_autocorrected":
             meta["status"] = "ok_autocorrected"
@@ -550,7 +563,7 @@ def _execute_single_tool(
         result = f"⚠️ TOOL_ARG_ERROR: Could not parse arguments for '{requested_fn_name}': {e}"
         tool_result = ToolResult(status="error", code="TOOL_ARG_ERROR", text=result)
         result_meta = {
-            **_extract_result_metadata(fn_name, result, True),
+            **_extract_result_metadata(fn_name, result, True, tool_result),
             **_tool_result_fields(tool_result),
         }
         trace_ref = {}
@@ -612,11 +625,12 @@ def _execute_single_tool(
             "tool": fn_name, "args": args_for_log, "error": safe_error,
         }, correlation, tool_call_id=tool_call_id))
 
-    # Producer metadata is incomplete; keep the text classifiers authoritative
-    # until root, repair, process, shell, artifact, and plan-control producers are typed.
+    # Transitional status/is_error stays text-compatible. Process exit, signal,
+    # and artifact-registration facts below are already typed and never parsed
+    # from producer-controlled stdout.
     is_error = _is_tool_execution_failure(tool_ok, result)
     result_meta = {
-        **_extract_result_metadata(fn_name, result, is_error),
+        **_extract_result_metadata(fn_name, result, is_error, tool_result),
         **_tool_result_fields(tool_result),
     }
 
@@ -734,7 +748,7 @@ def _make_timeout_result(
         meta={"timeout_sec": timeout_sec},
     )
     result_meta = {
-        **_extract_result_metadata(fn_name, result, True),
+        **_extract_result_metadata(fn_name, result, True, tool_result),
         **_tool_result_fields(tool_result),
     }
     trace_ref = {}
@@ -1103,7 +1117,12 @@ def handle_tool_calls(
                         "args_for_log": {},
                         "is_code_tool": fn_name in tools.CODE_TOOLS,
                         "result_meta": {
-                            **_extract_result_metadata(fn_name, result_text, True),
+                            **_extract_result_metadata(
+                                fn_name,
+                                result_text,
+                                True,
+                                tool_result,
+                            ),
                             **_tool_result_fields(tool_result),
                         },
                         "tool_result": tool_result,

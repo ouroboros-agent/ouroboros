@@ -31,6 +31,7 @@ from ouroboros.tools.registry import (
     ToolEntry,
     active_repo_dir_for,
 )
+from ouroboros.tools.tool_result import _publish_process_result, _wrap_run_script_process_result
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
     active_tool_profile,
@@ -504,11 +505,11 @@ def _register_process_outputs(
     changed_paths: set[str] | None = None,
     before_outputs: Dict[str, tuple[bool, int, str]] | None = None,
     binding: ResolvedResourceBinding | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
     """Copy declared command outputs into the task artifact store."""
 
     if not outputs:
-        return "", False
+        return "", False, False
     notes: list[str] = []
     failed = False
     registered = False  # at least one canonical artifact record was actually created
@@ -594,20 +595,16 @@ def _register_process_outputs(
             notes.append(f"skipped non-file output: {text}")
             failed = True
     if not notes:
-        return "", False
-    # Distinguish a CANONICAL artifact registration from a cosmetic-only note (e.g.
-    # an unchanged declared output): the downstream artifact_registered detector
-    # (outcomes.py / loop_tool_execution.py) keys on the exact "ARTIFACT_OUTPUTS"
-    # marker, so a cosmetic note must NOT borrow it — else an unchanged output reads
-    # as a real registration / false recovery signal. "ARTIFACT_OUTPUT_NOTE" does
-    # not contain the "ARTIFACT_OUTPUTS" substring, so it is correctly ignored.
+        return "", False, False
+    # Only canonical registration gets ARTIFACT_OUTPUTS; cosmetic unchanged-output
+    # notes use ARTIFACT_OUTPUT_NOTE and cannot forge artifact_registered recovery.
     if failed:
         prefix = "⚠️ ARTIFACT_OUTPUT_ERROR"
     elif registered:
         prefix = "ARTIFACT_OUTPUTS"
     else:
         prefix = "ARTIFACT_OUTPUT_NOTE"
-    return "\n\n" + prefix + ":\n" + "\n".join(f"- {note}" for note in notes), failed
+    return "\n\n" + prefix + ":\n" + "\n".join(f"- {note}" for note in notes), failed, registered
 
 
 # v6.90.x (submarine unwind) — the DECLARATION-NUDGE marker, deliberately typed
@@ -1137,6 +1134,7 @@ def _run_shell(
         )
 
     cmd, autocorrect_note = _maybe_autocorrect_grep_backslash_pipe(cmd)
+    regex_autocorrected = bool(autocorrect_note)
 
     found_ops = _SHELL_OPERATORS.intersection(cmd)
     if found_ops:
@@ -1230,12 +1228,14 @@ def _run_shell(
             if getattr(res, "backend_trace", None):
                 executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
             if _is_search_no_match(res):
-                return autocorrect_note + (
+                text = autocorrect_note + (
                     f"{_describe_returncode(res.returncode, cwd=work_dir, binding=binding)} (no matches)\n"
                     f"{_format_process_output(res.stdout or '', '')}"
                     f"{executor_note}"
                 )
-            return autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir, binding=binding)}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
+                return _publish_process_result(ctx, "SHELL_NO_MATCH", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected)
+            text = autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir, binding=binding)}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
+            return _publish_process_result(ctx, "SHELL_EXIT_ERROR", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected)
         after_changed = _status_snapshot(repo_root)
         if after_changed != before_changed:
             # This resolved cwd may be outside the live-repo dispatcher snapshot.
@@ -1248,7 +1248,7 @@ def _run_shell(
         undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, cmd, outputs, scratch_abs=scratch_abs, command_start_ts=_command_start_ts)
         if undeclared_user_outputs:
             # Declaration NUDGE, not a failure — see _UNDECLARED_OUTPUTS_MARKER.
-            return (
+            text = (
                 autocorrect_note
                 + f"{_UNDECLARED_OUTPUTS_MARKER}: command appears to write user_files outputs "
                 "without declaring outputs=[...]. Declare generated user-visible files so "
@@ -1257,7 +1257,8 @@ def _run_shell(
                 + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n"
                 + _format_process_output(res.stdout or "", res.stderr or "")
             )
-        artifact_note, artifact_failed = _register_process_outputs(
+            return _publish_process_result(ctx, "ARTIFACT_OUTPUT_UNDECLARED", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected)
+        artifact_note, artifact_failed, artifact_registered = _register_process_outputs(
             ctx,
             outputs,
             pathlib.Path(work_dir),
@@ -1295,17 +1296,19 @@ def _run_shell(
                 + ". It is excluded from the workspace patch, but delete it before finishing so it does not linger."
             )
         if artifact_failed:
-            return (
+            text = (
                 autocorrect_note
                 + "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed. "
                 + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n"
                 + f"{_format_process_output(res.stdout or '', res.stderr or '')}"
                 + artifact_note
             )
+            return _publish_process_result(ctx, "ARTIFACT_OUTPUT_ERROR", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected)
         executor_note = ""
         if getattr(res, "backend_trace", None):
             executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
-        return autocorrect_note + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
+        text = autocorrect_note + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
+        return _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected)
     except subprocess.TimeoutExpired:
         # Timeout-created scratch still needs its exclusion fingerprint.
         _record_scratch_fingerprints(ctx, scratch_abs)
@@ -1481,12 +1484,7 @@ def _run_script(
             + ", ".join(undeclared_user_outputs)
             + ". Re-run with outputs=[...] or write the canonical deliverable via root=artifact_store."
         )
-    if str(result).lstrip().startswith("⚠️"):
-        tail = f"\n{audit_note}" if audit_note else ""
-        return f"{result}{tail}\n# script_path={script_path}"
-    if audit_note:
-        return f"{audit_note}\n# script_path={script_path}"
-    return f"# script_path={script_path}\n{result}"
+    return _wrap_run_script_process_result(ctx, result, audit_note, script_path)
 
 
 def get_tools() -> List[ToolEntry]:
