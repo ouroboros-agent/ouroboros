@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
@@ -63,6 +64,85 @@ def test_registry_tool_resolution_owner_facades_preserve_identity():
         name: str(inspect.signature(getattr(tool_resolution, name)))
         for name in callables
     } == callables
+
+
+def test_dispatch_path_normalization_typed_fact_and_compatibility_projection(tmp_path):
+    from ouroboros.tools import tool_resolution
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "src" / "x.py"
+    ctx = SimpleNamespace(
+        repo_dir=workspace,
+        active_repo_dir=lambda: workspace,
+    )
+
+    no_hit_args = {"root": "user_files", "path": "notes.txt"}
+    no_hit = tool_resolution._normalize_dispatch_path_args_result(
+        ctx,
+        "read_file",
+        no_hit_args,
+    )
+    assert no_hit == tool_resolution._DispatchPathNormalization()
+    assert no_hit_args == {"root": "user_files", "path": "notes.txt"}
+
+    read_text = (
+        "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: absolute path "
+        f"{str(target)!r} is under the active workspace; the call ran with "
+        "root='active_workspace'. Pass root='active_workspace' directly for "
+        "workspace paths."
+    )
+    read_args = {"root": "user_files", "path": str(target)}
+    read_result = tool_resolution._normalize_dispatch_path_args_result(
+        ctx,
+        "read_file",
+        read_args,
+    )
+    assert read_result == tool_resolution._DispatchPathNormalization(text=read_text)
+    assert read_args == {"root": "active_workspace", "path": "src/x.py"}
+
+    compat_read_args = {"root": "user_files", "path": str(target)}
+    assert (
+        tool_resolution._normalize_dispatch_path_args(
+            ctx,
+            "read_file",
+            compat_read_args,
+        )
+        == read_text
+    )
+    assert compat_read_args == read_args
+
+    write_text = (
+        "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path "
+        f"{str(target)!r} is under the active workspace, but root='user_files' does not "
+        "write there. Retry the same call with root='active_workspace' (the same "
+        "path is accepted)."
+    )
+    write_args = {"root": "user_files", "path": str(target)}
+    write_result = tool_resolution._normalize_dispatch_path_args_result(
+        ctx,
+        "write_file",
+        write_args,
+    )
+    assert write_result == tool_resolution._DispatchPathNormalization(
+        text=write_text,
+        required_root="active_workspace",
+    )
+    assert write_args == {"root": "user_files", "path": str(target)}
+
+    compat_write_args = dict(write_args)
+    assert (
+        tool_resolution._normalize_dispatch_path_args(
+            ctx,
+            "write_file",
+            compat_write_args,
+        )
+        == write_text
+    )
+    assert compat_write_args == write_args
+
+    with pytest.raises(FrozenInstanceError):
+        write_result.required_root = None
 
 
 def test_binding_set_projections_preserve_ordered_all_member_semantics(tmp_path, monkeypatch):

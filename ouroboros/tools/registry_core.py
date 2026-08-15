@@ -47,7 +47,6 @@ from ouroboros.tools.tool_resolution import (
     _binding_set_targets_system_repo,
     _binding_state_drive_root,
     _build_builtin_target_binding,
-    _normalize_dispatch_path_args,
     _target_binding_operation,
     active_repo_dir_for,
     system_repo_dir_for,
@@ -785,8 +784,9 @@ class ToolRegistry:
             public_arg_error = tool_resolution._prepare_public_builtin_args(entry, args)
             if public_arg_error:
                 return public_arg_error
-            _route_note = _normalize_dispatch_path_args(self._ctx, name, args)
-            if _route_note and name in ("write_file", "edit_text"):
+            path_normalization = tool_resolution._normalize_dispatch_path_args_result(self._ctx, name, args)
+            _route_note = path_normalization.text
+            if path_normalization.required_root == "active_workspace":
                 return ToolResult(status="blocked", code="ROOT_REQUIRED", text=_route_note, meta={"required_root": "active_workspace"})
         heal_no_enable = bool(task_constraint and task_constraint.mode == "skill_repair")
         if heal_no_enable:

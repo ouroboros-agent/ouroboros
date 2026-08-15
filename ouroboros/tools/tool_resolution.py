@@ -5,7 +5,8 @@ from __future__ import annotations
 import inspect
 import os
 import pathlib
-from typing import Any, Callable, Dict, List
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Literal
 
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
 from ouroboros.shell_parse import is_absolute_path_text
@@ -65,11 +66,20 @@ def system_repo_dir_for(ctx: Any) -> pathlib.Path:
 # the dispatch guards below and their handlers run every payload path through
 # `canonical_repo_relative_path`, the same normalization this seam applies.
 _PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "list_files", "search_code", "query_code"})
+_TOP_LEVEL_PATH_WRITE_TOOLS = frozenset({"write_file", "edit_text"})
 # Repo-lane write tools that take a top-level `root` arg. Every gate keyed to
 # "a write that lands in the repo working tree" must judge the whole set, not
 # the historical write_file/edit_text pair — a new editing primitive that misses
 # one of these gates is a silently weaker lane, not a new capability.
 _ROOT_ARG_REPO_WRITE_TOOLS = frozenset({"write_file", "edit_text", "apply_patch", "edit_batch"})
+
+
+@dataclass(frozen=True)
+class _DispatchPathNormalization:
+    """Exact dispatch note plus any explicit root required before dispatch."""
+
+    text: str = ""
+    required_root: Literal["active_workspace"] | None = None
 
 
 def _payload_write_paths(name: str, args: Dict[str, Any]) -> List[str]:
@@ -234,7 +244,11 @@ def _format_tool_arg_error(entry: Any) -> str:
     )
 
 
-def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> str:
+def _normalize_dispatch_path_args_result(
+    ctx: Any,
+    name: str,
+    args: Dict[str, Any],
+) -> _DispatchPathNormalization:
     """ROOT-FIX (v6.35.0): normalize an absolute / redundant-root-basename
     active_workspace|system_repo path arg IN PLACE at the dispatch boundary, so
     the handler AND every downstream guard (protected-path, protected-artifact,
@@ -254,7 +268,7 @@ def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> 
     corrected, never the authority. ``query_code`` is excluded: its
     root=user_files external-target contract handles absolute paths natively."""
     if name not in _PATH_NORMALIZED_TOOLS:
-        return ""
+        return _DispatchPathNormalization()
     root_arg = str(args.get("root") or "active_workspace")
     if root_arg in ("active_workspace", "system_repo"):
         try:
@@ -268,13 +282,13 @@ def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> 
                         _f["path"] = normalize_root_relative(norm_root, _f["path"])
         except Exception:
             pass
-        return ""
+        return _DispatchPathNormalization()
     if root_arg != "user_files" or name == "query_code":
-        return ""
+        return _DispatchPathNormalization()
     try:
         workspace = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
     except Exception:
-        return ""
+        return _DispatchPathNormalization()
 
     def _under_workspace(text: str) -> bool:
         if not is_absolute_path_text(text):
@@ -295,13 +309,16 @@ def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> 
                 candidates.append(_f["path"])
     hits = [text for text in candidates if _under_workspace(text)]
     if not hits:
-        return ""
-    if name in ("write_file", "edit_text"):
-        return (
-            "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path "
-            f"{hits[0]!r} is under the active workspace, but root='user_files' does not "
-            "write there. Retry the same call with root='active_workspace' (the same "
-            "path is accepted)."
+        return _DispatchPathNormalization()
+    if name in _TOP_LEVEL_PATH_WRITE_TOOLS:
+        return _DispatchPathNormalization(
+            text=(
+                "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path "
+                f"{hits[0]!r} is under the active workspace, but root='user_files' does not "
+                "write there. Retry the same call with root='active_workspace' (the same "
+                "path is accepted)."
+            ),
+            required_root="active_workspace",
         )
     args["root"] = "active_workspace"
     try:
@@ -314,12 +331,20 @@ def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> 
                     _f["path"] = normalize_root_relative(workspace, _f["path"])
     except Exception:
         pass
-    return (
-        "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: absolute path "
-        f"{hits[0]!r} is under the active workspace; the call ran with "
-        "root='active_workspace'. Pass root='active_workspace' directly for "
-        "workspace paths."
+    return _DispatchPathNormalization(
+        text=(
+            "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: absolute path "
+            f"{hits[0]!r} is under the active workspace; the call ran with "
+            "root='active_workspace'. Pass root='active_workspace' directly for "
+            "workspace paths."
+        )
     )
+
+
+def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> str:
+    """Compatibility projection of the typed dispatch-path normalization."""
+
+    return _normalize_dispatch_path_args_result(ctx, name, args).text
 
 
 _GENERIC_VCS_TARGET_TOOLS = frozenset({

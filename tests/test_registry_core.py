@@ -51,7 +51,9 @@ def test_registry_core_extraction_preserves_only_proven_facades():
         "_task_constraint_path_allowed",
     }
     private_resolution_names = {
+        "_DispatchPathNormalization",
         "_ROOT_ARG_REPO_WRITE_TOOLS",
+        "_TOP_LEVEL_PATH_WRITE_TOOLS",
         "_TOOL_ARG_ALIASES",
         "_IGNORE_ROOT_ARG_TOOLS",
         "_binding_error_text",
@@ -60,6 +62,7 @@ def test_registry_core_extraction_preserves_only_proven_facades():
         "_format_tool_arg_error",
         "_handler_public_params",
         "_light_binding_failure_redirect",
+        "_normalize_dispatch_path_args_result",
         "_normalize_tool_call_args",
         "_payload_write_paths",
         "_prepare_public_builtin_args",
@@ -231,3 +234,69 @@ def test_active_workspace_root_redirect_is_native_with_legacy_loop_projection(tm
     assert row["result_meta"]["tool_result_code"] == "ROOT_REQUIRED"
     assert row["result_meta"]["tool_result_meta"] == {"required_root": "active_workspace"}
     assert calls == []
+
+
+def test_registry_uses_typed_required_root_not_note_or_tool_name(tmp_path, monkeypatch):
+    import ouroboros.safety as safety
+    from ouroboros.tools import tool_resolution
+    from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.tool_result import ToolResult
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    repo.mkdir()
+    drive.mkdir()
+    tools = ToolRegistry(repo_dir=repo, drive_root=drive)
+    calls = []
+
+    def handler(_ctx, *, _resolved_binding=None, **_kwargs):
+        calls.append(_resolved_binding)
+        return "OK"
+
+    tools.override_handler("write_file", handler)
+    tools.override_handler("read_file", handler)
+    monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
+
+    normalizations = []
+
+    def normalize(_ctx, name, _args):
+        normalizations.append(name)
+        if name == "write_file":
+            return tool_resolution._DispatchPathNormalization(
+                text="⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: benign additive note",
+            )
+        return tool_resolution._DispatchPathNormalization(
+            text="typed required-root fact",
+            required_root="active_workspace",
+        )
+
+    monkeypatch.setattr(
+        tool_resolution,
+        "_normalize_dispatch_path_args_result",
+        normalize,
+    )
+
+    benign = tools.execute_result(
+        "write_file",
+        {"root": "active_workspace", "path": "note.txt", "content": "unchanged"},
+    )
+    assert benign == ToolResult(
+        status="ok",
+        code="OK",
+        text="OK\n\n⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: benign additive note",
+        meta={"route_note": True},
+    )
+    assert len(calls) == 1
+
+    required = tools.execute_result(
+        "read_file",
+        {"root": "active_workspace", "path": "note.txt"},
+    )
+    assert required == ToolResult(
+        status="blocked",
+        code="ROOT_REQUIRED",
+        text="typed required-root fact",
+        meta={"required_root": "active_workspace"},
+    )
+    assert len(calls) == 1
+    assert normalizations == ["write_file", "read_file"]
