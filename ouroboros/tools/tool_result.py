@@ -13,10 +13,15 @@ _TOOL_STATUSES = frozenset({"ok", "error", "blocked", "timeout", "unavailable"})
 _CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _FIRST_MARKER_RE = re.compile(r"^⚠️ ([A-Z][A-Z0-9_]*)")
 _SAFETY_SEPARATOR = "\n\n---\n"
-_ROUTE_NOTE_PREFIX = "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE"
 _MCP_RESULT_ENVELOPE_PREFIX = "External MCP tool result from "
 _MAX_META_ITEMS = 32
 _MAX_META_BYTES = 8192
+_HOST_META_KEYS = frozenset(
+    {"route_note", "safety_warning", "ambiguous_safety_wrapper"}
+)
+# Producer metadata keeps its exact limits. Composition may add only these
+# closed, boolean host annotations, within a separately bounded byte reserve.
+_MAX_HOST_META_BYTES = 128
 
 
 @dataclass(frozen=True)
@@ -297,8 +302,13 @@ class ToolResult:
         if not isinstance(self.text, str):
             raise TypeError("tool result text must be a string")
         raw_meta = dict(self.meta or {})
-        if len(raw_meta) > _MAX_META_ITEMS or any(not isinstance(key, str) for key in raw_meta):
-            raise ValueError("tool result meta must have at most 32 string keys")
+        if any(not isinstance(key, str) for key in raw_meta):
+            raise ValueError("tool result meta keys must be strings")
+        producer_meta = {
+            key: value for key, value in raw_meta.items() if key not in _HOST_META_KEYS
+        }
+        if len(producer_meta) > _MAX_META_ITEMS:
+            raise ValueError("tool result meta must have at most 32 non-host keys")
         try:
             encoded = json.dumps(
                 raw_meta,
@@ -307,10 +317,23 @@ class ToolResult:
                 separators=(",", ":"),
                 sort_keys=True,
             )
-        except (TypeError, ValueError) as exc:
+            producer_encoded = json.dumps(
+                producer_meta,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (RecursionError, TypeError, ValueError) as exc:
             raise TypeError("tool result meta must contain JSON-safe values") from exc
-        if len(encoded.encode("utf-8")) > _MAX_META_BYTES:
+        producer_bytes = len(producer_encoded.encode("utf-8"))
+        if producer_bytes > _MAX_META_BYTES:
             raise ValueError("tool result meta exceeds 8192 encoded bytes")
+        # Keep every payload valid under the old aggregate cap, then permit
+        # only the fixed host reserve beyond it as producer bytes approach it.
+        total_limit = max(_MAX_META_BYTES, producer_bytes + _MAX_HOST_META_BYTES)
+        if len(encoded.encode("utf-8")) > total_limit:
+            raise ValueError("tool result host metadata exceeds its reserved overhead")
         object.__setattr__(self, "meta", MappingProxyType(json.loads(encoded)))
 
 
@@ -491,13 +514,57 @@ class LegacyTextResultAdapter:
                 text=text,
                 meta={"dynamic_provider": True},
             )
-        classified_text = text
-        route_marker = f"\n\n{_ROUTE_NOTE_PREFIX}"
-        route_index = classified_text.rfind(route_marker)
-        route_note = route_index >= 0 and "\n" not in classified_text[route_index + 2 :]
-        if route_note:
-            classified_text = classified_text[:route_index]
-        status, code, meta = _classify_legacy_text(classified_text)
+        status, code, meta = _classify_legacy_text(text)
+        return ToolResult(status=status, code=code, text=text, meta=meta)
+
+
+def _compose_execute_result_result(
+    tool_name: str,
+    base: str | ToolResult,
+    route_note: str,
+    safety_msg: str,
+) -> ToolResult:
+    """Compose host-owned annotations without re-adapting a typed base result."""
+
+    base_result = (
+        base
+        if isinstance(base, ToolResult)
+        else LegacyTextResultAdapter.from_text(tool_name, base)
+    )
+    text = _compose_execute_result(base_result.text, route_note, safety_msg)
+    if safety_msg and text.count(_SAFETY_SEPARATOR) > 1:
+        meta = dict(base_result.meta)
+        meta["ambiguous_safety_wrapper"] = True
         if route_note:
             meta["route_note"] = True
-        return ToolResult(status=status, code=code, text=text, meta=meta)
+        return ToolResult(
+            status="error",
+            code="SAFETY_ERROR",
+            text=text,
+            meta=meta,
+        )
+
+    meta = dict(base_result.meta)
+    if route_note:
+        meta["route_note"] = True
+    if not safety_msg:
+        return ToolResult(
+            status=base_result.status,
+            code=base_result.code,
+            text=text,
+            meta=meta,
+        )
+    if base_result.code == "OK":
+        return ToolResult(
+            status="ok",
+            code="SAFETY_WARNING",
+            text=text,
+            meta=meta,
+        )
+    meta["safety_warning"] = True
+    return ToolResult(
+        status=base_result.status,
+        code=base_result.code,
+        text=text,
+        meta=meta,
+    )

@@ -1,4 +1,8 @@
 from ouroboros.loop_tool_execution import _extract_result_metadata, _is_tool_execution_failure
+from ouroboros.tools.tool_result import (
+    LegacyTextResultAdapter,
+    _compose_execute_result_result,
+)
 
 
 def test_get_tool_timeout_honors_per_call_override(monkeypatch):
@@ -31,6 +35,35 @@ def test_review_blocked_is_not_treated_as_tool_failure():
 
 def test_domain_errors_are_not_treated_as_tool_failures():
     assert not _is_tool_execution_failure(True, "⚠️ GIT_ERROR (commit): hook rejected commit")
+
+
+def test_binding_result_mappings_preserve_legacy_loop_classification():
+    cases = (
+        ("query_code", "⚠️ TOOL_ARG_ERROR (query_code): ValueError: bad root", "error", "TOOL_ARG_ERROR", True, "error"),
+        ("apply_patch", "⚠️ TOOL_ERROR: ValueError: bad root", "error", "TOOL_ERROR", True, "error"),
+        ("vcs_status", "⚠️ GIT_ERROR: ValueError: bad root", "ok", "GIT_ERROR", False, "error"),
+    )
+    for tool, text, status, code, is_error, legacy_status in cases:
+        typed = LegacyTextResultAdapter.from_text(tool, text)
+        actual_error = _is_tool_execution_failure(True, text)
+        assert (typed.status, typed.code) == (status, code)
+        assert actual_error is is_error
+        assert _extract_result_metadata(tool, text, actual_error)["status"] == legacy_status
+
+
+def test_typed_safety_composition_preserves_current_legacy_loop_masking():
+    typed = _compose_execute_result_result(
+        "apply_patch",
+        "⚠️ TOOL_ERROR: failed",
+        "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: fixture",
+        "⚠️ SAFETY_WARNING: inspect",
+    )
+    is_error = _is_tool_execution_failure(True, typed.text)
+
+    assert (typed.status, typed.code) == ("error", "TOOL_ERROR")
+    assert typed.meta == {"route_note": True, "safety_warning": True}
+    assert is_error is False
+    assert _extract_result_metadata("apply_patch", typed.text, is_error)["status"] == "ok"
 
 
 def test_executor_failures_are_still_tool_failures():

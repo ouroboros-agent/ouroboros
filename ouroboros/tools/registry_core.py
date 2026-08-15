@@ -54,7 +54,7 @@ from ouroboros.tools.tool_resolution import (
 from ouroboros.tools.tool_result import (
     LegacyTextResultAdapter,
     ToolResult,
-    _compose_execute_result,
+    _compose_execute_result_result,
 )
 from ouroboros.tools.registry_guards import (
     _EPHEMERAL_ALLOWED_TOOLS,
@@ -852,8 +852,8 @@ class ToolRegistry:
             try:
                 resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
             except Exception as exc:
-                redirect = tool_resolution._light_binding_failure_redirect(name, args)
-                if redirect:
+                redirect = tool_resolution._light_binding_failure_result(name, args)
+                if redirect is not None:
                     return redirect
                 operation = _target_binding_operation(name, args)
                 if operation in {"shell", "service"}:
@@ -1057,7 +1057,7 @@ class ToolRegistry:
                 tool_name=name,
             )
 
-        return _compose_execute_result(result, _route_note, safety_msg)
+        return _compose_execute_result_result(name, result, _route_note, safety_msg) if _route_note or safety_msg else result
 
     def execute_result(self, name: str, args: Dict[str, Any]) -> ToolResult:
         """Dispatch once and adapt only producers that still return legacy text."""

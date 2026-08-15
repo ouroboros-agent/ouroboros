@@ -64,6 +64,7 @@ def test_registry_core_extraction_preserves_only_proven_facades():
         "_format_tool_arg_error",
         "_handler_public_params",
         "_light_binding_failure_redirect",
+        "_light_binding_failure_result",
         "_normalize_dispatch_path_args_result",
         "_normalize_tool_call_args",
         "_payload_write_paths",
@@ -482,6 +483,187 @@ def test_stable_host_predispatch_denials_are_native_and_keep_legacy_projection(
 
 
 @pytest.mark.parametrize(
+    ("tool_name", "args", "detail", "status", "code", "text", "legacy_status", "is_error", "adapter_calls"),
+    (
+        ("read_file", {"path": "x"}, "profile=acting cannot read active_workspace.", "blocked", "ACCESS_BLOCKED", "⚠️ TOOL_ACCESS_BLOCKED: profile=acting cannot read active_workspace.", "blocked", True, 0),
+        ("query_code", {"op": "digest"}, "binding failed", "error", "TOOL_ARG_ERROR", "⚠️ TOOL_ARG_ERROR (query_code): RuntimeError: binding failed", "error", True, 0),
+        ("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}, "binding failed", "error", "TOOL_ERROR", "⚠️ TOOL_ERROR: RuntimeError: binding failed", "error", True, 0),
+        ("edit_batch", {"edits": [{"path": "x", "old_str": "a", "new_str": "b", "count": 1}]}, "binding failed", "error", "TOOL_ERROR", "⚠️ TOOL_ERROR: RuntimeError: binding failed", "error", True, 0),
+        ("vcs_status", {}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "error", False, 0),
+        ("vcs_diff", {}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "error", False, 0),
+        ("read_file", {"path": "x"}, "binding failed", "error", "LEGACY_TOOL_ERROR", "⚠️ READ_FILE_ERROR: RuntimeError: binding failed", "error", True, 1),
+    ),
+)
+def test_binding_failures_cut_over_only_the_exact_native_families(
+    tool_name,
+    args,
+    detail,
+    status,
+    code,
+    text,
+    legacy_status,
+    is_error,
+    adapter_calls,
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    import ouroboros.config as config
+    import ouroboros.tools.registry_core as registry_core
+    import ouroboros.tools.tool_resolution as tool_resolution
+    from ouroboros.loop_tool_execution import _execute_single_tool
+    from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    logs = drive / "logs"
+    repo.mkdir()
+    logs.mkdir(parents=True)
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    downstream = []
+    registry.override_handler(
+        tool_name,
+        lambda *_args, **_kwargs: downstream.append("handler") or "unreachable",
+    )
+    monkeypatch.setattr(config, "get_runtime_mode", lambda: "advanced")
+    monkeypatch.setattr(
+        "ouroboros.safety.check_safety",
+        lambda *_args, **_kwargs: downstream.append("safety") or (True, ""),
+    )
+    monkeypatch.setattr(
+        registry_core,
+        "_build_builtin_target_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(detail)),
+    )
+    adapted = []
+    original_adapter = LegacyTextResultAdapter.from_text
+    monkeypatch.setattr(
+        LegacyTextResultAdapter,
+        "from_text",
+        classmethod(
+            lambda _cls, name, value: (
+                adapted.append((name, value))
+                or original_adapter(name, value)
+            )
+        ),
+    )
+
+    row = _execute_single_tool(
+        registry,
+        {
+            "id": f"binding-{tool_name}",
+            "function": {"name": tool_name, "arguments": json.dumps(args)},
+        },
+        logs,
+        "task-binding",
+    )
+
+    assert row["tool_result"] == ToolResult(status=status, code=code, text=text)
+    assert row["result"] == text
+    assert row["is_error"] is is_error
+    assert row["result_meta"] == {
+        "status": legacy_status,
+        "tool_result_status": status,
+        "tool_result_code": code,
+        "tool_result_meta": {},
+    }
+    assert len(adapted) == adapter_calls
+    assert downstream == []
+    if tool_name == "apply_patch":
+        assert tool_resolution._binding_error_text(
+            "future_binding_tool",
+            "active_workspace",
+            RuntimeError("binding failed"),
+        ) == ToolResult(
+            status="error",
+            code="TOOL_ERROR",
+            text="⚠️ TOOL_ERROR: RuntimeError: binding failed",
+        )
+
+
+def test_light_binding_root_redirect_is_native_without_invented_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    import ouroboros.config as config
+    import ouroboros.tools.registry_core as registry_core
+    import ouroboros.tools.tool_resolution as tool_resolution
+    from ouroboros.loop_tool_execution import _execute_single_tool
+    from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    home = tmp_path / "home"
+    logs = drive / "logs"
+    repo.mkdir()
+    home.mkdir()
+    logs.mkdir(parents=True)
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    calls = []
+    registry.override_handler(
+        "write_file",
+        lambda *_args, **_kwargs: calls.append("handler") or "unreachable",
+    )
+    monkeypatch.setattr(config, "get_runtime_mode", lambda: "light")
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    monkeypatch.setattr(
+        registry_core,
+        "_build_builtin_target_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("outside root")),
+    )
+    monkeypatch.setattr(
+        "ouroboros.safety.check_safety",
+        lambda *_args, **_kwargs: calls.append("safety") or (True, ""),
+    )
+    monkeypatch.setattr(
+        LegacyTextResultAdapter,
+        "from_text",
+        classmethod(
+            lambda _cls, *_args, **_kwargs: pytest.fail("legacy adapter used")
+        ),
+    )
+    target = str(home / "Desktop" / "report.html")
+    args = {"path": target, "content": "<html></html>"}
+    text = (
+        "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
+        f"({target!r}) was given but root defaulted to 'active_workspace'. "
+        "Pass root='user_files' to write under the owner's home, e.g. "
+        "write_file(root='user_files', path='Desktop/file.html', content=...)."
+    )
+    expected = ToolResult(status="blocked", code="ROOT_REQUIRED", text=text)
+
+    row = _execute_single_tool(
+        registry,
+        {
+            "id": "binding-light-root",
+            "function": {"name": "write_file", "arguments": json.dumps(args)},
+        },
+        logs,
+        "task-binding-light",
+    )
+
+    assert row["tool_result"] == expected
+    assert row["is_error"] is True
+    assert row["result_meta"] == {
+        "status": "root_required_user_files",
+        "tool_result_status": "blocked",
+        "tool_result_code": "ROOT_REQUIRED",
+        "tool_result_meta": {},
+    }
+    cognitive = tool_resolution._light_binding_failure_result(
+        "write_file",
+        {"root": "runtime_data", "path": "memory/identity.md"},
+    )
+    assert isinstance(cognitive, str) and cognitive.startswith("⚠️ COGNITIVE_TOOL_REQUIRED:")
+    assert calls == []
+
+
+@pytest.mark.parametrize(
     ("scenario", "expected_status", "expected_code", "legacy_status"),
     (
         ("cognitive", "ok", "LEGACY_WARNING", "cognitive_tool_required"),
@@ -500,7 +682,7 @@ def test_light_actionable_redirects_keep_legacy_mapping_without_light_remap(
 
     from ouroboros.loop_tool_execution import _execute_single_tool
     from ouroboros.tools.registry import ToolRegistry
-    from ouroboros.tools.tool_result import ToolResult
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
 
     repo = tmp_path / "repo"
     drive = tmp_path / "drive"
@@ -523,6 +705,18 @@ def test_light_actionable_redirects_keep_legacy_mapping_without_light_remap(
 
     registry.override_handler("write_file", forbidden("handler"))
     monkeypatch.setattr("ouroboros.safety.check_safety", forbidden("safety"))
+    adapter_calls = []
+    original_adapter = LegacyTextResultAdapter.from_text
+    monkeypatch.setattr(
+        LegacyTextResultAdapter,
+        "from_text",
+        classmethod(
+            lambda _cls, name, text: (
+                adapter_calls.append((name, text))
+                or original_adapter(name, text)
+            )
+        ),
+    )
 
     if scenario == "cognitive":
         args = {
@@ -575,4 +769,5 @@ def test_light_actionable_redirects_keep_legacy_mapping_without_light_remap(
         "tool_result_code": expected_code,
         "tool_result_meta": {},
     }
+    assert len(adapter_calls) == 3
     assert downstream_calls == []

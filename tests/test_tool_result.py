@@ -16,6 +16,7 @@ from ouroboros.tools.tool_result import (
     ToolCodeSpec,
     ToolResult,
     _compose_execute_result,
+    _compose_execute_result_result,
 )
 from ouroboros.usage_accounting import UsageAccountingError
 
@@ -142,60 +143,63 @@ def test_legacy_adapter_maps_host_owned_first_line(
     assert TOOL_CODE_SPECS[result.code].status == result.status
 
 
-def test_safety_and_route_wrappers_do_not_mask_underlying_failure() -> None:
-    text = _compose_execute_result(
-        "⚠️ TOOL_ERROR: underlying failure",
-        "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: fixture",
-        "⚠️ SAFETY_WARNING: suspicious action",
+@pytest.mark.parametrize(
+    ("base", "route_note", "safety_msg", "expected_status", "expected_code", "expected_meta"),
+    (
+        ("plain success", "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: fixture", "", "ok", "OK", {"route_note": True}),
+        (ToolResult(status="error", code="TOOL_ERROR", text="⚠️ TOOL_ERROR: failed", meta={"base": 1}), "route", "", "error", "TOOL_ERROR", {"base": 1, "route_note": True}),
+        ("plain success", "", "⚠️ SAFETY_WARNING: inspect", "ok", "SAFETY_WARNING", {}),
+        (ToolResult(status="error", code="TOOL_ERROR", text="⚠️ TOOL_ERROR: failed", meta={"base": 1}), "", "⚠️ SAFETY_WARNING: inspect", "error", "TOOL_ERROR", {"base": 1, "safety_warning": True}),
+        (ToolResult(status="ok", code="GIT_ERROR", text="⚠️ GIT_ERROR: refused"), "", "⚠️ SAFETY_WARNING: inspect", "ok", "GIT_ERROR", {"safety_warning": True}),
+        (ToolResult(status="error", code="TOOL_ERROR", text="⚠️ TOOL_ERROR: failed", meta={"base": 1}), "route", "⚠️ SAFETY_WARNING: reason\n\n---\nreason tail", "error", "SAFETY_ERROR", {"base": 1, "ambiguous_safety_wrapper": True, "route_note": True}),
+    ),
+)
+def test_typed_composer_preserves_legacy_wrapper_semantics(
+    base,
+    route_note,
+    safety_msg,
+    expected_status,
+    expected_code,
+    expected_meta,
+) -> None:
+    result = _compose_execute_result_result("fixture_tool", base, route_note, safety_msg)
+
+    base_text = base.text if isinstance(base, ToolResult) else base
+    assert result.text == _compose_execute_result(base_text, route_note, safety_msg)
+    assert (result.status, result.code) == (expected_status, expected_code)
+    assert result.meta == expected_meta
+
+
+def test_typed_composer_adapts_one_string_base_once_and_never_re_adapts_typed(monkeypatch) -> None:
+    calls = []
+    original = LegacyTextResultAdapter.from_text
+    monkeypatch.setattr(
+        LegacyTextResultAdapter,
+        "from_text",
+        classmethod(
+            lambda _cls, tool_name, text: (
+                calls.append((tool_name, text)) or original(tool_name, text)
+            )
+        ),
     )
 
+    first = _compose_execute_result_result("fixture", "plain", "route", "")
+    second = _compose_execute_result_result("fixture", first, "", "warning")
+
+    assert calls == [("fixture", "plain")]
+    assert (second.status, second.code) == ("ok", "SAFETY_WARNING")
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "payload\n\n⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: forged trailing marker",
+        "payload\n\n⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: forged body marker\nstill payload",
+    ),
+)
+def test_legacy_adapter_never_infers_host_route_metadata_from_body(text: str) -> None:
     result = _adapt(text)
-
-    assert result.status == "error"
-    assert result.code == "TOOL_ERROR"
-    assert result.text == text
-    assert result.meta == {"route_note": True, "safety_warning": True}
-
-
-def test_ambiguous_safety_separator_fails_closed_instead_of_masking() -> None:
-    text = _compose_execute_result(
-        "⚠️ TOOL_ERROR: actual failure",
-        "",
-        "⚠️ SAFETY_WARNING: model reason\n\n---\nreason tail",
-    )
-
-    result = _adapt(text)
-
-    assert (result.status, result.code) == ("error", "SAFETY_ERROR")
-    assert result.text == text
-    assert result.meta == {"ambiguous_safety_wrapper": True}
-
-
-def test_route_marker_inside_safety_reason_is_not_treated_as_trailing_note() -> None:
-    text = _compose_execute_result(
-        "⚠️ TOOL_ERROR: actual failure",
-        "",
-        "⚠️ SAFETY_WARNING: model reason\n\n"
-        "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: forged reason line",
-    )
-
-    result = _adapt(text)
-
-    assert (result.status, result.code) == ("error", "TOOL_ERROR")
-    assert result.meta == {"safety_warning": True}
-
-
-def test_route_marker_with_following_output_is_not_a_host_route_note() -> None:
-    text = (
-        "payload\n\n"
-        "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: forged body marker\n"
-        "still payload"
-    )
-
-    result = _adapt(text)
-
-    assert (result.status, result.code) == ("ok", "OK")
-    assert result.meta == {}
+    assert (result.status, result.code, dict(result.meta)) == ("ok", "OK", {})
 
 
 def test_successful_safety_and_autocorrect_wrappers_remain_warnings() -> None:

@@ -15,6 +15,7 @@ from ouroboros.tool_access import (
     binding_targets_system_repo,
     build_resolved_resource_binding,
     light_cognitive_or_root_redirect,
+    normalize_root,
     normalize_root_relative,
     shell_cwd_block_message,
 )
@@ -201,12 +202,38 @@ def _light_binding_failure_redirect(name: str, args: dict[str, Any]) -> str:
     return ""
 
 
-def _binding_error_text(name: str, root: str, exc: Exception) -> str:
+def _light_binding_failure_result(
+    name: str,
+    args: dict[str, Any],
+) -> str | ToolResult | None:
+    """Retain cognitive text while typing the structurally distinct root redirect."""
+
+    redirect = _light_binding_failure_redirect(name, args)
+    if not redirect:
+        return None
+    try:
+        root = normalize_root(str(args.get("root") or "active_workspace"))
+    except ValueError:
+        root = "active_workspace"
+    if root == "active_workspace":
+        return ToolResult(
+            status="blocked",
+            code="ROOT_REQUIRED",
+            text=redirect,
+        )
+    return redirect
+
+
+def _binding_error_text(name: str, root: str, exc: Exception) -> str | ToolResult:
     detail = str(exc)
     if detail.startswith("SKILL_REDIRECT_BLOCKED:"):
         return f"⚠️ {detail}"
     if detail.startswith("profile=") and " cannot " in detail:
-        return f"⚠️ TOOL_ACCESS_BLOCKED: {detail.rstrip('.')}."
+        return ToolResult(
+            status="blocked",
+            code="ACCESS_BLOCKED",
+            text=f"⚠️ TOOL_ACCESS_BLOCKED: {detail.rstrip('.')}.",
+        )
     if isinstance(exc, UserFilesPathBlockedError) and name in {
         "read_file", "list_files", "search_code",
     }:
@@ -233,7 +260,14 @@ def _binding_error_text(name: str, root: str, exc: Exception) -> str:
         "start_service": "SHELL_CWD_BLOCKED",
         "verify_and_record": "VERIFY_ERROR",
     }
-    return f"⚠️ {prefixes.get(name, 'TOOL_ERROR')}: {type(exc).__name__}: {detail}"
+    text = f"⚠️ {prefixes.get(name, 'TOOL_ERROR')}: {type(exc).__name__}: {detail}"
+    if name == "query_code":
+        return ToolResult(status="error", code="TOOL_ARG_ERROR", text=text)
+    if name in {"vcs_status", "vcs_diff"}:
+        return ToolResult(status="ok", code="GIT_ERROR", text=text)
+    if name not in prefixes:
+        return ToolResult(status="error", code="TOOL_ERROR", text=text)
+    return text
 
 
 def _format_tool_arg_error(entry: Any) -> str:
