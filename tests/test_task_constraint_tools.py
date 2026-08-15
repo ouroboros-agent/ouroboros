@@ -431,17 +431,25 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
     assert isinstance(public_arg_error, str)
     assert public_arg_error.startswith("⚠️ TOOL_ARG_ERROR (search_code)")
 
-    root_redirect = registry._execute_legacy_text(
-        "edit_text",
-        {
-            "root": "user_files",
-            "path": str(ctx.repo_dir / "module.py"),
-            "old_str": "before",
-            "new_str": "after",
-        },
+    root_redirect_args = {
+        "root": "user_files",
+        "path": str(ctx.repo_dir / "module.py"),
+        "old_str": "before",
+        "new_str": "after",
+    }
+    root_redirect = registry._execute_legacy_text("edit_text", dict(root_redirect_args))
+    root_redirect_text = (
+        "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path "
+        f"{root_redirect_args['path']!r} is under the active workspace, but root='user_files' does not "
+        "write there. Retry the same call with root='active_workspace' (the same path is accepted)."
     )
-    assert isinstance(root_redirect, str)
-    assert root_redirect.startswith("⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE")
+    assert root_redirect == ToolResult(
+        status="blocked",
+        code="ROOT_REQUIRED",
+        text=root_redirect_text,
+        meta={"required_root": "active_workspace"},
+    )
+    assert registry.execute("edit_text", dict(root_redirect_args)) == root_redirect_text
 
     payload_arg_error = registry.execute_result(
         "write_file",

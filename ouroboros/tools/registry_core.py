@@ -1154,8 +1154,8 @@ class ToolRegistry:
             if public_arg_error:
                 return public_arg_error
             _route_note = _normalize_dispatch_path_args(self._ctx, name, args)
-            if _route_note.startswith("⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE"):
-                return _route_note
+            if _route_note and name in ("write_file", "edit_text"):
+                return ToolResult(status="blocked", code="ROOT_REQUIRED", text=_route_note, meta={"required_root": "active_workspace"})
         heal_no_enable = bool(task_constraint and task_constraint.mode == "skill_repair")
         if heal_no_enable:
             heal_block = _heal_mode_guard_result(

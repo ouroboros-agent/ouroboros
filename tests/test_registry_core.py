@@ -123,3 +123,77 @@ def test_registry_core_uses_canonical_managed_update_resolver(tmp_path, monkeypa
 
     assert result.status == "ok"
     assert result.text == "OK"
+
+
+def test_active_workspace_root_redirect_is_native_with_legacy_loop_projection(tmp_path, monkeypatch):
+    import json
+
+    import ouroboros.safety as safety
+    from ouroboros.loop_tool_execution import _execute_single_tool
+    from ouroboros.tools import tool_resolution
+    from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    logs = drive / "logs"
+    repo.mkdir()
+    logs.mkdir(parents=True)
+    tools = ToolRegistry(repo_dir=repo, drive_root=drive)
+    calls = []
+
+    def forbidden(label):
+        def fail(*_args, **_kwargs):
+            calls.append(label)
+            raise AssertionError(f"root redirect reached {label}")
+
+        return fail
+
+    tools.override_handler("write_file", forbidden("handler"))
+    monkeypatch.setattr(safety, "check_safety", forbidden("safety"))
+    monkeypatch.setattr(
+        tool_resolution,
+        "build_resolved_resource_binding",
+        forbidden("binding"),
+    )
+    monkeypatch.setattr(
+        LegacyTextResultAdapter,
+        "from_text",
+        forbidden("legacy adapter"),
+    )
+
+    target = str(repo / "result.txt")
+    args = {"root": "user_files", "path": target, "content": "result\n"}
+    expected_text = (
+        "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path "
+        f"{target!r} is under the active workspace, but root='user_files' does not "
+        "write there. Retry the same call with root='active_workspace' (the same path is accepted)."
+    )
+    expected = ToolResult(
+        status="blocked",
+        code="ROOT_REQUIRED",
+        text=expected_text,
+        meta={"required_root": "active_workspace"},
+    )
+
+    result = tools.execute_result("write_file", dict(args))
+    assert result == expected
+    assert tools.execute("write_file", dict(args)) == expected_text
+    assert not (repo / "result.txt").exists()
+
+    row = _execute_single_tool(
+        tools,
+        {
+            "id": "root-redirect",
+            "function": {"name": "write_file", "arguments": json.dumps(args)},
+        },
+        logs,
+    )
+    assert row["tool_result"] == expected
+    assert row["result"] == expected_text
+    assert row["is_error"] is True
+    assert row["result_meta"]["status"] == "root_required_active_workspace"
+    assert row["result_meta"]["tool_result_status"] == "blocked"
+    assert row["result_meta"]["tool_result_code"] == "ROOT_REQUIRED"
+    assert row["result_meta"]["tool_result_meta"] == {"required_root": "active_workspace"}
+    assert calls == []
