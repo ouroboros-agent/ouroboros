@@ -113,6 +113,41 @@ _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS = frozenset({
     "stage_adaptations",
     "stage_pr_merge",
 })
+_ACTING_NO_WORKSPACE_REPO_RESULT = ToolResult(
+    status="blocked",
+    code="ACCESS_BLOCKED",
+    text=(
+        "⚠️ ACTING_NO_WORKSPACE_BLOCKED: this acting subagent has no resolved isolated "
+        "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
+        "active_workspace/system_repo map to the live Ouroboros repo and are blocked."
+    ),
+)
+_ACTING_NO_WORKSPACE_PROCESS_RESULT = ToolResult(
+    status="blocked",
+    code="ACCESS_BLOCKED",
+    text=(
+        "⚠️ ACTING_NO_WORKSPACE_BLOCKED: shell/coding/service/integration tools need an "
+        "isolated workspace (their default target is the live repo). Schedule a self_worktree "
+        "/ external_workspace child for that work."
+    ),
+)
+_LIGHT_START_SERVICE_RESULT = ToolResult(
+    status="blocked",
+    code="LIGHT_MODE_BLOCKED",
+    text="⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses start_service against the Ouroboros repository because long-running services can mutate after initial tool checks. For external services, set cwd under user_files, task_drive, or artifact_store; switch to advanced/pro only for reviewed Ouroboros self-modification.",
+)
+
+
+def _protected_write_block_result(*, path: str, runtime_mode: str, action: str) -> ToolResult:
+    return ToolResult(
+        status="blocked",
+        code="CORE_PROTECTION_BLOCKED",
+        text=protected_write_block_message(
+            path=path,
+            runtime_mode=runtime_mode,
+            action=action,
+        ),
+    )
 
 
 class ToolRegistry:
@@ -775,11 +810,11 @@ class ToolRegistry:
         except Exception as exc:
             workspace_block_reason = f"workspace metadata validation failed: {type(exc).__name__}: {exc}"
         if workspace_block_reason:
-            return (
+            return ToolResult(status="blocked", code="WORKSPACE_BLOCKED", text=(
                 "⚠️ WORKSPACE_MODE_BLOCKED: invalid external workspace metadata: "
                 f"{workspace_block_reason}. Workspace tasks must not overlap the "
                 "Ouroboros repo, runtime data, or control plane."
-            )
+            ))
         if entry is not None:
             public_arg_error = tool_resolution._prepare_public_builtin_args(entry, args)
             if public_arg_error:
@@ -838,18 +873,10 @@ class ToolRegistry:
         # to data roots and block shell/coding/service (whose default target is the repo).
         if acting_subagent and not workspace_mode:
             if name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS and str(args.get("root", "") or "active_workspace") in ("active_workspace", "system_repo"):
-                return (
-                    "⚠️ ACTING_NO_WORKSPACE_BLOCKED: this acting subagent has no resolved isolated "
-                    "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
-                    "active_workspace/system_repo map to the live Ouroboros repo and are blocked."
-                )
+                return _ACTING_NO_WORKSPACE_REPO_RESULT
             if name in ("run_command", "run_script", "start_service",
                         "integrate_subagent_patch", "integrate_delegated_patch"):
-                return (
-                    "⚠️ ACTING_NO_WORKSPACE_BLOCKED: shell/coding/service/integration tools need an "
-                    "isolated workspace (their default target is the live repo). Schedule a self_worktree "
-                    "/ external_workspace child for that work."
-                )
+                return _ACTING_NO_WORKSPACE_PROCESS_RESULT
         # Hardcoded sandbox: light blocks repo mutation; advanced protects
         # core/contracts/release; pro still relies on commit review.
         try:
@@ -875,7 +902,7 @@ class ToolRegistry:
         args, python_resolution, python_block = tool_resolution._resolve_python_predispatch(
             self, name, args, _runtime_mode, effective_constraint, resolved_binding,
         )
-        if python_block:
+        if python_block is not None:
             return python_block
         allow_short_relative = bool(
             effective_constraint and effective_constraint.mode == "skill_repair"
@@ -909,15 +936,22 @@ class ToolRegistry:
             and not light_skill_scoped_str_replace
             and not registry_guards._authorized_managed_update_resolver(self._ctx)
         ):
-            return light_cognitive_or_root_redirect(name, args) or (
-                "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks Ouroboros "
-                f"self-repo/control-plane mutation via {name!r}. For user-visible "
-                "deliverables use root=user_files (for example Desktop/file.html), "
-                "root=artifact_store for the canonical task artifact, or root=task_drive "
-                "for scratch. Skill payload edits remain allowed only through "
-                "root=skill_payload with bucket and skill_name "
-                "(data/skills/<bucket>/<skill>/) or skill_repair constraints. "
-                "Switch to advanced/pro only for reviewed Ouroboros self-modification."
+            light_redirect = light_cognitive_or_root_redirect(name, args)
+            if light_redirect is not None:
+                return light_redirect
+            return ToolResult(
+                status="blocked",
+                code="LIGHT_MODE_BLOCKED",
+                text=(
+                    "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks Ouroboros "
+                    f"self-repo/control-plane mutation via {name!r}. For user-visible "
+                    "deliverables use root=user_files (for example Desktop/file.html), "
+                    "root=artifact_store for the canonical task artifact, or root=task_drive "
+                    "for scratch. Skill payload edits remain allowed only through "
+                    "root=skill_payload with bucket and skill_name "
+                    "(data/skills/<bucket>/<skill>/) or skill_repair constraints. "
+                    "Switch to advanced/pro only for reviewed Ouroboros self-modification."
+                ),
             )
 
         protected_write_paths = []
@@ -946,7 +980,7 @@ class ToolRegistry:
             )
             if protected_matches and not allow_protected:
                 first = protected_matches[0]
-                return protected_write_block_message(
+                return _protected_write_block_result(
                     path=first.path,
                     runtime_mode=_runtime_mode,
                     action=f"run tool {name!r} against",
@@ -961,7 +995,7 @@ class ToolRegistry:
                     or acting_self_worktree
                 )
             ):
-                return ("⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses start_service against the Ouroboros repository because long-running services can mutate after initial tool checks. For external services, set cwd under user_files, task_drive, or artifact_store; switch to advanced/pro only for reviewed Ouroboros self-modification.")
+                return _LIGHT_START_SERVICE_RESULT
             block_result = registry_guard_process._run_shell_safety_check(
                 self,
                 shell_guards.process_shell_guard_args(name, args, ctx=self._ctx, runtime_mode=_runtime_mode),

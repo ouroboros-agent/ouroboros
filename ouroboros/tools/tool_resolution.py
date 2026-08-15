@@ -18,6 +18,7 @@ from ouroboros.tool_access import (
     normalize_root_relative,
     shell_cwd_block_message,
 )
+from ouroboros.tools.tool_result import ToolResult
 
 
 def _coerce_real_path(value: Any) -> pathlib.Path | None:
@@ -482,7 +483,7 @@ def _resolve_python_predispatch(
     runtime_mode: str,
     effective_constraint: Any,
     resolved_binding: Any = None,
-) -> tuple[Dict[str, Any], Any, str]:
+) -> tuple[Dict[str, Any], Any, str | ToolResult | None]:
     """Resolve an exact python/python3 request ONCE, before the shell guard.
 
     Every downstream guard and the handler therefore see byte-identical
@@ -514,9 +515,14 @@ def _resolve_python_predispatch(
                 str((args or {}).get("cwd") or ""),
                 operation="service" if name == "start_service" else "shell",
             )
-        return args, python_resolution, (
-            "⚠️ PYTHON_INTERPRETER_UNAVAILABLE: Ouroboros could not prove "
-            "the target interpreter for this launch surface "
-            f"({python_resolution.error_reason}). The process was not started."
+        return args, python_resolution, ToolResult(
+            status="unavailable",
+            code="CAPABILITY_UNAVAILABLE",
+            text=(
+                "⚠️ PYTHON_INTERPRETER_UNAVAILABLE: Ouroboros could not prove "
+                "the target interpreter for this launch surface "
+                f"({python_resolution.error_reason}). The process was not started."
+            ),
+            meta={"reason": python_resolution.error_reason},
         )
-    return args, python_resolution, ""
+    return args, python_resolution, None

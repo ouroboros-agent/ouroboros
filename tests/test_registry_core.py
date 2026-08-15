@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 
 def test_registry_core_extraction_preserves_only_proven_facades():
     """Execution moves once; the compatibility module exports only proven ABI."""
@@ -300,3 +302,277 @@ def test_registry_uses_typed_required_root_not_note_or_tool_name(tmp_path, monke
     )
     assert len(calls) == 1
     assert normalizations == ["write_file", "read_file"]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "tool_name", "args", "expected_code", "expected_text", "legacy_status"),
+    (
+        (
+            "workspace_metadata",
+            "read_file",
+            {"path": "README.md"},
+            "WORKSPACE_BLOCKED",
+            "⚠️ WORKSPACE_MODE_BLOCKED: invalid external workspace metadata: "
+            "fixture workspace overlap. Workspace tasks must not overlap the "
+            "Ouroboros repo, runtime data, or control plane.",
+            "workspace_blocked",
+        ),
+        (
+            "acting_repo_write",
+            "write_file",
+            {"path": "result.txt", "content": "result\n"},
+            "ACCESS_BLOCKED",
+            "⚠️ ACTING_NO_WORKSPACE_BLOCKED: this acting subagent has no resolved isolated "
+            "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
+            "active_workspace/system_repo map to the live Ouroboros repo and are blocked.",
+            "blocked",
+        ),
+        (
+            "acting_process",
+            "run_command",
+            {"cmd": ["true"]},
+            "ACCESS_BLOCKED",
+            "⚠️ ACTING_NO_WORKSPACE_BLOCKED: shell/coding/service/integration tools need an "
+            "isolated workspace (their default target is the live repo). Schedule a self_worktree "
+            "/ external_workspace child for that work.",
+            "blocked",
+        ),
+        (
+            "light_repo_mutation",
+            "write_file",
+            {"path": "README.md", "content": "changed\n"},
+            "LIGHT_MODE_BLOCKED",
+            "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks Ouroboros "
+            "self-repo/control-plane mutation via 'write_file'. For user-visible "
+            "deliverables use root=user_files (for example Desktop/file.html), "
+            "root=artifact_store for the canonical task artifact, or root=task_drive "
+            "for scratch. Skill payload edits remain allowed only through "
+            "root=skill_payload with bucket and skill_name "
+            "(data/skills/<bucket>/<skill>/) or skill_repair constraints. "
+            "Switch to advanced/pro only for reviewed Ouroboros self-modification.",
+            "light_mode_blocked",
+        ),
+        (
+            "light_service",
+            "start_service",
+            {"name": "fixture", "cmd": ["sleep", "1"]},
+            "LIGHT_MODE_BLOCKED",
+            "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses start_service against the "
+            "Ouroboros repository because long-running services can mutate after initial tool "
+            "checks. For external services, set cwd under user_files, task_drive, or "
+            "artifact_store; switch to advanced/pro only for reviewed Ouroboros self-modification.",
+            "light_mode_blocked",
+        ),
+        (
+            "protected_write",
+            "write_file",
+            {"path": "BIBLE.md", "content": "changed\n"},
+            "CORE_PROTECTION_BLOCKED",
+            "⚠️ CORE_PROTECTION_BLOCKED: runtime_mode='advanced' refuses to run tool "
+            "'write_file' against protected safety-critical path: BIBLE.md. Switch to "
+            "runtime_mode='pro' and let the normal triad + scope review cover the protected "
+            "core/contract/release change before commit.",
+            "protected_blocked",
+        ),
+    ),
+)
+def test_stable_host_predispatch_denials_are_native_and_keep_legacy_projection(
+    scenario,
+    tool_name,
+    args,
+    expected_code,
+    expected_text,
+    legacy_status,
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    import ouroboros.config as config
+    import ouroboros.safety as safety
+    import ouroboros.tools.registry_core as registry_core
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.loop_tool_execution import _execute_single_tool
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    logs = drive / "logs"
+    repo.mkdir()
+    logs.mkdir(parents=True)
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    if scenario.startswith("acting_"):
+        registry.set_context(
+            ToolContext(
+                repo_dir=repo,
+                drive_root=drive,
+                task_constraint=TaskConstraint(
+                    mode="acting_subagent",
+                    surface="self_worktree",
+                ),
+            )
+        )
+
+    downstream_calls: list[str] = []
+
+    def forbidden(label):
+        def fail(*_args, **_kwargs):
+            downstream_calls.append(label)
+            raise AssertionError(f"predispatch denial reached {label}")
+
+        return fail
+
+    if tool_name in registry._entries:
+        registry.override_handler(tool_name, forbidden("handler"))
+    monkeypatch.setattr(safety, "check_safety", forbidden("safety"))
+    monkeypatch.setattr(
+        LegacyTextResultAdapter,
+        "from_text",
+        forbidden("legacy adapter"),
+    )
+    monkeypatch.setattr(
+        registry_core,
+        "workspace_mode_block_reason",
+        (
+            (lambda _ctx: "fixture workspace overlap")
+            if scenario == "workspace_metadata"
+            else (lambda _ctx: "")
+        ),
+    )
+    monkeypatch.setattr(
+        config,
+        "get_runtime_mode",
+        lambda: "light" if scenario.startswith("light_") else "advanced",
+    )
+    if scenario == "light_repo_mutation":
+        monkeypatch.setattr(
+            registry_core,
+            "light_cognitive_or_root_redirect",
+            lambda _name, _args: None,
+        )
+
+    expected = ToolResult(
+        status="blocked",
+        code=expected_code,
+        text=expected_text,
+    )
+    assert registry.execute_result(tool_name, dict(args)) == expected
+    assert registry.execute(tool_name, dict(args)) == expected_text
+
+    row = _execute_single_tool(
+        registry,
+        {
+            "id": f"predispatch-{scenario}",
+            "function": {"name": tool_name, "arguments": json.dumps(args)},
+        },
+        logs,
+        f"task-{scenario}",
+    )
+    assert row["tool_result"] == expected
+    assert row["result"] == expected_text
+    assert row["is_error"] is True
+    assert row["result_meta"] == {
+        "status": legacy_status,
+        "tool_result_status": "blocked",
+        "tool_result_code": expected_code,
+        "tool_result_meta": {},
+    }
+    assert downstream_calls == []
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_status", "expected_code", "legacy_status"),
+    (
+        ("cognitive", "ok", "LEGACY_WARNING", "cognitive_tool_required"),
+        ("user_files", "blocked", "ROOT_REQUIRED", "root_required_user_files"),
+    ),
+)
+def test_light_actionable_redirects_keep_legacy_mapping_without_light_remap(
+    scenario,
+    expected_status,
+    expected_code,
+    legacy_status,
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from ouroboros.loop_tool_execution import _execute_single_tool
+    from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.tool_result import ToolResult
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    home = tmp_path / "home"
+    logs = drive / "logs"
+    repo.mkdir()
+    home.mkdir()
+    logs.mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    downstream_calls: list[str] = []
+
+    def forbidden(label):
+        def fail(*_args, **_kwargs):
+            downstream_calls.append(label)
+            raise AssertionError(f"light redirect reached {label}")
+
+        return fail
+
+    registry.override_handler("write_file", forbidden("handler"))
+    monkeypatch.setattr("ouroboros.safety.check_safety", forbidden("safety"))
+
+    if scenario == "cognitive":
+        args = {
+            "root": "runtime_data",
+            "path": "memory/identity.md",
+            "content": "x" * 60,
+        }
+        expected_text = (
+            "⚠️ COGNITIVE_TOOL_REQUIRED: cognitive memory is not written via 'write_file'. "
+            "Use the dedicated first-class tools (always available in light mode): "
+            "update_identity for memory/identity.md, update_scratchpad for "
+            "memory/scratchpad.md, knowledge_write for memory/knowledge/<topic>.md. They "
+            "apply the correct structure (journaling, timestamped blocks, index maintenance). "
+            "Read the current state before writing (Bible P12)."
+        )
+    else:
+        target = str(home / "Desktop" / "report.html")
+        args = {"path": target, "content": "<html></html>"}
+        expected_text = (
+            "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
+            f"({target!r}) was given but root defaulted to 'active_workspace'. "
+            "Pass root='user_files' to write under the owner's home, e.g. "
+            "write_file(root='user_files', path='Desktop/file.html', content=...)."
+        )
+
+    expected = ToolResult(
+        status=expected_status,
+        code=expected_code,
+        text=expected_text,
+    )
+    assert registry.execute_result("write_file", dict(args)) == expected
+    assert registry.execute("write_file", dict(args)) == expected_text
+    assert "LIGHT_MODE_BLOCKED" not in expected_text
+
+    row = _execute_single_tool(
+        registry,
+        {
+            "id": f"light-redirect-{scenario}",
+            "function": {"name": "write_file", "arguments": json.dumps(args)},
+        },
+        logs,
+        f"task-light-redirect-{scenario}",
+    )
+    assert row["tool_result"] == expected
+    assert row["result"] == expected_text
+    assert row["is_error"] is True
+    assert row["result_meta"] == {
+        "status": legacy_status,
+        "tool_result_status": expected_status,
+        "tool_result_code": expected_code,
+        "tool_result_meta": {},
+    }
+    assert downstream_calls == []
