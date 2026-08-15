@@ -1072,14 +1072,17 @@ class TestToolContextReviewState:
 class TestSandboxCoversRepoWrite:
     def test_sandbox_mentions_repo_write(self):
         registry = _get_registry_module()
+        from ouroboros.tools import tool_resolution
+
         source = inspect.getsource(registry.ToolRegistry._execute_legacy_text)
         assert "_ROOT_ARG_REPO_WRITE_TOOLS" in source
-        assert "write_file" in registry._ROOT_ARG_REPO_WRITE_TOOLS
+        assert "write_file" in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS
 
     def test_sandbox_checks_files_param(self):
         """Sandbox must check files array for safety-critical paths."""
-        registry = _get_registry_module()
-        assert registry._payload_write_paths(
+        from ouroboros.tools import tool_resolution
+
+        assert tool_resolution._payload_write_paths(
             "write_file",
             {"files": [{"path": "BIBLE.md", "content": "x"}]},
         ) == ["BIBLE.md"]

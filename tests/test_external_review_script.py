@@ -71,6 +71,7 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         "ouroboros/tools/registry_guard_process.py",
         "ouroboros/tools/registry_guards.py",
         "ouroboros/tools/tool_resolution.py",
+        "ouroboros/tools/extension_dispatch.py",
         "ouroboros/tools/tool_catalog.py",
         "ouroboros/tools/tool_context.py",
         "ouroboros/tools/tool_result.py",
@@ -440,6 +441,7 @@ def test_contributor_snapshot_checks_each_duplicate_installer_link(
         "ouroboros/tools/registry_guard_process.py",
         "ouroboros/tools/registry_guards.py",
         "ouroboros/tools/tool_resolution.py",
+        "ouroboros/tools/extension_dispatch.py",
         "ouroboros/tools/tool_result.py",
     ],
 )

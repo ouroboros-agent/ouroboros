@@ -64,32 +64,33 @@ def _cases(fixture: dict, name: str) -> list[dict]:
 
 def test_baseline_source_and_complete_census_are_exact():
     fixture = _fixture()
-    assert fixture["baseline_source_sha"] == "a191e1cc21a380176bcedc9b8edd86078fc87fa1"
-    assert fixture["observed_head_sha"] == "d30c560457d6de8cf36fb6339880d228fc740729"
+    assert (fixture["baseline_source_sha"], fixture["observed_head_sha"]) == ("a191e1cc21a380176bcedc9b8edd86078fc87fa1", "d30c560457d6de8cf36fb6339880d228fc740729")
     assert fixture["observed_drift"]["entries"] == [
-        {"status": "M", "paths": ["ouroboros/packaged_cli_install.py"]},
-        {"status": "M", "paths": ["tests/test_packaged_cli.py"]},
-    ]
+        {"status": "M", "paths": ["ouroboros/packaged_cli_install.py"]}, {"status": "M", "paths": ["tests/test_packaged_cli.py"]}]
     census = fixture["baseline_census"]
     assert (census["hard_count"], census["band_count"], census["byte_debt_count"]) == (74, 62, 6)
     disposition = census["disposition"]
-    assert len(disposition) == 136
-    assert len({row["path"] for row in disposition}) == 136
-    assert sum(row["debt_class"] == "hard" for row in disposition) == 74
-    assert sum(row["debt_class"] == "band" for row in disposition) == 62
-    assert sum(row["byte_plan"] != "within_limit" for row in disposition) == 6
+    assert (len(disposition), len({row["path"] for row in disposition}), sum(row["debt_class"] == "hard" for row in disposition), sum(row["debt_class"] == "band" for row in disposition), sum(row["byte_plan"] != "within_limit" for row in disposition)) == (136, 136, 74, 62, 6)
     assert all(row["stream"] in {"T", "S", "L", "W"} for row in disposition)
     hard = {row["path"]: row["stream"] for row in disposition if row["debt_class"] == "hard"}
-    assert v7_evidence._sha256_json(hard) == "c90b72e08692e91188aab04ea8749bcf0469f427b485a71fd595dbfa089ff96f"
-    assert {stream: list(hard.values()).count(stream) for stream in "TSLW"} == {"T": 9, "S": 29, "L": 24, "W": 12}
+    assert (v7_evidence._sha256_json(hard), {stream: list(hard.values()).count(stream) for stream in "TSLW"}) == ("c90b72e08692e91188aab04ea8749bcf0469f427b485a71fd595dbfa089ff96f", {"T": 9, "S": 29, "L": 24, "W": 12})
     assert hard["ouroboros/skill_review.py"] == "L"
     assert hard["tests/test_claudexor_owned_daemon.py"] == "S"
-    assert sum(row["assignment_authority"] == "normative_spec_7" for row in disposition) == 74
-    assert sum(row["assignment_authority"] == "non_authoritative_evidence_projection" for row in disposition) == 62
+    assert (sum(row["assignment_authority"] == "normative_spec_7" for row in disposition), sum(row["assignment_authority"] == "non_authoritative_evidence_projection" for row in disposition)) == (74, 62)
     assert all(row["production_owner"] and row["characterization_test"] for row in disposition)
     owners = {row["path"]: [row["stream"], row["production_owner"]] for row in disposition}
     assert owners["tests/test_devtools_benchmarks.py"] == ["W", "devtools/benchmarks"]
     assert v7_evidence._sha256_json(owners) == "8a86c43c57ad766a8a0cb74d23fbbce16352b7bc6328059799f05c97e7912ee4"
+
+
+def test_protected_dispatch_channels_are_sha_bound_to_baseline_symbols():
+    expected = {"builtin_dispatch": "ouroboros/tools/registry.py::ToolRegistry.execute", "extension_dispatch": "ouroboros/tools/extension_dispatch.py::dispatch_extension_tool", "mcp_dispatch": "ouroboros/tools/registry.py::ToolRegistry._dispatch_mcp_tool"}
+    fixture = _fixture(); channels = fixture["runtime_probe"]["protected_surfaces"]["channels"]
+    assert {name: channels[name] for name in expected} == expected
+    assert v7_migration.BASELINE_SHA == fixture["baseline_source_sha"] == "a191e1cc21a380176bcedc9b8edd86078fc87fa1"
+    for reference in expected.values():
+        path, symbol = reference.split("::"); source = v7_migration._source_text(REPO, v7_migration.BASELINE_SHA, path)
+        assert symbol.rsplit(".", 1)[-1] in source and v7_migration._symbol_exists(REPO, path, symbol, ref=v7_migration.BASELINE_SHA)
 
 
 def test_census_uses_the_production_iterator_on_an_exact_ref_snapshot(tmp_path):
@@ -300,7 +301,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 187
+    assert len(rows) == 190
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -532,17 +533,37 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         "ouroboros/tools/registry.py::resolve_skill_payload_target":
             "ouroboros/contracts/skill_payload_policy.py::resolve_skill_payload_target",
     }
-    registry_core_symbols = """ToolRegistry log _stray_skill_payload_failsoft
-        _PROCESS_COMMAND_TOOLS _SHELL_GUARDED_TOOLS
-        _ROOT_ARG_REPO_WRITE_TOOLS _payload_write_paths _REPO_MUTATION_TOOLS
-        _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS _TOOL_ARG_ALIASES _IGNORE_ROOT_ARG_TOOLS
-        _handler_public_params _entry_public_params _entry_has_public_param_schema
-        _normalize_tool_call_args _prepare_public_builtin_args _light_binding_failure_redirect
-        _binding_error_text _payload_dispatch_constraint _format_tool_arg_error""".split()
+    registry_core_symbols = """ToolRegistry log _PROCESS_COMMAND_TOOLS
+        _SHELL_GUARDED_TOOLS _REPO_MUTATION_TOOLS
+        _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS""".split()
     registry_core_rows = {
         f"ouroboros/tools/registry.py::{symbol}":
             f"ouroboros/tools/registry_core.py::{symbol}"
         for symbol in registry_core_symbols
+    }
+    registry_resolution_symbols = """_ROOT_ARG_REPO_WRITE_TOOLS _payload_write_paths
+        _TOOL_ARG_ALIASES _IGNORE_ROOT_ARG_TOOLS _handler_public_params
+        _entry_public_params _entry_has_public_param_schema _normalize_tool_call_args
+        _prepare_public_builtin_args _light_binding_failure_redirect _binding_error_text
+        _format_tool_arg_error""".split()
+    registry_resolution_rows = {
+        f"ouroboros/tools/registry.py::{symbol}":
+            f"ouroboros/tools/tool_resolution.py::{symbol}"
+        for symbol in registry_resolution_symbols
+    }
+    registry_guard_rows = {
+        "ouroboros/tools/registry.py::_stray_skill_payload_failsoft":
+            "ouroboros/tools/registry_guards.py::_stray_skill_payload_failsoft",
+        "ouroboros/tools/registry.py::_payload_dispatch_constraint":
+            "ouroboros/tools/registry_guards.py::_payload_dispatch_constraint",
+    }
+    registry_dispatch_method_rows = {
+        "ouroboros/tools/registry.py::ToolRegistry._dispatch_mcp_tool":
+            "ouroboros/tools/extension_dispatch.py::_dispatch_mcp_tool_result",
+        "ouroboros/tools/registry.py::ToolRegistry._dispatch_extension_tool":
+            "ouroboros/tools/extension_dispatch.py::_dispatch_extension_tool_result",
+        "ouroboros/tools/registry.py::ToolRegistry._resolve_python_predispatch":
+            "ouroboros/tools/tool_resolution.py::_resolve_python_predispatch",
     }
     dependency_symbols_by_owner = {
         "ouroboros/tool_capabilities.py": "ACTING_SUBAGENT_MODE ACTING_SUBAGENT_TOOL_NAMES CORE_TOOL_NAMES LOCAL_READONLY_SUBAGENT_MODE LOCAL_READONLY_SUBAGENT_TOOL_NAMES META_TOOL_NAMES",
@@ -559,9 +580,14 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         for symbol in symbols.split()
     }
     implemented.update(registry_core_rows)
+    implemented.update(registry_resolution_rows)
+    implemented.update(registry_guard_rows)
+    implemented.update(registry_dispatch_method_rows)
     implemented.update(registry_dependency_owners)
     registry_extraction_no_facade_rows = (
         set(registry_core_rows) - {"ouroboros/tools/registry.py::ToolRegistry"}
+    ) | set(registry_resolution_rows) | set(registry_guard_rows) | set(
+        registry_dispatch_method_rows
     ) | set(registry_dependency_owners)
     retired_current = {
         "ouroboros/tools/registry.py::_HEAL_PROTECTED_PAYLOAD_FILENAMES":
@@ -840,7 +866,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 160
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 163
     assert sum(row["old path/symbol"] in retired_current for row in rows) == 2
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})

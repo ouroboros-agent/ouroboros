@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, List, Optional
 import ouroboros.tools.registry_guard_process as registry_guard_process
 import ouroboros.tools.registry_guards as registry_guards
 import ouroboros.tools.shell_guards as shell_guards
+import ouroboros.tools.extension_dispatch as extension_dispatch
+import ouroboros.tools.tool_resolution as tool_resolution
 from ouroboros.runtime_mode_policy import (
     mode_allows_protected_write,
     protected_paths_in,
@@ -30,7 +32,6 @@ from ouroboros.tool_access import (
     canonical_repo_relative_path,
     light_cognitive_or_root_redirect,
     shell_cwd_block_message,
-    UserFilesPathBlockedError,
     workspace_mode_block_reason,
 )
 from ouroboros.tools.tool_catalog import (
@@ -66,29 +67,10 @@ from ouroboros.tools.registry_guards import (
     _resource_allowed,
     _subagent_and_update_guard_result,
 )
-from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
-from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
-from ouroboros.contracts.skill_payload_policy import (
-    cross_skill_redirect_error,
-    decide_payload_short_form,
-    synthesize_payload_constraint,
-)
+from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_task_constraint
 
 log = logging.getLogger("ouroboros.tools.registry")
 _FROZEN_TOOL_MANIFEST_PATH: pathlib.Path | None = None
-
-
-def _stray_skill_payload_failsoft(root_arg: str, workspace_mode: bool, task_constraint: Any) -> bool:
-    """Whether stray bucket/skill_name on a write tool should be DROPPED rather than
-    surfaced as SKILL_PAYLOAD_ARG_ERROR. Fail-soft ONLY for a WORKSPACE edit that is
-    NOT skill-authoring: there bucket/skill_name are model noise (the B2 footgun —
-    reflexive bucket="external" on an /app edit). In light/advanced non-workspace
-    skill-authoring (or an explicit root=skill_payload / skill_repair) the specific
-    error is the intended helpful signal."""
-    skill_payload_intent = root_arg == "skill_payload" or bool(
-        task_constraint and getattr(task_constraint, "mode", "") == "skill_repair"
-    )
-    return bool(workspace_mode and not skill_payload_intent)
 
 
 _PROCESS_COMMAND_TOOLS = frozenset({"run_command", "run_script", "start_service"})
@@ -102,49 +84,6 @@ _PROCESS_COMMAND_TOOLS = frozenset({"run_command", "run_script", "start_service"
 # receipt, so they would only annotate the returned text, not gate the durable receipt —
 # adding them would give false assurance while the pre-exec guards already do the gating.
 _SHELL_GUARDED_TOOLS = _PROCESS_COMMAND_TOOLS | {"verify_and_record"}
-# Repo-lane write tools that take a top-level `root` arg. Every gate keyed to
-# "a write that lands in the repo working tree" must judge the whole set, not
-# the historical write_file/edit_text pair — a new editing primitive that misses
-# one of these gates is a silently weaker lane, not a new capability.
-_ROOT_ARG_REPO_WRITE_TOOLS = frozenset({"write_file", "edit_text", "apply_patch", "edit_batch"})
-
-
-def _payload_write_paths(name: str, args: Dict[str, Any]) -> List[str]:
-    """Repo paths a write tool will touch, in the spelling its guards must judge.
-
-    write_file/edit_text carry `path`/`files[]` and were already canonicalized by
-    `_normalize_dispatch_path_args`. apply_patch addresses files inside the patch
-    text (`*** Update File: <path>`) and edit_batch inside `edits[]`, so their
-    paths reach this point RAW and are canonicalized here — otherwise a
-    protected-path gate reads `repo/BIBLE.md` (not a protected-table member)
-    while the write lands on `BIBLE.md`.
-    """
-
-    paths: List[str] = []
-    if name == "write_file":
-        if isinstance(args.get("path"), str) and args["path"]:
-            paths.append(args["path"])
-        for entry in args.get("files") or []:
-            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
-                paths.append(entry["path"])
-    elif name == "edit_text":
-        if isinstance(args.get("path"), str):
-            paths.append(args["path"])
-    elif name == "edit_batch":
-        for entry in args.get("edits") or []:
-            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
-                paths.append(entry["path"])
-    elif name == "apply_patch":
-        # Derived from the REAL parser (lazy import: edit_ops imports this
-        # module), so the gate can never drift from what apply_patch will do.
-        # An unparseable patch yields no paths and is refused by the handler
-        # before any write, so the gate has nothing to miss.
-        from ouroboros.tools.edit_ops import patch_target_paths
-
-        paths.extend(patch_target_paths(str(args.get("patch") or "")))
-    return [p for p in paths if str(p or "").strip()]
-
-
 _REPO_MUTATION_TOOLS = frozenset({
     "write_file",
     "commit_reviewed",
@@ -175,235 +114,6 @@ _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS = frozenset({
     "stage_adaptations",
     "stage_pr_merge",
 })
-
-
-_TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
-    "*": {"max_entries": "max_results"},
-}
-_IGNORE_ROOT_ARG_TOOLS = frozenset({
-    "commit_reviewed",
-    "vcs_commit_reviewed",
-})
-def _handler_public_params(handler: Callable[..., Any]) -> list[str]:
-    try:
-        params = list(inspect.signature(handler).parameters)
-    except (TypeError, ValueError):
-        return []
-    return [name for name in params if name not in {"ctx", "_resolved_binding"}]
-
-
-def _entry_public_params(entry: "ToolEntry") -> list[str]:
-    try:
-        params = entry.schema.get("parameters") or {}
-        props = params.get("properties")
-        if isinstance(props, dict):
-            return [str(name) for name in props]
-    except Exception:
-        pass
-    return _handler_public_params(entry.handler)
-
-
-def _entry_has_public_param_schema(entry: "ToolEntry") -> bool:
-    try:
-        params = entry.schema.get("parameters") or {}
-        return isinstance(params.get("properties"), dict)
-    except Exception:
-        return False
-
-
-def _normalize_tool_call_args(entry: "ToolEntry", args: dict[str, Any]) -> None:
-    tool_name = entry.name
-    accepted = set(_entry_public_params(entry))
-    aliases: dict[str, str] = {}
-    aliases.update(_TOOL_ARG_ALIASES.get("*", {}))
-    aliases.update(_TOOL_ARG_ALIASES.get(tool_name, {}))
-    for alias, canonical in aliases.items():
-        if alias in args and canonical in accepted and alias not in accepted and canonical not in args:
-            args[canonical] = args.pop(alias)
-    if tool_name in _IGNORE_ROOT_ARG_TOOLS and "root" in args and "root" not in accepted:
-        args.pop("root", None)
-
-
-def _prepare_public_builtin_args(entry: "ToolEntry", args: dict[str, Any]) -> str:
-    """Normalize and validate only the model-visible builtin argument surface.
-
-    This runs after capability/lineage availability checks but before path
-    normalization, target selection, Python predispatch, or target-sensitive
-    guards. Private dispatch carriers therefore cannot be supplied by the model
-    and invalid public calls cannot trigger target work before rejection.
-    """
-
-    _normalize_tool_call_args(entry, args)
-    public_params = set(_entry_public_params(entry))
-    if _entry_has_public_param_schema(entry) and any(key not in public_params for key in args):
-        return _format_tool_arg_error(entry)
-    try:
-        inspect.signature(entry.handler).bind(object(), **args)
-    except TypeError:
-        return _format_tool_arg_error(entry)
-    return ""
-
-
-def _light_binding_failure_redirect(name: str, args: dict[str, Any]) -> str:
-    """Project an existing light-mode UX redirect after a failed target bind."""
-
-    try:
-        from ouroboros.config import get_runtime_mode
-
-        if get_runtime_mode() == "light":
-            return light_cognitive_or_root_redirect(name, args) or ""
-    except Exception:
-        pass
-    return ""
-
-
-def _binding_error_text(name: str, root: str, exc: Exception) -> str:
-    detail = str(exc)
-    if detail.startswith("SKILL_REDIRECT_BLOCKED:"):
-        return f"⚠️ {detail}"
-    if detail.startswith("profile=") and " cannot " in detail:
-        return f"⚠️ TOOL_ACCESS_BLOCKED: {detail.rstrip('.')}."
-    if isinstance(exc, UserFilesPathBlockedError) and name in {
-        "read_file", "list_files", "search_code",
-    }:
-        return f"⚠️ USER_FILES_PATH_BLOCKED: {detail}"
-    if root == "skill_payload" and name in {"write_file", "edit_text"}:
-        return f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {detail}"
-    prefixes = {
-        "read_file": "READ_FILE_ERROR",
-        "list_files": "LIST_FILES_ERROR",
-        "search_code": "SEARCH_ERROR",
-        "query_code": "TOOL_ARG_ERROR (query_code)",
-        "write_file": "WRITE_FILE_ERROR",
-        "edit_text": "EDIT_TEXT_ERROR",
-        "vcs_status": "GIT_ERROR",
-        "vcs_diff": "GIT_ERROR",
-        "vcs_pull_ff": "PULL_ERROR",
-        "vcs_restore": "RESTORE_ERROR",
-        "vcs_revert": "REVERT_ERROR",
-        "skill_review": "SKILL_REVIEW_ERROR",
-        "skill_preflight": "SKILL_PREFLIGHT_ERROR",
-        "submit_skill_to_hub": "SUBMIT_BLOCKED",
-        "run_command": "SHELL_CWD_BLOCKED",
-        "run_script": "SCRIPT_CWD_BLOCKED",
-        "start_service": "SHELL_CWD_BLOCKED",
-        "verify_and_record": "VERIFY_ERROR",
-    }
-    return f"⚠️ {prefixes.get(name, 'TOOL_ERROR')}: {type(exc).__name__}: {detail}"
-
-
-def _payload_dispatch_constraint(
-    ctx: Any,
-    *,
-    name: str,
-    args: dict[str, Any],
-    task_constraint: Optional[TaskConstraint],
-    workspace_mode: bool,
-) -> tuple[Optional[TaskConstraint], ToolResult | None]:
-    """Preserve repair selectors without letting stray selectors retarget work."""
-
-    raw_bucket = str(args.get("bucket", "") or "")
-    raw_skill_name = str(args.get("skill_name", "") or "")
-    explicit_skill_root = str(args.get("root", "") or "").strip().lower() == "skill_payload"
-    short_form_decision = None if explicit_skill_root else decide_payload_short_form(
-        bucket=raw_bucket,
-        skill_name=raw_skill_name,
-        path_text=str(args.get("path", "") or "."),
-        repo_dir=pathlib.Path(ctx.repo_dir),
-        drive_root=pathlib.Path(ctx.drive_root),
-    )
-    if explicit_skill_root:
-        # Binding selection already handled the explicit target. This legacy
-        # constraint exists only for the light-mode data-payload carve-out.
-        synthesized = synthesize_payload_constraint(raw_bucket, raw_skill_name)
-    else:
-        synthesized = (
-            short_form_decision.constraint
-            if short_form_decision is not None
-            and task_constraint
-            and task_constraint.mode == "skill_repair"
-            else None
-        )
-
-    if (
-        (raw_bucket or raw_skill_name)
-        and short_form_decision is not None
-        and short_form_decision.error
-        and name in {"write_file", "edit_text"}
-    ):
-        root_arg = str(args.get("root", "") or "").strip().lower()
-        if _stray_skill_payload_failsoft(root_arg, workspace_mode, task_constraint):
-            log.info(
-                "Ignoring stray bucket/skill_name on %s (workspace edit, root=%s): %s",
-                name,
-                root_arg or "active_workspace",
-                short_form_decision.error[:80],
-            )
-            args.pop("bucket", None)
-            args.pop("skill_name", None)
-            synthesized = None
-        else:
-            return None, ToolResult(
-                status="error",
-                code="TOOL_ARG_ERROR",
-                text=f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}",
-            )
-
-    redirect_err = cross_skill_redirect_error(task_constraint, synthesized)
-    if redirect_err and name in {"write_file", "edit_text"}:
-        return None, ToolResult(
-            status="blocked",
-            code="HEAL_MODE_BLOCKED",
-            text=f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}",
-        )
-    if task_constraint and task_constraint.mode == "skill_repair":
-        return task_constraint, None
-    return synthesized or task_constraint, None
-
-
-def _format_tool_arg_error(entry: "ToolEntry") -> str:
-    params = _entry_public_params(entry)
-    accepted = ", ".join(params) if params else "none"
-    return (
-        f"⚠️ TOOL_ARG_ERROR ({entry.name}): invalid arguments for {entry.name}. "
-        f"Accepted parameters: {accepted}."
-    )
-
-
-def _extension_dispatch_candidate(
-    ctx: ToolContext,
-    name: str,
-) -> tuple[Optional[Dict[str, Any]], bool]:
-    """Return a live descriptor or a host-attested unavailable marker."""
-    try:
-        from ouroboros.extension_loader import (
-            get_tool as _ext_get_tool,
-            is_extension_live as _ext_is_live,
-            parse_extension_surface_name as _ext_parse_name,
-        )
-    except Exception:
-        return None, False
-    if not _ext_parse_name(name):
-        return None, False
-    try:
-        ext_tool = _ext_get_tool(name)
-        meta = getattr(ctx, "task_metadata", {})
-        budget_root = meta.get("budget_drive_root") if isinstance(meta, dict) else ""
-        capability_root = pathlib.Path(
-            budget_root
-            or getattr(ctx, "budget_drive_root", "")
-            or getattr(ctx, "drive_root", "")
-            or "."
-        ).resolve(strict=False)
-        if ext_tool and not _ext_is_live(
-            str(ext_tool.get("skill") or ""),
-            capability_root,
-            repo_path=str(ext_tool.get("skills_repo_path") or "") or None,
-        ):
-            return None, True
-        return ext_tool, False
-    except Exception:
-        return None, False
 
 
 class ToolRegistry:
@@ -570,7 +280,10 @@ class ToolRegistry:
             # Advertise only what the acting profile can actually execute: writes go
             # ONLY to the isolated surface (active_workspace); reads use the read roots;
             # browser evaluate is unavailable (rejected at execute time).
-            if entry.name in _ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
+            if (
+                entry.name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS
+                or entry.name in _GENERIC_VCS_TARGET_TOOLS
+            ):
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
                 if isinstance(root_schema.get("enum"), list):
@@ -961,84 +674,6 @@ class ToolRegistry:
                 return 63
         return 360
 
-    def _dispatch_extension_tool(self, name: str, ext_tool: Dict[str, Any], args: Optional[Dict[str, Any]]) -> ToolResult:
-        """Dispatch live extension tools through the registry's typed seam."""
-        from ouroboros.tools.extension_dispatch import _dispatch_extension_tool_result
-
-        return _dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
-
-    def _dispatch_mcp_tool(self, name: str, args: Dict[str, Any]) -> ToolResult:
-        """Run one MCP tool while preserving provider-owned result facts."""
-        from ouroboros.safety import check_safety as _mcp_check_safety
-        is_safe, safety_msg = _mcp_check_safety(
-            name,
-            args,
-            messages=getattr(self._ctx, "messages", None),
-            ctx=self._ctx,
-        )
-        if not is_safe:
-            return ToolResult(status="blocked", code="SAFETY_VIOLATION", text=safety_msg)
-        try:
-            from ouroboros.mcp_client import _call_mcp_tool_result as _mcp_call
-
-            result = _mcp_call(name, args or {})
-        except Exception as exc:
-            text = f"⚠️ TOOL_ERROR ({name}): {exc}"
-            return ToolResult(status="error", code="TOOL_ERROR", text=text)
-        if not safety_msg:
-            return result
-        text = _compose_execute_result(result.text, "", safety_msg)
-        meta = {**dict(result.meta), "safety_warning": True}
-        if result.code == "OK":
-            return ToolResult(status="ok", code="SAFETY_WARNING", text=text, meta=meta)
-        return ToolResult(status=result.status, code=result.code, text=text, meta=meta)
-
-    def _resolve_python_predispatch(
-        self,
-        name: str,
-        args: Dict[str, Any],
-        runtime_mode: str,
-        effective_constraint: Any,
-        resolved_binding: Any = None,
-    ) -> tuple[Dict[str, Any], Any, str]:
-        """Resolve an exact python/python3 request ONCE, before the shell guard.
-
-        Every downstream guard and the handler therefore see byte-identical
-        argv; launchers must not select an interpreter after this boundary.
-        """
-        args, python_resolution = resolve_process_python(
-            self._ctx,
-            name,
-            args,
-            runtime_mode=runtime_mode,
-            effective_constraint=effective_constraint,
-            resolved_binding=resolved_binding,
-        )
-        record_python_resolution(self._ctx, python_resolution)
-        if python_resolution is not None and python_resolution.error_reason:
-            if python_resolution.error_reason == "cwd_resolution_failed":
-                # The failure is the CWD CONFINEMENT policy, not interpreter
-                # provenance: python argv is resolved pre-dispatch, so without
-                # this the same bad cwd that gets the self-healing
-                # SHELL_CWD_BLOCKED root list from a non-python command got an
-                # opaque interpreter message naming nothing (submarine waves
-                # 1/3, `python3 -m http.server` in a coop tree). Emit the ONE
-                # canonical cwd message (label=path root list); the
-                # python_interpreter_resolution trace above keeps the true
-                # reason, and the typed SHELL_CWD_BLOCKED status lands in the
-                # policy-denial family instead of degrading execution.
-                return args, python_resolution, shell_cwd_block_message(
-                    self._ctx,
-                    str((args or {}).get("cwd") or ""),
-                    operation="service" if name == "start_service" else "shell",
-                )
-            return args, python_resolution, (
-                "⚠️ PYTHON_INTERPRETER_UNAVAILABLE: Ouroboros could not prove "
-                "the target interpreter for this launch surface "
-                f"({python_resolution.error_reason}). The process was not started."
-            )
-        return args, python_resolution, ""
-
     def _invoke_builtin_handler(
         self,
         name: str,
@@ -1071,7 +706,7 @@ class ToolRegistry:
                 try:
                     inspect.signature(entry.handler).bind(self._ctx, **handler_args)
                 except TypeError:
-                    return _format_tool_arg_error(entry), None
+                    return tool_resolution._format_tool_arg_error(entry), None
                 return None, entry.handler(self._ctx, **handler_args)
             except TypeError as e:
                 return f"⚠️ TOOL_ERROR ({name}): {e}", None
@@ -1103,10 +738,7 @@ class ToolRegistry:
         acting_protected_grant = acting_subagent and bool(getattr(task_constraint, "protected_paths_grant", False))
         acting_tool_grants = set(getattr(task_constraint, "external_tool_grants", ()) or ()) if acting_subagent else set()
         entry = self._entries.get(name)
-        ext_tool, extension_unavailable = _extension_dispatch_candidate(
-            self._ctx,
-            name,
-        ) if entry is None else (None, False)
+        ext_tool, extension_unavailable = extension_dispatch._extension_dispatch_candidate(self._ctx, name) if entry is None else (None, False)
 
         _mcp_is_name = None
         if entry is None and ext_tool is None:
@@ -1150,7 +782,7 @@ class ToolRegistry:
                 "Ouroboros repo, runtime data, or control plane."
             )
         if entry is not None:
-            public_arg_error = _prepare_public_builtin_args(entry, args)
+            public_arg_error = tool_resolution._prepare_public_builtin_args(entry, args)
             if public_arg_error:
                 return public_arg_error
             _route_note = _normalize_dispatch_path_args(self._ctx, name, args)
@@ -1171,7 +803,7 @@ class ToolRegistry:
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)())
         effective_constraint = task_constraint
         if entry is not None:
-            effective_constraint, payload_result = _payload_dispatch_constraint(
+            effective_constraint, payload_result = registry_guards._payload_dispatch_constraint(
                 self._ctx,
                 name=name,
                 args=args,
@@ -1185,7 +817,7 @@ class ToolRegistry:
             try:
                 resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
             except Exception as exc:
-                redirect = _light_binding_failure_redirect(name, args)
+                redirect = tool_resolution._light_binding_failure_redirect(name, args)
                 if redirect:
                     return redirect
                 operation = _target_binding_operation(name, args)
@@ -1196,7 +828,7 @@ class ToolRegistry:
                         operation=operation,
                         error=exc,
                     )
-                return _binding_error_text(
+                return tool_resolution._binding_error_text(
                     name,
                     str(args.get("root") or "active_workspace"),
                     exc,
@@ -1205,7 +837,7 @@ class ToolRegistry:
         # have active_workspace/system_repo fall back to the LIVE repo. Confine it
         # to data roots and block shell/coding/service (whose default target is the repo).
         if acting_subagent and not workspace_mode:
-            if name in _ROOT_ARG_REPO_WRITE_TOOLS and str(args.get("root", "") or "active_workspace") in ("active_workspace", "system_repo"):
+            if name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS and str(args.get("root", "") or "active_workspace") in ("active_workspace", "system_repo"):
                 return (
                     "⚠️ ACTING_NO_WORKSPACE_BLOCKED: this acting subagent has no resolved isolated "
                     "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
@@ -1227,10 +859,10 @@ class ToolRegistry:
             _runtime_mode = "advanced"
 
         if is_mcp:
-            return self._dispatch_mcp_tool(name, args)
+            return extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
-                return self._dispatch_extension_tool(name, ext_tool, args)
+                return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
             text = f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
             if extension_unavailable:
                 return ToolResult(
@@ -1240,8 +872,8 @@ class ToolRegistry:
                     meta={"dynamic_provider": True},
                 )
             return text
-        args, python_resolution, python_block = self._resolve_python_predispatch(
-            name, args, _runtime_mode, effective_constraint, resolved_binding,
+        args, python_resolution, python_block = tool_resolution._resolve_python_predispatch(
+            self, name, args, _runtime_mode, effective_constraint, resolved_binding,
         )
         if python_block:
             return python_block
@@ -1289,11 +921,11 @@ class ToolRegistry:
             )
 
         protected_write_paths = []
-        if name in _ROOT_ARG_REPO_WRITE_TOOLS:
+        if name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS:
             root_name = str(args.get("root", "") or "active_workspace")
             protected_write_paths = [
                 canonical_repo_relative_path(self._ctx, root_name, p)
-                for p in _payload_write_paths(name, args)
+                for p in tool_resolution._payload_write_paths(name, args)
             ]
             if resolved_binding is not None:
                 protected_target = (

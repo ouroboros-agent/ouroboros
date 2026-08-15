@@ -1,4 +1,4 @@
-"""Extension tool dispatch helpers for the tool registry."""
+"""Dynamic extension discovery and typed extension/MCP dispatch."""
 
 from __future__ import annotations
 
@@ -8,7 +8,76 @@ import pathlib
 import threading
 from typing import Any, Dict, Optional
 
-from ouroboros.tools.tool_result import ToolResult, ToolStatus
+from ouroboros.tools.tool_context import ToolContext
+from ouroboros.tools.tool_result import ToolResult, ToolStatus, _compose_execute_result
+
+
+def _extension_dispatch_candidate(
+    ctx: ToolContext,
+    name: str,
+) -> tuple[Optional[Dict[str, Any]], bool]:
+    """Return a live descriptor or a host-attested unavailable marker."""
+    try:
+        from ouroboros.extension_loader import (
+            get_tool as _ext_get_tool,
+            is_extension_live as _ext_is_live,
+            parse_extension_surface_name as _ext_parse_name,
+        )
+    except Exception:
+        return None, False
+    if not _ext_parse_name(name):
+        return None, False
+    try:
+        ext_tool = _ext_get_tool(name)
+        meta = getattr(ctx, "task_metadata", {})
+        budget_root = meta.get("budget_drive_root") if isinstance(meta, dict) else ""
+        capability_root = pathlib.Path(
+            budget_root
+            or getattr(ctx, "budget_drive_root", "")
+            or getattr(ctx, "drive_root", "")
+            or "."
+        ).resolve(strict=False)
+        if ext_tool and not _ext_is_live(
+            str(ext_tool.get("skill") or ""),
+            capability_root,
+            repo_path=str(ext_tool.get("skills_repo_path") or "") or None,
+        ):
+            return None, True
+        return ext_tool, False
+    except Exception:
+        return None, False
+
+
+def _dispatch_mcp_tool_result(
+    ctx: Any,
+    name: str,
+    args: Dict[str, Any],
+) -> ToolResult:
+    """Run one MCP tool while preserving provider-owned result facts."""
+    from ouroboros.safety import check_safety as _mcp_check_safety
+
+    is_safe, safety_msg = _mcp_check_safety(
+        name,
+        args,
+        messages=getattr(ctx, "messages", None),
+        ctx=ctx,
+    )
+    if not is_safe:
+        return ToolResult(status="blocked", code="SAFETY_VIOLATION", text=safety_msg)
+    try:
+        from ouroboros.mcp_client import _call_mcp_tool_result as _mcp_call
+
+        result = _mcp_call(name, args or {})
+    except Exception as exc:
+        text = f"⚠️ TOOL_ERROR ({name}): {exc}"
+        return ToolResult(status="error", code="TOOL_ERROR", text=text)
+    if not safety_msg:
+        return result
+    text = _compose_execute_result(result.text, "", safety_msg)
+    meta = {**dict(result.meta), "safety_warning": True}
+    if result.code == "OK":
+        return ToolResult(status="ok", code="SAFETY_WARNING", text=text, meta=meta)
+    return ToolResult(status=result.status, code=result.code, text=text, meta=meta)
 
 
 def _extension_result(

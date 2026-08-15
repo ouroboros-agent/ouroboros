@@ -640,7 +640,7 @@ def test_acting_subagent_without_workspace_cannot_touch_the_live_repo(tmp_path, 
 
 
 def test_acting_subagent_schema_narrows_root_for_every_repo_write_tool():
-    from ouroboros.tools.registry_core import _ROOT_ARG_REPO_WRITE_TOOLS
+    from ouroboros.tools.tool_resolution import _ROOT_ARG_REPO_WRITE_TOOLS
 
     assert {"write_file", "edit_text", "apply_patch", "edit_batch"} == set(_ROOT_ARG_REPO_WRITE_TOOLS)
 

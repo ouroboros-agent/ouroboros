@@ -12,6 +12,7 @@ def test_registry_core_extraction_preserves_only_proven_facades():
         registry,
         registry_core,
         registry_guards,
+        extension_dispatch,
         tool_catalog,
         tool_context,
         tool_resolution,
@@ -49,6 +50,30 @@ def test_registry_core_extraction_preserves_only_proven_facades():
         "_resource_allowed",
         "_task_constraint_path_allowed",
     }
+    private_resolution_names = {
+        "_ROOT_ARG_REPO_WRITE_TOOLS",
+        "_TOOL_ARG_ALIASES",
+        "_IGNORE_ROOT_ARG_TOOLS",
+        "_binding_error_text",
+        "_entry_has_public_param_schema",
+        "_entry_public_params",
+        "_format_tool_arg_error",
+        "_handler_public_params",
+        "_light_binding_failure_redirect",
+        "_normalize_tool_call_args",
+        "_payload_write_paths",
+        "_prepare_public_builtin_args",
+        "_resolve_python_predispatch",
+    }
+    private_guard_names = {
+        "_payload_dispatch_constraint",
+        "_stray_skill_payload_failsoft",
+    }
+    private_extension_names = {
+        "_dispatch_extension_tool_result",
+        "_dispatch_mcp_tool_result",
+        "_extension_dispatch_candidate",
+    }
     proven = {
         "BrowserState",
         "ToolContext",
@@ -71,6 +96,15 @@ def test_registry_core_extraction_preserves_only_proven_facades():
     assert registry._compose_execute_result is tool_result._compose_execute_result
     assert all(getattr(registry, name) is getattr(tool_resolution, name) for name in resolution_names)
     assert all(getattr(registry, name) is getattr(registry_guards, name) for name in guard_names)
+    assert all(hasattr(tool_resolution, name) for name in private_resolution_names)
+    assert all(hasattr(registry_guards, name) for name in private_guard_names)
+    assert all(hasattr(extension_dispatch, name) for name in private_extension_names)
+    retired_private = private_resolution_names | private_guard_names | private_extension_names
+    assert all(not hasattr(registry_core, name) for name in retired_private)
+    assert all(not hasattr(registry, name) for name in retired_private)
+    assert not hasattr(registry.ToolRegistry, "_dispatch_extension_tool")
+    assert not hasattr(registry.ToolRegistry, "_dispatch_mcp_tool")
+    assert not hasattr(registry.ToolRegistry, "_resolve_python_predispatch")
     assert registry.ToolRegistry.__module__ == "ouroboros.tools.registry_core"
     assert str(inspect.signature(registry.ToolRegistry.execute)) == (
         "(self, name: 'str', args: 'Dict[str, Any]') -> 'str'"

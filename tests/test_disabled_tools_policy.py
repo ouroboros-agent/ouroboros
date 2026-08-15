@@ -411,6 +411,7 @@ def test_external_resource_guard_precedes_child_policy_and_never_dispatches(
 ):
     import ouroboros.loop_tool_execution as execution
     from ouroboros import extension_loader, mcp_client
+    from ouroboros.tools import extension_dispatch
 
     repo = tmp_path / "repo"
     data = tmp_path / "data"
@@ -440,7 +441,7 @@ def test_external_resource_guard_precedes_child_policy_and_never_dispatches(
             lambda **_kwargs: calls.__setitem__("discovery", calls["discovery"] + 1),
         )
         monkeypatch.setattr(mcp_client, "is_mcp_tool_name", lambda candidate: candidate == name)
-        monkeypatch.setattr(ToolRegistry, "_dispatch_mcp_tool", _physical)
+        monkeypatch.setattr(extension_dispatch, "_dispatch_mcp_tool_result", _physical)
 
     monkeypatch.setattr(
         "ouroboros.safety.check_safety",
@@ -506,6 +507,7 @@ def test_external_discovery_failure_does_not_fabricate_a_resource_denial(
 ):
     import ouroboros.loop_tool_execution as execution
     from ouroboros import extension_loader, mcp_client
+    from ouroboros.tools import extension_dispatch
 
     repo = tmp_path / "repo"
     data = tmp_path / "data"
@@ -537,7 +539,7 @@ def test_external_discovery_failure_does_not_fabricate_a_resource_denial(
 
         monkeypatch.setattr(mcp_client, "ensure_configured_from_settings", _configuration_failure)
         monkeypatch.setattr(mcp_client, "is_mcp_tool_name", lambda candidate: candidate == name)
-    monkeypatch.setattr(ToolRegistry, "_dispatch_mcp_tool", _physical)
+    monkeypatch.setattr(extension_dispatch, "_dispatch_mcp_tool_result", _physical)
     monkeypatch.setattr(
         "ouroboros.safety.check_safety",
         lambda *_a, **_k: calls.__setitem__("safety", calls["safety"] + 1) or (True, ""),

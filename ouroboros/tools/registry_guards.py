@@ -1,7 +1,8 @@
-"""Host-owned pre-dispatch access and managed-update guard outcomes."""
+"""Host-owned pre-dispatch capability, payload, and access guard outcomes."""
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import re
@@ -13,9 +14,12 @@ from ouroboros.contracts.skill_payload_policy import (
     SKILL_PAYLOAD_CONTROL_DIRNAMES,
     SKILL_PAYLOAD_CONTROL_FILENAMES,
     constraint_bucket_skill,
+    cross_skill_redirect_error,
+    decide_payload_short_form,
     is_skill_payload_control_filename,
     is_skill_payload_path,
     resolve_skill_payload_target,
+    synthesize_payload_constraint,
 )
 from ouroboros.contracts.task_constraint import TaskConstraint
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
@@ -47,6 +51,8 @@ from ouroboros.tools.tool_resolution import (
 )
 from ouroboros.tools.tool_result import ToolResult
 
+log = logging.getLogger("ouroboros.tools.registry")
+
 _WEB_TOOLS = frozenset({"web_search", "browse_page", "browser_action", "youtube_transcript"})
 _GITHUB_TOKEN_TOOLS = frozenset({
     "list_github_prs",
@@ -61,6 +67,88 @@ _GITHUB_TOKEN_TOOLS = frozenset({
     "submit_skill_to_hub",
     "generate_evolution_stats",
 })
+
+
+def _stray_skill_payload_failsoft(root_arg: str, workspace_mode: bool, task_constraint: Any) -> bool:
+    """Whether stray bucket/skill_name on a write tool should be DROPPED rather than
+    surfaced as SKILL_PAYLOAD_ARG_ERROR. Fail-soft ONLY for a WORKSPACE edit that is
+    NOT skill-authoring: there bucket/skill_name are model noise (the B2 footgun —
+    reflexive bucket="external" on an /app edit). In light/advanced non-workspace
+    skill-authoring (or an explicit root=skill_payload / skill_repair) the specific
+    error is the intended helpful signal."""
+    skill_payload_intent = root_arg == "skill_payload" or bool(
+        task_constraint and getattr(task_constraint, "mode", "") == "skill_repair"
+    )
+    return bool(workspace_mode and not skill_payload_intent)
+
+
+def _payload_dispatch_constraint(
+    ctx: Any,
+    *,
+    name: str,
+    args: dict[str, Any],
+    task_constraint: Optional[TaskConstraint],
+    workspace_mode: bool,
+) -> tuple[Optional[TaskConstraint], ToolResult | None]:
+    """Preserve repair selectors without letting stray selectors retarget work."""
+
+    raw_bucket = str(args.get("bucket", "") or "")
+    raw_skill_name = str(args.get("skill_name", "") or "")
+    explicit_skill_root = str(args.get("root", "") or "").strip().lower() == "skill_payload"
+    short_form_decision = None if explicit_skill_root else decide_payload_short_form(
+        bucket=raw_bucket,
+        skill_name=raw_skill_name,
+        path_text=str(args.get("path", "") or "."),
+        repo_dir=pathlib.Path(ctx.repo_dir),
+        drive_root=pathlib.Path(ctx.drive_root),
+    )
+    if explicit_skill_root:
+        # Binding selection already handled the explicit target. This legacy
+        # constraint exists only for the light-mode data-payload carve-out.
+        synthesized = synthesize_payload_constraint(raw_bucket, raw_skill_name)
+    else:
+        synthesized = (
+            short_form_decision.constraint
+            if short_form_decision is not None
+            and task_constraint
+            and task_constraint.mode == "skill_repair"
+            else None
+        )
+
+    if (
+        (raw_bucket or raw_skill_name)
+        and short_form_decision is not None
+        and short_form_decision.error
+        and name in {"write_file", "edit_text"}
+    ):
+        root_arg = str(args.get("root", "") or "").strip().lower()
+        if _stray_skill_payload_failsoft(root_arg, workspace_mode, task_constraint):
+            log.info(
+                "Ignoring stray bucket/skill_name on %s (workspace edit, root=%s): %s",
+                name,
+                root_arg or "active_workspace",
+                short_form_decision.error[:80],
+            )
+            args.pop("bucket", None)
+            args.pop("skill_name", None)
+            synthesized = None
+        else:
+            return None, ToolResult(
+                status="error",
+                code="TOOL_ARG_ERROR",
+                text=f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}",
+            )
+
+    redirect_err = cross_skill_redirect_error(task_constraint, synthesized)
+    if redirect_err and name in {"write_file", "edit_text"}:
+        return None, ToolResult(
+            status="blocked",
+            code="HEAL_MODE_BLOCKED",
+            text=f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}",
+        )
+    if task_constraint and task_constraint.mode == "skill_repair":
+        return task_constraint, None
+    return synthesized or task_constraint, None
 
 
 def _executor_backend_candidate_allowed(ctx: Any, candidate: str, allowed_roots: List[pathlib.Path]) -> bool:

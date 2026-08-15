@@ -23,8 +23,8 @@ same guard chain as ``edit_text``: path canonicalization FIRST (see
 ``_resolve_edit_target`` — a guard that judges a different spelling than the
 write uses is not a guard), then root access, protected artifact paths,
 project-room write guard, protected runtime paths. Because their paths ride
-inside the payload rather than a ``path`` arg, the dispatch gates in
-``registry.py`` read them back out through ``_payload_write_paths`` so the
+inside the payload rather than a ``path`` arg, the dispatch preparation owner in
+``tool_resolution.py`` reads them back out through ``_payload_write_paths`` so the
 acting-subagent and protected-write fences apply identically.
 
 (An ``edit_sketch`` fast-apply tool — strong-model sketch merged by the cheap
