@@ -11,6 +11,7 @@ import pathlib
 
 import pytest
 
+import ouroboros.tools.registry_guards as registry_guards
 from ouroboros.tool_access import (
     active_tool_profile,
     decide_tool_access,
@@ -18,7 +19,7 @@ from ouroboros.tool_access import (
     resolve_shell_cwd,
     user_files_path_block_reason,
 )
-from ouroboros.tools.registry import ToolContext, ToolRegistry, _command_mentions_protected_root
+from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.tools.registry_guard_process import _run_shell_safety_check
 
 
@@ -217,14 +218,18 @@ def test_external_shell_write_protects_child_drive(tmp_path):
 def test_command_mentions_protected_root_is_boundary_aware():
     root = "/x/ouroboros/data"
     # Whole path or a child path → match (the real protected-path cases).
-    assert _command_mentions_protected_root(f"touch {root}", root)
-    assert _command_mentions_protected_root(f"touch {root}/state.json", root)
-    assert _command_mentions_protected_root(f"cat '{root}/x' ", root)
+    assert registry_guards._command_mentions_protected_root(f"touch {root}", root)
+    assert registry_guards._command_mentions_protected_root(f"touch {root}/state.json", root)
+    assert registry_guards._command_mentions_protected_root(f"cat '{root}/x' ", root)
     # A different sibling path that merely shares the string prefix → NOT a match.
-    assert not _command_mentions_protected_root("touch /x/ouroboros/database/x", root)
-    assert not _command_mentions_protected_root("touch /x/ouroboros/data-backup", root)
-    assert not _command_mentions_protected_root("", root)
-    assert not _command_mentions_protected_root("touch /other/path", root)
+    assert not registry_guards._command_mentions_protected_root(
+        "touch /x/ouroboros/database/x", root,
+    )
+    assert not registry_guards._command_mentions_protected_root(
+        "touch /x/ouroboros/data-backup", root,
+    )
+    assert not registry_guards._command_mentions_protected_root("", root)
+    assert not registry_guards._command_mentions_protected_root("touch /other/path", root)
 
 
 def test_external_shell_read_blocks_relative_and_symlink_traversal(tmp_path):

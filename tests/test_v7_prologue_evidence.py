@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 107
+    assert len(rows) == 138
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -469,6 +469,68 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             "ouroboros/tools/registry_guards.py::_heal_protected_payload_sidecar",
         "ouroboros/tools/registry.py::ToolRegistry._heal_mode_block":
             "ouroboros/tools/registry_guards.py::_heal_mode_guard_result",
+        "ouroboros/tools/registry.py::_executor_backend_candidate_allowed":
+            "ouroboros/tools/registry_guards.py::_executor_backend_candidate_allowed",
+        "ouroboros/tools/registry.py::_command_mentions_protected_root":
+            "ouroboros/tools/registry_guards.py::_command_mentions_protected_root",
+        "ouroboros/tools/registry.py::_authorized_managed_update_resolver":
+            "ouroboros/tools/registry_guards.py::_authorized_managed_update_resolver",
+        "ouroboros/tools/registry.py::_light_mode_payload_mutation_allowed":
+            "ouroboros/tools/registry_guards.py::_light_mode_payload_mutation_allowed",
+        "ouroboros/tools/registry.py::ToolRegistry._protected_shell_block":
+            "ouroboros/tools/registry_guards.py::_protected_shell_block",
+        "ouroboros/tools/registry.py::ToolRegistry._git_protected_roots":
+            "ouroboros/tools/registry_guards.py::_git_protected_roots",
+        "ouroboros/tools/registry.py::ToolRegistry._resolved_shell_cwd":
+            "ouroboros/tools/registry_guards.py::_resolved_shell_cwd",
+        "ouroboros/tools/registry.py::ToolRegistry._external_workspace_git_block":
+            "ouroboros/tools/registry_guards.py::_external_workspace_git_block",
+        "ouroboros/tools/registry.py::ToolRegistry._external_runtime_protected_paths":
+            "ouroboros/tools/registry_guards.py::_external_runtime_protected_paths",
+        "ouroboros/tools/registry.py::ToolRegistry._external_shell_runtime_or_secret_block":
+            "ouroboros/tools/registry_guards.py::_external_shell_runtime_or_secret_block",
+        "ouroboros/tools/registry.py::ToolRegistry._workspace_shell_write_block":
+            "ouroboros/tools/registry_guards.py::_workspace_shell_write_block",
+        "ouroboros/tools/registry.py::ToolRegistry._shell_git_and_runtime_block":
+            "ouroboros/tools/registry_guards.py::_shell_git_and_runtime_block",
+        "tests/test_external_workspace_access.py::_command_mentions_protected_root":
+            "ouroboros/tools/registry_guards.py::_command_mentions_protected_root",
+        "ouroboros/tools/registry.py::PROTECTED_RUNTIME_PATHS":
+            "ouroboros/runtime_mode_policy.py::PROTECTED_RUNTIME_PATHS",
+        "ouroboros/tools/registry.py::task_artifact_dir_path":
+            "ouroboros/artifacts.py::task_artifact_dir_path",
+        "ouroboros/tools/registry.py::task_id_for_artifacts":
+            "ouroboros/artifacts.py::task_id_for_artifacts",
+        "ouroboros/tools/registry.py::run_shell_git_block_reason":
+            "ouroboros/git_shell_policy.py::run_shell_git_block_reason",
+        "ouroboros/tools/registry.py::workspace_git_safety_violation":
+            "ouroboros/git_shell_policy.py::workspace_git_safety_violation",
+        "ouroboros/tools/registry.py::is_absolute_path_text":
+            "ouroboros/shell_parse.py::is_absolute_path_text",
+        "ouroboros/tools/registry.py::path_text_is_inside":
+            "ouroboros/shell_parse.py::path_text_is_inside",
+        "ouroboros/tools/registry.py::shell_argv":
+            "ouroboros/shell_parse.py::shell_argv",
+        "ouroboros/tools/registry.py::shell_argv_with_path_tokens":
+            "ouroboros/shell_parse.py::shell_argv_with_path_tokens",
+        "ouroboros/tools/registry.py::PROTECTED_RUNTIME_PATHS_LOWER":
+            "ouroboros/tools/shell_guards.py::PROTECTED_RUNTIME_PATHS_LOWER",
+        "ouroboros/tools/registry.py::shell_has_write_indicator":
+            "ouroboros/tools/shell_guards.py::shell_has_write_indicator",
+        "ouroboros/tools/registry.py::shell_writer_targets_protected":
+            "ouroboros/tools/shell_guards.py::shell_writer_targets_protected",
+        "ouroboros/tools/registry.py::is_external_workspace":
+            "ouroboros/tool_access.py::is_external_workspace",
+        "ouroboros/tools/registry.py::normalize_root":
+            "ouroboros/tool_access.py::normalize_root",
+        "ouroboros/tools/registry.py::resolve_shell_cwd":
+            "ouroboros/tool_access.py::resolve_shell_cwd",
+        "ouroboros/tools/registry.py::SKILL_PAYLOAD_CONTROL_DIRNAMES":
+            "ouroboros/contracts/skill_payload_policy.py::SKILL_PAYLOAD_CONTROL_DIRNAMES",
+        "ouroboros/tools/registry.py::is_skill_payload_path":
+            "ouroboros/contracts/skill_payload_policy.py::is_skill_payload_path",
+        "ouroboros/tools/registry.py::resolve_skill_payload_target":
+            "ouroboros/contracts/skill_payload_policy.py::resolve_skill_payload_target",
     }
     existing_process_owner_rows = {
         "tests/test_skill_exec.py::test_run_shell_restores_obfuscated_self_authored_state_marker",
@@ -488,6 +550,24 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         "ouroboros/tools/registry.py::unwrap_env_argv",
         "ouroboros/tools/registry.py::workspace_executor_state_write_block",
         "ouroboros/tools/registry.py::writer_target_tokens",
+        "ouroboros/tools/registry.py::PROTECTED_RUNTIME_PATHS",
+        "ouroboros/tools/registry.py::task_artifact_dir_path",
+        "ouroboros/tools/registry.py::task_id_for_artifacts",
+        "ouroboros/tools/registry.py::run_shell_git_block_reason",
+        "ouroboros/tools/registry.py::workspace_git_safety_violation",
+        "ouroboros/tools/registry.py::is_absolute_path_text",
+        "ouroboros/tools/registry.py::path_text_is_inside",
+        "ouroboros/tools/registry.py::shell_argv",
+        "ouroboros/tools/registry.py::shell_argv_with_path_tokens",
+        "ouroboros/tools/registry.py::PROTECTED_RUNTIME_PATHS_LOWER",
+        "ouroboros/tools/registry.py::shell_has_write_indicator",
+        "ouroboros/tools/registry.py::shell_writer_targets_protected",
+        "ouroboros/tools/registry.py::is_external_workspace",
+        "ouroboros/tools/registry.py::normalize_root",
+        "ouroboros/tools/registry.py::resolve_shell_cwd",
+        "ouroboros/tools/registry.py::SKILL_PAYLOAD_CONTROL_DIRNAMES",
+        "ouroboros/tools/registry.py::is_skill_payload_path",
+        "ouroboros/tools/registry.py::resolve_skill_payload_target",
     }
     inherited_managed = {
         "docs/assets/home-ZhS5_vhA.js": (
@@ -608,6 +688,18 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
                     "ouroboros/tools/registry.py::ToolRegistry._ephemeral_block",
                     "ouroboros/tools/registry.py::ToolRegistry._subagent_and_update_gate",
                     "ouroboros/tools/registry.py::ToolRegistry._heal_mode_block",
+                    "ouroboros/tools/registry.py::_executor_backend_candidate_allowed",
+                    "ouroboros/tools/registry.py::_command_mentions_protected_root",
+                    "ouroboros/tools/registry.py::_light_mode_payload_mutation_allowed",
+                    "ouroboros/tools/registry.py::ToolRegistry._protected_shell_block",
+                    "ouroboros/tools/registry.py::ToolRegistry._git_protected_roots",
+                    "ouroboros/tools/registry.py::ToolRegistry._resolved_shell_cwd",
+                    "ouroboros/tools/registry.py::ToolRegistry._external_workspace_git_block",
+                    "ouroboros/tools/registry.py::ToolRegistry._external_runtime_protected_paths",
+                    "ouroboros/tools/registry.py::ToolRegistry._external_shell_runtime_or_secret_block",
+                    "ouroboros/tools/registry.py::ToolRegistry._workspace_shell_write_block",
+                    "ouroboros/tools/registry.py::ToolRegistry._shell_git_and_runtime_block",
+                    "tests/test_external_workspace_access.py::_command_mentions_protected_root",
                     "ouroboros/tools/registry.py::ToolRegistry._run_shell_safety_check",
                     "ouroboros/tools/registry.py::_light_repo_snapshot",
                     "ouroboros/tools/registry.py::_format_light_repo_write_block",
@@ -656,6 +748,24 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
                     "ouroboros/tools/registry.py::unwrap_env_argv",
                     "ouroboros/tools/registry.py::workspace_executor_state_write_block",
                     "ouroboros/tools/registry.py::writer_target_tokens",
+                    "ouroboros/tools/registry.py::PROTECTED_RUNTIME_PATHS",
+                    "ouroboros/tools/registry.py::task_artifact_dir_path",
+                    "ouroboros/tools/registry.py::task_id_for_artifacts",
+                    "ouroboros/tools/registry.py::run_shell_git_block_reason",
+                    "ouroboros/tools/registry.py::workspace_git_safety_violation",
+                    "ouroboros/tools/registry.py::is_absolute_path_text",
+                    "ouroboros/tools/registry.py::path_text_is_inside",
+                    "ouroboros/tools/registry.py::shell_argv",
+                    "ouroboros/tools/registry.py::shell_argv_with_path_tokens",
+                    "ouroboros/tools/registry.py::PROTECTED_RUNTIME_PATHS_LOWER",
+                    "ouroboros/tools/registry.py::shell_has_write_indicator",
+                    "ouroboros/tools/registry.py::shell_writer_targets_protected",
+                    "ouroboros/tools/registry.py::is_external_workspace",
+                    "ouroboros/tools/registry.py::normalize_root",
+                    "ouroboros/tools/registry.py::resolve_shell_cwd",
+                    "ouroboros/tools/registry.py::SKILL_PAYLOAD_CONTROL_DIRNAMES",
+                    "ouroboros/tools/registry.py::is_skill_payload_path",
+                    "ouroboros/tools/registry.py::resolve_skill_payload_target",
                 }
                 else row["old path/symbol"]
             )
@@ -679,7 +789,7 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 81
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 112
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 

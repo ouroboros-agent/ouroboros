@@ -8,6 +8,7 @@ import re
 import subprocess
 from typing import Any, Dict, Optional
 
+import ouroboros.tools.registry_guards as registry_guards
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.contracts.skill_payload_policy import (
     SKILL_OWNER_STATE_FILENAMES,
@@ -444,7 +445,7 @@ def _run_shell_safety_check(
     # their family (`ruby3.2` is `ruby`), so a versioned basename is exactly as
     # write-suspect as the unversioned one (XG-2R.2).
     writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and (interpreter_family(argv_executable) or argv_executable) in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
-    work_dir = self._resolved_shell_cwd(args, binding)
+    work_dir = registry_guards._resolved_shell_cwd(self, args, binding)
     if isinstance(work_dir, ToolResult):
         return work_dir
     if protected_artifact_block := protected_artifact_shell_block_reason(
@@ -471,7 +472,8 @@ def _run_shell_safety_check(
             text=executor_state_block,
         )
     if workspace_mode and writeish:
-        workspace_write_block = self._workspace_shell_write_block(
+        workspace_write_block = registry_guards._workspace_shell_write_block(
+            self,
             args,
             raw_cmd,
             cmd_path_lower,
@@ -593,8 +595,8 @@ def _run_shell_safety_check(
                     ),
                 )
 
-    if protected_shell := self._protected_shell_block(
-        raw_cmd, cmd_path_lower, binding, acting_self_worktree,
+    if protected_shell := registry_guards._protected_shell_block(
+        self, raw_cmd, cmd_path_lower, binding, acting_self_worktree,
     ):
         return protected_shell
 
@@ -605,8 +607,8 @@ def _run_shell_safety_check(
     if "gh auth" in cmd_words:
         return ToolResult(status="blocked", code="SAFETY_VIOLATION", text="⚠️ SAFETY_VIOLATION: Modifying GitHub authentication is not permitted.")
 
-    return self._shell_git_and_runtime_block(
-        raw_cmd, args, cmd_path_lower, workspace_mode,
+    return registry_guards._shell_git_and_runtime_block(
+        self, raw_cmd, args, cmd_path_lower, workspace_mode,
         acting_self_worktree, binding,
     )
 

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import ouroboros.tools.registry as registry_module
 import ouroboros.tools.registry_guard_process as process_guard
+import ouroboros.tools.registry_guards as registry_guards
 from ouroboros.artifacts import task_artifact_dir_path
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult
@@ -33,6 +34,21 @@ _FUNCTION_SIGNATURES = {
     "_snapshot_owner_files": "(self, state_drive_root: 'pathlib.Path | None' = None) -> 'Dict[pathlib.Path, Optional[str]]'",
     "_restore_owner_files": "(self, before: 'Dict[pathlib.Path, Optional[str]]', state_drive_root: 'pathlib.Path | None' = None) -> 'bool'",
     "_run_shell_post_checks": "(self, result: 'str', *, owner_snapshot: 'Dict[pathlib.Path, Optional[str]]', state_drive_root: 'pathlib.Path', light_repo_before: 'Optional[Dict[str, Any]]', workspace_refs_before: 'Optional[Dict[str, str]]', tool_name: 'str' = 'run_command') -> 'str'",
+}
+
+_REGISTRY_GUARD_SIGNATURES = {
+    "_executor_backend_candidate_allowed": "(ctx: 'Any', candidate: 'str', allowed_roots: 'List[pathlib.Path]') -> 'bool'",
+    "_command_mentions_protected_root": "(cmd_path_lower: 'str', root_text: 'str') -> 'bool'",
+    "_authorized_managed_update_resolver": "(ctx: 'Any') -> 'bool'",
+    "_light_mode_payload_mutation_allowed": "(*, ctx: 'Any', tool_name: 'str', args: 'Dict[str, Any]', runtime_mode: 'str', effective_constraint: 'Optional[TaskConstraint]', implicit_skill_cwd_allowed: 'bool', allow_short_relative: 'bool') -> 'bool'",
+    "_protected_shell_block": "(self, raw_cmd, cmd_path_lower, binding, acting_self_worktree) -> 'ToolResult | None'",
+    "_git_protected_roots": "(self) -> 'list'",
+    "_resolved_shell_cwd": "(self, args: 'Dict[str, Any]', binding: 'Any' = None) -> 'pathlib.Path | ToolResult'",
+    "_external_workspace_git_block": "(self, raw_cmd: 'Any', work_dir: 'pathlib.Path') -> 'ToolResult | None'",
+    "_external_runtime_protected_paths": "(self, binding: 'Any' = None) -> 'tuple[list, list, list, list]'",
+    "_external_shell_runtime_or_secret_block": "(self, raw_cmd: 'Any', cmd_path_lower: 'str', args: 'Dict[str, Any]', work_dir: 'Optional[pathlib.Path]' = None, binding: 'Any' = None) -> 'ToolResult | None'",
+    "_workspace_shell_write_block": "(self, args: 'Dict[str, Any]', raw_cmd: 'Any', cmd_path_lower: 'str', explicit_write_targets: 'list[str]', executable_path_tokens: 'set[str]', runtime_mode: 'str', acting_subagent: 'bool', binding: 'Any') -> 'ToolResult | None'",
+    "_shell_git_and_runtime_block": "(self, raw_cmd: 'Any', args: 'Dict[str, Any]', cmd_path_lower: 'str', workspace_mode: 'bool', acting_self_worktree: 'bool', binding: 'Any') -> 'ToolResult | None'",
 }
 
 _CONSTANT_CARDINALITIES = {
@@ -85,6 +101,47 @@ def test_process_guard_owner_surface_is_exact_and_retired_from_registry():
     assert not hasattr(ToolRegistry, "_run_shell_post_checks")
 
 
+def test_registry_shell_guard_owner_surface_is_exact_and_retired_from_registry():
+    for name, signature in _REGISTRY_GUARD_SIGNATURES.items():
+        assert str(inspect.signature(getattr(registry_guards, name))) == signature
+
+    assert (
+        registry_module._authorized_managed_update_resolver
+        is registry_guards._authorized_managed_update_resolver
+    )
+    retired_module_names = {
+        "PROTECTED_RUNTIME_PATHS",
+        "PROTECTED_RUNTIME_PATHS_LOWER",
+        "SKILL_PAYLOAD_CONTROL_DIRNAMES",
+        "_executor_backend_candidate_allowed",
+        "_command_mentions_protected_root",
+        "_light_mode_payload_mutation_allowed",
+        "is_absolute_path_text",
+        "is_external_workspace",
+        "is_skill_payload_path",
+        "normalize_root",
+        "path_text_is_inside",
+        "resolve_shell_cwd",
+        "resolve_skill_payload_target",
+        "run_shell_git_block_reason",
+        "shell_argv",
+        "shell_argv_with_path_tokens",
+        "shell_has_write_indicator",
+        "shell_writer_targets_protected",
+        "task_artifact_dir_path",
+        "task_id_for_artifacts",
+        "workspace_git_safety_violation",
+    }
+    assert all(not hasattr(registry_module, name) for name in retired_module_names)
+    retired_methods = set(_REGISTRY_GUARD_SIGNATURES) - {
+        "_executor_backend_candidate_allowed",
+        "_command_mentions_protected_root",
+        "_authorized_managed_update_resolver",
+        "_light_mode_payload_mutation_allowed",
+    }
+    assert all(not hasattr(ToolRegistry, name) for name in retired_methods)
+
+
 class _RegistryStub:
     def __init__(self, root: pathlib.Path):
         self.acting = False
@@ -106,17 +163,124 @@ class _RegistryStub:
     def _is_local_readonly_subagent(self):
         return False
 
-    def _resolved_shell_cwd(self, _args, _binding):
-        return self.work_dir
 
-    def _workspace_shell_write_block(self, *_args):
-        return None
+def test_process_guard_uses_explicit_registry_guard_owners_once_in_order(
+    tmp_path, monkeypatch,
+):
+    stub = _RegistryStub(tmp_path)
+    stub._ctx.is_workspace_mode = lambda: True
+    monkeypatch.setattr(
+        process_guard,
+        "protected_artifact_shell_block_reason",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        process_guard,
+        "workspace_executor_state_write_block",
+        lambda *_args, **_kwargs: None,
+    )
+    stages = (
+        "_resolved_shell_cwd",
+        "_workspace_shell_write_block",
+        "_protected_shell_block",
+        "_shell_git_and_runtime_block",
+    )
+    denial = ToolResult(status="blocked", code="WORKSPACE_BLOCKED", text="blocked")
 
-    def _protected_shell_block(self, *_args):
-        return None
+    for stop_index in range(len(stages) + 1):
+        calls: list[str] = []
 
-    def _shell_git_and_runtime_block(self, *_args):
-        return None
+        def resolved(owner, args, binding=None):
+            assert owner is stub
+            assert args["cmd"] == ["touch", "out.txt"]
+            assert binding == ()
+            calls.append("_resolved_shell_cwd")
+            return denial if stop_index == 0 else tmp_path
+
+        def workspace(owner, *args):
+            assert owner is stub
+            calls.append("_workspace_shell_write_block")
+            return denial if stop_index == 1 else None
+
+        def protected(owner, *args):
+            assert owner is stub
+            calls.append("_protected_shell_block")
+            return denial if stop_index == 2 else None
+
+        def git_runtime(owner, *args):
+            assert owner is stub
+            calls.append("_shell_git_and_runtime_block")
+            return denial if stop_index == 3 else None
+
+        monkeypatch.setattr(registry_guards, "_resolved_shell_cwd", resolved)
+        monkeypatch.setattr(registry_guards, "_workspace_shell_write_block", workspace)
+        monkeypatch.setattr(registry_guards, "_protected_shell_block", protected)
+        monkeypatch.setattr(registry_guards, "_shell_git_and_runtime_block", git_runtime)
+
+        result = process_guard._run_shell_safety_check(
+            stub,
+            {"cmd": ["touch", "out.txt"]},
+            "advanced",
+            (),
+        )
+        expected_calls = list(stages[: min(stop_index + 1, len(stages))])
+        assert calls == expected_calls
+        assert result is (None if stop_index == len(stages) else denial)
+
+
+def test_authorized_managed_update_resolver_preserves_allow_and_fail_closed(
+    monkeypatch,
+):
+    from supervisor import update_merge
+
+    ctx = SimpleNamespace(task_id="task-resolver", task_metadata={"tx": "fixture"})
+    calls = []
+
+    def authorized(task_id, metadata):
+        calls.append((task_id, metadata))
+        return "truthy"
+
+    monkeypatch.setattr(update_merge, "authorized_assisted_task", authorized)
+    assert registry_guards._authorized_managed_update_resolver(ctx) is True
+    assert calls == [("task-resolver", {"tx": "fixture"})]
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("fixture")
+
+    monkeypatch.setattr(update_merge, "authorized_assisted_task", unavailable)
+    assert registry_guards._authorized_managed_update_resolver(ctx) is False
+
+
+def test_git_protected_roots_preserve_order_and_duplicate_semantics(tmp_path):
+    roots = {
+        name: tmp_path / name
+        for name in (
+            "system", "drive", "meta-drive", "child-drive",
+            "headless-drive", "budget-drive",
+        )
+    }
+    stub = _RegistryStub(tmp_path)
+    stub._ctx = SimpleNamespace(
+        system_repo_dir=roots["system"],
+        repo_dir=roots["system"],
+        drive_root=roots["drive"],
+        task_metadata={
+            "drive_root": str(roots["meta-drive"]),
+            "child_drive_root": str(roots["child-drive"]),
+            "headless_child_drive_root": str(roots["headless-drive"]),
+            "budget_drive_root": str(roots["budget-drive"]),
+        },
+    )
+
+    assert registry_guards._git_protected_roots(stub) == [
+        roots["system"],
+        roots["system"],
+        roots["drive"],
+        roots["meta-drive"],
+        roots["child-drive"],
+        roots["headless-drive"],
+        roots["budget-drive"],
+    ]
 
 
 def test_run_shell_restores_obfuscated_self_authored_state_marker(tmp_path, monkeypatch):
