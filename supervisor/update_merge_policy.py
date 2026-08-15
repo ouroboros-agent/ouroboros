@@ -20,6 +20,7 @@ HOT_CODE_PATHS = frozenset({
     "ouroboros/tool_module_inventory.py",
     "ouroboros/tools/control.py",
     "ouroboros/tools/registry.py",
+    "ouroboros/tools/registry_core.py",
     "ouroboros/tools/registry_guard_process.py",
     "ouroboros/tools/registry_guards.py",
     "ouroboros/tools/tool_resolution.py",

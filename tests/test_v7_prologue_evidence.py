@@ -300,7 +300,7 @@ def test_updater_probe_fails_when_only_the_python_c_import_is_removed(monkeypatc
 def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
     assert v7_evidence.validate_migration(REPO) == []
     rows = v7_evidence._parse_migration(REPO / "MIGRATION_v7.md")
-    assert len(rows) == 138
+    assert len(rows) == 187
     assert len({row["old path/symbol"] for row in rows}) == len(rows)
     realized = {
         "tests/test_smoke.py::test_function_count_reasonable": "ouroboros/review.py::validate_size_ratchet",
@@ -532,6 +532,45 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
         "ouroboros/tools/registry.py::resolve_skill_payload_target":
             "ouroboros/contracts/skill_payload_policy.py::resolve_skill_payload_target",
     }
+    registry_core_symbols = """ToolRegistry log _stray_skill_payload_failsoft
+        _PROCESS_COMMAND_TOOLS _SHELL_GUARDED_TOOLS
+        _ROOT_ARG_REPO_WRITE_TOOLS _payload_write_paths _REPO_MUTATION_TOOLS
+        _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS _TOOL_ARG_ALIASES _IGNORE_ROOT_ARG_TOOLS
+        _handler_public_params _entry_public_params _entry_has_public_param_schema
+        _normalize_tool_call_args _prepare_public_builtin_args _light_binding_failure_redirect
+        _binding_error_text _payload_dispatch_constraint _format_tool_arg_error""".split()
+    registry_core_rows = {
+        f"ouroboros/tools/registry.py::{symbol}":
+            f"ouroboros/tools/registry_core.py::{symbol}"
+        for symbol in registry_core_symbols
+    }
+    dependency_symbols_by_owner = {
+        "ouroboros/tool_capabilities.py": "ACTING_SUBAGENT_MODE ACTING_SUBAGENT_TOOL_NAMES CORE_TOOL_NAMES LOCAL_READONLY_SUBAGENT_MODE LOCAL_READONLY_SUBAGENT_TOOL_NAMES META_TOOL_NAMES",
+        "ouroboros/contracts/skill_payload_policy.py": "SKILL_PAYLOAD_CONTROL_FILENAMES constraint_bucket_skill cross_skill_redirect_error decide_payload_short_form is_skill_payload_control_filename synthesize_payload_constraint",
+        "ouroboros/contracts/task_constraint.py": "TaskConstraint VALID_WRITE_SURFACES normalize_task_constraint",
+        "ouroboros/tool_access.py": "UserFilesPathBlockedError binding_targets_system_repo canonical_repo_relative_path light_cognitive_or_root_redirect normalize_root_relative shell_cwd_block_message workspace_mode_block_reason",
+        "ouroboros/runtime_mode_policy.py": "mode_allows_protected_write protected_paths_in protected_write_block_message",
+        "ouroboros/tools/shell_guards.py": "process_shell_guard_args",
+        "ouroboros/python_interpreter.py": "record_python_resolution resolve_process_python",
+    }
+    registry_dependency_owners = {
+        f"ouroboros/tools/registry.py::{symbol}": f"{owner}::{symbol}"
+        for owner, symbols in dependency_symbols_by_owner.items()
+        for symbol in symbols.split()
+    }
+    implemented.update(registry_core_rows)
+    implemented.update(registry_dependency_owners)
+    registry_extraction_no_facade_rows = (
+        set(registry_core_rows) - {"ouroboros/tools/registry.py::ToolRegistry"}
+    ) | set(registry_dependency_owners)
+    retired_current = {
+        "ouroboros/tools/registry.py::_HEAL_PROTECTED_PAYLOAD_FILENAMES":
+            "retired:unused payload-control alias removed with registry core extraction",
+        "tests/test_commit_gate.py::_get_registry_module": (
+            "retired:test-only registry import helper removed when CORE_TOOL_NAMES "
+            "characterization moved to its canonical owner"
+        ),
+    }
     existing_process_owner_rows = {
         "tests/test_skill_exec.py::test_run_shell_restores_obfuscated_self_authored_state_marker",
         "ouroboros/tools/registry.py::SKILL_OWNER_STATE_FILENAMES",
@@ -672,13 +711,19 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert upstream["status"] == "pending"
             assert row["new owner/path"] == implemented[row["old path/symbol"]]
             owner_path = row["new owner/path"].split("::", 1)[0]
-            if row["old path/symbol"] in existing_process_owner_rows:
+            if (
+                row["old path/symbol"] in existing_process_owner_rows
+                or row["old path/symbol"] in registry_dependency_owners
+            ):
                 assert (REPO / owner_path).is_file()
             else:
                 assert owner_path in v7_evidence.APPROVED_PENDING_OWNERS
             expected_delta = (
                 "D02"
-                if row["old path/symbol"] == "ouroboros/tools/registry.py::ToolEntry"
+                if row["old path/symbol"] in {
+                    "ouroboros/tools/registry.py::ToolEntry",
+                    "ouroboros/tools/registry.py::ToolRegistry",
+                }
                 else "none"
             )
             assert delta["id"] == expected_delta and delta["note"]
@@ -766,10 +811,16 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
                     "ouroboros/tools/registry.py::SKILL_PAYLOAD_CONTROL_DIRNAMES",
                     "ouroboros/tools/registry.py::is_skill_payload_path",
                     "ouroboros/tools/registry.py::resolve_skill_payload_target",
-                }
+                } | registry_extraction_no_facade_rows
                 else row["old path/symbol"]
             )
             assert row["facade/public contract"] == expected_facade
+        elif row["old path/symbol"] in retired_current:
+            assert row["new owner/path"] == retired_current[row["old path/symbol"]]
+            assert row["facade/public contract"] == "-"
+            assert delta["id"] == "none" and delta["note"]
+            assert upstream["status"] == "retired"
+            assert "v7 WIP" in upstream["note"]
         elif row["old path/symbol"] in inherited_managed:
             owner, status = inherited_managed[row["old path/symbol"]]
             assert row["new owner/path"] == owner
@@ -789,7 +840,8 @@ def test_migration_table_is_valid_and_uses_only_spec_approved_pending_owners():
             assert row["new owner/path"] in v7_evidence.APPROVED_PENDING_OWNERS
             assert row["facade/public contract"] == row["old path/symbol"]
     assert sum(row["old path/symbol"] in realized for row in rows) == 4
-    assert sum(row["old path/symbol"] in implemented for row in rows) == 112
+    assert sum(row["old path/symbol"] in implemented for row in rows) == 160
+    assert sum(row["old path/symbol"] in retired_current for row in rows) == 2
     assert sum(row["old path/symbol"] in inherited_managed for row in rows) == 21
     assert v7_migration.APPROVED_SEMANTIC_DELTAS == frozenset({"none", "D01", "D02"})
 

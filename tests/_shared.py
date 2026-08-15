@@ -89,10 +89,11 @@ def configure_frozen_tool_registry(monkeypatch, tmp_path):
 
     from ouroboros.tool_module_inventory import build_frozen_tool_manifest
     from ouroboros.tools import registry as registry_module
+    from ouroboros.tools import registry_core
 
     manifest = tmp_path / "frozen-tool-modules.json"
     tools_dir = Path(__file__).resolve().parents[1] / "ouroboros" / "tools"
     build_frozen_tool_manifest(tools_dir, manifest)
-    monkeypatch.setattr(registry_module, "_FROZEN_TOOL_MANIFEST_PATH", manifest)
+    monkeypatch.setattr(registry_core, "_FROZEN_TOOL_MANIFEST_PATH", manifest)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     return registry_module.ToolRegistry

@@ -24,7 +24,7 @@ from ouroboros.tool_module_inventory import (
     tool_modules_for_runtime,
     verify_frozen_tool_manifest,
 )
-from ouroboros.tools import registry as registry_module
+from ouroboros.tools import registry_core
 from ouroboros.tools.registry import ToolRegistry
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -70,8 +70,9 @@ mode, manifest, repo_dir, data_dir = sys.argv[1:]
 if mode == "frozen":
     sys.frozen = True
 from ouroboros.tools import registry as registry_module
+from ouroboros.tools import registry_core
 if mode == "frozen":
-    registry_module._FROZEN_TOOL_MANIFEST_PATH = pathlib.Path(manifest)
+    registry_core._FROZEN_TOOL_MANIFEST_PATH = pathlib.Path(manifest)
 registry = registry_module.ToolRegistry(pathlib.Path(repo_dir), pathlib.Path(data_dir))
 projection = []
 for name, entry in registry._base_catalog.entries.items():
@@ -247,7 +248,7 @@ def test_source_registry_logs_inventory_error_and_loads_healthy_owner(
     caplog,
 ):
     monkeypatch.setattr(
-        registry_module,
+        registry_core,
         "tool_modules_for_runtime",
         lambda *_args: (("core",), ("broken helper",)),
     )
@@ -309,6 +310,7 @@ def test_build_materializes_exact_current_inventory(tmp_path):
     assert manifest.read_bytes() == render_frozen_tool_manifest(inventory.tool_modules)
     assert load_frozen_tool_modules(manifest) == inventory.tool_modules
     assert f"{TOOL_PACKAGE}.registry" in inventory.package_modules
+    assert f"{TOOL_PACKAGE}.registry_core" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.registry_guard_process" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.tool_catalog" in inventory.package_modules
     assert f"{TOOL_PACKAGE}.tool_resolution" in inventory.package_modules
@@ -316,6 +318,7 @@ def test_build_materializes_exact_current_inventory(tmp_path):
     assert f"{TOOL_PACKAGE}.extension_dispatch" in inventory.package_modules
     assert "tool_result" not in inventory.tool_modules
     assert "registry_guard_process" not in inventory.tool_modules
+    assert "registry_core" not in inventory.tool_modules
     assert "tool_resolution" not in inventory.tool_modules
 
 
@@ -334,7 +337,8 @@ import pathlib
 import sys
 sys.frozen = True
 from ouroboros.tools import registry as registry_module
-registry_module._FROZEN_TOOL_MANIFEST_PATH = pathlib.Path(sys.argv[1])
+from ouroboros.tools import registry_core
+registry_core._FROZEN_TOOL_MANIFEST_PATH = pathlib.Path(sys.argv[1])
 registry_module.ToolRegistry(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))
 """
     completed = subprocess.run(
@@ -368,7 +372,7 @@ def test_inventoried_owner_import_failure_degrades_only_that_owner(
 ):
     real_import = importlib.import_module
     monkeypatch.setattr(
-        registry_module,
+        registry_core,
         "tool_modules_for_runtime",
         lambda *_args: (("missing_owner", "core"), ()),
     )

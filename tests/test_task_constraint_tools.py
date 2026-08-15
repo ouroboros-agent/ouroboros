@@ -345,9 +345,10 @@ def test_heal_guard_allow_paths_return_none(tmp_path):
 
 def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, monkeypatch):
     from ouroboros import mcp_client, safety
-    from ouroboros.tools import registry as registry_module
+    from ouroboros.tools import registry_core
     from ouroboros.tools import tool_resolution as resolution_module
     from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter
 
     ctx, _skill = _ctx(tmp_path)
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
@@ -364,7 +365,7 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
     registry.override_handler("write_file", forbidden("write handler"))
     monkeypatch.setattr(safety, "check_safety", forbidden("safety"))
     monkeypatch.setattr(
-        registry_module.LegacyTextResultAdapter,
+        LegacyTextResultAdapter,
         "from_text",
         classmethod(forbidden("legacy adapter")),
     )
@@ -382,7 +383,7 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
     assert registry.execute("search_code", {"query": "ToolRegistry"}) == builtin.text
 
     monkeypatch.setattr(
-        registry_module,
+        registry_core,
         "_extension_dispatch_candidate",
         lambda _ctx, _name: (object(), False),
     )
@@ -399,7 +400,7 @@ def test_registry_native_heal_guard_preserves_order_and_zero_dispatch(tmp_path, 
     )
 
     monkeypatch.setattr(
-        registry_module,
+        registry_core,
         "_extension_dispatch_candidate",
         lambda _ctx, _name: (None, False),
     )

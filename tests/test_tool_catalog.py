@@ -13,7 +13,7 @@ from ouroboros import extension_loader, mcp_client
 from ouroboros.contracts.task_constraint import TaskConstraint
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.tool_policy import format_capability_omissions
-from ouroboros.tools import registry as registry_module
+from ouroboros.tools import registry_core
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.tools.tool_catalog import (
     DuplicateToolNameError,
@@ -97,7 +97,7 @@ def test_registry_loader_does_not_degrade_a_first_party_duplicate(
     real_import = importlib.import_module
 
     monkeypatch.setattr(
-        registry_module,
+        registry_core,
         "tool_modules_for_runtime",
         lambda *_args: (("duplicate",), ()),
     )

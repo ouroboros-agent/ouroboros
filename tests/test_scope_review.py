@@ -100,6 +100,7 @@ def test_scope_review_refuses_ambiguous_workspace_root(tmp_path):
 def test_managed_resolver_enables_binary_metadata_context(tmp_path, monkeypatch):
     mod = _get_module("ouroboros.tools.scope_review")
     registry = _get_module("ouroboros.tools.registry")
+    registry_guards = _get_module("ouroboros.tools.registry_guards")
     repo = tmp_path / "repo"
     drive = tmp_path / "data"
     repo.mkdir()
@@ -111,6 +112,9 @@ def test_managed_resolver_enables_binary_metadata_context(tmp_path, monkeypatch)
         return None, mod._TouchedContextStatus(status="empty")
 
     monkeypatch.setattr(mod, "_build_scope_prompt", fake_build)
+    monkeypatch.setattr(
+        registry_guards, "_authorized_managed_update_resolver", lambda _ctx: True
+    )
     monkeypatch.setattr(
         registry, "_authorized_managed_update_resolver", lambda _ctx: True
     )

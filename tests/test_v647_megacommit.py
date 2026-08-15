@@ -713,7 +713,7 @@ def test_verify_and_record_is_shell_guarded_not_process_command():
     # boundary, which blocks a forbidden mutation before the handler runs) but is NOT in
     # _PROCESS_COMMAND_TOOLS — those POST-execution checks run AFTER the handler already
     # wrote the receipt, so they would not gate the durable receipt (an ordering inversion).
-    from ouroboros.tools.registry import _PROCESS_COMMAND_TOOLS, _SHELL_GUARDED_TOOLS
+    from ouroboros.tools.registry_core import _PROCESS_COMMAND_TOOLS, _SHELL_GUARDED_TOOLS
 
     assert "verify_and_record" in _SHELL_GUARDED_TOOLS
     assert "verify_and_record" not in _PROCESS_COMMAND_TOOLS

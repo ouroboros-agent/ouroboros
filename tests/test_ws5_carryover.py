@@ -483,7 +483,8 @@ def test_active_route_confirms_max_local_override_reports_unknown(monkeypatch, t
 # --- CW3: the ephemeral deny surface is complete (core envelope + non-core mutators) ---
 
 def test_ephemeral_allowlist_excludes_every_mutator_class():
-    from ouroboros.tools.registry import _EPHEMERAL_ALLOWED_TOOLS, _REPO_MUTATION_TOOLS
+    from ouroboros.tools.registry_core import _REPO_MUTATION_TOOLS
+    from ouroboros.tools.registry_guards import _EPHEMERAL_ALLOWED_TOOLS
 
     # CW3 default-deny: no durable repo/git mutator is in the allowlist...
     assert not (_REPO_MUTATION_TOOLS & _EPHEMERAL_ALLOWED_TOOLS)

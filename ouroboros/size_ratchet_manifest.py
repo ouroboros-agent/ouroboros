@@ -227,7 +227,7 @@ BAND_PATHS = {
     "ouroboros/task_results.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
-    "ouroboros/tools/registry.py": "v7 extraction reduces the tool execution facade below hard debt while preserving dispatch order and compatibility",
+    "ouroboros/tools/registry_core.py": "ToolRegistry execution authority extracted verbatim behind the compatibility facade while preserving guard and dispatch order",
     "ouroboros/tools/registry_guards.py": "consolidates existing root/CWD/workspace/git process receiver guards without semantic or ABI change",
     "ouroboros/tools/shell_guards.py": None,
     "ouroboros/tools/skill_exec.py": None,

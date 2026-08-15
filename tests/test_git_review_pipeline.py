@@ -68,7 +68,7 @@ def _get_review_module():
 
 
 def _get_registry_module():
-    return importlib.import_module("ouroboros.tools.registry")
+    return importlib.import_module("ouroboros.tools.registry_core")
 
 
 def _get_git_ops_module():
@@ -144,8 +144,9 @@ class TestRepoWriteRegistration:
         assert "write_file" in names
 
     def test_repo_write_in_core_tool_names(self):
-        registry = _get_registry_module()
-        assert "write_file" in registry.CORE_TOOL_NAMES
+        from ouroboros.tool_capabilities import CORE_TOOL_NAMES
+
+        assert "write_file" in CORE_TOOL_NAMES
 
     def test_repo_write_schema_has_files_param(self):
         from ouroboros.tools import core as core_mod

@@ -33,10 +33,6 @@ def _get_git_module():
     return importlib.import_module("ouroboros.tools.git")
 
 
-def _get_registry_module():
-    return importlib.import_module("ouroboros.tools.registry")
-
-
 def _get_git_ops_module():
     return importlib.import_module("supervisor.git_ops")
 
@@ -348,9 +344,10 @@ def test_configure_remote_uses_clean_url():
 # --- CORE_TOOL_NAMES ---
 
 def test_new_tools_in_core_tool_names():
-    registry = _get_registry_module()
+    from ouroboros.tool_capabilities import CORE_TOOL_NAMES
+
     for name in ("vcs_pull_ff", "vcs_restore", "vcs_revert"):
-        assert name in registry.CORE_TOOL_NAMES, (
+        assert name in CORE_TOOL_NAMES, (
             f"{name} must be in CORE_TOOL_NAMES"
         )
 
