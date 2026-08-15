@@ -29,7 +29,9 @@ from ouroboros.tool_access import (
     user_files_path_block_reason,
 )
 from ouroboros.tools.registry import ToolContext
+from ouroboros.tools import core_file_views as _core_file_views
 from ouroboros.tools.tool_resolution import active_repo_dir_for
+from ouroboros.tools.tool_result import _publish_builtin_result
 from ouroboros.utils import read_text, safe_relpath
 
 log = logging.getLogger(__name__)
@@ -57,52 +59,6 @@ def _direct_resource_binding(
         bucket=bucket,
         skill_name=skill_name,
     )
-
-def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_line: int = 1,
-                       start_char: int = 0) -> str:
-    """Return a line-ranged file view with the shared read-tool header.
-
-    ``start_char`` is a SUB-LINE cursor: it skips that many characters of the selected
-    window's body before rendering. It exists because delivery is char-bounded (the
-    outer tool-result truncator cuts at ``tool_result_limit``): a single line longer
-    than the budget can never be delivered whole by any line window, so the reader
-    advances WITHIN it by re-reading the same window with a growing ``start_char``.
-    Disclosed in the header, so the view never silently masquerades as the whole line.
-    """
-    start_raw, max_raw = _coerce_line_window(start_line, max_lines)
-    max_raw = max(1, max_raw)
-    lines = content.splitlines(keepends=True)
-    total = len(lines)
-    start = max(1, min(start_raw, total + 1))
-    end = min(start + max_raw - 1, total)
-    result = "".join(lines[start - 1:end])
-    offset = _coerce_start_char(start_char)
-    if offset:
-        result = result[offset:]
-        header = f"# {path} — lines {start}\u2013{end} of {total} (from char {offset} of this window)\n"
-    else:
-        header = f"# {path} — lines {start}\u2013{end} of {total}\n"
-    return header + result
-
-
-def _coerce_start_char(start_char: Any = 0) -> int:
-    try:
-        return max(0, int(start_char))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _coerce_line_window(start_line: Any = 1, max_lines: Any = 2000) -> tuple[int, int]:
-    try:
-        start_raw = int(start_line)
-    except (TypeError, ValueError):
-        start_raw = 1
-    try:
-        max_raw = int(max_lines)
-    except (TypeError, ValueError):
-        max_raw = 2000
-    return start_raw, max(1, max_raw)
-
 
 def _is_cognitive_data_path(norm: str) -> bool:
     text = str(norm or "").replace("\\", "/").lstrip("./")
@@ -357,7 +313,11 @@ def _repo_read(
         else active_repo_dir_for(ctx)
     )
     if is_restricted_subagent_profile(ctx) and _is_subagent_secret_repo_target(target, repo_root):
-        return "⚠️ REPO_READ_BLOCKED: this subagent cannot read repo secret or control files."
+        text = "⚠️ REPO_READ_BLOCKED: this subagent cannot read repo secret or control files."
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="blocked", legacy_is_error=True,
+        )
     try:
         content = read_text(target)
     except FileNotFoundError:
@@ -365,7 +325,7 @@ def _repo_read(
         base = norm.rsplit("/", 1)[-1]
         if "/" not in norm and base in _MEMORY_AT_DRIVE_MEMORY:
             title = base.split('.')[0].title()
-            return (
+            text = (
                 f"⚠️ NOT_FOUND: '{path}' is not at the repo root.\n\n"
                 f"This file lives at `data_root/memory/{base}`, not in the "
                 f"git repo. Some memory artifacts are already summarized in "
@@ -373,8 +333,22 @@ def _repo_read(
                 f"from the data root. If you need the raw file, call "
                 f"`read_file(root='runtime_data', path='memory/{base}')`."
             )
-        return f"⚠️ NOT_FOUND: file does not exist: {target}"
-    return _render_line_slice(display_path or path, content, max_lines=max_lines, start_line=start_line)
+            return _publish_builtin_result(
+                ctx, "RESOURCE_NOT_FOUND", text,
+                legacy_status="ok", legacy_is_error=False,
+            )
+        text = f"⚠️ NOT_FOUND: file does not exist: {target}"
+        return _publish_builtin_result(
+            ctx, "RESOURCE_NOT_FOUND", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
+    text = _core_file_views._render_line_slice(
+        display_path or path, content,
+        max_lines=max_lines, start_line=start_line,
+    )
+    return _publish_builtin_result(
+        ctx, "OK", text, legacy_status="ok", legacy_is_error=False,
+    )
 
 
 def _repo_list(
@@ -392,7 +366,11 @@ def _repo_list(
     if is_restricted_subagent_profile(ctx) and _is_subagent_secret_repo_target(target, repo_root):
         # First-class tool error, not an ok-shaped one-element JSON listing
         # (v6.54.3, review round 5 — the whole-call block IS the result).
-        return "⚠️ REPO_LIST_BLOCKED: this subagent cannot list repo secret or control paths."
+        text = "⚠️ REPO_LIST_BLOCKED: this subagent cannot list repo secret or control paths."
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="blocked", legacy_is_error=True,
+        )
     # ctx.repo_path already normalized absolute/redundant-prefix dirs; pass the
     # resulting root-relative form so _list_dir doesn't re-nest the raw input.
     try:
@@ -402,7 +380,10 @@ def _repo_list(
     items = _list_dir(repo_root, listed_rel, max_entries)
     if is_restricted_subagent_profile(ctx):
         items = _filter_subagent_secret_repo_listing(items, repo_root)
-    return json.dumps(items, ensure_ascii=False, indent=2)
+    text = json.dumps(items, ensure_ascii=False, indent=2)
+    return _publish_builtin_result(
+        ctx, "OK", text, legacy_status="ok", legacy_is_error=False,
+    )
 
 
 def _normalize_data_read_path(ctx: ToolContext, path: str) -> str:
@@ -422,16 +403,27 @@ def _data_read(
     task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     norm = _normalize_data_read_path(ctx, path)
     if (b := _project_store_access_block(norm)):
-        return b
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", b,
+            legacy_status="ok", legacy_is_error=False,
+        )
     if is_restricted_subagent_profile(ctx) and _is_subagent_secret_data_path(norm):
-        return "⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files."
+        text = "⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files."
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="data_blocked", legacy_is_error=True,
+        )
     if _resolved_binding is not None:
         target = _resolved_binding.target_path
     elif task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
             target = resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, norm)
         except ValueError as e:
-            return f"⚠️ DATA_READ_BLOCKED: {e}"
+            text = f"⚠️ DATA_READ_BLOCKED: {e}"
+            return _publish_builtin_result(
+                ctx, "ACCESS_BLOCKED", text,
+                legacy_status="data_blocked", legacy_is_error=True,
+            )
     else:
         target = ctx.drive_path(norm)
     if is_restricted_subagent_profile(ctx):
@@ -456,23 +448,47 @@ def _data_read(
                 for candidate in root.iterdir()
             )
         ):
-            return "⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files."
+            text = "⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files."
+            return _publish_builtin_result(
+                ctx, "ACCESS_BLOCKED", text,
+                legacy_status="data_blocked", legacy_is_error=True,
+            )
     state_root = (
         _resolved_binding.state_drive_root
         if _resolved_binding is not None
         else pathlib.Path(ctx.drive_root)
     )
     if _is_skill_owner_state_target(target, state_root) and target.name.lower() != "review.json":
-        return "DATA_READ_BLOCKED: skill owner state is not readable through generic data tools."
+        text = "DATA_READ_BLOCKED: skill owner state is not readable through generic data tools."
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     try:
         content = read_text(target)
-        start_raw, max_raw = _coerce_line_window(start_line, max_lines)
+        start_raw, max_raw = _core_file_views._coerce_line_window(
+            start_line, max_lines,
+        )
         if _is_cognitive_data_path(norm) and start_raw == 1 and max_raw == 2000:
             if display_path is None:
-                return content
+                return _publish_builtin_result(
+                    ctx, "OK", content,
+                    legacy_status="ok", legacy_is_error=False,
+                )
             full_line_count = max(1, len(content.splitlines()))
-            return _render_line_slice(display_path, content, max_lines=full_line_count, start_line=1)
-        return _render_line_slice(display_path or norm, content, max_lines=max_raw, start_line=start_raw)
+            text = _core_file_views._render_line_slice(
+                display_path, content,
+                max_lines=full_line_count, start_line=1,
+            )
+        else:
+            text = _core_file_views._render_line_slice(
+                display_path or norm, content,
+                max_lines=max_raw, start_line=start_raw,
+            )
+        return _publish_builtin_result(
+            ctx, "OK", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     except FileNotFoundError:
         if norm.replace("\\", "/").startswith("memory/"):
             explanation = (
@@ -487,9 +503,13 @@ def _data_read(
                 "memory/; if this path was expected to exist, verify it was "
                 "written correctly."
             )
-        return (
+        text = (
             f"⚠️ DATA_NOT_YET_CREATED: {path}\n\n"
             f"{explanation} Use list_files with root=runtime_data to confirm what currently exists."
+        )
+        return _publish_builtin_result(
+            ctx, "RESOURCE_NOT_FOUND", text,
+            legacy_status="ok", legacy_is_error=False,
         )
 
 
@@ -504,9 +524,17 @@ def _data_list(
     # Whole-call block states are FIRST-CLASS tool errors, never ok-shaped
     # one-element JSON listings (v6.54.3, review round 5).
     if (b := _project_store_access_block(norm_dir)):
-        return str(b)
+        text = str(b)
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     if is_restricted_subagent_profile(ctx) and _is_subagent_secret_data_path(norm_dir):
-        return "⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."
+        text = "⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="data_blocked", legacy_is_error=True,
+        )
     if is_restricted_subagent_profile(ctx):
         try:
             list_target = (
@@ -515,36 +543,61 @@ def _data_list(
                 else ctx.drive_path(norm_dir)
             )
         except ValueError as e:
-            return f"⚠️ DATA_LIST_BLOCKED: {e}"
+            text = f"⚠️ DATA_LIST_BLOCKED: {e}"
+            return _publish_builtin_result(
+                ctx, "ACCESS_BLOCKED", text,
+                legacy_status="data_blocked", legacy_is_error=True,
+            )
         root = (
             _resolved_binding.base_path
             if _resolved_binding is not None
             else pathlib.Path(ctx.drive_root).resolve(strict=False)
         )
         if _is_skill_owner_state_target(list_target, root) or is_skill_owner_state_alias(list_target, root):
-            return "⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."
+            text = "⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."
+            return _publish_builtin_result(
+                ctx, "ACCESS_BLOCKED", text,
+                legacy_status="data_blocked", legacy_is_error=True,
+            )
     if _resolved_binding is not None:
         root = _resolved_binding.base_path
         try:
             rel = _resolved_binding.target_path.relative_to(root).as_posix() or "."
         except ValueError:
-            return "⚠️ DATA_LIST_BLOCKED: resolved target escapes runtime_data root."
+            text = "⚠️ DATA_LIST_BLOCKED: resolved target escapes runtime_data root."
+            return _publish_builtin_result(
+                ctx, "ACCESS_BLOCKED", text,
+                legacy_status="data_blocked", legacy_is_error=True,
+            )
         items = _filter_out_project_store(norm_dir, _list_dir(root, rel, max_entries))
         if is_restricted_subagent_profile(ctx):
             items = _filter_subagent_secret_listing(items, root)
-        return json.dumps(items, ensure_ascii=False, indent=2)
+        text = json.dumps(items, ensure_ascii=False, indent=2)
+        return _publish_builtin_result(
+            ctx, "OK", text, legacy_status="ok", legacy_is_error=False,
+        )
     if task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
             root = resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, dir)
         except ValueError as e:
-            return f"⚠️ DATA_LIST_BLOCKED: {e}"
+            text = f"⚠️ DATA_LIST_BLOCKED: {e}"
+            return _publish_builtin_result(
+                ctx, "ACCESS_BLOCKED", text,
+                legacy_status="data_blocked", legacy_is_error=True,
+            )
         items = _list_dir(root, ".", max_entries)
-        return json.dumps(items, ensure_ascii=False, indent=2)
+        text = json.dumps(items, ensure_ascii=False, indent=2)
+        return _publish_builtin_result(
+            ctx, "OK", text, legacy_status="ok", legacy_is_error=False,
+        )
     # Drop any projects/<id> entry so a generic root listing never exposes the store.
     items = _filter_out_project_store(_normalize_data_read_path(ctx, dir), _list_dir(ctx.drive_root, dir, max_entries))
     if is_restricted_subagent_profile(ctx):
         items = _filter_subagent_secret_listing(items, pathlib.Path(ctx.drive_root))
-    return json.dumps(items, ensure_ascii=False, indent=2)
+    text = json.dumps(items, ensure_ascii=False, indent=2)
+    return _publish_builtin_result(
+        ctx, "OK", text, legacy_status="ok", legacy_is_error=False,
+    )
 
 def _profile_roots_hint(ctx: ToolContext, operation: str) -> str:
     """Name the roots THIS profile can actually use for ``operation``.
@@ -562,15 +615,33 @@ def _profile_roots_hint(ctx: ToolContext, operation: str) -> str:
         return ""
 
 
-def _access_or_block(ctx: ToolContext, root: str, operation: str) -> tuple[str, str]:
+def _access_or_block(
+    ctx: ToolContext,
+    root: str,
+    operation: str,
+    *,
+    publish_result: bool = False,
+) -> tuple[str, str]:
     try:
         normalized = normalize_root(root)
     except ValueError as exc:
-        return "", f"⚠️ TOOL_ARG_ERROR: {exc}{_profile_roots_hint(ctx, operation)}"
+        text = f"⚠️ TOOL_ARG_ERROR: {exc}{_profile_roots_hint(ctx, operation)}"
+        if publish_result:
+            _publish_builtin_result(
+                ctx, "TOOL_ARG_ERROR", text,
+                legacy_status="error", legacy_is_error=True,
+            )
+        return "", text
     profile = active_tool_profile(ctx)
     decision = decide_tool_access(profile=profile, root=normalized, operation=operation)  # type: ignore[arg-type]
     if not decision.allow:
-        return "", f"⚠️ TOOL_ACCESS_BLOCKED: {str(decision.reason).rstrip('.')}."
+        text = f"⚠️ TOOL_ACCESS_BLOCKED: {str(decision.reason).rstrip('.')}."
+        if publish_result:
+            _publish_builtin_result(
+                ctx, "ACCESS_BLOCKED", text,
+                legacy_status="blocked", legacy_is_error=True,
+            )
+        return "", text
     return normalized, ""
 
 
@@ -581,17 +652,18 @@ def _local_readonly_resource_block(
     base: pathlib.Path,
     *,
     action: str,
+    publish_result: bool = False,
 ) -> str:
     # Resource (active_workspace/system_repo) restriction is for STRICT read-only
     # subagents only — acting children legitimately write their isolated surface.
     from ouroboros.tool_access import active_tool_profile
     if active_tool_profile(ctx) != "local_readonly_subagent":
         return ""
+    text = ""
     if normalized in {"active_workspace", "system_repo"}:
         if _is_subagent_secret_repo_target(target, pathlib.Path(base)):
-            return f"⚠️ {action}_BLOCKED: this subagent cannot access repo secret or control paths."
-        return ""
-    if normalized in {"runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"}:
+            text = f"⚠️ {action}_BLOCKED: this subagent cannot access repo secret or control paths."
+    elif normalized in {"runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"}:
         root = pathlib.Path(base).resolve(strict=False)
         try:
             rel = pathlib.Path(target).resolve(strict=False).relative_to(root).as_posix()
@@ -603,8 +675,13 @@ def _local_readonly_resource_block(
             or _is_skill_owner_state_target(target, data_root)
             or is_skill_owner_state_alias(target, data_root)
         ):
-            return f"⚠️ {action}_BLOCKED: this subagent cannot access secret or owner-control data files."
-    return ""
+            text = f"⚠️ {action}_BLOCKED: this subagent cannot access secret or owner-control data files."
+    if text and publish_result:
+        _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="blocked", legacy_is_error=True,
+        )
+    return text
 
 
 def _root_display_path(root: str, path: str) -> str:
@@ -612,38 +689,6 @@ def _root_display_path(root: str, path: str) -> str:
     if rel.startswith("./"):
         rel = rel[2:]
     return f"{root}:{rel or '.'}"
-
-def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: int, result: str,
-                     start_char: int = 0) -> str:
-    """Append an advisory hint when the SAME file slice is re-read unchanged.
-
-    Per-task, key on (resolved path, slice); the change signal is (size, mtime).
-    A repeat read of an unchanged slice is usually wasted budget — nudge the model
-    to act on what it has. Advisory only (never blocks; different slices and
-    changed files are not flagged)."""
-    try:
-        resolved = pathlib.Path(target).resolve(strict=False)
-        st = resolved.stat()
-    except (OSError, TypeError, ValueError):
-        return result
-    if not isinstance(result, str) or result.startswith("⚠️"):
-        return result
-    key = f"{resolved}|{int(start_line)}|{int(max_lines)}|{_coerce_start_char(start_char)}"
-    sig = (st.st_size, st.st_mtime_ns)
-    seen = getattr(ctx, "_read_file_seen", None)
-    if not isinstance(seen, dict):
-        seen = {}
-        ctx._read_file_seen = seen
-    prev = seen.get(key)
-    seen[key] = sig
-    if prev is not None and prev == sig:
-        return (
-            result
-            + "\n\nℹ️ This exact view is unchanged since you already read it this task — "
-            "re-reading is usually wasted budget; act on what you have."
-        )
-    return result
-
 
 def _read_file(
     ctx: ToolContext,
@@ -656,7 +701,9 @@ def _read_file(
     skill_name: str = "",
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
-    normalized, block = _access_or_block(ctx, root, "read")
+    normalized, block = _access_or_block(
+        ctx, root, "read", publish_result=True,
+    )
     if block:
         return block
     try:
@@ -665,16 +712,28 @@ def _read_file(
             bucket=bucket, skill_name=skill_name,
         )
     except UserFilesPathBlockedError as exc:
-        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        text = f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="user_files_path_blocked", legacy_is_error=True,
+        )
     except Exception as exc:
-        return f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
+        text = f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
     target = binding.target_path
     protected_block = block_reason_for_path(ctx, target, "read_bytes", binding)
     if protected_block:
-        return protected_block
+        return _publish_builtin_result(
+            ctx, "RESOURCE_BLOCKED", protected_block,
+            legacy_status="resource_policy_blocked", legacy_is_error=True,
+        )
     if normalized == "system_repo":
         block_msg = _local_readonly_resource_block(
-            ctx, normalized, target, binding.base_path, action="READ_FILE"
+            ctx, normalized, target, binding.base_path,
+            action="READ_FILE", publish_result=True,
         )
         if block_msg:
             return block_msg
@@ -684,7 +743,8 @@ def _read_file(
             if binding.source == "project_room"
             else _root_display_path(normalized, path)
         )
-        return _annotate_reread(ctx, target, start_line, max_lines, _repo_read(
+        return _core_file_views._annotate_reread(
+            ctx, target, start_line, max_lines, _repo_read(
             ctx,
             path,
             max_lines=max_lines,
@@ -693,7 +753,8 @@ def _read_file(
             _resolved_binding=binding,
         ))
     if normalized == "runtime_data":
-        return _annotate_reread(ctx, target, start_line, max_lines, _data_read(
+        return _core_file_views._annotate_reread(
+            ctx, target, start_line, max_lines, _data_read(
             ctx,
             path,
             max_lines=max_lines,
@@ -702,14 +763,17 @@ def _read_file(
             _resolved_binding=binding,
         ))
     block_msg = _local_readonly_resource_block(
-        ctx, normalized, target, binding.base_path, action="READ_FILE"
+        ctx, normalized, target, binding.base_path,
+        action="READ_FILE", publish_result=True,
     )
     if block_msg:
         return block_msg
     try:
         content = read_text(target)
-        rendered = _render_line_slice(_root_display_path(normalized, path), content,
-                                      max_lines=max_lines, start_line=start_line, start_char=start_char)
+        rendered = _core_file_views._render_line_slice(
+            _root_display_path(normalized, path), content,
+            max_lines=max_lines, start_line=start_line, start_char=start_char,
+        )
         if normalized == "task_drive":
             # D7 coverage acknowledgement: what counts as read is what the DELIVERY
             # layer will actually hand the model, so the hook receives the rendered
@@ -722,17 +786,35 @@ def _read_file(
                                                start_char=start_char, rendered=rendered)
             except Exception:
                 log.warning("staged-output coverage acknowledgement hook failed", exc_info=True)
-        return _annotate_reread(ctx, target, start_line, max_lines, rendered, start_char=start_char)
+        text = _publish_builtin_result(
+            ctx, "OK", rendered,
+            legacy_status="ok", legacy_is_error=False,
+        )
+        return _core_file_views._annotate_reread(
+            ctx, target, start_line, max_lines, text, start_char=start_char,
+        )
     except FileNotFoundError:
-        return f"⚠️ NOT_FOUND: {_root_display_path(normalized, path)} (resolved: {target})"
+        text = f"⚠️ NOT_FOUND: {_root_display_path(normalized, path)} (resolved: {target})"
+        return _publish_builtin_result(
+            ctx, "RESOURCE_NOT_FOUND", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     except UserFilesPathBlockedError as exc:
         # Typed POLICY refusal, not an executor failure: the runtime said "no"
         # to this read. The distinct prefix routes it into the v6.57.0
         # policy-denial partition instead of a generic error that falsely
         # degrades a shipped task to tool_failure.
-        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        text = f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="user_files_path_blocked", legacy_is_error=True,
+        )
     except Exception as exc:
-        return f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
+        text = f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
 
 
 def _list_files(
@@ -744,7 +826,9 @@ def _list_files(
     skill_name: str = "",
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
-    normalized, block = _access_or_block(ctx, root, "list")
+    normalized, block = _access_or_block(
+        ctx, root, "list", publish_result=True,
+    )
     if block:
         return block
     try:
@@ -753,14 +837,25 @@ def _list_files(
             bucket=bucket, skill_name=skill_name,
         )
     except UserFilesPathBlockedError as exc:
-        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        text = f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="user_files_path_blocked", legacy_is_error=True,
+        )
     except Exception as exc:
-        return f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}"
+        text = f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
     protected_list_block = block_reason_for_path(
         ctx, binding.target_path, "static_introspection", binding
     )
     if protected_list_block:
-        return protected_list_block
+        return _publish_builtin_result(
+            ctx, "RESOURCE_BLOCKED", protected_list_block,
+            legacy_status="resource_policy_blocked", legacy_is_error=True,
+        )
     try:
         # Every listing branch runs inside this try: a hard iterdir/permission/
         # race failure from any helper becomes the first-class LIST_FILES_ERROR
@@ -781,12 +876,20 @@ def _list_files(
             items = _list_dir(binding.base_path, rel, max_entries)
             if is_restricted_subagent_profile(ctx):
                 items = _filter_subagent_secret_listing(items, binding.base_path)
-            return json.dumps(items, ensure_ascii=False, indent=2)
+            text = json.dumps(items, ensure_ascii=False, indent=2)
+            return _publish_builtin_result(
+                ctx, "OK", text,
+                legacy_status="ok", legacy_is_error=False,
+            )
         if normalized == "user_files":
             items = _list_user_files_dir(
                 ctx, binding.base_path, binding.target_path, max_entries
             )
-            return json.dumps(items, ensure_ascii=False, indent=2)
+            text = json.dumps(items, ensure_ascii=False, indent=2)
+            return _publish_builtin_result(
+                ctx, "OK", text,
+                legacy_status="ok", legacy_is_error=False,
+            )
         rel = binding.target_path.relative_to(binding.base_path).as_posix() or "."
         items = _list_dir(binding.base_path, rel, max_entries)
         if is_restricted_subagent_profile(ctx):
@@ -794,14 +897,30 @@ def _list_files(
                 items = _filter_subagent_secret_repo_listing(items, binding.base_path)
             elif normalized in {"task_drive", "skill_payload", "artifact_store", "user_files"}:
                 items = _filter_subagent_secret_listing(items, binding.base_path)
-        return json.dumps(items, ensure_ascii=False, indent=2)
+        text = json.dumps(items, ensure_ascii=False, indent=2)
+        return _publish_builtin_result(
+            ctx, "OK", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     except _ListingFailure as exc:
-        return f"⚠️ LIST_FILES_ERROR: {exc}"
+        text = f"⚠️ LIST_FILES_ERROR: {exc}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
     except UserFilesPathBlockedError as exc:
         # Typed POLICY refusal (see _read_file): policy denial, not tool_failure.
-        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        text = f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="user_files_path_blocked", legacy_is_error=True,
+        )
     except Exception as exc:
         # A hard failure is a first-class tool error, never a JSON "listing" that
         # reads as success with an error string inside (v6.54.3: that shape
         # silently poisoned reasoning in 63% of TB2.1 trials).
-        return f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}"
+        text = f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )

@@ -12,7 +12,7 @@ from ouroboros.tool_module_inventory import (
     discover_tool_module_inventory,
     load_frozen_tool_modules,
 )
-from ouroboros.tools import core, core_artifacts, core_file_tools
+from ouroboros.tools import core, core_artifacts, core_file_tools, core_file_views
 from ouroboros.tools.registry import ToolContext
 
 
@@ -60,10 +60,16 @@ _MOVED_NAMES = frozenset({
     "_send_video",
     "is_restricted_subagent_profile",
 })
+_VIEW_NAMES = frozenset({
+    "_annotate_reread",
+    "_coerce_line_window",
+    "_coerce_start_char",
+    "_render_line_slice",
+})
 
 
 def test_core_leaves_are_non_catalog_owners_without_core_backedges(tmp_path):
-    for module in (core_file_tools, core_artifacts):
+    for module in (core_file_tools, core_file_views, core_artifacts):
         source_path = pathlib.Path(module.__file__)
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         assert not any(
@@ -86,6 +92,7 @@ def test_core_leaves_are_non_catalog_owners_without_core_backedges(tmp_path):
     assert "core" in source_inventory.tool_modules
     assert "core_artifacts" not in source_inventory.tool_modules
     assert "core_file_tools" not in source_inventory.tool_modules
+    assert "core_file_views" not in source_inventory.tool_modules
     manifest = tmp_path / "_frozen_tool_modules.v1.json"
     build_frozen_tool_manifest(TOOLS, manifest)
     assert load_frozen_tool_modules(manifest) == source_inventory.tool_modules
@@ -132,8 +139,16 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
         if name.startswith(("_MAX_", "_detect_", "_send_"))
     }
     assert artifact_names <= vars(core_artifacts).keys()
-    assert (_MOVED_NAMES - artifact_names) <= vars(core_file_tools).keys()
+    assert _VIEW_NAMES <= vars(core_file_views).keys()
+    assert _VIEW_NAMES.isdisjoint(vars(core_file_tools))
+    assert (_MOVED_NAMES - artifact_names - _VIEW_NAMES) <= vars(core_file_tools).keys()
     assert _MOVED_NAMES.isdisjoint(vars(core))
+
+
+def test_delegate_output_imports_canonical_view_owner() -> None:
+    source = (REPO / "ouroboros" / "delegate_output.py").read_text(encoding="utf-8")
+    assert "from ouroboros.tools.core_file_views import (" in source
+    assert "from ouroboros.tools.core_file_tools import _coerce" not in source
 
 
 def test_extracted_read_and_list_result_bytes_are_stable(tmp_path):
@@ -156,8 +171,9 @@ def test_extracted_read_and_list_result_bytes_are_stable(tmp_path):
 def test_core_extraction_size_bounds_have_meaningful_headroom():
     counts = {
         module.__name__: len(pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines())
-        for module in (core, core_file_tools, core_artifacts)
+        for module in (core, core_file_tools, core_file_views, core_artifacts)
     }
     assert 1200 <= counts["ouroboros.tools.core"] <= 1499
-    assert 750 <= counts["ouroboros.tools.core_file_tools"] <= 1000
+    assert 750 <= counts["ouroboros.tools.core_file_tools"] < 950
+    assert counts["ouroboros.tools.core_file_views"] <= 1000
     assert 150 <= counts["ouroboros.tools.core_artifacts"] <= 1000

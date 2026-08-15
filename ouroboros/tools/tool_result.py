@@ -18,6 +18,49 @@ _SAFETY_SEPARATOR = "\n\n---\n"
 _MCP_RESULT_ENVELOPE_PREFIX = "External MCP tool result from "
 _MAX_META_ITEMS = 32
 _MAX_META_BYTES = 8192
+_LEGACY_COMPAT_STATUSES = frozenset(
+    {
+        # Complete vocabulary currently emitted by loop_tool_execution.
+        # Extend this closed set in the same change that introduces a new
+        # compatibility status; consumers still derive their authority from text.
+        "arg_error",
+        "artifact_output_error",
+        "artifact_output_undeclared",
+        "blocked",
+        "cognitive_tool_required",
+        "cwd_blocked",
+        "data_blocked",
+        "edit_ops_blocked",
+        "edit_text_blocked",
+        "elevation_blocked",
+        "error",
+        "git_via_shell_blocked",
+        "heal_mode_blocked",
+        "integration_blocked",
+        "light_mode_blocked",
+        "non_zero_exit",
+        "ok",
+        "ok_autocorrected",
+        "protected_blocked",
+        "resource_constraint_blocked",
+        "resource_policy_blocked",
+        "root_required_active_workspace",
+        "root_required_user_files",
+        "run_script_blocked",
+        "safety_violation",
+        "shell_error",
+        "skill_payload_blocked",
+        "skill_payload_control_blocked",
+        "skill_state_blocked",
+        "timeout",
+        "tool_reported_failure",
+        "user_files_path_blocked",
+        "violation",
+        "vlm_error",
+        "workspace_blocked",
+        "write_file_blocked",
+    }
+)
 _HOST_META_KEYS = frozenset(
     {
         "route_note",
@@ -26,11 +69,13 @@ _HOST_META_KEYS = frozenset(
         "owner_state_restored",
         "light_repo_changed",
         "workspace_git_refs_changed",
+        "legacy_status",
+        "legacy_is_error",
     }
 )
-# Producer metadata keeps its exact limits. Composition may add only these
-# closed, boolean host annotations, within a separately bounded byte reserve.
-_MAX_HOST_META_BYTES = 256
+# Producer metadata keeps its exact limits. Composition may add only the
+# closed host annotations above within a separately bounded byte reserve.
+_MAX_HOST_META_BYTES = 384
 _TOOL_RESULT_ATTR = "_active_builtin_tool_result"
 
 
@@ -150,6 +195,18 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "resource_blocked",
             "warning",
             "use a resource allowed by the task contract",
+        ),
+        "RESOURCE_NOT_FOUND": _code_spec(
+            "unavailable",
+            "resource_not_found",
+            "warning",
+            "select an existing resource or create it through its owning workflow",
+        ),
+        "RESOURCE_UNAVAILABLE": _code_spec(
+            "unavailable",
+            "resource_unavailable",
+            "warning",
+            "restore the resource or retry when it becomes available",
         ),
         "WORKSPACE_BLOCKED": _code_spec(
             "blocked",
@@ -411,6 +468,24 @@ class ToolResult:
         raw_meta = dict(self.meta or {})
         if any(not isinstance(key, str) for key in raw_meta):
             raise ValueError("tool result meta keys must be strings")
+        has_legacy_status = "legacy_status" in raw_meta
+        has_legacy_is_error = "legacy_is_error" in raw_meta
+        if has_legacy_status != has_legacy_is_error:
+            raise ValueError(
+                "legacy_status and legacy_is_error must be provided together"
+            )
+        if has_legacy_status:
+            legacy_status = raw_meta["legacy_status"]
+            if (
+                not isinstance(legacy_status, str)
+                or not legacy_status
+                or legacy_status not in _LEGACY_COMPAT_STATUSES
+            ):
+                raise ValueError(
+                    f"invalid legacy compatibility status: {legacy_status!r}"
+                )
+            if type(raw_meta["legacy_is_error"]) is not bool:
+                raise TypeError("legacy_is_error must be a boolean")
         producer_meta = {
             key: value for key, value in raw_meta.items() if key not in _HOST_META_KEYS
         }
@@ -473,6 +548,31 @@ def _publish_tool_result(ctx: Any, result: ToolResult) -> str:
     elif hasattr(ctx, _TOOL_RESULT_ATTR):
         setattr(ctx, _TOOL_RESULT_ATTR, result)
     return result.text
+
+
+def _publish_builtin_result(
+    ctx: Any,
+    code: str,
+    text: str,
+    *,
+    legacy_status: str,
+    legacy_is_error: bool,
+    meta: Mapping[str, Any] | None = None,
+) -> str:
+    """Publish structural builtin facts while preserving the string handler ABI."""
+
+    facts = dict(meta or {})
+    facts["legacy_status"] = legacy_status
+    facts["legacy_is_error"] = legacy_is_error
+    return _publish_tool_result(
+        ctx,
+        ToolResult(
+            status=TOOL_CODE_SPECS[code].status,
+            code=code,
+            text=text,
+            meta=facts,
+        ),
+    )
 
 
 def _install_tool_result_sidecar(

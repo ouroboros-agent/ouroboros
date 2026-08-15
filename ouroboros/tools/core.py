@@ -17,6 +17,7 @@ from ouroboros.artifacts import artifact_store_path_block_reason, copy_file_to_t
 from ouroboros.project_facts import project_store_access_block as _project_store_access_block
 from ouroboros.protected_artifacts import block_reason_for_path
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import _publish_builtin_result
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
     project_room_lens_dir,
@@ -816,8 +817,14 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                  _resolved_binding: ResolvedResourceBinding | None = None) -> str:
     """Search repo text with optional regex, path, glob, and result cap."""
     if not query:
-        return "⚠️ SEARCH_ERROR: query is required."
-    normalized, block = _core_file_tools._access_or_block(ctx, root, "search")
+        text = "⚠️ SEARCH_ERROR: query is required."
+        return _publish_builtin_result(
+            ctx, "TOOL_ARG_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
+    normalized, block = _core_file_tools._access_or_block(
+        ctx, root, "search", publish_result=True,
+    )
     if block:
         return block
     try:
@@ -826,18 +833,33 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             bucket=bucket, skill_name=skill_name,
         )
     except UserFilesPathBlockedError as exc:
-        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        text = f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="user_files_path_blocked", legacy_is_error=True,
+        )
     except Exception as exc:
-        return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
+        text = f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
     if normalized == "runtime_data" and (b := _project_store_access_block(_core_file_tools._normalize_data_read_path(ctx, path))):
-        return b
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", b,
+            legacy_status="ok", legacy_is_error=False,
+        )
 
     max_results = min(max(1, max_results), _MAX_SEARCH_RESULTS)
     root_path = binding.base_path
     display_search_path = _core_file_tools._root_display_path(normalized, path)
     search_root = binding.target_path
     if not search_root.exists():
-        return f"⚠️ SEARCH_ERROR: path not found: {display_search_path}"
+        text = f"⚠️ SEARCH_ERROR: path not found: {display_search_path}"
+        return _publish_builtin_result(
+            ctx, "RESOURCE_NOT_FOUND", text,
+            legacy_status="error", legacy_is_error=True,
+        )
     if normalized != "user_files":
         # Reject a search ROOT that escapes its resource root (e.g. the requested path is an
         # in-tree symlink pointing outside — untrusted child project/deliverable trees) BEFORE
@@ -845,20 +867,33 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         try:
             search_root.relative_to(root_path.resolve(strict=False))
         except ValueError:
-            return f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
+            text = f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
+            return _publish_builtin_result(
+                ctx, "TOOL_ERROR", text,
+                legacy_status="error", legacy_is_error=True,
+            )
     protected_root_block = block_reason_for_path(
         ctx, search_root, "static_introspection", binding
     )
     if protected_root_block:
-        return protected_root_block
+        return _publish_builtin_result(
+            ctx, "RESOURCE_BLOCKED", protected_root_block,
+            legacy_status="resource_policy_blocked", legacy_is_error=True,
+        )
     protected_root_read_block = block_reason_for_path(
         ctx, search_root, "read_bytes", binding
     )
     if protected_root_read_block and search_root.is_file():
-        return protected_root_read_block
+        return _publish_builtin_result(
+            ctx, "RESOURCE_BLOCKED", protected_root_read_block,
+            legacy_status="resource_policy_blocked", legacy_is_error=True,
+        )
     subagent_readonly = _core_file_tools.is_restricted_subagent_profile(ctx)
     if subagent_readonly:
-        block_msg = _core_file_tools._local_readonly_resource_block(ctx, normalized, search_root, root_path, action="SEARCH")
+        block_msg = _core_file_tools._local_readonly_resource_block(
+            ctx, normalized, search_root, root_path,
+            action="SEARCH", publish_result=True,
+        )
         if block_msg:
             return block_msg
     root_resolved = root_path.resolve(strict=False)
@@ -893,7 +928,11 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         try:
             re.compile(query)
         except re.error as e:
-            return f"⚠️ SEARCH_ERROR: invalid regex: {e}"
+            text = f"⚠️ SEARCH_ERROR: invalid regex: {e}"
+            return _publish_builtin_result(
+                ctx, "TOOL_ARG_ERROR", text,
+                legacy_status="error", legacy_is_error=True,
+            )
 
     import time as _time
     _search_t0 = _time.monotonic()  # start the wall-clock budget BEFORE rg, so a
@@ -906,10 +945,14 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                 search_root, query, regex=bool(regex), include=include,
                 max_results=max_results, path_allowed=_path_allowed_for_rg,
             )
-            return format_search_result(
+            text = format_search_result(
                 display_path=display_search_path, root_name=normalized,
                 root_path=root_path, query=query, regex=bool(regex),
                 max_results=max_results, result=rg_result,
+            )
+            return _publish_builtin_result(
+                ctx, "OK", text,
+                legacy_status="ok", legacy_is_error=False,
             )
     except (FileNotFoundError, RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Degrade to the policy-aware Python scanner for rg absent/failed/timeout
@@ -923,7 +966,11 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         else:
             pattern = re.compile(re.escape(query))
     except re.error as e:
-        return f"⚠️ SEARCH_ERROR: invalid regex: {e}"
+        text = f"⚠️ SEARCH_ERROR: invalid regex: {e}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ARG_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
 
     matches: List[str] = []
     files_searched = 0
@@ -1022,7 +1069,11 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     if not matches:
         suffix = f" {protected_omitted} protected artifact file(s) omitted." if protected_omitted else ""
         cap_note = f" Scan stopped after {_MAX_SEARCH_FILES_SCANNED} files — narrow the path or glob." if files_capped else ""
-        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{cap_note}{deadline_note}"
+        text = f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{cap_note}{deadline_note}"
+        return _publish_builtin_result(
+            ctx, "OK", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
 
     header = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {display_search_path} ({files_searched} files searched)"
     if files_capped:
@@ -1033,7 +1084,11 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         header += " — stopped at the time budget (results may be incomplete)"
     if protected_omitted:
         header += f" — {protected_omitted} protected artifact file(s) omitted"
-    return header + "\n\n" + "\n".join(matches)
+    text = header + "\n\n" + "\n".join(matches)
+    return _publish_builtin_result(
+        ctx, "OK", text,
+        legacy_status="ok", legacy_is_error=False,
+    )
 
 
 def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
@@ -1045,17 +1100,33 @@ def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
     try:
         tid = validate_task_id(task_id)
     except ValueError as exc:
-        return f"⚠️ TOOL_ARG_ERROR (forward_to_worker): {exc}"
+        text = f"⚠️ TOOL_ARG_ERROR (forward_to_worker): {exc}"
+        return _publish_builtin_result(
+            ctx, "TOOL_ARG_ERROR", text,
+            legacy_status="error", legacy_is_error=True,
+        )
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = pathlib.Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     data = load_effective_task_result(status_drive_root, tid)
     status = str(data.get("status") or "").lower()
     if not data:
-        return f"⚠️ TASK_NOT_FOUND: task {tid} is not registered."
+        text = f"⚠️ TASK_NOT_FOUND: task {tid} is not registered."
+        return _publish_builtin_result(
+            ctx, "RESOURCE_NOT_FOUND", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     if status in FINAL_STATUSES:
-        return f"⚠️ TASK_NOT_ACTIVE: task {tid} is already {status}."
+        text = f"⚠️ TASK_NOT_ACTIVE: task {tid} is already {status}."
+        return _publish_builtin_result(
+            ctx, "RESOURCE_UNAVAILABLE", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     if status != STATUS_RUNNING:
-        return f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, not running."
+        text = f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, not running."
+        return _publish_builtin_result(
+            ctx, "RESOURCE_UNAVAILABLE", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     # AR2-6: no NEW steering writes while a cancellation is pending. The
     # effective status honestly stays ``running`` (cancel_state=pending rides
     # beside it), so the checks above pass — consult the same predicate the
@@ -1065,10 +1136,14 @@ def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
         from ouroboros.cancel_intents import cancel_pending
 
         if cancel_pending(status_drive_root, tid):
-            return (
+            text = (
                 f"⚠️ TASK_CANCEL_PENDING: task {tid} has a pending cancellation — the "
                 "supervisor is tearing it down; the message was NOT delivered. Wait for "
                 "the settled outcome or start a new task."
+            )
+            return _publish_builtin_result(
+                ctx, "RESOURCE_UNAVAILABLE", text,
+                legacy_status="ok", legacy_is_error=False,
             )
     except Exception:
         log.debug("forward_to_worker cancel-pending check failed for %s", tid, exc_info=True)
@@ -1076,14 +1151,26 @@ def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
     target_parent = str(data.get("parent_task_id") or "").strip()
     target_root = str(data.get("root_task_id") or "").strip()
     if not current_task_id:
-        return "⚠️ TASK_FORBIDDEN: forward_to_worker requires an active task context."
+        text = "⚠️ TASK_FORBIDDEN: forward_to_worker requires an active task context."
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     allowed = target_parent == current_task_id or target_root == current_task_id
     if not allowed:
-        return f"⚠️ TASK_FORBIDDEN: task {tid} is not a child or descendant of the current task."
+        text = f"⚠️ TASK_FORBIDDEN: task {tid} is not a child or descendant of the current task."
+        return _publish_builtin_result(
+            ctx, "ACCESS_BLOCKED", text,
+            legacy_status="ok", legacy_is_error=False,
+        )
     child_drive = str(data.get("child_drive_root") or data.get("headless_child_drive_root") or data.get("drive_root") or "").strip()
     mailbox_drive = pathlib.Path(child_drive) if child_drive else pathlib.Path(ctx.drive_root)
     write_owner_message(mailbox_drive, message, task_id=tid, msg_id=uuid.uuid4().hex)
-    return f"Message forwarded to task {tid}"
+    text = f"Message forwarded to task {tid}"
+    return _publish_builtin_result(
+        ctx, "OK", text,
+        legacy_status="ok", legacy_is_error=False,
+    )
 
 def get_tools() -> List[ToolEntry]:
     return [
