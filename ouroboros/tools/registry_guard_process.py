@@ -393,7 +393,7 @@ def _run_shell_safety_check(
         except Exception as exc:
             return ToolResult(
                 status="blocked",
-                code="LEGACY_BLOCKED",
+                code="SHELL_CWD_BLOCKED",
                 text=shell_cwd_block_message(
                     self._ctx,
                     str(args.get("cwd") or ""),
@@ -411,7 +411,7 @@ def _run_shell_safety_check(
     if sudo_noninteractive_violation(argv):
         return ToolResult(
             status="blocked",
-            code="LEGACY_BLOCKED",
+            code="SUDO_INTERACTIVE_BLOCKED",
             text="⚠️ SUDO_INTERACTIVE_BLOCKED: sudo must be noninteractive. Use sudo -n for commands that can run without a password; if sudo -n fails, report validation/install blocked by environment.",
         )
     cmd_lower = (" ".join(str(x) for x in raw_cmd) if isinstance(raw_cmd, list) else str(raw_cmd)).lower()
@@ -422,7 +422,7 @@ def _run_shell_safety_check(
     if (acting_subagent or self._is_local_readonly_subagent()) and _subagent_shell_targets_secret(cmd_path_lower):
         return ToolResult(
             status="blocked",
-            code="LEGACY_BLOCKED",
+            code="SUBAGENT_SECRET_READ_BLOCKED",
             text=(
                 "⚠️ SUBAGENT_SECRET_READ_BLOCKED: subagents may not read Ouroboros secrets, "
                 "credentials, or owner-control state via shell. Use the gated read_file tool "
@@ -488,23 +488,23 @@ def _run_shell_safety_check(
 
     # Elevation pattern: blocked in all modes.
     if _detect_runtime_mode_elevation(cmd_lower):
-        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart.")
+        return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart.")
     if _detect_context_mode_self_lowering(cmd_lower):
-        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped.")
+        return ToolResult(status="blocked", code="CONTEXT_MODE_SELF_LOWERING_BLOCKED", text="⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped.")
     if _detect_scope_review_floor_self_lowering(cmd_lower, writeish=writeish):
-        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or /api/owner/scope-review-floor from something other than a pure read. The floor is a deprecated, enforcement-inert owner setting (BIBLE P3 scope-review applicability follows the owner context mode) — it stays owner-only, and the agent must not write owner settings through any channel. Ask the owner to change it via the dedicated /api/owner/scope-review-floor endpoint, or stop the agent and edit settings.json directly. Pure source inspection (grep/rg/cat/jq/git grep) is allowed; an interpreter or HTTP client naming the endpoint is not, whatever verb it spells.")
+        return ToolResult(status="blocked", code="SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED", text="⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or /api/owner/scope-review-floor from something other than a pure read. The floor is a deprecated, enforcement-inert owner setting (BIBLE P3 scope-review applicability follows the owner context mode) — it stays owner-only, and the agent must not write owner settings through any channel. Ask the owner to change it via the dedicated /api/owner/scope-review-floor endpoint, or stop the agent and edit settings.json directly. Pure source inspection (grep/rg/cat/jq/git grep) is allowed; an interpreter or HTTP client naming the endpoint is not, whatever verb it spells.")
     if _detect_safety_mode_self_lowering(cmd_lower):
-        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly.")
+        return ToolResult(status="blocked", code="SAFETY_MODE_SELF_LOWERING_BLOCKED", text="⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly.")
     if _detect_owner_skill_attest_self_call(cmd_lower):
-        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI.")
+        return ToolResult(status="blocked", code="OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED", text="⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI.")
     if _detect_mutative_toggle_self_change(cmd_lower):
-        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents.")
+        return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents.")
     if _detect_evolution_owner_control_self_change(cmd_lower):
-        return ToolResult(status="blocked", code="LEGACY_BLOCKED", text="⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or steer self-modification cycles. Change them via the owner Settings UI, or stop the agent and edit settings.json directly — the agent must not self-set evolution controls.")
+        return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or steer self-modification cycles. Change them via the owner Settings UI, or stop the agent and edit settings.json directly — the agent must not self-set evolution controls.")
     if _mentions_skill_owner_state(cmd_lower):
         return ToolResult(
             status="blocked",
-            code="LEGACY_BLOCKED",
+            code="SKILL_STATE_WRITE_BLOCKED",
             text=(
                 "⚠️ SKILL_STATE_WRITE_BLOCKED: skill review, enablement, "
                 "grants, and marketplace provenance are owner/review "
@@ -515,7 +515,7 @@ def _run_shell_safety_check(
     if "state" in cmd_lower and "skills" in cmd_lower and _mentions_detached_process(cmd_lower):
         return ToolResult(
             status="blocked",
-            code="LEGACY_BLOCKED",
+            code="SKILL_STATE_WRITE_BLOCKED",
             text=(
                 "⚠️ SKILL_STATE_WRITE_BLOCKED: detached shell processes must "
                 "not target skill state directories. Use the reviewed skill "

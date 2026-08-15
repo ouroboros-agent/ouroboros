@@ -508,7 +508,7 @@ def test_resolution_trace_failure_is_fail_soft(tmp_path, monkeypatch):
         (
             "cwd_resolution_failed",
             "blocked",
-            "LEGACY_BLOCKED",
+            "SHELL_CWD_BLOCKED",
             "cwd_blocked",
         ),
     ),

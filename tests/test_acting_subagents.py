@@ -1138,7 +1138,7 @@ def test_acting_subagent_cannot_shell_read_secrets(tmp_path):
     reg._ctx = ctx
     block = _run_shell_safety_check(reg, {"cmd": "cat ~/Ouroboros/data/settings.json"}, "pro")
     assert block is not None
-    assert block.code == "LEGACY_BLOCKED"
+    assert block.code == "SUBAGENT_SECRET_READ_BLOCKED"
     assert "SUBAGENT_SECRET_READ_BLOCKED" in block.text
 
 

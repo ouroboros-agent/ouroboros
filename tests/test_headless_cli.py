@@ -1240,7 +1240,7 @@ def test_workspace_shell_sudo_and_pro_passthrough_policy(tmp_path):
     for command in (["sudo", "true"], ["sh", "-c", "sudo true"], ["sudo", "-S", "true"], ["sudo", "-nS", "true"], ["sudoedit", "/etc/hosts"]):
         result = _run_shell_safety_check(registry, {"cmd": command}, "pro")
         assert result is not None
-        assert result.code == "LEGACY_BLOCKED"
+        assert result.code == "SUDO_INTERACTIVE_BLOCKED"
         assert "SUDO_INTERACTIVE_BLOCKED" in result.text
     assert _run_shell_safety_check(registry, {"cmd": ["sudo", "-n", "python", "-S", "-c", "print(1)"]}, "pro") is None
     for command in (["sh", "-c", "gh\nrepo\ncreate x"], ["sh", "-c", "gh\nauth\nlogin"]):

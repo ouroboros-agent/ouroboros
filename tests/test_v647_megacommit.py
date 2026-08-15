@@ -675,7 +675,7 @@ def test_verify_and_record_check_is_shell_guarded_against_subagent_secret_read()
     assert mapped["cmd"] == ["sh", "-c", "cat data/settings.json"]
     block = _run_shell_safety_check(reg, mapped, "advanced")
     assert block is not None
-    assert block.code == "LEGACY_BLOCKED"
+    assert block.code == "SUBAGENT_SECRET_READ_BLOCKED"
     assert "SECRET" in block.text.upper()
 
 

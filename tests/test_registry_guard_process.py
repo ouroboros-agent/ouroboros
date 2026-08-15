@@ -516,7 +516,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         return result
 
     sudo = check(["sudo", "true"])
-    assert sudo.code == "LEGACY_BLOCKED"
+    assert sudo.code == "SUDO_INTERACTIVE_BLOCKED"
     assert sudo.text == (
         "⚠️ SUDO_INTERACTIVE_BLOCKED: sudo must be noninteractive. Use sudo -n for commands "
         "that can run without a password; if sudo -n fails, report validation/install blocked "
@@ -525,7 +525,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
 
     stub.acting = True
     secret = check("cat data/settings.json")
-    assert secret.code == "LEGACY_BLOCKED"
+    assert secret.code == "SUBAGENT_SECRET_READ_BLOCKED"
     assert secret.text == (
         "⚠️ SUBAGENT_SECRET_READ_BLOCKED: subagents may not read Ouroboros secrets, "
         "credentials, or owner-control state via shell. Use the gated read_file tool "
@@ -536,7 +536,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
     cases = (
         (
             'save_settings({"ouroboros_runtime_mode":"pro"})',
-            "LEGACY_BLOCKED",
+            "ELEVATION_BLOCKED",
             "⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE "
             "elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, "
             "or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is "
@@ -545,7 +545,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_context_mode":"low"})',
-            "LEGACY_BLOCKED",
+            "CONTEXT_MODE_SELF_LOWERING_BLOCKED",
             "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt "
             "to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. "
             "Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit "
@@ -553,7 +553,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             "python -c 'post /api/owner/scope-review-floor'",
-            "LEGACY_BLOCKED",
+            "SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED",
             "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches "
             "OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or "
             "/api/owner/scope-review-floor from something other than a pure read. The floor is a "
@@ -566,7 +566,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_safety_mode":"off"})',
-            "LEGACY_BLOCKED",
+            "SAFETY_MODE_SELF_LOWERING_BLOCKED",
             "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to "
             "change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, "
             "/api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled "
@@ -576,7 +576,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             "curl -x post /api/owner/skills/alpha/attest-review",
-            "LEGACY_BLOCKED",
+            "OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED",
             "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an "
             "attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation "
             "skips the expensive LLM skill review and is OWNER-ONLY — the agent must not "
@@ -585,7 +585,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_allow_mutative_subagents":"true"})',
-            "LEGACY_BLOCKED",
+            "ELEVATION_BLOCKED",
             "⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it "
             "grants subagents write power against the live body). Change it by stopping the agent "
             "and editing settings.json directly, then restart — the agent must not self-enable "
@@ -593,7 +593,7 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             'save_settings({"ouroboros_post_task_evolution":"true"})',
-            "LEGACY_BLOCKED",
+            "ELEVATION_BLOCKED",
             "⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and "
             "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or "
             "steer self-modification cycles. Change them via the owner Settings UI, or stop the "
@@ -601,14 +601,14 @@ def test_process_guard_denials_preserve_exact_text(tmp_path, monkeypatch):
         ),
         (
             "echo state/skills/alpha/review.json",
-            "LEGACY_BLOCKED",
+            "SKILL_STATE_WRITE_BLOCKED",
             "⚠️ SKILL_STATE_WRITE_BLOCKED: skill review, enablement, grants, and marketplace "
             "provenance are owner/review controlled state. Use skill_review, toggle_skill/the "
             "Skills UI, or the desktop launcher confirmation flow.",
         ),
         (
             "nohup echo state/skills/alpha/unknown.json",
-            "LEGACY_BLOCKED",
+            "SKILL_STATE_WRITE_BLOCKED",
             "⚠️ SKILL_STATE_WRITE_BLOCKED: detached shell processes must not target skill state "
             "directories. Use the reviewed skill lifecycle tools instead.",
         ),
@@ -779,6 +779,6 @@ def test_loop_preserves_legacy_process_fields_while_consuming_native_denial(
     assert row["result_meta"] == {
         "status": "blocked",
         "tool_result_status": "blocked",
-        "tool_result_code": "LEGACY_BLOCKED",
+        "tool_result_code": "SUDO_INTERACTIVE_BLOCKED",
         "tool_result_meta": {},
     }

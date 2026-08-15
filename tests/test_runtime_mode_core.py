@@ -833,10 +833,12 @@ def test_default_lane_allows_mutating_git_outside_runtime(runtime_mode, tmp_path
 def test_default_lane_blocks_mutating_git_targeting_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg, repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
-    result = reg.execute(
+    typed = reg.execute_result(
         "run_command",
         {"cmd": ["git", "-C", str(repo), "commit", "-m", "x"], "cwd": str(home)},
     )
+    result = typed.text
+    assert typed.code == "GIT_VIA_SHELL_BLOCKED"
     assert "GIT_VIA_SHELL_BLOCKED" in result
     assert "commit_reviewed" in result
 

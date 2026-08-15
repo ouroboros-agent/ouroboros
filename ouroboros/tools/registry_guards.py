@@ -805,7 +805,7 @@ def _resolved_shell_cwd(
     except Exception as exc:
         return ToolResult(
             status="blocked",
-            code="LEGACY_BLOCKED",
+            code="SHELL_CWD_BLOCKED",
             text=shell_cwd_block_message(
                 self._ctx, raw_cwd, operation=operation, error=exc,
             ),
@@ -1298,7 +1298,7 @@ def _shell_git_and_runtime_block(
             subcmd = git_violation.removeprefix("git ").strip() or git_violation
             return ToolResult(
                 status="blocked",
-                code="LEGACY_BLOCKED",
+                code="GIT_VIA_SHELL_BLOCKED",
                 text=(
                     f"⚠️ GIT_VIA_SHELL_BLOCKED: `git {subcmd}` is blocked for acting "
                     "self_worktree children (no commits; the parent integrates the "
@@ -1348,7 +1348,7 @@ def _shell_git_and_runtime_block(
         )
     return ToolResult(
         status="blocked",
-        code="LEGACY_BLOCKED",
+        code="GIT_VIA_SHELL_BLOCKED",
         text=(
             f"⚠️ GIT_VIA_SHELL_BLOCKED: {git_violation}. Mutating git may not target "
             "the Ouroboros runtime (system repo / data drives): self-repo changes go "
