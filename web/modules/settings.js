@@ -714,7 +714,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         setStatus('Loading settings...', 'muted', 'load');
         try {
             const applied = await loadSettings();
-            if (reloadSequence !== loadSequence) return;
             if (!applied && byId('settings-status').dataset.owner === 'load') {
                 setStatus('Settings were not reloaded because your draft changed while loading. Your edits are kept.', 'warn', 'load');
             }

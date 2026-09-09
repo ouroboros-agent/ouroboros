@@ -718,7 +718,7 @@ export function createAvailableSubagentsEditor({
             state.loaded = true;
             state.parseError = '';
             state.saveAttempted = false;
-            state.setting = attachUiKeys(parsed.setting, state.setting.items);
+            if (!sameAssignment) state.setting = attachUiKeys(parsed.setting, state.setting.items);
             onDirtyChange(false);
             onGeneratedApply(buildAvailableSubagentsSetting(state.setting));
         } else if (!parsed.setting && !state.loaded) {

@@ -300,32 +300,45 @@ def test_mcp_local_json_errors_hold_whole_settings_save(subscription_ui):
 
 
 def test_older_failed_settings_reload_cannot_disable_newer_success(subscription_ui):
-    """A stale failed GET must not erase a newer successfully loaded document."""
+    """Release an old failure only after the newer real UI load has finished."""
     from playwright.sync_api import expect
 
-    ui = subscription_ui
-    page = ui['page']
-    page.goto(ui['url'] + '/#settings')
-    expect(page.locator('#btn-save-settings')).to_be_enabled(timeout=30_000)
+    ui, page = subscription_ui, subscription_ui['page']
+    with page.expect_response(lambda response: response.url.endswith('/api/model-catalog')):
+        page.goto(ui['url'] + '/#settings')
+    expect(page.locator('#btn-save-settings')).to_be_enabled()
     page.evaluate("""() => {
         const originalFetch = window.fetch;
-        let settingsReads = 0;
+        window.testSettingsReads = [];
         window.fetch = (input, init) => {
-            if (String(input).includes('/api/settings') && (!init || init.method === 'GET')) {
-                settingsReads += 1;
-                if (settingsReads === 1) {
-                    return new Promise((_, reject) => setTimeout(() => reject(new Error('older read failed')), 180));
-                }
-                return Promise.resolve(new Response(JSON.stringify({
-                    OUROBOROS_RUNTIME_MODE: 'advanced', OUROBOROS_CONTEXT_MODE: 'max',
-                    OUROBOROS_MAX_WORKERS: 10, _meta: { setup_contract: {} },
-                }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            if (String(input).endsWith('/api/settings') && (init?.method || 'GET') === 'GET') {
+                return new Promise((resolve, reject) => testSettingsReads.push({resolve, reject}));
             }
             return originalFetch(input, init);
         };
     }""")
     page.locator('#btn-reload-settings').click()
-    page.wait_for_timeout(25)
+    page.wait_for_function('testSettingsReads.length === 1')
     page.locator('#btn-reload-settings').click()
-    expect(page.locator('#btn-save-settings')).to_be_enabled(timeout=30_000)
-    expect(page.locator('#settings-status')).not_to_contain_text('Failed to load current settings')
+    page.wait_for_function('testSettingsReads.length === 2')
+    newer = {**ui['settings'], 'GITHUB_REPO': 'owner/newer-document'}
+    page.evaluate("""data => testSettingsReads[1].resolve(new Response(JSON.stringify(data), {
+        status: 200, headers: {'Content-Type': 'application/json'},
+    }))""", newer)
+    expect(page.locator('#s-gh-repo')).to_have_value('owner/newer-document')
+    expect(page.locator('#settings-status')).to_have_text('Settings loaded')
+    page.evaluate("""async () => {
+        testSettingsReads[0].reject(new Error('older read failed'));
+        // Await rejection handlers before asserting; no elapsed-time race.
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }""")
+    expect(page.locator('#btn-save-settings')).to_be_enabled()
+    expect(page.locator('#settings-status')).to_have_text('Settings loaded')
+    expect(page.locator('#s-gh-repo')).to_have_value('owner/newer-document')
+
+    # A failure of the current request still reports the real load failure.
+    page.locator('#btn-reload-settings').click()
+    page.wait_for_function('testSettingsReads.length === 3')
+    page.evaluate("testSettingsReads[2].reject(new Error('current read failed'))")
+    expect(page.locator('#btn-save-settings')).to_be_disabled()
+    expect(page.locator('#settings-status')).to_contain_text('current read failed')
