@@ -383,10 +383,11 @@ def protected_write_block_message(
 ) -> str:
     norm = normalize_repo_path(path)
     category = protected_path_category(norm)
+    target_modes = "runtime_mode='pro' or 'cyber_pro'" if str(runtime_mode).strip().lower() == "cyber_pro" else "runtime_mode='pro'"
     return (
         f"⚠️ CORE_PROTECTION_BLOCKED: runtime_mode={runtime_mode!r} refuses "
         f"to {action} protected {category or 'core'} path: {norm}. "
-        "Switch to runtime_mode='pro' or 'cyber_pro' and let the normal triad + scope review "
+        f"Switch to {target_modes} and let the normal triad + scope review "
         "cover the protected core/contract/release change before commit."
     )
 

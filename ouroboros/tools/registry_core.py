@@ -235,7 +235,7 @@ _ACTING_NO_WORKSPACE_PROCESS_RESULT = ToolResult(
 _LIGHT_START_SERVICE_RESULT = ToolResult(
     status="blocked",
     code="LIGHT_MODE_BLOCKED",
-    text="⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses start_service against the Ouroboros repository because long-running services can mutate after initial tool checks. For external services, set cwd under user_files, task_drive, or artifact_store; switch to advanced/pro/cyber_pro only for reviewed Ouroboros self-modification.",
+    text="⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses start_service against the Ouroboros repository because long-running services can mutate after initial tool checks. For external services, set cwd under user_files, task_drive, or artifact_store; switch to advanced/pro only for reviewed Ouroboros self-modification.",
 )
 
 
