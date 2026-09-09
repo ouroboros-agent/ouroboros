@@ -48,7 +48,7 @@ def test_files_layout_uses_internal_scroll_contract():
     assert "overflow: hidden;" in css
     assert ".files-list {" in css
     assert "overscroll-behavior: contain;" in css
-    assert "grid-template-rows: minmax(220px, 320px) minmax(0, 1fr);" in css
+    assert "grid-template-rows: minmax(0, 30%) minmax(0, 1fr);" in css
     assert 'max-height: none;' in css
 
 
@@ -198,4 +198,6 @@ def test_files_confirm_dialog_results_are_normalized():
     assert "return Boolean(result?.confirmed);" in source
     assert "if (!result?.confirmed) return;" in source
     assert "normalizeTone(tone || 'info', 'info')" in toast
-    assert "export function normalizeTone(tone = 'muted', fallback = 'muted')" in helper
+    primitives = _read("web/modules/ui_primitives.js")
+    assert "export function normalizeTone(tone = 'muted', fallback = 'muted')" in primitives
+    assert "export { renderSafeField, collectSafeFieldValues, normalizeTone, setInlineStatus } from './ui_primitives.js';" in helper
