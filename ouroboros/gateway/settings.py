@@ -478,7 +478,7 @@ def _api_owner_runtime_mode_sync(request: Request, body: Any) -> JSONResponse:
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     if raw_mode not in set(_config.VALID_RUNTIME_MODES):
-        return unsaved_error("'mode' must be one of: light, advanced, pro", 400)
+        return unsaved_error("'mode' must be one of: light, advanced, pro, cyber_pro", 400)
     # The digest is taken BEFORE the read that decides, so a write landing between the
     # two is refused rather than silently reverted by this request's write.
     digest = settings_document_digest()

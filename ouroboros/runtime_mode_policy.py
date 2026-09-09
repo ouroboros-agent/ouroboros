@@ -248,14 +248,14 @@ def protected_write_block_message(
     return (
         f"⚠️ CORE_PROTECTION_BLOCKED: runtime_mode={runtime_mode!r} refuses "
         f"to {action} protected {category or 'core'} path: {norm}. "
-        "Switch to runtime_mode='pro' and let the normal triad + scope review "
+        "Switch to runtime_mode='pro' or 'cyber_pro' and let the normal triad + scope review "
         "cover the protected core/contract/release change before commit."
     )
 
 
 def core_patch_notice(paths: Iterable[ProtectedPath | str]) -> str:
     return (
-        "⚠️ CORE_PATCH_NOTICE: runtime_mode='pro' is editing protected "
+        "⚠️ CORE_PATCH_NOTICE: runtime_mode='pro' or 'cyber_pro' is editing protected "
         "Ouroboros core/contract/release surface(s): "
         f"{format_protected_paths(paths)}. These changes can be committed only "
         "through the normal triad + scope review pipeline."

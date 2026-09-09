@@ -364,7 +364,7 @@ def _evolve_command(args: argparse.Namespace) -> int:
         runtime_mode = str(client.request("GET", "/api/state").get("runtime_mode", "") or "")
         if runtime_mode == "light":
             _print_json({
-                "error": "evolution requires runtime_mode 'advanced' or 'pro'; refused in 'light' mode",
+                "error": "evolution requires runtime_mode 'advanced', 'pro', or 'cyber_pro'; refused in 'light' mode",
                 "runtime_mode": runtime_mode,
             })
             return 1

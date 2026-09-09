@@ -396,7 +396,7 @@ def _format_light_repo_write_note(before: Dict[str, Any], after: Dict[str, Any],
         f"a mutation of the Ouroboros repository after {tool_name}. "
         "The command result is blocked and no automatic rollback was attempted "
         "to avoid overwriting concurrent human edits. "
-        f"Affected/dirty paths: {listed}. Switch to advanced/pro for repo writes."
+        f"Affected/dirty paths: {listed}. Switch to advanced/pro/cyber_pro for repo writes."
     )
 
 
@@ -682,7 +682,7 @@ def _run_shell_safety_check(
                     "shell commands that mutate the Ouroboros repository. "
                     "For external deliverables, run with cwd under user_files "
                     "(for example /Users/<you>/Desktop), root=artifact_store, "
-                    "or root=task_drive. Switch to advanced/pro only for "
+                    "or root=task_drive. Switch to advanced/pro/cyber_pro only for "
                     "reviewed Ouroboros self-modification."
                 ),
             )

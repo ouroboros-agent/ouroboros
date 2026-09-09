@@ -516,7 +516,7 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     if task_type in {"evolution", "review", "deep_self_review"}:
         return json_error(
             f"task type {task_type!r} is internal-only and cannot be created via the task API "
-            "(use /evolve or /review); evolution additionally requires advanced/pro runtime mode",
+            "(use /evolve or /review); evolution additionally requires advanced/pro/cyber_pro runtime mode",
             400,
         )
     if workspace_root and task_type != "task":
