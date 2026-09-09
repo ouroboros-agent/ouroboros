@@ -32,7 +32,7 @@ from ouroboros.runtime_mode_policy import (
 )
 from ouroboros.tool_capabilities import (
     ACTING_SUBAGENT_MODE,
-    ACTING_SUBAGENT_TOOL_NAMES,
+    acting_tool_names_for_context,
     CORE_TOOL_NAMES,
     LOCAL_READONLY_SUBAGENT_MODE,
     LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
@@ -509,7 +509,7 @@ class ToolRegistry:
                 names.add("verify_and_record")
             return frozenset(names)
         if self._is_acting_subagent():
-            return ACTING_SUBAGENT_TOOL_NAMES
+            return acting_tool_names_for_context(self._ctx)
         return frozenset(set(self.available_tools()) | set(META_TOOL_NAMES))
 
     def available_tools(self) -> List[str]:
@@ -524,7 +524,7 @@ class ToolRegistry:
             if _presence_tool_allowed(self._ctx, e.name)
             if _builtin_tool_availability(e.name, self._ctx)[0]
             if not local_readonly_subagent or self._readonly_tool_allowed(e.name)
-            if not acting_subagent or e.name in ACTING_SUBAGENT_TOOL_NAMES
+            if not acting_subagent or e.name in acting_tool_names_for_context(self._ctx)
         ]
 
     def _schema_for_entry(self, entry: ToolEntry) -> Dict[str, Any]:
@@ -698,7 +698,7 @@ class ToolRegistry:
             if _presence_tool_allowed(self._ctx, entry.name)
             if entry.name not in unavailable_tools
             if not local_readonly_subagent or self._readonly_tool_allowed(entry.name)
-            if not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES
+            if not acting_subagent or entry.name in acting_tool_names_for_context(self._ctx)
             if not ephemeral_turn or entry.name in _EPHEMERAL_ALLOWED_TOOLS  # CW3: default-deny allowlist
             for schema in self._schemas_for_entry(entry)
         ]
@@ -821,13 +821,13 @@ class ToolRegistry:
                 continue
             if local_readonly_subagent and not self._readonly_tool_allowed(e.name):
                 continue
-            if acting_subagent and e.name not in ACTING_SUBAGENT_TOOL_NAMES:
+            if acting_subagent and e.name not in acting_tool_names_for_context(self._ctx):
                 continue
             if ephemeral_turn and e.name not in _EPHEMERAL_ALLOWED_TOOLS:
                 continue  # CW3: the core/initial envelope is allowlisted too, not just schemas(core_only=False)
             if (
                 (local_readonly_subagent and self._readonly_tool_allowed(e.name))
-                or (acting_subagent and e.name in ACTING_SUBAGENT_TOOL_NAMES)
+                or (acting_subagent and e.name in acting_tool_names_for_context(self._ctx))
                 or e.name in CORE_TOOL_NAMES
                 or e.name in ("list_available_tools", "enable_tools")
             ):
@@ -876,7 +876,7 @@ class ToolRegistry:
         acting_subagent = self._is_acting_subagent()
         if self._is_local_readonly_subagent() and not self._readonly_tool_allowed(requested):
             return "hidden by the read-only subagent profile"
-        if acting_subagent and requested not in ACTING_SUBAGENT_TOOL_NAMES:
+        if acting_subagent and requested not in acting_tool_names_for_context(self._ctx):
             return "hidden by the acting subagent profile"
         return None
 
@@ -912,7 +912,7 @@ class ToolRegistry:
                 return None  # CW3: allowlist-consistent with schemas()/execute() (so enable_tools can't surface a denied tool)
             if local_readonly_subagent and not self._readonly_tool_allowed(requested):
                 return None
-            if acting_subagent and requested not in ACTING_SUBAGENT_TOOL_NAMES:
+            if acting_subagent and requested not in acting_tool_names_for_context(self._ctx):
                 return None
             return self._schema_for_entry(entry)
         try:

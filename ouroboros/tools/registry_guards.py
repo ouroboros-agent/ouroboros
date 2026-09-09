@@ -174,7 +174,10 @@ def _subagent_and_update_guard_result(
             "Nested readonly delegation is allowed only through schedule_subagent "
             "within configured depth/cap limits."
         ))
-    if acting_subagent and entry is not None and name not in _registry().ACTING_SUBAGENT_TOOL_NAMES:
+    from ouroboros.tool_capabilities import acting_tool_names_for_context
+
+    acting_allowed_names = acting_tool_names_for_context(registry._ctx)
+    if acting_subagent and entry is not None and name not in acting_allowed_names:
         return ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
             "⚠️ ACTING_SUBAGENT_BLOCKED: this mutative subagent may read and "
             "write inside its assigned write root and run shell/services "

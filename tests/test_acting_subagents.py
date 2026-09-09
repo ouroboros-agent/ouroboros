@@ -165,6 +165,31 @@ def test_cyber_acting_child_can_use_owner_credential_file_path(tmp_path, monkeyp
     assert user_files_path_block_reason(readonly, credential, operation="write")
 
 
+def test_cyber_acting_registry_exposes_review_skill_and_runtime_tools(tmp_path, monkeypatch):
+    _enable_cyber_mode_for_test(monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(
+            mode="acting_subagent", surface="external_workspace", write_root=str(workspace),
+        ),
+    )
+    reg = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    reg._ctx = ctx
+
+    names = set(reg.initial_tool_names())
+    assert {"review_status", "plan_task", "skill_review", "skill_exec", "toggle_evolution"} <= names
+    assert "commit_reviewed" not in names and "vcs_commit_reviewed" not in names
+    schemas = {
+        item["function"]["name"] for item in reg.schemas()
+        if item.get("function")
+    }
+    assert {"review_status", "plan_task", "skill_review", "skill_exec"} <= schemas
+    assert reg.get_schema_by_name("review_status") is not None
+    assert "TOOL_ACCESS_BLOCKED" not in reg.execute("review_status", {})
+
+
 # --------------------------------------------------------------------------- #
 # 3. Registry gating for acting subagents
 # --------------------------------------------------------------------------- #
