@@ -701,6 +701,16 @@ def _run_supervisor(settings: dict) -> None:
         _supervisor_error = f"Supervisor init failed: {exc}"
         _consciousness = None
         log.critical("Supervisor initialization failed", exc_info=True)
+        try:
+            # Provider-configured lifespan normally relies on this supervisor
+            # owner for boot recovery. If initialization itself fails, keep the
+            # same custody pass instead of serving with orphan RUNNING rows.
+            _run_startup_task_recovery(
+                DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+                prior_worker_pids=None,
+            )
+        except Exception:
+            log.critical("Startup recovery after supervisor initialization failure failed", exc_info=True)
         _supervisor_ready.set()
         _supervisor_thread = None
         return

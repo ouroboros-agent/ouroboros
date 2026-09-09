@@ -329,6 +329,20 @@ def test_real_supervisor_orders_custody_recovery_before_prune(roots, monkeypatch
     assert order == ["migrate", "capture-pids", "restore", "kill", "spawn", "custody", "recover", ("prune", True)]
 
 
+def test_supervisor_init_failure_keeps_boot_recovery_owner():
+    import ast
+    import inspect
+    import server
+    tree = ast.parse(inspect.getsource(server._run_supervisor))
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+             and node.func.id == "_run_startup_task_recovery"]
+    assert len(calls) == 2
+    assert any(any(isinstance(parent, ast.ExceptHandler) for parent in ast.walk(tree))
+               for _ in calls)
+
+
 def test_lifespan_does_not_race_recovery_against_provider_supervisor():
     import ast
     import inspect
