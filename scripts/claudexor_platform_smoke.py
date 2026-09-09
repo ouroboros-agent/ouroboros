@@ -958,7 +958,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.managed_runtime:
             # The fixture edits its own legacy custody. It must never attach to
             # an installed daemon or discover the operator's native accounts.
-            isolated = pathlib.Path(tempfile.mkdtemp(prefix="cx-", dir="/tmp" if os.name != "nt" else None)).resolve()
+            isolated = pathlib.Path(tempfile.mkdtemp(prefix="cx-")).resolve()
             home = isolated / "home"
             home.mkdir()
             for key in list(os.environ):

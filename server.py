@@ -573,6 +573,7 @@ def _run_supervisor(settings: dict) -> None:
         except Exception:
             log.debug("Failed to stop previous consciousness instance", exc_info=True)
         _consciousness = None
+    prior_worker_pids: set[int] | None = None
     try:
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
 
@@ -705,9 +706,15 @@ def _run_supervisor(settings: dict) -> None:
             # Provider-configured lifespan normally relies on this supervisor
             # owner for boot recovery. If initialization itself fails, keep the
             # same custody pass instead of serving with orphan RUNNING rows.
+            recovery_pids = prior_worker_pids
+            if recovery_pids is None:
+                try:
+                    recovery_pids = _startup_worker_pids(DATA_DIR)
+                except Exception:
+                    recovery_pids = None
             _run_startup_task_recovery(
                 DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
-                prior_worker_pids=None,
+                prior_worker_pids=recovery_pids,
             )
         except Exception:
             log.critical("Startup recovery after supervisor initialization failure failed", exc_info=True)

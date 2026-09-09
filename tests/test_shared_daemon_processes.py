@@ -181,7 +181,7 @@ import subprocess, sys, time
 from ouroboros import platform_layer as pl
 kwargs = pl.subprocess_new_group_kwargs()
 use_job = pl.IS_WINDOWS and sys.argv[4] != 'headless'
-if use_job: kwargs['creationflags'] |= 4
+if use_job: kwargs.update(pl.subprocess_new_group_kwargs(breakaway_from_job=True))
 worker = subprocess.Popen([sys.executable, '-u', '-c', sys.argv[2], sys.argv[1], sys.argv[3]], **kwargs)
 if use_job:
     job = pl.create_kill_on_close_job(allow_breakaway=sys.argv[4] != 'legacy')
