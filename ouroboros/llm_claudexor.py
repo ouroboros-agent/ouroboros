@@ -35,7 +35,7 @@ from ouroboros.usage_accounting import (
     execute_physical_attempt, execute_physical_attempt_async,
     last_physical_attempt_capture,
 )
-from ouroboros.utils import append_jsonl, utc_now_iso
+from ouroboros.utils import append_jsonl, sanitize_tool_result_for_log, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +76,18 @@ class ClaudexorModelError(RuntimeError):
         self.model_role = model_role
         self.operation_id = operation_id
         self.route = copy.deepcopy(route or {})
+
+    @property
+    def display_message(self) -> str:
+        """Show typed provider details without changing exception classification text."""
+        context = self.problem.get("context") or {}
+        details = [] if self.code == "model_outcome_unknown" else [
+            f"{label}={value.strip()}"
+            for key, label in (("vendorCode", "provider_code"), ("parameter", "parameter"))
+            if isinstance(value := context.get(key), str) and value.strip()
+        ]
+        # Details lead so the existing terminal preview can name the refusal.
+        return sanitize_tool_result_for_log("; ".join([", ".join(details), str(self)]) if details else str(self))
 
 
 class ClaudexorModelNotDispatched(ClaudexorModelError, ProviderNotDispatched):

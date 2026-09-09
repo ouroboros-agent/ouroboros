@@ -1337,6 +1337,11 @@ text, including when the prior provider supplied no ordinary content. The exact
 `model_request_invalid` create refusal proves validation failed before command
 admission; a generic HTTP error or failed status read cannot prove non-dispatch.
 
+`ClaudexorModelError.display_message` adds sanitized typed `vendorCode` and
+`parameter` details to the existing error event and terminal preview only after
+classification. Exception text and machine fields retain their retry, compaction
+and custody semantics; unknown outcomes do not expose underlying provider details.
+
 `ClaudexorGateway` uses purpose-bound byte uploads, one idempotent operation ID,
 status/result reads, cancellation and explicit result acknowledgement. A lost
 local HTTP reply rejoins the same operation; an unknown provider outcome cannot
