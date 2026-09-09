@@ -230,6 +230,18 @@ def test_helper_never_finalizes_without_terminal_child_source(tmp_path, monkeypa
     assert "result" not in load_task_result(parent, task["id"])
 
 
+def test_missing_terminal_source_does_not_stamp_running_result_with_artifact_failure(tmp_path, monkeypatch):
+    parent, child, task = _child(tmp_path)
+    write_task_result(parent, task["id"], "running", result="still executing")
+    monkeypatch.setattr(headless, "finalize_task_artifacts", lambda *a: pytest.fail("invented terminal source"))
+    report = headless.prepare_terminal_task_files(parent, task)
+    current = load_task_result(parent, task["id"], strict=True)
+    assert report["terminal_source_present"] is False
+    assert report["error"]
+    assert current["status"] == "running"
+    assert "artifact_status" not in current and "artifact_error" not in current
+
+
 def test_helper_retains_terminal_child_when_canonical_write_fails(tmp_path, monkeypatch):
     parent, child, task = _child(tmp_path)
     _store(child, task["id"], _call(child)["manifest_ref"])

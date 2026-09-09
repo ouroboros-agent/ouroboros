@@ -593,6 +593,11 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
         from ouroboros.observability import redact_projection
         report["error"] = str(redact_projection(f"{type(exc).__name__}: {exc}").value)
         log.warning("Terminal file preparation failed for %s: %s", task_id, report["error"])
+        # A missing or nonterminal source belongs to the existing crash/retry
+        # policy. Only a real terminal source whose copy/finalization failed
+        # may stamp the canonical result with an artifact failure.
+        if report["terminal_source_present"] is not True:
+            return report
         try:
             existing = load_task_result(canonical_root, task_id, strict=True)
             if existing:
