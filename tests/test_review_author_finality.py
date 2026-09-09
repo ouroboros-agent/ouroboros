@@ -133,3 +133,107 @@ def test_advisory_acceptance_author_finish_skips_improvement_capsule(monkeypatch
     assert decision["author_disposition"]["disposition"] == "rejected"
     assert decision["author_disposition"]["subject_hash"]
     assert tool_ctx._task_acceptance_reviewed is True
+
+
+def test_skill_author_finish_uses_existing_review_without_dispatch_same_hash(
+    monkeypatch, tmp_path,
+):
+    from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_review_state
+    from ouroboros.tool_access_types import ResolvedResourceBinding
+    from ouroboros.tools import skill_exec as skill_exec_mod
+    from tests.test_skill_exec import _build_skill, _make_ctx
+
+    skills_root = tmp_path / "skills"
+    skill_dir = _build_skill(skills_root, "demo")
+    ctx = _make_ctx(tmp_path)
+    binding = ResolvedResourceBinding(
+        profile="self_modification", root="skill_payload", operation="review",
+        base_path=skill_dir, target_path=skill_dir, source="test",
+        skill_name="demo", state_drive_root=tmp_path,
+    )
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    monkeypatch.setattr(skill_exec_mod, "build_resolved_resource_binding", lambda *a, **k: binding)
+    monkeypatch.setattr(skill_exec_mod, "_skill_tool_preflight", lambda *a, **k: "")
+    prior_hash = compute_content_hash(skill_dir)
+    save_review_state(tmp_path, "demo", SkillReviewState(
+        status="blockers", content_hash=prior_hash,
+        findings=[{"item": "bug_hunting", "verdict": "FAIL", "severity": "critical", "reason": "review finding"}],
+        raw_actor_records=[{"slot_id": "s0", "status": "ok"}],
+    ))
+    monkeypatch.setattr(
+        skill_exec_mod, "run_skill_review_lifecycle_blocking",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("author finish dispatched a new panel")),
+        raising=False,
+    )
+    out = skill_exec_mod._handle_review_skill(
+        ctx, skill="demo", _resolved_binding=binding,
+        author_disposition="rejected", author_rationale="The finding is outside this task.",
+    )
+    assert "Author finish recorded" in out
+    assert "review finding" in out
+    loaded = __import__("ouroboros.skill_loader", fromlist=["load_review_state"]).load_review_state(tmp_path, "demo")
+    assert loaded.author_disposition["subject_hash"] == prior_hash
+    assert loaded.status == "blockers"
+
+
+def test_skill_author_finish_binds_changed_hash_after_preflight_without_panel(
+    monkeypatch, tmp_path,
+):
+    from ouroboros.skill_loader import SkillReviewState, compute_content_hash, load_review_state, save_review_state
+    from ouroboros.tool_access_types import ResolvedResourceBinding
+    from ouroboros.tools import skill_exec as skill_exec_mod
+    from tests.test_skill_exec import _build_skill, _make_ctx
+
+    skills_root = tmp_path / "skills"
+    skill_dir = _build_skill(skills_root, "demo", script_body="print('old')\n")
+    ctx = _make_ctx(tmp_path)
+    binding = ResolvedResourceBinding(
+        profile="self_modification", root="skill_payload", operation="review",
+        base_path=skill_dir, target_path=skill_dir, source="test",
+        skill_name="demo", state_drive_root=tmp_path,
+    )
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    monkeypatch.setattr(skill_exec_mod, "build_resolved_resource_binding", lambda *a, **k: binding)
+    monkeypatch.setattr(skill_exec_mod, "_skill_tool_preflight", lambda *a, **k: "")
+    old_hash = compute_content_hash(skill_dir)
+    save_review_state(tmp_path, "demo", SkillReviewState(
+        status="blockers", content_hash=old_hash,
+        findings=[{"item": "bug_hunting", "verdict": "FAIL", "severity": "critical", "reason": "old finding"}],
+        raw_actor_records=[{"slot_id": "s0", "status": "ok"}],
+    ))
+    (skill_dir / "scripts" / "hello.py").write_text("print('fixed')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        skill_exec_mod, "run_skill_review_lifecycle_blocking",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("changed-hash finish dispatched a panel")),
+        raising=False,
+    )
+    out = skill_exec_mod._handle_review_skill(
+        ctx, skill="demo", _resolved_binding=binding,
+        author_disposition="partial", author_rationale="The fix addresses the actionable part.",
+    )
+    current_hash = compute_content_hash(skill_dir)
+    loaded = load_review_state(tmp_path, "demo")
+    assert current_hash != old_hash
+    assert loaded.content_hash == current_hash
+    assert loaded.reviewed_content_hash == old_hash
+    assert loaded.author_disposition["subject_hash"] == current_hash
+    assert loaded.status == "blockers"
+    assert "raw reviewer findings" in out
+
+
+def test_ordinary_advisory_commit_does_not_invent_author_finish(tmp_path):
+    from types import SimpleNamespace
+    from ouroboros.review_state import load_state
+    from ouroboros.tools.commit_gate import _record_commit_attempt
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        repo_dir=tmp_path,
+        task_id="",
+        _review_advisory=["advisory finding"],
+        _current_review_attempt_number=0,
+    )
+    _record_commit_attempt(ctx, commit_message="ordinary advisory", status="succeeded")
+    attempts = load_state(tmp_path).attempts
+    assert attempts
+    assert attempts[-1].author_disposition == {}

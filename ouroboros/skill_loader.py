@@ -83,6 +83,7 @@ class SkillReviewState:
     # content_hash and never changes the raw reviewer findings or deterministic
     # preflight status.
     author_disposition: Dict[str, Any] = field(default_factory=dict)
+    reviewed_content_hash: str = ""
 
     def is_stale_for(self, current_hash: str) -> bool:
         if not current_hash:
@@ -108,6 +109,8 @@ class SkillReviewState:
             data["advisory_result"] = dict(self.advisory_result)
         if self.author_disposition:
             data["author_disposition"] = dict(self.author_disposition)
+        if self.reviewed_content_hash:
+            data["reviewed_content_hash"] = str(self.reviewed_content_hash)
         has_review_verdicts = any(
             str(f.get("verdict") or "").upper() in {"PASS", "FAIL"}
             for f in self.findings
@@ -655,6 +658,7 @@ def load_review_state(
         advisory_result=dict(advisory_result),
         review_profile=review_profile,
         author_disposition=author_disposition,
+        reviewed_content_hash=str(data.get("reviewed_content_hash") or ""),
     )
 
 

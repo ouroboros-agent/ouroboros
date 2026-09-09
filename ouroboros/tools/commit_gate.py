@@ -523,12 +523,11 @@ def _record_commit_attempt(
         scope_model = _req("scope_model")
         triad_raw_results = _req("triad_raw_results", None)
         scope_raw_result = _req("scope_raw_result", None)
+        # Ordinary advisory continuation is not an author finish.  Only an
+        # explicit caller-supplied record is persisted here; the review
+        # findings and advisory override remain the evidence for an unmarked
+        # successful commit.
         author_disposition = _req("author_disposition", None)
-        # An author-disposition record is an explicit owner/agent stance, not
-        # an inference from reaching a successful commit.  Ordinary Advisory
-        # commits retain their raw findings without manufacturing an
-        # ``accepted`` decision; callers that actually collect the author's
-        # rationale pass the validated record through this field.
         block_class = _req("block_class")
         rebuttal_sha256 = _req("rebuttal_sha256")
         paid = _req("paid", False)

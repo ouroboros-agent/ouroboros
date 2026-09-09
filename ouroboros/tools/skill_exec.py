@@ -37,6 +37,7 @@ from ouroboros.tool_access import (
     ResolvedResourceBinding,
     build_resolved_resource_binding,
     canonical_data_root,
+    load_bound_skill,
 )
 from ouroboros.tools.shell import (
     _active_subprocesses,
@@ -566,6 +567,80 @@ def _handle_list_skills(ctx: ToolContext, **_kwargs: Any) -> str:
     return json.dumps(summary, ensure_ascii=False, indent=2)
 
 
+def _author_finish_existing_skill_review(
+    ctx: ToolContext,
+    binding: ResolvedResourceBinding,
+    skill_name: str,
+    *,
+    disposition: str,
+    rationale: str,
+) -> Optional[Dict[str, Any]]:
+    """Apply an explicit advisory author finish without buying a new panel.
+
+    The first reviewer panel remains the source of findings.  A later finish
+    call may bind that evidence to the current payload hash, including after a
+    local fix, once the existing deterministic preflight passes.  The raw
+    findings/status stay intact and no PASS is minted.
+    """
+    from ouroboros.config import get_review_enforcement
+    from ouroboros.review_records import build_author_disposition
+    from ouroboros.skill_loader import compute_content_hash, load_review_state, save_review_state
+    from ouroboros.skill_review import _run_deterministic_preflight
+
+    if str(get_review_enforcement() or "").strip().lower() != "advisory":
+        return {"error": "SKILL_REVIEW_ERROR: explicit author finish requires advisory enforcement."}
+    loaded = load_bound_skill(binding)
+    if loaded is None:
+        return {"error": "SKILL_REVIEW_ERROR: selected skill is unavailable for author finish."}
+    current_hash = compute_content_hash(
+        loaded.skill_dir,
+        manifest_entry=loaded.manifest.entry,
+        manifest_scripts=loaded.manifest.scripts,
+    )
+    drive_root = binding.state_drive_root
+    review_state = load_review_state(drive_root, skill_name, skill_type=loaded.manifest.type, skill_dir=loaded.skill_dir)
+    if review_state.status == "pending":
+        return {"error": "SKILL_REVIEW_ERROR: existing review is pending or has no reviewer verdict."}
+    if not (review_state.findings or review_state.raw_actor_records or review_state.raw_result):
+        return {"error": "SKILL_REVIEW_ERROR: no prior reviewer evidence is available for author finish."}
+    try:
+        author_record = build_author_disposition(
+            disposition=disposition,
+            rationale=rationale,
+            subject_hash=current_hash,
+            reviewer_signal=review_state.status,
+            enforcement="advisory",
+        )
+    except ValueError as exc:
+        return {"error": f"SKILL_REVIEW_ERROR: {exc}"}
+    previous_hash = str(review_state.content_hash or "")
+    if previous_hash != current_hash:
+        # A changed payload is accepted only after the existing deterministic
+        # gate checks the complete current payload.  This is not a reviewer
+        # PASS: the prior findings remain attached as historical evidence.
+        preflight = _run_deterministic_preflight(
+            ctx, drive_root, loaded, current_hash, persist=False, binding=binding,
+        )
+        if preflight is not None:
+            return {"error": "SKILL_REVIEW_ERROR: deterministic preflight did not pass for the current payload."}
+        review_state.reviewed_content_hash = previous_hash
+        review_state.content_hash = current_hash
+    review_state.author_disposition = author_record
+    save_review_state(drive_root, skill_name, review_state)
+    return {
+        "skill_name": skill_name,
+        "status": review_state.status,
+        "content_hash": current_hash,
+        "findings": list(review_state.findings or []),
+        "reviewer_models": list(review_state.reviewer_models or []),
+        "raw_actor_records": list(review_state.raw_actor_records or []),
+        "raw_result": review_state.raw_result,
+        "advisory_result": dict(review_state.advisory_result or {}),
+        "author_disposition": author_record,
+        "reviewed_content_hash": review_state.reviewed_content_hash,
+    }
+
+
 def _handle_review_skill(
     ctx: ToolContext,
     skill: str = "",
@@ -593,6 +668,29 @@ def _handle_review_skill(
         _load_accepted_rebuttals,
         render_skill_review_block,
     )
+    author_value = str(author_disposition or "").strip().lower()
+    author_reason = " ".join(str(author_rationale or "").split()).strip()
+    if author_value or author_reason:
+        if author_value not in {"accepted", "rejected", "partial", "deferred"} or not author_reason:
+            return "⚠️ SKILL_REVIEW_ERROR: explicit author finish requires a valid disposition and rationale."
+        finished = _author_finish_existing_skill_review(
+            ctx, binding, skill_name, disposition=author_value, rationale=author_reason,
+        )
+        if finished is None:
+            return "⚠️ SKILL_REVIEW_ERROR: author finish could not bind the selected skill revision."
+        if finished.get("error"):
+            return str(finished["error"])
+        attempt_idx = _count_attempts_for_content(
+            binding.state_drive_root, skill_name, str(finished.get("content_hash") or ""),
+        ) or 1
+        accepted_rebuttals = _load_accepted_rebuttals(binding.state_drive_root, skill_name)
+        markdown = render_skill_review_block(
+            finished, attempt_idx=attempt_idx, accepted_rebuttals=accepted_rebuttals,
+        )
+        return markdown + (
+            "\n\nAuthor finish recorded for the current hash; raw reviewer findings and "
+            "the prior reviewer signal remain unchanged. No reviewer PASS was fabricated."
+        )
     from ouroboros.skill_review_runner import run_skill_review_lifecycle_blocking
 
     def _review_with_optional_rebuttal(review_ctx: ToolContext, review_name: str):
@@ -616,39 +714,6 @@ def _handle_review_skill(
     )
     drive_root = binding.state_drive_root
     content_hash = str(payload.get("content_hash") or "")
-    author_value = str(author_disposition or "").strip().lower()
-    author_reason = " ".join(str(author_rationale or "").split()).strip()
-    if author_value or author_reason:
-        from ouroboros.config import get_review_enforcement
-        from ouroboros.review_records import build_author_disposition
-        from ouroboros.skill_loader import load_review_state, save_review_state
-
-        if str(get_review_enforcement() or "").strip().lower() != "advisory":
-            return "⚠️ SKILL_REVIEW_ERROR: author finish is available only under advisory enforcement; raw review findings remain recorded."
-        if not content_hash:
-            return "⚠️ SKILL_REVIEW_ERROR: the review returned no content hash; no author finish was persisted."
-        try:
-            author_record = build_author_disposition(
-                disposition=author_value,
-                rationale=author_reason,
-                subject_hash=content_hash,
-                reviewer_signal=str(payload.get("status") or ""),
-                enforcement="advisory",
-            )
-        except ValueError as exc:
-            return f"⚠️ SKILL_REVIEW_ERROR: {exc}"
-        review_state = load_review_state(drive_root, skill_name)
-        if review_state.content_hash != content_hash:
-            return "⚠️ SKILL_REVIEW_ERROR: the selected skill revision changed; no author finish was persisted."
-        # Deterministic preflight/pending outcomes remain non-executable even in
-        # advisory mode; author finish records the stance but cannot launder a
-        # missing or failed gate into a verdict.
-        if normalize_skill_review_status(review_state.status) == "pending":
-            return "⚠️ SKILL_REVIEW_ERROR: deterministic or infrastructure review is pending; raw findings remain recorded."
-        review_state.author_disposition = author_record
-        save_review_state(drive_root, skill_name, review_state)
-        payload = dict(payload)
-        payload["author_disposition"] = author_record
     attempt_idx = _count_attempts_for_content(drive_root, skill_name, content_hash) if content_hash else 1
     if attempt_idx <= 0:
         attempt_idx = 1
