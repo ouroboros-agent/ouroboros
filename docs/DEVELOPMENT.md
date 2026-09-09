@@ -1585,7 +1585,7 @@ schedule retain their separate existing CI owners.
 ### Light mode and external deliverables
 
 - `runtime_mode=light` is a self-modification boundary (`ouroboros/config.py`
-  owns the semantics; ARCHITECTURE "Safety and runtime mode" states why). User-visible deliverables are allowed when they are outside the
+  owns the semantics; ARCHITECTURE "Safety and runtime mode" states why). `pro` and `cyber_pro` share the protected-rewrite seam, while `cyber_pro` additionally permits the selected owner-configuration paths; User-visible deliverables are allowed when they are outside the
   Ouroboros repo/control-plane.
 - Preferred flow: `task_drive` for scratch, `artifact_store` for canonical
   deliverables, `user_files` for the owner's visible copy.
