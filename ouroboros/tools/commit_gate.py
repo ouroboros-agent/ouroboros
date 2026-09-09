@@ -524,18 +524,11 @@ def _record_commit_attempt(
         triad_raw_results = _req("triad_raw_results", None)
         scope_raw_result = _req("scope_raw_result", None)
         author_disposition = _req("author_disposition", None)
-        if author_disposition is None and status == "succeeded" and getattr(ctx, "_review_advisory", None):
-            from ouroboros.review_records import build_author_disposition
-            try:
-                author_disposition = build_author_disposition(
-                    disposition="accepted",
-                    rationale="Author continued after reviewing the recorded advisory findings.",
-                    subject_hash=str(snapshot_hash or ""),
-                    reviewer_signal="advisory",
-                    enforcement="advisory",
-                )
-            except ValueError:
-                author_disposition = {}
+        # An author-disposition record is an explicit owner/agent stance, not
+        # an inference from reaching a successful commit.  Ordinary Advisory
+        # commits retain their raw findings without manufacturing an
+        # ``accepted`` decision; callers that actually collect the author's
+        # rationale pass the validated record through this field.
         block_class = _req("block_class")
         rebuttal_sha256 = _req("rebuttal_sha256")
         paid = _req("paid", False)

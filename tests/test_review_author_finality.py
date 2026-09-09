@@ -1,6 +1,16 @@
 import json
+import inspect
 
 import pytest
+
+
+def test_commit_attempt_does_not_infer_author_finish_from_success():
+    from ouroboros.tools import commit_gate
+
+    source = inspect.getsource(commit_gate._record_commit_attempt)
+    assert 'author_disposition = _req("author_disposition", None)' in source
+    assert 'if author_disposition is None and status == "succeeded"' not in source
+    assert 'disposition="accepted"' not in source
 
 
 def test_author_disposition_is_hash_bound_and_rejects_malformed():
