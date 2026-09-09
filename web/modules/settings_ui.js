@@ -29,6 +29,16 @@ const EFFORT_FIELDS = [
     ['s-effort-consciousness', 'Consciousness', 'high'],
 ];
 
+// Runtime mode is one axis of the owner policy contract. Keep the Settings
+// presentation in the same vocabulary as the onboarding setup contract; the
+// saved value is still handled by settings.js and the owner endpoint.
+const RUNTIME_MODE_OPTIONS = [
+    { value: 'light', label: 'Light' },
+    { value: 'advanced', label: 'Advanced' },
+    { value: 'pro', label: 'Pro' },
+    { value: 'cyber_pro', label: 'Cyber Pro' },
+];
+
 function providerCard({ id, title, icon, hint, body, open = false }) {
     return `
         <details class="settings-provider-card" data-provider-card="${id}" ${open ? 'open' : ''}>
@@ -405,6 +415,7 @@ export function renderSettingsPage() {
                                     { value: 'blocking', label: 'Blocking' },
                                 ],
                             })}
+                            <div class="settings-inline-note" data-policy-state="review" role="status" aria-live="polite"></div>
                         </div>
                     </div>
 
@@ -542,6 +553,7 @@ export function renderSettingsPage() {
                                     { value: 'off', label: 'Off' },
                                 ],
                             })}
+                            <div class="settings-inline-note" data-policy-state="supervisor" role="status" aria-live="polite"></div>
                             <div id="s-safety-skip-counter" class="settings-section-copy"></div>
                         </div>
                     </div>
@@ -571,28 +583,26 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Runtime Mode</h3>
+                        <h3>Access</h3>
                         <div class="settings-section-copy">
                             Separate axis from Review Enforcement. Controls how far Ouroboros is allowed to self-modify.
                             <code>Light</code> blocks repo self-modification but allows reviewed + enabled skills to run.
                             <code>Advanced</code> is the default &mdash; self-modify the evolutionary layer; protected core/contract/release files stay guarded by the shared runtime-mode policy.
                             <code>Pro</code> can edit protected core/contract/release surfaces, but commits still go through the normal triad + scope review gate; Advanced remains limited to the evolutionary layer.
+                            <code>Cyber Pro</code> grants the full host and configuration authority, including credentials, policy settings, and protected rewrites. Review Enforcement remains independent, so <code>Blocking</code> stays available in Cyber Pro.
                             <br><strong>Human controlled:</strong> desktop builds ask the launcher for native confirmation before saving a mode change.
                             Web/Docker sessions save mode changes through the owner endpoint; the new mode takes effect after restart.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Runtime Mode</label>
+                            <label>Access level</label>
                             <input id="s-runtime-mode" type="hidden" value="advanced">
                             ${renderSegmentedField({
                                 target: 's-runtime-mode',
                                 modifier: 'data-runtime-mode-group',
                                 title: 'Runtime mode changes require native launcher confirmation and restart.',
-                                options: [
-                                    { value: 'light', label: 'Light' },
-                                    { value: 'advanced', label: 'Advanced' },
-                                    { value: 'pro', label: 'Pro' },
-                                ],
+                                options: RUNTIME_MODE_OPTIONS,
                             })}
+                            <div class="settings-inline-note" data-policy-state="access" role="status" aria-live="polite"></div>
                         </div>
                     </div>
 

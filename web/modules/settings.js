@@ -131,9 +131,9 @@ function syncPolicyState(root, meta) {
     const access = state.access || {};
     render('access', access.restart_required
         ? `Saved: ${policyValueLabel(access.configured)} · Active: ${policyValueLabel(access.effective)} · Restart required`
-        : `Active: ${policyValueLabel(access.effective)} · Access changes require restart`);
+        : `Active: ${policyValueLabel(access.effective)} · Applies after restart`);
     const suffix = (item) => item.pending
-        ? `Saved: ${policyValueLabel(item.configured)} · ${state.running_task_snapshot ? 'Current task keeps its snapshot · ' : ''}Next task uses the saved value`
+        ? `Saved: ${policyValueLabel(item.configured)} · Current task keeps its snapshot · Next task uses the saved value`
         : `Effective for new tasks: ${policyValueLabel(item.effective)}`;
     render('supervisor', suffix(state.supervisor || {}));
     render('review', suffix(state.review || {}));

@@ -129,6 +129,15 @@
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract
  * @property {AvailableSubagentsSettingsMeta=} available_subagents
+ * @property {SettingsPolicyState=} policy_state
+ */
+
+/**
+ * @typedef {Object} SettingsPolicyState
+ * @property {{configured:string,effective:string,restart_required:boolean,applies:string}} access
+ * @property {{configured:string,effective:string,pending:boolean,applies:string}} supervisor
+ * @property {{configured:string,effective:string,pending:boolean,applies:string}} review
+ * @property {boolean} running_task_snapshot
  */
 
 /**

@@ -72,7 +72,7 @@ def test_llm_internal_fallbacks_follow_shipped_model_defaults(monkeypatch):
 def test_valid_runtime_modes_is_frozen_tuple():
     from ouroboros.config import VALID_RUNTIME_MODES
 
-    assert VALID_RUNTIME_MODES == ("light", "advanced", "pro")
+    assert VALID_RUNTIME_MODES == ("light", "advanced", "pro", "cyber_pro")
 
 
 @pytest.mark.parametrize("mode", ["light", "advanced", "pro"])
