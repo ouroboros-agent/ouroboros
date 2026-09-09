@@ -2395,6 +2395,30 @@
    "is_error": false,
    "status": "ok"
   },
+  "ident:SKILL_REVIEW_AUTHOR_FINISH_BLOCKED:named": {
+   "is_error": true,
+   "status": "blocked"
+  },
+  "ident:SKILL_REVIEW_AUTHOR_FINISH_BLOCKED:plain": {
+   "is_error": true,
+   "status": "blocked"
+  },
+  "ident:SKILL_REVIEW_AUTHOR_FINISH_INVALID:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:SKILL_REVIEW_AUTHOR_FINISH_INVALID:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:SKILL_REVIEW_AUTHOR_FINISH_STALE:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:SKILL_REVIEW_AUTHOR_FINISH_STALE:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
   "ident:SKILL_REVIEW_ERROR:named": {
    "is_error": true,
    "status": "error"

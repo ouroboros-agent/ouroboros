@@ -753,7 +753,15 @@ def _run_shell_safety_check(
     # GitHub repo create/delete/auth — argv-positional, never substring (#447 A7).
     from ouroboros.git_shell_policy import gh_shell_block_reason
 
-    if gh_block := gh_shell_block_reason(raw_cmd, runtime_mode=runtime_mode):
+    try:
+        gh_block = gh_shell_block_reason(raw_cmd, runtime_mode=runtime_mode)
+    except TypeError as exc:
+        # Preserve the existing injectable policy seam for callers/tests that
+        # provide the legacy one-argument observer.
+        if "runtime_mode" not in str(exc):
+            raise
+        gh_block = gh_shell_block_reason(raw_cmd)
+    if gh_block:
         return ToolResult(status="blocked", code="SAFETY_VIOLATION", text=gh_block)
 
     return registry_guards._shell_git_and_runtime_block(
