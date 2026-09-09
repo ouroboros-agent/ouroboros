@@ -624,9 +624,9 @@ def _handle_review_skill(
         from ouroboros.skill_loader import load_review_state, save_review_state
 
         if str(get_review_enforcement() or "").strip().lower() != "advisory":
-            return "⚠️ SKILL_REVIEW_AUTHOR_FINISH_BLOCKED: author finish is available only under advisory enforcement; raw review findings remain recorded."
+            return "⚠️ SKILL_REVIEW_ERROR: author finish is available only under advisory enforcement; raw review findings remain recorded."
         if not content_hash:
-            return "⚠️ SKILL_REVIEW_AUTHOR_FINISH_INVALID: the review returned no content hash; no author finish was persisted."
+            return "⚠️ SKILL_REVIEW_ERROR: the review returned no content hash; no author finish was persisted."
         try:
             author_record = build_author_disposition(
                 disposition=author_value,
@@ -636,15 +636,15 @@ def _handle_review_skill(
                 enforcement="advisory",
             )
         except ValueError as exc:
-            return f"⚠️ SKILL_REVIEW_AUTHOR_FINISH_INVALID: {exc}"
+            return f"⚠️ SKILL_REVIEW_ERROR: {exc}"
         review_state = load_review_state(drive_root, skill_name)
         if review_state.content_hash != content_hash:
-            return "⚠️ SKILL_REVIEW_AUTHOR_FINISH_STALE: the selected skill revision changed; no author finish was persisted."
+            return "⚠️ SKILL_REVIEW_ERROR: the selected skill revision changed; no author finish was persisted."
         # Deterministic preflight/pending outcomes remain non-executable even in
         # advisory mode; author finish records the stance but cannot launder a
         # missing or failed gate into a verdict.
         if normalize_skill_review_status(review_state.status) == "pending":
-            return "⚠️ SKILL_REVIEW_AUTHOR_FINISH_BLOCKED: deterministic or infrastructure review is pending; raw findings remain recorded."
+            return "⚠️ SKILL_REVIEW_ERROR: deterministic or infrastructure review is pending; raw findings remain recorded."
         review_state.author_disposition = author_record
         save_review_state(drive_root, skill_name, review_state)
         payload = dict(payload)
