@@ -154,7 +154,7 @@ def test_widgets_media_sources_are_constrained_to_extension_routes_or_data_urls(
 
 def test_widgets_downloads_use_host_handler_not_navigation():
     source = _widgets_js()
-    helper = _read("web/modules/ui_helpers.js")
+    helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     assert "data-widget-download-url" in source
     assert "event.preventDefault();" in source
     assert "downloadViaHostBridge(" in source
@@ -442,11 +442,11 @@ def test_widgets_job_poll_retries_transient_transport_without_dropping_id():
 
 
 def test_widgets_use_design_radius_tokens():
-    style = (REPO_ROOT / "web" / "style.css").read_text(encoding="utf-8")
-    block_start = style.index(".widget-field input,")
+    style = _read("web/ui.css")
+    block_start = style.index(".ui-control {")
     block_end = style.index("}", block_start)
     block = style[block_start:block_end]
-    assert "border-radius: var(--radius-sm);" in block
+    assert "border-radius: var(--radius);" in block
     assert "border-radius: 9px;" not in block
 
 
@@ -509,7 +509,7 @@ def test_widget_json_wraps_inside_its_host_card():
 
 def test_widget_fault_status_wraps_inside_narrow_card():
     style = _read("web/style.css")
-    root = style.split(":root {", 1)[1].split("}", 1)[0]
+    root = _read("web/ui.css").split(":root {", 1)[1].split("}", 1)[0]
     controls = style.split(".widgets-card-controls {", 1)[1].split("}", 1)[0]
     status = style.split(".widgets-card-controls .ui-status:not([hidden]) {", 1)[1].split("}", 1)[0]
     assert "--widget-fault-status-max-width: min(240px, 35vw);" in root
@@ -619,7 +619,7 @@ def test_widgets_forms_charts_and_kanban_keep_host_owned_contracts():
     renderer with its number formatter and http(s)-only link guard followed in
     the cycle-A fix round."""
     source = _widgets_js()
-    helper = _read("web/modules/ui_helpers.js")
+    helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     chart = _read("web/modules/widget_chart.js")
     assert "renderSafeField(" in source
     assert "collectSafeFieldValues(" in source
@@ -669,7 +669,7 @@ def test_widgets_responsive_design_system_styles_are_host_owned():
 
 def test_widget_public_tones_share_the_host_normalizer_and_canonical_css():
     source = _widgets_js()
-    helper = _read("web/modules/ui_helpers.js")
+    helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     style = _read("web/style.css")
     assert "function widgetTone" not in _framed_widget_sources()
     assert "normalizeTone(component.tone)" in source

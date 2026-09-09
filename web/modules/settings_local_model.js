@@ -1,5 +1,6 @@
 import { showToast } from './toast.js';
-import { apiFetch } from './api_client.js';
+import { apiFetch, fetchJson } from './api_client.js';
+import { setInlineStatus } from './ui_helpers.js';
 
 
 function readLocalModelBody() {
@@ -45,14 +46,18 @@ function setProgressBar(fraction) {
 }
 
 export function bindLocalModelControls({ state }) {
+    let destroyed = false;
+    let stopPending = false;
+    let ready = false;
     async function updateLocalStatus() {
-        if (state.activePage !== 'settings') return;
+        if (destroyed || state.activePage !== 'settings') return;
         try {
-            const resp = await apiFetch('/api/local-model/status', { cache: 'no-store' });
-            const d = await resp.json();
+            const d = await fetchJson('/api/local-model/status', { cache: 'no-store' });
+            if (destroyed) return;
             const el = document.getElementById('local-model-status');
             if (!el) return;
             const isReady = d.status === 'ready';
+            ready = isReady;
             const isInstalling = d.runtime_status === 'installing';
             const isDownloading = d.status === 'downloading';
             const runtimeMissing = d.runtime_status === 'missing' || d.runtime_status === 'install_error';
@@ -74,7 +79,7 @@ export function bindLocalModelControls({ state }) {
             el.textContent = text;
             el.dataset.tone = isReady ? 'ok' : (d.status === 'error' || d.runtime_status === 'install_error' ? 'error' : 'muted');
 
-            document.getElementById('btn-local-stop').disabled = !isReady;
+            document.getElementById('btn-local-stop').disabled = stopPending || !isReady;
             document.getElementById('btn-local-test').disabled = !isReady;
             document.getElementById('btn-local-start').disabled = isInstalling || isDownloading;
 
@@ -144,12 +149,29 @@ export function bindLocalModelControls({ state }) {
     document.getElementById('btn-local-start').addEventListener('click', triggerStart);
 
     document.getElementById('btn-local-stop').addEventListener('click', async () => {
+        if (destroyed || stopPending) return;
+        const button = document.getElementById('btn-local-stop');
+        const status = document.getElementById('local-model-action-status');
+        stopPending = true;
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+        setInlineStatus(status, 'Stopping…', 'muted');
         try {
-            await apiFetch('/api/local-model/stop', { method: 'POST' });
+            const result = await fetchJson('/api/local-model/stop', { method: 'POST' }, { rejectOkFalse: true });
+            if (destroyed) return;
+            if (result?.status !== 'stopped' || result?.error) throw new Error(result?.error || 'The server did not confirm Stop.');
             setProgressBar(null);
-            updateLocalStatus();
+            setInlineStatus(status, 'Local model stopped.', 'ok');
+            status?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+            await updateLocalStatus();
         } catch (e) {
-            showToast('Failed: ' + e.message, 'error');
+            if (!destroyed) {
+                setInlineStatus(status, `Stop failed: ${e.message}. You can retry Stop.`, 'error');
+                status?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+            }
+        } finally {
+            stopPending = false;
+            if (!destroyed) { button.disabled = !ready; button.removeAttribute('aria-busy'); }
         }
     });
 
@@ -197,5 +219,6 @@ export function bindLocalModelControls({ state }) {
     }
 
     updateLocalStatus();
-    setInterval(updateLocalStatus, 3000);
+    const interval = setInterval(updateLocalStatus, 3000);
+    return () => { destroyed = true; clearInterval(interval); };
 }

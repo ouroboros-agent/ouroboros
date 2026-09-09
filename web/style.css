@@ -1,150 +1,4 @@
-:root {
-    --bg-primary: #0d0b0f;
-    --bg-secondary: #1a1520;
-    --bg-card: rgba(255, 255, 255, 0.06);
-    --bg-hover: rgba(255, 255, 255, 0.08);
-    /* Type scale + foreground semantics: docs/DESIGN.md. Four sizes, no fifth. */
-    --type-meta: 12px;
-    --type-body: 14px;
-    --type-section: 16px;
-    --type-page: 24px;
-    --line-meta: 1.35;
-    --line-body: 1.5;
-    --line-title: 1.3;
-    --text-primary: #e2e8f0;
-    --text-secondary: rgba(255, 255, 255, 0.54);
-    --text-meta: rgba(255, 255, 255, 0.68);
-    --text-disabled: rgba(255, 255, 255, 0.38);
-    --text-muted: var(--text-disabled);  /* legacy alias */
-    --accent: #c93545;
-    --accent-light: #f07a86;
-    --accent-dim: rgba(201, 53, 69, 0.15);
-    /* Accent alpha tokens; keep future tweaks off hardcoded rgba literals. */
-    --accent-04: rgba(201, 53, 69, 0.04);
-    --accent-05: rgba(201, 53, 69, 0.05);
-    --accent-08: rgba(201, 53, 69, 0.08);
-    --accent-10: rgba(201, 53, 69, 0.10);
-    --accent-12: rgba(201, 53, 69, 0.12);
-    --accent-18: rgba(201, 53, 69, 0.18);
-    --accent-22: rgba(201, 53, 69, 0.22);
-    --accent-25: rgba(201, 53, 69, 0.25);
-    --accent-35: rgba(201, 53, 69, 0.35);
-    --accent-45: rgba(201, 53, 69, 0.45);
-    --accent-55: rgba(201, 53, 69, 0.55);
-    --accent-65: rgba(201, 53, 69, 0.65);
-    /* Project identity (vivid fuchsia): a converted task card, its sidebar marker,
-       and the project panel header share this so "this is a project" reads as a
-       deliberate state — never the red task accent (looked like an error, P3) and
-       never the blue owner voice. The old calm-indigo sat next to the user-message
-       blue and the two blurred together; fuchsia is unmistakably its own role.
-       Base is legible-on-dark fuchsia-400; every tint shares the SAME hue (C7.3). */
-    --project: #e879f9;
-    --project-08: rgba(232, 121, 249, 0.08);
-    --project-12: rgba(232, 121, 249, 0.12);
-    --project-18: rgba(232, 121, 249, 0.18);
-    /* User / owner voice: the owner's chat bubble + sender accents. Tokenized so
-       the hue lives in one place and stays clear of the project fuchsia (C7.2). */
-    --user-bubble-from: rgba(80, 120, 190, 0.14);
-    --user-bubble-to: rgba(55, 85, 155, 0.12);
-    --user-border: rgba(110, 150, 210, 0.18);
-    --user-glow: rgba(160, 190, 245, 0.04);
-    --user-sender: rgba(155, 185, 240, 0.95);
-    --user-text: rgba(215, 230, 255, 0.96);
-    /* System / owner-control voice: amber notices (system bubble + sender). Same
-       hue as the system role, tokenized so it tracks one source (C7.2). */
-    --system-bubble-bg: rgba(245, 158, 11, 0.12);
-    --system-border: rgba(245, 158, 11, 0.45);
-    --system-sender: rgba(245, 158, 11, 0.9);
-    --system-text: rgba(255, 240, 210, 0.78);
-    /* Assistant / agent voice: the assistant bubble's sender + body tints,
-       tokenized like the user/system voices above (C7.2). */
-    --assistant-sender: rgba(250, 125, 125, 0.95);
-    --assistant-text: rgba(255, 235, 238, 0.96);
-    --blue: #3b82f6;
-    --amber: #f59e0b;
-    --amber-dim: rgba(245, 158, 11, 0.15);
-    --green: #22c55e;
-    --green-dim: rgba(34, 197, 94, 0.15);
-    --red: #ef4444;
-    --red-dim: rgba(239, 68, 68, 0.15);
-    --divider: rgba(255, 255, 255, 0.06);
-    --surface-border: rgba(255, 255, 255, 0.08);
-    --surface-border-soft: rgba(255, 255, 255, 0.06);
-    --surface-card: rgba(255, 255, 255, 0.03);
-    --surface-card-soft: rgba(255, 255, 255, 0.025);
-    --surface-control: rgba(255, 255, 255, 0.04);
-    --diagram-font: Inter, system-ui, sans-serif;
-    --diagram-bg: #151318;
-    --diagram-primary: #25222c;
-    --diagram-primary-text: #f4eef7;
-    --diagram-border: #6f6678;
-    --diagram-line: #9b90a6;
-    --diagram-secondary: #302b39;
-    --diagram-tertiary: #19171d;
-    --ui-card-bg: var(--surface-card);
-    --ui-card-bg-soft: var(--surface-card-soft);
-    --ui-card-border: var(--surface-border);
-    --ui-modal-bg: rgba(18, 20, 26, 0.98);
-    /* Status triples: fg/bg/border named together, never derived
-       (docs/DESIGN.md "Status and chips"). The fg tints are readable at 12px on
-       near-black; the saturated --green/--amber/--red stay for dots, tracks and
-       other large indicators. */
-    --status-ok-fg: #6ee7b7;
-    --status-ok-bg: var(--green-dim);
-    --status-ok-border: rgba(34, 197, 94, 0.28);
-    --status-warn-fg: #fcd34d;
-    --status-warn-bg: var(--amber-dim);
-    --status-warn-border: rgba(245, 158, 11, 0.30);
-    --status-error-fg: #fca5a5;
-    --status-error-bg: var(--red-dim);
-    --status-error-border: rgba(239, 68, 68, 0.30);
-    --status-neutral-fg: var(--text-meta);
-    --status-neutral-bg: rgba(255, 255, 255, 0.06);
-    --status-neutral-border: rgba(255, 255, 255, 0.12);
-    --focus-accent-border: rgba(201, 53, 69, 0.4);
-    --focus-accent-ring: var(--accent-10);
-    --radius-xs: 3px;
-    --radius-sm: 8px;
-    /* In-between radius used by chips, counters, and fade rules. */
-    --radius-md: 10px;
-    --radius: 12px;
-    --radius-lg: 16px;
-    --radius-xl: 20px;
-    --page-header-padding-y: 10px;
-    --page-header-padding-x: 20px;
-    --page-header-padding-bottom: 6px;
-    --pill-padding-y: 7px;
-    --pill-padding-x: 14px;
-    --pill-font-size: 13px;
-    --pill-radius: 999px;
-    --pill-strip-padding: 6px 0 8px;
-    --button-padding-y: 8px;
-    --button-padding-x: 16px;
-    --button-font-size: 13px;
-    --button-min-height: 34px;
-    --widget-fault-status-max-width: min(240px, 35vw);
-    /* App shell: persistent desktop sidebar + optional project detail pane. */
-    --sidebar-width: 280px;
-    --project-panel-width: clamp(340px, 36vw, 440px);
-    --nav-item-radius: 10px;
-    /* One hover fill for an item in a popup menu or a picker list. Six menus
-       used five different fills (0.04 / 0.06 / 0.08 / an accent tint / an
-       undeclared --surface-2), so the same gesture looked like a different
-       control depending on which menu you opened. */
-    --menu-item-hover: rgba(255, 255, 255, 0.07);
-    /* 8pt spacing scale (Apple HIG / common 8pt grid) — use these instead of
-       ad-hoc pixel values so spacing stays consistent across components. */
-    --space-1: 4px;
-    --space-2: 8px;
-    --space-3: 12px;
-    --space-4: 16px;
-    --space-5: 24px;
-    /* Bounded scroll region for the Updates restore list (DESIGN section 5:
-       a new visual dimension becomes a variable before a page-local literal). */
-    --updates-list-max-height: 320px;
-    --vvh: 100dvh;
-}
-
+/* Shared values and controls live in ui.css; this sheet owns page composition. */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 /* The universal reset above also clears the UA's `dialog { margin: auto }`,
@@ -153,8 +7,6 @@
    dialogs as a class, not per dialog. */
 dialog { margin: auto; }
 
-/* Color-only utility — never a font-size (docs/DESIGN.md ".muted"). */
-.muted { color: var(--text-meta); }
 
 [hidden] {
     display: none !important;
@@ -239,6 +91,8 @@ body.resizing-panels { user-select: none; }
     gap: var(--space-1);
     scrollbar-width: thin;
 }
+
+.sidebar-scroll > * { flex-shrink: 0; }
 
 #nav-version {
     display: block;
@@ -651,15 +505,7 @@ body.resizing-panels { user-select: none; }
     flex-shrink: 0;
 }
 
-.files-toolbar input {
-    flex: 1;
-    min-width: 0;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--divider);
-    color: var(--text-primary);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
-}
+.files-toolbar input { flex: 1; min-width: 0; }
 
 .files-browser-header {
     display: flex;
@@ -780,6 +626,7 @@ body.resizing-panels { user-select: none; }
 }
 
 .files-preview-header {
+    flex-wrap: wrap;
     padding: 16px 20px 12px;
     border-bottom: 1px solid var(--divider);
     display: flex;
@@ -789,11 +636,14 @@ body.resizing-panels { user-select: none; }
     flex-shrink: 0;
 }
 
+.files-preview-header > :first-child { flex: 1 1 220px; min-width: 0; }
 .files-preview-actions {
-    display: inline-flex;
-    gap: 8px;
-    flex-shrink: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    min-width: 0;
 }
+.files-preview-status { padding: var(--space-2) var(--space-4); overflow-wrap: anywhere; }
 
 .files-preview-path {
     font-size: 14px;
@@ -831,31 +681,11 @@ body.resizing-panels { user-select: none; }
     gap: 12px;
 }
 
-.files-editor-name {
-    width: 100%;
-    border: 1px solid var(--divider);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--text-primary);
-    font: inherit;
-}
-
 .files-editor {
-    width: 100%;
     flex: 1;
     min-height: 320px;
-    border: 0;
-    outline: none;
     resize: none;
     margin: 0;
-    padding: 0;
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    line-height: inherit;
-    white-space: pre;
-    tab-size: 4;
 }
 
 .files-preview-image {
@@ -903,51 +733,7 @@ body.resizing-panels { user-select: none; }
     box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
 }
 
-.files-context-menu {
-    position: fixed;
-    min-width: 160px;
-    padding: 6px;
-    border-radius: var(--radius);
-    border: 1px solid var(--divider);
-    background: rgba(18, 20, 26, 0.96);
-    box-shadow: 0 20px 45px rgba(0, 0, 0, 0.35);
-    z-index: 20;
-}
-
-.files-context-item {
-    width: 100%;
-    border: none;
-    border-radius: var(--radius-sm);
-    padding: 10px 12px;
-    background: transparent;
-    color: var(--text-primary);
-    text-align: left;
-    cursor: pointer;
-}
-
-.files-context-item:hover {
-    background: var(--menu-item-hover);
-}
-
-.files-context-item-danger {
-    color: var(--status-error-fg);
-}
-
-.files-context-item-danger:hover {
-    background: rgba(239, 68, 68, 0.12);
-    color: #fecaca;
-}
-
-.files-modal-input {
-    width: 100%;
-    margin-top: 14px;
-    border: 1px solid var(--divider);
-    border-radius: var(--radius-md);
-    padding: 11px 12px;
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--text-primary);
-    font: inherit;
-}
+.files-modal-input { margin-top: var(--space-3); }
 
 .page-header,
 .app-page-header {
@@ -1066,7 +852,8 @@ body.resizing-panels { user-select: none; }
     transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
-.app-tab:hover,
+.app-tab:hover { background: var(--menu-item-hover); }
+
 .app-tab.active,
 .app-tab.is-active {
     color: var(--text-primary);
@@ -1091,21 +878,15 @@ body.resizing-panels { user-select: none; }
 
 .scroll-fade-y {
     --scroll-fade-edge: 32px;
-    -webkit-mask-image: linear-gradient(
-        180deg,
-        transparent 0,
-        black var(--scroll-fade-edge),
-        black calc(100% - var(--scroll-fade-edge)),
-        transparent 100%
-    );
-            mask-image: linear-gradient(
-        180deg,
-        transparent 0,
-        black var(--scroll-fade-edge),
-        black calc(100% - var(--scroll-fade-edge)),
-        transparent 100%
-    );
+    --scroll-fade-top: 0px;
+    --scroll-fade-bottom: 0px;
+    -webkit-mask-image: linear-gradient(180deg, transparent 0,
+        black var(--scroll-fade-top), black calc(100% - var(--scroll-fade-bottom)), transparent 100%);
+    mask-image: linear-gradient(180deg, transparent 0,
+        black var(--scroll-fade-top), black calc(100% - var(--scroll-fade-bottom)), transparent 100%);
 }
+.scroll-fade-y[data-scroll-above] { --scroll-fade-top: var(--scroll-fade-edge); }
+.scroll-fade-y[data-scroll-below] { --scroll-fade-bottom: var(--scroll-fade-edge); }
 
 .page-header .spacer { flex: 1; }
 
@@ -1123,21 +904,26 @@ body.resizing-panels { user-select: none; }
     z-index: 5;
     row-gap: 10px;
     pointer-events: none;
-    /* Fade to transparent so the transcript scrolls under without a hard edge. */
-    background: linear-gradient(
-        180deg,
-        rgba(13, 11, 15, 0.92) 0%,
-        rgba(13, 11, 15, 0.78) 45%,
-        rgba(13, 11, 15, 0.38) 80%,
-        rgba(13, 11, 15, 0.00) 100%
-    );
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    -webkit-mask-image: none;
+    mask-image: none;
+    overflow: visible;
+}
+
+/* Blur is decoration, so fade its own layer without masking header actions. */
+.chat-page-header::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: linear-gradient(180deg, var(--bg-primary), transparent);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
-    /* Dropdowns/menus must not fade under a header mask; the background
-       gradient is enough to soften the transcript edge. */
-    -webkit-mask-image: none;
-            mask-image: none;
-    overflow: visible;
+    -webkit-mask-image: linear-gradient(180deg, black 45%, transparent 100%);
+    mask-image: linear-gradient(180deg, black 45%, transparent 100%);
 }
 
 .chat-page-header > * {
@@ -1445,7 +1231,7 @@ body.resizing-panels { user-select: none; }
 @media (max-width: 980px) {
     .files-layout {
         grid-template-columns: 1fr;
-        grid-template-rows: minmax(220px, 320px) minmax(0, 1fr);
+        grid-template-rows: minmax(0, 30%) minmax(0, 1fr);
         grid-template-areas:
             "sidebar"
             "preview";
@@ -1455,7 +1241,10 @@ body.resizing-panels { user-select: none; }
         border-right: none;
         border-bottom: 1px solid var(--divider);
         max-height: none;
+        overflow-y: auto;
     }
+    .files-sidebar > * { flex-shrink: 0; }
+    .files-sidebar .files-list { overflow: visible; }
 
 }
 
@@ -2029,15 +1818,7 @@ body.resizing-panels { user-select: none; }
     min-height: 1.45em;
 }
 
-.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity {
-    min-height: 3em;
-}
-
-/* The latest-activity line is the card's own reading text, so it is body
-   size: a card's summary outranks its timeline details (DESIGN.md §5). Root
-   activity remains visually quiet until naming; collapsed cards still reserve
-   its two-line band while running (a finished card folds an empty band,
-   below). Anywhere-wrap protects narrow cards and URLs. */
+/* Activity grows with useful content. Details retain the complete source. */
 .chat-live-activity {
     color: var(--text-meta);
     font-size: var(--type-body);
@@ -2046,21 +1827,11 @@ body.resizing-panels { user-select: none; }
     min-width: 0;
     overflow-wrap: anywhere;
 }
-
-.chat-live-activity:empty {
-    display: none;
+.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity {
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
 }
-
-.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity:empty {
-    display: -webkit-box;
-    visibility: hidden;
-}
-
-/* A finished card receives no more narration, so an empty band is dead air:
-   it folds, and the one-time height change lands with the finish re-render. */
-.chat-live-card[data-finished="1"]:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity:empty {
-    display: none;
-}
+.chat-live-card > .chat-live-summary-button .chat-live-activity:empty { display: none; }
 
 .chat-live-count {
     color: var(--text-secondary);
@@ -2406,31 +2177,12 @@ body.resizing-panels { user-select: none; }
     width: 100%;
     max-width: 100%;
     border-color: var(--accent-18);
-    background: rgba(255, 255, 255, 0.025);
+    background: var(--bg-secondary);
     box-shadow: inset 0 1px 0 rgba(255, 200, 210, 0.03);
 }
 
-/* Depth cue for a grandchild and deeper (#623, owner: nested frames stay): the
-   narrow regime flattens the indentation rails to keep the text column, so a
-   box nested inside a child box takes a slightly stronger tint and border than
-   its parent — depth reads from tone, not from pixels the column cannot spare.
-   The first four depths alternate; deeper boxes retain the last translucent
-   tint, which continues to layer over the containing box. */
-.chat-subagents .chat-subagents > .chat-live-card.subagent {
-    border-color: var(--accent-25);
-    background: rgba(255, 255, 255, 0.045);
-}
-
-.chat-subagents .chat-subagents .chat-subagents > .chat-live-card.subagent {
-    border-color: var(--accent-18);
-    background: rgba(255, 255, 255, 0.025);
-}
-
-.chat-subagents .chat-subagents .chat-subagents .chat-subagents > .chat-live-card.subagent {
-    border-color: var(--accent-25);
-    background: rgba(255, 255, 255, 0.045);
-}
-
+/* An opaque secondary surface prevents translucent tints accumulating at depth.
+   Nested frames and parent-child rails remain the hierarchy cue. */
 .chat-live-card.subagent .chat-live-summary-button {
     padding: 9px 12px;
 }
@@ -2441,7 +2193,7 @@ body.resizing-panels { user-select: none; }
    cost, last update, docked Reviews count). Only its narration line waits for
    expansion. The title stays on one line and stays IN the identity row at every
    width (the narrow-regime rule above gives it a 160px demand and lets the side
-   controls wrap under it instead). */
+   controls wrap under it instead). Activity now stays visible beneath it. */
 .chat-live-card.subagent .chat-live-title {
     font-weight: 400;
     color: var(--text-secondary);
@@ -2459,7 +2211,10 @@ body.resizing-panels { user-select: none; }
     text-overflow: ellipsis;
 }
 
-.chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity,
+.chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity {
+    -webkit-line-clamp: 1;
+    line-clamp: 1;
+}
 .chat-live-card.subagent .chat-live-toggle,
 .chat-live-card.subagent .chat-live-meta:empty {
     display: none;
@@ -3398,98 +3153,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     background: var(--ui-card-bg-soft);
 }
 
-.ui-chip,
-:where(.status-badge, .skills-status-chip, .mcp-server-status, .evo-runtime-pill, .evo-runtime-chip) {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border-radius: 999px;
-    white-space: nowrap;
-}
-
-/* The chip primitive reserves its border so a tone can paint it without
-   changing the chip's size. The aliases above keep their own geometry. */
-.ui-chip {
-    border: 1px solid transparent;
-}
-
-.ui-status,
-:where(.settings-inline-status, .marketplace-status, .wizard-runtime-status) {
-    color: var(--text-secondary);
-    font-size: var(--type-meta);
-    line-height: var(--line-meta);
-}
-
-/* Tone primitive (docs/DESIGN.md "Status and chips"). A status states a fact
-   with an EXPLICIT pair; it never derives its foreground from whatever generic
-   opacity happens to sit on the element.
-   Two shapes, because a status appears as two things:
-     - `.ui-status[data-tone]` — a status SENTENCE: foreground only, rendered as
-       dot + text. Giving it a fill would turn every inline status into a badge
-       and make the loudest thing on the panel the one that says "connected".
-     - `.ui-chip[data-tone]` — a status CHIP: the full triple, because the chip
-       itself is the status and has nothing else to carry it.
-   Tone is a STATE and must outrank the `.muted` utility: `#mp-status` carries
-   both classes, so a :where()-wrapped tone (specificity 0) would lose to it. */
-.ui-chip[data-tone="ok"] {
-    color: var(--status-ok-fg);
-    background: var(--status-ok-bg);
-    border-color: var(--status-ok-border);
-}
-.ui-chip[data-tone="warn"] {
-    color: var(--status-warn-fg);
-    background: var(--status-warn-bg);
-    border-color: var(--status-warn-border);
-}
-.ui-chip[data-tone="danger"],
-.ui-chip[data-tone="error"] {
-    color: var(--status-error-fg);
-    background: var(--status-error-bg);
-    border-color: var(--status-error-border);
-}
-.ui-chip[data-tone="neutral"],
-.ui-chip[data-tone="muted"] {
-    color: var(--status-neutral-fg);
-    background: var(--status-neutral-bg);
-    border-color: var(--status-neutral-border);
-}
-
-.ui-status[data-tone="ok"],
-.settings-inline-status[data-tone="ok"],
-.settings-test-result[data-tone="ok"],
-.marketplace-status[data-tone="ok"] { color: var(--status-ok-fg); }
-.ui-status[data-tone="warn"],
-.settings-inline-status[data-tone="warn"],
-.settings-test-result[data-tone="warn"],
-.marketplace-status[data-tone="warn"] { color: var(--status-warn-fg); }
-.ui-status[data-tone="danger"],
-.ui-status[data-tone="error"],
-.settings-inline-status[data-tone="danger"],
-.settings-inline-status[data-tone="error"],
-.settings-test-result[data-tone="danger"],
-.settings-test-result[data-tone="error"],
-.marketplace-status[data-tone="danger"] { color: var(--status-error-fg); }
-/* `muted` is a tone the code emits but no rule named. */
-.ui-status[data-tone="neutral"],
-.ui-status[data-tone="muted"],
-.settings-inline-status[data-tone="neutral"],
-.settings-inline-status[data-tone="muted"],
-.marketplace-status[data-tone="muted"] { color: var(--status-neutral-fg); }
-
-/* Status = dot + text (docs/DESIGN.md). Settings shell only. */
-.settings-inline-status[data-tone]:not(:empty)::before {
-    content: "";
-    display: inline-block;
-    flex: 0 0 auto;
-    width: 6px;
-    height: 6px;
-    margin-right: 7px;
-    border-radius: 999px;
-    background: currentColor;
-    vertical-align: middle;
-    position: relative;
-    top: -1px;
-}
 
 .ui-modal-backdrop,
 :where(.marketplace-modal-backdrop) {
@@ -3549,95 +3212,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     margin: 16px 0 12px;
 }
 
-.btn {
-    padding: var(--button-padding-y) var(--button-padding-x);
-    border-radius: var(--radius-sm);
-    border: 1px solid transparent;
-    font-size: var(--button-font-size);
-    font-weight: 500;
-    font-family: inherit;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    min-height: var(--button-min-height);
-    text-align: center;
-    transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.btn:focus-visible {
-    outline: 2px solid var(--focus-accent-border);
-    outline-offset: 2px;
-}
-
-.btn:hover {
-    transform: scale(1.02);
-}
-
-.btn:active {
-    transform: scale(0.98);
-    box-shadow: 0 0 0 3px var(--accent-08);
-}
-
-.btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-    transform: none;
-    box-shadow: none;
-}
-
-.btn-primary {
-    background: var(--accent-dim);
-    color: var(--accent-light);
-    border-color: var(--accent-18);
-}
-.btn-primary:hover {
-    background: var(--accent-25);
-    border-color: var(--accent-35);
-}
-/* An action the owner can take is legible at rest (docs/DESIGN.md section 6):
-   a button label parked at secondary ink reads as disabled next to the one
-   beside it. */
-.btn-secondary {
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--text-primary);
-    border-color: rgba(255, 255, 255, 0.10);
-}
-.btn-secondary:hover {
-    background: rgba(255, 255, 255, 0.07);
-    border-color: var(--accent-25);
-}
-.btn-ghost {
-    background: transparent;
-    color: var(--text-primary);
-    border-color: rgba(255, 255, 255, 0.08);
-}
-.btn-ghost:hover {
-    background: rgba(255, 255, 255, 0.04);
-}
-.btn-danger {
-    background: rgba(220, 38, 38, 0.2);
-    color: var(--status-error-fg);
-    border: 1px solid rgba(220, 38, 38, 0.3);
-}
-.btn-danger:hover { background: rgba(220, 38, 38, 0.35); }
-
-.btn-save {
-    background: var(--green-dim);
-    color: var(--green);
-    border-color: rgba(34, 197, 94, 0.22);
-}
-.btn-save:hover { background: rgba(34, 197, 94, 0.25); }
-.btn-default {
-    background: var(--bg-card);
-    color: var(--text-primary);
-    border-color: rgba(255, 255, 255, 0.08);
-}
-.btn-default:hover {
-    background: var(--bg-hover);
-    border-color: rgba(255, 255, 255, 0.14);
-}
 
 .form-section { margin-bottom: 24px; }
 
@@ -3666,25 +3240,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     color: var(--text-secondary);
 }
 
-.form-field input, .form-field select,
-.reviewer-slot-controls input, .reviewer-slot-controls select {
-    padding: 8px 12px;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--divider);
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    font-size: 14px;
-    font-family: inherit;
-    outline: none;
-    width: 320px;
-    max-width: 100%;
-    transition: border-color 0.2s, box-shadow 0.2s;
-}
-
-.form-field input:focus {
-    border-color: var(--focus-accent-border);
-    box-shadow: 0 0 0 3px var(--focus-accent-ring);
-}
 
 .local-toggle {
     display: flex;
@@ -4151,15 +3706,18 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .costs-budget-save { margin-top: 4px; }
 .costs-stats-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
-    margin-bottom: 24px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
 }
 .costs-tables-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
     gap: 20px;
 }
+.costs-stats-grid > *, .costs-tables-grid > * { min-width: 0; }
+.costs-tables-grid > * { overflow-x: auto; }
+.costs-stats-grid .stat-value { overflow-wrap: anywhere; }
 .costs-table-label { font-size: 14px; color: var(--text-secondary); margin: 0 0 8px; }
 .cost-cell-name { font-size: 12px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cost-cell-right { text-align: right; }
@@ -4756,15 +4314,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-size: 11.5px;
 }
 
-.skills-presence-runtime select,
-.skills-presence-runtime input {
-    min-height: 32px;
-    border: 1px solid rgba(250, 250, 250, 0.12);
-    border-radius: var(--radius-sm);
-    background: rgba(12, 14, 18, 0.8);
-    color: var(--text-primary);
-    padding: 5px 8px;
-}
+
 
 .skills-presence-runtime input {
     width: 110px;
@@ -4828,53 +4378,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .skills-card-menu-trigger:hover {
     border-color: var(--accent-25);
-    color: var(--text-primary);
-}
-
-.skills-card-menu-dialog {
-    /* Anchored non-modal popover aligned to the trigger's right edge. */
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    left: auto;
-    margin: 0;
-    min-width: 160px;
-    padding: 6px;
-    border-radius: var(--radius);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(18, 20, 26, 0.96);
-    color: var(--text-primary);
-    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
-    z-index: 50;
-}
-
-.skills-menu-item {
-    width: 100%;
-    border: 0;
-    background: transparent;
-    color: var(--text-secondary);
-    border-radius: var(--radius-sm);
-    padding: 9px 10px;
-    text-align: left;
-    cursor: pointer;
-    font: inherit;
-    font-size: 12px;
-}
-
-.skills-menu-item:disabled,
-.skills-menu-item.is-disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
-}
-
-.skills-menu-item:disabled:hover,
-.skills-menu-item.is-disabled:hover {
-    background: transparent;
-    color: var(--text-secondary);
-}
-
-.skills-menu-item:hover {
-    background: var(--menu-item-hover);
     color: var(--text-primary);
 }
 
@@ -5000,26 +4503,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     flex-wrap: wrap;
 }
 
-.marketplace-search {
-    flex: 1 1 240px;
-    min-width: 200px;
-    height: 36px;
-    min-height: 36px;
-    padding: 6px 10px;
-    border: 1px solid rgba(250, 250, 250, 0.1);
-    background: rgba(255, 255, 255, 0.03);
-    color: inherit;
-    border-radius: 6px;
-    font: inherit;
-    font-size: 13px;
-}
-
-.marketplace-search:focus {
-    outline: none;
-    border-color: var(--focus-accent-border);
-    box-shadow: 0 0 0 3px var(--focus-accent-ring);
-    background: rgba(255, 255, 255, 0.05);
-}
+.marketplace-search { flex: 1 1 240px; min-width: min(200px, 100%); }
 
 .marketplace-checkbox {
     display: inline-flex;
@@ -5257,6 +4741,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-modal {
+    max-height: calc(var(--vvh) - 8vh);
+    min-height: 0;
     border-radius: var(--radius-md);
     padding: 16px;
     max-width: 900px;
@@ -5321,11 +4807,14 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 10px;
 }
 
+.marketplace-modal-head, .marketplace-modal-actions { flex-shrink: 0; }
+.marketplace-modal-body > * { flex-shrink: 0; }
 .marketplace-modal-body {
+    min-height: 0;
+    flex: 1 1 auto;
     display: flex;
     flex-direction: column;
     gap: 14px;
-    max-height: 70vh;
     overflow-y: auto;
 }
 
@@ -5344,6 +4833,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .marketplace-modal-actions {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: 8px;
 }
@@ -5662,11 +5152,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widget-field-span-4 { grid-column: span 4; }
 
 .widget-field {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-    color: rgba(250, 250, 250, 0.72);
-    font-size: 13px;
+    min-width: 0;
 }
 
 .widget-field-inline {
@@ -5674,25 +5160,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     align-items: center;
 }
 
-.widget-field input,
-.widget-field textarea,
-.widget-field select {
-    min-width: 0;
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    border-radius: var(--radius-sm);
-    background: rgba(13, 11, 15, 0.74);
-    color: var(--text-primary);
-    padding: 8px 10px;
-    font: inherit;
-}
-
-.widget-field textarea { resize: vertical; }
-
-.widget-field-help {
-    color: var(--text-secondary);
-    font-size: 11px;
-    line-height: 1.35;
-}
 
 .widget-group {
     border: 1px solid rgba(255, 255, 255, 0.07);
@@ -5858,16 +5325,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-size: 10px;
 }
 
-.widget-kanban-move select {
-    min-width: 0;
-    max-width: 112px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 5px;
-    background: rgba(13, 11, 15, 0.82);
-    color: var(--text-primary);
-    font: inherit;
-    padding: 3px 5px;
-}
+.widget-kanban-move select { min-width: 0; max-width: 112px; }
 
 .widget-progress {
     display: flex;
@@ -6190,8 +5648,7 @@ textarea.chat-input {
     width: 100%;
     align-items: stretch;
     margin: var(--space-1) 0 var(--space-2);
-    max-height: 38vh;
-    min-height: 0;
+    flex-shrink: 0;
 }
 
 .nav-projects-list {
@@ -6200,8 +5657,7 @@ textarea.chat-input {
     gap: 1px;
     width: 100%;
     align-items: stretch;
-    overflow-y: auto;
-    min-height: 0;
+    flex-shrink: 0;
 }
 
 .nav-projects-list[hidden] {
@@ -6357,41 +5813,6 @@ textarea.chat-input {
     outline-offset: -2px;
 }
 
-.project-row-menu {
-    position: fixed;
-    top: var(--prm-top, 0);
-    left: var(--prm-left, 0);
-    z-index: 120;
-    display: flex;
-    flex-direction: column;
-    min-width: 180px;
-    padding: 4px;
-    border: 1px solid var(--divider);
-    border-radius: var(--radius-md, 8px);
-    background: var(--ui-modal-bg);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-    max-width: min(260px, calc(100vw - 16px));
-}
-
-.project-row-menu button {
-    text-align: left;
-    padding: 7px 10px;
-    border: none;
-    background: transparent;
-    color: var(--text-primary);
-    font-size: 13px;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-}
-
-.project-row-menu button:hover {
-    background: var(--menu-item-hover);
-}
-
-.project-row-menu button.danger {
-    color: var(--status-error-fg);
-}
-
 /* New Project dialog */
 .new-project-dialog {
     max-width: 560px;
@@ -6430,6 +5851,8 @@ textarea.chat-input {
     cursor: pointer;
 }
 
+.new-project-selected-target { overflow-wrap: anywhere; }
+
 .new-project-source-detail {
     margin-bottom: var(--space-3);
 }
@@ -6449,12 +5872,12 @@ textarea.chat-input {
     padding: 6px 10px;
     border-bottom: 1px solid var(--divider);
     font-size: 12px;
-    word-break: break-all;
 }
+.new-project-browser-path > strong { min-width: 0; overflow-wrap: anywhere; }
+.new-project-browser-path > button { flex: 0 0 auto; white-space: nowrap; }
+
 
 .new-project-browser-list {
-    max-height: 220px;
-    overflow-y: auto;
     display: flex;
     flex-direction: column;
 }
@@ -6912,16 +6335,7 @@ textarea.chat-input {
 .harness-code-entry { display: flex; flex-direction: column; gap: 6px; }
 .harness-code-entry label { font-size: var(--type-meta); line-height: var(--line-meta); color: var(--text-meta); }
 .harness-code-entry-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.harness-code-entry-row input {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    font-size: var(--type-body);
-    padding: 6px 10px;
-    border: 1px solid var(--ui-card-border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-control);
-    color: var(--text-primary);
-    min-width: 220px;
-}
+.harness-code-entry-row input { min-width: min(220px, 100%); }
 /* The demoted attach fallback: collapsed by default, visually secondary. */
 .harness-advanced {
     align-self: stretch;
@@ -7280,34 +6694,6 @@ textarea.chat-input {
 }
 
 .chat-photo-actions summary::-webkit-details-marker { display: none; }
-
-.chat-photo-menu {
-    position: absolute;
-    top: 34px;
-    right: 0;
-    display: grid;
-    width: max-content;
-    min-width: 160px;
-    overflow: hidden;
-    border: 1px solid var(--ui-card-border);
-    border-radius: var(--radius-sm);
-    background: var(--ui-modal-bg);
-    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
-}
-
-.chat-photo-menu button {
-    padding: 8px 10px;
-    border: 0;
-    border-bottom: 1px solid var(--divider);
-    background: transparent;
-    color: var(--text-primary);
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-}
-
-.chat-photo-menu button:last-child { border-bottom: 0; }
-.chat-photo-menu button:hover { background: var(--menu-item-hover); }
 
 .chat-file-card {
     display: grid;
@@ -7703,3 +7089,172 @@ textarea.chat-input {
 }
 
 /* === design-system:migrated-end === */
+
+.project-work-pointer {
+    min-width: 0;
+    max-width: 100%;
+    flex: 1 1 180px;
+    justify-content: flex-start;
+    text-align: left;
+    overflow: hidden;
+}
+.project-work-coverage { font-size: var(--type-meta); color: var(--text-meta); }
+.chat-panel-statusbar { flex-wrap: wrap; gap: var(--space-2); }
+.chat-live-executor-chip { max-width: 100%; white-space: normal; }
+.chat-live-meta-text, .chat-live-executor-chip .harness-identity-label { overflow-wrap: anywhere; }
+.chat-bubble .message:not(:has(> *)),
+.chat-bubble .message > :is(p:not(:has(img, video)), ul, ol, blockquote, .md-h1, .md-h2, .md-h3) {
+    max-inline-size: 72ch;
+}
+
+/* track-migration:begin — Baseline recipes only for consumers not yet adopted
+   in this parallel track. Aggregate removes this block after owner adapters land. */
+.skills-card-menu-dialog:not(.ui-popup) {
+    /* Anchored non-modal popover aligned to the trigger's right edge. */
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    left: auto;
+    margin: 0;
+    min-width: 160px;
+    padding: 6px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(18, 20, 26, 0.96);
+    color: var(--text-primary);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
+    z-index: 50;
+}
+
+.skills-card-menu-dialog:not(.ui-popup) .skills-menu-item {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+    padding: 9px 10px;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+}
+
+.skills-card-menu-dialog:not(.ui-popup) .skills-menu-item:disabled,
+.skills-card-menu-dialog:not(.ui-popup) .skills-menu-item.is-disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.skills-card-menu-dialog:not(.ui-popup) .skills-menu-item:disabled:hover,
+.skills-card-menu-dialog:not(.ui-popup) .skills-menu-item.is-disabled:hover {
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+.skills-card-menu-dialog:not(.ui-popup) .skills-menu-item:hover {
+    background: var(--menu-item-hover);
+    color: var(--text-primary);
+}
+
+
+.chat-photo-menu:not(.ui-popup) {
+    position: absolute;
+    top: 34px;
+    right: 0;
+    display: grid;
+    width: max-content;
+    min-width: 160px;
+    overflow: hidden;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius-sm);
+    background: var(--ui-modal-bg);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
+}
+
+.chat-photo-menu:not(.ui-popup) button {
+    padding: 8px 10px;
+    border: 0;
+    border-bottom: 1px solid var(--divider);
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.chat-photo-menu:not(.ui-popup) button:last-child { border-bottom: 0; }
+.chat-photo-menu:not(.ui-popup) button:hover { background: var(--menu-item-hover); }
+
+
+
+
+
+.form-field input:not(.ui-control):not(.ui-checkbox), .form-field select:not(.ui-control):not(.ui-checkbox),
+.reviewer-slot-controls input:not(.ui-control):not(.ui-checkbox), .reviewer-slot-controls select:not(.ui-control):not(.ui-checkbox) {
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--divider);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    width: 320px;
+    max-width: 100%;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.form-field input:not(.ui-control):not(.ui-checkbox):focus {
+    border-color: var(--focus-accent-border);
+    box-shadow: 0 0 0 3px var(--focus-accent-ring);
+}
+
+
+.marketplace-search:not(.ui-control) {
+    height: 36px;
+    min-height: 36px;
+    padding: 6px 10px;
+    border: 1px solid rgba(250, 250, 250, 0.1);
+    background: rgba(255, 255, 255, 0.03);
+    color: inherit;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 13px;
+}
+
+.marketplace-search:not(.ui-control):focus {
+    outline: none;
+    border-color: var(--focus-accent-border);
+    box-shadow: 0 0 0 3px var(--focus-accent-ring);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+
+.skills-presence-runtime select:not(.ui-control),
+.skills-presence-runtime input:not(.ui-control) {
+    min-height: 32px;
+    border: 1px solid rgba(250, 250, 250, 0.12);
+    border-radius: var(--radius-sm);
+    background: rgba(12, 14, 18, 0.8);
+    color: var(--text-primary);
+    padding: 5px 8px;
+}
+
+.skills-presence-runtime input:not(.ui-control) {
+    width: 110px;
+}
+
+
+.widget-kanban-move select:not(.ui-control) {
+    min-width: 0;
+    max-width: 112px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 5px;
+    background: rgba(13, 11, 15, 0.82);
+    color: var(--text-primary);
+    font: inherit;
+    padding: 3px 5px;
+}
+
+
+/* track-migration:end */

@@ -289,6 +289,7 @@ def test_project_sidebar_and_menu_static_contracts():
     html = (root / "web" / "index.html").read_text(encoding="utf-8")
     app = (root / "web" / "app.js").read_text(encoding="utf-8")
     menu = (root / "web" / "modules" / "project_create.js").read_text(encoding="utf-8")
+    menu_behavior = (root / "web" / "modules" / "ui_interactions.js").read_text(encoding="utf-8")
     chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
     css = (root / "web" / "style.css").read_text(encoding="utf-8")
 
@@ -325,9 +326,10 @@ def test_project_sidebar_and_menu_static_contracts():
     assert 'role="menuitem" data-prm="rename"' in menu
     assert 'role="menuitem" class="danger" data-prm="delete"' in menu
     assert 'data-prm="hide"' not in menu
+    assert "binding = bindMenu(menu," in menu
     for key in ("Escape", "ArrowDown", "ArrowUp", "Home", "End"):
-        assert key in menu
-    assert "window.innerWidth" in menu and "window.innerHeight" in menu
+        assert key in menu_behavior
+    assert "win.innerWidth" in menu_behavior and "win.innerHeight" in menu_behavior
     assert "const PROJECT_NAME_MAX = 80" in menu
     assert "newName.length > maxNameLength" in menu
     assert 'maxlength="${maxNameLength}"' in menu

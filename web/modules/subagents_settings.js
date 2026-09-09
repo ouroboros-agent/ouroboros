@@ -3,38 +3,19 @@
 // route/model/account/effort presentation is shared.
 
 import {
-    FACET_ACCOUNTS,
-    FACET_CATALOG,
-    FACET_QUOTA,
-    READ_OK,
-    accountRows,
-    bindStatusSurface,
-    boundedStatusRefresh,
-    claudexorStatus,
-    familyLabel,
+    FACET_ACCOUNTS, FACET_CATALOG, FACET_QUOTA, READ_OK, accountRows,
+    bindStatusSurface, boundedStatusRefresh, claudexorStatus, familyLabel,
 } from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
-    EFFORT_CHOICES,
-    ROUTE_KIND_AGENT_SESSION,
-    ROUTE_KIND_API_MODEL,
-    compoundSessionEffortConflict,
-    changeRouteChoice,
-    routeModelFields,
-    routeModelInputHtml,
-    routeTargetFromModel,
-    routeSupportsAccount,
-    effortSelectHtml,
-    encodeRouteChoice,
-    indexProfilesByHarness,
-    mintStableId,
-    profileOptionsFor,
-    routeChoiceGroups,
-    selectHtml,
-    serializeRouteSpec,
-    sessionModelOptions,
+    EFFORT_CHOICES, ROUTE_KIND_AGENT_SESSION, ROUTE_KIND_API_MODEL,
+    compoundSessionEffortConflict, changeRouteChoice, routeModelFields,
+    routeModelInputHtml, routeTargetFromModel, routeSupportsAccount, effortSelectHtml,
+    encodeRouteChoice, indexProfilesByHarness, mintStableId, profileOptionsFor,
+    routeChoiceGroups, selectHtml, serializeRouteSpec, sessionModelOptions, updateRouteControlOptions,
 } from './route_editor_primitives.js';
+import { modelChooserHtml, bindModelChoosers } from './model_chooser.js';
 import { harnessMap, rowMeta, rowStatus, sessionRouteVerdict } from './subagent_status_primitives.js';
 import { revealNewRow } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
@@ -378,20 +359,20 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
                     <button type="button" class="btn btn-default" data-subagent-remove aria-label="Remove Subagent ${ordinal}">Remove</button>
                 </div>
             </div>
-            <label class="available-subagent-purpose">Description
-                <textarea data-subagent-field="recommended_use" rows="1" aria-label="Description for Subagent ${ordinal}" placeholder="When should Ouroboros choose this subagent?">${escapeHtml(row.recommended_use)}</textarea>
+            <label class="available-subagent-purpose ui-field">Description
+                <textarea class="ui-control" data-subagent-field="recommended_use" rows="1" aria-label="Description for Subagent ${ordinal}" placeholder="When should Ouroboros choose this subagent?">${escapeHtml(row.recommended_use)}</textarea>
             </label>
             <div class="available-subagent-route">
                 ${selectHtml(`data-subagent-field="route" aria-label="Source for Subagent ${ordinal}"`, routeGroups, encodeRouteChoice(row))}
                 ${session
-                    ? selectHtml(`data-subagent-field="model" aria-label="Agent session model for Subagent ${ordinal}"`, [{ label: '', options: modelOptions }], split.model)
+                    ? modelChooserHtml(`data-subagent-field="model" aria-label="Agent session model for Subagent ${ordinal}"`, split.model, `actor-${rowKey}-models`, modelOptions, { placeholder: 'Engine default model' })
                     : routeModelInputHtml(`data-subagent-field="model" aria-label="${split.subscription ? 'Subscription' : 'API'} model for Subagent ${ordinal}"`, row.route, state.apiModels, `actor-${rowKey}-models`)}
                 ${routeSupportsAccount(row.route)
                     ? selectHtml(`data-subagent-field="account" aria-label="Account for Subagent ${ordinal}"`, [{ label: '', options: profileOptions }], row.route.credential_profile_id || '')
                     : ''}
                 ${effortSelectHtml(`data-subagent-field="effort" aria-label="Reasoning effort for Subagent ${ordinal}"`, row.effort || '', 'route default')}
             </div>
-            <div class="available-subagent-meta" data-subagent-meta${meta.tone ? ` data-tone="${escapeHtml(meta.tone)}"` : ''} title="${escapeHtml(meta.text)}"${meta.text ? '' : ' hidden'}>${escapeHtml(meta.text)}</div>
+            <div id="actor-${escapeHtml(rowKey)}-meta" class="available-subagent-meta ui-field-help" data-subagent-meta${meta.tone ? ` data-tone="${escapeHtml(meta.tone)}"` : ''} title="${escapeHtml(meta.text)}"${meta.text ? '' : ' hidden'}>${escapeHtml(meta.text)}</div>
         </article>`;
 }
 
@@ -435,8 +416,10 @@ export function createAvailableSubagentsEditor({
 } = {}) {
     const getDoc = typeof doc === 'function' ? doc : () => doc;
     const getWin = typeof win === 'function' ? win : () => win;
+    let disposeChoosers = () => {};
     const state = {
         loaded: false,
+        destroyed: false,
         parseError: '',
         unloadedOmissionAllowed: false,
         setting: { enabled: true, items: [] },
@@ -506,6 +489,10 @@ export function createAvailableSubagentsEditor({
             const el = container.querySelector(`[data-subagent-row="${row._uiKey || row.subagent_id}"]`);
             if (!el) return;
             el.toggleAttribute('data-invalid', judged);
+            el.querySelectorAll('[data-subagent-field]').forEach((field) => {
+                field.setAttribute('aria-describedby', `actor-${row._uiKey || row.subagent_id}-meta`);
+                if (field.dataset.subagentField !== 'recommended_use') field.setAttribute('aria-invalid', String(judged));
+            });
             const status = rowStatus(row, state);
             const statusEl = el.querySelector('[data-subagent-status]');
             if (statusEl) {
@@ -565,7 +552,7 @@ export function createAvailableSubagentsEditor({
                 paint();
             });
             rowElement.querySelector('[data-subagent-field="model"]')?.addEventListener(
-                row.route.kind === ROUTE_KIND_AGENT_SESSION ? 'change' : 'input',
+                'input',
                 (event) => {
                     const previous = encodeRouteChoice(row);
                     row.route.target_id = routeTargetFromModel(row.route, event.target.value);
@@ -609,9 +596,9 @@ export function createAvailableSubagentsEditor({
         });
     }
 
-    function paint() {
+    function paint({ discoveryOnly = false } = {}) {
         const container = host();
-        if (!container) return false;
+        if (!container || state.destroyed) return false;
         const nextSignature = availableSubagentsRenderSignature(state);
         if (nextSignature === state.signature) return false;
         const focused = focusSnapshot(container, getDoc());
@@ -621,10 +608,26 @@ export function createAvailableSubagentsEditor({
         const source = state.source ? `Source: ${state.source}.` : '';
         const readProblem = state.statusError
             ? 'Live agent availability could not be read. Saved rows remain unchanged.' : '';
+        if (discoveryOnly && container.querySelector('.available-subagents-list')) {
+            state.setting.items.forEach((row, index) => {
+                const el = container.querySelector(`[data-subagent-row="${row._uiKey || row.subagent_id}"]`);
+                if (!el) return;
+                const template = getDoc().createElement('template');
+                template.innerHTML = availableSubagentRowMarkup(row, state, index);
+                const desired = template.content.firstElementChild;
+                updateRouteControlOptions(el, desired);
+                el.querySelector('.available-subagent-route-identity-wrap').innerHTML = desired.querySelector('.available-subagent-route-identity-wrap').innerHTML;
+            });
+            container.querySelector('.available-subagents-source').textContent = [source, readProblem].filter(Boolean).join(' ');
+            Object.assign(container.querySelector('[data-subagents-diagnostics]'), { textContent: diagnostics.join(' · '), hidden: !diagnostics.length });
+            renderValidation();
+            return true;
+        }
+        disposeChoosers();
         container.innerHTML = `
             <div class="available-subagents-toolbar">
-                <label class="local-toggle">
-                    <input type="checkbox" data-subagents-enabled ${state.setting.enabled ? 'checked' : ''} ${state.loaded ? '' : 'disabled'}>
+                <label class="local-toggle ui-field ui-field-inline">
+                    <input class="ui-checkbox" type="checkbox" data-subagents-enabled aria-label="Available subagents enabled" ${state.setting.enabled ? 'checked' : ''} ${state.loaded ? '' : 'disabled'}>
                     Enabled
                 </label>
                 <span class="available-subagents-count">${state.setting.items.length}/${MAX_AVAILABLE_SUBAGENTS}</span>
@@ -659,6 +662,7 @@ export function createAvailableSubagentsEditor({
             revealRow(uiKey);
         });
         bindRows(container);
+        disposeChoosers = bindModelChoosers(container);
         restoreFocus(container, focused);
         renderValidation();
         return true;
@@ -708,6 +712,8 @@ export function createAvailableSubagentsEditor({
             outerDraftClean,
             parsedSetting: parsed.setting,
         });
+        const sameAssignment = parsed.setting && state.loaded
+            && JSON.stringify(buildAvailableSubagentsSetting(parsed.setting)) === JSON.stringify(buildAvailableSubagentsSetting(state.setting));
         if (canApply) {
             state.loaded = true;
             state.parseError = '';
@@ -719,7 +725,7 @@ export function createAvailableSubagentsEditor({
             state.parseError = parsed.error;
         }
         state.signature = '';
-        paint();
+        paint({ discoveryOnly: state.loaded && (!canApply || sameAssignment) });
         return { applied: canApply, error: parsed.error };
     }
 
@@ -736,13 +742,13 @@ export function createAvailableSubagentsEditor({
             state.parseError = `Available subagents preview failed: ${state.diagnostics.join(' · ')}`;
         }
         state.signature = '';
-        paint();
+        paint({ discoveryOnly: state.loaded });
     }
 
     async function reloadStatus() {
         await boundedStatusRefresh(store);
         adoptStatus();
-        paint();
+        paint({ discoveryOnly: true });
         // Generated rows are enrichment, never a second unbounded gate on the
         // Settings critical path. The response is generation- and clean-gated.
         void maybeRefreshGeneratedPreview({ force: true });
@@ -794,7 +800,7 @@ export function createAvailableSubagentsEditor({
                 win: getWin,
                 listener: () => {
                     adoptStatus();
-                    paint();
+                    paint({ discoveryOnly: true });
                     void maybeRefreshGeneratedPreview();
                 },
             });
@@ -807,7 +813,7 @@ export function createAvailableSubagentsEditor({
                     .map((item) => String(item.value || item.id || ''))
                     .filter(Boolean);
                 state.signature = '';
-                paint();
+                paint({ discoveryOnly: true });
             };
             target?.addEventListener?.('settings-model-catalog:updated', onCatalog);
             state.catalogDisposer = () => target?.removeEventListener?.('settings-model-catalog:updated', onCatalog);
@@ -817,6 +823,9 @@ export function createAvailableSubagentsEditor({
     }
 
     function destroy() {
+        state.destroyed = true;
+        state.previewGeneration += 1;
+        disposeChoosers();
         state.statusDisposer?.();
         state.catalogDisposer?.();
         state.statusDisposer = null;
@@ -878,14 +887,14 @@ export function renderSubagentsSection() {
                 </div>
             </div>
             <div class="form-grid two">
-                <div class="form-field">
-                    <label>Active subagents per root</label>
-                    <input id="s-active-subagents" type="number" min="1" max="500" value="6">
+                <div class="form-field ui-field">
+                    <label for="s-active-subagents">Active subagents per root</label>
+                    <input class="ui-control" id="s-active-subagents" type="number" min="1" max="500" value="6">
                     <div class="settings-inline-note">How many children one root task may run at once.</div>
                 </div>
-                <div class="form-field">
-                    <label>Subagent depth</label>
-                    <input id="s-subagent-depth" type="number" min="0" max="10" value="3">
+                <div class="form-field ui-field">
+                    <label for="s-subagent-depth">Subagent depth</label>
+                    <input class="ui-control" id="s-subagent-depth" type="number" min="0" max="10" value="3">
                     <div class="settings-inline-note">How deep the chain may nest. <code>0</code> turns delegation off entirely.</div>
                 </div>
             </div>
@@ -893,13 +902,13 @@ export function renderSubagentsSection() {
                 <summary>Advanced — where subagents check out their work</summary>
                 <div class="settings-subsection-body">
                     <div class="form-grid two">
-                        <div class="form-field">
-                            <label>Subagent worktree root</label>
-                            <input id="s-subagent-worktree-root" type="text" placeholder="~/Ouroboros/subagent_worktrees">
+                        <div class="form-field ui-field">
+                            <label for="s-subagent-worktree-root">Subagent worktree root</label>
+                            <input class="ui-control" id="s-subagent-worktree-root" type="text" placeholder="~/Ouroboros/subagent_worktrees">
                         </div>
-                        <div class="form-field">
-                            <label>Subagent projects root (genesis)</label>
-                            <input id="s-subagent-projects-root" type="text" placeholder="~/Ouroboros/projects">
+                        <div class="form-field ui-field">
+                            <label for="s-subagent-projects-root">Subagent projects root (genesis)</label>
+                            <input class="ui-control" id="s-subagent-projects-root" type="text" placeholder="~/Ouroboros/projects">
                         </div>
                     </div>
                     <div class="settings-inline-note">
@@ -969,27 +978,19 @@ export function applySubagentsSettings(settings) {
     });
 }
 
-export async function reloadSubagentsSection() {
-    await settingsEditor?.reloadStatus();
-}
+export async function reloadSubagentsSection() { await settingsEditor?.reloadStatus(); }
 
 export function destroySubagentsSection() {
     settingsEditor?.destroy();
     settingsEditor = null;
 }
 
-export function collectSubagentsSettings() {
-    return settingsEditor?.collect() || {};
-}
+export function collectSubagentsSettings() { return settingsEditor?.collect() || {}; }
 
-export function validateSubagentsDraft() {
-    return settingsEditor?.validate() || ['Available subagents editor is not loaded.'];
-}
+export function validateSubagentsDraft() { return settingsEditor?.validate() || ['Available subagents editor is not loaded.']; }
 
 /** Settings' Save button: the draft's own errors become visible from here on. */
-export function noteSubagentsSaveAttempt() {
-    settingsEditor?.noteSaveAttempt();
-}
+export function noteSubagentsSaveAttempt() { settingsEditor?.noteSaveAttempt(); }
 
 // Compatibility name retained for focused callers; the signature now covers
 // the actor list rather than the retired singleton route.

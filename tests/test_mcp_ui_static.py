@@ -116,7 +116,11 @@ def test_mcp_css_defines_required_classes(settings_css: str) -> None:
     assert ".mcp-server-card" in settings_css
     assert ".mcp-server-status-ok" in settings_css
     assert ".mcp-server-status-danger" in settings_css
-    assert ".settings-shell .form-field textarea" in settings_css
+    shared = (REPO_ROOT / "web" / "ui.css").read_text(encoding="utf-8")
+    assert ".ui-control {" in shared and "textarea.ui-control" in shared
+    source = (WEB / "mcp_settings.js").read_text(encoding="utf-8")
+    assert '<textarea class="ui-control"' in source
+    assert 'class="form-field ui-field"' in source
 
 
 def test_settings_ui_mcp_section_describes_hot_reload(settings_ui_source: str) -> None:

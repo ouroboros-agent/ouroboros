@@ -36,18 +36,6 @@
     outline: 2px solid var(--focus-accent-border);
     outline-offset: 2px;
 }
-.model-wait-picker .model-role-controls input,
-.model-wait-picker .model-role-controls select {
-    background: var(--bg-secondary);
-    border: 1px solid var(--surface-border);
-    border-radius: var(--radius-sm);
-    padding: var(--space-1) var(--space-2);
-}
-.model-wait-picker .model-role-controls input:focus {
-    border-color: var(--focus-accent-border);
-    box-shadow: 0 0 0 3px var(--focus-accent-ring);
-    outline: none;
-}
 .chat-live-phase.waiting { color: var(--status-warn-fg); background: var(--status-warn-bg); }
 .chat-live-card[data-model-waiting="1"]:not([data-finished="1"]) .chat-live-phase { animation: none; }
 .chat-live-card[data-model-waiting="1"] > .chat-live-summary-button .chat-live-typing { display: none; }

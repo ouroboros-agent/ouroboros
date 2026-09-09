@@ -179,9 +179,9 @@ def test_accent_tokens_have_concrete_rgba_values():
     cycle. This guard pins the fix and prevents the same regression
     class from returning silently.
     """
-    src = (REPO_ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "web" / "ui.css").read_text(encoding="utf-8")
     root_match = re.search(r":root\s*\{([^}]+)\}", src, re.S)
-    assert root_match, ":root block not found in web/style.css"
+    assert root_match, ":root block not found in web/ui.css"
     root_body = root_match.group(1)
 
     # The ladder is read from the file rather than snapshotted here: rungs are
