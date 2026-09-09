@@ -117,6 +117,17 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
     aggregate = str(wave.get("aggregate") or "")
     fp = str(wave.get("request_fingerprint") or "")
     at_cap = cap is not None and cycles_paid >= cap
+    author = wave.get("author_disposition")
+    author_note = ""
+    if isinstance(author, dict) and author.get("disposition") and author.get("rationale"):
+        author_note = (
+            f"Author finish recorded as {author.get('disposition')} against this exact "
+            "review fingerprint; raw reviewer findings remain evidence. "
+        )
+        if enforcement == "blocking":
+            author_note += "Blocking enforcement still holds the open plan gate. "
+        else:
+            author_note += "Advisory enforcement permits proceeding with the review open. "
     if bool(wave.get("closed")):
         if plan_review_notes_are_annotatable(wave):
             return (
@@ -137,7 +148,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
         # call). Quorum arithmetic, per-slot typed states above, and the replay mechanics;
         # the decision (revise the spec, wait, escalate, proceed if permitted) is the LLM's.
         counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
-        text = (
+        text = author_note + (
             f"DEGRADED: parseable reviewer verdicts {counts.get('parseable', 0)} of "
             f"{counts.get('configured', 0)} configured slot(s) — below the review quorum "
             f"({counts.get('quorum', '?')}). Per-slot typed states (code and reset time, when "
@@ -160,7 +171,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             )
     elif aggregate == "REVIEW_REQUIRED":
         blocking = [f for f in wave.get("findings") or [] if f.get("class") == "blocking"]
-        text = (
+        text = author_note + (
             "Notes are optional. Disposition need_evidence (accept | reject | defer, with a rationale) in ONE "
             f"call: plan_task(review_disposition={{review_fingerprint: '{fp}', items: [...]}}) — no "
             "reviewer call, no cycle. "
@@ -173,7 +184,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
                 "(new fingerprint, next paid cycle) or a reject that the next paid delta cycle judges. "
             )
     else:
-        text = (
+        text = author_note + (
             "Blocking findings: accept ⇒ change the spec and re-call plan_task (new fingerprint, "
             f"{'the cap is reached — no further paid cycle' if at_cap else 'next paid cycle ' + str(cycles_paid + 1) + ('' if cap is None else f' of {cap}')}); "
             "reject ⇒ record reject + rationale via review_disposition naming this fingerprint — it "
@@ -280,6 +291,9 @@ def _render_wave(
     if wave.get("dispositions"):
         lines += ["", "### Dispositions", "", "```json",
                   json.dumps(wave.get("dispositions"), ensure_ascii=False, indent=2), "```"]
+    if isinstance(wave.get("author_disposition"), dict):
+        lines += ["", "### Author finish", "", "```json",
+                  json.dumps(wave.get("author_disposition"), ensure_ascii=False, indent=2), "```"]
     if wave.get("closure_notes") or notes:
         lines += ["", "Closure notes: " + "; ".join([*(wave.get("closure_notes") or []), *(notes or [])])]
     outcome, closed = wave_control_state(wave)

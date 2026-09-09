@@ -114,10 +114,9 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
         i for i, line in enumerate(src)
         if "_set_acceptance_decision(" in line and not line.lstrip().startswith("def ")
     ]
-    # 19th writer (F6 upstream sync): the A-material identical-acceptance
-    # refusal joins the forced-rail bypass recorder and the forced
-    # children_unabsorbed terminalizer.
-    assert len(starts) == 19, f"writer inventory changed: {len(starts)} call sites"
+    # 20th writer: advisory author-finality records an honest terminal decision
+    # after the first host panel without manufacturing reviewer PASS.
+    assert len(starts) == 20, f"writer inventory changed: {len(starts)} call sites"
     allowed_status = {
         "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
         "ACCEPTANCE_FINALIZED_UNACCEPTED",

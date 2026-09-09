@@ -108,6 +108,8 @@ def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
             else {} if raw_scope is None
             else {"raw_results": [_malformed_roster_row("scope_review")]}
         ),
+        author_disposition=(dict(d.get("author_disposition"))
+                            if isinstance(d.get("author_disposition"), dict) else {}),
         paid=bool(d.get("paid", False)),
         review_owner_pid=_coerce_int(d.get("review_owner_pid", 0)),
         raw_stripped=bool(d.get("raw_stripped", False)),

@@ -19,6 +19,7 @@ from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.skill_review_status import STATUS_BLOCKERS, STATUS_CLEAN, STATUS_PENDING, STATUS_WARNINGS, VALID_SKILL_REVIEW_STATUSES, aggregate_skill_review_status, normalize_skill_review_status, skill_review_gate
 from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,10 @@ class SkillReviewState:
     raw_actor_records: List[Dict[str, Any]] = field(default_factory=list)
     advisory_result: Dict[str, Any] = field(default_factory=dict)
     review_profile: str = ""
+    # Optional author-finality record for an advisory review.  It is bound to
+    # content_hash and never changes the raw reviewer findings or deterministic
+    # preflight status.
+    author_disposition: Dict[str, Any] = field(default_factory=dict)
 
     def is_stale_for(self, current_hash: str) -> bool:
         if not current_hash:
@@ -101,6 +106,8 @@ class SkillReviewState:
             data["review_profile"] = str(self.review_profile)
         if self.advisory_result:
             data["advisory_result"] = dict(self.advisory_result)
+        if self.author_disposition:
+            data["author_disposition"] = dict(self.author_disposition)
         has_review_verdicts = any(
             str(f.get("verdict") or "").upper() in {"PASS", "FAIL"}
             for f in self.findings
@@ -623,6 +630,10 @@ def load_review_state(
         if isinstance(data.get("advisory_result"), dict)
         else {}
     )
+    author_disposition = validate_author_disposition(
+        data.get("author_disposition"),
+        subject_hash=str(data.get("content_hash") or ""),
+    ) or {}
     try:
         prompt_chars = int(data.get("prompt_chars") or 0)
     except (TypeError, ValueError):
@@ -643,6 +654,7 @@ def load_review_state(
         raw_actor_records=[r for r in raw_actor_records if isinstance(r, dict)],
         advisory_result=dict(advisory_result),
         review_profile=review_profile,
+        author_disposition=author_disposition,
     )
 
 

@@ -523,6 +523,19 @@ def _record_commit_attempt(
         scope_model = _req("scope_model")
         triad_raw_results = _req("triad_raw_results", None)
         scope_raw_result = _req("scope_raw_result", None)
+        author_disposition = _req("author_disposition", None)
+        if author_disposition is None and status == "succeeded" and getattr(ctx, "_review_advisory", None):
+            from ouroboros.review_records import build_author_disposition
+            try:
+                author_disposition = build_author_disposition(
+                    disposition="accepted",
+                    rationale="Author continued after reviewing the recorded advisory findings.",
+                    subject_hash=str(snapshot_hash or ""),
+                    reviewer_signal="advisory",
+                    enforcement="advisory",
+                )
+            except ValueError:
+                author_disposition = {}
         block_class = _req("block_class")
         rebuttal_sha256 = _req("rebuttal_sha256")
         paid = _req("paid", False)
@@ -671,6 +684,8 @@ def _record_commit_attempt(
                     if scope_raw_result is not None
                     else getattr(existing, "scope_raw_result", None) or {}
                 ),
+                author_disposition=(dict(author_disposition)
+                                    if isinstance(author_disposition, dict) else {}),
                 block_class=block_class or str(getattr(existing, "block_class", "") or ""),
                 rebuttal_sha256=rebuttal_sha256 or str(getattr(existing, "rebuttal_sha256", "") or ""),
                 paid=bool(paid or getattr(existing, "paid", False)),
