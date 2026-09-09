@@ -189,6 +189,9 @@ def test_python_inline_strings_and_comments_do_not_create_write_shape():
         ["python3", "-c", "print('BIBLE.md write_text'); # os.remove('/tmp/x')"]
     ) is False
     assert interpreter_write_shape(
+        "sh -c \"python3 -c 'print(\\\"BIBLE.md write_text\\\")'\""
+    ) is False
+    assert interpreter_write_shape(
         "python3 -c \"print('BIBLE.md write_text')\" > report.txt"
     ) is True
 
