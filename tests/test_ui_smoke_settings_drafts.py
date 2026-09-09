@@ -297,3 +297,35 @@ def test_mcp_local_json_errors_hold_whole_settings_save(subscription_ui):
     if isinstance(servers, str): servers = json.loads(servers)
     assert servers[-1]['env'] == {'PORT': '9000'}
     assert servers[-1].get('env_from_settings') in ({}, None)
+
+
+def test_older_failed_settings_reload_cannot_disable_newer_success(subscription_ui):
+    """A stale failed GET must not erase a newer successfully loaded document."""
+    from playwright.sync_api import expect
+
+    ui = subscription_ui
+    page = ui['page']
+    page.goto(ui['url'] + '/#settings')
+    expect(page.locator('#btn-save-settings')).to_be_enabled(timeout=30_000)
+    page.evaluate("""() => {
+        const originalFetch = window.fetch;
+        let settingsReads = 0;
+        window.fetch = (input, init) => {
+            if (String(input).includes('/api/settings') && (!init || init.method === 'GET')) {
+                settingsReads += 1;
+                if (settingsReads === 1) {
+                    return new Promise((_, reject) => setTimeout(() => reject(new Error('older read failed')), 180));
+                }
+                return Promise.resolve(new Response(JSON.stringify({
+                    OUROBOROS_RUNTIME_MODE: 'advanced', OUROBOROS_CONTEXT_MODE: 'max',
+                    OUROBOROS_MAX_WORKERS: 10, _meta: { setup_contract: {} },
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            }
+            return originalFetch(input, init);
+        };
+    }""")
+    page.locator('#btn-reload-settings').click()
+    page.wait_for_timeout(25)
+    page.locator('#btn-reload-settings').click()
+    expect(page.locator('#btn-save-settings')).to_be_enabled(timeout=30_000)
+    expect(page.locator('#settings-status')).not_to_contain_text('Failed to load current settings')

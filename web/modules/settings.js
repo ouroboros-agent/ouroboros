@@ -710,9 +710,11 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     async function reloadSettingsWithFeedback() {
         if (settingsSaving) return;
         if (settingsDirty && !(await confirmDiscardSettings('reload Settings'))) return;
+        const reloadSequence = loadSequence + 1;
         setStatus('Loading settings...', 'muted', 'load');
         try {
             const applied = await loadSettings();
+            if (reloadSequence !== loadSequence) return;
             if (!applied && byId('settings-status').dataset.owner === 'load') {
                 setStatus('Settings were not reloaded because your draft changed while loading. Your edits are kept.', 'warn', 'load');
             }
@@ -726,6 +728,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 );
             }
         } catch (error) {
+            if (reloadSequence !== loadSequence) return;
             settingsLoaded = false;
             syncSettingsLoadState();
             setStatus(
