@@ -68,8 +68,10 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "repo_writer_admission_closed", "send_with_budget",
     })),
     "supervisor/worker_pool_lifecycle.py": ("supervisor/workers.py", "_pool", frozenset({
-        "DRIVE_ROOT", "MAX_WORKERS", "REPO_DIR", "WORKERS", "Worker", "_WORKER_PIDS_FILENAME",
-        "_WORKER_POOL_DISABLED_REASON",
+        # Runtime676: execution reader/disable moved from the facade; RUNNING
+        # and patched sibling calls must remain late-bound through that facade.
+        "DRIVE_ROOT", "MAX_WORKERS", "REPO_DIR", "RUNNING", "WORKERS", "Worker", "_WORKER_PIDS_FILENAME",
+        "_WORKER_POOL_DISABLED_REASON", "_worker_pool_execution_state", "disable_exhausted_worker_pool",
         "_get_ctx", "_reconcile_confirmed_dead_review_owner",
         "_verify_worker_sha_after_spawn", "get_event_q", "kill_workers", "load_state",
         "reconstruct_task_cost", "send_with_budget",
@@ -117,12 +119,13 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "utc_now_iso",
     })),
     "supervisor/worker_health.py": ("supervisor/workers.py", "_pool", frozenset({
-        "CRASH_TS", "DRIVE_ROOT", "QUEUE_MAX_RETRIES", "RUNNING", "WORKERS",
+        # Runtime707: health hands off recovery; the reaper owns storm/respawn.
+        "DRIVE_ROOT", "QUEUE_MAX_RETRIES", "RUNNING", "WORKERS",
         "_LAST_SPAWN_TIME", "_SPAWN_GRACE_SEC", "_emit_task_done_terminal",
         "_ensure_workers_healthy_locked", "_reconcile_confirmed_dead_review_owner",
         "_worker_crash_storm_detected", "append_jsonl", "coerce_chat_identity",
-        "get_event_q", "kill_workers", "load_state", "reconstruct_task_cost",
-        "respawn_worker", "send_with_budget", "terminal_task_metadata",
+        "disable_exhausted_worker_pool", "get_event_q", "load_state", "reconstruct_task_cost",
+        "send_with_budget", "terminal_task_metadata",
         "utc_now_iso",
     })),
     # D10 lane rows (oracle ouroboros_v7_wip @ 9f691656). git_ops leaves carry

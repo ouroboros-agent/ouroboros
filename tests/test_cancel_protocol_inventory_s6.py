@@ -61,13 +61,20 @@ TERMINAL_WRITERS = {
     ('ouroboros/delegate_terminal.py::_rewrite_execution_evidence', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',
     ('ouroboros/gateway/tasks.py::_admission_rejection_response', 'STATUS_FAILED'): 'terminal',
     ('ouroboros/gateway/tasks.py::_complete_api_task_admission', '"failed"'): 'terminal',
-    ('ouroboros/headless.py::copy_child_task_result', 'child_status'): 'dynamic',
+    # The scanner treats a variable status as dynamic. This create-only site
+    # seeds scheduled/running from pooled membership and never ends a task;
+    # test_hurry_initial_lifecycle pins both choices and existing-row preservation.
+    ('ouroboros/gateway/task_hurry.py::_admit_hurry_locked', 'pooled_status'): 'dynamic',
+    # Runtime707: CURRENT-ref retry publication moved out of observability's
+    # locked sweep; terminal file-failure publication moved off event drain.
+    # Both retain CURRENT lifecycle status rather than authoring completion.
+    ('ouroboros/headless.py::retry_child_task_refs', 'source["status"]'): 'dynamic',
+    ('ouroboros/headless.py::prepare_terminal_task_files', 'existing["status"]'): 'dynamic',
     ('ouroboros/headless.py::finalize_task_artifacts', 'status'): 'dynamic',
     ('ouroboros/headless.py::finalize_task_artifacts', 'str(existing.get("status") or status or "completed")'): 'terminal',
     ('ouroboros/mutation_attribution.py::advance_mutation_baseline', 'status'): 'dynamic',
     ('ouroboros/mutation_attribution.py::capture_mutation_baseline', 'status'): 'dynamic',
     ('ouroboros/mutation_attribution.py::record_terminal_mutation_candidates', 'status'): 'dynamic',
-    ('ouroboros/observability.py::_retry_pending_child_ref_promotion', 'str(loaded_result.get("status") or "")'): 'dynamic',
     ('ouroboros/post_task_checkpoint.py::set_root_post_task_checkpoint', 'str(existing.get("status") or task.get("status") or STATUS_COMPLETED)'): 'terminal',
     ('ouroboros/project_dialogue.py::_append_terminal_task_projection', 'status'): 'dynamic',
     ('ouroboros/project_dialogue.py::persist_continuation_narrative', 'requested_status'): 'dynamic',
@@ -81,7 +88,6 @@ TERMINAL_WRITERS = {
     ('supervisor/events_project_routing.py::_persist_promote_rejection', 'STATUS_FAILED'): 'terminal',
     ('supervisor/events_schedule_task.py::_reject_schedule_task', 'status'): 'dynamic',
     ('supervisor/events_task_done.py::_finish_task_done_dispatch', 'STATUS_FAILED'): 'terminal',
-    ('supervisor/events_task_done.py::_handle_task_done', 'str(existing.get("status") or "")'): 'dynamic',
     ('supervisor/events_task_done.py::_resolve_lifecycle_fault', 'STATUS_FAILED'): 'terminal',
     ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/task_admission.py::record_scheduled_admission', 'STATUS_FAILED'): 'terminal',
@@ -95,8 +101,10 @@ TERMINAL_WRITERS = {
     ('supervisor/worker_assignment.py::_cancel_unauthorized_evolution', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/worker_assignment.py::assign_tasks', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/worker_assignment.py::assign_tasks', 'STATUS_FAILED'): 'terminal',
-    ('supervisor/worker_health.py::_ensure_workers_healthy_locked', 'STATUS_CANCELLED'): 'terminal',
-    ('supervisor/worker_health.py::_ensure_workers_healthy_locked', 'STATUS_FAILED'): 'terminal',
+    # Runtime707: identical terminal writers now run on the existing reaper,
+    # after source/CURRENT readiness checks; detection no longer writes results.
+    ('supervisor/worker_health.py::_recover_crashed_task_without_terminal', 'STATUS_CANCELLED'): 'terminal',
+    ('supervisor/worker_health.py::_recover_crashed_task_without_terminal', 'STATUS_FAILED'): 'terminal',
     ('supervisor/worker_pool_lifecycle.py::_write_failure_result', 'final_status'): 'dynamic',
     ('supervisor/worker_promotion.py::_fail_promoted_task_loudly', 'STATUS_FAILED'): 'terminal',
     ('supervisor/workers.py::_settle_cancelled_pending_row', 'status_cancelled'): 'dynamic',
@@ -381,6 +389,7 @@ def test_c9_the_registration_failure_rule_is_the_one_shared_helper():
     assert callers <= {
         "supervisor/cancel_publication.py::_finalize_cancel_intent_on_miss",
         "supervisor/task_lifecycle.py::cancel_task_custody",
+        "supervisor/task_lifecycle.py::_finish_captured_running",
     }, callers
 
 

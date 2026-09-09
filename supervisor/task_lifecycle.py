@@ -624,7 +624,10 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
         if captured_pending is None:
             for worker in workers.WORKERS.values():
                 if worker.busy_task_id == task_id:
-                    if settled and not _worker_possibly_alive(worker):
+                    from ouroboros.headless import terminal_task_files_ready
+                    bound_task = (q.RUNNING.get(task_id) or {}).get("task") or {"id": task_id}
+                    if (settled and not _worker_possibly_alive(worker)
+                            and terminal_task_files_ready(q.DRIVE_ROOT, bound_task, _load_result_row(q, task_id))):
                         # Settled result AND provably dead process: no live
                         # ownership remains — the fast path below settles and
                         # recovers a stranded ``reaping`` marker. Only a
@@ -1096,13 +1099,9 @@ def _finish_captured_running(
     workspace artifact capture from the REAL tree → settled durable result →
     delivery + ``task_done`` → drive cleanup.
 
-    ``settled_status`` (GR6-1b) names a task whose durable result settled
-    BEFORE custody captured its still-live worker (post-task cognition burning
-    past the terminal write). The kill/join above the durable boundary is
-    identical; afterwards nothing is rewritten — the stored terminal truth is
-    the answer (no salvage, no artifact re-capture over a result that already
-    carries its own), it is registered as owed and delivered idempotently, and
-    the intent settles ``already_settled`` after the confirmed death.
+    A settled_status can be an early checkpoint. Fully published CURRENT stays
+    byte-identical; incomplete child adoption/artifacts use the existing file
+    helper after confirmed death, before owed delivery, settlement and cleanup.
     """
     q = _queue_module()
     from supervisor.worker_pool_lifecycle import kill_worker_tree
@@ -1116,10 +1115,11 @@ def _finish_captured_running(
     # worker outside RUNNING, where `task_subtree_is_live` cannot see it and the
     # cascade would report a settled tree.
     try:
-        if worker.proc.pid:
-            kill_worker_tree(worker.proc.pid, keep_services=True)
-        elif worker.proc.is_alive():
-            worker.proc.terminate()
+        if worker.proc.is_alive():
+            if worker.proc.pid:
+                kill_worker_tree(worker.proc.pid, keep_services=True)
+            else:
+                worker.proc.terminate()
         worker.proc.join(timeout=5)
         if worker.proc.is_alive() and worker.proc.pid:
             kill_worker_tree(worker.proc.pid, keep_services=True)
@@ -1143,96 +1143,38 @@ def _finish_captured_running(
     custody_audit = _audit_delegated_runs_on_kill(q, task_id)
     unreconciled = list(custody_audit.get("unreconciled") or [])
 
-    if settled_status:
-        # GR6-1b short-circuit, hoisted ABOVE every mutating step (GR7-2): the
-        # result settled before the capture, the worker is now confirmed dead —
-        # the kill is about the PROCESS, never the result, so the stored row
-        # must survive BYTE-IDENTICAL. The old order ran child copy-back /
-        # artifact finalize / memory export first, which mutated the settled
-        # row (``headless_child_drive_root`` + a ``memory_export.json``
-        # artifact on a shared drive; a split-drive copy-back REPLACING the
-        # canonical settled answer — completion-wins violations). Deliver +
-        # settle exactly like the natural-completion branch.
-        from ouroboros.cost_projection import carry_cost_meta
-
-        stored = load_task_result(q.DRIVE_ROOT, task_id) or {}
-        # ABI-3: carry_cost_meta CONVERTS a stored legacy pair (deprecated-
-        # wins) so the cancel path emits honest names only.
-        stored_cost = carry_cost_meta(stored) or {
-            "cost_accounting_status": "unavailable", "cost_final": False,
-            "accounted_upper_bound_usd": None}
-        owed_ok = _register_owed_terminal_delivery(
-            q, task, task_id, stored, deliver=deliver,
-            unreconciled_runs=unreconciled,
-        )
-        if not owed_ok and intent and intent.get("request_id"):
-            _release_intent_claim(
-                q, task_id,
-                error="owed terminal-delivery registration failed", intent=intent,
-            )
-        else:
-            _settle_intent(q, task_id, outcome=SETTLED_ALREADY,
-                           detail=str(stored.get("status") or settled_status),
-                           intent=intent)
-        return _publish_cancelled_task(
-            q, task_id, task, worker, stored, stored_cost,
-            deliver=deliver, unreconciled_runs=unreconciled,
-        )
-
-    # POST-KILL natural-completion re-check (the incident's root cause, fixed):
-    # forked/workspace/subagent tasks self-finalize on the CHILD drive and are
-    # copied back only on task_done. The child's REAL result decides — SETTLED
-    # statuses only (the old FINAL_STATUSES check read the cancel latch back as
-    # "terminal" and published intent as an outcome). Natural completion WINS
-    # (owner 4=A): a child that finished before the kill keeps its completed
-    # result and artifacts; the cancel settles as "already settled".
+    # A terminal checkpoint can precede split-drive adoption and artifact capture.
+    # Keep fully published CURRENT byte-identical; complete only work still owed.
     try:
-        from ouroboros.headless import (
-            copy_child_task_result, finalize_task_artifacts, task_is_readonly_subagent,
-        )
+        from ouroboros.headless import prepare_terminal_task_files, terminal_task_files_ready
         from ouroboros.cost_projection import carry_cost_meta
-        from ouroboros.task_status import SETTLED_STATUSES
 
-        child_result = copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), task)
-        if child_result and str(child_result.get("status") or "") in SETTLED_STATUSES:
-            # A4 ordering: artifact capture/finalize BEFORE publication, so the
-            # kept natural result carries its real artifacts.
-            try:
-                if not task_is_readonly_subagent(task):
-                    finalize_task_artifacts(pathlib.Path(q.DRIVE_ROOT), task)
-            except Exception:
-                log.debug("Artifact finalize failed for naturally-settled %s", task_id, exc_info=True)
-            # ABI-3: carry_cost_meta CONVERTS a stored legacy pair
-            # (deprecated-wins) so the cancel path emits honest names only.
-            child_cost = carry_cost_meta(child_result) or {
+        stored = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+        ready = terminal_task_files_ready(q.DRIVE_ROOT, task, stored)
+        if not ready:
+            prepared = prepare_terminal_task_files(pathlib.Path(q.DRIVE_ROOT), task)
+            stored = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+            ready = terminal_task_files_ready(q.DRIVE_ROOT, task, stored)
+            if not ready and (settled_status or prepared.get("terminal_source_present") is not False):
+                raise RuntimeError("terminal file publication is unresolved")
+        if ready:
+            stored_cost = carry_cost_meta(stored) or {
                 "cost_accounting_status": "unavailable", "cost_final": False,
                 "accounted_upper_bound_usd": None}
-            kept_row = load_task_result(q.DRIVE_ROOT, task_id) or child_result
-            # GR2-4: the kept answer is registered as OWED before the intent
-            # settles — a crash between the two must not lose both the
-            # watchdog trigger and the delivery. GR3-4: a registration that
-            # could NOT be made durable leaves the intent OPEN (claim released
-            # for the watchdog) instead of settling over an unowed answer —
-            # the retry finds the settled result and re-delivers on the miss
-            # lane.
             owed_ok = _register_owed_terminal_delivery(
-                q, task, task_id, kept_row, deliver=deliver,
-                unreconciled_runs=unreconciled,
+                q, task, task_id, stored, deliver=deliver, unreconciled_runs=unreconciled,
             )
-            if not owed_ok and intent and intent.get("request_id"):
-                _release_intent_claim(
-                    q, task_id,
-                    error="owed terminal-delivery registration failed", intent=intent,
-                )
-            else:
-                _settle_intent(q, task_id, outcome=SETTLED_ALREADY,
-                               detail=str(child_result.get("status") or ""), intent=intent)
+            _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
+                                     outcome=SETTLED_ALREADY, detail=str(stored["status"]))
             return _publish_cancelled_task(
-                q, task_id, task, worker, kept_row,
-                child_cost, deliver=deliver, unreconciled_runs=unreconciled,
+                q, task_id, task, worker, stored, stored_cost,
+                deliver=deliver, unreconciled_runs=unreconciled,
             )
     except Exception:
-        log.debug("Child-drive terminal re-check failed for %s", task_id, exc_info=True)
+        log.warning("Cancel terminal-file recovery remains pending for %s", task_id, exc_info=True)
+        _restore_custody(task_id, worker=worker)
+        _release_intent_claim(q, task_id, error="terminal file publication unresolved", intent=intent)
+        return CANCEL_FAILED
 
     # Cost reconstruction is EVIDENCE, not custody: a ledger read that fails must
     # degrade to unknown fields rather than strand a task whose worker is already

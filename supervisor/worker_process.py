@@ -250,6 +250,24 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
             for e in events:
                 e2 = dict(e)
                 e2["worker_id"] = wid
+                if (
+                    e2.get("type") == "task_done"
+                    and e2.get("task_id") == task.get("id")
+                    and not (task.get("_ephemeral_turn") or task.get("_is_direct_chat")
+                             or e2.get("_ephemeral") or e2.get("ephemeral_decision"))
+                ):
+                    # Earlier frames (including the answer) keep their order.
+                    # Do not release this slot until its first save attempt ends.
+                    try:
+                        from ouroboros.headless import prepare_terminal_task_files
+
+                        prepared = prepare_terminal_task_files(_drive, task)
+                        if prepared.get("error"):
+                            log.warning("Terminal file preparation for %s: %s", task.get("id"), prepared["error"])
+                    except Exception:
+                        # File publication must not enter the model's crash-retry rail.
+                        log.exception("Terminal file preparation failed for %s", task.get("id"))
+                    e2["_files_prepared_attempt"] = int(task.get("_attempt") or 1)
                 out_q.put(e2)
         except Exception as _e:
             _log_worker_crash(wid, _drive, "handle_task", _e, _tb.format_exc())

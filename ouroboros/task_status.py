@@ -511,7 +511,7 @@ def load_effective_task_result(
     )
 
 
-def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
+def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset()) -> int:
     """Durably finalize on-disk RUNNING task results the effective-status
     projection already considers terminal.
 
@@ -540,7 +540,7 @@ def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
         return 0
     for row in running:
         task_id = str(row.get("task_id") or row.get("id") or "")
-        if not task_id:
+        if not task_id or task_id in exclude_task_ids:
             continue
         try:
             effective = load_effective_task_result(root, task_id)

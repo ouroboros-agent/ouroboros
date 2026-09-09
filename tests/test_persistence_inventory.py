@@ -396,10 +396,22 @@ class _PathResolver:
     def _locals(self, scope: ast.AST, consts: dict[str, str],
                 nodes: list[ast.AST]) -> dict[str, str]:
         local: dict[str, str] = {}
+        created_dirs = {node.func.value.id for node in nodes
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "mkdir" and isinstance(node.func.value, ast.Name)}
         for node in nodes:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 \
                     and isinstance(node.targets[0], ast.Name):
-                rel, ok = self.resolve(node.value, consts, local)
+                value = node.value
+                if (node.targets[0].id in created_dirs and isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Attribute) and value.func.attr == "resolve"
+                        and isinstance(value.func.value, ast.BinOp) and isinstance(value.func.value.op, ast.Div)
+                        and self._segment(value.func.value.right, consts) in TOP_LEVEL):
+                    # A constructor creates this resolved directory. Its declared
+                    # store prefix survives canonicalization; an arbitrary locator
+                    # reader's resolve() is not a declaration of another store.
+                    value = value.func.value
+                rel, ok = self.resolve(value, consts, local)
                 if ok and _is_named(rel):
                     local[node.targets[0].id] = rel
             elif isinstance(node, ast.For) and isinstance(node.target, ast.Name) \
@@ -883,3 +895,21 @@ def test_no_parameter_rooted_spelling_lands_at_the_data_ROOT():
         if path.split("/")[0] in {"uninstalled.json", "__extension_imports"}
     )
     assert not misrooted, f"parameter-rooted spellings left at the data root: {misrooted}"
+
+
+def test_resolved_observability_root_matches_real_writer_outputs(tmp_path):
+    """Canonical root spelling must not turn blobs/calls into data-root stores."""
+    from ouroboros import observability
+
+    root = tmp_path / "data"
+    call = observability.persist_call(root, task_id="inventory", call_id="call",
+                                      call_type="llm_response", payload={"answer": "retained"})
+    manifest = observability.read_call_manifest_ref(root, call["manifest_ref"], task_id="inventory")
+    assert observability.read_blob_ref(root, manifest["full_payload_ref"]) == {"answer": "retained"}
+    paths = scan_data_paths()
+    for ref in (call["manifest_ref"], manifest["full_payload_ref"]):
+        relative = pathlib.Path(ref["path"]).relative_to(root.resolve()).as_posix()
+        assert relative.startswith("observability/")
+        assert any(fnmatch.fnmatchcase(relative, path) for path in paths)
+    assert {"observability/blobs/*.*.gz", "observability/calls/*/*.json"} <= paths
+    assert not any(path.startswith(("blobs/", "calls/")) for path in paths)

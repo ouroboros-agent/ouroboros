@@ -311,7 +311,7 @@ def test_nested_unavailable_source_is_disclosed_without_reconstructing_preview(t
     assert not (artifacts.task_artifact_dir_path(parent, "source") / result["path"]).exists()
 
 
-def test_copyback_keeps_bulk_artifacts_outside_lock_and_selected_review_refs_inside(tmp_path, monkeypatch):
+def test_copyback_prepares_bulk_artifacts_and_selected_review_refs_outside_lock(tmp_path, monkeypatch):
     from ouroboros import headless, observability
 
     parent = tmp_path / "canonical"
@@ -330,7 +330,7 @@ def test_copyback_keeps_bulk_artifacts_outside_lock_and_selected_review_refs_ins
         return bulk_copy(*args, **kwargs)
 
     def promote_review(*args, **kwargs):
-        assert lock.exists(), "review references were promoted before CURRENT selection"
+        assert not lock.exists(), "CURRENT review reference I/O entered the result lock"
         observed.append("review")
         return promote(*args, **kwargs)
 

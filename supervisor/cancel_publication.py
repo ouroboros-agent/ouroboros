@@ -281,6 +281,10 @@ def _publish_cancelled_task(
     from supervisor import workers
 
     from ouroboros.task_results import STATUS_CANCELLED
+    from ouroboros.headless import terminal_task_files_ready
+
+    if not terminal_task_files_ready(q.DRIVE_ROOT, {**stored, **task, "id": task_id}, stored):
+        return CANCEL_FAILED  # Publication/cleanup cannot outrun terminal source custody.
 
     settled_status = str((stored or {}).get("status") or STATUS_CANCELLED)
     # The row leaves RUNNING only NOW — death confirmed, terminal result durable.
@@ -335,17 +339,8 @@ def _publish_cancelled_task(
     # The helper serializes against shutdown with the lifecycle lock and starts
     # the child outside the queue lock; on failure the marker is cleared under
     # the lock so the crash detector can recover the slot on a later tick.
-    try:
-        workers.respawn_worker(worker.wid)
-    except Exception:
-        log.warning("Respawn after cancelling %s failed; clearing reaping for recovery", task_id, exc_info=True)
-        try:
-            with q._queue_lock:
-                slot = workers.WORKERS.get(worker.wid)
-                if slot is not None:
-                    slot.reaping = False
-        except Exception:
-            log.debug("Could not clear the slot marker for %s", task_id, exc_info=True)
+    from supervisor.task_reaper import _respawn_after_reap
+    _respawn_after_reap(q, workers, worker.wid, expected_worker=worker)
     if str(task.get("delegation_role") or "") == "subagent":
         try:
             from ouroboros.headless import remove_subagent_task_drive

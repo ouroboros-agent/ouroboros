@@ -524,9 +524,8 @@ def _reconcile_seal_directions(
         report["sealed_attempts"] += 1
         seal = None
         try:
-            manifest = json.loads(
-                pathlib.Path(str(ref.get("path") or "")).read_text(encoding="utf-8")
-            )
+            from ouroboros.observability import read_call_manifest_ref
+            manifest = read_call_manifest_ref(root, ref, task_id=str(row.get("task_id") or ""))
             if isinstance(manifest, dict):
                 seal = manifest.get("model_send_seal")
         except Exception:

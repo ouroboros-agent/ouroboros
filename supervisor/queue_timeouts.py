@@ -350,10 +350,15 @@ def _enforce_task_timeouts_locked(
             if not update_evolution_transaction(task_id, dispatch_status="reaping"):
                 log.warning("Evolution timeout teardown deferred: reaping state was not durable for %s", task_id)
                 continue
+        current_worker = workers.WORKERS.get(worker_id)
+        if current_worker is not None and current_worker.busy_task_id != task_id:
+            continue  # A stale queue row cannot hand a newer worker to teardown.
         _queue().RUNNING.pop(task_id, None)
         proc_handle = None
+        captured_worker = None
         if worker_id in workers.WORKERS:
             w = workers.WORKERS[worker_id]
+            captured_worker = w
             if w.busy_task_id == task_id:
                 w.busy_task_id = None
             # Mark reaping under the lock so assign_tasks and the crash detector both skip
@@ -391,9 +396,12 @@ def _enforce_task_timeouts_locked(
         _queue()._ensure_reaper_started()
         _queue()._reap_queue.put({
             "worker_id": worker_id,
+            "worker": captured_worker,
+            "drive_root": str(_queue().DRIVE_ROOT),
+            "meta": meta,
             "proc": proc_handle,
             "task_id": str(task_id),
-            "task": task,
+            "task": dict(task),
             "task_type": task_type,
             "terminal_reason": terminal_reason,
             "attempt": attempt,

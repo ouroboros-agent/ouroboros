@@ -12,8 +12,9 @@ its command line, `OUROBOROS_DATA_DIR=<our data dir>` in its environment, and
 every launcher-started generation carries them, while a direct or dev run of the same checkout does
 not and is spared with a warning. An environment that cannot be READ is never a licence to kill.
 
-The custody ledger is deliberately never consulted: missing ledger entries are the defect this
-sweep repairs, so a ledger lookup would spare exactly the strays that matter. Enforcement requires a
+Server selection deliberately does not require custody: missing server entries are the defect this
+sweep repairs. The caller supplies shared-daemon roots only to spare their descendant branches.
+Enforcement requires a
 byte-exact environment source, so kills happen only on /proc hosts (the field-incident platform);
 elsewhere the sweep says so and does nothing — Windows orphans already die with the launcher's
 kill-on-close Job Object, and the ps -E fallback mixes argv into the environment column, which
@@ -209,7 +210,10 @@ def _pid_gone(pid: int) -> bool:
     return _pl.pid_provably_gone(pid)
 
 
-def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[str]) -> bool:
+def _revalidate_and_kill(
+    pid: int, server_paths: Set[str], data_dir_values: Set[str],
+    retained_descendant_roots: "Optional[Set[int]]" = None,
+) -> bool:
     """Re-prove ``pid`` from live state and signal the PROVEN ROOT with NOTHING in between: any
     lookup in that gap is a window for the pid to exit and be recycled onto a stranger —
     descendants are therefore captured before revalidation, then the root is signalled directly
@@ -223,7 +227,9 @@ def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[
     # reparents its children to init, after which no parent-walk finds them. A
     # fork landing after this capture is the next pass's job — that is what the
     # bounded rescans exist for.
-    descendants = _pl.collect_descendant_pids(pid)
+    descendants = _pl.collect_descendant_pids(pid, **(
+        {"exclude_pids": retained_descendant_roots} if retained_descendant_roots else {}
+    ))
     if not _runs_our_server(pid, server_paths) or not _is_launcher_managed(pid, data_dir_values):
         return False
     _signal_pid(pid)
@@ -241,6 +247,7 @@ def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[
 def reap_same_install_strays(
     repo_dir, data_dir, reason: str = "startup",
     exclude_pids: "Optional[Iterable[int]]" = None,
+    retained_descendant_roots: "Optional[Set[int]]" = None,
 ) -> List[int]:
     """Kill proven same-install strays; return the proven pids still alive after the last pass.
 
@@ -287,7 +294,7 @@ def reap_same_install_strays(
             if not proven:
                 break
             for pid in sorted(proven):
-                if _revalidate_and_kill(pid, server_paths, data_dir_values):
+                if _revalidate_and_kill(pid, server_paths, data_dir_values, retained_descendant_roots):
                     killed.add(pid)
             time.sleep(_SETTLE_SEC)
         else:

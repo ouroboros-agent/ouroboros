@@ -81,6 +81,8 @@ from ouroboros.server_liveness import (  # noqa: F401
 )
 from ouroboros.server_maintenance import (  # noqa: F401
     _LAST_CANCEL_INTENT_SWEEP,
+    _migrate_startup_cancel_latches,
+    _startup_worker_pids,
     _installed_skill_names,
     _periodic_supervisor_maintenance,
     _periodic_zombie_reconcile,
@@ -628,6 +630,8 @@ def _run_supervisor(settings: dict) -> None:
         import types
         import queue as _queue_mod
 
+        _migrate_startup_cancel_latches(DATA_DIR)
+        prior_worker_pids = _startup_worker_pids(DATA_DIR)
         restored_pending = restore_pending_from_snapshot()
         kill_workers(preserve_pending=True)
         spawn_workers(max_workers)
@@ -638,40 +642,17 @@ def _run_supervisor(settings: dict) -> None:
             pre_adopt_planned_handoffs(DATA_DIR, list(PENDING))
         except Exception:
             log.debug("Planned delegate pre-adoption failed", exc_info=True)
-        _resume_interrupted_project_deletions()
-        # Original startup order preserved: drive prunes, custody sweep (reap
-        # orphaned processes), THEN worktree prune.
-        _startup_prune_sweeps()
         _startup_custody_sweep()
+        recovered_files = _run_startup_task_recovery(
+            DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+            prior_worker_pids=prior_worker_pids,
+        )
+        _resume_interrupted_project_deletions()
+        _startup_prune_sweeps(preserve_task_sources=bool(
+            recovered_files["unresolved"] or recovered_files["protected"] or recovered_files["errors"]))
         _startup_worktree_prune()
 
         _prune_delegated_snapshots()
-
-        try:
-            from ouroboros.observability import prune_observability_blobs
-            from ouroboros.tools.services import prune_service_logs
-
-            observability_report = prune_observability_blobs(DATA_DIR)
-            service_report = prune_service_logs(DATA_DIR)
-            if (
-                observability_report.get("enabled")
-                or observability_report.get("manifest_count")
-                or observability_report.get("blob_count")
-                or observability_report.get("deleted_manifests")
-                or observability_report.get("deleted_blobs")
-                or observability_report.get("errors")
-                or service_report.get("deleted_dirs")
-                or service_report.get("deleted_files")
-                or service_report.get("errors")
-            ):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "runtime_artifact_prune",
-                    "observability": observability_report,
-                    "services": service_report,
-                })
-        except Exception:
-            log.debug("Runtime artifact prune failed", exc_info=True)
 
         if restored_pending > 0:
             st_boot = load_state()
@@ -1271,11 +1252,11 @@ async def lifespan(app):
     # Startup-only: after the prior process generation is gone, finalize orphaned
     # RUNNING results and resolve an indeterminate post-task synthesis phase.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    _run_startup_task_recovery(
-        lifespan_drive_root,
-        REPO_DIR,
-        skip_live_data=pytest_default_real_data_dir,
-    )
+    if not has_startup_ready_provider(settings):
+        _run_startup_task_recovery(
+            lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
+            prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
+        )
 
     # Reload enabled+reviewed extensions across restarts.
     try:

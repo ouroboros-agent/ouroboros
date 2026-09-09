@@ -644,16 +644,14 @@ def reserve_task_admission(
             try:
                 from supervisor import workers
 
-                disabled_reason = str(workers._WORKER_POOL_DISABLED_REASON or "")
-                pool = workers.WORKERS if worker_pool is None else worker_pool
-                worker_count = len(pool)
+                pool_state = workers._worker_pool_execution_state(worker_pool)
             except Exception:
                 return {"status": "blocked", "reason": "worker_pool_state_unavailable"}
-            if disabled_reason or worker_count <= 0:
+            if not pool_state["available"]:
                 return {
                     "status": "blocked",
                     "reason": "worker_pool_unavailable",
-                    "worker_pool_disabled_reason": disabled_reason or "no_workers",
+                    "worker_pool_disabled_reason": pool_state["disabled_reason"],
                 }
         queue.ADMISSION_RESERVATIONS[tid] = token
         return {"status": "reserved", "reason": ""}

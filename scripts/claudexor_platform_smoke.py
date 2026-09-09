@@ -10,7 +10,8 @@ left open beside it as Q8):
             run pinned to the named harness, poll it to a terminal state, read its
             PRIMARY ARTIFACT to EOF, observe the child's edit on disk, and read
             back the applied-containment facts. For a managed runtime it also
-            exercises the serving closure's identity-bound graceful stop. That is
+            exercises the serving closure's identity-bound graceful stop, then
+            ordinary CLI shutdown over an active fake run and legacy custody. That is
             the transport, lifecycle, platform paths and Ouroboros-to-Claudexor seam. The artifact read
             is a plain EOF read verified against the size the run itself reported
             — it is NOT the production custody acknowledgement, which never runs
@@ -498,6 +499,125 @@ def graceful_stop_managed_runtime(
     }
 
 
+def verify_operator_stop_fixture(root: pathlib.Path, facts: Dict[str, Any]) -> None:
+    """Real operator CLI + writer lease, on the smoke's own fresh generation only."""
+    from unittest.mock import patch
+    from ouroboros import claudexor_daemon as daemon, claudexor_runtime, config, process_custody as custody
+    from ouroboros.platform_layer import pid_is_alive
+    from ouroboros.utils import atomic_write_json
+
+    owner = daemon.get_owned_daemon()
+    if owner._proc is not None:
+        owner._proc.wait(timeout=5)  # Replacement ACK may precede the old Node's exit.
+    try:
+        gateway = daemon.ensure_owned_gateway()
+    except BaseException:
+        owner.stop()
+        raise
+    proc = owner._proc  # Capture the fixture we spawned; the stop actor has no Popen authority.
+    run_id, stopped = "", False
+    proof: Dict[str, Any] = {}
+    facts["operator_stop"] = proof
+    try:
+        if proc is None or proc.poll() is not None:
+            raise SmokeFailure("operator_fixture_not_owned", "the fixture must spawn its own daemon")
+        proof["daemon_pid"] = proc.pid
+        manager = claudexor_runtime.get_runtime_manager()
+        cli, pin = manager.resolve_cli_command(require_npm=False), manager.pin
+        body = gateway.handshake()
+        if not cli or pin is None or gateway.engine_version != pin.version or handshake_engine_sha(body) != pin.build_sha:
+            raise SmokeFailure("operator_fixture_identity", "the managed CLI/daemon pin is unavailable or mismatched")
+        proof.update(cli_command=cli, engine_version=pin.version, engine_sha=pin.build_sha)
+        home = daemon.owned_config_dir() / "daemon"
+        candidates = [*home.glob("*.writer/owner.json"), *home.glob("*.writer/active.writer/owner.json")]
+        leases = [(p, json.loads(p.read_text(encoding="utf-8"))) for p in candidates]
+        leases = [(p, row) for p, row in leases if row.get("pid") == proc.pid]
+        rows = custody._read_ledger(config.DATA_DIR)
+        own = [r for r in rows if r.get("pid") == proc.pid and r.get("purpose") == daemon.CUSTODY_PURPOSE]
+        if len(leases) != 1 or len(own) != 1:
+            raise SmokeFailure("operator_fixture_custody", "expected one exact fixture lease and custody row")
+        lease, lease_owner = leases[0]
+        lease_owner.pop("identity", None)  # Absent is legacy; null would be malformed.
+        atomic_write_json(lease, lease_owner)
+        own[0]["fingerprint"]["start_time"] = ""
+        own[0]["fingerprint"].pop("start_time_boot", None)
+        custody._rewrite_ledger(config.DATA_DIR, rows)
+        if custody._fingerprint_matches(own[0], require_measured=True):
+            raise SmokeFailure("operator_fixture_not_legacy", "legacy row unexpectedly grants signal authority")
+        proof.update(legacy_birth=True, lease_path=str(lease), lease_identity_absent=True)
+        gateway.register_project(str(root))
+        handle = gateway.start_run(
+            build_request("fixture", "fake-hang", "", "", root, "Wait for operator stop", 300),
+            idempotency_key=uuid.uuid4().hex,
+        )
+        run_id = str(handle.get("runId") or handle.get("jobId") or "")
+        if not run_id:
+            raise SmokeFailure("operator_fixture_run_missing", "fake-hang returned no run id")
+        proof["run_id"] = run_id
+        deadline = time.monotonic() + 30
+        while True:
+            summary = gateway.get_run(run_id, timeout_sec=2).get("summary") or {}
+            run_dir = pathlib.Path(summary["runDir"]) if summary.get("runDir") else None
+            entered = False
+            for path in run_dir.glob("events.jsonl") if run_dir else []:
+                # A live writer may not have finished its final line yet.
+                raw = path.read_text(encoding="utf-8")
+                for line in raw.splitlines(keepends=True):
+                    if line.strip() and line.endswith("\n"):
+                        row = json.loads(line)
+                        event = row.get("payload") or {}
+                        if row.get("type") == "harness.event" and event.get("harness_id") == "fake-hang" and event.get("type") == "thinking":
+                            entered = True
+                            proof["entered_event_seq"] = row.get("seq")
+            if summary.get("state") == "running" and entered:
+                proof.update(fake_hang_entered=True, run_dir=str(run_dir))
+                break
+            if time.monotonic() >= deadline or summary.get("state") in TERMINAL_STATES:
+                raise SmokeFailure("operator_fixture_not_running", "fake-hang did not enter its active wait")
+            time.sleep(.1)
+        fresh = daemon.OwnedClaudexorDaemon()
+        actual_run, observed = subprocess.run, []
+
+        def record(argv: List[str], **kwargs: Any) -> Any:
+            result = actual_run(argv, **kwargs)
+            if list(argv) == [*cli, "daemon", "stop", "--json"]:
+                receipt = json.loads(result.stdout) if result.returncode == 0 else None
+                observed.append({"exit_code": result.returncode, "receipt": receipt})
+                proof["cli_attempts"] = observed
+            return result
+
+        if fresh._proc is not None:
+            raise SmokeFailure("operator_fixture_not_attached", "stop actor unexpectedly owns a Popen handle")
+        with patch.object(daemon.subprocess, "run", side_effect=record), patch.object(
+            custody, "stop_ledgered_processes", side_effect=AssertionError("forced fallback is not cooperative proof"),
+        ):
+            outcome = fresh.stop_outcome()
+        if (outcome != "stopped" or len(observed) != 1 or observed[0]["exit_code"] != 0
+                or not isinstance(observed[0]["receipt"], dict)
+                or observed[0]["receipt"].get("ok") is not True
+                or observed[0]["receipt"].get("stopped") is not True
+                or observed[0]["receipt"].get("outcome") != "exited"):
+            raise SmokeFailure("operator_stop_unconfirmed", "ordinary CLI did not prove cooperative shutdown")
+        proof["daemon_exit_code"] = proc.wait(timeout=5)
+        retained = [r for r in custody._read_ledger(config.DATA_DIR) if r.get("pid") == proc.pid]
+        if (proof["daemon_exit_code"] != 0 or pid_is_alive(proc.pid) or lease.parent.exists()
+                or len(retained) != 1 or retained[0]["fingerprint"].get("start_time") != ""):
+            raise SmokeFailure("operator_stop_not_settled", "process/lease death or unchanged legacy custody not proven")
+        stopped = True
+        proof.update(stopped=True, pid_gone=True, lease_released=True, forced_fallback=False)
+    finally:
+        if run_id and not stopped:
+            try:
+                gateway.cancel_run(run_id, reason="operator-stop fixture teardown")
+            except Exception:
+                pass
+        gateway.close()
+        # The original fixture Popen remains cleanup authority even if CLI proof fails.
+        owner.stop()
+        if proc is not None and proc.poll() is None:
+            raise SmokeFailure("operator_fixture_leaked", "fixture daemon did not exit during teardown")
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -549,6 +669,8 @@ def _limits_block(lane: str) -> List[str]:
             "- The primary artifact was read to EOF, but the production custody "
             "acknowledgement (the durable D7 row) is part of the delegation path this "
             "smoke does not drive.",
+            "- Managed fixture shutdown also runs the real operator CLI over an active "
+            "fake-hang and a legacy writer lease; that fake still spawns no harness process.",
         ]
     return lines
 
@@ -602,13 +724,21 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
         "transport_floor": CLAUDEXOR_MIN_VERSION,
         "delegated_marker_floor": CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
     }
+    if args.managed_runtime and args.lane == "fixture":
+        from ouroboros.config import DATA_DIR
+        facts["fixture_data_root"] = str(DATA_DIR)
 
     owned_daemon = None
     if args.managed_runtime:
         from ouroboros.claudexor_daemon import ensure_owned_gateway, get_owned_daemon
 
         owned_daemon = get_owned_daemon()
-        gateway = ensure_owned_gateway()
+        try:
+            gateway = ensure_owned_gateway()
+        except BaseException:
+            if args.lane == "fixture" and owned_daemon._proc is not None:
+                owned_daemon.stop()
+            raise
         owned_status = owned_daemon.status_dict()
         facts["daemon"] = str(owned_status.get("config_dir") or "managed")
         facts["managed_runtime"] = owned_status.get("runtime") or {}
@@ -758,6 +888,8 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
                 engine,
                 engine_build_sha,
             )
+            if args.lane == "fixture":
+                verify_operator_stop_fixture(root, facts)
         return facts
     except SmokeFailure as exc:
         # Everything learned before the refusal belongs in the report: a summary that
@@ -821,6 +953,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 2
         args.model, args.effort = "", ""
+        if args.secret_env:
+            parser.error("the fixture lane accepts no credentials")
+        if args.managed_runtime:
+            # The fixture edits its own legacy custody. It must never attach to
+            # an installed daemon or discover the operator's native accounts.
+            isolated = pathlib.Path(tempfile.mkdtemp(prefix="cx-", dir="/tmp" if os.name != "nt" else None)).resolve()
+            home = isolated / "home"
+            home.mkdir()
+            for key in list(os.environ):
+                if key.endswith(("API_KEY", "TOKEN", "PASSWORD", "SECRET", "CREDENTIALS")) or (
+                    key.startswith(("OUROBOROS_", "CLAUDEXOR_")) and key != "OUROBOROS_BUNDLE_DIR"
+                ):
+                    os.environ.pop(key, None)
+            os.environ.update(
+                HOME=str(home), USERPROFILE=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+                APPDATA=str(home / "AppData" / "Roaming"), LOCALAPPDATA=str(home / "AppData" / "Local"),
+                OUROBOROS_APP_ROOT=str(isolated), OUROBOROS_DATA_DIR=str(isolated / "data"),
+                OUROBOROS_SETTINGS_PATH=str(isolated / "data" / "settings.json"),
+            )
+            print(f"[smoke] isolated fixture root: {isolated}", flush=True)
 
     try:
         facts = run_smoke(args)

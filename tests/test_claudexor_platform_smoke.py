@@ -16,6 +16,8 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +33,128 @@ def _load_smoke():
 
 
 smoke = _load_smoke()
+
+
+def test_managed_fixture_main_rebinds_before_runtime_imports(tmp_path, monkeypatch):
+    monkeypatch.setattr(smoke.os, "environ", dict(os.environ))
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path / "live-data"))
+    monkeypatch.setenv("CLAUDEXOR_CONFIG_DIR", str(tmp_path / "live-engine"))
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-secret")
+    monkeypatch.setenv("OUROBOROS_BUNDLE_DIR", str(tmp_path / "bundle"))
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    monkeypatch.setattr(smoke.tempfile, "mkdtemp", lambda **_kw: str(isolated))
+    def run(args):
+        assert args.lane == "fixture" and args.managed_runtime
+        assert os.environ["OUROBOROS_DATA_DIR"] == str(isolated / "data")
+        assert os.environ["HOME"] == str(isolated / "home")
+        assert os.environ["USERPROFILE"] == str(isolated / "home")
+        assert "CLAUDEXOR_CONFIG_DIR" not in os.environ and "OPENAI_API_KEY" not in os.environ
+        assert os.environ["OUROBOROS_BUNDLE_DIR"] == str(tmp_path / "bundle")
+        return {}
+    monkeypatch.setattr(smoke, "run_smoke", run)
+    monkeypatch.setattr(smoke, "emit_summary", lambda *_a: None)
+    assert smoke.main(["--managed-runtime", "--lane", "fixture"]) == 0
+
+
+@pytest.mark.parametrize("platform", ["darwin-arm64", "linux-x64", "win32-x64"])
+def test_operator_cli_resolves_exact_bundled_node_without_npm_or_install(tmp_path, monkeypatch, platform):
+    from ouroboros import claudexor_runtime as rt, config, platform_layer as pl
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    manager = rt.ClaudexorRuntimeManager()
+    pin = manager.pin
+    assert pin is not None
+    cli = rt.managed_runtime_dir(pin) / pin.cli_entrypoint
+    cli.parent.mkdir(parents=True)
+    cli.write_text("fixture CLI")
+    node = tmp_path / "bundle" / "node-standalone" / ("node.exe" if platform == "win32-x64" else "bin/node")
+    node.parent.mkdir(parents=True)
+    node.write_text("exact fixture Node")
+    monkeypatch.setattr(manager, "_managed_metadata", lambda: {"verified": True})
+    monkeypatch.setattr(pl, "bundled_resource_bases", lambda: [tmp_path / "bundle"])
+    monkeypatch.setattr(pl, "embedded_node_candidates", lambda _base: [node])
+    monkeypatch.setattr(pl, "probe_node_version", lambda path: pin.node_version if path == str(node) else "")
+    monkeypatch.setattr(pl, "node_distribution_platform", lambda: platform)
+    monkeypatch.setattr(manager, "_install", lambda *_a, **_kw: pytest.fail("read-only resolution installed runtime"))
+    monkeypatch.setattr(manager, "_probe", lambda *_a, **_kw: pytest.fail("resolution probed the daemon"))
+    monkeypatch.setattr(manager, "ensure", lambda *_a, **_kw: pytest.fail("resolution provisioned runtime"))
+    assert manager.resolve_cli_command(require_npm=False) == [str(node), str(cli)]
+    assert manager.resolve_cli_command() == [] and manager.resolve_cli_command(require_npm=True) == []
+
+
+@pytest.mark.parametrize("barrier,receipt,rc,passes", [
+    (False, {"ok": True, "stopped": True, "outcome": "exited"}, 0, True),
+    (True, {"ok": True, "stopped": True, "outcome": "exited"}, 0, True),
+    (True, {"ok": True, "stopped": True, "outcome": "killed"}, 0, False),
+    (True, {"ok": True}, 0, False),
+    (True, {"ok": True, "stopped": True, "outcome": "exited"}, 1, False),
+])
+def test_operator_fixture_observes_receipt_and_always_cleans_up(tmp_path, monkeypatch, barrier, receipt, rc, passes):
+    from ouroboros import claudexor_daemon as d, claudexor_runtime as rt, config, process_custody as c, platform_layer as pl
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    home = tmp_path / "claudexor" / "daemon"
+    lease_dir = home / "fixture.writer"
+    if barrier:
+        lease_dir = lease_dir / "active.writer"
+    lease_dir.mkdir(parents=True)
+    lease = lease_dir / "owner.json"
+    lease.write_text(json.dumps({"pid": 42, "token": "fixture-token", "identity": {"present": True}}))
+    c.append_jsonl(c.ledger_path(tmp_path), {"pid": 42, "purpose": d.CUSTODY_PURPOSE,
+                                           "fingerprint": {"start_time": "new", "start_time_boot": "new"}})
+    monkeypatch.setattr(c, "_fingerprint_matches", lambda *_a, **_kw: False)
+    run_dir = tmp_path / "run"
+    events = run_dir / "events.jsonl"
+    events.parent.mkdir(parents=True)
+    events.write_text('{"seq":6,"type":"harness.event","payload":{"harness_id":"fake-hang","type":"thinking"}}\n{"partial":')
+    cleanup, cancelled, calls = [], [], []
+    old = SimpleNamespace(wait=lambda **_kw: 0)
+    proc = SimpleNamespace(pid=42, poll=lambda: None if not cleanup else 0, wait=lambda **_kw: 0)
+    owner = SimpleNamespace(_proc=old, stop=lambda: cleanup.append(True))
+    gateway = SimpleNamespace(
+        engine_version="3.10.1", handshake=lambda: {"engine": {"sha": "a" * 40}},
+        register_project=lambda _r: "project", start_run=lambda *_a, **_kw: {"runId": "run"},
+        get_run=lambda *_a, **_kw: {"summary": {"state": "running", "runDir": str(run_dir)}},
+        cancel_run=lambda *_a, **_kw: cancelled.append(True), close=lambda: None,
+    )
+    def start():
+        owner._proc = proc
+        return gateway
+    monkeypatch.setattr(d, "ensure_owned_gateway", start)
+    monkeypatch.setattr(d, "get_owned_daemon", lambda: owner)
+    def cli_command(*, require_npm):
+        assert require_npm is False
+        return ["node", "claudexor.bundle.cjs"]
+    monkeypatch.setattr(rt, "get_runtime_manager", lambda: SimpleNamespace(
+        pin=SimpleNamespace(version="3.10.1", build_sha="a" * 40),
+        resolve_cli_command=cli_command,
+    ))
+    def run(argv, **kw):
+        calls.append(argv)
+        assert "identity" not in json.loads(lease.read_text())
+        assert c._read_ledger(tmp_path)[0]["fingerprint"] == {"start_time": ""}
+        if passes:
+            lease.unlink()
+            lease_dir.rmdir()
+        return smoke.subprocess.CompletedProcess(argv, rc, stdout=json.dumps(receipt))
+    monkeypatch.setattr(smoke.subprocess, "run", run)
+    def stop():
+        result = smoke.subprocess.run(["node", "claudexor.bundle.cjs", "daemon", "stop", "--json"])
+        return "stopped" if result.returncode == 0 and receipt.get("stopped") else "unconfirmed"
+    monkeypatch.setattr(d, "OwnedClaudexorDaemon", lambda: SimpleNamespace(_proc=None, stop_outcome=stop))
+    monkeypatch.setattr(pl, "pid_is_alive", lambda _pid: False)
+    monkeypatch.setattr(smoke, "build_request", lambda *_a: {"harnesses": ["fake-hang"]})
+    facts = {}
+    if passes:
+        smoke.verify_operator_stop_fixture(tmp_path, facts)
+        assert facts["operator_stop"]["pid_gone"] and facts["operator_stop"]["lease_released"]
+    else:
+        with pytest.raises(smoke.SmokeFailure, match="cooperative shutdown"):
+            smoke.verify_operator_stop_fixture(tmp_path, facts)
+    assert cleanup == [True] and bool(cancelled) is not passes
+    assert calls == [["node", "claudexor.bundle.cjs", "daemon", "stop", "--json"]]
 
 
 # -- the path-shape guard ------------------------------------------------------

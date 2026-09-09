@@ -4,6 +4,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 _TEST_SUBAGENTS = '{"enabled":true,"items":[{"subagent_id":"api-scout","name":"API scout","recommended_use":"Tests","route":{"kind":"api_model","target_id":"openai/gpt-5.6-sol"},"effort":"high"}]}'
 
 
@@ -2763,7 +2765,11 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "childdone", "worker_id": 7, "task_type": "task"}, ctx)
+    from ouroboros.headless import prepare_terminal_task_files
+
+    prepare_terminal_task_files(tmp_path, ctx.RUNNING["childdone"]["task"])
+    ev_module._handle_task_done({"task_id": "childdone", "worker_id": 7, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
     assert load_task_result(tmp_path, "childdone")["result"] == "summary"
     assert not (tmp_path / "task_results" / "artifacts" / "childdone" / "memory_export.json").exists()
@@ -2800,7 +2806,9 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "childfail", "worker_id": 8, "task_type": "task"}, ctx)
+    prepare_terminal_task_files(tmp_path, ctx.RUNNING["childfail"]["task"])
+    ev_module._handle_task_done({"task_id": "childfail", "worker_id": 8, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
     assert load_task_result(tmp_path, "childfail")["status"] == STATUS_FAILED
     assert sent and "failed" in sent[-1][1]
@@ -2862,26 +2870,8 @@ def test_handle_task_done_skips_workspace_readonly_subagent_artifacts(tmp_path, 
     import ouroboros.headless as headless
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 
-    calls = []
-
-    def fake_copy(root, task):
-        calls.append(("copy", task["id"]))
-        return write_task_result(pathlib.Path(root), task["id"], STATUS_COMPLETED, result="child handoff")
-
-    monkeypatch.setattr(headless, "copy_child_task_result", fake_copy)
-
-    def fake_finalize(root, task):
-        calls.append(("finalize", task["id"]))
-        write_task_result(
-            pathlib.Path(root),
-            task["id"],
-            STATUS_COMPLETED,
-            result="done",
-            artifact_status="failed",
-            artifact_bundle={"status": "failed", "artifacts": []},
-        )
-
-    monkeypatch.setattr(headless, "finalize_task_artifacts", fake_finalize)
+    for name in ("copy_child_task_result", "finalize_task_artifacts"):
+        monkeypatch.setattr(headless, name, lambda *_a: pytest.fail("canonical readonly task needs no file work"))
     pushed = []
 
     worker = SimpleNamespace(busy_task_id="workspace-child")
@@ -2907,10 +2897,11 @@ def test_handle_task_done_skips_workspace_readonly_subagent_artifacts(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "workspace-child", "worker_id": 3, "task_type": "task"}, ctx)
+    write_task_result(tmp_path, "workspace-child", STATUS_COMPLETED, result="child handoff")
+    headless.prepare_terminal_task_files(tmp_path, ctx.RUNNING["workspace-child"]["task"])
+    ev_module._handle_task_done({"task_id": "workspace-child", "worker_id": 3, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
-    assert ("copy", "workspace-child") in calls
-    assert ("finalize", "workspace-child") not in calls
     assert pushed[-1]["status"] == STATUS_COMPLETED
     assert pushed[-1]["artifact_status"] is None
 

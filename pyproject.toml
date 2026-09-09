@@ -33,6 +33,8 @@ dependencies = [
     # uv-created source/tool environments do not seed pip unless it is declared.
     "pip",
     "httpx",
+    # Native process command/tree observations for shared-daemon custody on Windows.
+    "psutil>=7.2; sys_platform == 'win32'",
     # Runtime custom-tool calls are validated against the exact projected schema.
     "jsonschema>=4.0",
     "ddgs",

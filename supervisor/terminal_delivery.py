@@ -71,19 +71,13 @@ _HOST_SALVAGE_RECEIPT = (
 def cleanup_settled_owner_mailbox(
     drive_root: Any, task_id: str, task: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Keep model-wait choices until the canonical post-task phase settles."""
-    from ouroboros.owner_mailbox import cleanup_task_mailbox
-    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+    """Release the execution mailbox only after its canonical obligations settle."""
+    from ouroboros.owner_mailbox import cleanup_task_mailbox, settled_mailbox_cleanup_allowed
     from ouroboros.task_results import load_task_result
-    from ouroboros.task_status import SETTLED_STATUSES
     from supervisor.queue import _task_drive_for_task
 
     durable = load_task_result(pathlib.Path(drive_root), str(task_id)) or {}
-    pending = (durable.get("child_ref_promotion") or {}).get("pending_refs", [])
-    if any(isinstance(ref, dict) and ref.get("kind") == "task_attachment" for ref in pending):
-        return  # Accepted inputs still need this mailbox as their retry source.
-    post_status = (durable.get("root_phase_checkpoint") or {}).get("post_task_synthesis")
-    if str(durable.get("status") or "") in SETTLED_STATUSES and not post_task_synthesis_is_open(post_status):
+    if settled_mailbox_cleanup_allowed(durable):
         cleanup_task_mailbox(_task_drive_for_task(task or durable, str(task_id)), str(task_id))
 
 

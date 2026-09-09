@@ -403,6 +403,7 @@ def test_split_authored_narrative_keeps_only_canonical_result_ref_after_child_gc
 
 
 def test_duplicate_task_done_after_child_copyback_appends_one_canonical_projection(tmp_path):
+    from ouroboros.headless import prepare_terminal_task_files
     from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
     from supervisor import events
 
@@ -431,6 +432,9 @@ def test_duplicate_task_done_after_child_copyback_appends_one_canonical_projecti
     event = {"task_id": "child-copy", "worker_id": 7, "task_type": "task",
              "chat_id": 41, "status": "completed"}
 
+    prepared = prepare_terminal_task_files(tmp_path, task)
+    assert not prepared["error"]
+    event["_files_prepared_attempt"] = int(task.get("_attempt") or 1)
     events._handle_task_done(event, ctx)
     events._handle_task_done(event, ctx)
 

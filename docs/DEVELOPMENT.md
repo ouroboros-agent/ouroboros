@@ -1929,11 +1929,22 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   the ONE shared `owner_hurry.retry_reset`. UI surfaces share
   `web/modules/task_control_menu.js`; the `owner_hurry` event family stays
   non-chat (`log_events.js` `visible=false`).
+  Before that projection, queue-owned hurry admission initializes only an absent
+  pooled result, using the observed PENDING/RUNNING lifecycle. The existing
+  task-result writer's atomic `create_only` branch preserves any racing stored
+  row byte-for-byte; strict validation still rejects unknown authority. Direct
+  turns stay outside this initialization, and no model/start/cost/grant facts
+  are inferred from the click.
 - Code owners stay narrow behind one public queue/lifecycle surface:
   retry-aware target/subtree-liveness in `supervisor/queue_transitions.py`,
   capture-miss terminalization/publication in
   `supervisor/cancel_publication.py`, owner-stop delivery/validation in
   `supervisor/owner_stop.py`.
+- Keep agent in-band cancel and the existing periodic cancel/delivery/ref sweep
+  off supervisor drain. Reuse durable intent claims and generation checks; local
+  in-flight keys only deduplicate dispatch and release on failure. Preserve the
+  existing cadence and HTTP response contract. Do not queue unrelated Stop work
+  behind a new general-purpose file executor.
 
 ### Onboarding and Settings surfaces
 
@@ -2242,7 +2253,11 @@ by "Provider Independence" above. Call-site imperatives:
   active capacity; grant the original worker only after reserving active capacity.
   Keep attempt, start time, completed effects and usage unchanged across a warm
   wake. Idle replacement retirement uses the existing lifecycle serializer and
-  readiness owner, with process start outside the queue lock. Waiting exempts only
+  readiness owner, with process start outside the queue lock. A confirmed-dead
+  exhausted replacement may transfer its reservation to that same original worker;
+  persist the resume before dispatch, restoring both capacity marks on failure.
+  Booting/temporary-reaping slots still reserve capacity: excluding all reaping
+  would buy an extra child beyond MAX_WORKERS. Waiting exempts only
   idle timeout; Stop, deadline, absolute ceiling and monetary admission still bind.
   Cold recovery requires the acknowledged planned-restart handoff through every
   shutdown cleanup. Restore the original CostCeiling before Runtime/ContextFit
@@ -2313,19 +2328,21 @@ by "Provider Independence" above. Call-site imperatives:
   `runtime_limits.py`, both re-exported through `ouroboros.config`, which stays
   the one import surface. Register the env key; do not scatter magic wait
   numbers across call sites (`tests/test_timeout_policy.py`).
-- Worker readiness is its own bound, not a tuning knob: `WORKER_READY_WINDOW_SEC`
-  and `WORKER_READY_MAX_ATTEMPTS` sit in `runtime_limits.py` (re-exported by `config.py`) beside the spawn grace as
-  structural constants (a warm forkserver child confirms in ~3-4 s; the window is the
-  pool's existing init budget). Never fold "the child confirmed ready" into
-  process liveness (`proc.is_alive`) or the task idle rail: a child deadlocked
-  on a lock inherited across fork is alive and holds no task. The readiness
-  seam in `supervisor/worker_pool_lifecycle.py` is the one place both spawn
-  paths pass through; a slot it holds `reaping` is not capacity. Because it
-  owns capacity, its watcher body is guarded: an unexpected failure (the event
-  reader, `load_state`, a teardown) releases the wave's still-booting slots
-  with a typed `worker_ready_released` row (`reason=watcher_error`) instead of
-  leaving them parked, and a missing `events.jsonl` is an empty read for the
-  reader, not an error.
+- Worker readiness has its own structural `WORKER_READY_WINDOW_SEC` and
+  `WORKER_READY_MAX_ATTEMPTS` in `runtime_limits.py`, re-exported by config.
+  The shared spawn/readiness owner distinguishes temporary reaping from the final
+  `Worker.readiness_exhausted` fact bound to the current worker object. Temporary
+  slots reserve capacity without accepting assignment; late ready/error events
+  must not reopen exhausted slots or affect a newer pool. Busy/booting capacity
+  and a valid live owner-wait stack keep queue admission available. Reuse the
+  lifecycle-owned execution-state reader (workers facade) at reserve/final enqueue
+  and snapshot; retain the separate repository-writer policy at public admission and internal boot/update
+  exceptions. True exhaustion refuses new pooled work; after existing RUNNING
+  file custody settles, the ordinary stop owner fails unstarted PENDING work with
+  the Restart hint. Failed writes retain terminalization retry, never false Done
+  or an automatic fresh startup budget. Watcher errors release still-booting
+  non-exhausted slots with `worker_ready_released`; missing events are an empty
+  read. Readiness, process liveness and task idle deadlines stay independent.
 - Nested process wrappers are ordered, never tied: the provider bound settles
   before its killable child, the child before the generic ToolEntry envelope
   (fixed structural settlement margin from `config.py`), so a child or
@@ -2492,8 +2509,49 @@ by "Provider Independence" above. Call-site imperatives:
   Verify the persisted consumer after the actual snapshot merge and child cleanup,
   not just the copy result. Select the current publication before relocating its
   references; relocation must not advance semantic publication counters or make a
-  stale child replace a newer review. Keep bulk artifact copying outside result
-  locks; the existing current-field projector can settle the selected review refs.
+  stale child replace a newer review. Select the CURRENT publication/ref basis,
+  prepare bulk bytes outside result locks, then compare that basis in the current
+  field projector before publishing prepared refs. A changed basis retries outside
+  the lock; unrelated CURRENT fields survive. Pending retry starts from CURRENT,
+  not an old child body. One operation-scoped memo may reuse verified work; it
+  must not cache failure as success or survive as a second store.
+- Pooled terminal file preparation belongs to `headless.prepare_terminal_task_files`
+  at the worker's own non-ephemeral task_done boundary, after blocking post-task
+  work and before releasing the slot. Earlier answer/metrics delivery stays early.
+  `_files_prepared_attempt` is a private attempt observation, not a saved-result
+  receipt. The event owner re-reads CURRENT and uses `terminal_task_files_ready`;
+  an early completed post-task checkpoint does not prove split-drive body adoption.
+  Existing pending refs may remain after the first attempt; required artifact
+  finalization must have an outcome. Neither an I/O exception nor a lost event
+  authorizes model replay. The transient `terminal_source_present` distinguishes
+  known source, known absence and unknown read; never persist it as a new anchor.
+- Health owns captured terminal-file preparation/recovery; the existing reaper
+  owns queue execution and deferred-job replay on the health cadence. Preserve
+  worker/meta/task/attempt/root identity across each off-lock operation. Unknown
+  source or incomplete CURRENT publication retains the same job/reservation;
+  confirmed absence reaches the existing fault/crash policy. A sticky early
+  completed status stays intact while a publication fault sets execution
+  `infra_failed`, preserving answer/review/objective/cost. A ready CURRENT or
+  cancellation winner must not receive the fault. Keep the normal terminal event
+  owner for queue release and project/evolution hooks; no separate crash executor.
+  Host crash terminals withdraw their captured RUNNING owner before emission;
+  drain yields only to a recovery job that actually accepted ownership. Cancel
+  checks file readiness before source removal, preserving fully adopted CURRENT
+  bytes. Deferred timeout jobs keep their original worker/attempt/root binding;
+  old file recovery cannot kill, requeue or replace a newer execution.
+- Same physical observability store means verified reuse of original manifest
+  bytes and canonical path spelling, not a rewrite or native promotion marker.
+  Distinct-root copying keeps its existing marker and filename. Missing aliases
+  resolve only through the exact verified canonical CAS/call readers; corruption,
+  wrong scope and identity mismatch never use that fallback. Do not add digest
+  filenames, an initial-adoption anchor or a persistent transfer store.
+- Pooled mailbox cleanup follows the file helper, using the existing settled
+  cleanup predicate also used at startup. Accepted pending attachment refs and
+  open post-task work protect the source; direct canonical cleanup remains direct.
+  Recover terminal child sources before the actual startup prune, including a
+  restarted supervisor. The transient recovery report defers task-source pruning
+  for that pass when any protected/unresolved source or ownership/read error
+  remains; no saved anchor is required. Never race unknown prior worker ownership.
 - The host buys one authoritative acceptance panel per PAID IDENTITY —
   `sha256(candidate_hash + the sorted set of nonempty (obligation_id,
   disposition, sha256(reason)) tuples)`; an empty disposition reason hashes
@@ -2732,38 +2790,51 @@ shutdown and restart, the managed-update fence, unready-slot replacement, cancel
 and timeout custody alike — which spares the ledger's live `daemon`-scope roots
 (`process_custody.live_daemon_root_pids`, including the owner's retained legacy
 purposes) and, for one task's cancel or timeout only, the kept services; a direct `kill_pid_tree` on a worker anywhere else in
-`supervisor/` is a defect. The explicit stop (`OwnedClaudexorDaemon.stop`, which
-Panic calls before the worker tree-kill) requires the owned marker for attached
-roots, then matches the ledger against one set of live start-time and command
-observations. An authenticated endpoint, the gateway's typed HTTP transport failure, or a
-positively absent descriptor for a marked own startup permits that stop; a
-received refusal, protocol/malformed response, or invalid existing descriptor/token
-never does. Preserve a received HTTP status
-before reading the body, so a later read timeout cannot erase an authentication
-refusal. Local protocol/configuration and response-decoding failures are not
-network-unavailability evidence. Keep transport provenance distinct from the
-public stale status; a matching error-code string is not transport proof.
-Only confirmed exit permits `process_stopped`
-and pruning; concurrent and unreadable ledger bytes remain intact under the append
-lock. Maintenance compacts the exact observed byte prefix while keeping the latest
-surviving row per PID and every concurrent append. A changed prefix defers compaction
-until a fresh sweep; opaque rows stay byte-for-byte intact.
-Each root gets its own exit window; partial success never means the whole
-daemon stop succeeded. Unconfirmed stop emits a critical diagnostic and existing
-supervisor-log row, including lock contention and unknown custody. The manager lock uses the short-poll bound and never covers runtime preparation,
-network or exit waits. Stop retires in-flight callers before delayed preparation
-can spawn. A caller wait expiry never kills a live startup: join this lifecycle's
-purpose-filtered custody, recheck it after runtime preparation, and keep engine
-writer election authoritative. Strict admission reads distinguish an absent ledger
-from unreadable/corrupt state; the existing conservative sparing selector stays
-unchanged for teardown. Keep startup and normal-admission waits independent, with
-unchanged defaults in the settings leaf re-exported by config. Diagnostics identify
-the current PID/build and shared-log interval; do not present an old tail as cause.
-Authenticated attach and own spawn create a missing marker only after validating
-the home again under the shared JSON publication lock. Atomic publication leaves absence or a complete
-marker after a write fault; existing malformed or foreign markers are never
-replaced. The reaper's permissive keep is never stop authority, and a daemon known
-only by name or port is never signalled.
+`supervisor/` is a defect. The explicit stop (`OwnedClaudexorDaemon.stop_outcome`, used by Panic and
+Restart) separates authenticated cooperative shutdown from forced signalling.
+A valid owned marker and authenticated same-home endpoint permit the already
+installed managed CLI `daemon stop --json`; read-only resolution must not ensure
+or install a runtime, start a daemon, probe accounts or inherit another home's
+socket override. Pure operator commands select the existing exact Node with
+`resolve_cli_command(require_npm=False)`; npm-dependent installation retains its
+separate toolchain requirement, so ordinary stop works on Windows and bundled-only installs. Require exit0 and a terminal stop receipt, then observe known
+root/child exits. RPC acknowledgement and lease release alone are not physical
+exit proof. A surviving endpoint is disclosed, never chased as the old target.
+Capture existing custody before the request; forced fallback may signal only
+those unchanged rows with both measured birth and command, or the manager's own
+Popen. Legacy Windows empty-birth rows retain their old permissive keep and cannot
+be re-attested from a later observation, but a healthy daemon can stop through CLI.
+
+Preserve received HTTP refusals before reading the body: token/protocol/decoded
+response failures and invalid discovery are not transport-unavailability evidence.
+A typed network failure or positively absent descriptor for marked startup keeps
+its existing fallback meaning; a matching error-code string alone gives no right
+to signal. Unknown/missing CLI does not relax that rule. Confirmed signal-stop
+exit permits `process_stopped` and pruning; concurrent or unreadable ledger bytes
+survive the append lock and exact-prefix compaction. Partial success stays
+unconfirmed, with the existing critical supervisor row and retained custody.
+Manager-lock acquisition is bounded; preparation/network/exit waits remain outside
+it, and Stop retires delayed spawns. The existing operator CLI and captured-exit
+bounds are `config.CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC` and
+`config.CLAUDEXOR_STOP_EXIT_WAIT_SEC`, defined once in runtime_limits. Join existing
+purpose-filtered startup custody before and after runtime preparation; caller wait expiry never kills it or replaces
+engine writer election. Keep startup and normal admission waits independent,
+identify current PID/build/log interval rather than an old log tail, and preserve
+existing malformed/foreign ownership markers. Publish a missing marker atomically
+only after revalidating the home under the shared JSON lock.
+
+Ordinary close preserves the shared daemon on every platform, including forced
+worker/server/stray cleanup. Exclusions protect the whole subtree, not merely a
+ledger row. The launcher Job allows explicit breakaway only when the daemon asks;
+ordinary generation children remain covered. Do not apply this lifetime to all
+skill companions or broaden reserved-port/service ancestry rules. Windows birth,
+command, Job and explicit prior-generation stop require native Windows evidence;
+psutil is a main Windows-only dependency, and both embedded and frozen imports
+need packaging proof. A portable fixture does not establish those claims. An old
+immutable launcher keeps its disclosed limitation until its package is updated.
+Platform-lock/ABI/fingerprint rationale is specified once in ARCHITECTURE §1
+"Platform substrate"; code keeps the local invariant and that pointer.
+
 Explicit stop and next-start runtime selection remain separate contracts: a
 newer engine pin is never hot-swapped and the daemon's next start selects it; a
 planned restart whose landed checkout pins another engine version or build ends

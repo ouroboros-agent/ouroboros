@@ -207,16 +207,14 @@ def enqueue_task(
             try:
                 from supervisor import workers
 
-                disabled_reason = str(workers._WORKER_POOL_DISABLED_REASON or "")
-                worker_count = len(workers.WORKERS)
+                pool_state = workers._worker_pool_execution_state()
             except Exception:
-                disabled_reason = "state_unavailable"
-                worker_count = 0
-            if disabled_reason or worker_count <= 0:
+                pool_state = {"available": False, "disabled_reason": "state_unavailable"}
+            if not pool_state["available"]:
                 if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                     ADMISSION_RESERVATIONS.pop(task_id, None)
                 t["_admission_blocked"] = "worker_pool_unavailable"
-                t["_worker_pool_disabled_reason"] = disabled_reason or "no_workers"
+                t["_worker_pool_disabled_reason"] = pool_state["disabled_reason"]
                 return t
         if admission_token and reserved_token != admission_token:
             t["_admission_blocked"] = "admission_reservation_lost"
@@ -386,13 +384,22 @@ def queue_deep_self_review_task(reason: str, model: str = "", force: bool = Fals
     if (not force) and queue_has_task_type("deep_self_review"):
         return None
     tid = uuid.uuid4().hex[:8]
-    enqueue_task({
+    admitted = enqueue_task({
         "id": tid,
         "type": "deep_self_review",
         "chat_id": int(target_chat_id),
         "text": reason or "Deep self-review",
         "model": model,
+        "_require_worker_pool": True,
     })
+    if admitted.get("_admission_blocked"):
+        reason = admitted.get("_worker_pool_disabled_reason") or admitted["_admission_blocked"]
+        send_with_budget(
+            int(target_chat_id),
+            f"Deep self-review could not be queued: {reason}. Use /restart to restore the worker pool.",
+            role="system", system_type="deep_self_review_unavailable",
+        )
+        return None
     persist_queue_snapshot(reason="deep_self_review_enqueued")
     # Typed SYSTEM row: an acknowledgement is never a task's answer, and the bench
     # trajectory reader takes the last UNTYPED outbound row as one.

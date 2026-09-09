@@ -433,9 +433,9 @@ def test_recorded_server_cleanup_ignores_unrelated_pid(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "pid_is_alive", lambda _pid: True)
     monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 22222)
     monkeypatch.setattr(launcher, "process_command", lambda _pid: "/usr/bin/python unrelated.py")
-    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid: killed.append(("pid", pid)))
-    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid: killed.append(("pgid", pgid)))
-    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid: killed.append(("term", pgid)))
+    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: killed.append(("pid", pid)))
+    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid, **kw: killed.append(("pgid", pgid)))
+    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid, **kw: killed.append(("term", pgid)))
 
     launcher._cleanup_recorded_server_process("test")
 
@@ -471,9 +471,9 @@ def test_recorded_server_cleanup_kills_verified_process_group(monkeypatch, tmp_p
     monkeypatch.setattr(launcher, "process_command", lambda _pid: f"{sys.executable} {server_py}")
     monkeypatch.setattr(launcher, "current_process_group_id", lambda: 99999)
     monkeypatch.setattr(launcher, "time", types.SimpleNamespace(sleep=lambda *_a, **_k: None))
-    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid: killed.append(("term", pgid)))
-    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid: killed.append(("killpg", pgid)))
-    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid: killed.append(("pid", pid)))
+    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid, **kw: killed.append(("term", pgid)))
+    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid, **kw: killed.append(("killpg", pgid)))
+    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: killed.append(("pid", pid)))
 
     launcher._cleanup_recorded_server_process("test")
 
@@ -510,9 +510,9 @@ def test_recorded_server_cleanup_ignores_mismatched_process_group(monkeypatch, t
     monkeypatch.setattr(launcher, "pid_is_alive", lambda _pid: True)
     monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 44444)
     monkeypatch.setattr(launcher, "process_command", lambda _pid: f"{sys.executable} {server_py}")
-    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid: killed.append(("term", pgid)))
-    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid: killed.append(("killpg", pgid)))
-    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid: killed.append(("pid", pid)))
+    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid, **kw: killed.append(("term", pgid)))
+    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid, **kw: killed.append(("killpg", pgid)))
+    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: killed.append(("pid", pid)))
 
     launcher._cleanup_recorded_server_process("test")
 
@@ -582,7 +582,7 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     monkeypatch.setattr(launcher, "_load_settings", lambda: {})
     monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
     monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
-    monkeypatch.setattr(launcher, "create_kill_on_close_job", lambda: calls.append(("create_job", None)) or "job")
+    monkeypatch.setattr(launcher, "create_kill_on_close_job", lambda **kw: calls.append(("create_job", kw)) or "job")
     monkeypatch.setattr(launcher, "assign_pid_to_job", lambda job, pid: calls.append(("assign", (job, pid))) or True)
     monkeypatch.setattr(launcher, "resume_process", lambda pid: calls.append(("resume", pid)) or True)
 
@@ -595,7 +595,7 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     lifecycle_calls = [call for call in calls if call[0] != "popen_env"]
     assert lifecycle_calls[:4] == [
         ("popen_flags", 0x204),
-        ("create_job", None),
+        ("create_job", {"allow_breakaway": True}),
         ("assign", ("job", 54321)),
         ("resume", 54321),
     ]

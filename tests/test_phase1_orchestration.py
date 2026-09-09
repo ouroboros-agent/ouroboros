@@ -417,14 +417,20 @@ def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monk
     monkeypatch.setattr(q, "_kept_service_pids", lambda: set(), raising=False)
 
     calls = []
-    monkeypatch.setattr(headless, "finalize_task_artifacts",
-                        lambda root, task: (calls.append(str(task.get("id"))), [])[1])
+    def finalize(root, task):
+        calls.append(str(task["id"]))
+        write_task_result(root, task["id"], "completed", artifact_status="ready",
+                          artifact_finalized_at="fixture")
+        return []
+    monkeypatch.setattr(headless, "finalize_task_artifacts", finalize)
 
     def _run(task, artifact_status):
         # Pre-write the worker's own terminal result so the reaper's post-kill re-check honors
         # it (self_status set) instead of clobbering it — the branch crit#2 lives in.
         write_task_result(tmp_path, str(task["id"]), "completed", artifact_status=artifact_status)
-        q._reap_timed_out_task({"worker_id": 4, "proc": None, "task_id": task["id"],
+        task["workspace_root"] = str(tmp_path / "workspace")
+        q._reap_timed_out_task({"worker_id": 4, "proc": workers[4].proc, "worker": workers[4],
+                                "drive_root": str(tmp_path), "task_id": task["id"],
                                 "task": task, "task_type": "task",
                                 "terminal_reason": "idle_timeout", "attempt": 1})
 
@@ -499,7 +505,7 @@ def test_reaper_fails_closed_when_worker_not_confirmed_dead(tmp_path, monkeypatc
     write_task_result(tmp_path, "wedged1", STATUS_RUNNING, result="in progress")
 
     q._reap_timed_out_task({
-        "worker_id": 5, "proc": _AliveProc(), "task_id": "wedged1",
+        "worker_id": 5, "proc": slot.proc, "worker": slot, "drive_root": str(tmp_path), "task_id": "wedged1",
         "task": {"id": "wedged1", "type": "task", "chat_id": 7}, "task_type": "task",
         "terminal_reason": "idle_timeout", "attempt": 1,
         "owner_chat_id": 7,

@@ -198,7 +198,7 @@ def test_spawn_reaps_orphans_and_records_pids():
     assert "reap_orphaned_workers()" in src
     assert "_record_worker_pids()" in src
     # reap guards against PID reuse and only group-kills its own setsid session
-    assert "if pgid and pgid == pid:" in _read("supervisor/worker_pool_lifecycle.py")
+    assert "if pgid and pgid == pid and not shares_retained_group:" in _read("supervisor/worker_pool_lifecycle.py")
 
 
 def test_emergency_cleanup_joins_children():

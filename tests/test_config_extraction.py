@@ -32,6 +32,8 @@ _ADDED_OWNERS = {
     "task_model_binding": model_slots,
     "apply_model_role_override": model_slots,
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
+    "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
+    "CLAUDEXOR_STOP_EXIT_WAIT_SEC": runtime_limits,
 }
 
 _MOVED_OWNERS = {

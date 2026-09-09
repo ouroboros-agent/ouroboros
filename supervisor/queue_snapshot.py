@@ -98,9 +98,9 @@ def persist_queue_snapshot(reason: str = "") -> bool:
             worker_total = len(_ws)
             active_worker_count = sum(1 for w in _ws if getattr(w, "active_capacity", True))
             parked_worker_count = worker_total - active_worker_count
-            worker_pool_disabled_reason = str(
-                getattr(_workers_mod, "_WORKER_POOL_DISABLED_REASON", "") or ""
-            )
+            worker_pool_disabled_reason = _workers_mod._worker_pool_execution_state()["disabled_reason"]
+            if worker_pool_disabled_reason == "no_workers":
+                worker_pool_disabled_reason = ""  # Absence is counted above, not an explicit disablement.
             reaping_count = sum(1 for _w in _ws if getattr(_w, "reaping", False))
             assignable_idle_workers = sum(
                 1 for _w in _ws

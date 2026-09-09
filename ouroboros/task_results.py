@@ -886,27 +886,22 @@ def write_task_result(
     *,
     _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
     strict_existing_dict: bool = False,
+    create_only: bool = False,
     **fields: Any,
 ) -> Dict[str, Any]:
     """Merge-write a task result under a per-file lock.
 
-    Worker processes, the supervisor thread, and gateway handlers all read-modify-write
-    the same ``task_results/<id>.json``; the lock evaluates the monotonic-status guard
-    against the CURRENT on-disk status, so the winner of
-    a concurrent terminal race is decided by the monotonic reducer, not timing.
-    Terminal statuses are sticky: natural completion WINS a late cancel (owner
-    decision 4=A) — there is deliberately no override that lets a cancellation
-    replace an already-completed result (discarding a result is a separate
-    explicit parent action, ``discard_child_result``). ``_field_projector`` is the narrow
-    custody seam for fields and status that depend on CURRENT; it runs under this same lock
-    after ordinary review-publication selection. A projector may then publish verified
-    refs of that selected publication or derive its patch directly from CURRENT;
-    replaying the incoming-review merge afterward would undo that physical handoff.
-    ``strict_existing_dict`` is reserved for authority-preserving callers:
-    when true, an existing malformed/non-object or wrong-schema result raises
-    instead of being treated as an empty row and overwritten.  The check
-    happens inside the same file lock as the merge, so a malformed authority
-    cannot slip in between a caller's probe and its terminal write.
+    Workers, supervisor and gateways share CURRENT under this lock: the monotonic
+    reducer decides terminal races, so natural completion wins a late cancel.
+    Discarding a result remains the separate explicit ``discard_child_result``.
+    ``_field_projector`` runs after review-publication selection under the same
+    lock, deriving fields/status from CURRENT or publishing its verified refs;
+    repeating the incoming-review merge afterward would undo that handoff.
+    ``strict_existing_dict`` refuses malformed/non-object, empty, wrong-identity
+    or wrong-schema authority under the write lock, never replacing it with {}.
+    ``create_only`` aborts on an existing nonempty row after those checks, before
+    projection, normalization or timestamps. Pair it with strict validation to
+    initialize only absence while preserving unknown bytes.
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
@@ -923,6 +918,8 @@ def write_task_result(
         # ABI 7.0: every write stamps the row; a row another schema version
         # owns (a rollback survivor) is never silently downgraded.
         require_writable_task_result_schema(existing, path)
+        if create_only and existing:
+            return None
         prepared_fields = dict(fields)
         if "review_projection" in prepared_fields:
             prepared_fields["review_projection"] = merge_review_projection(

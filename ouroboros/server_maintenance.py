@@ -9,6 +9,9 @@ the delegated-snapshot GC that fails closed on an unreadable custody log.
 from __future__ import annotations
 
 import pathlib
+import json
+import os
+import threading
 import time
 
 from ouroboros.server_process import DATA_DIR, log
@@ -39,6 +42,31 @@ def _installed_skill_names():
 
 
 _LAST_CANCEL_INTENT_SWEEP = [0.0]
+_CANCEL_INTENT_SWEEP_LOCK = threading.Lock()
+
+
+def _run_cancel_delivery_ref_sweep(drive_root: pathlib.Path) -> None:
+    """One existing maintenance pass; the drain retains no file/cancel work."""
+    try:
+        try:
+            from supervisor.task_lifecycle import sweep_cancel_intents
+            outcomes = sweep_cancel_intents()
+            if outcomes:
+                log.info("Cancel-intent watchdog settled: %s", outcomes)
+        except Exception:
+            log.debug("Cancel-intent watchdog sweep failed", exc_info=True)
+        try:
+            from supervisor.terminal_delivery import replay_pending_deliveries
+            replay_pending_deliveries(drive_root)
+        except Exception:
+            log.debug("Pending terminal-delivery replay failed", exc_info=True)
+        try:
+            from ouroboros.observability import retry_pending_child_ref_promotions
+            retry_pending_child_ref_promotions(drive_root)
+        except Exception:
+            log.debug("Pending child-ref promotion retry failed", exc_info=True)
+    finally:
+        _CANCEL_INTENT_SWEEP_LOCK.release()
 
 
 def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconcile: list) -> None:
@@ -46,34 +74,14 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
     watchdog and pending child-ref promotion replay (every 20s), custody reap of
     orphaned task-scoped processes (every 600s) + review-job zombie reconcile
     (every 300s). Each cadence gates itself via its own last-run marker."""
-    if time.time() - _LAST_CANCEL_INTENT_SWEEP[0] > 20:
+    if time.time() - _LAST_CANCEL_INTENT_SWEEP[0] > 20 and _CANCEL_INTENT_SWEEP_LOCK.acquire(blocking=False):
         _LAST_CANCEL_INTENT_SWEEP[0] = time.time()
         try:
-            # Phase A watchdog: re-feed open durable cancel intents into custody
-            # (the ONE settle owner) so a lost control event can no longer wedge
-            # a cancellation forever — the Poltergeist incident class.
-            from supervisor.task_lifecycle import sweep_cancel_intents
-
-            outcomes = sweep_cancel_intents()
-            if outcomes:
-                log.info("Cancel-intent watchdog settled: %s", outcomes)
+            threading.Thread(target=_run_cancel_delivery_ref_sweep, args=(pathlib.Path(DATA_DIR),),
+                             name="terminal-maintenance", daemon=True).start()
         except Exception:
-            log.debug("Cancel-intent watchdog sweep failed", exc_info=True)
-        try:
-            # Phase A2/F7: re-enqueue terminal answers registered as OWED whose
-            # send never got confirmed (a crash between settle and send used to
-            # lose the owner's answer forever — the incident class itself).
-            from supervisor.terminal_delivery import replay_pending_deliveries
-
-            replay_pending_deliveries(DATA_DIR)
-        except Exception:
-            log.debug("Pending terminal-delivery replay failed", exc_info=True)
-        try:
-            from ouroboros.observability import retry_pending_child_ref_promotions
-
-            retry_pending_child_ref_promotions(DATA_DIR)
-        except Exception:
-            log.debug("Pending child-ref promotion retry failed", exc_info=True)
+            _CANCEL_INTENT_SWEEP_LOCK.release()
+            log.warning("Terminal maintenance could not start", exc_info=True)
     if time.time() - last_custody_reap[0] > 600:
         last_custody_reap[0] = time.time()
         try:
@@ -271,7 +279,7 @@ def prune_agent_media_uploads(
     return report
 
 
-def _startup_prune_sweeps() -> None:
+def _startup_prune_sweeps(*, preserve_task_sources: bool = False) -> None:
     """Startup hygiene: prune stale task drives/trees and orphaned temp files."""
     from supervisor.state import append_jsonl
 
@@ -279,12 +287,14 @@ def _startup_prune_sweeps() -> None:
         from ouroboros.headless import prune_headless_task_drives, prune_task_drives, prune_task_trees
         from ouroboros.utils import sweep_stale_temp_files
 
-        prune_report = prune_headless_task_drives(DATA_DIR)
-        task_drive_report = prune_task_drives(DATA_DIR)
-        # Ephemeral task-tree coordination ledgers age out with their terminal root.
-        prune_task_trees(DATA_DIR)
-        # Reap orphaned atomic-write temp files (.*.tmp.*) left by a hard kill.
-        sweep_stale_temp_files(DATA_DIR)
+        prune_report, task_drive_report = {}, {}
+        if preserve_task_sources:
+            log.warning("Startup task-source prune deferred: file recovery or ownership is unresolved")
+        else:
+            prune_report = prune_headless_task_drives(DATA_DIR)
+            task_drive_report = prune_task_drives(DATA_DIR)
+            prune_task_trees(DATA_DIR)
+            sweep_stale_temp_files(DATA_DIR)
         if (
             prune_report.get("pruned")
             or prune_report.get("errors")
@@ -355,7 +365,7 @@ def _startup_prune_sweeps() -> None:
         # dispatch path (fail-closed: no result keeps the mailbox).
         from ouroboros.owner_mailbox import sweep_settled_owner_mailboxes
 
-        mailbox_report = sweep_settled_owner_mailboxes(DATA_DIR)
+        mailbox_report = {} if preserve_task_sources else sweep_settled_owner_mailboxes(DATA_DIR)
         if mailbox_report.get("removed"):
             append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
                 "ts": utc_now_iso(),
@@ -396,6 +406,34 @@ def _startup_prune_sweeps() -> None:
     except Exception:
         log.debug("Observation fold failed", exc_info=True)
 
+    if not preserve_task_sources:
+        try:
+            from ouroboros.observability import prune_observability_blobs
+            from ouroboros.tools.services import prune_service_logs
+
+            observability_report = prune_observability_blobs(DATA_DIR)
+            service_report = prune_service_logs(DATA_DIR)
+            if (
+                observability_report.get("enabled")
+                or observability_report.get("manifest_count")
+                or observability_report.get("blob_count")
+                or observability_report.get("deleted_manifests")
+                or observability_report.get("deleted_blobs")
+                or observability_report.get("errors")
+                or service_report.get("deleted_dirs")
+                or service_report.get("deleted_files")
+                or service_report.get("errors")
+            ):
+                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
+                    "ts": utc_now_iso(),
+                    "type": "runtime_artifact_prune",
+                    "observability": observability_report,
+                    "services": service_report,
+                })
+        except Exception:
+            log.debug("Runtime artifact prune failed", exc_info=True)
+
+
 
 def _cursor_refresh_settled_terminals() -> None:
     """Cursor-driven pass: runs settled OUTSIDE a generation's reconcile
@@ -419,22 +457,24 @@ def _cursor_refresh_settled_terminals() -> None:
 def _startup_custody_sweep() -> None:
     """Both custody surfaces, swept once per generation at supervisor startup.
 
-    This generation has no workers yet. The shared installation daemon can
-    still serve recoverable runs from the prior generation and must survive.
+    Live owners can survive an in-process supervisor revival. The shared
+    installation daemon and those owners keep their existing custody.
     """
     try:
         from ouroboros.claudexor_daemon import CUSTODY_PURPOSE
         from ouroboros.process_custody import reap_orphaned_processes
 
+        live_tasks = _startup_live_task_ids(DATA_DIR)
         reaped = reap_orphaned_processes(
             DATA_DIR, live_owner_skills=_installed_skill_names(),
+            running_task_ids=live_tasks,
             retained_purposes={CUSTODY_PURPOSE},
         )
         if reaped:
             log.info("Process custody reaper killed %d orphaned process(es): %s", len(reaped), reaped)
     except Exception:
         log.debug("Process custody startup reap failed", exc_info=True)
-    _reconcile_delegated_runs(set())
+    _reconcile_delegated_runs(_startup_live_task_ids(DATA_DIR))
     try:
         # D1a boot backfill, ONCE per generation and AFTER the orphan reconcile
         # (so this generation's settlements are already visible to the audit):
@@ -583,25 +623,8 @@ def _resume_interrupted_project_deletions() -> None:
         log.debug("Project deletion recovery failed", exc_info=True)
 
 
-def _run_startup_task_recovery(
-    drive_root: pathlib.Path,
-    repo_dir: pathlib.Path,
-    *,
-    skip_live_data: bool,
-) -> None:
-    """Reconcile durable task phases once, after the prior process is gone.
-
-    The cancel-latch migration goes FIRST, ahead of every other durable
-    task-result read this boot performs. Under ABI-2 a pre-redesign latch file
-    is unstamped, so whichever read reaches it first quarantines it: the
-    orphan reconcile below used to win that race and the wedged task then
-    reached no terminal at all. The migration carries the one carve-out that
-    admits those rows (see ``cancel_intents.migrate_legacy_cancel_latches``),
-    so it must run before the readers whose quarantine it is exempting them
-    from — every OTHER unstamped row still quarantines on the next read.
-    """
-    if skip_live_data:
-        return
+def _migrate_startup_cancel_latches(drive_root: pathlib.Path) -> None:
+    """Before restore/readers can quarantine an unstamped legacy cancel latch."""
     try:
         # Phase A boot migration: legacy ``cancel_requested`` status latches
         # become ordinary durable cancel intents; the supervisor watchdog then
@@ -614,15 +637,159 @@ def _run_startup_task_recovery(
                      len(migrated), migrated)
     except Exception:
         log.debug("Legacy cancel-latch migration failed", exc_info=True)
+
+
+def _startup_live_task_ids(drive_root: pathlib.Path, *, include_pending: bool = False) -> set[str]:
+    """Existing queue/direct/post-task owners; recovery also preserves pending work."""
+    from ouroboros.post_task_checkpoint import POST_TASK_SYNTHESIS_INFLIGHT, POST_TASK_SYNTHESIS_LOCK
+    from supervisor import queue, workers
+    from supervisor.active_activity import get_direct_activity_registry
+
+    with queue._queue_lock:
+        ids = set(queue.RUNNING)
+        if include_pending:
+            ids.update(str(task.get("id") or "") for task in queue.PENDING)
+        ids.update(w.busy_task_id for w in workers.WORKERS.values() if w.busy_task_id)
+    ids.update(row["activity_id"] for row in get_direct_activity_registry().snapshot())
+    root = str(pathlib.Path(drive_root).resolve(strict=False))
+    with POST_TASK_SYNTHESIS_LOCK:
+        ids.update(task_id for (path, task_id) in POST_TASK_SYNTHESIS_INFLIGHT if path == root)
+    if include_pending:
+        # No-provider startup has not restored PENDING. The saved continuation
+        # remains owned by queue restore, never by file/post-task recovery.
+        from ouroboros.task_status import _load_queue_snapshot
+        snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
+        if snapshot.get("_snapshot_invalid"):
+            raise ValueError("startup pending ownership is unreadable")
+        ids.update(str(row["task"].get("id") or "") for row in snapshot.get("pending", [])
+                   if isinstance(row, dict) and isinstance(row.get("task"), dict)
+                   and row["task"].get("_owner_wait_resume"))
+    return ids - {""}
+
+
+def _startup_worker_pids(drive_root: pathlib.Path) -> set[int] | None:
+    """Capture prior worker ownership before spawn overwrites its legacy pid file.
+
+    These observations only defer recovery; they grant no signal authority. An
+    unconfirmed survivor or unreadable record never proves safe file capture.
+    """
+    from ouroboros.process_custody import _read_ledger_strict
+    try:
+        path = pathlib.Path(drive_root) / "state" / "worker_pids.json"
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            record = {"workers": []}
+        pids = {int(row["pid"]) for row in record["workers"]}
+        server_pid = int(record.get("server_pid") or 0)
+        if server_pid and server_pid != os.getpid():
+            pids.add(server_pid)
+        readable, entries = _read_ledger_strict(pathlib.Path(drive_root))
+        if not readable:
+            return None
+        pids.update(int(row["pid"]) for row in entries if str(row.get("purpose") or "").startswith("worker:"))
+        return pids - {0, os.getpid()}
+    except (OSError, ValueError, TypeError, KeyError):
+        log.warning("Startup worker ownership is unreadable; file recovery is deferred", exc_info=True)
+        return None
+
+
+def _recover_terminal_task_files(drive_root: pathlib.Path, protected: set[str]) -> dict:
+    """Recover only known child directories, never infer a new model execution."""
+    from ouroboros.headless import (
+        HEADLESS_TASKS_DIR, TASK_DRIVES_DIR, prepare_terminal_task_files,
+        terminal_task_files_ready,
+    )
+    from ouroboros.observability import _has_pending_ref_promotion
+    from ouroboros.task_results import load_task_result, validate_task_id
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    root = pathlib.Path(drive_root)
+    report = {"recovered": [], "unresolved": [], "protected": sorted(protected), "errors": []}
+    for base, suffix in ((root / HEADLESS_TASKS_DIR, "data"), (root / TASK_DRIVES_DIR, "")):
+        try:
+            directories = sorted(base.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            report["errors"].append(str(exc))
+            report["unresolved"].append("*")
+            continue
+        for directory in directories:
+            if not directory.is_dir() or directory.name in protected:
+                continue
+            task_id, child_root = directory.name, directory / suffix
+            try:
+                validate_task_id(task_id)
+                current = load_task_result(root, task_id, strict=True) or {}
+                task = {**current, "id": task_id, "drive_root": str(child_root)}
+                ready = terminal_task_files_ready(root, task, current)
+                pending = _has_pending_ref_promotion(current.get("child_ref_promotion"))
+                if ready and not pending:
+                    continue  # Already saved; do not re-copy or recapture on every boot.
+                if not ready:
+                    source = load_task_result(child_root, task_id, strict=True) or {}
+                    if source.get("status") not in SETTLED_STATUSES:
+                        if (pending or current.get("status") == "completed") and (
+                            suffix or current.get("headless_child_drive_root") or current.get("child_drive_root")
+                        ):
+                            report["unresolved"].append(task_id)
+                        continue  # Ordinary canonical task scratch has no child result.
+                    task = {**source, **current, "id": task_id, "drive_root": str(child_root)}
+                prepared = prepare_terminal_task_files(root, task)
+                settled = load_task_result(root, task_id, strict=True)
+                if prepared["error"] or not terminal_task_files_ready(root, task, settled):
+                    report["unresolved"].append(task_id)
+                else:
+                    report["recovered"].append(task_id)
+            except Exception as exc:
+                report["unresolved"].append(task_id)
+                report["errors"].append(f"{task_id}: {type(exc).__name__}: {exc}")
+    return report
+
+
+def _run_startup_task_recovery(
+    drive_root: pathlib.Path, repo_dir: pathlib.Path, *, skip_live_data: bool,
+    prior_worker_pids: set[int] | None = None,
+) -> dict:
+    """File recovery precedes orphan materialization and the caller's actual prune.
+
+    Provider boot calls this from the supervisor, after process custody; the
+    no-provider lifespan calls it without spawning anything. There is no racing
+    lifespan recovery once a supervisor can run. Unknown/live prior ownership
+    defers the destructive work, without waiting or resurrecting a model task.
+    """
+    report = {"recovered": [], "unresolved": [], "protected": [], "errors": []}
+    if skip_live_data:
+        return report
+    _migrate_startup_cancel_latches(drive_root)
+    from ouroboros.platform_layer import pid_is_alive
+    if prior_worker_pids is None or any(pid_is_alive(pid) for pid in prior_worker_pids):
+        report["errors"].append("prior_worker_ownership_unconfirmed")
+        log.warning("Startup file/task recovery deferred: prior worker ownership is unconfirmed")
+        return report
+    try:
+        protected = _startup_live_task_ids(drive_root, include_pending=True)
+    except Exception as exc:
+        report["errors"].append(f"startup_ownership_unconfirmed: {type(exc).__name__}")
+        log.warning("Startup task recovery deferred: live/pending ownership is unreadable", exc_info=True)
+        return report
+    report = _recover_terminal_task_files(drive_root, protected)
+    excluded = protected | set(report["unresolved"])
+    if report["errors"]:
+        log.warning("Startup task file recovery has gaps: %s", report)
+    if "*" in excluded:
+        return report  # Directory enumeration could not identify the unsafe rows.
     try:
         from ouroboros.task_status import reconcile_orphaned_running_tasks
 
-        reconcile_orphaned_running_tasks(drive_root)
+        reconcile_orphaned_running_tasks(drive_root, exclude_task_ids=excluded)
     except Exception:
         log.warning("Orphaned running-task reconciliation at startup failed", exc_info=True)
     try:
         from ouroboros.agent_task_pipeline import recover_pending_root_post_task_synthesis
 
-        recover_pending_root_post_task_synthesis(drive_root, repo_dir)
+        recover_pending_root_post_task_synthesis(drive_root, repo_dir, exclude_task_ids=excluded)
     except Exception:
         log.warning("Root post-task synthesis recovery at startup failed", exc_info=True)
+    return report

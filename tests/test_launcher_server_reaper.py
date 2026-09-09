@@ -281,7 +281,7 @@ def test_a_pid_that_dies_between_proof_and_signal_is_not_killed(monkeypatch):
 
     real_revalidate = reaper._revalidate_and_kill
 
-    def vanishing(pid, server_paths, data_dir_values):
+    def vanishing(pid, server_paths, data_dir_values, retained_descendant_roots=None):
         commands[pid] = ""  # exited between the scan and the signal
         return real_revalidate(pid, server_paths, data_dir_values)
 
@@ -484,7 +484,7 @@ def test_a_sweep_aborted_mid_work_reports_survivors_not_clean(monkeypatch, caplo
         monkeypatch, pids=[9990631], commands={9990631: OURS}, env_states={9990631: _proof()},
     )
 
-    def exploding(pid, server_paths, data_dir_values):
+    def exploding(pid, server_paths, data_dir_values, retained_descendant_roots=None):
         raise RuntimeError("mid-sweep failure")
 
     monkeypatch.setattr(reaper, "_revalidate_and_kill", exploding)
@@ -557,5 +557,5 @@ def test_descendant_discovery_uses_the_shared_platform_seam():
     """The reaper owns identity policy, while generic tree discovery stays in
     platform_layer so its OS behavior cannot drift into a second copy."""
     source = inspect.getsource(reaper)
-    assert "_pl.collect_descendant_pids(pid)" in source
+    assert "_pl.collect_descendant_pids(pid," in source
     assert "def _descendants(" not in source

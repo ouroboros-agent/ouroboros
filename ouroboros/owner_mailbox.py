@@ -685,15 +685,34 @@ def cleanup_task_mailbox(drive_root: pathlib.Path, task_id: str) -> None:
             log.debug("Failed to cleanup mailbox for task %s", task_id, exc_info=True)
 
 
+def settled_mailbox_cleanup_allowed(result: Dict[str, Any]) -> bool:
+    """A settled task still owns its mailbox while post-work or input copy is owed."""
+    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    if str(result.get("status") or "") not in SETTLED_STATUSES:
+        return False
+    checkpoint = result.get("root_phase_checkpoint") or {}
+    promotion = result.get("child_ref_promotion") or {}
+    if not isinstance(checkpoint, dict) or not isinstance(promotion, dict):
+        return False
+    if post_task_synthesis_is_open(checkpoint.get("post_task_synthesis")):
+        return False
+    pending = promotion.get("pending_refs", [])
+    return isinstance(pending, list) and not any(
+        isinstance(ref, dict) and ref.get("kind") == "task_attachment"
+        for ref in pending
+    )
+
+
 def sweep_settled_owner_mailboxes(drive_root: pathlib.Path) -> Dict[str, Any]:
     """Startup sweep of mailboxes whose task died off the terminal paths (CPL4-C18).
 
     The only regular unlink is the task_done dispatch; a task that never
     reached it (crash, lost event, hard kill) leaked its mailbox forever.
-    A mailbox goes ONLY when the task's durable result is SETTLED — no result
-    or a non-terminal result keeps it (fail-closed: an undelivered owner
-    directive must survive any ambiguity). Lock sidecars are untouched
-    (self-healing by staleness).
+    A mailbox goes only after terminal file recovery, with a settled result,
+    settled post-task work and no pending input copy. No result keeps it.
+    Lock sidecars are untouched (self-healing by staleness).
     """
     report: Dict[str, Any] = {"removed": [], "kept": 0}
     mailbox_dir = pathlib.Path(drive_root) / _MAILBOX_DIR
@@ -712,10 +731,8 @@ def sweep_settled_owner_mailboxes(drive_root: pathlib.Path) -> Dict[str, Any]:
             continue  # not a task mailbox we can reason about: keep
         try:
             from ouroboros.task_results import load_task_result
-            from ouroboros.task_status import SETTLED_STATUSES
-
             result = load_task_result(pathlib.Path(drive_root), task_id) or {}
-            settled = str(result.get("status") or "") in SETTLED_STATUSES
+            settled = settled_mailbox_cleanup_allowed(result)
         except Exception:
             settled = False
         if not settled:

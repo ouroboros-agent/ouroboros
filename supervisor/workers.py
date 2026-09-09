@@ -88,6 +88,8 @@ class Worker:
     reaping: bool = False
     # A required owner wait keeps this process and task, lending only dispatch capacity.
     active_capacity: bool = True
+    # Unlike temporary reaping, the readiness owner exhausted its bounded attempts.
+    readiness_exhausted: bool = False
 
 
 _EVENT_Q = None
@@ -184,24 +186,16 @@ from supervisor.queue import _queue_lock
 
 
 def worker_pool_admission_state(ctx: Any = None) -> Dict[str, Any]:
-    """Return the user-facing managed-task executor admission state.
-
-    A busy or reaping pool is still a valid queue target.  Only an explicitly
-    disabled pool, or a genuinely absent pool after supervisor readiness, is
-    unavailable.  Internal boot/update recovery may enqueue before an initial
-    spawn and therefore does not use this user-ingress predicate.
-    """
-    pool = getattr(ctx, "WORKERS", WORKERS) if ctx is not None else WORKERS
-    with _queue_lock:
-        disabled_reason = str(_WORKER_POOL_DISABLED_REASON or "")
-        worker_count = len(pool)
+    """Busy/booting pools and live owner waits can queue work; exhausted pools cannot."""
+    state = _worker_pool_execution_state(
+        getattr(ctx, "WORKERS", None), running=getattr(ctx, "RUNNING", None),
+    )
     update_reason = repo_writer_admission_closed()
-    available = worker_count > 0 and not disabled_reason and not update_reason
+    available = state["available"] and not update_reason
     return {
-        "available": available,
+        **state, "available": available,
         "reason_code": "" if available else "worker_pool_unavailable",
-        "disabled_reason": disabled_reason or update_reason or ("no_workers" if not worker_count else ""),
-        "worker_count": worker_count,
+        "disabled_reason": state["disabled_reason"] or update_reason,
     }
 
 
@@ -211,7 +205,7 @@ def ensure_worker_pool_started(n: int = 0, *, allow_disabled_restart: bool = Fal
         # Update admission can be closed while the one authorized assisted
         # resolver is already running. That does not make an existing healthy
         # pool absent and must never trigger a second full-pool spawn.
-        if WORKERS and not _WORKER_POOL_DISABLED_REASON:
+        if _worker_pool_execution_state()["available"]:
             return True
     state = worker_pool_admission_state()
     if state["available"]:
@@ -2150,6 +2144,8 @@ from supervisor.worker_health import (  # noqa: E402, F401 -- intentional public
 )
 from supervisor.worker_pool_lifecycle import (  # noqa: E402, F401 -- intentional public re-exports
     _WORKER_LIFECYCLE_LOCK,
+    _worker_pool_execution_state,
+    disable_exhausted_worker_pool,
     _first_worker_event_since,
     _kill_survivors,
     _record_worker_pids,

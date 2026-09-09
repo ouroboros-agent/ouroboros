@@ -230,8 +230,11 @@ def _run_post_task_processing_async(
             if post_task_key is not None:
                 with _POST_TASK_SYNTHESIS_LOCK:
                     _POST_TASK_SYNTHESIS_INFLIGHT.pop(post_task_key, None)
-            from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
-            cleanup_settled_owner_mailbox(intent_root, stage_task_id, task_snapshot)
+            if not in_worker_process():
+                # Pooled completion still owes child files and accepted inputs.
+                # Its terminal owner cleans up after the first save attempt.
+                from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+                cleanup_settled_owner_mailbox(intent_root, stage_task_id, task_snapshot)
 
     from ouroboros.model_wait import current_model_wait, task_model_wait_scope
     parent_wait = current_model_wait()
@@ -273,6 +276,7 @@ def _run_post_task_processing_async(
 
 def recover_pending_root_post_task_synthesis(
     drive_root: Any, repo_dir: Any = None,
+    *, exclude_task_ids: frozenset[str] = frozenset(),
 ) -> int:
     """Resume an undispatched root synthesis; degrade an indeterminate one.
 
@@ -293,6 +297,8 @@ def recover_pending_root_post_task_synthesis(
     recovered = 0
     for stored in rows:
         task_id = str(stored.get("task_id") or stored.get("id") or "")
+        if task_id in exclude_task_ids:
+            continue
         checkpoint = stored.get("root_phase_checkpoint")
         phase = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
         if not task_id or not _post_task_synthesis_is_open(phase):

@@ -790,8 +790,10 @@ def test_periodic_maintenance_invokes_pending_ref_promotion_sweep(
     import ouroboros.server_maintenance as server_maintenance
     import supervisor.task_lifecycle as task_lifecycle
     import supervisor.terminal_delivery as terminal_delivery
+    import threading
 
     calls: list[pathlib.Path] = []
+    finished = threading.Event()
     # The cadence state and drive root live in the maintenance owner (v7 server split).
     monkeypatch.setattr(server_maintenance, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server_maintenance.time, "time", lambda: 10_000.0)
@@ -801,10 +803,13 @@ def test_periodic_maintenance_invokes_pending_ref_promotion_sweep(
     monkeypatch.setattr(
         observability,
         "retry_pending_child_ref_promotions",
-        lambda root: calls.append(pathlib.Path(root)) or {},
+        lambda root: (calls.append(pathlib.Path(root)), finished.set(), {})[-1],
         raising=False,
     )
 
     server_maintenance._periodic_supervisor_maintenance([10_000.0], [10_000.0])
 
+    assert finished.wait(2)
+    assert server_maintenance._CANCEL_INTENT_SWEEP_LOCK.acquire(timeout=2)
+    server_maintenance._CANCEL_INTENT_SWEEP_LOCK.release()
     assert calls == [tmp_path]

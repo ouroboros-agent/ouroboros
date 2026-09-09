@@ -12,7 +12,7 @@ import pathlib
 from typing import Any, Dict
 
 from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
-from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
+from ouroboros.outcomes import EXECUTION_INFRA_FAILED, infra_failed_axes, normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.task_results import (
@@ -453,9 +453,11 @@ def _resolve_lifecycle_fault(
     - A durable cancel intent (or a legacy ``cancel_requested`` latch) exists:
       cancellation custody and the watchdog already own this task, so the row
       stays exactly where it is and they settle it honestly.
-    - Nothing owns it: the event is a genuine lifecycle bug, so the task is
-      TERMINALIZED as ``failed`` with a typed reason and the slot is released.
-      A wedged worker costs strictly more than an honest infra failure.
+    - Nothing owns it: record the infrastructure failure and release the slot.
+      An early terminal checkpoint keeps its sticky lifecycle and receives the
+      failed execution axis; other stored axes and authored text stay intact.
+      A CURRENT fully published result wins over a stale fault. Failed storage
+      retains the existing file-recovery owner for the next health tick.
 
     ``detail`` overrides the default event-status wording — the durable-result
     fault (AR2-3) refuses an event whose OWN status looks settled.
@@ -510,27 +512,48 @@ def _resolve_lifecycle_fault(
         log.debug("assisted-merge orphan watchdog failed (lifecycle fault)", exc_info=True)
     stored: Dict[str, Any] = {}
     try:
+        from ouroboros.headless import terminal_task_files_ready
         from ouroboros.task_results import STATUS_FAILED, write_task_result
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        def project_fault(current: Dict[str, Any], _incoming: Dict[str, Any]) -> Dict[str, Any]:
+            bound = {**current, **task_row, "id": task_id}
+            if terminal_task_files_ready(ctx.DRIVE_ROOT, bound, current):
+                return {"status": current["status"]}  # A completed publication won this race.
+            status = current.get("status") if current.get("status") in SETTLED_STATUSES else STATUS_FAILED
+            axes = normalize_outcome_axes({**current, "status": status})
+            axes["execution"] = {
+                **axes["execution"], "status": EXECUTION_INFRA_FAILED,
+                "reason_code": "task_done_lifecycle_fault",
+            }
+            return {
+                "status": status, "reason_code": "task_done_lifecycle_fault", "outcome_axes": axes,
+                **({"result": detail} if not current.get("result") else {}),
+            }
 
         write_task_result(
             ctx.DRIVE_ROOT, task_id, STATUS_FAILED,
-            reason_code="task_done_lifecycle_fault",
-            result=detail,
-            outcome_axes=infra_failed_axes(
-                "task_done_lifecycle_fault", review_trigger="supervisor_terminal",
-            ),
+            _field_projector=project_fault, strict_existing_dict=True,
         )
-        stored = load_task_result(ctx.DRIVE_ROOT, task_id) or {}
+        stored = load_task_result(ctx.DRIVE_ROOT, task_id, strict=True) or {}
+        fault_written = (
+            stored.get("reason_code") == "task_done_lifecycle_fault"
+            and normalize_outcome_axes(stored)["execution"]["status"] == EXECUTION_INFRA_FAILED
+        )
+        if not fault_written and not terminal_task_files_ready(
+            ctx.DRIVE_ROOT, {**stored, **task_row, "id": task_id}, stored,
+        ):
+            raise OSError("Lifecycle-fault publication did not settle canonical truth")
     except Exception:
-        # GR3-6: durable persistence FAILED — retain lifecycle ownership. The
-        # row stays in RUNNING and the slot stays busy: releasing them over a
-        # non-settled durable truth would recreate the exact wedge this seam
-        # closes (task invisible, nothing scheduled to finish it). The next
-        # fault/watchdog pass retries.
+        # Preserve unknown durable truth, with an actual retry owner on the
+        # existing reaper/health cadence rather than an unowned busy slot.
         log.error(
-            "Failed to terminalize lifecycle-fault task %s; retaining lifecycle "
-            "ownership (no slot release)", task_id, exc_info=True,
+            "Failed to terminalize lifecycle-fault task %s; retaining file recovery",
+            task_id, exc_info=True,
         )
+        from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+        enqueue_terminal_file_recovery(ctx, evt, task_row)
         return
     # GR3-6: the synthetic terminal goes through the NORMAL dispatch seam —
     # terminal UI frame, acceptance-fence clearing, campaign/project hooks,
@@ -551,9 +574,12 @@ def _resolve_lifecycle_fault(
             default=HIDDEN_CHAT_ID,
         ),
         "status": status,
-        "reason_code": str(stored.get("reason_code") or "task_done_lifecycle_fault"),
+        "reason_code": str(stored.get("reason_code") or ""),
         "outcome_axes": normalize_outcome_axes(stored),
     }
+    for key in ("review_projection", "review_status", "artifact_status", "artifact_bundle", "root_phase_checkpoint"):
+        if key in stored:
+            task_done_event[key] = stored[key]
     try:
         task_done_event.update(_events()._authoritative_terminal_cost(
             task_id, task_row, stored, evt, pathlib.Path(ctx.DRIVE_ROOT),
@@ -623,15 +649,25 @@ def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> boo
             return False  # non-settled claims were already refused at the gate
         try:
             durable_status = str(
-                (load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}).get("status") or ""
+                (load_task_result(ctx.DRIVE_ROOT, str(task_id), strict=True) or {}).get("status") or ""
             ).strip().lower()
         except Exception:
-            # An unreadable row is not proof of a fault; fail open toward the
-            # ordinary dispatch (its own missing-result fallback still runs).
-            log.debug("task_done durable validation read failed for %s", task_id, exc_info=True)
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            meta = ctx.RUNNING.get(str(task_id), {})
+            enqueue_terminal_file_recovery(ctx, evt, meta.get("task") or {})
+            log.warning("task_done durable validation read failed for %s", task_id, exc_info=True)
+            return True
+        meta = ctx.RUNNING.get(str(task_id), {})
+        recovery = meta.get("_terminal_file_recovery") or {}
+        invalid_source = bool(recovery.get("event_sent")) and recovery.get("terminal_source_present") is False
+        if not invalid_source and (durable_status in SETTLED_STATUSES or durable_status == STATUS_INTERRUPTED):
             return False
-        if durable_status in SETTLED_STATUSES or durable_status == STATUS_INTERRUPTED:
-            return False
+        if evt.get("_files_prepared_attempt") is not None and not recovery.get("event_sent"):
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            if enqueue_terminal_file_recovery(ctx, evt, meta.get("task") or {}):
+                return True
         log.error(
             "task_done for %s claims settled %r but the durable result is %r; "
             "refused (durable lifecycle fault)",
@@ -654,6 +690,9 @@ def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> boo
         _events()._resolve_lifecycle_fault(
             evt, ctx, evt_status,
             detail=(
+                "Worker published task_done without a settled execution source; "
+                "the supervisor terminalized it so the slot is not wedged."
+                if invalid_source else
                 f"Worker published task_done claiming settled {evt_status or '(blank)'!r} "
                 f"while the durable result is {durable_status or 'absent'!r} (not settled) "
                 "and no cancellation owns this task; the supervisor terminalized it so the "
@@ -662,11 +701,23 @@ def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> boo
         )
         return True
     except Exception:
-        log.debug("task_done durable validation failed open for %s", task_id, exc_info=True)
-        return False
+        log.warning("task_done durable validation unavailable for %s", task_id, exc_info=True)
+        return True
 
 
 def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
+    task_id = evt.get("task_id")
+    wid = evt.get("worker_id")
+    meta = ctx.RUNNING.get(str(task_id or ""), {}) if task_id else {}
+    task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+    prepared_attempt = evt.get("_files_prepared_attempt")
+    if prepared_attempt is not None and (
+        type(prepared_attempt) is not int or prepared_attempt < 1
+        or (meta and prepared_attempt != int(meta.get("attempt") or task.get("_attempt") or 1))
+        or (meta.get("worker_id") is not None and wid != meta["worker_id"])
+    ):
+        log.warning("Ignoring terminal file preparation from a stale task/worker attempt: %s", task_id)
+        return
     # Phase A1.7: ``task_done`` asserts a SETTLED outcome. A non-settled status
     # (the incident's shape: the cancel latch published as a terminal) is a
     # durable LIFECYCLE FAULT — recorded loudly, RUNNING/worker state NOT
@@ -704,10 +755,13 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
                 log.debug("task_done_invalid_status record failed", exc_info=True)
             _events()._resolve_lifecycle_fault(evt, ctx, _evt_status)
             return
-    task_id = evt.get("task_id")
-    wid = evt.get("worker_id")
-    meta = ctx.RUNNING.get(str(task_id or ""), {}) if task_id else {}
-    task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+    recovery = meta.get("_terminal_file_recovery") or {}
+    if task and not (evt.get("_ephemeral") or task.get("_is_direct_chat") or _evt_status == STATUS_INTERRUPTED):
+        if prepared_attempt is None or (recovery and not recovery.get("event_sent")):
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            if enqueue_terminal_file_recovery(ctx, evt, task):
+                return
     event_metadata = evt.get("metadata")
     task_metadata = (
         task.get("metadata")
@@ -729,68 +783,29 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
 
     final_task_result: Dict[str, Any] = {}
     if task_id:
+        # Every real file operation has ended on its worker or reaper. The
+        # internal stamp proves only that attempt; CURRENT disk is authority.
+        if _events()._task_done_durable_fault(evt, ctx, task_id):
+            return
         try:
-            from ouroboros.headless import (
-                copy_child_task_result,
-                finalize_task_artifacts,
-                task_is_readonly_subagent,
-            )
+            final_task_result = load_task_result(ctx.DRIVE_ROOT, str(task_id), strict=True) or {}
+            if not evt.get("_ephemeral") and _evt_status != STATUS_INTERRUPTED:
+                from ouroboros.headless import terminal_task_files_ready
 
-            if task:
-                copy_child_task_result(ctx.DRIVE_ROOT, task)
-            # AR2-3 (§8-A1): task_done is validated through the DURABLE result,
-            # not the event's own status claim. The read sits AFTER the child
-            # copy-back (split-drive tasks settle on the child drive first) and
-            # BEFORE artifact finalization, which would default-stamp a
-            # fabricated ``completed`` row for a workspace task that never
-            # wrote one — exactly the shape this refusal must catch.
-            if _events()._task_done_durable_fault(evt, ctx, task_id):
-                return
-            if task:
-                if not task_is_readonly_subagent(task):
-                    finalize_task_artifacts(ctx.DRIVE_ROOT, task)
-                if str(task.get("delegation_role") or "") != "subagent":
-                    _events()._checkpoint_coop_roots_on_root_done(ctx, task, str(task_id or ""))
-        except Exception as exc:
-            try:
-                from ouroboros.headless import ARTIFACT_STATUS_FAILED
-                from ouroboros.outcomes import artifact_bundle_from_result
+                if not terminal_task_files_ready(
+                    ctx.DRIVE_ROOT, {**final_task_result, **task, "id": str(task_id)}, final_task_result,
+                ):
+                    from supervisor.task_reaper import enqueue_terminal_file_recovery
 
-                existing = load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}
-                # GR2-3b: annotate ONLY a row that exists. The old fallback
-                # defaulted a MISSING row's status to "completed" — a copy-back
-                # exception then minted a fabricated completion that the
-                # monotonic guard defended and the durable validation below
-                # would read back as settled. A task with no durable result
-                # stays absent here and is judged by the fault seam instead.
-                if existing and str(existing.get("status") or ""):
-                    fields = {
-                        "artifact_status": ARTIFACT_STATUS_FAILED,
-                        "artifact_error": f"{type(exc).__name__}: {exc}",
-                        "artifact_finalized_at": utc_now_iso(),
-                    }
-                    provisional = {**existing, **fields}
-                    fields["artifact_bundle"] = artifact_bundle_from_result(provisional)
-                    write_task_result(
-                        ctx.DRIVE_ROOT,
-                        str(task_id),
-                        str(existing.get("status") or ""),
-                        **fields,
-                    )
-            except Exception:
-                pass
-            log.warning("Failed to finalize headless artifacts for task %s", task_id, exc_info=True)
-            # GR2-3b: an exception on the copy-back path must not SKIP the
-            # durable validation — the incident shape is precisely a task_done
-            # whose durable truth never landed. (When the exception came from
-            # artifact finalization AFTER a passed validation, this re-check is
-            # an idempotent read that passes again.)
-            if _events()._task_done_durable_fault(evt, ctx, task_id):
-                return
-        try:
-            final_task_result = load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}
+                    if enqueue_terminal_file_recovery(ctx, evt, task):
+                        return
         except Exception:
-            final_task_result = {}
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            enqueue_terminal_file_recovery(ctx, evt, task)
+            return
+        if task and str(task.get("delegation_role") or "") != "subagent":
+            _events()._checkpoint_coop_roots_on_root_done(ctx, task, str(task_id))
 
     outcome_axes = normalize_outcome_axes({**evt, **(final_task_result if isinstance(final_task_result, dict) else {})})
     reason_code = final_task_result.get("reason_code") or evt.get("reason_code")

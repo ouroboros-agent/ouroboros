@@ -328,7 +328,7 @@ def test_boot_migrates_the_latch_before_any_quarantining_read():
     from ouroboros import server_maintenance
 
     recovery = inspect.getsource(server_maintenance._run_startup_task_recovery)
-    assert recovery.index("migrate_legacy_cancel_latches") < recovery.index(
+    assert recovery.index("_migrate_startup_cancel_latches") < recovery.index(
         "reconcile_orphaned_running_tasks"), recovery
     assert "migrate_legacy_cancel_latches" not in inspect.getsource(
         server_maintenance._startup_custody_sweep), (

@@ -425,6 +425,9 @@ def test_unlatched_task_reaches_the_normal_acceptance_machinery(tmp_path, monkey
         lambda c: resolved.append(True) or real(c),
     )
     monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "advisory")
+    # This control proves pacing is reached, not reviewer metadata/network discovery.
+    monkeypatch.setattr(task_pacing, "review_launch_allowed",
+                        lambda snapshot: (False, "review_skipped_deadline_reserve"))
     ctx = _acceptance_ctx(tmp_path, latched=False)
     trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     loop_mod._run_task_acceptance_review_once(
@@ -614,17 +617,40 @@ def test_crash_requeue_runs_the_shared_retry_reset(tmp_path, monkeypatch):
     (_attempt+1 same-id front requeue) must strip the executable control AND
     archive the projection before the retry attempt is admitted."""
     from tests.test_terminal_durability_v664 import _crashed_worker, _install_supervisor
+    from supervisor import queue, worker_health, workers as worker_pool
 
+    for module in (queue, worker_pool):
+        monkeypatch.setattr(module, "PENDING", [])
+        monkeypatch.setattr(module, "RUNNING", {})
+    monkeypatch.setattr(worker_pool, "WORKERS", {})
+    monkeypatch.setattr(queue, "BUDGET_ROOT_FENCES", {})
     _queue, _state, workers, events = _install_supervisor(tmp_path, monkeypatch)
+    jobs = _q.Queue()
+    monkeypatch.setattr(_queue, "_reap_queue", jobs)
+    monkeypatch.setattr(_queue, "_ensure_reaper_started", lambda: None)
     task = {"id": "crash-1", "type": "task", "chat_id": 0, "_attempt": 1}
+    # A started task has lifecycle truth before hurry adds its status-free projection.
+    write_task_result(tmp_path, task["id"], "running", chat_id=0)
     # The dead attempt had an executable hurry: mailbox control + applied block.
     write_owner_message(tmp_path, "owner_hurry", "crash-1", msg_id="hurry:r1", kind=KIND_HURRY)
     oh.record_requested(tmp_path, "crash-1", request_id="r1", attempt=1)
     oh.record_applied(tmp_path, "crash-1", attempt=1)
     _crashed_worker(monkeypatch, workers, task)
     monkeypatch.setattr(workers, "load_state", lambda: {})
+    reset_calls = []
+    real_reset = oh.retry_reset
+    def reset(*args, **kwargs):
+        reset_calls.append((args, kwargs))
+        return real_reset(*args, **kwargs)
+    monkeypatch.setattr(oh, "retry_reset", reset)
 
     workers.ensure_workers_healthy()
+    assert workers.PENDING == [] and reset_calls == [], "health only reserves the queued recovery"
+    job = jobs.get_nowait()
+    assert job["kind"] == "confirmed_dead_worker" and job["task_id"] == "crash-1"
+    worker_health.recover_confirmed_dead_worker(job)
+    assert jobs.empty(), "one crash recovery must not schedule an unowned retry loop"
+    assert len(reset_calls) == 1 and reset_calls[0][1]["reason"] == "worker_crash_requeue"
 
     # Same-id front requeue with the bumped attempt.
     assert [(t["id"], t["_attempt"]) for t in workers.PENDING] == [("crash-1", 2)]

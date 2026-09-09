@@ -28,6 +28,50 @@ log = logging.getLogger(__name__)
 reap_queue: "_stdqueue.Queue[Dict[str, Any]]" = _stdqueue.Queue()
 _reaper_thread: "Optional[threading.Thread]" = None
 _reaper_start_lock = threading.Lock()
+_deferred_reap_jobs: list[dict] = []
+
+
+class TerminalFileRecoveryPending(RuntimeError):
+    """The captured task still owns files; retry on health, never replay model work."""
+
+
+def _submit_terminal_file_recovery(ctx: Any, task_id: str, meta: dict, state: dict) -> None:
+    from supervisor.worker_health import _submit_terminal_file_recovery as submit
+    submit(ctx, task_id, meta, state)
+
+
+def enqueue_terminal_file_recovery(ctx: Any, evt: dict, task: dict) -> bool:
+    from supervisor.worker_health import enqueue_terminal_file_recovery as enqueue
+    return enqueue(ctx, evt, task)
+
+
+def retry_terminal_file_recoveries() -> None:
+    from supervisor.worker_health import retry_terminal_file_recoveries as retry
+    retry()
+
+
+def _recover_terminal_files(job: dict) -> None:
+    from supervisor.worker_health import _recover_terminal_files as recover
+    recover(job)
+
+
+def _retry_deferred_reap_jobs() -> None:
+    """The pump retains and re-submits its own deferred jobs on a health tick."""
+    global _deferred_reap_jobs
+    from supervisor import queue as q
+
+    with q._queue_lock:
+        deferred, _deferred_reap_jobs = _deferred_reap_jobs, []
+    if deferred:
+        try:
+            q._ensure_reaper_started()
+        except Exception:
+            with q._queue_lock:
+                _deferred_reap_jobs.extend(deferred)
+            log.warning("Deferred reaper work remains pending", exc_info=True)
+        else:
+            for job in deferred:
+                q._reap_queue.put(job)
 
 
 def reaper_loop() -> None:
@@ -37,7 +81,23 @@ def reaper_loop() -> None:
         except Exception:
             continue
         try:
-            reap_timed_out_task(job)
+            if job.get("kind") == "terminal_file_recovery":
+                _recover_terminal_files(job)
+            elif job.get("kind") == "confirmed_dead_worker":
+                from supervisor.worker_health import recover_confirmed_dead_worker
+                recover_confirmed_dead_worker(job)
+            elif job.get("kind") == "worker_crash_storm":
+                _stop_crashed_worker_pool(job)
+            else:
+                reap_timed_out_task(job)
+        except TerminalFileRecoveryPending:
+            from supervisor.queue import _queue_lock
+
+            # The same reaper retains its existing job and physical reservation.
+            # The ordinary health tick retries it once, without a busy retry loop.
+            with _queue_lock:
+                _deferred_reap_jobs.append(job)
+            log.warning("Reaper file custody remains pending for %s", job.get("task_id"))
         except Exception:
             log.error("Reaper failed for task %s", (job or {}).get("task_id"), exc_info=True)
             # Self-heal: an escape BEFORE the guarded teardown (e.g. the top-of-function
@@ -53,7 +113,8 @@ def reaper_loop() -> None:
                 if _wid_raw is not None:
                     with _ql:
                         _w = _w_mod.WORKERS.get(int(_wid_raw))
-                        if _w is not None:
+                        expected = (job or {}).get("worker")
+                        if _w is not None and (expected is None or _w is expected):
                             _w.reaping = False
             except Exception:
                 log.debug("Reaper: self-heal reaping-clear failed", exc_info=True)
@@ -79,6 +140,29 @@ def ensure_reaper_started() -> None:
             log.warning("Task reaper thread had died; restarting it.")
         _reaper_thread = threading.Thread(target=reaper_loop, name="task-reaper", daemon=True)
         _reaper_thread.start()
+
+
+def _stop_crashed_worker_pool(job: dict) -> None:
+    """The old crash-storm decision runs after captured terminal-file custody settles."""
+    from supervisor import queue as q, workers
+    from supervisor.worker_pool_lifecycle import _WORKER_LIFECYCLE_LOCK
+
+    captured = dict(job["workers"])
+    with _WORKER_LIFECYCLE_LOCK:
+        with q._queue_lock:
+            if (pathlib.Path(job["drive_root"]) != pathlib.Path(workers.DRIVE_ROOT)
+                    or set(workers.WORKERS) != set(captured)
+                    or any(workers.WORKERS[wid] is not worker for wid, worker in captured.items())):
+                return
+            for worker in captured.values():
+                meta = workers.RUNNING.get(worker.busy_task_id)
+                if isinstance(meta, dict) and (
+                    meta.get("_terminal_file_recovery") or not worker.proc.is_alive()
+                ):
+                    raise TerminalFileRecoveryPending("captured terminal task has not settled")
+        if not workers.kill_workers(disable_reason="worker_crash_storm"):
+            raise TerminalFileRecoveryPending("crash-storm terminalization was not durable")
+        workers.CRASH_TS.clear()
 
 
 def request_finalization_grace(
@@ -1067,24 +1151,16 @@ def _deliver_reap_salvage(
 def _finish_self_finalized_task(
     _q: Any, workers_mod: Any, task: Dict[str, Any], task_id: str, task_type: str,
     self_status: str, _existing: Optional[Dict[str, Any]], terminal_metadata: Any,
-    unreconciled_runs: Optional[list] = None,
+    unreconciled_runs: Optional[list] = None, *, worker_id: Optional[int] = None,
+    files_prepared_attempt: Optional[int] = None,
 ) -> None:
-    """Honor a worker's OWN terminal result found after the kill (never clobber
-    it or enqueue a retry) and finish everything its death interrupted.
+    """Publish the task's own terminal and recover only unfinished artifacts.
 
-    A mirrored child result (copy_child_task_result sets artifact_status to
-    'finalizing' for workspace tasks) still needs the artifact finalization the
-    normal task_done path runs in _handle_task_done. The reaper already
-    terminalized the task, so it is no longer in RUNNING and that path finds no
-    task to finalize — complete it here. Rescue ONLY a stuck non-terminal
-    artifact state: re-running finalize on an already-terminal result can
-    regress it to FAILED (e.g. the workspace was cleaned up). Readonly
-    subagents have no durable artifacts and are skipped (shared gate).
+    A matching preparation stamp means the file helper already completed this
+    attempt; otherwise legacy callers may still owe pending/finalizing capture.
+    CURRENT review, answer, and completed artifacts are never recaptured.
     """
-    # D1b (R4): the self-finalized row keeps its own terminal write untouched;
-    # a stale non-empty stored disclosure is cleared by the same guarded
-    # stale-only refresh the fast already-settled cancel lane runs — it never
-    # mints a row and never rewrites a current one.
+    # Refresh only stale delegated-custody disclosures through their own writer.
     try:
         from ouroboros.delegate_terminal import refresh_terminal_reconciliation
 
@@ -1103,18 +1179,15 @@ def _finish_self_finalized_task(
         )
 
         _art = str((_existing or {}).get("artifact_status") or "").strip().lower()
-        if _art in {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING} and not task_is_readonly_subagent(task):
+        if (files_prepared_attempt is None
+                and _art in {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}
+                and not task_is_readonly_subagent(task)):
             finalize_task_artifacts(pathlib.Path(_q.DRIVE_ROOT), task)
     except Exception:
         log.debug("Reaper: artifact finalize for self-finalized %s failed", task_id, exc_info=True)
 
-    # GR3-5: the worker may equally have died BEFORE its final answer was
-    # delivered (or before the buffered send ever left) — an already-terminal
-    # recovery that emits only task_done resolves the card while the owner's
-    # answer stays on disk forever. Route the recovery through the SAME
-    # owed-registration delivery seam the cancel miss lane uses:
-    # owed-before-enqueued, deduped by the shared delivery_id, so a copy the
-    # worker already delivered is suppressed durably. Fail-soft.
+    # Owe the retained answer before task_done, through the same durable dedupe
+    # as normal delivery; a missed worker frame must not lose the answer.
     try:
         from supervisor.terminal_delivery import deliver_miss_lane_outcome
 
@@ -1130,9 +1203,7 @@ def _finish_self_finalized_task(
     except Exception:
         log.debug("Reaper: terminal delivery for self-finalized %s failed", task_id, exc_info=True)
 
-    # The worker may have died before emitting its task_done (and the crash
-    # detector now skips reaping slots): emit an idempotent task_done so the
-    # UI card resolves.
+    # A missed worker terminal still resolves its card through normal dispatch.
     try:
         done_chat_id = int(task.get("chat_id") or 0) if isinstance(task, dict) else 0
         workers_mod.get_event_q().put({
@@ -1140,48 +1211,50 @@ def _finish_self_finalized_task(
                 "chat_id": done_chat_id, "status": self_status,
                 "reason_code": str((_existing or {}).get("reason_code") or ""),
                 "metadata": terminal_metadata,
+                **({"worker_id": worker_id} if worker_id is not None else {}),
+                **({"_files_prepared_attempt": files_prepared_attempt}
+                   if files_prepared_attempt is not None else {}),
         })
     except Exception:
         log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
+        if files_prepared_attempt is not None:
+            raise TerminalFileRecoveryPending("saved terminal event was not delivered")
 
 
 def _load_post_kill_terminal_result(
     q: Any, task: Dict[str, Any], task_id: str,
 ) -> tuple[str, Optional[Dict[str, Any]]]:
-    """Return terminal truth that won the worker-death boundary, if any."""
-    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+    """Read CURRENT, prepare only unfinished files; unknown source never permits replay."""
+    from ouroboros.task_results import load_task_result
+    from ouroboros.headless import prepare_terminal_task_files, terminal_task_files_ready
 
-    self_status = ""
-    existing: Optional[Dict[str, Any]] = None
     try:
-        existing = load_task_result(q.DRIVE_ROOT, task_id)
-        if existing and str(existing.get("status") or "") in _TRULY_TERMINAL_STATUSES:
-            self_status = str(existing.get("status") or "")
-    except Exception:
-        log.debug("Reaper: post-kill terminal re-check failed for %s", task_id, exc_info=True)
-    # Forked/workspace/subagent tasks self-finalize on the CHILD drive and are copied back
-    # only on task_done; a worker that died after writing its child result but before
-    # copy-back would be missed by the parent-drive check above. Mirror the child result
-    # back and honor it (no interrupted/failed clobber, no duplicate retry).
-    if not self_status:
-        try:
-            from ouroboros.headless import copy_child_task_result
+        existing = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+        if terminal_task_files_ready(q.DRIVE_ROOT, task, existing):
+            return str(existing["status"]), existing
+        prepared = prepare_terminal_task_files(pathlib.Path(q.DRIVE_ROOT), task)
+        existing = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+    except Exception as exc:
+        raise TerminalFileRecoveryPending("terminal publication read is unresolved") from exc
+    if terminal_task_files_ready(q.DRIVE_ROOT, task, existing):
+        return str(existing["status"]), existing
+    if prepared.get("terminal_source_present") is not False:
+        raise TerminalFileRecoveryPending("terminal files have not been published")
+    return "", existing
 
-            child = copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), task)
-            if child and str(child.get("status") or "") in _TRULY_TERMINAL_STATUSES:
-                existing = child
-                self_status = str(child.get("status") or "")
-        except Exception:
-            log.debug("Reaper: child-drive terminal re-check failed for %s", task_id, exc_info=True)
-    return self_status, existing
-
-
-def _respawn_after_reap(q: Any, workers_mod: Any, worker_id: int) -> None:
+def _respawn_after_reap(
+    q: Any, workers_mod: Any, worker_id: int, *, expected_worker: Any = None,
+) -> None:
     """Reopen a reaped slot, leaving crash recovery available on failure."""
-    # respawn_worker owns the lifecycle race with shutdown and starts the child
-    # outside _queue_lock, so a fork can never inherit the RLock from this thread.
+    # The lifecycle serializer guards replacement; process start stays outside queue lock.
+    from supervisor.worker_pool_lifecycle import _WORKER_LIFECYCLE_LOCK
+
     try:
-        workers_mod.respawn_worker(worker_id)
+        with _WORKER_LIFECYCLE_LOCK:
+            with q._queue_lock:
+                if expected_worker is not None and workers_mod.WORKERS.get(worker_id) is not expected_worker:
+                    return
+            workers_mod.respawn_worker(worker_id)
     except Exception:
         log.warning(
             "Reaper: respawn failed for worker %d; clearing reaping for recovery",
@@ -1191,7 +1264,7 @@ def _respawn_after_reap(q: Any, workers_mod: Any, worker_id: int) -> None:
         try:
             with q._queue_lock:
                 worker = workers_mod.WORKERS.get(worker_id)
-                if worker is not None:
+                if worker is not None and (expected_worker is None or worker is expected_worker):
                     worker.reaping = False
         except Exception:
             pass
@@ -1201,25 +1274,63 @@ def _respawn_after_reap(q: Any, workers_mod: Any, worker_id: int) -> None:
         log.debug("Reaper: failed to persist queue snapshot after respawn", exc_info=True)
 
 
-def reap_timed_out_task(job: Dict[str, Any]) -> None:
-    """Full teardown for a timed-out task, run OFF the supervisor loop (Variant A).
+def _timeout_job_is_current(job: dict, q: Any, workers: Any) -> bool:
+    """An old timeout may recover its files, never control a replacement execution."""
+    with q._queue_lock:
+        worker = job.get("worker")
+        current = workers.WORKERS.get(job.get("worker_id"))
+        live = q.RUNNING.get(job["task_id"])
+        return (
+            str(q.DRIVE_ROOT) == job["drive_root"] and current is worker
+            and (worker is None or (worker.proc is job.get("proc")
+                 and worker.busy_task_id in (None, "", job["task_id"])))
+            and (live is None or (live is job.get("meta")
+                 and int(live.get("attempt") or 1) == int(job.get("attempt") or 1)))
+            and not any(str(t.get("id")) == job["task_id"] for t in q.PENDING)
+        )
 
-    Order is load-bearing for correctness: kill+join the worker process FIRST, then gate the
-    WHOLE post-kill sequence (terminal write, task_done, retry, respawn) on confirmed death.
-    Because the original process is provably dead before any of them, a still-alive worker can
-    never race a concurrently-assigned retry (which, for a subagent, reuses the same task
-    id/drive) or have its result clobbered. If it does NOT confirm dead, the sequence is skipped
-    (strict fail-closed): the slot is held ``reaping`` and a durable STATUS_RUNNING result is
-    persisted via ``_hold_wedged_worker`` so the task is reconciled — not lost in limbo — on the
-    next generation. A POST-KILL already-terminal re-check honors a worker that self-finalized at
-    the idle boundary instead of clobbering its result or running a duplicate. The loop already
-    popped RUNNING/cleared busy_task_id and marked the slot ``reaping`` under the lock; on
-    confirmed death respawn_worker installs a fresh reaping=False Worker, re-opening the slot.
+
+def _recover_replaced_timeout_files(job: dict, q: Any, workers: Any) -> None:
+    """File-only recovery for a dead original, with no authority over a new task/slot."""
+    from ouroboros.headless import prepare_terminal_task_files
+
+    proc, task_id, task = job.get("proc"), job["task_id"], job["task"]
+    with q._queue_lock:
+        same_root = str(q.DRIVE_ROOT) == job["drive_root"]
+        if same_root and (task_id in q.RUNNING or any(str(t.get("id")) == task_id for t in q.PENDING)):
+            return  # The same logical id belongs to another attempt now.
+    if proc is not None and proc.is_alive():
+        return  # A replacement is not proof the original stopped writing.
+    if not same_root:
+        prepare_terminal_task_files(pathlib.Path(job["drive_root"]), task)
+        return  # Publication belongs to that installation's own event consumer.
+    status, current = _load_post_kill_terminal_result(q, task, task_id)
+    if status:
+        _finish_self_finalized_task(
+            q, workers, task, task_id, str(task.get("type") or ""), status, current,
+            workers.terminal_task_metadata(task.get("metadata")),
+            files_prepared_attempt=int(job.get("attempt") or 1),
+        )
+
+
+def reap_timed_out_task(job: Dict[str, Any]) -> None:
+    """Kill the captured worker off-loop; confirm death before publication or retry.
+
+    A saved terminal result wins over timeout. Unfinished file publication keeps
+    this exact job on the reaper's health-driven retry, without model replay.
+    A replacement pool/task can receive neither teardown nor retry/respawn from
+    this job; its old dead task's files remain independently recoverable.
     """
     from supervisor import queue as _q
     from supervisor import workers as workers_mod
 
     worker_id = int(job.get("worker_id")) if job.get("worker_id") is not None else -1
+    # Older in-process callers acquire this binding once, before any deferred replay.
+    job.setdefault("worker", workers_mod.WORKERS.get(worker_id))
+    job.setdefault("drive_root", str(_q.DRIVE_ROOT))
+    if not _timeout_job_is_current(job, _q, workers_mod):
+        _recover_replaced_timeout_files(job, _q, workers_mod)
+        return
     proc = job.get("proc")
     task_id = str(job.get("task_id") or "")
     task = job.get("task") if isinstance(job.get("task"), dict) else {}
@@ -1238,14 +1349,11 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     will_retry = bool(job.get("will_retry"))
     retry_task_id = str(job.get("retry_task_id") or "")
     incident_toast_once = str(job.get("incident_toast_once") or f"{task_id}:{terminal_reason}:{attempt}")
-    # 1. Kill first; every terminal write, retry, and respawn is gated on confirmed death.
-    if not _kill_and_confirm_worker_dead(proc, worker_id, task_id):
-        # Fully fail-closed: do NOTHING downstream that could race a still-live worker. Leave the
-        # slot reaping=True (the loop already cleared busy_task_id; clearing reaping would let the
-        # crash detector treat the live, non-busy orphan as a healthy IDLE worker and assign it a new
-        # task). A durable STATUS_RUNNING result is persisted so the task is reconciled (not lost in
-        # limbo) on the next generation — the custody reaper terminalizes the orphan after a
-        # worker_boot. Surface it loudly so the owner can /restart if truly wedged.
+    confirmed = _kill_and_confirm_worker_dead(proc, worker_id, task_id)
+    if not _timeout_job_is_current(job, _q, workers_mod):
+        _recover_replaced_timeout_files(job, _q, workers_mod)
+        return
+    if not confirmed:
         _hold_wedged_worker(task_id, task_type, worker_id, terminal_reason, runtime_sec,
                             _incident_chat_id(task, owner_chat_id))
         return
@@ -1261,15 +1369,8 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     except Exception:
         log.debug("Reaper: failed to archive service logs for %s", task_id, exc_info=True)
 
-    # GR5-2: the killed worker's graceful ``release_task_runs`` never ran, so
-    # its open delegated (Claudexor) runs would keep mutating while the retry
-    # starts — and the orphan sweep never fires, because the retried task keeps
-    # the owner "alive". Reconcile custody NOW (the same seam + post-reconcile
-    # open_runs/pending_invocations re-audit the cancel kill path uses), BEFORE
-    # the retry/respawn decision; still-open runs are disclosed on the reap
-    # outcome (result field + the typed ``delegated_runs_unreconciled`` event
-    # the shared helper emits). Custody reconciliation only — the reaper mints
-    # no cancel intents (owner-declined). Fail-soft: the helper never raises.
+    # A killed worker cannot release its delegated runs. Reconcile and re-audit
+    # through cancellation's existing owner before considering a paid retry.
     from supervisor.cancel_publication import _audit_delegated_runs_on_kill, _custody_disclosure_fields
 
     custody_audit = _audit_delegated_runs_on_kill(_q, task_id, trigger=f"reaper_{terminal_reason}")
@@ -1281,14 +1382,17 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         write_task_result,
     )
 
-    # 2. POST-KILL already-terminal re-check: the worker may have self-finalized right at
-    #    the boundary. The process is dead now, so this decision is final.
+    # Confirmed-dead files precede publication and any retry.
     self_status, _existing = _load_post_kill_terminal_result(_q, task, task_id)
+    if not _timeout_job_is_current(job, _q, workers_mod):
+        _recover_replaced_timeout_files(job, _q, workers_mod)
+        return
 
     if self_status:
         _finish_self_finalized_task(
             _q, workers_mod, task, task_id, task_type, self_status,
             _existing, terminal_metadata, unreconciled,
+            worker_id=worker_id, files_prepared_attempt=attempt,
         )
     else:
         # 3. Reconstruct real cost/rounds from durable llm_usage (the killed worker never
@@ -1303,14 +1407,12 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                 "cost_accounting_error": "ledger_unavailable",
             }
 
-        # Salvage the last persisted assistant text so a hard kill surfaces real progress.
+        # Preserve the last assistant text on the canonical drive before cleanup.
         salvage_note = ""
         try:
             from ouroboros.observability import salvaged_output_note
             salvage_note = salvaged_output_note(
                 _q._task_drive_for_task(task, task_id), task_id,
-                # Symmetric with the cancel path: the child drive holding the
-                # blobs does not outlive the task, the canonical drive does.
                 preserve_root=pathlib.Path(_q.DRIVE_ROOT),
             )
         except Exception:
@@ -1340,10 +1442,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                         reason_code=terminal_reason,
                         review_trigger="supervisor_terminal",
                     ),
-                    # GR5-2: the reap outcome discloses the delegated runs the
-                    # custody reconcile above could not settle. UNCONDITIONAL
-                    # (D1b): a clean audit writes [] to clear a stale stored
-                    # list; the audit envelope rides the same single write (R2).
+                    # An empty current audit clears stale debt in the same write.
                     **_custody_disclosure_fields(custody_audit),
                     **recon_fields,
                     result=(
@@ -1450,9 +1549,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         except Exception:
             log.debug("Reaper: failed to log task_terminal_timeout for %s", task_id, exc_info=True)
 
-        # Guarded: a notification failure (e.g. a torn-down bus during shutdown) must NOT
-        # abort the reaper before respawn, or the slot would stay reaping=True forever.
-        # C4: the notice goes to the TASK'S chat; owner chat only as absent-binding fallback.
+        # Notification failures cannot hold the slot; route to its task's chat.
         incident_chat_id = _incident_chat_id(task, owner_chat_id)
         if incident_chat_id is not None:
             try:
@@ -1498,6 +1595,6 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                 recon_fields, terminal_metadata,
             )
 
-    # 5. Respawn a fresh worker for the slot; on failure, clear reaping so the
-    # crash detector can recover it instead of leaving a permanently held slot.
-    _respawn_after_reap(_q, workers_mod, worker_id)
+    # Only the originally captured slot may be replaced.
+    if job["worker"] is not None:
+        _respawn_after_reap(_q, workers_mod, worker_id, expected_worker=job["worker"])

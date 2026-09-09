@@ -19,6 +19,10 @@ from ouroboros.settings_defaults import (
 
 # Local model-operation status polling; not a provider deadline or quota timer.
 CLAUDEXOR_MODEL_POLL_INTERVAL_SEC = 0.25
+# Existing CLI RPC (10s), termination confirmation (20s), and process startup slack.
+CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC = 35.0
+# Physical exit observation after a clean operator-stop receipt, not a task deadline.
+CLAUDEXOR_STOP_EXIT_WAIT_SEC = 5.0
 
 
 EXTENSION_STREAM_CHUNK_BYTES = 64 * 1024
