@@ -927,6 +927,11 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
         })
     author_record = None
     if disposition.get("author_disposition") is not None:
+        if enforcement != "advisory":
+            return _bad(
+                "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: author_disposition is advisory-only; "
+                "the selected blocking enforcement remains authoritative"
+            )
         try:
             author_record = build_author_disposition_from_mapping(disposition["author_disposition"], subject_hash=fingerprint, reviewer_signal=str(wave.get("aggregate") or ""), enforcement=enforcement)
         except ValueError as exc:

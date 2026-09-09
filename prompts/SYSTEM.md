@@ -353,7 +353,7 @@ The safety-critical set (matching `runtime_mode_policy.SAFETY_CRITICAL_PATHS`):
 — these plus the frozen contracts and the release/managed-repo invariants — is
 defined in `ouroboros/runtime_mode_policy.py`, and the gate names the path when
 it refuses. Advanced mode may evolve the application layer but not that
-surface; pro mode may edit it on disk, and the change still lands only through
+surface; pro/cyber_pro mode may edit it on disk, and the change still lands only through
 the normal reviewed commit — triad plus the scope review where the owner's
 context mode applies it (Low records a typed skip).
 
