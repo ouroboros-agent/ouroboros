@@ -46,7 +46,8 @@ def test_access_and_review_round_trip_without_losing_restart_truth(direct_server
             assert page.locator('#s-review-enforcement').input_value() == "blocking"
             access = page.locator('[data-policy-state="access"]')
             assert "Saved: Cyber Pro" in access.inner_text()
-            assert "Active: Light" in access.inner_text()
+            assert "Current process: Light" in access.inner_text()
+            assert "Next task: Cyber Pro" in access.inner_text()
             assert "Restart required" in access.inner_text()
             access.scroll_into_view_if_needed()
             page.screenshot(path=str(evidence / "settings-policy-reload-desktop.png"))
