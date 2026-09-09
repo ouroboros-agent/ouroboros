@@ -1102,6 +1102,30 @@ def test_rank_aware_github_policy_keeps_ordinary_setup_blocked():
     assert gh_shell_block_reason("gh auth login", runtime_mode="pro")
 
 
+@pytest.mark.parametrize("cmd", [
+    "git rebase HEAD~1",
+    "git update-ref refs/heads/feature HEAD",
+    "git filter-repo --path other.txt --invert-paths",
+])
+def test_bible_history_predicate_allows_unrelated_git_history_operations(cmd):
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    assert protected_bible_history_delete_reason(cmd) == ""
+
+
+@pytest.mark.parametrize("cmd", [
+    "git rm BIBLE.md",
+    "git mv BIBLE.md BIBLE.old",
+    "git checkout -- BIBLE.md",
+    "git update-index --remove BIBLE.md",
+    "git filter-repo --path BIBLE.md --invert-paths",
+])
+def test_bible_history_predicate_blocks_explicit_bible_targets(cmd):
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    assert "BIBLE" in protected_bible_history_delete_reason(cmd)
+
+
 def test_advanced_mode_blocks_runshell_protected_backslash_path(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = _registry(tmp_path)

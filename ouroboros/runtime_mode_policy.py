@@ -43,22 +43,49 @@ def protected_bible_history_delete_reason(raw_cmd: object) -> str:
 
         delete_heads = {"rm", "unlink", "mv"}
         history_verbs = {
-            "filter-branch", "filter-repo", "rebase", "replace", "update-ref",
+            "filter-branch", "filter-repo", "checkout", "restore", "read-tree",
+            "update-index", "reset", "commit", "rebase", "replace",
         }
+
+        def _bible_path(words: list[str], *, path_flag_only: bool = False) -> bool:
+            """Recognize an explicit BIBLE.md path, including --path= forms."""
+            candidates: list[str] = []
+            expect_value = False
+            for word in words:
+                token = str(word).strip("'\"")
+                if expect_value:
+                    candidates.append(token)
+                    expect_value = False
+                    continue
+                if token in {"--path", "--path-file", "--paths"}:
+                    expect_value = True
+                    continue
+                if token.startswith("--path="):
+                    candidates.append(token.split("=", 1)[1])
+                    continue
+                if not path_flag_only:
+                    candidates.append(token)
+            return any(
+                pathlib.PurePath(candidate.replace("\\", "/")).name.casefold() == "bible.md"
+                for candidate in candidates
+            )
+
         for segment in shell_segments(raw_cmd):
             _env, argv = collect_leading_env(segment)
             if not argv:
                 continue
             head = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
             words = [str(item).replace("\\", "/") for item in argv[1:]]
-            bible = any(pathlib.PurePath(word).name.casefold() == "bible.md" for word in words)
+            bible = _bible_path(words)
             if head in delete_heads and bible:
                 return "BIBLE_DELETE_BLOCKED: the BIBLE.md file must remain physically present."
             if head == "git":
                 verbs = [word.lower() for word in words if not word.startswith("-")]
                 if verbs and verbs[0] in {"rm", "mv"} and bible:
                     return "BIBLE_DELETE_BLOCKED: git rm/git mv cannot remove or rename BIBLE.md."
-                if verbs and verbs[0] in history_verbs:
+                if verbs and verbs[0] in history_verbs and _bible_path(
+                    words, path_flag_only=(verbs[0] in {"filter-branch", "filter-repo"})
+                ):
                     return "BIBLE_HISTORY_REWRITE_BLOCKED: BIBLE history must remain physically recoverable."
         return ""
     except Exception:
