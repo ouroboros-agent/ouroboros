@@ -514,9 +514,9 @@ def _profile_roots_hint(ctx: ToolContext, operation: str) -> str:
     model turns a dead-end error into a self-correcting retry instead of a
     probe loop over blocked roots (v6.70.0)."""
     try:
-        from ouroboros.tool_access import _POLICY
+        from ouroboros.tool_access import _POLICY, _effective_policy_profile
 
-        policy = _POLICY.get(active_tool_profile(ctx), {})
+        policy = _POLICY.get(_effective_policy_profile(active_tool_profile(ctx)), {})
         visible = sorted(root for root, ops in policy.items() if operation in ops)
         return f" Roots your profile can {operation}: {', '.join(visible) or '(none)'}."
     except Exception:

@@ -90,7 +90,7 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     at schedule time (and the child sees first line of its context) what the child
     CAN and CANNOT do. Prevents the wasted rounds where a prober child hit
     workspace_blocked on run_script because neither side knew shell was off."""
-    matrix = _POLICY.get(profile, {})
+    matrix = _POLICY.get(_effective_policy_profile(profile), {})
     shell_roots = sorted(root for root, ops in matrix.items() if "shell" in ops)
     write_roots = sorted(root for root, ops in matrix.items() if ops & {"write", "edit"})
     has_shell = bool(shell_roots)
@@ -105,25 +105,28 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     return "child capabilities — " + " · ".join(bits)
 
 
+def _effective_policy_profile(profile: ToolProfile) -> ToolProfile:
+    """Map an acting child to the existing full matrix only in Cyber Pro."""
+    if profile != "acting_subagent":
+        return profile
+    try:
+        from ouroboros.config import get_runtime_mode
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
+            return "operator_control"
+    except Exception:
+        pass
+    return profile
+
+
 def decide_tool_access(
     *,
     profile: ToolProfile,
     root: ResourceRoot,
     operation: Operation,
 ) -> ToolAccessDecision:
-    effective_profile = profile
-    if profile == "acting_subagent":
-        try:
-            from ouroboros.config import get_runtime_mode
-            from ouroboros.runtime_mode_policy import runtime_mode_at_least
-
-            if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
-                # Cyber Pro is an explicit owner-selected widening of a
-                # non-readonly child. Reuse the existing full principal matrix;
-                # readonly children keep their fail-closed profile.
-                effective_profile = "operator_control"
-        except Exception:
-            pass
+    effective_profile = _effective_policy_profile(profile)
     allowed = operation in _POLICY.get(effective_profile, {}).get(root, set())
     if allowed:
         return ToolAccessDecision(True, guard=f"{effective_profile}:{root}:{operation}")
@@ -257,7 +260,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     """
 
     profile = active_tool_profile(ctx)
-    policy = _POLICY.get(profile, {})
+    policy = _POLICY.get(_effective_policy_profile(profile), {})
     # H2 (capinv-447): a root is writable iff a MUTATING operation is granted on
     # it. Grouping "vcs" as write-like claimed writable roots for the read-only
     # child profile (status/diff-only vcs), contradicting summarize_subagent_profile.
