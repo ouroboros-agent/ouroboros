@@ -326,6 +326,8 @@ def _finish_task_done_dispatch(
                 progress_meta["reason_code"] = str(task_done_event["reason_code"])
             if "review_projection" in task_done_event:
                 progress_meta["review_projection"] = task_done_event["review_projection"]
+            if "model_execution" in task_done_event:
+                progress_meta["model_execution"] = task_done_event["model_execution"]
             ctx.send_with_budget(
                 chat_id,
                 f"{icon} Subagent {task_id} {verb} ({task.get('role') or 'researcher'}).",
@@ -840,6 +842,11 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         task_done_event["review_status"] = review_status
     if review_projection := _events()._task_done_review_projection(final_task_result, evt):
         task_done_event["review_projection"] = review_projection
+    model_execution = final_task_result.get("model_execution")
+    if evt.get("_ephemeral"):
+        model_execution = evt.get("model_execution")
+    if isinstance(model_execution, dict):
+        task_done_event["model_execution"] = model_execution
     try:
         append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", task_done_event)
     except Exception:

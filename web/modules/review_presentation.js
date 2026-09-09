@@ -1,3 +1,4 @@
+import { setInertCardPresentation } from './task_phase_chip.js';
 import { escapeHtmlAttr } from './utils.js';
 import { taskSourceDownloadUrl } from './api_client.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
@@ -41,9 +42,9 @@ const finiteCount = (value) => {
 };
 
 export function setReviewAnchor(record, enabled, writePhase) {
-    if (!record || Boolean(record.reviewAnchor) === enabled) return false;
+    if (!record || (record.historicalUnavailable || record.historicalUnconfirmed) || Boolean(record.reviewAnchor) === enabled) return false;
     record.reviewAnchor = enabled;
-    record.phaseEl.hidden = enabled;
+    setInertCardPresentation(record, enabled);
     if (enabled) {
         record.titleEl.textContent = record.suggestedName || 'Reviews';
         record.inlineTypingEl.style.display = 'none';

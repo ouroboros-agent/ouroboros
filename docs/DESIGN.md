@@ -390,6 +390,10 @@ element in the card shares one keyboard ring (2px `--focus-accent-border`,
 2px offset). Component geometry (card min/max width) keeps local literals like
 the rest of the chat surface.
 
+Required Project questions appear in Main as one neutral System pointer with `Open question`, then `View question` after the recorded answer or expiry. The form remains in Project. Missing source says `Question status unavailable`; resumed work without a recorded answer keeps neutral `Question in <Project>` wording. An explicit click reveals that exact question without toggling the room closed or moving the viewport on background updates.
+
+History with no current execution or known outcome keeps its expandable content under `Outcome unavailable`, without a task chip, typing or Stop. Before complete live-source reconciliation, it is `Activity unconfirmed`. Positive current activity restores only its proven controls. A delivery warning may coexist with a preserved task-acceptance PASS. Model metadata says `Last solve response`, naming the initial request only when the route changed.
+
 ### Subscription waits inside task cards
 
 Quota exhaustion and a confirmed need to sign in again use the same component,

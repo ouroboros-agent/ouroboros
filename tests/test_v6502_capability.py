@@ -86,8 +86,8 @@ def test_build_swarm_efficiency_rolls_up_fanout_events(tmp_path):
     roll = _build_swarm_efficiency(_Env(tmp_path), {"id": "root1"})
     assert roll is not None
     assert roll["subagent_count"] == 3            # c1,c2,c3 (other-parent x1 excluded)
-    assert roll["wave_count"] == 2
-    assert roll["inter_wave_latency_sec_total"] == 194.0
+    assert roll["fanout_count"] == 2
+    assert roll["fanout_interval_sec_total"] == 194.0
     assert sorted(roll["lanes_requested"]) == ["heavy", "light"]
     # A plain task's rollup carries no intent annotation (rc-phaseC).
     assert "intent_source" not in roll and "requested_count" not in roll
@@ -130,8 +130,8 @@ def test_build_swarm_efficiency_rollup_carries_intent_source_and_requested_count
     roll = _build_swarm_efficiency(_Env(tmp_path), _swarm_task("t-swarm"))
     assert roll is not None
     assert roll["subagent_count"] == 3
-    assert roll["wave_count"] == 2
-    assert roll["inter_wave_latency_sec_total"] == 3.5
+    assert roll["fanout_count"] == 2
+    assert roll["fanout_interval_sec_total"] == 3.5
     assert roll["lanes_requested"] == ["heavy", "codex-route"]
     assert roll["intent_source"] == "swarm"
     assert roll["requested_count"] == 3
@@ -217,7 +217,7 @@ def test_write_task_result_persists_swarm_efficiency(tmp_path):
 
     drive = tmp_path / "drive"
     drive.mkdir()
-    roll = {"subagent_count": 3, "wave_count": 2, "inter_wave_latency_sec_total": 194.0, "lanes_requested": ["heavy", "light"]}
+    roll = {"subagent_count": 3, "fanout_count": 2, "fanout_interval_sec_total": 194.0, "lanes_requested": ["heavy", "light"]}
     rec = write_task_result(drive, "fa11fa11", STATUS_COMPLETED, swarm_efficiency=roll)
     assert rec.get("swarm_efficiency") == roll          # accepted as a field (no TypeError)
     persisted = load_task_result(drive, "fa11fa11")

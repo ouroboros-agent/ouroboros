@@ -61,8 +61,8 @@ def test_ephemeral_terminal_facts_survive_real_chat_persistence_and_history(
     text = "The original answer stays intact."
     pipeline.emit_task_results(
         SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), None, None,
-        pending, task, text, {"execution_status": execution, "reason_code": reason},
-        {"tool_calls": [], "reasoning_notes": [],
+        pending, task, text, {"execution_status": execution, "reason_code": reason, "rounds": 2},
+        {"tool_calls": [{"name": "read_file"}, {"name": "route_to_project"}], "reasoning_notes": [],
          "delivery_candidate": {"degraded": execution == "degraded", "degraded_reason": reason}},
         start_time=0.0, drive_logs=logs,
     )
@@ -79,6 +79,8 @@ def test_ephemeral_terminal_facts_survive_real_chat_persistence_and_history(
     [frame] = [row for row in live if row.get("type") == "chat"]
     for row in (final["progress_meta"], stored, frame, replayed):
         assert row["ephemeral_decision"] is True
+        assert row["tool_calls"] == 2
+        assert row["rounds"] == 2
         assert row["task_terminal_status"] == "completed"
         assert row["outcome_axes"] == terminal["outcome_axes"]
         assert row["reason_code"] == reason

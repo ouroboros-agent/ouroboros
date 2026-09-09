@@ -396,7 +396,7 @@ export function taskReasonDetail(evt) {
         const rationale = String(decision.rationale || '').split(/\s+/).filter(Boolean).join(' ');
         return `Acceptance: ${decision.status}${rationale ? ` — ${rationale}` : ''}`;
     }
-    if (!evt?.reason_code) return '';
+    if (!evt?.reason_code || evt.reason_code === 'final_message') return '';
     const receiptVeto = record.outcome_axes?.objective?.receipt_veto;
     if (receiptVeto?.reason === evt.reason_code && receiptVeto.detail) {
         return `Reason: ${String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')}`;
@@ -721,6 +721,7 @@ export function summarizeLogEvent(evt) {
             meta: taskMeta(
                 evt.task_type || '',
                 ...taskOutcomeMeta(evt),
+                modelExecutionLabel(evt.model_execution),
                 evt.reason_code || '',
                 formatLogDuration(evt.duration_sec),
                 evt.tool_calls != null ? `${evt.tool_calls} tools` : '',
@@ -748,6 +749,7 @@ export function summarizeLogEvent(evt) {
             body: reviewDetails,
             meta: taskMeta(
                 ...taskOutcomeMeta(evt),
+                modelExecutionLabel(evt.model_execution),
                 // №8/Q3: the owner-requested soft stop shows the honest marker
                 // instead of the raw machine reason code.
                 taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : reasonCode,
@@ -849,7 +851,8 @@ export function summarizeLogEvent(evt) {
                 evt.role ? `role=${evt.role}` : '',
                 evt.requested_model_lane ? `lane=${evt.requested_model_lane}` : '',
                 evt.depth != null ? `depth=${evt.depth}` : '',
-                evt.inter_wave_latency_sec != null ? `Δ=${evt.inter_wave_latency_sec}s` : '',
+                ('fanout_interval_sec' in evt ? evt.fanout_interval_sec : evt.inter_wave_latency_sec) != null
+                    ? `since previous fan-out ${'fanout_interval_sec' in evt ? evt.fanout_interval_sec : evt.inter_wave_latency_sec}s` : '',
             ],
         });
     }
@@ -925,6 +928,46 @@ function chatView({
     // paint the same fact; absent stays absent (no placeholder chip).
     if (chip) out.executorChip = chip;
     return out;
+}
+
+// Final chat, task_done and replay share one logical completion note.
+export function taskTerminalSummary(evt = {}) {
+    const terminal = evt.task_phase !== 'finalizing' && evt.outcome_final !== false
+        && (evt.outcome_final === true || evt.system_type === 'task_summary'
+            || taskDoneIsTerminal(evt) || (evt.type === 'task_done' && evt.ephemeral_decision === true));
+    const outcome = taskTerminalPhase(evt);
+    const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');
+    const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]
+        .filter(Boolean).join('\n');
+    return {
+        ...chatView({
+            phase: presentation.phase, headline: presentation.headline, body,
+            visible: true, promote: true, terminal,
+            dedupeKey: `task_done|${evt.task_id || ''}`,
+        }),
+        ...(evt.model_execution && typeof evt.model_execution === 'object'
+            ? { modelExecution: evt.model_execution } : {}),
+        ...(Number.isInteger(evt.tool_calls) ? { toolCalls: evt.tool_calls } : {}),
+    };
+}
+
+// Requested route, usable solve route and provider-reported name are distinct.
+export function modelExecutionLabel(fact) {
+    if (!fact || typeof fact !== 'object') return '';
+    const requested = compactModel(fact.requested_model || '');
+    if (fact.source !== 'usable_solve_response') {
+        return requested ? `Requested ${requested} · execution not observed` : 'Execution not observed';
+    }
+    const used = String(fact.used_model || '');
+    const reported = String(fact.reported_model || '');
+    const requestDiffers = String(fact.requested_model || '') !== used
+        || fact.requested_use_local !== fact.used_local;
+    const initial = requested && requestDiffers
+        ? ` (initial request: ${requested}${fact.requested_use_local ? ' · local' : ''})` : '';
+    return [`Last solve response: ${compactModel(reported || used)}${initial}`,
+        fact.used_local === true ? 'local' : '', fact.provider || '',
+        reported && reported !== used ? `route: ${used}` : ''].filter(Boolean).join(' · ');
+
 }
 
 export function summarizeChatLiveEvent(evt) {
@@ -1189,40 +1232,7 @@ export function summarizeChatLiveEvent(evt) {
         });
     }
 
-    if (t === 'task_done') {
-        const terminal = taskDoneIsTerminal(evt);
-        const outcome = taskTerminalPhase(evt);
-        const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');
-        const unavailable = evt.cost_accounting_status === 'unavailable';
-        // C13: the SHARED accessor and its null policy — same alias precedence as
-        // chat.js and the Python seams, and a REAL $0 prints instead of vanishing.
-        const ownValue = accountedUpperBound(evt) ?? (evt.cost ?? null);
-        const ownCost = unavailable
-            ? 'cost unavailable'
-            : (ownValue != null ? `${formatLogMoney(ownValue)}${evt.cost_final === false ? ' (pending)' : ''}` : '');
-        const childrenCost = (accountedUpperBoundWithChildren(evt) ?? -1) > (ownValue ?? 0)
-            ? `+children=${formatLogMoney(accountedUpperBoundWithChildren(evt))}${evt.cost_with_children_partial ? ' (partial)' : ''}`
-            : '';
-        // №8/Q3: an owner-requested soft stop keeps 'done' severity but carries
-        // its own headline and the owner-request marker in the details meta.
-        const softStopped = taskStoppedWithSummary(evt);
-        const reasonDetail = taskReasonDetail(evt);
-        return chatView({
-            phase: presentation.phase,
-            headline: presentation.headline,
-            body: reasonDetail,
-            visible: true,
-            promote: true,
-            terminal,
-            meta: [softStopped ? OWNER_STOP_DETAIL_MARKER : '', ownCost, childrenCost].filter(Boolean),
-            dedupeKey: key(
-                JSON.stringify(evt.outcome_axes || {}),
-                JSON.stringify(evt.review_projection || {}),
-                evt.status || '',
-                evt.reason_code || '',
-            ),
-        });
-    }
+    if (t === 'task_done') return taskTerminalSummary(evt);
 
 
     if (t === 'task_cost_finalized') {

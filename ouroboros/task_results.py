@@ -74,11 +74,9 @@ def effective_task_acceptance_review_cycles(
 def _root_task_acceptance_review_cap(
     root_result: Dict[str, Any],
 ) -> Optional[int]:
-    """Resolve one tree cap from the canonical root result.
-
-    Claimants never supply a fallback: descendants could otherwise widen the
-    shared wallet with their own deadline, and a deleted root could be silently
-    recreated from process-local state.
+    """Resolve the cap only from the canonical root result: no claimant fallback.
+    Otherwise a descendant's deadline could widen the shared wallet, or
+    process-local state could silently recreate a deleted root.
     """
 
     if not root_result or "task_contract" not in root_result:
@@ -122,15 +120,11 @@ def _root_task_acceptance_review_cap(
 
 
 def task_acceptance_required_blocking() -> bool:
-    """The Required+Blocking acceptance lane, derived ONCE for every reader.
-
-    Byte-for-byte the real gate's predicate (``loop_acceptance``:
-    ``ctx.mode == "required" and get_review_enforcement() == "blocking"``) —
-    ``ctx.mode`` is ``config.get_task_review_mode()``, captured by
-    ``loop._run_task_acceptance_review_once`` at the acceptance launch, and
-    ``loop.get_review_enforcement`` IS ``config.get_review_enforcement``. The
-    cap reader and the capacity projection share this one derivation so no
-    second spelling can drift from the gate it projects."""
+    """Shared Required+Blocking predicate for the cap and capacity readers.
+    It matches ``loop_acceptance``: ``ctx.mode == 'required'`` (captured from
+    ``config.get_task_review_mode()`` at ``_run_task_acceptance_review_once``)
+    and ``loop.get_review_enforcement() == 'blocking'``. That getter is the
+    same config getter used here, so these projections cannot drift apart."""
     from ouroboros import config
 
     return bool(
@@ -736,22 +730,27 @@ def task_result_path(drive_root: Any, task_id: str, *, create: bool = True) -> p
     return task_results_dir(drive_root, create=create) / f"{validate_task_id(task_id)}.json"
 
 
+def _normalize_swarm_efficiency(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the two retired fan-out names without rewriting historical records."""
+    value = data.get("swarm_efficiency")
+    if not isinstance(value, dict):
+        return data
+    value = dict(value)
+    for old, new in (("wave_count", "fanout_count"),
+                     ("inter_wave_latency_sec_total", "fanout_interval_sec_total")):
+        if old in value:
+            value.setdefault(new, value.pop(old))
+    return {**data, "swarm_efficiency": value}
+
+
 def load_task_result(
     drive_root: Any, task_id: str, *, strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Read one exact task result.
+    """Read one exact result through schema admission, tolerating old fan-out names.
 
-    Observational callers retain the historical fail-soft default.  Admission
-    callers pass ``strict=True`` so an existing unreadable row cannot be
-    reinterpreted as an unused task identity.
-
-    Schema admission (ABI 7.0, Q8=B): an inadmissible stored row — see
-    ``task_result_schema_refusal`` — is QUARANTINED by the fail-soft path
-    (moved under ``task_results/quarantine/``, one batched durable event) and
-    the read reports no result; the strict path raises WITHOUT moving, so an
-    authority probe never mutates storage. Admissible rows are returned as
-    stored, without projecting their deliverables or independent state axes.
-    """
+    Fail-soft refusal quarantines with a batched event and returns None; strict
+    refusal raises without moving, so unreadable identities cannot be readmitted.
+    Neither mode materializes deliverables or independent state axes."""
     try:
         tid = validate_task_id(task_id)
         path = task_result_path(drive_root, tid, create=False)
@@ -786,7 +785,7 @@ def load_task_result(
         or not str(data.get("status") or "").strip()
     ):
         raise ValueError(f"task result authority is unreadable or invalid: {path}")
-    return data
+    return _normalize_swarm_efficiency(data)
 
 
 def list_task_results(

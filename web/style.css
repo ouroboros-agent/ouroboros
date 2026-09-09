@@ -2058,7 +2058,7 @@ body.resizing-panels { user-select: none; }
 
 /* A finished card receives no more narration, so an empty band is dead air:
    it folds, and the one-time height change lands with the finish re-render. */
-.chat-live-card[data-finished="1"]:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity:empty {
+.chat-live-card:is([data-finished="1"], [data-inert="1"]):not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity:empty {
     display: none;
 }
 

@@ -2919,6 +2919,7 @@ rules, not a copied color/radius/dimension inventory.
   header reports connection and server-authoritative activity only; failed
   task status does not synthesize header attention, a toast, unread state,
   or an owner action.
+- Preserve task-owned model-call provenance through result storage, copy-back and terminal/history rendering. Show the last usable solve response separately from initial routing and final-answer authorship; post-task or cost-only updates cannot erase it. Fan-out counters describe emissions and wall-clock intervals, never inferred execution waves.
 - Chat viewport invariant: sample live-edge intent before an ordinary
   transcript mutation — native scroll anchoring is not proof the owner's
   visible message stays stable, so focused regressions disable it. Follow

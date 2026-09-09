@@ -14,8 +14,9 @@ import {
     taskOutcomeSeverity,
     taskStoppedWithSummary,
     taskTerminalPhase,
+    taskTerminalSummary,
 } from '../modules/log_events.js';
-import { senderLabel } from '../modules/chat_activity.js';
+import { senderLabel, buildTimelineItemHtml } from '../modules/chat_activity.js';
 
 const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 
@@ -44,7 +45,7 @@ test('chat live card headline reads factual "Done" with the owner marker', () =>
     assert.equal(view.headline, 'Done');
     assert.equal(view.phase, 'done');                     // NOT warn-styled
     assert.equal(view.terminal, true);
-    assert.ok(view.meta.includes(OWNER_STOP_DETAIL_MARKER));
+    assert.ok(view.body.includes(OWNER_STOP_DETAIL_MARKER));
     assert.match(OWNER_STOP_DETAIL_MARKER, /owner's request/);
     assert.match(OWNER_STOP_DETAIL_MARKER, /best available result/);
     assert.doesNotMatch(view.headline, /Finished with warnings/);
@@ -66,18 +67,23 @@ test('an expiry kill still reads Cancelled — honesty outranks the soft-stop la
     assert.equal(summarizeChatLiveEvent(expired).headline, 'Cancelled');
 });
 
-test('the chat.js terminal seam keeps soft-stop truth in the details', () => {
-    // Pinned at source: the shared task presentation owns the factual headline,
-    // and the details panel body carries the owner-request marker.
-    assert.match(chat, /taskStoppedWithSummary\(msg \|\| \{\}\)/);
-    assert.match(
-        chat,
-        /taskPresentation\(finalizing && outcome !== 'error' \? 'working' : outcome\)/,
-    );
-    assert.match(chat, /softStopped \? OWNER_STOP_DETAIL_MARKER : ''/);
-    assert.match(chat, /\[softStopDetail, reasonDetail\]\.filter\(Boolean\)\.join\('\\n'\)/);
-    assert.match(chat, /visible: Boolean\(softStopDetail \|\| reasonDetail \|\| outcome === 'error'\)/);
-    assert.doesNotMatch(chat, /reviewDetails/);
+test('the chat terminal seam shares one note with the owner marker in its body', () => {
+    assert.match(chat, /const summary = taskTerminalSummary\(\{ \.\.\.msg, task_id: taskId \}\)/);
+    const summary = taskTerminalSummary(softStop);
+    assert.equal(summary.phase, 'done');
+    assert.equal(summary.headline, 'Done');
+    assert.equal(summary.body, OWNER_STOP_DETAIL_MARKER);
+    assert.equal(summary.visible, true);
+    assert.equal(summary.terminal, true);
+    assert.deepEqual(summarizeChatLiveEvent(softStop), summary);
+    const priorDocument = globalThis.document;
+    globalThis.document = { createElement: () => ({ textContent: '', get innerHTML() { return this.textContent; } }) };
+    try {
+        const html = buildTimelineItemHtml({ ...summary, lineKey: 'terminal' }, { expandedLineKeys: new Set() });
+        assert.match(html, /owner's request/);
+        assert.match(html, /best available result/);
+        assert.match(html, /chat-live-line done/);
+    } finally { globalThis.document = priorDocument; }
 });
 
 // --- MINOR 7 (Q4): cancel_receipt rendered as 📋 System, not assistant ---

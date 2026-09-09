@@ -124,8 +124,17 @@ def _save(drive_root: Any, data: Dict[str, Any]) -> None:
     atomic_write_json(path, with_schema_version(dict(data), _REGISTRY_SCHEMA_VERSION))
 
 
-def _load_bindings(drive_root: Any) -> Dict[str, Any]:
-    data = read_json_dict(_bindings_path(drive_root))
+def _load_bindings(drive_root: Any, *, strict: bool = False) -> Dict[str, Any]:
+    if strict:
+        import json
+        try:
+            data = json.loads(_bindings_path(drive_root).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"bindings": {}}
+        if not isinstance(data, dict) or not isinstance(data.get("bindings"), dict):
+            raise ValueError("Project bindings are unavailable")
+    else:
+        data = read_json_dict(_bindings_path(drive_root))
     if not isinstance(data, dict) or not isinstance(data.get("bindings"), dict):
         return {"bindings": {}}
     return data
@@ -309,14 +318,15 @@ def all_task_bindings(drive_root: Any) -> Dict[str, int]:
     return out
 
 
-def all_task_project_bindings(drive_root: Any) -> Dict[str, Dict[str, Any]]:
+def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[str, Dict[str, Any]]:
     """Map task_id -> {project_id, chat_id} for ALL post-hoc 'Turn into project'
     bindings. Richer than all_task_bindings (chat-id only): the UI uses project_id
     to turn a bound main-chat card into a pointer that opens the project panel
-    (F4), not merely to suppress the stray convert button (P2). Never raises."""
+    (F4), not merely to suppress the stray convert button (P2). Strict snapshot
+    readers propagate source failures so absence never impersonates completeness."""
     out: Dict[str, Dict[str, Any]] = {}
     try:
-        for tid, row in _load_bindings(drive_root).get("bindings", {}).items():
+        for tid, row in _load_bindings(drive_root, strict=strict).get("bindings", {}).items():
             if not isinstance(row, dict):
                 continue
             pid = str(row.get("project_id") or "").strip()
@@ -327,6 +337,8 @@ def all_task_project_bindings(drive_root: Any) -> Dict[str, Dict[str, Any]]:
             if pid and cid:
                 out[str(tid)] = {"project_id": pid, "chat_id": cid}
     except Exception:
+        if strict:
+            raise
         log.debug("all_task_project_bindings failed", exc_info=True)
     return out
 

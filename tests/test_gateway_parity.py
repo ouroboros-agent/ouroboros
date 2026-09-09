@@ -367,15 +367,19 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert _notrequired_fields(ActiveDirectTurn) == {"model_waits", "task_attempt"}, (
         "ActiveDirectTurn keeps its required base; waits and attempt are optional live-owner facts"
     )
-    assert _notrequired_fields(ActiveChatActivity) == {"model_waits", "task_attempt"}, (
+    assert _notrequired_fields(ActiveChatActivity) == {"model_waits", "task_attempt", "required_question"}, (
         "ActiveChatActivity keeps the same required base and optional wait/attempt facts"
     )
-    assert get_type_hints(ActiveChatActivity, include_extras=True) == get_type_hints(ActiveDirectTurn, include_extras=True), (
+    activity_fields = get_type_hints(ActiveChatActivity, include_extras=True)
+    assert {key: value for key, value in activity_fields.items() if key != "required_question"} == get_type_hints(ActiveDirectTurn, include_extras=True), (
         "ActiveChatActivity must mirror ActiveDirectTurn's field shape so one client reducer hydrates both"
     )
     from ouroboros.gateway.schema import json_schema_for
 
-    assert json_schema_for(ActiveChatActivity) == json_schema_for(ActiveDirectTurn), (
+    activity_schema = json_schema_for(ActiveChatActivity)
+    assert activity_schema["properties"].pop("required_question")["type"] == "object"
+    assert "required_question" not in activity_schema["required"]
+    assert activity_schema == json_schema_for(ActiveDirectTurn), (
         "the shared activity shape must preserve flat keys, types and requiredness"
     )
     assert _notrequired_fields(TypingOutbound) == {
@@ -450,6 +454,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "action",
         "target",
         "target_label",
+        "project_id",
+        "project_chat_id",
         "routing_token",
         "status",
         "options",

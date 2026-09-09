@@ -1174,6 +1174,10 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         and not deferred_child_suffix
         and not forced_best_effort_with_deferred_child
         and objective.get("status") != OBJECTIVE_FAIL
+        # Delivery warning and the current acceptance verdict are independent
+        # facts. _objective_axis already selected the bound, non-superseded
+        # review; preserve that assessment without clearing delivery degradation.
+        and objective.get("source") != "task_acceptance_review"
     ):
         objective.update({
             "status": OBJECTIVE_DEGRADED,
@@ -1281,6 +1285,7 @@ def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict
         {key: item.get(key) for key in (
             "llm_call_id", "execution_id", "round_id", "round", "request_ref",
             "response_ref", "model", "resolved_model", "provider",
+            "reported_model", "use_local", "usable_solve_response",
         )}
         for item in usage.get("llm_call_refs") or []
         if isinstance(item, dict)
