@@ -25,16 +25,14 @@ from devtools.e2e_live.ui_probe import GuardedUI
 
 SM1_NEW_ACCENT = "#2f7de1"
 SM1_COMMIT_MESSAGE = "ui: e2e_live SM1 accent token change (reviewed commit)"
-SM1_CSS_PATH = "web/style.css"
-# ``web/onboarding.css`` is inlined into the standalone first-run page and mirrors the app's
-# ``:root`` tokens BY VALUE; ``tests/test_web_typography_static.py`` pins that every token both
-# files declare resolves to the same value. ``--accent`` is one of them, so the change lands in
-# BOTH files in one reviewed commit (the first paid run edited style.css alone and the tests
-# preflight of ``commit_reviewed`` refused the commit on the parity invariant).
-SM1_MIRROR_CSS_PATH = "web/onboarding.css"
-SM1_CSS_PATHS = (SM1_CSS_PATH, SM1_MIRROR_CSS_PATH)
+SM1_CSS_PATH = "web/ui.css"
+# One source, two real documents. Shared-source presence alone cannot detect a missing link
+# or a page-local override; the browser checks both documents after the reviewed restart.
+SM1_CSS_PATHS = (SM1_CSS_PATH,)
+SM1_REQUIRED_PALETTE = frozenset({"--accent", "--accent-light", "--accent-dim",
+                                "--accent-04", "--accent-65", "--focus-accent-border", "--focus-accent-ring"})
 # The stub's README Version History row (the release preflight requires one per VERSION).
-SM1_HISTORY_ROW = "Live E2E stand SM1 rehearsal: the brand accent changed in both stylesheets."
+SM1_HISTORY_ROW = "Live E2E stand SM1 rehearsal: the shared brand accent changed for the app and setup wizard."
 _ACCENT_RE = re.compile(r"^(\s*--accent:\s*)([^;]+);", re.MULTILINE)
 _CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _CSS_TOKEN_RE = re.compile(r"(--[a-z0-9-]+)\s*:\s*([^;]+);")
@@ -177,8 +175,7 @@ def css_with_accent(css_text: str, value: str) -> str:
 
 
 def css_root_tokens(css_text: str) -> dict[str, str]:
-    """``{token: value}`` of the FIRST ``:root`` block, comments stripped — the same reading
-    ``tests/test_web_typography_static.py`` applies to both stylesheets."""
+    """``{token: value}`` of the shared stylesheet's FIRST ``:root`` block, comments stripped."""
     css = _CSS_COMMENT_RE.sub("", css_text)
     end = css.find("\n}")
     root = css if end < 0 else css[:end]
@@ -187,11 +184,10 @@ def css_root_tokens(css_text: str) -> dict[str, str]:
     return {name: " ".join(value.split()) for name, value in _CSS_TOKEN_RE.findall(root)}
 
 
-def css_mirror_drift(style_css: str, onboarding_css: str) -> dict[str, tuple[str, str]]:
-    """Shared ``:root`` tokens whose values differ between the two files (empty == parity)."""
-    style, onboarding = css_root_tokens(style_css), css_root_tokens(onboarding_css)
-    return {token: (style[token], onboarding[token])
-            for token in sorted(set(style) & set(onboarding)) if style[token] != onboarding[token]}
+def sm1_palette_tokens(css_text: str) -> dict[str, str]:
+    """Accent roles and ladder from the actual shared source, not a second palette table."""
+    return {name: value for name, value in css_root_tokens(css_text).items()
+            if name == "--accent" or name.startswith(("--accent-", "--focus-accent-"))}
 
 
 def commit_refusal_facts(ledger: dict, tools_rows: list, stored: dict) -> dict:
@@ -416,9 +412,10 @@ def sm1_prompt() -> str:
     return (
         f"Change the product's brand accent to {SM1_NEW_ACCENT} (a blue) consistently with the design "
         "system (docs/DESIGN.md §3: the one --accent value, its named roles and the accent alpha "
-        f"ladder) in BOTH {SM1_CSS_PATH} and {SM1_MIRROR_CSS_PATH}, keeping the two sheets' token "
-        "parity (tests/test_web_typography_static.py pins it); verify the visible result the way the "
-        "review policy requires (exercise at least one real consumer flow in the browser and inspect "
+        f"ladder) in the shared {SM1_CSS_PATH}, loaded by both the app and the setup wizard. "
+        "Keep the effective palette consistent on / and /onboarding, including their actual controls "
+        "(tests/test_web_typography_static.py pins the shared source); verify the visible result the way the "
+        "review policy requires (exercise real consumers in both browser documents and inspect "
         "it); then land it as a reviewed release through preflight_review and commit_reviewed with "
         f"commit message '{SM1_COMMIT_MESSAGE}', following the release policy the review organs "
         "enforce (every commit is a release: the synchronized version carriers are bumped in the same "
@@ -500,7 +497,7 @@ def release_carriers_desync_at(clone: pathlib.Path, rev: str) -> str:
 
 
 def sm1_out_of_scope(clone: pathlib.Path, rev: str, files: list[str]) -> list[str]:
-    """Committed paths OUTSIDE the SM1 contract: the two stylesheets, the release carriers the
+    """Committed paths OUTSIDE the SM1 contract: the shared stylesheet, the release carriers the
     SSOT names, ``docs/DESIGN.md``, and any other ``web/**/*.css`` whose change is comment-only."""
     from ouroboros.tools.release_sync import CARRIER_SPAN_PATHS
 
@@ -532,20 +529,20 @@ def run_sm1(ctx: LaneContext) -> None:
     ctx.check("committed_css_carries_new_accent",
               all(accent_value(committed[p]) == SM1_NEW_ACCENT and committed[p] != before[p] for p in SM1_CSS_PATHS),
               accent_committed={p: accent_value(committed[p]) for p in SM1_CSS_PATHS})
-    # The WHOLE shared ``:root`` token set agrees between the sheets: a re-derived accent family
-    # is fine exactly as long as both carry the same values.
-    drift = css_mirror_drift(committed[SM1_CSS_PATH], committed[SM1_MIRROR_CSS_PATH])
-    ctx.check("committed_css_mirror_parity", not drift, css_mirror_drift=drift)
+    palette = sm1_palette_tokens(committed[SM1_CSS_PATH])
+    ctx.check("committed_palette_roles_present",
+              SM1_REQUIRED_PALETTE <= palette.keys() and all(palette.values()),
+              palette_committed=palette)
     version_after = _git_show(ctx.clone, rev, "VERSION").strip()
     ctx.check("committed_version_bumped", version_is_bumped(version_before, version_after), version_committed=version_after)
     desync = release_carriers_desync_at(ctx.clone, rev)
     ctx.check("committed_release_carriers_in_sync", desync == "", release_carriers_desync=desync[:500])
     files = [f for f in _git(["show", "--format=", "--name-only", rev], ctx.clone).splitlines() if f]
-    # The stand pins only the observable contract: both sheets are IN the commit. Files beyond
-    # the sheets, the carriers and the documented companions are recorded as a fact, never a
+    # The stand pins only the observable contract: the shared source is IN the commit. Files beyond
+    # the source, the carriers and the documented companions are recorded as a fact, never a
     # failure: a scope reviewer may legitimately name another accent touchpoint (an inline
     # colour on the unlock page, the site stylesheet), and the reviewers own that judgment.
-    ctx.check("committed_diff_includes_sheets", all(path in files for path in SM1_CSS_PATHS),
+    ctx.check("committed_diff_includes_palette", all(path in files for path in SM1_CSS_PATHS),
               committed_files=files, committed_companions=sm1_out_of_scope(ctx.clone, rev, files))
     clean, porcelain, transient = worktree_after_commit(ctx.clone)
     ctx.check("worktree_clean_after_commit", clean, worktree_porcelain=porcelain, worktree_transient=transient)
@@ -565,17 +562,29 @@ def run_sm1(ctx: LaneContext) -> None:
     ctx.check("scope_review_complete_event",
               bool(ctx.wait_events(task_oracle, "scope_review_complete", lambda _row: True)))
     ctx.check_paid_tokens([task_id])
-    # R12: the computed style is read from the COMMITTED CSS after a restart.
+    # Include the original names too: silently dropping a role cannot shrink the browser proof.
+    names = SM1_REQUIRED_PALETTE | palette.keys() | sm1_palette_tokens(before[SM1_CSS_PATH]).keys()
+    check_sm1_rendered_palette(ctx, names)
+
+
+def check_sm1_rendered_palette(ctx: LaneContext, names: set[str]) -> None:
+    """R12: both real documents consume the landed palette after restart. This proves delivery
+    and consistency, not design quality; the existing reviewers still judge the derived colors."""
     ctx.restart()
     if ctx.ui is None:
         ctx.check("ui_computed_style", False, ui_reason=ctx.ui_reason)
         return
-    ctx.ui.goto("/")
-    observed = str(ctx.ui.computed_property(":root", "--accent") or "").strip()
-    # Only meaningful on a landed commit: a served working-tree edit would show the same value.
-    ctx.check("ui_computed_style", observed == SM1_NEW_ACCENT and ctx.checks["commit_landed"],
-              accent_computed=observed)
-    ctx.screenshot("sm1_after_restart")
+    observed = {}
+    for label, path, ready in (("app", "/", "#chat-input"), ("onboarding", "/onboarding", ".wizard-shell")):
+        ctx.ui.goto(path, ready_selector=ready)
+        values = {name: str(ctx.ui.computed_property(":root", name) or "").strip() for name in sorted(names)}
+        observed[label] = values
+        ctx.check(f"ui_{label}_palette", bool(names) and all(values.values())
+                  and values.get("--accent") == SM1_NEW_ACCENT and ctx.checks["commit_landed"])
+        ctx.screenshot(f"sm1_{label}_after_restart")
+    # A correct / value alone must not hide an unavailable or differently styled wizard.
+    ctx.check("ui_computed_style", ctx.checks["ui_app_palette"] and ctx.checks["ui_onboarding_palette"]
+              and observed["app"] == observed["onboarding"], palette_computed=observed)
 
 
 def sm1_next_version(version: str, taken: "frozenset[str] | set[str]" = frozenset()) -> str:
@@ -664,7 +673,7 @@ def sm1_stub_script(clone: pathlib.Path) -> dict:
         {"tool": "commit_reviewed", "arguments": {
             "commit_message": SM1_COMMIT_MESSAGE, "paths": [w["arguments"]["path"] for w in writes],
             "goal": "Change the brand accent for the live E2E stand and release it",
-            "scope": f"{SM1_CSS_PATH}, {SM1_MIRROR_CSS_PATH} and the release version carriers."}},
+            "scope": f"{SM1_CSS_PATH} and the release version carriers."}},
         {"final": "SM1 done: the brand accent change landed as a reviewed release."},
     ]}
 

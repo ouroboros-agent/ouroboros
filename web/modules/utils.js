@@ -9,15 +9,8 @@ export function escapeHtmlText(text) {
     return div.innerHTML;
 }
 
-export function escapeHtmlAttr(value) {
-    return String(value ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;')
-        .replace(/`/g, '&#96;');
-}
+export { escapeHtmlAttr } from './ui_primitives.js';
+import { escapeHtmlAttr } from './ui_primitives.js';
 
 export const escapeHtml = escapeHtmlText;
 
@@ -155,7 +148,8 @@ export function renderHubCard(item, {
     official = false,
 } = {}) {
     const slug = item.slug;
-    const spinner = pending ? '<span class="marketplace-working-spinner" aria-hidden="true"></span>' : '';
+    const working = Boolean(pending) && pending.failed !== true;
+    const spinner = working ? '<span class="marketplace-working-spinner" aria-hidden="true"></span>' : '';
     const lifecycleHint = lifecycle?.hint
         ? `<div class="marketplace-card-state-hint">${escapeHtmlAttr(lifecycle.hint)}</div>`
         : '';
@@ -163,7 +157,7 @@ export function renderHubCard(item, {
         ? `<span class="skills-status-chip skills-status-ok">Installed v${escapeHtmlAttr(installed.version || item.latest_version || '')}</span>`
         : '';
     return `
-        <article class="${pending ? 'marketplace-card is-working' : 'marketplace-card'}" data-slug="${escapeHtmlAttr(slug)}">
+        <article class="${working ? 'marketplace-card is-working' : 'marketplace-card'}" data-slug="${escapeHtmlAttr(slug)}">
             <div class="marketplace-card-head">
                 <div class="marketplace-card-title">
                     <strong>${escapeHtmlAttr(item.display_name || slug)}</strong>
@@ -511,6 +505,8 @@ export function initMatrixRain() {
     const ctx = canvas.getContext('2d');
     const chars = '\u30A2\u30A4\u30A6\u30A8\u30AA\u30AB\u30AD\u30AF\u30B1\u30B3\u30B5\u30B7\u30B9\u30BB\u30BD\u30BF\u30C1\u30C4\u30C6\u30C8\u30CA\u30CB\u30CC\u30CD\u30CE\u30CF\u30D2\u30D5\u30D8\u30DB\u30DE\u30DF\u30E0\u30E1\u30E2\u30E4\u30E6\u30E8\u30E9\u30EA\u30EB\u30EC\u30ED\u30EF\u30F2\u30F3ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\u03A8\u03A9\u03A6\u0394\u039B\u039E\u03A3\u0398\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u043A\u043B\u043C\u043D\u043E\u043F\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044D\u044E\u044F'.split('');
     const fontSize = 14;
+    const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let timer = null;
     let columns = [];
     let w = 0, h = 0;
 
@@ -520,6 +516,7 @@ export function initMatrixRain() {
         const colCount = Math.floor(w / fontSize);
         while (columns.length < colCount) columns.push(Math.random() * h / fontSize | 0);
         columns.length = colCount;
+        if (motion.matches) draw();
     }
     resize();
     window.addEventListener('resize', resize);
@@ -540,5 +537,19 @@ export function initMatrixRain() {
         }
     }
 
-    setInterval(draw, 66);
+    function syncMotion() {
+        if (timer !== null) clearInterval(timer);
+        timer = null;
+        if (motion.matches) draw();
+        else timer = setInterval(draw, 66);
+    }
+    motion.addEventListener('change', syncMotion);
+    syncMotion();
+    return () => {
+        if (timer !== null) clearInterval(timer);
+        timer = null;
+        motion.removeEventListener('change', syncMotion);
+        window.removeEventListener('resize', resize);
+        canvas.remove();
+    };
 }

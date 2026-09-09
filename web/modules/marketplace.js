@@ -61,7 +61,7 @@ export async function promptUpdateVersion(slug, latest, { dialogImpl = openConfi
 function controlsTemplate() {
     return `
         <div class="marketplace-controls">
-            <input type="search" id="mp-query" class="marketplace-search"
+            <input type="search" id="mp-query" class="marketplace-search ui-control" aria-label="Search ClawHub skills"
                    placeholder="Search ClawHub skills by name or summary…" autocomplete="off">
             <button class="btn btn-primary" data-mp-search>Search</button>
         </div>
@@ -100,7 +100,14 @@ function hasInstalledUiTab(installed) {
     return installed?.has_ui_tab === true;
 }
 
-export function lifecycleFor(summary, installed, pending) {
+export function lifecycleFor(summary, installed, pending, { installedUnavailable = false } = {}) {
+    if (installedUnavailable) {
+        return {
+            tone: 'warn', label: 'Installed state unavailable',
+            hint: '',
+            action: '', button: 'Unavailable', disabled: true,
+        };
+    }
     if (pending) {
         if (pending.failed === true) {
             return {
@@ -272,13 +279,14 @@ export function staleRepairSecondaryHtml(slug, installed, pending) {
 }
 
 
-function summaryCard(summary, installedMap, isPlugin) {
+function summaryCard(summary, installedMap, isPlugin, installedUnavailable = false) {
     const slug = summary.slug;
     const pending = getPending(slug);
     const installed = installedMap.get(slug);
     const installedAtVersion = installed?.provenance?.version || installed?.version || '';
     const isInstalled = !!installed;
     const updateAvailable = isInstalled
+        && !installedUnavailable
         && summary.latest_version
         && installedAtVersion
         && summary.latest_version !== installedAtVersion;
@@ -287,14 +295,14 @@ function summaryCard(summary, installedMap, isPlugin) {
     const license = summary.license || 'no-license';
     const homepageHref = safeExternalUrl(summary.homepage);
     const reviewBadge = isInstalled ? statusBadgeForReview(installed.review_status) : '';
-    const lifecycle = lifecycleFor(summary, installed, pending);
+    const lifecycle = lifecycleFor(summary, installed, pending, { installedUnavailable });
     const primaryHtml = isPlugin
         ? `<button class="btn btn-default" disabled title="OpenClaw Node/TypeScript plugins are not installable in Ouroboros. Use a Python port or MCP bridge.">Plugin</button>`
         : `<button class="btn btn-primary marketplace-next-action"
                    data-mp-action="${escapeHtml(lifecycle.action)}"
                    data-slug="${escapeHtml(slug)}"
                    ${lifecycle.disabled || !lifecycle.action ? 'disabled' : ''}>${escapeHtml(lifecycle.button)}</button>`;
-    const secondaryHtml = isPlugin
+    const secondaryHtml = isPlugin || installedUnavailable
         ? ''
         : isInstalled
             ? `
@@ -344,7 +352,7 @@ function renderResults(host, summaries, installedMap, registryCount, diagnostics
         return;
     }
     host.innerHTML = summaries
-        .map((s) => summaryCard(s, installedMap, !!s.is_plugin))
+        .map((s) => summaryCard(s, installedMap, !!s.is_plugin, diagnostics?.installedUnavailable))
         .join('');
 }
 
@@ -366,7 +374,7 @@ function renderPagination(host, { query, limit, count, cursor, hasPrevious, next
 
 
 function showStatus(host, message, tone) {
-    const el = document.getElementById('mp-status');
+    const el = host.querySelector('#mp-status');
     if (!el) return;
     el.dataset.tone = tone || '';
     el.textContent = message || '';
@@ -385,15 +393,16 @@ async function loadInstalled({ signal: externalSignal } = {}) {
     try {
         const [data, catalog] = await Promise.all([
             fetchJson('/api/marketplace/clawhub/installed', { signal: controller.signal }),
-            fetchJson('/api/extensions', { signal: controller.signal }).catch(() => ({ skills: [] })),
+            fetchJson('/api/extensions', { signal: controller.signal }).catch(() => null),
         ]);
+        if (!Array.isArray(data?.skills)) throw new Error('Installed skills response is unavailable.');
         const uiTabSkills = new Set(
-            (catalog.live?.ui_tabs || [])
+            (catalog?.live?.ui_tabs || [])
                 .map((tab) => String(tab?.skill || tab?.skill_name || tab?.extension || ''))
                 .filter(Boolean)
         );
         const byName = new Map();
-        for (const skill of catalog.skills || []) {
+        for (const skill of catalog?.skills || []) {
             if (skill.name) byName.set(skill.name, { ...skill, has_ui_tab: uiTabSkills.has(skill.name) });
         }
         const map = new Map();
@@ -402,12 +411,12 @@ async function loadInstalled({ signal: externalSignal } = {}) {
             const provSlug = skill.provenance?.slug;
             if (provSlug) map.set(provSlug, merged);
         }
-        return map;
+        return { map, available: true, enrichmentAvailable: Array.isArray(catalog?.skills) };
     } catch (err) {
         if (err?.name !== 'AbortError') {
             console.warn('marketplace: installed lookup failed', err);
         }
-        return new Map();
+        return { map: null, available: false, error: err };
     } finally {
         clearTimeout(timer);
         if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
@@ -438,6 +447,8 @@ export function initMarketplace(pane, controlsHost = null) {
         onlyOfficial: false,
         results: [],
         installedMap: new Map(),
+        installedUnavailable: true,
+        catalogLoaded: false,
         cursor: '',
         cursorHistory: [],
         nextCursor: '',
@@ -456,6 +467,7 @@ export function initMarketplace(pane, controlsHost = null) {
     // Abort + token guard prevent slow stale searches from overwriting fresh UI.
     let activeController = null;
     let refreshToken = 0;
+    let destroyed = false;
 
     function syncControlsForMode() {
         const searchMode = Boolean(String(state.query || '').trim());
@@ -464,7 +476,26 @@ export function initMarketplace(pane, controlsHost = null) {
             : '';
     }
 
+    function renderCurrentResults() {
+        if (destroyed || !state.catalogLoaded) return;
+        renderResults(resultsHost, state.results, state.installedMap, state.results.length, {
+            query: state.query,
+            official: state.onlyOfficial,
+            registryPath: state.registryPath,
+            attempts: state.registryAttempts,
+            installedUnavailable: state.installedUnavailable,
+        });
+    }
+
+    function showActionFailure(slug, message, tone = 'danger') {
+        if (destroyed) return;
+        const cardVisible = Array.from(resultsHost.querySelectorAll('[data-slug]'))
+            .some(card => card.dataset.slug === slug);
+        if (!cardVisible) showStatus(pane, `${slug}: ${message}`, tone);
+    }
+
     async function refresh() {
+        if (destroyed) return;
         syncControlsForMode();
         const query = String(state.query || '').trim();
         showStatus(pane, query ? `Searching for "${query}"…` : 'Browsing ClawHub…', 'muted');
@@ -475,24 +506,24 @@ export function initMarketplace(pane, controlsHost = null) {
         activeController = myController;
         const myToken = ++refreshToken;
         try {
-            const [data, installedMap] = await Promise.all([
-                runSearch(state, { signal: myController.signal }),
+            const [catalog, installed] = await Promise.all([
+                runSearch(state, { signal: myController.signal }).then(data => ({ data }), error => ({ error })),
                 loadInstalled({ signal: myController.signal }),
             ]);
-            if (myToken !== refreshToken) return;
-            state.results = data.results || [];
-            state.installedMap = installedMap;
+            if (destroyed || myToken !== refreshToken) return;
+            state.installedUnavailable = !installed.available;
+            if (installed.available) state.installedMap = installed.map;
             state.installedMap.pendingBySlug = getPendingBySlug();
+            if (catalog.error) throw catalog.error;
+            const data = catalog.data;
+            if (!Array.isArray(data?.results)) throw new Error('Marketplace response is unavailable.');
+            state.results = data.results;
+            state.catalogLoaded = true;
             state.nextCursor = data.next_cursor || '';
             state.registryPath = data.registry_path || 'packages';
             state.registryAttempts = data.registry_attempts || [];
             const registryWarnings = Array.isArray(data.registry_warnings) ? data.registry_warnings : [];
-            renderResults(resultsHost, state.results, state.installedMap, state.results.length, {
-                query,
-                official: state.onlyOfficial,
-                registryPath: state.registryPath,
-                attempts: state.registryAttempts,
-            });
+            renderCurrentResults();
             renderPagination(paginationHost, {
                 query,
                 limit: state.limit,
@@ -503,21 +534,25 @@ export function initMarketplace(pane, controlsHost = null) {
             });
             const mode = query ? 'search' : 'browse';
             const official = state.onlyOfficial ? ' · official only' : '';
-            if (registryWarnings.length) {
+            if (!installed.available) {
+                showStatus(pane, 'Installed skills could not be read. Previous installed details are shown where available; Refresh to retry.', 'warn');
+            } else if (!installed.enrichmentAvailable) {
+                showStatus(pane, `${state.results.length} skills · live widget details unavailable. Refresh to retry.`, 'warn');
+            } else if (registryWarnings.length) {
                 showStatus(pane, `${state.results.length} skill${state.results.length === 1 ? '' : 's'} · ${mode}${official} · ${state.registryPath} · ${registryWarnings[0]}`, 'warn');
             } else {
                 showStatus(pane, `${state.results.length} skill${state.results.length === 1 ? '' : 's'} · ${mode}${official} · ${state.registryPath}`, 'muted');
             }
         } catch (err) {
-            if (err?.name === 'AbortError' || myToken !== refreshToken) return;
+            if (destroyed || err?.name === 'AbortError' || myToken !== refreshToken) return;
             const rawMessage = String(err?.body?.error || err?.message || err || '');
             const firstLine = rawMessage.split('\n').map((line) => line.trim()).filter(Boolean)[0] || 'Marketplace request failed';
             const timeout = /timed out|timeout/i.test(rawMessage);
             const message = timeout
                 ? 'ClawHub did not respond in time. Try again, or search by name to narrow the request.'
                 : firstLine.replace(/^Error:\s*/i, '');
-            showStatus(pane, message, 'danger');
-            resultsHost.innerHTML = `<div class="skills-load-error">${escapeHtml(message)}</div>`;
+            showStatus(pane, `${message}${state.catalogLoaded ? ' · Showing previous results.' : ''}`, 'danger');
+            renderCurrentResults();
             paginationHost.hidden = true;
         } finally {
             if (activeController === myController) activeController = null;
@@ -525,21 +560,26 @@ export function initMarketplace(pane, controlsHost = null) {
     }
 
     function scheduleRefresh(immediate) {
+        if (destroyed) return;
         if (debounceTimer) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(refresh, immediate ? 0 : 300);
     }
 
-    pane._marketplaceRefresh = () => scheduleRefresh(true);
+    pane._marketplaceRefresh = () => {
+        clearTimeout(debounceTimer);
+        return refresh();
+    };
 
-    startLifecyclePoller(() => {
+    const disposeLifecycle = startLifecyclePoller(() => {
         state.installedMap.pendingBySlug = getPendingBySlug();
-        renderResults(resultsHost, state.results, state.installedMap, state.results.length, {
-            query: state.query,
-            official: state.onlyOfficial,
-            registryPath: state.registryPath,
-            attempts: state.registryAttempts,
-        });
+        renderCurrentResults();
     });
+    pane._marketplaceDestroy = () => {
+        destroyed = true;
+        clearTimeout(debounceTimer);
+        activeController?.abort();
+        disposeLifecycle();
+    };
 
     async function toggleInstalledSkill(installed, enabled) {
         return jsonPost(`/api/skills/${encodeURIComponent(installed.name)}/toggle`, { enabled });
@@ -700,6 +740,10 @@ export function initMarketplace(pane, controlsHost = null) {
         const actionBtn = event.target.closest('[data-mp-action]');
         const updateBtn = event.target.closest('[data-mp-update]');
         const uninstallBtn = event.target.closest('[data-mp-uninstall]');
+        if ((actionBtn || updateBtn || uninstallBtn) && state.installedUnavailable) {
+            showStatus(pane, 'Installed skills could not be read. Refresh before retrying this action.', 'warn');
+            return;
+        }
         if (actionBtn) {
             const slug = actionBtn.dataset.slug;
             const action = actionBtn.dataset.mpAction;
@@ -713,7 +757,6 @@ export function initMarketplace(pane, controlsHost = null) {
                     ? installErrorCopy(err.message || String(err))
                     : (err.message || String(err));
                 const tone = action === 'install' && isRateLimitError(failedMessage) ? 'warn' : 'danger';
-                showStatus(pane, `${slug}: ${failedMessage}`, tone);
                 setPending(slug, {
                     ...getPending(slug),
                     label: `${action} failed`,
@@ -723,6 +766,7 @@ export function initMarketplace(pane, controlsHost = null) {
                     retry_action: action,
                     retry_label: action === 'install' ? 'Retry install' : `Retry ${action}`,
                 });
+                showActionFailure(slug, failedMessage, tone);
             } finally {
                 if (!failedMessage) setPending(slug, null);
                 actionBtn.disabled = false;
@@ -761,6 +805,7 @@ export function initMarketplace(pane, controlsHost = null) {
                 target: sanitized,
                 retry_version: targetVersion,
             });
+            let updateError = '';
             try {
                 const body = targetVersion ? { version: targetVersion } : {};
                 const result = await jsonPost(`/api/marketplace/clawhub/update/${encodeURIComponent(sanitized)}`, body);
@@ -772,20 +817,21 @@ export function initMarketplace(pane, controlsHost = null) {
                     emitSkillLifecycle('update', sanitized, result);
                 }
             } catch (err) {
+                updateError = err.message || String(err);
                 setPending(slug, {
                     label: 'Failed',
                     tone: 'danger',
-                    message: err.message || String(err),
+                    message: updateError,
                     failed: true,
                     retry_action: 'update',
                     retry_label: 'Retry update',
                     target: sanitized,
                     retry_version: targetVersion,
                 });
-                showStatus(pane, `Update error: ${err.message}`, 'danger');
             } finally {
                 updateBtn.disabled = false;
-                scheduleRefresh(true);
+                await pane._marketplaceRefresh();
+                if (updateError) showActionFailure(slug, updateError);
             }
             return;
         }
@@ -813,5 +859,5 @@ export function initMarketplace(pane, controlsHost = null) {
         }
     });
 
-    refresh();
+    return refresh();
 }

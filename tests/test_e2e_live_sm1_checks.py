@@ -6,8 +6,12 @@ from __future__ import annotations
 
 import pathlib
 import subprocess
+import types
+
+import pytest
 
 from devtools.e2e_live import scenarios
+from devtools.e2e_live.ui_probe import UIProbe
 
 
 def _repo(root: pathlib.Path) -> pathlib.Path:
@@ -54,3 +58,54 @@ def test_the_landing_commit_call_records_its_skip_flags():
     clean = [{"tool": "commit_reviewed", "result_preview": "OK: committed", "args": {"paths": ["a"]}}]
     assert scenarios.commit_refusal_facts({}, clean, {})["landing_skip_flags"] == []
     assert scenarios.commit_refusal_facts({}, [], {})["landing_skip_flags"] == []
+
+
+def test_ui_probe_waits_for_the_requested_document():
+    calls = []
+    probe = UIProbe("http://lane.test")
+    probe.page = types.SimpleNamespace(
+        goto=lambda url, **kw: calls.append(("goto", url)),
+        wait_for_selector=lambda selector, **kw: calls.append(("ready", selector)),
+    )
+    probe.goto()
+    probe.goto("/onboarding", ready_selector=".wizard-shell")
+    assert calls == [("goto", "http://lane.test/"), ("ready", "#chat-input"),
+                     ("goto", "http://lane.test/onboarding"), ("ready", ".wizard-shell")]
+
+
+@pytest.mark.parametrize("problem", ["none", "missing-sheet", "stale-accent", "stale-focus", "no-commit"])
+def test_sm1_oracle_requires_both_effective_palettes_and_the_landed_commit(tmp_path, problem):
+    calls = []
+
+    class PaletteUI:
+        path = ""
+
+        def goto(self, path, *, ready_selector):
+            self.path = path
+            calls.append((path, ready_selector))
+
+        def computed_property(self, selector, name):
+            assert selector == ":root"
+            if self.path == "/onboarding":
+                if problem == "missing-sheet":
+                    return ""
+                if (problem == "stale-accent" and name == "--accent") or (
+                        problem == "stale-focus" and name == "--focus-accent-border"):
+                    return "#c93545"
+            return scenarios.SM1_NEW_ACCENT
+
+        screenshot = close = lambda self, *args: None
+
+    server = types.SimpleNamespace(base_url="http://lane.test")
+    ctx = scenarios.LaneContext(server=server, clone=tmp_path, data_root=tmp_path, oracle=None,
+                                harness=None, ui_resolver=lambda _: (PaletteUI(), ""), ui_reason="",
+                                shots=tmp_path, log=lambda _: None, task_timeout=1,
+                                restart=lambda: (calls.append("restart") or server))
+    ctx.check("commit_landed", problem != "no-commit")
+    scenarios.check_sm1_rendered_palette(ctx, scenarios.SM1_REQUIRED_PALETTE)
+    assert calls == ["restart", ("/", "#chat-input"), ("/onboarding", ".wizard-shell")]
+    assert ctx.checks["ui_computed_style"] is (problem == "none")
+    assert ctx.checks["ui_app_palette"] is (problem != "no-commit")
+    assert ctx.checks["ui_onboarding_palette"] is (problem in {"none", "stale-focus"})
+    assert len(ctx.facts["palette_computed"]["app"]) == len(scenarios.SM1_REQUIRED_PALETTE)
+    ctx.close_ui()
