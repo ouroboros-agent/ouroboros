@@ -88,4 +88,3 @@ def test_wizard_same_preview_keeps_live_row_handler_and_finish_payload(subscript
     if isinstance(payload, str):
         payload = json.loads(payload)
     assert payload["items"][0]["recommended_use"] == "WIZARD EDIT 456"
-
