@@ -19,7 +19,12 @@ import re
 import tokenize
 from typing import Any, Callable, List, Optional
 
-from ouroboros.shell_parse import shell_argv, shell_argv_with_inline, shell_argv_with_path_tokens
+from ouroboros.shell_parse import (
+    shell_argv,
+    shell_argv_with_inline,
+    shell_argv_with_path_tokens,
+    shell_command_string,
+)
 
 SHELL_WRITE_INDICATORS = (
     "rm ", "rm\t", ">", "sed -i", "tee ", "truncate",
@@ -344,8 +349,14 @@ def _shell_write_indicator_scan(
         interpreter_family_name = interpreter_family(
             pathlib.PurePath(filtered_tokens[0]).name.lower().removesuffix(".exe")
         )
-    shell_wrapper = bool(filtered_tokens) and pathlib.PurePath(filtered_tokens[0]).name.lower() in {"sh", "bash", "zsh"}
-    if interpreter_lane and (interpreter_family_name == "python" or shell_wrapper) and inline_bodies:
+    shell_wrapper = bool(filtered_tokens) and pathlib.PurePath(
+        filtered_tokens[0]
+    ).name.lower() in {"sh", "bash", "zsh"}
+    if (
+        interpreter_lane
+        and (interpreter_family_name == "python" or shell_wrapper)
+        and inline_bodies
+    ):
         for body in inline_bodies:
             body_lower = body.lower()
             if body_lower:
@@ -426,15 +437,21 @@ def interpreter_write_shape(raw_cmd: Any) -> bool:
     external-workspace runtime/secret read guard and the LLM safety supervisor
     stay the covering controls.
     """
-    if _shell_write_indicator_scan(raw_cmd, include_bare_open=False, interpreter_lane=True):
-        return True
-
     argv = shell_argv(raw_cmd)
     if not argv:
         return False
     from ouroboros.tools.shell_guards import interpreter_family, interpreter_inline_code
 
     executable = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
+    if executable in {"sh", "bash", "zsh"}:
+        inner = shell_command_string(argv)
+        if inner:
+            # Reuse the same structural classifier for a shell wrapper's body;
+            # this removes prose-only Python indicators while retaining nested
+            # writes and redirects.
+            return interpreter_write_shape(inner)
+    if _shell_write_indicator_scan(raw_cmd, include_bare_open=False, interpreter_lane=True):
+        return True
     family = interpreter_family(executable)
     if family:
         bodies = interpreter_inline_code(argv)
