@@ -1085,6 +1085,9 @@ def test_pro_mode_keeps_bible_delete_blocked_but_allows_ordinary_rm(tmp_path, mo
     bible_result = reg.execute("run_command", {"cmd": "rm BIBLE.md"})
     assert "BIBLE_DELETE_BLOCKED" in bible_result
     assert (tmp_path / "BIBLE.md").exists()
+    rename_result = reg.execute("run_command", {"cmd": "git mv BIBLE.md BIBLE.old"})
+    assert "BIBLE_DELETE_BLOCKED" in rename_result
+    assert (tmp_path / "BIBLE.md").exists()
     scratch_result = reg.execute("run_command", {"cmd": "rm scratch.txt"})
     assert "BIBLE_DELETE_BLOCKED" not in scratch_result
     assert not (tmp_path / "scratch.txt").exists()

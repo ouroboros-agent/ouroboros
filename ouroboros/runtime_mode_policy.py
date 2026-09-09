@@ -56,8 +56,8 @@ def protected_bible_history_delete_reason(raw_cmd: object) -> str:
                 return "BIBLE_DELETE_BLOCKED: the BIBLE.md file must remain physically present."
             if head == "git":
                 verbs = [word.lower() for word in words if not word.startswith("-")]
-                if verbs and verbs[0] == "rm" and bible:
-                    return "BIBLE_DELETE_BLOCKED: git rm cannot remove BIBLE.md."
+                if verbs and verbs[0] in {"rm", "mv"} and bible:
+                    return "BIBLE_DELETE_BLOCKED: git rm/git mv cannot remove or rename BIBLE.md."
                 if verbs and verbs[0] in history_verbs:
                     return "BIBLE_HISTORY_REWRITE_BLOCKED: BIBLE history must remain physically recoverable."
         return ""
