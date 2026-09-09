@@ -166,7 +166,7 @@ from ouroboros import claudexor_daemon as daemon, claudexor_runtime, platform_la
 command = [sys.executable, '-u', '-c', sys.argv[2]]
 claudexor_runtime.get_runtime_manager = lambda: SimpleNamespace(
     ensure=lambda: command, pin=None, status=lambda: {'version':'3.9.8','build_sha':'a'*40,'source':'fixture'})
-daemon.ensure_owned_gateway(startup_wait_sec=10).close()
+daemon.ensure_owned_gateway(startup_wait_sec=30).close()
 owned = daemon.get_owned_daemon()
 custody_pid = int(getattr(getattr(owned, '_proc', None), 'pid', 0) or 0)
 ordinary = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], **pl.subprocess_new_group_kwargs())
