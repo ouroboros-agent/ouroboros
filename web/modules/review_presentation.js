@@ -564,7 +564,8 @@ function planWaveDetail(wave) {
         lines.push(
             `Author finish: ${text(author.disposition)}${text(author.reviewer_signal) ? ` · reviewer signal=${text(author.reviewer_signal)}` : ''}`
             + `${text(author.rationale) ? ` · ${text(author.rationale)}` : ''}`
-            + `${text(author.subject_hash) ? ` · subject=${text(author.subject_hash)}` : ''}`,
+            + `${text(author.subject_hash) ? ` · reviewed_content_hash=${text(author.subject_hash)}` : ''}`
+            + `${text(author.source) ? ` · source=${text(author.source)}` : ''}`,
         );
     }
     return lines.filter(Boolean).join('\n');
@@ -806,7 +807,7 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
                 ? taskSourceDownloadUrl(owner, panel.applied_source_ref) : '' },
             detailText: `${formatReviewProjection({ panels: [panel] })}
 ${panel.author_disposition && typeof panel.author_disposition === 'object' && text(panel.author_disposition.disposition)
-    ? `Author finish: ${text(panel.author_disposition.disposition)}${text(panel.author_disposition.reviewer_signal) ? ` · reviewer signal=${text(panel.author_disposition.reviewer_signal)}` : ''}${text(panel.author_disposition.rationale) ? ` · ${text(panel.author_disposition.rationale)}` : ''}${text(panel.author_disposition.subject_hash) ? ` · subject=${text(panel.author_disposition.subject_hash)}` : ''}`
+    ? `Author finish: ${text(panel.author_disposition.disposition)}${text(panel.author_disposition.reviewer_signal) ? ` · reviewer signal=${text(panel.author_disposition.reviewer_signal)}` : ''}${text(panel.author_disposition.rationale) ? ` · ${text(panel.author_disposition.rationale)}` : ''}${text(panel.author_disposition.subject_hash) ? ` · reviewed_content_hash=${text(panel.author_disposition.subject_hash)}` : ''}${text(panel.author_disposition.source) ? ` · source=${text(panel.author_disposition.source)}` : ''}`
     : ''}
 Cost unavailable`.trim(),
         };

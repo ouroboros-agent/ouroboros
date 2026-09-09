@@ -44,12 +44,20 @@ def test_policy_projection_distinguishes_restart_and_next_task(monkeypatch):
     assert state["access"] == {
         "configured": "cyber_pro",
         "effective": "advanced",
+        "current_process": "advanced",
+        "next_task": "cyber_pro",
         "restart_required": True,
         "applies": "restart",
     }
+    assert state["supervisor"]["current_process"] == "full"
+    assert state["supervisor"]["next_task"] == "light"
     assert state["supervisor"]["pending"] is True
+    assert state["supervisor"]["active_task_snapshot"] is True
     assert state["supervisor"]["applies"] == "next_task"
+    assert state["review"]["current_process"] == "advisory"
+    assert state["review"]["next_task"] == "blocking"
     assert state["review"]["pending"] is True
+    assert state["review"]["active_task_snapshot"] is True
     assert state["review"]["applies"] == "next_task"
     assert state["running_task_snapshot"] is True
 
@@ -69,9 +77,9 @@ def test_settings_get_exposes_policy_state_in_existing_meta(monkeypatch):
     monkeypatch.setattr(gateway, "_default_port", lambda _request: 8765)
     monkeypatch.setattr(gateway, "_has_started_agent_tasks", lambda: False)
     monkeypatch.setattr(gateway, "_build_policy_state", lambda _value: {
-        "access": {"configured": "cyber_pro", "effective": "advanced", "restart_required": True, "applies": "restart"},
-        "supervisor": {"configured": "full", "effective": "full", "pending": False, "applies": "next_task"},
-        "review": {"configured": "advisory", "effective": "advisory", "pending": False, "applies": "next_task"},
+        "access": {"configured": "cyber_pro", "effective": "advanced", "current_process": "advanced", "next_task": "cyber_pro", "restart_required": True, "applies": "restart"},
+        "supervisor": {"configured": "full", "effective": "full", "current_process": "full", "next_task": "full", "pending": False, "applies": "next_task", "active_task_snapshot": False},
+        "review": {"configured": "advisory", "effective": "advisory", "current_process": "advisory", "next_task": "advisory", "pending": False, "applies": "next_task", "active_task_snapshot": False},
         "running_task_snapshot": False,
     })
     scope = {

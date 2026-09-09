@@ -134,9 +134,9 @@
 
 /**
  * @typedef {Object} SettingsPolicyState
- * @property {{configured:string,effective:string,restart_required:boolean,applies:string}} access
- * @property {{configured:string,effective:string,pending:boolean,applies:string}} supervisor
- * @property {{configured:string,effective:string,pending:boolean,applies:string}} review
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,restart_required:boolean,applies:string}} access
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} supervisor
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} review
  * @property {boolean} running_task_snapshot
  */
 

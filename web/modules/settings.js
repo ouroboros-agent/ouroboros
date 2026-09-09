@@ -130,11 +130,11 @@ function syncPolicyState(root, meta) {
     };
     const access = state.access || {};
     render('access', access.restart_required
-        ? `Saved: ${policyValueLabel(access.configured)} · Active: ${policyValueLabel(access.effective)} · Restart required`
-        : `Active: ${policyValueLabel(access.effective)} · Applies after restart`);
-    const suffix = (item) => item.pending
-        ? `Saved: ${policyValueLabel(item.configured)} · Current task keeps its snapshot · Next task uses the saved value`
-        : `Effective for new tasks: ${policyValueLabel(item.effective)}`;
+        ? `Saved: ${policyValueLabel(access.configured)} · Current process: ${policyValueLabel(access.current_process || access.effective)} · Next task: ${policyValueLabel(access.next_task || access.configured)} · Restart required`
+        : `Current process: ${policyValueLabel(access.current_process || access.effective)} · Next task: ${policyValueLabel(access.next_task || access.configured)}`);
+    const suffix = (item) => item.active_task_snapshot
+        ? `Saved: ${policyValueLabel(item.configured)} · Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)} · Current task keeps its start snapshot`
+        : `Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)}`;
     render('supervisor', suffix(state.supervisor || {}));
     render('review', suffix(state.review || {}));
 }

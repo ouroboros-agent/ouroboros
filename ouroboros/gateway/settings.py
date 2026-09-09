@@ -173,26 +173,35 @@ def _build_policy_state(settings: Dict[str, Any]) -> dict:
     configured_review = str(
         settings.get("OUROBOROS_REVIEW_ENFORCEMENT") or "advisory").strip().lower()
     effective_review = get_review_enforcement()
+    running_task_snapshot = bool(_has_started_agent_tasks())
     return {
         "access": {
             "configured": configured_access,
             "effective": effective_access,
+            "current_process": effective_access,
+            "next_task": configured_access,
             "restart_required": configured_access != effective_access,
             "applies": "restart",
         },
         "supervisor": {
             "configured": configured_supervisor,
             "effective": effective_supervisor,
-            "pending": configured_supervisor != effective_supervisor,
+            "current_process": effective_supervisor,
+            "next_task": configured_supervisor,
+            "pending": configured_supervisor != effective_supervisor or running_task_snapshot,
             "applies": "next_task",
+            "active_task_snapshot": running_task_snapshot,
         },
         "review": {
             "configured": configured_review if configured_review in {"advisory", "blocking"} else "advisory",
             "effective": effective_review,
-            "pending": configured_review != effective_review,
+            "current_process": effective_review,
+            "next_task": configured_review if configured_review in {"advisory", "blocking"} else "advisory",
+            "pending": configured_review != effective_review or running_task_snapshot,
             "applies": "next_task",
+            "active_task_snapshot": running_task_snapshot,
         },
-        "running_task_snapshot": bool(_has_started_agent_tasks()),
+        "running_task_snapshot": running_task_snapshot,
     }
 
 
