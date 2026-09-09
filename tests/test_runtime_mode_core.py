@@ -1131,6 +1131,11 @@ def test_cyber_pro_blocks_runtime_identity_delete_with_repo_data_split(tmp_path,
     )
     assert "IDENTITY_DELETE_BLOCKED" in result
     assert identity.exists()
+    identity_shell = protected_bible_history_delete_reason(
+        "python3 -c \"import subprocess; subprocess.run('rm memory/identity.md', shell=True)\"",
+        protect_bible=False, identity_path=identity, cwd=data,
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in identity_shell
     wrapped = protected_bible_history_delete_reason(
         ["sh", "-c", "rm memory/identity.md"], protect_bible=False,
         identity_path=identity, cwd=data,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import shlex
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -116,14 +117,24 @@ def protected_bible_history_delete_reason(
                             deletion = any(
                                 isinstance(item, ast.Constant)
                                 and str(item.value).strip().lower() in {"rm", "unlink"}
-                                for item in __import__("ast").walk(node)
+                                for item in ast.walk(node)
                             )
+                            for item in ast.walk(node):
+                                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                                    continue
+                                try:
+                                    tokens = shlex.split(item.value)
+                                except ValueError:
+                                    continue
+                                if tokens and pathlib.PurePath(tokens[0]).name.lower() in {"rm", "unlink", "mv"}:
+                                    deletion = True
+                                    found.extend(tokens[1:])
                     if isinstance(func, ast.Name) and func.id in {"remove", "unlink"}:
                         deletion = True
                     if deletion:
                         found.extend(
                             str(item.value)
-                            for item in __import__("ast").walk(node)
+                            for item in ast.walk(node)
                             if isinstance(item, ast.Constant)
                             and isinstance(item.value, str)
                         )
