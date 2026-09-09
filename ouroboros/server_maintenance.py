@@ -716,10 +716,17 @@ def _recover_terminal_task_files(drive_root: pathlib.Path, protected: set[str]) 
             report["unresolved"].append("*")
             continue
         for directory in directories:
-            if not directory.is_dir() or directory.name in protected:
+            if not directory.is_dir() or directory.is_symlink() or directory.name in protected:
                 continue
             task_id, child_root = directory.name, directory / suffix
             try:
+                base_resolved = base.resolve(strict=True)
+                directory_resolved = directory.resolve(strict=True)
+                if directory_resolved.parent != base_resolved:
+                    continue
+                if suffix and child_root.is_symlink():
+                    continue
+                child_root.resolve(strict=True).relative_to(directory_resolved)
                 validate_task_id(task_id)
                 current = load_task_result(root, task_id, strict=True) or {}
                 task = {**current, "id": task_id, "drive_root": str(child_root)}

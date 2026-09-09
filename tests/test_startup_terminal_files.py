@@ -126,6 +126,20 @@ def test_orphan_exclusion_filters_before_effective_materialization(roots, monkey
     assert load_task_result(root, "dead")["status"] == "failed"
 
 
+def test_startup_recovery_skips_symlinked_external_task_drive(roots):
+    root, repo = roots
+    external = root.parent / "external-task-drive"
+    external.mkdir()
+    write_task_result(external, "evil", "completed", result="outside data")
+    drives = root / "task_drives"
+    drives.mkdir()
+    (drives / "evil").symlink_to(external, target_is_directory=True)
+    report = _recovery(root, repo)
+    assert report["recovered"] == []
+    assert report["unresolved"] == []
+    assert not (root / "task_results" / "evil.json").exists()
+
+
 @pytest.mark.parametrize("family", ["headless", "task_drives"])
 @pytest.mark.parametrize("status", ["failed", "cancelled", "rejected_duplicate"])
 @pytest.mark.parametrize("child_status", [None, "running"])
