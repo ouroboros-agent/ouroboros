@@ -1092,6 +1092,13 @@ def _workspace_shell_write_block(
     pro_workspace_passthrough = (
         mode_allows_protected_write(runtime_mode) and not acting_subagent
     )
+    if acting_subagent:
+        try:
+            from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+            pro_workspace_passthrough = runtime_mode_at_least(runtime_mode, "cyber_pro")
+        except Exception:
+            pass
     protected_roots = [
         getattr(self._ctx, "system_repo_dir", None) or getattr(self._ctx, "repo_dir", None),
         getattr(self._ctx, "drive_root", None),
@@ -1291,7 +1298,17 @@ def _shell_git_and_runtime_block(
         # write-aware — `is_readonly_git_command` refuses `--output=` and
         # `--no-index`, so neither a runtime write nor a settings dump
         # can ride "read-only git".
-        if _registry().is_external_workspace(self._ctx) and not is_readonly_git_command(raw_cmd):
+        cyber_authority = False
+        try:
+            from ouroboros.config import get_runtime_mode
+            from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+            cyber_authority = self._is_acting_subagent() and runtime_mode_at_least(
+                get_runtime_mode(), "cyber_pro"
+            )
+        except Exception:
+            pass
+        if _registry().is_external_workspace(self._ctx) and not is_readonly_git_command(raw_cmd) and not cyber_authority:
             if ext_block := _external_shell_runtime_or_secret_block(
                 self, raw_cmd, cmd_path_lower, args, work_dir=work_dir,
                 binding=binding,

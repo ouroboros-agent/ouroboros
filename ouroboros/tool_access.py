@@ -111,14 +111,27 @@ def decide_tool_access(
     root: ResourceRoot,
     operation: Operation,
 ) -> ToolAccessDecision:
-    allowed = operation in _POLICY.get(profile, {}).get(root, set())
+    effective_profile = profile
+    if profile == "acting_subagent":
+        try:
+            from ouroboros.config import get_runtime_mode
+            from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+            if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
+                # Cyber Pro is an explicit owner-selected widening of a
+                # non-readonly child. Reuse the existing full principal matrix;
+                # readonly children keep their fail-closed profile.
+                effective_profile = "operator_control"
+        except Exception:
+            pass
+    allowed = operation in _POLICY.get(effective_profile, {}).get(root, set())
     if allowed:
-        return ToolAccessDecision(True, guard=f"{profile}:{root}:{operation}")
-    allowed_roots = ", ".join(sorted(r for r, ops in _POLICY.get(profile, {}).items() if operation in ops)) or "(none)"
+        return ToolAccessDecision(True, guard=f"{effective_profile}:{root}:{operation}")
+    allowed_roots = ", ".join(sorted(r for r, ops in _POLICY.get(effective_profile, {}).items() if operation in ops)) or "(none)"
     return ToolAccessDecision(
         False,
-        reason=f"profile={profile} cannot {operation} root={root}. Roots your profile can {operation}: {allowed_roots}.",
-        guard=f"{profile}:{root}:{operation}",
+        reason=f"profile={effective_profile} cannot {operation} root={root}. Roots your profile can {operation}: {allowed_roots}.",
+        guard=f"{effective_profile}:{root}:{operation}",
     )
 
 

@@ -113,6 +113,58 @@ def test_profile_normal_task_is_self_modification(tmp_path):
     assert active_tool_profile(ctx) == "self_modification"
 
 
+def _enable_cyber_mode_for_test(monkeypatch):
+    import ouroboros.config as config
+    import ouroboros.runtime_mode_policy as policy
+
+    monkeypatch.setattr(config, "get_runtime_mode", lambda: "cyber_pro")
+    monkeypatch.setitem(policy._RUNTIME_MODE_RANK, "cyber_pro", 3)
+
+
+def test_cyber_acting_child_inherits_owner_resource_matrix(tmp_path, monkeypatch):
+    from ouroboros.tool_access import decide_tool_access
+
+    _enable_cyber_mode_for_test(monkeypatch)
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(mode="acting_subagent", surface="external_workspace"),
+    )
+    assert active_tool_profile(ctx) == "acting_subagent"
+    assert decide_tool_access(
+        profile="acting_subagent", root="user_files", operation="write",
+    ).allow
+    assert decide_tool_access(
+        profile="acting_subagent", root="task_drive", operation="shell",
+    ).allow
+    assert not decide_tool_access(
+        profile="local_readonly_subagent", root="user_files", operation="write",
+    ).allow
+
+
+def test_cyber_acting_child_can_use_owner_credential_file_path(tmp_path, monkeypatch):
+    from ouroboros.tool_access_user_files import user_files_path_block_reason
+
+    _enable_cyber_mode_for_test(monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(mode="acting_subagent", surface="external_workspace"),
+    )
+    credential = home / ".ssh" / "id_rsa"
+    credential.parent.mkdir()
+    credential.write_text("owner key", encoding="utf-8")
+    assert user_files_path_block_reason(ctx, credential, operation="write") == ""
+    readonly_root = tmp_path / "readonly"
+    readonly_root.mkdir()
+    readonly = _profile_ctx(
+        readonly_root,
+        constraint=TaskConstraint(mode="local_readonly_subagent"),
+    )
+    assert user_files_path_block_reason(readonly, credential, operation="write")
+
+
 # --------------------------------------------------------------------------- #
 # 3. Registry gating for acting subagents
 # --------------------------------------------------------------------------- #

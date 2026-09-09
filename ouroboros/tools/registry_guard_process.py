@@ -524,7 +524,7 @@ def _run_shell_safety_check(
     while "//" in cmd_path_lower: cmd_path_lower = cmd_path_lower.replace("//", "/")
     # Subagents must not read owner secrets/credentials/control state via shell
     # (read_file already denies these). read_file is the gated inspection path.
-    if (acting_subagent or self._is_local_readonly_subagent()) and _subagent_shell_targets_secret(
+    if (acting_subagent or self._is_local_readonly_subagent()) and not cyber_authority and _subagent_shell_targets_secret(
             raw_cmd, ctx=self._ctx, cwd=getattr(binding, "target_path", None)):
         return ToolResult(
             status="blocked",
