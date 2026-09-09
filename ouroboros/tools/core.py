@@ -50,6 +50,7 @@ from ouroboros.contracts.skill_payload_policy import (
 from ouroboros.tools.core_file_tools import (  # noqa: F401
     _ListingFailure,
     _MEMORY_AT_DRIVE_MEMORY,
+    _raw_owner_secret_access_allowed,
     _SKILL_OWNER_STATE_FILENAMES,
     _SUBAGENT_SECRET_FILE_NAMES,
     _access_or_block,
@@ -965,6 +966,8 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         # bytes must be masked here too — on BOTH the rg path and the Python
         # fallback. Names/paths stay; values become ***.
         if normalized != "user_files" and not subagent_readonly:
+            return result_text
+        if normalized == "user_files" and _raw_owner_secret_access_allowed(ctx):
             return result_text
         masked_text, masked = mask_secret_bytes(
             result_text, mask_opaque=normalized not in {"active_workspace", "system_repo"},

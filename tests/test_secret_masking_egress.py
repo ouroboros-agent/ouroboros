@@ -241,6 +241,18 @@ def test_read_file_user_files_masks_secret_bytes_with_disclosure(user_files_ctx)
     assert not out.startswith("⚠️")  # the read itself succeeds
 
 
+def test_cyber_owner_mode_can_read_literal_owner_file_bytes(user_files_ctx, monkeypatch):
+    """The explicit high-power owner mode may use a supplied key literally."""
+    from ouroboros.tools import core_file_tools
+
+    ctx, home = user_files_ctx
+    (home / "keys.txt").write_text(f"OPENROUTER_API_KEY={OPENROUTER_KEY}\n", encoding="utf-8")
+    monkeypatch.setattr(core_file_tools, "_raw_owner_secret_access_allowed", lambda _ctx: True)
+    out = _read_file(ctx, "keys.txt", root="user_files")
+    assert OPENROUTER_KEY in out
+    assert "SECRET_BYTES_MASKED" not in out
+
+
 def test_read_file_user_files_plain_file_has_no_masking_note(user_files_ctx):
     ctx, home = user_files_ctx
     (home / "notes.txt").write_text("just prose, nothing secret\n", encoding="utf-8")
@@ -333,6 +345,19 @@ def test_search_user_files_masks_secret_bytes_on_both_egresses(user_files_ctx, m
     assert OPENROUTER_KEY not in out_fb, out_fb[:300]
     assert "creds.txt" in out_fb  # the match itself is still reported
     assert "SECRET_BYTES_MASKED" in out_fb
+
+
+def test_cyber_owner_mode_can_search_literal_owner_file_bytes(user_files_ctx, monkeypatch):
+    from ouroboros.tools import core as core_tools
+    from ouroboros.tools import core_file_tools
+
+    ctx, home = user_files_ctx
+    (home / "keys.txt").write_text(f"OPENROUTER_API_KEY={OPENROUTER_KEY}\n", encoding="utf-8")
+    monkeypatch.setattr(core_file_tools, "_raw_owner_secret_access_allowed", lambda _ctx: True)
+    monkeypatch.setattr(core_tools, "_raw_owner_secret_access_allowed", lambda _ctx: True)
+    out = core_tools._code_search(ctx, "OPENROUTER", root="user_files")
+    assert OPENROUTER_KEY in out
+    assert "SECRET_BYTES_MASKED" not in out
 
 
 def test_search_non_user_files_root_is_not_masked(user_files_ctx):

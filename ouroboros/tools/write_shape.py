@@ -330,6 +330,28 @@ def _shell_write_indicator_scan(
     else:
         inline_bodies = frozenset()
 
+    # Interpreter bodies are judged structurally by their family-specific
+    # parser below.  Remove their source text from the coarse shell vocabulary
+    # scan so a string/comment such as ``print('write_text')`` cannot masquerade
+    # as a shell write channel.  Keep the surrounding argv intact: redirects or
+    # a real writer outside the body still remain visible to this scan.
+    indicator_text = filtered_text
+    raw_indicator_text = text
+    interpreter_family_name = ""
+    if interpreter_lane and filtered_tokens:
+        from ouroboros.tools.shell_guards import interpreter_family
+
+        interpreter_family_name = interpreter_family(
+            pathlib.PurePath(filtered_tokens[0]).name.lower().removesuffix(".exe")
+        )
+    shell_wrapper = bool(filtered_tokens) and pathlib.PurePath(filtered_tokens[0]).name.lower() in {"sh", "bash", "zsh"}
+    if interpreter_lane and (interpreter_family_name == "python" or shell_wrapper) and inline_bodies:
+        for body in inline_bodies:
+            body_lower = body.lower()
+            if body_lower:
+                indicator_text = indicator_text.replace(body_lower, " ")
+                raw_indicator_text = raw_indicator_text.replace(body_lower, " ")
+
     def _in_located_body(tok: str) -> bool:
         # Joined flags carry the body INSIDE the token (`-cBODY`, `--eval=BODY`).
         return any(body and body in tok for body in inline_bodies)
@@ -368,8 +390,8 @@ def _shell_write_indicator_scan(
                 return True
         return False
 
-    if _indicator_hits(filtered_text, allow_bare_redirect=True) or _indicator_hits(
-        text, allow_bare_redirect=False
+    if _indicator_hits(indicator_text, allow_bare_redirect=True) or _indicator_hits(
+        raw_indicator_text, allow_bare_redirect=False
     ):
         return True
     if include_bare_open and (
@@ -381,6 +403,14 @@ def _shell_write_indicator_scan(
 
 def shell_has_write_indicator(raw_cmd: Any) -> bool:
     return _shell_write_indicator_scan(raw_cmd, include_bare_open=True)
+
+
+def _python_targets_or_unknown(body: str) -> bool:
+    """Return the structural write verdict for one Python inline body."""
+    from ouroboros.tools.shell_guards import _python_write_targets_and_unknown
+
+    targets, unknown = _python_write_targets_and_unknown(body)
+    return bool(targets or unknown)
 
 
 def interpreter_write_shape(raw_cmd: Any) -> bool:
@@ -398,6 +428,38 @@ def interpreter_write_shape(raw_cmd: Any) -> bool:
     """
     if _shell_write_indicator_scan(raw_cmd, include_bare_open=False, interpreter_lane=True):
         return True
+
+    argv = shell_argv(raw_cmd)
+    if not argv:
+        return False
+    from ouroboros.tools.shell_guards import interpreter_family, interpreter_inline_code
+
+    executable = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
+    family = interpreter_family(executable)
+    if family:
+        bodies = interpreter_inline_code(argv)
+        if bodies and family == "python":
+            # Python bodies have a real AST target walk.  It distinguishes a
+            # call/comment/string containing a writer word from an actual write,
+            # while unknown execution remains write-capable (fail closed).
+            return any(
+                bool(_python_targets_or_unknown(body)) for body in bodies
+            )
+        if bodies and family in {"node", "ruby"}:
+            # Keep the shared regex as a fallback for native idioms whose
+            # literal-target extractor cannot resolve a variable destination
+            # (for example Ruby IO.binwrite or a destructured Node writer).
+            if any(
+                bool(script_literal_write_targets_and_unknown(family, body)[0])
+                or script_literal_write_targets_and_unknown(family, body)[1]
+                for body in bodies
+            ):
+                return True
+
+    # A non-inline script path (and Perl, whose syntax is intentionally not
+    # parsed here) keeps the established conservative vocabulary.  Inline
+    # Python/Node/Ruby bodies returned above never reach this text search, so
+    # their prose cannot reintroduce the false positive.
     if isinstance(raw_cmd, list):
         text = " ".join(str(x) for x in raw_cmd)
     else:

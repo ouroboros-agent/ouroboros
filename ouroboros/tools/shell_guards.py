@@ -395,8 +395,13 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
             return receiver.id in str_names or receiver.id in non_path_names
         return (
             isinstance(receiver, ast.Call)
-            and isinstance(receiver.func, ast.Name)
-            and receiver.func.id in local_classes
+            and (
+                (isinstance(receiver.func, ast.Name) and receiver.func.id in local_classes)
+                or (
+                    isinstance(receiver.func, ast.Name)
+                    and receiver.func.id in {"list", "tuple", "set", "dict"}
+                )
+            )
         )
 
     for node in ast.walk(tree):
@@ -426,6 +431,17 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
             elif isinstance(node.value, (ast.List, ast.Tuple, ast.Set, ast.Dict)) or (
                 isinstance(node.value, ast.Constant) and not isinstance(node.value.value, str)
             ):
+                non_path_names.add(bound)
+                str_names.discard(bound)
+            elif (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in {"list", "tuple", "set", "dict"}
+            ):
+                # Built-in collection constructors produce collection receivers;
+                # their ``remove``/``replace`` methods cannot mutate the file
+                # system.  Treat them like literal collections so a string item
+                # named ``BIBLE.md`` is not promoted to a filesystem target.
                 non_path_names.add(bound)
                 str_names.discard(bound)
             else:
