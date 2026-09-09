@@ -116,9 +116,12 @@ def test_profile_normal_task_is_self_modification(tmp_path):
 def _enable_cyber_mode_for_test(monkeypatch):
     import ouroboros.config as config
     import ouroboros.runtime_mode_policy as policy
+    import ouroboros.settings_scales as scales
 
-    monkeypatch.setattr(config, "get_runtime_mode", lambda: "cyber_pro")
+    monkeypatch.setattr(scales, "VALID_RUNTIME_MODES", (*scales.VALID_RUNTIME_MODES, "cyber_pro"))
+    monkeypatch.setattr(config, "VALID_RUNTIME_MODES", (*config.VALID_RUNTIME_MODES, "cyber_pro"))
     monkeypatch.setitem(policy._RUNTIME_MODE_RANK, "cyber_pro", 3)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
 
 
 def test_cyber_acting_child_inherits_owner_resource_matrix(tmp_path, monkeypatch):
