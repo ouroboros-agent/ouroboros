@@ -405,8 +405,6 @@ def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) ->
         ):
             return False
     except Exception:
-        # Legacy/no-metadata cleanup behavior remains fail-soft. Newly produced
-        # valid metadata is parsed by the helper without raising.
         pass
     bases = (headless_base, task_drive_base)
     removed = False
@@ -437,7 +435,6 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         child_result = load_task_result(child_drive, task_id)
         if not isinstance(child_result, dict):
             return None
-        # Bulk refs precede publication/GC; review refs first select CURRENT below.
         from ouroboros.observability import promote_child_task_refs
 
         review_fields = {key: value for key, value in child_result.items() if key == "review_projection"}
