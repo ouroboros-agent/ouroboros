@@ -5,6 +5,8 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
 
 def _patch_queue(queue_module, workers_module, monkeypatch, tmp_path, workers):
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
@@ -415,6 +417,13 @@ def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monk
     workers = {4: SimpleNamespace(busy_task_id=None, proc=_FakeProc(), reaping=True)}
     _patch_queue(q, w, monkeypatch, tmp_path, workers)
     monkeypatch.setattr(q, "_kept_service_pids", lambda: set(), raising=False)
+    # A prior server lifespan can legitimately close the process-global bus.
+    # This fixture owns its publication collector, not a new supervisor bus.
+    monkeypatch.setattr(w, "_EVENT_Q_SHUTDOWN", True)
+    with pytest.raises(RuntimeError, match="supervisor event bus is shutting down"):
+        w.get_event_q()
+    emitted = []
+    monkeypatch.setattr(w, "get_event_q", lambda: SimpleNamespace(put=emitted.append))
 
     calls = []
     def finalize(root, task):
@@ -448,6 +457,10 @@ def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monk
     _run({"id": "wt3", "type": "task", "delegation_role": "subagent",
           "task_constraint": {"mode": "local_readonly_subagent"}}, "finalizing")
     assert calls == [], "a readonly subagent has no durable artifacts to finalize"
+    terminals = [event for event in emitted if event.get("type") == "task_done"]
+    assert [event["task_id"] for event in terminals] == ["wt1", "wt2", "wt3"]
+    assert all(event["status"] == "completed" and event["chat_id"] == 0 for event in terminals)
+    assert all(event["_files_prepared_attempt"] == 1 and event["worker_id"] == 4 for event in terminals)
 
 
 def test_task_is_readonly_subagent_gate():

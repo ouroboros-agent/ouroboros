@@ -97,17 +97,36 @@ def test_startup_revival_keeps_actual_current_owners(tmp_path, monkeypatch, star
     assert {row.run_id for row in dc.open_runs(tmp_path)} == {f"run-{task_id}" for task_id in expected}
 
 
-def test_both_custody_surfaces_see_the_same_live_task_set(monkeypatch):
+def test_both_custody_surfaces_see_the_same_live_task_set(tmp_path, monkeypatch, startup_owners):
     """The periodic sweep must hand the delegated reconciler the SAME live task set the
     process reaper gets. Two copies of "is the owner still running" is exactly how one
     custody surface ends up reaping while its twin does not."""
     import time
+    import threading
 
     import ouroboros.server_maintenance as sm
     import ouroboros.delegate_custody as dc
     import ouroboros.process_custody as pc
     import supervisor.queue as queue
+    import supervisor.task_lifecycle as lifecycle
 
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    lock = threading.Lock()
+    monkeypatch.setattr(sm, "_CANCEL_INTENT_SWEEP_LOCK", lock)
+    monkeypatch.setattr(sm, "_LAST_CANCEL_INTENT_SWEEP", [0.0])
+    entered, release = threading.Event(), threading.Event()
+    threads = []
+    def tracked_thread(**kwargs):
+        thread = threading.Thread(**kwargs)
+        threads.append(thread)
+        return thread
+    monkeypatch.setattr(sm, "threading", SimpleNamespace(Thread=tracked_thread))
+    real_sweep = lifecycle.sweep_cancel_intents
+    def delayed_sweep():
+        entered.set()
+        assert release.wait(5), "test must release its maintenance work"
+        return real_sweep()
+    monkeypatch.setattr(lifecycle, "sweep_cancel_intents", delayed_sweep)
     seen = {}
     monkeypatch.setattr(pc, "reap_orphaned_processes",
                         lambda root, **kw: seen.__setitem__("processes", kw.get("running_task_ids")) or [])
@@ -121,8 +140,19 @@ def test_both_custody_surfaces_see_the_same_live_task_set(monkeypatch):
     from supervisor.active_activity import get_direct_activity_registry
 
     get_direct_activity_registry().register("native-live", 1)
-    sm._periodic_supervisor_maintenance([0.0], [time.time()])
-    assert seen["processes"] == seen["delegated"] == {"t-live", "native-live"}, seen
+    try:
+        sm._periodic_supervisor_maintenance([0.0], [time.time()])
+        assert seen["processes"] == seen["delegated"] == {"t-live", "native-live"}, seen
+        assert entered.wait(2) and len(threads) == 1
+        assert threads[0].name == "terminal-maintenance" and threads[0].is_alive()
+    finally:
+        # The actual maintenance owner finishes before monkeypatch restores its
+        # root, lock and dependent functions, including when an assertion fails.
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+    assert not lock.locked(), "the real maintenance finally released its latch"
 
 
 def test_an_orphaned_delegated_run_is_reconciled_when_its_owner_is_gone(tmp_path, monkeypatch):

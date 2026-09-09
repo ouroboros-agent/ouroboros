@@ -378,7 +378,13 @@ def test_s6_subagent_tree_lineage_quiescence_and_child_result_handoff(
             assert S6_CHILD_MARKER in wait_blob, "child result text never reached the parent"
 
             # Quiescence: the child's terminal task_done precedes the parent's.
-            done_ids = [str(row.get("task_id") or "") for row in oracle.events("task_done")]
+            def terminal_done_ids():
+                rows = oracle.events("task_done")
+                ids = [str(row.get("task_id") or "") for row in rows]
+                return ids if child_id in ids and parent_id in ids else None
+
+            done_ids = wait_until(terminal_done_ids, 60)
+            assert done_ids is not None, done_ids
             assert child_id in done_ids and parent_id in done_ids, done_ids
             assert done_ids.index(child_id) < done_ids.index(parent_id), done_ids
 
