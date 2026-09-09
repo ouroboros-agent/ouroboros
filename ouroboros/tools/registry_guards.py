@@ -884,7 +884,7 @@ def _external_shell_runtime_or_secret_block(
 
 def _protected_shell_block(
     self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
-    runtime_mode: str = "",
+    runtime_mode: str = "", *, structural_targets: list[str] | None = None,
 ) -> ToolResult | None:
     """Apply payload/core write guards to the selected physical target."""
     items = _registry()._binding_items(binding)
@@ -912,13 +912,16 @@ def _protected_shell_block(
                 "payload files instead."
             ),
         )
-    if targets_system:
-        if reason := protected_bible_history_delete_reason(raw_cmd):
-            return ToolResult(
-                status="blocked",
-                code="SAFETY_VIOLATION",
-                text=f"⚠️ SAFETY_VIOLATION: {reason}",
-            )
+    if reason := protected_bible_history_delete_reason(
+        raw_cmd, extra_paths=structural_targets or (), protect_bible=targets_system,
+        identity_path=pathlib.Path(self._ctx.drive_root) / "memory" / "identity.md",
+        cwd=pathlib.Path(getattr(binding, "target_path", None) or self._ctx.repo_dir),
+    ):
+        return ToolResult(
+            status="blocked",
+            code="SAFETY_VIOLATION",
+            text=f"⚠️ SAFETY_VIOLATION: {reason}",
+        )
     if _authorized_managed_update_resolver(self._ctx):
         return None
     if (

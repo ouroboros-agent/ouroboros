@@ -8,6 +8,7 @@ triad + scope review gate.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 from dataclasses import dataclass
 from typing import Iterable
@@ -31,7 +32,11 @@ def runtime_mode_at_least(runtime_mode: str, minimum: str) -> bool:
     return mode_rank >= 0 and minimum_rank >= 0 and mode_rank >= minimum_rank
 
 
-def protected_bible_history_delete_reason(raw_cmd: object) -> str:
+def protected_bible_history_delete_reason(
+    raw_cmd: object, *, extra_paths: Iterable[str] = (),
+    protect_bible: bool = True, identity_path: pathlib.Path | None = None,
+    cwd: pathlib.Path | None = None,
+) -> str:
     """Return a refusal for physical BIBLE deletion or repository history rewrites.
 
     This is deliberately a small argv/verb predicate at the existing shell
@@ -47,7 +52,18 @@ def protected_bible_history_delete_reason(raw_cmd: object) -> str:
             "update-index", "reset", "commit", "rebase", "replace",
         }
 
-        def _bible_path(words: list[str], *, path_flag_only: bool = False) -> bool:
+        def _protected_target(candidate: str) -> bool:
+            path = pathlib.Path(candidate.replace("\\", "/"))
+            if protect_bible and path.name.casefold() == "bible.md":
+                return True
+            return bool(identity_path is not None and (
+                (cwd or pathlib.Path.cwd()) / path
+            ).resolve(strict=False) == identity_path.resolve(strict=False))
+
+        def _bible_path(
+            words: list[str], *, path_flag_only: bool = False,
+            extra: Iterable[str] = (),
+        ) -> bool:
             """Recognize an explicit BIBLE.md path, including --path= forms."""
             candidates: list[str] = []
             expect_value = False
@@ -66,9 +82,54 @@ def protected_bible_history_delete_reason(raw_cmd: object) -> str:
                 if not path_flag_only:
                     candidates.append(token)
             return any(
-                pathlib.PurePath(candidate.replace("\\", "/")).name.casefold() == "bible.md"
-                for candidate in candidates
+                _protected_target(candidate)
+                for candidate in (*candidates, *(str(path) for path in (*extra_paths, *extra)))
             )
+
+        def _python_delete_paths(body: str) -> list[str]:
+            """Extract literal targets of structural Python deletion calls."""
+            try:
+                from ouroboros.tools.shell_guards import python_body_ast
+
+                tree = python_body_ast(body)
+                if tree is None:
+                    return []
+                found: list[str] = []
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    func = node.func
+                    deletion = False
+                    if isinstance(func, ast.Attribute):
+                        attr = str(func.attr or "")
+                        receiver = func.value
+                        if attr in {"remove", "unlink", "rmtree", "removedirs"}:
+                            deletion = (
+                                isinstance(receiver, ast.Name)
+                                and receiver.id in {"os", "shutil"}
+                            ) or (
+                                isinstance(receiver, ast.Call)
+                                and isinstance(receiver.func, ast.Name)
+                                and receiver.func.id in {"Path", "PurePath"}
+                            )
+                        if attr in {"run", "call", "check_call", "check_output", "Popen"}:
+                            deletion = any(
+                                isinstance(item, ast.Constant)
+                                and str(item.value).strip().lower() in {"rm", "unlink"}
+                                for item in __import__("ast").walk(node)
+                            )
+                    if isinstance(func, ast.Name) and func.id in {"remove", "unlink"}:
+                        deletion = True
+                    if deletion:
+                        found.extend(
+                            str(item.value)
+                            for item in __import__("ast").walk(node)
+                            if isinstance(item, ast.Constant)
+                            and isinstance(item.value, str)
+                        )
+                return found
+            except Exception:
+                return []
 
         for segment in shell_segments(raw_cmd):
             _env, argv = collect_leading_env(segment)
@@ -76,17 +137,56 @@ def protected_bible_history_delete_reason(raw_cmd: object) -> str:
                 continue
             head = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
             words = [str(item).replace("\\", "/") for item in argv[1:]]
+            if head in {"sh", "bash", "zsh"}:
+                nested = ""
+                for index, word in enumerate(words[:-1]):
+                    if word in {"-c", "--command"}:
+                        nested = words[index + 1]
+                        break
+                if nested:
+                    nested_reason = protected_bible_history_delete_reason(
+                        nested, extra_paths=extra_paths, protect_bible=protect_bible,
+                        identity_path=identity_path, cwd=cwd,
+                    )
+                    if nested_reason:
+                        return nested_reason
+                    continue
             bible = _bible_path(words)
             if head in delete_heads and bible:
-                return "BIBLE_DELETE_BLOCKED: the BIBLE.md file must remain physically present."
+                label = "IDENTITY" if any(
+                    pathlib.PurePath(word.strip("'\"")).name.casefold() == "identity.md"
+                    for word in words
+                ) else "BIBLE"
+                return f"{label}_DELETE_BLOCKED: protected identity history must remain physically present."
             if head == "git":
                 verbs = [word.lower() for word in words if not word.startswith("-")]
                 if verbs and verbs[0] in {"rm", "mv"} and bible:
-                    return "BIBLE_DELETE_BLOCKED: git rm/git mv cannot remove or rename BIBLE.md."
+                    label = "IDENTITY" if any(
+                        pathlib.PurePath(word.strip("'\"")).name.casefold() == "identity.md"
+                        for word in words
+                    ) else "BIBLE"
+                    return f"{label}_DELETE_BLOCKED: git rm/git mv cannot remove or rename protected identity files."
                 if verbs and verbs[0] in history_verbs and _bible_path(
                     words, path_flag_only=(verbs[0] in {"filter-branch", "filter-repo"})
                 ):
                     return "BIBLE_HISTORY_REWRITE_BLOCKED: BIBLE history must remain physically recoverable."
+            head_name = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
+            if head_name.startswith(("python", "python3")):
+                try:
+                    from ouroboros.tools.shell_guards import interpreter_inline_code
+
+                    for body in interpreter_inline_code([str(item) for item in argv]):
+                        deleted = _python_delete_paths(body)
+                        if any(
+                            _protected_target(str(path))
+                            for path in deleted
+                        ):
+                            target = "identity.md" if any(
+                                pathlib.PurePath(path).name.casefold() == "identity.md" for path in deleted
+                            ) else "bible.md"
+                            return f"{target.upper().replace('.MD', '')}_DELETE_BLOCKED: protected identity history must remain physically present."
+                except Exception:
+                    pass
         return ""
     except Exception:
         return ""

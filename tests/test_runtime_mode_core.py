@@ -1088,9 +1088,60 @@ def test_pro_mode_keeps_bible_delete_blocked_but_allows_ordinary_rm(tmp_path, mo
     rename_result = reg.execute("run_command", {"cmd": "git mv BIBLE.md BIBLE.old"})
     assert "BIBLE_DELETE_BLOCKED" in rename_result
     assert (tmp_path / "BIBLE.md").exists()
-    scratch_result = reg.execute("run_command", {"cmd": "rm scratch.txt"})
-    assert "BIBLE_DELETE_BLOCKED" not in scratch_result
-    assert not (tmp_path / "scratch.txt").exists()
+    python_result = reg.execute(
+        "run_command", {"cmd": "python3 -c \"import os; os.remove('BIBLE.md')\""},
+    )
+    assert "BIBLE_DELETE_BLOCKED" in python_result
+    subprocess_result = reg.execute(
+        "run_command",
+        {"cmd": "python3 -c \"import subprocess; subprocess.run(['rm','BIBLE.md'])\""},
+    )
+    assert "BIBLE_DELETE_BLOCKED" in subprocess_result
+    update_index_result = reg.execute(
+        "run_command", {"cmd": "git update-index --force-remove BIBLE.md"},
+    )
+    assert "BIBLE" in update_index_result
+    identity = tmp_path / "memory" / "identity.md"
+    identity.parent.mkdir()
+    identity.write_text("identity\n", encoding="utf-8")
+    identity_result = reg.execute("run_command", {"cmd": "rm memory/identity.md"})
+    assert "IDENTITY_DELETE_BLOCKED" in identity_result
+    assert identity.exists()
+    identity_python = reg.execute(
+        "run_command", {"cmd": "python3 -c \"import os; os.remove('memory/identity.md')\""},
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in identity_python
+
+
+def test_cyber_pro_blocks_runtime_identity_delete_with_repo_data_split(tmp_path, monkeypatch):
+    """The production-shaped data/memory identity path stays present in Cyber."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    (data / "memory").mkdir(parents=True)
+    identity = data / "memory" / "identity.md"
+    identity.write_text("identity\n", encoding="utf-8")
+    (data / "memory" / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    result = protected_bible_history_delete_reason(
+        "rm memory/identity.md", protect_bible=False,
+        identity_path=identity, cwd=data,
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in result
+    assert identity.exists()
+    wrapped = protected_bible_history_delete_reason(
+        ["sh", "-c", "rm memory/identity.md"], protect_bible=False,
+        identity_path=identity, cwd=data,
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in wrapped
+    assert identity.exists()
+    scratch = protected_bible_history_delete_reason(
+        "rm memory/scratch.txt", protect_bible=False,
+        identity_path=identity, cwd=data,
+    )
+    assert scratch == ""
 
 
 def test_rank_aware_github_policy_keeps_ordinary_setup_blocked():

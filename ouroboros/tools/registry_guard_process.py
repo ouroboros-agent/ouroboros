@@ -744,9 +744,16 @@ def _run_shell_safety_check(
         else []
     )
 
+    structural_targets = [
+        str(target)
+        for row in target_rows
+        if len(row) > 1
+        for target in (row[1] or [])
+    ]
     if protected_shell := registry_guards._protected_shell_block(
         self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
         runtime_mode,
+        structural_targets=structural_targets,
     ):
         return protected_shell
 
