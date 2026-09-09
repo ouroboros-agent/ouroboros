@@ -167,7 +167,8 @@ def test_headroom_is_derived_from_the_zero_diff_message(synthetic_repo, isolated
     stable = mrp._governance_prefix(synthetic_repo)["stable_prefix"]
     dynamic = review._REVIEW_PROMPT_TEMPLATE_DYNAMIC.format(
         goal_section=build_goal_section("", "", ""), scope_section="", current_files_section="",
-        rebuttal_section="", review_history_section="", diff_text="", changed_files="app.py")
+        rebuttal_section="", review_history_section="", diff_text="", changed_files="app.py",
+        task_evidence_section="")
     zero_message = head + stable + "\n" + dynamic + mrp.TRIAD_USER_TURN
     assert report["zero_diff_message"]["total"]["chars"] == len(zero_message)
     assert fit["zero_diff_message_chars_div_4"] == estimate_tokens(zero_message)

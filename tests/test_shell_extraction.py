@@ -119,15 +119,19 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
-    # Re-pinned for upstream ``d0caa69b`` ("tool refusals: name the unsupported
-    # argument and own the timeout alias once"), which deleted the duplicate
-    # ``timeout`` alias property from BOTH schemas because the alias now lives
-    # once in ``tool_resolution._TOOL_ARG_ALIASES["*"]``. That deletion is the
-    # only difference from the previous digest
-    # ``1e012faf410bf57c91a896d227aa4175cd08d38794c4b8f0404e390e79b1730a``:
-    # re-inserting the two removed properties into these very schema objects
-    # reproduces it byte for byte.
+    # Only run_script's description changed: its temporary file now lives in
+    # an ignored per-invocation workspace directory or the existing task drive.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
+        "e053d8164ac708c9053b5ea9cf5271b70c1a05667a33f14253101bb2b1ce9cfd"
+    )
+    original = json.loads(schema_bytes)
+    original[1]["description"] = (
+        "Run a short task-scoped temporary script with a declared interpreter. "
+        "Use for multi-line diagnostics or harness helpers; generated script files live under the task drive. "
+        "The underlying command result echoes the resolved cwd."
+    )
+    assert hashlib.sha256(json.dumps(original, sort_keys=True, ensure_ascii=False,
+                                    separators=(",", ":")).encode()).hexdigest() == (
         "0c0215cafdb54ee2231e43f9edafbe8aa21d4a5aa3841eba4ab45b5ab5e3eb42"
     )
     assert {

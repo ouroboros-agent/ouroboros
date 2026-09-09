@@ -231,7 +231,7 @@ def test_widgets_keep_iframe_sandbox_locked_down():
     assert "const csp = moduleFrameCsp(tab.skill);" in module
     assert "connect-src" not in source
     assert "'unsafe-eval'" not in source
-    assert "window.OuroborosWidget = { fetch: request, onEvent, download };" in source
+    assert "window.OuroborosWidget = { fetch: request, onEvent, download, openExternal: (url) => openExternal(url) };" in source
     assert "module widget fetch outside extension route prefix" in source
 
 

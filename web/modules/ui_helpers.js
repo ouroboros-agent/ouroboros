@@ -1,6 +1,6 @@
 import { apiFetch } from './api_client.js';
 import { PAGE_ICONS } from './page_icons.js';
-import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { escapeHtmlAttr as escapeHtml, safeExternalUrl } from './utils.js';
 // Cycle note: toast.js imports normalizeTone from this module. Both edges only
 // call the imported function inside function bodies (never at module eval), so
 // the ES-module cycle is benign.
@@ -466,6 +466,31 @@ async function copyShellLinkWithToast(url, win, doc, toast) {
     toast('Link copied — open it in your browser.', 'info');
 }
 
+/** Open an absolute external link without awaiting any work before host handoff.
+ * A browser noopener call may return null even when the new page opened.
+ */
+export async function openExternalViaHostBridge(url, {
+    win = window, doc = document, toast = showToast, api = shellBridgeApi(win),
+} = {}) {
+    const target = safeExternalUrl(url);
+    if (target === '#') throw new Error('Unsupported external link');
+    if (api) {
+        const result = api.open_external_url ? await api.open_external_url(target) : null;
+        if (result?.ok) return { ...result, native: true };
+        await copyShellLinkWithToast(target, win, doc, toast);
+        return { ok: false, native: true, degraded: 'copy-link' };
+    }
+    const telegram = win.Telegram?.WebApp;
+    const telegramHost = doc.documentElement?.dataset?.ouroborosHost === 'telegram' || telegram;
+    if (telegramHost && /^https?:/i.test(target)) {
+        if (typeof telegram?.openLink !== 'function') throw new Error('Telegram link opener is not ready; try the link again');
+        telegram.openLink(target);
+        return { ok: true, native: false, host: 'telegram' };
+    }
+    win.open(target, '_blank', 'noopener');
+    return { ok: true, native: false, host: 'browser' };
+}
+
 async function routeShellUrl(kind, url, deps) {
     const { api, win, doc, toast, openFile, downloadFile, filename = '', wantsDownload = false } = deps;
     try {
@@ -482,12 +507,7 @@ async function routeShellUrl(kind, url, deps) {
             if (wantsDownload) await downloadFile(url, name);
             else await openFile(url, name);
         } else if (kind === 'external') {
-            // Version-skew fallback (no open_external_url on an old packaged
-            // launcher) and an honest bridge failure ({ok:false}: no browser
-            // could be launched) degrade the same way: hand the owner the link
-            // instead of leaving a silently dead control.
-            const result = api?.open_external_url ? await api.open_external_url(url) : null;
-            if (!result?.ok) await copyShellLinkWithToast(url, win, doc, toast);
+            await openExternalViaHostBridge(url, { api, win, doc, toast });
         } else if (kind === 'bytes') {
             const result = await downloadBlobViaHostBridge(url, filename, { win, doc });
             if (result.unavailable) { toast(result.error, 'warn'); return; }

@@ -144,7 +144,9 @@ def test_desktop_bridge_version_skew_fallback_chain():
     chain."""
     helper = _read("web/modules/ui_helpers.js")
 
-    assert "api?.open_external_url" in helper
+    assert "export async function openExternalViaHostBridge(" in helper
+    assert "api.open_external_url ? await api.open_external_url(target) : null" in helper
+    assert "await openExternalViaHostBridge(url, { api, win, doc, toast });" in helper
     assert "'Link copied — open it in your browser.'" in helper
     assert "api.save_bytes_to_downloads(payload.name, payload.b64)" in helper
     assert "downloadBlobViaHostBridge(url, filename, { win, doc })" in helper

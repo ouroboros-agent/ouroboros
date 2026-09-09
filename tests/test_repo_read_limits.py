@@ -360,6 +360,7 @@ def test_triad_review_prompt_includes_architecture_md(tmp_path):
         review_history_section="",
         diff_text="DIFF",
         changed_files="changed_file.py",
+        task_evidence_section="",
     )
     assert "UNIQUE_MARKER_12345" in rendered, (
         "ARCHITECTURE.md content must appear in the rendered triad review prompt"

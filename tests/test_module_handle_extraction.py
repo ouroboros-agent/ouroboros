@@ -455,6 +455,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "ouroboros/tools/preflight_review_run.py": ("ouroboros/tools/claude_advisory_review.py", "_car", frozenset({
         "SEVERITY_DRIVEN_ITEMS", "_advisory_native_model", "_advisory_review_diff",
+        "_api_window_skip_warning",
         "_build_advisory_prompt", "_format_advisory_error", "_get_changed_file_list",
         "_get_runtime_diagnostics", "_llm_extract_advisory_items",
         "_mandatory_read_corpus_chars", "_maybe_overflow_skip", "_predispatch_size_skip", "_persist_preflight_record",

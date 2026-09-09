@@ -94,12 +94,16 @@ def _actor_outcome(actor: dict) -> str:
             + ": " + str(actor.get("error")))
 
 
-def _degraded_replay_note(wave: dict) -> str:
+def _degraded_replay_note(wave: dict, *, paid_available: bool = True) -> str:
     """The honest replay mechanics of one recorded DEGRADED wave (aligned with the
     engine's `plan_wave_replay_decision`): a wave with structural snapshot evidence
     replays while its epoch and the reviewer roster stand; one without (its slots
     died at dispatch time, invisible to the pre-fan-out snapshot) never replays —
     a transient death is never cached as structural."""
+    if not paid_available:
+        replay = ("an identical envelope can replay this result for free while its health epoch and roster stand; "
+                  if wave.get("health_epoch") else "no structural lane evidence was recorded; ")
+        return replay + "the cycle cap is reached, so neither an identical nor revised request can start another paid panel, even after lane recovery"
     if wave.get("health_epoch"):
         return (
             "an identical envelope replays this recorded result at no further cost while "
@@ -142,7 +146,8 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             f"{counts.get('configured', 0)} configured slot(s) — below the review quorum "
             f"({counts.get('quorum', '?')}). Per-slot typed states (code and reset time, when "
             "known) are listed under Reviewer slots above. This wave is recorded and OPEN; "
-            f"{_degraded_replay_note(wave)}; a changed spec starts the next paid cycle. "
+            f"{_degraded_replay_note(wave, paid_available=not at_cap)}. "
+            + ("A changed spec may start another paid cycle. " if not at_cap else "")
         )
         if wave.get("quorum_unreachable"):
             # Naming asymmetry, on purpose: the wave fact is the bare
@@ -169,16 +174,15 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             ids = ", ".join(str(f.get("finding_id") or f.get("id")) for f in blocking[:4])
             text += (
                 f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}) stay OPEN whatever "
-                "you disposition — a blocking finding closes only through a changed spec "
-                "(new fingerprint, next paid cycle) or a reject that the next paid delta cycle judges. "
+                "you disposition. "
+                + ("A changed spec or a justified rejection may be judged in another paid cycle. "
+                   if not at_cap else "The cycle cap is reached; no further paid panel is available. ")
             )
     else:
         text = (
-            "Blocking findings: accept ⇒ change the spec and re-call plan_task (new fingerprint, "
-            f"{'the cap is reached — no further paid cycle' if at_cap else 'next paid cycle ' + str(cycles_paid + 1) + ('' if cap is None else f' of {cap}')}); "
-            "reject ⇒ record reject + rationale via review_disposition naming this fingerprint — it "
-            "rides into the next paid delta cycle where reviewers mark it resolved or still-open. "
-            "A disposition never closes REVISE_PLAN. "
+            "Blocking findings remain OPEN. A disposition records your rationale without closing REVISE_PLAN. "
+            + ("The cycle cap is reached; no further paid panel is available. " if at_cap else
+               "You may change the spec or record a justified rejection for a subsequent paid delta review. ")
         )
     if enforcement == "blocking":
         text += (
@@ -203,6 +207,17 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
         )
     return text
 
+
+
+def _closure_note_view(note: str) -> str:
+    """Legacy host notes describe state; the current renderer owns available steps."""
+    prefix = str(note).partition(":")[0]
+    meaning = {
+        "blocking_finding_below_quorum_stays_open": "blocking findings remain open after disposition",
+        "revise_plan_not_closable_by_disposition": "disposition does not close blocking findings",
+        "degraded_not_closable_by_disposition": "no parseable reviewer quorum; disposition does not close the wave",
+    }.get(prefix)
+    return f"{prefix}: {meaning}" if meaning else str(note)
 
 
 def _render_wave(
@@ -244,7 +259,7 @@ def _render_wave(
         # Banner aligned with _next_step: the replay promise depends on whether the
         # wave carries structural snapshot evidence (see _degraded_replay_note).
         lines += ["", "⚠️ DEGRADED: no parseable reviewer quorum — recorded as an OPEN wave; "
-                  + _degraded_replay_note(wave) + "."]
+                  + _degraded_replay_note(wave, paid_available=cap is None or cycles_paid < cap) + "."]
     actor_lines = [
         f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')} · host_file_read: "
         f"{a.get('host_file_read_attestation')} · {_actor_outcome(a)}"
@@ -281,7 +296,7 @@ def _render_wave(
         lines += ["", "### Dispositions", "", "```json",
                   json.dumps(wave.get("dispositions"), ensure_ascii=False, indent=2), "```"]
     if wave.get("closure_notes") or notes:
-        lines += ["", "Closure notes: " + "; ".join([*(wave.get("closure_notes") or []), *(notes or [])])]
+        lines += ["", "Closure notes: " + "; ".join(_closure_note_view(note) for note in [*(wave.get("closure_notes") or []), *(notes or [])])]
     outcome, closed = wave_control_state(wave)
     lines += [
         "", "## Plan Review Contract", "",

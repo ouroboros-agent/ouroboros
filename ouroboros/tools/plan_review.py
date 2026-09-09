@@ -19,7 +19,7 @@ replays the recorded wave free (no panel, no cycle). Closure
 Note-only REVIEW_REQUIRED closes immediately; need_evidence closes by disposition
 at $0; a below-quorum blocking finding stays open. REVISE_PLAN never closes by
 disposition — accept ⇒ changed spec (next paid cycle), reject ⇒ rationale rides
-into the next delta cycle. Under blocking enforcement an open wave HOLDS
+into a subsequent delta cycle when another paid cycle is available. Under blocking enforcement an open wave HOLDS
 finalization (``owner_hurry.force_plan_decision``); at the cap the typed
 ``plan_review_cycles_exhausted`` result + event leave the honest exits: owner
 unstick or a ``blocked_with_evidence`` terminal. Advisory proceeds open under the
@@ -205,8 +205,9 @@ _DISPOSITION_SCHEMA = {
     "description": (
         "Disposition mode only (send ONLY this field): answer the findings of the wave "
         "named by review_fingerprint. note/need_evidence findings close at $0; a blocking "
-        "finding you accept needs a changed spec (new call), one you reject rides with your "
-        "rationale into the next paid cycle. Never closes REVISE_PLAN."
+        "finding stays open. A subsequent paid delta review may consider a changed spec or "
+        "justified rejection when another paid cycle is available. Recording a disposition "
+        "consumes no cycle and never closes REVISE_PLAN."
     ),
     "properties": {
         "review_fingerprint": {"type": "string"},
@@ -240,8 +241,8 @@ def get_tools():
                     "reviewers return typed findings against the spec (blocking findings must name "
                     "the spec element they break); the host aggregates: GREEN closes; "
                     "Notes are optional; need_evidence closes by review_disposition at no cost; REVISE_PLAN needs "
-                    "a changed spec (next paid cycle) or a reject-with-rationale judged in the next "
-                    "cycle. Cycles are bounded by the owner's Max review cycles; an unchanged "
+                    "a changed spec or justified rejection judged by a subsequent paid delta review "
+                    "when another paid cycle is available. Cycles are bounded by the owner's Max review cycles; an unchanged "
                     "envelope replays the recorded result for free (a locator a reviewer asked for "
                     "with need_evidence is attached by the host next time and makes the envelope "
                     "new). Under blocking enforcement an "

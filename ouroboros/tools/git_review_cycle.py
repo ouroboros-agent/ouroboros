@@ -70,6 +70,14 @@ def _review_custody_pending(ctx: ToolContext) -> bool:
     )
 
 
+def _release_review_evidence_if_settled(ctx: ToolContext) -> None:
+    """The existing review-custody boundary owns temporary session-file lifetime."""
+    from ouroboros.review_evidence import release_commit_review_session_view
+
+    if not _review_custody_pending(ctx):
+        release_commit_review_session_view(getattr(ctx, "_commit_review_evidence", None) or {})
+
+
 def _fingerprint_staged_diff(repo_dir: pathlib.Path) -> Dict[str, Any]:
     """Bind review to the exact commit material, not only a textual diff.
 
@@ -710,6 +718,12 @@ def _run_reviewed_stage_cycle(
     from ouroboros.review_state import compute_snapshot_hash
 
     prepared_snapshot = compute_snapshot_hash(pathlib.Path(ctx.repo_dir), commit_message, paths=advisory_paths)
+    from ouroboros.review_evidence import capture_commit_review_evidence, pending_commit_review_evidence
+
+    if not getattr(ctx, "_advisory_reconciled", False):
+        ctx._commit_review_evidence = (
+            pending_commit_review_evidence(ctx) if getattr(ctx, "_review_reconcile_only", False)
+            else capture_commit_review_evidence(ctx) if advisory_replay is None else {})
     advisory_gate_outcome = None
     if not bool(getattr(ctx, "_review_reconcile_only", False)):
         advisory_gate_outcome = _git()._advisory_and_tests_gate(
@@ -723,6 +737,7 @@ def _run_reviewed_stage_cycle(
             goal=goal, scope=scope,
         )
     if advisory_gate_outcome is not None:
+        _release_review_evidence_if_settled(ctx)
         return advisory_gate_outcome
     if not bool(getattr(ctx, "_review_reconcile_only", False)):
         after_preflight = _git()._fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
@@ -731,6 +746,7 @@ def _run_reviewed_stage_cycle(
             ctx, commit_message, commit_start, pre_fingerprint, after_preflight, worktree_changed=changed,
         )
         if revalidation is not None:
+            _release_review_evidence_if_settled(ctx)
             return revalidation
     _git()._record_commit_attempt(
         ctx,
@@ -794,6 +810,7 @@ def _run_reviewed_stage_cycle(
             )
         finally:
             _git()._reconcile_and_clear_review_roster(ctx)
+            _release_review_evidence_if_settled(ctx)
     blocked, combined_msg, block_reason, combined_findings, scope_advisory = _git()._aggregate_review_verdict(
         review_err,
         scope_result,

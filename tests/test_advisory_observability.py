@@ -106,7 +106,11 @@ def test_empty_advisory_result_is_error(monkeypatch, tmp_path):
     assert items == []
     assert raw.startswith("⚠️ ADVISORY_ERROR:")
     assert "empty output" in raw
-    assert any(ev.get("type") == "advisory_suspect_result" for ev in ctx.pending_events)
+    events = [ev for ev in ctx.pending_events if ev.get("type") == "advisory_suspect_result"]
+    assert len(events) == 1
+    assert events[0]["cost_usd"] == 1.23
+    assert events[0]["session_id"] == 'sess-empty'
+    assert events[0]["prompt_chars"] == len("prompt")
 
 
 def test_handle_advisory_error_persists_session_id(monkeypatch, tmp_path):
@@ -181,7 +185,11 @@ def test_skill_advisory_duplicate_expected_items_warn_not_error(monkeypatch, tmp
 
     assert len(items) == 3
     assert not raw.startswith("⚠️ ADVISORY_ERROR:")
-    assert any(ev.get("type") == "advisory_contract_warning" for ev in ctx.pending_events)
+    events = [ev for ev in ctx.pending_events if ev.get("type") == "advisory_contract_warning"]
+    assert len(events) == 1
+    assert events[0]["cost_usd"] == 0.2
+    assert events[0]["session_id"] == 'sess-duplicate'
+    assert events[0]["prompt_chars"] == len("prompt")
     assert not any(ev.get("type") == "advisory_suspect_result" for ev in ctx.pending_events)
 
 
@@ -269,7 +277,11 @@ def test_skill_advisory_missing_expected_items_still_errors(monkeypatch, tmp_pat
     assert "Full reviewer output:" in raw
     assert raw.startswith("⚠️ ADVISORY_ERROR:")
     assert "checklist contract mismatch" in raw
-    assert any(ev.get("type") == "advisory_suspect_result" for ev in ctx.pending_events)
+    events = [ev for ev in ctx.pending_events if ev.get("type") == "advisory_suspect_result"]
+    assert len(events) == 1
+    assert events[0]["cost_usd"] == 0.2
+    assert events[0]["session_id"] == 'sess-partial'
+    assert events[0]["prompt_chars"] == len("prompt")
 
 
 # ---------------------------------------------------------------------------

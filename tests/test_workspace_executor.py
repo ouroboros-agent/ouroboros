@@ -619,3 +619,97 @@ def test_start_service_local_branch_uses_case_aware_overlay(tmp_path, monkeypatc
     assert env["PATH"] == "/bundle/bin:C:/stale"
     assert "Path" not in env
     assert payload.get("state") in ("running", "ready", "started", None) or payload
+
+
+@pytest.mark.parametrize("layout", ["repo", "nested", "worktree", "plain"])
+def test_live_run_scripts_keep_git_clean_and_own_only_their_scratch(tmp_path, monkeypatch, layout):
+    import concurrent.futures
+    import pathlib
+    import subprocess
+    import time
+    from ouroboros.tools import shell
+
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    system_repo = tmp_path / "system"
+    workspace = tmp_path / "workspace"
+    _init_repo(system_repo)
+    if layout == "worktree":
+        subprocess.run(["git", "worktree", "add", "--detach", str(workspace)], cwd=system_repo,
+                       check=True, capture_output=True)
+    elif layout == "plain":
+        workspace.mkdir()
+    else:
+        _init_repo(workspace)
+    cwd = workspace / "nested" if layout == "nested" else workspace
+    cwd.mkdir(exist_ok=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    releases = [data / f"release-{i}" for i in range(2)]
+    ready = [data / f"ready-{i}" for i in range(2)]
+    ctxs = [ToolContext(repo_dir=system_repo, drive_root=data, workspace_root=workspace,
+                       workspace_mode="external", task_id=f"script-{i}") for i in range(2)]
+    scripts = [
+        "import pathlib, time, sys\n"
+        f"pathlib.Path({str(ready[i])!r}).write_text(sys.argv[0])\n"
+        f"while not pathlib.Path({str(releases[i])!r}).exists(): time.sleep(0.01)\n"
+        "print('finished', pathlib.Path.cwd(), sys.argv[1])\n"
+        for i in range(2)
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(shell._run_script, ctxs[i], scripts[i], interpreter=sys.executable,
+                               args=[f"argument-{i}"], cwd=str(cwd), timeout_sec=20) for i in range(2)]
+        try:
+            until = time.monotonic() + 15
+            while not all(path.exists() for path in ready) and time.monotonic() < until:
+                if any(f.done() for f in pending):
+                    pytest.fail(str([f.result() for f in pending if f.done()]))
+                time.sleep(0.01)
+            assert all(path.exists() for path in ready), "scripts did not reach READY"
+            paths = [pathlib.Path(path.read_text()) for path in ready]
+            assert len({path.parent for path in paths}) == 2
+            assert all(path.is_file() for path in paths)
+            assert all((path.parent / ".gitignore").read_text() == "*\n" for path in paths)
+            if layout != "plain":
+                status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                        cwd=workspace, check=True, capture_output=True, text=True)
+                assert status.stdout == ""
+            neighbour = cwd / ".ouroboros" / "tmp_scripts" / "user.txt"
+            neighbour.write_text("user work")
+            if layout != "plain":
+                status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                        cwd=workspace, check=True, capture_output=True, text=True)
+                assert "user.txt" in status.stdout
+                assert "script_" not in status.stdout
+            releases[0].touch()
+            assert "argument-0" in pending[0].result(timeout=15)
+            assert not paths[0].parent.exists()
+            assert paths[1].is_file()
+        finally:
+            for release in releases:
+                release.touch()
+        results = [future.result(timeout=15) for future in pending]
+    assert all("exit_code=0" in result for result in results)
+    assert neighbour.read_text() == "user work"
+    assert not any(path.parent.exists() for path in paths)
+    if layout == "plain":
+        assert not (workspace / ".git").exists()
+
+
+def test_run_script_mapping_refusal_cleans_its_own_directory(tmp_path, monkeypatch):
+    from ouroboros.tools import shell
+    from types import SimpleNamespace
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(repo_dir=workspace, drive_root=data, workspace_root=workspace,
+                      workspace_mode="external", task_id="map-refusal")
+    monkeypatch.setattr(shell, "_executor_can_run_cwd", lambda *a: True)
+    monkeypatch.setattr(shell, "executor_ref_from_ctx", lambda *a: SimpleNamespace(kind="docker_exec"))
+    def refuse(*args):
+        raise ValueError("no mapping")
+    monkeypatch.setattr(shell, "executor_map_host_path", refuse)
+    result = shell._run_script(ctx, "print('unused')", cwd=str(workspace))
+    assert "could not map temp script path" in result
+    assert not (workspace / ".ouroboros").exists()

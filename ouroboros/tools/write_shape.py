@@ -19,7 +19,7 @@ import re
 import tokenize
 from typing import Any, Callable, List, Optional
 
-from ouroboros.shell_parse import shell_argv, shell_argv_with_inline, shell_argv_with_path_tokens
+from ouroboros.shell_parse import POSIX_SHELL_HEADS, shell_argv, shell_argv_with_inline, shell_argv_with_path_tokens
 
 SHELL_WRITE_INDICATORS = (
     "rm ", "rm\t", ">", "sed -i", "tee ", "truncate",
@@ -322,7 +322,7 @@ def _shell_write_indicator_scan(
         bodies = list(interpreter_inline_code(argv))
         # An sh -c wrap hides the interpreter one level down; locate the inner
         # bodies too so a '>' comparison inside them is not read as a redirect.
-        if argv and str(argv[0]).rsplit("/", 1)[-1].lower() in {"sh", "bash", "zsh"}:
+        if argv and str(argv[0]).rsplit("/", 1)[-1].lower() in POSIX_SHELL_HEADS:
             inner = shell_command_string(argv)
             if inner:
                 bodies.extend(interpreter_inline_code(shell_argv(inner)))

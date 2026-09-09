@@ -218,3 +218,17 @@ def test_review_skill_tool_result_has_no_raw_json_block(tmp_path, monkeypatch):
     out = skill_exec_mod._handle_review_skill(ctx, skill="alpha")
     assert "Raw review payload" not in out
     assert "<details>" not in out
+
+
+def test_history_preserves_real_round_and_snapshot_numbers():
+    from ouroboros.skill_review import _build_skill_review_history_section
+    history = [{"review_round": n, "snapshot_attempt": n - 5, "snapshot_revised": n == 9,
+                "status": "warnings", "content_hash": "abc", "failure_signature": [f"reason-{n}"]}
+               for n in range(6, 10)]
+    text = _build_skill_review_history_section(history)
+    assert "Review round 7, snapshot attempt 2" in text
+    assert "Review round 9, snapshot attempt 4" in text
+    assert "snapshot_revised=True" in text and "reason-9" in text
+    assert "Review round 6" not in text and "Attempt 1:" not in text
+    legacy = _build_skill_review_history_section([{"status": "warnings"}])
+    assert "Review round unknown, snapshot attempt unknown" in legacy

@@ -491,6 +491,7 @@ class _ScopePromptContext:
     # None for every ordinary commit — the pack then reads the staged diff.
     managed_subject: Optional[Any] = None
     window_binding: Optional[dict] = None
+    task_evidence: Optional[dict] = None
 
 
 def _build_scope_prompt(
@@ -601,6 +602,8 @@ def _build_scope_prompt(
     if touched_status is not None:
         return None, touched_status
 
+    from ouroboros.review_evidence import commit_review_evidence_section
+    task_evidence_compact = False
     repo_pack_placeholder = "__GENERATED_SCOPE_ATLAS_PENDING__"
 
     def _assemble_prompt(current_files_section: str) -> str:
@@ -613,6 +616,7 @@ def _build_scope_prompt(
             diff_text=diff_text,
             repo_pack_placeholder=repo_pack_placeholder,
             critical_calibration=_sr().CRITICAL_FINDING_CALIBRATION,
+            task_evidence_section=commit_review_evidence_section(context.task_evidence or {}, delivery="packet", compact=task_evidence_compact),
         )
         _SCOPE_STABLE_PREFIX_LEN.set(stable_len)
         return prompt_text
@@ -726,6 +730,11 @@ def _build_scope_prompt(
         else:
             # Even the manifest cannot fit beside the fixed part: shrink it for room.
             deficit = max(50_000, fixed_prompt_tokens + _atlas_min_allowance - input_limit)
+
+        if context.task_evidence and not task_evidence_compact:
+            task_evidence_compact = True
+            ladder_steps.append({"step": "task_evidence_excerpt_omitted", "source_ref": context.task_evidence.get("source_ref")})
+            continue
 
         # Degradable never holds atlas-required-beyond-diff paths: the atlas
         # refuses a diff-only required artifact by design, so that rung could

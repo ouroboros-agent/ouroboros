@@ -246,3 +246,25 @@ def test_scope_receipt_validator_cli_edges(tmp_path, capsys):
 
     assert main(["validate", str(tmp_path / "absent.json")]) == 1
     assert "cannot read receipt" in capsys.readouterr().err
+
+
+def test_scope_receipt_survives_trailing_markdown_checkboxes(tmp_path, capsys):
+    import json
+    from scripts.validate_scope_receipt import main
+    from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS
+    from ouroboros.triad_review import extract_json_array
+
+    rows = [{"item": item, "verdict": "FAIL" if i == 0 else "PASS", "severity": "advisory",
+             "reason": f"Checked the concrete {item} source and its consumers."}
+            for i, item in enumerate(sorted(SCOPE_REQUIRED_ITEMS))]
+    path = tmp_path / "receipt.md"
+    for prefix, suffix in [("", "\n- [ ] Follow up"), ("- [ ] Before\n", "\n[]\n- [ ] After"), ("```json\n", "\n```\n- [ ] Remaining")]:
+        path.write_text(prefix + json.dumps(rows) + suffix)
+        assert main(["validate", str(path)]) == 0
+        assert "1 FAIL row(s)" in capsys.readouterr().out
+    # Whole JSON objects are not repaired by selecting a nested valid array.
+    path.write_text(json.dumps({"nested": rows}))
+    assert main(["validate", str(path)]) == 1
+    path.write_text("- [ ] Only a checkbox")
+    assert main(["validate", str(path)]) == 1
+    assert extract_json_array("[]") == []
