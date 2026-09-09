@@ -15,7 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import claudexor_daemon as daemon, platform_layer as pl, process_custody as custody
+from ouroboros import claudexor_daemon as daemon
+from ouroboros import platform_layer as pl
+from ouroboros import process_custody as custody
 
 
 def test_selective_windows_tree_uses_one_snapshot_without_taskkill_tree(monkeypatch):
@@ -165,9 +167,11 @@ command = [sys.executable, '-u', '-c', sys.argv[2]]
 claudexor_runtime.get_runtime_manager = lambda: SimpleNamespace(
     ensure=lambda: command, pin=None, status=lambda: {'version':'3.9.8','build_sha':'a'*40,'source':'fixture'})
 daemon.ensure_owned_gateway(startup_wait_sec=10).close()
+owned = daemon.get_owned_daemon()
+custody_pid = int(getattr(getattr(owned, '_proc', None), 'pid', 0) or 0)
 ordinary = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], **pl.subprocess_new_group_kwargs())
 info = json.loads((root/'claudexor'/'fixture-engine.json').read_text())
-info.update(worker_pid=os.getpid(), ordinary_pid=ordinary.pid)
+info.update(worker_pid=os.getpid(), ordinary_pid=ordinary.pid, custody_pid=custody_pid)
 (root/'ready.json').write_text(json.dumps(info))
 time.sleep(120)
 '''
@@ -185,7 +189,7 @@ if use_job:
         worker.kill(); worker.wait(timeout=5)
         if job: pl.close_job(job)
         raise RuntimeError('fixture worker could not enter its launcher Job')
-time.sleep(120)
+worker.wait(timeout=120)
 '''
 
 _CLI = r'''
@@ -198,7 +202,7 @@ home = pathlib.Path(os.environ['CLAUDEXOR_CONFIG_DIR'])
 info = json.loads((home/'fixture-engine.json').read_text())
 request = urllib.request.Request('http://127.0.0.1:%s/fixture-stop'%info['port'],
     data=b'{}', headers={'Authorization':'Bearer '+(home/'daemon'/'token').read_text()})
-urllib.request.urlopen(request, timeout=5).close()
+urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5).close()
 deadline = time.monotonic()+5
 while pid_is_alive(info['pid']) and not pid_is_zombie(info['pid']):
     if time.monotonic() > deadline: raise SystemExit(1)
@@ -227,6 +231,15 @@ def shared_tree(tmp_path, monkeypatch, request):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     source = str(pathlib.Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = os.pathsep.join([source, env.get("PYTHONPATH", "")])
+    # Bind the whole fixture process tree before the launcher starts. Setting
+    # DATA_DIR only inside _WORKER leaves the launcher and its first imports
+    # carrying a caller's real data-plane overrides.
+    env.update(
+        OUROBOROS_DATA_DIR=str(tmp_path),
+        OUROBOROS_SETTINGS_PATH=str(tmp_path / "settings.json"),
+    )
+    for crossing in ("CLAUDEXOR_CONFIG_DIR", "CLAUDEXOR_DAEMON_SOCK", "CLAUDEXOR_CONTROL_PORT"):
+        env.pop(crossing, None)
     log_path = tmp_path / "launcher.log"
     with log_path.open("wb") as log:
         parent = subprocess.Popen(
@@ -237,7 +250,18 @@ def shared_tree(tmp_path, monkeypatch, request):
         )
     info = {}
     try:
-        _wait(lambda: (tmp_path / "ready.json").exists() or parent.poll() is not None, timeout=60)
+        try:
+            _wait(lambda: (tmp_path / "ready.json").exists() or parent.poll() is not None, timeout=60)
+        except AssertionError as exc:
+            def read_log(path):
+                try:
+                    return path.read_text()
+                except OSError:
+                    return "<missing>"
+            raise AssertionError(
+                f"{exc}\nlauncher.log:\n{read_log(log_path)}\n"
+                f"daemon.log:\n{read_log(tmp_path / 'claudexor' / 'daemon.log')}"
+            ) from exc
         assert parent.poll() is None, log_path.read_text()
         info = json.loads((tmp_path / "ready.json").read_text())
         _wait(lambda: (tmp_path / "claudexor" / "client-work.txt").exists())
@@ -250,7 +274,7 @@ def shared_tree(tmp_path, monkeypatch, request):
         if parent.poll() is None:
             pl.kill_process_tree(parent)
         parent.wait(timeout=5)
-        for name in ("ordinary_pid", "harness_pid", "worker_pid", "pid"):
+        for name in ("ordinary_pid", "harness_pid", "worker_pid", "custody_pid", "pid"):
             if info.get(name) and not _gone(info[name]):
                 pl.kill_pid_tree(info[name])
                 _wait(lambda: _gone(info[name]))
@@ -259,7 +283,8 @@ def shared_tree(tmp_path, monkeypatch, request):
 def _continues(root, info):
     def alive():
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{info['port']}/alive", timeout=2) as response:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://127.0.0.1:{info['port']}/alive", timeout=2) as response:
                 return response.read() == b"client-B-keeps-working"
         except (OSError, urllib.error.URLError):
             return False
@@ -287,7 +312,7 @@ def _fixture_cli(root, monkeypatch):
 def test_real_ancestor_cleanup_spares_daemon_and_other_client(tmp_path, shared_tree):
     parent, info = shared_tree
     roots = custody.live_daemon_root_pids(tmp_path)
-    assert roots == {info["pid"]}
+    assert roots == {info["custody_pid"]}
     pl.kill_process_tree(parent, exclude_pids=roots)
     parent.wait(timeout=5)
     _wait(lambda: _gone(info["worker_pid"]) and _gone(info["ordinary_pid"]))
@@ -440,7 +465,7 @@ def test_windows_first_use_keeps_working_with_legacy_job_or_without_launcher_job
         parent.wait(timeout=5)
         _wait(lambda: _gone(info["pid"]) and _gone(info["harness_pid"]))
     else:
-        pl.kill_process_tree(parent, exclude_pids={info["pid"]})
+        pl.kill_process_tree(parent, exclude_pids={info["custody_pid"]})
         parent.wait(timeout=5)
         _wait(lambda: _gone(info["worker_pid"]))
         _continues(tmp_path, info)

@@ -151,14 +151,21 @@ def test_reap_orphaned_workers(tmp_path, monkeypatch):
     cmds = {111: "python -B -c multiprocessing.spawn", 222: "", 333: "/usr/bin/SomethingElse"}
     monkeypatch.setattr(pl, "process_command", lambda pid: cmds.get(int(pid), ""))
     monkeypatch.setattr(pl, "process_group_id", lambda pid: int(pid))  # session leader
-    killed_groups, killed_pids = [], []
+    killed_groups, killed_trees = [], []
     monkeypatch.setattr(pl, "kill_process_group_id", lambda pgid: killed_groups.append(int(pgid)))
-    monkeypatch.setattr(pl, "force_kill_pid", lambda pid: killed_pids.append(int(pid)))
+    # The shared tree owner is the platform boundary. Mock it on every OS so
+    # this unit never executes taskkill against a synthetic PID on Windows;
+    # native leaf mechanics have their own real-process tests.
+    monkeypatch.setattr(
+        pl,
+        "kill_pid_tree",
+        lambda pid, **kwargs: killed_trees.append((int(pid), kwargs)),
+    )
 
     n = workers.reap_orphaned_workers()
 
     assert n == 1
-    assert killed_pids == [111]
+    assert killed_trees == [(111, {"exclude_pids": set()})]
     assert killed_groups == [111]
 
 
