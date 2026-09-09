@@ -51,7 +51,7 @@ _REGISTRY_GUARD_SIGNATURES = {
     "_command_mentions_protected_root": "(cmd_path_lower: 'str', root_text: 'str') -> 'bool'",
     "_authorized_managed_update_resolver": "(ctx: 'Any') -> 'bool'",
     "_light_mode_payload_mutation_allowed": "(*, ctx: 'Any', tool_name: 'str', args: 'Dict[str, Any]', runtime_mode: 'str', effective_constraint: 'Optional[TaskConstraint]', implicit_skill_cwd_allowed: 'bool', allow_short_relative: 'bool') -> 'bool'",
-    "_protected_shell_block": "(self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish) -> 'ToolResult | None'",
+    "_protected_shell_block": "(self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish, runtime_mode: 'str' = '') -> 'ToolResult | None'",
     "_git_protected_roots": "(self) -> 'list'",
     "_resolved_shell_cwd": "(self, args: 'Dict[str, Any]', binding: 'Any' = None) -> 'pathlib.Path | ToolResult'",
     "_external_workspace_git_block": "(self, raw_cmd: 'Any', work_dir: 'pathlib.Path') -> 'ToolResult | None'",

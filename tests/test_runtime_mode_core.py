@@ -1064,6 +1064,41 @@ def test_advanced_mode_blocks_runshell_protected_python_writer(tmp_path, monkeyp
     assert "BIBLE.md" in result
 
 
+def test_pro_mode_allows_runshell_protected_writer_with_core_notice(tmp_path, monkeypatch):
+    """Pro shell writes share the editor's protected-path allowance and notice."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    reg = _registry(tmp_path)
+    result = reg.execute(
+        "run_command",
+        {"cmd": "python -c \"from pathlib import Path; Path('BIBLE.md').write_text('x')\""},
+    )
+    assert "SAFETY_VIOLATION" not in result
+    assert "CORE_PATCH_NOTICE" in result
+    assert (tmp_path / "BIBLE.md").read_text(encoding="utf-8") == "x"
+
+
+def test_pro_mode_keeps_bible_delete_blocked_but_allows_ordinary_rm(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    (tmp_path / "BIBLE.md").write_text("constitution\n", encoding="utf-8")
+    (tmp_path / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+    reg = _registry(tmp_path)
+    bible_result = reg.execute("run_command", {"cmd": "rm BIBLE.md"})
+    assert "BIBLE_DELETE_BLOCKED" in bible_result
+    assert (tmp_path / "BIBLE.md").exists()
+    scratch_result = reg.execute("run_command", {"cmd": "rm scratch.txt"})
+    assert "BIBLE_DELETE_BLOCKED" not in scratch_result
+    assert not (tmp_path / "scratch.txt").exists()
+
+
+def test_rank_aware_github_policy_keeps_ordinary_setup_blocked():
+    from ouroboros.git_shell_policy import gh_shell_block_reason
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least, runtime_mode_rank
+
+    assert runtime_mode_rank("pro") >= runtime_mode_rank("advanced")
+    assert runtime_mode_at_least("pro", "pro")
+    assert gh_shell_block_reason("gh auth login", runtime_mode="pro")
+
+
 def test_advanced_mode_blocks_runshell_protected_backslash_path(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = _registry(tmp_path)

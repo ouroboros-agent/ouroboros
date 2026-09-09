@@ -24,6 +24,8 @@ import ouroboros.tools.registry_guards as registry_guards
 import ouroboros.tools.shell_guards as shell_guards
 import ouroboros.tools.tool_resolution as tool_resolution
 from ouroboros.runtime_mode_policy import (
+    PROTECTED_RUNTIME_PATHS,
+    core_patch_notice,
     mode_allows_protected_write,
     protected_paths_in,
     protected_write_block_message,
@@ -73,6 +75,7 @@ from ouroboros.tools.tool_result import (
     _install_tool_result_sidecar,
     _published_tool_result,
     _restore_tool_result_sidecar,
+    _replace_tool_result,
 )
 from ouroboros.tools.registry_guards import (
     _EPHEMERAL_ALLOWED_TOOLS,
@@ -265,6 +268,28 @@ def _protected_write_block_result(*, path: str, runtime_mode: str, action: str) 
             action=action,
         ),
     )
+
+
+def _append_shell_core_notice(
+    result: str | ToolResult, raw_cmd: Any, *, paths: list[str] | None = None,
+) -> str | ToolResult:
+    """Attach the same protected-change notice used by editor writes.
+
+    The shell guard deliberately returns ``None`` for Pro/Cyber rewrites, so
+    the post-execution path records that a protected surface was attempted
+    without turning the mode-aware allowance into an unreviewed success claim.
+    """
+    text = (" ".join(str(part) for part in raw_cmd)
+            if isinstance(raw_cmd, list) else str(raw_cmd or "")).replace("\\", "/").lower()
+    paths = list(paths or [path for path in sorted(PROTECTED_RUNTIME_PATHS) if path.lower() in text])
+    if not paths:
+        return result
+    notice = core_patch_notice(paths)
+    if isinstance(result, ToolResult):
+        if result.status == "blocked":
+            return result
+        return _replace_tool_result(result, text=result.text + "\n\n" + notice)
+    return str(result) + "\n\n" + notice
 
 
 class ToolRegistry:
@@ -1328,6 +1353,18 @@ class ToolRegistry:
             result = checked
         elif early_error is not None:
             return early_error
+
+        if (
+            name in _PROCESS_COMMAND_TOOLS
+            and mode_allows_protected_write(_runtime_mode)
+            and targets_system_repo
+            and getattr(self._ctx, "_protected_shell_notice_paths", None)
+        ):
+            result = _append_shell_core_notice(
+                result,
+                args.get("cmd", args.get("command", "")),
+                paths=getattr(self._ctx, "_protected_shell_notice_paths", None),
+            )
 
         return _compose_execute_result_result(name, result, _route_note, safety_msg) if _route_note or safety_msg else result
 

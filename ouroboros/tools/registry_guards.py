@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.tools.tool_result import ToolResult
 from ouroboros.tools.write_shape import _no_deliverables_decision, _workspace_write_candidates
+from ouroboros.runtime_mode_policy import (
+    mode_allows_protected_write,
+    protected_bible_history_delete_reason,
+)
 
 if TYPE_CHECKING:  # annotation-only imports (inert at runtime)
     from ouroboros.contracts.task_constraint import TaskConstraint
@@ -880,6 +884,7 @@ def _external_shell_runtime_or_secret_block(
 
 def _protected_shell_block(
     self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
+    runtime_mode: str = "",
 ) -> ToolResult | None:
     """Apply payload/core write guards to the selected physical target."""
     items = _registry()._binding_items(binding)
@@ -907,9 +912,20 @@ def _protected_shell_block(
                 "payload files instead."
             ),
         )
+    if targets_system:
+        if reason := protected_bible_history_delete_reason(raw_cmd):
+            return ToolResult(
+                status="blocked",
+                code="SAFETY_VIOLATION",
+                text=f"⚠️ SAFETY_VIOLATION: {reason}",
+            )
     if _authorized_managed_update_resolver(self._ctx):
         return None
-    if targets_system and _registry().shell_writer_targets_protected(raw_cmd):
+    if (
+        targets_system
+        and _registry().shell_writer_targets_protected(raw_cmd)
+        and not mode_allows_protected_write(runtime_mode)
+    ):
         return ToolResult(
             status="blocked",
             code="SAFETY_VIOLATION",
@@ -919,7 +935,7 @@ def _protected_shell_block(
                 + ", ".join(sorted(_registry().PROTECTED_RUNTIME_PATHS))
             ),
         )
-    if targets_system:
+    if targets_system and not mode_allows_protected_write(runtime_mode):
         for cf in _registry().PROTECTED_RUNTIME_PATHS_LOWER:
             # The MODE-AWARE composition fact, not the coarse legacy scan: a
             # pure read that merely mentions a protected name (`grep -n delete
@@ -1071,7 +1087,7 @@ def _workspace_shell_write_block(
     # The root's existing user_files authority is independent of cwd.
     # Acting children retain their isolated write surface in every mode.
     pro_workspace_passthrough = (
-        str(runtime_mode or "").strip().lower() == "pro" and not acting_subagent
+        mode_allows_protected_write(runtime_mode) and not acting_subagent
     )
     protected_roots = [
         getattr(self._ctx, "system_repo_dir", None) or getattr(self._ctx, "repo_dir", None),

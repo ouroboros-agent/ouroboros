@@ -137,7 +137,9 @@ def browser_url_block_reason(url: str, ctx: Any = None, *, restricted: bool) -> 
     return ""
 
 
-def browser_request_block_reason(request: Any, ctx: Any, *, restricted: bool) -> str:
+def browser_request_block_reason(
+    request: Any, ctx: Any, *, restricted: bool, runtime_mode: str = ""
+) -> str:
     """One request decision: the target decision plus owner-operation shapes at Ouroboros.
 
     The owner POST shapes apply at a proven Ouroboros endpoint and at an expected
@@ -146,6 +148,11 @@ def browser_request_block_reason(request: Any, ctx: Any, *, restricted: bool) ->
     reason = browser_url_block_reason(request.url, ctx, restricted=restricted)
     if reason or restricted:
         return reason  # Restricted target checks already refused every runtime identity.
+    if runtime_mode:
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        if runtime_mode_at_least(runtime_mode, "cyber_pro"):
+            return ""
     if any(predicate(request) for predicate in (
         _is_context_mode_owner_post, _is_safety_mode_owner_post,
         _is_owner_skill_attest_post, _is_owner_settings_self_elevation_post,
@@ -359,10 +366,17 @@ def _is_owner_settings_self_elevation_post(request: Any) -> bool:
     )
 
 
-def browser_evaluate_block_reason(url: str, value: str, ctx: Any = None) -> str:
+def browser_evaluate_block_reason(
+    url: str, value: str, ctx: Any = None, *, runtime_mode: str = ""
+) -> str:
     """Keep owner-operation JavaScript policy at the same owner as URL policy."""
     if not runtime_service_kind(url, ctx):
         return ""
+    if runtime_mode:
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        if runtime_mode_at_least(runtime_mode, "cyber_pro"):
+            return ""
     if _blocks_context_mode_self_lowering_js(value):
         return (
             "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: browser JavaScript "

@@ -12,6 +12,58 @@ import pathlib
 from dataclasses import dataclass
 from typing import Iterable
 
+from ouroboros.settings_scales import _RUNTIME_MODE_RANK
+
+
+def runtime_mode_rank(runtime_mode: str) -> int:
+    """Return the ordered runtime-mode rank without duplicating the vocabulary.
+
+    ``settings_scales`` is the owner of the persisted enum and rank. Unknown
+    values remain below every known mode.
+    """
+    return int(_RUNTIME_MODE_RANK.get(str(runtime_mode or "").strip().lower(), -1))
+
+
+def runtime_mode_at_least(runtime_mode: str, minimum: str) -> bool:
+    """Whether ``runtime_mode`` meets the named ordered capability floor."""
+    mode_rank = runtime_mode_rank(runtime_mode)
+    minimum_rank = runtime_mode_rank(minimum)
+    return mode_rank >= 0 and minimum_rank >= 0 and mode_rank >= minimum_rank
+
+
+def protected_bible_history_delete_reason(raw_cmd: object) -> str:
+    """Return a refusal for physical BIBLE deletion or repository history rewrites.
+
+    This is deliberately a small argv/verb predicate at the existing shell
+    guard seam.  It does not classify arbitrary content or restrict ordinary
+    ``rm`` commands elsewhere.
+    """
+    try:
+        from ouroboros.shell_parse import collect_leading_env, shell_segments
+
+        delete_heads = {"rm", "unlink", "mv"}
+        history_verbs = {
+            "filter-branch", "filter-repo", "rebase", "replace", "update-ref",
+        }
+        for segment in shell_segments(raw_cmd):
+            _env, argv = collect_leading_env(segment)
+            if not argv:
+                continue
+            head = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
+            words = [str(item).replace("\\", "/") for item in argv[1:]]
+            bible = any(pathlib.PurePath(word).name.casefold() == "bible.md" for word in words)
+            if head in delete_heads and bible:
+                return "BIBLE_DELETE_BLOCKED: the BIBLE.md file must remain physically present."
+            if head == "git":
+                verbs = [word.lower() for word in words if not word.startswith("-")]
+                if verbs and verbs[0] == "rm" and bible:
+                    return "BIBLE_DELETE_BLOCKED: git rm cannot remove BIBLE.md."
+                if verbs and verbs[0] in history_verbs:
+                    return "BIBLE_HISTORY_REWRITE_BLOCKED: BIBLE history must remain physically recoverable."
+        return ""
+    except Exception:
+        return ""
+
 
 SAFETY_CRITICAL_PATHS = frozenset({
     "BIBLE.md",
@@ -168,7 +220,7 @@ def protected_paths_in(paths: Iterable[str]) -> list[ProtectedPath]:
 
 
 def mode_allows_protected_write(runtime_mode: str) -> bool:
-    return str(runtime_mode or "").strip().lower() == "pro"
+    return runtime_mode_at_least(runtime_mode, "pro")
 
 
 def format_protected_paths(paths: Iterable[ProtectedPath | str]) -> str:
