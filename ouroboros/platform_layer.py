@@ -1263,12 +1263,14 @@ def create_new_session() -> None:
         os.setsid()
 
 
-def subprocess_new_group_kwargs(*, breakaway_from_job: bool = False) -> dict:
+def subprocess_new_group_kwargs(*, breakaway_from_job: bool = False, suspended: bool = False) -> dict:
     """Return subprocess kwargs for killable process-group/session isolation."""
     if IS_WINDOWS:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
         if breakaway_from_job:
             flags |= _windows_breakaway_flags()
+        if suspended:
+            flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
         return {"creationflags": flags}
     return {"start_new_session": True}
 
