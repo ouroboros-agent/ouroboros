@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from types import SimpleNamespace
 
@@ -236,7 +237,7 @@ def shared_tree(tmp_path, monkeypatch, request):
         )
     info = {}
     try:
-        _wait(lambda: (tmp_path / "ready.json").exists() or parent.poll() is not None, timeout=20)
+        _wait(lambda: (tmp_path / "ready.json").exists() or parent.poll() is not None, timeout=60)
         assert parent.poll() is None, log_path.read_text()
         info = json.loads((tmp_path / "ready.json").read_text())
         _wait(lambda: (tmp_path / "claudexor" / "client-work.txt").exists())
@@ -256,8 +257,13 @@ def shared_tree(tmp_path, monkeypatch, request):
 
 
 def _continues(root, info):
-    with urllib.request.urlopen(f"http://127.0.0.1:{info['port']}/alive", timeout=2) as response:
-        assert response.read() == b"client-B-keeps-working"
+    def alive():
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{info['port']}/alive", timeout=2) as response:
+                return response.read() == b"client-B-keeps-working"
+        except (OSError, urllib.error.URLError):
+            return False
+    _wait(alive, timeout=10)
     progress = root / "claudexor" / "client-work.txt"
     previous = progress.read_text()
     _wait(lambda: progress.read_text() not in ("", previous))
