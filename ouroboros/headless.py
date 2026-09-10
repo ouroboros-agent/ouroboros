@@ -443,36 +443,33 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         review_fields = {key: value for key, value in child_result.items() if key == "review_projection"}
         child_result, ref_promotion = promote_child_task_refs(
             pathlib.Path(parent_drive_root), child_drive, task_id,
-            {key: value for key, value in child_result.items() if key != "review_projection"},
-        )
+            {key: value for key, value in child_result.items() if key != "review_projection"})
         child_result.update(review_fields)
         _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
         child_status = str(child_result.pop("status", None) or "completed")
         child_result.pop("task_id", None)
-        payload = child_result
-        payload["child_ref_promotion"] = ref_promotion
-        if isinstance(payload.get("artifacts"), list):
+        child_result["child_ref_promotion"] = ref_promotion
+        if isinstance(child_result.get("artifacts"), list):
             try:
                 from ouroboros.outcomes import artifact_bundle_from_result
-
-                payload["artifact_bundle"] = artifact_bundle_from_result(payload)
+                child_result["artifact_bundle"] = artifact_bundle_from_result(child_result)
             except Exception:
-                payload.pop("artifact_bundle", None)
-        payload.setdefault("headless_child_drive_root", str(child_drive))
+                child_result.pop("artifact_bundle", None)
+        child_result.setdefault("headless_child_drive_root", str(child_drive))
         if (child_status in _FINAL_STATUSES and _workspace_root_from_task(task) is not None
                 and not task_is_readonly_subagent(task)):
             artifact_status = str(canonical_existing.get("artifact_status") or "").strip().lower()
             if artifact_status in ARTIFACT_TERMINAL_STATUSES | {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}:
-                payload["artifacts"] = _merge_artifacts(
-                    list(canonical_existing.get("artifacts") or []), list(payload.get("artifacts") or []))
-                payload.update({key: canonical_existing[key] for key in _ARTIFACT_LIFECYCLE_FIELDS
+                child_result["artifacts"] = _merge_artifacts(
+                    list(canonical_existing.get("artifacts") or []), list(child_result.get("artifacts") or []))
+                child_result.update({key: canonical_existing[key] for key in _ARTIFACT_LIFECYCLE_FIELDS
                                 if key in canonical_existing})
             else:
-                payload["artifact_status"] = ARTIFACT_STATUS_FINALIZING
-            payload["child_status"] = child_status
+                child_result["artifact_status"] = ARTIFACT_STATUS_FINALIZING
+            child_result["child_status"] = child_status
 
         return retry_child_task_refs(parent_drive_root, child_drive, task_id,
-                                     replica={**payload, "status": child_status})
+                                     replica={**child_result, "status": child_status})
 
 
 def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: str,
@@ -489,7 +486,7 @@ def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: st
     )
     with child_ref_promotion_scope():
         while True:
-            source = load_task_result(parent, task_id, strict=True, _locked=True) or {}
+            source = load_task_result(parent, task_id, strict=True) or {}
             if replica is None and not source:
                 raise ValueError("pending child-ref authority is missing")
             if replica is None:

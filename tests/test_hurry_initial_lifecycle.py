@@ -22,7 +22,7 @@ from supervisor import queue, state, task_reaper, worker_health, workers
 
 @pytest.fixture
 def pool(tmp_path, monkeypatch):
-    from supervisor import git_ops
+    from supervisor import git_ops, task_lifecycle
 
     pending, running = [], {}
     for module in (queue, workers):
@@ -31,6 +31,9 @@ def pool(tmp_path, monkeypatch):
         monkeypatch.setattr(module, "RUNNING", running)
     for name in ("ADMISSION_RESERVATIONS", "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES"):
         monkeypatch.setattr(queue, name, {})
+    monkeypatch.setattr(task_lifecycle, "BUDGET_ROOT_FENCES", queue.BUDGET_ROOT_FENCES)
+    monkeypatch.setattr(task_lifecycle, "CANCELLED_ROOT_FENCES", {})
+    monkeypatch.setattr(task_lifecycle, "_ACTIVE_CASCADE_FENCES", {})
     monkeypatch.setattr(queue, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
     monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", tmp_path / "state/queue_snapshot.json")
     for name, value in {
@@ -287,8 +290,9 @@ def test_actual_direct_actor_admission_keeps_its_existing_contract(pool, monkeyp
 def test_initializer_runs_only_after_existing_admission_checks(pool, monkeypatch):
     from ouroboros.cancel_intents import request_cancel
 
-    queue.enqueue_task({"id": "child", "parent_task_id": "root", "root_task_id": "root",
-                        "delegation_role": "subagent", "chat_id": 1})
+    child = queue.enqueue_task({"id": "child", "parent_task_id": "root", "root_task_id": "root",
+                                "delegation_role": "subagent", "chat_id": 1})
+    assert not child.get("_admission_blocked"), child
     queue.enqueue_task({"id": "sealed", "chat_id": 1})
     queue.ACCEPTANCE_FENCES["sealed"] = {"status": "sealed"}
     queue.enqueue_task({"id": "cancelled", "chat_id": 1})

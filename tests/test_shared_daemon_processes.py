@@ -191,6 +191,8 @@ ordinary = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)
 info_path = root/'claudexor'/'fixture-engine.json'
 deadline = time.monotonic() + 30
 while True:
+    if time.monotonic() >= deadline:
+        raise RuntimeError('fixture harness startup did not publish a PID within 30s: ' + str(info_path))
     try:
         info = json.loads(info_path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
@@ -200,8 +202,6 @@ while True:
         raise RuntimeError(info['harness_error'])
     if info.get('harness_pid'):
         break
-    if time.monotonic() >= deadline:
-        raise RuntimeError('fixture harness startup did not publish a PID within 30s: ' + json.dumps(info))
     time.sleep(.01)
 info.update(worker_pid=os.getpid(), ordinary_pid=ordinary.pid, custody_pid=custody_pid)
 (root/'ready.json').write_text(json.dumps(info))

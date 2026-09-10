@@ -417,21 +417,6 @@ def read_json_dict(path: pathlib.Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def read_json_dict_locked(path: pathlib.Path) -> Optional[Dict[str, Any]]:
-    """Read one JSON authority while its sidecar writer lock is held."""
-    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
-
-    path = pathlib.Path(path)
-    lock_path = path.with_name(path.name + ".lock")
-    lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=4.0, stale_sec=90.0, owner_aware_stale=True)
-    if lock_fd is None:
-        raise TimeoutError(f"JSON authority lock unavailable: {path}")
-    try:
-        return read_json_dict(path)
-    finally:
-        release_exclusive_file_lock(lock_path, lock_fd)
-
-
 def update_json_locked(
     path: pathlib.Path,
     mutator: Any,
