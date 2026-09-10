@@ -45,6 +45,16 @@ PACKET_PRIOR_CYCLES_CHARS = 60_000
 
 FINDING_CLASSES = ("blocking", "note", "need_evidence")
 AGGREGATES = ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED")
+
+AUTHOR_DISPOSITION_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "description": "Optional advisory author finish bound to the exact review fingerprint; it never manufactures reviewer PASS or releases a blocking gate.",
+    "properties": {
+        "disposition": {"type": "string", "enum": ["accepted", "rejected", "partial", "deferred"]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["disposition", "rationale"],
+}
 DISPOSITION_DECISIONS = ("accept", "reject", "defer")
 
 _SPEC_STRING_LISTS = ("in_scope", "non_goals", "invariants", "affected_resources", "evidence")

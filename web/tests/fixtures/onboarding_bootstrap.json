@@ -299,6 +299,13 @@
         "label": "Pro",
         "tone": "Power",
         "value": "pro"
+      },
+      {
+        "className": "cyber-pro",
+        "copy": "Full host and configuration authority, including credentials, policy settings, and protected rewrites. Blocking or Advisory review remains your separate choice.",
+        "label": "Cyber Pro",
+        "tone": "Maximum power",
+        "value": "cyber_pro"
       }
     ],
     "steps": [

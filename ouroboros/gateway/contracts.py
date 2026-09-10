@@ -772,12 +772,30 @@ class AvailableSubagentsSettingsMeta(TypedDict, total=False):
     candidate: Optional[Dict[str, Any]]
 
 
+class SettingsPolicyAxis(TypedDict, total=False):
+    """Configured/effective owner policy values shown by Settings."""
+
+    configured: str
+    effective: str
+    restart_required: bool
+    pending: bool
+    applies: Literal["restart", "next_task"]
+
+
+class SettingsPolicyState(TypedDict):
+    access: SettingsPolicyAxis
+    supervisor: SettingsPolicyAxis
+    review: SettingsPolicyAxis
+    running_task_snapshot: bool
+
+
 class SettingsMeta(SettingsNetworkMeta, total=False):
     """Complete ``GET /api/settings`` ``_meta`` block."""
 
     custom_secret_keys: list[str]
     setup_contract: Dict[str, Any]
     available_subagents: AvailableSubagentsSettingsMeta
+    policy_state: SettingsPolicyState
 
 
 class SettingsSaveResponse(TypedDict, total=False):
@@ -1494,6 +1512,8 @@ __all__ = [
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "AvailableSubagentsSettingsMeta",
+    "SettingsPolicyAxis",
+    "SettingsPolicyState",
     "SettingsMeta",
     "SettingsSaveResponse",
     "OwnerRuntimeModeResponse",

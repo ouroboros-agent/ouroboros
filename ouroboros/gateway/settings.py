@@ -153,6 +153,58 @@ def _mask_mcp_servers_payload(servers: Any) -> list:
     return out
 
 
+def _build_policy_state(settings: Dict[str, Any]) -> dict:
+    """Project configured versus process-effective owner policy for Settings UI.
+
+    Persisted values are the pending choices.  Runtime access is boot-bound;
+    Supervisor and Review are hot-reloaded for the next task through the
+    existing settings path.  The projection deliberately carries no authority
+    and writes no second state record.
+    """
+    from ouroboros import config as _config
+    from ouroboros.review_model_routes import get_review_enforcement
+
+    configured_access = _config.normalize_runtime_mode(
+        settings.get("OUROBOROS_RUNTIME_MODE"))
+    effective_access = _config.get_runtime_mode()
+    configured_supervisor = _config.normalize_safety_mode(
+        settings.get("OUROBOROS_SAFETY_MODE"))
+    effective_supervisor = _config.get_safety_mode()
+    configured_review = str(
+        settings.get("OUROBOROS_REVIEW_ENFORCEMENT") or "advisory").strip().lower()
+    effective_review = get_review_enforcement()
+    running_task_snapshot = bool(_has_started_agent_tasks())
+    return {
+        "access": {
+            "configured": configured_access,
+            "effective": effective_access,
+            "current_process": effective_access,
+            "next_task": configured_access,
+            "restart_required": configured_access != effective_access,
+            "applies": "restart",
+        },
+        "supervisor": {
+            "configured": configured_supervisor,
+            "effective": effective_supervisor,
+            "current_process": effective_supervisor,
+            "next_task": configured_supervisor,
+            "pending": configured_supervisor != effective_supervisor or running_task_snapshot,
+            "applies": "next_task",
+            "active_task_snapshot": running_task_snapshot,
+        },
+        "review": {
+            "configured": configured_review if configured_review in {"advisory", "blocking"} else "advisory",
+            "effective": effective_review,
+            "current_process": effective_review,
+            "next_task": configured_review if configured_review in {"advisory", "blocking"} else "advisory",
+            "pending": configured_review != effective_review or running_task_snapshot,
+            "applies": "next_task",
+            "active_task_snapshot": running_task_snapshot,
+        },
+        "running_task_snapshot": running_task_snapshot,
+    }
+
+
 def _rehydrate_mcp_servers_payload(incoming: Any, current: Any) -> list:
     if not isinstance(incoming, list):
         return []
@@ -435,7 +487,7 @@ def _api_owner_runtime_mode_sync(request: Request, body: Any) -> JSONResponse:
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     if raw_mode not in set(_config.VALID_RUNTIME_MODES):
-        return unsaved_error("'mode' must be one of: light, advanced, pro", 400)
+        return unsaved_error("'mode' must be one of: light, advanced, pro, cyber_pro", 400)
     # The digest is taken BEFORE the read that decides, so a write landing between the
     # two is refused rather than silently reverted by this request's write.
     digest = settings_document_digest()
@@ -999,6 +1051,19 @@ async def api_settings_get(request: Request) -> JSONResponse:
     except (ValueError, OSError):
         port = _default_port(request)
     meta = _build_network_meta(_current_bind_host(request), port)
+    # Keep the three owner-facing policy axes honest after reload.  The values
+    # on the document are the pending/configured choices; process state is the
+    # effective value this server can currently report.  Runtime access is
+    # restart-bound, while Supervisor and Review are picked up for new tasks by
+    # the existing settings effect path.  This is presentation metadata only,
+    # not a second policy store.
+    try:
+        meta["policy_state"] = _build_policy_state(settings)
+    except Exception:
+        # A settings read must stay available even if an optional projection
+        # helper is unavailable during startup.  The persisted values remain
+        # the ordinary response fields and are still masked below.
+        log.debug("Could not build settings policy-state projection", exc_info=True)
     meta["custom_secret_keys"] = sorted(
         key for key in settings
         if key not in SECRET_SETTING_KEYS

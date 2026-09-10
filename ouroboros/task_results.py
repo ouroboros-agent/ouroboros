@@ -15,6 +15,7 @@ from ouroboros.cost_projection import (
     normalize_task_result_cost_planes,
 )
 from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
+from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
 
@@ -1074,6 +1075,13 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: full wave needs spec and findings")
             if not isinstance(wave.get("dispositions", []), list):
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: dispositions must be a list")
+            if "author_disposition" in wave:
+                author = validate_author_disposition(
+                    wave.get("author_disposition"),
+                    subject_hash=fingerprint,
+                )
+                if author is None:
+                    raise ValueError("PLAN_REVIEW_STATE_INVALID: author_disposition is malformed or stale")
         seen.add(fingerprint)
     cycles_paid = value.get("cycles_paid", 0)
     if not isinstance(cycles_paid, int) or isinstance(cycles_paid, bool) or cycles_paid < 0:
@@ -1415,6 +1423,8 @@ def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),
         "wave_artifact": copy.deepcopy(wave.get("wave_artifact") or {}),
+        **({"author_disposition": copy.deepcopy(wave["author_disposition"])}
+           if isinstance(wave.get("author_disposition"), dict) else {}),
         **({"spec_source_ref": copy.deepcopy(wave["spec_source_ref"])} if wave.get("spec_source_ref") else {}),
         **({"reviewed_at": str(wave["reviewed_at"])} if wave.get("reviewed_at") else {}),
     }
@@ -1557,6 +1567,7 @@ def record_plan_review_dispositions(
     closure_notes: Optional[List[str]] = None,
     wave_artifact: Optional[Dict[str, Any]] = None,
     recorded_at: str = "",
+    author_disposition: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Store the agent's dispositions on one FULL wave and its resulting closure.
     Only note-only closed waves accept annotations. Closure authority remains
@@ -1577,6 +1588,14 @@ def record_plan_review_dispositions(
             wave["closure_notes"] = list(closure_notes)
         if wave_artifact is not None:
             wave["wave_artifact"] = copy.deepcopy(wave_artifact)
+        if author_disposition is not None:
+            author = validate_author_disposition(
+                author_disposition,
+                subject_hash=fingerprint,
+            )
+            if author is None:
+                raise ValueError("PLAN_REVIEW_AUTHOR_DISPOSITION_INVALID: stale or malformed record")
+            wave["author_disposition"] = author
         if closed and str(wave.get("aggregate") or "") == "REVIEW_REQUIRED":
             wave["closed"] = True
         state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}

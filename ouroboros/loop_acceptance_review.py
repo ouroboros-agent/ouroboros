@@ -593,6 +593,62 @@ def _apply_task_acceptance_result(
         ctx.emit_progress("Task acceptance review: PASS (clean acceptance).")
         return False
 
+    # Advisory author-finality: the first host panel still runs and its raw
+    # findings stay durable, but an explicit author stance ends the dialogue
+    # without forcing the improvement capsule through another reviewer round.
+    # This never mints PASS and is deliberately unavailable to Blocking, where
+    # the selected gate remains the authority.
+    author_stance = (
+        ctx.llm_trace.get("acceptance_decision", {})
+        if isinstance(ctx.llm_trace.get("acceptance_decision"), dict) else {}
+    )
+    author_disposition = str(author_stance.get("agent_disposition") or "").strip().lower()
+    if (
+        _loop().get_review_enforcement() == "advisory"
+        and author_disposition in {"accepted", "rejected", "partial", "deferred"}
+    ):
+        from ouroboros.review_records import build_author_disposition
+        try:
+            author_record = build_author_disposition(
+                disposition=author_disposition,
+                rationale=str(author_stance.get("agent_rationale") or "") or "Author finished the advisory review.",
+                subject_hash=str(
+                    ctx.review_binding.get("binding_hash")
+                    or ctx.review_binding.get("candidate_hash")
+                    or ctx.content
+                ),
+                reviewer_signal=str(result.aggregate_signal or "DEGRADED").upper(),
+                enforcement="advisory",
+            )
+        except ValueError:
+            author_record = {}
+        ctx.tools._ctx._task_acceptance_reviewed = True
+        _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
+        _loop()._mark_root_acceptance_checkpoint(
+            ctx.tools._ctx,
+            ctx.llm_trace,
+            status=str(result.aggregate_signal or "DEGRADED").lower(),
+            pass_index=ctx.passes_done,
+        )
+        _loop()._set_acceptance_decision(ctx.llm_trace, {
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": "author_finish",
+            "source": "task_acceptance_review",
+            "rationale": (
+                "The author explicitly finished the advisory acceptance dialogue; "
+                "raw reviewer findings remain recorded and no reviewer PASS was fabricated."
+            ),
+            "author_disposition": author_record or author_disposition,
+            "author_rationale": str(author_stance.get("agent_rationale") or ""),
+            "reviewer_signal": str(result.aggregate_signal or "DEGRADED").upper(),
+            "dissent_noted": bool(dissent),
+        })
+        ctx.emit_progress(
+            f"Task acceptance review: {result.aggregate_signal} — author finished advisory review "
+            f"({author_disposition}); raw findings retained."
+        )
+        return False
+
     if reused:
         return _refuse_identical_acceptance(
             ctx, result,

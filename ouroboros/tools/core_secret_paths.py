@@ -31,7 +31,17 @@ def is_restricted_subagent_profile(ctx: ToolContext) -> bool:
     # state. Acting children may WRITE their isolated surface but never read owner
     # secrets; the resource WRITE distinction lives in _local_readonly_resource_block.
     from ouroboros.tool_access import active_tool_profile
-    return active_tool_profile(ctx) in ("local_readonly_subagent", "acting_subagent")
+    profile = active_tool_profile(ctx)
+    if profile == "acting_subagent":
+        try:
+            from ouroboros.config import get_runtime_mode
+            from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+            if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
+                return False
+        except Exception:
+            pass
+    return profile in ("local_readonly_subagent", "acting_subagent")
 
 
 def _is_subagent_secret_data_path(norm: str) -> bool:

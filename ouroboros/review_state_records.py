@@ -341,6 +341,9 @@ class CommitAttemptRecord:
     # free text) were compacted because the preserved accounting row fell
     # outside the newest-50 ledger window (see _strip_attempt_heavy_payload).
     raw_stripped: bool = False
+    # Optional canonical author-finish stance for an advisory commit. Raw
+    # reviewer evidence remains in the same attempt row beside this record.
+    author_disposition: Dict[str, Any] = field(default_factory=dict)
 
 
 def _attempt_identity_tuple(attempt: CommitAttemptRecord) -> tuple[str, str, str, str]:

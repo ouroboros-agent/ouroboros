@@ -13,6 +13,11 @@ import pathlib
 import subprocess
 
 from ouroboros.contracts.skill_payload_policy import SKILL_OWNER_STATE_STEMS
+from ouroboros.runtime_mode_policy import (
+    PROTECTED_RUNTIME_PATHS,
+    mode_allows_protected_write,
+    runtime_mode_at_least,
+)
 
 import ouroboros.tools.registry_guards as registry_guards
 from ouroboros.tools.tool_result import (
@@ -506,8 +511,9 @@ def _run_shell_safety_check(
     # must use write_file/edit_text, which apply the pro+grant gate).
     acting_self_worktree = self._acting_self_worktree()
     acting_subagent = self._is_acting_subagent()
+    cyber_authority = runtime_mode_at_least(runtime_mode, "cyber_pro")
     argv = _registry().strip_leading_env_assignments(_registry().unwrap_env_argv(_registry().shell_argv(raw_cmd)))
-    if _registry().sudo_noninteractive_violation(raw_cmd):
+    if not cyber_authority and _registry().sudo_noninteractive_violation(raw_cmd):
         return ToolResult(
             status="blocked",
             code="SUDO_INTERACTIVE_BLOCKED",
@@ -518,7 +524,7 @@ def _run_shell_safety_check(
     while "//" in cmd_path_lower: cmd_path_lower = cmd_path_lower.replace("//", "/")
     # Subagents must not read owner secrets/credentials/control state via shell
     # (read_file already denies these). read_file is the gated inspection path.
-    if (acting_subagent or self._is_local_readonly_subagent()) and _subagent_shell_targets_secret(
+    if (acting_subagent or self._is_local_readonly_subagent()) and not cyber_authority and _subagent_shell_targets_secret(
             raw_cmd, ctx=self._ctx, cwd=getattr(binding, "target_path", None)):
         return ToolResult(
             status="blocked",
@@ -621,17 +627,17 @@ def _run_shell_safety_check(
     # detector takes the shared read-carve (pure read-only inspection of the
     # key/endpoint names is allowed; the write shape or any non-inspection
     # head still blocks) — the scope-floor precedent applied family-wide.
-    if _detect_runtime_mode_elevation(cmd_lower, writeish=writeish):
+    if not cyber_authority and _detect_runtime_mode_elevation(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart.")
-    if _detect_context_mode_self_lowering(cmd_lower, writeish=writeish):
+    if not cyber_authority and _detect_context_mode_self_lowering(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="CONTEXT_MODE_SELF_LOWERING_BLOCKED", text="⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped.")
-    if _detect_safety_mode_self_lowering(cmd_lower, writeish=writeish):
+    if not cyber_authority and _detect_safety_mode_self_lowering(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="SAFETY_MODE_SELF_LOWERING_BLOCKED", text="⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly.")
     if _detect_owner_skill_attest_self_call(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED", text="⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI.")
-    if _detect_mutative_toggle_self_change(cmd_lower, writeish=writeish):
+    if not cyber_authority and _detect_mutative_toggle_self_change(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents.")
-    if _detect_evolution_owner_control_self_change(cmd_lower, writeish=writeish):
+    if not cyber_authority and _detect_evolution_owner_control_self_change(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or steer self-modification cycles. Change them via the owner Settings UI, or stop the agent and edit settings.json directly — the agent must not self-set evolution controls.")
     if _mentions_skill_owner_state(cmd_lower, writeish=writeish):
         return ToolResult(
@@ -728,15 +734,41 @@ def _run_shell_safety_check(
                     ),
                 )
 
+    # Carry the structural write fact to the post-execution composer so a
+    # permitted Pro/Cyber shell rewrite gets the same CORE_PATCH_NOTICE as an
+    # editor write.  Do not infer this from words in the command after the
+    # fact; ``writeish`` is the shared write_shape result above.
+    self._ctx._protected_shell_notice_paths = (
+        [p for p in sorted(PROTECTED_RUNTIME_PATHS) if p.lower() in cmd_path_lower]
+        if mode_allows_protected_write(runtime_mode) and writeish
+        else []
+    )
+
+    structural_targets = [
+        str(target)
+        for row in target_rows
+        if len(row) > 1
+        for target in (row[1] or [])
+    ]
     if protected_shell := registry_guards._protected_shell_block(
         self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
+        runtime_mode,
+        structural_targets=structural_targets,
     ):
         return protected_shell
 
     # GitHub repo create/delete/auth — argv-positional, never substring (#447 A7).
     from ouroboros.git_shell_policy import gh_shell_block_reason
 
-    if gh_block := gh_shell_block_reason(raw_cmd):
+    try:
+        gh_block = gh_shell_block_reason(raw_cmd, runtime_mode=runtime_mode)
+    except TypeError as exc:
+        # Preserve the existing injectable policy seam for callers/tests that
+        # provide the legacy one-argument observer.
+        if "runtime_mode" not in str(exc):
+            raise
+        gh_block = gh_shell_block_reason(raw_cmd)
+    if gh_block:
         return ToolResult(status="blocked", code="SAFETY_VIOLATION", text=gh_block)
 
     return registry_guards._shell_git_and_runtime_block(

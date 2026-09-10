@@ -559,6 +559,15 @@ function planWaveDetail(wave) {
     }
     if (wave.findings_texts_truncated) lines.push('Some finding texts were truncated at capture.');
     if (wave.spec_body_truncated) lines.push('Spec body was truncated at capture.');
+    const author = wave.author_disposition;
+    if (author && typeof author === 'object' && text(author.disposition)) {
+        lines.push(
+            `Author finish: ${text(author.disposition)}${text(author.reviewer_signal) ? ` · reviewer signal=${text(author.reviewer_signal)}` : ''}`
+            + `${text(author.rationale) ? ` · ${text(author.rationale)}` : ''}`
+            + `${text(author.subject_hash) ? ` · reviewed_content_hash=${text(author.subject_hash)}` : ''}`
+            + `${text(author.source) ? ` · source=${text(author.source)}` : ''}`,
+        );
+    }
     return lines.filter(Boolean).join('\n');
 }
 
@@ -796,7 +805,11 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
             execution: null,
             detailRef: { surface: 'task_acceptance', url: panel.applied_source_status === 'available'
                 ? taskSourceDownloadUrl(owner, panel.applied_source_ref) : '' },
-            detailText: `${formatReviewProjection({ panels: [panel] })}\nCost unavailable`.trim(),
+            detailText: `${formatReviewProjection({ panels: [panel] })}
+${panel.author_disposition && typeof panel.author_disposition === 'object' && text(panel.author_disposition.disposition)
+    ? `Author finish: ${text(panel.author_disposition.disposition)}${text(panel.author_disposition.reviewer_signal) ? ` · reviewer signal=${text(panel.author_disposition.reviewer_signal)}` : ''}${text(panel.author_disposition.rationale) ? ` · ${text(panel.author_disposition.rationale)}` : ''}${text(panel.author_disposition.subject_hash) ? ` · reviewed_content_hash=${text(panel.author_disposition.subject_hash)}` : ''}${text(panel.author_disposition.source) ? ` · source=${text(panel.author_disposition.source)}` : ''}`
+    : ''}
+Cost unavailable`.trim(),
         };
     });
     const latest = attempts.at(-1);

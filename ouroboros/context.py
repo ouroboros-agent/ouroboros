@@ -471,7 +471,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "note": (
                 "allow_mutative_subagents is the MASTER gate (an explicit owner toggle "
                 "applies to every surface; when it is empty the runtime mode decides, "
-                "SURFACE-AWARE: advanced/pro allow every surface, light allows "
+                "SURFACE-AWARE: advanced/pro/cyber_pro allow every surface, light allows "
                 "external_workspace/genesis — they build outside the Ouroboros runtime — "
                 "and keeps self_worktree off). mutative_subagent_surfaces lists what is "
                 "actually schedulable RIGHT NOW. Read THIS before declaring you cannot "

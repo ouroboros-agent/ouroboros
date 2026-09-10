@@ -565,6 +565,7 @@ ACCEPTANCE_DECISION_REASONS = (
     "review_degraded",
     "fence_reopen_failed",
     "infra_failure",
+    "author_finish",
     # The pacing/wallet reason two branches below already STAMP (`pass_reason ==
     # REASON_REVIEW_CYCLES_EXHAUSTED`); it was missing from the closed set, so a
     # spent shared cap shipped a reason no reader could validate.

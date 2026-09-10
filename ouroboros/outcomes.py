@@ -620,6 +620,14 @@ def _acceptance_decision_projection(acceptance_decision: Dict[str, Any]) -> Dict
         "agent_disposition": str(acceptance_decision.get("agent_disposition") or ""),
         "agent_rationale": str(acceptance_decision.get("agent_rationale") or "")[:500],
     }
+    if acceptance_decision.get("reason") == "author_finish":
+        record = acceptance_decision.get("author_disposition")
+        if isinstance(record, dict):
+            out["author_disposition"] = dict(record)
+        else:
+            out["author_disposition"] = str(record or "")
+        out["author_rationale"] = str(acceptance_decision.get("author_rationale") or "")[:500]
+        out["reviewer_signal"] = str(acceptance_decision.get("reviewer_signal") or "")
     # v6.54.4: dissent + obligations transparency (blocking review policy).
     if acceptance_decision.get("dissent_noted"):
         out["dissent_noted"] = True

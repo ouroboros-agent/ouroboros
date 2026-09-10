@@ -181,6 +181,34 @@ def test_prose_words_are_not_write_shapes_for_interpreters():
     assert interpreter_write_shape(["python3", "-c", "f.truncate(0)"]) is True
 
 
+def test_python_inline_strings_and_comments_do_not_create_write_shape():
+    """Writer vocabulary is structural: API names in output text/comments are
+    not filesystem channels, while an actual redirect outside the body remains
+    visible to the shell lane."""
+    assert interpreter_write_shape(
+        ["python3", "-c", "print('BIBLE.md write_text'); # os.remove('/tmp/x')"]
+    ) is False
+    assert interpreter_write_shape(
+        "sh -c \"python3 -c 'print(\\\"BIBLE.md write_text\\\")'\""
+    ) is False
+    assert interpreter_write_shape(
+        "python3 -c \"print('BIBLE.md write_text')\" > report.txt"
+    ) is True
+
+
+def test_python_collection_constructor_remove_is_not_a_path_write():
+    """A list/tuple/set/dict constructor produces a collection receiver; an item
+    named like a protected file is not a filesystem target."""
+    from ouroboros.tools.shell_guards import writer_target_rows
+
+    command = [
+        "python3", "-c",
+        "xs = list(('BIBLE.md',)); xs.remove('BIBLE.md'); print(xs)",
+    ]
+    assert interpreter_write_shape(command) is False
+    assert writer_target_rows(command)[0][1] == []
+
+
 # --- guard layer: workspace lanes ------------------------------------------
 
 

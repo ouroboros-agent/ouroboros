@@ -72,3 +72,16 @@ test('provider actions use the shared status-first action row contract', () => {
         assert.match(row, /aria-live="polite"/);
     }
 });
+
+test('access, supervisor, and review remain independent owner controls', () => {
+    const html = renderSettingsPage();
+    assert.match(html, /id="s-runtime-mode"/);
+    assert.match(html, /id="s-safety-mode"/);
+    assert.match(html, /id="s-review-enforcement"/);
+    assert.match(html, /data-policy-state="access"/);
+    assert.match(html, /data-policy-state="supervisor"/);
+    assert.match(html, /data-policy-state="review"/);
+    assert.match(html, /data-effort-value="cyber_pro">Cyber Pro</);
+    assert.match(html, /data-effort-value="blocking">Blocking</);
+    assert.match(html, /Review Enforcement remains independent[\s\S]*Blocking.*available in Cyber Pro/);
+});

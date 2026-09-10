@@ -84,11 +84,13 @@ def resolve_prompt_cache_ttl() -> str:
     return raw if raw in PROMPT_CACHE_TTL_SCALE else default
 
 
-# Runtime mode and review enforcement are separate axes.
-VALID_RUNTIME_MODES = ("light", "advanced", "pro")
+# Runtime mode and review enforcement are separate axes.  ``cyber_pro`` is the
+# owner-selected high-power access level; it remains an ordinary member of the
+# same closed scale so every consumer shares one vocabulary and rank.
+VALID_RUNTIME_MODES = ("light", "advanced", "pro", "cyber_pro")
 
 # Lower rank = stricter scope. ``save_settings`` refuses agent self-elevation.
-_RUNTIME_MODE_RANK = {"light": 0, "advanced": 1, "pro": 2}
+_RUNTIME_MODE_RANK = {"light": 0, "advanced": 1, "pro": 2, "cyber_pro": 3}
 
 
 def normalize_runtime_mode(value: Any) -> str:

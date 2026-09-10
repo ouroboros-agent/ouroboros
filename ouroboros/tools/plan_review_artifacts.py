@@ -184,6 +184,8 @@ def plan_review_authority_core(
             "identity": {key: copy.deepcopy(latest[key]) for key in ("cycle_index", "request_fingerprint", "previous_fingerprint", "spec_hash", "evidence_manifest_hash", "aggregate", "closed", "paid") if key in latest},
             "goal": spec.get("goal"), "acceptance_claims": recent(spec.get("acceptance_claims")),
             "findings": recent(latest.get("findings")), "dispositions": recent(latest.get("dispositions")),
+            "author_disposition": copy.deepcopy(latest.get("author_disposition"))
+            if isinstance(latest.get("author_disposition"), dict) else None,
         }
         core["waves"] = [_compact_plan_review_wave(wave) if isinstance(wave, dict) and not wave.get("compact") else wave for wave in core["waves"]]
         core["need_evidence_seen"] = recent(core.get("need_evidence_seen"))

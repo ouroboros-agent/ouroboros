@@ -33,6 +33,16 @@ _MISSING_EXECUTABLE_RE = re.compile(r"Executable doesn't exist at ([^\n]+)")
 _SUPPORTED_BROWSER_ENGINES = frozenset({"chromium", "webkit"})
 
 
+def _runtime_mode_for_browser(ctx: Any) -> str:
+    """Read the effective mode for owner-control browser operations."""
+    try:
+        from ouroboros.config import get_runtime_mode
+
+        return get_runtime_mode()
+    except Exception:
+        return "advanced"
+
+
 def _normalize_browser_engine(engine: str = "") -> str:
     value = str(engine or "chromium").strip().lower()
     if value not in _SUPPORTED_BROWSER_ENGINES:
@@ -445,7 +455,8 @@ def _ensure_browser(ctx: ToolContext, *, engine: str = "chromium", device: str =
     def route_request(route: Any) -> None:
         try:
             reason = browser_policy.browser_request_block_reason(
-                route.request, ctx, restricted=readonly_subagent)
+                route.request, ctx, restricted=readonly_subagent,
+                runtime_mode=_runtime_mode_for_browser(ctx))
         except Exception:
             log.warning("Browser request policy could not read target identity", exc_info=True)
             reason = "BROWSER_POLICY_UNAVAILABLE: runtime service identity could not be read"
@@ -1000,7 +1011,10 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
         elif normalized_action == "evaluate":
             if not value:
                 return "Error: value (JS code) required for evaluate"
-            if reason := browser_policy.browser_evaluate_block_reason(str(getattr(page, "url", "") or ""), value, ctx):
+            if reason := browser_policy.browser_evaluate_block_reason(
+                str(getattr(page, "url", "") or ""), value, ctx,
+                runtime_mode=_runtime_mode_for_browser(ctx),
+            ):
                 return reason
             try:
                 result = _evaluate_bounded(page, value, effective_default_ms)

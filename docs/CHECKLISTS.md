@@ -42,6 +42,11 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
   missing advisory provider) leaves a durable trace: a `review_advisory_override`
   event in `events.jsonl` plus the persistent `advisory_overrides_count` /
   recent-overrides fields in `review_status`. Silent advisory is forbidden.
+- **Author finality remains evidence, not reviewer PASS:** plan, task acceptance,
+  skill, and commit owners may record an explicit author disposition against the
+  exact current subject hash under advisory enforcement. Raw reviewer findings
+  and technical failures remain beside that record; stale or malformed hashes
+  are rejected, and Blocking enforcement keeps its own gate.
 - Once advisory is fresh → call commit_reviewed immediately without further edits.
 - `skip_advisory_review=True` skips only advisory freshness and the
   obligation/debt admission attached to it. Use LLM judgment when this cheap

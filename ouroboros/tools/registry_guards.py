@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.tools.tool_result import ToolResult
 from ouroboros.tools.write_shape import _no_deliverables_decision, _workspace_write_candidates
+from ouroboros.runtime_mode_policy import (
+    mode_allows_protected_write,
+    protected_bible_history_delete_reason,
+)
 
 if TYPE_CHECKING:  # annotation-only imports (inert at runtime)
     from ouroboros.contracts.task_constraint import TaskConstraint
@@ -170,7 +174,10 @@ def _subagent_and_update_guard_result(
             "Nested readonly delegation is allowed only through schedule_subagent "
             "within configured depth/cap limits."
         ))
-    if acting_subagent and entry is not None and name not in _registry().ACTING_SUBAGENT_TOOL_NAMES:
+    from ouroboros.tool_capabilities import acting_tool_names_for_context
+
+    acting_allowed_names = acting_tool_names_for_context(registry._ctx)
+    if acting_subagent and entry is not None and name not in acting_allowed_names:
         return ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
             "⚠️ ACTING_SUBAGENT_BLOCKED: this mutative subagent may read and "
             "write inside its assigned write root and run shell/services "
@@ -880,6 +887,7 @@ def _external_shell_runtime_or_secret_block(
 
 def _protected_shell_block(
     self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
+    runtime_mode: str = "", *, structural_targets: list[str] | None = None,
 ) -> ToolResult | None:
     """Apply payload/core write guards to the selected physical target."""
     items = _registry()._binding_items(binding)
@@ -907,9 +915,23 @@ def _protected_shell_block(
                 "payload files instead."
             ),
         )
+    if reason := protected_bible_history_delete_reason(
+        raw_cmd, extra_paths=structural_targets or (), protect_bible=targets_system,
+        identity_path=pathlib.Path(self._ctx.drive_root) / "memory" / "identity.md",
+        cwd=pathlib.Path(getattr(binding, "target_path", None) or self._ctx.repo_dir),
+    ):
+        return ToolResult(
+            status="blocked",
+            code="SAFETY_VIOLATION",
+            text=f"⚠️ SAFETY_VIOLATION: {reason}",
+        )
     if _authorized_managed_update_resolver(self._ctx):
         return None
-    if targets_system and _registry().shell_writer_targets_protected(raw_cmd):
+    if (
+        targets_system
+        and _registry().shell_writer_targets_protected(raw_cmd)
+        and not mode_allows_protected_write(runtime_mode)
+    ):
         return ToolResult(
             status="blocked",
             code="SAFETY_VIOLATION",
@@ -919,7 +941,7 @@ def _protected_shell_block(
                 + ", ".join(sorted(_registry().PROTECTED_RUNTIME_PATHS))
             ),
         )
-    if targets_system:
+    if targets_system and not mode_allows_protected_write(runtime_mode):
         for cf in _registry().PROTECTED_RUNTIME_PATHS_LOWER:
             # The MODE-AWARE composition fact, not the coarse legacy scan: a
             # pure read that merely mentions a protected name (`grep -n delete
@@ -1071,8 +1093,15 @@ def _workspace_shell_write_block(
     # The root's existing user_files authority is independent of cwd.
     # Acting children retain their isolated write surface in every mode.
     pro_workspace_passthrough = (
-        str(runtime_mode or "").strip().lower() == "pro" and not acting_subagent
+        mode_allows_protected_write(runtime_mode) and not acting_subagent
     )
+    if acting_subagent:
+        try:
+            from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+            pro_workspace_passthrough = runtime_mode_at_least(runtime_mode, "cyber_pro")
+        except Exception:
+            pass
     protected_roots = [
         getattr(self._ctx, "system_repo_dir", None) or getattr(self._ctx, "repo_dir", None),
         getattr(self._ctx, "drive_root", None),
@@ -1272,7 +1301,17 @@ def _shell_git_and_runtime_block(
         # write-aware — `is_readonly_git_command` refuses `--output=` and
         # `--no-index`, so neither a runtime write nor a settings dump
         # can ride "read-only git".
-        if _registry().is_external_workspace(self._ctx) and not is_readonly_git_command(raw_cmd):
+        cyber_authority = False
+        try:
+            from ouroboros.config import get_runtime_mode
+            from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+            cyber_authority = self._is_acting_subagent() and runtime_mode_at_least(
+                get_runtime_mode(), "cyber_pro"
+            )
+        except Exception:
+            pass
+        if _registry().is_external_workspace(self._ctx) and not is_readonly_git_command(raw_cmd) and not cyber_authority:
             if ext_block := _external_shell_runtime_or_secret_block(
                 self, raw_cmd, cmd_path_lower, args, work_dir=work_dir,
                 binding=binding,

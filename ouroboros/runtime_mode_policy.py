@@ -8,9 +8,199 @@ triad + scope review gate.
 
 from __future__ import annotations
 
+import ast
 import pathlib
+import shlex
 from dataclasses import dataclass
 from typing import Iterable
+
+from ouroboros.settings_scales import _RUNTIME_MODE_RANK
+
+
+def runtime_mode_rank(runtime_mode: str) -> int:
+    """Return the ordered runtime-mode rank without duplicating the vocabulary.
+
+    ``settings_scales`` is the owner of the persisted enum and rank. Unknown
+    values remain below every known mode.
+    """
+    return int(_RUNTIME_MODE_RANK.get(str(runtime_mode or "").strip().lower(), -1))
+
+
+def runtime_mode_at_least(runtime_mode: str, minimum: str) -> bool:
+    """Whether ``runtime_mode`` meets the named ordered capability floor."""
+    mode_rank = runtime_mode_rank(runtime_mode)
+    minimum_rank = runtime_mode_rank(minimum)
+    return mode_rank >= 0 and minimum_rank >= 0 and mode_rank >= minimum_rank
+
+
+def protected_bible_history_delete_reason(
+    raw_cmd: object, *, extra_paths: Iterable[str] = (),
+    protect_bible: bool = True, identity_path: pathlib.Path | None = None,
+    cwd: pathlib.Path | None = None,
+) -> str:
+    """Return a refusal for physical BIBLE deletion or repository history rewrites.
+
+    This is deliberately a small argv/verb predicate at the existing shell
+    guard seam.  It does not classify arbitrary content or restrict ordinary
+    ``rm`` commands elsewhere.
+    """
+    try:
+        from ouroboros.shell_parse import collect_leading_env, shell_segments
+
+        delete_heads = {"rm", "unlink", "mv"}
+        history_verbs = {
+            "filter-branch", "filter-repo", "checkout", "restore", "read-tree",
+            "update-index", "reset", "commit", "rebase", "replace",
+        }
+
+        def _protected_target(candidate: str) -> bool:
+            path = pathlib.Path(candidate.replace("\\", "/"))
+            if protect_bible and path.name.casefold() == "bible.md":
+                return True
+            return bool(identity_path is not None and (
+                (cwd or pathlib.Path.cwd()) / path
+            ).resolve(strict=False) == identity_path.resolve(strict=False))
+
+        def _bible_path(
+            words: list[str], *, path_flag_only: bool = False,
+            extra: Iterable[str] = (),
+        ) -> bool:
+            """Recognize an explicit BIBLE.md path, including --path= forms."""
+            candidates: list[str] = []
+            expect_value = False
+            for word in words:
+                token = str(word).strip("'\"")
+                if expect_value:
+                    candidates.append(token)
+                    expect_value = False
+                    continue
+                if token in {"--path", "--path-file", "--paths"}:
+                    expect_value = True
+                    continue
+                if token.startswith("--path="):
+                    candidates.append(token.split("=", 1)[1])
+                    continue
+                if not path_flag_only:
+                    candidates.append(token)
+            return any(
+                _protected_target(candidate)
+                for candidate in (*candidates, *(str(path) for path in (*extra_paths, *extra)))
+            )
+
+        def _python_delete_paths(body: str) -> list[str]:
+            """Extract literal targets of structural Python deletion calls."""
+            try:
+                from ouroboros.tools.shell_guards import python_body_ast
+
+                tree = python_body_ast(body)
+                if tree is None:
+                    return []
+                found: list[str] = []
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    func = node.func
+                    deletion = False
+                    if isinstance(func, ast.Attribute):
+                        attr = str(func.attr or "")
+                        receiver = func.value
+                        if attr in {"remove", "unlink", "rmtree", "removedirs"}:
+                            deletion = (
+                                isinstance(receiver, ast.Name)
+                                and receiver.id in {"os", "shutil"}
+                            ) or (
+                                isinstance(receiver, ast.Call)
+                                and isinstance(receiver.func, ast.Name)
+                                and receiver.func.id in {"Path", "PurePath"}
+                            )
+                        if attr in {"run", "call", "check_call", "check_output", "Popen"}:
+                            deletion = any(
+                                isinstance(item, ast.Constant)
+                                and str(item.value).strip().lower() in {"rm", "unlink"}
+                                for item in ast.walk(node)
+                            )
+                            for item in ast.walk(node):
+                                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                                    continue
+                                try:
+                                    tokens = shlex.split(item.value)
+                                except ValueError:
+                                    continue
+                                if tokens and pathlib.PurePath(tokens[0]).name.lower() in {"rm", "unlink", "mv"}:
+                                    deletion = True
+                                    found.extend(tokens[1:])
+                    if isinstance(func, ast.Name) and func.id in {"remove", "unlink"}:
+                        deletion = True
+                    if deletion:
+                        found.extend(
+                            str(item.value)
+                            for item in ast.walk(node)
+                            if isinstance(item, ast.Constant)
+                            and isinstance(item.value, str)
+                        )
+                return found
+            except Exception:
+                return []
+
+        for segment in shell_segments(raw_cmd):
+            _env, argv = collect_leading_env(segment)
+            if not argv:
+                continue
+            head = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
+            words = [str(item).replace("\\", "/") for item in argv[1:]]
+            if head in {"sh", "bash", "zsh"}:
+                nested = ""
+                for index, word in enumerate(words[:-1]):
+                    if word in {"-c", "--command"}:
+                        nested = words[index + 1]
+                        break
+                if nested:
+                    nested_reason = protected_bible_history_delete_reason(
+                        nested, extra_paths=extra_paths, protect_bible=protect_bible,
+                        identity_path=identity_path, cwd=cwd,
+                    )
+                    if nested_reason:
+                        return nested_reason
+                    continue
+            bible = _bible_path(words)
+            if head in delete_heads and bible:
+                label = "IDENTITY" if any(
+                    pathlib.PurePath(word.strip("'\"")).name.casefold() == "identity.md"
+                    for word in words
+                ) else "BIBLE"
+                return f"{label}_DELETE_BLOCKED: protected identity history must remain physically present."
+            if head == "git":
+                verbs = [word.lower() for word in words if not word.startswith("-")]
+                if verbs and verbs[0] in {"rm", "mv"} and bible:
+                    label = "IDENTITY" if any(
+                        pathlib.PurePath(word.strip("'\"")).name.casefold() == "identity.md"
+                        for word in words
+                    ) else "BIBLE"
+                    return f"{label}_DELETE_BLOCKED: git rm/git mv cannot remove or rename protected identity files."
+                if verbs and verbs[0] in history_verbs and _bible_path(
+                    words, path_flag_only=(verbs[0] in {"filter-branch", "filter-repo"})
+                ):
+                    return "BIBLE_HISTORY_REWRITE_BLOCKED: BIBLE history must remain physically recoverable."
+            head_name = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
+            if head_name.startswith(("python", "python3")):
+                try:
+                    from ouroboros.tools.shell_guards import interpreter_inline_code
+
+                    for body in interpreter_inline_code([str(item) for item in argv]):
+                        deleted = _python_delete_paths(body)
+                        if any(
+                            _protected_target(str(path))
+                            for path in deleted
+                        ):
+                            target = "identity.md" if any(
+                                pathlib.PurePath(path).name.casefold() == "identity.md" for path in deleted
+                            ) else "bible.md"
+                            return f"{target.upper().replace('.MD', '')}_DELETE_BLOCKED: protected identity history must remain physically present."
+                except Exception:
+                    pass
+        return ""
+    except Exception:
+        return ""
 
 
 SAFETY_CRITICAL_PATHS = frozenset({
@@ -168,7 +358,7 @@ def protected_paths_in(paths: Iterable[str]) -> list[ProtectedPath]:
 
 
 def mode_allows_protected_write(runtime_mode: str) -> bool:
-    return str(runtime_mode or "").strip().lower() == "pro"
+    return runtime_mode_at_least(runtime_mode, "pro")
 
 
 def format_protected_paths(paths: Iterable[ProtectedPath | str]) -> str:
@@ -193,17 +383,18 @@ def protected_write_block_message(
 ) -> str:
     norm = normalize_repo_path(path)
     category = protected_path_category(norm)
+    target_modes = "runtime_mode='pro' or 'cyber_pro'" if str(runtime_mode).strip().lower() == "cyber_pro" else "runtime_mode='pro'"
     return (
         f"⚠️ CORE_PROTECTION_BLOCKED: runtime_mode={runtime_mode!r} refuses "
         f"to {action} protected {category or 'core'} path: {norm}. "
-        "Switch to runtime_mode='pro' and let the normal triad + scope review "
+        f"Switch to {target_modes} and let the normal triad + scope review "
         "cover the protected core/contract/release change before commit."
     )
 
 
 def core_patch_notice(paths: Iterable[ProtectedPath | str]) -> str:
     return (
-        "⚠️ CORE_PATCH_NOTICE: runtime_mode='pro' is editing protected "
+        "⚠️ CORE_PATCH_NOTICE: runtime_mode='pro' or 'cyber_pro' is editing protected "
         "Ouroboros core/contract/release surface(s): "
         f"{format_protected_paths(paths)}. These changes can be committed only "
         "through the normal triad + scope review pipeline."

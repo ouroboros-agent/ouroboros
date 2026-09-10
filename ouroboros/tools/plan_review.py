@@ -90,6 +90,7 @@ from ouroboros.tools.plan_review_references import (
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tools.review_helpers import review_wave_binding_fence, review_wave_budget_gate
+from ouroboros.review_records import build_author_disposition_from_mapping
 from ouroboros.tools.review_synthesis import (
     PLAN_REVIEW_CONTROL_PREFIX,
 )
@@ -104,7 +105,6 @@ log = logging.getLogger(__name__)
 def _plan_review_wrapper_timeout_sec() -> float:
     return float(get_llm_transport_read_timeout_sec() + get_finalization_grace_sec())
 
-
 def _plan_task_tool_timeout_sec() -> float:
     # ``agent_session`` reviewers inherit the task's existing absolute
     # lifetime, which is deliberately much longer than an API transport read.
@@ -116,13 +116,11 @@ def _plan_task_tool_timeout_sec() -> float:
     ) + get_finalization_grace_sec()
 _TASK_EVIDENCE_RESULT_CHARS = 6_000
 
-
 @dataclass(frozen=True)
 class _PlanRequest:
     goal: str
     plan: str
     spec: Any
-
 
 _SPEC_SCHEMA = {
     "type": "object",
@@ -210,6 +208,7 @@ _DISPOSITION_SCHEMA = {
     ),
     "properties": {
         "review_fingerprint": {"type": "string"},
+        "author_disposition": plan_spec.AUTHOR_DISPOSITION_SCHEMA,
         "items": {
             "type": "array",
             "items": {
@@ -225,7 +224,6 @@ _DISPOSITION_SCHEMA = {
     },
     "required": ["review_fingerprint", "items"],
 }
-
 
 def get_tools():
     return [
@@ -266,12 +264,9 @@ def get_tools():
         )
     ]
 
-
 # --------------------------------------------------------------------------- handler
 
-
 _SPEC_FIELDS = frozenset(_SPEC_SCHEMA["properties"])
-
 
 def _vacuous(name: str, value: object) -> bool:
     """Nothing was said in this optional envelope field: absent, blank prose, or the
@@ -284,7 +279,6 @@ def _vacuous(name: str, value: object) -> bool:
                 and all(member in (None, "", []) for member in value.values()))
     return isinstance(value, str) and not value.strip()
 
-
 def _vacuous_disposition(value: object) -> bool:
     """A schema-shaped but empty disposition (models fill optional objects with defaults).
     An UNKNOWN key or a non-empty items list is never vacuous: refused, not ignored."""
@@ -292,12 +286,10 @@ def _vacuous_disposition(value: object) -> bool:
         return False
     return not str(value.get("review_fingerprint") or "").strip() and not value.get("items")
 
-
 def _typed_refusal(ctx: ToolContext, code: str, text: str) -> str:
     """Publish a refusal the producer ALREADY knows about (D02). The text ABI is
     unchanged; only the registry-visible status stops reading as a successful call."""
     return _publish_tool_result(ctx, ToolResult(status=TOOL_CODE_SPECS[code].status, code=code, text=text))
-
 
 def _handle_plan_task(ctx: ToolContext, **params) -> str:
     raw_disposition = params.get("review_disposition")
@@ -350,11 +342,9 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         log.error("plan_task failed: %s", e, exc_info=True)
         return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")
 
-
 # A FAULT of this call (broken review, unreadable authority); every other reason — budget,
 # configuration, context — is an availability outcome typed `unavailable`, never a fake success.
 _PLAN_FAULT_REASONS = frozenset({"review_failed", "plan_review_exact_artifact_unavailable", "plan_review_custody_invalid"})
-
 
 def _plan_unavailable(ctx: ToolContext, message: str, reason: str) -> str:
     """Persist a retryable availability outcome (the current fingerprint stays open-unavailable)."""
@@ -368,7 +358,6 @@ def _plan_unavailable(ctx: ToolContext, message: str, reason: str) -> str:
             ctx, "TOOL_ERROR", f"{message}\nERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}")
     return _typed_refusal(ctx, code, message)
 
-
 def _planning_state_location(ctx: ToolContext) -> tuple[pathlib.Path, str]:
     root = pathlib.Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
@@ -376,9 +365,7 @@ def _planning_state_location(ctx: ToolContext) -> tuple[pathlib.Path, str]:
         raise ValueError("PLAN_REVIEW_TASK_ID_REQUIRED: durable review state must belong to a real task")
     return root, task_id
 
-
 # ------------------------------------------------------------------- inputs / packet
-
 
 def _evidence_deny_paths(ctx: ToolContext) -> list[str]:
     """Paths evidence may never attach, whatever root the caller declares (C-06): the runtime
@@ -401,14 +388,12 @@ def _evidence_deny_paths(ctx: ToolContext) -> list[str]:
         pass
     return out
 
-
 def _plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
     """Identity of one review request (F4): goal, prose, canonical spec, evidence identity,
     the constitutional fact — never the exploration log (it changes no obligation)."""
     payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
                "constitutional": bool(constitutional)}
     return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-
 
 def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
     """Task-result projection; the evidence resolver hashes, budgets and redacts it."""
@@ -431,11 +416,9 @@ def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
         return json.dumps(projection, ensure_ascii=False, indent=2, default=str)
     return _read
 
-
 # W3 host attachment is bounded like the agent's own evidence list (MAX_LIST_ITEMS honoured
 # locators per task); what the cap drops is a NAMED `reviewer_request_cap` omission, never silent.
 _REVIEWER_REQUEST_CAP = plan_spec.MAX_LIST_ITEMS
-
 
 def _reviewer_requested_locators(ctx: ToolContext, state_root: pathlib.Path) -> tuple[list[str], list[str]]:
     """``(honoured, dropped)`` `need_evidence` locators from this task's earlier cycles
@@ -460,7 +443,6 @@ def _reviewer_requested_locators(ctx: ToolContext, state_root: pathlib.Path) -> 
         else:
             seen.append(loc)
     return seen, dropped
-
 
 def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: pathlib.Path) -> dict:
     """The ONE preamble the paid path and the dry-run seam share: normalize the spec (with the
@@ -525,9 +507,7 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         "fingerprint": fingerprint,
     }
 
-
 # --------------------------------------------------------------------------- review
-
 
 async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str:
     try:
@@ -781,13 +761,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         aggregate, agg["counts"], cycles_paid=paid_now, cap=cap))
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder)
 
-
 def _last_paid_wave(state: dict) -> Optional[dict]:
     for wave in reversed(state.get("waves") or []):
         if wave.get("paid") and not wave.get("compact"):
             return wave
     return None
-
 
 def build_plan_review_packet_for_dry_run(ctx: ToolContext, request: "_PlanRequest") -> dict:
     """Assemble the packet SHAPE of a fresh cycle (cycle_index=1, no prior-cycle section) with the
@@ -812,7 +790,6 @@ def build_plan_review_packet_for_dry_run(ctx: ToolContext, request: "_PlanReques
         "manifest": prepared["manifest"], "system_prompt": system_prompt,
         "user_content": user_content, "fingerprint": prepared["fingerprint"],
     }
-
 
 def _cycles_exhausted(
     ctx: ToolContext, state: dict, state_root: pathlib.Path, task_id: str, *,
@@ -891,15 +868,13 @@ def _cycles_exhausted(
     return _publish_plan_review_projection(
         ctx, {"aggregate_signal": "REVISE_PLAN", "closed": False}, text)
 
-
 # ---------------------------------------------------------------------- disposition
-
 
 def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
     def _bad(text: str) -> str:  # every refusal below is an argument-shape refusal
         return _typed_refusal(ctx, "TOOL_ARG_ERROR", text)
 
-    unknown = sorted(str(k) for k in disposition if k not in {"review_fingerprint", "items"})
+    unknown = sorted(str(k) for k in disposition if k not in {"review_fingerprint", "items", "author_disposition"})
     if unknown:
         return _bad("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: unknown fields: " + ", ".join(unknown))
     fingerprint = str(disposition.get("review_fingerprint") or "").strip()
@@ -950,6 +925,17 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             "decision": str(item.get("decision") or "").strip().lower()[:40],  # enum-like, bounded
             "rationale": plan_spec.bounded_text(item.get("rationale"), plan_spec.MAX_FINDING_TEXT_CHARS),
         })
+    author_record = None
+    if disposition.get("author_disposition") is not None:
+        if enforcement != "advisory":
+            return _bad(
+                "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: author_disposition is advisory-only; "
+                "the selected blocking enforcement remains authoritative"
+            )
+        try:
+            author_record = build_author_disposition_from_mapping(disposition["author_disposition"], subject_hash=fingerprint, reviewer_signal=str(wave.get("aggregate") or ""), enforcement=enforcement)
+        except ValueError as exc:
+            return _bad("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: " + str(exc))
     known = {str(f.get("finding_id") or "") for f in wave.get("findings") or []}
     unknown_ids = sorted({i["finding_id"] for i in items if i["finding_id"] not in known})
     if unknown_ids:
@@ -973,11 +959,14 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             "disposition_recorded_at": disposition_recorded_at,
             "supersedes_wave_artifact": prior_ref,
         })
+        if author_record is not None:
+            exact["author_disposition"] = author_record
         disposition_ref = _persist_plan_review_wave_artifact(root, task_id, exact)
         stored = record_plan_review_dispositions(
             root, task_id, fingerprint=fingerprint, dispositions=items,
             closed=bool(closure["closed"]), closure_notes=closure_notes,
             wave_artifact=disposition_ref, recorded_at=disposition_recorded_at,
+            author_disposition=author_record,
         )
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(
@@ -989,6 +978,5 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
     )
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=cycles_paid,
                                   enforcement=enforcement, notes=list(closure["notes"]))
-
 
 # ------------------------------------------------------------------------ rendering

@@ -113,6 +113,32 @@ function setButtonBusy(button, busy) {
     else button.removeAttribute('aria-busy');
 }
 
+function policyValueLabel(value) {
+    const labels = {
+        light: 'Light', advanced: 'Advanced', pro: 'Pro', cyber_pro: 'Cyber Pro',
+        full: 'Full', off: 'Off', advisory: 'Advisory', blocking: 'Blocking',
+    };
+    return labels[String(value || '').trim().toLowerCase()] || String(value || 'Unknown');
+}
+
+function syncPolicyState(root, meta) {
+    const state = meta?.policy_state;
+    if (!state) return;
+    const render = (key, text) => {
+        const node = root?.querySelector(`[data-policy-state="${key}"]`);
+        if (node) node.textContent = text;
+    };
+    const access = state.access || {};
+    render('access', access.restart_required
+        ? `Saved: ${policyValueLabel(access.configured)} · Current process: ${policyValueLabel(access.current_process || access.effective)} · Next task: ${policyValueLabel(access.next_task || access.configured)} · Restart required`
+        : `Current process: ${policyValueLabel(access.current_process || access.effective)} · Next task: ${policyValueLabel(access.next_task || access.configured)}`);
+    const suffix = (item) => item.active_task_snapshot
+        ? `Saved: ${policyValueLabel(item.configured)} · Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)} · Current task keeps its start snapshot`
+        : `Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)}`;
+    render('supervisor', suffix(state.supervisor || {}));
+    render('review', suffix(state.review || {}));
+}
+
 function readInt(id, fallback) {
     const value = parseInt(byId(id).value, 10);
     return Number.isNaN(value) ? fallback : value;
@@ -606,6 +632,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         resetSecretClearFlags(page);
         syncEffortSegments(page);
         syncRuntimeModeBridgeState();
+        syncPolicyState(page, s?._meta);
         syncPostTaskEvolutionUi();
         refreshSafetySkipCounter();  // fire-and-forget; fills the 24h audited-skip note
     }

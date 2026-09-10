@@ -963,6 +963,37 @@ test('task acceptance adapts only task_acceptance panels; advisory and commit st
     assert.deepEqual(reviewGroupsFromTaskDetail(detail).map((item) => item.surface), ['task_acceptance']);
 });
 
+test('author finish is shown beside raw reviewer signal without becoming PASS', () => {
+    const fingerprint = 'a'.repeat(64);
+    const plan = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint, status: 'closed' },
+            waves: [{
+                request_fingerprint: fingerprint,
+                aggregate: 'REVIEW_REQUIRED',
+                closed: true,
+                author_disposition: {
+                    disposition: 'partial',
+                    rationale: 'Fixed the defect and deferred cosmetic notes.',
+                    reviewer_signal: 'REVIEW_REQUIRED',
+                    subject_hash: fingerprint,
+                },
+            }],
+        },
+    });
+    const attemptKey = `${plan.id}:${plan.attempts[0].id}`;
+    const html = renderReviewsSection([plan], {
+        sectionExpanded: true,
+        expandedGroups: new Set([plan.id]),
+        expandedAttempts: new Set([attemptKey]),
+    });
+    assert.match(html, /Author finish: partial/);
+    assert.match(html, /reviewer signal=REVIEW_REQUIRED/);
+    assert.match(html, /Fixed the defect and deferred cosmetic notes/);
+    assert.match(html, /REVIEW_REQUIRED/);
+});
+
 test('renderer is quiet, accessible and never invents review dollars', () => {
     const group = reviewGroupFromHistoryRow(groupedSkillRow());
     const html = renderReviewsSection([group], {

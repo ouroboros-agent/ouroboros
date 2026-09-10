@@ -331,7 +331,12 @@ def get_allow_mutative_subagents(write_surface: str = "") -> bool:
         return True
     if text in {"0", "false", "no", "off"}:
         return False
-    if get_runtime_mode() in {"advanced", "pro"}:
+    # Runtime modes are ordered in settings_scales.  Keep this scheduling
+    # decision on the shared rank seam so a higher-power mode such as Cyber Pro
+    # cannot silently fall through to Light's self-worktree default.
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+    if runtime_mode_at_least(get_runtime_mode(), "advanced"):
         return True
     surface = str(write_surface or "").strip().lower()
     # Unset + light (or unknown mode): allowed for the external build surfaces,

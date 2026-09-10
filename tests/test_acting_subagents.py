@@ -113,6 +113,86 @@ def test_profile_normal_task_is_self_modification(tmp_path):
     assert active_tool_profile(ctx) == "self_modification"
 
 
+def _enable_cyber_mode_for_test(monkeypatch):
+    import ouroboros.config as config
+    import ouroboros.runtime_mode_policy as policy
+    import ouroboros.settings_scales as scales
+
+    monkeypatch.setattr(scales, "VALID_RUNTIME_MODES", (*scales.VALID_RUNTIME_MODES, "cyber_pro"))
+    monkeypatch.setattr(config, "VALID_RUNTIME_MODES", (*config.VALID_RUNTIME_MODES, "cyber_pro"))
+    monkeypatch.setitem(policy._RUNTIME_MODE_RANK, "cyber_pro", 3)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+
+
+def test_cyber_acting_child_inherits_owner_resource_matrix(tmp_path, monkeypatch):
+    from ouroboros.tool_access import decide_tool_access
+
+    _enable_cyber_mode_for_test(monkeypatch)
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(mode="acting_subagent", surface="external_workspace"),
+    )
+    assert active_tool_profile(ctx) == "acting_subagent"
+    assert decide_tool_access(
+        profile="acting_subagent", root="user_files", operation="write",
+    ).allow
+    assert decide_tool_access(
+        profile="acting_subagent", root="task_drive", operation="shell",
+    ).allow
+    assert not decide_tool_access(
+        profile="local_readonly_subagent", root="user_files", operation="write",
+    ).allow
+
+
+def test_cyber_acting_child_can_use_owner_credential_file_path(tmp_path, monkeypatch):
+    from ouroboros.tool_access_user_files import user_files_path_block_reason
+
+    _enable_cyber_mode_for_test(monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(mode="acting_subagent", surface="external_workspace"),
+    )
+    credential = home / ".ssh" / "id_rsa"
+    credential.parent.mkdir()
+    credential.write_text("owner key", encoding="utf-8")
+    assert user_files_path_block_reason(ctx, credential, operation="write") == ""
+    readonly_root = tmp_path / "readonly"
+    readonly_root.mkdir()
+    readonly = _profile_ctx(
+        readonly_root,
+        constraint=TaskConstraint(mode="local_readonly_subagent"),
+    )
+    assert user_files_path_block_reason(readonly, credential, operation="write")
+
+
+def test_cyber_acting_registry_exposes_review_skill_and_runtime_tools(tmp_path, monkeypatch):
+    _enable_cyber_mode_for_test(monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(
+            mode="acting_subagent", surface="external_workspace", write_root=str(workspace),
+        ),
+    )
+    reg = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    reg._ctx = ctx
+
+    names = set(reg.initial_tool_names())
+    assert {"review_status", "plan_task", "skill_review", "skill_exec", "toggle_evolution"} <= names
+    assert "commit_reviewed" not in names and "vcs_commit_reviewed" not in names
+    schemas = {
+        item["function"]["name"] for item in reg.schemas()
+        if item.get("function")
+    }
+    assert {"review_status", "plan_task", "skill_review", "skill_exec"} <= schemas
+    assert reg.get_schema_by_name("review_status") is not None
+    assert "TOOL_ACCESS_BLOCKED" not in reg.execute("review_status", {})
+
+
 # --------------------------------------------------------------------------- #
 # 3. Registry gating for acting subagents
 # --------------------------------------------------------------------------- #
