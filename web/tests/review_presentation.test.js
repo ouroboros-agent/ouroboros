@@ -1025,7 +1025,6 @@ test('task acceptance falls back to the explicit durable author decision', () =>
     assert.match(html, /REVIEW_REQUIRED/);
     assert.doesNotMatch(html, /verdict=PASS/);
 });
-
 test('renderer is quiet, accessible and never invents review dollars', () => {
     const group = reviewGroupFromHistoryRow(groupedSkillRow());
     const html = renderReviewsSection([group], {
