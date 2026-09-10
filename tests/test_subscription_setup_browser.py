@@ -120,9 +120,13 @@ def subscription_ui():
     thread.start()
     try:
         with playwright.sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            engine = os.environ.get("OUROBOROS_UI_BROWSER_ENGINE", "chromium")
+            if engine not in {"chromium", "webkit", "firefox"}:
+                raise ValueError(f"Unsupported browser engine: {engine}")
+            browser = getattr(pw, engine).launch(headless=True)
             try:
-                page = browser.new_page(viewport={"width": 1360, "height": 900})
+                page = browser.new_page(viewport={"width": 1360, "height": 900},
+                                        has_touch=os.environ.get("OUROBOROS_UI_HAS_TOUCH") == "1")
                 page.route_web_socket('**/ws', lambda ws: ws.send(json.dumps({"type": "heartbeat"})))
                 page.route("**/api/**", respond)
                 page.on("pageerror", lambda error: page_errors.append(str(error)))

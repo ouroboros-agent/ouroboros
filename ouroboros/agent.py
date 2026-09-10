@@ -1080,7 +1080,8 @@ class OuroborosAgent:
                 heartbeat_stop.set()
             self._current_task_type = None
 
-    def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None) -> None:
+    def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
+                       executor_observation: Optional[Dict[str, Any]] = None) -> None:
         """Owner-visible note; ``incident`` is the typed ``task_incident``/``toast_once``
         pair the browser toasts once — an ephemeral turn's only visible wait surface."""
         self._last_progress_ts = time.time()
@@ -1098,6 +1099,15 @@ class OuroborosAgent:
                 progress_meta["ephemeral_decision"] = True
             progress_meta.update(incident or {})
             progress_meta.update(self._subagent_progress_meta("progress"))
+            if executor_observation is not None:
+                from ouroboros.subagent_messages import executor_observation_meta
+
+                observation = executor_observation_meta(
+                    executor_observation, task_id=event["task_id"],
+                    task_attempt=getattr(getattr(self.tools, "_ctx", None), "task_attempt", None),
+                )
+                if observation:
+                    progress_meta["executor_observation"] = observation
             if progress_meta:
                 event["progress_meta"] = progress_meta
             self._event_queue.put(event)

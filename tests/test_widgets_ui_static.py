@@ -67,9 +67,8 @@ def test_widgets_page_reads_cheap_list_and_reconciles_by_signature():
     signature: unchanged → not one ``<article>`` is touched; changed → keyed
     patch (``web/modules/widget_list.js`` holds the pure helpers). The same
     sync runs on a visible ``extension_lifecycle`` event and on every WebSocket
-    (re)connect, never on a timer. The page has no Refresh control (owner
-    decision Q20): the window reload is the only hard reset, so nothing in the
-    page stops every kept-running card behind the owner's back."""
+    (re)connect, never on a timer. Contextual failed-read Retry uses that same
+    reconcile; it never restores the former blanket Refresh/reset behavior."""
     source = _widgets_js()
     helpers = _read("web/modules/widget_list.js")
     assert "apiClient.widgets()" in source
@@ -80,15 +79,15 @@ def test_widgets_page_reads_cheap_list_and_reconciles_by_signature():
     assert "export function widgetTabsSignature" in helpers
     assert "export function planWidgetListPatch" in helpers
     assert "const signature = widgetTabsSignature(tabs);" in source
-    assert "if (signature !== lastSignature) patchWidgetCards(list, lastTabs, tabs);" in source
+    assert "if (signature !== lastSignature) {" in source
+    assert "patchWidgetCards(list, lastTabs, tabs);" in source
     assert "ctx.ws.on('extension_lifecycle', reconcileWidgetList);" in source
     assert "ctx.ws.on('open', reconcileWidgetList);" in source
     assert "setInterval(" not in source
     # Entry paints the shell before the first await, then syncs.
     assert source.index("paintShell(lastTabs);") < source.index("await syncWidgets(generation);")
-    # Owner decision Q20: the page has no Refresh control at all. A window reload
-    # is the only hard reset, so nothing in the page can stop every kept-running
-    # program behind the owner's back, and no confirmation dialog is needed.
+    # Q17 adds recovery from failed reads while preserving Q20's prohibition on
+    # blanket reset. It neither clears Stop nor introduces restart confirmation.
     css = (REPO_ROOT / "web" / "style.css").read_text(encoding="utf-8")
     card = _read("web/modules/widget_card.js")
     for absent in ("widgets-refresh", "refreshBtn", "refreshWidgets", "confirmWidgetsRestart"):
@@ -97,6 +96,9 @@ def test_widgets_page_reads_cheap_list_and_reconciles_by_signature():
     assert "openConfirmDialog" not in card
     assert "widgets-refresh" not in css
     assert "actionsHtml" not in source
+    assert 'id="widgets-list-error"' in source
+    assert "retryButton.addEventListener('click', reconcileWidgetList);" in source
+    assert "listError.hidden = false;" in source
     # `render()` takes no force flag: there is no path that clears every owner
     # Stop and rebuilds every card while the page stays open.
     assert "async function render() {" in source
@@ -154,7 +156,7 @@ def test_widgets_media_sources_are_constrained_to_extension_routes_or_data_urls(
 
 def test_widgets_downloads_use_host_handler_not_navigation():
     source = _widgets_js()
-    helper = _read("web/modules/ui_helpers.js")
+    helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     assert "data-widget-download-url" in source
     assert "event.preventDefault();" in source
     assert "downloadViaHostBridge(" in source
@@ -367,7 +369,7 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
     assert "if (!isFramedWidget(tab)) return '';" in card
     assert card.count("btn btn-primary") == 1
     assert 'role="menuitemradio"' in card
-    assert '<dialog class="skills-card-menu-dialog" role="menu"' in card
+    assert '<dialog class="skills-card-menu-dialog ui-popup" role="menu"' in card
     assert 'class="skills-card-menu-trigger"' in card
     assert '<span class="ui-status" data-tone="neutral" data-widget-status hidden>' in card
     # Owner-facing menu wording, not the enum name (CA-11).
@@ -379,7 +381,9 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
     assert "const ICON_NAME = /^[a-z][a-z0-9_-]*$/i;" in card
     assert "setFrameHeight(mount.firstElementChild, frameHeight(tab.render || {}));" in card
     # Closing a menu hands focus back to its trigger when it was inside (CA-16, WebKit).
-    assert "trigger?.focus({ preventScroll: true });" in card
+    assert "const binding = bindMenu(popover, {" in card
+    assert "anchor: trigger," in card
+    assert "binding.close({ restoreFocus: true })" in card
     assert ".widgets-facade {" in style
     assert "height: var(--widget-frame-height, 320px);" in style.split(".widgets-facade {", 1)[1].split("}", 1)[0]
     assert ".widgets-card-controls .ui-status[data-tone]::before" in style
@@ -442,11 +446,11 @@ def test_widgets_job_poll_retries_transient_transport_without_dropping_id():
 
 
 def test_widgets_use_design_radius_tokens():
-    style = (REPO_ROOT / "web" / "style.css").read_text(encoding="utf-8")
-    block_start = style.index(".widget-field input,")
+    style = _read("web/ui.css")
+    block_start = style.index(".ui-control {")
     block_end = style.index("}", block_start)
     block = style[block_start:block_end]
-    assert "border-radius: var(--radius-sm);" in block
+    assert "border-radius: var(--radius);" in block
     assert "border-radius: 9px;" not in block
 
 
@@ -509,7 +513,7 @@ def test_widget_json_wraps_inside_its_host_card():
 
 def test_widget_fault_status_wraps_inside_narrow_card():
     style = _read("web/style.css")
-    root = style.split(":root {", 1)[1].split("}", 1)[0]
+    root = _read("web/ui.css").split(":root {", 1)[1].split("}", 1)[0]
     controls = style.split(".widgets-card-controls {", 1)[1].split("}", 1)[0]
     status = style.split(".widgets-card-controls .ui-status:not([hidden]) {", 1)[1].split("}", 1)[0]
     assert "--widget-fault-status-max-width: min(240px, 35vw);" in root
@@ -619,7 +623,7 @@ def test_widgets_forms_charts_and_kanban_keep_host_owned_contracts():
     renderer with its number formatter and http(s)-only link guard followed in
     the cycle-A fix round."""
     source = _widgets_js()
-    helper = _read("web/modules/ui_helpers.js")
+    helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     chart = _read("web/modules/widget_chart.js")
     assert "renderSafeField(" in source
     assert "collectSafeFieldValues(" in source
@@ -638,7 +642,8 @@ def test_widgets_forms_charts_and_kanban_keep_host_owned_contracts():
     assert "export function renderChartDataTable" in chart
     assert "data-widget-kanban-move" in source
     assert "widget-kanban-empty" in source
-    assert "mount.querySelectorAll('[data-widget-kanban-key]')" in source
+    assert "listen('change', (event) =>" in source
+    assert "select?.closest('[data-widget-kanban-key]')" in source
     assert "{ card_id: cardId, column_id: columnId }" in source
     assert "SAFE_FIELD_TYPES" in helper
     assert "autocomplete=\"new-password\"" in helper
@@ -669,7 +674,7 @@ def test_widgets_responsive_design_system_styles_are_host_owned():
 
 def test_widget_public_tones_share_the_host_normalizer_and_canonical_css():
     source = _widgets_js()
-    helper = _read("web/modules/ui_helpers.js")
+    helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     style = _read("web/style.css")
     assert "function widgetTone" not in _framed_widget_sources()
     assert "normalizeTone(component.tone)" in source

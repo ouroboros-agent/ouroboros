@@ -811,6 +811,43 @@ def test_provider_failure_hint_empty_without_error():
     assert _provider_failure_hint({}) == ""
 
 
+@pytest.mark.parametrize("vendor,parameter", [("string_above_max_length", "instructions"),
+    ("string_above_max_length", "max_tokens"), ("context_length_exceeded", "input"), ("rate_limit_exceeded", "input")])
+def test_claudexor_display_reaches_error_and_terminal_without_retry(tmp_path, monkeypatch, vendor, parameter):
+    import json
+    from ouroboros.llm_claudexor import ClaudexorModelError
+    from ouroboros.loop_transport import provider_recovery_hint
+
+    error = ClaudexorModelError({"code": "invalid_request", "message": "Codex model request was refused (HTTP 400).",
+        "context": {"httpStatus": 400, "vendorCode": vendor, "parameter": parameter, "providerMessage": "private-body"}})
+    baseline = classify_llm_exception(error)
+    events, usage = _RecordingEvents(), {"_context_fit_mode": "max"}
+
+    class Refused:
+        calls = 0
+
+        def chat(self, **kwargs):
+            self.calls += 1
+            raise error
+
+    llm = Refused()
+    monkeypatch.setattr("ouroboros.loop_llm_call.time.sleep", lambda _s: pytest.fail("Field refusal cannot retry"))
+    msg, _cost = call_llm_with_retry(llm, [{"role": "user", "content": "hi"}], "claudexor::fixture=exact-model",
+        None, "high", 3, tmp_path, "task-refusal", 1, events, usage, "task", False)
+    assert msg is None and llm.calls == 1
+    assert usage["_context_fit_mode"] == "max" and usage["_last_llm_error_kind"] == baseline.kind == "bad_request"
+    assert usage["_last_llm_retry_same_request"] is baseline.retry_same_request is False
+    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    event, = [row for row in rows if row["type"] == "llm_api_error"]
+    assert [row["data"] for row in events.events if row.get("data", {}).get("type") == "llm_api_error"] == [event]
+    assert event["error"] == error.display_message and event["status_code"] == baseline.status_code
+    assert event["provider_code"] == baseline.provider_code and event["provider_message"] == error.problem["message"]
+    assert "private-body" not in event["error"] and "remote_context_overflow" not in [row["type"] for row in rows]
+    hint = _provider_failure_hint(usage)
+    assert f"provider_code={vendor}" in hint and f"parameter={parameter}" in hint
+    assert provider_recovery_hint(usage) == provider_recovery_hint({**usage, "_last_llm_error": repr(error)})
+
+
 def test_call_llm_with_retry_accumulates_live_catalog_estimated_cost(tmp_path):
     import queue
 

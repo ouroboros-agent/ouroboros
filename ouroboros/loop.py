@@ -404,16 +404,14 @@ def run_llm_loop(
     stateful_executor = StatefulToolExecutor()
     exit_ctx = _LoopExitContext(
         tools, drive_root, task_id, event_queue, drive_logs, accumulated_usage, llm_trace,
+        ctx, getattr(ctx, "_execution_trace", None),
     )
     _owner_msg_seen: set = set()
     MAX_ROUNDS = _resolve_loop_max_rounds(ctx)
-    round_idx = 0
-    free_redial = False
+    round_idx, free_redial = 0, False
     transport_wait = None
     limit_ctx: Optional[_RoundLimitContext] = None
-    trace_ctx = ctx
-    previous_execution_trace = getattr(trace_ctx, "_execution_trace", None)
-    trace_ctx._execution_trace = llm_trace
+    ctx._execution_trace = llm_trace
     try:
         if saved:
             active_model, active_effort, active_use_local, active_context_mode, round_idx, context_fit_plan = resume_native_loop(
@@ -645,7 +643,6 @@ def run_llm_loop(
         return _handle_budget_exceeded(
             exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
     finally:
-        trace_ctx._execution_trace = previous_execution_trace
         # No stale active latch behind an in-process exit (a crash skips this frame, keeping the latch for recovery).
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="loop_exit")
         _cleanup_loop_resources(stateful_executor, exit_ctx)

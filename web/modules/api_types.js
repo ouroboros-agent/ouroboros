@@ -285,6 +285,9 @@
  *   subagent (delegated routes only) — the route it was sent to, not a receipt
  *   from the engine saying where it landed. Absent/empty = the ordinary native
  *   path; no chip is drawn.
+ * @property {Object=} executor_observation
+ *   Latest observed progress actor, bound to own task/attempt/run/revision.
+ *   model_source distinguishes requested and observed; not a terminal receipt.
  * @property {Object=} execution_evidence
  *   The completion-seam EVIDENCE the route decision is reconciled against:
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,

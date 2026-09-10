@@ -743,14 +743,14 @@ class _FakeUI:
         self.calls.append(("open", self.base_url))
         return self
 
-    def goto(self, path="/"):
+    def goto(self, path="/", *, ready_selector="#chat-input"):
         self.calls.append(("goto", path))
         if self.fail_goto is not None:
             raise self.fail_goto
 
     def computed_property(self, selector, prop):
         self.calls.append(("computed_property", selector, prop))
-        return "#123456"
+        return scenarios.SM1_NEW_ACCENT
 
     send_chat = rebind = lambda self, *a, **k: None
 
@@ -768,16 +768,10 @@ def _ui_resolver(calls: list, fail_goto: Exception | None = None):
 
 
 def _sm1_ui_tail(ctx: scenarios.LaneContext) -> None:
-    """The UI tail of ``run_sm1`` verbatim (restart, the ``ctx.ui`` truthiness gate, goto, the
-    computed property, the check, the screenshot): what the lazy guarded client must carry."""
-    ctx.restart()
-    if ctx.ui is None:
-        ctx.check("ui_computed_style", False, ui_reason=ctx.ui_reason)
-        return
-    ctx.ui.goto("/")
-    observed = str(ctx.ui.computed_property(":root", "--accent") or "").strip()
-    ctx.check("ui_computed_style", observed == "#123456", accent_computed=observed)
-    ctx.screenshot("sm1_after_restart")
+    """Exercise the production oracle, including both documents, without a paid task."""
+    if "commit_landed" not in ctx.checks:
+        ctx.check("commit_landed", True)
+    scenarios.check_sm1_rendered_palette(ctx, scenarios.SM1_REQUIRED_PALETTE)
 
 
 def test_ui_client_opens_on_first_use_and_restart_reopens_against_the_new_server(tmp_path):
@@ -790,8 +784,11 @@ def test_ui_client_opens_on_first_use_and_restart_reopens_against_the_new_server
     assert ctx.ui is not None and len(calls) == 1   # one client per open, not one per access
     _sm1_ui_tail(ctx)
     assert calls[1] == ("close", "http://127.0.0.1:1") and calls[2] == ("open", "http://127.0.0.1:2")
-    assert ctx.checks == {"ui_computed_style": True} and ctx.ui_reason == "" and "ui_reason" not in ctx.facts
-    assert ctx.screenshots == [str(tmp_path / "sm1_after_restart.png")]
+    assert ctx.checks == {"commit_landed": True, "ui_app_palette": True, "ui_onboarding_palette": True,
+                          "ui_computed_style": True} and ctx.ui_reason == "" and "ui_reason" not in ctx.facts
+    assert ctx.screenshots == [str(tmp_path / "sm1_app_after_restart.png"),
+                               str(tmp_path / "sm1_onboarding_after_restart.png")]
+    assert [c for c in calls if c[0] == "goto"] == [("goto", "/"), ("goto", "/onboarding")]
     ctx.close_ui()
     ctx.close_ui()                                   # idempotent
     assert [c for c in calls if c[0] == "close"] == [("close", "http://127.0.0.1:1"), ("close", "http://127.0.0.1:2")]
@@ -817,10 +814,11 @@ def test_closed_target_degrades_the_ui_checks_typed_and_keeps_every_other_check(
                restart=_FakeServer, shots=tmp_path)
     ctx.check("commit_landed", True)
     _sm1_ui_tail(ctx)                                # no exception escapes
-    assert ctx.checks == {"commit_landed": True, "ui_computed_style": False}
+    assert ctx.checks == {"commit_landed": True, "ui_app_palette": False, "ui_onboarding_palette": False,
+                          "ui_computed_style": False}
     assert ctx.ui_reason == ctx.facts["ui_reason"] == "ui_unavailable:TargetClosedError"
     assert ctx.facts["ui_errors"] == ["TargetClosedError: Target page, context or browser has been closed"]
-    assert ctx.facts["accent_computed"] == "" and ctx.screenshots == []
+    assert not any(ctx.facts["palette_computed"]["app"].values()) and ctx.screenshots == []
     assert [c[0] for c in calls] == ["open", "goto", "close"]   # closed on the failure, later calls no-ops
 
 
@@ -1070,40 +1068,34 @@ def test_commit_refusal_facts_name_every_typed_refusal():
     assert facts["terminal_status"] == "failed" and facts["terminal_reason_code"] == "budget_exhausted"
 
 
-def test_sm1_changes_both_stylesheets_and_keeps_the_mirror_parity():
-    """web/onboarding.css mirrors web/style.css BY VALUE (tests/test_web_typography_static.py):
-    the scenario edits, commits and validates both files, in the prompt, the stub and the
-    acceptance. Both take the FULL user path: no ``skip_tests``, no ``skip_advisory_review``,
-    no "do not bump" (the first paid run's narrower prompt was refused by the commit gate on
-    exactly the version bump, the design system and the missing UI evidence)."""
-    assert scenarios.SM1_CSS_PATHS == ("web/style.css", "web/onboarding.css")
+def test_sm1_changes_the_shared_palette_for_both_documents():
+    """One palette edit, same release/review path. Source ownership is not browser evidence:
+    separate real-document tests reject missing CSS and page-local palette overrides."""
+    assert scenarios.SM1_CSS_PATHS == ("web/ui.css",)
     prompt = scenarios.sm1_prompt()
-    assert "web/style.css" in prompt and "web/onboarding.css" in prompt and "docs/DESIGN.md" in prompt
+    assert "web/ui.css" in prompt and "/onboarding" in prompt and "docs/DESIGN.md" in prompt
+    assert "both browser documents" in prompt
     assert "skip_" not in prompt.lower() and "do not bump" not in prompt.lower() and "bumped in the same diff" in prompt
     script = scenarios.sm1_stub_script(REPO_ROOT)["agent"]
     writes = [s for s in script if s.get("tool") == "write_file"]
     written = [w["arguments"]["path"] for w in writes]
-    assert written[:2] == list(scenarios.SM1_CSS_PATHS)
+    assert written[0] == scenarios.SM1_CSS_PATH
+    assert "web/style.css" not in written and "web/onboarding.css" not in written
     commit = next(s for s in script if s.get("tool") == "commit_reviewed")["arguments"]
     assert commit["paths"] == written and "commit_message" in commit
     assert not any(key.startswith("skip_") for key in commit), "the stub rehearsal takes the full user path like the paid prompt"
-    edited = {w["arguments"]["path"]: w["arguments"]["content"] for w in writes if w["arguments"]["path"] in scenarios.SM1_CSS_PATHS}
-    for path, text in edited.items():
-        original = (REPO_ROOT / path).read_text(encoding="utf-8")
-        assert scenarios.accent_value(text) == scenarios.SM1_NEW_ACCENT
-        # The tree under test may ALREADY carry the target accent (this suite runs inside the
-        # SM1 candidate's hermetic preflight after the model applied the change): then the
-        # stub edit is a no-op by design, not a failure.
-        if scenarios.accent_value(original) != scenarios.SM1_NEW_ACCENT:
-            assert text != original
-        assert len(text.splitlines()) == len(original.splitlines())
-    assert scenarios.css_mirror_drift(edited["web/style.css"], edited["web/onboarding.css"]) == {}
-    # The parser reads the SAME :root block the invariant reads, and the invariant is real.
-    style_tokens = scenarios.css_root_tokens((REPO_ROOT / "web/style.css").read_text(encoding="utf-8"))
-    onboarding_tokens = scenarios.css_root_tokens((REPO_ROOT / "web/onboarding.css").read_text(encoding="utf-8"))
-    assert "--accent" in style_tokens and "--accent" in onboarding_tokens and len(set(style_tokens) & set(onboarding_tokens)) > 20
-    lopsided = scenarios.css_with_accent(edited["web/style.css"], "#000000")
-    assert scenarios.css_mirror_drift(lopsided, edited["web/onboarding.css"]) == {"--accent": ("#000000", scenarios.SM1_NEW_ACCENT)}
+    text = writes[0]["arguments"]["content"]
+    original = (REPO_ROOT / scenarios.SM1_CSS_PATH).read_text(encoding="utf-8")
+    assert scenarios.accent_value(text) == scenarios.SM1_NEW_ACCENT
+    # Hermetic preflight can already be running on the target-accent candidate.
+    if scenarios.accent_value(original) != scenarios.SM1_NEW_ACCENT:
+        assert text != original
+    assert len(text.splitlines()) == len(original.splitlines())
+    palette = scenarios.sm1_palette_tokens(text)
+    assert scenarios.SM1_REQUIRED_PALETTE <= palette.keys() and all(palette.values())
+    assert all(f"--accent-{alpha}" in palette for alpha in ("04", "05", "08", "10", "12", "18", "22", "25", "35", "45", "55", "65"))
+    for document in ("web/index.html", "web/onboarding_template.html"):
+        assert 'href="/static/ui.css"' in (REPO_ROOT / document).read_text(encoding="utf-8")
 
 
 def test_sm1_stub_bumps_the_release_carriers_through_the_sync_ssot(tmp_path):
@@ -1444,7 +1436,7 @@ def test_ui_client_prefers_the_suite_interface_when_it_has_this_surface(monkeypa
 @pytest.mark.serial
 def test_stub_sm1_end_to_end_on_a_real_isolated_server(tmp_path):
     """Real server, loopback stub model, no key: the commit lands through the review organ
-    (both stylesheets plus the release-carrier bump, no skip flags, through the same hermetic
+    (the shared palette plus the release-carrier bump, no skip flags, through the same hermetic
     tests preflight as the paid prompt), the durable rows and receipts exist, the
     seed is a clean detached clone of this tree's HEAD and the manifest names the stub as
     the model."""

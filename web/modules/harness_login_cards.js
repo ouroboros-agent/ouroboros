@@ -504,7 +504,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
             <div class="harness-code-entry" data-profile-name-entry>
                 <label for="harness-profile-name-input">Name for the ${escapeHtml(active.needsProfile.familyLabel || active.harness)} account (e.g. work, backup). Lowercase letters, digits, "-" and "_" — anything else becomes "-".</label>
                 <div class="harness-code-entry-row">
-                    <input type="text" id="harness-profile-name-input" data-profile-name-input autocomplete="off" spellcheck="false"
+                    <input class="ui-control" type="text" id="harness-profile-name-input" data-profile-name-input autocomplete="off" spellcheck="false"
                         placeholder="account name" value="${escapeHtml(active.profileNameValue || '')}">
                     <button type="button" class="btn btn-primary" data-profile-name-submit>Add account &amp; connect</button>
                 </div>
@@ -567,7 +567,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
             <div class="harness-code-entry" data-code-entry>
                 <label for="harness-code-input">If the browser shows a code instead of finishing, paste it here (otherwise the sign-in completes on its own):</label>
                 <div class="harness-code-entry-row">
-                    <input type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
+                    <input class="ui-control ui-control-code" type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
                         placeholder="sign-in code" value="${escapeHtml(active.inputValue || '')}"${active.inputSent ? ' disabled' : ''}>
                     <button type="button" class="btn btn-default" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
                 </div>

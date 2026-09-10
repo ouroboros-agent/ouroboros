@@ -26,6 +26,70 @@ ROUTE = {"source": "codex", "credentialProfileId": "account-a", "accountFingerpr
 REF = {"resourceId": "res-one", "sha256": "sha256:" + "a" * 64, "sizeBytes": 99}
 
 
+@pytest.mark.parametrize("unknown", [False, True])
+def test_display_diagnostics_preserve_exception_and_private_problem(unknown):
+    problem = {"code": "invalid_request", "message": "Codex model request was refused (HTTP 400).",
+               "retryable": True, "context": {"httpStatus": 400, "resetsAt": "2099-01-01T00:00:00Z",
+                   "vendorCode": "string_above_max_length", "parameter": "instructions",
+                   "providerMessage": "private provider body", "requestId": "private-request"}}
+    original = deepcopy(problem)
+    error = transport.ClaudexorModelError(problem, model_role="main", operation_id="op-1", route=ROUTE, unknown=unknown)
+    code = "model_outcome_unknown" if unknown else "invalid_request"
+    generic = f"{code}: {problem['message']}"
+    assert error.args == (generic,) and str(error) == generic
+    assert repr(error) == f"ClaudexorModelError({generic!r})"
+    assert error.code == code and error.body == ({"code": code} if unknown else original)
+    assert error.status_code == (0 if unknown else 400) and error.retryable is (not unknown)
+    assert error.reset_at == original["context"]["resetsAt"]
+    assert error.model_role == "main" and error.operation_id == "op-1" and error.route == ROUTE
+    display = error.display_message
+    assert ("provider_code=string_above_max_length, parameter=instructions" in display[:220]) is (not unknown)
+    assert "private provider body" not in display and "private-request" not in display
+    if unknown:
+        assert display == generic
+    problem["context"]["parameter"] = "changed after construction"
+    assert error.problem == original and error.display_message == display
+
+
+@pytest.mark.parametrize("context", [{}, {"vendorCode": None, "parameter": 42},
+                                     {"vendorCode": "  ", "parameter": ["private provider data"]}])
+def test_display_ignores_absent_or_nontext_details(context):
+    error = transport.ClaudexorModelError({"code": "invalid_request", "message": "Controlled refusal", "context": context})
+    assert error.display_message == str(error)
+
+
+def test_display_redacts_typed_details_without_mutating_custody():
+    token = "sk-" + "secretfixture" * 4
+    context = {"vendorCode": token, "parameter": "https://user:private-password@example.test/input"}
+    error = transport.ClaudexorModelError({"code": "invalid_request", "message": "Controlled refusal", "context": context})
+    assert token not in error.display_message and "private-password" not in error.display_message
+    assert "REDACTED" in error.display_message and error.problem["context"] == context
+
+
+@pytest.mark.parametrize("code,status,unknown,kind,retry,wait", [
+    ("invalid_request", 400, False, "bad_request", False, ""),
+    ("auth_required", 401, False, "auth_error", False, "auth"),
+    ("subscription_window_exhausted", 429, False, "subscription_window_exhausted", True, "quota"),
+    ("invalid_request", 400, True, "provider_outcome_unknown", False, ""),
+])
+@pytest.mark.parametrize("vendor,parameter", [("string_above_max_length", "instructions"),
+    ("string_above_max_length", "max_tokens"), ("rate_limit_exceeded", "input"), ("context_length_exceeded", "input")])
+def test_display_never_changes_classification_wait_or_compaction(code, status, unknown, kind, retry, wait, vendor, parameter):
+    from ouroboros.context_compaction import _typed_context_overflow
+    from ouroboros.loop_llm_call import classify_llm_exception
+    from ouroboros.model_wait import model_wait_reason
+
+    error = transport.ClaudexorModelError({"code": code, "message": "Controlled model refusal", "retryable": True,
+        "context": {"httpStatus": status, "vendorCode": vendor, "parameter": parameter}}, unknown=unknown)
+    assert error.display_message  # Computing a human view must not mutate behavioral readers.
+    classified = classify_llm_exception(error)
+    assert classified.kind == kind and classified.retry_same_request is retry
+    assert model_wait_reason(error) == wait
+    assert not _typed_context_overflow(error)
+    typed = transport.ClaudexorModelError({"code": "context_length_exceeded", "message": "Controlled refusal"})
+    assert _typed_context_overflow(typed) and classify_llm_exception(typed).kind == "context_overflow"
+
+
 def result(*, outcome="completed", cash=None, knowledge="unknown", route=None, problem=None):
     route = dict(ROUTE if route is None else route)
     return {"outcome": outcome, "message": {"role": "assistant", "content": "Ответ 🐍", "tool_calls": [
@@ -353,6 +417,35 @@ def test_confirmed_provider_failure_settles_real_usage_before_raising(setup):
     assert error.physical_attempt_capture.state == "settled"
     assert ledger(root)[-1]["cost_usd"] == 0.13 and ledger(root)[-1]["prompt_tokens"] == 20
     assert retained(root) == gateway.results[0]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_field_refusal_retains_then_acknowledges_once_with_display(setup, asynchronous):
+    root, gateway, client = setup
+    problem = {"code": "invalid_request", "message": "Codex model request was refused (HTTP 400).", "retryable": False,
+               "context": {"httpStatus": 400, "vendorCode": "string_above_max_length", "parameter": "instructions"}}
+    gateway.results = [result(outcome="failed", problem=problem)]
+    acknowledge = gateway.acknowledge_model_result
+
+    def after_retention(*args):
+        assert retained(root) == gateway.results[0]
+        return acknowledge(*args)
+
+    gateway.acknowledge_model_result = after_retention
+    with pytest.raises(transport.ClaudexorModelError) as caught:
+        if asynchronous:
+            asyncio.run(client.chat_async([], MODEL, model_role="main"))
+        else:
+            client.chat([], MODEL, model_role="main")
+    error = caught.value
+    assert error.problem == problem and error.body == problem and error.code == "invalid_request"
+    assert error.status_code == 400 and error.retryable is False
+    assert error.operation_id == "op-0" and error.model_role == "main" and error.route == ROUTE
+    assert "provider_code=string_above_max_length, parameter=instructions" in error.display_message[:220]
+    assert error.physical_attempt_capture.state == "settled"
+    assert error.usage["claudexor"]["result_custody"]["state"] == "acknowledged"
+    assert len(gateway.operations) == len(gateway.creates) == len(gateway.acks) == 1
+    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"]
 
 
 def test_proven_not_started_releases_and_never_fabricates_provider_usage(setup):

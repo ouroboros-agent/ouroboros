@@ -47,6 +47,8 @@ cancelled).
 
 Version 1.2.1 marks questions that wait for an owner answer and clears the
 waiting line after an answer submitted through Telegram.
+Version 1.2.2 re-seeds the bundled skill when these payload bytes change; it
+adds no new runtime behavior.
 
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled

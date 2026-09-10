@@ -21,12 +21,15 @@ def role_ui(subscription_ui):
             ui["posts"].append(("/api/settings", payload))
             ui["settings"].update(payload)
             ui["fixture"]["preview"]["reviewer_slots"] = json.loads(payload["OUROBOROS_REVIEWER_SLOTS"])
-            result = {"ok": True, "saved": True}
+            result = {"status": "saved", "saved": True, "restart_required": False}
         else:
             result = ui["settings"]
         route.fulfill(content_type="application/json", body=json.dumps(result))
 
     ui["page"].route("**/api/settings", settings_route)
+    ui["page"].route("**/api/owner/runtime-mode", lambda route: route.fulfill(
+        content_type="application/json", body=json.dumps({"ok": True, "saved": True,
+            "runtime_mode": "advanced", "restart_required": False})))
     return ui
 
 
@@ -86,8 +89,10 @@ def test_reviewer_source_roundtrip_restores_its_own_model_and_account(role_ui):
         route.select_option('subscription:opaque-source')
     page.locator('[data-advisory-row]').scroll_into_view_if_needed()
     capture(page, "reviewer-source-roundtrip-restored")
+    page.locator('[data-slot-custom-api]').fill('temporary-before-reload')
     with page.expect_response('**/api/reviewer-slots'):
         page.locator('#btn-reload-settings').click()
+        page.get_by_role('button', name='Discard and continue', exact=True).click()
     page.locator('[data-advisory-route]').select_option('api')
     assert page.locator('[data-advisory-api-model]').input_value() == ''
 

@@ -21,6 +21,34 @@ SUBAGENT_MESSAGE_FIELDS: tuple[str, ...] = (
 )
 
 
+def executor_observation_meta(
+    value: Any, *, task_id: str, task_attempt: Any = None,
+) -> Dict[str, Any]:
+    """Copy one progress observation without promoting it to execution evidence.
+
+    The owning run supplies its attempt/harness facts. Delivery can reject a
+    different task or known task attempt, but cannot infer a current executor
+    from task state. Missing legacy task attempts remain explicitly unknown.
+    """
+    if not isinstance(value, Mapping) or not task_id or value.get("task_id") != task_id:
+        return {}
+    keys = ("task_id", "task_attempt", "run_id", "attempt_id", "harness_id", "phase")
+    if any(not isinstance(value.get(key), str) for key in keys):
+        return {}
+    if any(not value[key] for key in keys if key != "task_attempt"):
+        return {}
+    if task_attempt is not None and value["task_attempt"] != str(task_attempt):
+        return {}
+    revision = value.get("revision")
+    if type(revision) is not int or revision < 0:
+        return {}
+    observation = {key: value[key] for key in keys}
+    observation["revision"] = revision
+    if isinstance(value.get("model"), str) and value["model"] and value.get("model_source") in ("requested", "observed"):
+        observation.update(model=value["model"], model_source=value["model_source"])
+    return observation
+
+
 def subagent_message_meta(
     record: Mapping[str, Any] | None,
     *,

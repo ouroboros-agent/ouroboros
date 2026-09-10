@@ -103,7 +103,7 @@ test('the update letter typedef promises exactly the fields the projection emits
 test('the live progress path forwards every progress field the endpoint emits and the chat UI consumes', () => {
     const emitted = pythonTupleNames(repoFile('ouroboros/gateway/history.py'), '_PROGRESS_META_FIELDS');
     for (const field of ['executor_route', 'model_lane', 'status', 'subagent_event',
-        'execution_evidence', 'actual_substrate']) {
+        'execution_evidence', 'actual_substrate', 'executor_observation']) {
         assert.ok(emitted.has(field), `${field} is no longer emitted by the history endpoint`);
     }
     // executor_route drives the executor chip in log_events.js; it must reach the
@@ -116,13 +116,21 @@ test('the live progress path forwards every progress field the endpoint emits an
     // a whitelist, and a whitelist silently drops whatever it forgot — which is how
     // a chip came back on reload and was missing while the task ran.
     const chat = moduleFile('chat.js');
-    const DELEGATION_KEYS = ['executor_route', 'execution_evidence', 'actual_substrate'];
+    const DELEGATION_KEYS = ['executor_route', 'execution_evidence', 'actual_substrate', 'executor_observation'];
+    const carry = chat.match(/const CARD_META_KEYS = \[([^\]]+)\]/)?.[1];
+    assert.ok(carry, 'shared card carry list must exist');
+    const carried = new Set([...carry.matchAll(/'([a-z_]+)'/g)].map(m => m[1]));
+    assert.match(chat, /return Object.fromEntries\(CARD_META_KEYS.map\(\(key\) => \[key, src\?\.\[key\]\]\)\)/);
+    const forwardedFields = (chunk) => {
+        assert.match(chunk, /\.\.\.cardMetaKeys\((msg|evt)\)/, 'both wire seams use the same carry owner');
+        return carried;
+    };
     const whitelists = chat.split('summarizeChatLiveEvent({').slice(1)
         .map((chunk) => chunk.slice(0, chunk.indexOf('});')))
         .filter((chunk) => !chunk.includes('...evt'));
     assert.ok(whitelists.length > 0, 'no enumerated live call site found — update this test');
     for (const chunk of whitelists) {
-        const forwarded = new Set([...chunk.matchAll(/^\s+([a-z_]+):/gm)].map((m) => m[1]));
+        const forwarded = forwardedFields(chunk);
         for (const key of DELEGATION_KEYS) {
             assert.ok(forwarded.has(key),
                 `a chat.js live whitelist drops ${key}: the chip only tells the truth after a reload`);
@@ -143,7 +151,7 @@ test('the live progress path forwards every progress field the endpoint emits an
     assert.ok(terminalWhitelists.length > 0,
         'no enumerated updateSubagentCardFromEvent call site found — update this test');
     for (const chunk of terminalWhitelists) {
-        const forwarded = new Set([...chunk.matchAll(/^\s+([a-z_]+):/gm)].map((m) => m[1]));
+        const forwarded = forwardedFields(chunk);
         for (const key of DELEGATION_KEYS) {
             assert.ok(forwarded.has(key),
                 `the synthesized subagent terminal drops ${key}: a log-channel-only terminal cannot upgrade the chip`);

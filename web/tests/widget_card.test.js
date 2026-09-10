@@ -105,7 +105,7 @@ test('only framed cards carry Start/Stop and the launch-policy menu', () => {
     assert.equal((controls.match(/btn-primary/g) || []).length, 1);
     assert.match(controls, /data-widget-power>Start</);
     assert.match(controls, /class="ui-status" data-tone="neutral" data-widget-status hidden/);
-    assert.match(controls, /<dialog class="skills-card-menu-dialog" role="menu"/);
+    assert.match(controls, /<dialog class="skills-card-menu-dialog ui-popup" role="menu"/);
     for (const mode of WIDGET_START_MODES) {
         assert.match(controls, new RegExp(`role="menuitemradio"[^>]*data-widget-start-mode="${mode}"`));
     }

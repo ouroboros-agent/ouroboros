@@ -351,6 +351,8 @@ class _LoopExitContext:
     drive_logs: pathlib.Path
     accumulated_usage: Dict[str, Any]
     llm_trace: Dict[str, Any]
+    trace_ctx: Any = None
+    previous_execution_trace: Any = None
 
 
 def _handle_budget_exceeded(
@@ -512,6 +514,8 @@ def _cleanup_loop_resources(
     ctx: _LoopExitContext,
 ) -> None:
     """Release attempt-scoped executors, services, and delegated runs."""
+    if ctx.trace_ctx is not None:
+        ctx.trace_ctx._execution_trace = ctx.previous_execution_trace
     if stateful_executor:
         try:
             from ouroboros.tools.browser import cleanup_browser

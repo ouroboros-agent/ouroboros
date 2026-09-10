@@ -1,7 +1,6 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
-import { compactModel } from './log_events.js';
 import { joinMarkdownHeadings } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import {
@@ -235,22 +234,13 @@ export function liveLineRowToggleKey(target, selection = null) {
     return (line.dataset && line.dataset.liveLineKey) || '';
 }
 
-/**
- * Two children of one parent whose compact headlines would read the same are
- * twins: the card then keeps the short task id to tell them apart. The key is
- * the DISPLAYED identity — the role (or its `Subagent` fallback) and the
- * compact model name — so equivalent spellings (`openai/gpt-5.6-sol`,
- * `openai::gpt-5.6-sol`, `gpt-5.6-sol`) collide exactly when the headlines do.
- */
-export function subagentIdentityKey({ parentId = '', role = '', model = '' } = {}) {
-    return `${parentId}\u0000${subagentIdentityTitle({ role, model })}`;
+/** Twins share a displayed role; their model is a separately labelled fact. */
+export function subagentIdentityKey({ parentId = '', role = '' } = {}) {
+    return `${parentId}\u0000${subagentIdentityTitle({ role })}`;
 }
 
-/** The child card's title: `role · model` (`Subagent · model` without a role), never an activity label. */
-export function subagentIdentityTitle({ role = '', model = '' } = {}) {
-    const name = String(role || '').trim() || 'Subagent';
-    const short = compactModel(model);
-    return short ? `${name} · ${short}` : name;
+export function subagentIdentityTitle({ role = '' } = {}) {
+    return String(role || '').trim() || 'Subagent';
 }
 
 export function subagentTwin(children, childId) {
@@ -508,7 +498,7 @@ export function projectCollapsedActivity({
 } = {}) {
     const current = boundActivityPreview(isSubagent ? body : headline);
     const candidate = current || boundActivityPreview(previous);
-    if (!isSubagent && !String(suggestedName || '').trim()) return '';
+    if (!isSubagent && candidate === boundActivityPreview(suggestedName || headline)) return '';
     return candidate;
 }
 

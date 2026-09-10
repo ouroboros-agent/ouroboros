@@ -570,7 +570,43 @@ def live_line(run_id: str, advance: _Advance) -> str:
     return f"🛰 delegated run {run_id} @seq {advance.seq}: {titles or '(new session events)'}{more}"
 
 
-def emit(ctx: Any, run_id: str, advance: _Advance) -> None:
+def executor_observation(
+    ctx: Any, run_id: str, advance: _Advance, detail: Dict[str, Any], entry: Any,
+) -> Dict[str, Any]:
+    """Latest typed actor in this owned run snapshot, never a liveness verdict.
+
+    Read the original timeline, not its truncated prose/display tail. The
+    summary route's observedModel belongs to a final attempt, so it cannot
+    identify a later live/reviewer attempt. Current live detail supplies no
+    per-attempt observed model; the requested model stays labelled as such.
+    """
+    from ouroboros.subagent_messages import executor_observation_meta
+
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    summary = detail.get("summary") or {}
+    if (getattr(entry, "task_id", None) != task_id
+            or getattr(entry, "run_id", None) != run_id
+            or summary.get("runId", run_id) != run_id
+            or detail.get("lastSeq") != advance.seq):
+        return {}
+    actor = next((row for row in reversed(_rows(detail))
+                  if all(isinstance(row.get(key), str) and row[key]
+                         for key in ("harnessId", "attemptId", "type"))), None)
+    if actor is None:
+        return {}
+    attempt = getattr(ctx, "task_attempt", None)
+    observation = {
+        "task_id": task_id, "task_attempt": str(attempt) if attempt is not None else "",
+        "run_id": run_id, "attempt_id": actor["attemptId"],
+        "harness_id": actor["harnessId"], "phase": actor["type"], "revision": advance.seq,
+    }
+    if getattr(entry, "model", "") and getattr(entry, "route_id", None) == actor["harnessId"]:
+        observation.update(model=entry.model, model_source="requested")
+    return executor_observation_meta(observation, task_id=task_id, task_attempt=attempt)
+
+
+def emit(ctx: Any, run_id: str, advance: _Advance, *,
+         detail: Optional[Dict[str, Any]] = None, entry: Any = None) -> None:
     """Push one advance to the LIVE progress surface, from inside the wait.
 
     `ctx.emit_progress_fn` is immediate (it puts the frame straight on the event queue),
@@ -584,7 +620,9 @@ def emit(ctx: Any, run_id: str, advance: _Advance) -> None:
     if not callable(fn):
         return
     try:
-        fn(live_line(run_id, advance))
+        observation = executor_observation(ctx, run_id, advance, detail, entry) if detail is not None else {}
+        metadata = {"executor_observation": observation} if observation else {}
+        fn(live_line(run_id, advance), **metadata)
     except Exception:
         log.debug("delegated progress emit failed", exc_info=True)
 

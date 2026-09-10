@@ -366,7 +366,7 @@ test('the editor shows a numbered row and only one owner-authored prose field', 
     }, 2);
 
     assert.match(html, /class="available-subagent-heading"[^>]*>Subagent 3</);
-    assert.match(html, />Description\s*<textarea data-subagent-field="recommended_use"/);
+    assert.match(html, />Description\s*<textarea\b[^>]*data-subagent-field="recommended_use"/);
     assert.equal((html.match(/<textarea\b/g) || []).length, 1);
     assert.doesNotMatch(html, /data-subagent-field="(?:id|name)"/);
     assert.doesNotMatch(html, />Stable ID<|<label>Name/);
@@ -698,7 +698,7 @@ test('the card head carries the ordinal, the route mark, a two-word status and t
     assert.match(head, /class="settings-inline-status" data-subagent-status data-tone="neutral" title="Saved intent · Agent session · live availability not checked">Saved · Not checked</);
     assert.match(head, /data-subagent-duplicate/);
     assert.match(head, /data-subagent-remove/);
-    assert.match(html, /<textarea data-subagent-field="recommended_use" rows="1"/);
+    assert.match(html, /<textarea\b[^>]*data-subagent-field="recommended_use" rows="1"/);
     assert.equal((html.match(/<textarea/g) || []).length, 1);
     // A routed row with no run evidence carries no meta band at all.
     assert.match(html, /data-subagent-meta[^>]*hidden/);

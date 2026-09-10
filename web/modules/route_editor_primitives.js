@@ -5,6 +5,7 @@
 
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { modelChooserHtml, updateModelChooserOptions } from './model_chooser.js';
 
 export const ROUTE_KIND_API_MODEL = 'api_model';
 export const ROUTE_KIND_AGENT_SESSION = 'agent_session';
@@ -80,9 +81,23 @@ export function routeModelSuggestions(route, items = []) {
 /** Catalog suggestions, not an entitlement or context claim for the selected account. */
 export function routeModelInputHtml(attrs, route, items, listId, { placeholder = 'Choose a model' } = {}) {
     const values = routeModelSuggestions(route, items);
-    return `<input ${attrs} list="${escapeHtml(listId)}" value="${escapeHtml(routeModelFields(route).model)}"
-        placeholder="${escapeHtml(placeholder)}" autocomplete="off" spellcheck="false">
-        <datalist id="${escapeHtml(listId)}">${values.map((value) => `<option value="${escapeHtml(value)}"></option>`).join('')}</datalist>`;
+    return modelChooserHtml(attrs, routeModelFields(route).model, listId, values, { placeholder });
+}
+
+/** Catalog repaint owns suggestions and native option labels, never a draft node. */
+export function updateRouteControlOptions(current, desired) {
+    for (const field of current.querySelectorAll('select')) {
+        const marker = [...field.attributes].find((attr) => attr.name.startsWith('data-'));
+        if (!marker) continue;
+        const next = [...desired.querySelectorAll('select')]
+            .find((node) => node.getAttribute(marker.name) === marker.value);
+        if (next && field.innerHTML !== next.innerHTML) {
+            const value = field.value;
+            field.innerHTML = next.innerHTML;
+            field.value = value;
+        }
+    }
+    updateModelChooserOptions(current, desired);
 }
 
 export function mintStableId(prefix, takenIds) {
@@ -291,7 +306,7 @@ export function selectHtml(attrs, groups, selected) {
         return group.label
             ? `<optgroup label="${escapeHtml(group.label)}">${body}</optgroup>` : body;
     }).join('');
-    return `<select ${attrs}>${options}</select>`;
+    return `<select class="ui-control" ${attrs}>${options}</select>`;
 }
 
 export function effortSelectHtml(attrs, selected, surfaceDefault = 'route default') {

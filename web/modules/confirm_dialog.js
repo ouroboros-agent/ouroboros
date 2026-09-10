@@ -1,4 +1,5 @@
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { bindDialogFocus } from './ui_interactions.js';
 
 let activeDialog = null;
 let activeClose = null;
@@ -53,7 +54,7 @@ export function openConfirmDialog({
                 <div class="marketplace-modal-body">
                     <p>${escapeHtml(body || 'Continue?')}</p>
                     ${renderConfirmDialogDetails(details)}
-                    ${input ? `<input class="files-modal-input confirm-dialog-input" data-confirm-input type="text" value="${escapeHtml(initialValue)}">` : ''}
+                    ${input ? `<input class="ui-control files-modal-input confirm-dialog-input" data-confirm-input type="text" aria-labelledby="confirm-dialog-title" value="${escapeHtml(initialValue)}">` : ''}
                 </div>
                 <div class="marketplace-modal-actions">
                     ${alert ? '' : `<button type="button" class="btn btn-default" data-confirm-cancel>${escapeHtml(cancelLabel)}</button>`}
@@ -62,12 +63,14 @@ export function openConfirmDialog({
             </div>
         `;
         let settled = false;
+        let disposeFocus = null;
         const finish = (value) => {
             if (settled) return;
             settled = true;
             document.removeEventListener('keydown', onKey);
             if (activeDialog === backdrop) activeDialog = null;
             if (activeClose === cancel) activeClose = null;
+            disposeFocus?.();
             backdrop.remove();
             resolve(value);
         };
@@ -86,7 +89,9 @@ export function openConfirmDialog({
             }
         });
         const onKey = (event) => {
-            if (event.key === 'Escape' && activeDialog === backdrop) {
+            if (activeDialog !== backdrop || event.defaultPrevented || event.isComposing) return;
+            if (event.key === 'Escape') {
+                event.preventDefault();
                 finish(result(false));
             } else if (input && event.key === 'Enter' && event.target?.matches?.('[data-confirm-input]')) {
                 event.preventDefault();
@@ -97,7 +102,10 @@ export function openConfirmDialog({
         document.body.appendChild(backdrop);
         activeDialog = backdrop;
         activeClose = cancel;
-        (backdrop.querySelector(input ? '[data-confirm-input]' : '[data-confirm-ok]'))?.focus();
+        disposeFocus = bindDialogFocus(backdrop.querySelector('[role="dialog"]'), {
+            initialFocus: backdrop.querySelector(input ? '[data-confirm-input]' : '[data-confirm-ok]'),
+            onEscape: cancel,
+        });
         backdrop.querySelector('[data-confirm-input]')?.select?.();
     });
 }
