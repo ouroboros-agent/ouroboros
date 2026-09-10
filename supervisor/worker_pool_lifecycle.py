@@ -718,17 +718,23 @@ def _worker_pool_execution_state(
     }
 
 
-@_serialized_worker_lifecycle
 def disable_exhausted_worker_pool() -> bool:
     """Use the existing terminalization owner only after all recoverable capacity is gone."""
-    with _queue_lock:
-        # A dead/finishing task may still own a saved child result. Its existing
-        # completion/reaper must settle that result before pending-only disablement.
-        if (not _pool().WORKERS or _pool().RUNNING or _pool()._worker_pool_execution_state()["disabled_reason"]
-                != "worker_readiness_exhausted"):
-            return False
-    return _pool().kill_workers(
-        disable_reason="worker_readiness_exhausted", terminal_status="failed",
-        result_reason=("Worker startup attempts were exhausted before this task could run. "
-                       "Use /restart to restore the worker pool, then submit the task again."),
-    )
+    # Health checks must not delay event intake behind another lifecycle operation.
+    # Admission already reads exhaustion independently; cleanup retries on the next tick.
+    if not _WORKER_LIFECYCLE_LOCK.acquire(blocking=False):
+        return False
+    try:
+        with _queue_lock:
+            # A dead/finishing task may still own a saved child result. Its existing
+            # completion/reaper must settle that result before pending-only disablement.
+            if (not _pool().WORKERS or _pool().RUNNING or _pool()._worker_pool_execution_state()["disabled_reason"]
+                    != "worker_readiness_exhausted"):
+                return False
+        return _pool().kill_workers(
+            disable_reason="worker_readiness_exhausted", terminal_status="failed",
+            result_reason=("Worker startup attempts were exhausted before this task could run. "
+                           "Use /restart to restore the worker pool, then submit the task again."),
+        )
+    finally:
+        _WORKER_LIFECYCLE_LOCK.release()

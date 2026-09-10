@@ -181,6 +181,15 @@ def _timestamp_from_result(result: Dict[str, Any], fallback: float) -> float:
     return fallback
 
 
+def _effective_task_result(parent: pathlib.Path, task_id: str) -> Dict[str, Any]:
+    """Prune reads the projected result; a projection failure reads canonical."""
+    try:
+        from ouroboros.task_status import load_effective_task_result
+
+        return load_effective_task_result(parent, task_id) or {}
+    except Exception:
+        return load_task_result(parent, task_id) or {}
+
 
 def _live_unpromoted_child_refs(
     promotion: Any, expected_child: pathlib.Path,
@@ -245,12 +254,7 @@ def prune_headless_task_drives(
         try:
             validate_task_id(task_id)
             dir_mtime = task_dir.stat().st_mtime
-            try:
-                from ouroboros.task_status import load_effective_task_result
-
-                result = load_effective_task_result(parent, task_id) or {}
-            except Exception:
-                result = load_task_result(parent, task_id) or {}
+            result = _effective_task_result(parent, task_id)
             status = str(result.get("status") or "").lower()
             if status not in _FINAL_STATUSES:
                 report["skipped"].append({"task_id": task_id, "reason": "parent_not_terminal", "status": status})
@@ -317,12 +321,7 @@ def prune_task_drives(
         try:
             validate_task_id(task_id)
             dir_mtime = task_dir.stat().st_mtime
-            try:
-                from ouroboros.task_status import load_effective_task_result
-
-                result = load_effective_task_result(parent, task_id) or {}
-            except Exception:
-                result = load_task_result(parent, task_id) or {}
+            result = _effective_task_result(parent, task_id)
             status = str(result.get("status") or "").lower()
             if status not in _FINAL_STATUSES:
                 report["skipped"].append({"task_id": task_id, "reason": "task_not_terminal", "status": status})
@@ -365,12 +364,7 @@ def prune_task_trees(
         report["scanned"] += 1
         try:
             dir_mtime = tree_dir.stat().st_mtime
-            try:
-                from ouroboros.task_status import load_effective_task_result
-
-                result = load_effective_task_result(parent, root_id) or {}
-            except Exception:
-                result = load_task_result(parent, root_id) or {}
+            result = _effective_task_result(parent, root_id)
             status = str(result.get("status") or "").lower()
             if status and status not in _FINAL_STATUSES:
                 report["skipped"].append({"root_task_id": root_id, "reason": "root_not_terminal", "status": status})
@@ -732,6 +726,12 @@ def _build_deliverable_manifest(
     }
 
 
+def _file_artifact(kind: str, path: pathlib.Path, **facts: Any) -> Dict[str, Any]:
+    """One row shape for an artifact written straight into the task artifact dir."""
+    return {"kind": kind, "name": path.name, "path": str(path),
+            "size": path.stat().st_size if path.exists() else 0, **facts}
+
+
 def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Write patch/memory-export artifacts for a completed headless task."""
 
@@ -781,26 +781,16 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
                 manifest,
                 trailing_newline=True,
             )
-            artifacts.append({
-                "kind": "workspace_patch_manifest",
-                "name": "workspace_patch.json",
-                "path": str(manifest_path),
-                "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
-                "workspace_root": str(workspace_root),
-            })
+            artifacts.append(_file_artifact("workspace_patch_manifest", manifest_path,
+                                            workspace_root=str(workspace_root)))
 
     child_drive = _child_drive_from_task(task)
     if child_drive is not None:
         try:
             export_path = artifact_dir / "memory_export.json"
             atomic_write_json(export_path, build_memory_export(child_drive, task), trailing_newline=True)
-            artifacts.append({
-                "kind": "memory_export",
-                "name": "memory_export.json",
-                "path": str(export_path),
-                "size": export_path.stat().st_size if export_path.exists() else 0,
-                "memory_mode": str(task.get("memory_mode") or ""),
-            })
+            artifacts.append(_file_artifact("memory_export", export_path,
+                                            memory_mode=str(task.get("memory_mode") or "")))
         except Exception as exc:
             if workspace_root is not None:
                 artifact_status = ARTIFACT_STATUS_FAILED
@@ -820,18 +810,14 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
             manifest_path = artifact_dir / "deliverable_manifest.json"
             dm = _build_deliverable_manifest(workspace_root, task_id, str(task.get("project_id") or ""))
             atomic_write_json(manifest_path, dm, trailing_newline=True)
-            artifacts.append({
-                "kind": "deliverable_manifest",
-                "name": "deliverable_manifest.json",
-                "path": str(manifest_path),
-                "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
-                "file_count": int(dm.get("file_count") or 0),
-                "truncated": bool(dm.get("truncated")),
-                "complete": dm["complete"], "gap_count": dm["gap_count"],
-                "errors": ([f"Automatic workspace listing is partial: {dm['gap_count']} read gaps."]
-                           if dm["gap_count"] else []),
-                "workspace_root": str(workspace_root),
-            })
+            artifacts.append(_file_artifact(
+                "deliverable_manifest", manifest_path,
+                file_count=int(dm.get("file_count") or 0), truncated=bool(dm.get("truncated")),
+                complete=dm["complete"], gap_count=dm["gap_count"],
+                errors=([f"Automatic workspace listing is partial: {dm['gap_count']} read gaps."]
+                        if dm["gap_count"] else []),
+                workspace_root=str(workspace_root),
+            ))
         except Exception as exc:
             artifact_status = ARTIFACT_STATUS_FAILED
             artifact_error = f"Deliverable manifest failed: {type(exc).__name__}: {exc}"

@@ -3,6 +3,7 @@
 import queue as stdqueue
 import json
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -141,6 +142,42 @@ def test_unsettled_dead_task_is_left_to_existing_completion_owner(pool):
     workers.RUNNING["saved"] = {"task": {"id": "saved"}, "worker_id": 3}
     assert not workers.disable_exhausted_worker_pool()
     assert "saved" in workers.RUNNING and workers.WORKERS[0] is pool.slot
+
+
+def test_exhaustion_check_does_not_wait_for_another_lifecycle_operation(pool, monkeypatch):
+    lock = threading.RLock()
+    monkeypatch.setattr(worker_pool_lifecycle, "_WORKER_LIFECYCLE_LOCK", lock)
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    outcomes = []
+    pool.slot.readiness_exhausted = True
+
+    def hold_lifecycle():
+        with lock:
+            entered.set()
+            assert release.wait(5)
+
+    def check_exhaustion():
+        try:
+            outcomes.append(workers.disable_exhausted_worker_pool())
+        finally:
+            completed.set()
+
+    holder = threading.Thread(target=hold_lifecycle)
+    check = threading.Thread(target=check_exhaustion)
+    holder.start()
+    try:
+        assert entered.wait(2)
+        check.start()
+        assert completed.wait(2), "health intake waited for lifecycle cleanup"
+        assert outcomes == [False]
+        assert workers.WORKERS[0] is pool.slot
+    finally:
+        release.set()
+        holder.join(5)
+        if check.ident is not None:
+            check.join(5)
+    assert workers.disable_exhausted_worker_pool()
+    assert not workers.WORKERS
 
 
 def test_repository_writer_policy_stays_separate_from_execution_capacity(pool, monkeypatch):

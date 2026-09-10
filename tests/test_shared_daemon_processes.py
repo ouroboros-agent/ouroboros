@@ -120,24 +120,32 @@ def test_operator_stop_receipt_does_not_stop_or_claim_a_live_successor(tmp_path,
 
 
 _ENGINE = r'''
-import http.server, json, os, pathlib, subprocess, sys, threading
+print('fixture-engine: Python entered', flush=True)
+import http.server, json, os, pathlib, socketserver, subprocess, sys, threading
 from ouroboros.platform_layer import subprocess_new_group_kwargs
+print('fixture-engine: imports ready', flush=True)
+
+class LoopbackHTTPServer(http.server.HTTPServer):
+    def server_bind(self):
+        # The fixture has no hostname semantics; avoid external reverse DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 home = pathlib.Path(os.environ['CLAUDEXOR_CONFIG_DIR'])
 home.mkdir(parents=True, exist_ok=True)
 progress = home / 'client-work.txt'
-harness = None
-fixture_info = home / 'fixture-engine.json'
-
-def write_fixture_info(info):
-    temporary = fixture_info.with_suffix('.tmp')
-    temporary.write_text(json.dumps(info))
-    temporary.replace(fixture_info)
-
+print('fixture-engine: starting harness', flush=True)
+harness = subprocess.Popen([sys.executable, '-c',
+    "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); n=0\nwhile True:\n n+=1; p.write_text(str(n)); time.sleep(.05)",
+    str(progress)], **subprocess_new_group_kwargs())
+print('fixture-engine: harness spawned', flush=True)
+(home / 'fixture-engine.json').write_text(json.dumps({'pid': os.getpid(), 'harness_pid': harness.pid}))
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args): pass
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b'client-B-keeps-working')
     def do_POST(self):
+        print('fixture-engine: POST ' + self.path, flush=True)
         self.rfile.read(int(self.headers.get('Content-Length', '0')))
         if self.headers.get('Authorization') != 'Bearer fixture-token':
             self.send_response(401); self.end_headers(); return
@@ -149,30 +157,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.wfile.write(json.dumps({'compatible': True, 'protocolMajor': 3,
                 'engine': {'version': '3.9.8', 'sha': 'a' * 40}}).encode())
-server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        print('fixture-engine: POST complete ' + self.path, flush=True)
+print('fixture-engine: binding loopback', flush=True)
+server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
 control = home / 'daemon'; control.mkdir(exist_ok=True)
 (control / 'token').write_text('fixture-token')
 (control / 'control-api.json').write_text(json.dumps({'host':'127.0.0.1',
     'port':server.server_port, 'tokenPath':str(control / 'token')}))
-fixture = {'pid':os.getpid(), 'port':server.server_port, 'harness_pid':0}
-write_fixture_info(fixture)
-
-def start_harness():
-    global harness
-    try:
-        harness = subprocess.Popen([sys.executable, '-c',
-            "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); n=0\nwhile True:\n n+=1; p.write_text(str(n)); time.sleep(.05)",
-            str(progress)], **subprocess_new_group_kwargs())
-        fixture['harness_pid'] = harness.pid
-    except Exception as exc:
-        fixture['harness_error'] = f'{type(exc).__name__}: {exc}'
-    write_fixture_info(fixture)
-
-threading.Thread(target=start_harness, daemon=True).start()
+(home / 'fixture-engine.json').write_text(json.dumps({'pid':os.getpid(),
+    'port':server.server_port, 'harness_pid':harness.pid}))
+print('fixture-engine: control published', flush=True)
 try: server.serve_forever(poll_interval=.05)
 finally:
     server.server_close()
-    if harness is not None and harness.poll() is None: harness.terminate(); harness.wait(timeout=5)
+    if harness.poll() is None: harness.terminate(); harness.wait(timeout=5)
 '''
 
 _WORKER = r'''
@@ -184,25 +182,19 @@ from ouroboros import claudexor_daemon as daemon, claudexor_runtime, platform_la
 command = [sys.executable, '-u', '-c', sys.argv[2]]
 claudexor_runtime.get_runtime_manager = lambda: SimpleNamespace(
     ensure=lambda: command, pin=None, status=lambda: {'version':'3.9.8','build_sha':'a'*40,'source':'fixture'})
+probe = daemon.OwnedClaudexorDaemon._classify_liveness
+def observe_probe(self, **kwargs):
+    started = time.monotonic()
+    print('fixture-worker: probe begin', file=sys.stderr, flush=True)
+    result = probe(self, **kwargs)
+    print('fixture-worker: probe %.3fs %s %s' % (time.monotonic() - started, result[1], result[2]), file=sys.stderr, flush=True)
+    return result
+daemon.OwnedClaudexorDaemon._classify_liveness = observe_probe
 daemon.ensure_owned_gateway(startup_wait_sec=30).close()
 owned = daemon.get_owned_daemon()
 custody_pid = int(getattr(getattr(owned, '_proc', None), 'pid', 0) or 0)
 ordinary = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], **pl.subprocess_new_group_kwargs())
-info_path = root/'claudexor'/'fixture-engine.json'
-deadline = time.monotonic() + 30
-while True:
-    if time.monotonic() >= deadline:
-        raise RuntimeError('fixture harness startup did not publish a PID within 30s: ' + str(info_path))
-    try:
-        info = json.loads(info_path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        time.sleep(.01)
-        continue
-    if info.get('harness_error'):
-        raise RuntimeError(info['harness_error'])
-    if info.get('harness_pid'):
-        break
-    time.sleep(.01)
+info = json.loads((root/'claudexor'/'fixture-engine.json').read_text())
 info.update(worker_pid=os.getpid(), ordinary_pid=ordinary.pid, custody_pid=custody_pid)
 (root/'ready.json').write_text(json.dumps(info))
 time.sleep(120)
@@ -221,7 +213,7 @@ if use_job:
         worker.kill(); worker.wait(timeout=5)
         if job: pl.close_job(job)
         raise RuntimeError('fixture worker could not enter its launcher Job')
-worker.wait(timeout=120)
+raise SystemExit(worker.wait(timeout=120))
 '''
 
 _CLI = r'''
@@ -254,6 +246,23 @@ def _wait(predicate, timeout=10):
 
 def _gone(pid):
     return not pl.pid_is_alive(pid) or custody.pid_is_zombie(pid)
+
+
+@pytest.mark.serial
+def test_loopback_fixture_bind_does_not_require_reverse_dns(monkeypatch):
+    import ast
+    import http.server
+    import socket
+    import socketserver
+
+    node = next(item for item in ast.parse(_ENGINE).body
+                if isinstance(item, ast.ClassDef) and item.name == "LoopbackHTTPServer")
+    namespace = {"http": http, "socketserver": socketserver}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "fixture-server", "exec"), namespace)
+    monkeypatch.setattr(socket, "getfqdn", lambda *_a: pytest.fail("fixture performed reverse DNS"))
+    with namespace["LoopbackHTTPServer"](("127.0.0.1", 0), http.server.BaseHTTPRequestHandler) as server:
+        assert server.server_name == "127.0.0.1"
+        assert server.server_port == server.server_address[1] > 0
 
 
 @pytest.fixture
@@ -294,7 +303,11 @@ def shared_tree(tmp_path, monkeypatch, request):
                 f"{exc}\nlauncher.log:\n{read_log(log_path)}\n"
                 f"daemon.log:\n{read_log(tmp_path / 'claudexor' / 'daemon.log')}"
             ) from exc
-        assert parent.poll() is None, log_path.read_text()
+        assert parent.poll() is None, (
+            log_path.read_text() + "\ndaemon.log:\n"
+            + ((tmp_path / "claudexor" / "daemon.log").read_text()
+               if (tmp_path / "claudexor" / "daemon.log").is_file() else "<missing>")
+        )
         info = json.loads((tmp_path / "ready.json").read_text())
         _wait(lambda: (tmp_path / "claudexor" / "client-work.txt").exists())
         yield parent, info
@@ -306,6 +319,8 @@ def shared_tree(tmp_path, monkeypatch, request):
         if parent.poll() is None:
             pl.kill_process_tree(parent)
         parent.wait(timeout=5)
+        if not info:
+            custody.stop_ledgered_processes(tmp_path, {daemon.CUSTODY_PURPOSE})
         for name in ("ordinary_pid", "harness_pid", "worker_pid", "custody_pid", "pid"):
             if info.get(name) and not _gone(info[name]):
                 pl.kill_pid_tree(info[name])
@@ -313,6 +328,13 @@ def shared_tree(tmp_path, monkeypatch, request):
 
 
 def _continues(root, info):
+    def diagnostics():
+        logs = [str(info)]
+        for path in (root / "launcher.log", root / "claudexor" / "daemon.log"):
+            logs.append(f"{path.name}:\n" + (path.read_text() if path.is_file() else "<missing>"))
+        return "\n".join(logs)
+    assert not _gone(info["pid"]), "fixture daemon exited after ancestor cleanup:\n" + diagnostics()
+    assert not _gone(info["harness_pid"]), "other fixture client exited after ancestor cleanup:\n" + diagnostics()
     def alive():
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -320,7 +342,10 @@ def _continues(root, info):
                 return response.read() == b"client-B-keeps-working"
         except (OSError, urllib.error.URLError):
             return False
-    _wait(alive, timeout=10)
+    try:
+        _wait(alive, timeout=10)
+    except AssertionError as exc:
+        raise AssertionError("fixture daemon has no HTTP response:\n" + diagnostics()) from exc
     progress = root / "claudexor" / "client-work.txt"
     previous = progress.read_text()
     _wait(lambda: progress.read_text() not in ("", previous))
