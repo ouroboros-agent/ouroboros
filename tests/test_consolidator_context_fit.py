@@ -493,3 +493,43 @@ def test_unavailable_capacity_reader_retains_ordinary_call(monkeypatch):
     monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
     llm = _LLM()
     assert _summary(llm)[0] and len(llm.calls) == 1
+
+
+@pytest.mark.parametrize("preceding_blocks", [0, 1])
+def test_refusal_bound_survives_preceding_logical_blocks(tmp_path, fit, preceding_blocks):
+    """Earlier success cannot consume a later unpublished block's refusal."""
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    fit.window = None
+    chat, blocks, meta = _paths(tmp_path)
+    count = 100 * (preceding_blocks + 1)
+    _write_chat(chat, count=count, text_size=5)
+    raw = chat.read_bytes()
+    interruption = ModelWaitInterrupted("deadline", role="light")
+
+    def first_cycle(llm, prompt):
+        if len(llm.calls) == preceding_blocks + 1:
+            error = _Refusal()
+            error.physical_attempt_capture = SimpleNamespace(state="settled")
+            raise error
+        if len(llm.calls) > preceding_blocks + 1:
+            raise interruption
+
+    first = _LLM(effect=first_cycle)
+    with pytest.raises(ModelWaitInterrupted) as caught:
+        c.consolidate(chat, blocks, meta, first)
+    assert caught.value is interruption
+    rejected = first.calls[preceding_blocks]["messages"][0]["content"]
+    saved = json.loads(meta.read_text())
+    assert saved["consolidation_retry"]["input_limit"]["input_bytes"] == len(rejected.encode()) - 1
+    assert saved.get("last_consolidated_offset", 0) == 0
+    assert not blocks.exists() and chat.read_bytes() == raw
+
+    second = _LLM()
+    c.consolidate(chat, blocks, meta, second)
+    next_prompt = second.calls[preceding_blocks]["messages"][0]["content"]
+    assert len(next_prompt.encode()) < len(rejected.encode())
+    assert chat.read_bytes() == raw
+    final = json.loads(meta.read_text())
+    assert final["last_consolidated_offset"] == count
+    assert "consolidation_retry" not in final

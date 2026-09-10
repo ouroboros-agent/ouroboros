@@ -290,7 +290,8 @@ def _run_block_consolidation(
         )
 
         total_usage = _merge_consolidation_usage(total_usage, usage)
-        meta.pop("consolidation_retry", None)
+        if (meta.get("consolidation_retry") or {}).get("source_sha256") == source_hash:
+            meta.pop("consolidation_retry", None)
         if not content and usage.get("_consolidation_retry"):
             meta["consolidation_retry"] = {"source_sha256": source_hash, "input_limit": usage["_consolidation_retry"]}
         if usage.get("_consolidation_errors"):
