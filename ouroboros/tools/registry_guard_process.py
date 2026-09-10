@@ -547,15 +547,10 @@ def _run_shell_safety_check(
     # Owner controls, credentials, safety and execution inspect the full argv.
     writer_cmd = local_shell_subject(raw_cmd)
     target_rows, write_target_argvs, explicit_write_targets, executable_path_tokens = _lane_writer_targets(writer_cmd)
-    # Writer-command membership canonicalizes versioned interpreter spellings to
-    # their family (`ruby3.2` is `ruby`), so a versioned basename is exactly as
-    # write-suspect as the unversioned one (XG-2R.2).
-    # Interpreter argv (direct or inside sh -c) takes the MODE-AWARE
-    # write-shape classifier: the bare `open(` token classified read-only
-    # `open(p, 'rb')` as a write ("the original GAIA class"). Write-mode
-    # opens, pathlib `.open('w')`, save-APIs, opaque subprocess escapes
-    # and shell-level indicators still classify as writes;
-    # `writer_target_tokens` keeps covering literal targets below.
+    # Canonical interpreter families include versioned names (XG-2R.2).
+    # Direct and sh -c bodies use mode-aware write_shape: open('rb') is a read;
+    # write-mode opens, save APIs, subprocess escapes and shell writes are not.
+    # writer_target_tokens separately covers literal destinations.
     write_shape_interpreter = bool(_registry().interpreter_family(argv_executable)) or (
         bool(inline_argv)
         and bool(_registry().interpreter_family(pathlib.PurePath(str(inline_argv[0])).name.lower().removesuffix(".exe")))

@@ -1009,20 +1009,16 @@ def _workspace_shell_write_block(
                 allowed_data_roots.append(resolved_root)
     if selected.root in {"task_drive", "artifact_store"}:
         allowed_data_roots.append(selected_base)
-    # Executor-backed commands use backend path spellings (for example
-    # ``/deliverables/report.html``), while the policy roots above are host
-    # paths. Keep the configured Deliverables root separate from the generic
-    # allow-root list: every descendant must still pass the target-specific
-    # user-files policy (hidden/credential/symlink checks) below.
+    # Backend paths (e.g. /deliverables/report.html) differ from host roots.
+    # Keep Deliverables separate: its descendants still need target-specific
+    # user-files checks for hidden/credential paths and symlinks.
     deliverables_root_lexical: pathlib.Path | None = None
     deliverables_root_lexical_alias: pathlib.Path | None = None
     deliverables_root_physical: pathlib.Path | None = None
     try:
         candidate_deliverables = _registry().resource_root_path(self._ctx, "deliverables")
-        # Retain the configured spelling even when the root itself is
-        # malformed or protected. Descendants must then take the
-        # target-specific path and fail closed before a broader
-        # workspace/data allow-root can accidentally admit them.
+        # Retain even malformed/protected root spellings so descendants cannot
+        # skip target checks through a broader workspace/data root.
         deliverables_root_physical = pathlib.Path(candidate_deliverables).resolve(strict=False)
         deliverables_root_lexical = _registry()._deliverables_root_lexical()
         deliverables_root_lexical_alias = _registry()._deliverables_root_lexical_alias()
@@ -1199,13 +1195,9 @@ def _workspace_shell_write_block(
                     continue
                 windows_drive_path = bool(re.match(r"^[A-Za-z]:[\\/]", candidate))
                 unc_path = candidate.startswith("\\\\")
-                # On the native Windows host, resolve drive paths exactly as
-                # POSIX paths are resolved below. This canonicalizes directory
-                # symlinks/junctions before containment: a workspace alias stays
-                # allowed, while an in-workspace spelling whose nested link exits
-                # the root is blocked. Keep lexical handling for foreign Windows
-                # spellings seen on POSIX and for UNC paths (which may require a
-                # network lookup merely to evaluate the guard).
+                # Resolve native Windows drive paths like POSIX paths, checking
+                # containment after symlink/junction resolution. Foreign Windows
+                # and UNC paths stay lexical to avoid unintended network lookups.
                 if (not windows_drive_path and not unc_path) or (
                     os.name == "nt" and windows_drive_path
                 ):
