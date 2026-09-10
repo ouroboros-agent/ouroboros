@@ -1,8 +1,8 @@
 import { refreshModelCatalog } from './settings_catalog.js';
-import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
+import { bindEffortSegments, syncEffortSegments, readCustomSecretDraft, collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
-import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
-import { adoptSubagentRoster, collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
+import { applyMcpSettings, collectMcpSettings, initMcpSettings, validateMcpSettings } from './mcp_settings.js';
+import { adoptSubagentRoster, collectReviewerSlots, initReviewerSlots, reloadReviewerSlots, validateReviewerSlots, noteReviewerSlotsSaveAttempt, discardReviewerSlotsDraft } from './reviewer_slots.js';
 import {
     applySubagentsSettings,
     availableSubagentsPreviewPayload,
@@ -95,15 +95,16 @@ function isTruthySetting(value) {
     return value === true || ['true', '1', 'yes', 'on'].includes(normalized);
 }
 
-// `owner` names the surface a message belongs to (today only the Available
-// subagents roster claims one); a later message from anyone else drops it, so
-// an owner may clear its own stale message but never a newer one.
-function setStatus(text, tone = 'ok', owner = '') {
+// A loading, validation or editor owner may update its own status. A later
+// message from anyone else drops that ownership, protecting the newer result.
+function setStatus(text, tone = 'ok', owner = '', subject = '') {
     const status = byId('settings-status');
     status.textContent = text;
     status.dataset.tone = tone;
     if (owner) status.dataset.owner = owner;
     else delete status.dataset.owner;
+    if (subject) status.dataset.subject = subject;
+    else delete status.dataset.subject;
 }
 
 function setButtonBusy(button, busy) {
@@ -135,37 +136,31 @@ function applySecretInputs(root, settings) {
 }
 
 
-function wireSecretRow(row) {
-    const input = row.querySelector('.secret-input');
-    const toggle = row.querySelector('[data-row-secret-toggle]');
-    const clear = row.querySelector('[data-row-secret-clear]');
-    if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
-    if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Show' : 'Hide'; });
-    if (clear && input) clear.addEventListener('click', () => {
-        input.value = ''; input.type = 'password'; input.dataset.forceClear = '1';
-        if (toggle) toggle.textContent = 'Show';
-        markSettingsDirty();
-        // Programmatic value changes fire no 'input' event, but a Clear is an
-        // edit like any other: the provider-test verdict listener must see it.
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-}
-
 function customSecretRow(key = '', value = '') {
     const id = `custom-secret-${Math.random().toString(36).slice(2)}`;
+    const ordinal = document.querySelectorAll('[data-custom-secret-row]').length + 1;
     const row = document.createElement('div');
     row.className = 'settings-custom-secret-row';
     row.dataset.customSecretRow = '1';
+    row.dataset.originalKey = key;
     row.innerHTML = `
-        <div class="form-field settings-custom-secret-key"><label>Key</label><input data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
-        <div class="form-field settings-custom-secret-value"><label>Value</label><div class="secret-input-row">
-            <input id="${id}" data-custom-secret-value class="secret-input" type="password" value="${escapeHtml(value || '')}" placeholder="Secret value">
-            <button type="button" class="btn btn-default" data-row-secret-toggle>Show</button>
-            <button type="button" class="btn btn-default" data-row-secret-clear>Clear</button>
-        </div><div class="settings-inline-note" data-custom-secret-error hidden></div></div>
+        <div class="form-field ui-field settings-custom-secret-key"><label for="${id}-key">Custom key ${ordinal}</label><input id="${id}-key" name="custom-key" type="text" class="ui-control" data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
+        <div class="form-field ui-field settings-custom-secret-value"><label for="${id}">Value for ${escapeHtml(key || `custom key ${ordinal}`)}</label><div class="secret-input-row">
+            <input id="${id}" name="custom-value" data-custom-secret-value class="secret-input ui-control" type="password" value="${escapeHtml(value || '')}" placeholder="Secret value">
+            <button type="button" class="btn btn-default secret-toggle" data-target="${id}" data-row-secret-toggle>Show</button>
+            <button type="button" class="btn btn-default secret-clear" data-target="${id}" data-row-secret-clear>Clear</button>
+        </div></div>
         <button type="button" class="btn btn-default settings-custom-secret-remove" data-custom-secret-remove>Remove</button>`;
-    wireSecretRow(row);
-    row.querySelector('[data-custom-secret-remove]')?.addEventListener('click', () => { row.dataset.removeCustomSecret = '1'; row.hidden = true; markSettingsDirty(); });
+    bindSecretInputs(row);
+    row.querySelector('[data-custom-secret-value]').dataset.appliedValue = value;
+    row.querySelector('[data-custom-secret-key]').addEventListener('input', (event) => {
+        row.querySelector(`label[for="${id}"]`).textContent = `Value for ${event.target.value.trim() || `custom key ${ordinal}`}`;
+    });
+    row.querySelector('[data-custom-secret-remove]')?.addEventListener('click', () => {
+        if (row.dataset.originalKey) { row.dataset.removeCustomSecret = '1'; row.hidden = true; }
+        else row.remove();
+        markSettingsDirty();
+    });
     return row;
 }
 
@@ -195,12 +190,13 @@ function renderRequestedSkillSecrets(root, skills, settings) {
         const id = `requested-secret-${idx}`;
         const el = document.createElement('div');
         el.className = 'settings-requested-secret-row';
-        el.innerHTML = `<div class="form-field"><label>${escapeHtml(key)}</label><div class="secret-input-row">
-            <input id="${id}" data-secret-setting="${escapeHtml(key)}" class="secret-input" type="password" value="${escapeHtml(settings[key] || '')}" placeholder="Secret value">
-            <button type="button" class="btn btn-default" data-row-secret-toggle>Show</button>
-            <button type="button" class="btn btn-default" data-row-secret-clear>Clear</button>
+        el.innerHTML = `<div class="form-field ui-field"><label for="${id}">${escapeHtml(key)}</label><div class="secret-input-row">
+            <input id="${id}" name="${escapeHtml(key)}" data-secret-setting="${escapeHtml(key)}" class="secret-input ui-control" type="password" value="${escapeHtml(settings[key] || '')}" placeholder="Secret value">
+            <button type="button" class="btn btn-default secret-toggle" data-target="${id}" data-row-secret-toggle>Show</button>
+            <button type="button" class="btn btn-default secret-clear" data-target="${id}" data-row-secret-clear>Clear</button>
         </div></div>`;
-        wireSecretRow(el); host.appendChild(el);
+        el.querySelector('.secret-input').dataset.appliedValue = settings[key] || '';
+        bindSecretInputs(el); host.appendChild(el);
     });
 }
 
@@ -232,9 +228,9 @@ function renderExtensionSettingsSections(root, sections) {
             const disabled = Boolean(component.disabled);
             const fieldOptions = {
                 disabled,
-                fieldClass: 'form-field',
-                inlineClass: 'settings-extension-checkbox',
-                helpClass: 'settings-inline-note',
+                fieldClass: 'form-field ui-field',
+                inlineClass: 'settings-extension-checkbox ui-field ui-field-inline',
+                helpClass: 'settings-inline-note ui-field-help',
             };
             return `
                 <form class="settings-extension-form" data-extension-settings-form data-extension-settings-key="${escapeHtml(formKey)}" data-skill="${escapeHtml(section.skill || '')}" data-route="${escapeHtml(rawRoute)}">
@@ -316,7 +312,7 @@ function collectSecretValue(id, body) {
         return;
     }
     const value = input.value;
-    if (value && !value.includes('...')) body[settingKey] = value;
+    if (value && value !== input.dataset.appliedValue) body[settingKey] = value;
 }
 
 
@@ -383,10 +379,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             page.activateSettingsTab(tabName);
         }
     };
-    bindSettingsTabs(page, { state });
+    const disposeSettingsTabs = bindSettingsTabs(page, { state });
     bindSecretInputs(page);
     bindEffortSegments(page);
-    bindLocalModelControls({ state });
+    const disposeLocalModel = bindLocalModelControls({ state });
     // Best-effort About version from /api/health.
     apiFetch('/api/health')
         .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
@@ -400,20 +396,26 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsLoaded = false;
     let settingsBaseline = '';
     let settingsDirty = false;
+    let draftRevision = 0;
+    let loadSequence = 0;
+    let settingsSaving = false;
+    let saveOutcomeUnknown = false;
+    let validationAttempted = false;
     const providerTestGenerations = new Map();
     const providerTestsInFlight = new Set();
     const modelRoles = createModelRolesEditor({ hostId: 'settings-model-roles',
-        onChange: () => updateSettingsDirtyState() });
+        onChange: () => onSettingsEdited() });
     modelRoles.mount();
-    initMcpSettings({ onChange: updateSettingsDirtyState });
-    initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
+    initMcpSettings({ onChange: onSettingsEdited });
+    initReviewerSlots({ onChange: () => onSettingsEdited() });
     initSubagentsSection({
-        onChange: () => updateSettingsDirtyState(),
-        // The roster's section line and the footer message it owns read one
-        // verdict: when the judged rows come clean, the footer clears with the
-        // line and the tint — unless someone else has written the footer since.
+        onChange: () => onSettingsEdited(),
+        // A judged roster may clear only the validation footer it authored.
+        // A cadence or other field error keeps its typed subject and survives.
         onJudged: (clean) => {
-            if (clean && byId('settings-status').dataset.owner === 'subagents') setStatus('', 'ok');
+            const status = byId('settings-status');
+            if (clean && status.dataset.owner === 'validation'
+                    && status.dataset.subject === 'subagents') setStatus('', 'ok');
         },
         isOuterDraftClean: () => !settingsDirty,
         onGeneratedApply: () => {
@@ -428,9 +430,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     function syncSettingsLoadState() {
         const saveBtn = byId('btn-save-settings');
         if (saveBtn) {
-            saveBtn.disabled = !settingsLoaded;
+            saveBtn.disabled = !settingsLoaded || settingsSaving || saveOutcomeUnknown;
             saveBtn.title = settingsLoaded
-                ? ''
+                ? (saveOutcomeUnknown ? 'Reload Settings to check the previous save before saving again.' : '')
                 : 'Reload current settings successfully before saving.';
         }
     }
@@ -468,8 +470,11 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     function snapshotSettingsDraft() {
         return stableSerializeDraft({
             ...collectBody(),
-            OUROBOROS_RUNTIME_MODE_DRAFT: byId('s-runtime-mode')?.value || 'advanced',
-            OUROBOROS_CONTEXT_MODE_DRAFT: byId('s-context-mode')?.value || 'max',
+            // Raw controls retain invalid/empty values and owner-only settings
+            // that the transport payload intentionally normalizes or omits.
+            controls: Array.from(page.querySelectorAll('input[id^="s-"], select[id^="s-"], textarea[id^="s-"], [data-secret-setting], [data-model-role-context]'),
+                (input) => [input.id, input.value, input.checked, input.validity?.badInput || false, input.dataset.forceClear || '']),
+            customSecrets: readCustomSecretDraft(page),
         });
     }
 
@@ -481,16 +486,22 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     function updateSettingsDirtyState() {
-        if (!settingsLoaded || !settingsBaseline) return;
-        const nextDirty = snapshotSettingsDraft() !== settingsBaseline;
+        const nextDirty = settingsLoaded && settingsBaseline
+            ? snapshotSettingsDraft() !== settingsBaseline : draftRevision > 0;
         if (nextDirty === settingsDirty) return;
         settingsDirty = nextDirty;
         const indicator = byId('settings-unsaved-indicator');
         if (indicator) indicator.classList.toggle('is-visible', settingsDirty);
     }
 
+    function onSettingsEdited() {
+        draftRevision += 1;
+        if (validationAttempted) renderValidation();
+        updateSettingsDirtyState();
+    }
+
     let baselineSettleDisposer = null;
-    function armCleanBaselineOnStatusSettle() {
+    function armCleanBaselineOnStatusSettle(revision) {
         // The sections' Claudexor status probe is fire-and-forget, so the
         // baseline can be taken before the store-gated collectors have their
         // facts — and their output changes when a snapshot lands (the accounts
@@ -509,16 +520,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             // copy but never the canonical actor draft; re-baselining a DIRTY
             // page would still absorb the owner's real row edit into the clean
             // baseline, so it remains forbidden.
-            // Disclosed residual: a cold-daemon settle landing AFTER an owner
-            // edit stays inside the unsaved-changes diff until the next save —
-            // rare (the reloads wait a bounded beat for the probe first) and
-            // fail-safe (an over-eager indicator, never a lost edit).
-            if (!settingsDirty && settingsLoaded) setSettingsCleanBaseline();
+            // After an edit, any availability-only difference remains in the
+            // draft comparison until the next load/save; it cannot absorb edits.
+            if (revision === draftRevision && !settingsDirty && settingsLoaded) setSettingsCleanBaseline();
         });
     }
 
     function discardUnsavedSettingsDraft() {
         applySettings(currentSettings || {});
+        discardReviewerSlotsDraft();
+        renderCustomSecrets(page, currentSettings || {});
+        validationAttempted = false;
+        paintSettingsFieldErrors(page, []);
         setSettingsCleanBaseline();
         setStatus('', 'ok');
     }
@@ -658,52 +671,66 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     async function loadSettings() {
+        const sequence = ++loadSequence;
+        const revision = draftRevision;
         const [data, extData] = await Promise.all([
             apiClient.settings(),
             apiClient.extensions().catch(() => ({})),
         ]);
+        if (!data || typeof data !== 'object' || Array.isArray(data) || data.error) {
+            throw new Error(data?.error || 'The server did not return a settings document.');
+        }
         const sections = Array.isArray(extData?.live?.settings_sections)
             ? extData.live.settings_sections
             : [];
+        if (sequence !== loadSequence || revision !== draftRevision) return false;
         currentSettings = data;
         applySettings(data);
         renderExtensionSettingsSections(page, sections);
         renderRequestedSkillSecrets(page, extData.skills || [], data);
         renderCustomSecrets(page, data);
-        // Await reviewer config and the Available-subagents bounded status beat BEFORE the clean
-        // baseline: their async arrival must not read as an unsaved owner edit.
-        // (The Claudexor status probe inside them is fire-and-forget — a cold
-        // daemon must not hold the Save button — so its LATER settlement is
-        // re-baselined below.)
-        await Promise.all([reloadReviewerSlots(), reloadSubagentsSection()]);
-        // Mark the document loaded before taking the baseline. A generated
-        // preview may settle in the microtask between these statements; its
-        // clean-gated callback must be allowed to fold that exact draft into
-        // the baseline rather than leave a false unsaved change behind.
+        // This confirmed document can already be edited and saved. Optional
+        // reviewer/status reads must not hold its baseline or Save capability.
         settingsLoaded = true;
+        saveOutcomeUnknown = false;
+        validationAttempted = false;
+        paintSettingsFieldErrors(page, []);
         setSettingsCleanBaseline();
-        armCleanBaselineOnStatusSettle();
+        armCleanBaselineOnStatusSettle(revision);
         _renderNetworkHint(data._meta);
-        markSettingsDirty = updateSettingsDirtyState;
         syncSettingsLoadState();
+        await Promise.all([reloadReviewerSlots({ isCurrent: () => sequence === loadSequence && revision === draftRevision }), reloadSubagentsSection()]);
+        if (sequence !== loadSequence || revision !== draftRevision) {
+            updateSettingsDirtyState();
+            return false;
+        }
+        // Optional enrichment belongs in a still-clean baseline, never in an
+        // owner edit made while one of those reads was pending.
+        setSettingsCleanBaseline();
+        return true;
     }
 
     async function reloadSettingsWithFeedback() {
-        setStatus('Loading settings...', 'muted');
-        settingsLoaded = false;
-        syncSettingsLoadState();
+        if (settingsSaving) return;
+        if (settingsDirty && !(await confirmDiscardSettings('reload Settings'))) return;
+        const reloadSequence = loadSequence + 1;
+        setStatus('Loading settings...', 'muted', 'load');
         try {
-            await loadSettings();
+            const applied = await loadSettings();
+            if (!applied && byId('settings-status').dataset.owner === 'load') {
+                setStatus('Settings were not reloaded because your draft changed while loading. Your edits are kept.', 'warn', 'load');
+            }
             try {
                 await refreshModelCatalog({ button: byId('btn-refresh-model-catalog') });
-                setStatus('Settings loaded', 'ok');
+                if (applied && byId('settings-status').dataset.owner === 'load' && !settingsDirty && !settingsSaving && !saveOutcomeUnknown) setStatus('Settings loaded', 'ok');
             } catch (error) {
-                setStatus(
+                if (applied && byId('settings-status').dataset.owner === 'load' && !settingsDirty && !settingsSaving && !saveOutcomeUnknown) setStatus(
                     `Settings loaded. Model catalog refresh failed: ${error.message || error}`,
                     'warn'
                 );
             }
         } catch (error) {
+            if (reloadSequence !== loadSequence) return;
             settingsLoaded = false;
             syncSettingsLoadState();
             setStatus(
@@ -714,14 +741,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     async function refreshSettingsAfterExtensionChange(reason = 'skills changed') {
-        if (extensionRefreshPending) return;
+        if (extensionRefreshPending || settingsSaving || saveOutcomeUnknown) return;
         if (settingsDirty) {
             setStatus(`Settings changed externally (${reason}). Reload after saving or discarding your draft.`, 'warn');
             return;
         }
         extensionRefreshPending = true;
         try {
-            await loadSettings();
+            if (!(await loadSettings())) return;
             setStatus('Settings refreshed', 'ok');
         } catch (error) {
             setStatus(`Settings refresh failed: ${error.message || error}`, 'warn');
@@ -782,28 +809,69 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         page.querySelectorAll('[data-secret-setting]').forEach((input) => {
             collectSecretValue(input.id, body);
         });
-        page.querySelectorAll('[data-custom-secret-row]').forEach((row) => {
-            const keyInput = row.querySelector('[data-custom-secret-key]');
-            const valueInput = row.querySelector('[data-custom-secret-value]');
-            const key = (keyInput?.value || '').trim().toUpperCase();
-            const error = row.querySelector('[data-custom-secret-error]');
-            if (!key) return;
-            if (!/^[A-Z][A-Z0-9_]{2,}$/.test(key)) { if (error) { error.hidden = false; error.textContent = 'Use uppercase letters, numbers, and underscores.'; } return; }
-            if (row.dataset.removeCustomSecret === '1' || valueInput?.dataset.forceClear === '1') { body[key] = ''; return; }
-            const value = valueInput?.value || '';
-            if (value && !value.includes('...')) body[key] = value;
-        });
-
+        Object.assign(body, collectCustomSecrets().values);
         return body;
     }
 
-    async function saveRuntimeModeViaNativeBridgeIfNeeded() {
-        const nextMode = byId('s-runtime-mode').value || 'advanced';
-        const currentMode = currentSettings?.OUROBOROS_RUNTIME_MODE || 'advanced';
-        const bridge = window.pywebview?.api?.request_runtime_mode_change;
-        if (nextMode === currentMode) {
-            return bridge ? await bridge(nextMode) : await apiClient.ownerRuntimeMode(nextMode);
+    function collectCustomSecrets() {
+        const customKeys = new Set(currentSettings?._meta?.custom_secret_keys || []);
+        return collectCustomSecretDraft(readCustomSecretDraft(page),
+            Object.keys(currentSettings).filter((key) => !customKeys.has(key)));
+    }
+
+    function validationSummary(errors) {
+        return errors.length > 1 ? `${errors[0]} (${errors.length} fields need attention.)` : errors[0] || '';
+    }
+
+    function collectValidation() {
+        const fields = validateMcpSettings();
+        const cadence = byId('s-evo-cadence-n');
+        if (byId('s-post-task-evolution-mode')?.value === 'every_n' && !/^[1-9]\d*$/.test(cadence.value.trim())) {
+            fields.push({ input: cadence, message: 'Every-N cadence needs a whole number ≥ 1.' });
         }
+        page.querySelectorAll('input[id^="s-"], select[id^="s-"], textarea[id^="s-"]').forEach((input) => {
+            if (input === cadence || fields.some((error) => error.input === input)
+                    || input.hasAttribute('data-model-role-context') || !input.willValidate || input.validity.valid) return;
+            const label = input.labels?.[0]?.textContent || input.name || input.id;
+            fields.push({ input, message: `${label.trim()}: ${input.validationMessage}` });
+        });
+        const rows = [...page.querySelectorAll('[data-custom-secret-row]')];
+        collectCustomSecrets().errors.forEach(({ index, field, message }) => {
+            if (rows[index]?.dataset.judged === '1') fields.push({ input: rows[index].querySelector(`[data-custom-secret-${field}]`), message });
+        });
+        const groups = [
+            ['fields', fields.map(({ message }) => message)],
+            ['models', modelRoles.validateAll()],
+            ['subagents', validateSubagentsDraft().map((error) => `Available subagents: ${error}`)],
+            ['reviewers', validateReviewerSlots()],
+        ];
+        const messages = groups.flatMap(([, rows]) => rows).filter(Boolean);
+        const subject = groups.find(([, rows]) => rows.some(Boolean))?.[0] || '';
+        return { fields, messages, subject };
+    }
+
+    function renderValidation() {
+        const { fields, messages, subject } = collectValidation();
+        paintSettingsFieldErrors(page, fields);
+        if (byId('settings-status').dataset.owner === 'validation') {
+            if (messages.length) setStatus(validationSummary(messages), 'warn', 'validation', subject);
+            else setStatus('', 'ok');
+        }
+        return { messages, subject };
+    }
+
+    async function confirmDiscardSettings(action) {
+        return openConfirmDialog({
+            title: 'Unsaved settings',
+            body: `You have unsaved settings changes. Discard them and ${action}?`,
+            confirmLabel: 'Discard and continue', cancelLabel: 'Stay',
+        });
+    }
+
+    async function saveRuntimeModeViaNativeBridgeIfNeeded(nextMode) {
+        const currentMode = currentSettings?.OUROBOROS_RUNTIME_MODE || 'advanced';
+        if (nextMode === currentMode) return null;
+        const bridge = window.pywebview?.api?.request_runtime_mode_change;
         // Only the browser-side confirm is migrated to the in-house dialog; the
         // desktop pywebview bridge path above stays exactly as it was.
         const result = bridge
@@ -814,17 +882,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 confirmLabel: 'Change mode',
             }))
                 ? await apiClient.ownerRuntimeMode(nextMode)
-                : { ok: false, error: 'Runtime mode change cancelled.' });
+                : { ok: false, saved: false, error: 'Runtime mode change cancelled.' });
         if (!result || result.ok !== true) {
-            throw new Error(result?.error || 'Runtime mode change was cancelled.');
+            throw Object.assign(new Error(result?.error || 'Runtime mode change was cancelled.'), { body: result });
         }
         return result;
     }
 
-    async function saveAutoGrantViaNativeBridgeIfNeeded() {
-        const checkbox = byId('s-auto-grant-reviewed-skills');
-        if (!checkbox) return null;
-        const nextEnabled = Boolean(checkbox.checked);
+    async function saveAutoGrantViaNativeBridgeIfNeeded(nextEnabled) {
         const currentEnabled = isTruthySetting(currentSettings?.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
         if (nextEnabled === currentEnabled) return null;
         const bridge = window.pywebview?.api?.request_auto_grant_reviewed_skills_change;
@@ -837,19 +902,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 confirmLabel: nextEnabled ? 'Enable' : 'Disable',
             }))
                 ? await apiClient.ownerAutoGrant(nextEnabled)
-                : { ok: false, error: 'Reviewed-skill auto-grant change cancelled.' });
+                : { ok: false, saved: false, error: 'Reviewed-skill auto-grant change cancelled.' });
         if (!result || result.ok !== true) {
-            throw new Error(result?.error || 'Reviewed-skill auto-grant change was cancelled.');
+            throw Object.assign(new Error(result?.error || 'Reviewed-skill auto-grant change was cancelled.'), { body: result });
         }
         return result;
     }
 
-    async function saveSafetyModeViaOwnerEndpointIfNeeded() {
+    async function saveSafetyModeViaOwnerEndpointIfNeeded(next) {
         // Owner-only, dropped from the generic /api/settings POST — saved through the
         // dedicated audited endpoint. Confirm on LOWERING coverage (full > light > off).
-        const input = byId('s-safety-mode');
-        if (!input) return null;
-        const next = input.value || 'full';
         const current = currentSettings?.OUROBOROS_SAFETY_MODE || 'full';
         if (next === current) return null;
         const lowering = (_SAFETY_MODE_RANK[next] ?? 2) < (_SAFETY_MODE_RANK[current] ?? 2);
@@ -862,11 +924,11 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 confirmLabel: 'Lower safety mode',
                 danger: true,
             });
-            if (!ok) throw new Error('Safety mode change was not confirmed.');
+            if (!ok) throw Object.assign(new Error('Safety mode change was not confirmed.'), { body: { saved: false } });
         }
         const result = await apiClient.ownerSafetyMode(next);
         if (!result || result.ok !== true) {
-            throw new Error(result?.error || 'Safety mode change failed.');
+            throw Object.assign(new Error(result?.error || 'Safety mode change failed.'), { body: result });
         }
         return result;
     }
@@ -943,19 +1005,17 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         return acked;
     }
 
-    async function saveContextModeViaOwnerEndpointIfNeeded() {
-        const input = byId('s-context-mode');
-        if (!input) return null;
-        const next = input.value || 'max';
+    async function saveContextModeViaOwnerEndpointIfNeeded(next) {
         const current = currentSettings?.OUROBOROS_CONTEXT_MODE || 'max';
         if (next === current) return null;
         const result = await apiClient.ownerContextMode(next);
         if (!result || result.ok !== true) {
-            throw new Error(result?.error || 'Context mode change failed.');
+            throw Object.assign(new Error(result?.error || 'Context mode change failed.'), { body: result });
         }
         return result;
     }
 
+    markSettingsDirty = onSettingsEdited;
     syncSettingsLoadState();
     syncRuntimeModeBridgeState();
     syncAutoGrantBridgeState();
@@ -967,25 +1027,22 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // discard: opening a second dialog resolves the first as false (stay),
         // so at most one confirmed leave runs discardUnsavedSettingsDraft().
         setBeforePageLeave(async ({ from }) => {
-            if (from !== 'settings' || !settingsDirty) return true;
-            const leave = await openConfirmDialog({
-                title: 'Unsaved settings',
-                body: 'You have unsaved settings changes. Discard them and leave Settings?',
-                confirmLabel: 'Discard and leave',
-                cancelLabel: 'Stay',
-            });
+            if (from !== 'settings') return true;
+            if (settingsSaving) return false;
+            if (!settingsDirty) return true;
+            const leave = await confirmDiscardSettings('leave Settings');
             if (leave) discardUnsavedSettingsDraft();
             return leave;
         });
     }
 
-    page.addEventListener('input', updateSettingsDirtyState);
-    page.addEventListener('change', updateSettingsDirtyState);
+    page.addEventListener('input', onSettingsEdited);
+    page.addEventListener('change', onSettingsEdited);
     page.addEventListener('click', (event) => {
         if (event.target.closest('[data-effort-value], .secret-clear, [data-row-secret-clear], [data-custom-secret-remove]')) {
             queueMicrotask(() => {
                 syncPostTaskEvolutionUi();
-                updateSettingsDirtyState();
+                onSettingsEdited();
             });
         }
     });
@@ -1020,9 +1077,17 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     });
 
     const onModelCatalog = (event) => modelRoles.adoptCatalog(event.detail);
+    const beforeUnload = (event) => {
+        if (settingsDirty || settingsSaving) { event.preventDefault(); event.returnValue = ''; }
+    };
+    window.addEventListener('beforeunload', beforeUnload);
     document.addEventListener('settings-model-catalog:updated', onModelCatalog);
     window.addEventListener('pagehide', (event) => {
         if (event.persisted) return;
+        disposeSettingsTabs();
+        window.removeEventListener('beforeunload', beforeUnload);
+        disposeLocalModel();
+        baselineSettleDisposer?.();
         modelRoles.destroy();
         document.removeEventListener('settings-model-catalog:updated', onModelCatalog);
     });
@@ -1110,6 +1175,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let restartPending = false;
 
     byId('btn-save-settings').addEventListener('click', async () => {
+        if (settingsSaving || saveOutcomeUnknown) return;
         if (!settingsLoaded) {
             setStatus('Reload current settings successfully before saving.', 'warn');
             return;
@@ -1118,21 +1184,24 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // whichever validation aborts it below — so from here the roster shows
         // its own errors beside the rows they name, not only in this status.
         noteSubagentsSaveAttempt();
-        // Validate Every-N cadence before save: malformed N must NOT silently coerce
-        // into a valid (e.g. every-task) cadence. Abort with a visible error instead.
-        if (byId('s-post-task-evolution-mode')?.value === 'every_n'
-            && !/^[1-9]\d*$/.test((byId('s-evo-cadence-n')?.value || '').trim())) {
-            setStatus('Every-N cadence needs a whole number ≥ 1.', 'warn');
-            return;
-        }
-        const subagentErrors = validateSubagentsDraft();
-        const modelError = modelRoles.validate();
-        if (modelError) { setStatus(modelError, 'warn'); return; }
-        if (subagentErrors.length) {
-            setStatus(`Available subagents: ${subagentErrors[0]}`, 'warn', 'subagents');
+        noteReviewerSlotsSaveAttempt();
+        modelRoles.noteSaveAttempt();
+        page.querySelectorAll('[data-custom-secret-row]').forEach((row) => { row.dataset.judged = '1'; });
+        validationAttempted = true;
+        const { messages: errors, subject } = renderValidation();
+        if (errors.length) {
+            setStatus(validationSummary(errors), 'warn', 'validation', subject);
             return;
         }
         const body = collectBody();
+        loadSequence += 1;
+        const sentRevision = draftRevision;
+        const ownerDraft = {
+            runtime: byId('s-runtime-mode').value || 'advanced',
+            autoGrant: Boolean(byId('s-auto-grant-reviewed-skills').checked),
+            context: byId('s-context-mode').value || 'max',
+            safety: byId('s-safety-mode').value || 'full',
+        };
         const subagentsChanged = subagentSettingsFingerprint(body.OUROBOROS_SUBAGENTS)
             !== subagentSettingsFingerprint(currentSettings?.OUROBOROS_SUBAGENTS);
 
@@ -1140,13 +1209,21 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // Capability probes on review-route changes make a save take seconds;
         // an idle "Save Settings" over that window reads as a dead click.
         const saveButton = byId('btn-save-settings');
+        settingsSaving = true;
         setButtonBusy(saveButton, true);
         setStatus('Saving…', 'muted');
         // A pending restart LATCHES: a later save that needs no restart must
         // not hide the button while the process still runs the old config.
         if (!restartPending) byId('btn-restart-now')?.setAttribute('hidden', '');
+        let saved = false;
         try {
             const data = await apiClient.saveSettings(body);
+            if (data?.status !== 'saved') {
+                const error = new Error(data?.error || 'The server did not confirm the settings save.');
+                error.body = data;
+                throw error;
+            }
+            saved = true;
             let runtimeModeResult = null;
             let runtimeModeError = '';
             let autoGrantResult = null;
@@ -1156,24 +1233,32 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             let safetyModeResult = null;
             let safetyModeError = '';
             try {
-                runtimeModeResult = await saveRuntimeModeViaNativeBridgeIfNeeded();
+                runtimeModeResult = await saveRuntimeModeViaNativeBridgeIfNeeded(ownerDraft.runtime);
             } catch (error) {
-                runtimeModeError = error.message || String(error);
+                const failure = settingsWriteFailure(error, "Runtime mode");
+                runtimeModeError = failure.text;
+                saveOutcomeUnknown ||= failure.unknown;
             }
             try {
-                autoGrantResult = await saveAutoGrantViaNativeBridgeIfNeeded();
+                autoGrantResult = await saveAutoGrantViaNativeBridgeIfNeeded(ownerDraft.autoGrant);
             } catch (error) {
-                autoGrantError = error.message || String(error);
+                const failure = settingsWriteFailure(error, "Reviewed-skill auto-grant");
+                autoGrantError = failure.text;
+                saveOutcomeUnknown ||= failure.unknown;
             }
             try {
-                contextModeResult = await saveContextModeViaOwnerEndpointIfNeeded();
+                contextModeResult = await saveContextModeViaOwnerEndpointIfNeeded(ownerDraft.context);
             } catch (error) {
-                contextModeError = error.message || String(error);
+                const failure = settingsWriteFailure(error, "Context mode");
+                contextModeError = failure.text;
+                saveOutcomeUnknown ||= failure.unknown;
             }
             try {
-                safetyModeResult = await saveSafetyModeViaOwnerEndpointIfNeeded();
+                safetyModeResult = await saveSafetyModeViaOwnerEndpointIfNeeded(ownerDraft.safety);
             } catch (error) {
-                safetyModeError = error.message || String(error);
+                const failure = settingsWriteFailure(error, "Safety mode");
+                safetyModeError = failure.text;
+                saveOutcomeUnknown ||= failure.unknown;
             }
             let reviewAcks = 0;
             let reviewAckError = '';
@@ -1182,7 +1267,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             } catch (error) {
                 reviewAckError = error.message || String(error);
             }
-            await loadSettings();
+            const ownerError = runtimeModeError || autoGrantError || contextModeError || safetyModeError;
+            const draftKept = ownerError || sentRevision !== draftRevision || !(await loadSettings());
             syncAutoGrantBridgeState();
             let statusMsg;
             let statusType = 'ok';
@@ -1215,7 +1301,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusType = 'warn';
             }
             if (runtimeModeError) {
-                statusMsg = `${statusMsg} Runtime mode was not changed: ${runtimeModeError}`;
+                statusMsg = `${statusMsg} ${runtimeModeError}`;
                 statusType = 'warn';
             }
             if (autoGrantResult) {
@@ -1225,18 +1311,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusMsg = `${statusMsg} Context mode saved as ${contextModeResult.context_mode}.`;
             }
             if (contextModeError) {
-                statusMsg = `${statusMsg} Context mode was not changed: ${contextModeError}`;
+                statusMsg = `${statusMsg} ${contextModeError}`;
                 statusType = 'warn';
             }
             if (safetyModeResult?.safety_mode) {
                 statusMsg = `${statusMsg} Safety supervisor saved as ${safetyModeResult.safety_mode}.`;
             }
             if (safetyModeError) {
-                statusMsg = `${statusMsg} Safety mode was not changed: ${safetyModeError}`;
+                statusMsg = `${statusMsg} ${safetyModeError}`;
                 statusType = 'warn';
             }
             if (autoGrantError) {
-                statusMsg = `${statusMsg} Reviewed-skill auto-grant was not changed: ${autoGrantError}`;
+                statusMsg = `${statusMsg} ${autoGrantError}`;
                 statusType = 'warn';
             }
             if (reviewAcks > 0) {
@@ -1246,6 +1332,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusMsg = `${statusMsg} The scope-reviewer window confirmation was not saved: ${reviewAckError}`;
                 statusType = 'warn';
             }
+            if (draftKept) {
+                statusMsg += saveOutcomeUnknown ? '. Your draft is kept. Reload Settings to check before saving again.' : '. Your current draft is kept.';
+                statusType = 'warn';
+            }
             setStatus(statusMsg, statusType);
             if (data.restart_required || runtimeModeResult?.restart_required) {
                 restartPending = true;
@@ -1253,9 +1343,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             if (restartPending) byId('btn-restart-now')?.removeAttribute('hidden');
             window.dispatchEvent(new CustomEvent('ouro:settings-updated', { detail: { reason: 'settings saved', source: 'settings' } }));
         } catch (e) {
-            setStatus('Failed to save: ' + e.message, 'warn');
+            const receipt = e?.body || e?.payload;
+            const confirmedSaved = saved || receipt?.saved === true;
+            saveOutcomeUnknown = !confirmedSaved && receipt?.saved !== false;
+            setStatus(confirmedSaved
+                ? `Settings were saved, but a later step failed: ${e.message}. Your draft is kept.`
+                : saveOutcomeUnknown
+                    ? `Save outcome unknown: ${e.message}. Your draft is kept. Reload Settings to check before saving again.`
+                    : `Settings were not saved: ${e.message}. Your draft is kept.`, 'warn');
         } finally {
+            settingsSaving = false;
             setButtonBusy(saveButton, false);
+            syncSettingsLoadState();
         }
     });
 

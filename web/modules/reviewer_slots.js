@@ -12,10 +12,9 @@
 //    model/effort/account are shown as READ-ONLY derived facts (the roster
 //    stays their SSOT); the stored forms are mutually exclusive:
 //    {slot_id, route, effort} XOR {slot_id, subagent_id, effort}.
-//  * On the API route the model id is a FREE-TEXT input with a datalist of
-//    catalog suggestions — the same catalog-assisted entry the model cards
-//    use. On a harness route the MODEL is a dropdown fed by Claudexor
-//    discovery. No invalid combinations can be composed.
+//  * Model ids use the same editable chooser as Models and Available subagents.
+//    Source/account/effort remain short native selects. Catalogs suggest values;
+//    they never assign one or erase an undiscovered saved selection.
 //  * The provider shown for a delegated row is the HARNESS NAME (codex,
 //    claude, cursor, …) — never "Claudexor", and never a `provider::model`
 //    string syntax.
@@ -34,6 +33,7 @@ import {
     parseAvailableSubagentsSetting,
 } from './subagents_settings.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { modelChooserHtml, bindModelChoosers } from './model_chooser.js';
 
 export const ROUTE_KIND_API = 'api_chat';
 export const ROUTE_KIND_SESSION = routeEditor.ROUTE_KIND_AGENT_SESSION;
@@ -480,6 +480,7 @@ export function advisoryRouteTransition(prev, decoded, memory = {}) {
 
 const state = {
     loaded: false,
+    loadedDraft: null,
     configError: '',
     loadError: '',
     source: '',
@@ -509,6 +510,8 @@ const state = {
     accountsKnown: false,
     store: claudexorStatus,
     disposers: [],
+    disposeChoosers: () => {},
+    saveAttempted: false,
     onChange: () => {},
 };
 
@@ -615,7 +618,9 @@ export function renderReviewerSlotsSection() {
             </div>
             <div class="reviewer-slots-group">
                 <h4 class="reviewer-slots-heading">Deep self-review</h4>
-                <div class="settings-inline-note">
+                <details class="settings-subsection">
+                <summary>How whole-system review works</summary>
+                <div class="settings-inline-note settings-subsection-body">
                     Who runs <code>/review</code>, the whole-system review against BIBLE.md. An API model here
                     receives ONE packed review — the repository Atlas plus the full memory whitelist in a single
                     large-context call (unlike the advisory, whose API model runs an inspection episode). A
@@ -625,6 +630,7 @@ export function renderReviewerSlotsSection() {
                     inline byte-exact — memory is never receipt-checked. The row's effort outranks the Behavior-tab deep
                     self-review effort; every report starts with a provenance header naming the delivery.
                 </div>
+                </details>
                 <div id="reviewer-deep-review-row" class="reviewer-slot-rows"></div>
             </div>
         </div>
@@ -694,6 +700,7 @@ function subagentIdentityMarkup(row) {
 
 function rowHtml(row, group) {
     const { catalogKnown, accountsKnown } = state;
+    const label = `${group === 'triad' ? 'Triad' : 'Scope'} reviewer ${categoryRows(group).indexOf(row) + 1}`;
     if (row.subagent_id) {
         const last = state.lastExecutions[row.slot_id];
         const lastText = last ? describeLastExecution(last) : '';
@@ -703,8 +710,8 @@ function rowHtml(row, group) {
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
             ${subagentIdentityMarkup(row)}
             <div class="reviewer-slot-controls">
-                ${reviewerPickerHtml('data-slot-route aria-label="Reviewer"', row)}
-                ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort || '', 'subagent default')}
+                ${reviewerPickerHtml(`data-slot-route aria-label="${label} source"`, row)}
+                ${effortSelectHtml(`data-slot-effort aria-label="${label} reasoning effort"`, row.effort || '', 'subagent default')}
                 <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
@@ -731,11 +738,11 @@ function rowHtml(row, group) {
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
             ${reviewerRouteIdentityMarkup(row.route, harnessesById(), { catalogKnown, modelSources: state.modelSources })}
             <div class="reviewer-slot-controls">
-                ${reviewerPickerHtml('data-slot-route aria-label="Reviewer"', row)}
-                ${session ? '' : routeEditor.routeModelInputHtml('data-slot-custom-api aria-label="Model"', row.route, state.catalogModels, `reviewer-${row.slot_id}-models`)}
-                ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
-                ${routeEditor.routeSupportsAccount(row.route) ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
-                ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort, surfaceDefault)}
+                ${reviewerPickerHtml(`data-slot-route aria-label="${label} source"`, row)}
+                ${session ? modelChooserHtml(`data-slot-model aria-label="${label} agent model"`, split.model, `reviewer-${row.slot_id}-models`, modelOptions, { placeholder: 'Engine default model' })
+                    : routeEditor.routeModelInputHtml(`data-slot-custom-api aria-label="${label} model"`, row.route, state.catalogModels, `reviewer-${row.slot_id}-models`)}
+                ${routeEditor.routeSupportsAccount(row.route) ? selectHtml(`data-slot-profile aria-label="${label} account"`, [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
+                ${effortSelectHtml(`data-slot-effort aria-label="${label} reasoning effort"`, row.effort, surfaceDefault)}
                 <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
@@ -754,7 +761,7 @@ function singletonHtml(spec) {
     const last = state.lastExecutions[spec.lastKey];
     const lastText = last ? describeLastExecution(last) : '';
     const enabled = spec.enabledToggle
-        ? `<label class="local-toggle"><input type="checkbox" data-${a}-enabled ${row.enabled !== false ? 'checked' : ''}> Enabled</label>`
+        ? `<label class="local-toggle ui-field ui-field-inline"><input class="ui-checkbox" type="checkbox" data-${a}-enabled aria-label="${spec.ariaName} enabled" ${row.enabled !== false ? 'checked' : ''}> Enabled</label>`
         : '';
     const meta = (parts) => `<div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(parts.join(' · '))}</div>`;
     if (row.subagent_id) {
@@ -800,7 +807,7 @@ function singletonHtml(spec) {
                 ${enabled}
                 ${reviewerPickerHtml(`data-${a}-route aria-label="${spec.ariaName} reviewer"`, row, { apiLabel: spec.apiLabel })}
                 ${session
-                    ? selectHtml(`data-${a}-model aria-label="${spec.ariaName} harness model"`, [{ label: '', options: modelOptions }], split.model)
+                    ? modelChooserHtml(`data-${a}-model aria-label="${spec.ariaName} agent model"`, split.model, `${a}-models`, modelOptions, { placeholder: 'Engine default model' })
                     : routeEditor.routeModelInputHtml(`data-${a}-api-model aria-label="${spec.ariaName} model id"`, row.route, state.catalogModels, `${a}-models`, { placeholder: split.subscription ? 'Choose a model' : spec.apiPlaceholder })}
                 ${routeEditor.routeSupportsAccount(row.route) ? selectHtml(`data-${a}-profile aria-label="${spec.ariaName} credential account"`, [{ label: '', options: profileOptions }], row.route?.profile_id || '') : ''}
                 ${effortSelectHtml(
@@ -814,7 +821,79 @@ function singletonHtml(spec) {
     `;
 }
 
-function renderRows() {
+function reviewerRowError(row, allowEmpty = false) {
+    const none = { message: '', field: '' };
+    if (row.subagent_id) return none;
+    const route = row.route || {};
+    if (!allowEmpty && !String(route.target_id || '').trim()) return { message: 'Choose a model or reviewer source.', field: 'model' };
+    if (routeEditor.routeModelFields(route).subscription && !routeEditor.routeModelFields(route).model.trim()) return { message: 'Choose a subscription model.', field: 'model' };
+    const conflict = route.kind === ROUTE_KIND_SESSION
+        ? routeEditor.compoundSessionEffortConflict(route.target_id, row.effort) : '';
+    return conflict ? { message: `Reasoning effort conflicts with the model’s ${conflict} effort.`, field: 'effort' } : none;
+}
+
+function reviewerValidationRows(draft) {
+    return [
+        ...['triad', 'scope'].flatMap((group) => (draft[group] || []).map((row, index) => ({
+            row, key: row.slot_id, label: `${group === 'triad' ? 'Triad' : 'Scope'} reviewer ${index + 1}`,
+        }))),
+        ...(draft.advisory ? [{ row: draft.advisory, key: 'advisory', label: 'Advisory', allowEmpty: true }] : []),
+        ...(draft.deepReview && draft.deepReview.materialized !== false
+            ? [{ row: draft.deepReview, key: 'deep-review', label: 'Deep self-review' }] : []),
+    ];
+}
+
+export function reviewerSlotsDraftErrors(draft) {
+    if (!draft.loaded) return [];
+    const errors = ['triad', 'scope'].filter((group) => !draft[group]?.length)
+        .map((group) => `Add at least one ${group} reviewer.`);
+    for (const { row, label, allowEmpty } of reviewerValidationRows(draft)) {
+        const { message: error } = reviewerRowError(row, allowEmpty);
+        if (error) errors.push(`${label}: ${error}`);
+    }
+    return errors;
+}
+
+export function validateReviewerSlots() { return reviewerSlotsDraftErrors(state); }
+
+export function noteReviewerSlotsSaveAttempt() {
+    state.saveAttempted = true;
+    reviewerValidationRows(state).forEach(({ row }) => { row._uiAttempted = true; });
+    paintReviewerValidation();
+}
+
+function paintReviewerValidation() {
+    if (typeof document === 'undefined') return;
+    const section = document.getElementById('reviewer-slots-section');
+    if (!section) return;
+    for (const { row, key, allowEmpty } of reviewerValidationRows(state)) {
+        const el = [...section.querySelectorAll('[data-slot-id]')].find((node) => node.dataset.slotId === key)
+            || section.querySelector(`[data-${key}-row]`);
+        if (!el) continue;
+        const { message: error, field: invalidField } = row._uiAttempted ? reviewerRowError(row, allowEmpty) : { message: '', field: '' };
+        let message = el.querySelector('[data-reviewer-validation]');
+        if (!message) { message = document.createElement('div'); message.dataset.reviewerValidation = ''; message.className = 'ui-status ui-field-help'; el.appendChild(message); }
+        message.id = `reviewer-${key}-error`;
+        Object.assign(message, { textContent: error, hidden: !error });
+        message.dataset.tone = 'error';
+        el.toggleAttribute('data-invalid', Boolean(error));
+        const meta = el.querySelector('.reviewer-slot-meta');
+        if (meta) meta.id = `reviewer-${key}-meta`;
+        el.querySelectorAll('input, select').forEach((field) => {
+            field.setAttribute('aria-describedby', `${meta?.id || ''} ${message.id}`.trim());
+            const isModel = field.hasAttribute('data-model-chooser');
+            const isEffort = field.matches('[data-slot-effort], [data-advisory-effort], [data-deep-review-effort]');
+            field.setAttribute('aria-invalid', String(Boolean(error) && (invalidField === 'model' ? isModel : isEffort)));
+        });
+    }
+    if (state.saveAttempted && !state.loadError && !state.configError) {
+        const box = document.getElementById('reviewer-slots-error');
+        const errors = validateReviewerSlots();
+        if (box) Object.assign(box, { textContent: errors.join(' '), hidden: !errors.length });
+    }
+}
+
+function renderRows({ discoveryOnly = false } = {}) {
     const active = document.activeElement;
     const owner = active?.closest?.('.reviewer-slot-row');
     const marker = owner && active.getAttributeNames().find((name) => name.startsWith('data-'));
@@ -844,6 +923,26 @@ function renderRows() {
     const singles = Object.values(SINGLETONS).map((spec) => [spec, document.getElementById(spec.rowId)]);
     const boxes = Object.entries(CATEGORIES).map(([group, cat]) => [group, cat, document.getElementById(cat.rowsId)]);
     if (singles.some(([, box]) => !box) || boxes.some(([, , box]) => !box)) return;
+    const updateDiscovery = (current, html) => {
+        if (!current) return;
+        const template = document.createElement('template');
+        template.innerHTML = html;
+        const desired = template.content.firstElementChild;
+        routeEditor.updateRouteControlOptions(current, desired);
+        for (const selector of ['.reviewer-slot-meta', '.reviewer-slot-route-identity']) {
+            const before = current.querySelector(selector), after = desired.querySelector(selector);
+            if (before && after) { before.innerHTML = after.innerHTML; before.title = after.title; }
+        }
+    };
+    if (discoveryOnly) {
+        for (const [group, , box] of boxes) for (const row of categoryRows(group)) {
+            updateDiscovery([...box.querySelectorAll('[data-slot-id]')].find((node) => node.dataset.slotId === row.slot_id), rowHtml(row, group));
+        }
+        for (const [spec, box] of singles) updateDiscovery(box.firstElementChild, singletonHtml(spec));
+        paintReviewerValidation();
+        return;
+    }
+    state.disposeChoosers();
     for (const [group, cat, box] of boxes) {
         box.innerHTML = categoryRows(group).map((row) => rowHtml(row, group)).join('')
             || `<div class="muted">${cat.empty}</div>`;
@@ -856,6 +955,8 @@ function renderRows() {
     }
     for (const [spec, box] of singles) box.innerHTML = singletonHtml(spec);
     bindRowEvents();
+    state.disposeChoosers = bindModelChoosers(document.getElementById('reviewer-slots-section'));
+    paintReviewerValidation();
     if (marker) {
         const row = [...document.querySelectorAll('.reviewer-slot-row')]
             .find((element) => rowAttrs.every((attr) => element.getAttribute(attr.name) === attr.value));
@@ -903,7 +1004,7 @@ function bindRowEvents() {
             }
             state.onChange();
         });
-        rowEl.querySelector('[data-slot-model]')?.addEventListener('change', (event) => {
+        rowEl.querySelector('[data-slot-model]')?.addEventListener('input', (event) => {
             const split = splitSessionTarget(row.route.target_id);
             row.route.target_id = composeSessionTarget(split.harness, event.target.value);
             state.onChange();
@@ -971,7 +1072,7 @@ function bindSingletonEvents(section, spec) {
     // Mirrors of the triad-row model/api/profile handlers. These controls
     // exist only on their own kind's branch of singletonHtml, so each
     // querySelector binds at most one of them per render.
-    el.querySelector(`[data-${a}-model]`)?.addEventListener('change', (event) => {
+    el.querySelector(`[data-${a}-model]`)?.addEventListener('input', (event) => {
         const split = splitSessionTarget(row.route?.target_id);
         row.route.target_id = composeSessionTarget(split.harness, event.target.value);
         edited();
@@ -1023,6 +1124,8 @@ function addRow(group) {
 
 // One projection for both persisted settings and the unsaved setup compiler.
 export function applyReviewerSlotsDraft(data) {
+    state.loadedDraft = structuredClone(data);
+    state.saveAttempted = false;
     state.loadError = '';
     state.configError = String(data.config_error || '');
     state.source = String(data.source || '');
@@ -1033,7 +1136,7 @@ export function applyReviewerSlotsDraft(data) {
     // normalized to the shared api_chat spelling here — the retired legacy
     // 'api' (Claude-SDK) kind is parse-only server-side and this UI never
     // writes it again.
-    const rowIn = (row) => ({ ...row, route: { ...(row.route || {}) } });
+    const rowIn = (row) => ({ ...row, _uiAttempted: false, route: { ...(row.route || {}) } });
     state.triad = Array.isArray(data.triad) ? data.triad.map(rowIn) : [];
     state.scope = Array.isArray(data.scope) ? data.scope.map(rowIn) : [];
     state.advisory = data.advisory ? rowIn(data.advisory) : state.advisory;
@@ -1070,13 +1173,20 @@ export function applyReviewerSlotsDraft(data) {
     renderRows();
 }
 
-export async function reloadReviewerSlots() {
+/** Explicit discard returns to the last loaded view, including unsaved defaults. */
+export function discardReviewerSlotsDraft() {
+    if (state.loadedDraft) applyReviewerSlotsDraft(state.loadedDraft);
+}
+
+export async function reloadReviewerSlots({ isCurrent = () => true } = {}) {
     try {
         const resp = await apiFetch('/api/reviewer-slots', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        if (!isCurrent()) return;
         applyReviewerSlotsDraft(data);
     } catch (error) {
+        if (!isCurrent()) return;
         // A transport failure is NOT a verdict on the saved configuration: the
         // config-error banner accuses the owner's settings of blocking review, and
         // a network blip must never say that. Separate field, separate sentence.
@@ -1094,7 +1204,7 @@ export async function reloadReviewerSlots() {
     // surface binding repaints these rows when the snapshot lands.
     await boundedStatusRefresh(state.store);
     adoptStatusSnapshot();
-    renderRows();
+    renderRows({ discoveryOnly: true });
 }
 
 function adoptStatusSnapshot() {
@@ -1124,7 +1234,7 @@ export function adoptSubagentRoster(settings) {
 
 export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
     destroyReviewerSlots();
-    state.onChange = typeof onChange === 'function' ? onChange : () => {};
+    state.onChange = () => { paintReviewerValidation(); if (typeof onChange === 'function') onChange(); };
     state.store = store;
     // Seed from whatever the shared store already holds, so a render triggered
     // before the first notify (the model-catalog event) is not rendered from a
@@ -1147,7 +1257,7 @@ export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
                 state.harnesses, state.profilesByHarness]);
             if (next === signature) return;
             signature = next;
-            renderRows();
+            renderRows({ discoveryOnly: true });
         },
     }));
     for (const [group, cat] of Object.entries(CATEGORIES)) {
@@ -1157,16 +1267,16 @@ export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
         const items = event?.detail?.items || [];
         state.modelSources = event?.detail?.model_sources || [];
         state.catalogModels = items.map((item) => String(item.value || item.id || '')).filter(Boolean);
-        renderRows();
+        renderRows({ discoveryOnly: true });
     };
     document.addEventListener('settings-model-catalog:updated', onCatalog);
     state.disposers.push(() => document.removeEventListener('settings-model-catalog:updated', onCatalog));
-    // The initial load is driven by settings.js loadSettings(), which awaits
-    // reloadReviewerSlots() BEFORE taking the clean-draft baseline — otherwise
-    // the async arrival of the rows would read as an unsaved edit.
+    // Settings makes the loaded document usable immediately. Late reviewer
+    // enrichment updates its baseline only while that draft remains clean.
 }
 
 export function destroyReviewerSlots() {
+    state.disposeChoosers();
     for (const dispose of state.disposers.splice(0)) {
         try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
     }
@@ -1176,11 +1286,9 @@ export function destroyReviewerSlots() {
 // Never author the setting from an UNLOADED view (an unrelated save must not
 // overwrite the owner's configuration with an empty page), and a transport
 // failure is not a verdict on the saved value either. But a LOADED view always
-// sends what it shows — including an empty triad/scope. The old empty-set
-// guard silently dropped the key, so deleting every row Saved "successfully"
-// while saving nothing; now the backend's own 400 («triad needs at least one
-// slot») surfaces through the existing failed-save status. Validation SSOT
-// stays on the backend — no client-side duplicate.
+// serializes what it shows, including empty groups. Settings validates the
+// current draft before submitting; this pure serializer never hides invalid
+// rows. Backend validation remains authoritative for every other caller.
 export function reviewerSlotsSavePayload({ loaded = false, loadError = '', triad = [], scope = [], advisory, deepReview } = {}) {
     if (loadError || !loaded) return {};
     return { OUROBOROS_REVIEWER_SLOTS: buildReviewerSlotsSetting({ triad, scope, advisory, deepReview }) };

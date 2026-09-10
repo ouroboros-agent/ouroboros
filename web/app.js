@@ -3,6 +3,7 @@
 import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
 import { loadVersion, initMatrixRain } from './modules/utils.js';
+import { bindScrollFade } from './modules/scroll_fade.js';
 import { initChat, createChatInstance } from './modules/chat.js';
 import { createStateSnapshotSequencer } from './modules/chat_activity.js';
 import { initFiles } from './modules/files.js';
@@ -734,7 +735,13 @@ initUpdateStatus(ctx);
 
 initOnboardingOverlay();
 
-initMatrixRain();
+const disposeMatrixRain = initMatrixRain();
+const disposeScrollFades = Array.from(document.querySelectorAll('.scroll-fade-y'), bindScrollFade);
+window.addEventListener('pagehide', (event) => {
+    if (event.persisted) return;
+    disposeMatrixRain();
+    disposeScrollFades.forEach((dispose) => dispose());
+});
 loadVersion();
 syncNavigationState();
 const hashPage = pageFromHash();
@@ -795,14 +802,8 @@ if (hashPage && hashPage !== state.activePage) showPage(hashPage);
     function findScrollableKeyboardNode(target) {
         let el = target;
         while (el && el !== document.body) {
-            if (
-                el.id === 'chat-messages'
-                || el.id === 'chat-input'
-                || el.classList?.contains('chat-messages')
-                || el.classList?.contains('chat-input')
-                || el.classList?.contains('chat-live-timeline')
-                || el.classList?.contains('sidebar-scroll')
-            ) return el;
+            const overflow = getComputedStyle(el).overflowY;
+            if (['auto', 'scroll'].includes(overflow) && el.scrollHeight > el.clientHeight) return el;
             el = el.parentElement;
         }
         return null;

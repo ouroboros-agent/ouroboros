@@ -41,9 +41,9 @@ class UIProbe:
         """A restarted lane server listens on new ports; the page stays open."""
         self.base_url = str(base_url).rstrip("/")
 
-    def goto(self, path: str = "/") -> None:
+    def goto(self, path: str = "/", *, ready_selector: str = "#chat-input") -> None:
         self.page.goto(self.base_url + path, wait_until="domcontentloaded", timeout=60_000)
-        self.page.wait_for_selector("#chat-input", timeout=60_000)
+        self.page.wait_for_selector(ready_selector, timeout=60_000)
 
     def computed_property(self, selector: str, prop: str) -> str:
         return str(self.page.evaluate(
@@ -99,8 +99,8 @@ class GuardedUI:
             self.close()
             return None
 
-    def goto(self, path: str = "/") -> None:
-        self._call("goto", path)
+    def goto(self, path: str = "/", *, ready_selector: str | None = None) -> None:
+        self._call("goto", path, **({"ready_selector": ready_selector} if ready_selector else {}))
 
     def computed_property(self, selector: str, prop: str) -> str | None:
         return self._call("computed_property", selector, prop)

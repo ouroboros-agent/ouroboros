@@ -17,17 +17,17 @@ test('named root card shows the latest activity headline under the coined title'
     }), 'Analyzing the dataset');
 });
 
-test('unnamed root card suppresses the line (title already shows the activity)', () => {
+test('root suppresses duplicated title but can show distinct previous activity before naming)', () => {
     assert.equal(projectCollapsedActivity({
         suggestedName: '',
         headline: 'Analyzing the dataset',
     }), '');
-    // Suppressed even when a previous activity was remembered.
+    // No title has replaced the previous activity, so useful existing text remains.
     assert.equal(projectCollapsedActivity({
         suggestedName: '',
         headline: '',
         previous: 'Earlier step',
-    }), '');
+    }), 'Earlier step');
 });
 
 test('subagent card always feeds the line from the routed progress body', () => {
@@ -140,16 +140,16 @@ test('subagent projection keeps identity, compact facts and complete disclosure'
         status: 'running',
     });
     // Identity only: the status lives in the chip and the id shows only for twins.
-    assert.equal(summary.headline, 'researcher · claude-fable-5');
+    assert.equal(summary.headline, 'researcher');
     // A roleless child is `Subagent · model`: the id is a render-time twin tag, never identity.
     assert.equal(summarizeChatLiveEvent({
         type: 'send_message', is_progress: true, delegation_role: 'subagent',
         subagent_task_id: 'child987654', parent_task_id: 'parent1', model: 'openai/gpt-5.6-sol',
         subagent_event: 'running', content: 'x', status: 'running',
-    }).headline, 'Subagent · gpt-5.6-sol');
+    }).headline, 'Subagent');
     // chat.js writes the child title from the lineage map; it must read like the reducer's headline.
-    assert.equal(subagentIdentityTitle({ role: 'researcher', model: 'anthropic/claude-fable-5' }), 'researcher · claude-fable-5');
-    assert.equal(subagentIdentityTitle({ role: '', model: 'openai::gpt-5.6-sol' }), 'Subagent · gpt-5.6-sol');
+    assert.equal(subagentIdentityTitle({ role: 'researcher', model: 'anthropic/claude-fable-5' }), 'researcher');
+    assert.equal(subagentIdentityTitle({ role: '', model: 'openai::gpt-5.6-sol' }), 'Subagent');
     assert.equal(subagentIdentityTitle({ role: 'planner', model: '' }), 'planner');
     assert.ok(summary.activityPreview.length <= COLLAPSED_ACTIVITY_MAX);
     assert.match(summary.fullBody, /UNIQUE_CHILD_TAIL$/);
@@ -219,21 +219,20 @@ test('the collapsed activity line is plain text: the renderer\'s markdown invent
     assert.equal(plainActivityText('#### Deep\n``x → y`` tail'), 'Deep —\nx → y tail');
     assert.equal(plainActivityText('```js\nlet a = 1;\n```'), 'let a = 1;');
     assert.equal(boundActivityPreview('| a | b |\n|---|---|\n| 1 | 2 |'), 'a b 1 2');
-    // Markers-only text keeps its source: an empty projection would flip the
-    // reserved activity band's :empty rules on the card.
+    // Markers-only text keeps its source: an empty projection would hide the
+    // card's activity band.
     assert.equal(plainActivityText('---'), '---');
-    // Whitespace-only narration projects to nothing: the band's :empty rules
-    // (reserve while running, fold when finished) need a truly empty node.
+    // Whitespace-only narration projects to nothing so :empty hides the band.
     assert.equal(boundActivityPreview(' \n\t '), '');
     assert.equal(plainActivityText(''), '');
     // Composition: the bound preview is built on the plain projection.
     assert.equal(boundActivityPreview('  **Reading**\n  the   ledger  '), 'Reading the ledger');
 });
 
-test('twins are two children of one parent with the same role and model', () => {
+test('twins share one parent and displayed role while model stays metadata', () => {
     const children = new Map([
         ['a', { parentId: 'p', role: 'scout', model: 'gemini-3.6-flash' }],
-        ['b', { parentId: 'p', role: 'scout', model: 'gemini-3.6-flash' }],
+        ['b', { parentId: 'p', role: 'scout', model: 'openai/gpt-5.6-sol' }],
         ['c', { parentId: 'p', role: 'reviewer', model: 'gemini-3.6-flash' }],
         ['d', { parentId: 'q', role: 'scout', model: 'gemini-3.6-flash' }],
     ]);
@@ -242,13 +241,13 @@ test('twins are two children of one parent with the same role and model', () => 
     assert.equal(subagentTwin(children, 'c'), false);
     assert.equal(subagentTwin(children, 'd'), false);
     assert.equal(subagentTwin(children, 'missing'), false);
-    // The collision key is the DISPLAYED identity: equivalent model spellings and the
-    // roleless fallback collide exactly when the headlines read the same.
+    // The collision key is the displayed headline; a roleless child and an
+    // explicitly named Subagent therefore collide even with different models.
     const spelled = new Map([
         ['e', { parentId: 'p', role: 'scout', model: 'openai/gpt-5.6-sol' }],
         ['f', { parentId: 'p', role: 'scout', model: 'openai::gpt-5.6-sol' }],
         ['g', { parentId: 'p', role: '', model: 'gpt-5.6-sol' }],
-        ['h', { parentId: 'p', role: 'Subagent', model: 'gpt-5.6-sol' }],
+        ['h', { parentId: 'p', role: 'Subagent', model: 'other-model' }],
     ]);
     assert.equal(subagentTwin(spelled, 'e'), true);
     assert.equal(subagentTwin(spelled, 'f'), true);

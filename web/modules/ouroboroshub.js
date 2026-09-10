@@ -75,7 +75,7 @@ function lifecycleForVerdict(verdict, pending, listingRow) {
                 return { tone: 'danger', label: 'Catalog entry conflict', hint: 'The catalog holds more than one entry with this name.' };
             }
             if (verdict.badges.includes('listing_unavailable')) {
-                return { tone: 'warn', label: 'Hub facts unavailable', hint: 'Installed skills could not be read; actions are hidden until the list loads.' };
+                return { tone: 'warn', label: 'Hub facts unavailable', hint: '' };
             }
             if (facts.occupying_bucket) {
                 return {
@@ -179,7 +179,7 @@ function resultError(data) {
 function controlsTemplate() {
     return `
         <div class="marketplace-controls">
-            <input type="search" id="oh-query" class="marketplace-search"
+            <input type="search" id="oh-query" class="marketplace-search ui-control" aria-label="Search OuroborosHub skills"
                    placeholder="Search official Ouroboros skills…" autocomplete="off">
             <button class="btn btn-primary" data-oh-search>Search</button>
         </div>
@@ -208,6 +208,8 @@ export function initOuroborosHub(pane, controlsHost = null) {
         results: [],
         listingByName: new Map(),
         listingUnavailable: false,
+        catalogLoaded: false,
+        catalogUnavailable: false,
     };
     const controlsRoot = controlsHost || pane;
     const queryInput = controlsRoot.querySelector('#oh-query');
@@ -238,7 +240,7 @@ export function initOuroborosHub(pane, controlsHost = null) {
             // must see catalogRow=null (slug absent) for the frozen wait_pr/
             // pending semantics, never a fabricated catalog fact.
             item.listing_only === true ? null : catalogRow,
-            { listingUnavailable: state.listingUnavailable },
+            { listingUnavailable: state.listingUnavailable, catalogUnavailable: state.catalogUnavailable },
         );
         return { verdict, rawSkill, listingRow, catalogRow };
     }
@@ -261,13 +263,16 @@ export function initOuroborosHub(pane, controlsHost = null) {
     }
 
     function renderCards() {
+        if (destroyed || !state.catalogLoaded) return;
         results.innerHTML = state.results.map((item) => card(item)).join('')
             || '<div class="muted">No official skills found.</div>';
     }
 
     let refreshGeneration = 0;
+    let destroyed = false;
 
     async function refresh() {
+        if (destroyed) return;
         // Stale-response guard: a slow earlier refresh must never overwrite
         // the results of a newer one (e.g. typed query racing initial load).
         const generation = ++refreshGeneration;
@@ -277,19 +282,25 @@ export function initOuroborosHub(pane, controlsHost = null) {
             if (state.query.trim()) params.set('q', state.query.trim());
             // Global listing beside the catalog — a listing fetch failure is an
             // honest "Hub facts unavailable" state, never "Not installed".
-            const [catalogData, listingData] = await Promise.all([
-                fetchJson(`/api/marketplace/ouroboroshub/catalog?${params}`),
+            const [catalog, listingData] = await Promise.all([
+                fetchJson(`/api/marketplace/ouroboroshub/catalog?${params}`).then(data => ({ data }), error => ({ error })),
                 fetchJson('/api/extensions').catch(() => null),
             ]);
-            if (generation !== refreshGeneration) return;
-            state.results = catalogData.results || [];
-            state.listingUnavailable = listingData === null;
-            state.listingByName = new Map();
-            for (const skill of listingData?.skills || []) {
-                if (skill?.name && !state.listingByName.has(skill.name)) {
-                    state.listingByName.set(skill.name, skill);
+            if (destroyed || generation !== refreshGeneration) return;
+            state.listingUnavailable = !Array.isArray(listingData?.skills);
+            if (!state.listingUnavailable) {
+                state.listingByName = new Map();
+                for (const skill of listingData.skills) {
+                    if (skill?.name && !state.listingByName.has(skill.name)) {
+                        state.listingByName.set(skill.name, skill);
+                    }
                 }
             }
+            if (catalog.error) throw catalog.error;
+            if (!Array.isArray(catalog.data?.results)) throw new Error('Hub catalog response is unavailable.');
+            state.results = catalog.data.results;
+            state.catalogLoaded = true;
+            state.catalogUnavailable = false;
             // A first-time submission is ABSENT from the catalog until its PR
             // merges: synthesize a card row from the receipt-bearing listing
             // entry so the frozen wait_pr/"Submitted PR #N" state is reachable
@@ -311,11 +322,15 @@ export function initOuroborosHub(pane, controlsHost = null) {
                 });
             }
             renderCards();
-            show(`${state.results.length} official skill${state.results.length === 1 ? '' : 's'}`, 'muted');
+            show(state.listingUnavailable
+                ? 'Installed skills could not be read. Previous details are retained where available; Refresh to retry.'
+                : `${state.results.length} official skill${state.results.length === 1 ? '' : 's'}`,
+                state.listingUnavailable ? 'warn' : 'muted');
         } catch (err) {
-            if (generation !== refreshGeneration) return;
-            show(err.message || String(err), 'danger');
-            results.innerHTML = `<div class="skills-load-error">Hub facts unavailable: ${escapeHtml(err.message || err)}</div>`;
+            if (destroyed || generation !== refreshGeneration) return;
+            state.catalogUnavailable = true;
+            show(`Hub catalog unavailable: ${err.message || err}.${state.catalogLoaded ? ' Showing previous results.' : ''} Refresh to retry.`, 'danger');
+            renderCards();
         }
     }
 
@@ -414,6 +429,7 @@ export function initOuroborosHub(pane, controlsHost = null) {
         }
         setPending(slug, { label: pendingLabel, tone: 'warn', message: pendingMessage, target });
         show(`${pendingLabel} ${slug}…`, 'muted');
+        let actionError = '';
         try {
             const data = action === 'update'
                 ? await fetchJson(`/api/marketplace/ouroboroshub/update/${encodeURIComponent(target)}`, {
@@ -435,6 +451,7 @@ export function initOuroborosHub(pane, controlsHost = null) {
             clearPending(slug);
         } catch (err) {
             const message = typedErrorText(err);
+            actionError = message;
             setPending(slug, {
                 label: 'Failed',
                 tone: 'danger',
@@ -444,9 +461,11 @@ export function initOuroborosHub(pane, controlsHost = null) {
                 retry_label: 'Retry',
                 target,
             });
-            show(`${slug}: ${message}`, 'danger');
         } finally {
-            refresh();
+            await refresh();
+            if (!destroyed && actionError && !Array.from(results.querySelectorAll('[data-slug]')).some(card => card.dataset.slug === slug)) {
+                show(`${slug}: ${actionError}`, 'danger');
+            }
         }
     }
 
@@ -456,9 +475,14 @@ export function initOuroborosHub(pane, controlsHost = null) {
         pane._ohTimer = setTimeout(refresh, 250);
     });
     controlsRoot.querySelector('[data-oh-search]').addEventListener('click', refresh);
-    startLifecyclePoller(() => {
+    const disposeLifecycle = startLifecyclePoller(() => {
         renderCards();
     });
+    pane._ouroboroshubDestroy = () => {
+        destroyed = true;
+        clearTimeout(pane._ohTimer);
+        disposeLifecycle();
+    };
     results.addEventListener('click', async (event) => {
         const clearButton = event.target.closest('[data-oh-clear-publication]');
         if (clearButton) {
@@ -489,5 +513,5 @@ export function initOuroborosHub(pane, controlsHost = null) {
         }
     });
     pane._ouroboroshubRefresh = refresh;
-    refresh();
+    return refresh();
 }

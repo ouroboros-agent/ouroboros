@@ -930,6 +930,9 @@ def _record_llm_call_error(
     safe_error = sanitize_tool_result_for_log(repr(error))
     classification = classify_llm_exception(error, safe_error)
     provider_message = _exception_provider_message(error, safe_error)
+    # Display metadata must not enter the classifier's text heuristics.
+    display_message = getattr(error, "display_message", None)
+    display_error = sanitize_tool_result_for_log(display_message) if isinstance(display_message, str) and display_message else safe_error
     custody_fields = attempt_custody_event_fields(error)
     will_retry = classification.retry_same_request
     repeats = _transport_death_repeats(ctx.accumulated_usage, ctx.round_id)
@@ -973,7 +976,7 @@ def _record_llm_call_error(
     # preserving its identity for live/backfill dedupe. No llm_round_error
     # sibling here; Background Consciousness keeps its own separate producer.
     error_event = {
-        "ts": utc_now_iso(), "type": "llm_api_error", **identity, "error": safe_error,
+        "ts": utc_now_iso(), "type": "llm_api_error", **identity, "error": display_error,
         "error_kind": classification.kind, "retry_same_request": will_retry,
         "status_code": classification.status_code, "provider_code": classification.provider_code,
         "provider_message": provider_message,
@@ -983,7 +986,7 @@ def _record_llm_call_error(
     }
     if not append_jsonl(ctx.drive_logs / "events.jsonl", error_event) or not has_log_sink():
         emit_log_event(ctx.event_queue, error_event, log_label="LLM call error")
-    ctx.accumulated_usage.update(_last_llm_error=_short_error_text(safe_error),
+    ctx.accumulated_usage.update(_last_llm_error=_short_error_text(display_error),
                                  _last_llm_error_kind=classification.kind, _last_llm_retry_same_request=will_retry)
     if classification.retry_after_sec is not None:
         ctx.accumulated_usage["_last_llm_retry_after_sec"] = classification.retry_after_sec

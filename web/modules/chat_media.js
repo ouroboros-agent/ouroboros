@@ -3,6 +3,7 @@ import { showToast } from './toast.js';
 import { downloadViaHostBridge, normalizeTone, openViaHostBridge } from './ui_helpers.js';
 import { MAX_LINK_ACTIONS } from './api_types.js';
 import { apiFetch, taskArtifactDownloadUrl } from './api_client.js';
+import { bindMenu } from './ui_interactions.js';
 
 const MIME_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
 const BASE64_RE = /^[A-Za-z0-9+/=\s]+$/;
@@ -434,17 +435,41 @@ export function createChatMedia({
 
     function photoActionsHtml() {
         return `<details class="chat-photo-actions">
-            <summary aria-label="Photo actions">•••</summary>
-            <div class="chat-photo-menu">
-                <button type="button" data-photo-action="open">Open in new tab</button>
-                <button type="button" data-photo-action="download">Download</button>
-                <button type="button" data-photo-action="copy">Copy to clipboard</button>
+            <summary aria-label="Photo actions" aria-haspopup="menu" aria-expanded="false">•••</summary>
+            <div class="chat-photo-menu ui-popup" role="menu" aria-label="Photo actions" hidden>
+                <button type="button" role="menuitem" data-photo-action="open">Open in new tab</button>
+                <button type="button" role="menuitem" data-photo-action="download">Download</button>
+                <button type="button" role="menuitem" data-photo-action="copy">Copy to clipboard</button>
             </div>
         </details>`;
     }
 
     function wirePhotoActions(item, source, sourceRef, filename, mime) {
         const action = (name) => item.querySelector(`[data-photo-action="${name}"]`);
+        const details = item.querySelector('.chat-photo-actions');
+        const trigger = details.querySelector('summary');
+        const menu = details.querySelector('.chat-photo-menu');
+        let binding = null;
+        listen(trigger, 'click', (event) => {
+            event.preventDefault();
+            if (binding) return binding.close({ restoreFocus: true });
+            document.body.appendChild(menu);
+            menu.hidden = false;
+            details.open = true;
+            trigger.setAttribute('aria-expanded', 'true');
+            binding = bindMenu(menu, { anchor: trigger, onClose: () => {
+                binding = null;
+                menu.hidden = true;
+                details.open = false;
+                trigger.setAttribute('aria-expanded', 'false');
+                details.appendChild(menu);
+            } });
+        });
+        listen(menu, 'click', (event) => {
+            if (event.target.closest('[data-photo-action]')) binding?.close({ restoreFocus: true });
+        }, { capture: true });
+        disposers.add(() => { binding?.destroy(); menu.remove(); });
+
         // A durable photo rides the host-bridge helper with BOTH addresses
         // (bridge form for the launcher gate, canonical for browsers); a data:
         // display keeps window.open, whose shell interceptor saves the bytes.

@@ -32,6 +32,7 @@ the structural fact, no browser needed.
 from __future__ import annotations
 
 import pathlib
+from html.parser import HTMLParser
 import re
 
 
@@ -131,6 +132,7 @@ def _migrated_style_region(raw: bool = False) -> str:
 
 def _migrated_sources() -> dict[str, str]:
     return {
+        "web/ui.css": _decommented(_read("web/ui.css")),
         "web/settings.css": _decommented(_read("web/settings.css")),
         "web/onboarding.css": _decommented(_read("web/onboarding.css")),
         "web/model_roles.css": _decommented(_read("web/model_roles.css")),
@@ -146,11 +148,11 @@ def _migrated_sources() -> dict[str, str]:
 
 
 def test_type_scale_tokens_are_declared_once_in_the_root_block() -> None:
-    css = _decommented(_read("web/style.css"))
+    css = _decommented(_read("web/ui.css"))
     root = css[: css.index("\n}")]
-    assert root.lstrip().startswith(":root"), "expected :root to open web/style.css"
+    assert root.lstrip().startswith(":root"), "expected :root to open web/ui.css"
     for token in TYPE_TOKENS + LINE_TOKENS + FOREGROUND_TOKENS + STATUS_TOKENS:
-        assert f"{token}:" in root, f"{token} missing from web/style.css :root"
+        assert f"{token}:" in root, f"{token} missing from web/ui.css :root"
     # Exactly four sizes: a fifth --type-* token means the scale grew without a
     # docs/DESIGN.md decision.
     declared = set(re.findall(r"(--type-[a-z]+)\s*:", root))
@@ -174,44 +176,43 @@ def _root_declarations(rel: str) -> dict[str, str]:
     }
 
 
-def test_onboarding_mirrors_the_scale_by_value() -> None:
-    """onboarding.css is INLINED into a standalone first-run page and cannot
-    import style.css, so it must carry the same tokens itself or every wizard
-    rule that names one silently resolves to nothing.
+class _Stylesheets(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.paths: list[str] = []
 
-    Carrying them is not enough: a mirror that drifts is worse than no mirror,
-    because both sides look tokenised while the wizard quietly renders a
-    different product. The wizard shipped its own brand red (``#e85d6f``
-    against the app's ``#c93545``), its own green, and its own foreground greys
-    — so the first screen a new owner saw was the one screen that did not match
-    the app. Every name declared in BOTH files must therefore resolve to the
-    SAME value; a name that exists on only one side stays free."""
-    style = _root_declarations("web/style.css")
-    onboarding = _root_declarations("web/onboarding.css")
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        href = values.get("href") or ""
+        if tag == "link" and values.get("rel") == "stylesheet" and href.startswith("/static/"):
+            self.paths.append("web/" + href.removeprefix("/static/").split("?", 1)[0])
 
-    for token in TYPE_TOKENS + LINE_TOKENS + FOREGROUND_TOKENS + STATUS_TOKENS:
-        assert token in onboarding, f"{token} missing from web/onboarding.css :root"
 
-    shared = sorted(set(style) & set(onboarding))
-    # Guard against a vacuous pass if either :root is reshaped: the mirror is
-    # the point, so it has to actually overlap.
-    assert len(shared) > 20, f"only {len(shared)} shared tokens; is the mirror still real?"
-    drifted = {
-        token: (style[token], onboarding[token])
-        for token in shared
-        if style[token] != onboarding[token]
-    }
-    assert not drifted, (
-        "web/onboarding.css mirrors web/style.css BY VALUE (docs/DESIGN.md "
-        "header): it is inlined standalone and cannot import the app "
-        "stylesheet, so a shared token name that resolves differently is a "
-        "second product. Fix the value, or rename the wizard-local token so it "
-        "stops claiming to be the shared one.\n"
-        + "\n".join(
-            f"  {token}: style.css={s!r} onboarding.css={o!r}"
-            for token, (s, o) in sorted(drifted.items())
-        )
-    )
+def _document_stylesheets(document: str) -> list[str]:
+    parser = _Stylesheets()
+    parser.feed(_read(document))
+    assert parser.paths, f"no local stylesheets in {document}"
+    return parser.paths
+
+
+def test_both_documents_load_one_real_shared_palette_before_page_styles() -> None:
+    """No copied palette: both hosts must load the same nonempty source.
+
+    Required roles prevent an empty source from passing. Page declarations
+    cannot silently shadow a shared role and make onboarding a second theme.
+    Actual effective palette and controls are also exercised in the browser.
+    """
+    shared = _root_declarations("web/ui.css")
+    required = TYPE_TOKENS + LINE_TOKENS + FOREGROUND_TOKENS + STATUS_TOKENS + ("--accent",)
+    for token in required:
+        assert shared.get(token), f"{token} missing from shared palette"
+    assert len(shared) > 20, "shared source must contain the actual palette"
+    for document in ("web/index.html", "web/onboarding_template.html"):
+        sheets = _document_stylesheets(document)
+        assert sheets[0] == "web/ui.css" and sheets.count("web/ui.css") == 1
+        for sheet in sheets[1:]:
+            declared = set(DECLARATION.findall(_decommented(_read(sheet))))
+            assert not (declared & shared.keys()), f"{sheet} shadows shared roles: {declared & shared.keys()}"
 
 
 def test_no_tiny_raw_font_sizes_on_migrated_surfaces() -> None:
@@ -255,9 +256,9 @@ def test_muted_is_a_global_colour_only_utility() -> None:
     """Root cause #1. `.muted` must resolve globally, and must NOT set a size:
     its call sites are sized by their contexts, so a font-size here would
     silently resize all of them."""
-    css = _decommented(_read("web/style.css"))
+    css = _decommented(_read("web/ui.css"))
     bodies = [body for selector, body in RULE.findall(css) if selector.strip() == ".muted"]
-    assert bodies, "no global `.muted` rule in web/style.css"
+    assert bodies, "no global `.muted` rule in web/ui.css"
     declarations = [
         part.split(":", 1)[0].strip()
         for body in bodies
@@ -291,12 +292,9 @@ def test_settings_field_labels_use_the_named_meta_foreground() -> None:
     --text-meta, in both stylesheets that carried a copy of it."""
     for rel in ("web/settings.css", "web/onboarding.css"):
         css = _read(rel)
-        # The token's own declaration is the one place the literal may appear:
-        # onboarding.css mirrors style.css by value and has no import.
-        body = css.replace("--text-meta: rgba(255, 255, 255, 0.68)", "")
-        assert "rgba(255, 255, 255, 0.68)" not in body
-        # The wizard's former private grey family, retired when it started
-        # mirroring style.css by value.
+        # Only the shared source declares the value. Page rules name its role.
+        assert "rgba(255, 255, 255, 0.68)" not in css
+        # The wizard's former private grey family remains retired.
         assert "rgba(237, 242, 247, 0.68)" not in css
         assert "var(--text-meta)" in css, f"{rel} never names --text-meta"
 
@@ -342,11 +340,11 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
 # Token hygiene: declared <-> used, in both directions
 # ---------------------------------------------------------------------------
 
-# Files that resolve their variables against web/style.css `:root`. They are
-# loaded together by web/index.html, so a token declared in one and named in
-# the other is correct. web/onboarding.css is NOT here: it is inlined into a
-# standalone page with its own `:root` and is covered by the mirror test above.
-ROOT_CONSUMERS = ("web/style.css", "web/settings.css", "web/model_roles.css", "web/reviewer_slots.css", "web/model_wait.css")
+# Derive consumers from the real documents; a declaration in the SPA cannot
+# accidentally satisfy an unresolved wizard variable (or the reverse).
+ROOT_CONSUMERS = tuple(dict.fromkeys(
+    _document_stylesheets("web/index.html") + _document_stylesheets("web/onboarding_template.html")
+))
 
 VAR_REFERENCE = re.compile(r"var\(\s*(--[a-z0-9-]+)")
 DECLARATION = re.compile(r"^\s*(--[a-z0-9-]+)\s*:", re.MULTILINE)
@@ -371,19 +369,16 @@ def test_every_css_variable_is_declared_somewhere() -> None:
     `--text-link` — each carrying a hardcoded fallback that was the value
     actually rendering, and three of those fallbacks (`#e5534b`, `#b58900`,
     `#16181d`) were colours from no palette in this product."""
-    declared = set()
-    for rel in ROOT_CONSUMERS:
-        declared |= set(DECLARATION.findall(_decommented(_read(rel))))
     js = _js_sources()
-
     dangling: list[str] = []
-    for rel in ROOT_CONSUMERS:
-        source = _decommented(_read(rel))
-        for lineno, line in enumerate(source.splitlines(), 1):
-            for name in VAR_REFERENCE.findall(line):
-                if name in declared or name in js:
-                    continue
-                dangling.append(f"{rel}:{lineno}: var({name})")
+    for document in ("web/index.html", "web/onboarding_template.html"):
+        sheets = _document_stylesheets(document)
+        declared = set().union(*(set(DECLARATION.findall(_decommented(_read(rel)))) for rel in sheets))
+        for rel in sheets:
+            for lineno, line in enumerate(_decommented(_read(rel)).splitlines(), 1):
+                for name in VAR_REFERENCE.findall(line):
+                    if name not in declared and name not in js:
+                        dangling.append(f"{document}: {rel}:{lineno}: var({name})")
     assert not dangling, (
         "these variables are never declared, in CSS or by a JS setProperty, so "
         "every rule naming one silently renders its fallback (or nothing). Name "
@@ -401,7 +396,7 @@ def test_every_root_token_has_a_reader() -> None:
     with no reader is not a reserve; it is a claim the code does not make.
 
     There is no allowlist. If a token is worth keeping, something uses it."""
-    root = _root_declarations("web/style.css")
+    root = _root_declarations("web/ui.css")
     used = set()
     for rel in ROOT_CONSUMERS:
         used |= set(VAR_REFERENCE.findall(_decommented(_read(rel))))
@@ -409,7 +404,7 @@ def test_every_root_token_has_a_reader() -> None:
 
     orphans = sorted(name for name in root if name not in used and name not in js)
     assert not orphans, (
-        "these :root tokens in web/style.css have no reader in the stylesheets "
+        "these :root tokens in web/ui.css have no reader in the stylesheets "
         "or the web modules. Either use them or delete them: a documented token "
         "that resolves nowhere is why surfaces reach for literals "
         "(docs/DESIGN.md 'Status and chips').\n"
@@ -421,7 +416,7 @@ def test_every_root_token_has_a_reader() -> None:
 # Focus canon: one ring vocabulary across the whole app (docs/DESIGN.md "Focus")
 # ---------------------------------------------------------------------------
 
-FOCUS_FILES = (*ROOT_CONSUMERS, "web/onboarding.css")
+FOCUS_FILES = ROOT_CONSUMERS
 FOCUS_TOKENS = ("var(--focus-accent-border)", "var(--focus-accent-ring)")
 
 

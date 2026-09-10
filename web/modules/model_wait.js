@@ -320,13 +320,13 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             error: '', saved: false, lastRequest: null };
         node.innerHTML = `<div class="model-wait-heading"><strong data-wait-role></strong><span class="ui-status" data-tone="warn" data-wait-reason></span></div>
             <div class="model-wait-meta" data-wait-model></div><div class="model-wait-meta" data-wait-reset></div>
-            <label class="model-wait-auto"><input type="checkbox" data-wait-auto> <span data-wait-auto-label></span></label>
+            <label class="model-wait-auto"><input class="ui-checkbox" type="checkbox" data-wait-auto> <span data-wait-auto-label></span></label>
             <div class="model-wait-actions"><button class="btn btn-default" type="button" data-wait-change>Change model or account</button>
                 <button class="btn btn-default" type="button" data-wait-login>Sign in again</button>
                 <button class="btn btn-default" type="button" data-wait-retry>Try again</button>
                 <button class="btn btn-default" type="button" data-wait-settings>Settings</button></div>
             <div class="model-wait-picker" data-wait-picker hidden>${modelRolesHost(editorId)}
-                <label class="model-wait-auto"><input type="checkbox" data-wait-persist> Also save this role in Settings</label>
+                <label class="model-wait-auto"><input class="ui-checkbox" type="checkbox" data-wait-persist> Also save this role in Settings</label>
                 <div class="model-wait-actions"><button class="btn btn-default" type="button" data-wait-apply disabled>Apply to this ${taskId === 'bg-consciousness' ? 'cycle' : 'task'}</button>
                     <span class="model-wait-meta" data-wait-scope></span></div></div>
             <div class="model-wait-notice ui-status" data-wait-notice role="status" aria-live="polite"></div>

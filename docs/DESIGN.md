@@ -11,9 +11,10 @@ Authority split:
   that keep those semantics intact — where values may live, which component is
   the SSOT, what counts as review debt, how a visual change is verified.
 
-Values themselves live in `web/style.css` `:root` (and are mirrored by value in
-`web/onboarding.css`, which is inlined standalone and cannot import it). This
-file names roles; it does not copy an inventory.
+Shared values and control recipes live in `web/ui.css`, loaded before page
+styles by both the SPA and the served onboarding document. Page styles own
+composition, not another copy of the shared palette. This file names roles;
+it does not copy an inventory.
 
 The theme is **dark only**. There is no light-theme plumbing, and adding a
 second theme is an architecture change, not a styling change.
@@ -110,13 +111,13 @@ A new alpha is a rung added to the ladder, never an `rgba()` literal in a rule:
 the ladder is what makes "make the accent calmer" a one-line change instead of
 a grep.
 
-The first-run wizard carried a *second* brand red for a while, so the first
-screen a new owner saw was the one screen that did not match the app.
-`web/onboarding.css` is inlined standalone and cannot import `web/style.css`,
-so it mirrors the shared tokens **by value**, and
-`tests/test_web_typography_static.py` fails if a name declared in both `:root`
-blocks resolves differently. A wizard-only token is fine; a wizard-only *value*
-for a shared name is not.
+The app and first-run wizard consume the same palette source. A shared accent
+change updates its named roles and alpha ladder there; neither page shadows
+those roles with its own values. `tests/test_web_typography_static.py` checks
+the actual stylesheet links, nonempty shared roles and per-document variable
+resolution. The SM1 browser oracle also checks both rendered documents after
+restart, so a missing link or a page-local override cannot pass as consistency.
+A wizard-only layout token is fine; a second value for a shared role is not.
 
 ### Focus
 
@@ -144,6 +145,29 @@ Text fields are the exception, and they keep their own established idiom:
 `border-color: var(--focus-accent-border)` plus
 `box-shadow: 0 0 0 3px var(--focus-accent-ring)`. A field already has a border
 to recolour, so an outline outside it would be a second frame.
+
+### Controls and editable choices
+
+Text, number, password, select and multiline fields use the same `.ui-control`
+family; `.ui-checkbox` keeps native checkbox behavior. `.ui-field` groups a
+label, control and optional `.ui-field-help`. A placeholder is an example,
+never the field's only name. Help and validation belong to that field without
+changing the alignment of neighboring controls and their actions.
+
+Short fixed choices keep native selects, including the platform's own popup.
+Model selection uses the shared editable chooser: suggestions assist typing
+without becoming an allowlist. A saved unknown model remains editable; a
+catalog refresh preserves the real input, selection and composition. Escape
+or blur closes suggestions without assigning a value. Selected, hover, focus,
+disabled and invalid states have different meanings and remain distinguishable.
+
+Tabs expose one selected view and one keyboard entry point. Arrow keys and
+Home/End move through available tabs; restoring a selected tab reveals it by
+scrolling its strip, without moving the page or taking focus. Menus and
+editable suggestion lists share viewport placement, not keyboard semantics:
+a menu moves focus among actions, a chooser keeps it in the input. Dialog
+focus stays in the modal context and returns on close when the caller remains
+available. Popups sit outside decorative clipping and fit the usable viewport.
 
 ### `.muted`
 
@@ -280,13 +304,30 @@ not move them into the migrated set in section 8.
   `--text-secondary`; an expanded row returns to `--type-body` in
   `--text-primary`. Details never render larger than the summary above them;
   an inline label inside a row is semibold at the row's own size.
-- **A nested child card is subordinate to its root.** Collapsed, it is an
-  identity row — status chip · `role · model` · `N notes` and the chevron (the
-  `Show details` label belongs to the root) — in `--text-secondary` ink at
-  weight 400, with no reserved title or activity lines, over its metadata row
-  (harness chip with the run count, cost, last update). Only its narration
-  line waits for expansion. The root keeps `--text-primary` at weight 500 for
-  its title.
+- **A nested child card is subordinate to its root.** Its compact identity
+  row shows status, role, notes and a chevron; a short task id disambiguates
+  otherwise identical siblings. Executor facts and the agent/coordinator model
+  occupy the metadata row, so the task's coordinating model cannot masquerade
+  as its external executor. A child keeps one useful activity line visible;
+  a root permits up to three. Empty activity reserves no band, and a duplicate
+  title is not activity. Full narration and Reviews expand independently.
+  The root keeps primary title ink at weight 500, children secondary ink at
+  400. Nested frames preserve real ancestry; their opaque secondary surface
+  avoids accumulating translucent white tints at greater depth.
+- **An executor label states its evidence.** A progress actor is labelled
+  `last update`, with requested model or `model unconfirmed`; it is not proof
+  of current computation. Settled observed models are separate historical
+  facts, not a claim that their union is the current actor. Missing identity
+  stays unconfirmed; marks and configured routes never manufacture execution.
+
+### Project work pointer
+
+A Project keeps its conversation and real nested task cards. One compact pointer
+leads to an unfinished represented root, or the latest represented root when all
+are finished. It states `Loaded messages only` unless history coverage is complete;
+without a represented card it states that absence and has no action. Navigation
+moves the conversation to the existing card without changing the next message's
+recipient, opening another work pane or manufacturing activity.
 
 ### List editors
 
@@ -546,8 +587,12 @@ desktop window size merely because a step has several fields.
 
 ## 8. Migration state
 
-The scale is applied surface by surface. Migrated today:
+The scale is applied to complete component families and declared page regions.
+Using a migrated field inside a historical page does not claim the whole page
+has migrated. Migrated today:
 
+- `web/ui.css` (shared palette, fields, buttons, status/chip recipes and
+  menu/chooser chrome, used by both top-level documents and optional author pages)
 - `web/settings.css` (settings shell, model/effort cards, MCP cards)
 - `web/onboarding.css` (the whole first-run wizard)
 - `web/model_roles.css` and `web/reviewer_slots.css` (shared role editors)
@@ -562,11 +607,24 @@ The scale is applied surface by surface. Migrated today:
   literals with no token equivalents yet)
 - the global `.muted`, `.form-section h3` and shared `.ui-status` tone rules
 
-Not yet migrated: skills, marketplace, widgets, logs, evolution. They are
-historical and keep their literals until their own pass. Do not part-migrate a
-surface: a half-tokenised stylesheet is harder to reason about than an untouched
-one. The semantic status/action/notification contract above already applies to
-these surfaces; it does not by itself authorize a visual token migration.
+The remaining page-specific typography in skills, marketplace, widgets, logs
+and evolution is historical. Their adopted common controls follow the shared
+family; unrelated page rules keep their literals until their own pass. Migrate
+each selected family completely and remove its replaced recipes in the same
+change. Do not introduce a half-tokenised second field family or describe a
+control adoption as an all-page redesign. The semantic status/action/notification
+contract already applies everywhere.
 
 `tests/test_web_typography_static.py` guards the migrated set only. Extending
-the guard to a new surface and migrating that surface are the same commit.
+the guard and migrating the corresponding family or region are the same commit.
+
+### Author freedom
+
+An extension may use the optional shared buttons, fields and status functions
+inside its own module or route-iframe page, override them, or design a completely
+independent interface. `.ouro-ui` supplies font and native dark-control context;
+the named classes opt controls into the recipes, with no page-wide reset.
+The kit reads the installed source at a new mount; retained frames keep the styling
+they loaded. It introduces no theme polling, forced remount or mandatory visual
+conformance. Author layout, validation, operations and loading feedback remain
+author-owned; the small source recipes are in `docs/examples/author_ui_kit/`.

@@ -50,12 +50,16 @@ def _install_child_fixture(mode, events_path):
 
         def detail(self):
             pending = mode in {"pending", "cancel"} or mode == "slow" and self.polls < 8
-            refused = mode in {"quota", "auth", "mixed"}
+            not_started = mode in {"quota", "auth", "mixed"}
+            refused = not_started or mode == "field"
             problem = {"code": {"quota": "subscription_window_exhausted", "auth": "auth_required",
-                                "mixed": "credential_pool_exhausted"}.get(mode, "fixture_error"),
+                                "mixed": "credential_pool_exhausted", "field": "invalid_request"}.get(mode, "fixture_error"),
                        "message": "controlled refusal", "context": {"resetsAt": "2099-01-01T00:00:00Z"}}
+            if mode == "field":
+                problem["context"].update(httpStatus=400, vendorCode="string_above_max_length",
+                                          parameter="instructions", providerMessage="private provider body")
             return {"id": self.operation, "state": "running" if pending else "failed" if refused else "succeeded",
-                    "dispatch": {"state": "started" if pending else "not_started" if refused else "response_received",
+                    "dispatch": {"state": "started" if pending else "not_started" if not_started else "response_received",
                                  "route": ROUTE},
                     "response": {"state": "absent"} if pending else {"state": "ready", "ref": REF},
                     "problem": problem if refused else None}
@@ -201,6 +205,27 @@ def test_real_child_preserves_typed_refusal_receipt(child_fixture, mode, code):
     assert error.model_role == "vision"
     assert error.physical_attempt_capture.state == "released"
     assert error.ledger_attempt_ids == [error.physical_attempt_capture.attempt_id]
+
+
+def test_real_child_reconstructs_provider_field_display_after_settlement(child_fixture):
+    state, events, root = child_fixture
+    state["mode"] = "field"
+    with pytest.raises(ClaudexorModelError) as caught:
+        _call()
+    error = caught.value
+    assert type(error) is ClaudexorModelError
+    assert error.code == "invalid_request" and error.status_code == 400 and error.retryable is False
+    assert error.operation_id == "operation-exact" and error.route == ROUTE and error.model_role == "vision"
+    assert error.body == error.problem and error.problem["context"]["providerMessage"] == "private provider body"
+    assert "provider_code=string_above_max_length, parameter=instructions" in error.display_message[:220]
+    assert "private provider body" not in error.display_message
+    assert str(error) == "invalid_request: controlled refusal"
+    assert error.physical_attempt_capture.state == "settled"
+    assert error.ledger_attempt_ids == [error.physical_attempt_capture.attempt_id]
+    rows = _events(events)
+    assert sum(row["kind"] == "generation" for row in rows) == sum(row["kind"] == "ack" for row in rows) == 1
+    attempts = [json.loads(line) for line in (root / ua.LEDGER_REL).read_text().splitlines()]
+    assert [row["state"] for row in attempts] == ["reserved", "dispatched", "settled"]
 
 
 def test_parent_cancel_reaches_same_live_operation(child_fixture):

@@ -123,6 +123,23 @@ const SUBSTRATE_NOTE = {
 };
 
 export function executorChip(evt) {
+    const raw = evt?.executor_observation;
+    const observation = raw && raw.task_id === String(evt?.subagent_task_id || evt?.task_id || '')
+        && raw.run_id && raw.attempt_id && raw.harness_id && Number.isInteger(raw.revision)
+        ? raw : null;
+    if (observation && !evt?.execution_evidence) {
+        const name = harnessPresentation(observation.harness_id).label;
+        const model = observation.model_source === 'observed' || observation.model_source === 'requested'
+            ? compactModel(observation.model) : '';
+        return {
+            harness: observation.harness_id,
+            hasEvidence: false,
+            observation,
+            sourceTs: Date.parse(evt?.ts || evt?.timestamp || '') || 0,
+            label: `${name}${model ? ` · ${model} (${observation.model_source})` : ' · model unconfirmed'} · last update`,
+            title: `Latest observed activity: ${name}, run ${observation.run_id}, attempt ${observation.attempt_id}, revision ${observation.revision}. This is progress, not a terminal execution receipt.`,
+        };
+    }
     const route = String(evt?.executor_route || '').trim();
     if (!route) return null;
     // The route id is OPAQUE (`harness` or `harness=model`): print the harness
@@ -130,7 +147,7 @@ export function executorChip(evt) {
     const harness = route.split('=')[0].trim().toLowerCase();
     if (!harness) return null;
     const name = harnessPresentation(harness).label;
-    const base = { harness, label: name };
+    const base = { harness, label: name, sourceTs: Date.parse(evt?.ts || evt?.timestamp || '') || 0 };
     // LAYERED TRUTH, label-level. Identity (mark + product name) comes from the
     // harness_presentation SSOT; the run STATE stays on this label. The route is
     // a DISPATCH decision; whether a delegated run actually happened is
@@ -258,6 +275,8 @@ export function executorChip(evt) {
         ...base,
         hasEvidence: true,
         label: counted ? `${name} · ${okPart}${unresolvedPart}` : `${name} · ${runsPart}${unresolvedPart}`,
+        observedModels: Array.isArray(evidence.harness_models)
+            ? [...new Set(evidence.harness_models.filter((model) => typeof model === 'string' && model))] : [],
         title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${counted ? ` (${okPart})` : ''}, ${costPart}`) + unresolvedTitle + accessPart,
     };
 }
@@ -272,7 +291,7 @@ function subagentHeadline(sid = '', role = '', label = '', model = '', { full = 
     const cleanRole = String(role || '').trim() || 'Subagent';
     const suffix = full && label ? ` — ${label}` : '';
     // Show the resolved model compactly NEXT TO the role (e.g. "planning-scout · gemini-3.5-flash").
-    const modelPart = compactModel(model) ? ` · ${compactModel(model)}` : '';
+    const modelPart = full && compactModel(model) ? ` · agent model ${compactModel(model)}` : '';
     return `${cleanRole}${modelPart}${shortId && full ? ` (${shortId})` : ''}${suffix}`;
 }
 
@@ -902,6 +921,7 @@ function chatView({
     fullRef = '',
     truncated = false,
     chip = null,
+    model = '',
 } = {}) {
     const out = {
         phase,
@@ -924,6 +944,7 @@ function chatView({
     // genuinely-full output on demand instead of showing only the capped preview.
     if (fullRef) out.fullRef = String(fullRef);
     if (truncated) out.truncated = true;
+    if (model) out.model = model;
     // Phase 6: the executor chip rides the projection so live and replay routes
     // paint the same fact; absent stays absent (no placeholder chip).
     if (chip) out.executorChip = chip;
@@ -1086,6 +1107,7 @@ export function summarizeChatLiveEvent(evt) {
             ],
             // «ТУТ … субагент на codex» — the child's own executor chip.
             chip: executorChip(evt),
+            model: evt.model,
             dedupeKey: `subagent:${sid}:${label}:${status}:${progressText.full || resultText.full || errorText.full || ''}`,
         });
     }
@@ -1117,8 +1139,16 @@ export function summarizeChatLiveEvent(evt) {
             // «ТУТ бабл … на codex» — an ordinary progress bubble carries the chip
             // too whenever the frame disclosed a delegated executor.
             chip: executorChip(evt),
+            model: evt.model,
             dedupeKey: progressText.full ? `progress:${progressText.full}` : `progress:${evt.task_id || ''}`,
         });
+    }
+
+    if (t === 'llm_usage') {
+        // A helper call can share the task id. Only the task's own loop (or
+        // background consciousness loop) supplies its coordinating model.
+        const ownLoop = Number.isInteger(evt.round) || evt.source === 'consciousness';
+        return chatView({ model: ownLoop ? evt.model : '', visible: false, dedupeKey: key(evt.round || '') });
     }
 
     if (t === 'task_started' || t === 'task_received') {
@@ -1309,5 +1339,15 @@ export function isGroupedTaskEvent(evt) {
 // (receipt) chip is never downgraded by a later evidence-less (dispatch)
 // frame — the history sync after justFinished anchors on a mid-run row.
 export function keepStickyExecutorChip(prior, next) {
-    return !!(prior && prior.hasEvidence && next && !next.hasEvidence);
+    if (!prior || !next) return false;
+    if (prior.sourceTs && next.sourceTs && next.sourceTs < prior.sourceTs) return true;
+    const before = prior.observation, after = next.observation;
+    if (before && after) {
+        return before.task_id === after.task_id && before.task_attempt === after.task_attempt
+            && before.run_id === after.run_id && after.revision < before.revision;
+    }
+    // A typed live observation outranks any later evidence-less dispatch label,
+    // even when the route name changes while the same card is reconciled.
+    if (before && !after && !next.hasEvidence) return true;
+    return Boolean(prior.hasEvidence && !next.hasEvidence);
 }

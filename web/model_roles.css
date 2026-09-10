@@ -40,18 +40,12 @@
 .model-role-meta:empty { display: none; }
 .model-role-meta { margin-top: var(--space-1); }
 .model-role-row + .model-role-row { margin-top: var(--space-2); }
-.model-role-controls > input { flex: 2 1 220px; min-width: 0; }
+.model-role-controls > input,
+.model-role-controls > .ui-model-chooser { flex: 2 1 220px; min-width: 0; }
 .model-role-controls > select { flex: 1 1 170px; min-width: 0; }
 .model-role-controls > [data-model-role-account] { flex-basis: 220px; }
 .model-role-order { flex: 0 0 auto; }
 .model-role-order .btn { padding-inline: var(--space-2); }
-.model-role-editor input,
-.model-role-editor select {
-    font-size: var(--type-body);
-    color: var(--text-primary);
-}
-.wizard-content .model-role-controls > input,
-.wizard-content .model-role-controls > select { padding-block: var(--space-1); }
 .model-role-details { margin-top: var(--space-1); }
 .model-role-details > summary {
     display: inline-block;
@@ -59,8 +53,7 @@
     padding-block: var(--space-1);
 }
 .model-role-details > summary:focus-visible,
-.model-role-editor button:focus-visible,
-.model-role-editor select:focus-visible {
+.model-role-editor button:focus-visible {
     outline: 2px solid var(--focus-accent-border);
     outline-offset: 2px;
 }
@@ -70,7 +63,8 @@
 .model-role-controls [hidden] { display: none; }
 @media (max-width: 720px) {
     .model-role-controls { flex-wrap: wrap; }
-    .model-role-controls > input { flex-basis: 100%; order: 1; }
+    .model-role-controls > input,
+.model-role-controls > .ui-model-chooser { flex-basis: 100%; order: 1; }
     .model-role-controls > select { flex-basis: 150px; }
     .model-role-order { order: 2; margin-left: auto; }
 }

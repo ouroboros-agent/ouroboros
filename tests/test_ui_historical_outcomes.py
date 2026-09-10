@@ -11,7 +11,14 @@ from ouroboros.task_results import write_task_result, task_results_dir
 
 def test_retained_terminal_is_history_only_until_client_checks_current_activity(tmp_path):
     task = {"id": "past-root", "chat_id": 1, "root_task_id": "past-root", "delegation_role": "root"}
-    result = write_task_result(tmp_path, task["id"], "cancelled", result="Preserved work", **{k: v for k, v in task.items() if k != "id"})
+    model_execution = {
+        "source": "usable_solve_response", "used_model": "fallback-model",
+        "requested_model": "initial-model", "used_local": False,
+    }
+    result = write_task_result(
+        tmp_path, task["id"], "cancelled", result="Preserved work",
+        model_execution=model_execution, **{k: v for k, v in task.items() if k != "id"},
+    )
     (tmp_path / "logs").mkdir(exist_ok=True)
     (tmp_path / "logs" / "progress.jsonl").write_text(json.dumps({
         "task_id": task["id"], "chat_id": 1, "content": "Inspecting the source",
@@ -26,6 +33,7 @@ def test_retained_terminal_is_history_only_until_client_checks_current_activity(
     rows = json.loads(response.body)["messages"]
     assert len(rows) == 1  # synthetic summary text stays hidden
     assert rows[0]["historical_terminal"]["status"] == "cancelled"
+    assert rows[0]["historical_terminal"]["model_execution"] == model_execution
     assert "task_terminal_status" not in rows[0]
     assert "outcome_axes" not in rows[0]
     assert quarantine.read_bytes() == before

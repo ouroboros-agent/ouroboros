@@ -786,6 +786,8 @@ def _append_terminal_task_projection(
             "reason_code": reason, "result_ref": result_ref,
             "text": f"{text} {details}",
         }
+        if isinstance(effective.get("model_execution"), dict):
+            row["model_execution"] = dict(effective["model_execution"])
         appended = append_canonical_task_summary(drive_root, row)
         if not appended:
             return {"status": str(current.get("status") or status)}
@@ -815,8 +817,11 @@ def historical_terminal_projection(entry: Dict[str, Any]) -> Optional[Dict[str, 
             or not entry.get("task_id") or entry.get("status") not in SETTLED_STATUSES
             or entry.get("outcome_phase") not in {"done", "warn", "error", "cancelled"}):
         return None
-    return {"status": entry["status"], "phase": entry["outcome_phase"],
-            "ts": str(entry.get("ts") or ""), "provenance": entry["outcome_authority"]}
+    projection = {"status": entry["status"], "phase": entry["outcome_phase"],
+                  "ts": str(entry.get("ts") or ""), "provenance": entry["outcome_authority"]}
+    if isinstance(entry.get("model_execution"), dict):
+        projection["model_execution"] = dict(entry["model_execution"])
+    return projection
 
 
 def append_terminal_task_projection(

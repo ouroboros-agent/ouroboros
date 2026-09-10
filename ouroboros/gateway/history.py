@@ -22,7 +22,7 @@ from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.project_dialogue import historical_terminal_projection
-from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, subagent_message_meta
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, executor_observation_meta, subagent_message_meta
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.utils import strip_markdown, utc_now_iso
 
@@ -85,6 +85,7 @@ _PROGRESS_META_FIELDS = (
     # Phase 6: the resolved delegated route (a harness id), so a replayed
     # bubble keeps its executor chip instead of losing it on reload.
     "executor_route",
+    "executor_observation",
     # The completion-seam evidence block (delegated runs started/settled,
     # subscription spend, harness models) — the chip's layered truth on replay.
     "execution_evidence",
@@ -1006,6 +1007,12 @@ def _collect_progress_rows(
             for field in _PROGRESS_META_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
+            if "executor_observation" in rec:
+                observation = executor_observation_meta(
+                    rec.pop("executor_observation"), task_id=rec["task_id"],
+                )
+                if observation:
+                    rec["executor_observation"] = observation
             # ABI-3: the whitelist passes only the honest cost names; a stored
             # legacy row's pair is CONVERTED here (deprecated-wins) instead of
             # being replayed under the retired spelling or silently dropped.

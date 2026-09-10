@@ -296,6 +296,9 @@
  *   subagent (delegated routes only) — the route it was sent to, not a receipt
  *   from the engine saying where it landed. Absent/empty = the ordinary native
  *   path; no chip is drawn.
+ * @property {Object=} executor_observation
+ *   Latest observed progress actor, bound to own task/attempt/run/revision.
+ *   model_source distinguishes requested and observed; not a terminal receipt.
  * @property {Object=} execution_evidence
  *   The completion-seam EVIDENCE the route decision is reconciled against:
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
@@ -617,7 +620,7 @@
  * @typedef {Object} TaskOutcomeHistoryFields
  * @property {"working"|"done"|"warn"|"error"|"cancelled"=} outcome_phase  // canonical display phase; "working" is not terminal
  * @property {boolean=} outcome_final  // true only after the canonical task outcome settles; false marks a pre-finalization narrative
- * @property {{status: string, phase: string, ts: string, provenance: string}=} historical_terminal
+ * @property {{status: string, phase: string, ts: string, provenance: string, model_execution?: Object}=} historical_terminal
  * @property {Object=} model_execution
  */
 

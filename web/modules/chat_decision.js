@@ -33,6 +33,8 @@ export function createChatDecision({
     showToast,
     fetchDetail = null,
     onDomWrite = (mutate) => mutate(),
+    isMain = false,
+    insertMessageNode = null,
 }) {
     const observations = new Map();
     const quizViews = new Map();
@@ -166,6 +168,14 @@ export function createChatDecision({
         updatePointer(view, { ...msg, quiz_state: state });
         if (fetchDetail && !['answered', 'expired_terminal', 'superseded'].includes(state)) void refreshPointer(view);
         return bubble;
+    }
+
+    function appendQuestionPointer(msg) {
+        if (!isMain || !insertMessageNode) return false;
+        return onDomWrite(() => {
+            const bubble = buildQuestionPointer(msg);
+            return bubble ? insertMessageNode(bubble) !== false : false;
+        });
     }
 
     function normalizeQuiz(msg) {
@@ -688,7 +698,7 @@ export function createChatDecision({
         return setCardState(card, String(frame.state || ''), index) || changed;
     }
 
-    return { buildQuizCard, buildQuestionPointer, readQuestion, revealQuestion, setCardState, applyQuizStateFrame, renderRoutingDecision,
+    return { buildQuizCard, buildQuestionPointer, appendQuestionPointer, readQuestion, revealQuestion, setCardState, applyQuizStateFrame, renderRoutingDecision,
         refreshQuestions: () => Promise.all([...pointerViews.values()]
             .filter((view) => !['answered', 'expired_terminal', 'superseded'].includes(view.card.dataset.state))
             .map(refreshPointer)),

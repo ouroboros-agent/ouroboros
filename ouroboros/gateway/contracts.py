@@ -170,6 +170,10 @@ class ChatOutbound(TypedDict):
     # engine saying where it landed: a landing below the ask is disclosed on
     # `capability_delta`, not by rewriting this field.
     executor_route: NotRequired[str]
+    # Latest observed progress actor, NOT terminal evidence or current liveness.
+    # Own task_id/task_attempt/run_id/attempt_id, harness_id, phase, revision;
+    # optional model has explicit model_source (requested or observed).
+    executor_observation: NotRequired[Dict[str, Any]]
     # The completion-seam EVIDENCE the route decision is reconciled against
     # (subagents.envelope_from_task): delegated runs started/settled/succeeded,
     # terminal failure states, disclosed subscription spend (+estimated flag),

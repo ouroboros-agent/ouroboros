@@ -1,9 +1,9 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
-import { createSystemMessageAction } from './ui_helpers.js';
-import { harnessIdentityMarkup } from './harness_presentation.js';
+import { executorIdentityMarkup } from './harness_presentation.js';
 import { compactModel, modelExecutionLabel } from './log_events.js';
+import { createSystemMessageAction } from './ui_helpers.js';
 import { joinMarkdownHeadings } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import {
@@ -31,6 +31,12 @@ export function withTaskCostMeta(summary, payload, { replace = false, rawTs = ''
         out.meta = out.meta.filter((entry) => !String(entry || '').startsWith('cost='));
     }
     return out;
+}
+
+export function applyHistoricalModelExecution(record, historical) {
+    if (!record || record.modelExecution || !historical?.model_execution) return false;
+    record.modelExecution = historical.model_execution;
+    return true;
 }
 
 export function senderLabel(role, isProgress = false, systemType = '', opts = {}, chatSessionId = '') {
@@ -240,22 +246,13 @@ export function liveLineRowToggleKey(target, selection = null) {
     return (line.dataset && line.dataset.liveLineKey) || '';
 }
 
-/**
- * Two children of one parent whose compact headlines would read the same are
- * twins: the card then keeps the short task id to tell them apart. The key is
- * the DISPLAYED identity — the role (or its `Subagent` fallback) and the
- * compact model name — so equivalent spellings (`openai/gpt-5.6-sol`,
- * `openai::gpt-5.6-sol`, `gpt-5.6-sol`) collide exactly when the headlines do.
- */
-export function subagentIdentityKey({ parentId = '', role = '', model = '' } = {}) {
-    return `${parentId}\u0000${subagentIdentityTitle({ role, model })}`;
+/** Twins share a displayed role; their model is a separately labelled fact. */
+export function subagentIdentityKey({ parentId = '', role = '' } = {}) {
+    return `${parentId}\u0000${subagentIdentityTitle({ role })}`;
 }
 
-/** The child card's title: `role · model` (`Subagent · model` without a role), never an activity label. */
-export function subagentIdentityTitle({ role = '', model = '' } = {}) {
-    const name = String(role || '').trim() || 'Subagent';
-    const short = compactModel(model);
-    return short ? `${name} · ${short}` : name;
+export function subagentIdentityTitle({ role = '' } = {}) {
+    return String(role || '').trim() || 'Subagent';
 }
 
 export function subagentTwin(children, childId) {
@@ -519,7 +516,7 @@ export function projectCollapsedActivity({
 } = {}) {
     const current = boundActivityPreview(isSubagent ? body : headline);
     const candidate = current || boundActivityPreview(previous);
-    if (!isSubagent && !String(suggestedName || '').trim()) return '';
+    if (!isSubagent && candidate === boundActivityPreview(suggestedName || headline)) return '';
     return candidate;
 }
 
@@ -1055,19 +1052,19 @@ export function costMetaKeys(src) {
     return Object.fromEntries(COST_META_KEYS.map((key) => [key, src?.[key]]));
 }
 
+const CARD_META_KEYS = [
+    ...COST_META_KEYS, 'executor_route', 'execution_evidence', 'actual_substrate',
+    'executor_observation', 'model_execution', 'tool_calls', 'model', 'ts',
+];
+export function cardMetaKeys(src) {
+    return Object.fromEntries(CARD_META_KEYS.map((key) => [key, src?.[key]]));
+}
+
 // the ONE meta-line renderer, fed entirely from record state,
 // so a replay batch renders it exactly once per card.
-export function renderLiveCardMeta(record) {
+export function renderLiveCardMeta(record, { agentModel = record?.agentModel || '' } = {}) {
     if (!record?.metaEl) return false;
-    const executorChipHtml = record.executorChip
-        ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtmlAttr(record.executorChip.title || '')}">`
-          + harnessIdentityMarkup(record.executorChip.harness, {
-              label: record.executorChip.label || '',
-              className: 'chat-live-executor-identity',
-          })
-          + '</span>'
-        : '';
-    const html = executorChipHtml + [
+    const html = executorIdentityMarkup(record.executorChip, { agentModel: compactModel(agentModel) }) + [
         record.groupId === 'bg-consciousness' ? 'Background thinking' : '',
         record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
         modelExecutionLabel(record.modelExecution),

@@ -121,7 +121,7 @@ function renderServerCard(server, index) {
                 </div>
                 <div class="mcp-server-card-actions">
                     <label class="mcp-server-enabled">
-                        <input type="checkbox" data-mcp-field="enabled" ${enabled ? 'checked' : ''}>
+                        <input class="ui-checkbox" type="checkbox" aria-label="MCP server ${index + 1}: Enabled" data-mcp-field="enabled" ${enabled ? 'checked' : ''}>
                         <span>Enabled</span>
                     </label>
                     <button type="button" class="btn btn-default" data-mcp-test>Test</button>
@@ -130,72 +130,72 @@ function renderServerCard(server, index) {
                 </div>
             </header>
             <div class="form-grid two">
-                <div class="form-field">
-                    <label>Server ID</label>
-                    <input type="text" data-mcp-field="id" value="${escapeHtml(id)}" placeholder="github" autocomplete="off" spellcheck="false">
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-id">Server ID</label>
+                    <input type="text" class="ui-control" id="mcp-${index}-id" aria-label="MCP server ${index + 1}: Server ID" data-mcp-field="id" value="${escapeHtml(id)}" placeholder="github" autocomplete="off" spellcheck="false">
                 </div>
-                <div class="form-field">
-                    <label>Display name</label>
-                    <input type="text" data-mcp-field="name" value="${escapeHtml(name)}" placeholder="GitHub MCP" autocomplete="off" spellcheck="false">
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-name">Display name</label>
+                    <input type="text" class="ui-control" id="mcp-${index}-name" aria-label="MCP server ${index + 1}: Display name" data-mcp-field="name" value="${escapeHtml(name)}" placeholder="GitHub MCP" autocomplete="off" spellcheck="false">
                 </div>
             </div>
             <div class="form-grid two">
-                <div class="form-field">
-                    <label>Transport</label>
-                    <select data-mcp-field="transport">${transportOptions}</select>
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-transport">Transport</label>
+                    <select class="ui-control" id="mcp-${index}-transport" aria-label="MCP server ${index + 1}: Transport" data-mcp-field="transport">${transportOptions}</select>
                 </div>
-                <div class="form-field">
-                    <label>${isStdio ? 'Command' : 'Server URL'}</label>
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-endpoint">${isStdio ? 'Command' : 'Server URL'}</label>
                     ${isStdio
-                        ? `<input type="text" data-mcp-field="command" value="${escapeHtml(command)}" placeholder="npx" autocomplete="off" spellcheck="false">`
-                        : `<input type="text" data-mcp-field="url" value="${escapeHtml(url)}" placeholder="https://example.com/mcp" autocomplete="off" spellcheck="false">`}
+                        ? `<input type="text" class="ui-control" id="mcp-${index}-endpoint" aria-label="MCP server ${index + 1}: Command" data-mcp-field="command" value="${escapeHtml(command)}" placeholder="npx" autocomplete="off" spellcheck="false">`
+                        : `<input type="text" class="ui-control" id="mcp-${index}-endpoint" aria-label="MCP server ${index + 1}: Server URL" data-mcp-field="url" value="${escapeHtml(url)}" placeholder="https://example.com/mcp" autocomplete="off" spellcheck="false">`}
                 </div>
             </div>
             ${isStdio ? `
             <div class="form-row">
-                <div class="form-field">
-                    <label>Arguments (one per line)</label>
-                    <textarea data-mcp-field="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/path/to/folder" autocomplete="off" spellcheck="false">${escapeHtml(args.join('\n'))}</textarea>
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-args">Arguments (one per line)</label>
+                    <textarea class="ui-control" id="mcp-${index}-args" aria-label="MCP server ${index + 1}: Arguments (one per line)" data-mcp-field="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/path/to/folder" autocomplete="off" spellcheck="false">${escapeHtml(args.join('\n'))}</textarea>
                     <span class="muted">Each line is passed as one argument. Ouroboros does not use a shell.</span>
                 </div>
             </div>
             <div class="form-grid two">
-                <div class="form-field">
-                    <label>Working directory (optional)</label>
-                    <input type="text" data-mcp-field="cwd" value="${escapeHtml(String(server.cwd ?? ''))}" placeholder="/path/to/project" autocomplete="off" spellcheck="false">
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-cwd">Working directory (optional)</label>
+                    <input type="text" class="ui-control" id="mcp-${index}-cwd" aria-label="MCP server ${index + 1}: Working directory (optional)" data-mcp-field="cwd" value="${escapeHtml(String(server.cwd ?? ''))}" placeholder="/path/to/project" autocomplete="off" spellcheck="false">
                     <span class="muted">Used for both discovering and calling tools. Empty uses the default directory.</span>
                 </div>
-                <div class="form-field">
-                    <label>Environment from settings (JSON)</label>
-                    <textarea data-mcp-field="env_from_settings" rows="4" placeholder='{"API_TOKEN": "MY_MCP_KEY"}' autocomplete="off" spellcheck="false">${escapeHtml(envRefs)}</textarea>
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-env_from_settings">Environment from settings (JSON)</label>
+                    <textarea class="ui-control" id="mcp-${index}-env_from_settings" aria-label="MCP server ${index + 1}: Environment from settings (JSON)" data-mcp-field="env_from_settings" rows="4" placeholder='{"API_TOKEN": "MY_MCP_KEY"}' autocomplete="off" spellcheck="false">${escapeHtml(envRefs)}</textarea>
                     <span class="muted">Map environment names to saved setting keys. Put secret values in Settings → Custom keys.</span>
                 </div>
             </div>
             <div class="form-row">
-                <div class="form-field">
-                    <label>Environment (JSON, optional)</label>
-                    <textarea data-mcp-field="env" rows="3" placeholder='{"PORT": "8080", "DEBUG": "1"}' autocomplete="off" spellcheck="false">${escapeHtml(literalEnv)}</textarea>
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-env">Environment (JSON, optional)</label>
+                    <textarea class="ui-control" id="mcp-${index}-env" aria-label="MCP server ${index + 1}: Environment (JSON, optional)" data-mcp-field="env" rows="3" placeholder='{"PORT": "8080", "DEBUG": "1"}' autocomplete="off" spellcheck="false">${escapeHtml(literalEnv)}</textarea>
                     <span class="muted">Ordinary values passed directly to the process. Settings references override matching names; use Custom keys for secrets.</span>
                 </div>
             </div>` : `
             <div class="form-grid two">
-                <div class="form-field">
-                    <label>Auth header</label>
-                    <input type="text" data-mcp-field="auth_header" value="${escapeHtml(authHeader)}" placeholder="Authorization" autocomplete="off" spellcheck="false">
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-auth_header">Auth header</label>
+                    <input type="text" class="ui-control" id="mcp-${index}-auth_header" aria-label="MCP server ${index + 1}: Auth header" data-mcp-field="auth_header" value="${escapeHtml(authHeader)}" placeholder="Authorization" autocomplete="off" spellcheck="false">
                 </div>
-                <div class="form-field">
-                    <label>Auth token (optional)</label>
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-auth_token">Auth token (optional)</label>
                     <div class="secret-input-row">
-                        <input type="password" data-mcp-field="auth_token" value="${escapeHtml(authToken)}" placeholder="${escapeHtml(authPlaceholder)}" autocomplete="off" spellcheck="false">
+                        <input type="password" class="ui-control" id="mcp-${index}-auth_token" aria-label="MCP server ${index + 1}: Auth token (optional)" data-mcp-field="auth_token" value="${escapeHtml(authToken)}" placeholder="${escapeHtml(authPlaceholder)}" autocomplete="off" spellcheck="false">
                         <button type="button" class="btn btn-default" data-mcp-token-toggle>Show</button>
                         <button type="button" class="btn btn-default" data-mcp-token-clear>Clear</button>
                     </div>
                 </div>
             </div>`}
             <div class="form-row">
-                <div class="form-field">
-                    <label>Allowed tools (optional, comma-separated)</label>
-                    <input type="text" data-mcp-field="allowed_tools" value="${escapeHtml(allowedTools)}" placeholder="search, read_repo" autocomplete="off" spellcheck="false">
+                <div class="form-field ui-field">
+                    <label for="mcp-${index}-allowed_tools">Allowed tools (optional, comma-separated)</label>
+                    <input type="text" class="ui-control" id="mcp-${index}-allowed_tools" aria-label="MCP server ${index + 1}: Allowed tools (optional, comma-separated)" data-mcp-field="allowed_tools" value="${escapeHtml(allowedTools)}" placeholder="search, read_repo" autocomplete="off" spellcheck="false">
                 </div>
             </div>
             <div class="settings-inline-status mcp-server-message" data-mcp-message hidden></div>
@@ -492,6 +492,25 @@ export function applyMcpSettings(settings) {
     mcpDirtyTokens = new Set();
     renderAll();
     refreshStatus();
+}
+
+/** Validate the current editable MCP draft without painting or changing it. */
+export function validateMcpSettings() {
+    const errors = [];
+    document.querySelectorAll('[data-mcp-field="env"], [data-mcp-field="env_from_settings"]').forEach((input) => {
+        let value, parsed = false;
+        try { value = JSON.parse(input.value || '{}'); parsed = true; } catch {}
+        if (!parsed || (value !== null && (typeof value !== 'object' || Array.isArray(value)
+                || Object.entries(value).some(([name, item]) => !name || name.includes('=')
+                    || name.includes('\u0000') || typeof item !== 'string' || item.includes('\u0000'))))) {
+            errors.push({ input, message: 'Enter a JSON object with nonempty environment names and string values, for example {"PORT":"8080"}. Your input is retained.' });
+        }
+    });
+    const timeout = document.getElementById('s-mcp-tool-timeout');
+    if (timeout && (timeout.validity.badInput || (timeout.value.trim() && (!Number.isFinite(Number(timeout.value)) || Number(timeout.value) <= 0)))) {
+        errors.push({ input: timeout, message: 'Enter a positive tool timeout in seconds.' });
+    }
+    return errors;
 }
 
 export function collectMcpSettings() {

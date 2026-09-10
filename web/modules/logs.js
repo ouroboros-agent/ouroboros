@@ -1,5 +1,6 @@
 import { escapeHtml } from './utils.js';
 import { apiFetch } from './api_client.js';
+import { setInlineStatus } from './ui_helpers.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     LOG_CATEGORIES,
@@ -24,6 +25,7 @@ export function initLogs({ ws, state, mount }) {
     // reconnect re-backfill) render once. Bounded; a rare full clear briefly
     // disables the guard, which at worst re-shows one row — never drops one.
     const renderedLogKeys = new Set();
+    let backfillRevision = 0;
 
     state.activeFilters = state.activeFilters || Object.fromEntries(
         Object.keys(LOG_CATEGORIES).map((key) => [key, true]),
@@ -34,12 +36,14 @@ export function initLogs({ ws, state, mount }) {
     page.className = 'settings-embedded-content settings-logs-panel';
     page.innerHTML = `
         <div class="logs-filters" id="log-filters"><button class="btn btn-default logs-inline-clear" id="btn-clear-logs">Clear</button></div>
+        <div class="ui-status logs-history-status" role="status"></div>
         <div id="log-entries"></div>
     `;
     mount.appendChild(page);
 
     const filtersDiv = page.querySelector('#log-filters');
     const logEntries = page.querySelector('#log-entries');
+    const historyStatus = page.querySelector('.logs-history-status');
     function isLogsVisible() {
         return state.activePage === 'dashboard' && state.dashboardActiveSubtab === 'logs';
     }
@@ -389,20 +393,31 @@ export function initLogs({ ws, state, mount }) {
     // with the live stream, so this neither drops the pre-connect window nor
     // double-renders the post-connect overlap.
     async function backfillRecentLogs() {
+        const revision = ++backfillRevision;
+        setInlineStatus(historyStatus, 'Loading recent history…');
+        historyStatus.hidden = false;
         const merged = [];
+        const failed = [];
         for (const name of ['events', 'tools', 'progress', 'supervisor']) {
             try {
                 const resp = await apiFetch(`/api/logs/${name}?limit=150`, { cache: 'no-store' });
-                if (!resp.ok) continue;
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const data = await resp.json();
-                if (Array.isArray(data.entries)) merged.push(...data.entries);
-            } catch (err) {
-                /* best-effort backfill: live stream still works without it */
+                if (!Array.isArray(data?.entries)) throw new Error('History unavailable');
+                merged.push(...data.entries);
+            } catch {
+                failed.push(name);
             }
         }
         const tsOf = (evt) => Date.parse(evt?.ts || evt?.timestamp || '') || 0;
         merged.sort((a, b) => tsOf(a) - tsOf(b));
         for (const evt of merged) addLogEntry(evt);
+        if (revision === backfillRevision) {
+            setInlineStatus(historyStatus, failed.length
+                ? `Recent history is incomplete: ${failed.join(', ')} could not be loaded. Live events are shown as they arrive; reconnect reloads recent history.`
+                : '', 'error');
+            historyStatus.hidden = failed.length === 0;
+        }
         scrollToLatest();
     }
 

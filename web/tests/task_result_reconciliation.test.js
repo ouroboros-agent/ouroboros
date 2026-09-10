@@ -61,15 +61,46 @@ test(' retained cancelled fact outranks untyped historical answer after result q
 for (const via of ['log', 'detail']) test(`child terminal ${via} retains the producer model observation`, async () => {
     const observation = {source: 'usable_solve_response', used_model: 'fallback', requested_model: 'initial',
         used_local: false, requested_use_local: false, llm_call_id: 'call', provider: 'openrouter'};
+    const executor = {task_id: 'child', task_attempt: '1', run_id: 'run', attempt_id: 'a01',
+        harness_id: 'cursor', phase: 'harness.event', revision: 1, model: 'cursor-model', model_source: 'requested'};
     const fx = makeInstance([], {child: {task_id: 'child', status: 'completed', model_execution: observation}});
     try {
         await fx.instance.refreshHistory({revision: 1});
         fx.handlers.get('chat')({chat_id: 1, role: 'assistant', is_progress: true, content: 'child working',
             task_id: 'child', subagent_task_id: 'child', parent_task_id: 'root', delegation_role: 'subagent',
-            subagent_role: 'reader', subagent_event: 'running', model: 'initial'});
+            subagent_role: 'reader', subagent_event: 'running', model: 'initial', executor_observation: executor});
         fx.handlers.get('log')({chat_id: 1, data: {type: 'task_done', task_id: via === 'log' ? 'child' : 'root', status: 'completed',
             ...(via === 'log' ? {model_execution: observation} : {})}});
         await new Promise(resolve => setImmediate(resolve));
-        assert.match(fx.card('child').querySelector('[data-live-meta]').innerHTML, /Last solve response: fallback/);
+        const meta = fx.card('child').querySelector('[data-live-meta]').innerHTML;
+        assert.match(meta, /Last solve response: fallback/);
+        assert.match(meta, /Coordinator: initial/);
+        assert.match(meta, /Cursor/);
+    } finally {fx.instance.destroy(); restoreDom(fx.prior);}
+});
+
+for (const fresh of [false, true]) test(`pruned model history preserves current evidence: ${fresh}`, async () => {
+    const historical = {status: 'completed', phase: 'done', ts: '2026-09-09T09:02:00Z',
+        provenance: 'canonical_task_result_after_finalization',
+        model_execution: {source: 'usable_solve_response', used_model: 'old-fallback', used_local: false}};
+    const rows = [{task_id: 'past', is_progress: true, text: 'Historical work',
+        ts: '2026-09-09T09:00:00Z', historical_terminal: historical}];
+    const fx = makeInstance(rows);
+    try {
+        if (fresh) {
+            rows[0] = {...rows[0], historical_terminal: undefined,
+                model_execution: {source: 'usable_solve_response', used_model: 'current-model', used_local: false}};
+            await fx.instance.refreshHistory({revision: 1});
+            rows[0] = {...rows[0], model_execution: undefined, historical_terminal: historical};
+        }
+        await fx.instance.refreshHistory({revision: 2});
+        const meta = () => fx.card('past').querySelector('[data-live-meta]').innerHTML;
+        assert.doesNotMatch(meta(), /Last solve response: old-fallback/);
+        if (fresh) assert.match(meta(), /Last solve response: current-model/);
+        fx.instance.hydrateStateSnapshot({active_chat_activities: [],
+            active_chat_activities_complete: true, supervisor_ready: true}, Infinity, 2);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(fx.card('past').querySelector('[data-live-phase]').textContent, 'Done');
+        assert.match(meta(), fresh ? /Last solve response: current-model/ : /Last solve response: old-fallback/);
     } finally {fx.instance.destroy(); restoreDom(fx.prior);}
 });

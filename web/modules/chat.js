@@ -6,6 +6,7 @@ import { showToast } from './toast.js';
 import { createSystemMessageAction, renderProjectChip } from './ui_helpers.js';
 import { cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
+import { bindProjectWorkPointer } from './project_work_pointer.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
@@ -122,7 +123,8 @@ import {
     taskCostProjection,
     unconfirmedForegroundCardIds,
     withTaskCostMeta,
-    costMetaKeys,
+    applyHistoricalModelExecution,
+    cardMetaKeys,
     renderCollapsedActivity,
     renderLiveCardMeta,
     ensureLiveActionsEl,
@@ -302,16 +304,9 @@ export function createChatInstance({
         showToast,
         fetchDetail: fetchTaskDetailStrict,
         onDomWrite: withStableViewport,
+        isMain,
+        insertMessageNode,
     });
-
-    function appendQuestionPointer(msg) {
-        if (!isMain) return false;
-        return withStableViewport(() => {
-            const bubble = chatDecision.buildQuestionPointer(msg);
-            return bubble ? insertMessageNode(bubble) !== false : false;
-        });
-    }
-
 
     async function loadUiPreferences() {
         try {
@@ -491,6 +486,15 @@ export function createChatInstance({
     const LIVE_CARD_CAP = 200;
     const liveCardBound = createLiveCardBound(LIVE_CARD_CAP);
     const liveCardRecords = new Map();
+    const workPointer = asPanel ? bindProjectWorkPointer(page.querySelector('.chat-panel-statusbar'), {
+        records: liveCardRecords, getWindow: () => historyWindow,
+        onNavigate: (root) => {
+            messagesDiv.scrollTop += root.getBoundingClientRect().top - messagesDiv.getBoundingClientRect().top;
+            _savedStick = false;
+            _savedScrollTop = messagesDiv.scrollTop;
+            updateScrollButton();
+        },
+    }) : null;
     const modelWaits = createModelWaitController({
         getRecord: (id, create = true) => {
             if (create) forceTaskCard(id);
@@ -591,10 +595,9 @@ export function createChatInstance({
     try {
         pendingReconnectBannerText = reconnectBannerText(new URL(window.location.href).searchParams.get('_ouro_reason') || '');
     } catch {}
-
     // An ephemeral (decision) turn's id is remembered ONLY so the card factory
     // never offers "Turn into project" (#691): its work renders on the ordinary
-    // live card with host-attested authority alone (no `cancelable`, no Cancel).
+    // live card with host-attested authority (no `cancelable`, no Cancel).
     function registerEphemeralDecisionFrame(frame) {
         const taskId = taskKey(frame?.task_id);
         if (taskId && frame?.ephemeral_decision) ephemeralDecisionTaskIds.add(taskId);
@@ -666,7 +669,7 @@ export function createChatInstance({
             hydrateDirectActivities(activities, snapshotRequestedAt, snapshotGeneration,
                 data.active_chat_activities_complete === true && data.supervisor_ready === true);
             for (const activity of activities) {
-                if (isMain && activity.required_question) appendQuestionPointer(activity.required_question);
+                if (activity.required_question) chatDecision.appendQuestionPointer(activity.required_question);
                 if (Number(activity.chat_id ?? 1) === chatId) modelWaits.observe(activity.activity_id, activity);
             }
         }
@@ -714,6 +717,7 @@ export function createChatInstance({
         if (_viewportMutationDepth > 0) return mutate();
         if (_restoring || !isInstanceVisible()) {
             const result = mutate();
+            workPointer?.update();
             if (remoteContent && result && !_savedStick) _hasNewActivity = true;
             return result;
         }
@@ -729,6 +733,7 @@ export function createChatInstance({
         _viewportMutationDepth = 1;
         try {
             result = mutate();
+            workPointer?.update();
             return result;
         } finally {
             _viewportMutationDepth = 0;
@@ -1851,6 +1856,7 @@ export function createChatInstance({
         if (summary.human && headline) {
             record.lastHumanHeadline = headline;
         }
+        if (summary.model) record.agentModel = summary.model;
 
         const shouldPromote = Boolean(summary.promote) || record.finished;
         const activeHeadline = shouldPromote
@@ -1881,7 +1887,7 @@ export function createChatInstance({
         if (activityCandidate) record.collapsedActivity = boundActivityPreview(activityCandidate);
         const activityText = projectCollapsedActivity({
             isSubagent: record.isSubagent,
-            suggestedName: record.suggestedName,
+            suggestedName: title,
             headline: record.isSubagent ? '' : record.collapsedActivity,
             body: record.isSubagent ? record.collapsedActivity : '',
             previous: record.collapsedActivity,
@@ -1956,7 +1962,7 @@ export function createChatInstance({
             }
         }
         updateLiveCardCount(record);
-        // Cost-only bookkeeping does not move the activity clock.
+        // Cost does not move the activity clock.
         if (ts && (summary.human || activityCandidate)) record.latestActivityTs = ts;
         if (summary.costProjection) {
             record.costMeta = mergeStickyCostMeta(record.costMeta, summary.costProjection);
@@ -2085,8 +2091,8 @@ export function createChatInstance({
 
     // child task_id -> { parentId, role, model } from subagent lifecycle pings. Child
     // cards mount under the parent, but their phase/terminal state is independent
-    // (a finished child never marks the parent done); a later model-less event keeps
-    // the previously seen model so the "role · model" headline survives.
+    // (a finished child never marks the parent done). Model-less events keep the
+    // previously seen model in the separate metadata line.
     const subagentChildParents = new Map();
     // Children whose card reached a terminal phase: late non-lifecycle progress
     // must NOT revive it back to "working".
@@ -2158,7 +2164,7 @@ export function createChatInstance({
         if (!taskId) return false;
         modelWaits.observe(taskId, msg);
         let changed = false;
-        // Only host-attested local progress grants Stop authority.
+        // Only host-attested progress grants Stop authority.
         if (grantCancelAuthority && msg?.cancelable === true && msg?.task_id) {
             changed = markTaskCancelable(String(msg.task_id));
         }
@@ -2183,12 +2189,7 @@ export function createChatInstance({
             ...Object.fromEntries(['subagent_event', 'subagent_task_id', 'root_task_id',
                 'parent_task_id', 'delegation_role', 'subagent_role', 'status', 'result',
                 'trace_summary', 'error', 'artifact_status'].map((key) => [key, msg?.[key] || ''])),
-            // Delegation trio: a forgotten key freezes the chip
-            // (wire_contract.test.js pins all three).
-            executor_route: msg?.executor_route || '',
-            execution_evidence: msg?.execution_evidence,
-            actual_substrate: msg?.actual_substrate || '',
-            ...costMetaKeys(msg),
+            ...cardMetaKeys(msg),
             lifecycle: msg?.lifecycle || null,
         });
         if (!summary) return changed;
@@ -2332,17 +2333,12 @@ export function createChatInstance({
             subagent_task_id: childId,
             subagent_role: info.role,
             subagent_event: event,
-            model: info.model || '',
-            // Second whitelist: a log-channel-only terminal still upgrades the chip.
-            executor_route: evt.executor_route || '',
-            execution_evidence: evt.execution_evidence,
-            actual_substrate: evt.actual_substrate || '',
             review_projection: evt.review_projection,
             model_execution: evt.model_execution,
             result: evt.result || '',
             error: evt.error || '',
             reason_code: evt.reason_code || '',
-            ...costMetaKeys(evt),
+            ...cardMetaKeys(evt),
         }, evt.ts || evt.timestamp || new Date().toISOString()));
     }
 
@@ -2385,8 +2381,6 @@ export function createChatInstance({
             ) return forceTaskCardVisibleChange(taskId, rawTs);
             return false;
         };
-        // Root and child cards share telemetry, summary and sticky metadata;
-        // only child lineage and terminal custody differ.
         const childInfo = subagentChildParents.get(taskId);
         if (childInfo && eventType === 'task_done') return routeSubagentTerminalToCard(taskId, evt);
         if (childInfo && subagentTerminalChildren.has(taskId)) return false;
@@ -2503,7 +2497,7 @@ export function createChatInstance({
                     detail: { project: { id: projectId, name: projectName || 'Project' } },
                 })),
             }));
-            bubble.querySelector('.message')?.append(actions);
+            bubble.querySelector('.message')?.after(actions);
         }
         wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
         stampNodeTimestamp(bubble, ts);
@@ -2750,9 +2744,7 @@ export function createChatInstance({
                                 else renderLiveCardMeta(historyCard);
                             }
                         }
-                        if (msg.historical_terminal && liveCardRecords.has(taskId)) {
-                            liveCardRecords.get(taskId).historicalTerminal = msg.historical_terminal;
-                        }
+                        if (msg.historical_terminal && historyCard) historyCard.historicalTerminal = msg.historical_terminal;
                         continue;
                     }
                     if (msg.system_type === 'task_summary' || (msg.ephemeral_decision && msg.tool_calls > 0)) {
@@ -2789,7 +2781,7 @@ export function createChatInstance({
                 }
                 for (const msg of messages) {
                     const taskId = msg.task_id || '';
-                    if (msg.system_type === 'project_question_pointer') { appendQuestionPointer(msg); continue; }
+                    if (msg.system_type === 'project_question_pointer') { chatDecision.appendQuestionPointer(msg); continue; }
                     // Owner-bound reviews attached in pass 1 are not terminal chat bubbles.
                     if (
                         handleCardReference(msg) !== undefined
@@ -3795,7 +3787,12 @@ export function createChatInstance({
                 if (!vouched && detail === null) {
                     revokeManagedTaskCancelAuthority(taskId);
                     const historical = currentRecord.historicalTerminal;
-                    if (historical) return finishLiveCard(taskId, historical.phase) || changed;
+                    if (historical) {
+                        if (applyHistoricalModelExecution(currentRecord, historical)) {
+                            changed = renderLiveCardMeta(currentRecord) || changed;
+                        }
+                        return finishLiveCard(taskId, historical.phase) || changed;
+                    }
                     changed = setHistoricalUnavailable(currentRecord, true) || changed;
                     renderLiveCardMeta(currentRecord);
                     syncChatStatus();
@@ -3907,7 +3904,7 @@ export function createChatInstance({
 
     onWs('chat', (msg) => {
         if (!isMyThread(msg)) return;
-        if (msg.system_type === 'project_question_pointer') { appendQuestionPointer(msg); return; }
+        if (msg.system_type === 'project_question_pointer') { chatDecision.appendQuestionPointer(msg); return; }
         if (msg.role === 'user') {
             const clientMessageId = msg.client_message_id || '';
             const senderSessionId = msg.sender_session_id || '';
@@ -4203,6 +4200,7 @@ export function createChatInstance({
             }
             wsDisposers.length = 0;
             chatMedia.destroy();
+            workPointer?.destroy();
             chatDecision.destroy();
             modelWaits.destroy();
             window.removeEventListener('ouro:page-shown', handlePageShown);

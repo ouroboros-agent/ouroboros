@@ -1,11 +1,12 @@
 """Rendered contracts of NESTED subagent cards and of card text selection.
 
 A nested child is subordinate to its root: collapsed, it is an identity row
-(status chip · `role · model` · notes and chevron, no `Show details` label) in
-quieter ink over its metadata row (harness chip with the run count, cost, last
-update, docked `Reviews N`); only its narration waits for expansion. The card's
+(status chip · role identity · notes and chevron, no `Show details` label) in
+quieter ink over its metadata row (agent model, harness chip with the run count,
+cost, last update, docked `Reviews N`). One useful narration line stays visible;
+the complete narration waits for expansion. The card's
 summary outranks its details: a body-size activity line over meta-size timeline
-rows, an expanded row back at body size. Twins (same parent, role and model)
+rows, an expanded row back at body size. Twins (same parent and displayed role)
 keep the short task id, a lone child does not, and no headline carries the
 status word the chip already shows. Card text is selectable, and a drag that
 selects text never toggles the card while a plain click still does.
@@ -34,14 +35,18 @@ FACTS = """sel => {
     const rect = (el) => el.getBoundingClientRect();
     const title = q('[data-live-title]');
     const lh = parseFloat(style(title).lineHeight);
+    const activity = q('[data-live-activity]');
+    const activityStyle = style(activity);
+    const activityLh = parseFloat(activityStyle.lineHeight);
     return {
         text: title.textContent, expanded: card.dataset.expanded,
         titleLines: lh > 0 ? rect(title).height / lh : 99,
         titleWeight: style(title).fontWeight, titleColor: style(title).color,
         titleSelect: style(title).userSelect || style(title).webkitUserSelect,
         titleTop: rect(title).top, chipTop: rect(q('[data-live-phase]')).top,
-        activityDisplay: style(q('[data-live-activity]')).display,
-        activityFont: style(q('[data-live-activity]')).fontSize,
+        activityDisplay: activityStyle.display,
+        activityLines: activityLh > 0 ? rect(activity).height / activityLh : 99,
+        activityFont: activityStyle.fontSize,
         metaDisplay: style(q('[data-live-meta]')).display, metaText: q('[data-live-meta]').textContent,
         metaTop: rect(q('[data-live-meta]')).top,
         chipText: q('.chat-live-executor-chip')?.textContent || '', chipHeight: q('.chat-live-executor-chip') ? rect(q('.chat-live-executor-chip')).height : 0,
@@ -111,16 +116,20 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                 twin_b = page.evaluate(FACTS, CHILD % "f6e5d4c3b2a1-twin")
                 lone = page.evaluate(FACTS, CHILD % "nest-review")
                 # Identity, not status: twins keep the short id, a lone child does not.
-                assert twin_a["text"] == "scout · gemini-3.6-flash (a1b2c3d4)", twin_a
-                assert twin_b["text"] == "scout · gemini-3.6-flash (f6e5d4c3)", twin_b
-                assert lone["text"] == "reviewer · gemini-3.6-flash", lone
+                assert twin_a["text"] == "scout (a1b2c3d4)", twin_a
+                assert twin_b["text"] == "scout (f6e5d4c3)", twin_b
+                assert lone["text"] == "reviewer", lone
+                for facts in (twin_a, twin_b):
+                    assert "Coordinator: gemini-3.6-flash" in facts["metaText"], facts
+                assert "Agent model: gemini-3.6-flash" in lone["metaText"], lone
                 for facts in (twin_a, twin_b, lone):
                     assert "Done" not in facts["text"] and "—" not in facts["text"], facts
                     # Identity row: the title shares the chip row and takes one line; the
-                    # metadata row stays (harness/cost/updated), only the narration waits.
+                    # metadata stays, with one useful narration line above it.
                     assert abs(facts["titleTop"] - facts["chipTop"]) <= 4, facts
                     assert facts["titleLines"] <= 1.2, facts
-                    assert facts["activityDisplay"] == "none" and facts["metaDisplay"] != "none", facts
+                    assert facts["activityDisplay"] != "none" and facts["activityLines"] <= 1.2, facts
+                    assert facts["metaDisplay"] != "none", facts
                     assert "updated" in facts["metaText"], facts
                     # The `Show details` label is the root's; a child keeps notes + chevron.
                     assert facts["toggleDisplay"] == "none", facts
@@ -133,7 +142,10 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                     assert facts["chipText"] == "Cursor · 1 ok" and facts["chipHeight"] > 0, facts
                 assert lone["chipText"] == "", lone
                 assert root["titleWeight"] == "500", root
-                assert root["activityDisplay"] != "none" and root["metaDisplay"] != "none", root
+                # Root history uses the same text for its title and latest event;
+                # duplicate activity reserves no band, while metadata stays visible.
+                assert root["activityDisplay"] == "none" and root["activityLines"] == 0, root
+                assert root["metaDisplay"] != "none", root
                 assert root["toggleDisplay"] != "none", root
                 # The summary outranks the details: body-size activity line.
                 assert root["activityFont"] == "14px", root
@@ -163,9 +175,9 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                                       "subagent_role": "reviewer", "subagent_event": "running", "content": "second reviewer"})
                 page.wait_for_selector(CHILD % "0badc0de9999-rev", state="attached", timeout=30_000)
                 page.wait_for_timeout(300)
-                assert page.evaluate(FACTS, CHILD % "a1b2c3d4e5f6-twin")["text"] == "scout · gemini-3.6-flash (a1b2c3d4)"
-                assert page.evaluate(FACTS, CHILD % "nest-review")["text"] == "reviewer · gemini-3.6-flash (nest-rev)"
-                assert page.evaluate(FACTS, CHILD % "0badc0de9999-rev")["text"] == "reviewer · gemini-3.6-flash (0badc0de)"
+                assert page.evaluate(FACTS, CHILD % "a1b2c3d4e5f6-twin")["text"] == "scout (a1b2c3d4)"
+                assert page.evaluate(FACTS, CHILD % "nest-review")["text"] == "reviewer (nest-rev)"
+                assert page.evaluate(FACTS, CHILD % "0badc0de9999-rev")["text"] == "reviewer (0badc0de)"
                 # A selection being copied survives a sibling's lineage frame (no-op title writes).
                 twin_title = page.locator(f'{CHILD % "a1b2c3d4e5f6-twin"} > .chat-live-summary-button [data-live-title]')
                 twin_title.evaluate("el => el.scrollIntoView({block: 'center'})")
@@ -184,8 +196,8 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                 page.wait_for_selector(CHILD % "5555eeee6666-new", state="attached", timeout=30_000)
                 assert page.evaluate("() => window.getSelection().toString()").strip(), "a sibling frame must not clear the selection"
                 page.evaluate("() => window.getSelection().removeAllRanges()")
-                # Twins are a full projection: two scheduled model-less children of one role are
-                # twins; once each resolves to a different model the tags come off again.
+                # Twins are a role projection: model observations live in metadata and never
+                # change whether same-role siblings need their short ids.
                 for cid in ("11112222aaaa-pln", "33334444bbbb-pln"):
                     _emit_ws_frame(page, {**child_frame, "model": "", "task_id": cid, "subagent_task_id": cid,
                                           "subagent_role": "planner", "subagent_event": "scheduled", "content": "queued"})
@@ -211,8 +223,12 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                     _emit_ws_frame(page, {**child_frame, "model": model, "task_id": cid, "subagent_task_id": cid,
                                           "subagent_role": "planner", "subagent_event": "running", "content": "planning"})
                 page.wait_for_timeout(300)
-                assert page.evaluate(FACTS, CHILD % "11112222aaaa-pln")["text"] == "planner · gpt-5.6-sol"
-                assert page.evaluate(FACTS, CHILD % "33334444bbbb-pln")["text"] == "planner · gemini-3.6-flash"
+                first_planner = page.evaluate(FACTS, CHILD % "11112222aaaa-pln")
+                second_planner = page.evaluate(FACTS, CHILD % "33334444bbbb-pln")
+                assert first_planner["text"] == "planner (11112222)"
+                assert second_planner["text"] == "planner (33334444)"
+                assert "Agent model: gpt-5.6-sol" in first_planner["metaText"]
+                assert "Agent model: gemini-3.6-flash" in second_planner["metaText"]
                 # A child's review count docks on its metadata row while collapsed, like the root's.
                 _emit_ws_frame(page, {**child_frame, "task_id": "nest-review", "subagent_task_id": "nest-review",
                                       "subagent_role": "reviewer", "subagent_event": "completed",
