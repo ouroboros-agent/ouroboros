@@ -129,6 +129,20 @@ def _compact_local_text(text: str, mode: str) -> str:
     return _compact_markdown_sections(text, preserve_titles=preserve_titles, reason=reason)
 
 
+def local_context_limits(max_tokens: int) -> Tuple[int, int]:
+    """Current local window and effective output cap, shared with caller preflight."""
+    ctx_len = 0
+    local_max = min(max_tokens, 2048)
+    try:
+        from ouroboros.local_model import get_manager
+        ctx_len = get_manager().get_context_length()
+        if ctx_len > 0:
+            local_max = min(max_tokens, max(256, ctx_len // 4))
+    except Exception:
+        pass
+    return ctx_len, local_max
+
+
 class _LocalLaneMixin:
     """Local-context compaction and the local chat request."""
 
@@ -200,15 +214,7 @@ class _LocalLaneMixin:
             for idx, block in enumerate(content):
                 if isinstance(block, dict) and str(block.get("type") or "") in ("image_url", "image"):
                     content[idx] = {"type": "text", "text": "[image omitted: model has no vision]"}
-        local_max = min(max_tokens, 2048)
-        ctx_len = 0
-        try:
-            from ouroboros.local_model import get_manager
-            ctx_len = get_manager().get_context_length()
-            if ctx_len > 0:
-                local_max = min(max_tokens, max(256, ctx_len // 4))
-        except Exception:
-            pass
+        ctx_len, local_max = local_context_limits(max_tokens)
 
         if ctx_len > 0:
             clean_messages = self._prepare_messages_for_local_context(clean_messages, ctx_len, local_max)

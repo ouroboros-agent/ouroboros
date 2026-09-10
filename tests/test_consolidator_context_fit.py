@@ -47,7 +47,7 @@ def fit(monkeypatch):
     monkeypatch.setattr(c, "_consolidation_route", lambda: ("test/model", False))
 
     def resolve(task, *, allow_fetch):
-        assert allow_fetch is False
+        assert allow_fetch is bool(task["use_local_model"])
         fact.tasks.append(dict(task))
         evidence = CapabilityEvidence(
             fact.window or 0, "confirmed" if fact.window else "unknown", "test", "route-test",
@@ -394,7 +394,7 @@ def test_light_account_and_manual_window_share_real_context_resolver(monkeypatch
     assert all(call["model_account_override"] == "light-account" for call in llm.calls)
     assert all(call["model"] == model and call["model_role"] == "light" for call in llm.calls)
     assert all(p["options"]["credential_profile_id"] == "light-account" for p in probes)
-    assert all(p["provider"] == "claudexor" and p["allow_fetch"] is False for p in probes)
+    assert all(p["provider"] == "claudexor" and p["allow_fetch"] is True for p in probes)
     assert all(context_fit.estimate_context_prompt_tokens(call["messages"]) + 16384 <= 17000 for call in llm.calls)
     assert _source(llm.accepted) == text
 
