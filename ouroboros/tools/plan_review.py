@@ -18,8 +18,8 @@ replays the recorded wave free (no panel, no cycle). Closure
 (``plan_spec.closure_after_disposition``): GREEN closes;
 Note-only REVIEW_REQUIRED closes immediately; need_evidence closes by disposition
 at $0; a below-quorum blocking finding stays open. REVISE_PLAN never closes by
-disposition — accept ⇒ changed spec (next paid cycle), reject ⇒ rationale rides
-into a subsequent delta cycle when another paid cycle is available. Under blocking enforcement an open wave HOLDS
+disposition. A subsequent paid delta review may evaluate a changed spec or a
+justified rejection when another paid cycle is available. Under blocking enforcement an open wave HOLDS
 finalization (``owner_hurry.force_plan_decision``); at the cap the typed
 ``plan_review_cycles_exhausted`` result + event leave the honest exits: owner
 unstick or a ``blocked_with_evidence`` terminal. Advisory proceeds open under the

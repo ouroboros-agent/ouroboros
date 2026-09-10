@@ -379,6 +379,48 @@ def test_telegram_owner_wait_upgrade_reseeds_current_version(tmp_path, fake_log)
         assert (installed / path).read_bytes() == (seed_dir / "telegram" / path).read_bytes()
 
 
+@pytest.mark.serial
+@pytest.mark.parametrize("name,source,old_version,new_version", [
+    ("telegram", "d5418e05b822feaf6aaa652e8cdc5b53af1232cc", "1.2.1", "1.2.2"),
+    ("unix_computer_use", "162ad3fe6791fcaf6cf625e6b0c50d3a2a27e7f8", "0.4.1", "0.4.2"),
+])
+def test_resync_delivers_payload_from_real_previous_seed(tmp_path, fake_log, name, source, old_version, new_version):
+    """Use the full seed before 59ce693b / 3f8db1e1, including its real payload.
+
+    These official history objects are available in CI's full checkout; a missing
+    object is a fixture error, not evidence that an upgrade was exercised.
+    """
+    import io
+    import subprocess
+    import tarfile
+
+    from ouroboros.launcher_bootstrap import _per_skill_version_resync, _read_skill_manifest
+    from ouroboros.skill_loader import compute_content_hash
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    drive = tmp_path / "data"
+    native = drive / "skills" / "native"
+    installed = native / name
+    installed.mkdir(parents=True)
+    archived = subprocess.run(["git", "archive", f"{source}:skills/{name}"], cwd=repo,
+                              capture_output=True, check=True)
+    with tarfile.open(fileobj=io.BytesIO(archived.stdout)) as archive:
+        for member in archive:
+            if member.isdir():
+                continue
+            target = installed / member.name
+            assert member.isfile() and target.resolve().is_relative_to(installed.resolve())
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.extractfile(member).read())
+    (installed / ".seed-origin").write_text(f"seeded_from={source}\n", encoding="utf-8")
+    assert _read_skill_manifest(installed).version == old_version
+    assert _per_skill_version_resync(repo / "skills", native, fake_log, drive_root=drive) == 1
+    manifest = _read_skill_manifest(installed)
+    assert manifest.version == new_version
+    hash_args = {"manifest_entry": manifest.entry, "manifest_scripts": manifest.scripts}
+    assert compute_content_hash(installed, **hash_args) == compute_content_hash(repo / "skills" / name, **hash_args)
+
+
 @pytest.mark.parametrize("drift", [False, True])
 def test_same_version_hash_drift_is_only_diagnostic(staging, fake_log, caplog, drift):
     from ouroboros.launcher_bootstrap import _per_skill_version_resync

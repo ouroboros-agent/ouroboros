@@ -837,8 +837,8 @@ declared keys whose values are `None`, `""` or `[]`) is ignored, never mistaken
 for a second operation, while any non-empty list, undeclared key or non-blank
 string is meaning and makes the call mixed. Never replay the plan envelope with
 the disposition.
-Any real blocking finding, including one below quorum, stays open for a changed
-spec or a justified rejection evaluated in the next paid delta cycle; advice
+Any real blocking finding, including one below quorum, stays open pending a paid
+delta review of a changed spec or justified rejection, when capacity remains; advice
 does not become a blocker through repetition. Blocking `REVISE_PLAN` likewise
 requires another panel when another paid cycle is available; advisory
 may proceed only under loud host disclosure and the agent's rationale.
