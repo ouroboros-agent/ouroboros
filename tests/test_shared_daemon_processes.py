@@ -189,6 +189,7 @@ owned = daemon.get_owned_daemon()
 custody_pid = int(getattr(getattr(owned, '_proc', None), 'pid', 0) or 0)
 ordinary = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], **pl.subprocess_new_group_kwargs())
 info_path = root/'claudexor'/'fixture-engine.json'
+deadline = time.monotonic() + 30
 while True:
     try:
         info = json.loads(info_path.read_text())
@@ -199,6 +200,8 @@ while True:
         raise RuntimeError(info['harness_error'])
     if info.get('harness_pid'):
         break
+    if time.monotonic() >= deadline:
+        raise RuntimeError('fixture harness startup did not publish a PID within 30s: ' + json.dumps(info))
     time.sleep(.01)
 info.update(worker_pid=os.getpid(), ordinary_pid=ordinary.pid, custody_pid=custody_pid)
 (root/'ready.json').write_text(json.dumps(info))
