@@ -14,7 +14,7 @@ from ouroboros.cost_projection import (
     COST_OPENNESS_FIELDS,
     normalize_task_result_cost_planes,
 )
-from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
+from ouroboros.utils import read_json_dict, read_json_dict_locked, update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -735,7 +735,6 @@ def task_results_dir(drive_root: Any, *, create: bool = True) -> pathlib.Path:
 def task_result_path(drive_root: Any, task_id: str, *, create: bool = True) -> pathlib.Path:
     return task_results_dir(drive_root, create=create) / f"{validate_task_id(task_id)}.json"
 
-
 def load_task_result(
     drive_root: Any, task_id: str, *, strict: bool = False, _locked: bool = False,
 ) -> Optional[Dict[str, Any]]:
@@ -753,16 +752,10 @@ def load_task_result(
     stored, without projecting their deliverables or independent state axes.
     """
     if _locked:
-        from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
         path = task_result_path(drive_root, task_id, create=False)
-        lock_path = path.with_name(path.name + ".lock")
-        lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=4.0, stale_sec=90.0, owner_aware_stale=True)
-        if lock_fd is None:
-            raise TimeoutError(f"task result authority lock unavailable: {path}")
-        try:
-            return load_task_result(drive_root, task_id, strict=strict)
-        finally:
-            release_exclusive_file_lock(lock_path, lock_fd)
+        locked_data = read_json_dict_locked(path)
+    else:
+        locked_data = None
     try:
         tid = validate_task_id(task_id)
         path = task_result_path(drive_root, tid, create=False)
@@ -770,7 +763,7 @@ def load_task_result(
         if strict:
             raise
         return None
-    data = read_json_dict(path)
+    data = locked_data if _locked else read_json_dict(path)
     if data is None and not path.is_file():
         return None  # plainly absent — nothing stored, nothing to admit
     refusal = task_result_schema_refusal(data)
@@ -798,7 +791,6 @@ def load_task_result(
     ):
         raise ValueError(f"task result authority is unreadable or invalid: {path}")
     return data
-
 
 def list_task_results(
     drive_root: Any,
