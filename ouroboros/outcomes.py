@@ -1053,7 +1053,12 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     if usage_status == RESULT_INFRA_FAILED:
         execution_status = EXECUTION_INFRA_FAILED
         reason_code = usage_reason or REASON_PROVIDER_FAILURE
-        failure = {"kind": "provider", "reason_code": reason_code}
+        # An internal lifecycle error is a RUNTIME failure — the same kind the
+        # host-fallback prefix table below already assigns to this exact
+        # terminal text; calling it a provider failure made the two paths of
+        # this one function contradict each other.
+        failure_kind = "runtime" if reason_code == REASON_TASK_EXCEPTION else "provider"
+        failure = {"kind": failure_kind, "reason_code": reason_code}
         # The overflow salvage keeps `llm_api_error`; a waited-out outage or the unknown
         # no-resend fence may leave the same sticky kind behind under its own reason code,
         # and the published projection must not contradict the terminal that chose it.

@@ -255,7 +255,7 @@ def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
         "delegation_role": "root",
         "metadata": metadata,
     }
-    for key in ("attachments", "context", "expected_output", "constraints", "deadline_at"):
+    for key in ("attachments", "context", "expected_output", "constraints", "deadline_at", "project_id"):
         if key in template:
             task[key] = template[key]
     allowed_resources = normalize_allowed_resources(template.get("allowed_resources") or metadata.get("allowed_resources") or {})

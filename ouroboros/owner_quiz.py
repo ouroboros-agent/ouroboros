@@ -215,15 +215,52 @@ def reconcile_terminal(drive_root: Any, task_id: str) -> List[str]:
     answered block."""
     stamp = utc_now_iso()
     expired: List[str] = []
+    terminal_quizzes: List[str] = []
 
     def _mutator(quizzes: Dict[str, Dict[str, Any]]) -> Any:
         for key, block in quizzes.items():
-            if str(block.get("state") or STATE_OPEN) == STATE_OPEN:
+            state = str(block.get("state") or STATE_OPEN)
+            if state == STATE_OPEN:
                 block.update({"state": STATE_EXPIRED_TERMINAL, "reconciled_at": stamp})
                 expired.append(str(key))
+                terminal_quizzes.append(str(key))
+            elif state == STATE_EXPIRED_TERMINAL:
+                # A previous call may have committed quiz expiry before the
+                # paired task-result repair failed. Keep the second pass
+                # idempotent so it can close the wait without a new quiz event.
+                terminal_quizzes.append(str(key))
         return True if expired else _KEEP
 
     _mutate_projection(drive_root, task_id, _mutator)
+    if terminal_quizzes:
+        from ouroboros.task_results import (
+            require_writable_task_result_schema,
+            stamp_task_result_schema,
+        )
+
+        def _close_owner_wait(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            require_writable_task_result_schema(current)
+            wait = current.get("owner_wait")
+            if not isinstance(wait, dict) or str(wait.get("state") or "") != "waiting":
+                return None
+            quiz_id = str(wait.get("quiz_id") or "")
+            if quiz_id not in terminal_quizzes:
+                return None
+            updated = dict(current)
+            updated["owner_wait"] = {
+                **wait,
+                "state": STATE_EXPIRED_TERMINAL,
+                "reconciled_at": stamp,
+            }
+            return stamp_task_result_schema(updated)
+
+        # The quiz and its waiting continuation share the same task-result
+        # authority. Close the paired wait after the quiz projection so a
+        # terminal task cannot replay as both expired and still waiting.
+        update_json_locked(
+            _quiz_result_path(drive_root, task_id),
+            _close_owner_wait,
+        )
     return expired
 
 

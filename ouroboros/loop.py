@@ -641,6 +641,17 @@ def run_llm_loop(
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="budget")
         return _handle_budget_exceeded(
             exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
+    except Exception as exc:
+        # The caller still owns the terminal projection, but the loop owns the
+        # accumulated evidence. Keep the same in-memory objects on the raised
+        # exception so an unexpected lifecycle failure cannot turn a completed
+        # multi-round trace into an empty ``0 calls`` result.
+        try:
+            setattr(exc, "_ouroboros_loop_usage", accumulated_usage)
+            setattr(exc, "_ouroboros_loop_trace", llm_trace)
+        except Exception:
+            pass
+        raise
     finally:
         # No stale active latch behind an in-process exit (a crash skips this frame, keeping the latch for recovery).
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="loop_exit")

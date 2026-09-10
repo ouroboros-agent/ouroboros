@@ -933,21 +933,43 @@ class OuroborosAgent:
                         "traceback": truncate_for_log(tb, 2000),
                     })
                     text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
-                    usage = {
-                        "execution_status": "infra_failed",
-                        "reason_code": "task_exception",
-                    }
+                    captured_usage = getattr(e, "_ouroboros_loop_usage", None)
+                    captured_trace = getattr(e, "_ouroboros_loop_trace", None)
+                    if isinstance(captured_usage, dict):
+                        usage = dict(captured_usage)
+                    else:
+                        usage = {}
+                    if isinstance(captured_trace, dict):
+                        llm_trace = captured_trace
+                    usage.update(
+                        execution_status="infra_failed",
+                        reason_code="task_exception",
+                    )
                     try:
+                        from ouroboros.outcomes import collect_trace_refs, derive_loop_outcome
+                        from ouroboros.agent_task_pipeline import build_trace_summary
                         from ouroboros.task_results import STATUS_FAILED, write_task_result
                         # CW3: an ephemeral decision turn leaves no durable task_result even on error.
                         if not bool(task.get("_ephemeral_turn")):
+                            # The loop's own tally rides ``loop_outcome.usage``
+                            # (ABI-3's honest loop plane); the top-level
+                            # total_rounds/prompt_tokens/completion_tokens stay
+                            # the LEDGER's answer, written by the finalization
+                            # pipeline from reconstruct_task_cost.
+                            loop_outcome = derive_loop_outcome(text, usage, llm_trace)
+                            trace_refs = loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace)
                             write_task_result(
                                 self.env.drive_root,
                                 str(task.get("id") or ""),
                                 STATUS_FAILED,
                                 result=text,
                                 reason_code="task_exception",
-                                outcome_axes=infra_failed_axes("task_exception", review_trigger="agent_exception"),
+                                outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
+                                    "task_exception", review_trigger="agent_exception",
+                                ),
+                                loop_outcome=loop_outcome,
+                                trace_summary=build_trace_summary(llm_trace),
+                                trace_refs=trace_refs,
                             )
                     except Exception:
                         pass
