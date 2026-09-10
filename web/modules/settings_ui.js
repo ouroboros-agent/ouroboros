@@ -1,4 +1,4 @@
-import { renderPageHeader, renderSegmentedField, renderTabStrip } from './page_header.js';
+import { renderPageHeader, renderSegmentedField, renderTabStrip, bindTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness_accounts.js';
 import { renderReviewerSlotsSection } from './reviewer_slots.js';
@@ -58,10 +58,10 @@ function providerCard({ id, title, icon, hint, body, open = false }) {
 
 function secretField({ id, settingKey, label, placeholder }) {
     return `
-        <div class="form-field">
-            <label>${label}</label>
+        <div class="form-field ui-field">
+            <label for="${id}">${label}</label>
             <div class="secret-input-row">
-                <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}">
+                <input id="${id}" name="${settingKey}" data-secret-setting="${settingKey}" class="secret-input ui-control" type="password" placeholder="${placeholder}">
                 <button type="button" class="btn btn-default secret-toggle" data-target="${id}">Show</button>
                 <button type="button" class="btn btn-default secret-clear" data-target="${id}">Clear</button>
             </div>
@@ -70,7 +70,7 @@ function secretField({ id, settingKey, label, placeholder }) {
 }
 
 function plainField({ id, label, placeholder }) {
-    return `<div class="form-field"><label>${label}</label><input id="${id}" placeholder="${placeholder}"></div>`;
+    return `<div class="form-field ui-field"><label for="${id}">${label}</label><input id="${id}" name="${id}" type="text" class="ui-control" placeholder="${placeholder}"></div>`;
 }
 
 const PROVIDER_CARDS = [
@@ -171,7 +171,11 @@ export const PROVIDER_TEST_INPUTS = Object.fromEntries(
 
 function providerSettingsCard(spec) {
     const fields = (spec.fields || [])
-        .map((field) => field.settingKey ? secretField(field) : plainField(field))
+        .map((field) => {
+            const named = { ...field, label: field.label === "API Key" || field.label === "Base URL"
+                ? `${spec.title} ${field.label}` : field.label };
+            return field.settingKey ? secretField(named) : plainField(named);
+        })
         .join('');
     const test = spec.testProvider ? `
             <div class="settings-action-row">
@@ -210,7 +214,7 @@ const EFFORT_OPTIONS = [
 function effortField({ id, label, defaultValue }) {
     return `
         <div class="settings-effort-card">
-            <label>${label}</label>
+            <label for="${id}">${label}</label>
             <input id="${id}" type="hidden" value="${defaultValue}">
             ${renderSegmentedField({ target: id, options: EFFORT_OPTIONS })}
         </div>
@@ -282,7 +286,8 @@ export function renderSettingsPage() {
                 <div class="settings-tabs-bar">
                     <button type="button" class="settings-mobile-back" data-settings-back hidden>Settings</button>
                     ${renderTabStrip({
-                        items: SETTINGS_TABS,
+                        items: SETTINGS_TABS.map((item) => ({ ...item,
+                            tabId: `settings-tab-${item.value}`, panelId: `settings-panel-${item.value}` })),
                         active: 'providers',
                         dataAttr: 'data-settings-tab',
                         ariaLabel: 'Settings sections',
@@ -315,9 +320,9 @@ export function renderSettingsPage() {
                     <div class="form-section compact">
                         <h3>Legacy Compatibility</h3>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Legacy OpenAI Base URL</label>
-                                <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 or compatible endpoint">
+                            <div class="form-field ui-field">
+                                <label for="s-openai-base-url">Legacy OpenAI Base URL</label>
+                                <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 or compatible endpoint" class="ui-control" name="s-openai-base-url" type="text">
                             </div>
                         </div>
                         <div class="settings-inline-note">Backward-compatibility escape hatch for older installs. For new custom providers, use the dedicated <code>OpenAI Compatible</code> card instead.</div>
@@ -331,10 +336,10 @@ export function renderSettingsPage() {
                             placeholder: 'Leave blank to keep the network surface open',
                         })}</div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Server Bind Host</label>
-                                <input id="s-server-host" placeholder="127.0.0.1 or 0.0.0.0">
-                                <div class="settings-inline-note">Use <code>127.0.0.1</code> for this machine only. Use <code>0.0.0.0</code> for LAN/Docker access with a Network Password in the same save. Specific LAN IP binds are manual/env-only.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-server-host">Server Bind Host</label>
+                                <input id="s-server-host" placeholder="127.0.0.1 or 0.0.0.0" class="ui-control" name="s-server-host" type="text" aria-describedby="s-server-host-help">
+                                <div class="settings-inline-note ui-field-help" id="s-server-host-help">Use <code>127.0.0.1</code> for this machine only. Use <code>0.0.0.0</code> for LAN/Docker access with a Network Password in the same save. Specific LAN IP binds are manual/env-only.</div>
                             </div>
                         </div>
                         <div class="settings-inline-note">Adds a password wall only for non-localhost app and API access. If you expose Ouroboros on LAN or Docker, set a password before sharing the URL.</div>
@@ -371,10 +376,10 @@ export function renderSettingsPage() {
                     <div class="form-section">
                         <h3>Other Model Slots</h3>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>Web Search Model</label>
-                                <input id="s-websearch-model" placeholder="gpt-5.2">
-                                <div class="settings-inline-note">OpenAI model for <code>web_search</code>. Requires <code>OPENAI_API_KEY</code> and an empty Legacy Base URL.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-websearch-model">Web Search Model</label>
+                                <input id="s-websearch-model" placeholder="gpt-5.2" class="ui-control" name="s-websearch-model" type="text" aria-describedby="s-websearch-model-help">
+                                <div class="settings-inline-note ui-field-help" id="s-websearch-model-help">OpenAI model for <code>web_search</code>. Requires <code>OPENAI_API_KEY</code> and an empty Legacy Base URL.</div>
                             </div>
                         </div>
                     </div>
@@ -482,8 +487,8 @@ export function renderSettingsPage() {
                             Closed-loop skill development can auto-grant the keys and host permissions a skill declares after a fresh executable review for the current content hash.
                             Leave this off when every skill permission should require a separate human approval.
                         </div>
-                        <label class="local-toggle" title="Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.">
-                            <input type="checkbox" id="s-auto-grant-reviewed-skills">
+                        <label class="local-toggle ui-field ui-field-inline" title="Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.">
+                            <input type="checkbox" id="s-auto-grant-reviewed-skills" class="ui-checkbox" name="s-auto-grant-reviewed-skills">
                             Auto-grant reviewed skills' keys and permissions
                         </label>
                     </div>
@@ -630,23 +635,23 @@ export function renderSettingsPage() {
                             <div class="settings-inline-note"><strong>Counts every eligible task, including trivial chats.</strong> <code>Every N=1</code> means Ouroboros considers self-improvement after every task, then runs the actual cycle later on an idle supervisor tick.</div>
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
+                            <div class="form-field ui-field">
                                 <div data-evo-every-n-row>
-                                <label>Every N Tasks</label>
-                                <input id="s-evo-cadence-n" type="number" min="1" step="1" placeholder="3">
-                                <div class="settings-inline-note">Visible only when Self-Improvement Trigger = Every N Tasks.</div>
+                                <label for="s-evo-cadence-n">Every N Tasks</label>
+                                <input id="s-evo-cadence-n" type="number" min="1" step="1" placeholder="3" class="ui-control" name="s-evo-cadence-n" aria-describedby="s-evo-cadence-n-help">
+                                <div class="settings-inline-note ui-field-help" id="s-evo-cadence-n-help">Visible only when Self-Improvement Trigger = Every N Tasks.</div>
                                 </div>
                             </div>
-                            <div class="form-field">
-                                <label>Per-Cycle Budget Reserve (USD)</label>
-                                <input id="s-evo-budget" placeholder="0">
-                                <div class="settings-inline-note">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task hard cost cap and the supervisor's reserved-budget floor.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-evo-budget">Per-Cycle Budget Reserve (USD)</label>
+                                <input id="s-evo-budget" placeholder="0" class="ui-control" name="s-evo-budget" type="text" aria-describedby="s-evo-budget-help">
+                                <div class="settings-inline-note ui-field-help" id="s-evo-budget-help">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task hard cost cap and the supervisor's reserved-budget floor.</div>
                             </div>
                         </div>
-                        <div class="form-field">
-                            <label>Standing Objective (optional)</label>
-                            <input id="s-evo-objective" placeholder="(none) — e.g. prioritize test coverage and latency">
-                            <div class="settings-inline-note">Optional steer appended to every evolution cycle objective. It never overrides the LLM-first promotion; leave empty for pure LLM choice.</div>
+                        <div class="form-field ui-field">
+                            <label for="s-evo-objective">Standing Objective (optional)</label>
+                            <input id="s-evo-objective" placeholder="(none) — e.g. prioritize test coverage and latency" class="ui-control" name="s-evo-objective" type="text" aria-describedby="s-evo-objective-help">
+                            <div class="settings-inline-note ui-field-help" id="s-evo-objective-help">Optional steer appended to every evolution cycle objective. It never overrides the LLM-first promotion; leave empty for pure LLM choice.</div>
                         </div>
                     </div>
 
@@ -656,17 +661,17 @@ export function renderSettingsPage() {
                             Cadence for Ouroboros's background cognition loop. These values are read at startup; save them, then restart for the new timing to take effect.
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>BG Wakeup Min (sec)</label>
-                                <input id="s-bg-wakeup-min" type="number" min="1" step="1" placeholder="30">
+                            <div class="form-field ui-field">
+                                <label for="s-bg-wakeup-min">BG Wakeup Min (sec)</label>
+                                <input id="s-bg-wakeup-min" type="number" min="1" step="1" placeholder="30" class="ui-control" name="s-bg-wakeup-min">
                             </div>
-                            <div class="form-field">
-                                <label>BG Wakeup Max (sec)</label>
-                                <input id="s-bg-wakeup-max" type="number" min="1" step="1" placeholder="7200">
+                            <div class="form-field ui-field">
+                                <label for="s-bg-wakeup-max">BG Wakeup Max (sec)</label>
+                                <input id="s-bg-wakeup-max" type="number" min="1" step="1" placeholder="7200" class="ui-control" name="s-bg-wakeup-max">
                             </div>
-                            <div class="form-field">
-                                <label>BG Max Rounds</label>
-                                <input id="s-bg-max-rounds" type="number" min="1" step="1" placeholder="10">
+                            <div class="form-field ui-field">
+                                <label for="s-bg-max-rounds">BG Max Rounds</label>
+                                <input id="s-bg-max-rounds" type="number" min="1" step="1" placeholder="10" class="ui-control" name="s-bg-max-rounds">
                             </div>
                         </div>
                         <div class="settings-inline-note"><strong>Applies after restart:</strong> BG Wakeup Min/Max and BG Max Rounds are read when the background cognition loop starts.</div>
@@ -681,10 +686,10 @@ export function renderSettingsPage() {
                             cloning or pulling them. Leave empty to use only the data plane.
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Skills Repo Path</label>
-                                <input id="s-skills-repo-path" placeholder="~/Ouroboros/skills or /absolute/path/to/skills">
-                                <div class="settings-inline-note">Absolute or <code>~</code>-prefixed path. Ouroboros never clones/pulls this directory — you manage it yourself.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-skills-repo-path">Skills Repo Path</label>
+                                <input id="s-skills-repo-path" placeholder="~/Ouroboros/skills or /absolute/path/to/skills" class="ui-control" name="s-skills-repo-path" type="text" aria-describedby="s-skills-repo-path-help">
+                                <div class="settings-inline-note ui-field-help" id="s-skills-repo-path-help">Absolute or <code>~</code>-prefixed path. Ouroboros never clones/pulls this directory — you manage it yourself.</div>
                             </div>
                         </div>
                     </div>
@@ -701,10 +706,10 @@ export function renderSettingsPage() {
                             are filtered out — only skill packages are installable.
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Registry URL</label>
-                                <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1">
-                                <div class="settings-inline-note">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-clawhub-registry-url">Registry URL</label>
+                                <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1" class="ui-control" name="s-clawhub-registry-url" type="text" aria-describedby="s-clawhub-registry-url-help">
+                                <div class="settings-inline-note ui-field-help" id="s-clawhub-registry-url-help">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
                             </div>
                         </div>
                     </div>
@@ -728,13 +733,13 @@ export function renderSettingsPage() {
                             </div>
                         </div>
                         <div class="form-grid two">
-                            <label class="local-toggle">
-                                <input type="checkbox" id="s-mcp-enabled">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" id="s-mcp-enabled" class="ui-checkbox" name="s-mcp-enabled">
                                 Enable MCP client
                             </label>
-                            <div class="form-field">
-                                <label>Per-tool timeout (s)</label>
-                                <input id="s-mcp-tool-timeout" type="number" min="1" value="60">
+                            <div class="form-field ui-field">
+                                <label for="s-mcp-tool-timeout">Per-tool timeout (s)</label>
+                                <input id="s-mcp-tool-timeout" type="number" min="1" value="60" class="ui-control" name="s-mcp-tool-timeout">
                             </div>
                         </div>
                         <div id="mcp-global-status" class="settings-inline-status">Checking MCP status…</div>
@@ -745,9 +750,9 @@ export function renderSettingsPage() {
                         <h3>Source Control</h3>
                         <div class="settings-section-copy">Repository metadata for GitHub integration. Tokens live in Secrets; this is not secret.</div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>GitHub Repo</label>
-                                <input id="s-gh-repo" placeholder="owner/repo-name">
+                            <div class="form-field ui-field">
+                                <label for="s-gh-repo">GitHub Repo</label>
+                                <input id="s-gh-repo" placeholder="owner/repo-name" class="ui-control" name="s-gh-repo" type="text">
                             </div>
                         </div>
                     </div>
@@ -756,31 +761,31 @@ export function renderSettingsPage() {
                         <h3>Local Model Runtime</h3>
                         <div class="settings-section-copy">Only fill this in when you want Ouroboros to start and route to a GGUF model on this machine.</div>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>Model Source</label>
-                                <input id="s-local-source" placeholder="bartowski/Llama-3.3-70B-Instruct-GGUF or /path/to/model.gguf">
+                            <div class="form-field ui-field">
+                                <label for="s-local-source">Model Source</label>
+                                <input id="s-local-source" placeholder="bartowski/Llama-3.3-70B-Instruct-GGUF or /path/to/model.gguf" class="ui-control" name="s-local-source" type="text">
                             </div>
-                            <div class="form-field">
-                                <label>GGUF Filename (for HF repos)</label>
-                                <input id="s-local-filename" placeholder="Llama-3.3-70B-Instruct-Q4_K_M.gguf">
+                            <div class="form-field ui-field">
+                                <label for="s-local-filename">GGUF Filename (for HF repos)</label>
+                                <input id="s-local-filename" placeholder="Llama-3.3-70B-Instruct-Q4_K_M.gguf" class="ui-control" name="s-local-filename" type="text">
                             </div>
                         </div>
                         <div class="form-grid four">
-                            <div class="form-field">
-                                <label>Port</label>
-                                <input id="s-local-port" type="number" value="8766">
+                            <div class="form-field ui-field">
+                                <label for="s-local-port">Port</label>
+                                <input id="s-local-port" type="number" value="8766" class="ui-control" name="s-local-port">
                             </div>
-                            <div class="form-field">
-                                <label>GPU Layers (-1 = all)</label>
-                                <input id="s-local-gpu-layers" type="number" value="-1">
+                            <div class="form-field ui-field">
+                                <label for="s-local-gpu-layers">GPU Layers (-1 = all)</label>
+                                <input id="s-local-gpu-layers" type="number" value="-1" class="ui-control" name="s-local-gpu-layers">
                             </div>
-                            <div class="form-field">
-                                <label>Context Length</label>
-                                <input id="s-local-ctx" type="number" value="16384">
+                            <div class="form-field ui-field">
+                                <label for="s-local-ctx">Context Length</label>
+                                <input id="s-local-ctx" type="number" value="16384" class="ui-control" name="s-local-ctx">
                             </div>
-                            <div class="form-field">
-                                <label>Chat Format</label>
-                                <input id="s-local-chat-format" placeholder="auto-detect">
+                            <div class="form-field ui-field">
+                                <label for="s-local-chat-format">Chat Format</label>
+                                <input id="s-local-chat-format" placeholder="auto-detect" class="ui-control" name="s-local-chat-format" type="text">
                             </div>
                         </div>
                         <div class="settings-toolbar">
@@ -788,7 +793,8 @@ export function renderSettingsPage() {
                             <button class="btn btn-primary" id="btn-local-stop">Stop</button>
                             <button class="btn btn-primary" id="btn-local-test">Test Tool Calling</button>
                         </div>
-                        <div id="local-model-status" class="settings-inline-status">Status: Offline</div>
+                        <div id="local-model-status" class="settings-inline-status" role="status" aria-live="polite">Status: Offline</div>
+                        <div id="local-model-action-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
                         <div id="local-model-progress-wrap" class="local-model-progress-wrap local-model-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
                             <div id="local-model-progress-bar" class="local-model-progress-bar"></div>
                         </div>
@@ -804,25 +810,25 @@ export function renderSettingsPage() {
                              runtime worker processes, not an agent setting. -->
                         <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>Max Workers</label>
-                                <input id="s-workers" type="number" min="1" max="50" value="10">
+                            <div class="form-field ui-field">
+                                <label for="s-workers">Max Workers</label>
+                                <input id="s-workers" type="number" min="1" max="50" value="10" class="ui-control" name="s-workers">
                             </div>
-                            <div class="form-field">
-                                <label>Concurrent Presence Conversations</label>
-                                <input id="s-presence-max-active" type="number" min="1" max="20" value="2">
+                            <div class="form-field ui-field">
+                                <label for="s-presence-max-active">Concurrent Presence Conversations</label>
+                                <input id="s-presence-max-active" type="number" min="1" max="20" value="2" class="ui-control" name="s-presence-max-active">
                             </div>
-                            <div class="form-field">
-                                <label>Tool Timeout (s)</label>
-                                <input id="s-tool-timeout" type="number" value="600">
+                            <div class="form-field ui-field">
+                                <label for="s-tool-timeout">Tool Timeout (s)</label>
+                                <input id="s-tool-timeout" type="number" value="600" class="ui-control" name="s-tool-timeout">
                             </div>
-                            <div class="form-field">
-                                <label>Total Budget (USD)</label>
-                                <input id="s-total-budget" type="number" min="0.01" step="any" value="200.0">
+                            <div class="form-field ui-field">
+                                <label for="s-total-budget">Total Budget (USD)</label>
+                                <input id="s-total-budget" type="number" min="0.01" step="any" value="200.0" class="ui-control" name="s-total-budget">
                             </div>
-                            <div class="form-field">
-                                <label>Per-Task Cost Cap (USD)</label>
-                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="50.0">
+                            <div class="form-field ui-field">
+                                <label for="s-settings-per-task-cost">Per-Task Cost Cap (USD)</label>
+                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="50.0" class="ui-control" name="s-settings-per-task-cost">
                             </div>
                         </div>
                     </div>
@@ -837,9 +843,9 @@ export function renderSettingsPage() {
                             <strong>GC Retention</strong> is the single age knob (days) for all disposable runtime artifacts the startup garbage collector removes: acting-subagent worktrees, terminal task drives, and leftover service logs (hard max 365). Genesis projects are durable and never auto-removed. Where subagents check out that work is set in <code>Agents</code>.
                         </div>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>GC Retention (days)</label>
-                                <input id="s-gc-retention-days" type="number" min="1" max="365" value="7">
+                            <div class="form-field ui-field">
+                                <label for="s-gc-retention-days">GC Retention (days)</label>
+                                <input id="s-gc-retention-days" type="number" min="1" max="365" value="7" class="ui-control" name="s-gc-retention-days">
                             </div>
                         </div>
                     </div>
@@ -894,7 +900,7 @@ export function renderSettingsPage() {
                 </div>
                 <div class="settings-footer-status">
                     <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
-                    <div id="settings-status" class="settings-inline-status"></div>
+                    <div id="settings-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
                 </div>
             </div>
         </div>
@@ -902,48 +908,52 @@ export function renderSettingsPage() {
 }
 
 export function bindSettingsTabs(root, options = {}) {
-    const tabs = Array.from(root.querySelectorAll('.settings-tab'));
     const panels = Array.from(root.querySelectorAll('.settings-panel'));
     const scrollRoot = root.querySelector('.settings-scroll');
     const state = options.state || null;
     const onActivate = typeof options.onActivate === 'function' ? options.onActivate : null;
 
-    // All viewports use horizontal tab pills; mobile back remains DOM-only for compat.
-    function activate(tabName) {
+    const tabs = bindTabStrip(root.querySelector('.settings-tabs'), {
+        dataAttr: 'data-settings-tab', onChange: (value) => activate(value),
+    });
+    panels.forEach((panel) => {
+        panel.id = `settings-panel-${panel.dataset.settingsPanel}`;
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', `settings-tab-${panel.dataset.settingsPanel}`);
+    });
+
+    function activate(tabName, notify = true) {
+        if (!tabs.select(tabName)) return;
+        const changed = root.dataset.activeSettingsTab !== tabName;
         root.dataset.activeSettingsTab = tabName;
-        let activeButton = null;
-        tabs.forEach((button) => {
-            const isActive = button.dataset.settingsTab === tabName;
-            button.classList.toggle('active', isActive);
-            button.setAttribute('aria-selected', String(isActive));
-            if (isActive) activeButton = button;
-        });
         panels.forEach((panel) => {
             panel.classList.toggle('active', panel.dataset.settingsPanel === tabName);
+            panel.hidden = panel.dataset.settingsPanel !== tabName;
         });
-        if (scrollRoot) scrollRoot.scrollTop = 0;
+        if (scrollRoot && changed && notify) scrollRoot.scrollTop = 0;
         if (state) state.settingsActiveSubtab = tabName;
-        // Keep active pill visible in the horizontal strip.
-        if (activeButton && typeof activeButton.scrollIntoView === 'function') {
-            activeButton.scrollIntoView({
-                behavior: 'auto',
-                inline: 'center',
-                block: 'nearest',
-            });
+        if (notify && changed) {
+            if (onActivate) onActivate(tabName);
+            window.dispatchEvent(new CustomEvent('ouro:settings-subtab-shown', { detail: { tab: tabName } }));
         }
-        if (onActivate) onActivate(tabName);
-        window.dispatchEvent(new CustomEvent('ouro:settings-subtab-shown', { detail: { tab: tabName } }));
     }
 
-    tabs.forEach((button) => {
-        button.addEventListener('click', () => activate(button.dataset.settingsTab));
-    });
     root.activateSettingsTab = activate;
-    if (state && !state.settingsActiveSubtab) state.settingsActiveSubtab = 'providers';
-    root.dataset.activeSettingsTab = state?.settingsActiveSubtab || 'providers';
+    activate(state?.settingsActiveSubtab || 'providers', false);
+    return () => { tabs.destroy(); delete root.activateSettingsTab; };
 }
 
 export function bindSecretInputs(root) {
+    root.querySelectorAll('.secret-toggle, .secret-clear').forEach((button) => {
+        const input = root.querySelector(`#${button.dataset.target}`);
+        if (!input) return;
+        button.setAttribute('aria-controls', input.id);
+        const label = input.labels?.[0];
+        if (label) {
+            label.id ||= `${input.id}-label`;
+            button.setAttribute('aria-describedby', label.id);
+        }
+    });
     root.querySelectorAll('.secret-input').forEach((input) => {
         input.addEventListener('input', () => {
             if (input.value.trim()) delete input.dataset.forceClear;

@@ -52,29 +52,11 @@ def test_ui_publish_stale_card_reaches_selected_preflight_and_task(
             try:
                 page = browser.new_page(viewport={"width": 1280, "height": 900})
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                # Opening the Skills page starts TWO reads: /api/skills paints
-                # the cards, and the display-only OuroborosHub catalog repaints
-                # the WHOLE list when it settles (renderSkillsList's
-                # catalogSettled.then re-runs paint over container.innerHTML).
-                # A repaint landing between the menu-trigger click and the
-                # submit-hub click below recreates the card's <dialog> CLOSED,
-                # so the click waits its full 30s for a hidden menu item. Gate
-                # the flow on the catalog response (server-bounded at 15s) and
-                # settle one frame so the deferred repaint has applied before
-                # any interaction (same hydration-gate precedent as
-                # tests/test_ui_smoke_status_attention.py).
-                with page.expect_response(
-                    lambda response: "/api/marketplace/ouroboroshub/catalog"
-                    in response.url,
-                    timeout=30_000,
-                ) as catalog_hydration:
-                    page.click('[data-nav-page="skills"]')
-                catalog_hydration.value.finished()
+                # Installed cards are usable before the optional Hub catalog
+                # settles. Its badge-only update must not close the open menu.
+                page.click('[data-nav-page="skills"]')
                 card = page.locator(f'.skills-card[data-skill="{skill_name}"]').first
                 card.wait_for(state="visible", timeout=30_000)
-                page.evaluate(
-                    "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
-                )
                 assert card.locator(".skills-submit-hub").get_attribute("data-submit-disabled") == "false"
 
                 # The passive catalogue no longer contains this row, but the selected
@@ -85,7 +67,7 @@ def test_ui_publish_stale_card_reaches_selected_preflight_and_task(
                     f"**/api/skills/{skill_name}/publish-preflight",
                     timeout=30_000,
                 ) as preflight_request:
-                    card.locator(".skills-submit-hub").click()
+                    page.locator(f'.skills-card-menu-dialog[open] .skills-submit-hub[data-skill="{skill_name}"]').click()
                 assert preflight_request.value.method == "POST"
 
                 dialog = page.locator(".confirm-dialog")

@@ -11,6 +11,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { widgetKey } from './widget_list.js';
 import { frameHeight, setFrameHeight } from './widget_module.js';
+import { bindMenu } from './ui_interactions.js';
 
 // Mirrors the validator's WIDGET_START_MODES (ouroboros/extension_ui_validation.py,
 // the SSOT for the enum and the per-kind defaults).
@@ -76,7 +77,7 @@ export function renderWidgetCardControls(tab) {
         <button type="button" class="btn btn-primary btn-sm" data-widget-power>Start</button>
         <div class="skills-card-menu">
             <button type="button" class="skills-card-menu-trigger" aria-label="Launch policy" aria-haspopup="menu" aria-expanded="false" data-widget-menu-trigger>⋮</button>
-            <dialog class="skills-card-menu-dialog" role="menu" aria-label="Launch policy">
+            <dialog class="skills-card-menu-dialog ui-popup" role="menu" aria-label="Launch policy">
                 <div class="widgets-menu-heading">Launch policy</div>
                 ${items}
             </dialog>
@@ -153,58 +154,51 @@ export function renderWidgetFacade(mount, tab) {
     setFrameHeight(mount.firstElementChild, frameHeight(tab.render || {}));
 }
 
-let menusBound = false;
-
-/**
- * Launch-policy menus: one delegated binding over the Widgets list, same
- * open/close behaviour as the Skills card menu (anchored non-modal `<dialog>`;
- * outside click, Escape and scroll close it). Selecting an item calls
- * `onSelectMode(cardKey, mode)`.
- */
+/** Launch-policy domain adapter over the shared keyboard/viewport menu. */
 export function bindWidgetCardMenus(list, onSelectMode) {
-    if (!list || menusBound) return;
-    menusBound = true;
-    const closeMenus = (exceptMenu = null) => {
-        list.querySelectorAll('.skills-card-menu').forEach((menu) => {
-            if (menu === exceptMenu) return;
-            const popover = menu.querySelector('.skills-card-menu-dialog');
-            const trigger = menu.querySelector('[data-widget-menu-trigger]');
-            // Focus goes back to the trigger when it was inside the closing menu
-            // (Chromium does this for a <dialog>; WebKit does not).
-            const hadFocus = Boolean(popover?.open && popover.contains(document.activeElement));
-            if (popover?.open) popover.close();
-            trigger?.setAttribute('aria-expanded', 'false');
-            if (hadFocus) trigger?.focus({ preventScroll: true });
-        });
-    };
-    list.addEventListener('click', (event) => {
+    if (!list) return { close() {}, destroy() {} };
+    let active = null;
+    const close = () => active?.binding.close();
+    const onClick = (event) => {
         const trigger = event.target.closest('[data-widget-menu-trigger]');
-        if (trigger) {
-            const menu = trigger.closest('.skills-card-menu');
-            const popover = menu?.querySelector('.skills-card-menu-dialog');
-            const opening = !popover?.open;
-            closeMenus(opening ? menu : null);
-            if (!popover) return;
-            trigger.setAttribute('aria-expanded', opening ? 'true' : 'false');
-            if (opening) {
-                popover.show();
-                (popover.querySelector('[aria-checked="true"]') || popover.querySelector('[role="menuitemradio"]'))?.focus();
-            } else {
+        if (!trigger) return;
+        const wasOpen = active?.trigger === trigger;
+        close();
+        if (wasOpen) return;
+        const card = trigger.closest('[data-widget-key]');
+        const popover = trigger.closest('.skills-card-menu')?.querySelector('.skills-card-menu-dialog');
+        const key = card?.dataset.widgetKey || '';
+        if (!popover || !key) return;
+        // Capture the owning card before moving the popup outside clipped cards.
+        const home = popover.parentNode;
+        home.ownerDocument.body.append(popover);
+        popover.show();
+        trigger.setAttribute('aria-expanded', 'true');
+        const onMode = (selection) => {
+            const item = selection.target.closest('[data-widget-start-mode]');
+            if (!item) return;
+            const mode = item.dataset.widgetStartMode || '';
+            active?.binding.close({ restoreFocus: true });
+            onSelectMode(key, mode);
+        };
+        popover.addEventListener('click', onMode);
+        const binding = bindMenu(popover, {
+            anchor: trigger,
+            onClose() {
+                popover.removeEventListener('click', onMode);
                 popover.close();
-            }
-            return;
-        }
-        const item = event.target.closest('[data-widget-start-mode]');
-        if (!item) return;
-        closeMenus();
-        const key = item.closest('[data-widget-key]')?.dataset.widgetKey || '';
-        if (key) onSelectMode(key, item.dataset.widgetStartMode || '');
-    });
-    document.addEventListener('click', (event) => {
-        if (!event.target.closest?.('.widgets-card .skills-card-menu')) closeMenus();
-    }, true);
-    document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape') closeMenus();
-    });
-    window.addEventListener('scroll', () => closeMenus(), true);
+                if (home.isConnected) home.append(popover);
+                else popover.remove();
+                trigger.setAttribute('aria-expanded', 'false');
+                active = null;
+            },
+        });
+        active = { trigger, binding };
+        (popover.querySelector('[aria-checked="true"]') || popover.querySelector('[role="menuitemradio"]'))?.focus({ preventScroll: true });
+    };
+    list.addEventListener('click', onClick);
+    return {
+        close,
+        destroy() { close(); list.removeEventListener('click', onClick); },
+    };
 }

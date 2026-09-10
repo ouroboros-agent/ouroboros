@@ -1419,7 +1419,7 @@ and requires K passes for EACH selected scenario.
 
 | Scenario | Work and required evidence | Rationale / limits |
 |---|---|---|
-| SM1 | Change the brand accent consistently with DESIGN.md §3 in `web/style.css` and `web/onboarding.css`, exercise a real browser consumer, then land a reviewed release through `preflight_review` → `commit_reviewed`. The full profile uses advanced runtime and blocking enforcement, with no landing skip flags. Acceptance retains the S2 checks: the commit exists, both committed sheets carry the new accent and agree on their whole shared `:root` token set, VERSION strictly increases, the landed carriers pass `commit_admission.release_metadata_preflight`, the worktree is clean, a real advisory ledger row and `scope_review_complete` exist, usage is positive, and the browser reads the committed accent after restart. | Onboarding is standalone and mirrors tokens by value, so changing only one sheet breaks parity. A complete palette includes the named accent roles and alpha ladder; forbidding a bump or skipping review would test a task contrary to the product's own release policy. `vision_evidence_present` records browser/vision tool rows for reviewers to judge, not a host assertion that the image was inspected. `committed_companions` records paths beyond the sheets, release carriers, DESIGN and comment-only CSS as facts, not an automatic scope failure: reviewers may identify another legitimate accent consumer. The clean-tree check discloses and tolerates only transient `.ouroboros/` scratch. |
+| SM1 | Change the shared brand accent consistently with DESIGN.md §3 in `web/ui.css`, exercise the app and setup wizard, then land a reviewed release through `preflight_review` → `commit_reviewed`. The full profile uses advanced runtime and blocking enforcement, with no landing skip flags. Acceptance retains the S2 checks: the commit exists and includes the changed shared palette with nonempty accent/focus roles, VERSION strictly increases, the landed carriers pass `commit_admission.release_metadata_preflight`, the worktree is clean, a real advisory ledger row and `scope_review_complete` exist, usage is positive, and the browser reads the new accent and matching accent/focus roles on both `/` and `/onboarding` after restart. | One shared file does not prove both documents loaded it: the browser oracle detects a missing wizard link or divergent page override. The named accent roles and alpha ladder remain part of the palette. SM1's lane-local release/review/restart contract is separate from a version-neutral contributor PR; changing its source oracle must not remove those obligations. `vision_evidence_present` records browser/vision tool rows for reviewers to judge, not a host assertion that the image was inspected. `committed_companions` records paths beyond the palette, release carriers, DESIGN and comment-only CSS as facts, not an automatic scope failure: reviewers may identify another legitimate accent consumer. The clean-tree check discloses and tolerates only transient `.ouroboros/` scratch. |
 | SW1 | The Swarm button arms `force_plan` on the ordinary chat send. Require the managed root and plan review, at least two completed children with causal parent/root/depth lineage, a `swarm_fanout` receipt covering them, absorbed-child finalization, the with-children cost rollup without retired aliases, positive usage and the `/proc` environment-based orphan check. | UI admission, child execution and root accounting are separate proofs. An API fallback can continue diagnostics when the browser is unavailable, but cannot pass `ui_swarm_path_exercised`. Children spend under their root's fence. |
 | SK1 | The model authors `SKILL.md` + `plugin.py` and calls `skill_preflight`; the runner reviews, grants exactly the manifest's one privileged permission (`inject_chat`), enables, dispatches, disables and deletes. Require persisted findings plus HTTP 200 with `executable_review` in BOTH the review response and `/api/extensions`; retain separate `author_*` / `dispatch_*` terminals. Dispatch needs the generation-bearing durable row, typed `status=ok`, exact echo and one host-attributed owner-chat relay per successful call. | The product's executable-review gate decides eligibility under the applied enforcement; SK1 sets no enforcement override. Clean state, non-PASS items, status and blocking reason remain facts, because requiring all-PASS would measure author quality instead of the lifecycle. A generation digest alone also appears on failed dispatches. The fixture exercises its declared permission rather than requesting an unused grant. |
 
@@ -1564,7 +1564,9 @@ Focused contracts live in `tests/test_e2e_live_runner.py` (including exact FIFO
 feasibility fixtures), `tests/test_e2e_live_sm1_checks.py`,
 `tests/test_e2e_live_sk1_plugin.py`, `tests/test_e2e_live_panel.py`,
 `tests/test_server_runner_absorb_wait.py` and `tests/test_e2e_live_ci_lane.py`;
-`tests/test_web_typography_static.py` owns shared CSS-token parity. The real
+`tests/test_web_typography_static.py` owns shared-source loading and variable
+resolution; `tests/test_e2e_live_sm1_palette_browser.py` exercises the two-document
+palette oracle, including missing-source and stale-focus-role failures. The real
 SM1 stub rehearsal is separately gated by `integration`, `serial` and
 `OUROBOROS_E2E_DEEP=mock`; it starts a real server and the hermetic suite, so
 ordinary focused/default tests must not accidentally launch it.
@@ -1944,6 +1946,19 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   raw-model sources can supply Main; an Agent-only connection cannot invent one.
   Subscription copy says "without an API key", never guaranteed free. Provider
   credits/spend settings are not enabled or changed by connecting an account.
+- Settings validates the complete draft before any Save request; never omit an
+  invalid custom-key row and save the remainder. Keep pure draft collection and
+  dirty comparison separate from field-error painting. A failed save/refresh
+  preserves edits; leaving or reloading a dirty draft asks before discarding.
+  Preserve saved/unsaved/unknown write receipts and the independent owner-only
+  endpoints. Tests: `web/tests/settings_validation.test.js` and the real
+  `tests/test_ui_smoke_settings_drafts.py` consumer.
+- Model-role and actor/reviewer adapters use `model_chooser.js`; the chooser
+  owns suggestions/keyboard/position only, never route identity or entitlement.
+  Update options in place and dispose bindings before replacing inputs. Short
+  source/account choices stay native; retain arbitrary API ids and saved
+  undiscovered choices. Tests: `web/tests/model_chooser.test.js`,
+  `tests/test_model_chooser_browser.py`, `tests/test_subscription_role_routes_browser.py`.
 - Models, actors and reviewers share source/model/account controls. Preserve
   exact pins on ordinary save/reload and catalog failure; a source's credential
   harness comes from its metadata, never an assumed equal name. A referenced
@@ -2855,29 +2870,49 @@ review-only.
 `docs/DESIGN.md` owns visual and interaction semantics; this section owns
 the engineering rules that preserve them — where values may live, which
 component is the SSOT, what counts as review debt, how a visual change is
-verified. `web/style.css` custom properties and shared component classes are
-the value SSOT; documentation keeps semantic roles and failure-prevention
-rules, not a copied color/radius/dimension inventory.
+verified. `web/ui.css` owns shared values and field/button/status/popup recipes;
+both `web/index.html` and `web/onboarding_template.html` load it before their
+page styles. `web/style.css` and the page sheets keep shell/page composition.
+Documentation keeps semantic roles and failure-prevention rules, not a copied
+color/radius/dimension inventory. These are reusable components in the existing
+SPA, not a relocatable-page or multi-instance panel framework.
 
+- Select shared control classes on the controls themselves (`.ui-control`,
+  `.ui-checkbox`, `.ui-field`, `.ui-field-help`), not an expanding list of
+  page ancestors. A family migration removes replaced chrome in the same
+  change without claiming unrelated page typography migrated. Domain drafts,
+  validation and serializers stay with their current owners.
+- `web/modules/ui_primitives.js` is the self-contained safe-field renderer,
+  collector, attribute escaping and tone/status source; `ui_helpers.js` and
+  `utils.js` retain the corresponding re-exports. Keep this leaf independent
+  of shell, network and document-global initialization so real first-party
+  and author consumers share one implementation. `web/tests/ui_primitives.test.js`
+  pins that portability and the escaping/password contract.
 - A text declaration on a migrated surface names a `--type-*` size token AND
   a named foreground token: a rule that declares a size and no colour is the
   exact defect that made secondary text inherit near-white primary ink.
   `tests/test_web_typography_static.py` keeps the class closed on the
-  migrated files; migrating a new surface and extending that guard are the
-  same commit.
+  migrated families/regions; extending that guard and migrating its subject
+  are the same commit (DESIGN §8 names the boundary).
 - The variable contract is checked in BOTH directions across the whole
   stylesheet by the same test file: a `var(--x)` must resolve — an
   undeclared one silently renders its hardcoded fallback, which becomes the
   real value nobody can find — and a `:root` token must have a reader,
   because a token that resolves nowhere is what makes surfaces reach for
-  literals. Fix a dangling name by pointing it at an existing token, not by
-  declaring a new one.
+  literals. Each document resolves against the sheets it actually loads;
+  neither page may shadow shared palette names. Fix a dangling name by
+  pointing it at an existing token, not by declaring a new one.
 - Layout and controls: top-level pages use a fixed `renderPageHeader`
   outside an independently scrolling body; page icons come from
   `web/modules/page_icons.js`; primary actions (including Refresh) live in
   the `renderPageHeader({ actionsHtml })` slot; tab strips are one
-  design-system control (`renderTabStrip` + `.app-tab-strip`/`.app-tab` +
-  the `--pill-*` tokens); scroll bodies share the `.scroll-fade-y` mask;
+  design-system control (`renderTabStrip` + `bindTabStrip` in `page_header.js`,
+  `.app-tab-strip`/`.app-tab` and the `--pill-*` tokens). The binder owns
+  selected state, ARIA, roving focus and strip-only reveal; callbacks own
+  loading/panels, and programmatic `select()` never calls them. Dispose the
+  binder and its resize observer with the owning page. Scroll bodies share
+  `.scroll-fade-y`; `scroll_fade.js::bindScrollFade` enables an edge only when
+  content is actually hidden there and returns its observer/listener disposer;
   masonry packing uses `web/modules/masonry.js::applyMasonry` (CSS Grid row
   packing leaves row gaps under shorter cards): it packs in the page's key
   order and writes only `--masonry-*` custom properties — never move
@@ -2919,6 +2954,19 @@ rules, not a copied color/radius/dimension inventory.
   header reports connection and server-authoritative activity only; failed
   task status does not synthesize header attention, a toast, unread state,
   or an owner action.
+- Executor presentation consumes the existing task/run attempt facts. Keep
+  `executor_observation` event-local through Agent, supervisor delivery, progress
+  history and both Chat metadata paths; ordinary coordinator notes inherit none.
+  Its current producer reads the already-polled typed timeline, with a requested
+  model only for the matching harness. Do not borrow a final-attempt model or
+  parse progress prose to fill an absent live observation. Label last activity
+  separately from current computation, configured/coordinator model and settled
+  observed-model history. Preserve terminal-only `execution_evidence` and
+  `actual_substrate`, with no new poller or execution-state store. Tests:
+  `tests/test_executor_observation.py` and `web/tests/wire_contract.test.js`.
+  Render the projected chip/model facts through
+  `harness_presentation.js::executorIdentityMarkup`; keep execution-evidence
+  selection in `log_events.js` and avoid a second label builder in Chat.
 - Chat viewport invariant: sample live-edge intent before an ordinary
   transcript mutation — native scroll anchoring is not proof the owner's
   visible message stays stable, so focused regressions disable it. Follow
@@ -2929,6 +2977,14 @@ rules, not a copied color/radius/dimension inventory.
   cross-instance restoration as explicit lifecycle transactions. Browser
   coverage is chosen by risk; this WebKit-sensitive contract requires the
   engines exercised by its marker-gated UI smoke.
+
+The Project work pointer is a navigation component over the existing Chat card
+registry (`project_work_pointer.js`), updated inside the same viewport mutation
+transaction. Preserve its loaded-window coverage disclosure; a represented
+unfinished card is not independent proof of current execution. Its click changes
+only the messages container's scroll position and existing reading intent, never
+message routing. Dispose it with the chat; do not add a second card tree, poller
+or task-state store for this navigation affordance.
 
 ### Responsive and accessible behavior
 
@@ -2960,14 +3016,41 @@ are always non-confirming. Critical actions test the exact confirmed result
 and keep the confirmation plus side effect in one injectable flow.
 `tests/test_web_dialogs_static.py` keeps the native-dialog class closed.
 
+`ui_interactions.js::bindDialogFocus` owns the modal keyboard boundary and
+conditional restoration; callers mount first and dispose before removal,
+keeping their own result/cancel contracts. `bindMenu` adds action-menu keyboard
+and dismissal behavior over `bindPopoverPosition`; editable suggestion lists
+use positioning alone, preserving native input and domain route serialization.
+Mount `.ui-popup` outside clipping ancestors and
+consume its measured `--ui-popup-*` properties in shared CSS. The owner retains
+markup, portal removal and action dispatch; no overlay registry is needed.
+Dispose before removing a popup, and close/restore a menu before opening a
+dialog from its action. `web/tests/ui_interactions.test.js` pins callbacks,
+focus, geometry and cleanup; actual menu/chooser/dialog browser consumers
+remain necessary for viewport and engine-sensitive behavior.
+
+Files keeps one current editable document through cancelled navigation, ordinary
+folder refresh, failed Save and clipboard feedback. Pointer/keyboard submission
+shares one in-flight write; newer text remains dirty after an earlier save.
+The New Project adapter shares dialog focus and menu behavior while retaining
+all source modes and its selected target independently of browser navigation.
+`tests/test_ui_smoke_files_project_drafts.py` verifies these real consumers.
+
 ### Declarative widgets
 
 `web/modules/widgets.js` is the host for reviewed widget declarations:
 forms/actions, text/data/media, tabs/charts, async jobs, files,
 map/calendar/kanban, and composition through `group`, `metric`, and
 `callout`. Nested interactive components use stable identity and one
-disposer; `subscription.render` is transitively passive. Escape text and
-attributes for their actual HTML contexts, constrain media to extension
+disposer; `subscription.render` is transitively passive. Data updates patch
+the existing component/field nodes at the mount's identity seam, preserving
+selection, composition, native popup state and password input. Passwords stay
+only in their mounted control, never in the retained form-value snapshot.
+Forms and actions own visible pending/result/error feedback by component id;
+an optional status component or a sibling's shared data target is not that
+action's result. Preserve the existing job identity, bounded retries and
+disposal contracts. Escape text and attributes for their actual HTML contexts,
+constrain media to extension
 routes or safe data URLs, and keep charts accessible through a semantic
 table. Rare `kind: "module"` UI runs only in a sandboxed opaque-origin
 iframe with no `allow-same-origin`; its document policy admits scripts,
@@ -2982,7 +3065,9 @@ policy menu, the facade — lives in `widget_card.js`, reorder handles in
 `widget_reorder.js`, chart/table helpers in `widget_chart.js`, the pure
 list-signature and keyed-patch helpers in `widget_list.js`; the page
 compares the list signature after every `GET /api/widgets` and touches no
-card node when it is unchanged.
+card node when it is unchanged. A failed list read exposes contextual Retry
+through that same reconciliation; it preserves unchanged frames and the
+owner's Stop choices. Do not turn Retry into a global refresh/remount.
 Long-running actions use a durable job id and resumable status polling.
 Every timer, listener, observer, stream, abort controller, chart, and
 mounted widget has a paired disposer. Enforcement:
@@ -2993,7 +3078,29 @@ mounted widget has a paired disposer. Enforcement:
 (keyed patch of a running card, reconnect reconcile) and
 `tests/test_widgets_ui_browser_capabilities.py` (the frame CSP, sandbox and
 permissions boundary on Chromium and WebKit) — run all four before a release
-that touched Widgets.
+that touched Widgets. `tests/test_widgets_ui_browser_identity.py` additionally
+pins retained interactive nodes, composition/password lifetime, local action
+feedback and non-destructive list Retry through real declarative consumers.
+
+### Optional author controls
+
+Use `ouroboros.server_web.read_author_kit_assets(request.app.state.repo_dir)`
+to read the fixed installed `web/ui.css` and `web/modules/ui_primitives.js`
+sources for an author-owned page. Resolve at the page/kit GET that serves a
+new mount, not at extension registration; the request root is propagated by
+both in-process and out-of-process dispatch. No bundle cache, new endpoint or
+auth exception belongs in the helper.
+
+`docs/examples/author_ui_kit/` contains the two ordinary extension recipes:
+a module gets source text from its own route through `OuroborosWidget.fetch`,
+adds CSS and imports the self-contained module from a frame-local Blob URL;
+a route iframe embeds the same source safely in its initial HTML under its
+own CSP. Revoke temporary Blob URLs. These paths need no opaque `/static`
+request, new bridge message or widget schema flag. Keep the kit optional and
+author-overridable; retained mounts keep their loaded source, with no theme
+poller or forced remount. Tests `test_author_ui_kit.py` and
+`test_author_ui_kit_browser.py` cover source-root delivery and actual framed
+consumers; they do not certify an arbitrary author's CSP or application.
 
 ## MCP Client Integration
 

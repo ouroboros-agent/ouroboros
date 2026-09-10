@@ -83,14 +83,14 @@ export function initCosts({ state, mount }) {
                     <button class="btn btn-default btn-sm costs-budget-refresh" id="btn-refresh-costs">Refresh</button>
                 </div>
                 <div class="costs-budget-fields">
-                    <div class="form-field">
-                        <label>Total Budget ($)</label>
-                        <input id="s-budget" type="number" value="200">
+                    <div class="form-field ui-field">
+                        <label for="s-budget">Total Budget ($)</label>
+                        <input id="s-budget" class="ui-control" type="number" value="200">
                     </div>
-                    <div class="form-field">
-                        <label>Per-task Cost Cap ($)</label>
-                        <input id="s-per-task-cost" type="number" value="50">
-                        <div class="settings-inline-note">Hard dispatch cap for the whole root task tree. In-flight calls settle normally; increasing the cap does not auto-resume paused work.</div>
+                    <div class="form-field ui-field">
+                        <label for="s-per-task-cost">Per-task Cost Cap ($)</label>
+                        <input id="s-per-task-cost" class="ui-control" type="number" value="50" aria-describedby="costs-per-task-note">
+                        <div class="settings-inline-note ui-field-help" id="costs-per-task-note">Hard dispatch cap for the whole root task tree. In-flight calls settle normally; increasing the cap does not auto-resume paused work.</div>
                     </div>
                 </div>
                 <button class="btn btn-save costs-budget-save" id="btn-save-budget">Save Budget</button>

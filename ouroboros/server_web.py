@@ -24,6 +24,22 @@ def resolve_web_dir(repo_dir: pathlib.Path) -> pathlib.Path:
     return repo_web_dir
 
 
+def read_author_kit_assets(repo_dir: pathlib.Path) -> dict[str, str]:
+    """Read the installed portable controls for an opt-in author page.
+
+    Extension handlers pass ``request.app.state.repo_dir`` so in-process and
+    isolated route workers read the same serving tree. Authors return these
+    texts through their own route or embed them in their HTML; this helper
+    creates no endpoint, cache, state or authentication exception. Read at
+    mount, not registration, so a new page receives the installed UI source.
+    """
+    web_dir = resolve_web_dir(pathlib.Path(repo_dir))
+    return {
+        "css": (web_dir / "ui.css").read_text(encoding="utf-8"),
+        "javascript": (web_dir / "modules" / "ui_primitives.js").read_text(encoding="utf-8"),
+    }
+
+
 class NoCacheStaticFiles:
     """Wrap StaticFiles to add Cache-Control: no-cache headers."""
 

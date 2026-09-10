@@ -98,6 +98,10 @@ class ElementStub {
     appendChild(node) { return this.insertBefore(node, null); }
     append(...nodes) { nodes.forEach((node) => this.appendChild(node)); }
     prepend(node) { return this.insertBefore(node, this.children[0] || null); }
+    after(node) {
+        const parent = this.parentNode;
+        if (parent) parent.insertBefore(node, parent.children[parent.children.indexOf(this) + 1] || null);
+    }
     insertBefore(node, before) {
         if (node?.isDocumentFragment) {
             for (const child of [...node.children]) this.insertBefore(child, before);
@@ -268,9 +272,11 @@ test('plain project row renders escaped text with Open Project and no markdown m
         // Bug report #9: no enhancement pass — Mermaid/Chart/KaTeX/code-copy
         // only ever activate behind enhanceChatMarkdown's enhanced stamp.
         assert.equal(bubble.getAttribute('data-chat-markdown-enhanced'), '');
-        // Bug report #4: the Open Project action still rides the message body.
+        // The host action is beside prose, so Markdown margins cannot erase its gap.
         const message = bubble.querySelector('.message');
-        const actions = message.children.find((node) => node.classList.contains('system-message-actions'));
+        const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
+        assert.equal(message.contains(actions), false);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
         assert.ok(actions, 'system-message-actions container present');
         assert.equal(actions.children[0]?.textContent, 'Open Project ↗');
     } finally {

@@ -489,7 +489,7 @@ def test_ui_smoke_widget_launch_policy_and_ordered_stop(direct_server_with_data,
                 assert facade_height == 360, facade_height
                 page.screenshot(path=str(evidence_dir / f"widget-lifecycle-cards-{browser_name}.png"), full_page=True)
                 page.locator(f"{card('manual')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('manual')} [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
                 page.screenshot(path=str(evidence_dir / f"widget-lifecycle-menu-{browser_name}.png"), full_page=True)
                 page.keyboard.press("Escape")
                 page.locator(f"{card('manual')} [data-widget-start-mode=\"manual\"]").wait_for(state="hidden", timeout=5_000)
@@ -577,7 +577,7 @@ def test_ui_smoke_widget_launch_policy_and_ordered_stop(direct_server_with_data,
                 # Owner override from the card menu: Manual program → Auto starts it now and
                 # persists the whole map through the preferences API.
                 page.locator(f"{card('manual')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]").click()
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"auto\"]").click()
                 wait_frame(page, "manual", True)
                 prefs = page.evaluate("async () => (await fetch('/api/ui/preferences')).json()")
                 assert prefs["widget_start_mode"] == {f"{skill}:manual": "auto"}, prefs
