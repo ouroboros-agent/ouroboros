@@ -606,7 +606,7 @@ def test_confirmed_mixed_pool_waits_and_heals_on_the_same_live_call(elapsed_quot
     assert rows[0]["credential_profile_id"] == "", "A mixed pool has no single login target"
     assert rows[0]["quota_clock"]["active"] is True
     assert rows[-1]["state"] == "resolved" and rows[-1]["resolution"] == "resource_available"
-    assert rows[-1]["quota_clock"]["active"] is False and controller.paused_seconds() == 2.5
+    assert rows[-1]["quota_clock"]["active"] is False and controller.paused_seconds() == pytest.approx(2.5)
     assert load_task_result(root, "task-one")["model_waits"][rows[0]["wait_id"]]["reason"] == "auth_quota"
 
 
