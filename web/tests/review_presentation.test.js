@@ -994,6 +994,38 @@ test('author finish is shown beside raw reviewer signal without becoming PASS', 
     assert.match(html, /REVIEW_REQUIRED/);
 });
 
+test('task acceptance falls back to the explicit durable author decision', () => {
+    const detail = {
+        task_id: 'root',
+        review_projection: { panels: [{
+            panel_id: 'accept', surface: 'task_acceptance', aggregate_signal: 'REVIEW_REQUIRED',
+        }] },
+        review_status: { acceptance_decision: {
+            status: 'finalized_unaccepted',
+            reason: 'author_finish',
+            author_disposition: {
+                disposition: 'partial',
+                rationale: 'Fixed the defect; deferred the remaining note.',
+                subject_hash: 'binding-123',
+                reviewer_signal: 'REVIEW_REQUIRED',
+                source: 'author',
+            },
+        } },
+    };
+    const group = taskAcceptanceGroupFromTaskDetail(detail);
+    const attemptKey = `${group.id}:${group.attempts[0].id}`;
+    const html = renderReviewsSection([group], {
+        sectionExpanded: true,
+        expandedGroups: new Set([group.id]),
+        expandedAttempts: new Set([attemptKey]),
+    });
+    assert.match(html, /Author finish: partial/);
+    assert.match(html, /subject_hash=binding-123/);
+    assert.match(html, /reviewer signal=REVIEW_REQUIRED/);
+    assert.match(html, /REVIEW_REQUIRED/);
+    assert.doesNotMatch(html, /verdict=PASS/);
+});
+
 test('renderer is quiet, accessible and never invents review dollars', () => {
     const group = reviewGroupFromHistoryRow(groupedSkillRow());
     const html = renderReviewsSection([group], {

@@ -564,7 +564,7 @@ function planWaveDetail(wave) {
         lines.push(
             `Author finish: ${text(author.disposition)}${text(author.reviewer_signal) ? ` · reviewer signal=${text(author.reviewer_signal)}` : ''}`
             + `${text(author.rationale) ? ` · ${text(author.rationale)}` : ''}`
-            + `${text(author.subject_hash) ? ` · reviewed_content_hash=${text(author.subject_hash)}` : ''}`
+            + `${text(author.subject_hash) ? ` · subject_hash=${text(author.subject_hash)}` : ''}`
             + `${text(author.source) ? ` · source=${text(author.source)}` : ''}`,
         );
     }
@@ -783,7 +783,23 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
     const panels = (Array.isArray(projection?.panels) ? projection.panels : [])
         .filter((panel) => text(panel?.surface) === 'task_acceptance');
     if (!owner || !panels.length) return null;
+    const acceptanceDecision = detail?.outcome_axes?.review?.acceptance_decision
+        || detail?.review_status?.acceptance_decision;
+    const decisionAuthor = acceptanceDecision?.author_disposition;
+    const fallbackAuthor = decisionAuthor && typeof decisionAuthor === 'object'
+        ? decisionAuthor
+        : (text(acceptanceDecision?.agent_disposition)
+            ? {
+                disposition: text(acceptanceDecision.agent_disposition),
+                rationale: text(acceptanceDecision.author_rationale || acceptanceDecision.rationale),
+                reviewer_signal: text(acceptanceDecision.reviewer_signal),
+                subject_hash: text(acceptanceDecision.subject_hash || acceptanceDecision.binding_hash),
+                source: text(acceptanceDecision.source || 'author'),
+            }
+            : null);
     const attempts = panels.map((panel, index) => {
+        const author = panel.author_disposition && typeof panel.author_disposition === 'object'
+            ? panel.author_disposition : fallbackAuthor;
         const verdict = text(panel?.aggregate_signal || 'UNKNOWN');
         return {
             id: [attemptIdentity(panel, `panel:${index + 1}`),
@@ -806,8 +822,8 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
             detailRef: { surface: 'task_acceptance', url: panel.applied_source_status === 'available'
                 ? taskSourceDownloadUrl(owner, panel.applied_source_ref) : '' },
             detailText: `${formatReviewProjection({ panels: [panel] })}
-${panel.author_disposition && typeof panel.author_disposition === 'object' && text(panel.author_disposition.disposition)
-    ? `Author finish: ${text(panel.author_disposition.disposition)}${text(panel.author_disposition.reviewer_signal) ? ` · reviewer signal=${text(panel.author_disposition.reviewer_signal)}` : ''}${text(panel.author_disposition.rationale) ? ` · ${text(panel.author_disposition.rationale)}` : ''}${text(panel.author_disposition.subject_hash) ? ` · reviewed_content_hash=${text(panel.author_disposition.subject_hash)}` : ''}${text(panel.author_disposition.source) ? ` · source=${text(panel.author_disposition.source)}` : ''}`
+${author && text(author.disposition)
+    ? `Author finish: ${text(author.disposition)}${text(author.reviewer_signal) ? ` · reviewer signal=${text(author.reviewer_signal)}` : ''}${text(author.rationale) ? ` · ${text(author.rationale)}` : ''}${text(author.subject_hash) ? ` · subject_hash=${text(author.subject_hash)}` : ''}${text(author.source) ? ` · source=${text(author.source)}` : ''}`
     : ''}
 Cost unavailable`.trim(),
         };
