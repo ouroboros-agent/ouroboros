@@ -486,7 +486,7 @@ def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: st
     )
     with child_ref_promotion_scope():
         while True:
-            source = load_task_result(parent, task_id, strict=True) or {}
+            source = load_task_result(parent, task_id, strict=True, _locked=True) or {}
             if replica is None and not source:
                 raise ValueError("pending child-ref authority is missing")
             if replica is None:

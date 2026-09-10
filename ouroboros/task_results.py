@@ -737,7 +737,7 @@ def task_result_path(drive_root: Any, task_id: str, *, create: bool = True) -> p
 
 
 def load_task_result(
-    drive_root: Any, task_id: str, *, strict: bool = False,
+    drive_root: Any, task_id: str, *, strict: bool = False, _locked: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Read one exact task result.
 
@@ -752,6 +752,17 @@ def load_task_result(
     authority probe never mutates storage. Admissible rows are returned as
     stored, without projecting their deliverables or independent state axes.
     """
+    if _locked:
+        from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+        path = task_result_path(drive_root, task_id, create=False)
+        lock_path = path.with_name(path.name + ".lock")
+        lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=4.0, stale_sec=90.0, owner_aware_stale=True)
+        if lock_fd is None:
+            raise TimeoutError(f"task result authority lock unavailable: {path}")
+        try:
+            return load_task_result(drive_root, task_id, strict=strict)
+        finally:
+            release_exclusive_file_lock(lock_path, lock_fd)
     try:
         tid = validate_task_id(task_id)
         path = task_result_path(drive_root, tid, create=False)
