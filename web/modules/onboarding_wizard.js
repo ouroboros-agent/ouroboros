@@ -73,6 +73,8 @@ import { accountRowFacts } from './harness_accounts.js';
         modelContextWindows: {},
         apiAccessOpen: false,
         apiBudgetOpen: false,
+        subagentsOpen: false,
+        reviewersOpen: false,
         localSourceOpen: Boolean(INITIAL_STATE.localSource),
         moreProvidersOpen: Boolean(
             INITIAL_STATE.cloudruKey || INITIAL_STATE.minimaxKey || INITIAL_STATE.deepseekKey
@@ -103,6 +105,7 @@ import { accountRowFacts } from './harness_accounts.js';
     let agentsStep = null;
     let modelSources = [];
     let catalogGeneration = 0;
+    const stepScrollPositions = new Map();
     const modelRoles = createModelRolesEditor({ hostId: 'onboarding-model-roles', onChange: (settings) => {
         adoptModelSettings(settings);
         state.modelsDirty = true;
@@ -133,8 +136,9 @@ import { accountRowFacts } from './harness_accounts.js';
 
     function applySetupPreview(response) {
         if (!state.modelsDirty && response.model_settings) {
+            const previous = JSON.stringify(draftSettings());
             adoptModelSettings(response.model_settings);
-            loadModelRoles();
+            if (JSON.stringify(draftSettings()) !== previous) loadModelRoles();
         }
         if (!state.reviewerDraftDirty && response.reviewer_slots) {
             state.reviewerSlots = typeof response.reviewer_slots === 'string'
@@ -148,12 +152,10 @@ import { accountRowFacts } from './harness_accounts.js';
                 if (generation !== catalogGeneration) return;
                 modelSources = catalog.model_sources || [];
                 modelRoles.adoptCatalog(catalog);
-                if (state.currentStep === 'summary') render();
-                else syncCurrentStepActionState();
+                refreshSummary();
             }).catch(() => {}); // An unread catalog never invents a model source.
         }
-        if (state.currentStep === 'summary') render();
-        else syncCurrentStepActionState();
+        refreshSummary();
     }
 
     function loadModelRoles() {
@@ -263,6 +265,8 @@ import { accountRowFacts } from './harness_accounts.js';
         if (next) next.disabled = nextButtonShouldBeDisabled();
         const quick = document.getElementById('quick-start-btn');
         if (quick) quick.hidden = !hasModelSubscription();
+        const error = root.querySelector('.wizard-error');
+        if (error) error.textContent = state.error;
     }
 
     function markStepEdited() {
@@ -401,10 +405,7 @@ import { accountRowFacts } from './harness_accounts.js';
     function nextStep() {
         const error = validateCurrentStep();
         state.error = error;
-        if (error) {
-            render();
-            return;
-        }
+        if (error) return syncCurrentStepActionState();
         if (['accounts', 'providers'].includes(state.currentStep)) applyModelDefaults(false);
         if (['accounts', 'providers', 'models', 'review_mode', 'budget'].includes(state.currentStep)) {
             // Preview is enrichment, never a navigation gate. Refresh in the
@@ -414,17 +415,27 @@ import { accountRowFacts } from './harness_accounts.js';
         }
         const index = STEP_ORDER.indexOf(state.currentStep);
         if (index >= 0 && index < STEP_ORDER.length - 1) {
-            state.currentStep = STEP_ORDER[index + 1];
+            navigateStep(STEP_ORDER[index + 1]);
         }
-        state.error = '';
-        render();
     }
 
     function previousStep() {
         const index = STEP_ORDER.indexOf(state.currentStep);
-        if (index > 0) state.currentStep = STEP_ORDER[index - 1];
+        if (index > 0) navigateStep(STEP_ORDER[index - 1], { restorePosition: true });
+    }
+
+    // Navigation owns the viewport. Status/catalog repaints never reset it or
+    // take focus from an edited field; Back returns to the retained step draft.
+    function navigateStep(stepId, { restorePosition = false } = {}) {
+        if (stepId === state.currentStep) return;
+        stepScrollPositions.set(state.currentStep, window.scrollY);
+        state.currentStep = stepId;
         state.error = '';
         render();
+        const heading = root.querySelector('.step-title');
+        heading?.setAttribute('tabindex', '-1');
+        heading?.focus({ preventScroll: true });
+        window.scrollTo({ top: restorePosition ? stepScrollPositions.get(stepId) || 0 : 0, left: 0, behavior: 'instant' });
     }
 
     const apiRequest = fetchJson;
@@ -499,9 +510,9 @@ import { accountRowFacts } from './harness_accounts.js';
                 <button type="button" class="btn btn-ghost" id="wizard-local-start">Start local runtime</button>
                 <button type="button" class="btn btn-ghost" id="wizard-local-stop" disabled>Stop</button>
                 <button type="button" class="btn btn-ghost" id="wizard-local-test" disabled>Test tool calling</button>
-                <span id="wizard-local-status" class="wizard-runtime-status">Status: Offline</span>
+                <span id="wizard-local-status" class="wizard-runtime-status" role="status">Status: Offline</span>
             </div>
-            <div id="wizard-local-test-result" class="wizard-test-result"></div>
+            <div id="wizard-local-test-result" class="wizard-test-result" role="status"></div>
         `;
     }
 
@@ -595,26 +606,26 @@ import { accountRowFacts } from './harness_accounts.js';
         function providerKeyField({ id, label, placeholder, value, note, inputType }) {
             const type = inputType || 'password';
             return `
-                <div class="field">
+                <div class="field ui-field">
                 <div class="field-label-row">
                     <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
-                    <button class="field-clear" data-clear="${escapeHtml(id)}" type="button">Clear</button>
+                    <button class="field-clear" data-clear="${escapeHtml(id)}" type="button" aria-label="Clear ${escapeHtml(label)}">Clear</button>
                 </div>
-                <input id="${escapeHtml(id)}" type="${escapeHtml(type)}" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}">
-                <div class="field-note">${escapeHtml(note)}</div>
+                <input id="${escapeHtml(id)}" class="ui-control" type="${escapeHtml(type)}" aria-describedby="${escapeHtml(id)}-help" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}">
+                <div id="${escapeHtml(id)}-help" class="field-note ui-field-help">${escapeHtml(note)}</div>
             </div>
             `;
         }
 
         function localInputField([id, stateKey, label, placeholder, note, className, type = 'text', min = '', step = '']) {
             const clear = ['local-source', 'local-filename', 'local-chat-format'].includes(id)
-                ? `<button class="field-clear" data-clear="${id}" type="button">Clear</button>`
+                ? `<button class="field-clear" data-clear="${id}" type="button" aria-label="Clear ${label}">Clear</button>`
                 : '';
             return `
-                <div class="${className}">
+                <div class="${className} ui-field">
                     <div class="field-label-row"><label for="${id}">${label}</label>${clear}</div>
-                    <input id="${id}" type="${type}" ${min ? `min="${min}"` : ''} ${step ? `step="${step}"` : ''} placeholder="${placeholder}" value="${escapeHtml(state[stateKey])}">
-                    ${note ? `<div class="field-note">${note}</div>` : ''}
+                    <input id="${id}" class="ui-control" type="${type}" ${note ? `aria-describedby="${id}-help"` : ''} ${min ? `min="${min}"` : ''} ${step ? `step="${step}"` : ''} placeholder="${placeholder}" value="${escapeHtml(state[stateKey])}">
+                    ${note ? `<div id="${id}-help" class="field-note ui-field-help">${note}</div>` : ''}
                 </div>
             `;
         }
@@ -662,24 +673,24 @@ import { accountRowFacts } from './harness_accounts.js';
                 </summary>
                 <div class="wizard-collapse-body">
                     <div class="field-grid">
-                        <div class="field">
+                        <div class="field ui-field">
                             <div class="field-label-row">
                                 <label for="local-preset">Preset</label>
-                                <button class="field-clear" data-clear="local-preset" type="button">Clear</button>
+                                <button class="field-clear" data-clear="local-preset" type="button" aria-label="Clear local preset">Clear</button>
                             </div>
-                                <select id="local-preset">
+                                <select id="local-preset" class="ui-control" aria-describedby="local-preset-help">
                                     <option value="" ${localPreset === '' ? 'selected' : ''}>None</option>
                                     ${Object.entries(LOCAL_PRESETS).map(([id, preset]) => `<option value="${escapeHtml(id)}" ${localPreset === id ? 'selected' : ''}>${escapeHtml(preset.label)}</option>`).join('')}
                                     <option value="custom" ${localPreset === 'custom' ? 'selected' : ''}>Custom source</option>
                                 </select>
-                            <div class="field-note">Most people can ignore this. Open it only if you want local GGUF routing.</div>
+                            <div id="local-preset-help" class="field-note ui-field-help">Most people can ignore this. Open it only if you want local GGUF routing.</div>
                         </div>
-                        <div class="field">
-                                <div class="field-label-row"><label>Local routing</label></div>
-                                <div class="selection-row">
-                                    ${LOCAL_ROUTING_MODES.map((mode) => `<button class="selection-pill ${state.localRoutingMode === mode.value ? 'active' : ''}" data-local-mode="${escapeHtml(mode.value)}" type="button">${escapeHtml(mode.buttonLabel || mode.label)}</button>`).join('')}
+                        <div class="field ui-field">
+                                <div class="field-label-row"><label id="local-routing-label">Local routing</label></div>
+                                <div class="selection-row" role="group" aria-labelledby="local-routing-label" aria-describedby="local-routing-help">
+                                    ${LOCAL_ROUTING_MODES.map((mode) => `<button class="selection-pill ${state.localRoutingMode === mode.value ? 'active' : ''}" data-local-mode="${escapeHtml(mode.value)}" aria-pressed="${state.localRoutingMode === mode.value}" type="button">${escapeHtml(mode.buttonLabel || mode.label)}</button>`).join('')}
                                 </div>
-                                <div class="field-note">Ignored unless a local model source is configured below.</div>
+                                <div id="local-routing-help" class="field-note ui-field-help">Ignored unless a local model source is configured below.</div>
                             </div>
                             ${LOCAL_FIELDS.map(localInputField).join('')}
                         </div>
@@ -744,13 +755,14 @@ import { accountRowFacts } from './harness_accounts.js';
     async function reviewAndStart() {
         if (validateProvidersStep()) return;
         state.error = '';
+        const originStep = state.currentStep;
         const ready = await agentsStep.refreshSubagentsPreview({ force: true });
+        if (state.currentStep !== originStep) return;
         if (!ready) {
             state.error = agentsStep.previewError || 'Setup suggestions could not be prepared. Try again or choose your models manually.';
-            render(); return;
+            syncCurrentStepActionState(); return;
         }
-        state.currentStep = 'summary';
-        render();
+        navigateStep('summary');
     }
 
     function subscriptionQuotaHtml() {
@@ -794,7 +806,7 @@ import { accountRowFacts } from './harness_accounts.js';
             </div>
                 ${profile === 'openai-compatible' ? renderCompatibleModelLoader() : ''}
                 ${modelRolesHost('onboarding-model-roles')}
-                <details class="wizard-collapse"><summary>Available subagents</summary>
+                <details class="wizard-collapse" data-collapse="subagents" ${state.subagentsOpen ? 'open' : ''}><summary>Available subagents</summary>
                     <div class="wizard-collapse-body">${availableSubagentsEditorHost('onboarding-available-subagents')}</div>
                 </details>
         `;
@@ -813,12 +825,12 @@ import { accountRowFacts } from './harness_accounts.js';
                 </div>
                 </div>
                 <div class="wizard-inline-note">${state.reviewerSlots ? 'Your reviewer assignments are ready below. You can change every reviewer, including deep self-review.' : 'Reviewer assignments will be prepared from your connected access.'}</div>
-                <details class="wizard-collapse"><summary>Reviewers</summary>
+                <details class="wizard-collapse" data-collapse="reviewers" ${state.reviewersOpen ? 'open' : ''}><summary>Reviewers</summary>
                     <div class="wizard-collapse-body">${renderReviewerSlotsSection()}</div>
                 </details>
                 <div class="wizard-choice-grid">
                     ${REVIEW_MODES.map((mode) => `
-                        <button type="button" class="wizard-choice ${escapeHtml(mode.className || mode.value)} ${state.reviewEnforcement === mode.value ? 'active' : ''}" data-review-mode="${escapeHtml(mode.value)}">
+                        <button type="button" class="wizard-choice ${escapeHtml(mode.className || mode.value)} ${state.reviewEnforcement === mode.value ? 'active' : ''}" data-review-mode="${escapeHtml(mode.value)}" aria-pressed="${state.reviewEnforcement === mode.value}">
                             <span class="tone">${escapeHtml(mode.tone)}</span>
                             <h3>${escapeHtml(mode.label)}</h3>
                             <p>${escapeHtml(mode.copy)}</p>
@@ -830,20 +842,20 @@ import { accountRowFacts } from './harness_accounts.js';
                     <p class="field-note">${escapeHtml(runtimeModeCopy)}</p>
                     <div class="wizard-choice-grid three">
                         ${RUNTIME_MODES.map((mode) => `
-                            <button type="button" class="wizard-choice ${escapeHtml(mode.className || mode.value)} ${runtimeMode === mode.value ? 'active' : ''}" data-runtime-mode="${escapeHtml(mode.value)}">
+                            <button type="button" class="wizard-choice ${escapeHtml(mode.className || mode.value)} ${runtimeMode === mode.value ? 'active' : ''}" data-runtime-mode="${escapeHtml(mode.value)}" aria-pressed="${runtimeMode === mode.value}">
                                 <span class="tone">${escapeHtml(mode.tone)}</span>
                                 <h3>${escapeHtml(mode.label)}</h3>
                                 <p>${escapeHtml(mode.copy)}</p>
                             </button>
                         `).join('')}
                     </div>
-                <div class="field">
+                <div class="field ui-field">
                     <div class="field-label-row">
                         <label for="skills-repo-path">External skills repo (optional)</label>
-                        <button class="field-clear" data-clear="skills-repo-path" type="button">Clear</button>
+                        <button class="field-clear" data-clear="skills-repo-path" type="button" aria-label="Clear external skills repo">Clear</button>
                     </div>
-                    <input id="skills-repo-path" type="text" placeholder="~/Ouroboros/skills or /absolute/path/to/skills" value="${escapeHtml(state.skillsRepoPath || '')}">
-                    <div class="field-note">Optional. Extra discovery root on top of the in-data-plane <code>data/skills/{native,clawhub,external}/</code> tree. Leave empty if you do not maintain your own skills checkout — Ouroboros never clones/pulls this directory.</div>
+                    <input id="skills-repo-path" class="ui-control" type="text" aria-describedby="skills-repo-path-help" placeholder="~/Ouroboros/skills or /absolute/path/to/skills" value="${escapeHtml(state.skillsRepoPath || '')}">
+                    <div id="skills-repo-path-help" class="field-note ui-field-help">Optional. Extra discovery root on top of the in-data-plane <code>data/skills/{native,clawhub,external}/</code> tree. Leave empty if you do not maintain your own skills checkout — Ouroboros never clones/pulls this directory.</div>
                 </div>
             </div>
         `;
@@ -864,10 +876,10 @@ import { accountRowFacts } from './harness_accounts.js';
                     ${BUDGET_FIELDS.map((field) => `
                         <div class="panel-card">
                             <h3>${escapeHtml(field.title)}</h3>
-                            <div class="field">
+                            <div class="field ui-field">
                                 <label for="${escapeHtml(field.inputId)}">${escapeHtml(field.label)}</label>
-                                <input id="${escapeHtml(field.inputId)}" type="number" min="${escapeHtml(field.min || '0.01')}" step="${escapeHtml(field.step || 'any')}" value="${escapeHtml(state[field.stateKey])}">
-                                <div class="field-note">${escapeHtml(field.note)}</div>
+                                <input id="${escapeHtml(field.inputId)}" class="ui-control" type="number" aria-describedby="${escapeHtml(field.inputId)}-help" min="${escapeHtml(field.min || '0.01')}" step="${escapeHtml(field.step || 'any')}" value="${escapeHtml(state[field.stateKey])}">
+                                <div id="${escapeHtml(field.inputId)}-help" class="field-note ui-field-help">${escapeHtml(field.note)}</div>
                             </div>
                         </div>
                     `).join('')}
@@ -875,13 +887,22 @@ import { accountRowFacts } from './harness_accounts.js';
             `;
         }
 
-    function renderSummaryStep() {
-        const summary = summaryRows().map(([label, value]) => `
+    function summaryRowsHtml() {
+        return summaryRows().map(([label, value]) => `
             <div class="summary-kv">
                 <strong>${escapeHtml(label)}</strong>
                 <span>${escapeHtml(value)}</span>
             </div>
         `).join('');
+    }
+
+    function refreshSummary() {
+        const summary = root.querySelector('.summary-card');
+        if (summary) summary.innerHTML = summaryRowsHtml();
+        syncCurrentStepActionState();
+    }
+
+    function renderSummaryStep() {
         return `
             <div class="step-header">
                 <div>
@@ -889,7 +910,7 @@ import { accountRowFacts } from './harness_accounts.js';
                     <p class="step-copy">${escapeHtml(STEP_META.summary.copy)}</p>
                 </div>
             </div>
-            <div class="summary-card">${summary}</div>
+            <div class="summary-card">${summaryRowsHtml()}</div>
         `;
     }
 
@@ -978,7 +999,7 @@ import { accountRowFacts } from './harness_accounts.js';
                             ` : ''}
                         </div>
                     </div>
-                    <div class="wizard-error">${escapeHtml(state.error)}</div>
+                    <div class="wizard-error" role="status">${escapeHtml(state.error)}</div>
                     `}
                 </div>
             </div>
@@ -1023,22 +1044,6 @@ import { accountRowFacts } from './harness_accounts.js';
     }
 
     function bindProvidersStep() {
-        // Scoped per-collapse binding: a bare `.wizard-collapse` selector only
-        // reaches the FIRST details element, which silently drops the toggle
-        // persistence of every later collapse on the step.
-        const collapseStateKeys = {
-            'api-access': 'apiAccessOpen',
-            'more-providers': 'moreProvidersOpen',
-            'local-model': 'localSourceOpen',
-        };
-        Object.entries(collapseStateKeys).forEach(([collapseId, stateKey]) => {
-            const details = root.querySelector(`[data-collapse="${collapseId}"]`);
-            if (details) {
-                details.addEventListener('toggle', () => {
-                    state[stateKey] = details.open;
-                });
-            }
-        });
             const localPreset = document.getElementById('local-preset');
             const localSource = document.getElementById('local-source');
         const localFilename = document.getElementById('local-filename');
@@ -1079,14 +1084,7 @@ import { accountRowFacts } from './harness_accounts.js';
         bindStateInput(localContext, 'localContextLength');
         bindStateInput(localGpuLayers, 'localGpuLayers');
         bindStateInput(localChatFormat, 'localChatFormat');
-        root.querySelectorAll('[data-local-mode]').forEach((button) => {
-            button.addEventListener('click', () => {
-                state.localRoutingMode = button.getAttribute('data-local-mode');
-                state.error = '';
-                agentsStep?.invalidateGeneratedPreview();
-                render();
-            });
-        });
+        bindChoices('data-local-mode', 'localRoutingMode');
         if (LOCAL_RUNTIME_CONTROLS) {
             startLocalStatusPolling();
             document.getElementById('wizard-local-start')?.addEventListener('click', async () => {
@@ -1124,6 +1122,7 @@ import { accountRowFacts } from './harness_accounts.js';
             document.getElementById('wizard-local-stop')?.addEventListener('click', async () => {
                 try {
                     await apiRequest('/api/local-model/stop', { method: 'POST' });
+                    setLocalTestResult('', 'muted');
                     updateLocalStatus();
                 } catch (error) {
                     setLocalTestResult(`Stop failed: ${error.message}`, 'error');
@@ -1220,6 +1219,19 @@ import { accountRowFacts } from './harness_accounts.js';
         syncCurrentStepActionState();
     }
 
+    function bindChoices(attribute, stateKey) {
+        const buttons = root.querySelectorAll(`[${attribute}]`);
+        buttons.forEach((button) => button.addEventListener('click', () => {
+            state[stateKey] = button.getAttribute(attribute);
+            buttons.forEach((choice) => {
+                const selected = choice.getAttribute(attribute) === state[stateKey];
+                choice.classList.toggle('active', selected);
+                choice.setAttribute('aria-pressed', String(selected));
+            });
+            markStepEdited();
+        }));
+    }
+
     function bindReviewModeStep() {
         initReviewerSlots({ onChange: () => {
             state.reviewerDraftDirty = true;
@@ -1229,30 +1241,14 @@ import { accountRowFacts } from './harness_accounts.js';
         } });
         adoptSubagentRoster({ OUROBOROS_SUBAGENTS: state.availableSubagents });
         if (state.reviewerSlots) applyReviewerSlotsDraft(state.reviewerSlots);
-        root.querySelectorAll('[data-review-mode]').forEach((button) => {
-            button.addEventListener('click', () => {
-                state.reviewEnforcement = button.getAttribute('data-review-mode');
-                state.error = '';
-                agentsStep?.invalidateGeneratedPreview();
-                render();
-            });
-        });
-        root.querySelectorAll('[data-runtime-mode]').forEach((button) => {
-            button.addEventListener('click', () => {
-                state.runtimeMode = button.getAttribute('data-runtime-mode');
-                state.error = '';
-                agentsStep?.invalidateGeneratedPreview();
-                render();
-            });
-        });
+        bindChoices('data-review-mode', 'reviewEnforcement');
+        bindChoices('data-runtime-mode', 'runtimeMode');
         const skillsInput = document.getElementById('skills-repo-path');
         if (skillsInput) skillsInput.addEventListener('input', () => { state.skillsRepoPath = skillsInput.value; markStepEdited(); });
         syncCurrentStepActionState();
     }
 
         function bindBudgetStep() {
-            const disclosure = root.querySelector('[data-collapse="api-budget"]');
-            disclosure?.addEventListener('toggle', () => { state.apiBudgetOpen = disclosure.open; });
             BUDGET_FIELDS.forEach((field) => {
                 const input = document.getElementById(field.inputId);
                 if (input) input.addEventListener('input', () => { state[field.stateKey] = input.value; markStepEdited(); });
@@ -1422,10 +1418,7 @@ import { accountRowFacts } from './harness_accounts.js';
             : '';
         state.error = providersError || modelsError || reviewError || budgetError
             || subagentsError || previewError;
-        if (state.error) {
-            render();
-            return;
-        }
+        if (state.error) return syncCurrentStepActionState();
         state.saving = true;
         state.error = '';
         render();
@@ -1462,6 +1455,17 @@ import { accountRowFacts } from './harness_accounts.js';
             return;
         }
         bindClearButtons();
+        // Bind every disclosure independently; keeping only the first one
+        // loses later groups and the position of their draft on Back.
+        const collapseStateKeys = {
+            'api-access': 'apiAccessOpen', 'api-budget': 'apiBudgetOpen',
+            'more-providers': 'moreProvidersOpen', 'local-model': 'localSourceOpen',
+            subagents: 'subagentsOpen', reviewers: 'reviewersOpen',
+        };
+        root.querySelectorAll('[data-collapse]').forEach((details) => {
+            const key = collapseStateKeys[details.dataset.collapse];
+            if (key) details.addEventListener('toggle', () => { state[key] = details.open; });
+        });
         document.getElementById('back-btn')?.addEventListener('click', previousStep);
         document.getElementById('next-btn')?.addEventListener('click', () => {
             if (state.currentStep === 'summary') saveWizard();

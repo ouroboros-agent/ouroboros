@@ -90,3 +90,16 @@ export function harnessAccountIdentityMarkup(harnessId, {
     const identity = harnessIdentityMarkup(harnessId, { label, className });
     return identity + (profile ? ` (${escapeHtml(profile)})` : '');
 }
+
+/** Card identity consumes projected facts; it does not infer execution from marks. */
+export function executorIdentityMarkup(chip, { agentModel = '' } = {}) {
+    const identity = chip
+        ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(chip.title || '')}">`
+            + harnessIdentityMarkup(chip.harness, { label: chip.label || '', className: 'chat-live-executor-identity' }) + '</span>'
+        : '';
+    const facts = [
+        agentModel ? `${chip ? 'Coordinator' : 'Agent model'}: ${agentModel}` : '',
+        chip?.observedModels?.length ? `Observed: ${chip.observedModels.join(', ')}` : '',
+    ];
+    return identity + facts.filter(Boolean).map(text => `<span class="chat-live-meta-text">${escapeHtml(text)}</span>`).join('');
+}

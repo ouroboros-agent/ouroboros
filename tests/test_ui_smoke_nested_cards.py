@@ -1,7 +1,7 @@
 """Rendered contracts of NESTED subagent cards and of card text selection.
 
 A nested child is subordinate to its root: collapsed, it is an identity row
-(status chip · `role · model` · notes and chevron, no `Show details` label) in
+(status chip · role identity · notes and chevron, no `Show details` label) in
 quieter ink over its metadata row (harness chip with the run count, cost, last
 update, docked `Reviews N`); only its narration waits for expansion. The card's
 summary outranks its details: a body-size activity line over meta-size timeline

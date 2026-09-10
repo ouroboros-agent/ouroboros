@@ -151,7 +151,7 @@ function statusChip(skill, action, live) {
  * catalog snapshot (fetch failed or not passed) only listing-plane facts
  * ("Published vX") may be claimed.
  */
-function hubSyncBadges(skill, options = {}) {
+export function renderSkillHubBadges(skill, options = {}) {
     const map = options.hubCatalogByName instanceof Map ? options.hubCatalogByName : null;
     const verdict = hubSyncVerdict(
         hubListingRowFor(skill),
@@ -270,15 +270,15 @@ function presenceRuntimeBlock(skill) {
     const fingerprint = String(runtime.state_fingerprint || '');
     return `<form class="skills-presence-runtime" data-presence-runtime-form data-skill-name="${escapeHtml(skill.name)}" data-state-fingerprint="${escapeHtml(fingerprint)}">
         <div class="skills-presence-runtime-title">Presence runtime</div>
-        <label>Model
-            <select name="model_slot">
+        <label class="ui-field">Model
+            <select name="model_slot" class="ui-control">
                 <option value="" ${modelOverride ? '' : 'selected'}>Reviewed default (${escapeHtml(defaults.model_slot || 'main')})</option>
                 <option value="main" ${modelOverride === 'main' ? 'selected' : ''}>Main</option>
                 <option value="light" ${modelOverride === 'light' ? 'selected' : ''}>Light</option>
             </select>
         </label>
-        <label>Inline rounds
-            <input name="inline_max_rounds" type="number" min="1" step="1" value="${escapeHtml(roundsOverride)}" placeholder="${escapeHtml(defaults.inline_max_rounds || 10)}">
+        <label class="ui-field">Inline rounds
+            <input name="inline_max_rounds" class="ui-control" type="number" min="1" step="1" value="${escapeHtml(roundsOverride)}" placeholder="${escapeHtml(defaults.inline_max_rounds || 10)}">
         </label>
         <div class="skills-presence-runtime-actions">
             <button type="submit" class="btn btn-default btn-sm">Save</button>
@@ -290,6 +290,8 @@ function presenceRuntimeBlock(skill) {
 
 export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), repairingSkills = new Set(), live = {}, options = {}) {
     const safeName = escapeHtml(skill.name);
+    const description = skill.lifecycle_virtual && [skill.lifecycle_error, skill.load_error].includes(skill.description)
+        ? '' : skill.description;
     const reviewInProgress = reviewingSkills.has(skill.name);
     const repairInProgress = repairingSkills.has(skill.name);
     const action = primaryAction(skill, reviewInProgress, repairInProgress, live);
@@ -300,8 +302,8 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
     const payloadRoot = skill.payload_root || '';
     const localDelete = (source === 'self_authored' || source === 'external') && payloadRoot.startsWith('skills/external/');
     const prov = market ? skill.provenance : null;
-    const hubBadges = hubSyncBadges(skill, options);
-    const submit = submitHubReady(skill, Boolean(options.githubTokenConfigured));
+    const hubBadges = renderSkillHubBadges(skill, options);
+    const submit = submitHubReady(skill, options.githubTokenConfigured);
     // Instruction skills from a marketplace/external bucket can be converted into
     // runnable script skills by the repair agent (it authors scripts/<file> and
     // flips type instruction->script, then re-reviews). Offer it as a secondary
@@ -364,7 +366,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
     </details>`;
     return `<article class="skills-card" data-skill="${safeName}" ${reviewInProgress ? 'data-reviewing="1"' : ''} ${repairInProgress ? 'data-repairing="1"' : ''}>
         <header class="skills-card-head">
-            <div class="skills-card-title"><h3>${safeName}${sourceChip(skill) ? ` ${sourceChip(skill)}` : ''}${hubBadges ? ` ${hubBadges}` : ''}</h3>${skill.description ? `<p class="skills-card-desc">${escapeHtml(skill.description)}</p>` : ''}${formatRelativeAge(installedTime(skill)) ? `<div class="skills-card-installed muted">${escapeHtml(formatRelativeAge(installedTime(skill)))}</div>` : ''}</div>
+            <div class="skills-card-title"><h3>${safeName}${sourceChip(skill) ? ` ${sourceChip(skill)}` : ''}<span data-skill-hub-badges="${safeName}">${hubBadges ? ` ${hubBadges}` : ''}</span></h3>${description ? `<p class="skills-card-desc">${escapeHtml(description)}</p>` : ''}${formatRelativeAge(installedTime(skill)) ? `<div class="skills-card-installed muted">${escapeHtml(formatRelativeAge(installedTime(skill)))}</div>` : ''}</div>
             <div class="skills-card-toggle">${statusChip(skill, action, live)}${primary}${toggle}${menu}</div>
         </header>
         ${lockReason ? `<div class="skills-lock-hint ${action.action ? 'is-clickable' : ''}" title="${escapeHtml(lockReason)}" ${actionAttrs}>Locked: ${escapeHtml(lockReason)}</div>` : ''}
@@ -373,14 +375,55 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         ${grantBlock(skill)}
         ${reviewHistory(skill)}
         ${reviewFindings(skill)}
+        <div data-skill-errors>
         ${skill.lifecycle_status === 'failed' && skill.lifecycle_error ? `<div class="skills-load-error">${escapeHtml(skill.lifecycle_error)}</div>` : ''}
-        ${skill.load_error && !missingGrantLoadError(skill) ? `<div class="skills-load-error">${escapeHtml(skill.load_error)}</div>` : ''}
+        ${skill.load_error && !missingGrantLoadError(skill) && !(skill.lifecycle_status === 'failed' && skill.load_error === skill.lifecycle_error) ? `<div class="skills-load-error">${escapeHtml(skill.load_error)}</div>` : ''}
         ${skill.health_regressed ? `<div class="skills-load-error">Regression: was live at ${escapeHtml(String((skill.last_known_good || {}).version || '?'))} (${escapeHtml(String((skill.last_known_good || {}).sha || '').slice(0, 12))}); broken after a code update.</div>` : ''}
+        </div>
         <footer class="skills-card-actions">${details}</footer>
     </article>`;
 }
 
-function submitHubReady(skill, githubTokenConfigured = false) {
+/** Patch only state/queue-derived facts; forms, disclosure and open menus keep identity. */
+export function patchInstalledSkillEnrichment(card, skill, reviewing, repairing, live, options, menu = card) {
+    const template = card.ownerDocument.createElement('template');
+    template.innerHTML = renderInstalledSkillCard(skill, reviewing, repairing, live, options);
+    const next = template.content.firstElementChild;
+    function attributes(target, source, preserveDisabled = false) {
+        for (const attr of [...target.attributes]) {
+            if (preserveDisabled && attr.name === 'disabled') continue;
+            if (!source.hasAttribute(attr.name)) target.removeAttribute(attr.name);
+        }
+        for (const attr of source.attributes) {
+            if (preserveDisabled && attr.name === 'disabled') continue;
+            if (target.getAttribute(attr.name) !== attr.value) target.setAttribute(attr.name, attr.value);
+        }
+    }
+    for (const selector of ['.skills-status-chip', '.skills-primary-action', '[data-skill-errors]', '.skills-card-desc']) {
+        const target = card.querySelector(selector), source = next.querySelector(selector);
+        if (!target && source) {
+            // Only virtual queue rows gain a new action or description here.
+            (selector === '.skills-primary-action' ? card.querySelector('.skills-card-toggle')
+                : card.querySelector('.skills-card-title')).appendChild(source);
+        } else if (target && !source) target.remove();
+        else if (target && source) {
+            attributes(target, source, target.tagName === 'BUTTON' && target.dataset.skillAction === source.dataset.skillAction);
+            if (target.innerHTML !== source.innerHTML) target.innerHTML = source.innerHTML;
+        }
+    }
+    const control = card.querySelector('.skills-toggle');
+    if (control && control.dataset.skillPending !== 'true') {
+        const source = next.querySelector('.skills-toggle');
+        attributes(control.closest('.skills-switch'), source.closest('.skills-switch'));
+        attributes(control, source);
+        control.checked = source.checked;
+        control.disabled = source.disabled;
+    }
+    const publish = menu.querySelector('.skills-submit-hub'), nextPublish = next.querySelector('.skills-submit-hub');
+    if (publish && nextPublish) attributes(publish, nextPublish, true);
+}
+
+function submitHubReady(skill, githubTokenConfigured) {
     // Prefer the host's SSOT verdict. The additive task_start_allowed fact owns
     // admission when present; disabled remains only a compatibility projection.
     if (skill.submit_hub && typeof skill.submit_hub === 'object') {
@@ -397,7 +440,8 @@ function submitHubReady(skill, githubTokenConfigured = false) {
     const source = (skill.source || 'native').toLowerCase();
     const visible = ['external', 'self_authored', 'user_repo', 'ouroboroshub', 'clawhub'].includes(source);
     if (!visible) return { visible: false, disabled: true, reason: '' };
-    if (!githubTokenConfigured) return { visible: true, disabled: true, reason: 'Configure GITHUB_TOKEN in Settings -> Secrets' };
+    if (githubTokenConfigured !== true) return { visible: true, disabled: true, reason: githubTokenConfigured === false
+        ? 'Configure GITHUB_TOKEN in Settings -> Secrets' : 'GitHub token status unavailable. Refresh to retry.' };
     return {
         visible: true,
         publication_ready: false,

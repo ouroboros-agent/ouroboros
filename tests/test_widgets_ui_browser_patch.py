@@ -233,9 +233,9 @@ def test_ui_smoke_widget_changed_card_and_reconnect_reconcile(direct_server_with
 
                 page.route("**/api/ui/preferences", hold_reads)
                 page.locator(f"{card('manual')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]").click()
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"auto\"]").click()
                 page.locator(f"{card('hang')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").click()
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").click()
                 wait_held(1)
                 page.wait_for_timeout(400)
                 assert len(held) == 1, "the second change must wait for the first write"
@@ -261,7 +261,7 @@ def test_ui_smoke_widget_changed_card_and_reconnect_reconcile(direct_server_with
 
                 # (4) Escape closes the menu and returns focus to the ⋮ trigger.
                 page.locator(f"{card('hang')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
                 assert page.evaluate("() => document.activeElement?.hasAttribute('data-widget-start-mode')")
                 page.keyboard.press("Escape")
                 page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").wait_for(state="hidden", timeout=5_000)

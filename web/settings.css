@@ -261,63 +261,6 @@
     letter-spacing: normal;
 }
 
-.settings-shell .form-field input,
-.settings-shell .form-field select,
-.settings-shell .form-field textarea,
-.settings-shell .available-subagent-row input,
-.settings-shell .available-subagent-row select,
-.settings-shell .available-subagent-row textarea,
-.settings-shell .model-role-row input,
-.settings-shell .model-role-row select,
-.model-picker input {
-    width: 100%;
-    min-width: 0;
-    padding: 10px 12px;
-    border-radius: 12px;
-    border: 1px solid var(--surface-border);
-    background: rgba(26, 21, 32, 0.88);
-    color: var(--text-primary);
-    font-size: var(--type-body);
-    font-family: inherit;
-    outline: none;
-    transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
-}
-
-.settings-shell .form-field input::placeholder,
-.settings-shell .form-field textarea::placeholder,
-.settings-shell .available-subagent-row input::placeholder,
-.settings-shell .available-subagent-row textarea::placeholder,
-.secret-input::placeholder,
-.model-picker input::placeholder {
-    color: rgba(255, 255, 255, 0.24);
-}
-
-.settings-shell .form-field input:focus,
-.settings-shell .form-field select:focus,
-.settings-shell .form-field textarea:focus,
-.settings-shell .available-subagent-row input:focus,
-.settings-shell .available-subagent-row select:focus,
-.settings-shell .available-subagent-row textarea:focus,
-.settings-shell .model-role-row input:focus,
-.settings-shell .model-role-row select:focus,
-.model-picker input:focus {
-    border-color: var(--focus-accent-border);
-    box-shadow: 0 0 0 3px var(--focus-accent-ring);
-}
-
-.settings-shell .form-field textarea {
-    min-height: 84px;
-    resize: vertical;
-}
-
-.settings-shell .form-field select,
-.settings-shell .available-subagent-row select {
-    appearance: none;
-    padding-right: 36px;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%23e2e8f0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 12px center;
-}
 
 .mcp-servers-list {
     display: flex;
@@ -475,10 +418,11 @@
 .settings-footer {
     flex-shrink: 0;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 14px;
-    padding: 14px 2px 0;
+    gap: var(--space-3);
+    padding: var(--space-3) 2px 0;
     border-top: 1px solid rgba(255, 255, 255, 0.06);
     background: linear-gradient(180deg, rgba(13, 11, 15, 0), rgba(13, 11, 15, 0.92) 55%);
 }
@@ -486,6 +430,7 @@
 .settings-footer-actions,
 .settings-footer-status {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 10px;
 }
@@ -501,8 +446,10 @@
 }
 
 .settings-footer-status #settings-status {
-    min-width: 220px;
+    min-width: 0;
     max-width: 52ch;
+    flex: 1 1 220px;
+    overflow-wrap: anywhere;
     text-align: right;
 }
 
@@ -515,11 +462,6 @@
 
 .secret-input-row input {
     min-width: 0;
-}
-
-.secret-input-row .btn-default,
-.settings-custom-secret-remove {
-    min-height: 42px;
 }
 
 .available-subagents-editor {
@@ -647,16 +589,13 @@
     display: grid;
     grid-template-columns: minmax(180px, 0.65fr) minmax(260px, 1.35fr) auto;
     gap: 10px;
-    align-items: end;
-    padding: 12px;
-}
-
-.settings-custom-secret-row .secret-input-row {
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: start;
+    padding: var(--space-3);
 }
 
 .settings-custom-secret-remove {
-    padding: 0 12px;
+    align-self: end;
+    padding-inline: var(--space-3);
 }
 
 .settings-model-grid,
@@ -696,55 +635,11 @@
     line-height: var(--line-meta);
 }
 
-.model-picker {
-    position: relative;
-}
 
-.model-picker-results {
-    position: absolute;
-    z-index: 5;
-    top: calc(100% + 8px);
-    left: 0;
-    right: 0;
-    max-height: 260px;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    padding: 8px;
-    border-radius: 16px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(18, 20, 26, 0.98);
-    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
-}
 
-.model-picker-item {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    border: none;
-    background: transparent;
-    color: var(--text-primary);
-    text-align: left;
-    padding: 10px 12px;
-    border-radius: 12px;
-    cursor: pointer;
-}
 
-.model-picker-item:hover {
-    background: rgba(255, 255, 255, 0.06);
-}
 
-.model-picker-item-value {
-    font-size: var(--type-body);
-    line-height: var(--line-body);
-    font-weight: 600;
-}
 
-.model-picker-item-label {
-    color: var(--text-meta);
-    font-size: var(--type-meta);
-    line-height: var(--line-meta);
-}
 
 .settings-effort-card {
     gap: 10px;
@@ -908,8 +803,10 @@
     }
 
     .secret-input-row {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr) auto auto;
     }
+    .secret-input-row > input { grid-column: 1 / -1; }
+    .secret-input-row > button:first-of-type { grid-column: 2; }
 
     .settings-card-head,
     .settings-custom-secret-row {
@@ -996,3 +893,62 @@
         padding: 0 14px 14px;
     }
 }
+
+/* track-migration:begin — Removed after remaining form consumers adopt ui-control. */
+.settings-shell .form-field input:not(.ui-control):not(.ui-checkbox),
+.settings-shell .form-field select:not(.ui-control):not(.ui-checkbox),
+.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox),
+.settings-shell .available-subagent-row input:not(.ui-control):not(.ui-checkbox),
+.settings-shell .available-subagent-row select:not(.ui-control):not(.ui-checkbox),
+.settings-shell .available-subagent-row textarea:not(.ui-control):not(.ui-checkbox),
+.settings-shell .model-role-row input:not(.ui-control):not(.ui-checkbox),
+.settings-shell .model-role-row select:not(.ui-control):not(.ui-checkbox) {
+    width: 100%;
+    min-width: 0;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--surface-border);
+    background: rgba(26, 21, 32, 0.88);
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+}
+
+.settings-shell .form-field input:not(.ui-control):not(.ui-checkbox)::placeholder,
+.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox)::placeholder,
+.settings-shell .available-subagent-row input:not(.ui-control):not(.ui-checkbox)::placeholder,
+.settings-shell .available-subagent-row textarea:not(.ui-control):not(.ui-checkbox)::placeholder,
+.secret-input:not(.ui-control)::placeholder {
+    color: rgba(255, 255, 255, 0.24);
+}
+
+.settings-shell .form-field input:not(.ui-control):not(.ui-checkbox):focus,
+.settings-shell .form-field select:not(.ui-control):not(.ui-checkbox):focus,
+.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox):focus,
+.settings-shell .available-subagent-row input:not(.ui-control):not(.ui-checkbox):focus,
+.settings-shell .available-subagent-row select:not(.ui-control):not(.ui-checkbox):focus,
+.settings-shell .available-subagent-row textarea:not(.ui-control):not(.ui-checkbox):focus,
+.settings-shell .model-role-row input:not(.ui-control):not(.ui-checkbox):focus,
+.settings-shell .model-role-row select:not(.ui-control):not(.ui-checkbox):focus {
+    border-color: var(--focus-accent-border);
+    box-shadow: 0 0 0 3px var(--focus-accent-ring);
+}
+
+.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox) {
+    min-height: 84px;
+    resize: vertical;
+}
+
+.settings-shell .form-field select:not(.ui-control):not(.ui-checkbox),
+.settings-shell .available-subagent-row select:not(.ui-control):not(.ui-checkbox) {
+    appearance: none;
+    padding-right: 36px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%23e2e8f0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+}
+
+
+/* track-migration:end */

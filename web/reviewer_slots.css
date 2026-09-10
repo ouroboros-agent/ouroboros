@@ -26,7 +26,7 @@
     line-height: var(--line-meta);
 }
 .reviewer-slot-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-/* Field chrome comes from the shared .form-field rule above (dark-app tokens);
+/* Field chrome comes from ui.css .ui-control;
    only the row's sizing is local. Proportions follow the content (owner
    feedback): the route select stays compact — its widest dropdown OPTION must
    not set the closed width; the free-text model id (long provider/model ids)
@@ -35,8 +35,6 @@
 .reviewer-slot-controls input { min-width: 140px; max-width: 100%; width: auto; flex: 0 1 auto; }
 .reviewer-slot-controls select[data-slot-route],
 .reviewer-slot-controls select[data-advisory-route] { max-width: 240px; }
-.reviewer-slot-controls input[data-slot-custom-api] { flex: 1 1 260px; min-width: 240px; max-width: 520px; }
-.reviewer-slot-controls select[data-slot-model] { flex: 1 1 220px; max-width: 420px; }
 .reviewer-slot-controls [data-slot-remove] { margin-left: auto; }
 /* The base .local-toggle carries padding-bottom:8px for form layouts; inside a
    center-aligned control row that padding shoves the checkbox off-axis. The
@@ -61,12 +59,16 @@
     flex: 0 1 210px; max-width: 240px;
 }
 .reviewer-slot-controls input:is([data-slot-custom-api], [data-advisory-api-model], [data-deep-review-api-model]),
-.reviewer-slot-controls select:is([data-slot-model], [data-advisory-model], [data-deep-review-model]) {
-    flex: 1 1 180px; min-width: 160px; max-width: 100%;
+.reviewer-slot-controls select:is([data-slot-model], [data-advisory-model], [data-deep-review-model]),
+.reviewer-slot-controls > .ui-model-chooser {
+    flex: 1 1 180px; min-width: min(160px, 100%); max-width: 100%;
 }
+.reviewer-slot-controls .ui-model-chooser .ui-control { width: 100%; min-width: 0; }
 .reviewer-slot-controls select:is([data-slot-profile], [data-advisory-profile], [data-deep-review-profile]) {
     flex: 0 1 170px; min-width: 110px;
 }
 .reviewer-slot-controls select:is([data-slot-effort], [data-advisory-effort], [data-deep-review-effort]) {
     flex: 0 1 110px; min-width: 100px;
 }
+
+.reviewer-slot-row[data-invalid] { border-color: var(--status-error-border); }

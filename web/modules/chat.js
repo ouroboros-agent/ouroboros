@@ -6,11 +6,13 @@ import { showToast } from './toast.js';
 import { createSystemMessageAction, renderProjectChip } from './ui_helpers.js';
 import { cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
+import { bindProjectWorkPointer } from './project_work_pointer.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
+    compactModel,
     getLogTaskGroupId,
     isGroupedTaskEvent,
     isTerminalTaskDetail,
@@ -65,7 +67,7 @@ import {
     reviewGroupsFromTaskDetail,
     setReviewAnchor,
 } from './review_presentation.js';
-import { harnessIdentityMarkup } from './harness_presentation.js';
+import { executorIdentityMarkup } from './harness_presentation.js';
 import {
     captureLiveCardProjection,
     createHistoryResyncScheduler,
@@ -477,6 +479,15 @@ export function createChatInstance({
     const LIVE_CARD_CAP = 200;
     const liveCardBound = createLiveCardBound(LIVE_CARD_CAP);
     const liveCardRecords = new Map();
+    const workPointer = asPanel ? bindProjectWorkPointer(page.querySelector('.chat-panel-statusbar'), {
+        records: liveCardRecords, getWindow: () => historyWindow,
+        onNavigate: (root) => {
+            messagesDiv.scrollTop += root.getBoundingClientRect().top - messagesDiv.getBoundingClientRect().top;
+            _savedStick = false;
+            _savedScrollTop = messagesDiv.scrollTop;
+            updateScrollButton();
+        },
+    }) : null;
     const modelWaits = createModelWaitController({
         getRecord: (id, create = true) => {
             if (create) forceTaskCard(id);
@@ -698,6 +709,7 @@ export function createChatInstance({
         if (_viewportMutationDepth > 0) return mutate();
         if (_restoring || !isInstanceVisible()) {
             const result = mutate();
+            workPointer?.update();
             if (remoteContent && result && !_savedStick) _hasNewActivity = true;
             return result;
         }
@@ -713,6 +725,7 @@ export function createChatInstance({
         _viewportMutationDepth = 1;
         try {
             result = mutate();
+            workPointer?.update();
             return result;
         } finally {
             _viewportMutationDepth = 0;
@@ -1801,31 +1814,24 @@ export function createChatInstance({
         }),
     });
 
-    // The 12 cost-meta keys shared by both subagent whitelists (the delegation
-    // trio stays inline in each literal — the wire test scans those literals).
-    const COST_META_KEYS = [
+    // One carry list for both live progress and log-channel terminal projection.
+    const CARD_META_KEYS = [
         'cost_usd', 'accounted_upper_bound_usd', 'accounted_upper_bound_usd_with_children',
         'cost_accounting_status', 'cost_accounting_error', 'cost_final', 'cost_usd_with_children',
         'cost_with_children_partial', 'reserved_usd', 'unresolved_upper_bound_usd',
-        'unknown_unmetered', 'non_final_rows',
+        'unknown_unmetered', 'non_final_rows', 'executor_route', 'execution_evidence',
+        'actual_substrate', 'executor_observation', 'model', 'ts',
     ];
-    function costMetaKeys(src) {
-        return Object.fromEntries(COST_META_KEYS.map((key) => [key, src?.[key]]));
+    function cardMetaKeys(src) {
+        return Object.fromEntries(CARD_META_KEYS.map((key) => [key, src?.[key]]));
     }
 
     // the ONE meta-line renderer, fed entirely from record state,
     // so a replay batch renders it exactly once per card.
     function renderLiveCardMeta(record) {
         if (!record?.metaEl) return false;
-        const executorChipHtml = record.executorChip
-            ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtmlAttr(record.executorChip.title || '')}">`
-              + harnessIdentityMarkup(record.executorChip.harness, {
-                  label: record.executorChip.label || '',
-                  className: 'chat-live-executor-identity',
-              })
-              + '</span>'
-            : '';
-        const html = executorChipHtml + [
+        const agentModel = compactModel(record.isSubagent ? subagentChildParents.get(record.groupId)?.model : record.agentModel);
+        const html = executorIdentityMarkup(record.executorChip, { agentModel }) + [
             record.groupId === 'bg-consciousness' ? 'Background thinking' : '',
             ...(Array.isArray(record._lastFrameMeta) ? record._lastFrameMeta : []),
             ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),
@@ -1882,6 +1888,7 @@ export function createChatInstance({
         if (summary.human && headline) {
             record.lastHumanHeadline = headline;
         }
+        if (summary.model) record.agentModel = compactModel(summary.model);
 
         const shouldPromote = Boolean(summary.promote) || record.finished;
         const activeHeadline = shouldPromote
@@ -1910,7 +1917,7 @@ export function createChatInstance({
         if (activityCandidate) record.collapsedActivity = boundActivityPreview(activityCandidate);
         const activityText = projectCollapsedActivity({
             isSubagent: record.isSubagent,
-            suggestedName: record.suggestedName,
+            suggestedName: title,
             headline: record.isSubagent ? '' : record.collapsedActivity,
             body: record.isSubagent ? record.collapsedActivity : '',
             previous: record.collapsedActivity,
@@ -2128,8 +2135,8 @@ export function createChatInstance({
 
     // child task_id -> { parentId, role, model } from subagent lifecycle pings. Child
     // cards mount under the parent, but their phase/terminal state is independent
-    // (a finished child never marks the parent done); a later model-less event keeps
-    // the previously seen model so the "role · model" headline survives.
+    // (a finished child never marks the parent done). Model-less events keep the
+    // previously seen model in the separate metadata line.
     const subagentChildParents = new Map();
     // Children whose card reached a terminal phase: late non-lifecycle progress
     // must NOT revive it back to "working".
@@ -2226,12 +2233,7 @@ export function createChatInstance({
             ...Object.fromEntries(['subagent_event', 'subagent_task_id', 'root_task_id',
                 'parent_task_id', 'delegation_role', 'subagent_role', 'status', 'result',
                 'trace_summary', 'error', 'artifact_status'].map((key) => [key, msg?.[key] || ''])),
-            // Delegation trio: a forgotten key freezes the chip
-            // (wire_contract.test.js pins all three).
-            executor_route: msg?.executor_route || '',
-            execution_evidence: msg?.execution_evidence,
-            actual_substrate: msg?.actual_substrate || '',
-            ...costMetaKeys(msg),
+            ...cardMetaKeys(msg),
             lifecycle: msg?.lifecycle || null,
         });
         if (!summary) return changed;
@@ -2375,16 +2377,11 @@ export function createChatInstance({
             subagent_task_id: childId,
             subagent_role: info.role,
             subagent_event: event,
-            model: info.model || '',
-            // Second whitelist: a log-channel-only terminal still upgrades the chip.
-            executor_route: evt.executor_route || '',
-            execution_evidence: evt.execution_evidence,
-            actual_substrate: evt.actual_substrate || '',
             review_projection: evt.review_projection,
             result: evt.result || '',
             error: evt.error || '',
             reason_code: evt.reason_code || '',
-            ...costMetaKeys(evt),
+            ...cardMetaKeys(evt),
         }, evt.ts || evt.timestamp || new Date().toISOString()));
     }
 
@@ -2556,7 +2553,7 @@ export function createChatInstance({
                     detail: { project: { id: projectId, name: projectName || 'Project' } },
                 })),
             }));
-            bubble.querySelector('.message')?.append(actions);
+            bubble.querySelector('.message')?.after(actions);
         }
         wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
         stampNodeTimestamp(bubble, ts);
@@ -4218,6 +4215,7 @@ export function createChatInstance({
             }
             wsDisposers.length = 0;
             chatMedia.destroy();
+            workPointer?.destroy();
             modelWaits.destroy();
             window.removeEventListener('ouro:page-shown', handlePageShown);
             document.removeEventListener('visibilitychange', handlePageShown);

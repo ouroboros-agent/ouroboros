@@ -946,7 +946,8 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 # view stays as rich; what stops is waking the MODEL per event batch.
                 # The emit is also the frame the supervisor's idle enforcer reads, which
                 # a silently blocking wait would starve.
-                progress.emit(ctx, rid, seen.record(detail, last_seq, int(time.monotonic() - started)))
+                progress.emit(ctx, rid, seen.record(detail, last_seq, int(time.monotonic() - started)),
+                              detail=detail, entry=entry)
                 baseline = last_seq          # so the NEXT advance is counted once
             pending = _cx_pending(detail)
             if pending and _interactions_are_news(rid, pending):

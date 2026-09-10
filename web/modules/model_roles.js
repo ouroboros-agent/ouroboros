@@ -7,6 +7,7 @@ import { bindStatusSurface, claudexorStatus } from './claudexor_status_store.js'
 import { parseModelSource, composeModelSource, indexProfilesByHarness, profileOptionsFor, selectHtml, mintStableId } from './route_editor_primitives.js';
 import { revealNewRow } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { modelChooserHtml, bindModelChoosers, updateModelChooser } from './model_chooser.js';
 
 export const MODEL_ACCOUNTS_KEY = 'OUROBOROS_MODEL_ACCOUNTS';
 export const MODEL_CONTEXT_KEY = 'OUROBOROS_MODEL_CONTEXT_WINDOWS';
@@ -64,6 +65,8 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
     let loaded = false;
     let destroyed = false;
     let disposeStatus = null;
+    let disposeChoosers = () => {};
+    let validationAttempted = false;
     const catalogs = new Map();
     const requests = new Map();
     const host = () => getDoc()?.getElementById(hostId);
@@ -102,6 +105,18 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
     }
 
     function changed() { onChange(collect()); }
+    function rowErrors(row) {
+        const errors = [];
+        if (['main', 'fallback'].includes(row.slot.slot) && !row.model.trim()) {
+            errors.push({ field: '[data-model-role-model]', message: `${row.slot.label}: choose a model${row.slot.slot === 'fallback' ? ' or remove this fallback' : ''}.` });
+        }
+        const contextInput = getDoc()?.getElementById(`${inputIdFor(row)}-context`);
+        if (contextInput?.validity?.badInput || !Number.isSafeInteger(Number(row.context || 0)) || Number(row.context || 0) < 0) {
+            errors.push({ field: '[data-model-role-context]', message: `${row.slot.label}: context window must be a positive whole number, or Auto.` });
+        }
+        return errors;
+    }
+    function validateAll() { return rows.flatMap((row) => rowErrors(row).map(({ message }) => message)); }
     function effectiveSource(row) { return row.source === 'inherit' ? rows.find((entry) => entry.slot.slot === 'main')?.source || 'openrouter' : row.source; }
     function sourceId(row) { const source = effectiveSource(row); return source.startsWith('subscription:') ? source.slice(13) : ''; }
     function catalogKey(row) { return JSON.stringify([sourceId(row), row.account]); }
@@ -124,7 +139,7 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
         if (!showContext) return '';
         return `<details class="model-role-details"><summary>Context</summary>
             <div class="model-role-context">
-                <label>Window <input data-model-role-context type="number" min="0" step="1"
+                <label class="ui-field">Window <input id="${escapeHtml(inputIdFor(row))}-context" class="ui-control" data-model-role-context type="number" min="0" step="1"
                     placeholder="Auto" value="${escapeHtml(row.context || '')}" aria-label="${escapeHtml(row.slot.label)} context window"></label>
                 <span data-model-context-note>${escapeHtml(modelContextNote(currentItem(row), row.context))}</span>
             </div></details>`;
@@ -135,25 +150,26 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
         const inputId = inputIdFor(row);
         return `<div class="model-role-row" data-model-role="${escapeHtml(row.id)}">
             <div class="model-role-controls">
-                ${selectHtml('data-model-role-source aria-label="Source"', modelSourceGroups({ sources, providers, current: row.source }), row.source)}
-                <input id="${escapeHtml(inputId)}" data-model-role-model aria-label="${escapeHtml(row.slot.label)}" value="${escapeHtml(row.model)}" list="${escapeHtml(hostId)}-${escapeHtml(row.id)}-models" placeholder="${row.slot.slot === 'main' ? 'Choose a model' : 'Empty uses Main'}" autocomplete="off" spellcheck="false">
-                <select data-model-role-account aria-label="Account" ${sourceId(row) ? '' : 'hidden'}></select>
+                ${selectHtml(`data-model-role-source aria-label="${escapeHtml(row.slot.label)} source"`, modelSourceGroups({ sources, providers, current: row.source }), row.source)}
+                ${modelChooserHtml(`id="${escapeHtml(inputId)}" data-model-role-model aria-label="${escapeHtml(row.slot.label)}${isFallback ? ` ${index + 1}` : ''}"`, row.model, `${hostId}-${row.id}-models`, [], { placeholder: row.slot.slot === 'main' ? 'Choose a model' : 'Empty uses Main' })}
+                <select class="ui-control" data-model-role-account aria-label="${escapeHtml(row.slot.label)} account" ${sourceId(row) ? '' : 'hidden'}></select>
                 ${isFallback ? `<span class="model-role-order"><button type="button" class="btn btn-default" data-model-up aria-label="Move fallback up" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" class="btn btn-default" data-model-down aria-label="Move fallback down" ${index === total - 1 ? 'disabled' : ''}>↓</button><button type="button" class="btn btn-default" data-model-remove aria-label="Remove fallback">Remove</button></span>` : ''}
             </div>
-            <datalist id="${escapeHtml(hostId)}-${escapeHtml(row.id)}-models"></datalist>
-            <div class="model-role-notes"><span class="model-role-meta" data-model-role-status></span>${detailsHtml(row)}</div>
+            <div class="model-role-notes"><span id="${escapeHtml(hostId)}-${escapeHtml(row.id)}-status" class="model-role-meta ui-field-help" data-model-role-status></span>${detailsHtml(row)}</div>
+            <div class="ui-status ui-field-help" id="${escapeHtml(hostId)}-${escapeHtml(row.id)}-error" data-model-role-error data-tone="error" hidden></div>
         </div>`;
     }
 
     function render() {
         const element = host();
         if (!element || destroyed || !loaded) return;
+        disposeChoosers();
         element.innerHTML = slots.map((slot) => {
             const matching = rows.filter((row) => row.slot.slot === slot.slot);
             const local = matching[0]?.local || false;
             return `<section class="model-role-group" data-model-role-group="${escapeHtml(slot.slot)}">
                 <div class="model-role-head"><h4 title="${escapeHtml(slot.note || '')}">${escapeHtml(slot.label.replace(/ Model$/, ''))}</h4>
-                    ${slot.settingsToggleId ? `<label class="local-toggle"><input id="${escapeHtml(slot.settingsToggleId)}" type="checkbox" data-model-local ${local ? 'checked' : ''}> Local</label>` : ''}
+                    ${slot.settingsToggleId ? `<label class="local-toggle ui-field ui-field-inline"><input class="ui-checkbox" id="${escapeHtml(slot.settingsToggleId)}" type="checkbox" data-model-local aria-label="${escapeHtml(slot.label)} local runtime" ${local ? 'checked' : ''}> Local</label>` : ''}
                     ${slot.slot === 'fallback' ? '<button type="button" class="btn btn-default" data-model-add>Add fallback</button>' : ''}
                 </div>
                 ${slot.slot === 'fallback' ? '<p class="model-role-copy">Tried in this order. Subscription quota waits for your choice before using API.</p>' : ''}
@@ -161,6 +177,7 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
             </section>`;
         }).join('');
         bindRows(element);
+        disposeChoosers = bindModelChoosers(element);
         updateCatalogViews();
         for (const row of rows) void refreshRow(row);
     }
@@ -182,14 +199,23 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
             const accountHtml = selectHtml('', [{ options: profileOptionsFor(profiles[credentialHarness], row.account, { accountsKnown: store.accountsKnown && Boolean(credentialHarness) }) }], row.account);
             const accountOptions = accountHtml.slice(accountHtml.indexOf('>') + 1, accountHtml.lastIndexOf('</select>'));
             if (account.innerHTML !== accountOptions) account.innerHTML = accountOptions;
-            const list = node.querySelector('datalist');
-            list.innerHTML = itemsFor(row).map((item) => `<option value="${escapeHtml(parseModelSource(item.value || item.id).model)}">${escapeHtml(item.name || item.label || item.id)}</option>`).join('');
+            updateModelChooser(node.querySelector('[data-model-role-model]'), itemsFor(row).map((item) => ({
+                value: parseModelSource(item.value || item.id).model, label: item.name || item.label || item.id || item.value,
+            })));
             if (showContext) node.querySelector('[data-model-context-note]').textContent = modelContextNote(currentItem(row), row.context);
             const status = node.querySelector('[data-model-role-status]');
             const catalog = catalogs.get(catalogKey(row));
             status.textContent = row.local ? 'Uses the local runtime.'
                 : !row.model ? (row.slot.slot === 'main' ? 'Choose a model to continue.' : 'Uses Main.')
                     : sourceId(row) ? (catalog?.error || 'Uses your subscription. No API key required.') : '';
+            const errors = validationAttempted ? rowErrors(row) : [];
+            const message = node.querySelector('[data-model-role-error]');
+            Object.assign(message, { textContent: errors.map((error) => error.message).join(' '), hidden: !errors.length });
+            for (const selector of ['[data-model-role-model]', '[data-model-role-context]']) {
+                const field = node.querySelector(selector);
+                field?.setAttribute('aria-describedby', `${status.id} ${message.id}`);
+                field?.setAttribute('aria-invalid', String(errors.some((error) => error.field === selector)));
+            }
         }
     }
 
@@ -266,6 +292,7 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
 
     return {
         load(value, contract = {}) {
+            validationAttempted = false;
             settings = { ...value }; slots = contract.modelSlots || slots;
             providers = contract.providerProfiles || providers;
             rows = [];
@@ -292,15 +319,14 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
             updateCatalogViews();
         },
         collect,
+        validateAll,
+        noteSaveAttempt() { validationAttempted = true; updateCatalogViews(); },
         validate() {
-            const missing = rows.find((row) => row.slot.slot === 'main' && !row.model.trim());
-            if (missing) return 'Choose the Main model.';
-            if (rows.some((row) => row.slot.slot === 'fallback' && !row.model.trim())) return 'Choose a model for every fallback, or remove the empty row.';
-            if (rows.some((row) => !Number.isSafeInteger(Number(row.context || 0)) || Number(row.context || 0) < 0)) return 'Context windows must be positive whole numbers, or Auto.';
-            return '';
+            return validateAll()[0] || '';
         },
         destroy() {
             destroyed = true; disposeStatus?.(); disposeStatus = null;
+            disposeChoosers();
             for (const request of requests.values()) request.controller.abort();
         },
     };
