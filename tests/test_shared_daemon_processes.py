@@ -125,14 +125,9 @@ from ouroboros.platform_layer import subprocess_new_group_kwargs
 home = pathlib.Path(os.environ['CLAUDEXOR_CONFIG_DIR'])
 home.mkdir(parents=True, exist_ok=True)
 progress = home / 'client-work.txt'
-harness = None
-fixture_info = home / 'fixture-engine.json'
-
-def write_fixture_info(info):
-    temporary = fixture_info.with_suffix('.tmp')
-    temporary.write_text(json.dumps(info))
-    temporary.replace(fixture_info)
-
+harness = subprocess.Popen([sys.executable, '-c',
+    "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); n=0\nwhile True:\n n+=1; p.write_text(str(n)); time.sleep(.05)",
+    str(progress)], **subprocess_new_group_kwargs())
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args): pass
     def do_GET(self):
@@ -154,25 +149,12 @@ control = home / 'daemon'; control.mkdir(exist_ok=True)
 (control / 'token').write_text('fixture-token')
 (control / 'control-api.json').write_text(json.dumps({'host':'127.0.0.1',
     'port':server.server_port, 'tokenPath':str(control / 'token')}))
-fixture = {'pid':os.getpid(), 'port':server.server_port, 'harness_pid':0}
-write_fixture_info(fixture)
-
-def start_harness():
-    global harness
-    try:
-        harness = subprocess.Popen([sys.executable, '-c',
-            "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); n=0\nwhile True:\n n+=1; p.write_text(str(n)); time.sleep(.05)",
-            str(progress)], **subprocess_new_group_kwargs())
-        fixture['harness_pid'] = harness.pid
-    except Exception as exc:
-        fixture['harness_error'] = f'{type(exc).__name__}: {exc}'
-    write_fixture_info(fixture)
-
-threading.Thread(target=start_harness, daemon=True).start()
+(home / 'fixture-engine.json').write_text(json.dumps({'pid':os.getpid(),
+    'port':server.server_port, 'harness_pid':harness.pid}))
 try: server.serve_forever(poll_interval=.05)
 finally:
     server.server_close()
-    if harness is not None and harness.poll() is None: harness.terminate(); harness.wait(timeout=5)
+    if harness.poll() is None: harness.terminate(); harness.wait(timeout=5)
 '''
 
 _WORKER = r'''
@@ -188,18 +170,7 @@ daemon.ensure_owned_gateway(startup_wait_sec=30).close()
 owned = daemon.get_owned_daemon()
 custody_pid = int(getattr(getattr(owned, '_proc', None), 'pid', 0) or 0)
 ordinary = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], **pl.subprocess_new_group_kwargs())
-info_path = root/'claudexor'/'fixture-engine.json'
-while True:
-    try:
-        info = json.loads(info_path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        time.sleep(.01)
-        continue
-    if info.get('harness_error'):
-        raise RuntimeError(info['harness_error'])
-    if info.get('harness_pid'):
-        break
-    time.sleep(.01)
+info = json.loads((root/'claudexor'/'fixture-engine.json').read_text())
 info.update(worker_pid=os.getpid(), ordinary_pid=ordinary.pid, custody_pid=custody_pid)
 (root/'ready.json').write_text(json.dumps(info))
 time.sleep(120)
