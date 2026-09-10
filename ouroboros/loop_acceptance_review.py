@@ -526,50 +526,35 @@ def _apply_task_acceptance_result(
 ) -> bool:
     """Apply one panel result; return whether the agent must take another round."""
     from ouroboros.review_substrate import (
-        DIALOGUE_TERMINAL_STATUSES,
-        aggregate_dialogue_status,
-        build_improvement_capsule,
-        dissent_findings,
-        task_acceptance_is_clean,
+        DIALOGUE_TERMINAL_STATUSES, aggregate_dialogue_status,
+        build_improvement_capsule, dissent_findings, task_acceptance_is_clean,
     )
 
     if record_run:
         _record_host_acceptance_run(ctx, result)
     dissent = dissent_findings(result)
     blocking_lane = ctx.mode == "required" and _loop().get_review_enforcement() == "blocking"
-    # A REUSED panel (unchanged binding) is the SAME reviewer act applied
-    # again: re-collecting would mutate reviewer-authored state with no new
-    # input, and the shifted evidence revision would buy a fresh paid panel
-    # for a byte-identical resubmit (fable r2 #1); rows already collected.
+    # Reused panels already have obligations; collecting twice changes evidence
+    # revision and could buy a new panel for an identical resubmission (fable r2 #1).
     if blocking_lane and not reused:
         _loop()._collect_acceptance_obligations(ctx.llm_trace, result)
     open_obligations = _loop()._open_acceptance_obligations(ctx.llm_trace) if blocking_lane else []
-    # v6.74.0 (A1): the capsule leads with the verdict, the concrete open
-    # obligation ids, and the pre-rendered rails line (money/time/rounds/passes).
+    # Capsule: verdict, open obligation IDs, then money/time/round/pass limits.
     capsule = build_improvement_capsule(
         result,
         rails_line=ctx.rails_line,
         open_obligations=open_obligations,
     )
-    # v6.74.0 (A5): the reviewers' typed dialogue judgement, reduced over the
-    # CONTRIBUTING actors with the panel's own quorum; persisted for audit on
-    # the authoritative run record whatever branch applies below. `inconclusive`
-    # (no well-formed vote at all) grants the dialogue NO authority: it is not a
-    # terminal verdict and not a licence to continue — the existing non-dialogue
-    # terminals below decide, exactly as they did before the dialogue existed.
+    # Persist contributing actors' dialogue judgment using the panel's quorum.
+    # Inconclusive votes grant no authority; the non-dialogue terminals decide.
     dialogue = aggregate_dialogue_status(
         result, quorum=_acceptance_dialogue_quorum(result),
     )
     _attach_dialogue_to_host_run(ctx.llm_trace, dialogue)
     dialogue_terminal = dialogue["status"] in DIALOGUE_TERMINAL_STATUSES
     if reused and getattr(result, "replayed_from_superseded", False):
-        # A run superseded by an evidence revision replays ONLY into the typed
-        # identical-refusal terminal — never into clean-PASS authorization: its
-        # verdict predates the evidence change, so re-accepting would stamp a
-        # stale PASS (and the trace's superseded rows would contradict the
-        # applied decision — the delivery binding could never match). The
-        # refusal is conservative and consistent: nothing new was bought,
-        # nothing stale is re-authorized.
+        # Evidence superseded this run: replay only its identical-refusal terminal,
+        # never a stale PASS that contradicts the trace and current delivery binding.
         return _refuse_identical_acceptance(
             ctx, result,
             dialogue=dialogue, dissent=bool(dissent), open_obligations=open_obligations,
@@ -593,11 +578,8 @@ def _apply_task_acceptance_result(
         ctx.emit_progress("Task acceptance review: PASS (clean acceptance).")
         return False
 
-    # Advisory author-finality: the first host panel still runs and its raw
-    # findings stay durable, but an explicit author stance ends the dialogue
-    # without forcing the improvement capsule through another reviewer round.
-    # This never mints PASS and is deliberately unavailable to Blocking, where
-    # the selected gate remains the authority.
+    # After the first panel, an explicit Advisory author stance ends the dialogue.
+    # Retain raw findings, never mint PASS, and leave Blocking authority unchanged.
     author_stance = (
         ctx.llm_trace.get("acceptance_decision", {})
         if isinstance(ctx.llm_trace.get("acceptance_decision"), dict) else {}
@@ -613,9 +595,8 @@ def _apply_task_acceptance_result(
                 disposition=author_disposition,
                 rationale=str(author_stance.get("agent_rationale") or "") or "Author finished the advisory review.",
                 subject_hash=str(
-                    ctx.review_binding.get("binding_hash")
-                    or ctx.review_binding.get("candidate_hash")
-                    or ctx.content
+                    ctx.review_binding.get("binding_hash") or
+                    ctx.review_binding.get("candidate_hash") or ctx.content
                 ),
                 reviewer_signal=str(result.aggregate_signal or "DEGRADED").upper(),
                 enforcement="advisory",
@@ -625,10 +606,8 @@ def _apply_task_acceptance_result(
         ctx.tools._ctx._task_acceptance_reviewed = True
         _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
         _loop()._mark_root_acceptance_checkpoint(
-            ctx.tools._ctx,
-            ctx.llm_trace,
-            status=str(result.aggregate_signal or "DEGRADED").lower(),
-            pass_index=ctx.passes_done,
+            ctx.tools._ctx, ctx.llm_trace,
+            status=str(result.aggregate_signal or "DEGRADED").lower(), pass_index=ctx.passes_done,
         )
         _loop()._set_acceptance_decision(ctx.llm_trace, {
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
@@ -665,28 +644,18 @@ def _apply_task_acceptance_result(
         required_blocking=blocking_lane,
         ctx=ctx.tools._ctx,
     )
-    # A DEGRADED panel (no valid verdict quorum) cannot "judge" the dialogue:
-    # a lone terminal vote from the one contributing slot must NOT shadow the
-    # review_degraded path below, which is the only surface carrying the
-    # per-slot causes and degraded_reasons the v6.70.0 honesty invariant (P1)
-    # requires. Letting the dialogue-terminal branch fire here recorded a false
-    # "reviewer quorum judged" rationale and silently dropped those causes.
+    # DEGRADED has no verdict quorum: a lone terminal vote cannot replace the
+    # review_degraded path below, which preserves per-slot failure causes (P1).
     if dialogue_terminal and str(result.aggregate_signal or "DEGRADED").upper() != "DEGRADED":
-        # v6.74.0 (A5): a reviewer quorum judged the dialogue no longer
-        # actionable (unreachable_here / stable_disagreement). Finalize via
-        # the EXISTING honest path recording BOTH positions in one
-        # owner-visible line — reviewer authorship, not a host timer.
+        # Quorum judged the dialogue unreachable/stable; record both positions.
         ctx.tools._ctx._task_acceptance_reviewed = True
         _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
         _loop()._mark_root_acceptance_checkpoint(
-            ctx.tools._ctx,
-            ctx.llm_trace,
-            status=str(result.aggregate_signal or "DEGRADED").lower(),
-            pass_index=ctx.passes_done,
+            ctx.tools._ctx, ctx.llm_trace,
+            status=str(result.aggregate_signal or "DEGRADED").lower(), pass_index=ctx.passes_done,
         )
         _loop()._set_acceptance_decision(ctx.llm_trace, {
-            # The with/without-obligations distinction moves from the status token to
-            # the `open_obligations` id list this branch already records.
+            # Open obligations live in their ID list, not a different status token.
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
             "reason": "dialogue_terminal",
             "source": "task_acceptance_review",
@@ -737,10 +706,8 @@ def _apply_task_acceptance_result(
     ctx.tools._ctx._task_acceptance_reviewed = True
     _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
     _loop()._mark_root_acceptance_checkpoint(
-        ctx.tools._ctx,
-        ctx.llm_trace,
-        status=str(result.aggregate_signal or "DEGRADED").lower(),
-        pass_index=ctx.passes_done,
+        ctx.tools._ctx, ctx.llm_trace,
+        status=str(result.aggregate_signal or "DEGRADED").lower(), pass_index=ctx.passes_done,
     )
     if _loop()._dispose_obligations_on_clean_pass(
         ctx.llm_trace, result, open_obligations, bool(dissent),
@@ -759,13 +726,9 @@ def _apply_task_acceptance_result(
             "degraded_reasons": list(getattr(result, "degraded_reasons", []) or []),
             "open_obligations": [str(item.get("id")) for item in open_obligations],
         })
-        # Per-slot causes were always in the structured decision; the
-        # owner-visible line said only "no valid quorum", forcing a dig
-        # through task_results for WHICH slot failed and why (v6.70.0).
+        # Show the slot failure causes beside the verdict, not only in task_results.
         _degraded_reasons = list(getattr(result, "degraded_reasons", []) or [])
-        # Bounded PREVIEW for the chat line only — the complete causes live in
-        # the structured decision record (owner-facing full copy, per the
-        # v6.70.0 honesty invariant).
+        # Chat preview only; the structured decision keeps every complete cause.
         _reason_note = "; ".join(
             truncate_review_artifact(str(r), limit=300).replace("\n", " ")
             for r in _degraded_reasons[:4]
@@ -838,12 +801,8 @@ def _apply_task_acceptance_result(
         ctx.emit_progress(f"Task acceptance review: {result.aggregate_signal} (no changes suggested).")
     else:
         _loop()._set_acceptance_decision(ctx.llm_trace, {
-            # Round-9 CRITICAL 1: fall-through AFTER
-            # `task_acceptance_is_clean` refused the panel, so it cannot mint
-            # `accepted` (reserved for clean acceptance). Reachable: a
-            # reviewer claims `solved` with a MISSING criterion and the
-            # improvement cap spent — nothing actionable, yet not "accepted";
-            # the typed reason names WHY; tier honesty rides `outcome_tier`.
+            # A non-clean panel cannot mint accepted, even when solved lacks a
+            # criterion and no revision remains. Reason/outcome_tier preserve why.
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
             "reason": "no_actionable_changes",
             "source": "task_acceptance_review",

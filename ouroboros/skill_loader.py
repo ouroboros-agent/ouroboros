@@ -23,9 +23,6 @@ from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
 
-
-# Constants
-
 _MANIFEST_NAMES = ("SKILL.md", "skill.json")
 # Only metadata/cache names are skipped. Non-metadata dotfiles remain hashed
 # and reviewed because a skill subprocess can import/source/read them.
@@ -54,14 +51,9 @@ def review_status_allows_execution(status: str) -> bool:
 
 GRANTS_FILENAME = "grants.json"
 SELF_AUTHORED_MARKER_FILENAME = ".self_authored.json"
-# CPL4-C10: every per-skill owner-state document the runtime authors carries
-# the shared ABI-2 stamp on write (review.json, enabled.json, grants.json,
-# review_job.json, owner_attestation.json, accepted_rebuttals.json). Readers
-# keep legacy-0 tolerance: unstamped files are never retrofitted on read.
+# Stamp every authored skill owner-state document (CPL4-C10 / ABI-2);
+# legacy-0 readers never retrofit a stamp on read.
 SKILL_OWNER_STATE_SCHEMA_VERSION = 1
-
-
-# Dataclasses
 
 
 @dataclass
@@ -180,9 +172,6 @@ class _SkillLocationCandidate:
     skill_dir: pathlib.Path
 
 
-# Disk paths
-
-
 def _skills_state_root(drive_root: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / "skills"
 
@@ -261,9 +250,6 @@ def is_self_authored_skill_dir(
         and str(state_data.get("task_id") or "") == str(data.get("task_id") or "")
         and str(state_data.get("created_at") or "") == str(data.get("created_at") or "")
     )
-
-
-# Manifest discovery
 
 
 class _ManifestUnreadable(RuntimeError):
@@ -503,9 +489,6 @@ def compute_content_hash(
             raise SkillPayloadUnreadable(rel, exc) from exc
         file_digests.append((rel, file_digest.digest()))
     return reduce_skill_content_hash(file_digests)
-
-
-# State persistence
 
 
 def load_enabled(drive_root: pathlib.Path, name: str) -> bool:
@@ -923,9 +906,6 @@ def auto_grant_if_enabled(drive_root: pathlib.Path, skill: LoadedSkill) -> AutoG
         requested_permissions=requested_permissions,
         granted_permissions=list(requested_permissions),
     )
-
-
-# Discovery / loading
 
 
 def _safe_listdir(root: pathlib.Path) -> List[pathlib.Path]:
