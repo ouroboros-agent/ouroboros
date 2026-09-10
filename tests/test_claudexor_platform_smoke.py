@@ -58,6 +58,17 @@ def test_managed_fixture_main_rebinds_before_runtime_imports(tmp_path, monkeypat
     assert smoke.main(["--managed-runtime", "--lane", "fixture"]) == 0
 
 
+def test_managed_fixture_uses_short_posix_temp_parent(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(smoke.tempfile, "mkdtemp", lambda **kwargs: calls.append(kwargs) or str(tmp_path))
+    root = smoke.isolated_fixture_root()
+    assert root == tmp_path.resolve()
+    if os.name != "nt" and pathlib.Path("/tmp").is_dir():
+        assert calls == [{"prefix": "cx-", "dir": "/tmp"}]
+    else:
+        assert calls == [{"prefix": "cx-"}]
+
+
 @pytest.mark.parametrize("platform", ["darwin-arm64", "linux-x64", "win32-x64"])
 def test_operator_cli_resolves_exact_bundled_node_without_npm_or_install(tmp_path, monkeypatch, platform):
     from ouroboros import claudexor_runtime as rt, config, platform_layer as pl

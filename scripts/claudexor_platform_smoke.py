@@ -188,6 +188,21 @@ def seed_fixture_repo() -> pathlib.Path:
     return root
 
 
+def isolated_fixture_root() -> pathlib.Path:
+    """Create the managed smoke root where Claudexor's Unix socket can fit.
+
+    macOS caps pathname-based AF_UNIX sockets at a little over 100 bytes.  The
+    runner's default temporary directory can already consume most of that
+    budget, and the managed daemon appends ``data/claudexor/daemon/claudexord.sock``.
+    Keep only this disposable smoke root under the short POSIX temp alias; the
+    product's configured data directory remains untouched.
+    """
+    options = {"prefix": "cx-"}
+    if os.name != "nt" and pathlib.Path("/tmp").is_dir():
+        options["dir"] = "/tmp"
+    return pathlib.Path(tempfile.mkdtemp(**options)).resolve()
+
+
 # ---------------------------------------------------------------------------
 # The seam
 # ---------------------------------------------------------------------------
@@ -958,7 +973,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.managed_runtime:
             # The fixture edits its own legacy custody. It must never attach to
             # an installed daemon or discover the operator's native accounts.
-            isolated = pathlib.Path(tempfile.mkdtemp(prefix="cx-")).resolve()
+            isolated = isolated_fixture_root()
             home = isolated / "home"
             home.mkdir()
             for key in list(os.environ):
