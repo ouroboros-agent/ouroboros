@@ -126,7 +126,7 @@ import {
     applyHistoricalModelExecution,
     cardMetaKeys,
     renderCollapsedActivity,
-    renderLiveCardMeta,
+    renderLiveCardMeta as renderCardMeta,
     ensureLiveActionsEl,
 } from './chat_activity.js';
 
@@ -2089,14 +2089,15 @@ export function createChatInstance({
         return changed;
     }
 
-    // child task_id -> { parentId, role, model } from subagent lifecycle pings. Child
-    // cards mount under the parent, but their phase/terminal state is independent
-    // (a finished child never marks the parent done). Model-less events keep the
-    // previously seen model in the separate metadata line.
+    // Child lineage retains model-less updates; child finality is independent.
     const subagentChildParents = new Map();
-    // Children whose card reached a terminal phase: late non-lifecycle progress
-    // must NOT revive it back to "working".
+    // Late progress must not revive a terminal child.
     const subagentTerminalChildren = new Set();
+
+    function renderLiveCardMeta(record) {
+        return renderCardMeta(record, { agentModel: record?.isSubagent
+            ? subagentChildParents.get(record.groupId)?.model : record?.agentModel });
+    }
 
     function setSubagentParent(childId, { parentId = '', role = '', model = '' } = {}) {
         const prev = subagentChildParents.get(childId) || {};
@@ -2112,6 +2113,7 @@ export function createChatInstance({
             // Write only on change: a rewrite would destroy a selection being copied.
             const next = rec?.isSubagent ? childTitle(rec) : '';
             if (next && rec.titleEl.textContent !== next) rec.titleEl.textContent = next;
+            if (rec?.isSubagent) renderLiveCardMeta(rec);
         }
     }
 

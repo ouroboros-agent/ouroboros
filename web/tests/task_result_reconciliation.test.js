@@ -104,3 +104,27 @@ for (const fresh of [false, true]) test(`pruned model history preserves current 
         assert.match(meta(), fresh ? /Last solve response: current-model/ : /Last solve response: old-fallback/);
     } finally {fx.instance.destroy(); restoreDom(fx.prior);}
 });
+
+for (const external of [false, true]) test(`terminal child retains late lineage model independently of solve evidence: ${external}`, async () => {
+    const fx = makeInstance([]);
+    const child = {chat_id: 1, role: 'assistant', is_progress: true, task_id: 'planner',
+        subagent_task_id: 'planner', parent_task_id: 'root', delegation_role: 'subagent',
+        subagent_role: 'planner', subagent_event: 'scheduled', content: 'queued', model: '',
+        ...(external ? {executor_observation: {task_id: 'planner', task_attempt: '1', run_id: 'run',
+            attempt_id: 'a01', harness_id: 'cursor', phase: 'harness.event', revision: 1}} : {})};
+    try {
+        await fx.instance.refreshHistory({revision: 1});
+        fx.handlers.get('chat')(child);
+        fx.handlers.get('chat')({chat_id: 1, role: 'system', system_type: 'task_summary',
+            task_id: 'planner', subagent_task_id: 'planner', parent_task_id: 'root',
+            delegation_role: 'subagent', subagent_role: 'planner', content: 'Done',
+            task_terminal_status: 'completed',
+            model_execution: {source: 'usable_solve_response', used_model: 'actual-solver', used_local: false}});
+        fx.handlers.get('chat')({...child, subagent_event: 'running', content: 'planning', model: 'google/gemini-3.6-flash'});
+        const card = fx.card('planner');
+        const meta = card.querySelector('[data-live-meta]').innerHTML;
+        assert.match(meta, external ? /Coordinator: gemini-3\.6-flash/ : /Agent model: gemini-3\.6-flash/);
+        assert.match(meta, /Last solve response: actual-solver/);
+        assert.equal(card.dataset.finished, '1', 'late model evidence must not revive the terminal child');
+    } finally {fx.instance.destroy(); restoreDom(fx.prior);}
+});
