@@ -269,6 +269,8 @@ def _run_block_consolidation(
         formatted = _format_entries_for_block(chunk)
         first_ts = str(chunk[0].get("ts", "unknown"))
         last_ts = str(chunk[-1].get("ts", "unknown"))
+        source_hash = hashlib.sha256(json.dumps([identity_text, formatted], ensure_ascii=False).encode("utf-8")).hexdigest()
+        retry = meta.get("consolidation_retry") or {}
 
         content, usage = _create_block_summary(
             llm_client=llm_client,
@@ -277,15 +279,18 @@ def _run_block_consolidation(
             last_ts=last_ts,
             identity_text=identity_text,
             message_count=len(chunk),
+            _retry=retry.get("input_limit") if retry.get("source_sha256") == source_hash else None,
         )
 
-        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            total_usage[key] += usage.get(key, 0)
-        if total_usage["cost"] is not None:
-            if usage.get("cost") is None:
-                total_usage["cost"] = None
-            else:
-                total_usage["cost"] += float(usage["cost"])
+        total_usage = _merge_consolidation_usage(total_usage, usage)
+        meta.pop("consolidation_retry", None)
+        if not content and usage.get("_consolidation_retry"):
+            meta["consolidation_retry"] = {"source_sha256": source_hash, "input_limit": usage["_consolidation_retry"]}
+        if usage.get("_consolidation_errors"):
+            meta["last_consolidation_error"] = dict(
+                usage["_consolidation_errors"][-1], cursor_offset=last_offset + processed,
+                chat_log_signature=segment_sigs[0], message_count=len(chunk),
+            )
 
         if content and content.strip():
             first_date, last_date = first_ts[:10], last_ts[:10]
@@ -308,14 +313,13 @@ def _run_block_consolidation(
             break
 
     if not new_blocks:
-        _advance_cursor(meta, segments, segment_sigs, segment_entries, last_offset + processed)
         atomic_write_json(meta_path, meta)
-        return total_usage if total_usage["prompt_tokens"] or total_usage["completion_tokens"] else None
+        return total_usage
 
     existing_blocks = _load_blocks(blocks_path)
     all_blocks = existing_blocks + new_blocks
 
-    if len(all_blocks) > MAX_SUMMARY_BLOCKS:
+    if len(all_blocks) > MAX_SUMMARY_BLOCKS and content.strip():
         compress_count = min(ERA_COMPRESS_COUNT, len(all_blocks) - 1)
         old_blocks = all_blocks[:compress_count]
         remaining = all_blocks[compress_count:]
@@ -335,17 +339,11 @@ def _run_block_consolidation(
             era, era_usage = _compress_blocks_to_era(
                 old_blocks[run_start:run_end], llm_client, identity_text,
             )
+            total_usage = _merge_consolidation_usage(total_usage, era_usage)
         if era is not None:
             all_blocks = [
                 *old_blocks[:run_start], era, *old_blocks[run_end:], *remaining,
             ]
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                total_usage[key] += era_usage.get(key, 0)
-            if total_usage["cost"] is not None:
-                if era_usage.get("cost") is None:
-                    total_usage["cost"] = None
-                else:
-                    total_usage["cost"] += float(era_usage["cost"])
 
     _write_locked_json(blocks_path, all_blocks)
 
@@ -358,44 +356,121 @@ def _run_block_consolidation(
     return total_usage
 
 
-def _call_consolidation_llm(llm_client: Any, prompt: str, label: str) -> Tuple[str, Dict[str, Any]]:
+def _merge_consolidation_usage(*usages: Dict[str, Any]) -> Dict[str, Any]:
+    """Combine helper usage without turning absent spend/counters into zero."""
+    merged: Dict[str, Any] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cost"):
+        values = [usage.get(key) for usage in usages]
+        merged[key] = None if None in values else sum(values)
+    for key in ("ledger_attempt_ids", "_consolidation_errors"):
+        merged[key] = [value for usage in usages for value in usage.get(key, [])]
+    return merged
+
+
+def _call_consolidation_llm(
+    llm_client: Any, prompt: str, label: str, *, fixed_prompt: str = "",
+    input_limit: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    from contextlib import nullcontext
+    from math import ceil
+    from ouroboros.capability_evidence import is_known
+    from ouroboros.context_budget import SummarizerContextOverflow
+    from ouroboros.context_fit import (
+        _failed_route_evidence, _route_calibration_ratio, estimate_context_prompt_tokens, resolve_context_fit_route,
+    )
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
+    from ouroboros.model_wait import current_model_wait
+
+    facts: Dict[str, Any] = {}
+    invoked = False
+    waiter = current_model_wait()
+
+    def prepare(values: Dict[str, Any]) -> Dict[str, Any]:
+        # Use the same role, captured pin (including Auto), local flag and
+        # observed account as dispatch. Revalidate after an owner route switch.
+        observed = values.pop("_model_observed_route", None)
+        task = {
+            "model": values["model"], "use_local_model": values["use_local"],
+            "model_role": values["model_role"],
+            "credential_profile_id": values["model_account_override"],
+            "model_route": observed,
+        }
+        try:
+            route, evidence = resolve_context_fit_route(task, allow_fetch=False)
+        except Exception:
+            log.debug("Consolidation capacity unavailable; retaining unknown capacity", exc_info=True)
+            route, evidence = _failed_route_evidence(task)
+        density = _route_calibration_ratio(None, evidence.route_fp, route["model"])
+        def measure(text: str) -> int:
+            return ceil(estimate_context_prompt_tokens(
+                [{"role": "user", "content": text}], values["tools"],
+                provider=route["provider"], reasoning_effort=values["reasoning_effort"],
+            ) * density)
+        window = int(evidence.window_tokens) if is_known(evidence, require_fresh=True) else None
+        limit = window - values["max_tokens"] if window is not None else None
+        binding = dict(route_fp=evidence.route_fp, capacity_tokens=window, output_reserve_tokens=values["max_tokens"])
+        byte_limit = (input_limit["input_bytes"] if input_limit
+                      and all(input_limit.get(key) == value for key, value in binding.items()) else None)
+        facts.update(binding, input_tokens=measure(prompt), fixed_tokens=measure(fixed_prompt),
+                     measurement_density=density, input_limit=limit, byte_limit=byte_limit,
+                     input_bytes=len(prompt.encode("utf-8")), fixed_bytes=len(fixed_prompt.encode("utf-8")))
+        if ((limit is not None and facts["input_tokens"] > limit)
+                or (byte_limit is not None and facts["input_bytes"] > byte_limit)):
+            raise SummarizerContextOverflow("Complete consolidation request exceeds the route input capacity")
+        return values
+
     try:
         model, use_local = _consolidation_route()
-        msg, usage = llm_client.chat(
-            messages=[{"role": "user", "content": prompt}],
-            model=model,
-            model_role="light",
-            tools=None,
-            reasoning_effort="low",
-            max_tokens=16384,
-            use_local=use_local,
-        )
-        return msg.get("content", ""), usage
-    except Exception as e:
+        values = dict(messages=[{"role": "user", "content": prompt}], model=model,
+                      model_role="light", tools=None, reasoning_effort="low", max_tokens=16384,
+                      use_local=use_local,
+                      model_account_override=model_role_option(MODEL_ACCOUNTS_KEY, "light"))
+        if waiter:
+            values.update(waiter.overrides.get("light", {}))
+        values = prepare(values)
+        with waiter.register_reprepare("light", prepare) if waiter else nullcontext():
+            invoked = True
+            msg, usage = llm_client.chat(**values)
+        content = msg.get("content") or ""
+        if content.strip():
+            return content, usage
+        kind, message, preflight = "empty_summary", "Consolidation returned no summary", False
+    except Exception as error:
         from ouroboros.llm_claudexor import propagate_model_error
-        propagate_model_error(e)
-        log.error("%s failed: %s", label, e, exc_info=True)
-        return "", {"cost": 0}
+        propagate_model_error(error)
+        from ouroboros.loop_llm_call import classify_llm_exception
+        from ouroboros.transport_custody import _capture_on_chain
+
+        capture = _capture_on_chain(error)
+        preflight = isinstance(error, SummarizerContextOverflow) or not invoked
+        kind = ("context_overflow" if isinstance(error, SummarizerContextOverflow)
+                else "provider_outcome_unknown" if getattr(capture, "state", "") in {"dispatched", "unresolved"}
+                else classify_llm_exception(error).kind)
+        message = str(error)
+        usage = dict(getattr(error, "usage", None) or {})
+        usage.setdefault("cost", None if invoked else 0.0)
+        usage["ledger_attempt_ids"] = list(getattr(error, "ledger_attempt_ids", []))
+    from ouroboros.utils import sanitize_tool_result_for_log
+
+    fact = dict(facts, kind=kind, message=sanitize_tool_result_for_log(message), preflight_only=preflight)
+    log.warning("%s failed (%s): %s", label, kind, fact["message"])
+    return "", {**usage, "_consolidation_errors": [fact]}
 
 
-def _create_block_summary(
-    llm_client: Any,
+def _block_prompt(
     messages_text: str,
     first_ts: str,
     last_ts: str,
     identity_text: str,
     message_count: int,
-) -> Tuple[str, Dict[str, Any]]:
+) -> str:
     first_date = first_ts[:10]
     first_time = first_ts[11:16]
     last_time = last_ts[11:16]
-
-    identity_section = ""
-    if identity_text:
-        identity_section = f"\n## Identity context\n{identity_text}\n"
-
-    prompt = f"""You are a memory consolidator for Ouroboros, a self-modifying AI agent.
-Create a detailed episodic memory entry from these {message_count} messages.
+    identity_section = f"\n## Identity context\n{identity_text}\n" if identity_text else ""
+    return f"""You are a memory consolidator for Ouroboros, a self-modifying AI agent.
+Create a detailed episodic memory entry from the supplied source of {message_count} messages.
+The source may be one contiguous part of the block; summarize only the supplied part.
 
 ## Rules
 1. Header: ### Block: {first_date} {first_time} - {last_time}
@@ -410,7 +485,65 @@ Create a detailed episodic memory entry from these {message_count} messages.
 {messages_text}
 """
 
-    return _call_consolidation_llm(llm_client, prompt, "Block summary LLM call")
+
+def _split_consolidation_text(text: str) -> Optional[Tuple[str, str]]:
+    """Split a source payload near its midpoint without dropping any bytes."""
+    if len(text) < 2:
+        return None
+    midpoint = len(text) // 2
+    radius = max(1, len(text) // 4)
+    before = text.rfind("\n", 1, midpoint + 1)
+    after = text.find("\n", midpoint, len(text) - 1)
+    candidates = [p + 1 for p in (before, after) if p > 0 and abs((p + 1) - midpoint) <= radius]
+    split_at = min(candidates, key=lambda p: abs(p - midpoint)) if candidates else midpoint
+    if not 0 < split_at < len(text):
+        return None
+    return text[:split_at], text[split_at:]
+
+
+def _create_block_summary(
+    llm_client: Any, messages_text: str, first_ts: str, last_ts: str,
+    identity_text: str, message_count: int,
+    _retry: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Summarize a complete logical block, splitting only to fit its Light route.
+
+    Parts cover the source in order without clipping. Any failed/empty part
+    withholds the entire block and its cursor; unknown/control failures never
+    authorize another part. A real refusal lowers the same route's byte limit
+    for remaining parts and the next cycle, independent of density calibration.
+    """
+    pending, summaries, usages = [messages_text], [], []
+    input_limit = _retry
+    def result(content: str) -> Tuple[str, Dict[str, Any]]:
+        return content, {**_merge_consolidation_usage(*usages), "_consolidation_retry": input_limit}
+
+    fixed = _block_prompt("", first_ts, last_ts, identity_text, message_count)
+    while pending:
+        part = pending.pop()
+        prompt = _block_prompt(part, first_ts, last_ts, identity_text, message_count)
+        content, usage = _call_consolidation_llm(
+            llm_client, prompt, "Block summary LLM call", fixed_prompt=fixed, input_limit=input_limit,
+        )
+        usages.append(usage)
+        if content.strip():
+            summaries.append(content.strip())
+            continue
+        failure = usage["_consolidation_errors"][-1]
+        if failure["kind"] != "context_overflow":
+            return result("")
+        if not failure["preflight_only"] and "input_bytes" in failure:
+            input_limit = {key: failure[key] for key in (
+                "route_fp", "capacity_tokens", "output_reserve_tokens",
+            )}
+            input_limit["input_bytes"] = failure["input_bytes"] - 1
+            failure["byte_limit"] = input_limit["input_bytes"]
+        split = _split_consolidation_text(part)
+        if split is None or any(failure.get(limit) is not None and failure[fixed] > failure[limit]
+                                for fixed, limit in (("fixed_tokens", "input_limit"), ("fixed_bytes", "byte_limit"))):
+            return result("")
+        pending.extend(reversed(split))
+    return result("\n\n".join(summaries))
 
 
 def _compress_blocks_to_era(
