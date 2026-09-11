@@ -282,6 +282,53 @@ def test_typing_start_registry_kind_outranks_queue_stamp():
     assert ctx.bridge.calls[0]["kind"] == "ephemeral_decision"
 
 
+def test_typing_start_addresses_the_bound_project_chat(tmp_path):
+    """A task bound to a project AFTER admission keeps its origin chat on the
+    queue row, so the frame must resolve the binding at emission or the
+    indicator types into Main while the work lives in the project room."""
+    from ouroboros.projects_registry import bind_task_to_project
+    from supervisor.events import _handle_typing_start
+
+    binding = bind_task_to_project(
+        tmp_path, "root-bound", "typing-proj", 4242, origin={"absent": "system"}
+    )
+    ctx = SimpleNamespace(
+        bridge=_BridgeProbe(),
+        DRIVE_ROOT=tmp_path,
+        RUNNING={"root-bound": {"task": _root_task("root-bound", chat_id=1)}},
+    )
+    _handle_typing_start(
+        {"type": "typing_start", "chat_id": 1, "task_id": "root-bound", "phase": "thinking"},
+        ctx,
+    )
+
+    assert binding["project_chat_id"] == 4242
+    assert ctx.bridge.calls[0]["chat_id"] == 4242
+    assert ctx.bridge.calls[0]["kind"] == "managed_task"
+
+
+def test_typing_start_addresses_the_bound_project_chat_for_a_direct_turn(tmp_path):
+    """The same binding-first order for a registry-tracked turn, which never
+    appears in the RUNNING table at all."""
+    from ouroboros.projects_registry import bind_task_to_project
+    from supervisor.events import _handle_typing_start
+
+    bind_task_to_project(
+        tmp_path, "turn-bound", "typing-turn-proj", 4343, origin={"absent": "system"}
+    )
+    get_direct_activity_registry().register(
+        "turn-bound", chat_id=1, kind="ephemeral_decision", client_message_id="cmid-4",
+    )
+    ctx = SimpleNamespace(bridge=_BridgeProbe(), DRIVE_ROOT=tmp_path, RUNNING={})
+    _handle_typing_start(
+        {"type": "typing_start", "chat_id": 1, "task_id": "turn-bound", "phase": "thinking"},
+        ctx,
+    )
+
+    assert ctx.bridge.calls[0]["chat_id"] == 4343
+    assert ctx.bridge.calls[0]["kind"] == "ephemeral_decision"
+
+
 # ---------------------------------------------------------------------------
 # Seam 3: the early final answer carries the typed finalizing marker
 # ---------------------------------------------------------------------------
