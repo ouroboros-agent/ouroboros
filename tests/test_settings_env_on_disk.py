@@ -150,6 +150,28 @@ def test_a_disk_authored_key_is_not_projected_back_out_of_a_silent_file(
     assert os.environ["OUROBOROS_CONTEXT_MODE"] == "max"
 
 
+def test_structured_model_settings_keep_json_shape_in_environment(isolated_settings):
+    """UI-shaped model role objects stay parseable after process projection."""
+    from ouroboros import config as cfg
+
+    projected = {}
+    cfg.apply_settings_to_env({
+        "OUROBOROS_MODEL_ACCOUNTS": {"main": "", "fallback": ["work", ""]},
+        "OUROBOROS_MODEL_CONTEXT_WINDOWS": {"main": 131072, "fallback": [0, 65536]},
+    }, environ=projected)
+
+    assert json.loads(projected["OUROBOROS_MODEL_ACCOUNTS"]) == {
+        "fallback": ["work", ""], "main": "",
+    }
+    assert json.loads(projected["OUROBOROS_MODEL_CONTEXT_WINDOWS"]) == {
+        "fallback": [0, 65536], "main": 131072,
+    }
+    parsed, _ = cfg.normalize_model_role_options(
+        cfg.MODEL_ACCOUNTS_KEY, projected["OUROBOROS_MODEL_ACCOUNTS"])
+    assert parsed["fallback"] == ["work", ""]
+    assert "'main'" not in projected["OUROBOROS_MODEL_ACCOUNTS"]
+
+
 def test_install_time_facts_are_disk_only_in_both_directions(isolated_settings, monkeypatch):
     """`ENDPOINT_AUTHORED_SETTINGS` is stricter than the ratchets: those project
     once the file carries them, these never leave disk at all. An environment
