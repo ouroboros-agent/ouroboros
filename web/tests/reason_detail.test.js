@@ -104,7 +104,7 @@ test('an unaccepted decision explains the warning in its own words', () => {
     assert.doesNotMatch(taskReasonDetail(A4), /final_message/);
 });
 
-test('an accepted decision leaves the execution reason line byte-identical', () => {
+test('an accepted decision omits neutral final_message and preserves substantive reasons', () => {
     const accepted = {
         ...A4,
         outcome_axes: {
@@ -112,7 +112,8 @@ test('an accepted decision leaves the execution reason line byte-identical', () 
             review: { status: 'pass', acceptance_decision: { status: 'accepted', rationale: 'Quorum reached.' } },
         },
     };
-    assert.equal(taskReasonDetail(accepted), 'Reason: final_message');
+    assert.equal(taskReasonDetail(accepted), '');
+    assert.equal(taskReasonDetail({ ...accepted, reason_code: 'custom_reason' }), 'Reason: custom_reason');
 });
 
 test('a decision without a rationale states its status alone', () => {

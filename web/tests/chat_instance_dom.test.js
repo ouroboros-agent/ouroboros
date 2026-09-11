@@ -1,196 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
-class ClassList {
-    constructor(node) { this.node = node; this.names = new Set(); }
-    add(...names) { names.forEach((name) => this.names.add(name)); this.sync(); }
-    remove(...names) { names.forEach((name) => this.names.delete(name)); this.sync(); }
-    contains(name) { return this.names.has(name); }
-    toggle(name, force) {
-        const enabled = force === undefined ? !this.names.has(name) : Boolean(force);
-        if (enabled) this.names.add(name); else this.names.delete(name);
-        this.sync();
-        return enabled;
-    }
-    sync() { this.node._className = [...this.names].join(' '); }
-    from(value) { this.names = new Set(String(value || '').split(/\s+/).filter(Boolean)); this.sync(); }
-}
-class ElementStub {
-    constructor(tag = 'div', doc = null) {
-        this.tagName = tag.toUpperCase();
-        this.ownerDocument = doc;
-        this.dataset = {};
-        const styleValues = new Map();
-        this.style = { setProperty: (name, value) => styleValues.set(name, String(value)),
-            getPropertyValue: (name) => styleValues.get(name) || '' };
-        this.attributes = new Map();
-        this.children = [];
-        this.listeners = new Map();
-        this.classList = new ClassList(this);
-        this._className = '';
-        this._innerHTML = '';
-        this._textContent = '';
-        this.value = '';
-        this.hidden = false;
-        this.disabled = false;
-        // Detached until mounted under the connected mount (insertBefore /
-        // innerHTML propagate): a stub that reports every fresh node as
-        // connected hides the history-rebuild card path, whose pass 2 mounts a
-        // replayed root card only when `!rec.root.isConnected`.
-        this.isConnected = false;
-        this.offsetParent = {};
-        this.offsetHeight = 0;
-        this.scrollTop = 0;
-        this.scrollHeight = 0;
-        this.clientHeight = 400;
-    }
-    set className(value) { this.classList.from(value); }
-    get className() { return this._className; }
-    set textContent(value) {
-        this._textContent = String(value ?? '');
-        this._innerHTML = this._textContent
-            .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-    }
-    get textContent() { return this._textContent; }
-    set innerHTML(value) {
-        this._innerHTML = String(value || '');
-        if (!this.ownerDocument) return;
-        this.children = [];
-        for (const match of this._innerHTML.matchAll(/<([a-z0-9-]+)([^>]*)>/gi)) {
-            const node = new ElementStub(match[1], this.ownerDocument);
-            const attrs = match[2];
-            const idMatch = attrs.match(/\sid="([^"]+)"/i);
-            if (idMatch) node.id = idMatch[1];
-            const classMatch = match[0].match(/\sclass="([^"]*)"/i);
-            if (classMatch) node.className = classMatch[1];
-            for (const data of attrs.matchAll(/\sdata-([a-z0-9-]+)(?:="([^"]*)")?/gi)) {
-                const key = data[1].replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
-                node.dataset[key] = data[2] ?? '';
-            }
-            node.parentNode = this;
-            node.parentElement = this;
-            node.isConnected = this.isConnected;
-            this.children.push(node);
-            if (node.id) this.ownerDocument.byId.set(node.id, node);
-        }
-    }
-    get innerHTML() { return this._innerHTML; }
-    addEventListener(type, fn) {
-        if (!this.listeners.has(type)) this.listeners.set(type, []);
-        this.listeners.get(type).push(fn);
-    }
-    removeEventListener() {}
-    setAttribute(name, value) { this.attributes.set(name, String(value)); }
-    getAttribute(name) { return this.attributes.get(name) || ''; }
-    removeAttribute(name) { this.attributes.delete(name); }
-    appendChild(node) { return this.insertBefore(node, null); }
-    append(...nodes) { nodes.forEach((node) => this.appendChild(node)); }
-    prepend(node) { return this.insertBefore(node, this.children[0] || null); }
-    insertAdjacentElement(_position, node) { const list = this.parentNode?.children || []; return this.parentNode?.insertBefore(node, list[list.indexOf(this) + 1] || null); }
-    insertBefore(node, before) {
-        if (node?.isDocumentFragment) {
-            for (const child of [...node.children]) this.insertBefore(child, before);
-            return node;
-        }
-        node.parentNode?.removeChild?.(node);
-        const index = before ? this.children.indexOf(before) : -1;
-        if (index >= 0) this.children.splice(index, 0, node); else this.children.push(node);
-        node.parentNode = this;
-        node.parentElement = this;
-        const connect = (el, value) => { el.isConnected = value; for (const child of el.children || []) connect(child, value); };
-        connect(node, this.isConnected);
-        this.scrollHeight = this.children.length * 20;
-        return node;
-    }
-    removeChild(node) {
-        const index = this.children.indexOf(node);
-        if (index >= 0) this.children.splice(index, 1);
-        node.parentNode = null;
-        node.parentElement = null;
-    }
-    remove() { this.parentNode?.removeChild?.(this); this.isConnected = false; }
-    replaceChildren(...nodes) { this.children = []; nodes.forEach((node) => this.appendChild(node)); }
-    contains(node) {
-        if (node === this) return true;
-        return this.children.some((child) => child.contains(node));
-    }
-    querySelector(selector) {
-        const id = selector.match(/^\[id="([^"]+)"\]$/)?.[1];
-        if (id) return this.ownerDocument?.byId.get(id) || null;
-        const data = selector.match(/^\[data-([a-z0-9-]+)\]$/i)?.[1];
-        if (data) {
-            const key = data.replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
-            return this.children.find((child) => Object.hasOwn(child.dataset, key)) || null;
-        }
-        if (selector === '.typing-bubble') return this.children.find((child) => child.classList.contains('typing-bubble')) || null;
-        if (selector.startsWith('.')) {
-            const className = selector.slice(1).split(/[ :>\[]/)[0];
-            return this.children.find((child) => child.classList.contains(className)) || null;
-        }
-        return null;
-    }
-    querySelectorAll(selector) {
-        if (selector === '[id]') return this.children.filter((child) => child.id);
-        const data = selector.match(/^\[data-([a-z0-9-]+)\]$/i)?.[1];
-        if (data) {
-            const key = data.replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
-            return this.children.filter((child) => Object.hasOwn(child.dataset, key));
-        }
-        if (selector.startsWith('.')) {
-            const className = selector.slice(1).split(/[ :>\[]/)[0];
-            return this.children.filter((child) => child.classList.contains(className));
-        }
-        return [];
-    }
-    closest(selector) {
-        if (selector === '.page.active' && this.classList.contains('page') && this.classList.contains('active')) return this;
-        return this.parentElement?.closest?.(selector) || null;
-    }
-    getBoundingClientRect() { return { top: 0, bottom: 20, left: 0, right: 100, width: 100, height: 20 }; }
-    getClientRects() { return [this.getBoundingClientRect()]; }
-    focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; } click() {}
-}
-function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ active_direct_turns: [] }) })) {
-    const prior = {
-        document: globalThis.document, window: globalThis.window,
-        sessionStorage: globalThis.sessionStorage, fetch: globalThis.fetch,
-        ResizeObserver: globalThis.ResizeObserver,
-        requestAnimationFrame: globalThis.requestAnimationFrame,
-    };
-    const document = {
-        byId: new Map(), hidden: false, activeElement: null,
-        createElement(tag) { return new ElementStub(tag, document); },
-        createDocumentFragment() {
-            const fragment = new ElementStub('#document-fragment', document);
-            fragment.isDocumentFragment = true;
-            return fragment;
-        },
-        getElementById(id) { return document.byId.get(id) || null; },
-        addEventListener() {}, removeEventListener() {},
-    };
-    const mount = new ElementStub('div', document);
-    mount.isConnected = true;
-    document.byId.set('content', mount);
-    const storage = new Map();
-    globalThis.document = document;
-    globalThis.window = {
-        document, location: { href: 'http://local/' }, history: { replaceState() {} },
-        addEventListener() {}, removeEventListener() {}, dispatchEvent() {},
-        getSelection: () => null, innerHeight: 800, CSS: { escape: (value) => value },
-    };
-    globalThis.sessionStorage = {
-        getItem: (key) => storage.get(key) || null,
-        setItem: (key, value) => storage.set(key, String(value)),
-        removeItem: (key) => storage.delete(key),
-    };
-    globalThis.fetch = fetchImpl;
-    globalThis.ResizeObserver = class { observe() {} disconnect() {} };
-    globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
-    return { prior, mount };
-}
-function restoreDom(prior) {
-    Object.assign(globalThis, prior);
-}
+import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
 test('createChatInstance renders a real assistant bubble without senderLabel shadowing', () => {
     const { prior, mount } = installDom();
     const handlers = new Map();
@@ -1179,15 +990,6 @@ test('a stopped direct turn replays its persisted terminal word, never a blanket
 // final row (no progress/lifecycle rows, no task_terminal_status on subagent
 // finals), its grandchildren by task_summary rows.
 // ---------------------------------------------------------------------------
-function walkCard(node, taskId) {
-    if (node?.dataset?.taskId === taskId && node.classList?.contains('chat-live-card')) return node;
-    for (const child of node?.children || []) {
-        const hit = walkCard(child, taskId);
-        if (hit) return hit;
-    }
-    return null;
-}
-
 test('history rebuild keeps a lineage-known branch nested, never appended top-level (#636)', async () => {
     const rows = [
         { chat_id: 2, role: 'user', content: 'run the tree', text: 'run the tree', ts: '2026-09-06T14:00:00Z' },
@@ -1486,4 +1288,106 @@ test('a terminal root settles its still-open child card from the child result (#
         instance?.destroy();
         restoreDom(prior);
     }
+});
+
+// Routing activity has one completion note regardless of delivery order.
+for (const order of ['final-first', 'done-first', 'cold']) {
+    test(`routing activity retains counts/model and one completion note: ${order}`, async () => {
+        const final = { chat_id: 1, role: 'assistant', text: 'Routed to the project.',
+            content: 'Routed to the project.', task_id: 'routing-facts', ts: '2026-09-09T10:00:00Z',
+            task_terminal_status: 'completed', ephemeral_decision: true, tool_calls: 2, rounds: 2,
+            reason_code: 'final_message', outcome_axes: { execution: { status: 'ok' } },
+            model_execution: { source: 'usable_solve_response', requested_model: 'provider/model-a',
+                used_model: 'provider/model-b', reported_model: 'model-b-provider', provider: 'provider', used_local: false } };
+        const done = { ...final, type: 'task_done', status: '', ts: '2026-09-09T10:00:01Z' };
+        const { prior, mount } = installDom(async (url) => ({ ok: true, json: async () =>
+            String(url).startsWith('/api/chat/history') ? { messages: order === 'cold' ? [final] : [] }
+                : { active_direct_turns: [] } }));
+        const handlers = new Map();
+        const ws = { on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+            isConnected: () => true, send() {} };
+        let instance;
+        try {
+            instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                    isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
+            if (order === 'cold') await instance.refreshHistory({ revision: 1 });
+            else {
+                handlers.get('log')({ chat_id: 1, data: { type: 'tool_call_started', task_id: 'routing-facts',
+                    ephemeral_decision: true, tool: 'route_to_project', ts: '2026-09-09T09:59:59Z' } });
+                if (order === 'final-first') handlers.get('chat')(final);
+                handlers.get('log')({ chat_id: 1, data: done });
+                handlers.get('chat')(final);
+            }
+            const card = walkCard(globalThis.document.byId.get('chat-messages'), 'routing-facts');
+            assert.ok(card);
+            assert.equal(card.dataset.finished, '1');
+            assert.equal(card.querySelector('[data-live-title]').textContent, 'Conversation activity');
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, /2 tool calls/);
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
+            if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            const nodes = (node) => [node, ...node.children.flatMap(nodes)];
+            const notes = nodes(card).filter((n) => n.classList.contains('chat-live-line') && n.classList.contains('done'));
+            assert.equal(notes.length, 1);
+            assert.doesNotMatch(card.innerHTML, /Reason: final_message/);
+            handlers.get('log')({ chat_id: 1, data: { type: 'task_cost_finalized', task_id: 'routing-facts',
+                accounted_upper_bound_usd: 1, cost_final: true, cost_accounting_status: 'available' } });
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
+        } finally { instance?.destroy(); restoreDom(prior); }
+    });
+}
+
+for (const source of ['missing', 'failed-read']) {
+    test(`only a complete fresh snapshot and proven missing result make history inert: ${source}`, async () => {
+        const { prior, mount } = installDom(async (url) => String(url).startsWith('/api/tasks/')
+            ? { ok: false, status: source === 'missing' ? 404 : 503, json: async () => ({ error: source }) }
+            : { ok: true, json: async () => ({ active_direct_turns: [] }) });
+        const handlers = new Map();
+        const ws = { on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+            isConnected: () => true, send() {} };
+        let instance;
+        try {
+            instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                    isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
+            handlers.get('typing')({ chat_id: 1, task_id: 'old-root', activity_id: 'old-root', kind: 'managed_task' });
+            handlers.get('chat')({ chat_id: 1, task_id: 'old-root', role: 'assistant', is_progress: true,
+                content: 'Inspecting the old source', ts: '2026-09-09T09:00:00Z' });
+            const card = walkCard(globalThis.document.byId.get('chat-messages'), 'old-root');
+            instance.hydrateStateSnapshot({ active_chat_activities: [], supervisor_ready: true,
+                active_chat_activities_complete: false }, Infinity, 1);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.equal(card.querySelector('[data-live-phase]').hidden, false);
+            instance.hydrateStateSnapshot({ active_chat_activities: [], supervisor_ready: true,
+                active_chat_activities_complete: true }, Infinity, 2);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.equal(card.querySelector('[data-live-phase]').hidden, source === 'missing');
+            assert.equal(card.dataset.finished, '0', 'unavailable is not a fabricated lifecycle outcome');
+            if (source === 'missing') assert.match(card.querySelector('[data-live-meta]').innerHTML, /Outcome unavailable/);
+            handlers.get('typing')({ chat_id: 1, task_id: 'old-root', activity_id: 'old-root', kind: 'managed_task' });
+            assert.equal(card.querySelector('[data-live-phase]').hidden, false, 'fresh live evidence restores activity');
+        } finally { instance?.destroy(); restoreDom(prior); }
+    });
+}
+
+
+test('native terminal replay retains the actual narration as title', async () => {
+    const rows = [
+        { task_id: 'native-title', is_progress: true, text: '💬 still working', ts: '2026-09-09T08:00:00Z', task_terminal_status: 'completed' },
+        { task_id: 'native-title', role: 'assistant', text: 'The report is ready.', ts: '2026-09-09T08:01:00Z' },
+        { task_id: 'native-title', role: 'system', system_type: 'task_summary', text: 'Done.', ts: '2026-09-09T08:02:00Z',
+          tool_calls: 1, rounds: 2, outcome_final: true, outcome_phase: 'done', outcome_axes: { execution: { status: 'ok' } } },
+    ];
+    const { prior, mount } = installDom(async (url) => ({ ok: true, json: async () =>
+        String(url).startsWith('/api/chat/history') ? { messages: rows } : { active_direct_turns: [] } }));
+    const ws = { on() { return () => {}; }, isConnected: () => true, send() {} };
+    let instance;
+    try {
+        instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
+        await instance.refreshHistory({ revision: 1 });
+        const card = walkCard(globalThis.document.byId.get('chat-messages'), 'native-title');
+        assert.equal(card.querySelector('[data-live-title]').textContent, 'still working');
+    } finally { instance?.destroy(); restoreDom(prior); }
 });

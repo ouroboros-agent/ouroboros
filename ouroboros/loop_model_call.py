@@ -447,6 +447,7 @@ def _dispatch_round_model(
         context_fit_plan=plan, overrides=waiter.overrides if waiter else None)
     binding = (waiter.register_reprepare(role, lambda kwargs: _reprepare_waiting_main(ctx, kwargs))
                if waiter is not None else contextlib.nullcontext())
+    previous_call = ctx.accumulated_usage.get("_last_llm_call_meta")
     with binding:
         result = _loop().call_llm_with_retry(
             ctx.llm, ctx.messages, ctx.active_model, ctx.tool_schemas,
@@ -472,6 +473,13 @@ def _dispatch_round_model(
             use_local=ctx.active_use_local, preferred_mode=ctx.active_context_mode,
             tool_schemas=ctx.tool_schemas, model_role=role, model_route=observed,
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
+    call = ctx.accumulated_usage.get("_last_llm_call_meta")
+    execution_id = ctx.accumulated_usage.get("execution_id")
+    if (result[0] is not None and isinstance(call, dict) and call is not previous_call
+            and execution_id and call.get("execution_id") == execution_id
+            and call.get("round_id") == f"{execution_id}:round:{ctx.round_idx}"
+            and call.get("llm_call_id")):
+        call["usable_solve_response"] = True
     return result
 
 

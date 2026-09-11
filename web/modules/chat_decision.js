@@ -6,6 +6,7 @@
 // settles into the plain routing ack line once its dispatch is confirmed.
 import { MAX_DECISION_COMMENT, MAX_QUIZ_OPTIONS } from './api_types.js';
 import { renderRoutingAnnotation, routingOptionLabel } from './chat_activity.js';
+import { createSystemMessageAction } from './ui_helpers.js';
 
 const QUIZ_STATUS_TEXT = {
     open: 'Awaiting answer',
@@ -30,8 +31,153 @@ export function createChatDecision({
     renderMarkdown,
     enhanceMarkdown,
     showToast,
+    fetchDetail = null,
     onDomWrite = (mutate) => mutate(),
+    isMain = false,
+    insertMessageNode = null,
 }) {
+    const observations = new Map();
+    const quizViews = new Map();
+    const pointerViews = new Map();
+    const detailReads = new Map();
+    const questionKey = (taskId, quizId) => JSON.stringify([String(taskId || ''), String(quizId || '')]);
+    let disposed = false;
+    let questionNavigation = 0;
+    function observe(frame) {
+        const key = questionKey(frame.task_id, frame.quiz_id);
+        const previous = observations.get(key);
+        if (!frame.task_id || !frame.quiz_id) return frame;
+        if (previous && previous.state !== 'open' && frame.state === 'open') return previous;
+        if (previous?.state === 'answered' && frame.state === 'expired_terminal') return previous;
+        if (['open', 'answered', 'expired_terminal', 'superseded'].includes(frame.state)) {
+            observations.set(key, { ...previous, ...frame });
+            if (observations.size > 2000) observations.delete(observations.keys().next().value);
+        }
+        return ['answered', 'expired_terminal', 'superseded'].includes(observations.get(key)?.state)
+            ? observations.get(key) : frame;
+    }
+
+    async function readQuestion(taskId, quizId, projectId) {
+        if (!fetchDetail || disposed) return null;
+        if (!detailReads.has(taskId)) {
+            const promise = Promise.resolve().then(() => fetchDetail(taskId))
+                .finally(() => { if (detailReads.get(taskId) === promise) detailReads.delete(taskId); });
+            detailReads.set(taskId, promise);
+        }
+        const detail = await detailReads.get(taskId);
+        const block = detail?.owner_quiz?.[quizId];
+        if (disposed || String(detail?.task_id || detail?.id || '') !== String(taskId)
+            || (projectId && String(detail?.project_id || '') !== String(projectId))
+            || !block || String(block.quiz_id || '') !== String(quizId)
+            || !['open', 'answered', 'expired_terminal', 'superseded'].includes(block.state)) return null;
+        const current = observe({ ...block, task_id: taskId });
+        return { ...block, ...current, task_id: taskId, project_id: detail.project_id,
+            ts: block.asked_at, owner_wait_state: detail.owner_wait?.quiz_id === quizId ? detail.owner_wait.state : '' };
+    }
+
+    async function revealQuestion(taskId, quizId, projectId, chatId, appendQuiz, isVisible, beforeReveal = () => {}) {
+        const navigation = ++questionNavigation;
+        const current = () => !disposed && isVisible() && navigation === questionNavigation;
+        if (!projectId || !taskId || !quizId || !current()) return false;
+        let card = quizViews.get(questionKey(taskId, quizId));
+        if (!card) {
+            try {
+                const question = await readQuestion(taskId, quizId, projectId);
+                if (!current()) return false;
+                if (!question) { showToast('Question unavailable.', 'error'); return false; }
+                onDomWrite(() => appendQuiz({ ...question, chat_id: chatId, type: 'quiz' }));
+                card = quizViews.get(questionKey(taskId, quizId));
+            } catch {
+                if (current()) showToast('Question unavailable.', 'error');
+                return false;
+            }
+        }
+        if (!current() || !card) return false;
+        // An explicit target supersedes any pending restoration of the room's
+        // earlier scroll position; the chat instance owns that restoration.
+        beforeReveal();
+        card.scrollIntoView?.({ block: 'center', behavior: 'auto' });
+        (card.querySelector('.chat-quiz-comment') || card.querySelector('.chat-quiz-question'))?.focus?.({ preventScroll: true });
+        return true;
+    }
+
+    function pointerText(row, state) {
+        const lead = state === 'answered' ? 'Question answered'
+            : ['expired_terminal', 'superseded'].includes(state) ? 'Question expired'
+                : state !== 'open' ? 'Question status unavailable'
+                    : row.owner_wait_state === 'resumed' ? 'Question' : 'Answer needed';
+        return `${lead} in ${row.project_name || 'Project'}`;
+    }
+
+    function updatePointer(view, frame) {
+        const current = observe({ ...frame, state: frame.quiz_state || frame.state });
+        view.row = { ...view.row, ...frame };
+        const state = String(current.state || 'unknown');
+        return onDomWrite(() => {
+            const text = pointerText(view.row, state);
+            const action = state === 'open' ? 'Open question' : 'View question';
+            const changed = view.label.textContent !== text || view.action.textContent !== action
+                || view.card.dataset.state !== state;
+            if (view.label.textContent !== text) view.label.textContent = text;
+            if (view.card.dataset.state !== state) view.card.dataset.state = state;
+            if (view.action.textContent !== action) view.action.textContent = action;
+            return changed;
+        });
+    }
+
+    async function refreshPointer(view) {
+        const { task_id: taskId, quiz_id: quizId, project_id: projectId } = view.row;
+        try {
+            const question = await readQuestion(taskId, quizId, projectId);
+            if (!disposed && pointerViews.get(questionKey(taskId, quizId)) === view) {
+                updatePointer(view, { ...view.row, quiz_state: question?.state || 'unknown',
+                    owner_wait_state: question?.owner_wait_state || '' });
+            }
+        } catch {
+            if (!disposed && pointerViews.get(questionKey(taskId, quizId)) === view)
+                updatePointer(view, { ...view.row, quiz_state: 'unknown' });
+        }
+    }
+
+    function buildQuestionPointer(msg) {
+        if (!msg.task_id || !msg.quiz_id || !msg.project_id || !msg.project_chat_id) return null;
+        const key = questionKey(msg.task_id, msg.quiz_id);
+        const prior = pointerViews.get(key);
+        if (prior) { updatePointer(prior, msg); return null; }
+        const card = document.createElement('div');
+        card.className = 'project-question-pointer';
+        card.dataset.taskId = String(msg.task_id);
+        card.dataset.quizId = String(msg.quiz_id);
+        const label = document.createElement('span');
+        const view = { row: { ...msg }, card, label, action: null };
+        view.action = createSystemMessageAction({ label: 'Open question', onClick: () => {
+            window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: {
+                project: { id: view.row.project_id, name: view.row.project_name, chat_id: view.row.project_chat_id },
+                task_id: view.row.task_id, quiz_id: view.row.quiz_id,
+            } }));
+        } });
+        card.append(label, view.action);
+        const bubble = frameNode(msg, card);
+        bubble.classList.remove('assistant');
+        bubble.classList.add('system');
+        const sender = bubble.querySelector('.sender');
+        if (sender) sender.textContent = 'System';
+        pointerViews.set(key, view);
+        // Initial open delivery can race a closed frame missed by this instance.
+        const state = observations.get(key)?.state || (msg.quiz_state === 'open' && fetchDetail ? 'unknown' : msg.quiz_state);
+        updatePointer(view, { ...msg, quiz_state: state });
+        if (fetchDetail && !['answered', 'expired_terminal', 'superseded'].includes(state)) void refreshPointer(view);
+        return bubble;
+    }
+
+    function appendQuestionPointer(msg) {
+        if (!isMain || !insertMessageNode) return false;
+        return onDomWrite(() => {
+            const bubble = buildQuestionPointer(msg);
+            return bubble ? insertMessageNode(bubble) !== false : false;
+        });
+    }
+
     function normalizeQuiz(msg) {
         const nested = msg && typeof msg.quiz === 'object' && msg.quiz ? msg.quiz : null;
         const src = nested || msg || {};
@@ -40,7 +186,8 @@ export function createChatDecision({
         // Filtering instead would silently shift option_index against the
         // producer's original list — a wrong answer, not a degraded card.
         const raw = Array.isArray(src.options) ? src.options : [];
-        const normalized = raw.map((option) => (typeof option === 'string' ? { label: option } : option));
+        const normalized = raw.map((option, index) => (typeof option === 'string'
+            ? { label: option, ...(src.option_details?.[index] ? { detail: src.option_details[index] } : {}) } : option));
         const corrupt = normalized.some(
             (option) => !option || typeof option !== 'object' || !String(option.label || '').trim());
         const options = corrupt ? [] : normalized.slice(0, MAX_QUIZ_OPTIONS);
@@ -59,6 +206,7 @@ export function createChatDecision({
             // merges them from the projection). With no answeredIndex they
             // ARE the answer, not a remark beside one.
             comment: String(src.comment || ''),
+            detailsUnavailable: src.option_details === undefined && raw.every((option) => typeof option === 'string'),
         };
     }
 
@@ -162,6 +310,10 @@ export function createChatDecision({
 
     function setCardState(card, state, answeredIndex) {
         if (!card) return false;
+        const current = observe({ task_id: card.dataset.taskId, quiz_id: card.dataset.quizId,
+            state, answered_index: answeredIndex, comment: card.dataset.ownerComment || '' });
+        state = current.state;
+        answeredIndex = Number.isInteger(current.answered_index) ? current.answered_index : null;
         return onDomWrite(() => {
             let changed = card.dataset.state !== state;
             if (changed) card.dataset.state = state;
@@ -200,10 +352,34 @@ export function createChatDecision({
     function buildQuizCard(msg) {
         const quiz = normalizeQuiz(msg);
         if (!quiz.quizId || !quiz.taskId || !quiz.question || quiz.options.length < 2) return null;
+        const key = questionKey(quiz.taskId, quiz.quizId);
+        const current = observe({ task_id: quiz.taskId, quiz_id: quiz.quizId, state: quiz.state,
+            answered_index: quiz.answeredIndex, comment: quiz.comment });
+        quiz.state = current.state;
+        quiz.answeredIndex = Number.isInteger(current.answered_index) ? current.answered_index : null;
+        quiz.comment = current.comment || '';
+        const existing = quizViews.get(key);
+        if (existing) {
+            if (quiz.comment) existing.dataset.ownerComment = quiz.comment;
+            if (!quiz.detailsUnavailable) {
+                existing.querySelectorAll('.chat-quiz-option').forEach((button, index) => {
+                    const detail = quiz.options[index]?.detail;
+                    if (detail && !button.querySelector('.chat-quiz-option-detail')) {
+                        const line = document.createElement('span');
+                        line.className = 'chat-quiz-option-detail'; line.textContent = detail; button.append(line);
+                    }
+                });
+                existing.querySelector('.chat-quiz-details-unavailable')?.remove();
+            }
+            setCardState(existing, quiz.state, quiz.answeredIndex);
+            return null;
+        }
 
         const card = document.createElement('div');
         card.className = 'chat-quiz-card';
         card.dataset.quizId = quiz.quizId;
+        card.dataset.taskId = quiz.taskId;
+        quizViews.set(key, card);
 
         const head = document.createElement('div');
         head.className = 'chat-quiz-head';
@@ -225,6 +401,7 @@ export function createChatDecision({
         // so chat rendering improvements reach the card automatically.
         const question = document.createElement('div');
         question.className = 'chat-quiz-question';
+        question.tabIndex = -1;
         if (renderMarkdown) question.innerHTML = renderMarkdown(quiz.question);
         else question.textContent = quiz.question;
         card.append(question);
@@ -269,6 +446,12 @@ export function createChatDecision({
             optionsBox.append(btn);
         });
         card.append(optionsBox);
+        if (quiz.detailsUnavailable) {
+            const note = document.createElement('div');
+            note.className = 'chat-quiz-stake chat-quiz-details-unavailable';
+            note.textContent = 'Option details were not retained for this older question.';
+            card.append(note);
+        }
 
         // Free answer: none of the options may fit, and the owner must not be
         // forced to pick the least wrong one. Always visible while the card is
@@ -497,9 +680,14 @@ export function createChatDecision({
         // The card is found by identity, never appended: state changes must
         // not create a second card (the quiz frame dedupe is id+ts keyed).
         const quizId = String(frame && frame.quiz_id || '');
-        if (!quizId || !rootNode) return false;
-        const card = rootNode.querySelector(`.chat-quiz-card[data-quiz-id="${CSS.escape(quizId)}"]`);
-        if (!card) return false;
+        const taskId = String(frame && frame.task_id || '');
+        if (!quizId || !taskId || !rootNode) return false;
+        frame = observe(frame);
+        const key = questionKey(taskId, quizId);
+        const pointer = pointerViews.get(key);
+        const changed = pointer ? updatePointer(pointer, frame) : false;
+        const card = quizViews.get(key);
+        if (!card) return changed;
         const index = Number.isInteger(frame.answered_index) ? frame.answered_index : null;
         // The owner's recorded free-text answer rides the frame (#471) so the
         // live card shows `Owner's answer:` exactly as the replayed card does.
@@ -507,8 +695,18 @@ export function createChatDecision({
         // lifecycle frame (expired/superseded) carries no comment.
         const comment = String(frame.comment || '');
         if (comment) card.dataset.ownerComment = comment;
-        return setCardState(card, String(frame.state || ''), index);
+        return setCardState(card, String(frame.state || ''), index) || changed;
     }
 
-    return { buildQuizCard, setCardState, applyQuizStateFrame, renderRoutingDecision };
+    return { buildQuizCard, buildQuestionPointer, appendQuestionPointer, readQuestion, revealQuestion, setCardState, applyQuizStateFrame, renderRoutingDecision,
+        refreshQuestions: () => Promise.all([...pointerViews.values()]
+            .filter((view) => !['answered', 'expired_terminal', 'superseded'].includes(view.card.dataset.state))
+            .map(refreshPointer)),
+        resetViews(rows = []) {
+            const keep = new Set(rows.map((row) => questionKey(row.task_id, row.quiz_id || row.quiz?.quiz_id)));
+            for (const key of observations.keys()) if (!keep.has(key)) observations.delete(key);
+            quizViews.clear(); pointerViews.clear();
+        },
+        destroy() { disposed = true; observations.clear(); quizViews.clear(); pointerViews.clear(); detailReads.clear(); },
+    };
 }

@@ -996,7 +996,7 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                         }"""
                     )
                     assert geometry["title"]["lines"] <= 2.2, geometry
-                    assert geometry["activity"]["lines"] <= 2.2, geometry
+                    assert geometry["activity"]["lines"] <= 3.2, geometry
                     assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
                     named_meta = named.locator('[data-live-meta]').inner_text().split()
                     # Final ledger: the plain amount, never the open-ledger ceiling.
@@ -1030,14 +1030,12 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                     assert bands["named-act"]["finished"] is True, bands
                     assert bands["unnamed-act"]["finished"] is False, bands
                     assert bands["running-act"]["finished"] is False, bands
-                    for slot, low in (("title", 0.9), ("activity", 1.9)):
-                        heights = [bands[task_id][slot]["height"] for task_id in bands]
-                        assert max(heights) - min(heights) <= 1, bands
-                        assert all(low <= bands[task_id][slot]["lines"] <= low + 0.3 for task_id in bands), bands
-                    assert bands["unnamed-act"]["activity"]["display"] != "none", bands
-                    assert bands["unnamed-act"]["activity"]["visibility"] == "hidden", bands
-                    # D23 (owner, 2026-09-02): a FINISHED card folds an empty activity
-                    # band; a running card keeps the two-line reserve (31.08 seam).
+                    assert all(0.9 <= bands[task_id]["title"]["lines"] <= 1.2 for task_id in bands), bands
+                    assert 2.9 <= bands["named-act"]["activity"]["lines"] <= 3.2, bands
+                    assert 0.9 <= bands["running-act"]["activity"]["lines"] <= 1.2, bands
+                    assert bands["unnamed-act"]["activity"]["display"] == "none", bands
+                    # Useful root activity sizes naturally up to three lines; empty activity
+                    # reserves no band on either running or finished cards.
                     _emit_ws_frame(page, {
                         "type": "chat", "role": "assistant", "is_progress": True,
                         "chat_id": 1, "task_id": "done-empty", "suggested_name": "Quick task",
@@ -2366,6 +2364,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
             messageWidth: usableMessageWidth,
             rootWidth: root.getBoundingClientRect().width,
             deepestWidth: deepest.getBoundingClientRect().width,
+            rootMainTop: main.top,
             rootMainBottom: main.bottom,
             rootSideTop: side.top,
             rootSideBottom: side.bottom,
@@ -2390,13 +2389,19 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         assert facts["rootWidth"] - facts["deepestWidth"] <= 40, facts
         # Narrow regime: the side controls share the chip row, the title takes its own
         # full-width row below both.
-        assert facts["rootSideTop"] < facts["rootMainBottom"], facts
+        # Main and side controls start on one flex row. A terminal projection may
+        # make the main box zero-height; their shared top still distinguishes it
+        # from a real wrap, whose row gap would move the side down.
+        assert abs(facts["rootSideTop"] - facts["rootMainTop"]) <= 1, facts
         assert facts["rootTitleTop"] >= max(facts["rootMainBottom"], facts["rootSideBottom"]) - 1, facts
         assert all(card["scrollWidth"] <= card["clientWidth"] + 1 for card in facts["cardFacts"]), facts
         assert min(card["titleWidth"] for card in facts["cardFacts"]) >= 160, facts
         assert 0.9 <= min(card["titleLines"] for card in facts["cardFacts"]), facts
         assert max(card["titleLines"] for card in facts["cardFacts"]) <= 2.2, facts
-        assert max(card["activityLines"] for card in facts["cardFacts"]) <= 2.2, facts
+        assert max(card["activityLines"] for card in facts["cardFacts"]
+                   if not card["collapsedChild"]) <= 3.2, facts
+        assert max(card["activityLines"] for card in facts["cardFacts"]
+                   if card["collapsedChild"]) <= 1.2, facts
         # #623: a collapsed child keeps its identity row — the title beside the
         # chip, the summary at most two bands (the side wraps under only when a
         # 160px title cannot share the row), never a third band for the title.
@@ -2406,7 +2411,9 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert card["summaryBottom"] - card["mainTop"] <= 2.2 * card["titleHeight"] + 8, card
         assert all(card["activityTitle"] is None for card in facts["cardFacts"]), facts
         deepest = page.locator('.chat-live-card[data-task-id="layout-child-10"]')
-        assert "pty-tests · gemini-3.6-flash" in deepest.inner_text()
+        assert deepest.locator(':scope > .chat-live-summary-button [data-live-title]').inner_text() == "pty-tests"
+        assert "Agent model: gemini-3.6-flash" in deepest.locator(
+            ':scope > .chat-live-summary-button [data-live-meta]').inner_text()
         deepest.locator(":scope > [data-live-summary-button]").click()
         line_toggle = deepest.locator(":scope > [data-live-timeline] .chat-live-line-toggle").last
         line_toggle.wait_for(state="visible", timeout=5_000)
@@ -2421,13 +2428,14 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                     lineClient: line.clientWidth,
                     lineScroll: line.scrollWidth,
                     titleWidth: title.getBoundingClientRect().width,
+                    titleScrollWidth: title.scrollWidth,
                     text: line.innerText,
                 };
             }"""
         )
         assert expanded["cardScroll"] <= expanded["cardClient"] + 1, expanded
         assert expanded["lineScroll"] <= expanded["lineClient"] + 1, expanded
-        assert expanded["titleWidth"] >= 150, expanded
+        assert expanded["titleWidth"] >= min(expanded["titleScrollWidth"], 150) - 1, expanded
         assert long_url in expanded["text"], expanded
 
     def assert_jump_geometry(page, scope_selector, *, require_overflow=True):
@@ -2552,14 +2560,13 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert wide_facts[2]["left"] - wide_facts[1]["left"] >= 30, wide_facts
                 assert all(card["scroll"] <= card["client"] + 1 for card in wide_facts), wide_facts
                 for card in wide_facts[:2]:
-                    assert min(card["mainBottom"], card["sideBottom"]) \
-                        > max(card["mainTop"], card["sideTop"]), wide_facts
+                    assert abs(card["mainTop"] - card["sideTop"]) <= 1, wide_facts
                 # #623: the depth-2 collapsed child is in the 560px container regime
                 # (wrap allowed) yet keeps ONE identity row: chip, title, side controls.
                 deep = wide_facts[2]
                 assert deep["wrap"] == "wrap", wide_facts
                 assert abs(deep["titleTop"] - deep["mainTop"]) <= 4, wide_facts
-                assert deep["sideTop"] < deep["mainBottom"], wide_facts
+                assert abs(deep["mainTop"] - deep["sideTop"]) <= 1, wide_facts
 
                 # The 620-700px column (laptop with the project panel open): the root
                 # card takes up to 620px there and keeps its single-row header.
@@ -2662,6 +2669,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                             cardScroll: card.scrollWidth,
                             titleWidth: title.width,
                             titleTop: title.top,
+                            mainTop: main.top,
                             mainBottom: main.bottom,
                             sideTop: side.top,
                             sideBottom: side.bottom,
@@ -2672,7 +2680,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert panel_facts["cardWidth"] >= panel_facts["panelWidth"] * 0.9, panel_facts
                 assert panel_facts["cardScroll"] <= panel_facts["cardClient"] + 1, panel_facts
                 assert panel_facts["titleWidth"] >= 180, panel_facts
-                assert panel_facts["sideTop"] < panel_facts["mainBottom"], panel_facts
+                assert abs(panel_facts["mainTop"] - panel_facts["sideTop"]) <= 1, panel_facts
                 assert panel_facts["titleTop"] >= max(panel_facts["mainBottom"], panel_facts["sideBottom"]) - 1, panel_facts
                 assert_jump_geometry(
                     wide, "#panel-pchat-layout-project", require_overflow=False

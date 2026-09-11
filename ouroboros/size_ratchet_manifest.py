@@ -224,6 +224,7 @@ BAND_PATHS = {
     "tests/test_workspace_write_shape.py": "Upstream's write-shape suite grew with the per-segment target rows and effective-cwd cases; kept one focused suite over the one shell-guard policy it pins.",
     "tests/ui_chat_viewport_smoke.py": "Entered the band from 992 lines: the terminal-summary shrink bound gained its calibration rationale for the owner-approved 16px chat scale (frontend sprint 2026-09-01).",
     "web/modules/api_types.js": "The shared browser contract module now includes issue 265 publication-preflight types alongside the target settings and subagent contracts.",
+    "web/modules/chat_activity.js": "Existing task activity renderer consumes the shared quota/auth wait state; no parallel task card or lifecycle.",
     "web/modules/harness_accounts.js": None,
     "web/modules/log_events.js": None,
     "web/modules/onboarding_wizard.js": "Shrank INTO the band: the Claude Runtime onboarding card and its /api/claude-code/* polling were deleted with the retired transport (owner-approved Q4); no new content was added.",
@@ -247,5 +248,5 @@ BYTE_BASELINE_DEBT = {
 
 BYTE_DEBT = {
     "tests/test_devtools_benchmarks.py": 327840,
-    "web/modules/chat.js": 205865,
+    "web/modules/chat.js": 205837,
 }

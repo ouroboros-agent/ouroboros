@@ -101,8 +101,10 @@ test('direct API is a neutral channel presentation, never a harness identity', (
 
 test('Chat renders the executor evidence chip through the shared identity SSOT', () => {
     const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+    const activitySource = readFileSync(new URL('../modules/chat_activity.js', import.meta.url), 'utf8');
     const logSource = readFileSync(new URL('../modules/log_events.js', import.meta.url), 'utf8');
-    assert.match(chatSource, /executorIdentityMarkup\(record\.executorChip/);
+    assert.match(chatSource, /renderLiveCardMeta/);
+    assert.match(activitySource, /executorIdentityMarkup\(record\.executorChip/);
     const identitySource = readFileSync(new URL('../modules/harness_presentation.js', import.meta.url), 'utf8');
     assert.match(identitySource, /harnessIdentityMarkup\(chip\.harness/);
     assert.match(logSource, /harnessPresentation\(harness\)\.label/);
@@ -245,10 +247,10 @@ test('configured identity ignores stale daemon labels until the catalog read is 
 });
 
 test('Chat, Logs, onboarding, and reviewer lanes consume the same mark owner', () => {
-    const modules = ['chat.js', 'logs.js', 'onboarding_agents_step.js', 'reviewer_slots.js'];
+    const modules = ['chat_activity.js', 'logs.js', 'onboarding_agents_step.js', 'reviewer_slots.js'];
     for (const name of modules) {
         const source = readFileSync(new URL(`../modules/${name}`, import.meta.url), 'utf8');
-        assert.match(source, name === 'chat.js' ? /executorIdentityMarkup/ : /harnessIdentityMarkup/, `${name} bypasses harness presentation SSOT`);
+        assert.match(source, name === 'chat_activity.js' ? /executorIdentityMarkup/ : /harnessIdentityMarkup/, `${name} bypasses harness presentation SSOT`);
     }
     const events = readFileSync(new URL('../modules/log_events.js', import.meta.url), 'utf8');
     assert.match(events, /harnessPresentation/);

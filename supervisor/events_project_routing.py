@@ -30,6 +30,22 @@ def _events():
     return events
 
 
+def _routing_project_address(ctx: Any, target: str, status: str) -> Dict[str, Any]:
+    """Navigation address from the successful destination's registered binding."""
+    if not target or status not in {"scheduled", "delivered"}:
+        return {}
+    try:
+        from ouroboros.projects_registry import get_project, project_binding_for_task
+
+        binding = project_binding_for_task(ctx.DRIVE_ROOT, target) or {}
+        project = get_project(ctx.DRIVE_ROOT, str(binding.get("project_id") or ""))
+        if project and project.get("chat_id") and project.get("lifecycle") not in {"deleting", "deleted"}:
+            return {"project_id": project["id"], "project_chat_id": int(project["chat_id"])}
+    except Exception:
+        log.debug("Routing destination projection unavailable", exc_info=True)
+    return {}
+
+
 def _emit_routing_receipt(
     ctx: Any,
     evt: Dict[str, Any],
@@ -52,6 +68,7 @@ def _emit_routing_receipt(
     client_message_id = str(evt.get("client_message_id") or "").strip()
     routing_token = str(evt.get("routing_token") or "").strip()
     annotation_status = "not_applicable"
+    project_address = _routing_project_address(ctx, target, status)
     if client_message_id:
         try:
             from ouroboros.project_dialogue import append_chat_annotation
@@ -70,6 +87,7 @@ def _emit_routing_receipt(
                     detail=detail,
                     options=options,
                     attachment_manifest=attachment_manifest,
+                    **project_address,
                 )
                 else "failed"
             )
@@ -141,6 +159,7 @@ def _publish_routing_ack(
                 "target": target,
                 "target_label": target_label,
                 "status": status,
+                **_routing_project_address(ctx, target, status),
             }
             if options is not None:
                 ack_kwargs["options"] = options

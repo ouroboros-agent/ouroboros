@@ -3038,6 +3038,11 @@ SPA, not a relocatable-page or multi-instance panel framework.
   Render the projected chip/model facts through
   `harness_presentation.js::executorIdentityMarkup`; keep execution-evidence
   selection in `log_events.js` and avoid a second label builder in Chat.
+- Preserve task-owned model-call provenance through result storage, copy-back
+  and terminal/history rendering. Show the last usable solve response separately
+  from initial routing, executor observations and final-answer authorship;
+  post-task or cost-only updates cannot erase it. Fan-out counters describe
+  emissions and wall-clock intervals, never inferred execution waves.
 - Chat viewport invariant: sample live-edge intent before an ordinary
   transcript mutation — native scroll anchoring is not proof the owner's
   visible message stays stable, so focused regressions disable it. Follow

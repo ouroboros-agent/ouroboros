@@ -8,6 +8,7 @@ import {
     taskCostMeta,
     taskCostProjection,
 } from '../modules/chat.js';
+import { renderLiveCardMeta } from '../modules/chat_activity.js';
 import { costBucketPresentation, costDashboardPresentation } from '../modules/costs.js';
 import { summarizeLogEvent } from '../modules/log_events.js';
 import {
@@ -300,7 +301,18 @@ test('a cost-only frame never moves the card’s activity clock', () => {
     // freshly active. Pinned at source: the meta line reads the activity clock, and
     // only a human/activity-bearing frame advances it.
     const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(source, /record\.latestActivityTs \? `updated \$\{record\.latestActivityTs\}`/);
+    const priorDocument = globalThis.document;
+    globalThis.document = { createElement: () => ({ textContent: '', get innerHTML() { return this.textContent; } }) };
+    try {
+        const record = { latestActivityTs: '10:04', metaEl: { innerHTML: '', isConnected: true },
+            costMeta: { meta: ['$1.00'] } };
+        renderLiveCardMeta(record);
+        assert.match(record.metaEl.innerHTML, /updated 10:04/);
+        record.costMeta = { meta: ['$2.00'] };
+        renderLiveCardMeta(record);
+        assert.match(record.metaEl.innerHTML, /updated 10:04/);
+        assert.match(record.metaEl.innerHTML, /\$2\.00/);
+    } finally { globalThis.document = priorDocument; }
     assert.match(source, /if \(ts && \(summary\.human \|\| activityCandidate\)\) record\.latestActivityTs = ts/);
 });
 

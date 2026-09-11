@@ -116,11 +116,12 @@ test('the live progress path forwards every progress field the endpoint emits an
     // a whitelist, and a whitelist silently drops whatever it forgot — which is how
     // a chip came back on reload and was missing while the task ran.
     const chat = moduleFile('chat.js');
+    const activity = moduleFile('chat_activity.js');
     const DELEGATION_KEYS = ['executor_route', 'execution_evidence', 'actual_substrate', 'executor_observation'];
-    const carry = chat.match(/const CARD_META_KEYS = \[([^\]]+)\]/)?.[1];
+    const carry = activity.match(/const CARD_META_KEYS = \[([^\]]+)\]/)?.[1];
     assert.ok(carry, 'shared card carry list must exist');
     const carried = new Set([...carry.matchAll(/'([a-z_]+)'/g)].map(m => m[1]));
-    assert.match(chat, /return Object.fromEntries\(CARD_META_KEYS.map\(\(key\) => \[key, src\?\.\[key\]\]\)\)/);
+    assert.match(activity, /return Object.fromEntries\(CARD_META_KEYS.map\(\(key\) => \[key, src\?\.\[key\]\]\)\)/);
     const forwardedFields = (chunk) => {
         assert.match(chunk, /\.\.\.cardMetaKeys\((msg|evt)\)/, 'both wire seams use the same carry owner');
         return carried;

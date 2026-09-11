@@ -390,6 +390,10 @@ def run_llm_loop(
     invalidate_task_cache_splits(task_id or getattr(ctx, "task_id", ""))  # rebuilt attempt = new prefix
     max_retries = 3
     saved = load_owner_wait(ctx)
+    if not saved:
+        accumulated_usage["initial_model_request"] = {
+            "model": active_model, "use_local": active_use_local,
+        }
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
     if cost_ceiling.root_cap_usd is not None:
         # A resumed/late-started tree member must see tree spend before its

@@ -219,21 +219,20 @@ test('the collapsed activity line is plain text: the renderer\'s markdown invent
     assert.equal(plainActivityText('#### Deep\n``x → y`` tail'), 'Deep —\nx → y tail');
     assert.equal(plainActivityText('```js\nlet a = 1;\n```'), 'let a = 1;');
     assert.equal(boundActivityPreview('| a | b |\n|---|---|\n| 1 | 2 |'), 'a b 1 2');
-    // Markers-only text keeps its source: an empty projection would flip the
-    // reserved activity band's :empty rules on the card.
+    // Markers-only text keeps its source: an empty projection would hide the
+    // card's activity band.
     assert.equal(plainActivityText('---'), '---');
-    // Whitespace-only narration projects to nothing: the band's :empty rules
-    // (reserve while running, fold when finished) need a truly empty node.
+    // Whitespace-only narration projects to nothing so :empty hides the band.
     assert.equal(boundActivityPreview(' \n\t '), '');
     assert.equal(plainActivityText(''), '');
     // Composition: the bound preview is built on the plain projection.
     assert.equal(boundActivityPreview('  **Reading**\n  the   ledger  '), 'Reading the ledger');
 });
 
-test('twins are two children of one parent with the same role and model', () => {
+test('twins share one parent and displayed role while model stays metadata', () => {
     const children = new Map([
         ['a', { parentId: 'p', role: 'scout', model: 'gemini-3.6-flash' }],
-        ['b', { parentId: 'p', role: 'scout', model: 'gemini-3.6-flash' }],
+        ['b', { parentId: 'p', role: 'scout', model: 'openai/gpt-5.6-sol' }],
         ['c', { parentId: 'p', role: 'reviewer', model: 'gemini-3.6-flash' }],
         ['d', { parentId: 'q', role: 'scout', model: 'gemini-3.6-flash' }],
     ]);
@@ -242,13 +241,13 @@ test('twins are two children of one parent with the same role and model', () => 
     assert.equal(subagentTwin(children, 'c'), false);
     assert.equal(subagentTwin(children, 'd'), false);
     assert.equal(subagentTwin(children, 'missing'), false);
-    // The collision key is the DISPLAYED identity: equivalent model spellings and the
-    // roleless fallback collide exactly when the headlines read the same.
+    // The collision key is the displayed headline; a roleless child and an
+    // explicitly named Subagent therefore collide even with different models.
     const spelled = new Map([
         ['e', { parentId: 'p', role: 'scout', model: 'openai/gpt-5.6-sol' }],
         ['f', { parentId: 'p', role: 'scout', model: 'openai::gpt-5.6-sol' }],
         ['g', { parentId: 'p', role: '', model: 'gpt-5.6-sol' }],
-        ['h', { parentId: 'p', role: 'Subagent', model: 'gpt-5.6-sol' }],
+        ['h', { parentId: 'p', role: 'Subagent', model: 'other-model' }],
     ]);
     assert.equal(subagentTwin(spelled, 'e'), true);
     assert.equal(subagentTwin(spelled, 'f'), true);

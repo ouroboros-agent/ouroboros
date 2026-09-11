@@ -113,19 +113,19 @@ def _emit_swarm_fanout(
     objective: str,
     emitted_live: bool,
 ) -> None:
-    """Emit one durable swarm_fanout telemetry event per spawn wave (WS8).
+    """Emit one durable swarm_fanout telemetry event per fan-out emission.
 
     The name avoids task_/llm_/tool_ prefixes and the event sets no
     delegation_role/subagent_task_id, so the Logs UI never renders a phantom
     child card or folds it into a grouped-task lane (web/modules/log_events.js).
-    inter_wave_latency_sec reuses ``_last_wave_ts`` under the emit lock (no new
+    fanout_interval_sec reuses ``_last_fanout_ts`` under the emit lock (no new
     persistent state).
     """
     now = time.time()
     with _SCHEDULE_EMIT_LOCK:
-        prev = float(getattr(ctx, "_last_wave_ts", 0.0) or 0.0)
-        inter_wave = round(now - prev, 3) if prev > 0 else None
-        setattr(ctx, "_last_wave_ts", now)
+        prev = float(getattr(ctx, "_last_fanout_ts", 0.0) or 0.0)
+        fanout_interval = round(now - prev, 3) if prev > 0 else None
+        setattr(ctx, "_last_fanout_ts", now)
     evt = {
         "ts": utc_now_iso(),
         "type": "swarm_fanout",
@@ -138,14 +138,14 @@ def _emit_swarm_fanout(
         "task_ids": task_ids,
         "role": role,
         # The REQUEST. What the children actually ran on is a per-child DISPATCH
-        # fact and lives on each child's own record — a wave event written before
+        # fact and lives on each child's own record — a fan-out event written before
         # any child started cannot know it, and `effective_model_lanes` used to
         # claim it anyway.
         "requested_model_lane": requested_model_lane,
         "slot_count": len(task_ids),
         "objective_preview": objective[:200],
         "emitted_live": bool(emitted_live),
-        "inter_wave_latency_sec": inter_wave,
+        "fanout_interval_sec": fanout_interval,
     }
     try:
         append_jsonl(ctx.drive_logs() / "events.jsonl", evt)

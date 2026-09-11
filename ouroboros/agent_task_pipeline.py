@@ -54,6 +54,7 @@ from ouroboros.post_task_checkpoint import (
 from ouroboros.skill_publish_result import apply_skill_publish_receipt_veto
 from ouroboros.task_finalization import (
     build_sealed_final_package,
+    model_execution_projection,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
     deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed, stamp_root_final_phase,
     sealed_final_prompt_section, terminal_result_fields, terminal_notice_text,  # noqa: F401 -- the pipeline module keeps its historical import surface for the synthesis leaf
@@ -480,11 +481,10 @@ def emit_task_results(
     actor_fact, usage, llm_trace = actor_first_terminal_projection(ctx, task, usage, llm_trace, task.get("budget_drive_root") or getattr(env, "drive_root", None))
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
     receipt_root = pathlib.Path(str(getattr(env, "drive_root", None) or "."))
-    receipt_rows = task_verification_receipts(ctx, receipt_root, task)
     # Apply FR3 once so events and the durable result share the same flagged outcome.
     apply_receipt_absent_flag(
         loop_outcome, llm_trace, receipt_root, str(task.get("id") or ""),
-        expected_output=str(task.get("expected_output") or ""), receipts=receipt_rows,
+        expected_output=str(task.get("expected_output") or ""), receipts=task_verification_receipts(ctx, receipt_root, task),
     )
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
@@ -501,9 +501,11 @@ def emit_task_results(
         str(getattr(ctx, "_typed_routing_action_emitted", "") or "").strip()
     )
     _message_meta = subagent_message_meta(task, task_id=str(task.get("id") or ""))
+    n_tool_calls = len(llm_trace.get("tool_calls", []))
     if _ephemeral:
         _message_meta.update(ephemeral_decision=True, outcome_axes=outcome_axes,
-                             reason_code=reason_code)
+                             reason_code=reason_code, tool_calls=n_tool_calls,
+                             rounds=int(usage.get("rounds") or 0))
     send_event = {
         "type": "send_message", "chat_id": task["chat_id"],
         "text": text or "\u200b", "log_text": text or "",
@@ -517,7 +519,6 @@ def emit_task_results(
     send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, ephemeral=_ephemeral, presence=_presence)
     pending_events.append(build_presence_result_event(task, text, ctx, provider_notice=terminal_notice_text(usage)) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
-    n_tool_calls = len(llm_trace.get("tool_calls", []))
     n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
                         if isinstance(tc, dict) and tc.get("is_error"))
     try:
@@ -638,6 +639,8 @@ def emit_task_results(
         # managed-task controls (including "Turn into project").
         "ephemeral_decision": _ephemeral,
         **({"typed_routing_action": _typed_routing_action} if _ephemeral and _typed_routing_action else {}),
+        **({"model_execution": send_event["progress_meta"]["model_execution"]}
+           if "model_execution" in send_event.get("progress_meta", {}) else {}),
         # Carry the thread so the terminal card finalizes in its project panel
         # (per-thread fan-out), not just the main chat.
         "chat_id": int(task.get("chat_id") or 0),
@@ -973,6 +976,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                 }
             root_phase_checkpoint.setdefault("post_task_synthesis", "pending_once")
         review_projection = _compact_review_projection(llm_trace)
+        model_execution = model_execution_projection(usage)
         write_task_result(
             env.drive_root,
             str(task.get("id") or ""),
@@ -1031,6 +1035,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             final_answer=str(loop_outcome.get("final_answer") or ""),
             trace_summary=trace_summary,
             trace_refs=loop_outcome.get("trace_refs") or {},
+            **({"model_execution": model_execution} if model_execution is not None else {}),
             **cost_fields,
             review_evidence=review_evidence or {},
             completion_observations=observations,

@@ -13,6 +13,7 @@ like the hurry projection):
     "owner_quiz": {
         "<quiz_id>": {
             "quiz_id", "question", "options": [label, ...], "stake",
+            "option_details"?: [detail, ...],
             "assumption", "state": open|answered|expired_terminal,
             "asked_at", "answered_at"?, "answered_index"?, "request_id"?,
             "comment"?, "reconciled_at"?,
@@ -109,16 +110,23 @@ def record_asked(
     quiz_id: str, question: str, options: List[str],
     stake: str = "", assumption: str = "",
     wait_for_answer: bool = False,
+    option_details: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Worker-side projection write at ask time.
 
     The stored option labels are the ingress's validation authority: an
     ``option_index`` outside this list is refused, and the answer echoes the
     verbatim label back to the asking task."""
+    if option_details is not None and (
+        not isinstance(option_details, list) or len(option_details) != len(options)
+        or not all(isinstance(value, str) for value in option_details)
+    ):
+        raise ValueError("option_details must preserve the labels' length and order")
     stamp = utc_now_iso()
     block = {
         "quiz_id": str(quiz_id), "question": str(question or ""),
         "options": [str(label) for label in options],
+        **({"option_details": list(option_details)} if option_details is not None else {}),
         "stake": str(stake or ""), "assumption": str(assumption or ""),
         "state": STATE_OPEN, "asked_at": stamp,
         **({"wait_for_answer": True} if wait_for_answer else {}),

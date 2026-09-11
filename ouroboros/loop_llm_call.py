@@ -826,7 +826,9 @@ def _remember_llm_call(
     provider: str,
     request_ref: Dict[str, Any],
     response_ref: Dict[str, Any],
-) -> None:
+    reported_model: Any = None,
+    use_local: Optional[bool] = None,
+) -> Dict[str, Any]:
     call_meta = {
         "llm_call_id": llm_call_id,
         "execution_id": execution_id,
@@ -836,11 +838,14 @@ def _remember_llm_call(
         "model": model,
         "resolved_model": display_model,
         "provider": provider,
+        "reported_model": reported_model.strip() if isinstance(reported_model, str) and reported_model.strip() else None,
+        "use_local": use_local,
         "request_ref": request_ref.get("manifest_ref") if request_ref else None,
         "response_ref": response_ref.get("manifest_ref") if response_ref else None,
     }
     usage["_last_llm_call_meta"] = call_meta
     usage.setdefault("llm_call_refs", []).append(call_meta)
+    return call_meta
 
 
 def _normalize_usage_cost(
@@ -1466,7 +1471,7 @@ def call_llm_with_retry(
                 display_model=display_model,
                 provider=provider,
                 request_ref=request_ref,
-                response_ref=response_ref,
+                response_ref=response_ref, reported_model=usage.get("resolved_model"), use_local=bool(use_local),
             )
             category = task_type if task_type in ("evolution", "consciousness", "review", "summarize") else "task"
             emit_llm_usage_event(
