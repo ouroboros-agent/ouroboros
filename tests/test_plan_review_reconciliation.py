@@ -10,6 +10,7 @@ import pytest
 
 from tests.test_plan_review_engine import (
     CLEAN,
+    DECK_SPEC,
     _call,
     _control,
     _finding,
@@ -462,3 +463,163 @@ def test_missing_substrate_actor_stays_paid_and_custody_lost(harness, monkeypatc
     assert "Refusing a duplicate paid send" in second
     assert calls == [["s1", "s2", "s3"]]
     assert _state(harness)["cycles_paid"] == 1
+
+
+# ------------------------------------------------------------- collection (P1-3)
+
+
+def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=()):
+    """A substrate that honours the event route: a fresh dispatch released at its
+    drain deadline returns ``pending_dispatch`` rows; a reconcile returns the settled
+    rows (except ``still_pending`` slots, which are still running)."""
+    import ouroboros.review_custody as review_custody
+    import ouroboros.review_substrate as review_substrate
+
+    texts = dict(texts or {})
+
+    def substrate(request, *, slots, drive_root, llm, usage_ctx=None):
+        calls.append({"retry_key": request.retry_key, "slots": [s.slot_id for s in slots],
+                      "reconcile_only": request.reconcile_only, "drain": request.drain_deadline})
+        fresh = request.drain_deadline is not None and not request.reconcile_only
+        actors = []
+        for slot in slots:
+            pending = fresh or slot.slot_id in still_pending
+            actors.append({
+                "slot_id": slot.slot_id, "model": slot.model,
+                "status": "error" if pending else "ok",
+                "raw_text": "" if pending else texts.get(slot.slot_id, CLEAN),
+                "error": "Pending dispatch; the physical review operation is in flight" if pending else "",
+                "usage": {"resolved_model": slot.model, **({} if pending else {"physical_attempt_state": "settled"})},
+                "prompt_ref": {}, "response_ref": {}, "operation_id": f"op-{slot.slot_id}",
+                "operation_state": "pending_dispatch" if pending else "settled",
+                "late_result_pending": pending,
+            })
+        return SimpleNamespace(actors=actors)
+
+    monkeypatch.setattr(review_substrate, "run_review_request", substrate)
+    monkeypatch.setattr(review_custody, "review_retry_custody_available", lambda **_kwargs: True)
+
+
+def _collect(ctx, fingerprint, items=()):
+    from ouroboros.tools import plan_review as pr
+
+    return pr._handle_plan_task(ctx, review_disposition={"review_fingerprint": fingerprint, "items": list(items)})
+
+
+def test_disposition_with_empty_items_collects_the_settled_wave_without_a_second_send(harness, monkeypatch):
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    wave = _state(harness)["waves"][-1]
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    assert wave["custody_pending"] is True and wave["paid"] is False
+    assert calls[0]["drain"] is not None and calls[0]["reconcile_only"] is False
+
+    collected = _collect(ctx, wave["request_fingerprint"])
+    assert _control(collected) == {"outcome": "GREEN", "closed": True}
+    state = _state(harness)
+    assert state["cycles_paid"] == 1 and state["waves"][-1]["paid"] is True
+    # ONE reconcile call: the same retry key, every released slot, no re-dispatch, no wait.
+    assert [c["reconcile_only"] for c in calls] == [False, True]
+    assert calls[1]["retry_key"] == calls[0]["retry_key"] and calls[1]["slots"] == ["s1", "s2", "s3"]
+    assert calls[1]["drain"] is not None
+    assert state["current_attempt"]["fingerprint"] == wave["request_fingerprint"]
+
+
+def test_collection_never_waits_for_a_live_slot_and_stays_free(harness, monkeypatch):
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls, still_pending={"s3"})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    fingerprint = _state(harness)["waves"][-1]["request_fingerprint"]
+    peek = _collect(ctx, fingerprint)
+    assert _control(peek) == {"outcome": "DEGRADED", "closed": False}
+    wave = _state(harness)["waves"][-1]
+    assert wave["custody_pending"] is True
+    by_slot = {a["slot_id"]: a for a in wave["actors"]}
+    assert by_slot["s1"]["ok"] and by_slot["s2"]["ok"]
+    assert by_slot["s3"]["operation_state"] == "pending_dispatch"
+    assert calls[-1]["drain"] is not None  # window 0: a peek, never a wait
+    # Two settled physical rows prove dispatch: the cycle is paid now, once.
+    assert _state(harness)["cycles_paid"] == 1
+    # A disposition with items on a still-open wave is refused nothing: the peek
+    # text is returned and the items wait for the wave to settle.
+    again = _collect(ctx, fingerprint, items=[{"finding_id": "x", "decision": "accept", "rationale": "r"}])
+    assert _control(again) == {"outcome": "DEGRADED", "closed": False}
+    assert _state(harness)["cycles_paid"] == 1
+
+
+def test_new_envelope_reconciles_the_in_flight_wave_before_superseding(harness, monkeypatch):
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    _call(ctx)
+    old = _state(harness)["waves"][-1]
+    assert old["custody_pending"] is True
+    second = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})
+    assert _control(second) == {"outcome": "DEGRADED", "closed": False}
+    state = _state(harness)
+    waves = {w["request_fingerprint"]: w for w in state["waves"]}
+    # The old wave was collected (settled rows landed, closed GREEN, paid) BEFORE the
+    # new envelope superseded it; the new wave is the current open attempt.
+    assert waves[old["request_fingerprint"]]["closed"] is True
+    assert waves[old["request_fingerprint"]]["paid"] is True
+    new_fp = state["current_attempt"]["fingerprint"]
+    assert new_fp != old["request_fingerprint"] and waves[new_fp]["custody_pending"] is True
+    assert [c["reconcile_only"] for c in calls] == [False, True, False]
+    assert calls[1]["retry_key"] == calls[0]["retry_key"]
+    assert state["cycles_paid"] == 1  # the old wave's cycle; the new barrier wave is unpaid
+
+
+def test_compaction_keeps_an_in_flight_wave_full(tmp_path):
+    from ouroboros.task_results import _PLAN_REVIEW_FULL_WAVES, load_plan_review_state, record_plan_review_wave
+    from tests.test_plan_review import _wave
+
+    pending = {**_wave("a" * 64, aggregate="DEGRADED"), "paid": False, "custody_pending": True,
+               "actors": [{"slot_id": "s1", "operation_state": "pending_dispatch"}]}
+    record_plan_review_wave(tmp_path, "t", pending)
+    for index in range(_PLAN_REVIEW_FULL_WAVES + 1):
+        record_plan_review_wave(tmp_path, "t", _wave(f"{index:064x}", aggregate="GREEN", closed=True))
+    waves = load_plan_review_state(tmp_path, "t")["waves"]
+    first = waves[0]
+    assert first["request_fingerprint"] == "a" * 64
+    assert not first.get("compact") and first["custody_pending"] is True
+    assert waves[1].get("compact") is True
+
+
+def test_collect_binds_acceptance_claims_the_same_as_a_synchronous_close(harness, monkeypatch):
+    from ouroboros.contracts.task_contract import effective_acceptance_claims
+    from ouroboros.task_results import closed_plan_review_wave
+
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    _call(ctx)
+    state = _state(harness)
+    assert closed_plan_review_wave(state) is None
+    assert effective_acceptance_claims({}, closed_plan_review_wave(state)) == ([], "")
+    _collect(ctx, state["waves"][-1]["request_fingerprint"])
+    claims, source = effective_acceptance_claims({}, closed_plan_review_wave(_state(harness)))
+    assert source == "plan_review" and [c["claim"] for c in claims] == DECK_SPEC["acceptance_claims"]
+
+
+def test_two_step_wave_emits_one_advisory_open_event_and_keeps_the_paid_identity(harness, monkeypatch):
+    from ouroboros.loop_acceptance_review import acceptance_paid_identity
+
+    harness.state["enforcement"] = "advisory"
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls, still_pending={"s2"})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    fingerprint = _state(harness)["waves"][-1]["request_fingerprint"]
+    _collect(ctx, fingerprint)
+    rows = [json.loads(line) for line in
+            (harness.drive / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    opens = [r for r in rows if r.get("type") == "plan_review_advisory_open" and r.get("fingerprint") == fingerprint]
+    assert len(opens) == 1  # dispatch -> collect is ONE recorded-open state, deduplicated
+    # Two plan_task receipts change the acceptance EVIDENCE revision, never the
+    # paid identity a panel is bought under (candidate + dispositions only).
+    trace = {"tool_calls": [{"plan_review_outcome": "DEGRADED"}, {"plan_review_outcome": "DEGRADED"}],
+             "acceptance_obligations": []}
+    assert acceptance_paid_identity("cand", trace) == acceptance_paid_identity("cand", {"tool_calls": [], "acceptance_obligations": []})

@@ -28,9 +28,6 @@ host's loud disclosure. Domain-neutral: a spec with zero paths is first-class.
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
-import contextvars
 from hashlib import sha256
 import json
 import logging
@@ -51,7 +48,7 @@ from ouroboros.task_results import (
     plan_review_wave, current_plan_review_wave, record_plan_review_dispositions,
     plan_review_notes_are_annotatable,
 )
-from ouroboros.tools import plan_evidence, plan_spec
+from ouroboros.tools import plan_evidence, plan_review_collect as _collect, plan_spec
 from ouroboros.tools.plan_render import _next_step, _quote_control_lines, _render_wave  # noqa: F401 — engine renderers
 from ouroboros.tools.plan_review_runtime import (
     PLAN_NO_SNAPSHOT as _PLAN_NO_SNAPSHOT,
@@ -201,7 +198,9 @@ _DISPOSITION_SCHEMA = {
     "additionalProperties": False,
     "description": (
         "Disposition mode only (send ONLY this field): answer the findings of the wave "
-        "named by review_fingerprint. note/need_evidence findings close at $0; a blocking "
+        "named by review_fingerprint. While that wave is still open with reviewer slots in "
+        "flight, this call first COLLECTS what has settled at $0 without waiting (items may be "
+        "[]); to wait longer, re-submit the same envelope. note/need_evidence findings close at $0; a blocking "
         "finding stays open. A subsequent paid delta review may consider a changed spec or "
         "justified rejection when another paid cycle is available. Recording a disposition "
         "consumes no cycle and never closes REVISE_PLAN."
@@ -318,26 +317,8 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
     request = _PlanRequest(
         goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
     )
-    # The ToolEntry envelope is the outer settlement bound. The substrate
-    # owns each review slot's logical window and late-result custody; nesting a
-    # second asyncio.wait_for here only cancels the coroutine while its
-    # executor worker keeps running, then asyncio.run waits for that worker
-    # during shutdown and defeats the apparent timeout. Let the existing
-    # tool-timeout callback own the late settlement instead.
-    try:
-        try:
-            asyncio.get_running_loop()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                # copy_context: the registry's tool-result sidecar is a ContextVar,
-                # and the published native plan result must reach the dispatching
-                # thread's slot (D02) — a bare pool thread would publish into the void.
-                return pool.submit(
-                    contextvars.copy_context().run,
-                    asyncio.run,
-                    _run_plan_review_async(ctx, request),
-                ).result()
-        except RuntimeError:
-            return asyncio.run(_run_plan_review_async(ctx, request))
+    try:  # the ToolEntry envelope is the outer settlement bound (plan_review_collect.run_plan_coroutine)
+        return _collect.run_plan_coroutine(_run_plan_review_async(ctx, request))
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
         return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")
@@ -509,12 +490,13 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
 
 # --------------------------------------------------------------------------- review
 
-async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str:
+async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, collect: Optional[dict] = None) -> str:
+    """``collect`` = the recorded inputs of an open wave being collected at $0 (window 0)."""
     try:
         state_root, task_id = _planning_state_location(ctx)
     except ValueError as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
-    prepared = _prepare_plan_inputs(ctx, request, state_root)
+    prepared = collect if collect is not None else _prepare_plan_inputs(ctx, request, state_root)
     if prepared.get("error"):
         if "PLAN_SPEC_INVALID" in prepared["error"]:
             try:
@@ -535,6 +517,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         state = load_plan_review_state(state_root, task_id)
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
+    if collect is None:  # I3 reconcile-before-supersede: collect an in-flight wave at $0 first
+        state = await _collect.collect_before_supersede(ctx, state_root=state_root, task_id=task_id, state=state, fingerprint=fingerprint)
     enforcement = get_review_enforcement()
     cap = review_max_cycles()
     cycles_paid = int(state.get("cycles_paid") or 0)
@@ -699,7 +683,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         session_threads=session_threads,
         retry_key=retry_key,
         reconcile_only=resume_in_flight,
-        release_at_dispatch=not resume_in_flight,  # event route: return at the dispatch barrier
+        release_at_dispatch=collect is not None or not resume_in_flight,  # return at the barrier; a collect never waits
         reconciliation_identity={
             "subject_hash": fingerprint,
             "roster_hash": _plan_reviewer_config_fingerprint(configured_slots),
@@ -914,6 +898,11 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             f"claimed={fingerprint}). Re-call plan_task with the spec you want reviewed. "
             "No plan attempt was recorded.",
         )
+    if wave.get("custody_pending"):  # collection = the $0 custody reconcile of the addressed wave (window 0)
+        text, state, wave = _collect.collect_wave_sync(ctx, state_root=root, task_id=task_id, wave=wave)
+        if not disposition.get("items") or wave.get("custody_pending"):
+            return text
+        cycles_paid = int(state.get("cycles_paid") or 0)
     if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
         return _publish_rendered_wave(ctx, wave, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                       cached=True,

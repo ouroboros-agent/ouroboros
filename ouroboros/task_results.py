@@ -1509,7 +1509,7 @@ def record_plan_review_wave(
             state["need_evidence_seen"] = sorted({str(s) for s in need_evidence_seen if str(s)})
         full_from = max(0, len(waves) - _PLAN_REVIEW_FULL_WAVES)
         waves = [
-            (_compact_plan_review_wave(w) if idx < full_from and not w.get("compact") else w)
+            (_compact_plan_review_wave(w) if idx < full_from and not w.get("compact") and not w.get("custody_pending") else w)
             for idx, w in enumerate(waves)
         ]
         overflow = max(0, len(waves) - _PLAN_REVIEW_MAX_WAVES)

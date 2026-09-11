@@ -57,3 +57,93 @@ def announce_released_settlement(
         )
     except Exception:
         log.warning("plan review settled-wave frame failed for %s", task_id, exc_info=True)
+
+
+def run_plan_coroutine(coro: Any) -> Any:
+    """Run one plan-review coroutine to completion from a synchronous tool handler.
+
+    The ToolEntry envelope is the outer settlement bound: the substrate owns each
+    review slot's logical window and late-result custody, so no second
+    ``asyncio.wait_for`` is nested here (it would cancel the coroutine while its
+    executor worker keeps running, then ``asyncio.run`` waits for that worker at
+    shutdown and defeats the apparent timeout). ``copy_context``: the registry's
+    tool-result sidecar is a ContextVar, and the published native plan result must
+    reach the dispatching thread's slot (D02) — a bare pool thread would publish
+    into the void."""
+    import asyncio
+    import concurrent.futures
+    import contextvars
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(contextvars.copy_context().run, asyncio.run, coro).result()
+
+
+def prepared_from_wave(ctx: Any, exact: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
+    """The exact inputs of a RECORDED wave, for the engine's resume path: the
+    restored spec, prose and evidence manifest of the wave itself — never a
+    re-read of the evidence, so the collection cannot change the wave's identity."""
+    from ouroboros.review_substrate import review_repo_dirs_for
+    from ouroboros.tools.plan_review import _PlanRequest
+
+    system_root, active_root = review_repo_dirs_for(ctx)
+    spec = dict(exact.get("spec") or {})
+    request = _PlanRequest(
+        goal=str(spec.get("goal") or ""), plan=str(exact.get("plan_prose") or ""), spec=spec,
+    )
+    prepared = {
+        "spec": spec, "system_root": system_root, "active_root": active_root,
+        "constitutional": bool(exact.get("constitutional")),
+        "constitutional_note": str(exact.get("constitutional_note") or ""),
+        "manifest": dict(exact.get("evidence_manifest_full") or exact.get("evidence_manifest") or {}),
+        "manifest_hash": str(exact.get("evidence_manifest_hash") or ""),
+        "reminder": "", "fingerprint": str(exact.get("request_fingerprint") or ""),
+    }
+    return request, prepared
+
+
+async def collect_open_wave(ctx: Any, *, state_root: Any, task_id: str, wave: Dict[str, Any]) -> str:
+    """Collect one open wave: the engine's own resume path over the wave's recorded
+    inputs with drain window 0 — settled slots are reconciled, nothing is re-sent,
+    nothing is waited for, and the engine remains the sole wave writer/reducer."""
+    from ouroboros.tools import plan_review as engine
+
+    exact = engine._authority_wave(state_root, task_id, wave) or wave
+    request, prepared = prepared_from_wave(ctx, exact)
+    return await engine._run_plan_review_async(ctx, request, collect=prepared)
+
+
+def collect_wave_sync(ctx: Any, *, state_root: Any, task_id: str, wave: Dict[str, Any]) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Disposition-mode collection: ``(rendered text, reloaded state, authority wave)``."""
+    from ouroboros.task_results import load_plan_review_state, plan_review_wave
+    from ouroboros.tools import plan_review as engine
+
+    fingerprint = str(wave.get("request_fingerprint") or "")
+    text = run_plan_coroutine(collect_open_wave(ctx, state_root=state_root, task_id=task_id, wave=wave))
+    state = load_plan_review_state(state_root, task_id)
+    stored = plan_review_wave(state, fingerprint) or wave
+    return text, state, engine._authority_wave(state_root, task_id, stored) or stored
+
+
+async def collect_before_supersede(
+    ctx: Any, *, state_root: Any, task_id: str, state: Dict[str, Any], fingerprint: str,
+) -> Dict[str, Any]:
+    """Reconcile-before-supersede (I3): a NEW envelope arriving over an in-flight
+    wave first collects what has settled of that wave at $0 (window 0), then the
+    caller writes its superseding reference. Returns the (re)loaded state; an
+    unreadable old wave is logged and superseded as before."""
+    from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
+
+    current = current_plan_review_wave(state)
+    if not current or not current.get("custody_pending") or str(current.get("request_fingerprint") or "") == fingerprint:
+        return state
+    try:
+        await collect_open_wave(ctx, state_root=state_root, task_id=task_id, wave=current)
+    except (OSError, ValueError) as exc:
+        log.warning("in-flight plan wave %s could not be collected before supersede: %s",
+                    str(current.get("request_fingerprint") or "")[:8], exc)
+        return state
+    return load_plan_review_state(state_root, task_id)
