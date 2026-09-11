@@ -338,7 +338,7 @@ def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
     """
     out: list[tuple[str, pathlib.Path]] = []
     try:
-        policy = _POLICY.get(active_tool_profile(ctx), {})
+        policy = _POLICY.get(_effective_policy_profile(active_tool_profile(ctx)), {})
     except Exception:
         return out
     for root, ops in sorted(policy.items()):
