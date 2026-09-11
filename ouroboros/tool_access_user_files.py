@@ -79,6 +79,40 @@ def _subagent_projects_read_hint(
         return ""
 
 
+def _delegated_capture_read_hint(ctx: Any, resolved: pathlib.Path) -> str:
+    """A targeted refusal for a path that IS a delegated-run capture.
+
+    The generic four-root text cannot bind ANOTHER task's artifact store, so an
+    authorized orphan disposer was told to use roots that structurally cannot
+    reach the capture it had been sent to dispose, and escalated a manual
+    file-attach question to the owner instead. Name the route that exists.
+
+    Derived from the PATH SHAPE alone: a refusal must not replay the custody
+    log, so this states the owning task and the capture directory (both in the
+    path) and names the tool, rather than resolving the run id.
+    """
+    try:
+        from ouroboros.artifacts import DELEGATED_CAPTURE_PREFIX
+        from ouroboros.headless import ARTIFACTS_DIR
+
+        artifacts_root = (
+            pathlib.Path(_tool_access().canonical_data_root(ctx)) / ARTIFACTS_DIR
+        ).resolve(strict=False)
+        parts = pathlib.Path(resolved).resolve(strict=False).relative_to(artifacts_root).parts
+        if len(parts) < 3 or parts[1] != DELEGATED_CAPTURE_PREFIX:
+            return ""
+        return (
+            f"this is a delegated-run capture owned by task {parts[0]} (capture directory "
+            f"{parts[1]}/{parts[2]}); user_files never binds another task's artifact store. "
+            "Dispose it with integrate_delegated_patch(run_id=...), which reads the patch and "
+            "verifies it against the recorded sha256 manifest; while you are authorized to "
+            "dispose it (the owning task is terminal and you are a top-level task), "
+            "read_file(root='artifact_store') reaches this absolute path too"
+        )
+    except Exception:
+        return ""
+
+
 def user_files_path_block_reason(
     ctx: Any,
     candidate: pathlib.Path,
@@ -170,6 +204,9 @@ def user_files_path_block_reason(
                 projects_hint = _subagent_projects_read_hint(ctx, resolved, hard_protected_roots)
                 if projects_hint:
                     return projects_hint
+                capture_hint = _delegated_capture_read_hint(ctx, resolved)
+                if capture_hint:
+                    return capture_hint
                 return (
                     "path overlaps the Ouroboros repo/runtime workspace; use "
                     "root=active_workspace, root=task_drive, root=artifact_store, "

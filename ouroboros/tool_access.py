@@ -71,6 +71,7 @@ from ouroboros.tool_access_roots import (  # noqa: F401 — re-exported moved su
 )
 from ouroboros.tool_access_user_files import (  # noqa: F401 — re-exported moved surface
     UserFilesPathBlockedError,
+    _delegated_capture_read_hint,
     _subagent_projects_read_hint,
     resolve_user_file_path,
     user_files_path_block_reason,
@@ -625,6 +626,16 @@ def _resolve_target_in_selected_base(
                         anchored = delegated_capture_read_target(
                             canonical_data_root(ctx), task_id_for_artifacts(ctx), relative, resolved_base,
                         )
+                        if anchored is not None:
+                            return anchored
+                    else:
+                        # An ORPHAN's capture lives under ANOTHER task's prefix, so
+                        # `relative` is empty and control would fall straight to the
+                        # raise below. Read-only, prefix-confined, no new root: the
+                        # orphan disposition rule is the only authority consulted.
+                        from ouroboros.delegate_shared import orphan_capture_read_target
+
+                        anchored = orphan_capture_read_target(ctx, candidate)
                         if anchored is not None:
                             return anchored
         if is_absolute_path_text(path_text):

@@ -75,6 +75,7 @@ _MOVED_OWNERS = {
     "project_room_lens_dir": tool_access_roots,
     "resource_root_path": tool_access_roots,
     "UserFilesPathBlockedError": tool_access_user_files,
+    "_delegated_capture_read_hint": tool_access_user_files,
     "_subagent_projects_read_hint": tool_access_user_files,
     "resolve_user_file_path": tool_access_user_files,
     "user_files_path_block_reason": tool_access_user_files,
