@@ -440,8 +440,44 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     }
     if not swarm_intent:
         routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
+    receipt = _message_routing_receipt(ctx, client_message_id)
+    if receipt:
+        # DISCLOSURE, not a gate (owner decision B5=A): one owner message became a
+        # task and was then steered into three more live roots, each paying its own
+        # review wave, because the deciding turn was never told a receipt already
+        # existed. The choice stays with the model - no host ban on a second root.
+        routing_contract["message_routing_receipt"] = receipt
     md["routing_contract"] = routing_contract
     return md
+
+
+def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]:
+    """The existing routing receipt for THIS owner message, or {} when there is none.
+
+    Read from the annotation the routing rail already writes, so no new store and no
+    new reader: the decision turn simply sees what was already decided for the same
+    message. Fail-soft - a missing or torn annotations file leaves the turn exactly
+    as it was.
+    """
+    if not client_message_id:
+        return {}
+    try:
+        from ouroboros.project_dialogue import latest_chat_annotations
+
+        row = latest_chat_annotations(ctx.DRIVE_ROOT).get(str(client_message_id)) or {}
+    except Exception:
+        log.debug("message routing receipt lookup failed", exc_info=True)
+        return {}
+    if not row:
+        return {}
+    return {
+        "action": str(row.get("action") or ""),
+        "target": str(row.get("target") or ""),
+        "target_label": str(row.get("target_label") or ""),
+        "status": str(row.get("status") or ""),
+        "ts": str(row.get("ts") or ""),
+        "project_id": str(row.get("project_id") or ""),
+    }
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:

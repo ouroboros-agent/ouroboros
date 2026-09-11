@@ -90,6 +90,9 @@ def _emit_control_event(ctx: ToolContext, evt: Dict[str, Any]) -> str:
                     "ts": utc_now_iso(),
                     "type": "promote_chat_to_task_emitted",
                     "task_id": str(evt.get("task_id") or ""),
+                    # The owner message this root came from: without it the durable
+                    # ingress row cannot be joined to the message that caused it.
+                    "client_message_id": str(evt.get("client_message_id") or ""),
                     "routing_token": str(evt.get("routing_token") or ""),
                     "transport_mode": mode,
                     "sender_pid": os.getpid(),

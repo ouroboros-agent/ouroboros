@@ -2926,3 +2926,31 @@ def test_swarm_intent_survives_admission_to_the_finalization_read(tmp_path, monk
         "observed_started": 0,
         "status": "no_fanout_observed",
     }
+
+
+def test_promote_emission_row_carries_the_owner_message_id(tmp_path, monkeypatch):
+    """I7: the durable ingress row named the task and the routing token but not the
+    owner MESSAGE, so the same message becoming several roots could not be seen in
+    the record at all."""
+    import json
+
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    ctx = types.SimpleNamespace(
+        pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
+        task_metadata={"client_message_id": "cm-ingress"},
+    )
+
+    assert _promote_chat_to_task(
+        ctx, "Build the racer prototype", project_id="racer", predecessor_task_id="",
+    ).startswith("OK: task")
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    emitted = next(row for row in rows if row["type"] == "promote_chat_to_task_emitted")
+    assert emitted["client_message_id"] == "cm-ingress"
+    assert emitted["task_id"] == ctx.pending_events[0]["task_id"]
