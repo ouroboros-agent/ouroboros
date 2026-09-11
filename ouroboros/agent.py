@@ -810,6 +810,7 @@ class OuroborosAgent:
             category=str(task.get("type") or "task"),
             source="agent.task",
             global_limit_usd=global_limit,
+            global_limit_source="task_start_budget_resolver",
             root_limit_usd=root_limit if root_limit > 0 else None,
             root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
         )

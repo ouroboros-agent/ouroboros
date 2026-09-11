@@ -2148,6 +2148,14 @@ by "Provider Independence" above. Call-site imperatives:
   settlement persistence fails and leave an honest dispatched/unresolved
   bound. Callers that own a finalization reserve pass it explicitly so
   admission and the transport bound cannot disagree.
+- Keep root ceilings explicitly unreserved under the shared pool. Persist the
+  actual applied global limit and its supplied source/revision on the same
+  physical attempt through every transition; a missing revision is unknown,
+  never the current settings file hash. Pacing facts reuse the existing note
+  cadence and cached money projections. Count typed tool results incrementally
+  on the loop usage carrier; reported durations are overlapping observations,
+  not inferred sleeping/polling time or a new behavior gate. Tests:
+  `tests/test_budget_resource_facts.py`.
 - Tree-spend pacing decides on root-subtree ledger spend including in-flight
   holds; own cost is a disclosed lower-bound fallback, and unavailable is
   unknown, never `$0`. Resolve the original early threshold at the root and
