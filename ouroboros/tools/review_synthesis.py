@@ -356,6 +356,7 @@ def build_scope_review_prompt(
     diff_text: str,
     repo_pack_placeholder: str,
     critical_calibration: str,
+    task_evidence_section: str = "",
 ) -> tuple:
     # STABLE-FIRST for provider prompt caching: instructions, checklist and
     # canonical docs are byte-stable across commits and form the cache-marked
@@ -444,6 +445,8 @@ wider repository pack as omission.
 {intent_context}
 
 {history_block}
+
+{task_evidence_section}
 
 ## Current touched files (post-change — what the file looks like NOW)
 

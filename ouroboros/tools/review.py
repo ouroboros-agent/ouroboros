@@ -449,6 +449,7 @@ _REVIEW_PROMPT_TEMPLATE_DYNAMIC = """\
 {changed_files}
 
 {rebuttal_section}{review_history_section}
+{task_evidence_section}
 """
 
 
@@ -1070,6 +1071,13 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
                            session_profile=row_plan["session_profiles"][i], use_local=row_plan["use_local"][i])
                  for i in api_indices]
 
+    from ouroboros.review_evidence import commit_review_evidence_section, materialize_commit_review_session_view
+
+    task_evidence = dict(getattr(ctx, "_commit_review_evidence", None) or {})
+    if any(route is ReviewRouteKind.AGENT_SESSION for route in row_routes):
+        task_evidence = materialize_commit_review_session_view(task_evidence, target_repo)
+        ctx._commit_review_evidence = task_evidence
+    task_evidence_compact = False
     goal_section = build_goal_section(goal, scope, commit_message)
     scope_section = build_scope_section(scope)
 
@@ -1094,8 +1102,15 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
             review_history_section=review_history_section,
             diff_text=staged_diff,
             changed_files=review_changed,
+            task_evidence_section=commit_review_evidence_section(task_evidence, delivery="packet", compact=task_evidence_compact),
         )
         return stable + "\n" + dynamic, len(stable) + 1
+
+    def _compact_task_evidence():
+        nonlocal task_evidence_compact
+        task_evidence_compact = True
+    if task_evidence:
+        _assemble_prompt.compact_optional_evidence = _compact_task_evidence
 
     # P3 stays one-pass. The api pack, its fit ladder and the fixed_overflow
     # gate exist ONLY for the api rows (5.2/5.7): a session row retrieves with
@@ -1168,7 +1183,7 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
         "prompt": prompt, "stable_prefix_len": stable_prefix_len,
         "models": models, "routes": row_routes, "row_plan": row_plan,
         "session_task": session_task, "target_repo": target_repo,
-        "blocking_review": blocking_review,
+        "blocking_review": blocking_review, "task_evidence": task_evidence,
     }, None, False
 
 
@@ -1191,6 +1206,7 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
             session_root=str(prepared["target_repo"]),
             row_plan=prepared["row_plan"],
             retry_key=str(prepared.get("retry_key") or ""),
+            task_evidence=prepared.get("task_evidence"),
         )
         result = json.loads(result_json)
     except Exception as e:

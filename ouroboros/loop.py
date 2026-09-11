@@ -408,13 +408,14 @@ def run_llm_loop(
     stateful_executor = StatefulToolExecutor()
     exit_ctx = _LoopExitContext(
         tools, drive_root, task_id, event_queue, drive_logs, accumulated_usage, llm_trace,
+        ctx, getattr(ctx, "_execution_trace", None),
     )
     _owner_msg_seen: set = set()
     MAX_ROUNDS = _resolve_loop_max_rounds(ctx)
-    round_idx = 0
-    free_redial = False
+    round_idx, free_redial = 0, False
     transport_wait = None
     limit_ctx: Optional[_RoundLimitContext] = None
+    ctx._execution_trace = llm_trace
     try:
         if saved:
             active_model, active_effort, active_use_local, active_context_mode, round_idx, context_fit_plan = resume_native_loop(

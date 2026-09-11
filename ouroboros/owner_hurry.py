@@ -532,6 +532,16 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
             f"{tag} An open plan review from a previous schema cannot be honored. Re-call "
             "plan_task with your goal, plan and spec to start a fresh review before finalizing."
         )
+    from ouroboros.review_cycles import review_max_cycles
+
+    cap = review_max_cycles()
+    if cap is not None and int(decision.get("cycles_paid") or 0) >= cap:
+        return (
+            f"{tag} The paid plan-review cycle cap is reached; the task cannot dispatch another paid panel "
+            "for either an unchanged or revised request. The recorded findings and lawful free "
+            "dispositions remain available; a disposition does not close blocking findings "
+            "or a degraded wave. Existing in-flight custody can still settle."
+        )
     if decision.get("reviewer_slots_degraded"):
         # B2: facts, never a retry coach (P5). The replay promise is CONDITIONAL —
         # wording SSOT: plan_render._degraded_replay_note (a free replay exists only

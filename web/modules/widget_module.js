@@ -10,7 +10,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { bridgeChunkBuffer, moduleBridgeScript, moduleResizeScript } from './widget_frame.js';
 import { boundedNumber, WIDGET_DISPOSE_ACK_TIMEOUT_MS, WIDGET_REQUEST_TIMEOUT_MS } from './widget_job.js';
 import { setWidgetCardFault } from './widget_card.js';
-import { downloadViaHostBridge, downloadBlobViaHostBridge } from './ui_helpers.js';
+import { downloadViaHostBridge, downloadBlobViaHostBridge, openExternalViaHostBridge } from './ui_helpers.js';
 
 export const WIDGET_FRAME_DEFAULT_HEIGHT = 320;
 export const WIDGET_FRAME_MAX_HEIGHT = 8192;
@@ -258,6 +258,20 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         }
         post({ type: 'ouro-widget-download-result', id: msg.id, result });
     };
+    const relayExternal = async (msg) => {
+        let result;
+        try {
+            if (disposing || !iframe.isConnected) throw new Error('widget disposed');
+            if (window.navigator?.userActivation && !window.navigator.userActivation.isActive) {
+                throw new Error('Opening a link requires a user action');
+            }
+            // Invoked synchronously from onMessage, before any await/fetch.
+            result = await openExternalViaHostBridge(msg.url);
+        } catch (error) {
+            result = { ok: false, error: error?.message || String(error) };
+        }
+        post({ type: 'ouro-widget-open-external-result', id: msg.id, result });
+    };
     const onMessage = (event) => {
         if (disposed || !iframe || event.source !== iframe.contentWindow) return;
         const msg = event.data || {};
@@ -290,6 +304,10 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         if (msg.type === 'ouro-widget-events') {
             if (msg.op === 'subscribe') messageHandlers?.add(onWsMessage);
             else if (msg.op === 'unsubscribe') messageHandlers?.delete(onWsMessage);
+            return;
+        }
+        if (msg.type === 'ouro-widget-open-external') {
+            relayExternal(msg);
             return;
         }
         if (msg.type === 'ouro-widget-download') {

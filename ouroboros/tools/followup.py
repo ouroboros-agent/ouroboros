@@ -38,7 +38,8 @@ def get_tools() -> List[ToolEntry]:
                 "name": "schedule_followup",
                 "description": (
                     "Register a deferred follow-up task that the supervisor scheduler "
-                    "enqueues as an ordinary root task. Supply exactly one trigger: run_at "
+                    "enqueues as an ordinary root task. Root tasks only; subagents report "
+                    "the proposed follow-up to their parent. Supply exactly one trigger: run_at "
                     "for a one-shot ISO 8601 instant (naive = UTC), or cron for a recurring "
                     "5-field expression with an optional IANA timezone. Write the objective "
                     "in your own words — it becomes each future task's text verbatim. The "

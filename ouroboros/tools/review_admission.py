@@ -196,6 +196,9 @@ def fit_triad_prompt(api_models: list, assemble, current_files_section: str,
     slot_limits = {key: _slot_input_limit(index) for index, key in enumerate(keys)}
     input_limit = _rv._quorum_input_token_limit(keys, slot_limits)
     prompt, stable_prefix_len = assemble(current_files_section, diff_text)
+    if input_limit and estimate_tokens(prompt) > input_limit and getattr(assemble, "compact_optional_evidence", None):
+        assemble.compact_optional_evidence()
+        prompt, stable_prefix_len = assemble(current_files_section, diff_text)
     if input_limit and estimate_tokens(prompt) > input_limit:
         # Cold-start density rung: every api slot the full prompt overflows and
         # whose route has no fresh witness gets ONE bounded probe on a slice of
@@ -403,6 +406,14 @@ def prepare_scope_review(
     # RETRIEVES class: a session row and a configured-subagent api row deliver
     # by retrieval — neither assembles the packet/atlas below.
     retrieves = delivery_retrieves(route, subagent_id)
+    from ouroboros.review_evidence import commit_review_evidence_section, materialize_commit_review_session_view
+
+    task_evidence = dict(getattr(ctx, "_commit_review_evidence", None) or {})
+    if delegated:
+        task_evidence = materialize_commit_review_session_view(task_evidence, repo_dir)
+        ctx._commit_review_evidence = task_evidence
+    task_evidence_section = commit_review_evidence_section(
+        task_evidence, delivery="session" if delegated else "native" if retrieves else "packet")
 
     from ouroboros.tools.review_binary_context import StagedDiffUnavailable
     from ouroboros.tools.review_subject import managed_review_subject
@@ -430,6 +441,7 @@ def prepare_scope_review(
                 drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
                 governance_repo_dir=governance_repo,
                 managed_subject=subject,
+                task_evidence_section=task_evidence_section,
             )
             sr._SCOPE_CONTEXT_MANIFEST.set(session_manifest)
             prompt, context_status = session_task, None
@@ -454,6 +466,7 @@ def prepare_scope_review(
                         represent_binary=subject is not None,
                         managed_subject=subject,
                         window_binding=window_binding,
+                        task_evidence=task_evidence,
                     ),
                 )
 
@@ -541,7 +554,7 @@ def prepare_scope_review(
         "session_target": session_target,
         "session_profile": session_profile,
         "subagent_id": subagent_id,
-        "window_binding": window_binding,
+        "window_binding": window_binding, "task_evidence": task_evidence,
         "use_local": override.get("use_local"),
         "context_manifest": sr._current_scope_context_manifest(),
         "stable_prefix_len": int(sr._SCOPE_STABLE_PREFIX_LEN.get() or 0),
@@ -568,6 +581,7 @@ def commit_gate_paid_seats(triad_prepared, triad_exited, scope_rows) -> list:
         TRIAD_ROLE_HINT, TRIAD_USER_TURN, _review_output_budget, triad_api_messages,
     )
     from ouroboros.triad_review import REVIEW_JSON_ARRAY_CONTRACT
+    from ouroboros.review_evidence import commit_review_evidence_section
 
     sr = _scope()
 
@@ -618,7 +632,7 @@ def commit_gate_paid_seats(triad_prepared, triad_exited, scope_rows) -> list:
             chars = native_first_send_chars(
                 str(triad_prepared.get("target_repo") or ""), surface="multi_model_review",
                 role_hint=TRIAD_ROLE_HINT, slot_id=slot_id,
-                session_task=str(triad_prepared.get("session_task") or ""),
+                session_task=str(triad_prepared.get("session_task") or "") + ("\n\n" + commit_review_evidence_section(triad_prepared["task_evidence"], delivery="native") if triad_prepared.get("task_evidence") else ""),
                 output_contract=REVIEW_JSON_ARRAY_CONTRACT,
             )
         else:

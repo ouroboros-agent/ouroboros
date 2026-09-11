@@ -136,7 +136,7 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                                 surface: str = "multi_model_review",
                                 session_policy: dict = None,
                                 usage_attribution: dict = None,
-                                retry_key: str = "") -> str:
+                                retry_key: str = "", task_evidence: dict = None) -> str:
     if models is None:
         models = []
     try:
@@ -153,13 +153,13 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                     _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
                                               routes, session_task, session_root, row_plan,
                                               surface, session_policy, usage_attribution,
-                                              retry_key),
+                                              retry_key, task_evidence),
                 ).result()
         except RuntimeError:
             result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
                                                            routes, session_task, session_root, row_plan,
                                                            surface, session_policy, usage_attribution,
-                                                           retry_key))
+                                                           retry_key, task_evidence))
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         log.error("Multi-model review failed: %s", e, exc_info=True)
@@ -180,7 +180,7 @@ async def _query_model(
     session_target: str = "",
     session_profile: str = "",
     surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None,
-    retry_key: str = "", subagent_id: str = "", use_local: bool | None = None,
+    retry_key: str = "", subagent_id: str = "", use_local: bool | None = None, task_evidence: dict = None,
 ):
     async with semaphore:
         slot = None
@@ -192,6 +192,13 @@ async def _query_model(
             # RETRIEVES class (session row OR configured-subagent api row): the
             # compact session task replaces the assembled pack for both.
             retrieves = delivery_retrieves(slot_route, subagent_id)
+            from ouroboros.review_evidence import commit_review_evidence_refs, commit_review_evidence_section
+            evidence = task_evidence or {}
+            policy = dict(session_policy or {"output_contract": _rev().REVIEW_JSON_ARRAY_CONTRACT}) if retrieves else {}
+            if retrieves and evidence:
+                session_task += "\n\n" + commit_review_evidence_section(evidence, delivery="session" if delegated else "native")
+                if not delegated:
+                    policy["native_data_root"] = evidence["data_root"]
             _out_budget = _review_output_budget()
             request = ReviewRequest(
                 surface=surface,
@@ -205,7 +212,9 @@ async def _query_model(
                 no_proxy=True,
                 session_task=session_task if retrieves else "",
                 session_root=session_root if retrieves else "",
-                policy=(session_policy or {"output_contract": _rev().REVIEW_JSON_ARRAY_CONTRACT}) if retrieves else {},
+                policy=policy,
+                evidence={"task_execution": evidence} if evidence else {},
+                evidence_refs=commit_review_evidence_refs(evidence),
                 usage_attribution=usage_attribution or {},
                 task_attempt=getattr(ctx, "task_attempt", None) if ctx is not None else None,
                 retry_key=str(retry_key or ""),
@@ -281,7 +290,7 @@ async def _multi_model_review_async(content: str, prompt: str,
                                      surface: str = "multi_model_review",
                                      session_policy: dict = None,
                                      usage_attribution: dict = None,
-                                     retry_key: str = ""):
+                                     retry_key: str = "", task_evidence: dict = None):
     from ouroboros.review_execution import ReviewRouteKind, delivery_retrieves
 
     row_routes = list(routes or []) + [ReviewRouteKind.API_CHAT] * max(0, len(models) - len(routes or []))
@@ -332,7 +341,7 @@ async def _multi_model_review_async(content: str, prompt: str,
                      effort=row_efforts[idx], session_target=row_targets[idx],
                      session_profile=row_profiles[idx], surface=surface,
                      session_policy=session_policy, usage_attribution=usage_attribution,
-                     retry_key=retry_key, subagent_id=row_actors[idx], use_local=row_local[idx])
+                     retry_key=retry_key, subagent_id=row_actors[idx], use_local=row_local[idx], task_evidence=task_evidence)
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)

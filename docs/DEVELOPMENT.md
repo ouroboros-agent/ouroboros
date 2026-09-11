@@ -837,10 +837,10 @@ declared keys whose values are `None`, `""` or `[]`) is ignored, never mistaken
 for a second operation, while any non-empty list, undeclared key or non-blank
 string is meaning and makes the call mixed. Never replay the plan envelope with
 the disposition.
-Any real blocking finding, including one below quorum, stays open for a changed
-spec or a justified rejection evaluated in the next paid delta cycle; advice
+Any real blocking finding, including one below quorum, stays open pending a paid
+delta review of a changed spec or justified rejection, when capacity remains; advice
 does not become a blocker through repetition. Blocking `REVISE_PLAN` likewise
-requires another panel; advisory
+requires another panel when another paid cycle is available; advisory
 may proceed only under loud host disclosure and the agent's rationale.
 Reviewers return findings, including optional alternatives, not a required
 competing plan. A blocking finding must name the spec id it breaks, and there
@@ -981,6 +981,8 @@ That required presence test is the enforcing surface; CHECKLISTS item 11
 ---
 
 ## Review & Commit Protocol
+
+Keep optional task evidence outside the stable governance prefix; shrink its excerpt before reducing existing review material. A source pointer gives a packet-only model no retrieval capability. Rejoin preserves the original hash and project-local view while any physical reviewer may still read it. Removing an ignored view never deletes the canonical source; no separate notes corpus, blanket ToolResult metadata or mandatory whole-history read belongs to this evidence.
 
 Reviewed commits separate improvement evidence from candidate-bound authority.
 Finish the edits and focused tests, then call `commit_reviewed`; standalone
@@ -1674,9 +1676,7 @@ schedule retain their separate existing CI owners.
   `outputs` are copied when the service stops. Directory outputs become a
   complete manifest plus streamed zip. Policy-rejected members are skipped
   with explicit notes; missing or unreadable members fail the directory copy.
-  `run_script` stages its temporary script under the active workspace (`.ouroboros/tmp_scripts`) for a
-  workspace-bound script and under the task drive otherwise — never the
-  system-repo temp path — so relative imports, generated files and toolchain
+  `run_script` stages workspace scripts in a unique owned directory under `.ouroboros/tmp_scripts`, with a local `.gitignore` written before execution. Raw Git status and patches exclude that scratch without hiding neighbouring user files or changing Git configuration. Each call cleans only its own directory and then empty shared parents; cleanup failure preserves the process result with a warning. Non-workspace scripts keep the task-drive layout and garbage collection, so relative imports, generated files and toolchain
   discovery observe the requested cwd (`ouroboros/tools/shell.py`;
   `tests/test_shell_run_shell.py`).
 - Policy denials stay separate from execution failures:
@@ -3113,6 +3113,8 @@ all source modes and its selected target independently of browser navigation.
 `tests/test_ui_smoke_files_project_drafts.py` verifies these real consumers.
 
 ### Declarative widgets
+
+A module handler that calls `OuroborosWidget.openExternal(url)` or `window.open(url)` from an anchor click also calls `event.preventDefault()`. Invoke the helper directly during the gesture, before awaiting other work; automatic relaying respects an already-handled click.
 
 `web/modules/widgets.js` is the host for reviewed widget declarations:
 forms/actions, text/data/media, tabs/charts, async jobs, files,

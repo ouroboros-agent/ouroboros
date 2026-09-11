@@ -253,6 +253,7 @@ def _zero_diff_message(repo: pathlib.Path, prefix: dict[str, str], paths: list[s
         review_history_section="",
         diff_text="",
         changed_files="\n".join(paths),
+        task_evidence_section="",  # No task trace is part of this zero-diff baseline.
     )
     return {
         "constitutional_head_preamble_plus_BIBLE": _constitutional_head(repo),

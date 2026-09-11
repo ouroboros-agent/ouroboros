@@ -108,6 +108,11 @@ def test_docker_executor_run_script_uses_backend_script_path(tmp_path, monkeypat
     captured: dict[str, object] = {}
 
     def fake_execute(ctx, cmd, cwd, timeout_sec, env_overlay=None):
+        backend = str(cmd[1])
+        host = workspace / backend.removeprefix("/workspace/")
+        assert host.name == "script.py"
+        assert host.read_text() == "print('ok')"
+        assert (host.parent / ".gitignore").read_text() == "*\n"
         captured["cmd"] = list(cmd)
         captured["cwd"] = str(cwd)
         captured["env_overlay"] = env_overlay
