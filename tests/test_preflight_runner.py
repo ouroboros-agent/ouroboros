@@ -1023,7 +1023,7 @@ def test_temp_root_is_swept_between_passes_not_only_at_teardown(tmp_path, two_pa
 
 
 def test_second_pass_never_starts_once_the_total_budget_is_gone(tmp_path, two_pass_env, stub_passes):
-    """The 900s budget is TOTAL. Clamping an exhausted remainder up to one second
+    """The gate budget (1800s today) is TOTAL. Clamping an exhausted remainder up to one second
     (`max(1, int(...))`) let the serial pass start AFTER the deadline and run for
     another whole second; integer truncation could also gift most of a second
     back. An exhausted budget must return without spawning anything."""
@@ -3055,7 +3055,7 @@ def test_both_lanes_empty_blocks(tmp_path, two_pass_env):
 
 @requires_preflight_plugins
 def test_pass2_timeout_names_serial_pass(tmp_path, two_pass_env):
-    """The 900s budget is TOTAL; pass 2 gets the remainder and its timeout must
+    """The gate budget (1800s today) is TOTAL; pass 2 gets the remainder and its timeout must
     name the pass so a hung serial test is not mistaken for a hung parallel one."""
     from ouroboros.preflight_runner import run_hermetic_pytest
 
