@@ -267,6 +267,13 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     # one row covers all four producers. CHILD_RESULT_DISPOSITION_PARTIAL keeps
     # its warning: those entries did record.
     "CHILD_RESULT_DISPOSITION_INVALID": Delta(False, "ok", True, "argument_error", "A.I23", "a disposition the ledger refused to record is an argument error, not a success"),
+    # The refused steer is the owner's own answer (batch #3, 6g = A): the agent
+    # SEES the refusal (is_error, and the policy-denial bucket tool_reported_failure
+    # already routes to), while the execution health axis stays undegraded because
+    # the refusal is not the agent's failure. Nothing new is declared: that status
+    # has been a non-failure for the ledger since v6.83.0.
+    "STEER_REJECTED": Delta(False, "ok", True, "tool_reported_failure", "A.I23", "a steer the host refused is a refusal the agent must see, not a delivered message"),
+    "STEER_UNCONFIRMED": Delta(False, "ok", True, "tool_reported_failure", "A.I23", "a steer with no confirmed receipt did not provably arrive, so it is not a success"),
     "native:TOOL_ARG_ERROR:ERROR": Delta(False, "ok", True, "argument_error", "A.B7", "both commit entry points reject an empty commit message before attempting a commit"),
     "native:TOOL_ARG_ERROR:REJECTED": Delta(False, "ok", True, "argument_error", "A.B7", "scratchpad and identity writers reject empty or malformed content before writing"),
     "native:TOOL_ERROR:TASK_MESSAGE_UNWRITTEN": Delta(False, "ok", True, "error", "A.B7", "forward_to_worker failed to persist the requested message"),
