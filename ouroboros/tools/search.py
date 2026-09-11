@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import pathlib
 import time
 from dataclasses import replace
@@ -26,6 +25,7 @@ from ouroboros.usage_accounting import (
     settle_attempt,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, utc_now_iso
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -182,8 +182,8 @@ def _extract_sources_from_response(resp_obj: Any) -> List[Dict[str, str]]:
 
 def _resolve_openai_client_settings() -> tuple[str, str | None, str, str]:
     """Return credentials only for official OpenAI Responses web search."""
-    official_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
-    legacy_base_url = (os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+    official_key = (runtime_setting("OPENAI_API_KEY", "") or "").strip()
+    legacy_base_url = (runtime_setting("OPENAI_BASE_URL", "") or "").strip()
 
     if official_key and not legacy_base_url:
         return official_key, None, "openai", "openai"
@@ -191,14 +191,14 @@ def _resolve_openai_client_settings() -> tuple[str, str | None, str, str]:
 
 
 def _openrouter_model(model: str) -> str:
-    active = str(model or os.environ.get("OUROBOROS_WEBSEARCH_MODEL") or DEFAULT_SEARCH_MODEL).strip()
+    active = str(model or runtime_setting("OUROBOROS_WEBSEARCH_MODEL") or DEFAULT_SEARCH_MODEL).strip()
     if not active:
         active = DEFAULT_SEARCH_MODEL
     return active if "/" in active else f"openai/{active}"
 
 
 def _anthropic_model(model: str) -> str:
-    active = str(model or os.environ.get("OUROBOROS_WEBSEARCH_MODEL") or "").strip()
+    active = str(model or runtime_setting("OUROBOROS_WEBSEARCH_MODEL") or "").strip()
     if active.startswith("anthropic::"):
         return active[len("anthropic::"):]
     if active.startswith("anthropic/"):
@@ -211,9 +211,9 @@ def _available_web_search_backends() -> list[str]:
     openai_key, _base_url, _provider, _api_key_type = _resolve_openai_client_settings()
     if openai_key:
         backends.append("openai_responses")
-    if str(os.environ.get("OPENROUTER_API_KEY") or "").strip():
+    if str(runtime_setting("OPENROUTER_API_KEY") or "").strip():
         backends.append("openrouter_server_tool")
-    if str(os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+    if str(runtime_setting("ANTHROPIC_API_KEY") or "").strip():
         backends.append("anthropic_server_tool")
     try:
         import ddgs  # noqa: F401
@@ -225,7 +225,7 @@ def _available_web_search_backends() -> list[str]:
 
 
 def _web_search_backend_pin() -> str:
-    return (os.environ.get("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
+    return (runtime_setting("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
 
 
 def _web_search_outer_timeout_sec() -> int:
@@ -298,7 +298,7 @@ def _emit_simple_usage(
 def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search_context_size: str = "") -> str:
     if _web_search_deadline_exhausted(ctx):
         return _web_search_deadline_result()
-    api_key = str(os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    api_key = str(runtime_setting("OPENROUTER_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
     try:
@@ -349,7 +349,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
 def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
     if _web_search_deadline_exhausted(ctx):
         return _web_search_deadline_result()
-    api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    api_key = str(runtime_setting("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
     try:
@@ -568,7 +568,7 @@ def _web_search(
     api_key, base_url, provider, api_key_type = _resolve_openai_client_settings()
     if not api_key:
         return _fallbacks()
-    active_model = model or os.environ.get("OUROBOROS_WEBSEARCH_MODEL", DEFAULT_SEARCH_MODEL)
+    active_model = model or runtime_setting("OUROBOROS_WEBSEARCH_MODEL", DEFAULT_SEARCH_MODEL)
     active_context = search_context_size or DEFAULT_SEARCH_CONTEXT_SIZE
     active_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
     reservation = None

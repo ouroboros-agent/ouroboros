@@ -591,9 +591,8 @@ def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]
     owner-facing states (``ACCEPTANCE_DECISION_STATUSES``) plus a typed
     ``reason`` naming WHICH exit. A status outside the trio fails closed to
     ``finalized_unaccepted`` with its raw token surviving as ``reason`` — no
-    fourth state, no lost token. The agent's stance (``agent_disposition``/
-    ``agent_rationale``) carries forward, never overwritten (after P4.1 the
-    agent writes no status at all)."""
+    fourth state, no lost token. The author's historical stance survives;
+    owner/evidence supersession consumes its controlling finish intent."""
     previous = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
     merged = dict(decision)
     status = str(merged.get("status") or "")
@@ -602,16 +601,46 @@ def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]
         merged["status"] = ACCEPTANCE_FINALIZED_UNACCEPTED
         reason = reason or status or ACCEPTANCE_REASON_UNSPECIFIED
     merged["reason"] = reason
-    for key in ("agent_disposition", "agent_rationale"):
+    for key in ("agent_disposition", "agent_rationale", "author_disposition"):
         if previous.get(key) and not merged.get(key):
             merged[key] = previous.get(key)
+    if reason not in {"owner_followup", "evidence_refresh", "author_finish"} and not (
+        reason == "delivery_binding_superseded" and previous.get("reason") == "author_finish"
+    ) and previous.get("agent_finish_intent"):
+        merged["agent_finish_intent"] = previous["agent_finish_intent"]
     llm_trace["acceptance_decision"] = merged
     # A full applied-review source includes the host's actual decision, not
     # only the provider's earlier response. The decision above stays authority.
     for run in reversed(llm_trace.get("review_runs") or []):
         if isinstance(run, dict) and run.get("authority") == "host_root":
+            author = merged.get("author_disposition")
+            if reason == "author_finish" and isinstance(author, dict) and author.get("subject_hash") != run.get("binding_hash"):
+                break  # A revised author subject is a task fact, not this older panel's decision.
             run["applied_decision"] = dict(merged)
             break
+
+
+def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: Any) -> None:
+    """Record one explicit stance after feedback, separately from the host verdict."""
+    previous = trace.get("acceptance_decision")
+    merged = dict(previous) if isinstance(previous, dict) else {}
+    merged.setdefault("source", "agent_task_acceptance_review_tool")
+    merged["agent_disposition"] = str(decision.get("disposition") or "")
+    merged["agent_rationale"] = truncate_review_artifact(str(decision.get("rationale") or ""), limit=500)
+    merged.pop("agent_finish_intent", None)
+    feedback = next((run for run in reversed(trace.get("review_runs") or [])
+                     if isinstance(run, dict) and run.get("authority") == "host_root"
+                     and run.get("feedback_delivered")), None)
+    if ctx is not None and feedback and decision.get("explicit_finish") is True and merged["agent_rationale"].strip():
+        from ouroboros.loop_delivery import delivery_evidence_fingerprint
+
+        merged["agent_finish_intent"] = {
+            "review_binding_hash": str(feedback.get("binding_hash") or ""),
+            "tool_count": len(trace.get("tool_calls") or []),
+            "owner_directives": len(getattr(ctx, "_owner_directives", []) or []),
+            "evidence_fingerprint": delivery_evidence_fingerprint(ctx, trace),
+        }
+    trace["acceptance_decision"] = merged
 
 
 def _collect_acceptance_obligations(llm_trace: Dict[str, Any], result: Any) -> None:

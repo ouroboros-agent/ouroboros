@@ -361,13 +361,12 @@ def _reviewed_install_binding(drive_root: pathlib.Path, skill_name: str, skill_d
                               specs: List[Dict[str, Any]], expected_hash: str = "") -> str:
     """Revalidate new executable declarations through the existing review owner."""
     from ouroboros.skill_dependencies import payload_declared_install_specs
-    from ouroboros.skill_loader import load_skill, skill_review_gate
+    from ouroboros.skill_loader import load_skill
 
     loaded = load_skill(skill_dir, drive_root)
     if loaded is None or loaded.load_error or loaded.name != skill_name:
         raise RuntimeError("reviewed install payload cannot be resolved")
-    stale = loaded.review.is_stale_for(loaded.content_hash)
-    if not skill_review_gate(loaded.review.status, stale=stale)["executable_review"]:
+    if not loaded.review.gate_for(loaded.content_hash)["executable_review"]:
         raise RuntimeError("install declarations require a fresh executable skill review")
     if expected_hash and loaded.content_hash != expected_hash:
         raise RuntimeError("skill changed during dependency installation; re-review before retrying")

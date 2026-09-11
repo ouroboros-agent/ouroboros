@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import pathlib
 from typing import Any, Dict, Optional
 
 from ouroboros.evolution_fingerprint import _PLAN_REVIEW_SUFFIX
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -261,7 +261,7 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
         # Main-slot chooser (plan 5C): picking the next evolution objective is a
         # high-leverage cognitive decision, not a cheap-lane formatting call.
         chooser_model = str(
-            os.environ.get("OUROBOROS_MODEL", "") or SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+            runtime_setting("OUROBOROS_MODEL", "") or SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
         ).strip()
         resp, usage = chat_observed(
             client,

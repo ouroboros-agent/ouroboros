@@ -22,6 +22,7 @@ from ouroboros.llm import LLMClient
 from ouroboros.loop_llm_call import classify_llm_exception, is_rate_limit_text
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_provider_from_model
 from ouroboros.utils import sanitize_tool_result_for_log, utc_now_iso
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -616,12 +617,12 @@ _PROVIDER_KEY_ENV = {
 
 
 def _any_remote_provider_configured() -> bool:
-    return any(str(os.environ.get(k, "") or "").strip() for k in _REMOTE_PROVIDER_KEYS)
+    return any(str(runtime_setting(k, "") or "").strip() for k in _REMOTE_PROVIDER_KEYS)
 
 
 def _any_local_routing_enabled() -> bool:
     return any(
-        str(os.environ.get(k, "") or "").lower() in ("true", "1")
+        str(runtime_setting(k, "") or "").lower() in ("true", "1")
         for k in _LOCAL_ROUTING_KEYS
     )
 
@@ -635,20 +636,20 @@ def _light_model_has_reachable_provider(light_model: str) -> bool:
         return True  # don't over-block on classifier failure
     if key_type == "gigachat":
         # GigaChat accepts either an authorization key (OAuth) or user/password.
-        has_creds = bool(str(os.environ.get("GIGACHAT_CREDENTIALS", "") or "").strip())
-        has_basic = bool(str(os.environ.get("GIGACHAT_USER", "") or "").strip()) and bool(
-            str(os.environ.get("GIGACHAT_PASSWORD", "") or "").strip()
+        has_creds = bool(str(runtime_setting("GIGACHAT_CREDENTIALS", "") or "").strip())
+        has_basic = bool(str(runtime_setting("GIGACHAT_USER", "") or "").strip()) and bool(
+            str(runtime_setting("GIGACHAT_PASSWORD", "") or "").strip()
         )
         return has_creds or has_basic
     env_key = _PROVIDER_KEY_ENV.get(key_type)
     if env_key is None:
         return True
-    if not str(os.environ.get(env_key, "") or "").strip():
+    if not str(runtime_setting(env_key, "") or "").strip():
         return False
     if key_type == "openai-compatible":
         base_url = (
-            str(os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-            or str(os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+            str(runtime_setting("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
+            or str(runtime_setting("OPENAI_BASE_URL", "") or "").strip()
         )
         if not base_url:
             return False
@@ -673,7 +674,7 @@ def _safety_deadline_epoch(ctx: Optional[Any]) -> Optional[float]:
 
 def _resolve_safety_routing() -> Tuple[bool, bool, Optional[str]]:
     """Choose local/remote safety backend; unreachable fallback fails open."""
-    if str(os.environ.get("USE_LOCAL_LIGHT", "") or "").lower() in ("true", "1"):
+    if str(runtime_setting("USE_LOCAL_LIGHT", "") or "").lower() in ("true", "1"):
         return True, False, None
 
     light_model = get_light_model()

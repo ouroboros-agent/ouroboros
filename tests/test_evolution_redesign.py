@@ -514,6 +514,7 @@ body
 
 def test_skill_schedules_sync_into_core_scheduler(tmp_path):
     from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
+    from ouroboros.skill_loader import LoadedSkill, SkillReviewState
     from supervisor import queue
 
     queue.init(tmp_path)
@@ -530,15 +531,15 @@ scheduled_tasks:
 ---
 body
 """)
-    skill = SimpleNamespace(
+    skill = LoadedSkill(
         name="cron-demo",
+        skill_dir=tmp_path / "skill",
         manifest=manifest,
         enabled=True,
         load_error="",
         content_hash="abc",
-        review=SimpleNamespace(status="pass", is_stale_for=lambda _hash: False),
+        review=SkillReviewState(status="clean", content_hash="abc"),
     )
-
     report = queue.sync_skill_schedules([skill])
     schedules = queue.list_scheduled_tasks()["tasks"]
 
@@ -546,6 +547,16 @@ body
     assert schedules[0]["id"] == "skill-cron-demo-refresh"
     assert schedules[0]["enabled"] is True
     assert schedules[0]["trigger"]["expr"] == "0 * * * *"
+    # A changed payload loses critic authority; a fresh review restores it.
+    skill.content_hash = "changed"
+    queue.sync_skill_schedules([skill])
+    assert queue.list_scheduled_tasks()["tasks"][0]["enabled"] is False
+    skill.review = SkillReviewState(status="clean", content_hash="changed")
+    queue.sync_skill_schedules([skill])
+    assert queue.list_scheduled_tasks()["tasks"][0]["enabled"] is True
+    skill.enabled = False
+    queue.sync_skill_schedules([skill])
+    assert queue.list_scheduled_tasks()["tasks"][0]["enabled"] is False
 
 
 def test_skill_schedule_sync_refreshes_next_run_on_cron_change(tmp_path):

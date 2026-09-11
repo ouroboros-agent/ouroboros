@@ -1055,13 +1055,10 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: full wave needs spec and findings")
             if not isinstance(wave.get("dispositions", []), list):
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: dispositions must be a list")
-            if "author_disposition" in wave:
-                author = validate_author_disposition(
-                    wave.get("author_disposition"),
-                    subject_hash=fingerprint,
-                )
-                if author is None:
-                    raise ValueError("PLAN_REVIEW_STATE_INVALID: author_disposition is malformed or stale")
+        if "author_disposition" in wave and validate_author_disposition(
+            wave["author_disposition"], subject_hash=fingerprint,
+        ) is None:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: author_disposition is malformed or stale")
         seen.add(fingerprint)
     cycles_paid = value.get("cycles_paid", 0)
     if not isinstance(cycles_paid, int) or isinstance(cycles_paid, bool) or cycles_paid < 0:

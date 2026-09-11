@@ -293,7 +293,7 @@ def run_vision_child(*, child_timeout: float, subscription: bool, **kwargs: Any)
             script = "from ouroboros.tools.vision_process import child_main; import sys; child_main(sys.argv[1])"
             result = _tracked_subprocess_run([executable, "-c", script, str(payload_path)],
                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             text=True, timeout=child_timeout)
+                                             text=True, timeout=child_timeout, env=config.runtime_environ())
             try:
                 lines = [line for line in str(result.stdout or "").splitlines() if line.strip()]
                 value = json.loads(lines[-1]) if lines else None

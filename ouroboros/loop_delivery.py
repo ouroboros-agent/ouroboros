@@ -140,17 +140,22 @@ def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content
     return ""
 
 
-def _delivery_evidence_state(
-    tools: ToolRegistry,
-    ctx: _RoundLimitContext,
-    llm_trace: Dict[str, Any],
-) -> tuple[int, str]:
+def delivery_evidence_fingerprint(
+    tool_ctx: Any, llm_trace: Dict[str, Any], *, task_id: str = "",
+    status_root: Any = None, root_task_id: str = "",
+) -> str:
     """Fingerprint only evidence that can invalidate a complete answer."""
 
     from ouroboros.outcomes import read_context_verification_receipts
     from ouroboros.tools.join_ledger import _child_result_sha256
 
-    owner_directives = getattr(tools._ctx, "_owner_directives", [])
+    metadata = getattr(tool_ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    task_id = str(task_id or getattr(tool_ctx, "task_id", "") or "")
+    root_task_id = str(root_task_id or metadata.get("root_task_id") or task_id)
+    status_root = status_root or metadata.get("budget_drive_root") or getattr(tool_ctx, "budget_drive_root", None) or getattr(tool_ctx, "drive_root", None)
+    children = _loop()._load_direct_child_results(pathlib.Path(status_root), task_id, root_task_id) if status_root and task_id else []
+    owner_directives = getattr(tool_ctx, "_owner_directives", [])
     owner_directives = owner_directives if isinstance(owner_directives, list) else []
     children = [
         {
@@ -159,16 +164,9 @@ def _delivery_evidence_state(
             "sha256": _child_result_sha256(child),
             "disposition": _loop()._child_disposition_state(child),
         }
-        for child in _loop()._direct_child_results(ctx)
+        for child in children
     ]
-    receipt_root = pathlib.Path(
-        str(
-            getattr(tools._ctx, "drive_root", "")
-            or ctx.drive_root
-            or ctx.status_drive_root
-            or ctx.drive_logs.parent
-        )
-    )
+    receipt_root = getattr(tool_ctx, "drive_root", None) or status_root
     evidence = {
         "owner_directives": owner_directives,
         "tool_effects": reviewable_effect_projection(llm_trace),
@@ -186,7 +184,7 @@ def _delivery_evidence_state(
         ],
         "children": children,
         "verification_receipts": read_context_verification_receipts(
-            tools._ctx, ctx.task_id, fallback_root=receipt_root,
+            tool_ctx, task_id, fallback_root=receipt_root,
         ),
         # Task-scoped service teardown can register declared outputs or
         # surface an output-finalization failure. Those facts arise outside an
@@ -194,13 +192,25 @@ def _delivery_evidence_state(
         # a host acceptance panel could review the pre-teardown state.
         "service_finalization": _loop()._service_finalization_evidence(llm_trace),
     }
-    fingerprint = hashlib.sha256(json.dumps(
+    return hashlib.sha256(json.dumps(
         evidence,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
     ).encode("utf-8")).hexdigest()
+
+
+def _delivery_evidence_state(
+    tools: ToolRegistry,
+    ctx: _RoundLimitContext,
+    llm_trace: Dict[str, Any],
+) -> tuple[int, str]:
+    """Track the shared answer-invalidating evidence fingerprint."""
+    fingerprint = delivery_evidence_fingerprint(
+        tools._ctx, llm_trace, task_id=ctx.task_id, root_task_id=ctx.root_task_id,
+        status_root=ctx.status_drive_root or ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
+    )
     previous = str(getattr(tools._ctx, "_delivery_evidence_fingerprint", "") or "")
     revision = int(getattr(tools._ctx, "_delivery_evidence_revision", 0) or 0)
     if fingerprint != previous:

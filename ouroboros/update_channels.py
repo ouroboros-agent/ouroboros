@@ -44,7 +44,9 @@ def get_update_branch(settings: Mapping[str, Any] | None = None) -> str:
 
 
 def _bounded_timeout_setting(name: str) -> int:
-    raw = os.environ.get(name, UPDATE_SETTINGS_DEFAULTS[name])
+    from ouroboros.settings_integrity import runtime_setting
+
+    raw = runtime_setting(name, UPDATE_SETTINGS_DEFAULTS[name])
     try:
         parsed = int(float(raw))
     except (TypeError, ValueError):

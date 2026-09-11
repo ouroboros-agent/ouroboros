@@ -422,6 +422,7 @@ def _merge_attempt(existing: CommitAttemptRecord, incoming: CommitAttemptRecord)
         triad_models=list(incoming.triad_models or existing.triad_models),
         triad_raw_results=list(getattr(incoming, "triad_raw_results", None) or getattr(existing, "triad_raw_results", None) or []),
         scope_raw_result=dict(getattr(incoming, "scope_raw_result", None) or getattr(existing, "scope_raw_result", None) or {}),
+        author_disposition=dict(incoming.author_disposition or existing.author_disposition),
         # Once an attempt physically dispatched a paid triad/scope wave the fact is
         # durable: a later terminal update on the same row must never launder it.
         paid=bool(getattr(incoming, "paid", False) or getattr(existing, "paid", False)),

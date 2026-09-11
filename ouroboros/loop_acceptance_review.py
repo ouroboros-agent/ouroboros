@@ -517,6 +517,50 @@ def _set_applied_host_acceptance_impact(
     )
 
 
+def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
+    """Finish a current explicit response to delivered criticism, without another panel."""
+    if _loop().get_review_enforcement() != "advisory":
+        return False
+    stance = ctx.llm_trace.get("acceptance_decision") or {}
+    intent = stance.get("agent_finish_intent") or {}
+    feedback = next((run for run in reversed(ctx.llm_trace.get("review_runs") or [])
+                     if isinstance(run, dict) and run.get("authority") == "host_root"
+                     and run.get("feedback_delivered")), None)
+    disposition = str(stance.get("agent_disposition") or "")
+    from ouroboros.loop_delivery import delivery_evidence_fingerprint
+
+    if (not feedback or not intent or disposition not in {"accepted", "rejected", "partial", "deferred"}
+            or intent.get("review_binding_hash") != feedback.get("binding_hash")
+            or intent.get("tool_count") != len(ctx.llm_trace.get("tool_calls") or [])
+            or intent.get("owner_directives") != len(getattr(ctx.tools._ctx, "_owner_directives", []) or [])
+            or intent.get("evidence_fingerprint") != delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)):
+        return False
+    from ouroboros.review_records import build_author_disposition
+
+    author = build_author_disposition(
+        disposition=disposition, rationale=str(stance.get("agent_rationale") or ""),
+        subject_hash=ctx.review_binding["binding_hash"],
+        reviewer_signal=str(feedback.get("aggregate_signal") or "DEGRADED"), enforcement="advisory",
+    )
+    if not _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal"):
+        _loop()._supersede_task_acceptance_for_owner_followup(ctx.tools._ctx, ctx.llm_trace)
+        return True
+    ctx.tools._ctx._task_acceptance_reviewed = True
+    _loop()._mark_root_acceptance_checkpoint(
+        ctx.tools._ctx, ctx.llm_trace, status=author["reviewer_signal"].lower(), pass_index=ctx.passes_done,
+    )
+    ctx.llm_trace["review_decision"].update({"binding_hash": ctx.review_binding["binding_hash"], "author_finish": True})
+    _loop()._set_acceptance_decision(ctx.llm_trace, {
+        "status": ACCEPTANCE_FINALIZED_UNACCEPTED, "reason": "author_finish",
+        "source": "task_acceptance_review", "author_disposition": author,
+        "rationale": "The author finished after independent feedback; the current subject is author-accepted, not reviewer PASS.",
+        "reviewer_signal": author["reviewer_signal"],
+        "reviewer_binding_hash": feedback.get("binding_hash"),
+    })
+    ctx.emit_progress(f"Task acceptance review: {author['reviewer_signal']} — author finished advisory review ({disposition}); raw findings retained.")
+    return True
+
+
 def _apply_task_acceptance_result(
     ctx: _TaskAcceptanceContext,
     result: Any,
@@ -576,56 +620,6 @@ def _apply_task_acceptance_result(
                 "dissent_noted": bool(dissent),
             })
         ctx.emit_progress("Task acceptance review: PASS (clean acceptance).")
-        return False
-
-    # After the first panel, an explicit Advisory author stance ends the dialogue.
-    # Retain raw findings, never mint PASS, and leave Blocking authority unchanged.
-    author_stance = (
-        ctx.llm_trace.get("acceptance_decision", {})
-        if isinstance(ctx.llm_trace.get("acceptance_decision"), dict) else {}
-    )
-    author_disposition = str(author_stance.get("agent_disposition") or "").strip().lower()
-    if (
-        _loop().get_review_enforcement() == "advisory"
-        and author_disposition in {"accepted", "rejected", "partial", "deferred"}
-    ):
-        from ouroboros.review_records import build_author_disposition
-        try:
-            author_record = build_author_disposition(
-                disposition=author_disposition,
-                rationale=str(author_stance.get("agent_rationale") or "") or "Author finished the advisory review.",
-                subject_hash=str(
-                    ctx.review_binding.get("binding_hash") or
-                    ctx.review_binding.get("candidate_hash") or ctx.content
-                ),
-                reviewer_signal=str(result.aggregate_signal or "DEGRADED").upper(),
-                enforcement="advisory",
-            )
-        except ValueError:
-            author_record = {}
-        ctx.tools._ctx._task_acceptance_reviewed = True
-        _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
-        _loop()._mark_root_acceptance_checkpoint(
-            ctx.tools._ctx, ctx.llm_trace,
-            status=str(result.aggregate_signal or "DEGRADED").lower(), pass_index=ctx.passes_done,
-        )
-        _loop()._set_acceptance_decision(ctx.llm_trace, {
-            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
-            "reason": "author_finish",
-            "source": "task_acceptance_review",
-            "rationale": (
-                "The author explicitly finished the advisory acceptance dialogue; "
-                "raw reviewer findings remain recorded and no reviewer PASS was fabricated."
-            ),
-            "author_disposition": author_record or author_disposition,
-            "author_rationale": str(author_stance.get("agent_rationale") or ""),
-            "reviewer_signal": str(result.aggregate_signal or "DEGRADED").upper(),
-            "dissent_noted": bool(dissent),
-        })
-        ctx.emit_progress(
-            f"Task acceptance review: {result.aggregate_signal} — author finished advisory review "
-            f"({author_disposition}); raw findings retained."
-        )
         return False
 
     if reused:
@@ -698,6 +692,10 @@ def _apply_task_acceptance_result(
         if ctx.content and ctx.content.strip():
             ctx.messages.append({"role": "assistant", "content": ctx.content})
         _loop()._append_or_merge_user_message(ctx.messages, capsule)
+        for run in reversed(ctx.llm_trace.get("review_runs") or []):
+            if isinstance(run, dict) and run.get("authority") == "host_root":
+                run["feedback_delivered"] = True
+                break
         ctx.emit_progress(
             f"Task acceptance review: {result.aggregate_signal} — improvement note fed back."
         )
@@ -1257,13 +1255,6 @@ def _run_task_acceptance_review_once(
     )
     budget_snapshot = task_pacing.build_budget_snapshot(tools._ctx, profile=budget_profile)
     passes_done = int(getattr(tools._ctx, "_task_acceptance_improvement_passes", 0))
-    launch_ok, launch_reason = task_pacing.review_launch_allowed(budget_snapshot)
-    if not launch_ok:
-        return _skip_task_acceptance_for_launch_reason(
-            tools._ctx, llm_trace, launch_reason=launch_reason,
-            snapshot=budget_snapshot, passes_done=passes_done,
-            emit_progress=emit_progress,
-        )
     review_ctx = _TaskAcceptanceContext(
         tools=tools,
         content=content,
@@ -1302,6 +1293,18 @@ def _run_task_acceptance_review_once(
             evidence=review_ctx.evidence,
             fence_token_or_state=_direct_context_fence_state(tools._ctx, _fence_token),
         )
+        if _loop()._task_acceptance_owner_generation_changed(tools._ctx):
+            _loop()._supersede_task_acceptance_for_owner_followup(tools._ctx, llm_trace)
+            return True
+        if _finish_advisory_author(review_ctx):
+            return not bool(getattr(tools._ctx, "_task_acceptance_reviewed", False))
+        launch_ok, launch_reason = task_pacing.review_launch_allowed(budget_snapshot)
+        if not launch_ok:
+            return _skip_task_acceptance_for_launch_reason(
+                tools._ctx, llm_trace, launch_reason=launch_reason,
+                snapshot=budget_snapshot, passes_done=passes_done,
+                emit_progress=emit_progress,
+            )
         binding_hash = str(review_ctx.review_binding.get("binding_hash") or "")
         # A-material: what the tree's wallet actually buys. Stamped onto the
         # binding before the free-replay lookup and the dispatch claim both read it.

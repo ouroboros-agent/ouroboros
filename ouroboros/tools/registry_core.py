@@ -27,6 +27,7 @@ from ouroboros.runtime_mode_policy import (
     PROTECTED_RUNTIME_PATHS,
     core_patch_notice,
     mode_allows_protected_write,
+    runtime_mode_at_least,
     protected_paths_in,
     protected_write_block_message,
 )
@@ -604,19 +605,17 @@ class ToolRegistry:
                 props = schema.get("parameters", {}).get("properties", {})
                 for field in ("root", "bucket", "skill_name"):
                     props.pop(field, None)
-            elif entry.name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
+            elif (entry.name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS
+                  or entry.name in _GENERIC_VCS_TARGET_TOOLS
+                  or entry.name in {"read_file", "list_files", "search_code", "query_code"}):
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                if isinstance(root_schema.get("enum"), list):
-                    root_schema["enum"] = [root for root in root_schema["enum"] if root == "active_workspace"]
-            elif entry.name in {"read_file", "list_files", "search_code", "query_code"}:
-                # Acting profile reads its own surface + data roots, NOT the live
-                # system_repo (no system_repo in _POLICY['acting_subagent']).
-                schema = copy.deepcopy(schema)
-                root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                allowed = {"active_workspace"} if entry.name in {"search_code", "query_code"} else {"active_workspace", "runtime_data", "task_drive", "artifact_store"}
-                if isinstance(root_schema.get("enum"), list):
-                    root_schema["enum"] = [root for root in root_schema["enum"] if root in allowed]
+                operation = _target_binding_operation(entry.name, {})
+                if isinstance(root_schema.get("enum"), list) and operation:
+                    root_schema["enum"] = [root for root in root_schema["enum"]
+                        if decide_tool_access(profile=active_tool_profile(self._ctx), root=root,
+                                              operation=operation).allow
+                        and (entry.name != "query_code" or root in {"active_workspace", "system_repo"})]
         return {"type": "function", "function": schema}
 
     def _schemas_for_entry(self, entry: ToolEntry) -> List[Dict[str, Any]]:
@@ -1284,7 +1283,8 @@ class ToolRegistry:
             )
             allow_protected = registry_guards._authorized_managed_update_resolver(self._ctx) or (
                 mode_allows_protected_write(_runtime_mode)
-                and (acting_protected_grant or not acting_subagent)
+                and (acting_protected_grant or not acting_subagent
+                     or runtime_mode_at_least(_runtime_mode, "cyber_pro"))
             )
             if protected_matches and not allow_protected:
                 first = protected_matches[0]

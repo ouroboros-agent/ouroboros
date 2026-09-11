@@ -118,9 +118,7 @@ def _review_fields(
     github_token_configured: bool | None = None,
 ) -> dict[str, Any]:
     stale = loaded.review.is_stale_for(loaded.content_hash) if stale is None else stale
-    gate = (skill_review_gate(loaded.review.status, stale=stale,
-                              findings=getattr(loaded.review, "findings", None))
-            if gate is None else gate)
+    gate = loaded.review.gate_for(loaded.content_hash) if gate is None else gate
     source = str(getattr(loaded, "source", "") or "")
     official_hub_verified = False
     if source == "ouroboroshub":
@@ -166,6 +164,8 @@ def _review_fields(
         "review_status": loaded.review.status,
         "review_stale": stale,
         "review_gate": gate,
+        "author_disposition": dict(loaded.review.author_disposition),
+        "reviewed_content_hash": gate["reviewed_content_hash"],
         "executable_review": gate["executable_review"],
         # Surfaced so the UI can mark an owner-attested skill (LLM review skipped) distinctly
         # from a normal LLM-clean verdict, and hide the "Skip review" action once attested.

@@ -20,6 +20,7 @@ except ImportError:
     _HAS_STEALTH = False
 
 from ouroboros import browser_policy
+from ouroboros.config import runtime_setting
 from ouroboros.tool_access import active_tool_profile
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tools.tool_result import _compose_execute_result
@@ -653,7 +654,7 @@ def _inject_native_screenshot(ctx: ToolContext, b64: str) -> str:
         active_model = (
             str(getattr(ctx, "active_model", "") or "")
             or str(getattr(ctx, "task_model_override", "") or "")
-            or str(os.environ.get("OUROBOROS_MODEL", "") or "")
+            or str(runtime_setting("OUROBOROS_MODEL", "") or "")
         )
         from ouroboros.model_slots import task_model_binding
         from ouroboros.model_wait import current_model_wait

@@ -1215,6 +1215,7 @@ textarea::placeholder {
   .grid.two,
   .grid.three,
   .wizard-choice-grid,
+  .wizard-choice-grid.four,
   .agent-ladder-layout {
     grid-template-columns: 1fr;
   }

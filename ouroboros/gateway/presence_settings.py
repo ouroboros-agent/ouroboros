@@ -21,7 +21,7 @@ from ouroboros.presence_capabilities import (
 )
 from ouroboros.presence_profile import PresenceProfileError, parse_presence_profile
 from ouroboros.presence_runtime import PresenceRuntimeError, PresenceRuntimeOverrides
-from ouroboros.skill_loader import find_skill, review_status_allows_execution
+from ouroboros.skill_loader import find_skill
 
 log = logging.getLogger(__name__)
 _REQUEST_FIELDS = frozenset({"expected_state_fingerprint", "runtime_overrides"})
@@ -49,8 +49,7 @@ def presence_runtime_card_projection(drive_root: Path, loaded: Any) -> dict[str,
     extras = getattr(loaded.manifest, "raw_extra", {})
     if not isinstance(extras, Mapping) or "presence" not in extras:
         return None
-    stale = loaded.review.is_stale_for(loaded.content_hash)
-    if stale or not review_status_allows_execution(loaded.review.status):
+    if not loaded.review.gate_for(loaded.content_hash)["executable_review"]:
         return None
     try:
         profile = parse_presence_profile(loaded.manifest, loaded.skill_dir)
@@ -87,7 +86,7 @@ def _update_runtime_overrides(
     loaded = find_skill(drive_root, skill_name, repo_path=repo_path)
     if loaded is None:
         return {"error": "skill not found", "status_code": 404}
-    if loaded.review.is_stale_for(loaded.content_hash) or not review_status_allows_execution(loaded.review.status):
+    if not loaded.review.gate_for(loaded.content_hash)["executable_review"]:
         return {"error": "presence runtime overrides require a fresh executable review", "status_code": 409}
     profile = parse_presence_profile(loaded.manifest, loaded.skill_dir)
     if profile is None:

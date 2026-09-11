@@ -1161,6 +1161,9 @@ def test_rank_aware_github_policy_keeps_ordinary_setup_blocked():
 
 @pytest.mark.parametrize("cmd", [
     "git rebase HEAD~1",
+    "git checkout -- BIBLE.md",
+    "git restore BIBLE.md",
+    "git commit -m rewrite BIBLE.md",
     "git update-ref refs/heads/feature HEAD",
     "git filter-repo --path other.txt --invert-paths",
 ])
@@ -1173,7 +1176,6 @@ def test_bible_history_predicate_allows_unrelated_git_history_operations(cmd):
 @pytest.mark.parametrize("cmd", [
     "git rm BIBLE.md",
     "git mv BIBLE.md BIBLE.old",
-    "git checkout -- BIBLE.md",
     "git update-index --remove BIBLE.md",
     "git filter-repo --path BIBLE.md --invert-paths",
 ])

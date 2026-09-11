@@ -18,7 +18,7 @@ from ouroboros.skill_lifecycle_queue import LifecycleJobOptions, run_lifecycle_j
 from ouroboros.skill_loader import (
     discover_skills, find_skill, grant_status_for_skill, requested_core_setting_keys,
     requested_skill_permissions, save_enabled, save_skill_grants, skill_conflict_status,
-    skill_review_gate, skill_state_dir,
+    skill_state_dir,
 )
 from ouroboros.tool_access import active_tool_profile, canonical_data_root
 from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
@@ -32,7 +32,7 @@ def _refusal(message: str, status_code: int = 409, **facts: Any) -> dict[str, An
 
 def _review_facts(skill: Any, drive_root: Path) -> dict[str, Any]:
     stale = skill.review.is_stale_for(skill.content_hash)
-    gate = skill_review_gate(skill.review.status, stale=stale, findings=skill.review.findings)
+    gate = skill.review.gate_for(skill.content_hash)
     return {
         "skill": skill.name, "source": skill.source, "content_hash": skill.content_hash,
         "review_status": skill.review.status, "review_stale": stale,

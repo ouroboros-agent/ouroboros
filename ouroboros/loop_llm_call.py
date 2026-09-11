@@ -8,9 +8,10 @@ Extracted from loop.py to keep the main loop orchestrator focused.
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import contextlib
 import hashlib
-import os
 import pathlib
 import queue
 import time
@@ -191,7 +192,7 @@ def transient_retry_max(default_retries: int) -> int:
         default_value = int(SETTINGS_DEFAULTS.get("OUROBOROS_TRANSIENT_RETRY_MAX", _TRANSIENT_RETRY_DEFAULT))
     except Exception:
         default_value = _TRANSIENT_RETRY_DEFAULT
-    raw = os.environ.get("OUROBOROS_TRANSIENT_RETRY_MAX", "").strip()
+    raw = runtime_setting("OUROBOROS_TRANSIENT_RETRY_MAX", "").strip()
     try:
         value = int(raw) if raw else default_value
     except ValueError:

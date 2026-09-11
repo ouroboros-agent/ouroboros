@@ -71,18 +71,18 @@ class SkillReviewState:
     raw_actor_records: List[Dict[str, Any]] = field(default_factory=list)
     advisory_result: Dict[str, Any] = field(default_factory=dict)
     review_profile: str = ""
-    # Optional author-finality record for an advisory review.  It is bound to
-    # content_hash and never changes the raw reviewer findings or deterministic
-    # preflight status.
+    # Reviewer identity and current author acceptance are independent evidence.
     author_disposition: Dict[str, Any] = field(default_factory=dict)
-    reviewed_content_hash: str = ""
+    reviewed_content_hash: str = ""  # Original reviewer hash on earlier author-finish records.
 
     def is_stale_for(self, current_hash: str) -> bool:
-        if not current_hash:
-            return True
-        if not self.content_hash:
-            return True
-        return self.content_hash != current_hash
+        return not current_hash or (self.reviewed_content_hash or self.content_hash) != current_hash
+
+    def gate_for(self, current_hash: str, *, enforcement: Optional[str] = None) -> Dict[str, Any]:
+        return {**skill_review_gate(self.status, stale=self.is_stale_for(current_hash),
+                                   enforcement=enforcement, findings=self.findings,
+                                   author_disposition=self.author_disposition, current_hash=current_hash),
+                "reviewed_content_hash": self.reviewed_content_hash or self.content_hash}
 
     def to_dict(self) -> Dict[str, Any]:
         data = {
@@ -138,9 +138,7 @@ class LoadedSkill:
         if not self.manifest.is_script():
             # instruction has no payload; extension runs through PluginAPI.
             return False
-        if not review_status_allows_execution(self.review.status):
-            return False
-        if self.review.is_stale_for(self.content_hash):
+        if not self.review.gate_for(self.content_hash)["executable_review"]:
             return False
         from ouroboros.tools.skill_exec import _resolve_runtime_binary, _resolve_script_path
 
@@ -618,7 +616,6 @@ def load_review_state(
     )
     author_disposition = validate_author_disposition(
         data.get("author_disposition"),
-        subject_hash=str(data.get("content_hash") or ""),
     ) or {}
     try:
         prompt_chars = int(data.get("prompt_chars") or 0)
@@ -834,7 +831,7 @@ def grant_status_for_skill(drive_root: pathlib.Path, skill: LoadedSkill) -> Dict
     granted_permissions = [perm for perm in requested_permissions if perm in persisted_permissions]
     missing = [key for key in requested if key not in set(granted)]
     missing_permissions = [perm for perm in requested_permissions if perm not in set(granted_permissions)]
-    review_ready = review_status_allows_execution(skill.review.status) and not skill.review.is_stale_for(skill.content_hash)
+    review_ready = skill.review.gate_for(skill.content_hash)["executable_review"]
     # Scripts receive core keys via _scrub_env; extensions via PluginAPI.
     # Instruction skills cannot receive core keys.
     eligible_type = skill.manifest.is_script() or skill.manifest.is_extension()
@@ -882,9 +879,7 @@ def auto_grant_if_enabled(drive_root: pathlib.Path, skill: LoadedSkill) -> AutoG
         return outcome
     if skill.load_error:
         return outcome
-    if skill.review.is_stale_for(skill.content_hash):
-        return outcome
-    if not review_status_allows_execution(skill.review.status):
+    if not skill.review.gate_for(skill.content_hash)["executable_review"]:
         return outcome
     if normalize_skill_review_status(skill.review.status) == _REVIEW_STATUS_PENDING:
         return outcome
@@ -1491,7 +1486,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
     available = blocked_by_grants = pending_review = blocker_review = warning_review = broken = 0
     for s in skills:
         stale = s.review.is_stale_for(s.content_hash)
-        gate = skill_review_gate(s.review.status, stale=stale, findings=s.review.findings)
+        gate = s.review.gate_for(s.content_hash)
         if s.identity_collision:
             # Readiness probes include lifecycle/dependency state. A collision
             # has no unique lifecycle identity, so its UI projection must stay
@@ -1510,7 +1505,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
         blocked_by_grants += int(s.available_for_execution and not grants_usable)
         pending_review += int(
             s.review.status in (_REVIEW_STATUS_PENDING, "")
-            or (review_status_allows_execution(s.review.status) and stale)
+            or (stale and not gate["executable_review"])
         )
         blocker_review += int(s.review.status == _REVIEW_STATUS_FAIL)
         warning_review += int(s.review.status == _REVIEW_STATUS_ADVISORY)
@@ -1530,6 +1525,8 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
             "review_status": s.review.status,
             "review_stale": stale,
             "review_gate": gate,
+            "author_disposition": dict(s.review.author_disposition),
+            "reviewed_content_hash": gate["reviewed_content_hash"],
             "executable_review": gate["executable_review"],
             "available_for_execution": runnable,
             "runnable_via_skill_exec": s.available_for_execution,

@@ -487,6 +487,9 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: "required")
     monkeypatch.setattr(rs, "triad_delivery_slots", lambda **k: [object(), object(), object()])
 
+    # This scenario requires one improvement pass, independently of operator defaults.
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
+
     # (a) CONTRACT-VALID solved PASS (a non-empty completion_coach, as the required
     # contract demands) with no actionable findings -> still NO injection, finalize.
     # A coach alone must not re-loop an already-solved deliverable.

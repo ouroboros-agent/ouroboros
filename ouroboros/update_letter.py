@@ -41,6 +41,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.update_channels import normalize_update_channel
 from ouroboros.utils import atomic_write_json, read_json_dict, truncate_within_limit, utc_now_iso
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -434,7 +435,7 @@ def _light_uses_local(model: str) -> bool:
     """
     from ouroboros.provider_models import review_model_uses_local
 
-    if str(os.environ.get("USE_LOCAL_LIGHT", "") or "").strip().lower() in ("true", "1", "yes", "on"):
+    if str(runtime_setting("USE_LOCAL_LIGHT", "") or "").strip().lower() in ("true", "1", "yes", "on"):
         return True
     return review_model_uses_local(model)
 

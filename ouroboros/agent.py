@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import logging
 import os
 import pathlib
@@ -745,39 +747,42 @@ class OuroborosAgent:
         self._current_chat_id = None
         # Hot-reload settings so UI changes affect the next task without
         # restart; a failed reload is disclosed loudly, not swallowed (#285).
-        subagent_runtime.apply_task_start_settings_or_disclose(
+        settings_snapshot = subagent_runtime.apply_task_start_settings_or_disclose(
             str(task.get("id") or ""), self._emit_live_log)
 
         from ouroboros.usage_accounting import UsageScope, usage_scope
         from ouroboros.model_wait import task_model_wait_scope
         from ouroboros.utils import in_worker_process
 
-        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-        task_id = str(task.get("id") or metadata.get("task_id") or "")
-        root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
-        parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
-        budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
-        global_limit = resolve_total_budget_usd()
-        try:
-            root_limit = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
-        except (TypeError, ValueError):
-            root_limit = 0.0
-        scope = UsageScope(
-            drive_root=budget_root,
-            task_id=task_id,
-            root_task_id=root_task_id,
-            parent_task_id=parent_task_id,
-            category=str(task.get("type") or "task"),
-            source="agent.task",
-            global_limit_usd=global_limit,
-            root_limit_usd=root_limit if root_limit > 0 else None,
-            root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
-        )
-        with usage_scope(scope), task_model_wait_scope(
-            task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
-            worker_slot_held=in_worker_process(),
-        ):
-            return self._handle_task_scoped(task)
+        from ouroboros.config import task_settings_scope
+
+        with task_settings_scope(settings_snapshot):
+            metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+            task_id = str(task.get("id") or metadata.get("task_id") or "")
+            root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
+            parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
+            budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
+            global_limit = resolve_total_budget_usd()
+            try:
+                root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+            except (TypeError, ValueError):
+                root_limit = 0.0
+            scope = UsageScope(
+                drive_root=budget_root,
+                task_id=task_id,
+                root_task_id=root_task_id,
+                parent_task_id=parent_task_id,
+                category=str(task.get("type") or "task"),
+                source="agent.task",
+                global_limit_usd=global_limit,
+                root_limit_usd=root_limit if root_limit > 0 else None,
+                root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
+            )
+            with usage_scope(scope), task_model_wait_scope(
+                task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
+                worker_slot_held=in_worker_process(),
+            ):
+                return self._handle_task_scoped(task)
 
     def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._busy = True

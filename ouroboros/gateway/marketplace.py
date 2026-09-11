@@ -560,7 +560,7 @@ def _validate_path_param_name(name: str) -> Optional[str]:
 
 
 def _installed_skill_payload(skill: Any, drive_root: pathlib.Path, *, provenance: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    from ouroboros.skill_loader import grant_status_for_skill, skill_review_gate
+    from ouroboros.skill_loader import grant_status_for_skill
 
     try:
         rel_skill_dir = skill.skill_dir.resolve().relative_to(drive_root.resolve())
@@ -568,7 +568,7 @@ def _installed_skill_payload(skill: Any, drive_root: pathlib.Path, *, provenance
     except Exception:
         payload_root = ""
     stale = skill.review.is_stale_for(skill.content_hash)
-    gate = skill_review_gate(skill.review.status, stale=stale, findings=skill.review.findings)
+    gate = skill.review.gate_for(skill.content_hash)
     payload = {
         "name": skill.name,
         "type": skill.manifest.type,

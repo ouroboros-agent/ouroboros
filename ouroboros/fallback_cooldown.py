@@ -15,10 +15,10 @@ bad config value).
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from typing import Dict, Tuple
+from ouroboros.config import runtime_setting
 
 _cooldown: Dict[Tuple[str, bool], float] = {}
 _lock = threading.Lock()
@@ -26,7 +26,7 @@ _lock = threading.Lock()
 
 def cooldown_enabled() -> bool:
     """Default-on; only an explicit falsey value disables it."""
-    raw = str(os.environ.get("OUROBOROS_FALLBACK_COOLDOWN_ENABLED", "") or "").strip().lower()
+    raw = str(runtime_setting("OUROBOROS_FALLBACK_COOLDOWN_ENABLED", "") or "").strip().lower()
     if raw in {"0", "false", "no", "off"}:
         return False
     return True
@@ -34,7 +34,7 @@ def cooldown_enabled() -> bool:
 
 def _cooldown_sec() -> float:
     try:
-        return max(0.0, float(os.environ.get("OUROBOROS_FALLBACK_COOLDOWN_SEC", "") or 120.0))
+        return max(0.0, float(runtime_setting("OUROBOROS_FALLBACK_COOLDOWN_SEC", "") or 120.0))
     except (TypeError, ValueError):
         return 120.0
 
@@ -45,7 +45,7 @@ def attempts_per_model() -> int:
     candidates; the primary model keeps its full per-class retry budgets
     (OUROBOROS_TRANSIENT_RETRY_MAX / max_retries)."""
     try:
-        return max(1, min(2, int(os.environ.get("OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "") or 1)))
+        return max(1, min(2, int(runtime_setting("OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "") or 1)))
     except (TypeError, ValueError):
         return 1
 

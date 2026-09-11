@@ -14,9 +14,102 @@ import hashlib
 import json
 import os
 import sys
+import contextlib
+import contextvars
+import copy
+import threading
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
 SETTINGS_INTEGRITY_ENV = "OUROBOROS_SETTINGS_SHA256"
+_TASK_SETTINGS = contextvars.ContextVar("ouroboros_task_settings", default=None)
+# Only capture/projection holds this lock, never a task's execution lifetime.
+SETTINGS_ENV_LOCK = threading.RLock()
+
+
+@dataclass(frozen=True, repr=False)
+class TaskSettingsSnapshot:
+    """Private in-memory views; document values and env absence are distinct."""
+
+    settings: Mapping
+    environ: Mapping
+
+
+def _next_task_setting(key: str) -> bool:
+    from ouroboros.settings_scales import IMMEDIATE_SETTINGS, RESTART_REQUIRED_SETTINGS
+
+    return key not in IMMEDIATE_SETTINGS and key not in RESTART_REQUIRED_SETTINGS and key != "OUROBOROS_RUNTIME_MODE"
+
+
+def _projected_keys() -> set[str]:
+    from ouroboros.settings_defaults import RETIRED_COMMA_LIST_SETTING_KEYS, settings_env_keys
+    from ouroboros.model_slots import _LEGACY_SLOT_RENAMES
+
+    return (set(settings_env_keys()) | set(RETIRED_COMMA_LIST_SETTING_KEYS)
+            | {old for old, _new in _LEGACY_SLOT_RENAMES})
+
+
+@contextlib.contextmanager
+def task_settings_scope(snapshot):
+    """Bind one task's settings in memory only; concurrent tasks keep their own view."""
+    token = _TASK_SETTINGS.set(snapshot)
+    try:
+        yield
+    finally:
+        _TASK_SETTINGS.reset(token)
+
+
+def copy_task_settings_context(context) -> None:
+    """Carry settings through context transfers that intentionally omit Main call state."""
+    context.run(_TASK_SETTINGS.set, _TASK_SETTINGS.get())
+
+
+def runtime_setting(key: str, default=None):
+    """Environment-shaped runtime read; absence in the snapshot stays absent."""
+    snapshot = _TASK_SETTINGS.get()
+    if snapshot is not None and _next_task_setting(key):
+        return snapshot.environ.get(key, default)
+    return os.environ.get(key, default)
+
+
+def runtime_environ() -> dict[str, str]:
+    """Explicit child environment with this task's next-task settings overlaid."""
+    with SETTINGS_ENV_LOCK:
+        env = dict(os.environ)
+    snapshot = _TASK_SETTINGS.get()
+    if snapshot is not None:
+        for key in _projected_keys() | snapshot.settings.keys():
+            if _next_task_setting(key):
+                if key not in snapshot.environ:
+                    env.pop(key, None)
+                else:
+                    env[key] = snapshot.environ[key]
+    return env
+
+
+def runtime_settings(*, settings_reader=None) -> dict:
+    """Runtime document view; owner writers continue using config.load_settings."""
+    from ouroboros import config
+
+    settings = dict((settings_reader or config.load_settings)() or {})
+    snapshot = _TASK_SETTINGS.get()
+    if snapshot is not None:
+        for key in settings.keys() | snapshot.settings.keys():
+            if not _next_task_setting(key):
+                continue
+            if key not in snapshot.settings:
+                settings.pop(key, None)
+            else:
+                settings[key] = copy.deepcopy(snapshot.settings[key])
+    return settings
+
+
+def task_settings_snapshot(settings: dict, environ: dict) -> TaskSettingsSnapshot:
+    """Keep document-only values and exact projected presence without serializing either."""
+    return TaskSettingsSnapshot(
+        MappingProxyType(copy.deepcopy(settings)), MappingProxyType(dict(environ)))
 
 
 class SettingsIntegrityError(RuntimeError):

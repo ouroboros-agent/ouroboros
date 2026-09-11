@@ -85,3 +85,17 @@ test('access, supervisor, and review remain independent owner controls', () => {
     assert.match(html, /data-effort-value="blocking">Blocking</);
     assert.match(html, /Review Enforcement remains independent[\s\S]*Blocking.*available in Cyber Pro/);
 });
+
+test('settings copy distinguishes Cyber configuration authority without auto-enabling evolution', () => {
+    const html = renderSettingsPage();
+    const supervisor = html.split('<h3>Safety Supervisor</h3>')[1].split('<h3>Update Channel</h3>')[0];
+    const evolution = html.split('<h3>Post-Task Self-Evolution</h3>')[1].split('<h3>Background Cognition</h3>')[0];
+    assert.match(supervisor, /outside Cyber Pro, the agent cannot lower its own supervision/);
+    assert.match(supervisor, /Cyber Pro also lets the agent configure Supervisor coverage/);
+    assert.doesNotMatch(supervisor, /Owner-only/);
+    assert.match(evolution, /outside Cyber Pro, only the owner can enable this/);
+    assert.match(evolution, /Cyber Pro also lets the agent configure it/);
+    assert.match(evolution, /selecting Cyber Pro does not enable evolution automatically/);
+    for (const section of [supervisor, evolution]) assert.match(section, /Changes apply on the next task/);
+    assert.match(html, /Review Enforcement remains independent[\s\S]*Blocking.*available in Cyber Pro/);
+});

@@ -366,7 +366,8 @@ def test_keyless_reviewer_slots_parse_under_the_trees_own_parser():
 
 def test_f21_every_runtime_credential_env_read_is_stripped_from_the_keyless_child():
     """The CLASS pin behind the strip list: scan the runtime tree for every
-    credential-shaped env key it actually reads (os.environ[...] / .get / os.getenv)
+    credential-shaped env key it actually reads (os.environ[...] / .get / os.getenv
+    / runtime_setting)
     and require each to be unreachable in a keyless child — stripped as a provider
     credential, stripped by the base secret-shape sanitizer, or stripped as a stale
     inherited runtime key. A provider credential added upstream tomorrow fails HERE

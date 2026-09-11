@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Deque, Dict, Optional
 
 from ouroboros.utils import utc_now_iso as _now_iso
+from ouroboros.config import runtime_setting
+import contextvars
+from ouroboros.settings_integrity import copy_task_settings_context
 
 log = logging.getLogger(__name__)
 
@@ -226,7 +229,7 @@ def _lifecycle_deadline_sec() -> float:
     """
     from ouroboros.config import SETTINGS_DEFAULTS
 
-    raw = os.environ.get("OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC", "")
+    raw = runtime_setting("OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC", "")
     try:
         parsed = float(raw)
         if parsed > 0:
@@ -545,7 +548,9 @@ def run_lifecycle_job_blocking(
         except BaseException as exc:
             box["error"] = exc
 
-    thread = threading.Thread(target=_thread_main, name=f"skill-lifecycle-{kind}", daemon=False)
+    settings_context = contextvars.Context()
+    copy_task_settings_context(settings_context)
+    thread = threading.Thread(target=settings_context.run, args=(_thread_main,), name=f"skill-lifecycle-{kind}", daemon=False)
     thread.start()
     thread.join(timeout=_lifecycle_deadline_sec())
     if thread.is_alive():

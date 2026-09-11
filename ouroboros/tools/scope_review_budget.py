@@ -15,7 +15,7 @@ patch-visibility changes. ``_SCOPE_REVIEW_SLOT_TIMEOUT_SEC`` keeps the tip's
 
 from __future__ import annotations
 
-import os
+from ouroboros.config import runtime_setting
 
 # The parent's private aliases move with their budget readers; the canonical
 # owners stay scope_window / review_helpers / reviewer_window / triad_review.
@@ -111,7 +111,7 @@ def _get_scope_model() -> str:
             return models[0]
     except Exception:
         pass
-    return os.environ.get("OUROBOROS_SCOPE_REVIEW_MODEL", "").strip() or _SCOPE_MODEL_DEFAULT
+    return runtime_setting("OUROBOROS_SCOPE_REVIEW_MODEL", "").strip() or _SCOPE_MODEL_DEFAULT
 
 
 def _provider_error_is_oversize(usage: dict, prompt_tokens_est: int, scope_model: str,

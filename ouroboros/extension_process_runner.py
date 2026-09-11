@@ -662,6 +662,25 @@ def _base_env_for_skill(skill: Any, drive_root: pathlib.Path, repo_dir: pathlib.
     )
 
 
+def _task_settings_for_skill(skill: Any, drive_root: pathlib.Path) -> dict | None:
+    """Forward only the API's permitted values in the existing private call payload."""
+    from ouroboros.config import load_settings
+    from ouroboros.extension_plugin_api import PluginAPIImpl, _PluginAPIConfig
+    from ouroboros.settings_integrity import _TASK_SETTINGS, _next_task_setting
+
+    if _TASK_SETTINGS.get() is None:
+        return None
+    grants = grant_status_for_skill(drive_root, skill)
+    api = PluginAPIImpl(_PluginAPIConfig(
+        skill_name=skill.name, permissions=skill.manifest.permissions,
+        env_allowlist=skill.manifest.env_from_settings,
+        state_dir=skill_state_dir(drive_root, skill.name), settings_reader=load_settings,
+        granted_keys=grants.get("granted_keys") or [],
+    ))
+    return {key: value for key, value in api.get_settings(skill.manifest.env_from_settings).items()
+            if _next_task_setting(key)}
+
+
 def _extension_has_model_credentials(skill: Any, drive_root: pathlib.Path) -> bool:
     """Whether an OOP extension can actually read a funded model credential."""
     grants = grant_status_for_skill(pathlib.Path(drive_root), skill)
@@ -676,9 +695,9 @@ def _extension_has_model_credentials(skill: Any, drive_root: pathlib.Path) -> bo
     candidates = granted & allowed & MODEL_PROVIDER_CREDENTIAL_KEYS
     if "read_settings" not in permissions or not candidates:
         return False
-    from ouroboros.config import load_settings
+    from ouroboros.config import runtime_settings
 
-    settings = load_settings()
+    settings = runtime_settings()
     return any(str(settings.get(key) or "").strip() for key in candidates)
 
 
@@ -689,6 +708,7 @@ def catalog_extension_surfaces(skill: Any, *, drive_root: pathlib.Path, repo_dir
     return _run_child(
         {
             "mode": "catalog",
+            "task_settings": _task_settings_for_skill(skill, pathlib.Path(drive_root)),
             "skill_name": skill.name,
             "drive_root": str(drive_root),
             "repo_dir": str(repo_dir),
@@ -732,6 +752,7 @@ def dispatch_extension_tool_subprocess(ext_tool: Dict[str, Any], ctx: ToolContex
     result = _run_child(
         {
             "mode": "tool",
+            "task_settings": _task_settings_for_skill(skill, dispatch_drive_root),
             "skill_name": skill.name,
             "surface": str(ext_tool.get("name") or ""),
             "args": dict(args or {}),
@@ -771,6 +792,7 @@ def dispatch_extension_route_subprocess(spec: Dict[str, Any], request_payload: D
     child_factory = partial(_child_process,
         {
             "mode": "route",
+            "task_settings": _task_settings_for_skill(skill, pathlib.Path(drive_root)),
             "skill_name": skill.name,
             "surface": str(spec.get("path") or ""),
             "request": request_payload,
@@ -806,6 +828,7 @@ def dispatch_extension_ws_subprocess(spec: Dict[str, Any], msg: Dict[str, Any], 
     result = _run_child(
         {
             "mode": "ws",
+            "task_settings": _task_settings_for_skill(skill, pathlib.Path(drive_root)),
             "skill_name": skill.name,
             "surface": str(spec.get("type") or ""),
             "message": dict(msg or {}),
@@ -838,10 +861,20 @@ def _skill_for_dispatch(skill_name: str, drive_root: pathlib.Path, skills_repo_p
     return skill
 
 
-def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: pathlib.Path, skills_repo_path: pathlib.Path) -> Any:
+def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: pathlib.Path, skills_repo_path: pathlib.Path, *, task_settings: dict | None = None) -> Any:
     from ouroboros.config import load_settings
     from ouroboros.extension_loader import load_extension
+    from ouroboros.settings_integrity import _next_task_setting
     from ouroboros.skill_loader import discover_skills
+
+    def settings_reader():
+        live = load_settings()
+        if task_settings is None:
+            return live
+        # The complete permitted next-task subset also represents absence.
+        # Immediate controls stay live; the child's normal grants still apply.
+        return {**{key: value for key, value in live.items() if not _next_task_setting(key)},
+                **task_settings}
 
     skills = discover_skills(drive_root, repo_path=str(skills_repo_path))
     skill = next((item for item in skills if item.name == skill_name), None)
@@ -849,7 +882,7 @@ def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: p
         raise ExtensionProcessError(f"extension skill {skill_name!r} is missing")
     err = load_extension(
         skill,
-        load_settings,
+        settings_reader,
         drive_root=drive_root,
         skills=skills,
         repo_path=str(skills_repo_path),
@@ -1027,7 +1060,8 @@ def _child_main(input_path: str) -> None:
         channel = ChildResponseChannel()
     _bootstrap_quiet_child_crash_reporting()
     try:
-        skill = _load_child_extension(skill_name, drive_root, repo_dir, skills_repo_path)
+        skill = _load_child_extension(skill_name, drive_root, repo_dir, skills_repo_path,
+                                      task_settings=payload.get("task_settings"))
         if mode == "catalog":
             result = _surface_catalog()
         elif mode == "tool":

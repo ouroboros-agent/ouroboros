@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import pathlib
 import re
 from dataclasses import asdict, dataclass, field
@@ -60,6 +59,7 @@ from ouroboros.tool_access import (
 from ouroboros.tools.github import github_token_from_env_or_settings
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import utc_now_iso
+from ouroboros.config import runtime_setting
 
 _BRANCH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _PROVENANCE_SLUG_MAX = 128
@@ -602,7 +602,7 @@ def _select_optional_pr_core(
             model_role="light",
             reasoning_effort="low",
             max_tokens=8192,
-            use_local=os.environ.get("USE_LOCAL_LIGHT", "").lower() in {"true", "1"},
+            use_local=runtime_setting("USE_LOCAL_LIGHT", "").lower() in {"true", "1"},
             timeout=_PR_BODY_MODEL_TIMEOUT_SEC,
         )
         _record_llm_usage(ctx, model, usage)

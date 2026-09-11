@@ -34,9 +34,9 @@ def runtime_mode_at_least(runtime_mode: str, minimum: str) -> bool:
 
 
 def protected_bible_history_delete_reason(
-    raw_cmd: object, *, extra_paths: Iterable[str] = (),
+    raw_cmd: object, *,
     protect_bible: bool = True, identity_path: pathlib.Path | None = None,
-    cwd: pathlib.Path | None = None,
+    cwd: pathlib.Path | None = None, bible_path: pathlib.Path | None = None,
 ) -> str:
     """Return a refusal for physical BIBLE deletion or repository history rewrites.
 
@@ -48,22 +48,21 @@ def protected_bible_history_delete_reason(
         from ouroboros.shell_parse import collect_leading_env, shell_segments
 
         delete_heads = {"rm", "unlink", "mv"}
-        history_verbs = {
-            "filter-branch", "filter-repo", "checkout", "restore", "read-tree",
-            "update-index", "reset", "commit", "rebase", "replace",
-        }
+        history_verbs = {"filter-branch", "filter-repo", "rebase", "replace"}
+        work_dir = cwd or pathlib.Path.cwd()
+        bible_target = (bible_path or work_dir / "BIBLE.md").resolve(strict=False)
 
         def _protected_target(candidate: str) -> bool:
             path = pathlib.Path(candidate.replace("\\", "/"))
-            if protect_bible and path.name.casefold() == "bible.md":
+            target = (work_dir / path).resolve(strict=False)
+            if protect_bible and str(target).casefold() == str(bible_target).casefold():
                 return True
             return bool(identity_path is not None and (
-                (cwd or pathlib.Path.cwd()) / path
-            ).resolve(strict=False) == identity_path.resolve(strict=False))
+                str(target).casefold() == str(identity_path.resolve(strict=False)).casefold()
+            ))
 
         def _bible_path(
             words: list[str], *, path_flag_only: bool = False,
-            extra: Iterable[str] = (),
         ) -> bool:
             """Recognize an explicit BIBLE.md path, including --path= forms."""
             candidates: list[str] = []
@@ -84,7 +83,7 @@ def protected_bible_history_delete_reason(
                     candidates.append(token)
             return any(
                 _protected_target(candidate)
-                for candidate in (*candidates, *(str(path) for path in (*extra_paths, *extra)))
+                for candidate in candidates
             )
 
         def _python_delete_paths(body: str) -> list[str]:
@@ -156,13 +155,14 @@ def protected_bible_history_delete_reason(
                         break
                 if nested:
                     nested_reason = protected_bible_history_delete_reason(
-                        nested, extra_paths=extra_paths, protect_bible=protect_bible,
-                        identity_path=identity_path, cwd=cwd,
+                        nested, protect_bible=protect_bible,
+                        identity_path=identity_path, cwd=cwd, bible_path=bible_target,
                     )
                     if nested_reason:
                         return nested_reason
                     continue
-            bible = _bible_path(words)
+            operands = [word for word in words if not word.startswith("-")]
+            bible = _bible_path(operands[:-1] if head == "mv" else words)
             if head in delete_heads and bible:
                 label = "IDENTITY" if any(
                     pathlib.PurePath(word.strip("'\"")).name.casefold() == "identity.md"
@@ -171,7 +171,12 @@ def protected_bible_history_delete_reason(
                 return f"{label}_DELETE_BLOCKED: protected identity history must remain physically present."
             if head == "git":
                 verbs = [word.lower() for word in words if not word.startswith("-")]
-                if verbs and verbs[0] in {"rm", "mv"} and bible:
+                deleting = bool(verbs and (
+                    verbs[0] in {"rm", "mv"}
+                    or verbs[0] == "update-index" and any(flag in words for flag in ("--remove", "--force-remove"))
+                ))
+                git_targets = operands[1:-1] if verbs and verbs[0] == "mv" else operands[1:]
+                if deleting and _bible_path(git_targets):
                     label = "IDENTITY" if any(
                         pathlib.PurePath(word.strip("'\"")).name.casefold() == "identity.md"
                         for word in words

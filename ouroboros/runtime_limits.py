@@ -8,14 +8,15 @@ falls back to the shipped value instead of disabling a rail.
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 from ouroboros.settings_defaults import (
+    FINALIZATION_GRACE_DEFAULT_SEC,
     PACING_INTERVAL_DEFAULT_SEC,
     SETTINGS_DEFAULTS,
     SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
 )
+from ouroboros.settings_integrity import runtime_setting
 
 # Local model-operation status polling; not a provider deadline or quota timer.
 CLAUDEXOR_MODEL_POLL_INTERVAL_SEC = 0.25
@@ -60,7 +61,7 @@ def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
     shipped default. SSOT for the clamped scalar getters below — the seven of them were
     byte-identical except for key, caster and bounds (P7 DRY)."""
     try:
-        value = cast(os.environ.get(key, "") or SETTINGS_DEFAULTS[key])
+        value = cast(runtime_setting(key, "") or SETTINGS_DEFAULTS[key])
     except (TypeError, ValueError):
         value = cast(SETTINGS_DEFAULTS[key])
     return max(low, min(value, high))
@@ -69,7 +70,7 @@ def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
 def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_value: int = 1) -> int:
     """Bounded int setting; below ``min_value`` it is a typo and falls back to ``default``. Only
     subagent depth passes 0 — there an explicit 0 is a real owner choice, not unset (owner Q26)."""
-    raw = os.environ.get(key, SETTINGS_DEFAULTS.get(key, default))
+    raw = runtime_setting(key, SETTINGS_DEFAULTS.get(key, default))
     try:
         parsed = int(raw)
     except (TypeError, ValueError):
@@ -179,7 +180,7 @@ def get_vision_caption_timeout_sec() -> int:
 
 def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
     """Intrinsic self-pacing checkpoint cadence in seconds (0 disables)."""
-    raw = os.environ.get("OUROBOROS_PACING_INTERVAL_SEC")
+    raw = runtime_setting("OUROBOROS_PACING_INTERVAL_SEC")
     if raw is None and isinstance(settings, dict):
         raw = settings.get("OUROBOROS_PACING_INTERVAL_SEC")
     try:
@@ -191,7 +192,7 @@ def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
 
 def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int:
     """Supervisor-loop stall deadline in seconds (0 disables the watchdog)."""
-    raw = os.environ.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
+    raw = runtime_setting("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
     if raw is None and isinstance(settings, dict):
         raw = settings.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
     try:
@@ -255,3 +256,19 @@ def get_search_code_wall_sec() -> float:
     directory walk and the batched rg loop so a scan over a very large root cannot run
     unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
     return _clamped_number_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", low=5.0)
+
+
+def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
+    """Grace window in seconds: env, else the ``settings`` argument, else the
+    shipped default — the ``_clamped_number_setting`` shape. Deliberately NO
+    ``load_settings()`` fallback: a READ must never persist settings, and that
+    call runs the context-mode compatibility migration, which can WRITE a
+    normalized file under read-only observers (``task_pacing._reserve_sec``)."""
+    raw = runtime_setting("OUROBOROS_FINALIZATION_GRACE_SEC")
+    if raw is None and isinstance(settings, dict):
+        raw = settings.get("OUROBOROS_FINALIZATION_GRACE_SEC")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        parsed = int(FINALIZATION_GRACE_DEFAULT_SEC)
+    return max(0, min(parsed, 300))

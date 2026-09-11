@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 
 from pathlib import Path
+from ouroboros.config import runtime_setting
 
 
 def _evolution_restart_block_reason(ctx: ToolContext) -> str:
@@ -359,15 +360,14 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
         if model not in available:
             return f"⚠️ Unknown model: {model}. Available: {', '.join(available)}"
 
-        import os
         use_local = False
-        if model == os.environ.get("OUROBOROS_MODEL") and os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1"):
+        if model == runtime_setting("OUROBOROS_MODEL") and runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1"):
             use_local = True
-        elif model == os.environ.get("OUROBOROS_MODEL_LIGHT") and os.environ.get("USE_LOCAL_LIGHT", "").lower() in ("true", "1"):
+        elif model == runtime_setting("OUROBOROS_MODEL_LIGHT") and runtime_setting("USE_LOCAL_LIGHT", "").lower() in ("true", "1"):
             use_local = True
         else:
             from ouroboros.config import get_fallback_models
-            if model in get_fallback_models() and os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
+            if model in get_fallback_models() and runtime_setting("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
                 use_local = True
 
         ctx.active_model_override = model

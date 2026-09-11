@@ -8,10 +8,10 @@ of it, so an unknown value can never reach a consumer.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+from ouroboros.settings_integrity import runtime_setting
 
 # v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier is
 # defined (settings, llm.py builder, switch_model enum, subagent lanes). `ultra` = the codex
@@ -61,7 +61,7 @@ def resolve_effort(task_type: str) -> str:
         key = "OUROBOROS_EFFORT_TASK"
         default = "medium"
 
-    raw = os.environ.get(key, default)
+    raw = runtime_setting(key, default)
     return raw if raw in EFFORT_SCALE else default
 
 
@@ -80,7 +80,7 @@ def resolve_prompt_cache_ttl() -> str:
     (payload-carrying sites use the finalizer's applied TTL) — never by per-builder marking
     sites (docs/DEVELOPMENT.md cache-friendliness invariant)."""
     default = str(SETTINGS_DEFAULTS["OUROBOROS_PROMPT_CACHE_TTL"])
-    raw = str(os.environ.get("OUROBOROS_PROMPT_CACHE_TTL", default) or "").strip().lower()
+    raw = str(runtime_setting("OUROBOROS_PROMPT_CACHE_TTL", default) or "").strip().lower()
     return raw if raw in PROMPT_CACHE_TTL_SCALE else default
 
 
@@ -111,3 +111,46 @@ def normalize_safety_mode(value: Any) -> str:
 
 
 _SAFETY_MODE_RANK = {"full": 2, "light": 1, "off": 0}
+
+
+# Effect vocabulary shared by the owner gateway and task-local runtime readers.
+IMMEDIATE_SETTINGS = frozenset({
+    "TOTAL_BUDGET",
+    # The OUTER per-call tool cap reads settings.json BEFORE env on every tool
+    # call in every process (loop_tool_execution.py), so a saved change bites
+    # the currently running task's next tool call. The inner shell subprocess
+    # timeout still prefers the worker env (next task) — disclosed residual.
+    "OUROBOROS_TOOL_TIMEOUT_SEC",
+    "GITHUB_TOKEN",
+    "GITHUB_REPO",
+    "OUROBOROS_UPDATE_CHANNEL",
+    # The save handler hot-reconfigures MCP itself before responding
+    # (_apply_settings_save_side_effects), and worker processes re-check the
+    # settings mtime on their next tool-schema read; a reconfigure failure is
+    # surfaced as a save warning instead of silently keeping the claim.
+    "MCP_ENABLED",
+    "MCP_SERVERS",
+    "MCP_TOOL_TIMEOUT_SEC",
+})
+
+RESTART_REQUIRED_SETTINGS = frozenset({
+    "OUROBOROS_MAX_WORKERS",
+    "OUROBOROS_SERVER_HOST",
+    # The host-service port is bound once at server startup.
+    "OUROBOROS_HOST_SERVICE_PORT",
+    # Pooled workers load the extension registry once at spawn and never
+    # reload it per task; the save-time server reload keeps the skills UI
+    # fresh, but agent tasks see the new repo only after a restart.
+    "OUROBOROS_SKILLS_REPO_PATH",
+    "LOCAL_MODEL_SOURCE",
+    "LOCAL_MODEL_FILENAME",
+    "LOCAL_MODEL_PORT",
+    "LOCAL_MODEL_N_GPU_LAYERS",
+    "LOCAL_MODEL_CONTEXT_LENGTH",
+    "LOCAL_MODEL_CHAT_FORMAT",
+    # Background cognition reads these at consciousness __init__, so a change
+    # only takes effect after restart (Phase 4 Evolution settings group).
+    "OUROBOROS_BG_WAKEUP_MIN",
+    "OUROBOROS_BG_WAKEUP_MAX",
+    "OUROBOROS_BG_MAX_ROUNDS",
+})

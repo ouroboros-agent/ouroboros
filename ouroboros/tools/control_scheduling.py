@@ -59,6 +59,7 @@ from ouroboros.tools.control_subagent_spec import (
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for, system_repo_dir_for
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.config import runtime_settings
 
 
 def _publish_scheduling_refusal(ctx: Any, status: str, code: str, text: str) -> str:
@@ -610,7 +611,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     may_mutate = fields["may_mutate"]
     try:
         configured_subagent, legacy_selection = select_subagent_snapshot(
-            effective_runtime_subagent_settings(_ctl().load_settings()),
+            effective_runtime_subagent_settings(runtime_settings(settings_reader=_ctl().load_settings)),
             subagent_id=str(params.get("subagent_id") or ""),
             legacy_model_lane=params.get("model_lane"),
             legacy_executor=params.get("executor"),

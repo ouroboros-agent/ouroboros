@@ -900,7 +900,7 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
     # I-01: a disposition closes ONLY the CURRENT attempt's wave (never a superseded one).
     attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
     current_fp = str(attempt.get("fingerprint") or "")
-    if current_fp and current_fp != fingerprint:
+    if current_fp != fingerprint:
         return _bad(
             "ERROR: PLAN_REVIEW_DISPOSITION_STALE: a disposition can close only the CURRENT "
             f"plan-review wave; a newer attempt supersedes it (current={current_fp}, "
@@ -927,6 +927,12 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
         })
     author_record = None
     if disposition.get("author_disposition") is not None:
+        from ouroboros.review_custody import review_retry_cancelled
+
+        if review_retry_cancelled(ctx):
+            return _bad("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: cancellation prevents author finish")
+        if not wave.get("paid"):
+            return _bad("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: author finish requires an actual first review dispatch")
         if enforcement != "advisory":
             return _bad(
                 "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: author_disposition is advisory-only; "

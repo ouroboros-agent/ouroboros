@@ -1025,6 +1025,25 @@ test('task acceptance falls back to the explicit durable author decision', () =>
     assert.match(html, /REVIEW_REQUIRED/);
     assert.doesNotMatch(html, /verdict=PASS/);
 });
+test('a revised task author decision is shown once and never attached to historical panels', () => {
+    const detail = {
+        task_id: 'root',
+        review_projection: { panels: [
+            { panel_id: 'old', surface: 'task_acceptance', aggregate_signal: 'FAIL', binding_hash: 'h0', superseded_by_revision: true },
+            { panel_id: 'new', surface: 'task_acceptance', aggregate_signal: 'FAIL', binding_hash: 'h1' },
+        ] },
+        review_status: { acceptance_decision: {
+            status: 'finalized_unaccepted', reason: 'author_finish',
+            author_disposition: { disposition: 'partial', rationale: 'Current h2 accepted by author.', subject_hash: 'h2', reviewer_signal: 'FAIL', source: 'author' },
+        } },
+    };
+    const group = taskAcceptanceGroupFromTaskDetail(detail);
+    assert.match(group.authorDecisionText, /subject_hash=h2/);
+    for (const attempt of group.attempts) assert.doesNotMatch(attempt.detailText, /subject_hash=h2/);
+    const html = renderReviewsSection([group], { sectionExpanded: true, expandedGroups: new Set([group.id]), expandedAttempts: new Set(group.attempts.map(a => `${group.id}:${a.id}`)) });
+    assert.equal((html.match(/Current h2 accepted by author/g) || []).length, 1);
+    assert.equal((html.match(/data-review-author-decision/g) || []).length, 1);
+});
 test('renderer is quiet, accessible and never invents review dollars', () => {
     const group = reviewGroupFromHistoryRow(groupedSkillRow());
     const html = renderReviewsSection([group], {

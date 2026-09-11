@@ -147,7 +147,7 @@ def subagent_profile_satisfies(profile: ToolProfile, needs: Iterable[str]) -> tu
     operation on at least one root.
     """
 
-    ops_by_root = _POLICY.get(profile, {})
+    ops_by_root = _POLICY.get(_effective_policy_profile(profile), {})
     available_ops = {op for ops in ops_by_root.values() for op in ops}
     missing: list[str] = []
     for need in needs or []:

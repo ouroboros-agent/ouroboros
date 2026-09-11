@@ -7,7 +7,6 @@ usage event emission. Missing pricing is data, not a model-admission gate.
 
 from __future__ import annotations
 
-import os
 import queue
 import threading
 import time
@@ -17,6 +16,7 @@ import logging
 
 from ouroboros.provider_models import normalize_model_identity, provider_for_model
 from ouroboros.utils import utc_now_iso
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ _pricing_lock = threading.Lock()
 def _pricing_ttl_sec() -> float:
     """Live-pricing refetch interval (provider prices/ FX rates drift). Default 6h."""
     try:
-        return max(60.0, float(os.environ.get("OUROBOROS_PRICING_TTL_SEC", "") or 21600.0))
+        return max(60.0, float(runtime_setting("OUROBOROS_PRICING_TTL_SEC", "") or 21600.0))
     except (TypeError, ValueError):
         return 21600.0
 
@@ -243,9 +243,9 @@ def infer_model_category(model: str) -> str:
         model = model[:-8]
     normalized = normalize_model_identity(model)
     for cat, val in (
-        ("main", os.environ.get("OUROBOROS_MODEL", "")),
-        ("heavy", os.environ.get("OUROBOROS_MODEL_HEAVY", "")),
-        ("light", os.environ.get("OUROBOROS_MODEL_LIGHT", "")),
+        ("main", runtime_setting("OUROBOROS_MODEL", "")),
+        ("heavy", runtime_setting("OUROBOROS_MODEL_HEAVY", "")),
+        ("light", runtime_setting("OUROBOROS_MODEL_LIGHT", "")),
     ):
         if val and normalized == normalize_model_identity(val):
             return cat

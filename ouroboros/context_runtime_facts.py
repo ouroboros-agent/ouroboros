@@ -12,11 +12,11 @@ name, so historical imports and monkeypatch targets keep working unchanged.
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
 from ouroboros.task_pacing import in_task_cost_ceiling_disclosure as _in_task_cost_ceiling
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
         log.error("Budget authority unavailable for runtime context", exc_info=True)
         budget_info = {"status": "unavailable"}
     try:
-        root_cap = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+        root_cap = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
     except (TypeError, ValueError):
         root_cap = 0.0
     if root_cap > 0:

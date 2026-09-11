@@ -5,8 +5,9 @@ Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import json
-import os
 import pathlib
 import queue
 
@@ -243,7 +244,7 @@ def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_t
         safe_text = sanitize_tool_result_for_log(visible_text)
         emit_progress(safe_text)
         llm_trace["reasoning_notes"].append(safe_text)
-    elif str(os.environ.get("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
+    elif str(runtime_setting("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
         display_reasoning = LLMClient.extract_display_reasoning(msg)
         if display_reasoning:
             emit_progress(sanitize_tool_result_for_log(display_reasoning))

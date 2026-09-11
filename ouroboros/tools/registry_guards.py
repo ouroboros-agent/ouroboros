@@ -887,7 +887,7 @@ def _external_shell_runtime_or_secret_block(
 
 def _protected_shell_block(
     self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
-    runtime_mode: str = "", *, structural_targets: list[str] | None = None,
+    runtime_mode: str = "",
 ) -> ToolResult | None:
     """Apply payload/core write guards to the selected physical target."""
     items = _registry()._binding_items(binding)
@@ -916,7 +916,9 @@ def _protected_shell_block(
             ),
         )
     if reason := protected_bible_history_delete_reason(
-        raw_cmd, extra_paths=structural_targets or (), protect_bible=targets_system,
+        raw_cmd,
+        bible_path=pathlib.Path(_registry().active_repo_dir_for(self._ctx) if acting_self_worktree
+                                else _registry().system_repo_dir_for(self._ctx)) / "BIBLE.md",
         identity_path=pathlib.Path(self._ctx.drive_root) / "memory" / "identity.md",
         cwd=pathlib.Path(getattr(binding, "target_path", None) or self._ctx.repo_dir),
     ):
@@ -1298,7 +1300,7 @@ def _shell_git_and_runtime_block(
             from ouroboros.config import get_runtime_mode
             from ouroboros.runtime_mode_policy import runtime_mode_at_least
 
-            cyber_authority = self._is_acting_subagent() and runtime_mode_at_least(
+            cyber_authority = not self._is_local_readonly_subagent() and runtime_mode_at_least(
                 get_runtime_mode(), "cyber_pro"
             )
         except Exception:

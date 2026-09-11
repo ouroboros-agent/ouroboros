@@ -5,10 +5,10 @@ deep_self_review.py)."""
 
 from __future__ import annotations
 
-import os
 
 from ouroboros.model_slots import ResolvedModelTarget, parse_fallback_chain
 from ouroboros.settings_defaults import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, SETTINGS_DEFAULTS  # noqa: F401
+from ouroboros.settings_integrity import runtime_setting
 
 # MiniMax exposes the same OpenAI-compatible API on two regional hosts. Keep the
 # mapping centralized so transport, capability evidence, and settings diagnostics
@@ -213,17 +213,17 @@ def provider_has_credentials(provider: str) -> bool:
     if provider == "local":
         return True
     if provider == "openai-compatible":
-        compat = str(os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-        legacy_key = str(os.environ.get("OPENAI_API_KEY", "") or "").strip()
-        legacy_base = str(os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+        compat = str(runtime_setting("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
+        legacy_key = str(runtime_setting("OPENAI_API_KEY", "") or "").strip()
+        legacy_base = str(runtime_setting("OPENAI_BASE_URL", "") or "").strip()
         return bool(compat or (legacy_key and legacy_base))
     if provider == "gigachat":
-        creds = str(os.environ.get("GIGACHAT_CREDENTIALS", "") or "").strip()
-        user = str(os.environ.get("GIGACHAT_USER", "") or "").strip()
-        password = str(os.environ.get("GIGACHAT_PASSWORD", "") or "").strip()
+        creds = str(runtime_setting("GIGACHAT_CREDENTIALS", "") or "").strip()
+        user = str(runtime_setting("GIGACHAT_USER", "") or "").strip()
+        password = str(runtime_setting("GIGACHAT_PASSWORD", "") or "").strip()
         return bool(creds or (user and password))
     env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
-    return bool(str(os.environ.get(env_key, "") or "").strip())
+    return bool(str(runtime_setting(env_key, "") or "").strip())
 
 
 def provider_has_credentials_in_settings(provider: str, settings: dict) -> bool:
@@ -261,7 +261,7 @@ def model_has_credentials(model: str) -> bool:
 
 def local_only_review_route_env() -> bool:
     """Whether review slots must inherit the configured local Main route."""
-    local_main = str(os.environ.get("USE_LOCAL_MAIN", "") or "").strip().lower()
+    local_main = str(runtime_setting("USE_LOCAL_MAIN", "") or "").strip().lower()
     if local_main not in {"1", "true", "yes", "on"}:
         return False
     return not any(
@@ -290,12 +290,12 @@ def resolve_credentialed_model(default_model: str) -> str:
     # instead of testing the whole comma-string as one broken model id. Empty Light
     # (default -> Main) simply contributes nothing here.
     candidates: list[str] = []
-    light = str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip()
+    light = str(runtime_setting("OUROBOROS_MODEL_LIGHT", "") or "").strip()
     if light:
         candidates.append(light)
     candidates.extend(parse_fallback_chain())
     for env_name in ("OUROBOROS_MODEL",):
-        raw = str(os.environ.get(env_name, "") or "").strip()
+        raw = str(runtime_setting(env_name, "") or "").strip()
         if raw:
             candidates.append(raw)
     for candidate in candidates:

@@ -110,6 +110,7 @@ def test_async_extension_route_handler_is_awaited_on_event_loop_thread(tmp_path,
 def test_extension_manifest_state_scans_run_on_worker_thread(tmp_path, monkeypatch):
     import ouroboros.extension_loader as extension_loader
     import ouroboros.gateway.extensions as extensions_api
+    from ouroboros.skill_loader import SkillReviewState
 
     (tmp_path / "drive").mkdir()
     (tmp_path / "repo").mkdir()
@@ -130,7 +131,7 @@ def test_extension_manifest_state_scans_run_on_worker_thread(tmp_path, monkeypat
             ui_tab={},
         ),
         enabled=True,
-        review=SimpleNamespace(status="pass", is_stale_for=lambda _hash: False),
+        review=SkillReviewState(status="clean", content_hash="hash"),
         content_hash="hash",
         load_error="",
     )

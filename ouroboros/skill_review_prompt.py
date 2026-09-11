@@ -153,7 +153,8 @@ Skill Review Checklist items permit the behaviour in isolation. Treat
 BIBLE.md as the tie-breaker when a skill looks checklist-compliant but
 contradicts the runtime's constitutional commitments.
 
-The author may finish an advisory review for the exact current content hash.
+After the first actual review, the author may finish the advisory dialogue for
+the exact current content hash.
 That author disposition is a separate durable stance beside these raw findings;
 it is never a reviewer PASS, never valid for stale content, and never bypasses
 deterministic preflight or a blocking enforcement gate.

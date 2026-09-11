@@ -129,8 +129,8 @@ function syncPolicyState(root, meta) {
     };
     const access = state.access || {};
     render('access', access.restart_required
-        ? `Saved: ${policyValueLabel(access.configured)} · Current process: ${policyValueLabel(access.current_process || access.effective)} · Next task: ${policyValueLabel(access.next_task || access.configured)} · Restart required`
-        : `Current process: ${policyValueLabel(access.current_process || access.effective)} · Next task: ${policyValueLabel(access.next_task || access.configured)}`);
+        ? `Saved: ${policyValueLabel(access.configured)} · Current process: ${policyValueLabel(access.current_process || access.effective)} · After restart: ${policyValueLabel(access.configured)} · Restart required`
+        : `Current process: ${policyValueLabel(access.current_process || access.effective)} · After restart: ${policyValueLabel(access.configured)}`);
     const suffix = (item) => item.active_task_snapshot
         ? `Saved: ${policyValueLabel(item.configured)} · Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)} · Current task keeps its start snapshot`
         : `Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)}`;

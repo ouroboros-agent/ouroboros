@@ -41,8 +41,9 @@ size-ratchet byte cap).
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import logging
-import os
 import pathlib
 import queue
 import time
@@ -165,7 +166,7 @@ def emit_network_wait_event(
 
 
 def _use_local_fallback_configured() -> bool:
-    return os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
+    return runtime_setting("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
 
 
 def fallback_chain_allowed(

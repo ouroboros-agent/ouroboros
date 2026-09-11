@@ -26,7 +26,7 @@ from ouroboros.process_interpreters import (
     interpreter_path_overlay,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.config import load_settings
+from ouroboros.config import load_settings, runtime_settings
 from ouroboros.tools.tool_result import (
     ToolResult,
     _publish_tool_result,
@@ -384,7 +384,7 @@ def _start_service(
                     status="blocked", code="ACCESS_BLOCKED",
                     text="⚠️ SERVICE_ENV_REFERENCE_BLOCKED: this task cannot select settings-backed service environment. A root task can start the service; existing literal environment and configured MCP access remain available.",
                 ))
-        env, secret_values = resolve_process_env(env, refs, settings=load_settings() if refs else None)
+        env, secret_values = resolve_process_env(env, refs, settings=runtime_settings(settings_reader=load_settings) if refs else None)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (start_service): {exc}"
     service_name, name_error = _sanitize_service_name(name)

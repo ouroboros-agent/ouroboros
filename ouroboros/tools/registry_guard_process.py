@@ -624,11 +624,16 @@ def _run_shell_safety_check(
     # head still blocks) — the scope-floor precedent applied family-wide.
     if not cyber_authority and _detect_runtime_mode_elevation(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart.")
-    if not cyber_authority and _detect_context_mode_self_lowering(cmd_lower, writeish=writeish):
+    if _detect_context_mode_self_lowering(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="CONTEXT_MODE_SELF_LOWERING_BLOCKED", text="⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped.")
+    if _registry()._owner_control_mention_blocks(cmd_lower, (
+        "ouroboros_review_enforcement" in cmd_lower and any(sink in cmd_lower
+            for sink in ("settings.json", "save_settings", "/api/settings", "settings set", "ouroboros.cli"))
+    ), writeish):
+        return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: review enforcement remains owner-controlled in every access mode; configure it through the owner Settings UI.")
     if not cyber_authority and _detect_safety_mode_self_lowering(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="SAFETY_MODE_SELF_LOWERING_BLOCKED", text="⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly.")
-    if _detect_owner_skill_attest_self_call(cmd_lower, writeish=writeish):
+    if not cyber_authority and _detect_owner_skill_attest_self_call(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED", text="⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI.")
     if not cyber_authority and _detect_mutative_toggle_self_change(cmd_lower, writeish=writeish):
         return ToolResult(status="blocked", code="ELEVATION_BLOCKED", text="⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents.")
@@ -739,16 +744,9 @@ def _run_shell_safety_check(
         else []
     )
 
-    structural_targets = [
-        str(target)
-        for row in target_rows
-        if len(row) > 1
-        for target in (row[1] or [])
-    ]
     if protected_shell := registry_guards._protected_shell_block(
         self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
         runtime_mode,
-        structural_targets=structural_targets,
     ):
         return protected_shell
 
