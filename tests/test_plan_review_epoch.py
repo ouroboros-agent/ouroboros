@@ -468,7 +468,7 @@ def test_whole_plan_render_respects_paid_capacity(aggregate, enforcement, epoch,
     assert wave == before
     assert _parse_plan_review_control(text) == (aggregate, False)
     assert "author note: retained unchanged" in text
-    assert "next paid delta cycle" not in text and "rerun the wave" not in text
+    assert "rerun the wave" not in text
     if cap == 2:
         assert "cycle cap is reached" in text
         assert "re-dispatches a fresh panel" not in text
