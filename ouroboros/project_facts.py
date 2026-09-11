@@ -98,13 +98,37 @@ def _registered_project_for_workspace(canon_workspace: str) -> str:
     return ""
 
 
+def _bound_project_id(task_id: str) -> str:
+    """Project a task is DURABLY bound to, read at the canonical DATA_DIR, else "".
+
+    Fail-OPEN, exactly like ``_registered_project_for_workspace``: this runs on
+    the hot resolution path of every context build, and an unreadable bindings
+    store must not stop the work. The one caller that AUTHORIZES creating a
+    project (``ensure_project_scope``) reads the same binding strictly instead.
+    """
+    if not task_id:
+        return ""
+    try:
+        from ouroboros.config import DATA_DIR
+        from ouroboros.projects_registry import project_id_for_task
+
+        return sanitize_project_id(project_id_for_task(DATA_DIR, task_id))
+    except Exception:
+        return ""
+
+
 def resolve_project_id(task: Dict[str, Any]) -> str:
-    """Resolve a task's project id (S7): explicit ``project_id`` wins; else, for a
-    workspace task, a REGISTERED project bound to that folder (v6.58.0 registry-first)
-    or a stable hash of the workspace path; else ``""`` (not project-scoped — canonical
-    memory, unchanged behavior)."""
+    """Resolve a task's project id (S7): the DURABLE binding wins (owner decision
+    B4=A - a "turn into project" conversion never reaches a running worker, so the
+    task dict can still say nothing while the task belongs to a project); else an
+    explicit ``project_id``; else, for a workspace task, a REGISTERED project bound
+    to that folder (v6.58.0 registry-first) or a stable hash of the workspace path;
+    else ``""`` (not project-scoped — canonical memory, unchanged behavior)."""
     if not isinstance(task, dict):
         return ""
+    bound = _bound_project_id(str(task.get("id") or task.get("task_id") or "").strip())
+    if bound:
+        return bound
     pid = sanitize_project_id(task.get("project_id"))
     if pid:
         return pid

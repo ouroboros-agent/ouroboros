@@ -42,6 +42,33 @@ def test_resolve_project_id_empty_for_non_workspace():
     assert resolve_project_id({"type": "task", "memory_mode": "forked"}) == ""
 
 
+def test_resolve_project_id_reads_the_durable_binding_first(tmp_path, monkeypatch):
+    """B4=A: a "turn into project" conversion never reaches a running worker, so
+    the durable binding outranks whatever the task dict says (or fails to say)."""
+    from ouroboros.projects_registry import bind_task_to_project
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    bind_task_to_project(tmp_path, "t-bound", "bound-proj", 5150, origin={"absent": "system"})
+
+    assert resolve_project_id({"id": "t-bound"}) == "bound-proj"
+    assert resolve_project_id({"id": "t-bound", "project_id": "stale-proj"}) == "bound-proj"
+    assert resolve_project_id({"task_id": "t-bound"}) == "bound-proj"
+    # An unbound task keeps today's order untouched.
+    assert resolve_project_id({"id": "t-free", "project_id": "explicit"}) == "explicit"
+    assert resolve_project_id({"id": "t-free"}) == ""
+
+
+def test_resolve_project_id_stays_fail_open_on_an_unreadable_bindings_store(tmp_path, monkeypatch):
+    """The hot path must never stop the work: an unreadable store reads as "no
+    binding", exactly like the workspace registry probe beside it."""
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
+
+    assert resolve_project_id({"id": "t-x", "project_id": "explicit"}) == "explicit"
+    assert resolve_project_id({"id": "t-x"}) == ""
+
+
 def test_sanitize_project_id_is_path_safe():
     assert "/" not in sanitize_project_id("a/b/../c")
     assert sanitize_project_id("..") == ""

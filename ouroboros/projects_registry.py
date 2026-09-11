@@ -363,6 +363,27 @@ def project_chat_for_task(drive_root: Any, task_id: str) -> int:
         return 0
 
 
+def project_id_for_task(drive_root: Any, task_id: str, *, strict: bool = False) -> str:
+    """Project a task is DURABLY bound to, "" when it is bound to nothing.
+
+    The binding is the ONE truth about a task's project (owner decision B4=A):
+    ``task["project_id"]`` and a worker's in-memory ``ctx.project_id`` are
+    copies that a mid-run conversion never reaches. Reads the same mtime/size
+    cached view the live addressing seam already uses, so a hot-path caller
+    pays no extra parse. ``strict=True`` RAISES on an unreadable store instead
+    of reporting "unbound", for the one caller that authorizes creating a
+    project and must not do that blind.
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        return ""
+    bindings = (
+        _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
+    )
+    row = bindings.get(tid)
+    return str(row.get("project_id") or "").strip() if isinstance(row, dict) else ""
+
+
 _BINDINGS_LENS_CACHE: Dict[str, tuple] = {}
 
 

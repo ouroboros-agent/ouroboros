@@ -3,7 +3,20 @@ a named Ouroboros project and scope the CURRENT running task into it, instead of
 cyber-racing fallback (bare `mkdir ~/Desktop`). Idempotent for the same project,
 refuses to re-scope to a different one, rejects subagents."""
 
+import logging
 from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_bindings(tmp_path, monkeypatch):
+    """R13: the guard reads the durable bindings at the canonical data dir, so no
+    test in this module may reach the live root."""
+    import ouroboros.config as cfg
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    return tmp_path
 
 
 def _ctx(**kw):
@@ -44,6 +57,59 @@ def test_idempotent_same_project_and_refuses_different():
     out2 = _ensure_project_scope(ctx2, project_name="Cyber Racing")
     assert "cannot be re-scoped" in out2
     assert ctx2.project_id == "other-project"  # scope NOT changed
+
+
+def test_bound_task_renames_its_project_instead_of_creating_a_second(tmp_path):
+    """B4=A: the durable binding is the one truth. A task already bound to a
+    project that asks to be scoped to a differently named one keeps its project
+    and carries the requested name to it - the empty second project that split
+    token-observatory off token-atlas is exactly what this refuses."""
+    from ouroboros.projects_registry import bind_task_to_project, list_projects
+    from ouroboros.tools.control import _ensure_project_scope
+
+    bind_task_to_project(tmp_path, "t1", "token-atlas", 5150, origin={"absent": "system"})
+    ctx = _ctx()
+    out = _ensure_project_scope(ctx, project_name="Token Observatory")
+
+    assert "token-atlas" in out and "no second project" in out
+    assert "Token Observatory" in out
+    assert ctx.project_id == "token-atlas"
+    evs = [e for e in ctx.pending_events if e.get("type") == "ensure_project_scope"]
+    assert len(evs) == 1
+    assert evs[0]["project_id"] == "token-atlas"
+    assert evs[0]["project_name"] == "Token Observatory"
+    assert [p["id"] for p in list_projects(tmp_path)] == ["token-atlas"]
+
+
+def test_binding_outranks_a_stale_ctx_scope_and_stays_idempotent(tmp_path):
+    from ouroboros.projects_registry import bind_task_to_project
+    from ouroboros.tools.control import _ensure_project_scope
+
+    bind_task_to_project(tmp_path, "t1", "token-atlas", 5150, origin={"absent": "system"})
+    ctx = _ctx(project_id="stale-scope")
+    out = _ensure_project_scope(ctx, project_id="token-atlas")
+
+    assert "already scoped" in out
+    assert ctx.project_id == "token-atlas"
+    assert not [e for e in ctx.pending_events if e.get("type") == "ensure_project_scope"]
+
+
+def test_unreadable_bindings_are_disclosed_and_do_not_block(tmp_path, caplog):
+    """Proportionality: an unreadable store reads as "no binding" (the behaviour
+    before this seam existed) and says so once; only a READABLE binding refuses."""
+    from ouroboros.project_facts import project_id_from_display_name
+    from ouroboros.tools.control import _ensure_project_scope
+
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
+
+    ctx = _ctx()
+    with caplog.at_level(logging.WARNING):
+        out = _ensure_project_scope(ctx, project_name="Cyber Racing")
+
+    assert out.startswith("OK")
+    assert ctx.project_id == project_id_from_display_name("Cyber Racing")
+    assert "project_binding_unreadable" in caplog.text
 
 
 def test_rejects_subagent_and_requires_an_arg():
