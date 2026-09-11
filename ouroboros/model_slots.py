@@ -12,9 +12,9 @@ from __future__ import annotations
 import dataclasses
 import copy
 import json
-import os
 
 from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+from ouroboros.settings_integrity import runtime_setting
 
 
 MODEL_ACCOUNTS_KEY = "OUROBOROS_MODEL_ACCOUNTS"
@@ -74,7 +74,7 @@ def model_role_option(key: str, role: str, *, settings: dict | None = None) -> s
     and configured agents carry their own existing route credential field.
     """
     default = "" if key == MODEL_ACCOUNTS_KEY else 0
-    raw = (settings or {}).get(key, "") if settings is not None else os.environ.get(key, "")
+    raw = (settings or {}).get(key, "") if settings is not None else runtime_setting(key, "")
     options, _canonical = normalize_model_role_options(key, raw)
     family, separator, position = role.partition(":")
     if family == "fallback" and separator:
@@ -252,29 +252,29 @@ def _parse_model_list(value: str) -> list[str]:
 
 def _main_model() -> str:
     return (
-        str(os.environ.get("OUROBOROS_MODEL", "") or "").strip()
+        str(runtime_setting("OUROBOROS_MODEL", "") or "").strip()
         or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
     )
 
 
 def get_light_model() -> str:
     """Light slot; empty falls back to Main (heavy/consciousness stay empty->main)."""
-    return str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
+    return str(runtime_setting("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
 
 
 def get_heavy_model() -> str:
     """Return the heavy (strong acting/coding) lane slot; empty falls back to
     OUROBOROS_MODEL. Renamed from the legacy code slot."""
-    return str(os.environ.get("OUROBOROS_MODEL_HEAVY", "") or "").strip() or _main_model()
+    return str(runtime_setting("OUROBOROS_MODEL_HEAVY", "") or "").strip() or _main_model()
 
 
 def get_vision_model() -> str:
     """Return the vision/caption model slot; empty falls back to OUROBOROS_MODEL."""
-    return str(os.environ.get("OUROBOROS_MODEL_VISION", "") or "").strip() or _main_model()
+    return str(runtime_setting("OUROBOROS_MODEL_VISION", "") or "").strip() or _main_model()
 
 
 def get_image_input_mode() -> str:
-    raw = str(os.environ.get("OUROBOROS_IMAGE_INPUT_MODE", SETTINGS_DEFAULTS["OUROBOROS_IMAGE_INPUT_MODE"]) or "").strip().lower()
+    raw = str(runtime_setting("OUROBOROS_IMAGE_INPUT_MODE", SETTINGS_DEFAULTS["OUROBOROS_IMAGE_INPUT_MODE"]) or "").strip().lower()
     return raw if raw in {"auto", "caption", "inline", "off"} else "auto"
 
 
@@ -287,8 +287,8 @@ def parse_fallback_chain() -> list[str]:
     injection: an EXPLICITLY empty Fallbacks slot means "no cross-model fallback". The
     shipped default reaches a default install through apply_settings_to_env."""
     raw = (
-        str(os.environ.get("OUROBOROS_MODEL_FALLBACKS", "") or "").strip()
-        or str(os.environ.get("OUROBOROS_MODEL_FALLBACK", "") or "").strip()
+        str(runtime_setting("OUROBOROS_MODEL_FALLBACKS", "") or "").strip()
+        or str(runtime_setting("OUROBOROS_MODEL_FALLBACK", "") or "").strip()
     )
     return [m.strip() for m in _parse_model_list(raw) if str(m or "").strip()]
 
@@ -334,10 +334,10 @@ def migrate_legacy_slot_keys(settings: dict) -> dict:
 
 def get_consciousness_model() -> str:
     """Return the high-horizon background-consciousness model slot."""
-    return str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
+    return str(runtime_setting("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
 
 def get_deep_self_review_model() -> str:
     """Return the configured deep self-review model slot."""
-    return (str(os.environ.get("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
+    return (str(runtime_setting("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
             or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]))

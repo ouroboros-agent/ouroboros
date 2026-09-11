@@ -15,6 +15,7 @@ from ouroboros.tool_access import (
     path_is_relative_to,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.config import runtime_setting
 
 
 _OPS = (
@@ -38,7 +39,7 @@ _STRUCTURAL_MAX_FILES = 20000
 
 def _structural_wall_budget() -> float:
     try:
-        return max(5.0, float(os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45") or 45))
+        return max(5.0, float(runtime_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", "45") or 45))
     except Exception:
         return 45.0
 

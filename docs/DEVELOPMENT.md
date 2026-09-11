@@ -1588,7 +1588,7 @@ schedule retain their separate existing CI owners.
 ### Light mode and external deliverables
 
 - `runtime_mode=light` is a self-modification boundary (`ouroboros/config.py`
-  owns the semantics; ARCHITECTURE "Safety and runtime mode" states why). User-visible deliverables are allowed when they are outside the
+  owns the semantics; ARCHITECTURE "Safety and runtime mode" states why). `pro` and `cyber_pro` share the protected-rewrite seam, while `cyber_pro` additionally permits the selected owner-configuration paths; User-visible deliverables are allowed when they are outside the
   Ouroboros repo/control-plane.
 - Preferred flow: `task_drive` for scratch, `artifact_store` for canonical
   deliverables, `user_files` for the owner's visible copy.
@@ -1826,8 +1826,9 @@ both critical. The imperatives:
   historical permission from current Settings.
 - `active_tool_profile` fails closed to read-only, never to
   `self_modification`/`operator_control`; `external_tool_grants` is
-  deny-by-default; acting children keep commit, review, runtime control,
-  tool-enable, skills lifecycle, and cognitive-memory writes blocked; only
+  deny-by-default; acting children keep commit, tool-enable and cognitive-memory
+  tools blocked. Cyber-effective acting children inherit selected review, runtime
+  and skill tools through the existing matrix; ordinary restrictions remain. Only
   `schedule_subagent` may create subagents (forged `delegation_role`
   rejected at API/CLI ingress); live `memory_mode=shared` stays disabled
   (`tests/test_acting_subagents.py`). The subagent browser boundary refuses a
@@ -1953,6 +1954,18 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   behind a new general-purpose file executor.
 
 ### Onboarding and Settings surfaces
+
+- Current tasks use the existing task-entry settings read view; next-task saves
+  must not change an overlapping direct actor's Supervisor, Review, model or key.
+  Owner writers and grant classification read current disk state. Keep document
+  values and environment presence separate in the memory-only snapshot; preserve
+  immediate effects, explicit task overrides and boot pins. The OOP extension
+  payload carries only permitted typed values, never the whole snapshot. Test
+  actual child dispatch, unchanged empty/absent values, and current grant checks.
+- Cyber retains supplied-key/host/child authority and Supervisor configuration;
+  it cannot self-switch review scope/enforcement or context Low. Apply this at
+  existing guards and instructions without turning every setting into a new ban.
+
 
 - One five-step wizard serves subscriptions, API keys and mixed installs:
   Accounts → Models → Review → Budget → Summary. Quick Review & start runs the
@@ -2665,8 +2678,12 @@ by "Provider Independence" above. Call-site imperatives:
   `disposition_kind`/`obligation_id` (an unknown re-raise id fails closed to
   `new`, disclosed); a re-raise reopens the row without wiping the agent's
   argument; termination beyond a clean PASS/accepted rebuttal happens ONLY
-  via the reviewers' `dialogue_status` judgement or a real rail — no host
-  counters, no keyword gates (P5). One contributing reviewer may hold the
+  via the reviewers' `dialogue_status` judgement or a real rail under Blocking.
+  Advisory also permits explicit post-feedback author finish before another paid
+  panel, including a revised answer. Keep critic and author hashes separate;
+  bind controlling intent through the existing delivery-evidence fingerprint and
+  consume it on owner/evidence supersession. No semantic host counters or
+  keyword gates (P5). One contributing reviewer may hold the
   loop open only WITH MATERIAL (a `continue_actionable` vote without a
   concrete finding is disclosed and abstains); missing/invalid votes abstain
   and never default to continue; zero well-formed votes reduce to the typed

@@ -15,6 +15,7 @@ from ouroboros.cost_projection import (
     normalize_task_result_cost_planes,
 )
 from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
+from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
 
@@ -27,9 +28,7 @@ STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
 STATUS_CANCELLED = "cancelled"
 
-# ABI 7.0 (Q8=B) schema admission lives in ouroboros/task_result_schema.py
-# (module-size split); re-exported: every caller and test reaches the stamp,
-# the classifier and the quarantine through this module (F401 intended).
+# ABI 7.0 (Q8=B): re-export schema admission, stamping and quarantine for callers.
 from ouroboros.task_result_schema import (  # noqa: F401
     QUARANTINED_SCHEMA_REASON, TASK_RESULT_QUARANTINE_DIR, TASK_RESULT_SCHEMA_VERSION,
     emit_quarantine_event as _emit_quarantine_event,
@@ -264,33 +263,21 @@ def project_task_acceptance_review_capacity(
             "reason": f"review_capacity_unknown:{type(exc).__name__}",
         }
 
-# Intent latch: the agent/owner asked to cancel, but the supervisor has not yet
-# torn the task down. Ranks above running so a late running/scheduled mirror
-# cannot resurrect it, but below the truly-terminal statuses so the eventual
-# STATUS_CANCELLED write still lands.
+# Cancel intent outranks running mirrors but not terminal states: stale progress
+# cannot resurrect the task, and the supervisor's final CANCELLED write still lands.
 STATUS_CANCEL_REQUESTED = "cancel_requested"
 
-# The flat task-scope cost fields shared by live task events, progress-row
-# replay, task_summary chat rows, and the persisted result written here (v6.82
-# P1) — one home, so no consumer grows a divergent literal list.
-# DERIVED from the cost SSOT (``ouroboros/cost_projection.py``) rather than
-# re-typed: the HONEST names only (ABI 7.0/ABI-3: the retired
-# ``cost_usd[_with_children]`` aliases are read-tolerance, never carried
-# forward — a consumer copying by this list from a possibly-legacy source must
-# resolve the pair with ``carry_cost_meta`` instead of a key loop) and EVERY
-# accounting openness/integrity marker. Hand-maintained copies are how a
-# marker reaches one surface and not the next: ``non_final_rows`` rides with
-# ``cost_final`` because it is that flag's DISCLOSED CAUSE (v6.89.0 panel D2),
-# and ``ledger_integrity_degraded`` was produced by the authority but named in
-# no list at all, so it never reached any surface.
+# Events, progress replay, chat summaries and results share the cost-projection
+# SSOT's current names and ALL openness/integrity markers. Legacy cost_usd aliases
+# are read-only compatibility: use carry_cost_meta, not a key loop, to copy them.
+# In particular, non_final_rows explains cost_final; omitting it or
+# ledger_integrity_degraded would silently lose the authority's uncertainty.
 TASK_COST_META_FIELDS = tuple(dict.fromkeys(
     [new for new, _old in COST_ALIAS_PAIRS] + list(COST_OPENNESS_FIELDS)
 ))
 
-# Monotonic lifecycle ordering. A write that would move a task *backwards* past
-# the cancel-intent latch or a terminal status is ignored, so a stale
-# scheduled/running mirror can never clobber a cancel/terminal outcome
-# (the "ghost subagent" class). Unknown statuses are unranked and never block.
+# Monotonic lifecycle: stale scheduled/running mirrors cannot overwrite cancellation
+# or terminal outcomes (the ghost-subagent class). Unknown statuses never block.
 _TRULY_TERMINAL_STATUSES = frozenset({
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -970,18 +957,12 @@ def write_task_result(
     )
 
 
-# --------------------------------------------------------------------------- plan review state
-#
-# ``plan_review_state`` v2 (plan-review redesign, 2026-08-15): the durable record of
-# every ``plan_task`` cycle of ONE task. Task level: ``series_id`` (fresh per first v2
-# wave), ``cycles_paid`` (paid reviewer panels — the shared cap ``review_max_cycles()``
-# binds it), ``need_evidence_seen`` (per-task memory: one locator may be requested once),
-# ``current_attempt`` (the fingerprint the gate projects + open|unavailable|rail_degraded),
-# ``waves`` (bounded: the last ``_PLAN_REVIEW_FULL_WAVES`` in full, older ones compacted,
-# ``waves_omitted`` beyond ``_PLAN_REVIEW_MAX_WAVES``). A v1 record is READ-ONLY: it
-# loads without error under ``legacy_v1``; an open v1 wave projects as
-# ``legacy_open_requires_resubmission`` (S5 — never auto-closed) until a NEW plan_task
-# call starts a fresh v2 series.
+# plan_review_state v2 records each task's plan_task cycles: a fresh series_id,
+# cycles_paid bounded by review_max_cycles(), need_evidence_seen (one request per
+# locator), and current_attempt (fingerprint + open/unavailable/rail_degraded).
+# Keep _PLAN_REVIEW_FULL_WAVES whole, compact older waves and count waves_omitted
+# beyond _PLAN_REVIEW_MAX_WAVES. v1 remains read-only under legacy_v1; an open wave
+# requires resubmission until a new plan_task starts v2, never automatic closure.
 
 _PLAN_REVIEW_FULL_WAVES = 8
 _PLAN_REVIEW_MAX_WAVES = 64
@@ -1073,6 +1054,10 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: full wave needs spec and findings")
             if not isinstance(wave.get("dispositions", []), list):
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: dispositions must be a list")
+        if "author_disposition" in wave and validate_author_disposition(
+            wave["author_disposition"], subject_hash=fingerprint,
+        ) is None:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: author_disposition is malformed or stale")
         seen.add(fingerprint)
     cycles_paid = value.get("cycles_paid", 0)
     if not isinstance(cycles_paid, int) or isinstance(cycles_paid, bool) or cycles_paid < 0:
@@ -1414,6 +1399,8 @@ def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),
         "wave_artifact": copy.deepcopy(wave.get("wave_artifact") or {}),
+        **({"author_disposition": copy.deepcopy(wave["author_disposition"])}
+           if isinstance(wave.get("author_disposition"), dict) else {}),
         **({"spec_source_ref": copy.deepcopy(wave["spec_source_ref"])} if wave.get("spec_source_ref") else {}),
         **({"reviewed_at": str(wave["reviewed_at"])} if wave.get("reviewed_at") else {}),
     }
@@ -1556,6 +1543,7 @@ def record_plan_review_dispositions(
     closure_notes: Optional[List[str]] = None,
     wave_artifact: Optional[Dict[str, Any]] = None,
     recorded_at: str = "",
+    author_disposition: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Store the agent's dispositions on one FULL wave and its resulting closure.
     Only note-only closed waves accept annotations. Closure authority remains
@@ -1576,6 +1564,14 @@ def record_plan_review_dispositions(
             wave["closure_notes"] = list(closure_notes)
         if wave_artifact is not None:
             wave["wave_artifact"] = copy.deepcopy(wave_artifact)
+        if author_disposition is not None:
+            author = validate_author_disposition(
+                author_disposition,
+                subject_hash=fingerprint,
+            )
+            if author is None:
+                raise ValueError("PLAN_REVIEW_AUTHOR_DISPOSITION_INVALID: stale or malformed record")
+            wave["author_disposition"] = author
         if closed and str(wave.get("aggregate") or "") == "REVIEW_REQUIRED":
             wave["closed"] = True
         state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}

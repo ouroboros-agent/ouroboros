@@ -10,13 +10,13 @@ The dependency runs one way: this module never imports the coordinator.
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
 from ouroboros.model_wait import monotonic_now
 
 import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -512,7 +512,7 @@ def review_session_route() -> Any:
     """
     from ouroboros.subagents import get_subagent_harness, parse_subagent_harness
 
-    raw = str(os.environ.get(REVIEW_SESSION_ROUTE_ENV, "")).strip()
+    raw = str(runtime_setting(REVIEW_SESSION_ROUTE_ENV, "")).strip()
     route = parse_subagent_harness(raw)
     if route is not None: return route
     if raw and raw.lower() != "off":

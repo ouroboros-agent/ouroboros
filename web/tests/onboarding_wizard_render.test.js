@@ -144,6 +144,20 @@ test(`importing the onboarding wizard renders the '${step}' step without throwin
 });
 }
 
+test('the setup contract renders Cyber Pro beside the independent Blocking choice', async () => {
+    const reviewIndex = BOOTSTRAP.stepOrder.indexOf('review_mode');
+    const bootstrap = {
+        ...BOOTSTRAP,
+        stepOrder: [...BOOTSTRAP.stepOrder.slice(reviewIndex), ...BOOTSTRAP.stepOrder.slice(0, reviewIndex)],
+    };
+    await withWizard(bootstrap, 'cyber-pro-grid', async ({ doc }) => {
+        const html = doc.getElementById('root').innerHTML;
+        assert.match(html, /wizard-choice-grid four/);
+        assert.match(html, /data-runtime-mode="cyber_pro"[\s\S]*Cyber Pro/);
+        assert.match(html, /data-review-mode="blocking"[\s\S]*Blocking/);
+    });
+});
+
 test('wizard renders and submits the edited owner draft on Finish', { timeout: 3000 }, async () => {
     // Keep the real contract and input handlers: only start at the model step,
     // after provider access, so this regression needs no subscription service.

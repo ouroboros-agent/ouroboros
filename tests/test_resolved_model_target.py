@@ -103,13 +103,36 @@ def test_fallback_ladder_is_a_typed_view_of_the_chain_ssot(monkeypatch):
     assert all(c.effort == "" and c.context_window == 0 for c in candidates)
 
 
-def test_fallback_dispatch_lane_stays_the_global_flag():
-    """Equivalence pin for the sweep's byte-identical contract: the loop's
-    local-vs-remote lane still comes from the one global USE_LOCAL_FALLBACK
-    read, never from a per-candidate route field."""
-    source = (REPO / "ouroboros" / "loop_model_call.py").read_text(encoding="utf-8")
-    assert 'os.environ.get("USE_LOCAL_FALLBACK", "")' in source
-    assert "candidate.provider_route" not in source
+@pytest.mark.parametrize("captured_local", [False, True])
+def test_fallback_dispatch_lane_stays_the_global_flag(tmp_path, monkeypatch, captured_local):
+    """Every candidate uses the task's shared fallback flag, including after a save."""
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+    from ouroboros.settings_integrity import task_settings_scope, task_settings_snapshot
+
+    settings = {"USE_LOCAL_FALLBACK": str(captured_local).lower(),
+                "OUROBOROS_MODEL_FALLBACKS": "remote-model,other (local)"}
+    snapshot = task_settings_snapshot(settings, settings)
+    monkeypatch.setenv("USE_LOCAL_FALLBACK", str(not captured_local).lower())
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    dispatched = []
+
+    def call(ctx):
+        dispatched.append((ctx.active_model, ctx.active_use_local))
+        return None, 0.0, "max"
+
+    monkeypatch.setattr(loop, "_call_round_model", call)
+    with task_settings_scope(snapshot):
+        loop_model_call._run_cross_model_fallback_chain(
+            llm=None, ctx=SimpleNamespace(), tools=SimpleNamespace(_ctx=SimpleNamespace()),
+            messages=[], active_model="primary", active_use_local=False, tool_schemas=[],
+            active_effort="high", max_retries=1, drive_logs=tmp_path / "logs", task_id="t",
+            round_idx=1, event_queue=None, accumulated_usage={}, task_type="task",
+            emit_progress=lambda _: None, context_fit_plan=None, active_context_mode="max",
+        )
+    assert dispatched == [("remote-model", captured_local), ("other (local)", captured_local)]
 
 
 # ---------------------------------------------------------------------------

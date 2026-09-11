@@ -5,9 +5,10 @@ split); loop.py re-exports every name."""
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import logging
 import contextlib
-import os
 import pathlib
 import queue
 import time
@@ -107,7 +108,7 @@ def _run_cross_model_fallback_chain(
 
     _cooled(active_model, active_use_local)
     primary_context_usage = _snapshot_context_fit_usage(accumulated_usage)
-    fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
+    fallback_use_local = runtime_setting("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
     attempt_cap = _fcd.attempts_per_model()
     configured_chain = parse_fallback_chain()
     msg = None

@@ -137,7 +137,9 @@ def browser_url_block_reason(url: str, ctx: Any = None, *, restricted: bool) -> 
     return ""
 
 
-def browser_request_block_reason(request: Any, ctx: Any, *, restricted: bool) -> str:
+def browser_request_block_reason(
+    request: Any, ctx: Any, *, restricted: bool, runtime_mode: str = ""
+) -> str:
     """One request decision: the target decision plus owner-operation shapes at Ouroboros.
 
     The owner POST shapes apply at a proven Ouroboros endpoint and at an expected
@@ -146,6 +148,13 @@ def browser_request_block_reason(request: Any, ctx: Any, *, restricted: bool) ->
     reason = browser_url_block_reason(request.url, ctx, restricted=restricted)
     if reason or restricted:
         return reason  # Restricted target checks already refused every runtime identity.
+    if (_is_context_mode_owner_post(request) or _is_review_enforcement_post(request)) and runtime_service_kind(request.url, ctx):
+        return "BROWSER_OWNER_CONTROL_BLOCKED: review scope and enforcement belong to the owner"
+    if runtime_mode:
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        if runtime_mode_at_least(runtime_mode, "cyber_pro"):
+            return ""
     if any(predicate(request) for predicate in (
         _is_context_mode_owner_post, _is_safety_mode_owner_post,
         _is_owner_skill_attest_post, _is_owner_settings_self_elevation_post,
@@ -317,6 +326,17 @@ def _is_safety_mode_owner_post(request: Any) -> bool:
     return method == "POST" and path == "/api/owner/safety-mode"
 
 
+def _is_review_enforcement_post(request: Any) -> bool:
+    """The actual Settings field changes enforcement, independently of Access."""
+    import json
+    try:
+        return (str(request.method).upper() == "POST"
+                and urlparse(str(request.url)).path.rstrip("/") == "/api/settings"
+                and "OUROBOROS_REVIEW_ENFORCEMENT" in json.loads(request.post_data or "{}"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 
 def _is_owner_skill_attest_post(request: Any) -> bool:
     """A browser POST to the owner-only skill owner-attestation endpoint — the click/form
@@ -359,7 +379,9 @@ def _is_owner_settings_self_elevation_post(request: Any) -> bool:
     )
 
 
-def browser_evaluate_block_reason(url: str, value: str, ctx: Any = None) -> str:
+def browser_evaluate_block_reason(
+    url: str, value: str, ctx: Any = None, *, runtime_mode: str = ""
+) -> str:
     """Keep owner-operation JavaScript policy at the same owner as URL policy."""
     if not runtime_service_kind(url, ctx):
         return ""
@@ -370,6 +392,13 @@ def browser_evaluate_block_reason(url: str, value: str, ctx: Any = None) -> str:
             "Context mode is owner-controlled — ask the owner to use "
             "the Low/Max toggle."
         )
+    low = str(value or "").lower()
+    if "ouroboros_review_enforcement" in low and any(sink in low for sink in ("settings.json", "save_settings", "/api/settings")):
+        return "⚠️ ELEVATION_BLOCKED: review enforcement remains owner-controlled in every access mode."
+    if runtime_mode:
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+        if runtime_mode_at_least(runtime_mode, "cyber_pro"):
+            return ""
     if _blocks_safety_mode_self_lowering_js(value):
         return (
             "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: browser JavaScript "

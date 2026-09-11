@@ -34,6 +34,24 @@ def _attach_dir(drive, task_id):
 
 
 class TestStageTaskAttachments:
+    def test_cyber_owner_attachment_can_stage_credential_named_source(self, tmp_path, monkeypatch):
+        from ouroboros import config
+        from ouroboros.artifacts import stage_task_attachments
+        from ouroboros.runtime_mode_policy import _RUNTIME_MODE_RANK
+
+        monkeypatch.setattr(config, "get_runtime_mode", lambda: "cyber_pro")
+        monkeypatch.setitem(_RUNTIME_MODE_RANK, "cyber_pro", 3)
+        drive = _drive(tmp_path)
+        src = tmp_path / ".ssh" / "id_rsa"
+        src.parent.mkdir()
+        src.write_text("owner key", encoding="utf-8")
+
+        manifest = stage_task_attachments(drive, "cyber-task", [{"path": str(src)}])
+
+        assert manifest[0]["status"] == "staged"
+        staged = _attach_dir(drive, "cyber-task") / manifest[0]["relpath"].split("/", 1)[1]
+        assert staged.read_text(encoding="utf-8") == "owner key"
+
     def test_stages_into_artifact_store(self, tmp_path):
         from ouroboros.artifacts import stage_task_attachments
 

@@ -410,6 +410,7 @@ def test_manual_dependency_specs_are_not_dropped():
 
 
 def test_skill_readiness_discloses_manual_dependencies_without_blocking(tmp_path, monkeypatch):
+    from ouroboros.skill_loader import SkillReviewState
     from ouroboros.skill_readiness import skill_readiness_for_execution
 
     skill = SimpleNamespace(
@@ -419,7 +420,7 @@ def test_skill_readiness_discloses_manual_dependencies_without_blocking(tmp_path
         load_error="",
         enabled=True,
         source="",
-        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
+        review=SkillReviewState(status="clean", content_hash="h"),
         manifest=SimpleNamespace(raw_extra={"install_specs": [{"kind": "brew", "package": "ffmpeg"}]}),
     )
     monkeypatch.setattr("ouroboros.skill_loader.discover_skills", lambda _root: [])

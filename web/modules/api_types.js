@@ -131,6 +131,15 @@
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract
  * @property {AvailableSubagentsSettingsMeta=} available_subagents
+ * @property {SettingsPolicyState=} policy_state
+ */
+
+/**
+ * @typedef {Object} SettingsPolicyState
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,restart_required:boolean,applies:string}} access
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} supervisor
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} review
+ * @property {boolean} running_task_snapshot
  */
 
 /**
@@ -760,7 +769,9 @@
  * @property {string=} payload_root
  * @property {string=} review_status
  * @property {boolean=} review_stale
- * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, author_accepted: (boolean|undefined), reviewed_content_hash: (string|undefined), author_disposition: (Object|undefined), preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {string=} reviewed_content_hash
+ * @property {Object=} author_disposition
  * @property {boolean=} executable_review
  * @property {string=} review_profile
  * @property {boolean=} official_hub_verified

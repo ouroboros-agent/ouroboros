@@ -963,6 +963,87 @@ test('task acceptance adapts only task_acceptance panels; advisory and commit st
     assert.deepEqual(reviewGroupsFromTaskDetail(detail).map((item) => item.surface), ['task_acceptance']);
 });
 
+test('author finish is shown beside raw reviewer signal without becoming PASS', () => {
+    const fingerprint = 'a'.repeat(64);
+    const plan = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint, status: 'closed' },
+            waves: [{
+                request_fingerprint: fingerprint,
+                aggregate: 'REVIEW_REQUIRED',
+                closed: true,
+                author_disposition: {
+                    disposition: 'partial',
+                    rationale: 'Fixed the defect and deferred cosmetic notes.',
+                    reviewer_signal: 'REVIEW_REQUIRED',
+                    subject_hash: fingerprint,
+                },
+            }],
+        },
+    });
+    const attemptKey = `${plan.id}:${plan.attempts[0].id}`;
+    const html = renderReviewsSection([plan], {
+        sectionExpanded: true,
+        expandedGroups: new Set([plan.id]),
+        expandedAttempts: new Set([attemptKey]),
+    });
+    assert.match(html, /Author finish: partial/);
+    assert.match(html, /reviewer signal=REVIEW_REQUIRED/);
+    assert.match(html, /Fixed the defect and deferred cosmetic notes/);
+    assert.match(html, /REVIEW_REQUIRED/);
+});
+
+test('task acceptance falls back to the explicit durable author decision', () => {
+    const detail = {
+        task_id: 'root',
+        review_projection: { panels: [{
+            panel_id: 'accept', surface: 'task_acceptance', aggregate_signal: 'REVIEW_REQUIRED',
+        }] },
+        review_status: { acceptance_decision: {
+            status: 'finalized_unaccepted',
+            reason: 'author_finish',
+            author_disposition: {
+                disposition: 'partial',
+                rationale: 'Fixed the defect; deferred the remaining note.',
+                subject_hash: 'binding-123',
+                reviewer_signal: 'REVIEW_REQUIRED',
+                source: 'author',
+            },
+        } },
+    };
+    const group = taskAcceptanceGroupFromTaskDetail(detail);
+    const attemptKey = `${group.id}:${group.attempts[0].id}`;
+    const html = renderReviewsSection([group], {
+        sectionExpanded: true,
+        expandedGroups: new Set([group.id]),
+        expandedAttempts: new Set([attemptKey]),
+    });
+    assert.match(html, /Author finish: partial/);
+    assert.match(html, /subject_hash=binding-123/);
+    assert.match(html, /reviewer signal=REVIEW_REQUIRED/);
+    assert.match(html, /REVIEW_REQUIRED/);
+    assert.doesNotMatch(html, /verdict=PASS/);
+});
+test('a revised task author decision is shown once and never attached to historical panels', () => {
+    const detail = {
+        task_id: 'root',
+        review_projection: { panels: [
+            { panel_id: 'old', surface: 'task_acceptance', aggregate_signal: 'FAIL', binding_hash: 'h0', superseded_by_revision: true },
+            { panel_id: 'new', surface: 'task_acceptance', aggregate_signal: 'FAIL', binding_hash: 'h1' },
+        ] },
+        review_status: { acceptance_decision: {
+            status: 'finalized_unaccepted', reason: 'author_finish',
+            author_disposition: { disposition: 'partial', rationale: 'Current h2 accepted by author.', subject_hash: 'h2', reviewer_signal: 'FAIL', source: 'author' },
+        } },
+    };
+    const group = taskAcceptanceGroupFromTaskDetail(detail);
+    assert.match(group.authorDecisionText, /subject_hash=h2/);
+    for (const attempt of group.attempts) assert.doesNotMatch(attempt.detailText, /subject_hash=h2/);
+    const html = renderReviewsSection([group], { sectionExpanded: true, expandedGroups: new Set([group.id]), expandedAttempts: new Set(group.attempts.map(a => `${group.id}:${a.id}`)) });
+    assert.equal((html.match(/Current h2 accepted by author/g) || []).length, 1);
+    assert.equal((html.match(/data-review-author-decision/g) || []).length, 1);
+});
 test('renderer is quiet, accessible and never invents review dollars', () => {
     const group = reviewGroupFromHistoryRow(groupedSkillRow());
     const html = renderReviewsSection([group], {

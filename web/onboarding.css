@@ -403,8 +403,13 @@ textarea::placeholder {
 }
 
 .wizard-choice-grid.three {
-  /* Runtime-mode picker has three choices, not the default two. */
+  /* Runtime-mode picker for contracts with three choices. */
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.wizard-choice-grid.four {
+  /* Cyber Pro adds a fourth access level to the same independent picker. */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .wizard-choice {
@@ -1210,6 +1215,7 @@ textarea::placeholder {
   .grid.two,
   .grid.three,
   .wizard-choice-grid,
+  .wizard-choice-grid.four,
   .agent-ladder-layout {
     grid-template-columns: 1fr;
   }

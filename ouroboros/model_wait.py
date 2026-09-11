@@ -143,7 +143,10 @@ def copy_wait_context() -> contextvars.Context:
     Copying every ContextVar also transfers a previous physical capture and
     the parent's Main fit authority. Those belong to their original call.
     """
+    from ouroboros.settings_integrity import copy_task_settings_context
+
     copied = contextvars.Context()
+    copy_task_settings_context(copied)
     for variable in (_CURRENT, _REPREPARE, _CALENDAR, _LOGICAL):
         copied.run(variable.set, variable.get())
     return copied

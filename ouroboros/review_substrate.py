@@ -8,11 +8,11 @@ reviewer slots.
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
 from ouroboros.model_wait import monotonic_now
 
 from dataclasses import asdict, replace
 import logging
-import os
 import pathlib
 import time
 from typing import Any, Dict, List, Optional
@@ -287,7 +287,7 @@ class ReviewCoordinator:
         else:
             try:
                 configured_root_limit = float(
-                    os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0
+                    runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0
                 )
                 root_limit = configured_root_limit if configured_root_limit > 0 else None
             except (TypeError, ValueError):

@@ -25,6 +25,7 @@ from ouroboros.utils import (
     update_json_locked,
     utc_now_iso,
 )
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -917,7 +918,7 @@ def verify_system_state(env: Any, git_sha: str) -> None:
         issues += 1
         log.warning("WORLD.md missing — environment profile not available")
 
-    configured_model = os.environ.get("OUROBOROS_MODEL", "")
+    configured_model = runtime_setting("OUROBOROS_MODEL", "")
     checks["model"] = {"configured": configured_model or "(not set)"}
     if not configured_model:
         issues += 1

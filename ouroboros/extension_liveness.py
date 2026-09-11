@@ -20,7 +20,6 @@ from ouroboros.skill_loader import (
     discover_skills,
     grant_status_for_skill,
     skill_conflict_status,
-    skill_review_gate,
 )
 
 log = logging.getLogger(__name__)
@@ -54,7 +53,7 @@ def _extension_runtime_state(
             and load_failure.skill_dir == skill_dir_now
         )
 
-    review_gate = skill_review_gate(skill.review.status, stale=review_stale)
+    review_gate = skill.review.gate_for(hash_now)
     if drive_root is None:
         drive_root = pathlib.Path(skill.skill_dir).parent.parent.parent
     peers = list(skills) if skills is not None else discover_skills(

@@ -251,7 +251,7 @@ def capture_skill_publish_snapshot(loaded: LoadedSkill) -> SkillPublishSnapshot:
     """Capture one candidate and bind it to the stored review hash."""
 
     snapshot = capture_skill_publish_candidate(loaded)
-    stored_review_hash = str(getattr(loaded.review, "content_hash", "") or "")
+    stored_review_hash = str(loaded.review.reviewed_content_hash or loaded.review.content_hash or "")
     if not stored_review_hash or snapshot.content_hash != stored_review_hash:
         raise SkillPublishSnapshotError("snapshot_review_stale")
     return snapshot

@@ -128,7 +128,6 @@ BAND_PATHS = {
     "ouroboros/gateway/control.py": "Entered the band from 966 lines: the update-flow redesign added the shared stash-first prologue (_stash_local_work_fenced/_unwind_stashed_update) and the review-wave affordability floor to the update apply orchestration (update-flow-redesign sprint, Q9/Q10 owner decisions).",
     "ouroboros/gateway/extensions.py": "Extensions HTTP surface re-entered the band when the module endpoint moved to the in-memory reviewed bundle (widgets lifecycle 1a); shrink next touch.",
     "ouroboros/gateway/host_service.py": "The one loopback callback boundary for reviewed skills: token auth, the chat/decision/presence/WS-relay routes and, with #667, the operation read/cancel that joins existing chat, routing, turn and task records; one trust boundary, one module.",
-    "ouroboros/gateway/settings.py": "Retiring persistent auto-Low removed the former giant debt; the remaining owner and reviewer settings endpoints stay centralized while tracked in the shrinking band.",
     "ouroboros/gateways/claudexor.py": "The existing owned-engine gateway also owns typed model operations and exact-byte resource transfer; no second control client.",
     "ouroboros/launcher_bootstrap.py": "Native seed version resync keeps manifest parsing and equal-version payload diagnostics with the existing bootstrap owner; no separate loader or overwrite policy.",
     "ouroboros/loop_acceptance_review.py": "F6 upstream sync: the A-material acceptance family (paid identity, free replay, identical-refusal terminal, dialogue history) folded into the campaign review leaf per the sync principle (upstream leaf acceptance_dialogue.py retired)",
@@ -230,14 +229,11 @@ BAND_PATHS = {
     "web/modules/chat_activity.js": "Existing task activity renderer consumes the shared quota/auth wait state; no parallel task card or lifecycle.",
     "web/modules/harness_accounts.js": None,
     "web/modules/log_events.js": None,
-    "web/modules/onboarding_wizard.js": "Shrank INTO the band: the Claude Runtime onboarding card and its /api/claude-code/* polling were deleted with the retired transport (owner-approved Q4); no new content was added.",
-    "web/modules/review_presentation.js": "Review Checkpoint read-side grouping, lifecycle/verdict separation, and keyed disclosure reconciliation remain one pure adapter below the 1500-line band cap.",
     "web/modules/reviewer_slots.js": "Owner-approved 5A editor: per-row Direct model / Configured subagent source picker with read-only derived disclosure replaces the legacy Claude-SDK advisory input in the same module that owns reviewer-row editing.",
     "web/modules/settings.js": None,
     "web/modules/skills.js": "One installed-skill page controller owns independently settling primary/optional reads and current-generation menu, identity and badge updates; domain lifecycle, cards, hub truth and shared interactions remain separate owners.",
     "web/tests/chat_instance_dom.test.js": "Entered the band from 1000 lines with the alias-free subagent cost pin (stage-2 fix wave): that regression reproduces only through the real createChatInstance card path, and this file owns the DOM harness that drives it; split when the next createChatInstance face lands.",
     "web/tests/harness_login_cards.test.js": "Login-card suite grew past 1000 lines with the name-the-account face cases (agy pickup, issue #232); split when the next face lands.",
-    "web/tests/review_presentation.test.js": "Review Checkpoint lifecycle and verdict reconciliation remain covered by one focused presentation suite.",
 }
 
 BYTE_BASELINE_DEBT = {

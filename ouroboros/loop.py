@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import functools  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 import json  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 import hashlib  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
-import os
 import queue
 import pathlib
 import time  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
@@ -344,7 +345,7 @@ def _resolve_loop_max_rounds(ctx: Any = None) -> int:
 
     default = int(SETTINGS_DEFAULTS["OUROBOROS_MAX_ROUNDS"])
     try:
-        configured = max(1, int(os.environ.get("OUROBOROS_MAX_ROUNDS", str(default))))
+        configured = max(1, int(runtime_setting("OUROBOROS_MAX_ROUNDS", str(default))))
     except (ValueError, TypeError):
         log.warning("Invalid OUROBOROS_MAX_ROUNDS, defaulting to %s", default)
         configured = default
@@ -376,7 +377,7 @@ def run_llm_loop(
     active_effort = initial_effort
     local_override = getattr(ctx, "task_use_local_override", None)
     active_use_local = (bool(local_override) if local_override is not None else
-                        os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1"))
+                        runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1"))
     # Unknown routes get one honest call; no synthetic short-window capacity.
     _preferred_context_mode = get_context_mode()
     context_fit_plan = getattr(ctx, "context_fit_plan", None)

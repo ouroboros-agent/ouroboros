@@ -8,7 +8,6 @@ import hashlib  # noqa: F401  (prior import surface)
 import inspect  # noqa: F401  (prior import surface)
 import json
 import logging
-import os
 import re
 import threading  # noqa: F401  (prior import surface)
 import time  # noqa: F401  (prior import surface)
@@ -134,6 +133,7 @@ from ouroboros.usage_accounting import (
     usage_scope,
 )
 from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log  # noqa: F401
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class LLMClient(
         base_url: str = "https://openrouter.ai/api/v1",
     ):
         self._api_key_override = api_key
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self._api_key = api_key or runtime_setting("OPENROUTER_API_KEY", "")
         self._base_url = base_url
         self._client = None
         self._client_api_key: Optional[str] = None
@@ -635,12 +635,12 @@ class LLMClient(
 
     def default_model(self) -> str:
         """Return the single default model from env. LLM switches via tool if needed."""
-        return os.environ.get("OUROBOROS_MODEL", OPENROUTER_DEFAULTS["main"])
+        return runtime_setting("OUROBOROS_MODEL", OPENROUTER_DEFAULTS["main"])
 
     def available_models(self) -> List[str]:
         """Return list of available models from env (for switch_model tool schema)."""
         main = self.default_model()
-        light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
+        light = runtime_setting("OUROBOROS_MODEL_LIGHT", "")
         models = [main]
         if light and light != main:
             models.append(light)

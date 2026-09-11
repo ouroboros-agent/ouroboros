@@ -23,11 +23,11 @@ exactly as before, through ``config.resolve_effort(task_type)``.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone  # noqa: F401
 from typing import Any, Dict, List, Mapping
 
+from ouroboros.config import runtime_setting
 from ouroboros.config import (
     SETTINGS_DEFAULTS,
     get_heavy_model,
@@ -234,7 +234,7 @@ def get_subagent_harness() -> DelegationRoute | None:
     pricing, and bench provenance.
     """
     raw = str(
-        os.environ.get("OUROBOROS_SUBAGENT_HARNESS", "")
+        runtime_setting("OUROBOROS_SUBAGENT_HARNESS", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_HARNESS", "")
     ).strip()
     route = parse_subagent_harness(raw)
@@ -253,7 +253,7 @@ def get_subagent_harness() -> DelegationRoute | None:
     # spelling, and this is the ONLY reader of the pin key. Empty = the
     # engine's quota-aware rotation pool (D28).
     profile = str(
-        os.environ.get("OUROBOROS_SUBAGENT_PROFILE", "")
+        runtime_setting("OUROBOROS_SUBAGENT_PROFILE", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROFILE", "")
     ).strip()
     if profile:
@@ -549,7 +549,7 @@ def normalize_subagent_model_lane(value: Any) -> str:
 
 
 def _slot_model(key: str) -> str:
-    return str(os.environ.get(key, "") or SETTINGS_DEFAULTS.get(key, "") or "").strip()
+    return str(runtime_setting(key, "") or SETTINGS_DEFAULTS.get(key, "") or "").strip()
 
 
 _LANE_SLOT_KEYS = {
@@ -574,7 +574,7 @@ def lane_ran_on_main(lane: str, model: str) -> bool:
     """
     if lane not in {"heavy", "light"}:
         return False
-    env_slot = str(os.environ.get(_LANE_SLOT_KEYS[lane][0], "") or "").strip()
+    env_slot = str(runtime_setting(_LANE_SLOT_KEYS[lane][0], "") or "").strip()
     return not env_slot or bool(model and model != env_slot)
 
 
@@ -587,13 +587,13 @@ def _use_local_for_lane(lane: str, model: str) -> bool:
         # Follows Main's local flag, so USE_LOCAL_MAIN governs the effective model
         # rather than being silently ignored.
         return _use_local_for_lane("main", model)
-    slot_value = str(os.environ.get(model_key, "") or "").strip()
+    slot_value = str(runtime_setting(model_key, "") or "").strip()
     if lane == "main":
         slot_value = slot_value or str(SETTINGS_DEFAULTS.get(model_key, "") or "").strip()
     return (
         bool(model)
         and model == slot_value
-        and str(os.environ.get(local_key, "") or "").strip().lower() in {"1", "true", "yes", "on"}
+        and str(runtime_setting(local_key, "") or "").strip().lower() in {"1", "true", "yes", "on"}
     )
 
 

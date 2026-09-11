@@ -451,13 +451,15 @@ def build_improvement_capsule(
         # improves the result; otherwise produce your normal final answer" tail
         # was the measured cause of the do-nothing resubmit loop (SWE 1b311217:
         # 7 passes, zero tool calls). The anti-derailment guards stay verbatim.
-        "Three real moves are available: (1) FIX — change the work/answer so the next panel is "
+        "Four real moves are available: (1) FIX — change the work/answer so the next panel is "
         "clean; (2) REBUT — file obligation_dispositions (rejected + your reason) via the "
         "task_acceptance_review tool for findings you can show are wrong; the reviewer "
         "adjudicates the argument; (3) DECLARE UNREACHABLE — dispose an obligation as "
         "unsatisfiable in this environment (rejected + the concrete gap), and the reviewer "
         "judges reachability. Resubmitting the same answer with none of these moves changes "
-        "nothing. "
+        "nothing. (4) AUTHOR FINISH — under advisory enforcement, record accepted, rejected, "
+        "partial, or deferred with a rationale; the first panel's raw findings remain durable, "
+        "no reviewer PASS is fabricated, and Blocking enforcement still requires its own gate. "
         "Do not mention this review or the reviewer unless the user asked. "
         "The assessment tier above is an internal ledger label — never emit an internal ledger "
         "identifier as the deliverable itself."

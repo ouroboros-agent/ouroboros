@@ -268,7 +268,7 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "blocked",
             "light_mode_blocked",
             "warning",
-            "use advanced or pro mode for repository writes",
+            "use advanced, pro, or cyber_pro mode for repository writes",
         ),
         "WORKSPACE_GIT_REF_CHANGED": _code_spec(
             "blocked",

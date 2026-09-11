@@ -131,7 +131,7 @@ _MODEL_SLOTS = _rows(("slot", "stateKey", "settingKey", "inputId", "label", "not
 ))
 
 _REVIEW_MODES = _rows(("value", "label", "tone", "className", "copy"), (
-    ("advisory", "Advisory", "Flexible", "advisory", "Faster and cheaper. Review still runs, but you decide how to handle findings. Best when you want iteration speed and can manually watch for drift."),
+    ("advisory", "Advisory", "Flexible", "advisory", "Review still runs. After feedback, Ouroboros can fix, reject or finish; raw reviewer findings remain visible."),
     ("blocking", "Blocking", "Strict", "blocking", "Slower and more expensive, but much safer. Critical review findings stop commits, which dramatically reduces the chance of gradual code degradation."),
 ))
 
@@ -139,6 +139,7 @@ _RUNTIME_MODES = _rows(("value", "label", "tone", "className", "copy"), (
     ("light", "Light", "Safest", "light", "Self-modification of the main repo is disabled. Best for trying Ouroboros out without repo self-modification."),
     ("advanced", "Advanced", "Default", "advanced", "Self-modification of the evolutionary layer is allowed (current behaviour). Protected core/contract/release files stay guarded by Advanced mode."),
     ("pro", "Pro", "Power", "pro", "Direct protected-surface mode. Protected core/contract/release edits are allowed on disk, but commits still require the normal triad + scope review gate."),
+    ("cyber_pro", "Cyber Pro", "Maximum power", "cyber-pro", "Host and configuration authority, including credentials, models, Supervisor and protected rewrites. Review scope and Blocking or Advisory enforcement remain owner-controlled."),
 ))
 
 _LOCAL_ROUTING_MODES = _rows(("value", "buttonLabel", "label", "flags"), (

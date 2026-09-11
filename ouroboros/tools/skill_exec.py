@@ -13,7 +13,7 @@ import uuid
 from subprocess import Popen
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ouroboros.config import get_skills_repo_path, load_settings
+from ouroboros.config import get_skills_repo_path, load_settings, runtime_settings
 from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
 from ouroboros.platform_layer import merge_hidden_kwargs, subprocess_new_group_kwargs
 from ouroboros.provider_models import MODEL_PROVIDER_CREDENTIAL_KEYS
@@ -37,6 +37,7 @@ from ouroboros.tool_access import (
     ResolvedResourceBinding,
     build_resolved_resource_binding,
     canonical_data_root,
+    load_bound_skill,
 )
 from ouroboros.tools.shell import (
     _active_subprocesses,
@@ -129,7 +130,7 @@ def _scrub_env(
         if val is not None:
             env[key] = val
     if manifest_env_keys:
-        settings = load_settings()
+        settings = runtime_settings(settings_reader=load_settings)
         from ouroboros.skill_loader import requested_core_setting_keys
         protected_upper = {k.upper() for k in _FORBIDDEN_ENV_FORWARD_KEYS}
         protected_upper.update(requested_core_setting_keys(list(manifest_env_keys or [])))
@@ -566,10 +567,96 @@ def _handle_list_skills(ctx: ToolContext, **_kwargs: Any) -> str:
     return json.dumps(summary, ensure_ascii=False, indent=2)
 
 
+def _author_finish_existing_skill_review(
+    ctx: ToolContext,
+    binding: ResolvedResourceBinding,
+    skill_name: str,
+    *,
+    disposition: str,
+    rationale: str,
+) -> Optional[Dict[str, Any]]:
+    """Apply an explicit advisory author finish without buying a new panel.
+
+    The first reviewer panel remains the source of findings.  A later finish
+    call accepts the current payload after deterministic preflight, including
+    after a local fix. Reviewer hash, findings and status stay intact;
+    only the author record binds the newly accepted bytes.
+    """
+    from ouroboros.config import get_review_enforcement
+    from ouroboros.review_records import build_author_disposition
+    from ouroboros.skill_loader import compute_content_hash, load_review_state, save_review_state
+    from ouroboros.skill_review import _run_deterministic_preflight
+
+    if str(get_review_enforcement() or "").strip().lower() != "advisory":
+        return {"error": "SKILL_REVIEW_ERROR: explicit author finish requires advisory enforcement."}
+    loaded = load_bound_skill(binding)
+    if loaded is None:
+        return {"error": "SKILL_REVIEW_ERROR: selected skill is unavailable for author finish."}
+    current_hash = compute_content_hash(
+        loaded.skill_dir,
+        manifest_entry=loaded.manifest.entry,
+        manifest_scripts=loaded.manifest.scripts,
+    )
+    drive_root = binding.state_drive_root
+    review_state = load_review_state(drive_root, skill_name, skill_type=loaded.manifest.type, skill_dir=loaded.skill_dir)
+    if review_state.status == "pending":
+        return {"error": "SKILL_REVIEW_ERROR: existing review is pending or has no reviewer verdict."}
+    if not (review_state.findings or review_state.raw_actor_records or review_state.raw_result):
+        return {"error": "SKILL_REVIEW_ERROR: no prior reviewer evidence is available for author finish."}
+    try:
+        author_record = build_author_disposition(
+            disposition=disposition,
+            rationale=rationale,
+            subject_hash=current_hash,
+            reviewer_signal=review_state.status,
+            enforcement="advisory",
+        )
+    except ValueError as exc:
+        return {"error": f"SKILL_REVIEW_ERROR: {exc}"}
+    previous_hash = str(review_state.reviewed_content_hash or review_state.content_hash or "")
+    if previous_hash != current_hash:
+        # A changed payload is accepted only after the existing deterministic
+        # gate checks the complete current payload.  This is not a reviewer
+        # PASS: the prior findings remain attached as historical evidence.
+        preflight = _run_deterministic_preflight(
+            ctx, drive_root, loaded, current_hash, persist=False, binding=binding,
+        )
+        if preflight is not None:
+            return {"error": "SKILL_REVIEW_ERROR: deterministic preflight did not pass for the current payload."}
+    review_state.author_disposition = author_record
+    save_review_state(drive_root, skill_name, review_state)
+    from ouroboros.skill_loader import auto_grant_if_enabled
+    from ouroboros.skill_review_runner import _reconcile_deps_after_pass_review, _reconcile_extension_payload
+
+    loaded.review = review_state
+    auto_grant_if_enabled(drive_root, loaded)
+    deps_status, deps_error = _reconcile_deps_after_pass_review(drive_root, skill_name, binding=binding)
+    extension = (_reconcile_extension_payload(ctx, skill_name, drive_root=drive_root,
+                                             repo_path=None, binding=binding)
+                 if loaded.manifest.is_extension() else {})
+    return {
+        "skill_name": skill_name,
+        "status": review_state.status,
+        "content_hash": current_hash,
+        "findings": list(review_state.findings or []),
+        "reviewer_models": list(review_state.reviewer_models or []),
+        "raw_actor_records": list(review_state.raw_actor_records or []),
+        "raw_result": review_state.raw_result,
+        "advisory_result": dict(review_state.advisory_result or {}),
+        "author_disposition": author_record,
+        "reviewed_content_hash": previous_hash,
+        "deps_status": deps_status, "deps_error": deps_error, "extension": extension,
+        "review_stale": review_state.is_stale_for(current_hash),
+        "review_gate": review_state.gate_for(current_hash),
+    }
+
+
 def _handle_review_skill(
     ctx: ToolContext,
     skill: str = "",
     review_rebuttal: str = "",
+    author_disposition: str = "",
+    author_rationale: str = "",
     _resolved_binding: ResolvedResourceBinding | None = None,
     **_kwargs: Any,
 ) -> str:
@@ -591,6 +678,31 @@ def _handle_review_skill(
         _load_accepted_rebuttals,
         render_skill_review_block,
     )
+    author_value = str(author_disposition or "").strip().lower()
+    author_reason = " ".join(str(author_rationale or "").split()).strip()
+    if author_value or author_reason:
+        if author_value not in {"accepted", "rejected", "partial", "deferred"} or not author_reason:
+            return "⚠️ SKILL_REVIEW_ERROR: explicit author finish requires a valid disposition and rationale."
+        finished = _author_finish_existing_skill_review(
+            ctx, binding, skill_name, disposition=author_value, rationale=author_reason,
+        )
+        if finished is None:
+            return "⚠️ SKILL_REVIEW_ERROR: author finish could not bind the selected skill revision."
+        if finished.get("error"):
+            return str(finished["error"])
+        attempt_idx = _count_attempts_for_content(
+            binding.state_drive_root, skill_name, str(finished.get("content_hash") or ""),
+        ) or 1
+        accepted_rebuttals = _load_accepted_rebuttals(binding.state_drive_root, skill_name)
+        markdown = render_skill_review_block(
+            finished, attempt_idx=attempt_idx, accepted_rebuttals=accepted_rebuttals,
+        )
+        return markdown + (
+            f"\n\nReviewer hash: {finished['reviewed_content_hash']}; author hash: {finished['content_hash']}."
+            f"\n{finished['review_gate']['summary']} Dependencies: {finished['deps_status']} {finished['deps_error']}"
+            "\nAuthor finish recorded for the current hash; raw reviewer findings and "
+            "the prior reviewer signal remain unchanged. No reviewer PASS was fabricated."
+        )
     from ouroboros.skill_review_runner import run_skill_review_lifecycle_blocking
 
     def _review_with_optional_rebuttal(review_ctx: ToolContext, review_name: str):
@@ -777,8 +889,8 @@ def _handle_skill_exec(
             "executing."
         )
     stale = loaded.review.is_stale_for(current_hash)
-    gate = skill_review_gate(loaded.review.status, stale=stale)
-    if stale:
+    gate = loaded.review.gate_for(current_hash)
+    if stale and not gate["executable_review"]:
         return (
             f"⚠️ SKILL_EXEC_BLOCKED: skill {skill_name!r} was edited since "
             f"the last review. Re-run skill_review(skill={skill_name!r}) "
@@ -1129,6 +1241,15 @@ _REVIEW_SCHEMA = {
                     "recorded verdict free, and no rebuttal buys past the "
                     "paid-cycle ceiling."
                 ),
+            },
+            "author_disposition": {
+                "type": "string",
+                "enum": ["accepted", "rejected", "partial", "deferred"],
+                "description": "Optional advisory author finish for this exact content hash; keeps the original reviewer hash; changed payloads require deterministic preflight, and pending reviews cannot finish.",
+            },
+            "author_rationale": {
+                "type": "string",
+                "description": "Required when author_disposition is supplied; explain why the author accepts, rejects, partially accepts, or defers the raw findings.",
             },
         },
         "required": ["skill"],

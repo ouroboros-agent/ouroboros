@@ -72,7 +72,7 @@ def test_llm_internal_fallbacks_follow_shipped_model_defaults(monkeypatch):
 def test_valid_runtime_modes_is_frozen_tuple():
     from ouroboros.config import VALID_RUNTIME_MODES
 
-    assert VALID_RUNTIME_MODES == ("light", "advanced", "pro")
+    assert VALID_RUNTIME_MODES == ("light", "advanced", "pro", "cyber_pro")
 
 
 @pytest.mark.parametrize("mode", ["light", "advanced", "pro"])
@@ -1063,6 +1063,126 @@ def test_advanced_mode_blocks_runshell_protected_python_writer(tmp_path, monkeyp
     )
     assert "SAFETY_VIOLATION" in result
     assert "BIBLE.md" in result
+
+
+def test_pro_mode_allows_runshell_protected_writer_with_core_notice(tmp_path, monkeypatch):
+    """Pro shell writes share the editor's protected-path allowance and notice."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    reg = _registry(tmp_path)
+    result = reg.execute(
+        "run_command",
+        {"cmd": "python -c \"from pathlib import Path; Path('BIBLE.md').write_text('x')\""},
+    )
+    assert "SAFETY_VIOLATION" not in result
+    assert "CORE_PATCH_NOTICE" in result
+    assert (tmp_path / "BIBLE.md").read_text(encoding="utf-8") == "x"
+
+
+def test_pro_mode_keeps_bible_delete_blocked_but_allows_ordinary_rm(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    (tmp_path / "BIBLE.md").write_text("constitution\n", encoding="utf-8")
+    (tmp_path / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+    reg = _registry(tmp_path)
+    bible_result = reg.execute("run_command", {"cmd": "rm BIBLE.md"})
+    assert "BIBLE_DELETE_BLOCKED" in bible_result
+    assert (tmp_path / "BIBLE.md").exists()
+    rename_result = reg.execute("run_command", {"cmd": "git mv BIBLE.md BIBLE.old"})
+    assert "BIBLE_DELETE_BLOCKED" in rename_result
+    assert (tmp_path / "BIBLE.md").exists()
+    python_result = reg.execute(
+        "run_command", {"cmd": "python3 -c \"import os; os.remove('BIBLE.md')\""},
+    )
+    assert "BIBLE_DELETE_BLOCKED" in python_result
+    subprocess_result = reg.execute(
+        "run_command",
+        {"cmd": "python3 -c \"import subprocess; subprocess.run(['rm','BIBLE.md'])\""},
+    )
+    assert "BIBLE_DELETE_BLOCKED" in subprocess_result
+    update_index_result = reg.execute(
+        "run_command", {"cmd": "git update-index --force-remove BIBLE.md"},
+    )
+    assert "BIBLE" in update_index_result
+    identity = tmp_path / "memory" / "identity.md"
+    identity.parent.mkdir()
+    identity.write_text("identity\n", encoding="utf-8")
+    identity_result = reg.execute("run_command", {"cmd": "rm memory/identity.md"})
+    assert "IDENTITY_DELETE_BLOCKED" in identity_result
+    assert identity.exists()
+    identity_python = reg.execute(
+        "run_command", {"cmd": "python3 -c \"import os; os.remove('memory/identity.md')\""},
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in identity_python
+
+
+def test_cyber_pro_blocks_runtime_identity_delete_with_repo_data_split(tmp_path, monkeypatch):
+    """The production-shaped data/memory identity path stays present in Cyber."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    (data / "memory").mkdir(parents=True)
+    identity = data / "memory" / "identity.md"
+    identity.write_text("identity\n", encoding="utf-8")
+    (data / "memory" / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    result = protected_bible_history_delete_reason(
+        "rm memory/identity.md", protect_bible=False,
+        identity_path=identity, cwd=data,
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in result
+    assert identity.exists()
+    identity_shell = protected_bible_history_delete_reason(
+        "python3 -c \"import subprocess; subprocess.run('rm memory/identity.md', shell=True)\"",
+        protect_bible=False, identity_path=identity, cwd=data,
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in identity_shell
+    wrapped = protected_bible_history_delete_reason(
+        ["sh", "-c", "rm memory/identity.md"], protect_bible=False,
+        identity_path=identity, cwd=data,
+    )
+    assert "IDENTITY_DELETE_BLOCKED" in wrapped
+    assert identity.exists()
+    scratch = protected_bible_history_delete_reason(
+        "rm memory/scratch.txt", protect_bible=False,
+        identity_path=identity, cwd=data,
+    )
+    assert scratch == ""
+
+
+def test_rank_aware_github_policy_keeps_ordinary_setup_blocked():
+    from ouroboros.git_shell_policy import gh_shell_block_reason
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least, runtime_mode_rank
+
+    assert runtime_mode_rank("pro") >= runtime_mode_rank("advanced")
+    assert runtime_mode_at_least("pro", "pro")
+    assert gh_shell_block_reason("gh auth login", runtime_mode="pro")
+
+
+@pytest.mark.parametrize("cmd", [
+    "git rebase HEAD~1",
+    "git checkout -- BIBLE.md",
+    "git restore BIBLE.md",
+    "git commit -m rewrite BIBLE.md",
+    "git update-ref refs/heads/feature HEAD",
+    "git filter-repo --path other.txt --invert-paths",
+])
+def test_bible_history_predicate_allows_unrelated_git_history_operations(cmd):
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    assert protected_bible_history_delete_reason(cmd) == ""
+
+
+@pytest.mark.parametrize("cmd", [
+    "git rm BIBLE.md",
+    "git mv BIBLE.md BIBLE.old",
+    "git update-index --remove BIBLE.md",
+    "git filter-repo --path BIBLE.md --invert-paths",
+])
+def test_bible_history_predicate_blocks_explicit_bible_targets(cmd):
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    assert "BIBLE" in protected_bible_history_delete_reason(cmd)
 
 
 def test_advanced_mode_blocks_runshell_protected_backslash_path(tmp_path, monkeypatch):

@@ -10,6 +10,8 @@ at unload, so a late call is refused rather than served.
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_settings
+
 import functools
 import hashlib
 import inspect
@@ -276,7 +278,7 @@ class PluginAPIImpl:
         candidates = self._env_allow_upper & self._granted_upper & MODEL_PROVIDER_CREDENTIAL_KEYS
         if not candidates:
             return False
-        settings = self._settings_reader() or {}
+        settings = runtime_settings(settings_reader=self._settings_reader)
         return any(str(settings.get(key) or "").strip() for key in candidates)
 
     def _disclose_model_capable_dispatch(self, surface_kind: str, surface: str) -> str:
@@ -922,7 +924,7 @@ class PluginAPIImpl:
             if "read_settings" not in self._permissions:
                 # Missing permission fails closed without leaking key presence.
                 return {}
-            settings = self._settings_reader() or {}
+            settings = runtime_settings(settings_reader=self._settings_reader)
             with _lock:
                 if self._runtime_closing or self._runtime_closed or self._skill in _unloading:
                     return {}

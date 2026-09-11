@@ -28,6 +28,7 @@ from ouroboros.provider_models import (
     parse_claudexor_model,
     resolve_minimax_base_url,
 )
+from ouroboros.config import runtime_setting
 
 
 _OR_PROVIDER_PRESETS = {
@@ -40,7 +41,7 @@ _OR_PROVIDER_PRESETS = {
 def _resolve_or_provider() -> Dict[str, Any]:
     """Resolve ``OUROBOROS_OR_PROVIDER`` (a preset name or a raw JSON object) into an
     OpenRouter ``provider`` routing dict. Empty/unset/invalid -> ``{}`` (no routing)."""
-    raw = (os.environ.get("OUROBOROS_OR_PROVIDER") or "").strip()
+    raw = (runtime_setting("OUROBOROS_OR_PROVIDER") or "").strip()
     if not raw:
         return {}
     preset = _OR_PROVIDER_PRESETS.get(raw.lower())
@@ -307,7 +308,7 @@ class _ProviderRoutingMixin:
         def configured(key: str, default: Any = "") -> Any:
             if explicit_settings:
                 return settings.get(key, default)  # type: ignore[union-attr]
-            return os.environ.get(key, default)
+            return runtime_setting(key, default)
 
         provider, resolved_model = self._parse_provider_model(model)
         usage_model = self._qualified_model_name(provider, resolved_model)
@@ -446,7 +447,7 @@ class _ProviderRoutingMixin:
 
         current_api_key = configured("OPENROUTER_API_KEY", "") if explicit_settings else self._api_key_override
         if current_api_key is None:
-            current_api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            current_api_key = runtime_setting("OPENROUTER_API_KEY", "")
         return {
             "provider": "openrouter",
             "resolved_model": resolved_model,

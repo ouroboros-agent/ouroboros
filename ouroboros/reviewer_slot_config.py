@@ -59,6 +59,7 @@ from __future__ import annotations
 import contextlib as _contextlib
 import json
 import os
+from ouroboros.settings_integrity import runtime_environ, runtime_setting
 import pathlib
 import threading
 from dataclasses import dataclass
@@ -204,7 +205,7 @@ class ReviewerSlotConfig:
 
 
 def structured_reviewer_slots_raw() -> str:
-    return str(os.environ.get(REVIEWER_SLOTS_ENV, "") or "").strip()
+    return str(runtime_setting(REVIEWER_SLOTS_ENV, "") or "").strip()
 
 
 def structured_reviewer_slots_present() -> bool:
@@ -283,7 +284,7 @@ def _resolve_actor_slot(
         # process env, which concurrent review dispatch could observe.
         _override = _ROSTER_ENV_OVERRIDE.get()
         snapshot, _legacy = select_subagent_snapshot(
-            _override if _override is not None else os.environ,
+            _override if _override is not None else runtime_environ(),
             subagent_id=subagent_id,
         )
     except SubagentSelectionError as exc:
@@ -946,11 +947,11 @@ def reviewer_slot_save_check(
 
 
 @_contextlib.contextmanager
-def roster_env_override(subagents_raw: str):
+def roster_env_override(subagents_raw: str, *, environ=None):
     """Parse reviewer rows against THIS roster instead of the process env —
     the save handler's incoming roster, or a benchmark container's one-model
     roster — without mutating the environment concurrent dispatch observes."""
-    overlay = dict(os.environ)
+    overlay = dict(runtime_environ() if environ is None else environ)
     overlay["OUROBOROS_SUBAGENTS"] = str(subagents_raw)
     token = _ROSTER_ENV_OVERRIDE.set(overlay)
     try:
@@ -959,7 +960,7 @@ def roster_env_override(subagents_raw: str):
         _ROSTER_ENV_OVERRIDE.reset(token)
 
 
-def project_reviewer_slots_into_env() -> None:
+def project_reviewer_slots_into_env(*, environ=None) -> None:
     """Project the structured config into the legacy comma keys, at env-apply time.
 
     No review surface reads these keys while the structured key is present —
@@ -985,10 +986,12 @@ def project_reviewer_slots_into_env() -> None:
     """
     from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS
 
-    raw = structured_reviewer_slots_raw()
+    environ = os.environ if environ is None else environ
+    raw = str(environ.get(REVIEWER_SLOTS_ENV, "") or "").strip()
     if raw:
         try:
-            config = parse_reviewer_slots(raw)
+            with roster_env_override(str(environ.get("OUROBOROS_SUBAGENTS", "")), environ=environ):
+                config = parse_reviewer_slots(raw)
         except ValueError:
             import logging
 
@@ -1001,18 +1004,18 @@ def project_reviewer_slots_into_env() -> None:
             api_triad = [r.target_id for r in config.triad if not r.is_session]
             api_scope = [r.target_id for r in config.scope if not r.is_session]
             if api_triad:
-                os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join(api_triad)
+                environ["OUROBOROS_REVIEW_MODELS"] = ",".join(api_triad)
             else:
-                os.environ.pop("OUROBOROS_REVIEW_MODELS", None)
+                environ.pop("OUROBOROS_REVIEW_MODELS", None)
             if api_scope:
-                os.environ["OUROBOROS_SCOPE_REVIEW_MODELS"] = ",".join(api_scope)
+                environ["OUROBOROS_SCOPE_REVIEW_MODELS"] = ",".join(api_scope)
             else:
-                os.environ.pop("OUROBOROS_SCOPE_REVIEW_MODELS", None)
-                os.environ.pop("OUROBOROS_SCOPE_REVIEW_MODEL", None)
-    if not os.environ.get("OUROBOROS_REVIEW_MODELS"):
-        os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join(OPENROUTER_REVIEW_DEFAULTS["triad"])
-    if not os.environ.get("OUROBOROS_SCOPE_REVIEW_MODELS") and not os.environ.get("OUROBOROS_SCOPE_REVIEW_MODEL"):
-        os.environ["OUROBOROS_SCOPE_REVIEW_MODELS"] = ",".join(OPENROUTER_REVIEW_DEFAULTS["scope"])
+                environ.pop("OUROBOROS_SCOPE_REVIEW_MODELS", None)
+                environ.pop("OUROBOROS_SCOPE_REVIEW_MODEL", None)
+    if not environ.get("OUROBOROS_REVIEW_MODELS"):
+        environ["OUROBOROS_REVIEW_MODELS"] = ",".join(OPENROUTER_REVIEW_DEFAULTS["triad"])
+    if not environ.get("OUROBOROS_SCOPE_REVIEW_MODELS") and not environ.get("OUROBOROS_SCOPE_REVIEW_MODEL"):
+        environ["OUROBOROS_SCOPE_REVIEW_MODELS"] = ",".join(OPENROUTER_REVIEW_DEFAULTS["scope"])
 
 
 # ---------------------------------------------------------------------------

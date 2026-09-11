@@ -11,11 +11,11 @@ no cost.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.provider_models import normalize_model_identity
+from ouroboros.config import runtime_setting
 
 
 # The moved warnings keep the logger identity they were emitted under.
@@ -155,7 +155,7 @@ def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Option
     import logging
     log = logging.getLogger("ouroboros.llm")
 
-    api_key = (os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
+    api_key = (runtime_setting("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
     if not api_key:
         return {}
     try:
@@ -164,10 +164,10 @@ def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Option
         return {}
 
     base_url = (
-        os.environ.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
+        runtime_setting("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
     ).strip() or "https://foundation-models.api.cloud.ru/v1"
     try:
-        rate = float(os.environ.get("OUROBOROS_RUB_USD_RATE", ""))
+        rate = float(runtime_setting("OUROBOROS_RUB_USD_RATE", ""))
     except (TypeError, ValueError):
         return {}
     if rate <= 0:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import pathlib
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import (
@@ -18,6 +17,7 @@ from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 from ouroboros.model_wait import current_model_wait, model_waitable
 from ouroboros.utils import emit_cognitive_operation_event
 from ouroboros.observability import new_call_id
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -352,7 +352,7 @@ def _vision_capable_slot_candidates(client: Any, ctx: Any = None) -> List[str]:
         out.append(str(client.default_model() or "").strip())
     except Exception:
         pass
-    out.append(str(os.environ.get("OUROBOROS_MODEL", "") or "").strip())
+    out.append(str(runtime_setting("OUROBOROS_MODEL", "") or "").strip())
     # Fallbacks is a comma chain -> add each link as its own candidate (via the shared
     # SSOT parser, which also honors the legacy singular env), not the raw comma-string
     # (which would never match a vision-capable model id).

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import copy
 import functools
@@ -12,6 +13,7 @@ import time
 from dataclasses import replace
 from typing import Any, Callable, Dict, List
 
+from ouroboros.settings_integrity import copy_task_settings_context
 from ouroboros.cost_projection import cost_projection, resolve_cost_pair
 from ouroboros.task_results import (
     STATUS_COMPLETED,
@@ -265,7 +267,9 @@ def _run_post_task_processing_async(
         _run()
         return result.get("reflection_entry")
     try:
-        threading.Thread(target=_run, daemon=True).start()
+        settings_context = contextvars.Context()
+        copy_task_settings_context(settings_context)
+        threading.Thread(target=settings_context.run, args=(_run,), daemon=True).start()
     except Exception:
         _set_root_post_task_checkpoint(env, task_snapshot, "degraded")
         if post_task_key is not None:

@@ -173,7 +173,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     version = (pathlib.Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()
     assert f"GATEWAY_CONTRACT_VERSION = '{version}'" in text
     settings_meta_fields = {
-        "custom_secret_keys", "setup_contract", "available_subagents",
+        "custom_secret_keys", "setup_contract", "available_subagents", "policy_state",
     }
     assert settings_meta_fields <= set(SettingsMeta.__annotations__)
     assert _js_typedef_fields(text, "SettingsMeta") == settings_meta_fields

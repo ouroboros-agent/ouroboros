@@ -1253,10 +1253,23 @@ def test_session_strict_wallet_refusal_blocks_start_request(tmp_path, fake_route
 def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     tmp_path, fake_route, monkeypatch,
 ):
+    import time
+    from ouroboros import review_custody, review_execution, review_substrate
+
     entered, release = threading.Event(), threading.Event()
     stamped, finished = threading.Event(), threading.Event()
     original = FakeGateway.find_project_id
     original_close = FakeGateway.close
+    clock_start = time.monotonic()
+
+    def logical_now(*_args):
+        # Expire only after the worker reaches the transport. A 20ms wall-clock
+        # race can return before that point on a loaded runner, testing startup
+        # latency instead of whether a late physical send retains its stamp.
+        return clock_start + (1.0 if entered.is_set() else 0.0)
+
+    for module in (review_custody, review_execution, review_substrate):
+        monkeypatch.setattr(module, "monotonic_now", logical_now)
 
     def delayed_find(self, root):
         entered.set()
@@ -1291,8 +1304,6 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     # Gateway close precedes the substrate's final actor publication by a few
     # instructions. Wait for process-local custody too, otherwise the following
     # equal-content test can legitimately join this late actor.
-    import time
-
     from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
 
     key = _attempt_key(_agent_request(), _agent_slot(timeout_sec=0.02))

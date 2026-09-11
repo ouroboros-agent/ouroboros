@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import json
 import logging
 import os
@@ -463,15 +465,15 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
                 s for s in VALID_WRITE_SURFACES if get_allow_mutative_subagents(s)
             ),
             "write_surfaces": sorted(VALID_WRITE_SURFACES),
-            "web_search_backend": os.environ.get("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
+            "web_search_backend": runtime_setting("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
             "main_web_search": {
-                "mode": os.environ.get("OUROBOROS_MAIN_WEB_SEARCH", "off"),
-                "engine": os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "auto"),
+                "mode": runtime_setting("OUROBOROS_MAIN_WEB_SEARCH", "off"),
+                "engine": runtime_setting("OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "auto"),
             },
             "note": (
                 "allow_mutative_subagents is the MASTER gate (an explicit owner toggle "
                 "applies to every surface; when it is empty the runtime mode decides, "
-                "SURFACE-AWARE: advanced/pro allow every surface, light allows "
+                "SURFACE-AWARE: advanced/pro/cyber_pro allow every surface, light allows "
                 "external_workspace/genesis — they build outside the Ouroboros runtime — "
                 "and keeps self_worktree off). mutative_subagent_surfaces lists what is "
                 "actually schedulable RIGHT NOW. Read THIS before declaring you cannot "
@@ -1136,7 +1138,6 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
         if (
             not skill.get("enabled")
             or not bool(skill.get("executable_review"))
-            or skill.get("review_stale")
         ):
             continue
         name = _field(skill.get("name"), 80)
@@ -1154,6 +1155,8 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
         ]
         meta = f"{kind}{', v' + version if version else ''}{', ' + review_status if review_status else ''}"
         lines.append(f"- {name} ({meta}): {description or 'No description.'}")
+        if skill.get("review_gate", {}).get("author_accepted"):
+            lines.append("  Current payload accepted by author under Advisory; reviewer evidence remains at its original hash.")
         if when:
             lines.append(f"  Trigger: {when}")
         # CPL-7 Model Experience: bounded prose; absent section renders nothing.

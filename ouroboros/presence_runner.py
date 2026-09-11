@@ -277,6 +277,8 @@ def _build_task(
     drive_root: Path,
     staged_files: Sequence[Path],
 ) -> dict[str, Any]:
+    from ouroboros.config import runtime_setting
+
     task_id = _task_id(admission, event)
     chat_id = _stable_numeric_id("presence-conversation", event.conversation_key)
     actor_id = _stable_numeric_id(
@@ -314,7 +316,7 @@ def _build_task(
         from ouroboros.config import get_light_model
 
         metadata["model"] = get_light_model()
-        metadata["use_local_model"] = os.environ.get("USE_LOCAL_LIGHT", "").lower() in {"true", "1"}
+        metadata["use_local_model"] = runtime_setting("USE_LOCAL_LIGHT", "").lower() in {"true", "1"}
     task: dict[str, Any] = {
         "id": task_id,
         "type": "presence",

@@ -147,7 +147,7 @@ def reviewer_route(model_id: str, *, session: bool = False) -> tuple:
     harness IS the provider here, exactly as the reviewer-slot SSOT spells it,
     which is what makes the ack reachable and the record honest. The caller
     passes the ROW's configured kind; nothing sniffs the string."""
-    from ouroboros.config import load_settings
+    from ouroboros.config import runtime_settings
     from ouroboros.provider_models import provider_for_model
 
     if session:
@@ -159,14 +159,14 @@ def reviewer_route(model_id: str, *, session: bool = False) -> tuple:
         from ouroboros.provider_models import resolve_minimax_base_url
 
         return provider, str(
-            resolve_minimax_base_url(load_settings().get("MINIMAX_REGION") or "") or "")
+            resolve_minimax_base_url(runtime_settings().get("MINIMAX_REGION") or "") or "")
     settings_key = {
         "openai": "OPENAI_BASE_URL",
         "openai-compatible": "OPENAI_COMPATIBLE_BASE_URL",
         "cloudru": "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
         "gigachat": "GIGACHAT_BASE_URL",
     }.get(provider, "")
-    base_url = str(load_settings().get(settings_key) or "") if settings_key else ""
+    base_url = str(runtime_settings().get(settings_key) or "") if settings_key else ""
     return provider, base_url
 
 
@@ -229,7 +229,7 @@ def resolve_reviewer_window(
         # /models is authenticated); every other provider probes keyless.
         _probe_api_key = None
         if effective_provider == "minimax":
-            from ouroboros.config import load_settings as _ls
+            from ouroboros.config import runtime_settings as _ls
             _probe_api_key = str(_ls().get("MINIMAX_API_KEY") or "") or None
         with _route_probe_lock(route_fp):
             ev = probe(

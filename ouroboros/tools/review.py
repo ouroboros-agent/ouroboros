@@ -86,12 +86,12 @@ def get_tools():
                             "type": "string",
                             "enum": ["accepted", "rejected", "partial", "deferred"],
                             "default": "",
-                            "description": "Optional agent-authored stance on the acceptance review: accepted, rejected, partial, or deferred. Advisory only.",
+                            "description": "Explicit author stance. After receiving the first host review, supply this with rationale to finish Advisory for your current result, including a revised answer, without another panel. Before first feedback it is evidence only; later tool effects or owner/evidence supersession require a new stance. Never creates reviewer PASS.",
                         },
                         "rationale": {
                             "type": "string",
                             "default": "",
-                            "description": "Optional concise rationale for agent_disposition, especially when rejecting, partially accepting, or deferring reviewer feedback. If rationale is provided without a disposition, the stance defaults to partial.",
+                            "description": "Rationale required for an explicit Advisory author finish. Rationale without agent_disposition records a partial stance only and does not end review.",
                         },
                         "obligation_dispositions": {
                             "type": "array",
@@ -222,6 +222,7 @@ def _handle_task_acceptance_review(
     if disposition or agent_rationale or normalized_ob:
         agent_decision = {
             "disposition": disposition or "partial",
+            "explicit_finish": bool(disposition),
             "rationale": agent_rationale[:1000],
             "source": "agent_task_acceptance_review_tool",
         }

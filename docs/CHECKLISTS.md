@@ -42,6 +42,13 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
   missing advisory provider) leaves a durable trace: a `review_advisory_override`
   event in `events.jsonl` plus the persistent `advisory_overrides_count` /
   recent-overrides fields in `review_status`. Silent advisory is forbidden.
+- **Author finality remains evidence, not reviewer PASS:** plan, task acceptance,
+  skill, and commit owners may record an explicit author disposition against the
+  exact current subject hash under advisory enforcement after actual first feedback.
+  A revised author subject keeps the original critic hash/findings separately;
+  author finish precedes any repeat panel. A skill's changed bytes require the
+  existing deterministic preflight; Blocking still needs fresh reviewer authority.
+  Owner/evidence supersession consumes controlling intent, not historical evidence.
 - Once advisory is fresh → call commit_reviewed immediately without further edits.
 - `skip_advisory_review=True` skips only advisory freshness and the
   obligation/debt admission attached to it. Use LLM judgment when this cheap
@@ -611,7 +618,9 @@ and do not return `PASS` for an item that also has a `FAIL` — the concrete
     `blockers` are executable by operator choice. This changes
     `executable_review` only; it does not rewrite the verdict, suppress
     findings, or change `skill_review_status` semantics.
-  - `pending` and stale reviews are never executable.
+  - `pending` is never executable. A stale critic verdict does not authorize bytes;
+    under Advisory a separate current author acceptance may admit the payload
+    after deterministic preflight. Blocking still requires fresh critic evidence.
 - Review state stores findings and computes the verdict at load time. Agents
   and UI callers must use `review_gate.executable_review` / `executable_review`,
   not the raw status string, when deciding whether the skill is runnable.

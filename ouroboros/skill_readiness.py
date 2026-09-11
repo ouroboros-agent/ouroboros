@@ -5,7 +5,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ouroboros.skill_review_status import skill_review_gate
 
 log = logging.getLogger(__name__)
 
@@ -148,6 +147,7 @@ def acceptance_skill_lifecycle(
             "content_hash": skill.content_hash,
             "review_status": str(getattr(skill.review, "status", "") or ""),
             "review_stale": bool(skill.review.is_stale_for(skill.content_hash)),
+            "review_gate": skill.review.gate_for(skill.content_hash),
             "enabled": bool(getattr(skill, "enabled", False)),
             "ready": bool(readiness.ready),
             "blockers": list(readiness.blockers),
@@ -264,8 +264,8 @@ def skill_readiness_for_execution(
         next_actions.append({"phase": "payload", "tool": "skill_preflight", "reason": msg})
 
     stale = skill.review.is_stale_for(skill.content_hash)
-    gate = skill_review_gate(skill.review.status, stale=stale)
-    if stale:
+    gate = skill.review.gate_for(skill.content_hash)
+    if stale and not gate["executable_review"]:
         blockers.append("review_stale")
         agent_fixable.append("review_stale")
         next_actions.append({"phase": "review", "tool": "skill_review", "reason": "review_stale"})
