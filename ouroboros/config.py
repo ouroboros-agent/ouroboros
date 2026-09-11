@@ -974,6 +974,10 @@ def apply_settings_to_env(settings: dict, *, environ=None) -> None:
             if val is None or val == "":
                 environ.pop(k, None)
             else:
+                if k in (MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY):
+                    val = normalize_model_role_options(k, val)[1]
+                elif isinstance(val, (dict, list)):
+                    val = json.dumps(val, ensure_ascii=False, separators=(",", ":"))
                 environ[k] = str(val)
         # Reviewer-model floors moved into the structured-slot projection (6.1):
         from ouroboros.reviewer_slot_config import project_reviewer_slots_into_env

@@ -348,6 +348,28 @@ def test_generic_settings_save_validates_and_canonicalizes_available_subagents(
     assert '"name"' not in canonical
 
 
+def test_generic_settings_save_projects_model_role_objects_as_json(
+        monkeypatch, isolated_settings,
+):
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as settings_mod
+
+    app = _settings_app(monkeypatch, isolated_settings)
+    monkeypatch.setattr(settings_mod, "_apply_settings_to_env", cfg.apply_settings_to_env)
+    response = TestClient(app).post("/api/settings", json={
+        "OUROBOROS_MODEL_ACCOUNTS": {"main": "", "fallback": ["work", ""]},
+        "OUROBOROS_MODEL_CONTEXT_WINDOWS": {"main": 131072, "fallback": [0, 65536]},
+    })
+
+    assert response.status_code == 200, response.text
+    stored = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert json.loads(stored["OUROBOROS_MODEL_ACCOUNTS"]) == {
+        "fallback": ["work", ""], "main": "",
+    }
+    assert json.loads(os.environ["OUROBOROS_MODEL_ACCOUNTS"])["main"] == ""
+    assert json.loads(os.environ["OUROBOROS_MODEL_CONTEXT_WINDOWS"])["main"] == 131072
+
+
 def test_generic_settings_save_rejects_malformed_available_subagents_without_write(
     monkeypatch, isolated_settings,
 ):
