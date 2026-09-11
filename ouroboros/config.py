@@ -952,21 +952,6 @@ def get_mcp_tool_timeout_sec() -> int:
     return parsed if parsed > 0 else int(SETTINGS_DEFAULTS["MCP_TOOL_TIMEOUT_SEC"])
 
 
-def _serialize_env_setting(key: str, value: object) -> str:
-    """Project the incoming settings shape without leaking Python repr syntax.
-
-    Settings writers accept structured values from the UI before the persistence
-    prologue canonicalizes them for disk.  The process projection must carry the
-    same JSON-shaped value, otherwise ``str(dict)`` produces single-quoted text
-    that strict runtime readers cannot parse.
-    """
-    if key in (MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY):
-        return normalize_model_role_options(key, value)[1]
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    return str(value)
-
-
 def apply_settings_to_env(settings: dict, *, environ=None) -> None:
     """Push settings into environment variables for supervisor modules."""
     with _settings_integrity.SETTINGS_ENV_LOCK:
@@ -989,7 +974,11 @@ def apply_settings_to_env(settings: dict, *, environ=None) -> None:
             if val is None or val == "":
                 environ.pop(k, None)
             else:
-                environ[k] = _serialize_env_setting(k, val)
+                if k in (MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY):
+                    val = normalize_model_role_options(k, val)[1]
+                elif isinstance(val, (dict, list)):
+                    val = json.dumps(val, ensure_ascii=False, separators=(",", ":"))
+                environ[k] = str(val)
         # Reviewer-model floors moved into the structured-slot projection (6.1):
         from ouroboros.reviewer_slot_config import project_reviewer_slots_into_env
         project_reviewer_slots_into_env(environ=environ)
