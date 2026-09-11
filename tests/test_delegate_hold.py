@@ -36,6 +36,7 @@ def _configured_registry(tmp_path, task_id="t-hold"):
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = task_id
     registry._ctx.exact_model_route = True
+    registry._ctx._configured_subagent_route_kind = "agent_session"
     registry._ctx.task_metadata = {"configured_subagent": {"config_fingerprint": "fp"}}
     return registry
 
