@@ -480,11 +480,11 @@ def _copy_untracked(repo_dir: pathlib.Path, worktree: pathlib.Path) -> None:
 # inherited — `_preflight_env` scrubs the whole PYTEST_* namespace and re-injects
 # the count resolved here, which is clamped so it can never fall below two.
 _MIN_PREFLIGHT_WORKERS = 2
-# Private test-only seam. Read from the OPERATOR environment and never forwarded
-# to the candidate (the scrub removes every OUROBOROS_* key first): the nested
-# fixture repos in tests/test_preflight_runner.py hold 1-3 probe tests, so a full
-# `-n auto` fan-out would spend minutes on worker startup for nothing. It can
-# only lower the count TO the floor, never below it.
+# Operator lever for the parallel pass's xdist worker count, floored at two and
+# sized per concurrent build lane by the rule in docs/DEVELOPMENT.md. It also
+# keeps the nested fixture repos in tests/test_preflight_runner.py (1-3 probe
+# tests each) from spending minutes on a full `-n auto` fan-out. Read from the
+# OPERATOR environment, never forwarded to the candidate: the scrub drops it.
 _PREFLIGHT_WORKERS_ENV = "OUROBOROS_PREFLIGHT_TEST_WORKERS"
 
 

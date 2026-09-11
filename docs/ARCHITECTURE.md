@@ -1934,6 +1934,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults stay canonical in `conf
 | OUROBOROS_REVIEW_ENFORCEMENT | advisory | Review enforcement: advisory/blocking (closed enum; anything else coerces to the default) |
 | OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 1800 | Env-only: TOTAL wall-clock budget for the hermetic pre-commit pytest preflight (node lane + both passes; teardown + containment semantics in `preflight_runner.py`/`process_containment.py`) |
 | OUROBOROS_PREFLIGHT_SERIAL | unset | Env-only: `1` selects one serial pytest pass; scrubbed from the candidate environment |
+| OUROBOROS_PREFLIGHT_TEST_WORKERS | (unset) | Env-only: xdist worker count for the hermetic parallel pass; floor 2, otherwise `os.cpu_count()`. Read from the OPERATOR environment and scrubbed from the candidate; concurrent-lane sizing rule in `docs/DEVELOPMENT.md` |
 | OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS | true | Auto-grant manifest-declared permissions to cleanly reviewed skills (hash-bound; blocking findings never grant) |
 | OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS | true | Launcher seed/resync writes hash-pinned `native_seed` verdicts; acts only at seed/resync, no runtime grant endpoint |
 | OUROBOROS_CONTEXT_MODE | max | Owner context mode (`max`/`low`); also decides scope-review applicability — an explicit owner policy coupling, not an inferred model limitation (BIBLE P1/P3); owner routes/CLI only |
