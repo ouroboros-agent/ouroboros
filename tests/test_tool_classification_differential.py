@@ -259,6 +259,14 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "native:LEGACY_UNAVAILABLE:CHILD_RESULT_STALE": Delta(False, "ok", True, "unavailable", "A.B7", "join_ledger has no current child result to bind, unlike a changed result's policy denial"),
     "native:LEGACY_UNAVAILABLE:TASK_NOT_FOUND": Delta(False, "ok", True, "unavailable", "A.B7", "forward_to_worker has no registered target for this task id"),
     "native:TOOL_ARG_ERROR:CHILD_RESULT_DISPOSITION_INVALID": Delta(False, "ok", True, "argument_error", "A.B7", "join_ledger rejects malformed disposition arguments before recording them"),
+    # Owner item I23: a typed refusal must be recorded as a refusal, not as ok.
+    # The single form already publishes the typed argument error above; the batch
+    # envelope, the per-entry rejections and the ledger-append path return the
+    # same sentence as a PLAIN STRING, so only the identifier table reaches them
+    # (and the stored traces of every past refusal). The register is BY CODE, so
+    # one row covers all four producers. CHILD_RESULT_DISPOSITION_PARTIAL keeps
+    # its warning: those entries did record.
+    "CHILD_RESULT_DISPOSITION_INVALID": Delta(False, "ok", True, "argument_error", "A.I23", "a disposition the ledger refused to record is an argument error, not a success"),
     "native:TOOL_ARG_ERROR:ERROR": Delta(False, "ok", True, "argument_error", "A.B7", "both commit entry points reject an empty commit message before attempting a commit"),
     "native:TOOL_ARG_ERROR:REJECTED": Delta(False, "ok", True, "argument_error", "A.B7", "scratchpad and identity writers reject empty or malformed content before writing"),
     "native:TOOL_ERROR:TASK_MESSAGE_UNWRITTEN": Delta(False, "ok", True, "error", "A.B7", "forward_to_worker failed to persist the requested message"),

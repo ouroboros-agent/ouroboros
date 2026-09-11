@@ -16,6 +16,17 @@ def _parent_ctx(tmp_path, task_id: str = "parent1") -> SimpleNamespace:
     )
 
 
+def _typed_code(text: str) -> str:
+    """The code the one classifier assigns to a refusal sentence (owner item I23).
+
+    The plain-string producers below never publish a typed result, so the
+    identifier table is what decides whether a refused disposition is recorded as
+    an argument error or as a success."""
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+    return LegacyTextResultAdapter.from_text("tree_note", text).code
+
+
 def _payload(child_id: str, disposition: str, result_sha256: str) -> dict:
     return {
         "type": "child_result_disposition",
@@ -236,6 +247,7 @@ def test_malformed_disposition_names_every_violation_in_one_reply(tmp_path):
     result = _tree_note(_parent_ctx(tmp_path), "decision", "x" * 501, payload=bad)
 
     assert result.count("CHILD_RESULT_DISPOSITION_INVALID") == 1
+    assert _typed_code(result) == "TOOL_ARG_ERROR"
     for fragment in (
         "unknown key(s) supports_claims",
         "disposition must be one of",
@@ -281,6 +293,7 @@ def test_ledger_append_renders_the_same_aggregated_violations(tmp_path):
     )
 
     assert out.startswith("⚠️ CHILD_RESULT_DISPOSITION_INVALID:")
+    assert _typed_code(out) == "TOOL_ARG_ERROR"
     for fragment in (
         "unknown key(s) supports_claims",
         "disposition must be one of",
@@ -394,6 +407,8 @@ def test_batch_disposition_rejects_invalid_entries_individually(tmp_path):
     assert "[stranger9] ⚠️ CHILD_RESULT_LINEAGE_FORBIDDEN" in result
     assert "disposition must be one of" in result
     assert "[entry 4] ⚠️ CHILD_RESULT_DISPOSITION_INVALID: entry must be a JSON object." in result
+    # A partial batch stays a warning: the recorded entries are real work.
+    assert _typed_code(result) == "LEGACY_WARNING"
     rows = tree_ledger_rows("parent1", data_root=tmp_path)
     assert [row["payload"]["child_task_id"] for row in rows] == ["child1"]
 
@@ -413,6 +428,7 @@ def test_batch_disposition_envelope_is_validated_atomically(tmp_path):
         result = _tree_note(_parent_ctx(tmp_path), "decision", "why", payload=payload)
         assert "CHILD_RESULT_DISPOSITION_INVALID" in result
         assert "atomic no-op" in result
+        assert _typed_code(result) == "TOOL_ARG_ERROR"
     wrong_kind = _tree_note(
         _parent_ctx(tmp_path),
         "note",
