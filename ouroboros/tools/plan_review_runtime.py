@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import pathlib
+import time
 from typing import Any, Dict, List, Optional
 
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
@@ -306,8 +307,13 @@ async def run_plan_review_slots(
     retry_key: str = "",
     reconcile_only: bool = False,
     reconciliation_identity: Optional[dict] = None,
+    release_at_dispatch: bool = False,
 ) -> list[dict]:
     """ONE ``ReviewRequest`` fanned across the configured rows through the substrate.
+
+    ``release_at_dispatch`` returns at the dispatch barrier (drain window 0): slots
+    still running come back as typed ``pending_dispatch`` rows and settle into
+    process-local custody for a later $0 collection (``plan_review_collect``).
 
     api_chat rows read ``messages`` (system + user packet); agent_session rows read
     ``session_task``/``session_root``/``policy.output_contract`` and retrieve the
@@ -337,6 +343,7 @@ async def run_plan_review_slots(
         session_threads=dict(session_threads or {}),
         retry_key=str(retry_key or ""),
         reconcile_only=reconcile_only,
+        drain_deadline=time.monotonic() if release_at_dispatch else None,
         reconciliation_identity=dict(reconciliation_identity or {}),
         # The paid cycle's identity (plan fingerprint + cycle) owns its cache
         # split: a revised plan under the same task/model/slot starts cold.

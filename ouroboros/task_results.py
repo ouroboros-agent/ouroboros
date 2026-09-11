@@ -1477,7 +1477,7 @@ def record_plan_review_wave(
         # like any other paid wave: it replaces the predecessor and charges its cycle.
         # The degraded_retries counter therefore now counts only nothing-dispatched
         # attempts; the caller still renders the attempt it was handed.
-        if not wave.get("paid") and any(w.get("paid") for w in previous):
+        if not wave.get("paid") and not wave.get("custody_pending") and any(w.get("paid") for w in previous):
             for w in state.get("waves") or []:
                 if str(w.get("request_fingerprint") or "") == fingerprint and w.get("paid"):
                     w["degraded_retries"] = int(w.get("degraded_retries") or 0) + 1

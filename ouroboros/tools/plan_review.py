@@ -699,6 +699,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         session_threads=session_threads,
         retry_key=retry_key,
         reconcile_only=resume_in_flight,
+        release_at_dispatch=not resume_in_flight,  # event route: return at the dispatch barrier
         reconciliation_identity={
             "subject_hash": fingerprint,
             "roster_hash": _plan_reviewer_config_fingerprint(configured_slots),

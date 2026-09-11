@@ -236,6 +236,9 @@ def test_plan_task_outer_envelope_covers_agent_session_lifetime(monkeypatch):
 
     # max(transport + 2*grace, task ceiling + grace), not a short API-only
     # wrapper that can return while an agent-session worker is still paid/live.
+    # The envelope bounds a caller that WAITS (an identical envelope resuming an
+    # in-flight wave); a fresh dispatch returns at the dispatch barrier by design
+    # (ReviewRequest.drain_deadline) with its workers in process-local custody.
     assert plan_review._plan_task_tool_timeout_sec() == 21_720.0
     entry = next(item for item in plan_review.get_tools() if item.name == "plan_task")
     assert entry.timeout_sec == 21_720.0

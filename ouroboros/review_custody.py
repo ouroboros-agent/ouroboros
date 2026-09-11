@@ -14,6 +14,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
@@ -39,6 +40,8 @@ class ActiveReviewAttempt:
     event: threading.Event = field(default_factory=threading.Event)
     actor: Any = None
     timed_out: bool = False
+    released_early: bool = False  # the caller left at its drain deadline; not a logical timeout
+    wave_key: str = ""
     retry_state: Dict[str, Any] = field(default_factory=dict)
     pending_invocation_checkpoint: Callable[[str], None] | None = None
     recovery_binding: Dict[str, Any] = field(default_factory=dict)
@@ -50,7 +53,9 @@ _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
 # second time under the same logical identity.  Keep only the compact identity,
 # not the full actor/prompt, until process exit.
 _NO_RESEND: Dict[str, str] = {}
-_PENDING_STATES = {"in_flight", "custody_lost"}
+_PENDING_STATES = {"in_flight", "custody_lost", "pending_dispatch"}
+# Slots released at a caller's drain deadline, per wave: {slot_id: settled status or ''}.
+_RELEASED_WAVES: Dict[str, Dict[str, str]] = {}
 _PHYSICAL_CAPTURE_STATES = frozenset({"", *POSITIVE_PHYSICAL_ATTEMPT_STATES})
 _POSITIVE_CAPTURE_STATES = POSITIVE_PHYSICAL_ATTEMPT_STATES
 
@@ -795,7 +800,9 @@ def _emit_operation(
 
 def _late_or_timeout_actor(
     slot: Any, entry: Any, timeout: float, error_actor: Callable[..., Any],
+    *, released_early: bool = False,
 ) -> Any:
+    slot_id = str(getattr(slot, "slot_id", "") or "")
     if entry is not None:
         with _ACTIVE_LOCK:
             if entry.event.is_set() and entry.actor is not None:
@@ -803,7 +810,19 @@ def _late_or_timeout_actor(
                     return copy.deepcopy(entry.actor)
                 except Exception:
                     return entry.actor
-            entry.timed_out = True
+            if released_early:
+                entry.released_early = True
+                _RELEASED_WAVES.setdefault(entry.wave_key, {}).setdefault(slot_id, "")
+            else:
+                entry.timed_out = True
+    if released_early and entry is not None:
+        # Paid iff dispatched: a $0 presence until the settled row proves a physical send.
+        actor = error_actor(
+            slot, f"Pending dispatch; the physical review operation is in flight (window {timeout:g}s)",
+            entry.operation_id, "pending_dispatch",
+        )
+        actor.late_result_pending = True
+        return actor
     actor = error_actor(
         slot,
         f"Timeout after {timeout:g}s; physical review operation remains in flight",
@@ -969,7 +988,17 @@ def _settle_review_attempt(
             actor.status in {"ok", "empty"}
             or keyed_terminal_api_error
             or bool(failure_custody.get("delegated_run_started") and not pending_invocation)
+            # A typed $0 refusal settled after an early release replays at collection
+            # (a same-cycle retry of an unreleased refusal stays retryable, as before).
+            or (explicit_retry and entry.released_early
+                and str(getattr(actor, "operation_state", "") or "") == "not_dispatched")
         )
+        released_wave: Dict[str, str] = {}
+        if entry.released_early and entry.wave_key in _RELEASED_WAVES:
+            wave_slots = _RELEASED_WAVES[entry.wave_key]
+            wave_slots[str(getattr(slot, "slot_id", "") or "")] = str(actor.status or "settled")
+            if all(wave_slots.values()):
+                released_wave = _RELEASED_WAVES.pop(entry.wave_key)
         if replayable and usage_ctx is not None and (late or explicit_retry):
             settled = getattr(usage_ctx, "_review_settled_attempts", None)
             if not isinstance(settled, dict):
@@ -984,6 +1013,11 @@ def _settle_review_attempt(
             usage_ctx, task_id=task_id, request=request, entry=entry, slot=slot,
             phase="failed" if actor.status == "error" else "finished",
         )
+    if entry.released_early:  # plan review's event route: progress line + the settled-wave frame
+        from ouroboros.tools.plan_review_collect import announce_released_settlement
+
+        announce_released_settlement(usage_ctx, request=request, task_id=task_id, slot=slot,
+                                     actor=actor, settled_wave=released_wave)
     if late and not pending_invocation and not custody_lost and usage_ctx is not None:
         try:
             from ouroboros.tools.review_helpers import emit_review_event
@@ -1001,6 +1035,10 @@ def _settle_review_attempt(
         except Exception:
             log.debug("late review result event failed", exc_info=True)
     result_queue.put(actor)
+
+
+def _wave_key(request: Any) -> str:
+    return "|".join(str(getattr(request, key, "") or "") for key in ("surface", "task_id", "retry_key"))
 
 
 def _pending_checkpoint(usage_ctx: Any, request: Any, slot_id: str, operation_id: str) -> Any:
@@ -1152,6 +1190,7 @@ def run_custodied_review_slots(
                         retry_state=retry_payload,
                     )
                     entry.recovery_binding = review_operation_binding(request, slot, entry.operation_id)
+                    entry.wave_key = _wave_key(request)
                     entry.pending_invocation_checkpoint = _pending_checkpoint(usage_ctx, request, slot_id, entry.operation_id)
                     _ACTIVE[key] = entry
                     owner = True
@@ -1265,7 +1304,8 @@ def run_custodied_review_slots(
         str(getattr(slot, "slot_id", "") or "") for slot in slots
         if str(getattr(slot, "slot_id", "") or "") not in immediate_actors
     }
-    while pending:
+    drain_deadline = getattr(request, "drain_deadline", None)
+    while pending and (drain_deadline is None or time.monotonic() < drain_deadline):
         from ouroboros.deadline_utils import seconds_until
 
         calendar_remaining = seconds_until(getattr(request, "deadline_at", ""))
@@ -1281,6 +1321,8 @@ def run_custodied_review_slots(
         remaining = min(slot_deadlines[slot_id] - monotonic_now(slot_id) for slot_id in pending)
         if calendar_remaining is not None and pending & waiting_slots:
             remaining = min(remaining, calendar_remaining)
+        if drain_deadline is not None:
+            remaining = min(remaining, drain_deadline - time.monotonic())
         try:
             # A slot can expire between the expiry check and the clock reread.
             actor = result_queue.get(timeout=max(0.0, remaining))
@@ -1299,7 +1341,11 @@ def run_custodied_review_slots(
         timeout = slot_windows.get(slot_id)
         if timeout is None:
             timeout = _logical_timeout(slot, request, usage_meta)
-        actors.append(_late_or_timeout_actor(slot, entry, timeout, error_actor))
+        released = (
+            drain_deadline is not None and entry is not None
+            and slot_deadlines.get(slot_id, 0.0) > monotonic_now(slot_id)
+        )
+        actors.append(_late_or_timeout_actor(slot, entry, timeout, error_actor, released_early=released))
     return actors
 
 

@@ -187,6 +187,10 @@ class ReviewRequest:
     deadline_at: str = ""
     retry_key: str = ""
     reconcile_only: bool = False
+    # Absolute ``time.monotonic()`` instant after which the coordinator stops
+    # waiting for workers still in flight and returns their typed
+    # ``pending_dispatch`` rows; ``None`` waits each slot's own logical window.
+    drain_deadline: Optional[float] = None
     # Existing surface fingerprints, carried only to physical provenance.
     reconciliation_identity: Dict[str, Any] = field(default_factory=dict)
     task_attempt: Any = None

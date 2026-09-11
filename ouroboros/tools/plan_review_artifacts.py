@@ -219,8 +219,9 @@ def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
     if physical_state in POSITIVE_PHYSICAL_ATTEMPT_STATES:
         return True
     # With no physical capture, an explicit $0 state wins over the synthetic
-    # operation id assigned before provider admission.
-    if operation_state == "not_dispatched" or status == "not_dispatched":
+    # operation id assigned before provider admission; a slot released at the
+    # dispatch barrier (``pending_dispatch``) is unproven, hence $0 until settled.
+    if operation_state in {"not_dispatched", "pending_dispatch"} or status == "not_dispatched":
         return False
     # Pre-B1 rows and a current substrate omission may lack an operation id.
     # Absence is not proof of $0: only the explicit states above authorize that
@@ -283,9 +284,12 @@ def in_flight_resume_inputs(
             "The prior paid cycle's exact reviewer rows do not match its frozen roster. "
             "Refusing to guess which physical calls own custody."
         )}
+    # The cycle's own physical set: rows proven dispatched plus rows released at
+    # the dispatch barrier (awaiting their worker's report) — never re-dispatched.
     dispatched_ids = {
         str(row.get("slot_id") or "") for row in actor_rows
         if _row_has_physical_dispatch(row)
+        or str(row.get("operation_state") or "") == "pending_dispatch"
     }
     if not dispatched_ids or any(
         (str(row.get("operation_state") or "") == "in_flight"

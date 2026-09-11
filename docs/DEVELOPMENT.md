@@ -2484,7 +2484,11 @@ by "Provider Independence" above. Call-site imperatives:
 - Nested process wrappers are ordered, never tied: the provider bound settles
   before its killable child, the child before the generic ToolEntry envelope
   (fixed structural settlement margin from `config.py`), so a child or
-  provider result cannot arrive after its owner has abandoned custody.
+  provider result cannot arrive after its owner has abandoned custody. The
+  one deliberate early return is plan review's dispatch barrier
+  (`ReviewRequest.drain_deadline`): the wrapper returns while its workers run,
+  but custody is not abandoned — the workers settle into process-local custody
+  and announce the wave through the task mailbox (`plan_review_collect`).
 - Every physical LLM/review/VLM/tool operation that can outlive a logical
   wait emits typed `cognitive_operation` start and terminal facts; the
   supervisor uses the active-operation map only to spare the idle rail, and a
@@ -2499,7 +2503,9 @@ by "Provider Independence" above. Call-site imperatives:
   review row is a typed `$0 not_dispatched` actor — no worker, paid stamp, or
   active lease; an already-paid in-flight wave stays eligible for exact
   custody reconciliation without authorizing a new dispatch. An in-flight
-  reviewer never counts as final quorum, under either enforcement mode.
+  reviewer never counts as final quorum, under either enforcement mode; a
+  `pending_dispatch` row (released at the dispatch barrier) is neither quorum
+  nor a paid fact until its settled row proves the physical send.
 - Every zero-physical acceptance refusal takes that same shape — an
   unresolvable partial source, an immutable-core overflow, and a slot whose
   window cannot hold the rendered prompt all record a typed `$0
