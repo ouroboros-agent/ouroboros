@@ -1798,6 +1798,11 @@ both critical. The imperatives:
   in existing task source handles and only their references in the bounded
   review-state index; restore them for acceptance and plan comparisons.
   Redacted review evidence never substitutes for the original requirement text.
+  Access is stated ONCE, by the host, from the typed run shape: `_host_instructions`
+  renders `delegate_start_instructions.access_instruction(shape.access)` as one
+  sentence that names the profile and says it governs. Assignment prose about
+  access is CONTEXT, never authority, and is never parsed: a parent's prose ban
+  that contradicted the derived profile once cost a run and a review cycle.
   `subagents.route_health`
   is the ONE route reader for every consumer; quota readers project one
   `ClaudexorGateway.quota_state()` envelope

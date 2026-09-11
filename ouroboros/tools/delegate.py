@@ -50,6 +50,7 @@ from ouroboros.delegate_supervision import delegate_wait_entry as _delegate_wait
 from ouroboros.delegate_start_instructions import (
     HOST_INSTRUCTIONS as _HOST_INSTRUCTIONS,
     UNPROVEN_BOUNDARY_INSTRUCTION as _UNPROVEN_BOUNDARY_INSTRUCTION,
+    access_instruction,
     append_coordination_context,
 )
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
@@ -164,6 +165,7 @@ def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
         text = payload_host_instructions(text, payload_skill)
     if authority.delegated:
         text += _UNPROVEN_BOUNDARY_INSTRUCTION
+    text += access_instruction(authority.access)  # the typed profile outranks prose
     if assignment:
         text += "\n\n" + assignment
     return text
