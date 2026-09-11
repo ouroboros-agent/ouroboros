@@ -633,9 +633,7 @@ def run_llm_loop(
             assistant_msg = dict(msg)
             assistant_msg.setdefault("role", "assistant")
             messages.append(assistant_msg)
-
             _emit_round_progress(content, msg, emit_progress, llm_trace)
-
             handle_tool_calls(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,
                 messages, llm_trace, emit_progress
@@ -644,7 +642,6 @@ def run_llm_loop(
                              round_idx, tool_schemas, _owner_msg_seen)
             # Every completed batch rejoins one control/budget tail, warm or cold.
             pending_tool_budget, pending_tool_calls = True, tool_calls
-
     except BudgetExceeded as exc:
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="budget")
         return _handle_budget_exceeded(
@@ -653,7 +650,6 @@ def run_llm_loop(
         exit_ctx.attach_exception_evidence(exc)
         raise
     finally:
-        # No stale active latch behind an in-process exit (a crash skips this frame, keeping the latch for recovery).
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="loop_exit")
         _cleanup_loop_resources(stateful_executor, exit_ctx)
 

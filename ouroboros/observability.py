@@ -1507,14 +1507,12 @@ def salvaged_output_note(
     preserve_root: pathlib.Path | None = None,
 ) -> str:
     """Terminal-result suffix carrying the last persisted assistant text, or "".
-
     SSOT for every supervisor path that ends a task the task did not end itself
     (timeout kill, owner/agent cancellation). Those paths also DELETE the drive
     the text lives on, so a path that skips the salvage does not merely omit
     progress — it destroys the only copy (BIBLE P1). Keeping the note in one
     place is what makes "did this terminal path rescue the partial result?" a
     single answerable question instead of a per-call-site habit.
-
     The note itself is a bounded preview, but a truncated preview of a copy the
     caller is about to delete is not a rescue: when the preview loses content,
     the full text is preserved under ``preserve_root`` (the CANONICAL drive,
@@ -1523,7 +1521,6 @@ def salvaged_output_note(
     result is then the only copy there is, and it must be complete.
     """
     from ouroboros.utils import truncate_review_artifact
-
     try:
         salvaged = latest_llm_response_text(pathlib.Path(drive_root), str(task_id))
     except Exception:
@@ -1549,7 +1546,6 @@ def salvaged_output_note(
 
 def prune_observability_blobs(drive_root: pathlib.Path) -> Dict[str, Any]:
     """Startup observability census — counts only, never deletion.
-
     Forensic call manifests and CAS blobs are durable replay evidence,
     preserved indefinitely BY CONTRACT. The retirable half of this surface —
     ``OUROBOROS_OBSERVABILITY_RETENTION_DAYS``, a knob that was parsed,
@@ -1557,7 +1553,6 @@ def prune_observability_blobs(drive_root: pathlib.Path) -> Dict[str, Any]:
     7A): a documented no-op was a misleading operator surface. The key sits
     in ``RETIRED_SETTING_KEYS`` so stored ghosts drop on settings load.
     """
-
     root = pathlib.Path(drive_root) / OBSERVABILITY_DIR
     calls_root = root / "calls"
     blobs_root = root / "blobs"
@@ -1569,14 +1564,12 @@ def prune_observability_blobs(drive_root: pathlib.Path) -> Dict[str, Any]:
     }
     if not root.exists():
         return report
-
     for manifest_path in list(calls_root.glob("*/*.json")) if calls_root.exists() else []:
         try:
             manifest_path.stat()
             report["manifest_count"] += 1
         except Exception as exc:
             report["errors"].append(f"{manifest_path}: {type(exc).__name__}: {exc}")
-
     if blobs_root.exists():
         for blob_path in list(blobs_root.glob("*.gz")):
             try:
@@ -1584,19 +1577,16 @@ def prune_observability_blobs(drive_root: pathlib.Path) -> Dict[str, Any]:
                 report["blob_count"] += 1
             except Exception as exc:
                 report["errors"].append(f"{blob_path}: {type(exc).__name__}: {exc}")
-
     return report
 
 
 class SecretRedactingLogFilter(logging.Filter):
     """Mask secret-shaped values in every line of a stdlib logging handler.
-
     Root loggers propagate third-party INFO lines verbatim — httpx printed the
     full Telegram bot token inside its request-URL line every poll cycle.
     Reuses this module's redaction SSOT (token patterns incl. bot tokens, URL
     credentials, provider keys); any redaction failure keeps the original
     record rather than dropping the log line (v6.70.0)."""
-
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             message = record.getMessage()

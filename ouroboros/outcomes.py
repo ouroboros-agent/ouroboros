@@ -949,7 +949,6 @@ def _apply_actor_first_terminal_projection(
     outcome: Dict[str, Any], usage: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Overlay the configured actor's unresolved terminal fact on normal outcome truth."""
-
     actor = usage.get("actor_first_terminal")
     if not isinstance(actor, dict) or not actor:
         return outcome
@@ -984,7 +983,6 @@ def _apply_actor_first_terminal_projection(
 
 def _loop_usage_snapshot(usage: Dict[str, Any], resource_limit: Dict[str, Any]) -> Dict[str, Any]:
     """The loop-outcome's flat usage snapshot (module-size law extraction).
-
     ABI-3: the loop's own accounted cost rides the honest name — this
     sub-dict reaches the public task-result payload through ``loop_outcome``
     (stored legacy rows still resolve deprecated-wins at the projection
@@ -1003,7 +1001,6 @@ def _loop_usage_snapshot(usage: Dict[str, Any], resource_limit: Dict[str, Any]) 
 
 def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     """Return a typed LoopOutcome-compatible dict."""
-
     usage_status = str(usage.get("execution_status") or usage.get("result_status") or "").strip()
     usage_reason = str(usage.get("reason_code") or "").strip()
     resource_limit = dict(usage.get("resource_limit") or {}) if isinstance(usage.get("resource_limit"), dict) else {}
@@ -1066,7 +1063,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
                     "status": "artifact_output_error",
                     "reason": artifact_text[:500],
                 })
-
     if usage_status == RESULT_INFRA_FAILED:
         execution_status = EXECUTION_INFRA_FAILED
         reason_code = usage_reason or REASON_PROVIDER_FAILURE
@@ -1138,7 +1134,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "reason_code": reason_code,
             "tool_errors": tool_errors[:20],
         }
-
     # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
     # preserve stronger classifications and degrade only the false-green remainder.
     # Honest reachability (measured, not asserted): the FORCED-rail bypass reasons
@@ -1159,7 +1154,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "kind": "task_acceptance",
             "reason_code": reason_code,
         }
-
     review = _review_axis(llm_trace)
     objective = _objective_axis(review)
     plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
@@ -1248,7 +1242,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # headline a completed answer-bearing task as a top-level tool failure.
         headline_reason = REASON_FINAL_MESSAGE
         headline_failure = None
-
     outcome_axes = {
         "schema_version": 1,
         "lifecycle": {"status": "completed"},
@@ -1401,7 +1394,6 @@ def refresh_verification_ledger_artifacts(
     artifact_bundle: Dict[str, Any],
 ) -> Dict[str, Any] | None:
     """Return ``ledger`` with artifact status synchronized after finalization."""
-
     if not isinstance(ledger, dict):
         return ledger
     # An omitted-to-artifact stub is a PROJECTION of the artifact file, not a
@@ -1449,7 +1441,6 @@ def build_verification_ledger(
     review_evidence: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Build a task-scoped verification ledger from authoritative runtime facts."""
-
     entries: List[Dict[str, Any]] = []
     axes = loop_outcome.get("outcome_axes") if isinstance(loop_outcome.get("outcome_axes"), dict) else {}
     execution_axis = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
@@ -1474,7 +1465,6 @@ def build_verification_ledger(
             "objective": str(contract.get("objective") or ""),
             "expected_output": str(contract.get("expected_output") or ""),
         })
-
     for idx, call in enumerate(llm_trace.get("tool_calls") or [], start=1):
         if not isinstance(call, dict):
             continue
@@ -1496,7 +1486,6 @@ def build_verification_ledger(
             if ignored:
                 entry["blocked_status"] = status
             entries.append(entry)
-
     for recovery in execution_axis.get("recoveries") or []:
         if isinstance(recovery, dict):
             entries.append({
@@ -1506,11 +1495,9 @@ def build_verification_ledger(
                 "recovered_status": recovery.get("status"),
                 "recovered_by_call_index": recovery.get("recovered_by_call_index"),
             })
-
     for event in llm_trace.get("verification_events") or []:
         if isinstance(event, dict):
             entries.append({"kind": "runtime_event", **event})
-
     # FR3: host-attested verify_and_record receipts (injected into the trace by
     # _store_task_result before this build) become first-class ledger entries.
     # The row shape is the FIXED projection in `_outcome_receipts` (a new receipt key
@@ -1518,7 +1505,6 @@ def build_verification_ledger(
     for receipt in llm_trace.get("verification_receipts") or []:
         if isinstance(receipt, dict):
             entries.append(_outcome_receipts.verification_receipt_ledger_row(receipt))
-
     # Agent-invoked child/self review remains in the raw trace for forensics but
     # is advisory evidence, never an objective or verification authority.
     _review_selection = _outcome_receipts.select_current_review_runs(
@@ -1537,7 +1523,6 @@ def build_verification_ledger(
             "superseded": superseded,
             "finding_count": len(run.get("parsed_findings") or []),
         })
-
     artifact_status = str(artifact_bundle.get("status") or "")
     if artifact_status in {ARTIFACT_STATUS_FAILED, ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING, "missing"}:
         entries.append({
@@ -1545,7 +1530,6 @@ def build_verification_ledger(
             "status": artifact_status,
             "errors": artifact_bundle.get("errors") or [],
         })
-
     review = review_evidence or {}
     for key in ("critical_findings", "advisory_findings", "open_obligations"):
         items = review.get(key)
@@ -1559,7 +1543,6 @@ def build_verification_ledger(
                 "items": items[:10],
                 "omitted": max(0, len(items) - 10),
             })
-
     return {
         "schema_version": 2,
         "created_at": utc_now_iso(),
@@ -1587,7 +1570,6 @@ def maybe_write_verification_artifact(
     threshold_chars: int = 12_000,
 ) -> Dict[str, Any]:
     """Inline small ledgers; write large ledgers as task artifacts."""
-
     raw = json.dumps(ledger, ensure_ascii=False, sort_keys=True, default=str)
     if len(raw) <= threshold_chars:
         return {"inline": ledger, "artifact": None}
