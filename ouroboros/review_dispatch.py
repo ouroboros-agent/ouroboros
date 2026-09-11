@@ -367,14 +367,16 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
         values = asdict(slot) if is_dataclass(slot) else dict(getattr(slot, "__dict__", {}) or {})
         roster.append({k: v for k, v in values.items()
                        if k not in {"timeout_sec", "transport_timeout_sec"}})
+    retry_key = getattr(request, "retry_key", None)
     return {
-        "subject_hash": digest(request.retry_key or {
-            "subject": request.subject, "goal": request.goal, "scope": request.scope,
-            "evidence": request.evidence, "evidence_refs": request.evidence_refs,
-            "messages": request.messages, "slot_messages": request.slot_messages,
+        "subject_hash": digest(retry_key or {
+            "subject": getattr(request, "subject", ""), "goal": getattr(request, "goal", ""),
+            "scope": getattr(request, "scope", ""), "evidence": getattr(request, "evidence", ""),
+            "evidence_refs": getattr(request, "evidence_refs", []), "messages": getattr(request, "messages", []),
+            "slot_messages": getattr(request, "slot_messages", []),
         }),
-        "review_contract": str(contract or digest({"rendered": review_output_contract(request), "policy": request.policy})),
-        "roster_hash": digest(roster), "epoch": str(request.retry_key or ""),
+        "review_contract": str(contract or digest({"rendered": review_output_contract(request), "policy": getattr(request, "policy", "")})),
+        "roster_hash": digest(roster), "epoch": str(retry_key or ""),
         **supplied,
-        "root_task_id": str(root_task_id), "task_attempt": request.task_attempt,
+        "root_task_id": str(root_task_id), "task_attempt": getattr(request, "task_attempt", None),
     }
