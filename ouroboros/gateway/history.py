@@ -333,7 +333,7 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
         rec["ephemeral_decision"] = True
     for key in ("tool_calls", "rounds"):
         if key in entry:
-            rec[key] = int(entry[key])
+            rec[key] = None if entry[key] is None else int(entry[key])
     if entry.get("type") == "task_summary" or isinstance(entry.get("outcome_axes"), dict):
         rec["outcome_axes"] = normalize_outcome_axes(entry)
     if "reason_code" in entry:

@@ -86,3 +86,18 @@ def test_ephemeral_terminal_facts_survive_real_chat_persistence_and_history(
         assert "cancelable" not in row and "task_id_pending" not in row
     assert stored["text"] == replayed["text"] == frame["content"] == text
     assert not (tmp_path / "task_results" / "ephemeral-history.json").exists()
+
+
+def test_unknown_task_summary_counts_remain_readable_in_history(tmp_path, monkeypatch):
+    from ouroboros.post_task_synthesis import _run_task_summary
+
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed",
+                        lambda *_a, **_k: pytest.fail("unknown evidence must not buy a model call"))
+    _run_task_summary(SimpleNamespace(drive_root=tmp_path), None,
+                      {"id": "uncaptured-summary", "chat_id": 1, "text": "Inspect current work"},
+                      {"loop_evidence_unavailable": True},
+                      {"loop_evidence_unavailable": True, "tool_calls": []}, tmp_path / "logs")
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": "1"})))
+    [row] = json.loads(response.body)["messages"]
+    assert "round count unknown" in row["text"]
+    assert row["tool_calls"] is None and row["rounds"] is None
