@@ -1377,6 +1377,7 @@ def run_hermetic_pytest(
         if node_error := (node_result or {}).get("error"):
             return node_error
         empty_passes = 0
+        timings: list[tuple[str, float]] = []
         for spec in passes:
             # Keep the exact float remainder; rounding up would exceed the
             # shared total budget (including the preceding node lane).
@@ -1394,6 +1395,7 @@ def run_hermetic_pytest(
                 agent_python, worktree, temp_root, spec.args, remaining
             )
             elapsed = time.monotonic() - pass_started
+            timings.append((spec.label, round(elapsed, 1)))
             # Sweep between passes so a pass-1 escapee cannot touch pass 2.
             kill_processes_referencing(str(temp_root))
             if reap_error:
@@ -1471,7 +1473,7 @@ def run_hermetic_pytest(
                     and preflight_test_workload_unchanged(subject, worktree, timeout=timeout, pytest_args=pytest_args)
                     and (not subject.workload[4] or (node_result or {}).get("returncode") == 0)):
                 ctx._preflight_test_proof = subject
-                log_preflight_test_proof(ctx, subject, reused=False, phase=phase)
+                log_preflight_test_proof(ctx, subject, reused=False, phase=phase, passes=timings)
         return None
     except subprocess.TimeoutExpired:
         return f"⚠️ PRE_PUSH_TEST_ERROR: pytest timed out after {timeout} seconds"
