@@ -855,6 +855,34 @@ def _completion_excerpt(result: Dict[str, Any]) -> str:
     return ""
 
 
+def _custody_debt_reason(reason: str, result: Dict[str, Any], event: Dict[str, Any]) -> tuple:
+    """Split a stored custody-debt code into (execution reason, custody clause).
+
+    The custody overlay stamps ``delegated_custody_unreconciled`` as the row's
+    reason_code, and the debt then HEALS from the write side while
+    ``docs/ARCHITECTURE.md`` forbids that refresh rewriting reason_code. So the
+    stored code outlives the fact: nine of fourteen terminal rows named a debt
+    the same record showed as empty. Render time holds the only fresh truth, and
+    the fresh truth is the row's own ``delegated_runs_unreconciled`` list.
+
+    The debt is a WARNING BESIDE the rail cause, never a replacement: when both
+    are real the caller states them in one line. Any other reason code passes
+    through untouched."""
+    from ouroboros.outcomes import WARN_DELEGATED_CUSTODY_UNRECONCILED
+
+    if reason != WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        return reason, ""
+    debt: Any = None
+    execution_reason = ""
+    for source in (result, event):
+        if debt is None and isinstance(source.get("delegated_runs_unreconciled"), list):
+            debt = source["delegated_runs_unreconciled"]
+        axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+        execution_reason = execution_reason or str(execution.get("reason_code") or "")
+    return execution_reason, (WARN_DELEGATED_CUSTODY_UNRECONCILED if debt else "")
+
+
 def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     """One TERMINATED host clause for BOTH lifecycle rows.
 
@@ -877,6 +905,7 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
                 decision = holder["acceptance_decision"]
     status = str(decision.get("status") or "").strip()
     reason = str(result.get("reason_code") or event.get("reason_code") or "")
+    reason, custody = _custody_debt_reason(reason, result, event)
     if (reason != REASON_OWNER_REQUESTED_FINALIZATION and status != ACCEPTANCE_ACCEPTED
             and status and outcome_phase(result, event) in {"done", "warn"}):
         clause = f"Acceptance: {status}"
@@ -886,6 +915,10 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     elif reason and reason != REASON_OWNER_REQUESTED_FINALIZATION:
         detail = veto.get("detail") if veto.get("reason") == reason else ""
         clause = f"Reason: {' '.join(strip_markdown(str(detail)).split()) if detail else reason}"
+        if custody:
+            clause += f" ({custody})"
+    elif custody:
+        clause = f"Reason: {custody}"
     else:
         return ""
     return clause if clause.endswith((".", "!", "?", "…")) else clause + "."

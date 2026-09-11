@@ -131,7 +131,15 @@ test('a decision with no reason code still reaches the acceptance branch', () =>
 });
 
 test('a hard failure keeps explaining itself by its execution reason', () => {
-    const failed = { ...A4, status: 'failed', reason_code: 'delegated_custody_unreconciled' };
+    // The row carries the debt the code names: the host renderer
+    // (project_dialogue._completion_verdict) states this cause only while
+    // delegated_runs_unreconciled is non-empty, because the debt heals from the
+    // write side while the stored reason_code may not be rewritten. The fixture
+    // keeps the two twins describing the same record.
+    const failed = {
+        ...A4, status: 'failed', reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: ['run-a1'],
+    };
     assert.equal(taskReasonDetail(failed), 'Reason: delegated_custody_unreconciled');
 });
 

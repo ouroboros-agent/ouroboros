@@ -409,8 +409,13 @@ def test_host_verdict_keeps_the_execution_reason_when_acceptance_was_reached():
     assert _completion_verdict(accepted, {}) == "Reason: final_message."
     assert _completion_verdict({"status": "completed"}, {}) == ""
     # A hard failure explains itself by its execution reason, not by a decision.
+    # The custody debt this row names is one the row STILL owes: since owner item
+    # spam B that code is rendered only while delegated_runs_unreconciled is
+    # non-empty (see tests/test_terminal_truth_projection_p5.py), so the fixture
+    # carries the debt it claims.
     assert _completion_verdict(
         _a4_result(status="failed", reason_code="delegated_custody_unreconciled",
+                   delegated_runs_unreconciled=["run-a1"],
                    outcome_axes={"execution": {"status": "failed"},
                                  "review": {"acceptance_decision": dict(A4_DECISION)}}),
         {},
