@@ -175,7 +175,7 @@ def managed_transport_continuation(ctx: Any) -> bool:
     return bool(ctx is not None and getattr(ctx, "task_id", "")
                 and not getattr(ctx, "is_direct_chat", False)
                 and not getattr(ctx, "is_ephemeral_turn", False)
-                and not getattr(ctx, "exact_model_route", False))
+                and getattr(ctx, "_configured_subagent_route_kind", "") != "agent_session")
 
 
 def continue_unknown_transport(episode: TransportWaitEpisode, *, llm: Any, tools: Any,
