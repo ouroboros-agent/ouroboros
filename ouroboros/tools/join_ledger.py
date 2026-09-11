@@ -300,13 +300,19 @@ def _record_child_result_disposition_batch(
     envelope_extra = sorted(set(payload) - {"type", "children"})
     children = payload.get("children")
     if envelope_extra or not isinstance(children, list) or not children:
-        return (
-            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: the batch form is exactly "
-            "{'type': 'child_result_disposition', 'children': [{'child_task_id', "
-            "'disposition', 'child_result_sha256'}, ...]} with a non-empty array"
-            + (f" (unknown key(s): {', '.join(envelope_extra)})" if envelope_extra else "")
-            + ". Nothing was recorded (atomic no-op)."
-        )
+        # An ALL-OR-NOTHING argument error is published exactly like the single
+        # form's (same code, same identifier), so it reads as an argument error
+        # instead of LEGACY_WARNING. The text is byte-identical to the returned
+        # string on purpose: the registry counts a typed publication only while
+        # `published.text == result`, so rewording here silently untypes it.
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR", text=(
+                "⚠️ CHILD_RESULT_DISPOSITION_INVALID: the batch form is exactly "
+                "{'type': 'child_result_disposition', 'children': [{'child_task_id', "
+                "'disposition', 'child_result_sha256'}, ...]} with a non-empty array"
+                + (f" (unknown key(s): {', '.join(envelope_extra)})" if envelope_extra else "")
+                + ". Nothing was recorded (atomic no-op)."
+            )))
     lines: list[str] = []
     recorded = 0
     for index, entry in enumerate(children):
@@ -329,9 +335,18 @@ def _record_child_result_disposition_batch(
             "the failed entries below were rejected individually and must be corrected."
         )
     else:
+        # Zero recorded is the other all-or-nothing argument error. It publishes
+        # the WHOLE returned string, per-entry lines included: publishing only
+        # the header would break the `published.text == result` equality and drop
+        # this back to LEGACY_WARNING.
         header = (
             f"⚠️ CHILD_RESULT_DISPOSITION_INVALID: 0/{total} batch entries were recorded."
         )
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR", text=header + "\n" + "\n".join(lines)))
+    # The MIXED case stays an untyped warning: its text already names the exact
+    # counts, and a new identifier would need an APPROVED_DELTAS row plus a
+    # sanctioned regeneration of a golden pinned to another SHA.
     return header + "\n" + "\n".join(lines)
 
 
