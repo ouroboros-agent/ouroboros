@@ -296,3 +296,61 @@ def test_started_retry_race_adopts_same_durable_invocation(monkeypatch, tmp_path
     }
     assert recovery._read(tmp_path, task["id"])["status"] == "adopted"
     custody._CUSTODY.clear()
+
+
+def test_review_substrate_work_does_not_hold_the_actors_zero_run_fence(tmp_path):
+    """A pending review invocation and an open review run leave the slot free."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_recovery import unsettled_start_ids
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools.verify import _verify_and_record
+
+    custody._CUSTODY.clear()
+    (tmp_path / "repo").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "drive").mkdir(parents=True, exist_ok=True)
+    ctx = ToolContext(
+        repo_dir=str(tmp_path / "repo"), drive_root=str(tmp_path / "drive"),
+    )
+    ctx.task_id = "actor-with-review"
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    drive = custody.custody_root(ctx)
+    assert custody.record_start_requested(
+        drive,
+        run_id="",
+        task_id=ctx.task_id,
+        invocation_id="inv-review",
+        idempotency_key="inv-review",
+        request={"prompt": "review packet"},
+        route="codex",
+        source="review_substrate.extraction",
+    )
+    custody.record_started(drive, custody.RunCustody(
+        run_id="run-review", task_id=ctx.task_id, route_id="codex",
+        source="review_substrate",
+    ))
+    custody._CUSTODY.clear()
+
+    assert unsettled_start_ids(drive, ctx.task_id) == {
+        "open_run_ids": [],
+        "pending_invocation_ids": [],
+        "undisposed_patch_run_ids": [],
+    }
+
+    written = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="incomplete",
+        zero_run_basis="only read-only review runs remain open",
+    )
+
+    assert "zero_run_requires_settlement" not in written
+    assert [
+        row.get("contract_kind")
+        for row in read_verification_receipts(drive, ctx.task_id)
+    ] == ["delegation_zero_run"]
+    custody._CUSTODY.clear()
