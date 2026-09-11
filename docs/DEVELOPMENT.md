@@ -1864,6 +1864,18 @@ both critical. The imperatives:
   generic data-tool behavior while fixing subagent isolation
   (`forward_to_worker` writes only to validated running tasks in the
   current task/root lineage).
+- The DELEGATED lane is the other half of that rule: a delegated run edits a
+  private execution snapshot and reaches a tree only through
+  `integrate_delegated_patch`, whose apply normally requires the caller's
+  active root to EQUAL the run's recorded target. A terminal owner's orphan
+  relaxes that to containment: a swarm fanning into
+  `<project>/contributions/<track>` may dispose its dead children's captures
+  from the parent root, provided target and root both live under the
+  host-minted subagent-projects root. One predicate
+  (`delegate_shared.orphan_apply_target_ok`) serves the apply gate, the health
+  invariant and the tool description; every other guard (owner terminality,
+  top-level principal, proven drift, protected paths, staged-never-committed)
+  is unchanged (`tests/test_delegated_run_isolation_orphans.py`).
 - Outcome honesty: a delegating parent must not produce a clean no-tool
   final answer while direct children run undecided — one bounded absorption
   reminder, then best-effort (`children_unabsorbed`); while that gate is

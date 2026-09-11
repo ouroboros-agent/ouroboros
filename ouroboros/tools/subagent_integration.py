@@ -344,13 +344,15 @@ def _target_is_system_repo(ctx: ToolContext) -> bool:
 def _is_host_minted_projects_tree(path: pathlib.Path) -> bool:
     """True when ``path`` is a host-minted genesis/coop tree — i.e. inside the
     durable subagent-projects root. Owner-attached folders never live there, so this
-    is the structural boundary for the coop no-op (and the checkpoint-commit)."""
+    is the structural boundary for the coop no-op (and the checkpoint-commit).
+    It asks the SAME containment predicate the orphan apply gate asks
+    (``delegate_shared.orphan_apply_target_ok``); here the projects root is both
+    the boundary and the containment root, so the two can never drift apart."""
     try:
         from ouroboros.config import get_subagent_projects_root
-        from ouroboros.tool_access import path_is_relative_to
+        from ouroboros.delegate_shared import orphan_apply_target_ok
 
-        projects_root = pathlib.Path(get_subagent_projects_root()).expanduser().resolve(strict=False)
-        return path_is_relative_to(pathlib.Path(path).resolve(strict=False), projects_root)
+        return orphan_apply_target_ok(path, get_subagent_projects_root())
     except Exception:
         return False
 
@@ -938,7 +940,7 @@ def get_tools() -> List[ToolEntry]:
             {
                 "name": "integrate_delegated_patch",
                 "description": (
-                    "EXPLICITLY apply or reject the captured patch of ONE of your own delegated runs (delegate_start), or a terminal owner's orphan. Applying requires the caller's active Git root or fresh payload binding to equal the run's recorded target. Rejecting a terminal-owner orphan requires only the owner's terminality; it exists to release a dead task's locks and snapshot. A mutating delegated run edits a PRIVATE execution "
+                    "EXPLICITLY apply or reject the captured patch of ONE of your own delegated runs (delegate_start), or a terminal owner's orphan. Applying requires the caller's active Git root or fresh payload binding to equal the run's recorded target; for a terminal owner's ORPHAN the target may instead be a host-minted project tree NESTED inside that root (both under the subagent-projects root). Rejecting a terminal-owner orphan requires only the owner's terminality; it exists to release a dead task's locks and snapshot. A mutating delegated run edits a PRIVATE execution "
                     "snapshot; its diff is captured at terminal, and NOTHING reaches your tree "
                     "until you call this. apply = stage the run's diff into your active root "
                     "(sha256-verified; under the repo git lock every touched path is first "
@@ -952,9 +954,9 @@ def get_tools() -> List[ToolEntry]:
                     "instead a LIVE apply into the non-Git payload, guarded by a whole-payload "
                     "content-hash CAS — nothing is staged into your active root — and the "
                     "skill's existing review goes STALE: it must be re-run before the skill "
-                    "is relied on. Read the captured diff (see delegate_wait's "
-                    "workspace_capture block) before applying — the run's output is a claim, "
-                    "not a verified result. Finalizing your task while one of your runs is neither "
+                    "is relied on. The run's output is a claim, not a verified result: read the captured "
+                    "diff first (see delegate_wait's workspace_capture block) when your roots reach it, and "
+                    "otherwise call apply, which verifies the patch against its recorded sha256 manifest and answers with a typed verdict. Finalizing your task while one of your runs is neither "
                     "applied nor rejected leaves your custody audit unreconciled: the task completes as "
                     "Done with warnings (reason delegated_custody_unreconciled); reject is the closing move."
                 ),

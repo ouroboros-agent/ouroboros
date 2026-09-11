@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
@@ -99,4 +100,38 @@ def orphan_disposition_status(
     return status, entry, ""
 
 
-__all__ = ["_emit", "_fail", "_owned_run", "orphan_disposition_status"]
+def orphan_apply_target_ok(target: Any, active_root: Any) -> bool:
+    """May a disposition APPLY a run recorded against ``target`` from ``active_root``?
+
+    The nanny's own run still needs exact equality. An ORPHAN of a terminal
+    owner may additionally apply into a target NESTED inside the caller's
+    active root, provided BOTH live under ``get_subagent_projects_root()`` —
+    the host-minted project area. That is the aggregator shape the host itself
+    creates: a swarm fans into ``<project>/contributions/<track>`` clones of
+    the very tree the parent works in, and the host already checkpoint-commits
+    exactly those descendants (``coop_checkpoint._task_tree_coop_roots``), so
+    the widened set adds no tree the host was not already writing to. An
+    owner-attached folder never lives there, so this can never reach one.
+
+    ONE predicate for the apply gate, the health invariant, and the tool
+    description: a rule stated three ways drifts into three rules.
+    """
+    from ouroboros.config import get_subagent_projects_root
+    from ouroboros.tool_access import path_is_relative_to
+
+    try:
+        target_path = pathlib.Path(str(target or "")).expanduser().resolve(strict=False)
+        root_path = pathlib.Path(str(active_root or "")).expanduser().resolve(strict=False)
+    except (OSError, ValueError):
+        return False
+    if not str(target or "").strip() or not str(active_root or "").strip():
+        return False
+    if target_path == root_path:
+        return True
+    projects_root = pathlib.Path(get_subagent_projects_root()).expanduser().resolve(strict=False)
+    return (path_is_relative_to(target_path, root_path)
+            and path_is_relative_to(target_path, projects_root)
+            and path_is_relative_to(root_path, projects_root))
+
+
+__all__ = ["_emit", "_fail", "_owned_run", "orphan_apply_target_ok", "orphan_disposition_status"]
