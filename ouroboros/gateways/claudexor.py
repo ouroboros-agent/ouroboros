@@ -60,6 +60,14 @@ _READ_TIMEOUT_SEC = 60.0
 # their total wall-clock bound outside this phase-local adapter.
 # Passed per request via ``_request(timeout_sec=...)``; it never changes the default.
 SHORT_POLL_TIMEOUT_SEC = 5.0
+# The httpx failures a READ-ONLY observer may retry as the same unresolved read: the
+# socket delivered no daemon answer, so nothing is known about the run and nothing
+# was claimed. Classified by exception TYPE plus received status, never by prose; a
+# received 4xx/5xx still wins (see ``_request``).
+_OBSERVATION_RETRYABLE_ERRORS = (
+    httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+    httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError,
+)
 _ATTEMPTS_REL = "attempts"
 _ATTEMPT_RECORD = "attempt.yaml"
 
@@ -337,7 +345,7 @@ class ClaudexorGateway:
                 "daemon_unreachable",
                 f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
                 status_code=response.status_code if response is not None else 0,
-                observation_timeout=isinstance(exc, httpx.ReadTimeout)
+                observation_timeout=isinstance(exc, _OBSERVATION_RETRYABLE_ERRORS)
                 and (response is None or response.status_code < 400),
             ) from exc
         if response.status_code >= 400:

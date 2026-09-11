@@ -98,7 +98,7 @@ def test_typed_observation_timeout_keeps_same_run_inside_supervision(tmp_path, m
     assert sleeps == [delegate_supervision._TICK_SEC]
 
 
-@pytest.mark.parametrize("status", [200, 401, 403])
+@pytest.mark.parametrize("status", [200, 401, 403, 503])
 def test_received_auth_refusal_cannot_be_hidden_by_body_read_timeout(status):
     class BrokenBody(httpx.SyncByteStream):
         def __iter__(self):
@@ -127,3 +127,140 @@ def test_existing_control_returns_without_starting_another_observation(tmp_path,
         ctx, "run-existing", wait_once=lambda *_args: calls.append(1)))
     assert result["wake_events"] == [{"type": "deadline"}]
     assert calls == []
+
+
+@pytest.mark.parametrize("failure", [
+    httpx.ConnectError("connection refused"), httpx.ConnectTimeout("connect timed out"),
+    httpx.PoolTimeout("pool exhausted"), httpx.ReadError("connection reset"),
+    httpx.WriteError("broken pipe"), httpx.RemoteProtocolError("server disconnected"),
+])
+def test_read_only_retryable_transport_failures_are_typed_observation_holes(failure):
+    """A socket that delivered no daemon answer is the same unresolved read as a read
+    timeout: typed ``daemon_unreachable`` with ``observation_timeout`` set, so the
+    supervising wait renews quietly instead of waking the model on every 3 s beat
+    (I1: 359 refusals on 2026-09-10, two of them ReadError). Classified by the
+    exception TYPE, never by prose; a received status still wins (test above)."""
+
+    def _raise(_request):
+        raise failure
+
+    gateway = gateway_module.ClaudexorGateway(gateway_module.DaemonEndpoint("127.0.0.1", 1, "fixture"))
+    gateway._client.close()
+    gateway._client = httpx.Client(base_url="http://127.0.0.1:1", transport=httpx.MockTransport(_raise))
+    try:
+        with pytest.raises(gateway_module.ClaudexorUnavailable) as caught:
+            gateway.get_run("run-existing")
+        assert caught.value.code == "daemon_unreachable"
+        assert caught.value.observation_timeout is True
+        assert caught.value.status_code == 0
+        assert caught.value.__cause__ is failure
+    finally:
+        gateway.close()
+
+
+def test_observation_read_failure_carries_the_gateway_typed_code(tmp_path, monkeypatch):
+    """The observing wait relays the transport's own typed code as the quiet reason
+    (no hardcoded ``observation_read_timeout``), so the supervision loop can tell an
+    unreachable daemon apart from any other typed reason; a received refusal keeps
+    its refusal shape."""
+    ctx = _delegating_ctx(tmp_path, acting=False)
+    entry = delegate._RunCustody(task_id=ctx.task_id, route_id="fixture", model="fixture",
+                                project_id="fixture", project_owned=False, access="readonly")
+    monkeypatch.setitem(delegate_custody._CUSTODY, "run-dead", entry)
+    refusals = []
+
+    class _Dead:
+        def handshake(self, **_kw):
+            raise refusals[-1]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(gateway_module, "ClaudexorGateway", lambda: _Dead())
+    refusals.append(gateway_module.ClaudexorUnavailable(
+        "daemon_unreachable", "ConnectError: [Errno 61]", observation_timeout=True))
+    quiet = json.loads(delegate._delegate_wait(ctx, "run-dead", observation_only=True))
+    assert quiet["status"] == "observation_pending" and quiet["run_id"] == "run-dead"
+    assert quiet["reason"] == "daemon_unreachable"
+    refusals.append(gateway_module.ClaudexorUnavailable("http_401", "unauthorized", status_code=401))
+    refused = json.loads(delegate._delegate_wait(ctx, "run-dead", observation_only=True))
+    assert refused["status"] == "refused" and refused["reason"] == "http_401"
+
+
+def _scripted_wait_once(script):
+    steps = iter(script)
+
+    def wait_once(_ctx, run_id, _window, _seq):
+        status, reason = next(steps)
+        if status == "terminal":
+            return json.dumps({"status": "terminal", "run_id": run_id, "state": "succeeded"})
+        body = {"status": status, "run_id": run_id}
+        if reason:
+            body.update(reason=reason, waited_sec=0.1)
+        return json.dumps(body)
+
+    return wait_once
+
+
+def test_unreachable_daemon_episode_is_one_owner_line_each_way(tmp_path, monkeypatch):
+    """N consecutive ``daemon_unreachable`` ticks tell the owner ONCE; the first read the
+    daemon answers again tells the owner once more and re-arms the episode. The beat
+    stays one ``_TICK_SEC`` per unreachable tick (no backoff), and the dedup is the
+    client's ``toast_once`` on the existing typed pair, not new host state."""
+    ctx = _delegating_ctx(tmp_path, acting=False)
+    notes = []
+    ctx.emit_progress_fn = lambda text, *, incident=None: notes.append((text, incident))
+    sleeps = []
+    monkeypatch.setattr(delegate_supervision.time, "sleep", sleeps.append)
+    unreachable = ("observation_pending", "daemon_unreachable")
+    result = json.loads(delegate_supervision.supervised_wait(
+        ctx, "run-existing", wait_once=_scripted_wait_once([
+            unreachable, unreachable, unreachable, ("no_progress", None),
+            unreachable, ("terminal", None),
+        ])))
+    assert result["status"] == "terminal"
+    assert [text.startswith("Delegation daemon unreachable") for text, _ in notes] == [
+        True, False, True, False]
+    outage, recovered = notes[0][1], notes[1][1]
+    assert outage == {"task_incident": "delegation_daemon_unreachable",
+                      "toast_once": f"{ctx.task_id}:delegation_daemon_unreachable",
+                      "toast_tone": "warn"}
+    assert recovered == {"task_incident": "delegation_daemon_unreachable",
+                         "toast_once": f"{ctx.task_id}:delegation_daemon_recovered",
+                         "toast_tone": "ok"}
+    assert notes[2][1] == outage and notes[3][1] == recovered
+    assert sleeps == [delegate_supervision._TICK_SEC] * 4
+
+
+def test_other_typed_observation_reasons_say_nothing_to_the_owner(tmp_path, monkeypatch):
+    ctx = _delegating_ctx(tmp_path, acting=False)
+    notes = []
+    ctx.emit_progress_fn = lambda text, *, incident=None: notes.append((text, incident))
+    monkeypatch.setattr(delegate_supervision.time, "sleep", lambda _sec: None)
+    slow = ("observation_pending", "observation_read_timeout")
+    result = json.loads(delegate_supervision.supervised_wait(
+        ctx, "run-existing", wait_once=_scripted_wait_once([slow, slow, ("terminal", None)])))
+    assert result["status"] == "terminal"
+    assert notes == []
+
+
+@pytest.mark.parametrize("control", ["deadline", "cancellation_intent"])
+def test_outer_controls_still_cut_a_long_unobserved_stretch(tmp_path, monkeypatch, control):
+    """Quiet renewal on a dead socket never outlives the outer bounds: the deadline and a
+    cancellation intent end the unobserved stretch on the next beat (budget and the
+    absolute ceiling are the loop's own rails outside this function, pinned there)."""
+    ctx = _delegating_ctx(tmp_path, acting=False)
+    ctx.emit_progress_fn = lambda text, *, incident=None: None
+    monkeypatch.setattr(delegate_supervision.time, "sleep", lambda _sec: None)
+    ticks = []
+    monkeypatch.setattr(delegate_supervision, "_control_wakes",
+                        lambda _ctx: [{"type": control}] if len(ticks) >= 3 else [])
+
+    def wait_once(_ctx, run_id, _window, _seq):
+        ticks.append(1)
+        return json.dumps({"status": "observation_pending", "run_id": run_id,
+                           "reason": "daemon_unreachable", "waited_sec": 0.1})
+
+    result = json.loads(delegate_supervision.supervised_wait(ctx, "run-existing", wait_once=wait_once))
+    assert result["wake_events"] == [{"type": control}]
+    assert len(ticks) == 3, "the stretch ended on the control, not on a daemon answer"

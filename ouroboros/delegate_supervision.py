@@ -21,6 +21,26 @@ _TICK_SEC = 3
 _QUIET_STATUSES = {"progress", "no_progress", "observation_pending"}
 _LOOP_CONTROL_KINDS = {KIND_FINALIZE_NOW, KIND_HURRY}
 _MAX_COORDINATION_SEEN = 256
+# The gateway's typed code for a read that delivered no daemon answer at all
+# (``gateways.claudexor._request``): a quiet renewal here, never a model wake.
+_DAEMON_UNREACHABLE = "daemon_unreachable"
+
+
+def _owner_line(ctx: Any, text: str, key: str, tone: str) -> None:
+    """One owner-visible line per unreachable-daemon episode, through the task's
+    existing progress channel; the typed ``task_incident``/``toast_once`` pair is
+    what the client toasts once, so no host state is written for the dedup."""
+    fn = getattr(ctx, "emit_progress_fn", None)
+    if not callable(fn):
+        return
+    try:
+        fn(text, incident={
+            "task_incident": "delegation_daemon_unreachable",
+            "toast_once": f"{getattr(ctx, 'task_id', '') or ''}:{key}",
+            "toast_tone": tone,
+        })
+    except Exception:
+        pass
 
 
 def _attempt_key(ctx: Any) -> str:
@@ -831,13 +851,24 @@ def supervised_wait(
         "checkpoint_scheduled": bool(checkpoint_after_sec is not None),
     })
 
+    unobserved = False  # an unreachable-daemon episode is open (one owner line each way)
     while True:
         # A control already present does not wait behind another HTTP read.
-        if _control_wakes(ctx):
+        observed = not _control_wakes(ctx)
+        if not observed:
             raw = json.dumps({"status": "no_progress", "run_id": str(run_id)})
         else:
             raw = wait_once(ctx, run_id, _TICK_SEC, int(state.get("journal_cursor") or 0))
         payload = _payload(raw)
+        unreachable = (
+            payload.get("status") == "observation_pending"
+            and payload.get("reason") == _DAEMON_UNREACHABLE
+        )
+        if observed and unobserved and not unreachable:
+            # The first read the daemon answered again closes the episode.
+            unobserved = False
+            _owner_line(ctx, "Delegation daemon reachable again; delegated runs are "
+                        "being observed again.", "delegation_daemon_recovered", "ok")
         cursor = payload.get("last_seq")
         if isinstance(cursor, int):
             state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), cursor)
@@ -908,6 +939,16 @@ def supervised_wait(
                 "run_id": str(run_id), "reason": payload.get("reason"),
                 "waited_sec": payload.get("waited_sec"),
             })
+            if unreachable and not unobserved:
+                # The class the model can do nothing about: a dead socket is a quiet
+                # renewal on the same 3 s beat (no backoff, no durable counter), and
+                # the owner hears about it exactly once per episode. Deadline, ceiling,
+                # budget and cancel stay the outer bounds that cut a long unobserved
+                # stretch.
+                unobserved = True
+                _owner_line(ctx, "Delegation daemon unreachable; delegated runs are not "
+                            "being observed, the runs themselves keep going.",
+                            "delegation_daemon_unreachable", "warn")
             # A failed read is not a completed quiet window; retain the cursor
             # and avoid a busy loop if a transport fails before its read bound.
             time.sleep(_TICK_SEC)

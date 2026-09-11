@@ -541,3 +541,62 @@ def test_eligibility_probe_closes_its_gateway(tmp_path, monkeypatch, _quiet_prob
     _start_leaf(tmp_path, task_id="t-gw", run_id="run-gw")
     assert delegate_hold._single_live_run(registry._ctx) == "run-gw"
     assert closed == [True]
+
+
+def test_transport_dead_observation_keeps_the_hold_instead_of_a_refused_exit(
+    tmp_path, monkeypatch, _quiet_probe,
+):
+    """A dead socket during the hold is a quiet renewal with the typed reason
+    ``daemon_unreachable`` (never a ``refused`` wait), so ``_NON_WAKE_STATUSES``
+    must not take the no-resend terminal: the hold rides out the outage and resumes
+    on the leaf's real wake. Drives the REAL supervising wait over a scripted daemon."""
+    import ouroboros.delegate_progress as progress_mod
+    import ouroboros.delegate_supervision as supervision_mod
+    from ouroboros.gateways import claudexor as gateway_module
+
+    monkeypatch.setattr(supervision_mod.time, "sleep", lambda _sec: None)
+    polls = []
+
+    def scripted_poll(_gw, _run, _sec, **_k):
+        polls.append(1)
+        if len(polls) == 1:  # the hold's own liveness probe: the leaf is alive
+            return {"summary": {"state": "running", "effectiveAccess": "readonly"}, "lastSeq": 1}
+        if len(polls) == 2:  # first supervised tick: the daemon socket is dead
+            raise gateway_module.ClaudexorUnavailable(
+                "daemon_unreachable", "ConnectError: [Errno 61]", observation_timeout=True)
+        return {"lastSeq": 2, "summary": {
+            "state": "succeeded", "effectiveAccess": "readonly", "runDir": str(tmp_path / "run"),
+        }, "primaryOutput": {"kind": "answer", "text": "leaf result", "truncated": False}}
+
+    class _Gateway:
+        engine_version = ""
+
+        def handshake(self, **_kw):
+            self.engine_version = "3.10.2"
+            return {}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(progress_mod, "bounded_poll", scripted_poll)
+    monkeypatch.setattr(gateway_module, "ClaudexorGateway", lambda: _Gateway())
+
+    def check(messages, accumulated_usage):
+        assert "[DELEGATED LEAF WAKE / UNKNOWN-HOLD RESUME]" in messages[-1]["content"]
+        accumulated_usage.pop("_last_llm_error_kind", None)
+        return {"role": "assistant", "content": "integrated"}, 0.0
+
+    fake_call, calls = _unknown_then_check_call(check)
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    registry = _configured_registry(tmp_path, task_id="t-dead-socket")
+    _start_leaf(tmp_path, task_id="t-dead-socket", run_id="run-dead-socket")
+    notes = []
+    result, _usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
+
+    assert result == "integrated" and calls["n"] == 2
+    assert len(polls) == 3
+    details = [row.get("detail") for row in _read_hold_events(tmp_path) if row["phase"] == "ended"]
+    assert "wait_refused" not in details and "wait_observation_pending" not in details
+    assert [row["phase"] for row in _read_hold_events(tmp_path)] == ["entered", "resumed"]

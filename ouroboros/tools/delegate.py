@@ -810,8 +810,9 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     the connection, and every call is BOUNDED by what it has left (``progress.poll_bound``)
     so no read can outrun it as the 60s default could. The internal supervision
     observer instead makes one read under the ordinary transport bound narrowed by
-    the real task deadline; its three-second beat is not a network deadline. A read
-    timeout there retains unknown observation and the same run, without model wake.
+    the real task deadline; its three-second beat is not a network deadline. A transport
+    failure that delivered no daemon answer there (typed ``daemon_unreachable``, a read
+    timeout included) retains unknown observation and the same run, without model wake.
     Legacy caller-sized waits preserve their last-poll expiry contract.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
@@ -852,7 +853,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
         if observation_only and exc.observation_timeout:
             return json.dumps({
                 "status": "observation_pending", "run_id": rid,
-                "reason": "observation_read_timeout", "detail": str(exc),
+                "reason": exc.code, "detail": str(exc),
                 "waited_sec": time.monotonic() - started,
             })
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
@@ -1171,7 +1172,11 @@ def get_tools() -> List[ToolEntry]:
             "description": (
                 "Sleep on a delegated run until a meaningful event. Quiet transport windows "
                 "are renewed by the host with zero model calls; journal progress still streams "
-                "to the human but does not wake you. Terminal settlement, a new interaction, "
+                "to the human but does not wake you. A daemon that cannot be reached is the "
+                "same quiet renewal (typed reason daemon_unreachable, told to the owner once per "
+                "outage); while such a read hangs, a finalize_now/hurry control is noticed only "
+                "when it returns, up to ~60 s later rather than on the 3 s beat. "
+                "Terminal settlement, a new interaction, "
                 "fault, addressed owner/task message, a direct-child attention/terminal event, "
                 "cancel/deadline control, recovery judgment, or an explicit one-shot checkpoint "
                 "wakes exactly once. A run that asks its "
