@@ -65,6 +65,7 @@ from ouroboros.tools.plan_review_runtime import (
     plan_health_epoch as _plan_health_epoch,
     plan_wave_replay_decision as _plan_wave_replay_decision,
     plan_wave_has_in_flight as _plan_wave_has_in_flight,
+    plan_no_dispatch_line as _plan_no_dispatch_line,
     plan_wave_progress_line as _plan_wave_progress_line,
     root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
     run_plan_review_slots as _run_plan_review_slots,
@@ -719,6 +720,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             # D2/B2: the durable authority stayed the paid predecessor (this attempt
             # dispatched nothing); the tool answer still describes the attempt that ran.
             stored = wave
+            ctx.emit_progress_fn(_plan_no_dispatch_line(wave))
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}")
     try:
@@ -749,7 +751,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             task_id=task_id, cycles_paid=paid_now, cap=cap, enforcement=enforcement,
             fingerprint=fingerprint)
     ctx.emit_progress_fn(_plan_wave_progress_line(
-        aggregate, agg["counts"], cycles_paid=paid_now, cap=cap))
+        aggregate, agg["counts"], cycles_paid=paid_now, cap=cap, wave=wave))
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder)
 
 def _last_paid_wave(state: dict) -> Optional[dict]:

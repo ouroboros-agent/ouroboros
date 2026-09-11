@@ -696,3 +696,88 @@ def test_the_plan_spec_schema_discloses_both_halves_of_the_constitutional_trigge
     assert "system repository" in props["affected_resources"]["description"]
     evidence = props["evidence"]["description"]
     assert "system repository" in evidence and "EXISTING" in evidence
+
+
+# ------------------------------------------------------------- in-flight honesty (P1-4)
+
+
+def _actor(slot_id, *, ok=False, failure_code="", error=""):
+    return {"slot_id": slot_id, "model": "m", "ok": ok, "failure_code": failure_code, "error": error}
+
+
+def test_progress_line_dedups_typed_reasons_and_names_the_late_result():
+    from ouroboros.tools.plan_review_runtime import plan_wave_progress_line
+
+    counts = {"parseable": 0, "configured": 6, "blocking": 0, "note": 0, "need_evidence": 0}
+    same = [_actor(f"s{i}", failure_code="subscription_window_exhausted") for i in range(3)]
+    distinct = [_actor("d1", failure_code="credential_pool_exhausted"), _actor("d2", error="transport died"),
+                _actor("d3", error="x" * 400), _actor("d4", failure_code="deadline_exhausted")]
+    line = plan_wave_progress_line("DEGRADED", counts, cycles_paid=1, cap=2,
+                                   wave={"actors": same + distinct, "custody_pending": True})
+    assert line.count("subscription_window_exhausted") == 1  # three identical reasons -> one
+    assert "credential_pool_exhausted; transport died" in line
+    assert "(+1 more in the task result)" in line and "deadline_exhausted" not in line  # first four shown
+    assert "OMISSION NOTE" in line and "\n" not in line  # bounded, one line
+    assert line.endswith("late result pending (reviewer slots still in flight, not yet collected)")
+    # Every other aggregate renders byte-identically to the plain form.
+    plain = plan_wave_progress_line("GREEN", {**counts, "parseable": 6}, cycles_paid=1, cap=2)
+    assert plain == plan_wave_progress_line("GREEN", {**counts, "parseable": 6}, cycles_paid=1, cap=2,
+                                            wave={"actors": same, "custody_pending": False})
+    assert plain == "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
+
+
+def test_refused_redispatch_emits_a_separate_no_dispatch_line(harness, monkeypatch):
+    import ouroboros.review_substrate as review_substrate
+    from types import SimpleNamespace
+
+    harness.install({"s1": "", "s2": "", "s3": ""})  # every slot dies at dispatch time: paid, empty epoch
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx)) == {"outcome": "DEGRADED", "closed": False}
+    assert _state(harness)["cycles_paid"] == 1
+
+    def zero_send(request, *, slots, drive_root, llm, usage_ctx=None):
+        return SimpleNamespace(actors=[{
+            "slot_id": slot.slot_id, "model": slot.model, "status": "not_dispatched", "raw_text": "",
+            "error": "agent session slot has no session task", "failure_code": "session_task_missing",
+            "usage": {}, "prompt_ref": {}, "response_ref": {}, "operation_id": f"op-{slot.slot_id}",
+            "operation_state": "not_dispatched", "late_result_pending": False,
+        } for slot in slots])
+
+    monkeypatch.setattr(review_substrate, "run_review_request", zero_send)
+    harness.progress.clear()
+    _call(ctx)  # stale empty-epoch wave re-dispatches; every row refuses pre-send at $0
+    assert _state(harness)["cycles_paid"] == 1
+    no_dispatch = [line for line in harness.progress if line.startswith("📐 plan_task: no new reviewer cycle dispatched")]
+    assert no_dispatch == ["📐 plan_task: no new reviewer cycle dispatched: session_task_missing"]
+    assert harness.progress[-1].startswith("📐 plan_task: DEGRADED") and "session_task_missing" in harness.progress[-1]
+
+
+def test_gate_projection_carries_custody_pending_before_the_aggregate():
+    from ouroboros.task_results import plan_review_gate_projection
+    from tests.test_plan_review import _force_plan_gate_state
+
+    state = _force_plan_gate_state("degraded")
+    assert plan_review_gate_projection(state, "blocking")["custody_pending"] is False
+    state["waves"][0]["custody_pending"] = True
+    decision = plan_review_gate_projection(state, "blocking")
+    assert decision["custody_pending"] is True and decision["reviewer_slots_degraded"] is True
+    assert decision["allow"] is False  # the in-flight aggregate stays DEGRADED and holds
+
+
+def test_one_free_collection_before_the_blocking_gate(harness, monkeypatch):
+    from ouroboros.task_results import plan_review_gate_projection
+    from ouroboros.tools.plan_review_collect import collect_before_gate
+    from tests.test_plan_review_reconciliation import _install_barrier_substrate
+
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    _call(ctx)
+    state = _state(harness)
+    assert plan_review_gate_projection(state, "blocking")["custody_pending"] is True
+    collected = collect_before_gate(ctx, state)
+    assert [c["reconcile_only"] for c in calls] == [False, True]  # exactly one $0 collection
+    verdict = plan_review_gate_projection(collected, "blocking")
+    assert verdict["custody_pending"] is False and verdict["status"] == "closed" and verdict["allow"] is True
+    assert collect_before_gate(ctx, collected) is collected  # nothing pending: no second send
+    assert len(calls) == 2

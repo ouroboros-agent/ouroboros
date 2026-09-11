@@ -1168,7 +1168,7 @@ def plan_review_gate_projection(
                     "status": "cycles_exhausted" if wave.get("cycles_exhausted") else "open",
                     "outcome": outcome, "closed": False,
                     "fingerprint": str(wave.get("request_fingerprint") or ""),
-                    "reviewer_slots_degraded": outcome == "DEGRADED",
+                    "reviewer_slots_degraded": outcome == "DEGRADED", "custody_pending": bool(wave.get("custody_pending")),
                 }
                 if wave.get("quorum_unreachable"):
                     # B2b typed fact: the wave's own rows prove the quorum cannot be
@@ -1231,6 +1231,7 @@ def plan_review_gate_projection(
         "outcome": str(control.get("outcome") or ""),
         "closed": closed,
         "reviewer_slots_degraded": bool(control.get("reviewer_slots_degraded")),
+        "custody_pending": bool(control.get("custody_pending")),  # reviewers still working: read before aggregate
         "quorum_unreachable": bool(control.get("quorum_unreachable")),
         "earliest_reset": str(control.get("earliest_reset") or ""),
         "reason": str(hard_rail or control.get("reason") or ""),

@@ -147,3 +147,25 @@ async def collect_before_supersede(
                     str(current.get("request_fingerprint") or "")[:8], exc)
         return state
     return load_plan_review_state(state_root, task_id)
+
+
+def collect_before_gate(ctx: Any, state: Dict[str, Any]) -> Dict[str, Any]:
+    """ONE free collection before a blocking finalization verdict (owner batch 3,
+    6e=A): when the current wave still has custody pending, collect what has
+    settled at $0 (window 0, never a wait) and return the reloaded state; any
+    other state is returned untouched. The call site is the finalization gate
+    (``owner_hurry.force_plan_decision``), which then projects the verdict."""
+    from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
+    from ouroboros.tools.plan_review import _planning_state_location
+
+    current = current_plan_review_wave(state)
+    if not current or not current.get("custody_pending"):
+        return state
+    try:
+        state_root, task_id = _planning_state_location(ctx)
+        run_plan_coroutine(collect_open_wave(ctx, state_root=state_root, task_id=task_id, wave=current))
+        return load_plan_review_state(state_root, task_id)
+    except (OSError, ValueError, TimeoutError) as exc:
+        log.warning("plan wave %s could not be collected before the gate: %s",
+                    str(current.get("request_fingerprint") or "")[:8], exc)
+        return state

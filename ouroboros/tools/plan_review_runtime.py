@@ -626,22 +626,63 @@ def plan_row_disclosures(row: Dict[str, Any]) -> List[str]:
     return [f"profile_continuity: cannot_verify ({reason})"]
 
 
-def plan_wave_progress_line(aggregate: str, counts: Dict[str, Any], *, cycles_paid: int, cap: Any) -> str:
+_PROGRESS_REASON_CHARS = 160
+_PROGRESS_REASONS_SHOWN = 4
+
+
+def plan_slot_reasons(wave: Optional[Dict[str, Any]]) -> str:
+    """The failed slots' typed reasons, deduplicated in order, the first four
+    shown and the rest counted (``failure_code`` when the row carries one, else
+    its error text, each bounded by ``truncate_review_artifact``)."""
+    from ouroboros.utils import truncate_review_artifact
+
+    reasons: List[str] = []
+    for actor in (wave or {}).get("actors") or []:
+        if not isinstance(actor, dict) or actor.get("ok"):
+            continue
+        reason = str(actor.get("failure_code") or actor.get("error") or "unknown")
+        reason = truncate_review_artifact(reason, limit=_PROGRESS_REASON_CHARS).replace("\n", " ")
+        if reason not in reasons:
+            reasons.append(reason)
+    shown = "; ".join(reasons[:_PROGRESS_REASONS_SHOWN])
+    if len(reasons) > _PROGRESS_REASONS_SHOWN:
+        shown += f" (+{len(reasons) - _PROGRESS_REASONS_SHOWN} more in the task result)"
+    return shown
+
+
+def plan_wave_progress_line(
+    aggregate: str, counts: Dict[str, Any], *, cycles_paid: int, cap: Any,
+    wave: Optional[Dict[str, Any]] = None,
+) -> str:
     """The wave's final owner-visible progress line (pure; ``plan_review.py``
     sits at its size pin, so the formatting lives here). Honest DEGRADED:
     zero-count tails must never read as a clean result, so the
-    parseable/configured ratio and the distrust are named inline; every other
-    aggregate renders byte-identically to the plain form."""
+    parseable/configured ratio and the distrust are named inline, with the
+    failed slots' typed reasons (deduplicated, bounded) and the late-result
+    clause when reviewers are still working; every other aggregate renders
+    byte-identically to the plain form."""
     verdict = (
         f"DEGRADED ({counts['parseable']}/{counts['configured']} "
         "parseable reviewers; counts are untrusted)"
         if aggregate == "DEGRADED" else aggregate
     )
-    return (
+    line = (
         f"📐 plan_task: {verdict} — {counts['blocking']} blocking / "
         f"{counts['note']} note / {counts['need_evidence']} need_evidence; "
         f"cycles paid {cycles_paid}{'' if cap is None else f'/{cap}'}"
     )
+    reasons = plan_slot_reasons(wave) if aggregate == "DEGRADED" else ""
+    if reasons:
+        line += f"; slot reasons: {reasons}"
+    if (wave or {}).get("custody_pending"):
+        line += "; late result pending (reviewer slots still in flight, not yet collected)"
+    return line
+
+
+def plan_no_dispatch_line(wave: Dict[str, Any]) -> str:
+    """The separate progress line for an attempt that dispatched no new reviewer
+    cycle (every row a typed $0 refusal), naming the typed reasons."""
+    return f"📐 plan_task: no new reviewer cycle dispatched: {plan_slot_reasons(wave) or 'no typed reason recorded'}"
 
 
 # Root exploration log (plan F3/S8): the task's OWN tool calls before this call,
