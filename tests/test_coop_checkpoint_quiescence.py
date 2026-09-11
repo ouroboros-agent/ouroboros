@@ -391,3 +391,115 @@ def test_root_done_path_defers_to_quiescence_when_children_live(tmp_path, monkey
         _ctx(data), {"id": "root1", "root_task_id": "root1"}, "root1",
     )
     assert [s[1] for s in spawned] == ["root1"]
+
+
+# --- interrupted git operations (P6-4) --------------------------------------
+#
+# The host checkpoint-committed a coop tree in the middle of `git merge
+# --no-commit`: `git add -A` consumed MERGE_HEAD, baked the conflict markers
+# into history and added 51 scaffold files, 98 seconds before the worker whose
+# contract preconditions those were started. An interrupted operation is a
+# state its owner is halfway through, not an uncommitted pile.
+
+
+def _dirty_coop_tree(tmp_path, monkeypatch):
+    """A host-minted coop tree holding paid uncommitted work, plus the task
+    results that qualify it for the checkpoint."""
+    from ouroboros.task_results import write_task_result
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects_root))
+    data = tmp_path / "data"
+    (data / "logs").mkdir(parents=True)
+    tree = projects_root / "coop_root1"
+    _init_git_repo(tree)
+    write_task_result(data, "root1", "failed", reason_code="budget_exhausted", title="Sunken city")
+    write_task_result(
+        data, "child1", "failed",
+        delegation_role="subagent", parent_task_id="root1", root_task_id="root1",
+        task_constraint={"mode": "acting_subagent", "surface": "external_workspace",
+                         "write_root": str(tree)},
+    )
+    (tree / "paid-work.txt").write_text("do not lose me\n", encoding="utf-8")
+    return data, tree
+
+
+def _interrupt(tree: pathlib.Path, marker: str) -> None:
+    """The on-disk trace git leaves while an operation is mid-flight."""
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(tree),
+                          capture_output=True, text=True).stdout.strip()
+    (tree / ".git" / marker).write_text(head + "\n", encoding="utf-8")
+
+
+def _porcelain(tree: pathlib.Path) -> str:
+    return subprocess.run(["git", "status", "--porcelain"], cwd=str(tree),
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _subjects(tree: pathlib.Path) -> str:
+    return subprocess.run(["git", "log", "--format=%s"], cwd=str(tree),
+                          capture_output=True, text=True).stdout
+
+
+@pytest.mark.serial
+def test_checkpoint_skips_a_root_mid_merge_and_the_receipt_is_loud(tmp_path, monkeypatch):
+    from supervisor import events
+
+    data, tree = _dirty_coop_tree(tmp_path, monkeypatch)
+    _interrupt(tree, "MERGE_HEAD")
+
+    events._maybe_checkpoint_coop_on_tree_quiescence(
+        _ctx(data), _subagent_task("child1", "root1"), "child1",
+    )
+    import time
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        with events._COOP_CHECKPOINT_LOCK:
+            busy = "root1" in events._COOP_CHECKPOINT_INFLIGHT
+        if not busy:
+            break
+        time.sleep(0.05)
+    assert not busy, "off-loop checkpoint did not finish"
+
+    assert "checkpoint after task" not in _subjects(tree)
+    assert "paid-work.txt" in _porcelain(tree)  # still the owner's pile, untouched
+    assert (tree / ".git" / "MERGE_HEAD").exists()  # their merge survives
+    rows = [
+        json.loads(line)
+        for line in (data / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    receipts = [r for r in rows if r.get("type") == "coop_checkpoint_commit"]
+    assert receipts, "the skip must be visible, not silent"
+    assert receipts[-1]["skipped"] == "merge_in_progress"
+    assert receipts[-1]["committed"] is False
+
+
+@pytest.mark.serial
+def test_checkpoint_skips_a_root_mid_cherry_pick(tmp_path, monkeypatch):
+    from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
+
+    data, tree = _dirty_coop_tree(tmp_path, monkeypatch)
+    _interrupt(tree, "CHERRY_PICK_HEAD")
+
+    receipts = checkpoint_commit_coop_roots(data, "root1", title="Sunken city")
+    assert [r.get("skipped") for r in receipts] == ["cherry_pick_in_progress"], receipts
+    assert not any(r["committed"] for r in receipts)
+    assert "paid-work.txt" in _porcelain(tree)
+
+
+@pytest.mark.serial
+def test_a_clean_state_dirty_root_still_commits(tmp_path, monkeypatch):
+    """The skip is about interrupted operations only: an ordinary dirty coop
+    tree keeps its checkpoint."""
+    from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
+
+    data, tree = _dirty_coop_tree(tmp_path, monkeypatch)
+
+    receipts = checkpoint_commit_coop_roots(data, "root1", title="Sunken city")
+    assert [r.get("skipped", "") for r in receipts] == [""], receipts
+    assert all(r["committed"] for r in receipts)
+    assert "ouroboros: checkpoint after task root1" in _subjects(tree)
+    assert _porcelain(tree) == ""

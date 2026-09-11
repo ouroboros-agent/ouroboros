@@ -29,6 +29,32 @@ def _run_git(cmd: Sequence[str], cwd: pathlib.Path) -> "subprocess.CompletedProc
         return subprocess.CompletedProcess(list(cmd), 124, stdout="", stderr=f"{type(exc).__name__}: {exc}")
 
 
+_INTERRUPTED_GIT_MARKERS = {
+    "MERGE_HEAD": "merge_in_progress",
+    "CHERRY_PICK_HEAD": "cherry_pick_in_progress",
+    "REVERT_HEAD": "revert_in_progress",
+    "REBASE_HEAD": "rebase_in_progress",
+    "rebase-merge": "rebase_in_progress",
+    "rebase-apply": "rebase_in_progress",
+}
+
+
+def _interrupted_git_operation(root: pathlib.Path) -> str:
+    """Name the git operation ``root`` is halfway through, or "" when none is.
+
+    A merge, rebase, cherry-pick or revert in flight is a state its owner is
+    mid-way through, not an uncommitted pile: `git add -A` + commit consumes
+    MERGE_HEAD and bakes a half-resolved tree into history as a checkpoint.
+    The git dir is asked of git rather than assumed to be ``root/.git`` — a
+    coop tree can be a worktree whose ``.git`` is a file."""
+    probe = _run_git(["git", "rev-parse", "--absolute-git-dir"], root)
+    git_dir = pathlib.Path((probe.stdout or "").strip()) if probe.returncode == 0 else root / ".git"
+    for marker, operation in _INTERRUPTED_GIT_MARKERS.items():
+        if (git_dir / marker).exists():
+            return operation
+    return ""
+
+
 def _task_tree_coop_roots(drive_root: pathlib.Path, root_task_id: str) -> List[pathlib.Path]:
     """Unique host-minted genesis/coop tree roots this task tree's children were
     GRANTED WRITE to - read from the children's durable results (the constraint's
@@ -91,9 +117,11 @@ def checkpoint_commit_coop_roots(
     - Credential-shaped files (the SAME `_sensitive_untracked_reason` patterns the
       workspace patch excludes) are NOT staged — BIBLE "Leaking secrets: nowhere":
       this is a refusal to bake secrets into git history, disclosed in the receipt.
+    - Skipped for a root whose owner is mid merge/rebase/cherry-pick/revert; the
+      receipt names the operation (`skipped`) instead of committing their state.
     - Fail-soft per root (index.lock, git errors → logged skip; never raises).
 
-    Returns a list of per-root receipts {root, committed, sha?, skipped_sensitive[], error?}.
+    Returns receipts {root, committed, sha?, skipped_sensitive[], skipped?, error?}.
     """
     receipts: List[Dict[str, Any]] = []
     if has_live_tree_tasks:
@@ -108,6 +136,14 @@ def checkpoint_commit_coop_roots(
                 continue
             if not (status.stdout or "").strip():
                 receipts.append(receipt)  # clean tree — nothing to checkpoint
+                continue
+            interrupted = _interrupted_git_operation(root)
+            if interrupted:
+                # Someone else is mid-operation in this tree. Staging it would
+                # consume their MERGE_HEAD and commit a half-resolved state (a
+                # live root lost its merge and its conflict markers this way).
+                receipt["skipped"] = interrupted
+                receipts.append(receipt)
                 continue
             # Stage everything EXCEPT credential-shaped files (disclosed skip).
             add = _run_git(["git", "add", "-A"], root)
