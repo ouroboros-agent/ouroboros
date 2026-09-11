@@ -464,7 +464,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     function syncRuntimeModeBridgeState() {
-        const hasBridge = Boolean(window.pywebview?.api?.request_runtime_mode_change);
+        const hasBridge = Boolean(window.pywebview?.api?.confirm_runtime_mode_change);
         const group = document.querySelector('[data-runtime-mode-group]');
         if (group) {
             group.title = hasBridge
@@ -898,20 +898,25 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     async function saveRuntimeModeViaNativeBridgeIfNeeded(nextMode) {
         const currentMode = currentSettings?.OUROBOROS_RUNTIME_MODE || 'advanced';
         if (nextMode === currentMode) return null;
-        const bridge = window.pywebview?.api?.request_runtime_mode_change;
-        // Only the browser-side confirm is migrated to the in-house dialog; the
-        // desktop pywebview bridge path above stays exactly as it was.
-        const result = bridge
-            ? await bridge(nextMode)
-            : ((await openConfirmDialog({
+        // The native bridge is confirmation-only.  Older shells do not expose
+        // that method; fall back to the same in-app dialog so they never receive
+        // the legacy mutating request_runtime_mode_change call (which cannot
+        // represent Cyber Pro). Every surface writes through one owner endpoint.
+        const nativeConfirm = window.pywebview?.api?.confirm_runtime_mode_change;
+        const confirmed = nativeConfirm
+            ? (await nativeConfirm(nextMode))?.confirmed === true
+            : await openConfirmDialog({
                 title: 'Change runtime mode',
                 body: `Change Ouroboros runtime mode from ${currentMode} to ${nextMode}? The change takes effect after restart.`,
                 confirmLabel: 'Change mode',
-            }))
-                ? await apiClient.ownerRuntimeMode(nextMode)
-                : { ok: false, saved: false, error: 'Runtime mode change cancelled.' });
+            });
+        if (!confirmed) {
+            const result = { ok: false, saved: false, error: 'Runtime mode change cancelled.' };
+            throw Object.assign(new Error(result.error), { body: result });
+        }
+        const result = await apiClient.ownerRuntimeMode(nextMode);
         if (!result || result.ok !== true) {
-            throw Object.assign(new Error(result?.error || 'Runtime mode change was cancelled.'), { body: result });
+            throw Object.assign(new Error(result?.error || 'Runtime mode change failed.'), { body: result });
         }
         return result;
     }
