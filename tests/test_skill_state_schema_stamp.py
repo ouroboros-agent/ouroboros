@@ -73,10 +73,18 @@ def test_review_job_writes_route_through_the_stamped_seam(tmp_path):
     assert on_disk[SCHEMA_VERSION_KEY] == SKILL_OWNER_STATE_SCHEMA_VERSION
     assert on_disk["status"] == "running"
 
-    # Every review_job.json write site uses the seam — a direct atomic write
-    # would silently un-stamp merge writers.
+    # The heartbeat is a locked merge so it cannot erase a reserved roster.
+    runner._patch_review_job(tmp_path, "s", expected_job_id="j1", heartbeat_at="now")
+    merged = _read(runner.review_job_state_path(tmp_path, "s"))
+    assert merged[SCHEMA_VERSION_KEY] == SKILL_OWNER_STATE_SCHEMA_VERSION
+    assert merged["job_id"] == "j1" and merged["heartbeat_at"] == "now"
+    runner._patch_review_job(tmp_path, "s", expected_job_id="old", status="failed")
+    assert _read(runner.review_job_state_path(tmp_path, "s")) == merged
+    # Whole writers keep the stamped seam, the merge stamps before its locked write.
     src = inspect.getsource(runner)
-    assert src.count("_write_review_job(") >= 6  # def + five call sites
+    assert src.count("_write_review_job(") >= 5  # def + four whole writers
+    merge = inspect.getsource(runner._patch_review_job)
+    assert "update_json_locked(" in merge and "with_schema_version(" in merge
     assert "atomic_write_json(review_job_state_path" not in src
 
 

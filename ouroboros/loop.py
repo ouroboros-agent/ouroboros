@@ -61,6 +61,7 @@ from ouroboros.delegate_hold import (
     latch_after_unknown as _delegate_hold_latch,
 )
 from ouroboros.loop_transport import (
+    continue_unknown_transport as _continue_unknown_transport,
     TransportWaitEpisode,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     end_episode_budget as _end_episode_budget,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     fallback_chain_allowed as _fallback_chain_allowed,
@@ -423,8 +424,7 @@ def run_llm_loop(
         pending_tool_budget, pending_tool_calls = bool(saved), None
         while True:
             if free_redial or pending_tool_budget:
-                # Warm/cold tool tails and transport redials retain their logical round.
-                free_redial = False
+                free_redial = False  # Tool tails and transport waits retain their logical round.
             else:
                 round_idx += 1
 
@@ -502,55 +502,60 @@ def run_llm_loop(
                     return budget_result
                 continue
 
-            _inject_round_checkpoints(
-                round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages, accumulated_usage=accumulated_usage,
-                emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
-                drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
+            if (transport_wait is not None and transport_wait.wait_cause == "provider_outcome_unknown"
+                    and not _continue_unknown_transport(transport_wait, llm=llm, tools=tools, messages=messages,
+                        accumulated_usage=accumulated_usage, drive_logs=drive_logs, task_id=task_id, model=active_model, emit_progress=emit_progress)):
+                msg, cost = None, 0.0
+            else:
+                _inject_round_checkpoints(
+                    round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages, accumulated_usage=accumulated_usage,
+                    emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
+                    drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
 
-            messages, _compaction_usage = _run_round_compaction(
-                messages,
-                _CompactionRoundContext(
-                    tools=tools, drive_root=drive_root, drive_logs=drive_logs,
-                    task_id=task_id, round_idx=round_idx,
-                    event_queue=event_queue, emit_progress=emit_progress))
-            tools._ctx.messages = messages
-            limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
-            if _compaction_usage:
-                _account_compaction_usage(accumulated_usage, _compaction_usage, event_queue, task_id)
+                messages, _compaction_usage = _run_round_compaction(
+                    messages,
+                    _CompactionRoundContext(
+                        tools=tools, drive_root=drive_root, drive_logs=drive_logs,
+                        task_id=task_id, round_idx=round_idx,
+                        event_queue=event_queue, emit_progress=emit_progress))
+                tools._ctx.messages = messages
+                limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
+                if _compaction_usage:
+                    _account_compaction_usage(accumulated_usage, _compaction_usage, event_queue, task_id)
 
-            seal_task_transcript(messages)
+                seal_task_transcript(messages)
 
-            model_call = _RoundModelCallContext(
-                    llm=llm,
-                    messages=messages,
-                    tools=tools,
-                    context_fit_plan=context_fit_plan,
-                    active_model=active_model,
-                    tool_schemas=tool_schemas,
-                    active_effort=active_effort,
-                    max_retries=max_retries,
-                    drive_logs=drive_logs,
-                    task_id=task_id,
-                    round_idx=round_idx,
-                    event_queue=event_queue,
-                    accumulated_usage=accumulated_usage,
-                    task_type=task_type,
-                    active_use_local=active_use_local,
-                    active_context_mode=active_context_mode,
-                    drive_root=drive_root,
-                )
-            try:
-                msg, cost, active_context_mode = _call_round_model(model_call)
-            except ModelWaitInterrupted as error:
-                controlled = _handle_model_wait_control(limit_ctx, error, transport_episode=transport_wait)
-                if controlled is not None:
-                    text, accumulated_usage, forced_trace = controlled
-                    _merge_finalization_trace(llm_trace, forced_trace)
-                    return text, accumulated_usage, llm_trace
-                free_redial = True
-                continue
-            active_model, active_use_local = model_call.active_model, model_call.active_use_local
-            context_fit_plan = model_call.context_fit_plan
+                model_call = _RoundModelCallContext(
+                        llm=llm,
+                        messages=messages,
+                        tools=tools,
+                        context_fit_plan=context_fit_plan,
+                        active_model=active_model,
+                        tool_schemas=tool_schemas,
+                        active_effort=active_effort,
+                        max_retries=max_retries,
+                        drive_logs=drive_logs,
+                        task_id=task_id,
+                        round_idx=round_idx,
+                        event_queue=event_queue,
+                        accumulated_usage=accumulated_usage,
+                        task_type=task_type,
+                        active_use_local=active_use_local,
+                        active_context_mode=active_context_mode,
+                        drive_root=drive_root,
+                    )
+                try:
+                    msg, cost, active_context_mode = _call_round_model(model_call)
+                except ModelWaitInterrupted as error:
+                    controlled = _handle_model_wait_control(limit_ctx, error, transport_episode=transport_wait)
+                    if controlled is not None:
+                        text, accumulated_usage, forced_trace = controlled
+                        _merge_finalization_trace(llm_trace, forced_trace)
+                        return text, accumulated_usage, llm_trace
+                    free_redial = True
+                    continue
+                active_model, active_use_local = model_call.active_model, model_call.active_use_local
+                context_fit_plan = model_call.context_fit_plan
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
             last_error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")

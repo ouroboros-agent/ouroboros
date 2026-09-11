@@ -292,6 +292,7 @@ def _terminal_history_payload(
         "group_id", "review_round", "snapshot_attempt", "snapshot_revised",
         "task_id", "root_task_id", "origin_task_id", "origin_root_task_id",
         "presentation_owner_task_id", "chat_id", "source", "executions",
+        "review_wave", "review_resume_of",
     ):
         if key in job_data:
             payload[key] = job_data[key]
@@ -578,12 +579,12 @@ def _patch_review_job(
     **updates: Any,
 ) -> None:
     path = review_job_state_path(drive_root, skill_name)
-    data = _read_review_job(path)
-    current_job_id = str(data.get("job_id") or "")
-    if expected_job_id and current_job_id and current_job_id != expected_job_id:
-        return
-    data.update(updates)
-    _write_review_job(path, data)
+    from ouroboros.utils import update_json_locked
+    def patch(data):
+        if expected_job_id and data.get("job_id") != expected_job_id:
+            return None
+        return with_schema_version({**data, **updates}, SKILL_OWNER_STATE_SCHEMA_VERSION)
+    update_json_locked(path, patch, strict_existing_dict=True)
 
 
 @contextlib.contextmanager
@@ -661,6 +662,8 @@ def _call_review_with_lifecycle_guard(
         "_skill_review_snapshot_attempt": getattr(ctx, "_skill_review_snapshot_attempt", sentinel),
         "_skill_review_snapshot_revised": getattr(ctx, "_skill_review_snapshot_revised", sentinel),
         "_skill_review_resolved_binding": getattr(ctx, "_skill_review_resolved_binding", sentinel),
+        "_skill_review_resume": getattr(ctx, "_skill_review_resume", sentinel),
+        "_skill_review_wave_binding": getattr(ctx, "_skill_review_wave_binding", sentinel),
     }
     state_root = pathlib.Path(drive_root or ctx.drive_root)
     job_data = _read_review_job(review_job_state_path(state_root, skill_name))
@@ -979,6 +982,7 @@ def _on_started(
             "skill": skill_name,
             "content_hash": current_content_hash,
             "job_id": job.id,
+            "review_predecessor_job_id": str(previous.get("job_id") or ""),
             "lifecycle_status": job.status,
             "dedupe_key": job.dedupe_key,
             "started_at": job.started_at or now,

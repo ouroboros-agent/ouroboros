@@ -69,11 +69,22 @@ def set_terminal_host_notice(usage: Dict[str, Any], *parts: str) -> None:
         usage.pop("terminal_host_notice", None)
 
 
+def terminal_host_notice_text(result: Dict[str, Any]) -> str:
+    """Host notices plus the latest stored delegated receipt, without rewriting history."""
+    from ouroboros.delegate_terminal import terminal_custody_notice
+
+    base = str(result.get("terminal_host_notice") or "")
+    custody = terminal_custody_notice(result)
+    if not custody or base == custody or base.endswith("\n\n" + custody):
+        return base
+    return "\n\n".join(part for part in (base, custody) if part)
+
+
 def terminal_notice_text(result: Dict[str, Any]) -> str:
     """The same terminal notices on transports with one text body or no event stream."""
-    return "\n\n".join(str(result[key]) for key in (
-        "terminal_provider_notice", "terminal_host_notice",
-    ) if result.get(key))
+    return "\n\n".join(part for part in (
+        str(result.get("terminal_provider_notice") or ""), terminal_host_notice_text(result),
+    ) if part)
 
 
 def send_provider_death_notice(
@@ -154,10 +165,25 @@ def prepare_terminal_send_event(
     if not presence and task.get("_is_direct_chat") and (task.get("metadata") or {}).get("_host_operation"):
         correlation = host_operation_reply_kwargs(task.get("origin_message_ref"))
         send_event.setdefault("progress_meta", {}).update(correlation.get("progress_meta", {}))
+    # Loop cleanup may have cancelled a run after the last model observation.
+    # Read the audit it already persisted before constructing this delivery.
+    if not ephemeral:
+        from ouroboros.task_results import load_task_result
+
+        try:
+            current = load_task_result(
+                pathlib.Path(task.get("budget_drive_root") or env_drive_root), str(task.get("id") or ""),
+            ) or {}
+        except Exception:
+            log.warning("Current delegated receipt was unavailable at final delivery", exc_info=True)
+            current = {}
+        if isinstance(current.get("delegate_terminal_reconciliation"), dict):
+            usage["delegate_terminal_reconciliation"] = current["delegate_terminal_reconciliation"]
     origin = str(usage.get("terminal_origin") or "")
     notice = str(usage.get("terminal_provider_notice") or "")
-    if usage.get("terminal_host_notice") and not presence:
-        send_event["terminal_host_notice"] = usage["terminal_host_notice"]
+    host_notice = terminal_host_notice_text(usage)
+    if host_notice and not presence:
+        send_event["terminal_host_notice"] = host_notice
     if ephemeral and not presence:
         if task.get("suggested_name"):
             send_event.setdefault("progress_meta", {})["suggested_name"] = str(task["suggested_name"])
@@ -435,7 +461,7 @@ def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, An
         "artifact_manifest": manifest[:_SEALED_MANIFEST_MAX_FILES],
         **({"artifact_manifest_omitted": omitted} if omitted else {}),
         "completion_observations": row.get("completion_observations") or {"status": "unavailable"},
-        **({"terminal_host_notice": row["terminal_host_notice"]} if row.get("terminal_host_notice") else {}),
+        **({"terminal_host_notice": terminal_host_notice_text(row)} if terminal_host_notice_text(row) else {}),
     }
 
 

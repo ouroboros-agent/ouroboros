@@ -15,6 +15,7 @@ def review_operation_fields(actor: dict) -> dict:
         "operation_id": actor.get("operation_id") or "",
         "operation_state": actor.get("operation_state") or "settled",
         "late_result_pending": bool(actor.get("late_result_pending")),
+        "recovery_binding": dict(actor.get("recovery_binding") or {}),
         "pending_invocation_id": str(usage.get("pending_invocation_id") or ""),
         "delegated_run_id": str(usage.get("delegated_run_id") or ""),
     }

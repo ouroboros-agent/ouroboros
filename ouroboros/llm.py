@@ -14,7 +14,8 @@ import threading  # noqa: F401  (prior import surface)
 import time  # noqa: F401  (prior import surface)
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ouroboros.model_wait import model_waitable
+from ouroboros.model_wait import dispatch_deadline_remaining_sec, model_waitable
+from ouroboros.deadline_utils import caller_deadline_scoped
 
 from ouroboros.anthropic_native_custody import (  # noqa: F401  (prior import surface)
     anthropic_replay_scoped,
@@ -171,6 +172,7 @@ class LLMClient(
         self._async_remote_clients: Dict[Tuple[str, str, str, Tuple[Tuple[str, str], ...]], Any] = {}
         self._gigachat_clients: Dict[Tuple[str, str, str, str, str, bool], Any] = {}
 
+    @caller_deadline_scoped
     @model_waitable
     def chat(
         self,
@@ -193,6 +195,9 @@ class LLMClient(
         model_operation_observer: Any = None,
         model_account_override: str | None = None,
         default_temperature: Optional[float] = None,
+        stream: bool = False,
+        caller_deadline_ts: Optional[float] = None,
+        caller_execution_deadline: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes.
 
@@ -229,11 +234,13 @@ class LLMClient(
                     model_poll_control=model_poll_control,
                     model_operation_observer=model_operation_observer,
                     model_account_override=model_account_override,
+                    **({"stream": True} if stream else {}),
                 )
             usage["ledger_attempt_ids"] = list(attempt_ids)
             return message, usage
 
     @request_wire_scoped
+    @caller_deadline_scoped
     @model_waitable
     async def chat_async(
         self,
@@ -254,6 +261,9 @@ class LLMClient(
         model_account_override: str | None = None,
         use_local: bool = False,
         default_temperature: Optional[float] = None,
+        stream: bool = False,
+        caller_deadline_ts: Optional[float] = None,
+        caller_execution_deadline: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Async remote chat; no_proxy keeps forked macOS workers off OS proxy APIs.
 
@@ -295,17 +305,18 @@ class LLMClient(
                 )
             result[1]["ledger_attempt_ids"] = list(attempt_ids)
             return result
-        if tools:
-            raise ValueError("chat_async does not support tool calls")
         if target.get("provider") == "anthropic":
             with capture_attempt_ids() as attempt_ids:
-                result = await asyncio.to_thread(
-                    self._chat_anthropic, target, messages, tools, reasoning_effort,
+                result = await self._chat_anthropic_async(
+                    target, messages, tools, reasoning_effort,
                     max_tokens, tool_choice, temperature, no_proxy, timeout,
+                    **({"stream": True} if stream else {}),
                 )
             result[1]["ledger_attempt_ids"] = list(attempt_ids)
             return result
         if target.get("provider") == "gigachat":
+            if tools:
+                raise ValueError("chat_async does not support GigaChat tool calls")
             # The gigachat library client is synchronous; offload to a thread
             # like the Anthropic path so the event loop is never blocked.
             with capture_attempt_ids() as attempt_ids:
@@ -323,7 +334,10 @@ class LLMClient(
                     skip_capability_fetch=True,
                     allow_server_web_search=allow_server_web_search,
                     cache_affinity=cache_affinity,
+                    **({"stream": True} if stream else {}),
                 )
+                if dispatch_deadline_remaining_sec() is not None:
+                    kwargs["timeout"] = self._no_proxy_timeout(timeout)
                 prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
                 with capture_attempt_ids() as attempt_ids:
                     resp = await self._create_chat_completion_with_retries_async(
@@ -347,11 +361,14 @@ class LLMClient(
             target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
             allow_server_web_search=allow_server_web_search,
             cache_affinity=cache_affinity,
+            **({"stream": True} if stream else {}),
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's
             # per-request timeout instead of silently using the SDK default.
             kwargs["timeout"] = float(timeout)
+        elif dispatch_deadline_remaining_sec() is not None:
+            kwargs["timeout"] = getattr(client, "timeout", None)
         prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
         with capture_attempt_ids() as attempt_ids:
             resp = await self._create_chat_completion_with_retries_async(

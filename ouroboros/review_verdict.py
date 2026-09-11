@@ -49,17 +49,13 @@ def _criteria_have_supported_evidence(criteria: Any) -> bool:
 
 
 def _criteria_shape_valid(criteria: Any, tier: str) -> bool:
-    """Shape + tier coherence for a reviewer's criteria_used (v6.71.1).
+    """Validate criterion structure independently of the reviewer's claimed tier.
 
-    SHAPE: a non-empty list of {criterion, status ∈ enum}, and every 'supported'
-    criterion names evidence_refs. COHERENCE: 'solved' still requires ALL criteria
-    'supported' with refs — the release-clean bar (task_acceptance_is_clean) is
-    unchanged; a non-solved tier (best_effort / blocked_with_evidence) may honestly
-    carry partial/missing/rejected criteria. This lets an honest PASS that marks one
-    criterion 'partial' contribute as a valid NON-clean vote instead of being demoted
-    to parse_status=malformed — the old all-must-be-'supported' gate (the prompt itself
-    offers 'partial') silently starved the honest-partial path and fueled acceptance
-    loops (BIBLE P2/P3; the FAIL-veto and clean-solved contracts are untouched)."""
+    A well-formed partial/missing/rejected criterion preserves the reviewer's
+    PASS and original tier. Only ``task_acceptance_is_clean`` decides whether
+    those facts authorize solved completion; a contradiction is not bad JSON.
+    ``tier`` remains in this shared callback signature for existing callers.
+    """
     if not (isinstance(criteria, list) and criteria):
         return False
     for item in criteria:
@@ -72,8 +68,6 @@ def _criteria_shape_valid(criteria: Any, tier: str) -> bool:
             return False
         if status == "supported" and not item.get("evidence_refs"):
             return False
-    if str(tier or "").strip().lower() == OUTCOME_TIER_SOLVED:
-        return _criteria_have_supported_evidence(criteria)
     return True
 
 

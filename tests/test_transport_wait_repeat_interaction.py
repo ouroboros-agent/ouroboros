@@ -96,8 +96,10 @@ def test_interactive_turn_death_takes_the_repeat_rail_and_never_enters_a_wait_ep
         assert "waited and redialed" not in result and "no wait window" not in result
 
 
-@pytest.mark.parametrize("turn", ["managed", "is_direct_chat", "is_ephemeral_turn"])
-@pytest.mark.parametrize("with_record", [True, False])
+@pytest.mark.parametrize("turn,with_record", [
+    ("managed", False), ("is_direct_chat", True), ("is_direct_chat", False),
+    ("is_ephemeral_turn", True), ("is_ephemeral_turn", False),
+])
 def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unknown_source(
     tmp_path, monkeypatch, no_sleep, turn, with_record,
 ):
@@ -172,6 +174,7 @@ def test_deadline_refused_redial_still_names_the_class_the_repeat_was_released_w
     llm = _ScriptedLLM(_death, _released_connect, _released_connect)
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
+    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded paid-repeat rail.
     # Room for the grant (backoff 4 s + the admission reserve) and for one wait.
     metadata = {"deadline_at": (
         datetime.now(timezone.utc) + timedelta(seconds=get_finalization_grace_sec() + 8)
@@ -215,7 +218,9 @@ def test_generic_terminal_names_the_class_the_repeat_was_released_with(tmp_path,
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, _released_connect, lambda: _status_failure(400))
     notes = []
-    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, notes))
+    kwargs = _loop_kwargs(tmp_path, llm, notes)
+    kwargs["tools"]._ctx.is_direct_chat = True
+    result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 3  # the primary send, its released repeat, one free redial
     assert no_sleep == [4.0]

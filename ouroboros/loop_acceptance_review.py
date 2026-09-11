@@ -484,11 +484,10 @@ def _record_host_acceptance_run(ctx: _TaskAcceptanceContext, result: Any) -> Dic
     if type(getattr(ctx.tools._ctx, "task_attempt", None)) is int:
         run_record["task_attempt"] = ctx.tools._ctx.task_attempt
     run_record.update(ctx.review_binding or {})
-    aggregate = str(run_record.get("aggregate_signal") or "DEGRADED").upper()
+    from ouroboros.review_substrate import task_acceptance_is_clean
+
     run_record["enforcement_impact"] = (
-        "allows_completion"
-        if aggregate == "PASS"
-        else "degrades_completion"
+        "allows_completion" if task_acceptance_is_clean(result) else "degrades_completion"
     )
     ctx.llm_trace.setdefault("review_runs", []).append(run_record)
     seen = getattr(ctx.tools._ctx, "_task_acceptance_seen_bindings", None)

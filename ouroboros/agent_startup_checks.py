@@ -93,6 +93,11 @@ def task_result_authority_projection(
         for key, value in row.items()
         if key not in _TASK_RESULT_PROCESS_EVIDENCE_FIELDS
     }
+    from ouroboros.task_finalization import terminal_host_notice_text
+
+    notice = terminal_host_notice_text(row)
+    if notice:
+        authority["terminal_host_notice"] = notice
     contract = row.get("task_contract")
     if isinstance(contract, dict):
         authority["task_contract"] = copy.deepcopy(contract)

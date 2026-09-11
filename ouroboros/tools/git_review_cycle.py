@@ -12,6 +12,8 @@ import time.
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import hashlib
 import json
 import logging
@@ -59,9 +61,7 @@ def _review_custody_pending(ctx: ToolContext) -> bool:
         return True
     triad = list(getattr(ctx, "_last_triad_raw_results", []) or [])
     scope_raw = getattr(ctx, "_last_scope_raw_result", {}) or {}
-    scope_rows = list(scope_raw.get("raw_results") or []) if isinstance(scope_raw, dict) else []
-    if not scope_rows and isinstance(scope_raw, dict) and scope_raw:
-        scope_rows = [scope_raw]
+    scope_rows = list(scope_raw.get("raw_results") or [scope_raw]) if isinstance(scope_raw, dict) else []
     return any(
         bool(row.get("late_result_pending"))
         or str(row.get("operation_state") or "") in {"in_flight", "custody_lost"}
@@ -910,7 +910,7 @@ def _run_non_committing_review_cycle(
     _git()._reset_commit_review_state(ctx)
     commit_start = time.time()
     if not commit_message.strip():
-        return {"status": "failed", "message": "⚠️ ERROR: commit_message must be non-empty."}
+        return {"status": "failed", "message": _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="⚠️ ERROR: commit_message must be non-empty."))}
     ctx._current_review_commit_message = commit_message
     overlap_err = _git()._check_overlapping_review_attempt(ctx)
     if overlap_err:
@@ -994,7 +994,6 @@ def _run_non_committing_review_cycle(
         except Exception as exc:
             unstage_warning = f"⚠️ GIT_WARNING (reset): {_sanitize_git_error(str(exc))}"
         _git()._release_git_lock(lock)
-        if unstage_warning:
-            if 'outcome' in locals():
-                message = str(outcome.get("message", "") or "")
-                outcome["message"] = f"{message}\n\n---\n{unstage_warning}" if message else unstage_warning
+        if unstage_warning and 'outcome' in locals():
+            message = str(outcome.get("message", "") or "")
+            outcome["message"] = f"{message}\n\n---\n{unstage_warning}" if message else unstage_warning

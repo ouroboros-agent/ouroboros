@@ -387,6 +387,7 @@ def _call_scope_llm(
             "operation_id": str(actor.get("operation_id") or ""),
             "operation_state": str(actor.get("operation_state") or "settled"),
             "late_result_pending": bool(actor.get("late_result_pending")),
+            "recovery_binding": dict(actor.get("recovery_binding") or {}),
             "pending_invocation_id": str(actor.get("pending_invocation_id") or usage.get("pending_invocation_id") or ""),
             "delegated_run_id": str(actor.get("delegated_run_id") or usage.get("delegated_run_id") or ""),
             "failure_code": str(actor.get("failure_code") or ""),

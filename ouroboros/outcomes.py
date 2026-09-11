@@ -679,6 +679,11 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     tier = _aggregate_outcome_tier(_extract_outcome_tiers(runs))
     if tier:
         axis["outcome_tier"] = tier
+    # Only applied host facts demote a valid non-clean PASS; legacy rows retain their projection.
+    impacts = {str(run.get("enforcement_impact") or "") for run in runs
+               if run.get("authority") == "host_root"}
+    if impacts & {"degrades_completion", "requires_revision"}:
+        axis["enforcement_impact"] = "degrades_completion"
     if acceptance_decision:
         axis["acceptance_decision"] = _acceptance_decision_projection(acceptance_decision)
     _obligations = [o for o in (llm_trace.get("acceptance_obligations") or []) if isinstance(o, dict)]
@@ -709,14 +714,13 @@ def _objective_axis(review: Dict[str, Any]) -> Dict[str, Any]:
             "reason": _decision_reason,
         }
     if tier:
-        # Reviewer tier is the canonical objective lexicon (completion-coach):
-        # solved -> pass, best_effort -> best_effort, blocked_with_evidence ->
-        # fail. The false-solved veto is structural AND conservative: a solved
-        # claim earns PASS only from a clean PASS review; a DEGRADED review
-        # (quorum not met / slot failures) keeps objective degraded exactly as
-        # before this feature, and a FAIL verdict blocks the claim outright.
+        # Reviewer tiers are canonical: solved needs a clean PASS; a non-clean
+        # PASS is best-effort, DEGRADED stays degraded, and FAIL blocks the claim.
+        # Other tiers retain best_effort / blocked_with_evidence directly.
         if tier == OUTCOME_TIER_SOLVED and status == "pass":
-            objective = OBJECTIVE_PASS
+            objective = (OBJECTIVE_BEST_EFFORT
+                         if review.get("enforcement_impact") == "degrades_completion"
+                         else OBJECTIVE_PASS)
         elif tier == OUTCOME_TIER_SOLVED and status == "fail":
             objective = OBJECTIVE_FAIL
         elif tier == OUTCOME_TIER_SOLVED:
@@ -906,6 +910,11 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
     from ouroboros.cost_projection import normalize_task_result_cost_planes
 
     public = normalize_task_result_cost_planes(public)
+    from ouroboros.task_finalization import terminal_host_notice_text
+
+    notice = terminal_host_notice_text(public)
+    if notice:
+        public["terminal_host_notice"] = notice
     plan_state = public.get("plan_review_state")
     if isinstance(plan_state, dict) and plan_state.get("schema_version") == 1:
         plan_state["legacy_v1_projection"] = legacy_plan_review_projection(plan_state)

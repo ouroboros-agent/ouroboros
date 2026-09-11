@@ -22,6 +22,7 @@ from ouroboros import (
     llm_pricing,
     llm_probe,
     llm_routing,
+    llm_stream,
 )
 from ouroboros.llm import LLMClient
 
@@ -44,6 +45,7 @@ _LEAVES = (
     # upstream. It is an llm_* leaf all the same, so the leaf rules bind it —
     # never import the parent, no cycles, real weight.
     llm_probe,
+    llm_stream,
 )
 
 # Module-level names that moved. llm.py re-exports every one of them, so its

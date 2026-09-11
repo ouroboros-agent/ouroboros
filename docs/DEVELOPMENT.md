@@ -1065,8 +1065,7 @@ the serialized messages of the next send — each appended element charged as
 envelope plus list separator, so the counter equals the wire size), the owner
 deadline together with the slot's logical window (each send's transport
 timeout is clamped to the remainder and a spent window refuses before
-dispatch; the LLM client's recovery ladder reuses that timeout per recovery
-send — a disclosed residual), and the paid ledger; exhaustion is a typed
+dispatch; each internal recovery send re-reads the same caller deadlines), and the paid ledger; exhaustion is a typed
 refusal (`native_transcript_cap_exceeded`) for verdict shapes or a disclosed
 `native_incomplete` product for the report shape, and every end leaves its
 facts on the actor usage and custody row. A retrieving delivery canonicalizes
@@ -2082,6 +2081,16 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   subscriptions build presentations and run arbitrary tasks; product names
   (Claude Code, Codex, Cursor) are trademarks and stay as they are.
 
+### Transport and late-result custody
+
+- `LLMClient.chat` and `chat_async` accept optional `stream=False`, `caller_deadline_ts` (Unix seconds) and `caller_execution_deadline` (the existing quota-adjusted monotonic clock). Main opts into streaming. Subtract finalization reserve once at the caller; every physical recovery send re-checks the inherited bounds. Unset deadlines keep ordinary transport defaults. A socket-phase timeout is not an overall wall-clock promise, and late paid completion retains its original attempt.
+- Stream consumption completes inside physical accounting. Preserve indexed tools, native signatures, complete final framing and cumulative usage snapshots. An EOF/error/cancellation retains private wire evidence and cannot produce a usable partial answer. Only a structural parameter rejection uses the existing wire recovery; never infer a retry from missing stream text or ping cadence. Compatible async tool calls now use the same normalizer/validation path; local, GigaChat and Claudexor retain their separate wire contracts.
+- Late reviewer reuse resolves the exact operation's complete producer receipt from existing CAS, with original task/root/attempt, slot/route, subject, contract, roster/epoch and delegated invocation where present. The current surface remains the sole wave writer and reducer. No source file existence, preview or matching prompt prose alone grants authority; missing/partial/error/mismatched custody never buys another same-operation dispatch.
+- Managed unknown-outcome recovery uses the existing network-wait owner, with non-generating upstream observations and an explicit new-attempt notice after connectivity returns. Keep old outcome/cost unknown and apply current budget/Stop/deadline before dispatch. Subscription catalogs prove reachability only with generic `provenance="provider_http"` plus `observedAt` after wait entry and exact source/model/effective account; legacy/static catalogs remain unknown. A control-channel outage first rejoins the same accepted operation. Non-generating HEAD uses the existing connection allowance for every socket phase, narrowed by the owner remainder, rather than inheriting a cognitive read window without its lease. No scheduler, provider/model table, paid readiness probe or automatic manual-restart recovery is introduced.
+- `delegate_wait` supervision's three-second observation beat is separate from its HTTP read allowance. A typed read timeout is a quiet observation hole, with actual elapsed time; received auth/protocol failures and owner controls remain meaningful. After terminal cleanup, use the current custody host notice alongside the original answer/narrative. Genuine builtin refusals publish typed non-success at their producer; successful warnings and existing review/Git warning buckets keep their semantics. Acceptance JSON validity and completion cleanliness remain separate decisions.
+
+Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_lineage.py`, `test_terminal_custody_notice.py`, `test_delegate_observation_transport.py`, `test_transport_b_stream_deadlines.py`, `test_transport_unknown_continuation.py`, `test_builtin_refusal_results.py` and `test_v671_acceptance_convergence.py`. Use the ordinary isolated preflight runner; full provider/renderer smoke remains separate from local fake-provider evidence.
+
 ### LLM call rules
 
 - Claudexor model calls are a transport, not delegated reasoning. Keep model
@@ -2241,7 +2250,9 @@ by "Provider Independence" above. Call-site imperatives:
   non-retryable as-is (record the exact category and surface a recovery
   hint); a typed 408/429/5xx or a failure proven pre-dispatch may retry; a
   dispatched request with no terminal provider outcome stops same-model and
-  cross-model sends until reconciled — with one typed exception: the primary
+  cross-model sends until reconciled — with caller-owned continuation: ordinary managed cognition waits for upstream
+  recovery before adding a marked new-attempt input (see Transport and late-result
+  custody). The interactive primary
   main-loop round dispatch may repeat a request that died with a typed
   transport death (`transport_custody.is_retryable_transport_death`) at most
   twice per round, each repeat a NEW physical attempt on its own ledger row
@@ -2259,9 +2270,9 @@ by "Provider Independence" above. Call-site imperatives:
   budget rail cannot prove the repeat never left the host (`llm.chat` retries
   on the wire before a later reservation can be refused), so the record keeps
   the attempt booked and the budget terminal, not the provider terminal, ends
-  the round; the rail belongs to the primary
-  round dispatch of every main-loop actor (owner turns, managed tasks, native
-  API subagent children). Every other caller — forced-final, fallback
+  the round; the bounded repeat rail belongs to interactive primary rounds. Ordinary managed
+  tasks and native API children use upstream-observed continuation, while exact
+  session nanny routes keep their independent hold. Every other caller — forced-final, fallback
   candidates, review actors, safety, external-harness delegated runs — keeps
   `transport_death_retries=0`. A round that holds a transport-death repeat
   record sends nothing further except the typed-death repeats — a repeat that
@@ -2406,21 +2417,27 @@ by "Provider Independence" above. Call-site imperatives:
   monotonically forces no-resend. A dispatched request whose socket or
   stream ends without terminal provider evidence is
   `provider_outcome_unknown`: its `unresolved` ledger row is terminal and
-  THAT physical attempt is never resent by any route; the primary main-loop
+  THAT physical attempt is never resent by any route; an interactive primary
   completion may repeat the same logical request only after a typed transport
   death, at most twice per round, as a new physical attempt with its own row,
   re-prepared at send time (a transport retry is literally a new attempt, so a
   non-deterministic projection such as a vision caption that failed on the
   first attempt may differ and may cost its own preparation call); a NEW
-  logical request is legal only with a unique host-attested input absent from
-  the unknown one
-  (e.g. the nanny-leaf hold contract in `ouroboros/delegate_hold.py`).
+  logical request needs a unique host-attested input absent from the unknown
+  one: the managed upstream-recovery notice or the separate nanny-leaf wake
+  contract in `ouroboros/delegate_hold.py`.
 - A custody retry key names semantic material and an admitted cycle, not its
   rendered prompt: prior-round scaffolding may change while the same physical
   operation settles and must still join it; changed snapshots, owner intent,
   route/model rows, or a genuinely new cycle mint a new key. Skill Review
-  keys additionally bind the exact skill, lifecycle wave, content, and frozen
-  chunk digest/index. Commit review writes `paid=True`, the exact retry key,
+  keys bind the exact skill, logical wave, content and frozen chunk digest/index.
+  Reserve the entire chunk/operation roster in `review_job.review_wave` before
+  paid dispatch and carry it into terminal history. A new authorized lifecycle
+  may record `review_resume_of` for its exact unsuperseded predecessor and
+  reaggregate complete CAS without a paid stamp; leave the predecessor terminal
+  unchanged and apply the current lifecycle's own persistence and postconditions.
+  Changed task/root/attempt, group, content, contract, rebuttal or explicit
+  cancellation never inherits that wave; an unstarted chunk cannot authorize PASS. Commit review writes `paid=True`, the exact retry key,
   and both complete slot rosters with reserved operation ids in one locked
   write before either parallel surface starts; a window with no dispatch
   capacity leaves an unpaid `$0` wave and no paid stamp.

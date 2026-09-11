@@ -1104,6 +1104,31 @@ def retry_pending_child_ref_promotions(
     return report
 
 
+def call_manifest_path(drive_root: pathlib.Path, task_id: str, call_id: str) -> pathlib.Path:
+    """The shared address of a known call; resolving it creates nothing."""
+    root = pathlib.Path(drive_root)
+    if not root.is_absolute():
+        raise ValueError("observability drive_root must be an absolute path")
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "unknown")).strip("_") or "unknown"
+    safe_call = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(call_id)).strip("_")
+    return root / OBSERVABILITY_DIR / "calls" / safe_task / f"{safe_call}.json"
+
+
+def read_call_payload(drive_root: pathlib.Path, *, task_id: str, call_id: str) -> tuple:
+    """Read one exact call and its complete digest-verified existing CAS body."""
+    path = call_manifest_path(drive_root, task_id, call_id)
+    raw = path.read_bytes()
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict) or manifest.get("task_id") != task_id or manifest.get("call_id") != call_id:
+        raise ValueError("observability call identity mismatch")
+    payload = read_blob_ref(drive_root, manifest.get("full_payload_ref"))
+    ref = {"call_id": call_id, "manifest_ref": {"path": str(path), "call_id": call_id,
+           "sha256": hashlib.sha256(raw).hexdigest()},
+           "redacted_projection_ref": manifest.get("redacted_projection_ref"),
+           "full_payload_redacted": manifest.get("full_payload_redacted", True)}
+    return manifest, payload, ref
+
+
 def write_call_manifest(
     drive_root: pathlib.Path,
     *,
@@ -1113,9 +1138,9 @@ def write_call_manifest(
 ) -> Dict[str, Any]:
     """Write the small per-call manifest with refs into the private ledger."""
 
-    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "unknown")).strip("_") or "unknown"
-    safe_call = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(call_id or new_call_id("call"))).strip("_")
-    path = _observability_root(pathlib.Path(drive_root)) / "calls" / safe_task / f"{safe_call}.json"
+    path = call_manifest_path(drive_root, task_id, call_id or new_call_id("call"))
+    safe_call = path.stem
+    _observability_root(pathlib.Path(drive_root))
     path.parent.mkdir(parents=True, exist_ok=True)
     _chmod_private_dir(path.parent.parent)
     _chmod_private_dir(path.parent)

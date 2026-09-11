@@ -453,15 +453,29 @@ def test_no_proxy_uses_the_same_custom_physical_send(monkeypatch):
     assert usage["request_wire"]["applied_tool_dialect"] == "openai_chat_custom"
 
 
-def test_public_async_api_still_rejects_tool_calls():
+def test_public_async_api_preserves_tool_calls(tmp_path, monkeypatch):
+    from ouroboros.usage_accounting import UsageScope, usage_scope
+
     client = LLMClient(api_key="test")
-    with pytest.raises(ValueError, match="does not support tool calls"):
-        asyncio.run(client.chat_async(
+    captured = []
+
+    async def create(**kwargs):
+        captured.append(kwargs)
+        return _tool_response(_custom_call("call-async", "probe", '{"marker":"ok"}'))
+
+    remote = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(client, "_resolve_remote_target", lambda _model: _target())
+    monkeypatch.setattr(client, "_get_async_remote_client", lambda _target: remote)
+    with usage_scope(UsageScope(drive_root=tmp_path, task_id="async-tool")):
+        message, usage = asyncio.run(client.chat_async(
             [{"role": "user", "content": "Use a tool."}],
             "openai::future-model-without-prefix",
             tools=_tools(),
             reasoning_effort="medium",
         ))
+    assert len(captured) == 1 and captured[0]["tools"][0]["type"] == "custom"
+    assert message["tool_calls"][0]["function"] == {"name": "probe", "arguments": '{"marker":"ok"}'}
+    assert len(usage["ledger_attempt_ids"]) == 1
 
 
 @pytest.mark.parametrize(

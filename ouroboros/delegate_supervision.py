@@ -18,7 +18,7 @@ from ouroboros.owner_mailbox import (
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 _TICK_SEC = 3
-_QUIET_STATUSES = {"progress", "no_progress"}
+_QUIET_STATUSES = {"progress", "no_progress", "observation_pending"}
 _LOOP_CONTROL_KINDS = {KIND_FINALIZE_NOW, KIND_HURRY}
 _MAX_COORDINATION_SEEN = 256
 
@@ -791,7 +791,9 @@ def supervised_wait(
     if wait_once is None:
         from ouroboros.tools.delegate import _delegate_wait
 
-        wait_once = _delegate_wait
+        from functools import partial
+
+        wait_once = partial(_delegate_wait, observation_only=True)
     state = _load_state(ctx, run_id)
     replay = _pending_payload(ctx, state)
     if replay:
@@ -830,12 +832,11 @@ def supervised_wait(
     })
 
     while True:
-        raw = wait_once(
-            ctx,
-            run_id,
-            _TICK_SEC,
-            int(state.get("journal_cursor") or 0),
-        )
+        # A control already present does not wait behind another HTTP read.
+        if _control_wakes(ctx):
+            raw = json.dumps({"status": "no_progress", "run_id": str(run_id)})
+        else:
+            raw = wait_once(ctx, run_id, _TICK_SEC, int(state.get("journal_cursor") or 0))
         payload = _payload(raw)
         cursor = payload.get("last_seq")
         if isinstance(cursor, int):
@@ -902,6 +903,14 @@ def supervised_wait(
                 "interaction_ids": list(state["pending_wake"]["interaction_ids"]),
             })
             return _render_wake_payload(ctx, payload)
+        if payload.get("status") == "observation_pending":
+            _emit(ctx, "delegate_supervision_observation_pending", {
+                "run_id": str(run_id), "reason": payload.get("reason"),
+                "waited_sec": payload.get("waited_sec"),
+            })
+            # A failed read is not a completed quiet window; retain the cursor
+            # and avoid a busy loop if a transport fails before its read bound.
+            time.sleep(_TICK_SEC)
         state["coordination_cursor"] = next_coordination_cursor
         state["quiet_renewals"] = int(state.get("quiet_renewals") or 0) + 1
         renewals = int(state["quiet_renewals"])

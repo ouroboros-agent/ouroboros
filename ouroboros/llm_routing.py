@@ -18,6 +18,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.request_wire_recovery import request_wire_scoped
+from ouroboros.model_wait import dispatch_deadline_remaining_sec
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
 from ouroboros.provider_models import (
     DEEPSEEK_BASE_URL,
@@ -100,6 +101,7 @@ class _ProviderRoutingMixin:
         model_poll_control: Any = None,
         model_operation_observer: Any = None,
         model_account_override: str | None = None,
+        stream: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "claudexor":
@@ -120,6 +122,7 @@ class _ProviderRoutingMixin:
                 target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
                 no_proxy=no_proxy,
                 timeout=timeout,
+                **({"stream": True} if stream else {}),
             )
 
         if target.get("provider") == "gigachat":
@@ -139,7 +142,10 @@ class _ProviderRoutingMixin:
                     response_format=response_format,
                     cache_affinity=cache_affinity,
                     bypass_response_cache=bypass_response_cache,
+                    **({"stream": True} if stream else {}),
                 )
+                if dispatch_deadline_remaining_sec() is not None:
+                    kwargs["timeout"] = self._no_proxy_timeout(timeout)
                 prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
                 resp = self._create_chat_completion_with_retries(
                     _oa_client.chat.completions.create,
@@ -167,11 +173,14 @@ class _ProviderRoutingMixin:
             response_format=response_format,
             cache_affinity=cache_affinity,
             bypass_response_cache=bypass_response_cache,
+            **({"stream": True} if stream else {}),
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's
             # per-request timeout instead of silently using the SDK default.
             kwargs["timeout"] = float(timeout)
+        elif dispatch_deadline_remaining_sec() is not None:
+            kwargs["timeout"] = getattr(client, "timeout", None)
         prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
         resp = self._create_chat_completion_with_retries(
             client.chat.completions.create,

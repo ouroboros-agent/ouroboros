@@ -1223,12 +1223,14 @@ def format_subagent_absorption_message(
     omitted = 0
     from ouroboros.cost_projection import cost_display
 
+    from ouroboros.task_finalization import terminal_host_notice_text
+
     for child in terminal:
         cid = str(child.get("task_id") or child.get("id") or "")
         role = str(child.get("role") or "")
         result = provider_terminal_body(
             str(child.get("result") or "").strip(),
-            str(child.get("terminal_host_notice") or ""),
+            terminal_host_notice_text(child),
         )
         terminal_status = str(child.get("child_status") or "")
         status_suffix = (

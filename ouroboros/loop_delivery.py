@@ -675,7 +675,7 @@ def _resolve_forced_delivery_control_body(
         not armed
         and candidate is not None
         and candidate.control_episode_seen
-        and control_kind in {"keep", "replace", "invalid"}
+        and control_kind in {"keep", "replace", "invalid", "embedded"}
     )
     if not armed and not historical:
         return raw, False, False, False, False
@@ -783,7 +783,7 @@ def _resolve_delivery_control(
             tools._ctx._delivery_control_required = True
         elif (
             candidate.control_episode_seen
-            and control_kind in {"keep", "replace", "invalid"}
+            and control_kind in {"keep", "replace", "invalid", "embedded"}
         ):
             # The latch is gone but this lineage HAS been under host control, and
             # the body is protocol-shaped: reading it as prose would publish the

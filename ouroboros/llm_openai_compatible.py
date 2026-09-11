@@ -93,6 +93,7 @@ class _OpenAICompatibleLaneMixin:
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
         bypass_response_cache: bool = False,
+        stream: bool = False,
     ) -> Dict[str, Any]:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
@@ -159,6 +160,8 @@ class _OpenAICompatibleLaneMixin:
                 "messages": clean_messages,
                 token_limit_key: max_tokens,
             }
+            if stream:
+                kwargs.update(stream=True, stream_options={"include_usage": True})
             if provider == "openai":
                 cache_identity = self._prompt_cache_identity(
                     str(target.get("usage_model") or resolved_model),
@@ -298,6 +301,8 @@ class _OpenAICompatibleLaneMixin:
             "max_tokens": max_tokens,
             "extra_body": extra_body,
         }
+        if stream:
+            kwargs.update(stream=True, stream_options={"include_usage": True})
         if temperature is not None:
             kwargs["temperature"] = temperature
         if response_format:
@@ -354,6 +359,8 @@ class _OpenAICompatibleLaneMixin:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
         usage = resp_dict.get("usage") or {}
+        if isinstance(resp_dict.get("_stream_receipt"), dict):
+            usage["stream_receipt"] = dict(resp_dict["_stream_receipt"])
         if isinstance(usage, dict):
             # These keys are host-owned projections of designated outer fields;
             # provider usage extensions must not spoof their provenance.

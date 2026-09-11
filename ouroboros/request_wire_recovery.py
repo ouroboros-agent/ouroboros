@@ -732,13 +732,17 @@ def _classify_action(
     compact = low.replace(".", "_")
     for field in (*OPTIONAL_REQUEST_FIELDS, NESTED_REASONING_FIELD):
         aliases = {field, field.replace(".", "_"), field.split(".")[-1]}
-        if _field_is_present(payload, field) and any(alias in low or alias in compact for alias in aliases):
+        implicated = (field in error_tokens if field in {"stream", "stream_options"}
+                      else any(alias in low or alias in compact for alias in aliases))
+        if _field_is_present(payload, field) and implicated:
             if value_implicated or (
                 field != NESTED_REASONING_FIELD
                 and _names_exact_scalar_value(low, payload.get(field))
             ):
                 return None
             named.append(field)
+    if "stream" in named and "stream_options" in payload and "stream_options" not in named:
+        named.append("stream_options")
     if not named:
         return None
     return PendingWireAction(profile, {
@@ -888,9 +892,12 @@ def plan_nonlearning_optional_retry(
     named = [
         field for field in _NON_REASONING_OPTIONAL_FIELDS
         if field in payload and (
-            field in low or field.replace("_", ".") in low
+            (field in _error_tokens(low)) if field in {"stream", "stream_options"}
+            else (field in low or field.replace("_", ".") in low)
         )
     ]
+    if "stream" in named and "stream_options" in payload and "stream_options" not in named:
+        named.append("stream_options")
     if not named:
         return None
     repaired = copy.deepcopy(dict(payload))
@@ -920,6 +927,8 @@ def plan_next_wire_retry(
     body_error: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """One exception/body-parity entrypoint for the bounded transport drivers."""
+    if getattr(error, "stream_incomplete", False):
+        return None
     planned = (
         plan_wire_retry_from_body_error(error)
         if body_error else

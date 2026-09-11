@@ -23,11 +23,12 @@ from typing import Any, Dict, List, Optional, Set
 from ouroboros.anthropic_native_custody import is_replayed_native_content
 from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES
 from ouroboros.request_wire_recovery import prepare_wire_payload_for_send
-from ouroboros.transport_custody import is_loopback_base_url
+from ouroboros.transport_custody import ProviderNotDispatched, is_loopback_base_url
 from ouroboros.usage_accounting import (
     AttemptRequest,
     PhysicalAttemptPreconditionFailed,
     PhysicalAttemptPreparationFailed,
+    adopt_physical_attempt_capture,
     current_physical_attempt_context,
     current_physical_attempt_predicate,
     current_usage_scope,
@@ -45,6 +46,49 @@ _CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
 
 
 PROVIDER_POLICY_REFUSAL = "provider_policy_refusal"
+
+
+class PhysicalDispatchInterrupted(PhysicalAttemptPreconditionFailed):
+    """The existing caller control/deadline refused a send before request bytes."""
+
+    code = "model_operation_interrupted"
+
+    def __init__(self, reason: str):
+        super().__init__(f"Physical dispatch interrupted: {reason}")
+        self.control_reason = reason
+
+
+class _PhysicalSendNotStarted(PhysicalDispatchInterrupted, ProviderNotDispatched):
+    """Positive no-dispatch evidence for this send alone, not the recovery ladder."""
+
+
+def require_physical_dispatch_window() -> Optional[float]:
+    from ouroboros.model_wait import current_model_wait, dispatch_deadline_remaining_sec
+
+    owner = current_model_wait()
+    reason = owner.control_reason() if owner is not None else None
+    if reason:
+        raise _PhysicalSendNotStarted(reason)
+    remaining = dispatch_deadline_remaining_sec()
+    if remaining is not None and remaining <= 0:
+        raise _PhysicalSendNotStarted("deadline")
+    return remaining
+
+
+def preserve_prior_dispatch(error: BaseException, prior: Any) -> None:
+    """Raise with paid custody instead of a ladder-wide no-dispatch assertion."""
+    if (isinstance(error, PhysicalDispatchInterrupted)
+            and getattr(prior, "state", None) in {"dispatched", "unresolved"}):
+        failure = PhysicalDispatchInterrupted(error.control_reason)
+        failure.deadline_attempt_capture = getattr(error, "physical_attempt_capture", None)
+        failure.physical_attempt_capture = prior
+        adopt_physical_attempt_capture(prior)
+        raise failure from error
+
+
+def strongest_dispatch_capture(prior: Any, current: Any) -> Any:
+    """A later closed attempt cannot erase an earlier unresolved recovery send."""
+    return prior if getattr(prior, "state", None) in {"dispatched", "unresolved"} else current or prior
 
 
 class ProviderPolicyRefusal(RuntimeError):
@@ -323,15 +367,38 @@ def _candidate_before_dispatch(candidate: Dict[str, Any], request: AttemptReques
 
 def _execute_candidate(request: AttemptRequest, send: Any, before_dispatch: Any) -> Any:
     """Keep existing two-argument injected executors usable."""
+    adopt_physical_attempt_capture(None)
+    require_physical_dispatch_window()
+    send, before_dispatch = _deadline_checked_send(send, before_dispatch)
     if "before_dispatch" not in inspect.signature(execute_physical_attempt).parameters:
         return execute_physical_attempt(request, send)
     return execute_physical_attempt(request, send, before_dispatch=before_dispatch)
 
 
 async def _execute_candidate_async(request: AttemptRequest, send: Any, before_dispatch: Any) -> Any:
+    adopt_physical_attempt_capture(None)
+    require_physical_dispatch_window()
+    send, before_dispatch = _deadline_checked_send(send, before_dispatch)
     if "before_dispatch" not in inspect.signature(execute_physical_attempt_async).parameters:
         return await execute_physical_attempt_async(request, send)
     return await execute_physical_attempt_async(request, send, before_dispatch=before_dispatch)
+
+
+def _deadline_checked_send(send: Any, before_dispatch: Any):
+    def prepare(reservation):
+        manifest = before_dispatch(reservation) if before_dispatch is not None else None
+        try:
+            require_physical_dispatch_window()
+        except PhysicalDispatchInterrupted as exc:
+            exc.candidate_manifest_ref = manifest
+            raise
+        return manifest
+
+    def dispatch():
+        require_physical_dispatch_window()
+        return send()
+
+    return dispatch, prepare
 
 
 class _PayloadCachePolicyMixin:

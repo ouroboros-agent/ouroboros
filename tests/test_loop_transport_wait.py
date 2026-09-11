@@ -863,10 +863,9 @@ def test_redial_failing_with_different_kind_ends_episode_and_resumes_fallback(tm
     assert events[-1].get("detail") == "error_kind_changed:provider_transient"
 
 
-def test_redial_with_unknown_outcome_takes_unknown_no_resend_terminal(tmp_path, monkeypatch):
-    """A main-dispatch redial whose socket outcome is unknown ends the episode
-    AND the round: provider_outcome_unknown keeps its own no-resend terminal —
-    zero further dials of any kind."""
+def test_redial_unknown_waits_without_unproved_paid_continuation(tmp_path, monkeypatch):
+    """A formerly free redial needs upstream proof after it crosses dispatch.
+    Its owner deadline can close that unknown wait without another paid call."""
     calls = {"n": 0}
 
     def fake_call(_llm, _messages, _model, _tools, _effort, _max_retries, _drive_logs,
@@ -889,14 +888,22 @@ def test_redial_with_unknown_outcome_takes_unknown_no_resend_terminal(tmp_path, 
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     notes = []
-    _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    probes = []
+    def still_offline(*args, **kwargs):
+        probes.append(1)
+        registry._ctx.task_metadata = {"deadline_at": "2000-01-01T00:00:00Z"}
+        return {}
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable", still_offline)
+    _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
+    assert probes == [1]
 
     assert calls["n"] == 2  # zero dials after the unknown outcome
     assert usage.get("execution_status") == "infra_failed"
     assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
     events = _read_network_wait_events(tmp_path)
     assert events[-1]["phase"] == "ended"
-    assert events[-1].get("detail") == "error_kind_changed:provider_outcome_unknown"
+    assert events[-1].get("detail") == "deadline_exhausted"
 
 
 def test_episode_ledger_evidence_has_zero_dispatched_paid_attempts(tmp_path, monkeypatch):

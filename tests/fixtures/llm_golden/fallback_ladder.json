@@ -2698,13 +2698,45 @@
       }
     },
     {
-      "id": "fallback.async.rejects_tools",
-      "route": "chat_async refuses tool calls before touching a transport",
+      "id": "fallback.async.preserves_tools",
+      "route": "chat_async carries tool schemas and normalizes the returned tool call on the same physical route",
       "spec": {
         "env": {
           "OPENROUTER_API_KEY": "or-fixture-key"
         },
-        "transport": [],
+        "transport": [
+          {
+            "kind": "response",
+            "body": {
+              "id": "gen-async-tools",
+              "choices": [
+                {
+                  "index": 0,
+                  "finish_reason": "tool_calls",
+                  "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                      {
+                        "id": "call-read",
+                        "type": "function",
+                        "function": {
+                          "name": "read_file",
+                          "arguments": "{\"path\":\"README.md\"}"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 8,
+                "cost": 0.0031
+              }
+            }
+          }
+        ],
         "call": {
           "kind": "method",
           "name": "chat_async",
@@ -2754,11 +2786,128 @@
         }
       },
       "expected": {
-        "raised": {
-          "type": "ValueError",
-          "message": "chat_async does not support tool calls"
+        "returned": {
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call-read",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\":\"README.md\"}"
+                }
+              }
+            ],
+            "response_id": "gen-async-tools"
+          },
+          "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "cost": 0.0031,
+            "response_finish_reason": "tool_calls",
+            "provider": "openrouter",
+            "resolved_model": "x-ai/grok-4.5",
+            "cost_final": true,
+            "request_wire": {
+              "requested_effort": "medium",
+              "applied_effort": "medium",
+              "requested_tool_dialect": "function",
+              "applied_tool_dialect": "function",
+              "reason_code": "requested_wire_form",
+              "source_profile_fingerprint": "b3665fdf2866b600747bc031a414a4bb341b2d4663904da97f5ffebcbeabe844",
+              "accepted_profile_fingerprint": "b3665fdf2866b600747bc031a414a4bb341b2d4663904da97f5ffebcbeabe844",
+              "candidate_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8",
+              "ladder_ordinal": 1,
+              "applied_actions": [],
+              "task_local": false,
+              "attempt_id_present": true
+            }
+          },
+          "ledger_attempt_count": 1
         },
-        "sends": [],
+        "sends": [
+          {
+            "transport": "async_openai.chat.completions.create",
+            "client": {
+              "api_key": "or-fixture-key",
+              "base_url": "https://openrouter.ai/api/v1",
+              "default_headers": {
+                "HTTP-Referer": "https://ouroboros-agent.ai/",
+                "X-OpenRouter-Title": "Ouroboros"
+              },
+              "max_retries": 0,
+              "http_client": null
+            },
+            "payload": {
+              "extra_body": {
+                "reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                },
+                "session_id": "ouroboros-session-14476e6cd07256290bbf81c7a9463216"
+              },
+              "max_tokens": 65536,
+              "messages": [
+                {
+                  "content": "stable policy prefix",
+                  "role": "system"
+                },
+                {
+                  "content": "hello",
+                  "role": "user"
+                }
+              ],
+              "model": "x-ai/grok-4.5",
+              "tools": [
+                {
+                  "function": {
+                    "description": "two parts",
+                    "name": "apply_patch",
+                    "parameters": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "description": "read",
+                    "name": "read_file",
+                    "parameters": {
+                      "properties": {
+                        "path": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            },
+            "payload_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8"
+          }
+        ],
+        "physical_attempts": [
+          {
+            "source": "llm.chat",
+            "model": "x-ai/grok-4.5",
+            "provider": "openrouter",
+            "candidate_raw_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8",
+            "candidate_raw_size_bytes": 536,
+            "candidate_measurement_kind": "canonical_json_v1",
+            "states": [
+              "reserved",
+              "dispatched",
+              "settled"
+            ],
+            "prompt_cache_ttl": "",
+            "cost_final": true
+          }
+        ],
         "unused_script_steps": 0
       }
     },

@@ -9,6 +9,8 @@ switch the model or reasoning effort for the next round.
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import logging
 import os
 from hashlib import sha256
@@ -191,10 +193,10 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
                 "scratchpad). Persist durable project facts with knowledge_write.")
     if not content or not isinstance(content, str) or len(content.strip()) < 10:
         return (
-            "⚠️ REJECTED: content is empty or too short "
+            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ REJECTED: content is empty or too short "
             f"(got {type(content).__name__}, len={len(content) if isinstance(content, str) else 'N/A'}). "
             "Scratchpad must have meaningful content (10+ chars). "
-            "This likely means the tool call was malformed — check your arguments."
+            "This likely means the tool call was malformed — check your arguments.")))
         )
     from ouroboros.memory import Memory
     mem = Memory(drive_root=ctx.drive_root)
@@ -211,7 +213,7 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
         )
     except RuntimeError as exc:
         if "LEGACY_SCRATCHPAD_REQUIRES_MANUAL_UPGRADE" in str(exc):
-            return f"⚠️ {exc}"
+            return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=(f"⚠️ {exc}")))
         raise
     return f"OK: scratchpad block appended ({len(content)} chars, ts={block.get('ts', '?')[:16]})"
 
@@ -220,9 +222,9 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
     """Send a separate owner reply without completing the ongoing task."""
     chat_id = getattr(ctx, "current_chat_id", None)
     if chat_id is None or chat_id == "":  # 0 is a real hidden session, not absence
-        return "⚠️ No active chat — cannot send proactive message."
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ No active chat — cannot send proactive message.")))
     if not text or not text.strip():
-        return "⚠️ Empty message."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Empty message.")))
 
     from ouroboros.tools.owner_delivery import deliver_owner_event
     from ouroboros.utils import append_jsonl
@@ -260,10 +262,10 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
                 "task (identity stays continuous across projects — P1).")
     if not content or not isinstance(content, str) or len(content.strip()) < 50:
         return (
-            "⚠️ REJECTED: content is empty or too short "
+            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ REJECTED: content is empty or too short "
             f"(got {type(content).__name__}, len={len(content) if isinstance(content, str) else 'N/A'}). "
             "Identity must be a substantial text (50+ chars). "
-            "This likely means the tool call was malformed — check your arguments."
+            "This likely means the tool call was malformed — check your arguments.")))
         )
     from ouroboros.memory import Memory
     mem = Memory(drive_root=ctx.drive_root)
@@ -353,11 +355,11 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     # so a same-call model switch is not half-applied behind a rejected tier.
     requested_effort = str(effort or "").strip().lower()
     if requested_effort and requested_effort not in EFFORT_SCALE:
-        return f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}")))
 
     if model:
         if model not in available:
-            return f"⚠️ Unknown model: {model}. Available: {', '.join(available)}"
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown model: {model}. Available: {', '.join(available)}")))
 
         import os
         use_local = False

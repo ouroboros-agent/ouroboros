@@ -41,7 +41,7 @@ from ouroboros.triad_review import (
     review_output_shape,
 )
 from ouroboros.deadline_utils import (
-    bounded_seconds, owner_deadline_exhausted,
+    bounded_seconds, caller_deadline_arguments, owner_deadline_exhausted,
     review_transport_timeout,
 )
 from ouroboros.config import get_finalization_grace_sec
@@ -451,6 +451,8 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
             getattr(slot, "transport_timeout_sec", None),
             getattr(request, "deadline_at", ""),
         )
+        self._chat_kwargs.update(caller_deadline_arguments(getattr(request, "deadline_at", ""),
+                                getattr(self, "_logical_deadline_monotonic", None), reserve_sec=get_finalization_grace_sec()))
         return self._chat_kwargs
 
     def execute(self) -> ReviewAttemptResult:

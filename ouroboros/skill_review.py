@@ -408,19 +408,16 @@ def _skill_cycles_gate(
     content_hash: str,
     *,
     persist: bool = True,
+    file_packs: Optional[List[str]] = None,
 ) -> tuple[Optional["SkillReviewOutcome"], str, str, str]:
-    """Max Review Cycles on the skill gate (Q17/Q23), run BEFORE any paid
-    panel: a byte-identical snapshot with a recorded substantive verdict under
-    the same panel contract replays for FREE, and the shared knob bounds PAID
-    panel cycles per ceiling key (root task for task-driven groups; the manual
-    lane per content_hash). Returns ``(early_outcome_or_None,
-    contract_fingerprint, rebuttal_sha256, review_profile)`` — the resolved
-    profile is part of the panel-contract identity and is computed ONCE here
-    for the whole review."""
+    """Select exact late reconciliation or free substantive replay before paid
+    admission. The shared cap counts per root task, or per manual content hash.
+    Return (early outcome, contract fingerprint, rebuttal hash, shared profile)."""
     from ouroboros.skill_review_cycles import (
         free_replay_outcome,
         skill_review_contract_fingerprint,
         skill_review_cycles_refusal,
+        skill_review_wave_binding, select_skill_review_resume,
     )
     from ouroboros.tools.commit_gate import compute_rebuttal_sha256
 
@@ -431,6 +428,10 @@ def _skill_cycles_gate(
     )
     rebuttal_sha = compute_rebuttal_sha256(review_rebuttal)
     group_id = str(getattr(ctx, "_skill_review_group_id", "") or "") or f"manual:{skill.name}"
+    if file_packs is not None and select_skill_review_resume(ctx, skill, drive_root,
+            skill_review_wave_binding(ctx, skill, drive_root, content_hash, contract_fp,
+                                      rebuttal_sha, file_packs)):
+        return None, contract_fp, rebuttal_sha, review_profile
     replayed = free_replay_outcome(
         skill, drive_root=drive_root, group_id=group_id, content_hash=content_hash,
         contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
@@ -666,6 +667,7 @@ def review_skill(
     models = list(delivery["models"])
     early_outcome, contract_fp, rebuttal_sha, review_profile = _skill_cycles_gate(
         ctx, skill, drive_root, models, delivery, review_rebuttal, content_hash, persist=persist,
+        file_packs=file_packs,
     )
     if early_outcome is not None:
         return early_outcome
@@ -689,7 +691,7 @@ def review_skill(
     ]
     budget_block = (
         _review_wave_budget_block(ctx, skill.name, file_packs, api_models)
-        if api_models else None
+        if api_models and not getattr(ctx, "_skill_review_resume", None) else None
     )
     if budget_block is not None:
         return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING,
