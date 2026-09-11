@@ -1285,6 +1285,28 @@ def test_launcher_runtime_mode_bridge_saves_after_confirmation(monkeypatch):
     assert saved["OUROBOROS_RUNTIME_MODE"] == "pro"
 
 
+def test_launcher_owner_writer_persists_cyber_pro_after_boot_pin(isolated_settings, monkeypatch):
+    """The confirmed desktop-owner path must bypass the agent boot ratchet.
+
+    ``config.save_settings(..., allow_elevation=True)`` is intentionally inert
+    after boot.  The launcher must therefore use the existing owner settings
+    writer, otherwise a confirmed Cyber Pro choice is silently persisted as the
+    active Advanced mode again.
+    """
+    import launcher
+    from ouroboros import config as cfg
+
+    _seed_disk(isolated_settings, {"OUROBOROS_RUNTIME_MODE": "advanced"})
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    cfg.initialize_runtime_mode_baseline("advanced")
+
+    launcher._save_settings({"OUROBOROS_RUNTIME_MODE": "cyber_pro"})
+
+    on_disk = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert on_disk["OUROBOROS_RUNTIME_MODE"] == "cyber_pro"
+    assert os.environ["OUROBOROS_RUNTIME_MODE"] == "advanced"
+
+
 def test_launcher_runtime_mode_bridge_reports_pending_restart_against_active(monkeypatch):
     import launcher
 

@@ -852,8 +852,15 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict) -> None:
-    # Owner-process boundary: first-run/env/provider saves may elevate runtime mode.
-    save_settings(settings, allow_elevation=True)
+    # The desktop launcher is the owner-controlled writer.  The generic
+    # config.save_settings ratchet deliberately makes allow_elevation inert
+    # after boot, which is correct for agent-reachable callers but also made a
+    # confirmed Cyber Pro selection fall back to Advanced.  Reuse the existing
+    # owner writer so the confirmation is honored while its document lock,
+    # persistence normalization and other owner-only checks remain in force.
+    from ouroboros.gateway.owner_settings import _owner_write_settings
+
+    _owner_write_settings(settings)
 
 
 def _request_runtime_mode_change(mode: str, confirm_fn) -> dict:
