@@ -7,8 +7,9 @@ the raw pre-compaction bytes move verbatim into an append-only
 ``archive/usage_ledger/`` segment referenced (and hash-pinned) by the header.
 Nothing is deleted, in-flight rows never fold, idempotency-bearing kinds
 (subscription/external/legacy) never fold, and the pass commits ONLY after
-proving, on the candidate bytes, that the production aggregation renders
-byte-equal results — otherwise it aborts and the ledger stays byte-identical.
+proving, on the candidate bytes, that the production aggregation renders an
+identical NON-MONEY view and that the money itself is decimal-identical —
+otherwise it aborts and the ledger stays byte-identical.
 
 Monetary exactness rule (fixed by the design note): group sums are computed as
 exact ``Decimal``s of the literals stored in the file and carried on group
@@ -474,6 +475,30 @@ class _Group:
             )
 
 
+# The money keys every ``_summary`` carries — and therefore every
+# ``_breakdown_bucket``, which STARTS as one (``_usage_rows.py``). They are
+# projected out of the comparison below because ``_summary`` accumulates
+# dollars in BINARY floats and rounds at six places: the same history summed
+# as N per-row floats and as one exact per-group Decimal can round to either
+# side of the last digit. On the owner's live ledger that put 13 roots (51
+# buckets, 153 values) exactly 1e-6 apart and aborted a CORRECT fold every
+# time, holding the file at 77.8 MB against an 8 MB trigger. The answer is
+# not a tolerance: money is compared EXACTLY, one guard below, as decimals of
+# the literals actually stored.
+_FINGERPRINT_MONEY_KEYS = frozenset({
+    "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
+    "unresolved_upper_bound_usd", "accounted_usd",
+})
+
+
+def _without_money(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    """One summary/bucket as the NON-MONEY view its readers also consume."""
+    return {
+        key: value for key, value in bucket.items()
+        if key not in _FINGERPRINT_MONEY_KEYS
+    }
+
+
 def _render_fingerprint(finals: list) -> Dict[str, Any]:
     """The production-aggregation surfaces budget/display actually consume.
 
@@ -481,8 +506,14 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
     summaries + min known ``root_limit_usd``) and ``usage_breakdown`` (global
     bucket, per-axis buckets with the legacy/empty-key unattributed rule),
     built from the SAME ``_summary``/``_breakdown_bucket`` production
-    functions. Compared before/after on the candidate bytes; any inequality
-    aborts the compaction.
+    functions — minus the money keys (see above): the readers' NON-MONEY view
+    must be identical, and money is exact by Decimal in ``decimal_totals``.
+    What still has to match is everything a fold could actually lose: state
+    counts and their folded weights, physical calls, token sums, cache TTLs,
+    ``non_final_rows``/``cost_final``/``unknown_unmetered``, subscription
+    sessions and windows, the per-root minimum ``root_limit_usd``, and the
+    shape of every axis. Compared before/after on the candidate bytes; any
+    inequality aborts the compaction.
     """
     per_root: Dict[str, Any] = {}
     grouped_roots: Dict[str, list] = {}
@@ -497,7 +528,7 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             for value in (_number(row.get("root_limit_usd")) for row in rows)
             if value is not None
         ]
-        per_root[rid] = (_summary(rows), min(known) if known else None)
+        per_root[rid] = (_without_money(_summary(rows)), min(known) if known else None)
 
     def grouped(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         groups: Dict[str, list] = {}
@@ -509,14 +540,14 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             else:
                 groups.setdefault(key, []).append(row)
         return (
-            {key: _breakdown_bucket(groups[key]) for key in sorted(groups)},
-            _breakdown_bucket(unattributed),
+            {key: _without_money(_breakdown_bucket(groups[key])) for key in sorted(groups)},
+            _without_money(_breakdown_bucket(unattributed)),
         )
 
     return {
-        "summary": _summary(finals),
+        "summary": _without_money(_summary(finals)),
         "by_root": per_root,
-        "breakdown": _breakdown_bucket(finals),
+        "breakdown": _without_money(_breakdown_bucket(finals)),
         "axes": {
             field: grouped(field)
             for field in ("model", "provider", "category", "task_id", "root_task_id")
