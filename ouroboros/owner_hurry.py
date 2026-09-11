@@ -507,12 +507,17 @@ def force_plan_decision(
         "self_opened": not bool(metadata.get("force_plan")),
         **plan_review_gate_projection(state, effective, hard_rail=hard_rail),
     }
+    wave = {} if decision.get("closed") else (current_plan_review_wave(state) or {})
     if decision.get("reviewer_slots_degraded"):
         # The reminder's replay promise is conditional on the recorded wave's
         # structural health epoch (empty epoch = a re-dispatch is PAID), so the
         # epoch fact rides the decision for plan_review_reminder.
-        decision["degraded_health_epoch"] = (
-            (current_plan_review_wave(state) or {}).get("health_epoch") or "")
+        decision["degraded_health_epoch"] = wave.get("health_epoch") or ""
+    if wave.get("custody_pending"):
+        # A paid reviewer slot can still settle (plan_review_runtime records the
+        # wave DEGRADED and open for exactly that reason), so the disclosure must
+        # say a result is still owed instead of implying the panel is over.
+        decision["review_late_result_pending"] = True
     if hurry_armed and str(enforcement or "").lower() == "blocking":
         # Attribution only (task detail); the durable state and the configured
         # global enforcement are byte-identical before/after.
@@ -587,12 +592,21 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
     if decision.get("reviewer_slots_degraded"):
         outcome = f"{outcome or 'open'}; no parseable reviewer quorum"
     subject = "Blocking plan review" if decision.get("enforcement") == "blocking" else "Plan review"
+    # The wave is still OPEN at finalization, so the verb says so: "remained"
+    # told the owner a panel had ended that nobody had closed. When a paid slot
+    # can still settle, the same sentence carries that typed fact.
+    late = (
+        " A paid reviewer slot can still settle, so a late result is still owed."
+        if decision.get("review_late_result_pending") else ""
+    )
     if decision.get("status") == "rail_degraded":
-        rail_reason = str(forced_reason or decision.get("reason") or "task_rail")
+        rail_reason = str(forced_reason or decision.get("reason") or "")
         detail = f" ({outcome})" if outcome else ""
+        # An absent rail reason renders as absence, never as an internal token.
+        rail = f"the task-wide rail `{rail_reason}`" if rail_reason else "a task-wide rail"
         return (
-            f"\n\n⚠️ {subject} remained open{detail} when the task-wide rail "
-            f"`{rail_reason}` required best-effort finalization."
+            f"\n\n⚠️ {subject} is open{detail}; {rail} required best-effort "
+            f"finalization.{late}"
         )
     if decision.get("status") == "cycles_exhausted" and decision.get("enforcement") == "blocking":
         return (
@@ -613,8 +627,8 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
         )
     if decision.get("allow"):
         return (
-            f"\n\n⚠️ Plan review remained {outcome or 'unavailable'}; work proceeded under the "
-            "owner-selected advisory enforcement."
+            f"\n\n⚠️ Plan review is still open ({outcome or 'unavailable'}); work proceeded "
+            f"under the owner-selected advisory enforcement.{late}"
         )
     return ""
 

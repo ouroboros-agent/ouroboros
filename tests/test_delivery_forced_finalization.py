@@ -250,7 +250,9 @@ def test_blocking_open_plan_round_rail_preserves_useful_candidate(tmp_path, monk
     text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
 
     assert text.startswith("Useful verified work completed before the rail.")
-    assert "Blocking plan review remained open" in usage["terminal_host_notice"]
+    # The wave is still open at finalization, so the disclosure says so in the
+    # present tense: "remained" claimed a panel had ended that nobody closed.
+    assert "Blocking plan review is open" in usage["terminal_host_notice"]
     assert "`round_limit`" in usage["terminal_host_notice"]
     assert usage["reason_code"] == "round_limit"
 
