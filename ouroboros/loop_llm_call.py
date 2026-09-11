@@ -1504,7 +1504,6 @@ def call_llm_with_retry(
                 _emit_main_llm_call_state(event_queue, call_identity, "failed")
                 if event_type == "provider_incomplete_response" and not usage.get("provider_error"):
                     response_cache_bypass_requested = True
-                # fenced like any other class while the round holds an unresolved attempt
                 if not permanent_body_error and attempt < transient_budget - 1 and TRANSPORT_DEATHS_KEY not in accumulated_usage:
                     if _sleep_within_deadline(
                         min(2.0 ** attempt, _TRANSIENT_BACKOFF_CAP_SEC), deadline_ts
