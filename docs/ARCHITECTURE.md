@@ -599,7 +599,7 @@ Bundled resources use the §1 CLI/headless lookup order rather than assuming the
 │   │   ├── review_continuations/  ← durable blocked-review continuations (+ corrupt/ quarantine; archived/ holds settled un-resumed rows ≥7 days, never deleted)
 │   │   ├── workspace_executor_processes/ ← durable local/docker executor cleanup records
 │   │   ├── consciousness_observations.jsonl ← append-only inbox; rows retained until a settled successful cycle appends an ACK; malformed rows stay visible as source gaps
-│   │   ├── headless_tasks/<task_id>/data ← forked/empty child execution drives whose live per-call manifests are promoted at terminal (CLI / Headless Boundary above)
+│   │   ├── headless_tasks/<task_id>/data ← forked/empty child execution drives whose live per-call manifests are promoted at terminal; until then their refs are not resolvable by the canonical reader (#805; CLI / Headless Boundary above)
 │   │   ├── pycache/               ← embedded-interpreter bytecode (packaged builds; CLI / Headless Boundary above)
 │   │   ├── python-userbase/       ← embedded-interpreter user installs (packaged builds)
 │   │   ├── betterleaks/           ← versioned scanner runtime + archive cache, created only by the explicit source-checkout installer
@@ -1430,7 +1430,8 @@ of the exact account route, not CLI compaction thresholds. A manual value is a
 sizing assertion, not a provider unlock or a scope-review acknowledgement. Unknown
 capacity stays unknown; input size, response reservation and capacity are separate.
 Each model operation records its submitted options beside the engine's applied
-options; an absent applied-options report remains explicitly unknown.
+options; an absent applied-options report remains explicitly unknown, while the
+first mismatch in a task also produces one typed owner-visible notice.
 An account change rebinds preparation before another physical send.
 Ordinary sends, prospective wrap-up payloads and forced final replies share the
 same acting-role/account binding. Prospective subscription accounting uses the

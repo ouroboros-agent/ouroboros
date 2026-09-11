@@ -170,6 +170,31 @@ def test_fallback_notice_carries_lane_switch_incident_reason_and_pin(tmp_path, m
     }
 
 
+def test_api_fallback_notice_omits_inapplicable_account_clause(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai::alternate")
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    monkeypatch.setattr(loop, "_call_round_model", lambda _ctx: ({"role": "assistant"}, 0, "max"))
+    progress = []
+
+    loop_model_call._run_cross_model_fallback_chain(
+        llm=None, ctx=SimpleNamespace(active_model="primary", active_use_local=False),
+        tools=SimpleNamespace(_ctx=SimpleNamespace()), messages=[], active_model="primary",
+        active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+        drive_logs=tmp_path / "logs", task_id="task-7", round_idx=3, event_queue=None,
+        accumulated_usage={}, task_type="task",
+        emit_progress=lambda text, *, incident=None: progress.append(text),
+        context_fit_plan=None, active_context_mode="max",
+    )
+
+    assert len(progress) == 1
+    assert "account:" not in progress[0]
+
+
 # ---------------------------------------------------------------------------
 # Seam 2: the reviewer model lists (review_model_routes / reviewer slots).
 # ---------------------------------------------------------------------------

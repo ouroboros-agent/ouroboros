@@ -74,7 +74,7 @@ _PER_SUBJECT_REFUSALS = frozenset({
     "rate_limited", "subscription_window_exhausted",
 })
 _NON_PROVIDER_FAILURES = frozenset({
-    "model_operation_cancelled", "model_operation_interrupted", "model_outcome_unknown",
+    "model_operation_cancelled", "model_operation_interrupted",
 })
 
 
@@ -714,6 +714,7 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 invocation.acknowledge()
             updated = _reset_native(payload, error, invocation) if preparation == 0 else None
             if updated is None:
+                _remember_failed_profile(target, parameters, error)
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)
@@ -760,6 +761,7 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 await invocation.offload(invocation.acknowledge)
             updated = _reset_native(payload, error, invocation) if preparation == 0 else None
             if updated is None:
+                _remember_failed_profile(target, parameters, error)
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)

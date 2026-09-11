@@ -39,3 +39,30 @@ def test_main_loop_scopes_execution_affinity_to_claudexor(tmp_path):
 
     assert captured[0]["cache_affinity"] == "execution-7"
     assert captured[1]["cache_affinity"] == ""
+
+
+def test_main_loop_projects_claudexor_options_outside_the_route(tmp_path):
+    class LLM:
+        def chat(self, **_kwargs):
+            return ({"content": "done", "tool_calls": [], "finish_reason": "stop"}, {
+                "provider": "claudexor", "resolved_model": "claudexor::codex=model",
+                "cost": 0.0, "prompt_tokens": 1, "completion_tokens": 1,
+                "claudexor": {"route": {"credentialProfileId": "account-a"},
+                               "requested_options": {"reasoningEffort": "high"},
+                               "applied_options": {"reasoningEffort": "medium"},
+                               "options_honored": "mismatch"},
+            })
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    usage = {"execution_id": "execution-7"}
+    call_llm_with_retry(LLM(), [{"role": "user", "content": "work"}],
+                        "claudexor::codex=model", None, "high", 1,
+                        logs, "task", 1, queue.Queue(), usage)
+
+    assert usage["_model_route"] == {"credentialProfileId": "account-a"}
+    assert usage["_options"] == {
+        "requested_options": {"reasoningEffort": "high"},
+        "applied_options": {"reasoningEffort": "medium"},
+        "options_honored": "mismatch",
+    }

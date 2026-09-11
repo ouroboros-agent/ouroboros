@@ -460,6 +460,24 @@ def test_proven_not_started_releases_and_never_fabricates_provider_usage(setup):
     assert len(gateway.operations) == 1
 
 
+def test_typed_subject_refusal_suppresses_next_auto_preference(setup):
+    _, gateway, client = setup
+    refusal = result(outcome="failed", problem={
+        "code": "subscription_window_exhausted", "message": "window spent",
+        "context": {"httpStatus": 429},
+    })
+    gateway.results = [refusal, result()]
+    gateway.dispatch = ["not_started", "response_received"]
+    messages = [result()["message"]]
+
+    with pytest.raises(transport.ClaudexorModelNotDispatched):
+        client.chat(messages, MODEL, cache_affinity="execution-refusal")
+    client.chat(messages, MODEL, cache_affinity="execution-refusal")
+
+    assert gateway.uploads[0][0]["account"]["preferredProfileId"] == "account-a"
+    assert gateway.uploads[1][0]["account"] == {"mode": "auto"}
+
+
 @pytest.mark.parametrize("change", [{"credentialProfileId": "account-b", "accountFingerprint": "fingerprint-b"},
                                      {"model": None}, {"source": "different-source"}])
 def test_native_reset_requires_actual_account_change_and_keeps_canonical_tools(setup, change):

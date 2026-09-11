@@ -101,6 +101,7 @@ def _run_cross_model_fallback_chain(
     from ouroboros.config import fallback_candidate_targets
     from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, parse_fallback_chain
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
+    from ouroboros.provider_models import provider_for_model
 
     def _cooled(model: str, use_local: bool) -> None:
         if str(accumulated_usage.get("_last_llm_error_kind") or "") in _cooldown_kinds:
@@ -131,9 +132,12 @@ def _run_cross_model_fallback_chain(
         ptag = " (local)" if active_use_local else ""
         ftag = " (local)" if fallback_use_local else ""
         fallback_account = str(model_role_option(MODEL_ACCOUNTS_KEY, fallback_role) or "")
+        account_route = provider_for_model(fallback_model) == "claudexor"
+        account_note = f"; account: {fallback_account or 'Auto'}" if account_route else ""
         reason = str(accumulated_usage.get("_last_llm_error_kind") or "")
-        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}; account: {fallback_account or 'Auto'}"
-                      f"{f'; reason: {reason}' if reason else ''}{'; pinned account: siblings were not tried' if fallback_account else ''}",
+        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}"
+                      f"{account_note}"
+                      f"{f'; reason: {reason}' if reason else ''}{'; pinned account: siblings were not tried' if account_route and fallback_account else ''}",
                       incident={"task_incident": "model_lane_switch", "toast_once": f"{task_id}:model_lane_switch:{round_idx}:{fallback_model}"})
         # Cross-FAMILY fallback must not replay the primary's
         # provider-private reasoning to a different family (the GLM->Claude
@@ -437,7 +441,7 @@ def _dispatch_round_model(
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
 ) -> Tuple[Any, float]:
     from ouroboros.model_wait import current_model_wait
-    from ouroboros.loop_transport import managed_transport_continuation, transport_repeat_stop_requested
+    from ouroboros.loop_transport import emit_model_effort_mismatch, managed_transport_continuation, transport_repeat_stop_requested
     from ouroboros.owner_mailbox import OwnerMailboxPeek
 
     mailbox_peek = OwnerMailboxPeek()
@@ -482,6 +486,8 @@ def _dispatch_round_model(
             use_local=ctx.active_use_local, preferred_mode=ctx.active_context_mode,
             tool_schemas=ctx.tool_schemas, model_role=role, model_route=observed,
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
+    emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id,
+                               emit_progress=getattr(getattr(ctx.tools, "_ctx", None), "emit_progress_fn", None))
     call = ctx.accumulated_usage.get("_last_llm_call_meta")
     execution_id = ctx.accumulated_usage.get("execution_id")
     if (result[0] is not None and isinstance(call, dict) and call is not previous_call

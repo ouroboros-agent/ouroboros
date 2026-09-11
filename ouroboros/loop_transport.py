@@ -270,7 +270,7 @@ def reconcile_transport_wait(
     drive_logs: pathlib.Path,
     task_id: str,
     model: str,
-    emit_progress: Callable[..., None],
+    emit_progress: Optional[Callable[..., None]],
     after_local_pass: bool = False,
 ) -> Optional[TransportWaitEpisode]:
     """Reconcile the episode latch with one dispatch outcome.
@@ -504,7 +504,7 @@ def transport_wait_step(
     drive_logs: pathlib.Path,
     task_id: str,
     model: str,
-    emit_progress: Callable[..., None],
+    emit_progress: Optional[Callable[..., None]],
     incoming_messages: Optional[queue.Queue],
     owner_msg_seen: Optional[set],
 ) -> bool:
@@ -775,6 +775,30 @@ def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
     if not detail:
         return ""
     return f" Last provider error: {detail}"
+
+
+def emit_model_effort_mismatch(
+    accumulated_usage: Dict[str, Any], *, task_id: str, emit_progress: Optional[Callable[..., None]],
+) -> None:
+    """Disclose the first engine-applied option mismatch of a task."""
+    options = accumulated_usage.get("_options")
+    if (emit_progress is None or not isinstance(options, dict)
+            or options.get("options_honored") != "mismatch"
+            or accumulated_usage.get("_options_mismatch_notified")):
+        return
+    requested = options.get("requested_options") or {}
+    applied = options.get("applied_options") or {}
+    requested_effort = str(requested.get("reasoningEffort") or "unknown")
+    applied_effort = str(applied.get("reasoningEffort") or "unknown")
+    route = accumulated_usage.get("_model_route") or {}
+    account = str(route.get("credentialProfileId") or "")
+    accumulated_usage["_options_mismatch_notified"] = True
+    emit_progress(
+        f"⚠️ Claudexor served at {applied_effort} effort while {requested_effort} was requested"
+        f"{f' (Claudexor account {account})' if account else ''}.",
+        incident={"task_incident": "model_effort_mismatch",
+                  "toast_once": f"{task_id}:model_effort_mismatch"},
+    )
 
 
 def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:

@@ -2149,7 +2149,8 @@ Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_
   by their caller according to transport capability; explicit unsupported options
   refuse, rather than being silently removed and retried. Record submitted model
   options beside the engine's applied options on the usage row; an absent report
-  stays unknown and a mismatch is disclosure, never a dispatch gate.
+  stays unknown, while the first mismatch in a task also emits one typed owner
+  line. A mismatch is disclosure, never a dispatch gate.
 - The engine's active-turn token is one of those transport facts, so the CALLER
   owns its slot (`llm_claudexor.ModelTurnState` on the loop context, a wake-scoped
   one in Background Consciousness) and the engine boundary is its only writer.
@@ -2424,7 +2425,8 @@ by "Provider Independence" above. Call-site imperatives:
   production implementation and a test fake mirrors it
   (`lambda text, *, incident=None: ...`). A cross-model lane switch is the
   second owner note carrying this pair; it names both models, the selected
-  account, and the typed failure reason when the round record has one.
+  account when that route has accounts, and the typed failure reason when the
+  round record has one.
 - Timeout contract classes differ; keep the axes separate. A transport
   timeout only bounds a dead socket
   (`OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC`) — it is not a reasoning cutoff

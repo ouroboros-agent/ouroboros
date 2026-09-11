@@ -164,6 +164,7 @@ def test_status_null_failure_suppresses_only_the_next_same_route_preference():
     error = ClaudexorModelError(
         {"code": "server_error", "message": "stream ended"},
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
+        unknown=True,
     )
     _remember_failed_profile(target, parameters, error)
 

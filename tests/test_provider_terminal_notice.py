@@ -178,6 +178,57 @@ def test_provider_terminal_text_claims_only_recorded_recovery_facts():
     assert "same-model reroute" not in unknown
 
 
+@pytest.mark.parametrize("honored", ["confirmed", "unknown"])
+def test_applied_options_without_mismatch_emit_no_owner_line(honored):
+    progress = []
+    usage = {"_options": {"options_honored": honored}}
+
+    loop_transport.emit_model_effort_mismatch(
+        usage, task_id="task-7",
+        emit_progress=lambda text, *, incident=None: progress.append((text, incident)),
+    )
+
+    assert progress == []
+
+
+def test_effort_mismatch_emits_one_typed_owner_line_per_task(tmp_path, monkeypatch):
+    progress = []
+    applied_values = iter(("medium", "low"))
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.emit_progress_fn = lambda text, *, incident=None: progress.append((text, incident))
+    ctx = SimpleNamespace(
+        llm=None, messages=[], tools=registry, context_fit_plan=None,
+        active_model="claudexor::codex=model", tool_schemas=[], active_effort="high",
+        max_retries=1, drive_logs=tmp_path / "logs", task_id="task-7", round_idx=1,
+        event_queue=None, accumulated_usage={}, task_type="task", active_use_local=False,
+        active_context_mode="max", model_role="main",
+    )
+
+    def call(_llm, _messages, _model, _tools, _effort, _retries, _logs, _tid,
+             _round, _queue, usage, *_args, **_kwargs):
+        usage["_options"] = {
+            "requested_options": {"reasoningEffort": "high"},
+            "applied_options": {"reasoningEffort": next(applied_values)},
+            "options_honored": "mismatch",
+        }
+        usage["_model_route"] = {"credentialProfileId": "account-a"}
+        return {"role": "assistant", "content": "done"}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", call)
+    monkeypatch.setattr(loop, "_server_web_allowed_by_task", lambda _ctx: False)
+    loop._dispatch_round_model(ctx, None, attempt_cap=None)
+    loop._dispatch_round_model(ctx, None, attempt_cap=None)
+
+    assert len(progress) == 1
+    text, incident = progress[0]
+    assert "served at medium effort while high was requested" in text
+    assert "Claudexor account account-a" in text
+    assert incident == {
+        "task_incident": "model_effort_mismatch",
+        "toast_once": "task-7:model_effort_mismatch",
+    }
+
+
 def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, monkeypatch):
     from ouroboros.utils import sanitize_tool_result_for_log
     from tests.test_transport_death_retry import _ScriptedLLM, _death, _primary_call
