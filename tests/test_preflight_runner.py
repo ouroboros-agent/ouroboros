@@ -3,6 +3,7 @@ import inspect
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -220,7 +221,7 @@ def test_default_addopts_carry_the_durations_report():
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     addopts = re.search(r"^addopts\s*=\s*\"(.*)\"\s*$", pyproject, re.MULTILINE)
     assert addopts, "pyproject.toml addopts line not found"
-    flags = addopts.group(1)
+    flags = shlex.split(addopts.group(1))
     assert "--durations=25" in flags, f"addopts carries no slowest-test report: {flags!r}"
     assert "--durations-min=1.0" in flags, f"addopts reports durations without a floor: {flags!r}"
 
