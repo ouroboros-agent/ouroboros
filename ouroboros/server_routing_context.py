@@ -285,8 +285,17 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         results_error = f"result_directory_unreadable: {exc}"
     ordered = sorted(facts, key=lambda name: facts[name]["ts"] or facts[name]["updated_at"], reverse=True)
     finals = []
+    children = 0
     for name in ordered:
         if facts[name]["schema_refusal"]:
+            continue
+        # Only the owner's ROOT results are addressable predecessors (owner decision
+        # batch 3, answer 6b=A): a swarm wave's children are the newest results of
+        # ANY kind, so they evicted the owner's own roots from this window - which is
+        # how a root the same actor had just read stopped being offerable. The facts
+        # are already memoized, so the filter costs no extra read.
+        if facts[name]["parent_task_id"] or facts[name]["delegation_role"] == "subagent":
+            children += 1
             continue
         row = load_task_result(ctx.DRIVE_ROOT, pathlib.Path(name).stem)
         if row is not None:
@@ -321,8 +330,11 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         "omissions": {
             "projects": max(0, len(projects) - 40),
             "root_tasks": max(0, len(roots) - 40),
-            "final_results": None if unreadable else max(0, len(facts) - len(finals)),
+            # Kept meaning: results cut by the 16 cap. The children skipped above are
+            # a DIFFERENT omission and are counted as such, never folded in here.
+            "final_results": None if unreadable else max(0, len(facts) - children - len(finals)),
             "final_results_error": results_error,
+            "children": None if unreadable else children,
             # A bounded read cannot count bytes/rows it deliberately did not
             # visit. The exact historical messages remain available by id.
             "dialogue_rows": None,

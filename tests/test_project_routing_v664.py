@@ -686,6 +686,101 @@ def test_main_manifest_carries_working_dir_and_workspace_facts(tmp_path):
     assert final["workspace_mode"] == "external"
 
 
+def test_main_manifest_offers_owner_roots_not_swarm_children(tmp_path):
+    """I29 (owner decision batch 3, answer 6b=A): the predecessor window held the 16
+    newest results of ANY kind, so one swarm wave's children evicted the owner's own
+    roots and a result the owner had just read could not be continued from. Children
+    are skipped and counted as their OWN omission; the final_results count keeps its
+    cap-only meaning."""
+    import os
+
+    import server
+    from ouroboros.task_results import task_result_path, write_task_result
+
+    for index in range(16):
+        tid = f"root{index:02d}"
+        write_task_result(tmp_path, tid, "completed", objective=f"owner work {index}",
+                          ts=f"2026-08-10T00:00:{index:02d}Z")
+        os.utime(task_result_path(tmp_path, tid, create=False), (100 + index, 100 + index))
+    for index in range(2):
+        tid = f"child{index}"
+        write_task_result(tmp_path, tid, "completed", objective="helper work",
+                          parent_task_id="root15", root_task_id="root15",
+                          delegation_role="subagent", ts=f"2026-08-11T00:00:{index:02d}Z")
+        os.utime(task_result_path(tmp_path, tid, create=False), (900 + index, 900 + index))
+
+    manifest = server._main_routing_manifest(_ctx(tmp_path))
+    offered = [row["task_id"] for row in manifest["final_results"]]
+
+    assert len(offered) == 16
+    assert not [tid for tid in offered if tid.startswith("child")]
+    # The OLDEST owner root survives the cap the two children used to consume.
+    assert "root00" in offered
+    assert manifest["omissions"]["children"] == 2
+    assert manifest["omissions"]["final_results"] == 0
+
+
+def test_project_room_direct_chat_root_is_admitted_as_a_predecessor(tmp_path):
+    """The second half of the traced refusal (I29): a project room's direct-chat
+    root left the per-project pointer empty, so the room's own decision turn had no
+    predecessor to offer. With the pointer stamped, the promote admits it."""
+    import server
+    from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
+    from ouroboros.tools.control_routing import _attach_predecessor_authority_from_metadata
+    from ouroboros.tools.project_journal import record_project_last_result
+
+    project = create_project(tmp_path, "racer", name="Racer")
+    write_task_result(tmp_path, "roomturn1", "completed", project_id="racer",
+                      objective="answer in the room", ts="2026-08-10T00:00:01Z")
+    record_project_last_result("racer", "roomturn1", tmp_path)
+
+    metadata = server._decision_turn_metadata(
+        _ctx(tmp_path), int(project["chat_id"]), "room-1", {"project_id": "racer"},
+    )
+    assert metadata["project_last_task_result"]["task_id"] == "roomturn1"
+
+    evt: dict = {}
+    refusal = _attach_predecessor_authority_from_metadata(
+        types.SimpleNamespace(task_metadata=metadata, drive_root=tmp_path,
+                              budget_drive_root=str(tmp_path)),
+        evt, "roomturn1",
+    )
+    assert refusal == ""
+    assert evt["predecessor_task_id"] == "roomturn1"
+
+
+def test_promoting_from_an_owner_root_still_succeeds_after_the_child_filter(tmp_path):
+    """CHECKLISTS item 21 positive path: the narrowing removes CHILDREN from the
+    predecessor window, and the owner's own root result stays fully promotable
+    through the same manifest -> authority route."""
+    import server
+    from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
+    from ouroboros.tools.control_routing import _attach_predecessor_authority_from_metadata
+
+    create_project(tmp_path, "racer", name="Racer")  # keeps the Main manifest non-empty
+    write_task_result(tmp_path, "ownerroot1", "completed", objective="the owner's work",
+                      ts="2026-08-10T00:00:01Z")
+    write_task_result(tmp_path, "helper1", "completed", objective="helper work",
+                      parent_task_id="ownerroot1", root_task_id="ownerroot1",
+                      delegation_role="subagent", ts="2026-08-10T00:00:02Z")
+
+    metadata = server._decision_turn_metadata(_ctx(tmp_path), 1, "msg-1", {})
+    offered = [row["task_id"] for row in metadata["main_routing_manifest"]["final_results"]]
+    assert offered == ["ownerroot1"]
+
+    evt: dict = {}
+    refusal = _attach_predecessor_authority_from_metadata(
+        types.SimpleNamespace(task_metadata=metadata, drive_root=tmp_path,
+                              budget_drive_root=str(tmp_path)),
+        evt, "ownerroot1",
+    )
+    assert refusal == ""
+    assert evt["predecessor_task_id"] == "ownerroot1"
+    assert evt["predecessor_authority_source"]["tool"] == "get_task_result"
+
+
 def test_project_swarm_keeps_host_scope_when_registry_recheck_is_unavailable(
     tmp_path, monkeypatch,
 ):

@@ -582,6 +582,31 @@ class TestProjectLastResultPointer:
 
         assert get_project(tmp_path, "slime")["last_task_result_id"] == "task42"
 
+    def test_project_room_direct_chat_root_stamps_the_pointer(self, tmp_path, monkeypatch):
+        """I29: a project ROOM's direct-chat root writes a durable result carrying
+        project_id, but wrote no pointer - so the per-project fallback for "continue
+        from this result" was empty too, and a promote from that room found nothing.
+        The pointer is stamped; the deliberate letters-home exclusion stands."""
+        import ouroboros.agent_task_pipeline as atp
+        import ouroboros.config as cfg
+        from ouroboros.projects_registry import create_project, get_project
+
+        drive_root, _logs = _make_drive(tmp_path)
+        env, memory, ctx = _make_fake_env(drive_root)
+        monkeypatch.setattr(cfg, "DATA_DIR", drive_root)
+        monkeypatch.setattr(atp, "_run_post_task_processing_async", lambda *a, **kw: None)
+        project = create_project(drive_root, "slime", name="Slime")
+        pending: list = []
+
+        task = {"id": "roomturn1", "type": "task", "chat_id": project["chat_id"],
+                "project_id": "slime", "_is_direct_chat": True, "text": "how is it going?"}
+        _emit(atp, env, memory, ctx, pending, task, queue.Queue(), text="Fine.")
+
+        assert get_project(drive_root, "slime")["last_task_result_id"] == "roomturn1"
+        # Still NOT a letters-home task: no journal milestone, no digest.
+        assert not [e for e in pending if e.get("type") == "project_digest"]
+        assert not (drive_root / "projects" / "slime" / "journal.jsonl").exists()
+
 
 class TestProjectReflectionsReadBack:
     """A project-bound context must include the project's OWN full reflections
