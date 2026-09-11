@@ -977,9 +977,9 @@ def _loop_usage_snapshot(usage: Dict[str, Any], resource_limit: Dict[str, Any]) 
             round(float(usage["cost"]), 6)
             if usage.get("cost") is not None else None
         ),
-        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-        "completion_tokens": int(usage.get("completion_tokens") or 0),
-        "total_rounds": int(usage.get("rounds") or 0),
+        "prompt_tokens": None if usage.get("loop_evidence_unavailable") else int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": None if usage.get("loop_evidence_unavailable") else int(usage.get("completion_tokens") or 0),
+        "total_rounds": None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0),
         **({"resource_limit": resource_limit} if resource_limit else {}),
     }
 

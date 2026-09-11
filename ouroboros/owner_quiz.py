@@ -21,7 +21,7 @@ like the hurry projection):
 
 Structural expiry only (owner decision 30=A): a quiz dies with its author —
 ``reconcile_terminal`` runs on the task-done seam; there is no host TTL.
-The writer mutates ONLY the ``owner_quiz`` key via ``update_json_locked``
+The writers mutate ``owner_quiz`` and its paired terminal ``owner_wait`` via ``update_json_locked``
 (never ``write_task_result`` — its status-regression guard can drop the
 write), so concurrent terminal writers merge around it.
 """
@@ -224,10 +224,11 @@ def reconcile_terminal(drive_root: Any, task_id: str) -> List[str]:
                 block.update({"state": STATE_EXPIRED_TERMINAL, "reconciled_at": stamp})
                 expired.append(str(key))
                 terminal_quizzes.append(str(key))
-            elif state == STATE_EXPIRED_TERMINAL:
+            elif state in (STATE_EXPIRED_TERMINAL, STATE_ANSWERED):
                 # A previous call may have committed quiz expiry before the
                 # paired task-result repair failed. Keep the second pass
-                # idempotent so it can close the wait without a new quiz event.
+                # idempotent; an accepted answer can also await worker capacity
+                # when the task ends. Neither case rewrites the quiz's answer.
                 terminal_quizzes.append(str(key))
         return True if expired else _KEEP
 

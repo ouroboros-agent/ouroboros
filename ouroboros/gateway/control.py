@@ -497,17 +497,6 @@ def _rollback_fenced_update(reason: str, error: str, **extra: Any) -> JSONRespon
 
 
 def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONResponse:
-    # Managed update prepared owner-wait/restart custody before stopping the
-    # pool.  Arm the existing one-shot transaction token immediately before
-    # asking the server to re-exec, so direct-server mode can acknowledge the
-    # same transaction on the successor (launcher mode uses exit code 42).
-    try:
-        from supervisor.git_ops import DRIVE_ROOT
-        from ouroboros.delegate_recovery import arm_active_planned_restart_transaction
-
-        arm_active_planned_restart_transaction(DRIVE_ROOT)
-    except Exception:
-        log.warning("managed update restart transaction could not be armed", exc_info=True)
     try:
         restarting = _request_restart(request)
     except Exception as exc:

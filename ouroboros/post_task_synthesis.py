@@ -43,6 +43,8 @@ def _atp():
 
 def build_trace_summary(llm_trace: dict) -> str:
     """Return a compact human-readable summary of tool calls and agent notes."""
+    if llm_trace.get("loop_evidence_unavailable"):
+        return "## Tool trace (call count unknown)\nThe failed loop supplied no verified execution trace."
     tool_calls = llm_trace.get("tool_calls", []) or []
     notes = llm_trace.get("reasoning_notes", []) or []
 
@@ -289,8 +291,9 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
         task_id = str(task.get("id") or "unknown")
         canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
         summary_id = f"task-narrative:{task_id}"
-        n_tool_calls = len(llm_trace.get("tool_calls", []) or [])
-        rounds = int(usage.get("rounds") or 0)
+        n_tool_calls = None if llm_trace.get("loop_evidence_unavailable") else len(llm_trace.get("tool_calls", []) or [])
+        rounds = None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0)
+        round_text = "round count unknown" if rounds is None else f"{rounds}r"
         cost_text = _synthesis_cost_text(usage)
         outcome_axes = normalize_outcome_axes(usage)
         reason_code = str(usage.get("reason_code") or "")
@@ -316,11 +319,11 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 canonical_root, result_root, row, status=str(stored_result.get("status") or ""),
             )
         # Skip LLM summary for trivial tasks.
-        if n_tool_calls == 0 and rounds <= 1:
+        if n_tool_calls in (None, 0) and (rounds is None or rounds <= 1):
             goal = _truncate_with_notice(task.get("text", ""), 200)
             summary_text = (
                 f"Task {task_id} ({task.get('type', 'user')}): "
-                f"{goal}. {rounds}r, {cost_text}." + project_thread_note_for_task(task)
+                f"{goal}. {round_text}, {cost_text}." + project_thread_note_for_task(task)
             )
             _append_summary(summary_text)
             return
@@ -335,7 +338,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
             review_section = "(review evidence unavailable)"
         prompt = _TASK_SUMMARY_PROMPT.format(
             task_id=task_id, goal=goal or "(no goal text)",
-            task_type=task.get("type", "user"), rounds=rounds,
+            task_type=task.get("type", "user"), rounds="unknown" if rounds is None else rounds,
             cost_text=cost_text,
             usage_snapshot=_synthesis_usage_snapshot_text(usage),
             sealed_final=sealed_final_prompt_section(sealed_final),
@@ -364,7 +367,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
             log.warning("Task summary LLM call failed, using fallback", exc_info=True)
             summary_text = (
                 f"Task {task_id} ({task.get('type', 'user')}): "
-                f"{_truncate_with_notice(goal, 200)}. {rounds}r, {cost_text}."
+                f"{_truncate_with_notice(goal, 200)}. {round_text}, {cost_text}."
             )
         if summary_text:
             summary_text += project_thread_note_for_task(task)

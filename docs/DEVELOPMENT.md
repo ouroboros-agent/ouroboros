@@ -1894,6 +1894,11 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   plus execution root, task, attempt and seen ids. Read/parse/stat failure or torn
   data is not proof; never cache it. Check the in-memory incoming queue every tick.
   A changed source re-enters the full revocation-aware reader; no TTL or ACK in peek.
+- Terminal quiz reconciliation closes the paired wait even if the answer arrived
+  before worker capacity was granted; keep the answer and source unchanged. A
+  failed loop without captured evidence reports unknown counts through the existing
+  summary/outcome/metrics producers. Never infer zero work or read an unverified
+  checkpoint to fill the gap (`tests/test_autonomy_review_fixes.py`).
 - Cancellation observations use `task_status.observe_cancellation_target` before
   the existing intent write. They name the resolved physical target, separate
   task-result update/start facts from queue freshness, and optionally include

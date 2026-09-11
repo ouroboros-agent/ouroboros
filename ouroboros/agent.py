@@ -87,6 +87,46 @@ def _authority_source_terminal(refusal: Dict[str, Any]):
     return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
 
 
+def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, drive_logs: pathlib.Path):
+    """Project captured loop evidence, or its explicit absence, without recovery.
+
+    A failed cold-source read is never permission to read unverified checkpoint
+    bytes as usage. The loop tally stays in loop_outcome; top-level money and
+    counters remain the existing ledger reconstruction's answer.
+    """
+    captured_usage = getattr(exc, "_ouroboros_loop_usage", None)
+    captured_trace = getattr(exc, "_ouroboros_loop_trace", None)
+    usage = dict(captured_usage) if isinstance(captured_usage, dict) else {"loop_evidence_unavailable": True}
+    llm_trace = captured_trace if isinstance(captured_trace, dict) else {
+        "reasoning_notes": [], "tool_calls": [], "loop_evidence_unavailable": True,
+    }
+    usage.update(execution_status="infra_failed", reason_code="task_exception")
+    text = f"⚠️ Error during processing: {type(exc).__name__}: {exc}"
+    append_jsonl(drive_logs / "events.jsonl", {
+        "ts": utc_now_iso(), "type": "task_error", "task_id": task.get("id"),
+        "error": repr(exc), "traceback": truncate_for_log(traceback.format_exc(), 2000),
+    })
+    try:
+        from ouroboros.outcomes import collect_trace_refs, derive_loop_outcome
+        from ouroboros.agent_task_pipeline import build_trace_summary
+        from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+        # Ephemeral decision turns leave no durable task result, including errors.
+        if not bool(task.get("_ephemeral_turn")):
+            loop_outcome = derive_loop_outcome(text, usage, llm_trace)
+            write_task_result(
+                env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
+                result=text, reason_code="task_exception", loop_outcome=loop_outcome,
+                outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
+                    "task_exception", review_trigger="agent_exception"),
+                trace_summary=build_trace_summary(llm_trace),
+                trace_refs=loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace),
+            )
+    except Exception:
+        log.debug("Failed to persist task exception projection", exc_info=True)
+    return text, usage, llm_trace
+
+
 def _sync_task_project_scope(task: Dict[str, Any], ctx: Any) -> None:
     project_id = str(getattr(ctx, "project_id", "") or "").strip()
     if project_id and not str(task.get("project_id") or "").strip():
@@ -926,53 +966,7 @@ class OuroborosAgent:
                             # Empty events leave its queue slot/project owned until
                             # supervisor cancellation kills and settles this task.
                             return []
-                    tb = traceback.format_exc()
-                    append_jsonl(drive_logs / "events.jsonl", {
-                        "ts": utc_now_iso(), "type": "task_error",
-                        "task_id": task.get("id"), "error": repr(e),
-                        "traceback": truncate_for_log(tb, 2000),
-                    })
-                    text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
-                    captured_usage = getattr(e, "_ouroboros_loop_usage", None)
-                    captured_trace = getattr(e, "_ouroboros_loop_trace", None)
-                    if isinstance(captured_usage, dict):
-                        usage = dict(captured_usage)
-                    else:
-                        usage = {}
-                    if isinstance(captured_trace, dict):
-                        llm_trace = captured_trace
-                    usage.update(
-                        execution_status="infra_failed",
-                        reason_code="task_exception",
-                    )
-                    try:
-                        from ouroboros.outcomes import collect_trace_refs, derive_loop_outcome
-                        from ouroboros.agent_task_pipeline import build_trace_summary
-                        from ouroboros.task_results import STATUS_FAILED, write_task_result
-                        # CW3: an ephemeral decision turn leaves no durable task_result even on error.
-                        if not bool(task.get("_ephemeral_turn")):
-                            # The loop's own tally rides ``loop_outcome.usage``
-                            # (ABI-3's honest loop plane); the top-level
-                            # total_rounds/prompt_tokens/completion_tokens stay
-                            # the LEDGER's answer, written by the finalization
-                            # pipeline from reconstruct_task_cost.
-                            loop_outcome = derive_loop_outcome(text, usage, llm_trace)
-                            trace_refs = loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace)
-                            write_task_result(
-                                self.env.drive_root,
-                                str(task.get("id") or ""),
-                                STATUS_FAILED,
-                                result=text,
-                                reason_code="task_exception",
-                                outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
-                                    "task_exception", review_trigger="agent_exception",
-                                ),
-                                loop_outcome=loop_outcome,
-                                trace_summary=build_trace_summary(llm_trace),
-                                trace_refs=trace_refs,
-                            )
-                    except Exception:
-                        pass
+                    text, usage, llm_trace = _task_exception_terminal(self.env, task, e, drive_logs)
                     try:
                         from ouroboros.task_continuation import capture_review_continuation_from_state
                         capture_review_continuation_from_state(

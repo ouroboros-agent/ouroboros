@@ -19,6 +19,8 @@ from typing import Any
 
 from ouroboros.server_process import DATA_DIR, _owner_restart_requested, _restart_requested, log
 
+_RESTARTABLE_UPDATE_PHASES = frozenset({"pending_boot_smoke", "applying_replace"})
+
 
 def _owned_live_task_ids(ctx: Any) -> list:
     """Every id this generation's cancel intent can address: pooled tasks,
@@ -225,8 +227,7 @@ def _safe_restart_serialized(safe_restart_fn, *, reason: str, unsynced_policy: s
                 "An update intent marker with no update transaction could not be removed; "
                 "restart was deferred rather than applying an orphaned update."
             )
-        allowed_phases = {"pending_boot_smoke", "applying_replace"}
-        if status == "valid" and str(tx.get("phase") or "") not in allowed_phases:
+        if status == "valid" and str(tx.get("phase") or "") not in _RESTARTABLE_UPDATE_PHASES:
             return False, "Managed update merge is still being resolved; restart was deferred."
         return safe_restart_fn(reason=reason, unsynced_policy=unsynced_policy)
     finally:

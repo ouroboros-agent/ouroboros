@@ -514,6 +514,8 @@ def emit_task_results(
     n_tool_calls = len(llm_trace.get("tool_calls", []))
     n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
                         if isinstance(tc, dict) and tc.get("is_error"))
+    if llm_trace.get("loop_evidence_unavailable"):
+        n_tool_calls = n_tool_errors = None
     try:
         from supervisor.state import reconstruct_task_cost
 
