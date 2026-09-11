@@ -46,6 +46,11 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     assert content.startswith("[SWARM_INITIATIVE]")
     assert "Source: swarm." in content
     assert f"Resolved review enforcement: {enforcement}." in content
+    # The obligation is constitutional (BIBLE P3) and the gate is structural
+    # (owner_hurry.force_plan_decision); the ORDER of asking, exploring and
+    # planning belongs to the mind (BIBLE P5/P13), never to a prompt choreography.
+    assert "First call plan_task" not in content
+    assert "whether to ask, explore or plan first is your judgment" in content
     assert "Under blocking" in content
     assert "non-mutating preparation" in content
     assert "begin implementation only after review closes" in content
