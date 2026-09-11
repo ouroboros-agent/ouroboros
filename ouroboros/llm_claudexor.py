@@ -292,10 +292,10 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
     account = {"mode": "pin", "profileId": pin} if pin else {"mode": "auto"}
     failed = _FAILED_PROFILE.get()
     failed_key = (parameters.get("cache_affinity"), target["source"], target["resolved_model"])
-    same_execution = len(failed) == 4 and failed[0] == failed_key[0]
-    failed_profile = failed[3] if same_execution and failed[:3] == failed_key else ""
-    if same_execution:
-        _FAILED_PROFILE.set(())  # one request only; Pin still consumes the failure fact
+    same_route = len(failed) == 4 and failed[:3] == failed_key
+    failed_profile = failed[3] if same_route else ""
+    if same_route:
+        _FAILED_PROFILE.set(())  # the next matching-route request only; Pin still consumes it
     if not pin:
         # Carry the conversation's last account as a preference, not admission.
         # The engine is still the only actor choosing an eligible account.

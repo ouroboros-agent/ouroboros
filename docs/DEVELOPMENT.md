@@ -2034,7 +2034,7 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   slug plus a conflicting separate effort is a validation error, never two
   applied efforts.
   On the Auto lane, the host may prefer the last successful same-route account.
-  After a status-null or typed per-subject refusal, only the next request in the
+  After a status-null or typed per-subject refusal, only the next matching-route request in the
   same execution omits that preference and lets the engine choose; without an
   engine refusal fact, selecting a sibling is possible, not guaranteed. Pin
   remains exact and never rotates. `OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL=1`

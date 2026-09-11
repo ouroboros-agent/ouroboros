@@ -140,12 +140,12 @@ def test_model_invocation_records_requested_and_applied_options(applied, expecte
     assert observed["options_honored"] == expected
 
 
-def _continuation(profile="profile-a"):
+def _continuation(profile="profile-a", source="codex", model="gpt-6"):
     return [{
         "role": "assistant",
         "content": "prior answer",
         "nativeContinuation": {"route": {
-            "source": "codex", "model": "gpt-6", "credentialProfileId": profile,
+            "source": source, "model": model, "credentialProfileId": profile,
         }},
     }]
 
@@ -168,6 +168,27 @@ def test_status_null_failure_suppresses_only_the_next_same_route_preference():
     )
     _remember_failed_profile(target, parameters, error)
 
+    assert _request(target, _continuation(), None, parameters)["account"] == {"mode": "auto"}
+    assert _request(target, _continuation(), None, parameters)["account"] == {
+        "mode": "auto", "preferredProfileId": "profile-a",
+    }
+
+
+def test_failure_fact_survives_an_interleaved_request_on_another_route():
+    target = {"source": "codex", "resolved_model": "gpt-6"}
+    other = {"source": "claude", "resolved_model": "sonnet"}
+    parameters = {"cache_affinity": "execution-interleaved"}
+    error = ClaudexorModelError(
+        {"code": "server_error", "message": "stream ended"},
+        route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
+        unknown=True,
+    )
+    _remember_failed_profile(target, parameters, error)
+
+    # A request on another route neither consumes the fact nor loses its own preference.
+    assert _request(other, _continuation("profile-b", "claude", "sonnet"), None, parameters)["account"] == {
+        "mode": "auto", "preferredProfileId": "profile-b",
+    }
     assert _request(target, _continuation(), None, parameters)["account"] == {"mode": "auto"}
     assert _request(target, _continuation(), None, parameters)["account"] == {
         "mode": "auto", "preferredProfileId": "profile-a",
