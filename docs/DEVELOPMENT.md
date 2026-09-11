@@ -321,10 +321,16 @@ two normalizers instead of a third: `message_bus.notification_chat_route`
 answers "where does this notice go" (first DELIVERABLE candidate, `None` when
 none is) and `message_bus.coerce_chat_identity` answers "what is this row's
 address" (explicit value kept, absence defaulted). Address a task once at admission (`log_addressing.ingress_chat_id`) and pass
-the value downstream. Explicit browser-source Main addressing is distinct from
+the value downstream; a producer that sends to the owner DIRECTLY (nothing
+re-addresses it later) resolves the task's durable project binding AT EMISSION
+through `log_addressing.resolve_project_chat` and puts it ahead of the row's
+chat, because a task bound to a project after admission still carries the chat
+it was born in. Explicit browser-source Main addressing is distinct from
 the ordinary hidden API default; task type is never source provenance. Enforcement: `tests/test_chat_id_truthiness_guard.py` is the
-source lint that keeps the class closed; its allowlist is where a deliberate
-exception states its reason.
+source lint that keeps the class closed; it also sees the id read straight off a
+mapping inside a condition (`if row.get("chat_id") and ...`), the form where no
+local exists for the other alternatives to match; its allowlist is where a
+deliberate exception states its reason.
 
 ### Mutable external-fact inventory
 
