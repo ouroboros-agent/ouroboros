@@ -852,8 +852,15 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict) -> None:
-    # Owner-process boundary: first-run/env/provider saves may elevate runtime mode.
-    save_settings(settings, allow_elevation=True)
+    # The desktop launcher is the owner-controlled writer.  The generic
+    # config.save_settings ratchet deliberately makes allow_elevation inert
+    # after boot, which is correct for agent-reachable callers but also made a
+    # confirmed Cyber Pro selection fall back to Advanced.  Reuse the existing
+    # owner writer so the confirmation is honored while its document lock,
+    # persistence normalization and other owner-only checks remain in force.
+    from ouroboros.gateway.owner_settings import _owner_write_settings
+
+    _owner_write_settings(settings)
 
 
 def _request_runtime_mode_change(mode: str, confirm_fn) -> dict:
@@ -1380,6 +1387,29 @@ def main():
             except Exception as exc:
                 log.warning("Runtime mode native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
+
+        def confirm_runtime_mode_change(self, mode: str) -> dict:
+            """Confirm a mode change without writing it.
+
+            The SPA persists the selected mode through the owner HTTP endpoint.
+            Keeping this bridge side-effect free lets older shells fall back to
+            the same in-app confirmation instead of normalizing newer modes
+            such as Cyber Pro through their stale local enum.
+            """
+            try:
+                mode_text = str(mode or "").strip().lower()
+                if mode_text not in {"light", "advanced", "pro", "cyber_pro"}:
+                    return {"confirmed": False, "error": "Unknown runtime mode."}
+                settings = _load_settings()
+                current = normalize_runtime_mode(settings.get("OUROBOROS_RUNTIME_MODE"))
+                message = (
+                    f"Change Ouroboros runtime mode from {current} to {mode_text}?\n\n"
+                    "The new mode is saved through the owner endpoint and takes effect after restart."
+                )
+                return {"confirmed": bool(self._native_confirm("Confirm Runtime Mode Change", message))}
+            except Exception as exc:
+                log.warning("Runtime mode native confirmation failed: %s", exc, exc_info=True)
+                return {"confirmed": False, "error": f"Native confirmation failed: {exc}"}
 
         def request_auto_grant_reviewed_skills_change(self, enabled: bool) -> dict:
             try:
