@@ -491,7 +491,7 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
 
 
 def _compute_cache_hit_rate(env: Any) -> Optional[float]:
-    total_prompt = total_cached = count = 0
+    total_prompt = total_cached = count = reported = 0
     try:
         for ev in _iter_recent_jsonl(env.drive_path("logs/events.jsonl")):
             if ev.get("type") != "llm_round":
@@ -502,8 +502,13 @@ def _compute_cache_hit_rate(env: Any) -> Optional[float]:
                 total_prompt += pt
                 total_cached += int(usage.get("cached_tokens", 0))
                 count += 1
+                reported += 1 if "cached_tokens" in usage else 0
     except Exception:
         return None
-    if count < 5 or total_prompt == 0:
+    # Nobody reporting a cache is not a cache that missed: without the key the
+    # share is UNKNOWN, and the arithmetic zero below would render that absence
+    # as an honest 0% and send the owner hunting a caching regression no round
+    # ever measured. An explicitly reported 0 stays the real 0.0.
+    if count < 5 or total_prompt == 0 or reported == 0:
         return None
     return total_cached / total_prompt

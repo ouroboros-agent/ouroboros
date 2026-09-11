@@ -66,6 +66,28 @@ class TestCacheHitRateInvariant:
         result = build_health_invariants(env)
         assert "LOW CACHE HIT RATE" in result
 
+    def test_no_provider_reported_a_cache_leaves_the_share_unknown(self, tmp_path):
+        """Absence is not a measured zero: rounds that never carried
+        cached_tokens used to render as an honest 0% and read as a caching
+        regression nobody had measured."""
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        lines = [json.dumps({"type": "llm_round", "prompt_tokens": 1000}) for _ in range(15)]
+        env = self._make_env(tmp_path, lines)
+        assert _compute_cache_hit_rate(env) is None
+        assert "cache hit rate" not in build_health_invariants(env).lower()
+
+    def test_an_explicitly_reported_zero_is_still_a_real_zero(self, tmp_path):
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        lines = [
+            json.dumps({"type": "llm_round", "prompt_tokens": 1000, "cached_tokens": 0})
+            for _ in range(15)
+        ]
+        env = self._make_env(tmp_path, lines)
+        assert _compute_cache_hit_rate(env) == 0.0
+        assert "LOW CACHE HIT RATE" in build_health_invariants(env)
+
 
 def test_health_invariants_reports_remote_context_overflow(tmp_path):
     env = _make_health_env(
