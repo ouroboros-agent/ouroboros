@@ -283,6 +283,9 @@ CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
 # archives stay durable history (never GC'd), so the remediation is chain
 # indexing/compaction, never deletion.
 EVENTS_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
+# Warn before the observed 242-of-253 retained-drive corpus becomes routine;
+# count only direct children because startup health is an interactive path.
+RETAINED_EXECUTION_DRIVES_WARN_COUNT = 200
 
 
 def estimate_message_chars(messages: Any) -> int:

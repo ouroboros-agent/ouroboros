@@ -99,7 +99,7 @@ def _run_cross_model_fallback_chain(
     """Try fallbacks; unknown dispatch stops the chain."""
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.config import fallback_candidate_targets
-    from ouroboros.model_slots import parse_fallback_chain
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, parse_fallback_chain
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
 
     def _cooled(model: str, use_local: bool) -> None:
@@ -130,7 +130,11 @@ def _run_cross_model_fallback_chain(
             break
         ptag = " (local)" if active_use_local else ""
         ftag = " (local)" if fallback_use_local else ""
-        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}")
+        fallback_account = str(model_role_option(MODEL_ACCOUNTS_KEY, fallback_role) or "")
+        reason = str(accumulated_usage.get("_last_llm_error_kind") or "")
+        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}; account: {fallback_account or 'Auto'}"
+                      f"{f'; reason: {reason}' if reason else ''}{'; pinned account: siblings were not tried' if fallback_account else ''}",
+                      incident={"task_incident": "model_lane_switch", "toast_once": f"{task_id}:model_lane_switch:{round_idx}:{fallback_model}"})
         # Cross-FAMILY fallback must not replay the primary's
         # provider-private reasoning to a different family (the GLM->Claude
         # 400 "Invalid signature" death); the SSOT sanitizer no-ops same-family.

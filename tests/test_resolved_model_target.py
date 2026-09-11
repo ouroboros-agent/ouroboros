@@ -130,9 +130,44 @@ def test_fallback_dispatch_lane_stays_the_global_flag(tmp_path, monkeypatch, cap
             messages=[], active_model="primary", active_use_local=False, tool_schemas=[],
             active_effort="high", max_retries=1, drive_logs=tmp_path / "logs", task_id="t",
             round_idx=1, event_queue=None, accumulated_usage={}, task_type="task",
-            emit_progress=lambda _: None, context_fit_plan=None, active_context_mode="max",
+            emit_progress=lambda _text, *, incident=None: None,
+            context_fit_plan=None, active_context_mode="max",
         )
     assert dispatched == [("remote-model", captured_local), ("other (local)", captured_local)]
+
+
+def test_fallback_notice_carries_lane_switch_incident_reason_and_pin(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+
+    fallback = "claudexor::codex=fallback"
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", fallback)
+    monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", '{"fallback":["account-a"]}')
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    monkeypatch.setattr(loop, "_call_round_model", lambda _ctx: ({"role": "assistant"}, 0, "max"))
+    progress = []
+    ctx = SimpleNamespace(active_model="primary", active_use_local=False)
+    tools = SimpleNamespace(_ctx=SimpleNamespace())
+
+    loop_model_call._run_cross_model_fallback_chain(
+        llm=None, ctx=ctx, tools=tools, messages=[], active_model="primary",
+        active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+        drive_logs=tmp_path / "logs", task_id="task-7", round_idx=3, event_queue=None,
+        accumulated_usage={"_last_llm_error_kind": "provider_transient"}, task_type="task",
+        emit_progress=lambda text, *, incident=None: progress.append((text, incident)),
+        context_fit_plan=None, active_context_mode="max",
+    )
+
+    assert len(progress) == 1
+    text, incident = progress[0]
+    assert "account: account-a" in text and "reason: provider_transient" in text
+    assert "pinned account: siblings were not tried" in text
+    assert incident == {
+        "task_incident": "model_lane_switch",
+        "toast_once": f"task-7:model_lane_switch:3:{fallback}",
+    }
 
 
 # ---------------------------------------------------------------------------

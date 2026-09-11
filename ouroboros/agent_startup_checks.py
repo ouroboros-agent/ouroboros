@@ -860,6 +860,24 @@ def hot_store_growth_notes(env: Any) -> list:
             "replay scans this chain on ownership questions. Investigate chain "
             "indexing/compaction; archives are durable history and are never deleted."
         )
+    from ouroboros.context_budget import RETAINED_EXECUTION_DRIVES_WARN_COUNT
+    from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
+    retained_drive_count = 0
+    for retained_root in (
+        drive_root / HEADLESS_TASKS_DIR,
+        drive_root / TASK_DRIVES_DIR,
+    ):
+        try:
+            retained_drive_count += sum(path.is_dir() for path in retained_root.iterdir())
+        except OSError:
+            pass
+    if retained_drive_count > RETAINED_EXECUTION_DRIVES_WARN_COUNT:
+        notes.append(
+            "WARNING: HOT STORE GROWTH — retained execution drives under "
+            f"state/headless_tasks and task_drives total {retained_drive_count} "
+            f"(threshold {RETAINED_EXECUTION_DRIVES_WARN_COUNT}). Terminal-task retention "
+            "or pruning is lagging; inspect lifecycle GC without recursively sizing drives."
+        )
     return notes
 
 

@@ -1379,7 +1379,7 @@ def call_llm_with_retry(
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
                 "stream": True, "caller_deadline_ts": (None if deadline_ts is None
                     else float(deadline_ts) - float(transport_reserve_sec or 0.0)),
-                "use_local": use_local,
+                "use_local": use_local, "cache_affinity": execution_id if provider_for_model(model) == "claudexor" else "",
                 # These are optional host hints, not required tools. This
                 # transport has neither provider-owned web tools nor a bypass
                 # knob; ordinary Ouroboros web tools stay in the schema.

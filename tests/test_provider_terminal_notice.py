@@ -160,6 +160,24 @@ def test_deadline_text_does_not_hide_an_existing_unknown_attempt():
     assert "no retry or paid fallback was sent" in text
 
 
+def test_provider_terminal_text_claims_only_recorded_recovery_facts():
+    ordinary = loop_transport.provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_transient", "_last_llm_error": "HTTP 503"},
+        is_context_overflow=False, is_transport_wait=False, waited_sec=0.0,
+        interactive=False, is_deadline_exhausted=False,
+    )
+    assert "provider returned no usable response" in ordinary
+    assert "same-model reroute" not in ordinary
+
+    unknown = loop_transport.provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_outcome_unknown"},
+        is_context_overflow=False, is_transport_wait=False, waited_sec=0.0,
+        interactive=False, is_deadline_exhausted=False,
+    )
+    assert unknown.count("dispatched request has no terminal provider outcome") == 1
+    assert "same-model reroute" not in unknown
+
+
 def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, monkeypatch):
     from ouroboros.utils import sanitize_tool_result_for_log
     from tests.test_transport_death_retry import _ScriptedLLM, _death, _primary_call

@@ -239,7 +239,8 @@ def test_original_fallback_ordinal_keeps_account_after_filters(tmp_path, monkeyp
         llm=ctx.llm, ctx=ctx.tools._ctx, tools=ctx.tools, messages=ctx.messages,
         active_model=ctx.active_model, active_use_local=False, tool_schemas=[], active_effort="medium",
         max_retries=1, drive_logs=ctx.drive_logs, task_id=ctx.task_id, round_idx=1,
-        event_queue=None, accumulated_usage={}, task_type="task", emit_progress=lambda _text: None,
+        event_queue=None, accumulated_usage={}, task_type="task",
+        emit_progress=lambda _text, *, incident=None: None,
         context_fit_plan=ctx.context_fit_plan, active_context_mode="max")
     assert seen == ["fallback:1", "fallback:3"]
 

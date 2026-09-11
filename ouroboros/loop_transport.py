@@ -762,7 +762,7 @@ def provider_terminal_fallback_text(
             text += provider_recovery_hint(accumulated_usage)
         return text
     return (
-        "⚠️ The model provider returned no usable response after retries and same-model reroute."
+        "⚠️ The model provider returned no usable response."
         f"{provider_failure_hint(accumulated_usage)}{provider_recovery_hint(accumulated_usage)} "
         "Any files written so far are preserved in the workspace."
     )

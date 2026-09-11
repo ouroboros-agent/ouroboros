@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextvars
 from dataclasses import replace
 import json
 import logging
@@ -48,6 +49,7 @@ import time
 from typing import Any
 
 from ouroboros import config
+from ouroboros import context_fit
 from ouroboros._usage_response import provider_cost_value
 from ouroboros.anthropic_native_custody import scrub_native_custody
 from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_engine_version, read_owned_gateway
@@ -66,6 +68,14 @@ from ouroboros.usage_accounting import (
 from ouroboros.utils import append_jsonl, sanitize_tool_result_for_log, utc_now_iso
 
 log = logging.getLogger(__name__)
+_FAILED_PROFILE = contextvars.ContextVar("claudexor_failed_profile", default=())
+_PER_SUBJECT_REFUSALS = frozenset({
+    "auth_required", "auth_refresh_failed", "credential_unusable", "provider_refused",
+    "rate_limited", "subscription_window_exhausted",
+})
+_NON_PROVIDER_FAILURES = frozenset({
+    "model_operation_cancelled", "model_operation_interrupted", "model_outcome_unknown",
+})
 
 
 def model_catalog(source: str, credential_profile_id: str | None = None, *,
@@ -229,6 +239,16 @@ def adopt_turn_state(slot: ModelTurnState | None, payload: dict, result: dict) -
     slot.envelope = copy.deepcopy(envelope) if isinstance(envelope, dict) else None
 
 
+def _remember_failed_profile(target: dict, parameters: dict, error: ClaudexorModelError) -> None:
+    route = error.route or {}
+    key = (parameters.get("cache_affinity"), route.get("source"), route.get("model"))
+    if (key == (parameters.get("cache_affinity"), target["source"], target["resolved_model"])
+            and key[0] and route.get("credentialProfileId")
+            and ((error.status_code == 0 and error.code not in _NON_PROVIDER_FAILURES)
+                 or error.code in _PER_SUBJECT_REFUSALS)):
+        _FAILED_PROFILE.set((*key, route["credentialProfileId"]))
+
+
 def _request(target: dict, messages: list, tools: list | None, parameters: dict) -> dict:
     from ouroboros.llm_messages import _MessageShapingMixin
 
@@ -260,12 +280,22 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
             if isinstance(block, dict):
                 for name in ("_caption", "_source_path", "_context_capsule", "cache_control"):
                     block.pop(name, None)
+        if message.get("role") == "tool" and isinstance(content, list) and content and all(
+            isinstance(block, dict) and block.get("type") == "text" for block in content
+        ):
+            message["content"] = context_fit.extract_plain_text_from_content(content)
     role = parameters.get("model_role", "")
     override = parameters.get("model_account_override")
     if override is not None and not isinstance(override, str):
         raise ValueError("model_account_override must be a profile name, empty Auto, or None")
     pin = override.strip() if override is not None else model_role_option(MODEL_ACCOUNTS_KEY, role)
     account = {"mode": "pin", "profileId": pin} if pin else {"mode": "auto"}
+    failed = _FAILED_PROFILE.get()
+    failed_key = (parameters.get("cache_affinity"), target["source"], target["resolved_model"])
+    same_execution = len(failed) == 4 and failed[0] == failed_key[0]
+    failed_profile = failed[3] if same_execution and failed[:3] == failed_key else ""
+    if same_execution:
+        _FAILED_PROFILE.set(())  # one request only; Pin still consumes the failure fact
     if not pin:
         # Carry the conversation's last account as a preference, not admission.
         # The engine is still the only actor choosing an eligible account.
@@ -273,7 +303,7 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
             native = message.get("nativeContinuation") or {}
             route = native.get("route") or {}
             if route.get("source") == target["source"] and route.get("model") == target["resolved_model"]:
-                if route.get("credentialProfileId"):
+                if route.get("credentialProfileId") and route["credentialProfileId"] != failed_profile:
                     account["preferredProfileId"] = route["credentialProfileId"]
                 break
     options = {wire: parameters[key] for key, wire in (
@@ -522,12 +552,17 @@ class _ModelInvocation:
     def finish(self, result: dict) -> tuple[dict, dict]:
         usage, cost, final = _usage(result)
         route = result.get("route") or {}
+        requested_options = copy.deepcopy(self.payload.get("options") or {})
+        applied_options = copy.deepcopy(result.get("appliedOptions"))
+        options_honored = "unknown" if applied_options is None else (
+            "mismatch" if any(applied_options[key] != value for key, value in requested_options.items() if key in applied_options) else "confirmed")
         usage.update(provider="claudexor", resolved_model=self.target["usage_model"], cost=cost, cost_final=final,
                      cost_estimated=cost is not None and not final,
                      claudexor={"operation_id": self.operation_id, "model_role": self.role,
                                 "route": copy.deepcopy(route), "cost_evidence": copy.deepcopy(result.get("cost")),
                                 "outcome": result.get("outcome"), "problem": copy.deepcopy(result.get("problem")),
-                                "applied_options": copy.deepcopy(result.get("appliedOptions")),
+                                "requested_options": requested_options, "applied_options": applied_options,
+                                "options_honored": options_honored,
                                 "output_reserve_tokens": self.output_reserve, "output_cap_applied": False,
                                 "result_custody": {"state": "pending", "operation_id": self.operation_id,
                                                    "response_ref": self.response_ref,
@@ -682,6 +717,9 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)
+        except ClaudexorModelError as error:
+            _remember_failed_profile(target, parameters, error)
+            raise
         except PhysicalAttemptPreparationFailed as error:
             cause = error.__cause__
             if isinstance(cause, ClaudexorModelError):
@@ -725,6 +763,9 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)
+        except ClaudexorModelError as error:
+            _remember_failed_profile(target, parameters, error)
+            raise
         except PhysicalAttemptPreparationFailed as error:
             cause = error.__cause__
             if isinstance(cause, (ClaudexorModelError, asyncio.CancelledError)):

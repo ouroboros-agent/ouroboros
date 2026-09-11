@@ -563,7 +563,7 @@ Bundled resources use the §1 CLI/headless lookup order rather than assuming the
 │   ├── settings.json              ← user settings (API keys, models, budget)
 │   ├── task_results/              ← durable task results (task_results/<id>.json, every write stamped `_schema_version: 1`; an unstamped, future, malformed or retired-key row is QUARANTINED with log-only visibility and keeps its id occupied rather than being re-minted); artifacts/<task_id>/ holds .artifact_manifest.json (private metadata) + artifact files; .scratch_manifest.json declares ephemeral scratch {abs_path: sha256} excluded from patch capture only while content matches
 │   ├── artifact_versions/<task_id>/ ← artifact recovery history, last 5 versions per name
-│   ├── task_drives/<task_id>/     ← task-scoped scratch; startup prunes terminal tasks after the headless retention window
+│   ├── task_drives/<task_id>/     ← task-scoped scratch, including live per-call manifests; startup prunes terminal tasks after the headless retention window
 │   ├── task_trees/<root>/blackboard.jsonl ← append-only swarm blackboard + beacons; tree-scoped and ephemeral (task_tree_ledger.py), pruned on root terminal
 │   ├── state/
 │   │   ├── state.json             ← runtime state + compatibility cost projection; never the monetary authority
@@ -599,7 +599,7 @@ Bundled resources use the §1 CLI/headless lookup order rather than assuming the
 │   │   ├── review_continuations/  ← durable blocked-review continuations (+ corrupt/ quarantine; archived/ holds settled un-resumed rows ≥7 days, never deleted)
 │   │   ├── workspace_executor_processes/ ← durable local/docker executor cleanup records
 │   │   ├── consciousness_observations.jsonl ← append-only inbox; rows retained until a settled successful cycle appends an ACK; malformed rows stay visible as source gaps
-│   │   ├── headless_tasks/<task_id>/data ← forked/empty child memory drives (CLI / Headless Boundary above)
+│   │   ├── headless_tasks/<task_id>/data ← forked/empty child execution drives whose live per-call manifests are promoted at terminal (CLI / Headless Boundary above)
 │   │   ├── pycache/               ← embedded-interpreter bytecode (packaged builds; CLI / Headless Boundary above)
 │   │   ├── python-userbase/       ← embedded-interpreter user installs (packaged builds)
 │   │   ├── betterleaks/           ← versioned scanner runtime + archive cache, created only by the explicit source-checkout installer
@@ -617,7 +617,7 @@ Bundled resources use the §1 CLI/headless lookup order rather than assuming the
 │   │   ├── registry.md            ← memory awareness map
 │   │   └── owner_mailbox/         ← per-task user message files
 │   ├── projects/<id>/knowledge/   ← per-project facts + provenance sidecars; logs/task_reflections.jsonl holds full reflections with a bounded pointer row in the canonical log
-│   ├── observability/             ← private forensic ledger: blobs/<sha256>.json.gz compressed CAS payloads (0600) + calls/<task_id>/<call_id>.json manifests
+│   ├── observability/             ← canonical private forensic ledger: blobs/<sha256>.json.gz compressed CAS payloads (0600) + terminal-promoted calls/<task_id>/<call_id>.json manifests
 │   ├── services/<task_id>/<service>.log ← service runner logs; public tool output is bounded redacted tails + private blob refs
 │   ├── logs/
 │   │   ├── chat.jsonl             ← canonical chat: one logical message stored once, projected into Main/Project lenses
@@ -1368,6 +1368,8 @@ canonical history retains it. A nonempty `refusal` is preserved as assistant
 text, including when the prior provider supplied no ordinary content. The exact
 `model_request_invalid` create refusal proves validation failed before command
 admission; a generic HTTP error or failed status read cannot prove non-dispatch.
+The send copy also normalizes all-text tool results, so moving the message-side
+cache boundary does not rewrite bytes already sent; non-text blocks remain intact.
 
 `ClaudexorModelError.display_message` adds sanitized typed `vendorCode` and
 `parameter` details to the existing error event and terminal preview only after
@@ -1427,6 +1429,8 @@ never imply identical roles or accounts. Auto uses the largest advertised window
 of the exact account route, not CLI compaction thresholds. A manual value is a
 sizing assertion, not a provider unlock or a scope-review acknowledgement. Unknown
 capacity stays unknown; input size, response reservation and capacity are separate.
+Each model operation records its submitted options beside the engine's applied
+options; an absent applied-options report remains explicitly unknown.
 An account change rebinds preparation before another physical send.
 Ordinary sends, prospective wrap-up payloads and forced final replies share the
 same acting-role/account binding. Prospective subscription accounting uses the
@@ -1451,7 +1455,13 @@ helper result or verdict.
 actions use the existing mailbox and `/api/decisions` family
 `model_wait:<task>:<wait>`; task-result rows are projections, not restartable stack
 checkpoints or a second attempt ledger. Metadata polling makes no generation.
-Auto exhausts suitable same-model accounts before waiting; Pin never rotates.
+On Auto, the host may send the last successful same-route account as a preference,
+but omits that preference for the next request after a status-null or typed
+per-subject refusal on that account in the same execution. The engine remains
+the account chooser: without engine refusal evidence it may select the same
+top-headroom account again, so rotation is possible rather than guaranteed.
+Pin never rotates. The existing fallback budget remains unchanged; its defaults
+are one attempt per model and a 120-second cross-model cooldown.
 Even a configured API fallback waits for an explicit owner switch after a quota
 refusal. A temporary switch changes only the waiting role; optional persistence
 uses the ordinary settings writer. Pending acceptance, settings saved and worker
@@ -2098,7 +2108,7 @@ otherwise the view is partial and the consumer remains non-final or abstains.
 | Background Consciousness observations | `data/state/consciousness_observations.jsonl`, append-only enqueue/ACK rows owned by `BackgroundConsciousness` | Pending count/oldest metadata and a bounded recent observation rendering | `read_file(root='runtime_data', path='state/consciousness_observations.jsonl')` | Unacknowledged rows survive restart/overflow/error. Gaps block ACK and the existing direct identity rewrite; only a settled successful cycle appends ACK. |
 | Plan/review authority | Exact task-artifact/observability wave bodies, evidence selectors, reviewer route/thread receipts, and the bounded review hot index | Review status, latest wave, obligations, and compact findings; a predecessor's inherited `plan_review_state` is first projected to a compact authority core ordered around the newest wave's identity, acceptance claims, findings, and dispositions, with reviewer transport removed and `need_evidence_seen` last-priority. Every bounded collection names its total and omitted count; the projection discloses `full_chars` plus `source_ref`, and the named `include_authority` source stays complete | Exact artifact/source handle plus SHA/range/thread selectors | Missing or partial evidence is `DEGRADED`/`NOT_RUN`, never PASS. Exact artifacts remain bound to the reviewed candidate SHA; hot indexes may rotate only after the source is retained. |
 | Task acceptance (three deliveries) | The FULL host packet (`review_evidence.build_task_acceptance_evidence` under the host ladder, with its `__provenance__` table), the applied host run retained through canonical task source handles, and the paid-identity wallet ledger | The per-delivery work order: the api pack for a packet row; the FULL packet plus absolute pointers and the access disclosure for an agent-session row; the packet without its freely degradable tail plus the real data root for a native inspection row (`loop_acceptance_review.acceptance_retrieving_work_order`) | Exact `evidence_refs` from the packet's enumerable exhibit vocabulary; absolute pointers to the task's active workspace, task result record, artifact directory, verification receipts and tool-trajectory log; `review_projection.panels[].applied_source_ref` for the complete redacted applied review | Refs resolve against the FULL packet only, never the rendered projection; a session's reads are unobserved by the host (disclosed), a native episode's are `host_observed`; the immutable-core overflow refuses every delivery, a partial tool-result projection only packet rows; one strict wallet claim per panel whatever the rows' deliveries (owner R11). |
-| Canonical versus execution roots | Canonical budget/data root owns identity, authority, biography, results, and promoted observability; execution drives own tools, workspace, and transient trajectory | Project/fork/task lenses and status projections | Existing canonical-root resolver, task-result pointers, and source handles | A fork is an execution lens, not a second mind. Copy-back/promotion precedes GC for anything referenced by a canonical result; missing legacy bytes become an explicit gap. |
+| Canonical versus execution roots | Canonical budget/data root owns identity, authority, biography, results, and promoted observability; execution drives own tools, workspace, transient trajectory, and per-call manifests while a task runs | Project/fork/task lenses and status projections | Existing canonical-root resolver, task-result pointers, and source handles | A fork is an execution lens, not a second mind. Copy-back/promotion precedes GC for anything referenced by a canonical result; before terminal promotion the canonical reader cannot resolve a ref bound to a child drive (tracked as #805), and missing legacy bytes become an explicit gap. |
 
 ---
 

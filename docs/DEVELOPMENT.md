@@ -568,7 +568,10 @@ the hot-store growth health invariant
 that introduces a new append-only store read on an interactive path must
 enroll that store in the `ouroboros/context_budget.py` threshold table (with a
 justified constant) in the same commit — an unenrolled hot store is invisible
-to the tripwire.
+to the tripwire. Retained execution drives under both `state/headless_tasks`
+and `task_drives` are enrolled by direct-child count at
+`context_budget.RETAINED_EXECUTION_DRIVES_WARN_COUNT`; startup never recursively
+sizes those trees.
 
 ### Invariant: Source-complete decision pipeline
 
@@ -951,6 +954,8 @@ what the owner reads:
   to a durable full copy (e.g. an observability `response_ref`). Reviewer
   rationale is a cognitive artifact (BIBLE P1): projecting it truncated while
   the full copy sits unreferenced in private blobs is partial memory loss.
+  Terminal text asserts only recovery facts carried by the round record, never
+  a route mechanism that the selected transport cannot perform.
 - **Model-bound projections** (review packs, context sections, tool-result
   transport) keep their disclosed-truncation budgets — those are real context
   economics.
@@ -2028,6 +2033,13 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   saved-but-undiscovered choices stay visible and editable; a compound effort
   slug plus a conflicting separate effort is a validation error, never two
   applied efforts.
+  On the Auto lane, the host may prefer the last successful same-route account.
+  After a status-null or typed per-subject refusal, only the next request in the
+  same execution omits that preference and lets the engine choose; without an
+  engine refusal fact, selecting a sibling is possible, not guaranteed. Pin
+  remains exact and never rotates. `OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL=1`
+  and `OUROBOROS_FALLBACK_COOLDOWN_SEC=120` keep their existing escalation
+  budget and do not turn preference suppression into a retry or cooldown.
 - Saved intent, generated drafts, and live status are different axes: a
   status/catalog failure annotates a loaded row and never erases it; GET may
   return an unsaved candidate but only explicit Save or onboarding completion
@@ -2135,7 +2147,9 @@ Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_
   the same operation ID; record unknown outcomes as unknown. ACK only after the
   existing private CAS owns the exact result. Optional host hints must be chosen
   by their caller according to transport capability; explicit unsupported options
-  refuse, rather than being silently removed and retried.
+  refuse, rather than being silently removed and retried. Record submitted model
+  options beside the engine's applied options on the usage row; an absent report
+  stays unknown and a mismatch is disclosure, never a dispatch gate.
 - The engine's active-turn token is one of those transport facts, so the CALLER
   owns its slot (`llm_claudexor.ModelTurnState` on the loop context, a wake-scoped
   one in Background Consciousness) and the engine boundary is its only writer.
@@ -2262,7 +2276,9 @@ by "Provider Independence" above. Call-site imperatives:
   qualifies, migrated in the same call -- preserved on the
   direct-Anthropic lane by `_anthropic_blocks_from_content` and on
   OpenRouter by `supports_message_cache_control`, and pinned by
-  `tests/test_review_prompt_caching.py`;
+  `tests/test_review_prompt_caching.py`. The main loop declares an
+  execution-scoped cache affinity only for subscription transport; API-compatible
+  lanes retain their prefix-derived session identity;
   `review_substrate.assert_cache_breakpoint_cap` covers only the review
   builders. Review gate: CHECKLISTS item 22 (`cache_friendliness`).
 - Provider fallback is disabled only when the transcript carries a SEALED
@@ -2389,7 +2405,8 @@ by "Provider Independence" above. Call-site imperatives:
   waiting tunes the passive wait only.
 - Preserve raw terminal model/salvage bytes separately from the host-authored
   `terminal_provider_notice`. Existing receipts and secondary notices consume
-  those same facts; a retained answer must not hide wait or unknown-attempt
+  those same facts: attempted repeats, the last provider error, and an unknown
+  dispatched outcome. A retained answer must not hide wait or unknown-attempt
   evidence or invite a blind rerun. Ephemeral and message/deferred Presence
   responses render one host-labelled status section; cached Presence output
   is already rendered. Preserve silent/tool-delivered authority and never
@@ -2405,7 +2422,9 @@ by "Provider Independence" above. Call-site imperatives:
   reads the tone through `normalizeTone` and keeps the alarm tone for a
   frame without one — never parse `toast_once` or the text for it; `OuroborosAgent._emit_progress` is the
   production implementation and a test fake mirrors it
-  (`lambda text, *, incident=None: ...`).
+  (`lambda text, *, incident=None: ...`). A cross-model lane switch is the
+  second owner note carrying this pair; it names both models, the selected
+  account, and the typed failure reason when the round record has one.
 - Timeout contract classes differ; keep the axes separate. A transport
   timeout only bounds a dead socket
   (`OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC`) — it is not a reasoning cutoff
