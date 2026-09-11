@@ -43,6 +43,33 @@ def _owner_line(ctx: Any, text: str, key: str, tone: str) -> None:
         pass
 
 
+# A tick that returned no observation (a refusal, or a read the daemon never answered)
+# drops the loop's transport, so the next tick re-reads the descriptor and re-handshakes.
+_DROP_TRANSPORT_STATUSES = frozenset({"observation_pending", "refused"})
+
+
+def _loop_gateway() -> Any:
+    """The loop's own transport, built WITHOUT a handshake: the observing wait
+    handshakes it once (``engine_version`` is the receipt) and classifies any refusal
+    through its own typed path. An unreadable descriptor leaves the tick to its
+    per-call transport, which reports the same fact the same way."""
+    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+
+    try:
+        return ClaudexorGateway()
+    except ClaudexorUnavailable:
+        return None
+
+
+def _drop_gateway(gateway: Any) -> None:
+    if gateway is not None:
+        try:
+            gateway.close()
+        except Exception:
+            pass
+    return None
+
+
 def _attempt_key(ctx: Any) -> str:
     return str(getattr(ctx, "task_attempt", None) or 1)
 
@@ -808,6 +835,7 @@ def supervised_wait(
             "reason": "checkpoint_requires_time_and_reason",
             "detail": "checkpoint_after_sec and non-empty checkpoint_reason must be supplied together.",
         }, ensure_ascii=False, indent=2)
+    owns_transport = wait_once is None
     if wait_once is None:
         from ouroboros.tools.delegate import _delegate_wait
 
@@ -852,116 +880,125 @@ def supervised_wait(
     })
 
     unobserved = False  # an unreachable-daemon episode is open (one owner line each way)
-    while True:
-        # A control already present does not wait behind another HTTP read.
-        observed = not _control_wakes(ctx)
-        if not observed:
-            raw = json.dumps({"status": "no_progress", "run_id": str(run_id)})
-        else:
-            raw = wait_once(ctx, run_id, _TICK_SEC, int(state.get("journal_cursor") or 0))
-        payload = _payload(raw)
-        unreachable = (
-            payload.get("status") == "observation_pending"
-            and payload.get("reason") == _DAEMON_UNREACHABLE
-        )
-        if observed and unobserved and not unreachable:
-            # The first read the daemon answered again closes the episode.
-            unobserved = False
-            _owner_line(ctx, "Delegation daemon reachable again; delegated runs are "
-                        "being observed again.", "delegation_daemon_recovered", "ok")
-        cursor = payload.get("last_seq")
-        if isinstance(cursor, int):
-            state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), cursor)
-        addressed_wakes = _addressed_wakes(ctx, state)
-        control_wakes = _control_wakes(ctx)
-        coordination_events, next_coordination_cursor = _coordination_wakes(ctx, state)
-        wakes = addressed_wakes + control_wakes + coordination_events
-        checkpoint = state.get("checkpoint") if isinstance(state.get("checkpoint"), dict) else {}
-        due = bool(
-            checkpoint
-            and not checkpoint.get("consumed")
-            and float(checkpoint.get("due_at_unix") or 0) <= time.time()
-        )
-        meaningful = str(payload.get("status") or "") not in _QUIET_STATUSES
-        if meaningful or wakes or due:
-            if checkpoint and not checkpoint.get("consumed"):
-                checkpoint["consumed"] = True
-                checkpoint["consumed_at"] = utc_now_iso()
-                checkpoint["consumed_by"] = (
-                    "real_event" if meaningful or wakes else "scheduled_checkpoint"
-                )
-                state["checkpoint"] = checkpoint
-                _emit(ctx, "delegate_supervision_checkpoint_consumed", {
-                    "run_id": str(run_id), "reason": str(checkpoint.get("reason") or ""),
-                    "consumed_by": str(checkpoint.get("consumed_by") or ""),
-                })
-            if due and not meaningful and not wakes:
-                payload = {
-                    "status": "inspection_checkpoint",
-                    "run_id": str(run_id),
-                    "reason": str(checkpoint.get("reason") or ""),
-                    "last_seq": int(state.get("journal_cursor") or 0),
+    gateway = None  # the loop's own transport, only when it built the observing wait
+    try:
+        while True:
+            # A control already present does not wait behind another HTTP read.
+            observed = not _control_wakes(ctx)
+            if not observed:
+                raw = json.dumps({"status": "no_progress", "run_id": str(run_id)})
+            else:
+                if owns_transport and gateway is None:
+                    gateway = _loop_gateway()
+                raw = wait_once(ctx, run_id, _TICK_SEC, int(state.get("journal_cursor") or 0),
+                                **({"gateway": gateway} if gateway is not None else {}))
+            payload = _payload(raw)
+            if str(payload.get("status") or "") in _DROP_TRANSPORT_STATUSES:
+                gateway = _drop_gateway(gateway)
+            unreachable = (
+                payload.get("status") == "observation_pending"
+                and payload.get("reason") == _DAEMON_UNREACHABLE
+            )
+            if observed and unobserved and not unreachable:
+                # The first read the daemon answered again closes the episode.
+                unobserved = False
+                _owner_line(ctx, "Delegation daemon reachable again; delegated runs are "
+                            "being observed again.", "delegation_daemon_recovered", "ok")
+            cursor = payload.get("last_seq")
+            if isinstance(cursor, int):
+                state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), cursor)
+            addressed_wakes = _addressed_wakes(ctx, state)
+            control_wakes = _control_wakes(ctx)
+            coordination_events, next_coordination_cursor = _coordination_wakes(ctx, state)
+            wakes = addressed_wakes + control_wakes + coordination_events
+            checkpoint = state.get("checkpoint") if isinstance(state.get("checkpoint"), dict) else {}
+            due = bool(
+                checkpoint
+                and not checkpoint.get("consumed")
+                and float(checkpoint.get("due_at_unix") or 0) <= time.time()
+            )
+            meaningful = str(payload.get("status") or "") not in _QUIET_STATUSES
+            if meaningful or wakes or due:
+                if checkpoint and not checkpoint.get("consumed"):
+                    checkpoint["consumed"] = True
+                    checkpoint["consumed_at"] = utc_now_iso()
+                    checkpoint["consumed_by"] = (
+                        "real_event" if meaningful or wakes else "scheduled_checkpoint"
+                    )
+                    state["checkpoint"] = checkpoint
+                    _emit(ctx, "delegate_supervision_checkpoint_consumed", {
+                        "run_id": str(run_id), "reason": str(checkpoint.get("reason") or ""),
+                        "consumed_by": str(checkpoint.get("consumed_by") or ""),
+                    })
+                if due and not meaningful and not wakes:
+                    payload = {
+                        "status": "inspection_checkpoint",
+                        "run_id": str(run_id),
+                        "reason": str(checkpoint.get("reason") or ""),
+                        "last_seq": int(state.get("journal_cursor") or 0),
+                    }
+                if wakes:
+                    payload["wake_events"] = wakes
+                payload["coordination_context"] = coordination_live_context(ctx)
+                wake_id = uuid.uuid4().hex
+                payload["supervision_wake_id"] = wake_id
+                state["status"] = "wake_pending"
+                state["last_wake"] = payload
+                state["pending_wake"] = {
+                    "wake_id": wake_id,
+                    "attempt_key": _attempt_key(ctx),
+                    "payload": payload,
+                    "mailbox_ids": [
+                        str(item.get("msg_id") or "") for item in wakes
+                        if str(item.get("msg_id") or "")
+                        and str(item.get("kind") or "") not in _LOOP_CONTROL_KINDS
+                    ],
+                    "seen_mailbox_ids": [
+                        str(item.get("msg_id") or "") for item in wakes
+                        if str(item.get("msg_id") or "")
+                    ],
+                    "interaction_ids": sorted(_interaction_ids(payload)),
+                    "coordination_cursor": next_coordination_cursor,
+                    "created_at": utc_now_iso(),
                 }
-            if wakes:
-                payload["wake_events"] = wakes
-            payload["coordination_context"] = coordination_live_context(ctx)
-            wake_id = uuid.uuid4().hex
-            payload["supervision_wake_id"] = wake_id
-            state["status"] = "wake_pending"
-            state["last_wake"] = payload
-            state["pending_wake"] = {
-                "wake_id": wake_id,
-                "attempt_key": _attempt_key(ctx),
-                "payload": payload,
-                "mailbox_ids": [
-                    str(item.get("msg_id") or "") for item in wakes
-                    if str(item.get("msg_id") or "")
-                    and str(item.get("kind") or "") not in _LOOP_CONTROL_KINDS
-                ],
-                "seen_mailbox_ids": [
-                    str(item.get("msg_id") or "") for item in wakes
-                    if str(item.get("msg_id") or "")
-                ],
-                "interaction_ids": sorted(_interaction_ids(payload)),
-                "coordination_cursor": next_coordination_cursor,
-                "created_at": utc_now_iso(),
-            }
+                _save_state(ctx, state)
+                _emit(ctx, "delegate_supervision_wake_pending", {
+                    "run_id": str(run_id), "wake_id": wake_id,
+                    "payload": payload,
+                    "mailbox_ids": list(state["pending_wake"]["mailbox_ids"]),
+                    "interaction_ids": list(state["pending_wake"]["interaction_ids"]),
+                })
+                return _render_wake_payload(ctx, payload)
+            if payload.get("status") == "observation_pending":
+                _emit(ctx, "delegate_supervision_observation_pending", {
+                    "run_id": str(run_id), "reason": payload.get("reason"),
+                    "waited_sec": payload.get("waited_sec"),
+                })
+                if unreachable and not unobserved:
+                    # The class the model can do nothing about: a dead socket is a quiet
+                    # renewal on the same 3 s beat (no backoff, no durable counter), and
+                    # the owner hears about it exactly once per episode. Deadline, ceiling,
+                    # budget and cancel stay the outer bounds that cut a long unobserved
+                    # stretch.
+                    unobserved = True
+                    _owner_line(ctx, "Delegation daemon unreachable; delegated runs are not "
+                                "being observed, the runs themselves keep going.",
+                                "delegation_daemon_unreachable", "warn")
+                # A failed read is not a completed quiet window; retain the cursor
+                # and avoid a busy loop if a transport fails before its read bound.
+                time.sleep(_TICK_SEC)
+            state["coordination_cursor"] = next_coordination_cursor
+            state["quiet_renewals"] = int(state.get("quiet_renewals") or 0) + 1
+            renewals = int(state["quiet_renewals"])
+            if renewals == 1 or renewals & (renewals - 1) == 0:
+                _emit(ctx, "delegate_supervision_wait_renewed", {
+                    "run_id": str(run_id), "quiet_renewals": renewals,
+                    "journal_cursor": int(state.get("journal_cursor") or 0),
+                    "event_only": True,
+                })
             _save_state(ctx, state)
-            _emit(ctx, "delegate_supervision_wake_pending", {
-                "run_id": str(run_id), "wake_id": wake_id,
-                "payload": payload,
-                "mailbox_ids": list(state["pending_wake"]["mailbox_ids"]),
-                "interaction_ids": list(state["pending_wake"]["interaction_ids"]),
-            })
-            return _render_wake_payload(ctx, payload)
-        if payload.get("status") == "observation_pending":
-            _emit(ctx, "delegate_supervision_observation_pending", {
-                "run_id": str(run_id), "reason": payload.get("reason"),
-                "waited_sec": payload.get("waited_sec"),
-            })
-            if unreachable and not unobserved:
-                # The class the model can do nothing about: a dead socket is a quiet
-                # renewal on the same 3 s beat (no backoff, no durable counter), and
-                # the owner hears about it exactly once per episode. Deadline, ceiling,
-                # budget and cancel stay the outer bounds that cut a long unobserved
-                # stretch.
-                unobserved = True
-                _owner_line(ctx, "Delegation daemon unreachable; delegated runs are not "
-                            "being observed, the runs themselves keep going.",
-                            "delegation_daemon_unreachable", "warn")
-            # A failed read is not a completed quiet window; retain the cursor
-            # and avoid a busy loop if a transport fails before its read bound.
-            time.sleep(_TICK_SEC)
-        state["coordination_cursor"] = next_coordination_cursor
-        state["quiet_renewals"] = int(state.get("quiet_renewals") or 0) + 1
-        renewals = int(state["quiet_renewals"])
-        if renewals == 1 or renewals & (renewals - 1) == 0:
-            _emit(ctx, "delegate_supervision_wait_renewed", {
-                "run_id": str(run_id), "quiet_renewals": renewals,
-                "journal_cursor": int(state.get("journal_cursor") or 0),
-                "event_only": True,
-            })
-        _save_state(ctx, state)
+    finally:
+        _drop_gateway(gateway)
 
 
 def read_unknown_hold(ctx: Any) -> dict[str, Any]:

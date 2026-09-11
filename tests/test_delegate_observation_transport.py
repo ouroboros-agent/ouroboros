@@ -71,7 +71,9 @@ def test_public_wait_reads_response_slower_than_five_seconds(tmp_path, monkeypat
         assert time.monotonic() - started >= 5.0
         assert result["status"] == "terminal", result
         assert result["state"] == "succeeded"
-        assert requests == [("POST", "/v2/handshake"), ("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1)
+        # One handshake per supervision loop, one GET per tick (S2): the loop holds the
+        # transport across quiet ticks instead of rebuilding it every 3 s.
+        assert requests == [("POST", "/v2/handshake")] + [("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1)
     finally:
         server.shutdown()
         server.server_close()
