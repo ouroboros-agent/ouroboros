@@ -172,14 +172,15 @@ def _record_child_result_disposition(
             "shorten it yourself — it is never truncated for you)"
         )
     if problems:
-        return (
-            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: " + "; ".join(problems) + ". "
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR",
+            text=("⚠️ CHILD_RESULT_DISPOSITION_INVALID: " + "; ".join(problems) + ". "
             "Correct example: tree_note(kind='decision', text='<short why, ≤500 chars>', "
             "payload={'type': 'child_result_disposition', 'child_task_id': '<id>', "
             "'disposition': 'integrated'|'irrelevant'|'deferred', "
             "'child_result_sha256': '<the 64-hex sha from [SUBTASK_OUTCOME]/get_task_result>'})."
-            " Nothing was recorded (atomic no-op)."
-        )
+            " Nothing was recorded (atomic no-op).")
+        ))
     normalized = normalize_child_result_disposition_payload(payload)
     if normalized is None:  # unreachable: violations above are the same authority
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ CHILD_RESULT_DISPOSITION_INVALID: payload failed normalization.")))
