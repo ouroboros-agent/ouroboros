@@ -375,7 +375,10 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
             "evidence_refs": getattr(request, "evidence_refs", []), "messages": getattr(request, "messages", []),
             "slot_messages": getattr(request, "slot_messages", []),
         }),
-        "review_contract": str(contract or digest({"rendered": review_output_contract(request), "policy": getattr(request, "policy", "")})),
+        "review_contract": str(contract or digest({
+            "rendered": review_output_contract(request) if hasattr(request, "policy") else "",
+            "policy": getattr(request, "policy", ""),
+        })),
         "roster_hash": digest(roster), "epoch": str(retry_key or ""),
         **supplied,
         "root_task_id": str(root_task_id), "task_attempt": getattr(request, "task_attempt", None),
