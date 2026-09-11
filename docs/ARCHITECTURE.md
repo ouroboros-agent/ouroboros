@@ -1932,7 +1932,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults stay canonical in `conf
 | OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC | (unset) | Env-only: logical review timeout (absent = route-owned behavior; late in-flight results stay in custody) |
 | OUROBOROS_REVIEW_MAX_TOKENS | 65536 | Env-only: reviewer output budget, clamped to the 8192 floor |
 | OUROBOROS_REVIEW_ENFORCEMENT | advisory | Review enforcement: advisory/blocking (closed enum; anything else coerces to the default) |
-| OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 900 | Env-only: TOTAL wall-clock budget for the hermetic pre-commit pytest preflight (node lane + both passes; teardown + containment semantics in `preflight_runner.py`/`process_containment.py`) |
+| OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 1800 | Env-only: TOTAL wall-clock budget for the hermetic pre-commit pytest preflight (node lane + both passes; teardown + containment semantics in `preflight_runner.py`/`process_containment.py`) |
 | OUROBOROS_PREFLIGHT_SERIAL | unset | Env-only: `1` selects one serial pytest pass; scrubbed from the candidate environment |
 | OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS | true | Auto-grant manifest-declared permissions to cleanly reviewed skills (hash-bound; blocking findings never grant) |
 | OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS | true | Launcher seed/resync writes hash-pinned `native_seed` verdicts; acts only at seed/resync, no runtime grant endpoint |

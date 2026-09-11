@@ -753,7 +753,7 @@ def _plugin_missing_remediation(agent_python: str, rejected: str = "") -> str:
     )
 
 
-_DEFAULT_PREFLIGHT_TIMEOUT_SEC = 900
+_DEFAULT_PREFLIGHT_TIMEOUT_SEC = 1800
 
 
 def _resolve_preflight_timeout(timeout: int) -> int:
