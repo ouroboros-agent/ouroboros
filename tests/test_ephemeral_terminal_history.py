@@ -88,3 +88,58 @@ def test_ephemeral_terminal_facts_survive_real_chat_persistence_and_history(
         assert "cancelable" not in row and "task_id_pending" not in row
     assert stored["text"] == replayed["text"] == frame["content"] == text
     assert not (tmp_path / "task_results" / "ephemeral-history.json").exists()
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_ephemeral_exception_counts_keep_unknown_separate_from_recorded_zero(tmp_path, monkeypatch, captured):
+    from ouroboros.agent import _task_exception_terminal
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+    task = {"id": "ephemeral-exception", "type": "task", "chat_id": 1,
+            "text": "Inspect current work", "_is_direct_chat": True, "_ephemeral_turn": True}
+    error = RuntimeError("context preparation failed")
+    if captured:
+        error._ouroboros_loop_usage = {"rounds": 0}
+        error._ouroboros_loop_trace = {"tool_calls": [], "reasoning_notes": []}
+    text, usage, trace = _task_exception_terminal(env, task, error, logs)
+    monkeypatch.setattr(state, "reconstruct_task_cost", lambda *_a, **_k: {
+        "accounted_upper_bound_usd": None, "cost_final": False, "cost_accounting_status": "unavailable"})
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 1, "session_id": "test"})
+    bridge = message_bus.LocalChatBridge({})
+    live = []
+    bridge._broadcast_fn = live.append
+    monkeypatch.setattr(message_bus, "_BRIDGE", bridge)
+    pending = []
+    pipeline.emit_task_results(env, None, None, pending, task, text, usage, trace,
+                               start_time=0.0, drive_logs=logs)
+    final = next(row for row in pending if row["type"] == "send_message")
+    _handle_send_message(final, SimpleNamespace(DRIVE_ROOT=tmp_path,
+                         send_with_budget=message_bus.send_with_budget, append_jsonl=lambda *_a, **_k: None))
+    stored = json.loads((logs / "chat.jsonl").read_text())
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": "1"})))
+    [replayed] = json.loads(response.body)["messages"]
+    [frame] = [row for row in live if row.get("type") == "chat"]
+    expected = 0 if captured else None
+    for row in (final["progress_meta"], stored, frame, replayed):
+        assert row["tool_calls"] == row["rounds"] == expected
+        assert row["outcome_axes"]["execution"]["status"] == "infra_failed"
+        assert row["reason_code"] == "task_exception"
+    assert not (tmp_path / "task_results" / "ephemeral-exception.json").exists()
+
+
+def test_unknown_task_summary_counts_remain_readable_in_history(tmp_path, monkeypatch):
+    from ouroboros.post_task_synthesis import _run_task_summary
+
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed",
+                        lambda *_a, **_k: pytest.fail("unknown evidence must not buy a model call"))
+    _run_task_summary(SimpleNamespace(drive_root=tmp_path), None,
+                      {"id": "uncaptured-summary", "chat_id": 1, "text": "Inspect current work"},
+                      {"loop_evidence_unavailable": True},
+                      {"loop_evidence_unavailable": True, "tool_calls": []}, tmp_path / "logs")
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": "1"})))
+    [row] = json.loads(response.body)["messages"]
+    assert "round count unknown" in row["text"]
+    assert row["tool_calls"] is None and row["rounds"] is None

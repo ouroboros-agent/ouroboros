@@ -499,11 +499,11 @@ def emit_task_results(
     _presence = is_presence_task(task)
     _typed_routing_action = str(getattr(ctx, "_typed_routing_action_emitted", "") or "").strip()
     _message_meta = subagent_message_meta(task, task_id=str(task.get("id") or ""))
-    n_tool_calls = len(llm_trace.get("tool_calls", []))
+    n_tool_calls = None if llm_trace.get("loop_evidence_unavailable") else len(llm_trace.get("tool_calls", []))
     if _ephemeral:
         _message_meta.update(ephemeral_decision=True, outcome_axes=outcome_axes,
                              reason_code=reason_code, tool_calls=n_tool_calls,
-                             rounds=int(usage.get("rounds") or 0))
+                             rounds=None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0))
     send_event = {
         "type": "send_message", "chat_id": task["chat_id"],
         "text": text or "\u200b", "log_text": text or "",
@@ -520,7 +520,7 @@ def emit_task_results(
     n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
                         if isinstance(tc, dict) and tc.get("is_error"))
     if llm_trace.get("loop_evidence_unavailable"):
-        n_tool_calls = n_tool_errors = None
+        n_tool_errors = None
     try:
         from supervisor.state import reconstruct_task_cost
 
