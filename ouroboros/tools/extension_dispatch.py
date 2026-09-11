@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import pathlib
 import threading
+import contextvars
 from typing import Any, Dict, Optional
 
 from ouroboros.tools.tool_context import ToolContext
@@ -351,8 +352,11 @@ def _dispatch_extension_tool_untagged(
             except Exception as exc:
                 box["error"] = exc
 
+        # Preserve the admitted task settings snapshot across the async handler
+        # thread while keeping live immediate controls live in the API reader.
+        task_context = contextvars.copy_context()
         thread = threading.Thread(
-            target=_runner,
+            target=lambda: task_context.run(_runner),
             name=f"ext-tool-{name}-async",
             daemon=True,
         )
