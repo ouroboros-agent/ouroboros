@@ -451,8 +451,8 @@ _SEED_COMPLETE_MARKER = ".bootstrap-seed-complete"
 _POST_BOOTSTRAP_NEW_NATIVE_SEEDS = frozenset({"telegram", "unix_computer_use"})
 
 
-def _read_skill_manifest_version(skill_dir: pathlib.Path) -> str:
-    """Return a seed skill manifest version via the shared parser, or ``""``."""
+def _read_skill_manifest(skill_dir: pathlib.Path):
+    """Read a seed manifest with the shared parser, or return None."""
     for candidate in ("SKILL.md", "skill.json"):
         path = skill_dir / candidate
         if not path.is_file():
@@ -465,9 +465,15 @@ def _read_skill_manifest_version(skill_dir: pathlib.Path) -> str:
             from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
             manifest = parse_skill_manifest_text(text)
         except Exception:
-            return ""
-        return str(manifest.version or "").strip()
-    return ""
+            return None
+        return manifest
+    return None
+
+
+def _read_skill_manifest_version(skill_dir: pathlib.Path) -> str:
+    """Return the parsed seed version, or an empty string when unavailable."""
+    manifest = _read_skill_manifest(skill_dir)
+    return str(manifest.version or "").strip() if manifest is not None else ""
 
 
 def _reseed_native_skill_in_place(
@@ -532,11 +538,37 @@ def _per_skill_version_resync(
         if not (target / ".seed-origin").is_file():
             # User-managed skill in native/: never touch.
             continue
-        seed_version = _read_skill_manifest_version(entry)
-        target_version = _read_skill_manifest_version(target)
+        seed_manifest = _read_skill_manifest(entry)
+        target_manifest = _read_skill_manifest(target)
+        if seed_manifest is None or target_manifest is None:
+            continue
+        seed_version = str(seed_manifest.version or "").strip()
+        target_version = str(target_manifest.version or "").strip()
         if not seed_version or not target_version:
             continue
         if seed_version == target_version:
+            try:
+                from ouroboros.skill_loader import compute_content_hash
+                seed_hash = compute_content_hash(
+                    entry, manifest_entry=seed_manifest.entry,
+                    manifest_scripts=seed_manifest.scripts,
+                )
+                target_hash = compute_content_hash(
+                    target, manifest_entry=target_manifest.entry,
+                    manifest_scripts=target_manifest.scripts,
+                )
+            except Exception as exc:
+                log_obj.warning(
+                    "Native skill %s version %s payload comparison unavailable (%s)",
+                    entry.name, seed_version, type(exc).__name__,
+                )
+            else:
+                if seed_hash != target_hash:
+                    log_obj.warning(
+                        "Native skill %s version %s payload differs (seed=%s, installed=%s); "
+                        "installed files retained because the manifest version is unchanged",
+                        entry.name, seed_version, seed_hash, target_hash,
+                    )
             continue
         log_obj.info(
             "Native skill %s version drift (seed=%s, installed=%s) — re-seeding",

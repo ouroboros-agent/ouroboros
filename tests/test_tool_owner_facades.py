@@ -81,6 +81,7 @@ def test_tool_descriptor_owner_facades_preserve_identity():
         ("event_queue", None),
         ("task_id", None),
         ("messages", None),
+        ("_execution_trace", None),
         ("task_constraint", None),
         ("task_contract", "factory:dict"),
         ("task_depth", 0),

@@ -1,11 +1,12 @@
 """Shared helpers for the review stack (advisory, triad, scope reviews).
 
-No imports from other ouroboros.tools modules to avoid circular deps; the one
-sanctioned exception is the ``release_sync`` compatibility re-export of
-``check_worktree_version_sync`` (moved to its version-sync home).
+Keeps tool-runtime imports out to avoid circular dependencies. The pure result
+vocabulary preserves preflight failures; ``release_sync`` re-exports version sync.
 """
 
 from __future__ import annotations
+
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
 import json
 import logging
@@ -755,7 +756,7 @@ def _run_review_preflight_tests(ctx: "Any", timeout: Optional[int] = None, *, fo
         return _truncate_review_artifact(output, limit=MAX_OUTPUT) if output else None
     except Exception as exc:
         logger.warning("_run_review_preflight_tests failed: %s", exc, exc_info=True)
-        return f"⚠️ Unexpected error running tests: {exc}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ Unexpected error running tests: {exc}")))
 
 
 def format_advisory_error(prefix: str, result_error: str, stderr_tail: str,

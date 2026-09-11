@@ -253,6 +253,7 @@ def test_emit_task_results_ephemeral_turn_skips_all_durable_memory(tmp_path, mon
     done = next(evt for evt in pending_events if evt["type"] == "task_done")
     assert inline["progress_meta"] == {
         "ephemeral_decision": True, "task_terminal_status": "completed",
+        "tool_calls": 0, "rounds": 1,
         "outcome_axes": done["outcome_axes"], "reason_code": done["reason_code"],
         **carry_cost_meta({key: value for key, value in done.items()
                            if key not in {"accounted_upper_bound_usd_with_children", "cost_with_children_partial"}}),

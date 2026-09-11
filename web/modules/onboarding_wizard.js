@@ -44,6 +44,10 @@ import { accountRowFacts } from './harness_accounts.js';
         const MODEL_SLOTS = SETUP_CONTRACT.modelSlots || [];
         const REVIEW_MODES = SETUP_CONTRACT.reviewModes || [];
         const RUNTIME_MODES = SETUP_CONTRACT.runtimeModes || [];
+        // The setup contract owns the access ladder. Pick the matching layout
+        // for its current number of choices so adding Cyber Pro does not leave
+        // the fourth card stranded under a three-column presentation.
+        const RUNTIME_MODE_GRID_CLASS = RUNTIME_MODES.length > 3 ? 'four' : 'three';
         const LOCAL_ROUTING_MODES = SETUP_CONTRACT.localRoutingModes || [];
         const BUDGET_FIELDS = SETUP_CONTRACT.budgetFields || [];
         const LOCAL_FIELDS = [
@@ -838,9 +842,9 @@ import { accountRowFacts } from './harness_accounts.js';
                     `).join('')}
                 </div>
             <div class="panel-card runtime-mode-card">
-                <h3>Runtime mode</h3>
+                <h3>Access level</h3>
                     <p class="field-note">${escapeHtml(runtimeModeCopy)}</p>
-                    <div class="wizard-choice-grid three">
+                    <div class="wizard-choice-grid ${RUNTIME_MODE_GRID_CLASS}">
                         ${RUNTIME_MODES.map((mode) => `
                             <button type="button" class="wizard-choice ${escapeHtml(mode.className || mode.value)} ${runtimeMode === mode.value ? 'active' : ''}" data-runtime-mode="${escapeHtml(mode.value)}" aria-pressed="${runtimeMode === mode.value}">
                                 <span class="tone">${escapeHtml(mode.tone)}</span>

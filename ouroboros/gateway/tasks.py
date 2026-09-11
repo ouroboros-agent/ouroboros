@@ -516,7 +516,7 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     if task_type in {"evolution", "review", "deep_self_review"}:
         return json_error(
             f"task type {task_type!r} is internal-only and cannot be created via the task API "
-            "(use /evolve or /review); evolution additionally requires advanced/pro runtime mode",
+            "(use /evolve or /review); evolution additionally requires advanced/pro/cyber_pro runtime mode",
             400,
         )
     if workspace_root and task_type != "task":
@@ -906,7 +906,13 @@ def _task_get_response(request: Request) -> JSONResponse:
     drive_root = request_drive_root(request)
     data = load_effective_task_result(drive_root, task_id)
     if not data:
-        return json_error("task not found", 404)
+        try:
+            (task_results_dir(drive_root, create=False) / f"{task_id}.json").stat()
+        except FileNotFoundError:
+            return json_error("task not found", 404)
+        except OSError:
+            pass
+        return json_error("task result is unavailable", 503)
     payload = public_task_result(data)
     breakdown_view = _task_cost_breakdown_view(drive_root, data)
     if breakdown_view is not None:

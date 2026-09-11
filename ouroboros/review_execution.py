@@ -10,13 +10,13 @@ The dependency runs one way: this module never imports the coordinator.
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
 from ouroboros.model_wait import monotonic_now
 
 import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -41,7 +41,7 @@ from ouroboros.triad_review import (
     review_output_shape,
 )
 from ouroboros.deadline_utils import (
-    bounded_seconds, owner_deadline_exhausted,
+    bounded_seconds, caller_deadline_arguments, owner_deadline_exhausted,
     review_transport_timeout,
 )
 from ouroboros.config import get_finalization_grace_sec
@@ -451,6 +451,8 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
             getattr(slot, "transport_timeout_sec", None),
             getattr(request, "deadline_at", ""),
         )
+        self._chat_kwargs.update(caller_deadline_arguments(getattr(request, "deadline_at", ""),
+                                getattr(self, "_logical_deadline_monotonic", None), reserve_sec=get_finalization_grace_sec()))
         return self._chat_kwargs
 
     def execute(self) -> ReviewAttemptResult:
@@ -510,7 +512,7 @@ def review_session_route() -> Any:
     """
     from ouroboros.subagents import get_subagent_harness, parse_subagent_harness
 
-    raw = str(os.environ.get(REVIEW_SESSION_ROUTE_ENV, "")).strip()
+    raw = str(runtime_setting(REVIEW_SESSION_ROUTE_ENV, "")).strip()
     route = parse_subagent_harness(raw)
     if route is not None: return route
     if raw and raw.lower() != "off":

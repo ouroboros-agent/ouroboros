@@ -155,7 +155,7 @@ class TestSupervisorTaskDoneAuditTrail:
         # Minimal context mock
         class MockCtx:
             DRIVE_ROOT = tmp_path
-            RUNNING = {"test_td": {"task": {"type": "task"}}}
+            RUNNING = {"test_td": {"task": {"id": "test_td", "type": "task"}}}
             WORKERS = {}
             PENDING = []
 
@@ -227,6 +227,12 @@ class TestSupervisorTaskDoneAuditTrail:
             cost_final=True,
         )
 
+        # The real worker prepares files before publishing this same terminal frame.
+        from ouroboros.headless import prepare_terminal_task_files
+
+        task = ctx.RUNNING["test_td"]["task"]
+        assert not prepare_terminal_task_files(tmp_path, task)["error"]
+        evt["_files_prepared_attempt"] = int(task.get("_attempt") or 1)
         _handle_task_done(evt, ctx)
 
         assert events_file.exists(), "events.jsonl should be created by _handle_task_done"

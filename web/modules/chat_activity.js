@@ -1,6 +1,9 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
+import { executorIdentityMarkup } from './harness_presentation.js';
+import { compactModel, modelExecutionLabel } from './log_events.js';
+import { createSystemMessageAction } from './ui_helpers.js';
 import { joinMarkdownHeadings } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import {
@@ -21,10 +24,19 @@ export function withTaskCostMeta(summary, payload, { replace = false, rawTs = ''
     // evidence must show no money at all, not a bare per-call number.
     const base = replace ? { ...summary, meta: [] } : summary;
     const out = projection ? { ...base, costProjection: projection } : { ...base };
+    if (payload?.model_execution && typeof payload.model_execution === 'object') {
+        out.modelExecution = payload.model_execution;
+    }
     if (Array.isArray(out.meta) && out.meta.length) {
         out.meta = out.meta.filter((entry) => !String(entry || '').startsWith('cost='));
     }
     return out;
+}
+
+export function applyHistoricalModelExecution(record, historical) {
+    if (!record || record.modelExecution || !historical?.model_execution) return false;
+    record.modelExecution = historical.model_execution;
+    return true;
 }
 
 export function senderLabel(role, isProgress = false, systemType = '', opts = {}, chatSessionId = '') {
@@ -161,7 +173,7 @@ export function shouldAlwaysShowTaskCard(taskId = '') {
 
 export function isForegroundLiveCard(record) {
     return Boolean(
-        record?.root?.isConnected && !record.finished && !record.reviewAnchor
+        record?.root?.isConnected && !record.finished && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed
         && !isBackgroundTaskId(record.groupId)
     );
 }
@@ -443,6 +455,12 @@ export function clearStickyCardState(record) {
         record.activityEl.textContent = '';
         record.activityEl.removeAttribute('title');
     }
+    record.modelExecution = null;
+    record.toolCalls = null;
+    record.historicalUnavailable = false;
+    record.historicalUnconfirmed = false;
+    record.historicalTerminal = null;
+    record.lastLiveObservedAt = 0;
     return record;
 }
 
@@ -820,6 +838,7 @@ export function computeHydratedDirectActivities(
     snapshotBarrierMs = Infinity,
     concludedIds = null,
     snapshotGeneration = 0,
+    complete = true,
 ) {
     const nextMap = new Map(existingMap || []);
     if (!Array.isArray(turnsList)) return nextMap;
@@ -851,6 +870,7 @@ export function computeHydratedDirectActivities(
         nextMap.set(aid, hydrated);
     }
     for (const [aid, entry] of nextMap.entries()) {
+        if (!complete) break;
         if (activeIdsInSnapshot.has(aid)) continue;
         // Deletion authority is scoped to snapshot-enumerated kinds: a
         // kind-less typing entry is invisible to every snapshot source and is
@@ -888,9 +908,10 @@ export function reconcileHydratedDirectActivities(
     snapshotBarrierMs = Infinity,
     concludedIds = null,
     snapshotGeneration = 0,
+    complete = true,
 ) {
     const activities = computeHydratedDirectActivities(
-        existingMap, turnsList, chatId, snapshotBarrierMs, concludedIds, snapshotGeneration,
+        existingMap, turnsList, chatId, snapshotBarrierMs, concludedIds, snapshotGeneration, complete,
     );
     const globallyActiveActivityIds = new Set();
     for (const turn of Array.isArray(turnsList) ? turnsList : []) {
@@ -976,7 +997,9 @@ export function renderRoutingAnnotation(bubble, annotation) {
         return true;
     }
     const status = String(annotation.status || '');
-    const changed = !note || note.textContent !== text
+    const destinationKey = `${annotation.project_id || ''}|${annotation.project_chat_id || ''}|${annotation.target || ''}`;
+    const changed = !note || note.dataset.annotationText !== text
+        || note.dataset.destinationKey !== destinationKey
         || note.dataset.annotationStatus !== status
         || bubble.dataset.chatAnnotationStatus !== status;
     if (!note) {
@@ -986,8 +1009,88 @@ export function renderRoutingAnnotation(bubble, annotation) {
         if (time) time.before(note);
         else bubble.append(note);
     }
-    if (note.textContent !== text) note.textContent = text;
+    if (!changed) return false;
+    note.textContent = text;
+    note.dataset.annotationText = text;
+    note.dataset.destinationKey = destinationKey;
     if (note.dataset.annotationStatus !== status) note.dataset.annotationStatus = status;
     if (bubble.dataset.chatAnnotationStatus !== status) bubble.dataset.chatAnnotationStatus = status;
+    const destination = annotation.project_id && Number(annotation.project_chat_id) > 0
+        && ['scheduled', 'delivered'].includes(status);
+    if (destination) {
+        const button = createSystemMessageAction({
+            label: 'Open Project', title: 'Open Project',
+            onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: {
+                project: { id: annotation.project_id, chat_id: Number(annotation.project_chat_id) },
+                task_id: annotation.target || '',
+            } })),
+        });
+        note.append(button);
+    }
     return changed;
+}
+
+// Full narration stays in the timeline, not a mouse-only title.
+export function renderCollapsedActivity(record, text) {
+    if (!record?.activityEl) return false;
+    const changed = record.activityEl.textContent !== text
+        || Boolean(record.activityEl.hasAttribute?.('title'));
+    if (record.activityEl.textContent !== text) record.activityEl.textContent = text;
+    if (record.activityEl.hasAttribute?.('title')) record.activityEl.removeAttribute('title');
+    return Boolean(changed && record.activityEl.isConnected);
+}
+
+// The 12 cost-meta keys shared by both subagent whitelists (the delegation
+// trio stays inline in each literal — the wire test scans those literals).
+const COST_META_KEYS = [
+    'cost_usd', 'accounted_upper_bound_usd', 'accounted_upper_bound_usd_with_children',
+    'cost_accounting_status', 'cost_accounting_error', 'cost_final', 'cost_usd_with_children',
+    'cost_with_children_partial', 'reserved_usd', 'unresolved_upper_bound_usd',
+    'unknown_unmetered', 'non_final_rows',
+];
+export function costMetaKeys(src) {
+    return Object.fromEntries(COST_META_KEYS.map((key) => [key, src?.[key]]));
+}
+
+const CARD_META_KEYS = [
+    ...COST_META_KEYS, 'executor_route', 'execution_evidence', 'actual_substrate',
+    'executor_observation', 'model_execution', 'tool_calls', 'model', 'ts',
+];
+export function cardMetaKeys(src) {
+    return Object.fromEntries(CARD_META_KEYS.map((key) => [key, src?.[key]]));
+}
+
+// the ONE meta-line renderer, fed entirely from record state,
+// so a replay batch renders it exactly once per card.
+export function renderLiveCardMeta(record, { agentModel = record?.agentModel || '' } = {}) {
+    if (!record?.metaEl) return false;
+    const html = executorIdentityMarkup(record.executorChip, { agentModel: compactModel(agentModel) }) + [
+        record.groupId === 'bg-consciousness' ? 'Background thinking' : '',
+        record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
+        modelExecutionLabel(record.modelExecution),
+        Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '',
+        ...(Array.isArray(record._lastFrameMeta) ? record._lastFrameMeta : []),
+        ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),
+        record.latestActivityTs ? `updated ${record.latestActivityTs}` : '',
+    ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`).join(' · ');
+    if (record.metaEl.innerHTML === html) return false;
+    record.metaEl.innerHTML = html;
+    return Boolean(record.metaEl.isConnected);
+}
+
+// Only host-attested cancelable queue roots receive this control.
+export function ensureLiveActionsEl(record) {
+    if (!record?.root
+        || record.root.dataset.projectCreated === '1'
+        || record.root.dataset.projectCreating === '1') return null;
+    let actions = record.root.querySelector('.chat-live-actions');
+    if (!actions) {
+        actions = document.createElement('div');
+        actions.className = 'chat-live-actions';
+        const timeline = record.timelineEl && record.timelineEl.parentElement === record.root
+            ? record.timelineEl
+            : null;
+        record.root.insertBefore(actions, timeline);
+    }
+    return actions;
 }

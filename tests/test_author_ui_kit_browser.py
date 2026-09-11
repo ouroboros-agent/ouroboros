@@ -56,7 +56,7 @@ def register(api):
 
 def _style_document(installed, document):
     """Use each real product document's stylesheet order and real primitives."""
-    source = (installed / "web" / document).read_text()
+    source = (installed / "web" / document).read_text(encoding="utf-8")
     links = "\n".join(re.findall(r'<link\b[^>]*rel="stylesheet"[^>]*>', source))
     assert '/static/ui.css' in links, "the shared layer must serve both product documents"
     return f"""<!doctype html><html><head>{links}</head><body>
@@ -85,8 +85,8 @@ def author_kit_server(tmp_path, monkeypatch):
     shutil.copytree(REPO / "web", installed / "web")
     _copy_installed_runtime(installed)
     monkeypatch.setattr(widget_fixture, "REPO", installed)
-    monkeypatch.setattr(widget_fixture, "_PLUGIN", (EXAMPLE / "plugin.py").read_text() + _CUSTOM)
-    monkeypatch.setattr(widget_fixture, "_WIDGET", (EXAMPLE / "widget.js").read_text().replace(
+    monkeypatch.setattr(widget_fixture, "_PLUGIN", (EXAMPLE / "plugin.py").read_text(encoding="utf-8") + _CUSTOM)
+    monkeypatch.setattr(widget_fixture, "_WIDGET", (EXAMPLE / "widget.js").read_text(encoding="utf-8").replace(
         "/api/extensions/author_ui_kit/", "/api/extensions/export_widget/"))
     monkeypatch.setattr(widget_fixture, "_HTML", _HOST)
     original_writer = extension_fixture._write_ext_skill
@@ -269,7 +269,11 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             }""")
             assert _metrics(module, ".btn")["borderRadius"] == "37px"
             css = server["installed"] / "web/ui.css"
-            css.write_text(css.read_text() + '\n.ouro-ui .btn.btn-default { border-radius: 17px; }\n')
+            css.write_text(
+                css.read_text(encoding="utf-8")
+                + '\n.ouro-ui .btn.btn-default { border-radius: 17px; }\n',
+                encoding="utf-8",
+            )
             page.evaluate("async () => {await mountExample('module-new','module'); await mountExample('page-new','page');}")
             for key in ("module-new", "page-new"):
                 frame = _frame(page, key)
@@ -298,7 +302,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             module.wait_for_function("document.getElementById('root').dataset.event === 'delivered'")
             with page.expect_download() as download:
                 module.get_by_role("button", name="Export example", exact=True).click()
-            assert Path(download.value.path()).read_text() == "author kit export"
+            assert Path(download.value.path()).read_text(encoding="utf-8") == "author kit export"
 
             page.route("**/api/extensions/export_widget/author-kit", lambda request: request.fulfill(status=503))
             page.evaluate("() => mountExample('unavailable', 'module')")
@@ -312,7 +316,9 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
                 card.scroll_into_view_if_needed()
                 page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
                 card.screenshot(path=str(evidence / f"author-kit-{browser_name}-{key}.png"))
-            (evidence / f"author-kit-{browser_name}-styles.json").write_text(json.dumps(style_mismatches, indent=2))
+            (evidence / f"author-kit-{browser_name}-styles.json").write_text(
+                json.dumps(style_mismatches, indent=2), encoding="utf-8",
+            )
             page.evaluate("() => Promise.all(Object.values(disposers).map(dispose => dispose()))")
             assert page.locator("[data-widget-key] iframe").count() == 0
             assert page.evaluate("window.handlers.size") == 0

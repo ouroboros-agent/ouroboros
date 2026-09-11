@@ -2907,6 +2907,10 @@
    "is_error": true,
    "status": "git_via_shell_blocked"
   },
+  "native:LEGACY_BLOCKED:CHILD_RESULT_STALE": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:LEGACY_BLOCKED:REPO_LIST_BLOCKED": {
    "is_error": true,
    "status": "blocked"
@@ -2915,6 +2919,14 @@
    "is_error": true,
    "status": "blocked"
   },
+  "native:LEGACY_BLOCKED:TASK_CANCEL_PENDING": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:LEGACY_BLOCKED:TASK_NOT_ACTIVE": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:LEGACY_TOOL_ERROR:LIST_FILES_ERROR": {
    "is_error": true,
    "status": "error"
@@ -2922,6 +2934,14 @@
   "native:LEGACY_TOOL_ERROR:READ_FILE_ERROR": {
    "is_error": true,
    "status": "error"
+  },
+  "native:LEGACY_UNAVAILABLE:CHILD_RESULT_STALE": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:LEGACY_UNAVAILABLE:TASK_NOT_FOUND": {
+   "is_error": false,
+   "status": "ok"
   },
   "native:LEGACY_WARNING:DATA_NOT_YET_CREATED": {
    "is_error": false,
@@ -2971,6 +2991,14 @@
    "is_error": true,
    "status": "blocked"
   },
+  "native:TOOL_ARG_ERROR:CHILD_RESULT_DISPOSITION_INVALID": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:TOOL_ARG_ERROR:ERROR": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:TOOL_ARG_ERROR:GH_TARGET_INVALID": {
    "is_error": false,
    "status": "ok"
@@ -2979,9 +3007,17 @@
    "is_error": false,
    "status": "ok"
   },
+  "native:TOOL_ARG_ERROR:REJECTED": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:TOOL_ARG_ERROR:TOOL_ARG_ERROR": {
    "is_error": true,
    "status": "error"
+  },
+  "native:TOOL_ERROR:TASK_MESSAGE_UNWRITTEN": {
+   "is_error": false,
+   "status": "ok"
   },
   "native:USER_FILES_PATH_BLOCKED:USER_FILES_PATH_BLOCKED": {
    "is_error": true,

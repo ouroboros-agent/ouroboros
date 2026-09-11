@@ -88,6 +88,7 @@ def build_scope_session_task(
     drive_root: Optional[pathlib.Path] = None,
     governance_repo_dir: Optional[pathlib.Path] = None,
     managed_subject: Optional[Any] = None,
+    task_evidence_section: str = "",
 ) -> Tuple[str, Dict[str, Any]]:
     """The scope task in SESSION delivery, plus its forensic coverage manifest.
 
@@ -184,6 +185,7 @@ def build_scope_session_task(
             "your own tools)"
         ),
         critical_calibration=CRITICAL_FINDING_CALIBRATION,
+        task_evidence_section=task_evidence_section,
     )
     manifest: Dict[str, Any] = {
         # D-12's ratified spelling. It is deliberately NOT `agent_session`: that

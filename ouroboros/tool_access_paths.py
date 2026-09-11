@@ -59,10 +59,12 @@ def _deliverables_root() -> pathlib.Path:
     instead of escaping to the real ``~/Ouroboros/Deliverables`` (which the outside-home
     check would then reject). Otherwise the global config default applies.
     """
+    from ouroboros.config import runtime_setting
+
     from ouroboros.config import get_deliverables_root
 
     jail = (os.environ.get("OUROBOROS_USER_FILES_ROOT") or "").strip()
-    explicit = (os.environ.get("OUROBOROS_DELIVERABLES_ROOT") or "").strip()
+    explicit = (runtime_setting("OUROBOROS_DELIVERABLES_ROOT") or "").strip()
     if explicit:
         return pathlib.Path(explicit).expanduser().resolve(strict=False)
     if jail and not explicit:

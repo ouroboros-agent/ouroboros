@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import logging
 import os
 import pathlib
@@ -85,6 +87,46 @@ def _authority_source_terminal(refusal: Dict[str, Any]):
         "authority_source_unavailable": refusal,
     }
     return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
+
+
+def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, drive_logs: pathlib.Path):
+    """Project captured loop evidence, or its explicit absence, without recovery.
+
+    A failed cold-source read is never permission to read unverified checkpoint
+    bytes as usage. The loop tally stays in loop_outcome; top-level money and
+    counters remain the existing ledger reconstruction's answer.
+    """
+    captured_usage = getattr(exc, "_ouroboros_loop_usage", None)
+    captured_trace = getattr(exc, "_ouroboros_loop_trace", None)
+    usage = dict(captured_usage) if isinstance(captured_usage, dict) else {"loop_evidence_unavailable": True}
+    llm_trace = captured_trace if isinstance(captured_trace, dict) else {
+        "reasoning_notes": [], "tool_calls": [], "loop_evidence_unavailable": True,
+    }
+    usage.update(execution_status="infra_failed", reason_code="task_exception")
+    text = f"⚠️ Error during processing: {type(exc).__name__}: {exc}"
+    append_jsonl(drive_logs / "events.jsonl", {
+        "ts": utc_now_iso(), "type": "task_error", "task_id": task.get("id"),
+        "error": repr(exc), "traceback": truncate_for_log(traceback.format_exc(), 2000),
+    })
+    try:
+        from ouroboros.outcomes import collect_trace_refs, derive_loop_outcome
+        from ouroboros.agent_task_pipeline import build_trace_summary
+        from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+        # Ephemeral decision turns leave no durable task result, including errors.
+        if not bool(task.get("_ephemeral_turn")):
+            loop_outcome = derive_loop_outcome(text, usage, llm_trace)
+            write_task_result(
+                env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
+                result=text, reason_code="task_exception", loop_outcome=loop_outcome,
+                outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
+                    "task_exception", review_trigger="agent_exception"),
+                trace_summary=build_trace_summary(llm_trace),
+                trace_refs=loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace),
+            )
+    except Exception:
+        log.debug("Failed to persist task exception projection", exc_info=True)
+    return text, usage, llm_trace
 
 
 def _sync_task_project_scope(task: Dict[str, Any], ctx: Any) -> None:
@@ -745,39 +787,43 @@ class OuroborosAgent:
         self._current_chat_id = None
         # Hot-reload settings so UI changes affect the next task without
         # restart; a failed reload is disclosed loudly, not swallowed (#285).
-        subagent_runtime.apply_task_start_settings_or_disclose(
+        settings_snapshot = subagent_runtime.apply_task_start_settings_or_disclose(
             str(task.get("id") or ""), self._emit_live_log)
 
         from ouroboros.usage_accounting import UsageScope, usage_scope
         from ouroboros.model_wait import task_model_wait_scope
         from ouroboros.utils import in_worker_process
 
-        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-        task_id = str(task.get("id") or metadata.get("task_id") or "")
-        root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
-        parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
-        budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
-        global_limit = resolve_total_budget_usd()
-        try:
-            root_limit = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
-        except (TypeError, ValueError):
-            root_limit = 0.0
-        scope = UsageScope(
-            drive_root=budget_root,
-            task_id=task_id,
-            root_task_id=root_task_id,
-            parent_task_id=parent_task_id,
-            category=str(task.get("type") or "task"),
-            source="agent.task",
-            global_limit_usd=global_limit,
-            root_limit_usd=root_limit if root_limit > 0 else None,
-            root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
-        )
-        with usage_scope(scope), task_model_wait_scope(
-            task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
-            worker_slot_held=in_worker_process(),
-        ):
-            return self._handle_task_scoped(task)
+        from ouroboros.config import task_settings_scope
+
+        with task_settings_scope(settings_snapshot):
+            metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+            task_id = str(task.get("id") or metadata.get("task_id") or "")
+            root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
+            parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
+            budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
+            global_limit = resolve_total_budget_usd()
+            try:
+                root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+            except (TypeError, ValueError):
+                root_limit = 0.0
+            scope = UsageScope(
+                drive_root=budget_root,
+                task_id=task_id,
+                root_task_id=root_task_id,
+                parent_task_id=parent_task_id,
+                category=str(task.get("type") or "task"),
+                source="agent.task",
+                global_limit_usd=global_limit,
+                global_limit_source="task_start_budget_resolver",
+                root_limit_usd=root_limit if root_limit > 0 else None,
+                root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
+            )
+            with usage_scope(scope), task_model_wait_scope(
+                task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
+                worker_slot_held=in_worker_process(),
+            ):
+                return self._handle_task_scoped(task)
 
     def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._busy = True
@@ -926,31 +972,7 @@ class OuroborosAgent:
                             # Empty events leave its queue slot/project owned until
                             # supervisor cancellation kills and settles this task.
                             return []
-                    tb = traceback.format_exc()
-                    append_jsonl(drive_logs / "events.jsonl", {
-                        "ts": utc_now_iso(), "type": "task_error",
-                        "task_id": task.get("id"), "error": repr(e),
-                        "traceback": truncate_for_log(tb, 2000),
-                    })
-                    text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
-                    usage = {
-                        "execution_status": "infra_failed",
-                        "reason_code": "task_exception",
-                    }
-                    try:
-                        from ouroboros.task_results import STATUS_FAILED, write_task_result
-                        # CW3: an ephemeral decision turn leaves no durable task_result even on error.
-                        if not bool(task.get("_ephemeral_turn")):
-                            write_task_result(
-                                self.env.drive_root,
-                                str(task.get("id") or ""),
-                                STATUS_FAILED,
-                                result=text,
-                                reason_code="task_exception",
-                                outcome_axes=infra_failed_axes("task_exception", review_trigger="agent_exception"),
-                            )
-                    except Exception:
-                        pass
+                    text, usage, llm_trace = _task_exception_terminal(self.env, task, e, drive_logs)
                     try:
                         from ouroboros.task_continuation import capture_review_continuation_from_state
                         capture_review_continuation_from_state(

@@ -78,11 +78,14 @@ class ClaudexorUnavailable(RuntimeError):
     """
 
     def __init__(self, code: str, message: str, *, status_code: int = 0,
-                 required_actions: tuple[str, ...] = ()) -> None:
+                 required_actions: tuple[str, ...] = (), observation_timeout: bool = False) -> None:
         super().__init__(message)
         self.code = str(code or "claudexor_unavailable")
         self.status_code = int(status_code or 0)
         self.required_actions = tuple(required_actions or ())
+        # Read-only observers may retry this exact HTTP read without claiming
+        # anything about the worker. A received HTTP refusal still wins.
+        self.observation_timeout = bool(observation_timeout)
 
 
 # Cross-repo contract (B1): the engine's window-exhausted RunFailure codes. A
@@ -334,6 +337,8 @@ class ClaudexorGateway:
                 "daemon_unreachable",
                 f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
                 status_code=response.status_code if response is not None else 0,
+                observation_timeout=isinstance(exc, httpx.ReadTimeout)
+                and (response is None or response.status_code < 400),
             ) from exc
         if response.status_code >= 400:
             raise self._problem(response)
@@ -438,7 +443,8 @@ class ClaudexorGateway:
 
     def list_source_models(self, source: str,
                            credential_profile_id: Optional[str] = None, *,
-                           requested_model: Optional[str] = None) -> Dict[str, Any]:
+                           requested_model: Optional[str] = None,
+                           timeout_sec: Optional[float] = None) -> Dict[str, Any]:
         """Preserve the exact-profile catalog envelope; an omitted pin means engine Auto."""
         from urllib.parse import quote, urlencode
 
@@ -450,7 +456,7 @@ class ClaudexorGateway:
             query["requestedModel"] = requested_model
         if query:
             path += "?" + urlencode(query)
-        return _model_object(self._request("GET", path))
+        return _model_object(self._request("GET", path, **({"timeout_sec": timeout_sec} if timeout_sec is not None else {})))
 
     def upload_model_request(self, request: Dict[str, Any], *,
                              idempotency_key: str) -> Dict[str, Any]:

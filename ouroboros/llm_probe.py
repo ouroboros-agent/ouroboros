@@ -5,6 +5,8 @@ reasoning, cache, or capability-learning paths.  Target resolution and client
 construction remain owned by the routing leaf the client composes
 (:mod:`ouroboros.llm_routing`); this module only builds the final probe candidate
 and dispatches it through the existing physical-attempt accounting seam.
+Transport reachability is a separate non-generating metadata observation; it
+never reserves a paid attempt or claims the prior generation completed.
 """
 
 from __future__ import annotations
@@ -396,3 +398,64 @@ __all__ = [
     "probe_oversized_context",
     "probe_provider_readiness",
 ]
+
+
+def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
+                                 model_role: str = "main", account_override: Optional[str] = None,
+                                 observed_after: Optional[float] = None, expected_route: Optional[dict] = None) -> dict:
+    """Non-generating observation of the selected upstream, never a paid probe."""
+    import logging
+    import time
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.utils import utc_now_iso
+    from ouroboros.provider_models import parse_claudexor_model, provider_for_model
+    from ouroboros.transport_custody import is_loopback_base_url
+    try:
+        if provider_for_model(model) == "claudexor":
+            from ouroboros.llm_claudexor import model_catalog
+            from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
+            source, native_model = parse_claudexor_model(model)
+            account = (model_role_option(MODEL_ACCOUNTS_KEY, model_role)
+                       if account_override is None else account_override)
+            effective = expected_route or {}
+            effective_profile = effective.get("credentialProfileId")
+            if (effective.get("source", source) != source
+                    or effective.get("model", native_model) != native_model
+                    or (account and effective_profile and account != effective_profile)):
+                return {}
+            account = account or effective_profile
+            started = time.time() if observed_after is None else observed_after
+            catalog = model_catalog(source, account or None, requested_model=native_model,
+                                    timeout_sec=timeout)
+            observed = parse_deadline_ts(catalog.get("observedAt"))
+            # The existing model catalog owner performs fresh upstream discovery.
+            # Old/cache-only metadata cannot establish recovery from this outage.
+            if (catalog.get("source") == source and catalog.get("provenance") == "provider_http"
+                    and observed and observed.timestamp() >= started
+                    and (not account or catalog.get("credentialProfileId") == account)
+                    and (not effective.get("accountFingerprint")
+                         or catalog.get("accountFingerprint") == effective["accountFingerprint"])
+                    and any(item.get("id") == native_model for item in catalog.get("models", []))):
+                return {"kind": "upstream_catalog", "source": source,
+                        "observed_at": catalog["observedAt"], "provenance": catalog["provenance"],
+                        "credential_profile_id": catalog.get("credentialProfileId"),
+                        "account_fingerprint": catalog.get("accountFingerprint")}
+            return {}
+        target = llm._resolve_remote_target(model)
+        url = str(target.get("base_url") or "")
+        if not url or is_loopback_base_url(url):
+            return {}
+        import httpx
+        # Metadata carries no cognitive in-flight lease. Reuse the ordinary
+        # connection allowance for every HEAD phase, not the LLM read window.
+        timeout = min(float(timeout), float(llm._no_proxy_timeout(timeout).connect))
+        with httpx.Client(trust_env=False, timeout=timeout, follow_redirects=False) as client:
+            response = client.head(url)
+        # An upstream HTTP refusal still proves connectivity. A gateway/server
+        # outage does not. This says nothing about the old generation's outcome.
+        if 200 <= response.status_code < 500:
+            return {"kind": "upstream_http", "status_code": response.status_code,
+                    "observed_at": utc_now_iso()}
+    except Exception:
+        logging.getLogger(__name__).debug("upstream transport still unavailable", exc_info=True)
+    return {}

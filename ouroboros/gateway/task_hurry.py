@@ -42,10 +42,12 @@ def _admit_hurry_locked(task_id: str) -> Tuple[Optional[Dict[str, Any]], str, in
 
     with q._queue_lock:
         attempt = 1
+        pooled_status = ""
         task: Optional[Dict[str, Any]] = None
         meta = q.RUNNING.get(task_id) if isinstance(q.RUNNING, dict) else None
         if isinstance(meta, dict) and isinstance(meta.get("task"), dict):
             task = dict(meta["task"])
+            pooled_status = "running"
             raw_attempt = meta.get("attempt")
             if raw_attempt is None:
                 raw_attempt = task.get("_attempt")
@@ -62,6 +64,7 @@ def _admit_hurry_locked(task_id: str) -> Tuple[Optional[Dict[str, Any]], str, in
                 None,
             )
             if task is not None:
+                pooled_status = "scheduled"
                 try:
                     attempt = max(1, int(task.get("_attempt") or 1))
                 except (TypeError, ValueError):
@@ -91,12 +94,26 @@ def _admit_hurry_locked(task_id: str) -> Tuple[Optional[Dict[str, Any]], str, in
         try:
             from ouroboros.cancel_intents import cancel_pending
 
-            if cancel_pending(q.DRIVE_ROOT, task_id):
+            if cancel_pending(q.DRIVE_ROOT, task_id, strict=bool(pooled_status)):
                 # A pending/active stop WINS and owns the terminal reason
                 # (§19.7.2 item 2); hurry is refused, never queued behind it.
                 return None, "cancel_pending", attempt
         except Exception:
+            if pooled_status:
+                raise  # Preserve unreadable pooled authority before any hurry write.
             log.debug("hurry cancel-pending check failed for %s", task_id, exc_info=True)
+        if pooled_status:
+            from ouroboros.task_results import load_task_result, write_task_result
+
+            # Queue identity owns this lifecycle seed; direct turns stay unchanged.
+            # The worker can publish between read and write, so create atomically.
+            if str(task.get("id") or "") != task_id:
+                raise ValueError("hurry queue task identity mismatch")
+            if load_task_result(q.DRIVE_ROOT, task_id, strict=True) is None:
+                write_task_result(
+                    q.DRIVE_ROOT, task_id, pooled_status,
+                    create_only=True, strict_existing_dict=True,
+                )
         return task, "", attempt
 
 

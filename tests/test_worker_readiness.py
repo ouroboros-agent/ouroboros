@@ -272,6 +272,8 @@ def test_the_window_and_the_reported_wait_count_from_the_spawn_instant(pool, sea
 
 
 def test_the_replacement_loop_is_bounded_then_parked_and_reported(pool, seam, monkeypatch):
+    disabled = []
+    monkeypatch.setattr(pool.workers, "disable_exhausted_worker_pool", lambda: disabled.append(True))
     monkeypatch.setattr(pool.lifecycle, "WORKER_READY_MAX_ATTEMPTS", 2)
     monkeypatch.setattr(pool.workers, "load_state", lambda: {"current_sha": "abc123", "owner_chat_id": 7})
     first = _booting_slot(pool, 1, 5011)
@@ -284,6 +286,7 @@ def test_the_replacement_loop_is_bounded_then_parked_and_reported(pool, seam, mo
     assert seam.respawned == [(1, {"ready_attempt": 2})], "no respawn at the bound"
     assert seam.killed == [5011, 5012]
     assert last.reaping is True, "parked: never assignable, never respawned again"
+    assert last.readiness_exhausted and disabled == [True]
     rows = _rows(seam.supervisor, "worker_ready_timeout")
     assert [row["action"] for row in rows] == ["respawn", "parked"]
     assert rows[1]["attempt"] == 2 and rows[1]["max_attempts"] == 2

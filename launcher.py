@@ -293,6 +293,16 @@ def _update_server_process_record_port(pid: int, actual_port: int) -> None:
         log.debug("Failed to update server process record port", exc_info=True)
 
 
+def _retained_shared_daemon_pids() -> set[int]:
+    """Read this installation's shared daemon custody; never start or adopt it."""
+    from ouroboros.claudexor_daemon import CUSTODY_PURPOSE
+    from ouroboros.process_custody import live_daemon_root_pids
+
+    return live_daemon_root_pids(
+        DATA_DIR, purposes={CUSTODY_PURPOSE}, retained_purposes={CUSTODY_PURPOSE}, strict=True,
+    )
+
+
 def _cleanup_recorded_server_process(reason: str = "preflight") -> None:
     try:
         record_path = _server_process_record_path()
@@ -308,13 +318,14 @@ def _cleanup_recorded_server_process(reason: str = "preflight") -> None:
             return
         pid = int(record.get("pid") or 0)
         pgid = int(record.get("pgid") or 0)
+        retained = _retained_shared_daemon_pids()
         log.info("Cleaning recorded server process pid=%d pgid=%d (%s)", pid, pgid, reason)
         if not IS_WINDOWS and pgid > 0 and pgid != current_process_group_id():
-            terminate_process_group_id(pgid)
+            terminate_process_group_id(pgid, exclude_pids=retained)
             time.sleep(0.5)
-            kill_process_group_id(pgid)
+            kill_process_group_id(pgid, exclude_pids=retained)
         if pid_is_alive(pid):
-            kill_pid_tree(pid)
+            kill_pid_tree(pid, exclude_pids=retained)
         record_path.unlink(missing_ok=True)
     except Exception:
         log.warning("Failed to clean recorded server process (%s)", reason, exc_info=True)
@@ -329,6 +340,7 @@ def _cleanup_recorded_server_group_for_pid(pid: int, reason: str = "agent_exit")
         if not isinstance(record, dict) or int(record.get("pid") or 0) != int(pid):
             return
         pgid = int(record.get("pgid") or 0)
+        retained = _retained_shared_daemon_pids()
         live_pgid = process_group_id(int(pid)) if pid_is_alive(int(pid)) else 0
         if not IS_WINDOWS and live_pgid > 0 and pgid > 0 and pgid != live_pgid:
             log.info(
@@ -341,11 +353,11 @@ def _cleanup_recorded_server_group_for_pid(pid: int, reason: str = "agent_exit")
             pgid = 0
         if not IS_WINDOWS and pgid > 0 and pgid != current_process_group_id():
             log.info("Cleaning server process group pgid=%d after pid=%d exit (%s)", pgid, pid, reason)
-            terminate_process_group_id(pgid)
+            terminate_process_group_id(pgid, exclude_pids=retained)
             time.sleep(0.2)
-            kill_process_group_id(pgid)
+            kill_process_group_id(pgid, exclude_pids=retained)
         if pid_is_alive(int(pid)):
-            kill_pid_tree(int(pid))
+            kill_pid_tree(int(pid), exclude_pids=retained)
         record_path.unlink(missing_ok=True)
     except Exception:
         log.warning("Failed to clean recorded server process group (%s)", reason, exc_info=True)
@@ -410,7 +422,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     _agent_proc = proc
 
     if IS_WINDOWS:
-        job = create_kill_on_close_job()
+        job = create_kill_on_close_job(allow_breakaway=True)
         if job is None:
             log.error(
                 "Failed to create Windows Job Object; refusing to run without process-tree ownership."
@@ -511,7 +523,11 @@ def stop_agent() -> None:
         if IS_WINDOWS and job is not None:
             terminate_job(job)
         else:
-            kill_process_tree(proc)
+            try:
+                kill_process_tree(proc, exclude_pids=_retained_shared_daemon_pids())
+            except Exception:
+                log.warning("Shared daemon custody unavailable; stopping only the captured server", exc_info=True)
+                proc.kill()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -589,7 +605,9 @@ def _reap_same_install_strays(reason: str) -> list[int]:
     panic or window-close path — Emergency Stop tears down what it owns and adds no new killing.
     """
     try:
-        return _reap_same_install_strays_impl(REPO_DIR, DATA_DIR, reason)
+        return _reap_same_install_strays_impl(
+            REPO_DIR, DATA_DIR, reason, retained_descendant_roots=_retained_shared_daemon_pids(),
+        )
     except Exception:
         # A sweep that cannot run must not stop the launcher booting.
         log.warning("Same-install stray sweep failed (%s)", reason, exc_info=True)

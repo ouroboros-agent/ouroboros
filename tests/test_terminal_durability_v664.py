@@ -6,9 +6,26 @@ import inspect
 import json
 import pathlib
 import tempfile
+import queue as stdqueue
 from types import SimpleNamespace
 
 import pytest
+
+
+def _drain_health_jobs(monkeypatch):
+    """Drive the real deferred recovery synchronously without leaking the reaper."""
+    from supervisor import queue, worker_health
+
+    jobs = stdqueue.Queue()
+    monkeypatch.setattr(queue, "_reap_queue", jobs)
+    monkeypatch.setattr(queue, "_ensure_reaper_started", lambda: None)
+
+    def drain():
+        while not jobs.empty():
+            job = jobs.get_nowait()
+            assert job["kind"] == "confirmed_dead_worker"
+            worker_health.recover_confirmed_dead_worker(job)
+    return drain
 
 
 def _available_cost_fields(*, calls: int = 0, degraded: bool = False) -> dict:
@@ -76,7 +93,9 @@ def test_headless_worker_crash_emits_task_done_without_main_chat_reroute(tmp_pat
     monkeypatch.setattr("ouroboros.task_results.load_task_result", lambda *_a, **_k: None)
     monkeypatch.setattr("ouroboros.task_results.write_task_result", lambda *_a, **_k: None)
 
+    drain = _drain_health_jobs(monkeypatch)
     workers.ensure_workers_healthy()
+    drain()
 
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert len(terminal) == 1
@@ -997,7 +1016,9 @@ def test_evolution_stop_cleanup_finishes_the_health_sweep(tmp_path, monkeypatch)
     _crashed_worker(monkeypatch, workers, task)
     monkeypatch.setattr(workers, "load_state", lambda: {"evolution_mode_enabled": False})
 
+    drain = _drain_health_jobs(monkeypatch)
     workers.ensure_workers_healthy()
+    drain()
 
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert len(terminal) == 1, f"health sweep aborted before emitting: {events}"
@@ -1016,7 +1037,9 @@ def test_admission_blocked_crash_retry_finishes_the_health_sweep(tmp_path, monke
         queue, "enqueue_task", lambda *_a, **_k: {"_admission_blocked": "root_budget_fence"},
     )
 
+    drain = _drain_health_jobs(monkeypatch)
     workers.ensure_workers_healthy()
+    drain()
 
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert len(terminal) == 1, f"health sweep aborted before emitting: {events}"

@@ -523,6 +523,11 @@ def _record_commit_attempt(
         scope_model = _req("scope_model")
         triad_raw_results = _req("triad_raw_results", None)
         scope_raw_result = _req("scope_raw_result", None)
+        # Ordinary advisory continuation is not an author finish.  Only an
+        # explicit caller-supplied record is persisted here; the review
+        # findings and advisory override remain the evidence for an unmarked
+        # successful commit.
+        author_disposition = _req("author_disposition", None)
         block_class = _req("block_class")
         rebuttal_sha256 = _req("rebuttal_sha256")
         paid = _req("paid", False)
@@ -612,6 +617,19 @@ def _record_commit_attempt(
                     attempt=attempt_no,
                 )
 
+            from ouroboros.review_records import validate_author_disposition
+            from ouroboros.config import get_review_enforcement
+
+            author_record = getattr(existing, "author_disposition", {}) or {}
+            if author_disposition is not None:
+                subject = pre_review_fingerprint or str(getattr(existing, "pre_review_fingerprint", "") or "")
+                author_record = validate_author_disposition(author_disposition, subject_hash=subject) or {}
+                if (not subject or not getattr(existing, "paid", False)
+                        or subject != getattr(existing, "pre_review_fingerprint", "")
+                        or (post_review_fingerprint and post_review_fingerprint != subject)
+                        or get_review_enforcement() != "advisory"
+                        or author_record.get("enforcement") != "advisory"):
+                    author_record = {}
             attempt = CommitAttemptRecord(
                 ts=_utc_now(),
                 commit_message=commit_message,  # full message; durable evidence
@@ -671,6 +689,7 @@ def _record_commit_attempt(
                     if scope_raw_result is not None
                     else getattr(existing, "scope_raw_result", None) or {}
                 ),
+                author_disposition=author_record,
                 block_class=block_class or str(getattr(existing, "block_class", "") or ""),
                 rebuttal_sha256=rebuttal_sha256 or str(getattr(existing, "rebuttal_sha256", "") or ""),
                 paid=bool(paid or getattr(existing, "paid", False)),

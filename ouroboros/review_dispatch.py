@@ -334,3 +334,52 @@ def stamp_review_paid_on_dispatch(ctx: Any) -> None:
     invoke_review_paid_stamp(
         getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
     )
+
+
+def review_operation_binding(request: Any, slot: Any, operation_id: str) -> dict:
+    """Bind one physical result to its existing task, material and panel owners."""
+    from ouroboros.review_custody import _attempt_key
+
+    return {
+        **dict(getattr(request, "reconciliation_identity", {}) or {}),
+        "task_id": str(getattr(request, "task_id", "") or ""),
+        "surface": str(getattr(request, "surface", "") or ""),
+        "slot_id": str(getattr(slot, "slot_id", "") or ""),
+        "operation_id": str(operation_id or ""),
+        "request_key": _attempt_key(request, slot),
+    }
+
+
+def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: str, contract: Any = "") -> dict:
+    """Reuse the caller's material/cycle identity and the exact configured roster."""
+    import hashlib
+    import json
+    from dataclasses import asdict, is_dataclass
+    from ouroboros.review_execution import review_output_contract
+
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                         default=str).encode("utf-8")).hexdigest()
+
+    supplied = dict(getattr(request, "reconciliation_identity", None) or {})
+    roster = []
+    for slot in slots:
+        values = asdict(slot) if is_dataclass(slot) else dict(getattr(slot, "__dict__", {}) or {})
+        roster.append({k: v for k, v in values.items()
+                       if k not in {"timeout_sec", "transport_timeout_sec"}})
+    retry_key = getattr(request, "retry_key", None)
+    return {
+        "subject_hash": digest(retry_key or {
+            "subject": getattr(request, "subject", ""), "goal": getattr(request, "goal", ""),
+            "scope": getattr(request, "scope", ""), "evidence": getattr(request, "evidence", ""),
+            "evidence_refs": getattr(request, "evidence_refs", []), "messages": getattr(request, "messages", []),
+            "slot_messages": getattr(request, "slot_messages", []),
+        }),
+        "review_contract": str(contract or digest({
+            "rendered": review_output_contract(request) if hasattr(request, "policy") else "",
+            "policy": getattr(request, "policy", ""),
+        })),
+        "roster_hash": digest(roster), "epoch": str(retry_key or ""),
+        **supplied,
+        "root_task_id": str(root_task_id), "task_attempt": getattr(request, "task_attempt", None),
+    }

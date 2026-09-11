@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from ouroboros.runtime_mode_policy import FROZEN_CONTRACT_PATH_PREFIXES, PROTECTED_RUNTIME_PATHS
 from ouroboros.shell_parse import (
+    POSIX_SHELL_HEADS,
     EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE,
     collect_leading_env,
     embedded_absolute_path_tokens,
@@ -395,8 +396,13 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
             return receiver.id in str_names or receiver.id in non_path_names
         return (
             isinstance(receiver, ast.Call)
-            and isinstance(receiver.func, ast.Name)
-            and receiver.func.id in local_classes
+            and (
+                (isinstance(receiver.func, ast.Name) and receiver.func.id in local_classes)
+                or (
+                    isinstance(receiver.func, ast.Name)
+                    and receiver.func.id in {"list", "tuple", "set", "dict"}
+                )
+            )
         )
 
     for node in ast.walk(tree):
@@ -426,6 +432,17 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
             elif isinstance(node.value, (ast.List, ast.Tuple, ast.Set, ast.Dict)) or (
                 isinstance(node.value, ast.Constant) and not isinstance(node.value.value, str)
             ):
+                non_path_names.add(bound)
+                str_names.discard(bound)
+            elif (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in {"list", "tuple", "set", "dict"}
+            ):
+                # Built-in collection constructors produce collection receivers;
+                # their ``remove``/``replace`` methods cannot mutate the file
+                # system.  Treat them like literal collections so a string item
+                # named ``BIBLE.md`` is not promoted to a filesystem target.
                 non_path_names.add(bound)
                 str_names.discard(bound)
             else:
@@ -618,7 +635,7 @@ def shell_inspection_paths(
                 row_cwd = (row_cwd / pathlib.Path(wrapper_cwd).expanduser()).resolve(strict=False)
             head = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe")
             nested = []
-            if head in _SHELL_WRAPPER_HEADS and depth < _MAX_INLINE_RECURSION:
+            if head in POSIX_SHELL_HEADS and depth < _MAX_INLINE_RECURSION:
                 body = shell_command_string(argv)
                 nested = [body] if body else list(heredocs) if interpreter_reads_program_from_stdin(argv) else []
                 for body in nested:
@@ -905,7 +922,6 @@ _SED_SCRIPT_WRITE_RE = re.compile(
     r"(?<![A-Za-z_])[wW]\s+\S|(?<![A-Za-z_])e(?:\s*(?:$|;)|\s+\S)|/[gpimM0-9]*[we](?=\s|$|;)"
 )
 # A wrapper body is a command line; `cd` can move later relative writes.
-_SHELL_WRAPPER_HEADS = frozenset({"sh", "bash", "zsh", "dash", "ash"})
 _DIRECTORY_CHANGE_COMMANDS = frozenset({"cd", "pushd"})
 _MAX_INLINE_RECURSION = 3
 def writer_target_rows(raw_cmd: Any, _depth: int = 0) -> List[tuple]:
@@ -921,7 +937,7 @@ def writer_target_rows(raw_cmd: Any, _depth: int = 0) -> List[tuple]:
             continue
         executable = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
         program_argv, _stdin_redirects = split_redirections(argv)
-        if _depth < _MAX_INLINE_RECURSION and executable in _SHELL_WRAPPER_HEADS:
+        if _depth < _MAX_INLINE_RECURSION and executable in POSIX_SHELL_HEADS:
             shell_body = shell_command_string(argv)
             stdin_bodies = heredoc_bodies if not shell_body and interpreter_reads_program_from_stdin(program_argv) else ()
             nested = writer_target_rows(shell_body, _depth + 1)
@@ -1287,7 +1303,7 @@ def shell_writer_targets_protected(raw_cmd: Any) -> bool:
     if not argv:
         return False
     executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe")
-    if executable in {"bash", "sh", "zsh"}:
+    if executable in POSIX_SHELL_HEADS:
         inline = shell_command_string(argv)
         return bool(inline and shell_writer_targets_protected(inline))
     if not _light_writer_command(executable):
@@ -1437,7 +1453,7 @@ def light_shell_repo_mutation(
         return False
     executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe")
 
-    if executable in {"bash", "sh", "zsh"}:
+    if executable in POSIX_SHELL_HEADS:
         inline = shell_command_string(argv)
         if inline:
             return light_shell_repo_mutation(

@@ -103,14 +103,12 @@ def execute_panic_stop(
     install port — see the sweep below.
 
     The owned Claudexor daemon is stopped by ``get_owned_daemon().stop()``:
-    the self-started child and every custody-ledger root confirmed as this
-    installation's daemon (a prior generation's or a worker's spawn), each by
-    process group so the delegated harness runs die with it. Disclosed
-    residuals: a daemon this installation never ledgered (spawned inside the
-    spawn-to-record window, or by a caller outside custody) is not signalled
-    by name or port; on Windows the ledger identity is unmeasurable, so only
-    the self-started child is stopped here and the launcher's kill-on-close Job
-    Object ends the rest with the application.
+    authenticated same-home CLI shutdown handles attached and prior-generation
+    daemons, with measured custody/Popen signalling as fallback. Delegated work
+    ends through that explicit stop. The shared daemon survives ordinary close
+    outside the Windows launcher Job, so that Job is not a Panic backstop.
+    Unconfirmed shutdown remains disclosed with custody retained; names or
+    recycled descriptor ports never authorize signalling an unrelated process.
     """
     log.critical("PANIC STOP initiated.")
     try:
@@ -164,11 +162,9 @@ def execute_panic_stop(
     except Exception:
         pass
 
-    # Owned Claudexor daemon: panic is instant and hard, so no network run-cancel
-    # calls — stop() kills the self-spawned daemon and every ledger-confirmed own
-    # daemon root by process group, taking the delegated harness runs (their
-    # children) down with them; the worker tree-kill below spares daemon roots
-    # by design, so this explicit stop is what ends them (see docstring residuals).
+    # One explicit owned-daemon stop, including older server generations. No
+    # per-run cancellation fan-out: CLI shutdown and measured/Popen fallback
+    # own completion. Worker cleanup below deliberately spares shared daemons.
     try:
         from ouroboros.claudexor_daemon import get_owned_daemon
 

@@ -34,6 +34,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from ouroboros.platform_layer import (
+    IS_WINDOWS,
     kill_process_group_id,
     kill_process_tree,
     pid_is_alive,
@@ -251,6 +252,11 @@ def _fingerprint_matches(entry: Dict[str, Any], *, require_measured: bool = Fals
     recorded_cmd = str(fp.get("cmd_sha256") or "")
     if require_measured and not ((recorded_boot or recorded_start) and recorded_cmd):
         return False
+    if IS_WINDOWS and not (recorded_boot or recorded_start):
+        # Before native Windows observations this hash came from submitted argv,
+        # not the live command spelling. Keep its old liveness-only retention;
+        # it never supplies the measured identity required to signal a process.
+        return not require_measured
     if recorded_boot or recorded_start:
         live_start = process_start_time(pid)
         if require_measured and not live_start:
@@ -586,9 +592,18 @@ def pending_process_stops(drive_root: pathlib.Path, purposes: "set[str]") -> Lis
     return pending
 
 
+def process_stop_snapshot(drive_root: pathlib.Path, purposes: "set[str]") -> List[Dict[str, Any]]:
+    """Capture this stop's ledger rows before an asynchronous shutdown request."""
+    readable, entries = _read_ledger_strict(pathlib.Path(drive_root))
+    if not readable:
+        raise OSError("process custody ledger is unreadable or corrupt")
+    return [entry for entry in entries if entry.get("purpose") in purposes and _fingerprint_matches(entry)]
+
+
 def stop_ledgered_processes(
     drive_root: pathlib.Path, purposes: "set[str]", *, timeout_sec: float = 5.0,
     unconfirmed: Optional[List[str]] = None,
+    expected_entries: Optional[List[Dict[str, Any]]] = None,
 ) -> List[int]:
     """Kill the installation's own processes of the named purposes, any scope.
 
@@ -609,7 +624,9 @@ def stop_ledgered_processes(
     failures = unconfirmed if unconfirmed is not None else []
     for entry in entries:
         purpose = str(entry.get("purpose") or "")
-        if purpose not in purposes or not _fingerprint_matches(entry, require_measured=True):
+        if (purpose not in purposes
+                or (expected_entries is not None and entry not in expected_entries)
+                or not _fingerprint_matches(entry, require_measured=True)):
             survivors.append(entry)
             continue
         pid = int(entry.get("pid") or 0)
@@ -763,6 +780,12 @@ def reap_orphaned_processes(
     _, entries, previous = _read_ledger_records(drive_root, strict=False)
     if not entries:
         return []
+    retained_roots = {
+        int(entry["pid"]) for entry in entries
+        if ((entry.get("scope") == "daemon" and not str(entry.get("purpose") or "").startswith("companion:"))
+            or entry.get("purpose") in (retained_purposes or set()))
+        and _fingerprint_matches(entry)
+    }
     reaped: List[int] = []
     survivors: List[Dict[str, Any]] = []
     for entry in entries:
@@ -854,11 +877,11 @@ def reap_orphaned_processes(
         try:
             pgid = int(entry.get("pgid") or 0)
             if pgid > 0:
-                kill_process_group_id(pgid)
-            else:
+                kill_process_group_id(pgid, **({"exclude_pids": retained_roots} if retained_roots else {}))
+            if pgid <= 0 or (retained_roots and pid_is_alive(pid)):
                 from ouroboros.platform_layer import kill_pid_tree
 
-                kill_pid_tree(pid)
+                kill_pid_tree(pid, exclude_pids=retained_roots)
             reaped.append(pid)
             append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
                 "ts": utc_now_iso(),

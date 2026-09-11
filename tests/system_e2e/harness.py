@@ -740,7 +740,7 @@ class ReplayModel(LoopbackModelServer):
 
 # Every way the runtime tree reads an environment variable by literal name.
 _ENV_READ_RE = re.compile(
-    r"""os\.(?:environ(?:\.get)?[\[(]|getenv\()\s*["']([A-Z0-9_]+)["']"""
+    r"""(?:os\.(?:environ(?:\.get)?[\[(]|getenv\()|\bruntime_setting\()\s*["']([A-Z0-9_]+)["']"""
 )
 _CREDENTIAL_SHAPE_RE = re.compile(r"(API_KEY|CREDENTIALS|TOKEN|SECRET|PASSWORD)")
 RUNTIME_TREE_GLOBS = ("ouroboros/**/*.py", "supervisor/**/*.py", "server.py")
@@ -752,7 +752,7 @@ def runtime_credential_env_key_reads() -> set:
     Built from the source (not from a hand-kept list), so a provider credential
     added upstream tomorrow lands in the strip-coverage pin automatically instead of
     silently reaching a keyless child. Includes reads through ``os.environ[...]``,
-    ``os.environ.get`` and ``os.getenv``.
+    ``os.environ.get``, ``os.getenv`` and the task-captured ``runtime_setting``.
     """
     keys: set = set()
     for pattern in RUNTIME_TREE_GLOBS:

@@ -293,7 +293,9 @@ def test_deadline_local_finalize_gate(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_dispatched_outcome_skips_cross_model_fallback(tmp_path, monkeypatch):
+def test_managed_unknown_waits_without_cross_model_fallback_until_deadline(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros import loop_transport
     from ouroboros.tools.registry import ToolRegistry
 
     class FakeLLM:
@@ -318,6 +320,14 @@ def test_unknown_dispatched_outcome_skips_cross_model_fallback(tmp_path, monkeyp
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", forbidden_fallback)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    waits = []
+
+    def expire_while_waiting(seconds, wake_check):
+        waits.append(seconds)
+        registry._ctx.task_metadata["deadline_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        return False
+
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", expire_while_waiting)
 
     result, usage, _trace = run_llm_loop(
         messages=[{"role": "user", "content": "go"}],
@@ -331,6 +341,7 @@ def test_unknown_dispatched_outcome_skips_cross_model_fallback(tmp_path, monkeyp
     )
 
     assert calls == {"primary": 1, "fallback": 0}
+    assert len(waits) == 1
     assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
     assert "no retry or paid fallback" in result
 

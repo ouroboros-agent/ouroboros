@@ -113,11 +113,23 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
         # Fail-closed like the audits above: an unreadable registration state
         # must not read as "no deferred retirements".
         audit_failure = audit_failure or "registration_audit_failed"
+    terminal_runs = []
+    try:
+        if not audit_failure:
+            observed = state if state is not None else custody.replay(drive_root)
+            terminal_runs = sorted((
+                {"run_id": str(row.run_id), "state": str(row.terminal_state)}
+                for row in observed.values()
+                if row.task_id == mine and row.settled and row.terminal_state in custody.TERMINAL_STATES
+            ), key=lambda row: row["run_id"])
+    except Exception:
+        audit_failure = audit_failure or "terminal_receipt_audit_failed"
     if not audit_failure:
         result.update({
             "open_run_ids": open_ids,
             "pending_invocation_ids": invocation_ids,
             "undisposed_patch_run_ids": patch_ids,
+            "terminal_runs": terminal_runs,
             # DISCLOSED, never unreconciled: a settled run's project registration
             # awaiting retirement is cleanup debt with its own retry lane - it
             # must not convert the task's outcome (the old coupling did).
@@ -135,6 +147,41 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
         })
     if emit_evidence:
         _emit_audit_evidence(drive_root, result)
+
+
+def terminal_custody_notice(result: Mapping[str, Any]) -> str:
+    """Render current stored custody beside unchanged model-authored history.
+
+    No live join, lifecycle mutation or inference from a missing run: only the
+    audit's separate execution/invocation/patch and confirmed terminal facts.
+    """
+    audit = result.get("delegate_terminal_reconciliation")
+    if not isinstance(audit, Mapping) or not audit:
+        return ""
+    if audit.get("audit_status") != "ok":
+        return "Current delegated execution could not be verified; custody remains unresolved in task details."
+    terminal = [row for row in (audit.get("terminal_runs") or []) if isinstance(row, dict)]
+    non_success = [row for row in terminal if row.get("state") != "succeeded"]
+    groups = [
+        ("Open delegated execution", audit.get("open_run_ids")),
+        ("Pending delegated invocations", audit.get("pending_invocation_ids")),
+        ("Pending patch decisions", audit.get("undisposed_patch_run_ids")),
+    ]
+    if not non_success and not any(values for _label, values in groups):
+        return ""
+    lines = []
+    if non_success:
+        shown = "; ".join(f"{row.get('run_id')}: {row.get('state')}" for row in non_success[:10])
+        omitted = len(non_success) - 10
+        lines.append("Confirmed delegated terminal receipts: " + shown
+                     + (f" (+{omitted} more in task details)" if omitted > 0 else "") + ".")
+    for label, raw in groups:
+        values = [str(value) for value in raw] if isinstance(raw, list) else []
+        shown = ", ".join(values[:10]) or "none recorded by the current audit"
+        omitted = len(values) - 10
+        lines.append(label + ": " + shown
+                     + (f" (+{omitted} more in task details)" if omitted > 0 else "") + ".")
+    return "\n".join(lines)
 
 
 def _emit_audit_evidence(drive_root: Any, result: Mapping[str, Any]) -> None:
@@ -363,6 +410,7 @@ _ENVELOPE_DISCLOSURE_FIELDS = (
     "pending_invocation_ids",
     "undisposed_patch_run_ids",
     "deferred_project_retirements",
+    "terminal_runs",
 )
 
 

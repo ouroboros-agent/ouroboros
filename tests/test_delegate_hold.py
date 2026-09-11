@@ -36,6 +36,7 @@ def _configured_registry(tmp_path, task_id="t-hold"):
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = task_id
     registry._ctx.exact_model_route = True
+    registry._ctx._configured_subagent_route_kind = "agent_session"
     registry._ctx.task_metadata = {"configured_subagent": {"config_fingerprint": "fp"}}
     return registry
 
@@ -223,7 +224,13 @@ def test_generic_task_and_multi_run_never_hold(tmp_path, monkeypatch, _quiet_pro
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
 
-    # Generic task: no configured_subagent snapshot.
+    from ouroboros import loop_transport
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda *args: False)
+    def exhausted_network_wait(episode, *, tools, **kwargs):
+        tools._ctx.task_metadata = {"deadline_at": "2000-01-01T00:00:00Z"}
+        return False
+    monkeypatch.setattr(loop_mod, "_continue_unknown_transport", exhausted_network_wait)
+    # Generic tasks use the network owner, never the single-leaf nanny hold.
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = "t-generic"
     _start_leaf(tmp_path, task_id="t-generic", run_id="run-g")

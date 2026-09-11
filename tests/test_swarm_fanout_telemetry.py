@@ -12,7 +12,7 @@ from supervisor.events import _subagent_rejection_meta, _subagent_scheduled_meta
 def test_swarm_fanout_event_shape(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()
-    ctx = types.SimpleNamespace(drive_logs=lambda: logs, _last_wave_ts=0.0)
+    ctx = types.SimpleNamespace(drive_logs=lambda: logs, _last_fanout_ts=0.0)
     _emit_swarm_fanout(
         ctx,
         parent_task_id="p1",
@@ -39,13 +39,13 @@ def test_swarm_fanout_event_shape(tmp_path):
     assert evt["requested_model_lane"] == "auto"
     assert "effective_model_lanes" not in evt
     assert len(evt["objective_preview"]) == 200
-    assert evt["inter_wave_latency_sec"] is None  # first wave (prev ts was 0)
+    assert evt["fanout_interval_sec"] is None  # first wave (prev ts was 0)
 
 
-def test_swarm_fanout_inter_wave_latency_on_second_wave(tmp_path):
+def test_swarm_fanout_interval_on_second_fanout(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()
-    ctx = types.SimpleNamespace(drive_logs=lambda: logs, _last_wave_ts=0.0)
+    ctx = types.SimpleNamespace(drive_logs=lambda: logs, _last_fanout_ts=0.0)
     for _ in range(2):
         _emit_swarm_fanout(
             ctx, parent_task_id="p", root_task_id="r", depth=1,
@@ -54,8 +54,8 @@ def test_swarm_fanout_inter_wave_latency_on_second_wave(tmp_path):
         )
     evts = [json.loads(line) for line in (logs / "events.jsonl").read_text().splitlines()]
     assert len(evts) == 2
-    assert evts[0]["inter_wave_latency_sec"] is None
-    assert isinstance(evts[1]["inter_wave_latency_sec"], float)
+    assert evts[0]["fanout_interval_sec"] is None
+    assert isinstance(evts[1]["fanout_interval_sec"], float)
 
 
 # --- delegated harness runs fold into swarm telemetry ONLY under Swarm intent ---
@@ -65,7 +65,7 @@ def _delegating_host_ctx(tmp_path, metadata):
     logs = tmp_path / "logs"
     logs.mkdir(exist_ok=True)
     return types.SimpleNamespace(
-        drive_logs=lambda: logs, _last_wave_ts=0.0,
+        drive_logs=lambda: logs, _last_fanout_ts=0.0,
         task_id="t-host", task_depth=2, task_metadata=metadata,
     )
 

@@ -219,7 +219,7 @@ def compose_workspace_block(
         "Use read_file, write_file, list_files, search_code, vcs_status, vcs_diff, and run_command against this target workspace, not the Ouroboros system repo.\n"
         f"{render_workspace_preflight_summary(workspace_preflight)}\n"
         "Before editing, account for target-repo docs or root-level instructions if present.\n"
-        "Project-local dependency installs are allowed in external workspace tasks; system/global installs are for runtime_mode=pro only and must be noninteractive.\n"
+        "Project-local dependency installs are allowed in external workspace tasks; system/global installs are for runtime_mode=pro or cyber_pro and must be noninteractive.\n"
         "When work naturally splits into independent branches, or while a long build/download/test is running, use schedule_subagent for a focused parallel handoff instead of serializing every branch yourself.\n"
         "Before finalizing, re-read the original task and verify each explicit requirement through the interface/path/format/service the task names; do not treat a weaker surrogate self-test as completion.\n"
         "Final summaries belong in the final answer, not new repo markdown files unless requested.\n"

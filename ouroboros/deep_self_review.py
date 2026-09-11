@@ -27,7 +27,6 @@ receipts, coverage and completeness so consecutive reports stay comparable.
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
 import posixpath
 import time
@@ -64,6 +63,7 @@ from ouroboros.reviewer_slot_config import (  # noqa: E402
 from ouroboros.usage_accounting import BudgetExceeded  # noqa: E402
 from ouroboros.outcomes import REASON_DEEP_SELF_REVIEW_PACK_UNFIT  # noqa: E402
 from ouroboros.triad_review import REVIEW_REPORT_CONTRACT  # noqa: E402
+from ouroboros.config import runtime_setting
 
 # Output reservation inside the reviewer's 1M window (same class of fix as
 # scope_review._SCOPE_INPUT_TOKEN_LIMIT): 920K input + 100K output exceeds 1M
@@ -484,14 +484,14 @@ def _packed_credentials(configured: str) -> Tuple[str, Optional[str]]:
     """The packed row's payable spelling, or the typed credentials reason."""
     provider = provider_for_model(configured)
     if provider == "openai":
-        if provider_has_credentials("openai") and not os.environ.get("OPENAI_BASE_URL"):
+        if provider_has_credentials("openai") and not runtime_setting("OPENAI_BASE_URL"):
             return "", configured
         return f"no direct OpenAI credentials for {configured} (or OPENAI_BASE_URL redirects the route)", None
     if configured.startswith("openai/"):
         # OpenRouter route with a direct-OpenAI rewrite fallback.
         if provider_has_credentials("openrouter"):
             return "", configured
-        if provider_has_credentials("openai") and not os.environ.get("OPENAI_BASE_URL"):
+        if provider_has_credentials("openai") and not runtime_setting("OPENAI_BASE_URL"):
             slug = configured.split("/", 1)[1]
             if slug.endswith("-pro"):
                 # A `-pro` suffix is an OpenRouter ROUTING slug (reasoning

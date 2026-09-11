@@ -5,12 +5,20 @@ import { bridgeChunkBuffer, moduleBridgeScript, moduleResizeScript } from '../mo
 
 // Runs the child bootstrap against a fake `window`; `deliver` plays a
 // parent → child message, `posted` records child → parent messages.
-function bridgeHarness() {
+function bridgeHarness({ active = false, activationApi = true } = {}) {
     const posted = [];
     const parent = { postMessage(message) { posted.push(message); } };
     const listeners = new Map();
+    const docListeners = new Map();
+    const originalOpen = () => null;
     const window = {
         parent,
+        open: originalOpen,
+        navigator: activationApi ? { userActivation: { isActive: active } } : {},
+        document: {
+            addEventListener(type, fn) { const list = docListeners.get(type) || []; list.push(fn); docListeners.set(type, list); },
+            removeEventListener(type, fn) { docListeners.set(type, (docListeners.get(type) || []).filter((item) => item !== fn)); },
+        },
         addEventListener(type, listener) { listeners.set(type, listener); },
         removeEventListener(type, listener) {
             if (listeners.get(type) === listener) listeners.delete(type);
@@ -20,7 +28,7 @@ function bridgeHarness() {
     const deliver = (data, source = parent) => listeners.get('message')?.({ source, data: { nonce: 'nonce-1', ...data } });
     const chunk = (id, phase, extra = {}) => deliver({ type: 'ouro-widget-fetch-chunk', id, phase, ...extra });
     const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-    return { window, posted, listeners, deliver, chunk, flush };
+    return { window, posted, listeners, docListeners, originalOpen, deliver, chunk, flush };
 }
 
 const bytes = (...values) => new Uint8Array(values).buffer;
@@ -284,4 +292,42 @@ test('download uses the nonce bridge and settles from the actual host outcome', 
     const failure = window.OuroborosWidget.download('bad.txt', blob);
     deliver({ type: 'ouro-widget-download-result', id: 2, result: { ok: false, error: 'disk full' } });
     await assert.rejects(failure, /disk full/);
+});
+
+
+test('external-link request requires activation, checks parent and settles during disposal', async () => {
+    const h = bridgeHarness({ active: true });
+    const result = h.window.OuroborosWidget.openExternal('https://example.com');
+    assert.deepEqual(h.posted.at(-1), { type: 'ouro-widget-open-external', nonce: 'nonce-1', id: 1, url: 'https://example.com/' });
+    h.deliver({ type: 'ouro-widget-open-external-result', id: 1, result: { ok: true } }, {});
+    h.deliver({ type: 'ouro-widget-open-external-result', id: 1, nonce: 'wrong', result: { ok: true } });
+    h.deliver({ type: 'ouro-widget-open-external-result', id: 1, result: { ok: false, error: 'host unavailable' } });
+    await assert.rejects(result, /host unavailable/);
+    h.window.navigator.userActivation.isActive = false;
+    await assert.rejects(h.window.OuroborosWidget.openExternal('https://example.com'), /user action/);
+    h.window.navigator.userActivation.isActive = true;
+    await assert.rejects(h.window.OuroborosWidget.openExternal('/relative'), /Unsupported/);
+    const pending = h.window.OuroborosWidget.openExternal('https://example.com/again');
+    const rejected = assert.rejects(pending, /disposed/);
+    h.deliver({ type: 'ouro-widget-dispose' });
+    await rejected;
+    assert.equal(h.window.open, h.originalOpen);
+    assert.equal(h.docListeners.get('click').length, 0);
+});
+
+test('trusted anchors work on old hosts; synthetic, handled, download and internal links are untouched', async () => {
+    const h = bridgeHarness({ activationApi: false });
+    await assert.rejects(h.window.OuroborosWidget.openExternal('https://example.com'), /user action/);
+    const click = (href, changes = {}) => {
+        const anchor = { getAttribute() { return href; }, hasAttribute(name) { return name === 'download' && changes.download; } };
+        const event = { isTrusted: true, button: 0, defaultPrevented: false, target: { closest(selector) { return selector === 'a[href]' ? anchor : null; } },
+            preventDefault() { this.defaultPrevented = true; }, ...changes };
+        for (const fn of h.docListeners.get('click')) fn(event);
+        return event;
+    };
+    for (const [href, changes] of [['#x', {}], ['/relative', {}], ['https://example.com', { isTrusted: false }], ['https://example.com', { defaultPrevented: true }], ['https://example.com', { download: true }]]) click(href, changes);
+    assert.equal(h.posted.length, 0);
+    assert.equal(click('https://example.com').defaultPrevented, true);
+    assert.equal(h.posted.length, 1);
+    h.deliver({ type: 'ouro-widget-open-external-result', id: 1, result: { ok: true } });
 });

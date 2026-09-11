@@ -3,6 +3,7 @@ function reviewNodeKey(node) {
     if (Object.hasOwn(dataset, 'reviewSection')) return 'section';
     if (Object.hasOwn(dataset, 'reviewSectionToggle')) return 'section-toggle';
     if (Object.hasOwn(dataset, 'reviewHydrateStatus')) return 'hydrate-status';
+    if (Object.hasOwn(dataset, 'reviewAuthorDecision')) return 'author-decision';
     if (dataset.reviewGroup) return `group:${dataset.reviewGroup}`;
     if (dataset.reviewGroupToggle) return `group-toggle:${dataset.reviewGroupToggle}`;
     if (dataset.reviewAttempt) return `attempt:${dataset.reviewAttempt}`;

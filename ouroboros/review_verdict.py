@@ -49,17 +49,13 @@ def _criteria_have_supported_evidence(criteria: Any) -> bool:
 
 
 def _criteria_shape_valid(criteria: Any, tier: str) -> bool:
-    """Shape + tier coherence for a reviewer's criteria_used (v6.71.1).
+    """Validate criterion structure independently of the reviewer's claimed tier.
 
-    SHAPE: a non-empty list of {criterion, status ∈ enum}, and every 'supported'
-    criterion names evidence_refs. COHERENCE: 'solved' still requires ALL criteria
-    'supported' with refs — the release-clean bar (task_acceptance_is_clean) is
-    unchanged; a non-solved tier (best_effort / blocked_with_evidence) may honestly
-    carry partial/missing/rejected criteria. This lets an honest PASS that marks one
-    criterion 'partial' contribute as a valid NON-clean vote instead of being demoted
-    to parse_status=malformed — the old all-must-be-'supported' gate (the prompt itself
-    offers 'partial') silently starved the honest-partial path and fueled acceptance
-    loops (BIBLE P2/P3; the FAIL-veto and clean-solved contracts are untouched)."""
+    A well-formed partial/missing/rejected criterion preserves the reviewer's
+    PASS and original tier. Only ``task_acceptance_is_clean`` decides whether
+    those facts authorize solved completion; a contradiction is not bad JSON.
+    ``tier`` remains in this shared callback signature for existing callers.
+    """
     if not (isinstance(criteria, list) and criteria):
         return False
     for item in criteria:
@@ -72,8 +68,6 @@ def _criteria_shape_valid(criteria: Any, tier: str) -> bool:
             return False
         if status == "supported" and not item.get("evidence_refs"):
             return False
-    if str(tier or "").strip().lower() == OUTCOME_TIER_SOLVED:
-        return _criteria_have_supported_evidence(criteria)
     return True
 
 
@@ -457,13 +451,15 @@ def build_improvement_capsule(
         # improves the result; otherwise produce your normal final answer" tail
         # was the measured cause of the do-nothing resubmit loop (SWE 1b311217:
         # 7 passes, zero tool calls). The anti-derailment guards stay verbatim.
-        "Three real moves are available: (1) FIX — change the work/answer so the next panel is "
+        "Four real moves are available: (1) FIX — change the work/answer so the next panel is "
         "clean; (2) REBUT — file obligation_dispositions (rejected + your reason) via the "
         "task_acceptance_review tool for findings you can show are wrong; the reviewer "
         "adjudicates the argument; (3) DECLARE UNREACHABLE — dispose an obligation as "
         "unsatisfiable in this environment (rejected + the concrete gap), and the reviewer "
         "judges reachability. Resubmitting the same answer with none of these moves changes "
-        "nothing. "
+        "nothing. (4) AUTHOR FINISH — under advisory enforcement, record accepted, rejected, "
+        "partial, or deferred with a rationale; the first panel's raw findings remain durable, "
+        "no reviewer PASS is fabricated, and Blocking enforcement still requires its own gate. "
         "Do not mention this review or the reviewer unless the user asked. "
         "The assessment tier above is an internal ledger label — never emit an internal ledger "
         "identifier as the deliverable itself."

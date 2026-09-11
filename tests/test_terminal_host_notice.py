@@ -109,6 +109,31 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
     assert not trace["review_runs"][0].get("superseded_by_revision")
     assert trace["acceptance_decision"]["status"] == ("accepted" if verdict == "PASS" else "finalized_unaccepted")
 
+    # #533: transport/finalization warning must not erase the bound assessment.
+    from ouroboros.outcomes import derive_loop_outcome, normalize_outcome_axes, public_task_result
+    from ouroboros.task_results import load_task_result
+
+    trace["delivery_candidate"].update(degraded=True, degraded_reason="advisory_plan_review_open")
+    usage = {"terminal_host_notice": NOTICE}
+    axes = derive_loop_outcome(ANSWER, usage, trace)["outcome_axes"]
+    expected = "pass" if verdict == "PASS" else "fail"
+    assert axes["objective"]["status"] == expected
+    assert axes["objective"]["source"] == "task_acceptance_review"
+    assert axes["execution"]["status"] == "degraded"
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+    task = {"id": "parent1", "type": "task", "chat_id": 1, "text": "Produce a report",
+            "task_contract": tools._ctx.task_contract, "_skip_post_task_synthesis": True}
+    pipeline._store_task_result(env, task, ANSWER, usage, trace)
+    stored = load_task_result(tmp_path, "parent1")
+    assert stored["outcome_axes"]["objective"]["status"] == expected
+    assert normalize_outcome_axes(public_task_result(stored))["objective"]["source"] == "task_acceptance_review"
+    pending = []
+    pipeline.emit_task_results(env, None, None, pending, task, ANSWER, usage, trace,
+                              start_time=0.0, drive_logs=tmp_path / "logs")
+    terminal = next(row for row in pending if row["type"] == "task_done")
+    assert terminal["outcome_axes"]["objective"]["status"] == expected
+    assert load_task_result(tmp_path, "parent1")["outcome_axes"]["execution"]["status"] == "degraded"
+
     # Real input changes still supersede the binding even when answer bytes match.
     tools._ctx._owner_directives = [{"text": "Use the newly supplied source."}]
     changed = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")

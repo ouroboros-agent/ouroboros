@@ -142,6 +142,13 @@ def stage_task_attachments(
     declared = list(attachments) if isinstance(attachments, list) else []
     if not declared:
         return []
+    try:
+        from ouroboros.config import get_runtime_mode
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        allow_owner_sensitive = runtime_mode_at_least(get_runtime_mode(), "cyber_pro")
+    except Exception:
+        allow_owner_sensitive = False
 
     def _display_label(item: Any, raw_path: str, ordinal: int) -> str:
         if isinstance(item, dict):
@@ -264,7 +271,7 @@ def stage_task_attachments(
             if not source.is_file():
                 manifest.append(_rejected(ordinal, label, "source_not_file"))
                 continue
-            if secret_rule := _secret_source_reason(source):
+            if (secret_rule := _secret_source_reason(source)) and not allow_owner_sensitive:
                 log.info("stage_task_attachments: skipped secret source %s (%s)", source.name, secret_rule)
                 # Reason stays a closed vocabulary; the RULE that fired is named
                 # separately so the owner sees exactly why (G10, capinv-447).

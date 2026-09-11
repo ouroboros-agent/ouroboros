@@ -87,6 +87,10 @@ _TRANSPORT_UNREACHABLE = "transport_unreachable"
 # The typed answer of ``OwnedClaudexorDaemon.stop_outcome``: an unconfirmed stop
 # is already disclosed (critical log + supervisor row) with custody retained.
 DaemonStopOutcome = Literal["stopped", "nothing_to_stop", "unconfirmed"]
+from ouroboros.config import (
+    CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC as _OPERATOR_STOP_TIMEOUT_SEC,
+    CLAUDEXOR_STOP_EXIT_WAIT_SEC as _STOP_EXIT_WAIT_SEC,
+)
 
 
 def _handshake_serving_mode(body: Any) -> str:
@@ -546,6 +550,7 @@ class OwnedClaudexorDaemon:
         log_path = config_dir / "daemon.log"
         from ouroboros.config import DATA_DIR
         from ouroboros.process_custody import spawn_supervised
+        from ouroboros.platform_layer import subprocess_new_group_kwargs
 
         log.info("Spawning owned claudexord under %s from %s", config_dir, runtime.get("source") or "external")
         _write_ownership_marker()
@@ -569,6 +574,7 @@ class OwnedClaudexorDaemon:
                     stdin=subprocess.DEVNULL,
                     stdout=sink,
                     stderr=sink,
+                    **subprocess_new_group_kwargs(breakaway_from_job=True),
                 )
                 self._startup_attempt = {**attempt, "pid": self._proc.pid}
 
@@ -767,6 +773,33 @@ class OwnedClaudexorDaemon:
         """``stop_outcome`` as Panic reads it: True only for a confirmed stop."""
         return self.stop_outcome() == "stopped"
 
+    def _request_operator_stop(self) -> bool:
+        """Use the installed same-home CLI, never provisioning or waking a daemon."""
+        from ouroboros.claudexor_runtime import get_runtime_manager
+        from ouroboros.platform_layer import subprocess_hidden_kwargs
+
+        try:
+            command = get_runtime_manager().resolve_cli_command(require_npm=False)
+            if not command:
+                return False
+            env = dict(os.environ)
+            env["CLAUDEXOR_CONFIG_DIR"] = str(owned_config_dir())
+            for crossing in ("CLAUDEXOR_DAEMON_SOCK", "CLAUDEXOR_CONTROL_PORT"):
+                env.pop(crossing, None)
+            result = subprocess.run(
+                [*command, "daemon", "stop", "--json"], env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                timeout=_OPERATOR_STOP_TIMEOUT_SEC, **subprocess_hidden_kwargs(),
+            )
+            receipt = json.loads(result.stdout) if result.returncode == 0 else None
+            return bool(isinstance(receipt, dict) and receipt.get("ok") is True
+                        and receipt.get("stopped") is True and receipt.get("outcome") in {"exited", "killed"})
+        except Exception as exc:
+            # CLI stdout/stderr may contain private diagnostics. The existing
+            # stop owner independently decides whether measured fallback is valid.
+            log.warning("Owned daemon operator stop did not confirm completion (%s)", type(exc).__name__)
+            return False
+
     def stop_outcome(self) -> DaemonStopOutcome:
         """Stop verified own roots; report every unconfirmed remainder.
 
@@ -778,15 +811,20 @@ class OwnedClaudexorDaemon:
         to tell the two non-stops apart. Lock acquisition is bounded separately
         from HTTP connect/read phases and each root's exit wait; there is no
         promised absolute wall-clock deadline for the whole teardown. A
-        self-started Popen handle proves direct ownership; attached roots need
-        the owned marker and measured ledger identity, plus an
-        authenticated endpoint, typed transport failure, or a genuinely absent
-        descriptor for a marked startup. Network and exit waits run outside the
-        lock. An explicit token refusal or invalid discovery permits no fallback.
+        self-started Popen handle proves direct ownership. An authenticated
+        same-home endpoint permits ordinary CLI shutdown, including a legacy
+        attached daemon whose recorded birth was unavailable. Forced signalling
+        still requires the measured ledger identity plus an authenticated
+        endpoint, typed transport failure, or absent descriptor for a marked
+        startup. Network and exit waits run outside the lock. A token refusal
+        or invalid discovery permits no attached fallback.
         """
         from ouroboros.config import DATA_DIR
         from ouroboros.gateways.claudexor import SHORT_POLL_TIMEOUT_SEC
-        from ouroboros.process_custody import pending_process_stops, stop_ledgered_processes
+        from ouroboros.process_custody import (
+            pending_process_stops, pid_is_zombie, process_stop_snapshot, stop_ledgered_processes,
+        )
+        from ouroboros.platform_layer import collect_descendant_pids, pid_is_alive
 
         if not self._lock.acquire(timeout=SHORT_POLL_TIMEOUT_SEC):
             self._report_stop_unconfirmed("daemon manager lock unavailable; custody unchanged")
@@ -810,15 +848,51 @@ class OwnedClaudexorDaemon:
                 if detail:
                     self._last_error = detail
             pre_listener = state == "not_provisioned" and not os.path.lexists(owned_descriptor_path())
+            operator_stopped = False
             if endpoint is not None or state == _TRANSPORT_UNREACHABLE or pre_listener:
-                stopped = stop_ledgered_processes(root, purposes, unconfirmed=unconfirmed)
+                expected_entries, observed = [], set()
+                try:
+                    expected_entries = process_stop_snapshot(root, purposes)
+                    for entry in expected_entries:
+                        pid = int(entry["pid"])
+                        observed.add(pid)
+                        observed.update(collect_descendant_pids(pid))
+                    if self._proc is not None:
+                        observed.add(self._proc.pid)
+                except Exception:
+                    unconfirmed.append("stop target custody could not be observed")
+                if endpoint is not None:
+                    operator_stopped = self._request_operator_stop()
+                if operator_stopped:
+                    # Lease release confirms clean service shutdown; a Node tail
+                    # or captured harness child may still be physically alive.
+                    deadline = time.monotonic() + _STOP_EXIT_WAIT_SEC
+                    remaining = observed
+                    while remaining:
+                        remaining = {pid for pid in remaining if pid_is_alive(pid) and not pid_is_zombie(pid)}
+                        if not remaining or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+                else:
+                    stopped = stop_ledgered_processes(
+                        root, purposes, unconfirmed=unconfirmed, expected_entries=expected_entries,
+                    )
             child_stopped = self._terminate_child()
+            if operator_stopped:
+                remaining = {pid for pid in observed if pid_is_alive(pid) and not pid_is_zombie(pid)}
+                if remaining:
+                    unconfirmed.append(f"operator stop left process exit unconfirmed: {sorted(remaining)}")
+                live_endpoint, _, _ = self._classify_liveness(timeout_sec=SHORT_POLL_TIMEOUT_SEC)
+                if live_endpoint is not None:
+                    # The CLI's receipt concerns its pinned owner, not a new
+                    # daemon another client may have started during shutdown.
+                    unconfirmed.append("an authenticated owned endpoint remains after operator stop")
             if ownership_problem and owned_daemon_provisioned() and not child_stopped:
                 unconfirmed.append("descriptor ownership is unconfirmed")
             unconfirmed.extend(pending_process_stops(root, purposes))
             if self._proc is not None:
                 unconfirmed.append("self-started child exit unconfirmed")
-            if endpoint is not None and not stopped and not child_stopped:
+            if endpoint is not None and not stopped and not child_stopped and not operator_stopped:
                 unconfirmed.append("authenticated endpoint has no confirmed stopped root")
             if unconfirmed:
                 reason = ownership_problem or self._last_error
@@ -827,7 +901,7 @@ class OwnedClaudexorDaemon:
                 self._report_stop_unconfirmed("; ".join(dict.fromkeys(unconfirmed)))
                 return "unconfirmed"
             self._last_error = ""
-            return "stopped" if (child_stopped or stopped) else "nothing_to_stop"
+            return "stopped" if (operator_stopped or child_stopped or stopped) else "nothing_to_stop"
         finally:
             with self._lock:
                 self._stopping = False

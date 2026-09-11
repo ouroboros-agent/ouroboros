@@ -130,8 +130,19 @@ def _git_config_readonly(args: list[str]) -> bool:
 _GH_AUTH_MUTATING_VERBS = frozenset({"login", "logout", "refresh", "switch", "setup-git"})
 
 
-def gh_shell_block_reason(raw_cmd: Any) -> str:
-    """Positional gh policy: judged only where `gh` is a segment's command head."""
+def gh_shell_block_reason(raw_cmd: Any, *, runtime_mode: str = "") -> str:
+    """Positional gh policy, with Cyber Pro owner-authority escape.
+
+    The argv/segment parser remains the source of the ordinary-mode policy.
+    Cyber Pro is the explicit owner-selected mode that permits technical
+    authentication and repository setup attempts; the tool's factual result
+    (including provider/OS failure) is still returned unchanged.
+    """
+    if runtime_mode:
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        if runtime_mode_at_least(runtime_mode, "cyber_pro"):
+            return ""
     for segment in shell_segments(raw_cmd):
         _env, command = collect_leading_env(segment)
         if not command:
@@ -139,7 +150,7 @@ def gh_shell_block_reason(raw_cmd: Any) -> str:
         head = pathlib.PurePath(str(command[0])).name.lower()
         if head in {"bash", "sh", "zsh"}:
             inline = shell_command_string(command)
-            if inline and (nested := gh_shell_block_reason(inline)):
+            if inline and (nested := gh_shell_block_reason(inline, runtime_mode=runtime_mode)):
                 return nested
             continue
         if head != "gh":

@@ -351,6 +351,21 @@ class _LoopExitContext:
     drive_logs: pathlib.Path
     accumulated_usage: Dict[str, Any]
     llm_trace: Dict[str, Any]
+    trace_ctx: Any = None
+    previous_execution_trace: Any = None
+
+    def attach_exception_evidence(self, exc: Exception) -> None:
+        """The caller owns terminal projection; this loop owns its evidence.
+
+        Keep the same in-memory objects on the original exception so a lifecycle
+        failure cannot erase a completed multi-round trace. A failed attachment
+        leaves the caller's explicit unknown projection, never a new exception.
+        """
+        try:
+            setattr(exc, "_ouroboros_loop_usage", self.accumulated_usage)
+            setattr(exc, "_ouroboros_loop_trace", self.llm_trace)
+        except Exception:
+            log.debug("Loop exception evidence could not be attached", exc_info=True)
 
 
 def _handle_budget_exceeded(
@@ -512,6 +527,8 @@ def _cleanup_loop_resources(
     ctx: _LoopExitContext,
 ) -> None:
     """Release attempt-scoped executors, services, and delegated runs."""
+    if ctx.trace_ctx is not None:
+        ctx.trace_ctx._execution_trace = ctx.previous_execution_trace
     if stateful_executor:
         try:
             from ouroboros.tools.browser import cleanup_browser

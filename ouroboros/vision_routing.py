@@ -14,6 +14,7 @@ from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.provider_models import supports_vision
 from ouroboros.utils import emit_cognitive_operation_event
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +50,6 @@ class VisionRoutingContext:
 
 
 def resolve_vision_caption_model(ctx: Any, llm: Any, *, use_local: bool = False) -> str:
-    import os
     from ouroboros.model_wait import current_model_wait
 
     wait = current_model_wait()
@@ -58,7 +58,7 @@ def resolve_vision_caption_model(ctx: Any, llm: Any, *, use_local: bool = False)
         return ("" if override.get("use_local") or supports_vision(
             override["model"], model_role="vision") is False else override["model"])
 
-    explicit_raw = str(os.environ.get("OUROBOROS_MODEL_VISION", "") or "").strip()
+    explicit_raw = str(runtime_setting("OUROBOROS_MODEL_VISION", "") or "").strip()
     explicit = str(get_vision_model() or "").strip()
     if use_local and not explicit_raw:
         return ""

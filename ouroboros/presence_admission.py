@@ -24,7 +24,7 @@ from ouroboros.presence_capabilities import (
     resolve_presence_profile_state,
 )
 from ouroboros.presence_profile import PresenceProfileError, parse_presence_profile
-from ouroboros.skill_loader import find_skill, review_status_allows_execution
+from ouroboros.skill_loader import find_skill
 
 
 class PresenceAdmissionError(ValueError):
@@ -154,12 +154,13 @@ def admit_presence_turn(
             "presence_behavior_skill_disabled",
             "binding.behavior_skill",
         )
-    if skill.review.is_stale_for(skill.content_hash):
+    gate = skill.review.gate_for(skill.content_hash)
+    if gate["blocking_reason"] == "review_stale":
         raise PresenceAdmissionError(
             "presence_behavior_review_stale",
             "binding.behavior_skill",
         )
-    if not review_status_allows_execution(skill.review.status):
+    if not gate["executable_review"]:
         raise PresenceAdmissionError(
             "presence_behavior_review_not_executable",
             "binding.behavior_skill",

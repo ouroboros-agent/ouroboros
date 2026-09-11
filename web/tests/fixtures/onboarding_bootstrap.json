@@ -265,7 +265,7 @@
     "reviewModes": [
       {
         "className": "advisory",
-        "copy": "Faster and cheaper. Review still runs, but you decide how to handle findings. Best when you want iteration speed and can manually watch for drift.",
+        "copy": "Review still runs. After feedback, Ouroboros can fix, reject or finish; raw reviewer findings remain visible.",
         "label": "Advisory",
         "tone": "Flexible",
         "value": "advisory"
@@ -299,6 +299,13 @@
         "label": "Pro",
         "tone": "Power",
         "value": "pro"
+      },
+      {
+        "className": "cyber-pro",
+        "copy": "Host and configuration authority, including credentials, models, Supervisor and protected rewrites. Review scope and Blocking or Advisory enforcement remain owner-controlled.",
+        "label": "Cyber Pro",
+        "tone": "Maximum power",
+        "value": "cyber_pro"
       }
     ],
     "steps": [

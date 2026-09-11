@@ -284,8 +284,12 @@ def test_gr7_2_split_drive_child_answer_never_replaces_the_settled_canonical(
                  "child_drive_root": str(child_drive)},
         "worker_id": 0,
     }
-    write_task_result(qenv.drive, task_id, STATUS_COMPLETED, chat_id=5,
+    from ouroboros.headless import prepare_terminal_task_files
+
+    write_task_result(child_drive, task_id, STATUS_COMPLETED, chat_id=5,
                       result="the canonical settled answer")
+    # Complete the real adoption before testing a stale replica against CURRENT.
+    assert not prepare_terminal_task_files(qenv.drive, qenv.q.RUNNING[task_id]["task"])["error"]
     write_task_result(child_drive, task_id, STATUS_COMPLETED,
                       result="a DIFFERING child answer")
     row_path = task_result_path(qenv.drive, task_id)

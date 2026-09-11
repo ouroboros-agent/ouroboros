@@ -8,9 +8,11 @@ import pathlib
 
 def deliverables_root_lexical() -> pathlib.Path:
     """Return the configured Deliverables spelling without resolving children."""
+    from ouroboros.config import runtime_setting
+
     from ouroboros.config import get_deliverables_root
 
-    explicit = (os.environ.get("OUROBOROS_DELIVERABLES_ROOT") or "").strip()
+    explicit = (runtime_setting("OUROBOROS_DELIVERABLES_ROOT") or "").strip()
     jail = (os.environ.get("OUROBOROS_USER_FILES_ROOT") or "").strip()
     raw = explicit or (os.path.join(jail, "Deliverables") if jail else get_deliverables_root())
     try:

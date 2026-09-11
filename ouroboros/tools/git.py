@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import copy
 import json
 import hashlib  # noqa: F401
@@ -1136,7 +1138,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     _reset_commit_review_state(ctx)
     _commit_start = time.time()
     if not commit_message.strip():
-        return "⚠️ ERROR: commit_message must be non-empty."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ ERROR: commit_message must be non-empty.")))
     ctx._current_review_commit_message = commit_message
     # A managed marker authorizes exactly one reviewed two-parent resolution.
     from supervisor.update_merge import managed_assisted_tx_for

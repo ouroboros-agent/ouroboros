@@ -251,6 +251,7 @@ def _maybe_inject_time_budget_milestone(
     )
     if note is None:
         return False
+    note = task_pacing.with_resource_facts(note, tools._ctx, accumulated_usage)
     _loop()._append_or_merge_user_message(messages, note.text)
     _loop()._emit_checkpoint_event(event_queue, task_id, drive_logs, note.checkpoint)
     return True
@@ -293,6 +294,7 @@ def _maybe_inject_cost_budget_milestone(
     )
     if note is None:
         return False
+    note = task_pacing.with_resource_facts(note, tools._ctx, accumulated_usage)
     _loop()._append_or_merge_user_message(messages, note.text)
     _loop()._emit_checkpoint_event(event_queue, task_id, drive_logs, note.checkpoint)
     return True

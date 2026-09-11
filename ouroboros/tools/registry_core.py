@@ -24,13 +24,16 @@ import ouroboros.tools.registry_guards as registry_guards
 import ouroboros.tools.shell_guards as shell_guards
 import ouroboros.tools.tool_resolution as tool_resolution
 from ouroboros.runtime_mode_policy import (
+    PROTECTED_RUNTIME_PATHS,
+    core_patch_notice,
     mode_allows_protected_write,
+    runtime_mode_at_least,
     protected_paths_in,
     protected_write_block_message,
 )
 from ouroboros.tool_capabilities import (
     ACTING_SUBAGENT_MODE,
-    ACTING_SUBAGENT_TOOL_NAMES,
+    acting_tool_names_for_context,
     CORE_TOOL_NAMES,
     LOCAL_READONLY_SUBAGENT_MODE,
     LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
@@ -73,6 +76,7 @@ from ouroboros.tools.tool_result import (
     _install_tool_result_sidecar,
     _published_tool_result,
     _restore_tool_result_sidecar,
+    _replace_tool_result,
 )
 from ouroboros.tools.registry_guards import (
     _EPHEMERAL_ALLOWED_TOOLS,
@@ -265,6 +269,28 @@ def _protected_write_block_result(*, path: str, runtime_mode: str, action: str) 
             action=action,
         ),
     )
+
+
+def _append_shell_core_notice(
+    result: str | ToolResult, raw_cmd: Any, *, paths: list[str] | None = None,
+) -> str | ToolResult:
+    """Attach the same protected-change notice used by editor writes.
+
+    The shell guard deliberately returns ``None`` for Pro/Cyber rewrites, so
+    the post-execution path records that a protected surface was attempted
+    without turning the mode-aware allowance into an unreviewed success claim.
+    """
+    text = (" ".join(str(part) for part in raw_cmd)
+            if isinstance(raw_cmd, list) else str(raw_cmd or "")).replace("\\", "/").lower()
+    paths = list(paths or [path for path in sorted(PROTECTED_RUNTIME_PATHS) if path.lower() in text])
+    if not paths:
+        return result
+    notice = core_patch_notice(paths)
+    if isinstance(result, ToolResult):
+        if result.status == "blocked":
+            return result
+        return _replace_tool_result(result, text=result.text + "\n\n" + notice)
+    return str(result) + "\n\n" + notice
 
 
 class ToolRegistry:
@@ -484,7 +510,7 @@ class ToolRegistry:
                 names.add("verify_and_record")
             return frozenset(names)
         if self._is_acting_subagent():
-            return ACTING_SUBAGENT_TOOL_NAMES
+            return acting_tool_names_for_context(self._ctx)
         return frozenset(set(self.available_tools()) | set(META_TOOL_NAMES))
 
     def available_tools(self) -> List[str]:
@@ -499,7 +525,7 @@ class ToolRegistry:
             if _presence_tool_allowed(self._ctx, e.name)
             if _builtin_tool_availability(e.name, self._ctx)[0]
             if not local_readonly_subagent or self._readonly_tool_allowed(e.name)
-            if not acting_subagent or e.name in ACTING_SUBAGENT_TOOL_NAMES
+            if not acting_subagent or e.name in acting_tool_names_for_context(self._ctx)
         ]
 
     def _schema_for_entry(self, entry: ToolEntry) -> Dict[str, Any]:
@@ -579,19 +605,17 @@ class ToolRegistry:
                 props = schema.get("parameters", {}).get("properties", {})
                 for field in ("root", "bucket", "skill_name"):
                     props.pop(field, None)
-            elif entry.name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
+            elif (entry.name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS
+                  or entry.name in _GENERIC_VCS_TARGET_TOOLS
+                  or entry.name in {"read_file", "list_files", "search_code", "query_code"}):
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                if isinstance(root_schema.get("enum"), list):
-                    root_schema["enum"] = [root for root in root_schema["enum"] if root == "active_workspace"]
-            elif entry.name in {"read_file", "list_files", "search_code", "query_code"}:
-                # Acting profile reads its own surface + data roots, NOT the live
-                # system_repo (no system_repo in _POLICY['acting_subagent']).
-                schema = copy.deepcopy(schema)
-                root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                allowed = {"active_workspace"} if entry.name in {"search_code", "query_code"} else {"active_workspace", "runtime_data", "task_drive", "artifact_store"}
-                if isinstance(root_schema.get("enum"), list):
-                    root_schema["enum"] = [root for root in root_schema["enum"] if root in allowed]
+                operation = _target_binding_operation(entry.name, {})
+                if isinstance(root_schema.get("enum"), list) and operation:
+                    root_schema["enum"] = [root for root in root_schema["enum"]
+                        if decide_tool_access(profile=active_tool_profile(self._ctx), root=root,
+                                              operation=operation).allow
+                        and (entry.name != "query_code" or root in {"active_workspace", "system_repo"})]
         return {"type": "function", "function": schema}
 
     def _schemas_for_entry(self, entry: ToolEntry) -> List[Dict[str, Any]]:
@@ -673,7 +697,7 @@ class ToolRegistry:
             if _presence_tool_allowed(self._ctx, entry.name)
             if entry.name not in unavailable_tools
             if not local_readonly_subagent or self._readonly_tool_allowed(entry.name)
-            if not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES
+            if not acting_subagent or entry.name in acting_tool_names_for_context(self._ctx)
             if not ephemeral_turn or entry.name in _EPHEMERAL_ALLOWED_TOOLS  # CW3: default-deny allowlist
             for schema in self._schemas_for_entry(entry)
         ]
@@ -796,13 +820,13 @@ class ToolRegistry:
                 continue
             if local_readonly_subagent and not self._readonly_tool_allowed(e.name):
                 continue
-            if acting_subagent and e.name not in ACTING_SUBAGENT_TOOL_NAMES:
+            if acting_subagent and e.name not in acting_tool_names_for_context(self._ctx):
                 continue
             if ephemeral_turn and e.name not in _EPHEMERAL_ALLOWED_TOOLS:
                 continue  # CW3: the core/initial envelope is allowlisted too, not just schemas(core_only=False)
             if (
                 (local_readonly_subagent and self._readonly_tool_allowed(e.name))
-                or (acting_subagent and e.name in ACTING_SUBAGENT_TOOL_NAMES)
+                or (acting_subagent and e.name in acting_tool_names_for_context(self._ctx))
                 or e.name in CORE_TOOL_NAMES
                 or e.name in ("list_available_tools", "enable_tools")
             ):
@@ -851,7 +875,7 @@ class ToolRegistry:
         acting_subagent = self._is_acting_subagent()
         if self._is_local_readonly_subagent() and not self._readonly_tool_allowed(requested):
             return "hidden by the read-only subagent profile"
-        if acting_subagent and requested not in ACTING_SUBAGENT_TOOL_NAMES:
+        if acting_subagent and requested not in acting_tool_names_for_context(self._ctx):
             return "hidden by the acting subagent profile"
         return None
 
@@ -887,7 +911,7 @@ class ToolRegistry:
                 return None  # CW3: allowlist-consistent with schemas()/execute() (so enable_tools can't surface a denied tool)
             if local_readonly_subagent and not self._readonly_tool_allowed(requested):
                 return None
-            if acting_subagent and requested not in ACTING_SUBAGENT_TOOL_NAMES:
+            if acting_subagent and requested not in acting_tool_names_for_context(self._ctx):
                 return None
             return self._schema_for_entry(entry)
         try:
@@ -1259,7 +1283,8 @@ class ToolRegistry:
             )
             allow_protected = registry_guards._authorized_managed_update_resolver(self._ctx) or (
                 mode_allows_protected_write(_runtime_mode)
-                and (acting_protected_grant or not acting_subagent)
+                and (acting_protected_grant or not acting_subagent
+                     or runtime_mode_at_least(_runtime_mode, "cyber_pro"))
             )
             if protected_matches and not allow_protected:
                 first = protected_matches[0]
@@ -1328,6 +1353,18 @@ class ToolRegistry:
             result = checked
         elif early_error is not None:
             return early_error
+
+        if (
+            name in _PROCESS_COMMAND_TOOLS
+            and mode_allows_protected_write(_runtime_mode)
+            and targets_system_repo
+            and getattr(self._ctx, "_protected_shell_notice_paths", None)
+        ):
+            result = _append_shell_core_notice(
+                result,
+                args.get("cmd", args.get("command", "")),
+                paths=getattr(self._ctx, "_protected_shell_notice_paths", None),
+            )
 
         return _compose_execute_result_result(name, result, _route_note, safety_msg) if _route_note or safety_msg else result
 

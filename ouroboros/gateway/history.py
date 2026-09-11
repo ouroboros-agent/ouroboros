@@ -21,6 +21,7 @@ from ouroboros.gateway.cost_breakdown import make_cost_breakdown_endpoint  # noq
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+from ouroboros.project_dialogue import historical_terminal_projection
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, executor_observation_meta, subagent_message_meta
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.utils import strip_markdown, utc_now_iso
@@ -76,6 +77,7 @@ _PROGRESS_META_FIELDS = (
     "reason_code",
     "review_projection",
     "worker_saturation_warning",
+    "model_execution",
     "model_lane",
     "requested_model_lane",
     "effective_model_lane",
@@ -187,7 +189,7 @@ def _user_annotation(
         key: annotation.get(key)
         for key in (
             "action", "target", "target_label", "status", "detail", "options",
-            "attachment_manifest", "routing_token",
+            "attachment_manifest", "routing_token", "project_id", "project_chat_id",
         )
         if key in annotation
     }
@@ -331,9 +333,13 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
         return
     if entry.get("ephemeral_decision"):
         rec["ephemeral_decision"] = True
+    if isinstance(entry.get("model_execution"), dict):
+        rec["model_execution"] = dict(entry["model_execution"])
+    if entry.get("suggested_name"):
+        rec["suggested_name"] = str(entry["suggested_name"])
     for key in ("tool_calls", "rounds"):
         if key in entry:
-            rec[key] = int(entry[key])
+            rec[key] = None if entry[key] is None else int(entry[key])
     if entry.get("type") == "task_summary" or isinstance(entry.get("outcome_axes"), dict):
         rec["outcome_axes"] = normalize_outcome_axes(entry)
     if "reason_code" in entry:
@@ -374,7 +380,21 @@ def _load_terminal_result(
         result = load_effective_task_result(data_dir, task_id, materialize_artifacts=False)
     except Exception:
         result = None
-    cache[task_id] = result or {}
+    if result:
+        cache[task_id] = result
+    else:
+        # Empty effective read is not proof of absence: malformed/unreadable
+        # canonical files retain uncertainty. The existing schema owner may
+        # already have moved an obsolete result to quarantine.
+        from ouroboros.task_results import task_results_dir
+        try:
+            (task_results_dir(data_dir, create=False) / f"{task_id}.json").stat()
+        except FileNotFoundError:
+            cache[task_id] = {"_history_result_absent": True}
+        except OSError:
+            cache[task_id] = {}
+        else:
+            cache[task_id] = {}
     return cache[task_id]
 
 
@@ -384,6 +404,7 @@ def _annotate_terminal_task_truth(
     result_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     floor: str = "",
     anchored_children: Optional[set] = None,
+    historical_terminals: Optional[dict] = None,
 ) -> None:
     """Project bounded terminal truth and legacy child identity onto replay rows.
 
@@ -426,6 +447,7 @@ def _annotate_terminal_task_truth(
             str(message.get("task_id") or "")
             for message in combined
             if message.get("task_id")
+            and message.get("system_type") != "project_question_pointer"
             and not message.get("is_progress")
             and str(message.get("role") or "") in {"assistant", "system"}
             and str(message.get("task_id") or "") not in progress_task_ids
@@ -465,6 +487,8 @@ def _annotate_terminal_task_truth(
                     "outcome_axes": normalize_outcome_axes(result),
                     "outcome_phase": outcome_phase(result, {}), "outcome_final": task_id not in finalizing_tasks,
                 }
+                if isinstance(result.get("model_execution"), dict):
+                    terminal_truth["model_execution"] = dict(result["model_execution"])
                 if result.get("reason_code"):
                     terminal_truth["reason_code"] = str(result.get("reason_code") or "")
                 review_projection = result.get("review_projection")
@@ -521,8 +545,12 @@ def _annotate_terminal_task_truth(
         anchored = anchored_children or set()
         for message in combined:
             task_id = str(message.get("task_id") or "")
-            if not task_id:
+            if not task_id or message.get("system_type") == "project_question_pointer":
                 continue
+            if cache.get(task_id, {}).get("_history_result_absent"):
+                historical = (historical_terminals or {}).get(task_id)
+                if historical:
+                    message["historical_terminal"] = dict(historical)
             if message.get("system_type") == "task_model_wait":
                 if task_id in terminal_status_by_task:
                     message["task_terminal_status"] = terminal_status_by_task[task_id]
@@ -683,6 +711,8 @@ def _make_thread_filter(
         # without a registered project). Main is 1; explicit partition rows never
         # become ordinary conversation history. Keep this after the Project
         # branch so durable task binding stays unchanged.
+        if _question_project_chat(entry):
+            return True
         if entry_chat == HIDDEN_CHAT_ID:
             return False
         # Main / non-project view: exactly the two host-stamped Project-root
@@ -697,6 +727,16 @@ def _make_thread_filter(
             return False
         return entry_chat not in project_chat_ids
 
+    def _question_project_chat(entry):
+        if thread_id != 1 or not isinstance(entry, dict) or entry.get("type") != "quiz":
+            return 0
+        quiz = entry.get("quiz")
+        if not isinstance(quiz, dict) or quiz.get("wait_for_answer") is not True:
+            return 0
+        chat = _bound_project_chat(str(entry.get("task_id") or "")) or _stored_chat_id(entry.get("chat_id"), 1)
+        return chat if chat in project_chat_ids else 0
+
+    _row_matches_thread.question_project_chat = _question_project_chat
     return _row_matches_thread
 
 
@@ -708,6 +748,7 @@ def _collect_chat_rows(
     chat_annotations: Dict[str, Any],
     *,
     include_gaps: bool = False,
+    historical_terminals: Optional[dict] = None,
 ) -> tuple[list, int] | tuple[list, int, set[str]]:
     """Read + transform the chat stream.
 
@@ -719,6 +760,20 @@ def _collect_chat_rows(
     # projection. One projection read per distinct asking task, cached for
     # this call.
     quiz_projection_cache: Dict[str, Dict[str, Any]] = {}
+    question_projects = None
+    question_keys = set()
+
+    def _quiz_source(task_id):
+        if task_id not in quiz_projection_cache:
+            from ouroboros.task_results import task_result_path
+            from ouroboros.utils import read_json_dict
+
+            data = read_json_dict(task_result_path(chat_path.parent.parent, task_id, create=False)) or {}
+            quiz_projection_cache[task_id] = {
+                "quizzes": data.get("owner_quiz") if isinstance(data.get("owner_quiz"), dict) else {},
+                "wait": data.get("owner_wait") if isinstance(data.get("owner_wait"), dict) else {},
+            }
+        return quiz_projection_cache[task_id]
     combined: list = []
     chat_quota_rows = 0
     stream_gaps: set[str] = set()
@@ -726,30 +781,46 @@ def _collect_chat_rows(
     try:
         # Rotation-aware archive backfill lives in the module-level
         # _read_chat_history_entries helper (endpoint's thread filter threaded in).
-        if include_gaps:
-            _chat_entries = _read_chat_history_entries(
-                chat_path,
-                archive_dir,
-                n_human,
-                row_matches_thread,
-                include_gaps=True,
-            )
-            _chat_entries, stream_gaps = _chat_entries
-        else:
-            _chat_entries = _read_chat_history_entries(
-                chat_path, archive_dir, n_human, row_matches_thread
-            )
+        read_result = _read_chat_history_entries(
+            chat_path, archive_dir, n_human, row_matches_thread,
+            **({"include_gaps": True} if include_gaps else {}),
+        )
+        _chat_entries, stream_gaps = read_result if include_gaps else (read_result, set())
         # Window accounting for the response's truncation metadata: how many
         # read rows satisfy the SAME quota predicate the reader stopped on.
         chat_quota_rows = sum(
             1 for entry in _chat_entries if _chat_counts_toward_quota(entry)
         )
         for entry in _chat_entries:
+            # Preserve only the typed terminal fact from this already-bounded
+            # pass, before the synthetic cognitive row is hidden. Only ids in
+            # the final visible window are annotated with it below.
+            historical = historical_terminal_projection(entry)
+            if historical and historical_terminals is not None:
+                tid = str(entry["task_id"])
+                previous = historical_terminals.get(tid, {})
+                if historical["ts"] >= previous.get("ts", ""):
+                    historical_terminals[tid] = historical
             # Skip A2A virtual chat_ids so A2A task traffic does not appear in human chat history.
             if is_a2a_chat_id(entry.get("chat_id", 1)):
                 continue
             entry_chat = _stored_chat_id(entry.get("chat_id"), 1)
             if not row_matches_thread(entry_chat, entry):
+                continue
+            pointer_chat = getattr(row_matches_thread, "question_project_chat", lambda row: 0)(entry)
+            if pointer_chat:
+                from ouroboros.project_dialogue import project_question_pointer
+                from ouroboros.projects_registry import list_reserved_projects
+
+                if question_projects is None:
+                    question_projects = {row["chat_id"]: row for row in list_reserved_projects(chat_path.parent.parent)}
+                tid, qid = str(entry.get("task_id") or ""), str(entry["quiz"].get("quiz_id") or "")
+                source = _quiz_source(tid)
+                pointer = project_question_pointer(entry, source["quizzes"].get(qid),
+                                                   question_projects.get(pointer_chat), source["wait"])
+                if pointer and (tid, qid) not in question_keys:
+                    question_keys.add((tid, qid))
+                    combined.append(pointer)
                 continue
             direction = str(entry.get("direction", "")).lower()
             role = {"in": "user", "out": "assistant", "system": "system"}.get(direction)
@@ -823,11 +894,7 @@ def _collect_chat_rows(
                 quiz = dict(entry["quiz"])
                 _qtid = str(entry.get("task_id") or "")
                 if _qtid:
-                    if _qtid not in quiz_projection_cache:
-                        from ouroboros.owner_quiz import quiz_states
-
-                        quiz_projection_cache[_qtid] = quiz_states(chat_path.parent.parent, _qtid)
-                    _live = quiz_projection_cache[_qtid].get(str(quiz.get("quiz_id") or ""))
+                    _live = _quiz_source(_qtid)["quizzes"].get(str(quiz.get("quiz_id") or ""))
                     if isinstance(_live, dict):
                         quiz["state"] = str(_live.get("state") or quiz.get("state") or "open")
                         for key in ("answered_index", "comment"):  # the recorded answer itself
@@ -1406,9 +1473,10 @@ def _assemble_history_response(
     chat_path = data_dir / "logs" / "chat.jsonl"
     progress_path = data_dir / "logs" / "progress.jsonl"
     archive_dir = data_dir / "archive"
+    historical_terminals: Dict[str, dict] = {}
     combined, chat_quota_rows, chat_gaps = _collect_chat_rows(
         chat_path, archive_dir, n_human, row_matches_thread, chat_annotations,
-        include_gaps=True,
+        include_gaps=True, historical_terminals=historical_terminals,
     )
     progress_rows, progress_quota_rows, progress_gaps = _collect_progress_rows(
         progress_path, archive_dir, n_progress, row_matches_thread,
@@ -1437,6 +1505,7 @@ def _assemble_history_response(
     _annotate_terminal_task_truth(
         messages, data_dir, result_cache=result_cache,
         floor=floor, anchored_children=anchored_children,
+        historical_terminals=historical_terminals,
     )
 
     # Background consciousness writes no task_result, so its progress would

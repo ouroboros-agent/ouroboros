@@ -8,10 +8,13 @@ one an instruction about the runtime, not a report from a worker.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
+_cancel_event_lock = threading.Lock()
+_cancel_events_in_flight: set[tuple[str, str]] = set()
 
 
 def _handle_deep_self_review_request(evt: Dict[str, Any], ctx: Any) -> None:
@@ -115,6 +118,34 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
+    """Dispatch the existing custody driver without holding supervisor intake."""
+    task_id = str(evt.get("task_id") or "").strip()
+    if not task_id:
+        return
+    key = (str(ctx.DRIVE_ROOT), task_id)
+    with _cancel_event_lock:
+        if key in _cancel_events_in_flight:
+            return  # The durable intent also carries any stronger repeat request.
+        _cancel_events_in_flight.add(key)
+
+    def drive() -> None:
+        try:
+            _drive_cancel_task_event(evt, ctx)
+        except Exception:
+            log.warning("Cancel event remains with the durable watchdog for %s", task_id, exc_info=True)
+        finally:
+            with _cancel_event_lock:
+                _cancel_events_in_flight.discard(key)
+
+    try:
+        threading.Thread(target=drive, name=f"cancel-task-{task_id}", daemon=True).start()
+    except Exception:
+        with _cancel_event_lock:
+            _cancel_events_in_flight.discard(key)
+        log.warning("Could not dispatch cancel event for %s; durable watchdog retains it", task_id, exc_info=True)
+
+
+def _drive_cancel_task_event(evt: Dict[str, Any], ctx: Any) -> None:
     """Drive one agent-requested cancel through custody — TYPED outcome end to end.
 
     Custody publishes the settled truth itself: a cancelled child's

@@ -10,6 +10,7 @@ shape never leaks into the native wire format or back out of it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,7 +26,11 @@ from ouroboros.llm_attempt import (
     _candidate_before_dispatch,
     _execute_candidate,
     _finalized_physical_candidate,
+    preserve_prior_dispatch,
+    strongest_dispatch_capture,
 )
+from ouroboros.deadline_utils import physical_dispatch_timeout
+from ouroboros.llm_stream import consume_stream
 from ouroboros.llm_capability_policy import normalize_reasoning_effort
 from ouroboros.request_wire_recovery import (
     finalize_wire_response,
@@ -39,6 +44,41 @@ from ouroboros.usage_accounting import UsageAccountingError, last_physical_attem
 
 class _AnthropicLaneMixin:
     """Native Anthropic request building, dispatch and response normalisation."""
+
+    async def _chat_anthropic_async(self, *args, **kwargs):
+        """Retain the requests worker and its capture through logical cancellation."""
+        from ouroboros.usage_accounting import adopt_physical_attempt_capture
+
+        def invoke():
+            adopt_physical_attempt_capture(None)
+            try:
+                result = self._chat_anthropic(*args, **kwargs)
+                return result, None, last_physical_attempt_capture()
+            except BaseException as exc:
+                capture = getattr(exc, "physical_attempt_capture", None) or last_physical_attempt_capture()
+                if capture is not None:
+                    exc.physical_attempt_capture = capture
+                return None, exc, capture
+
+        worker = asyncio.create_task(asyncio.to_thread(invoke))
+        cancellation = None
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        result, error, capture = worker.result()
+        adopt_physical_attempt_capture(capture)
+        if cancellation is not None:
+            cancellation.physical_attempt_capture = capture
+            if error is not None and hasattr(error, "stream_receipt"):
+                cancellation.stream_receipt = error.stream_receipt
+            elif result is not None and result[1].get("stream_receipt"):
+                cancellation.stream_receipt = result[1]["stream_receipt"]
+            raise cancellation from error
+        if error is not None:
+            raise error
+        return result
 
     @staticmethod
     def _stringify_anthropic_content(value: Any) -> str:
@@ -331,6 +371,8 @@ class _AnthropicLaneMixin:
             "provider": "anthropic",
             "resolved_model": str(target.get("usage_model") or target.get("resolved_model") or ""),
         }
+        if isinstance(resp_dict.get("_stream_receipt"), dict):
+            usage["stream_receipt"] = dict(resp_dict["_stream_receipt"])
         if prompt_cache_ttl:
             usage["prompt_cache_ttl"] = prompt_cache_ttl
         write_split = self._cache_write_split(raw_usage)
@@ -431,12 +473,15 @@ class _AnthropicLaneMixin:
         no_proxy: bool = False,
         timeout: Optional[float] = None,
         allow_server_web_search: bool = False,
+        stream: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         import requests
 
         payload = self._build_remote_candidate(
             target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
         )
+        if stream:
+            payload["stream"] = True
         prompt_cache_ttl = self._normalize_payload_cache_ttl(target, payload)
 
         url = f"{str(target.get('base_url') or '').rstrip('/')}/messages"
@@ -446,25 +491,33 @@ class _AnthropicLaneMixin:
             "content-type": "application/json",
         }
         request_timeout = float(timeout) if timeout and timeout > 0 else 120
+        prior_capture = None
 
         def _send(candidate: Dict[str, Any]):
+            nonlocal prior_capture
             candidate = _finalized_physical_candidate(target, candidate, "messages")
             request = _attempt_request(target, candidate, source="llm.anthropic")
 
             def _post():
+                def receive(sent):
+                    if sent.status_code >= 400:
+                        body_preview = (sent.text or "")[:2000]
+                        raise requests.HTTPError(
+                            f"{sent.status_code} {sent.reason} for url {sent.url}: {body_preview}",
+                            response=sent,
+                        )
+                    return consume_stream(sent, native=True) if candidate.get("stream") else sent
+
+                def post(sender):
+                    return receive(sender(url, headers=headers, json=candidate,
+                                          timeout=physical_dispatch_timeout(request_timeout),
+                                          **({"stream": True} if candidate.get("stream") else {})))
+
                 if no_proxy:
                     with requests.Session() as session:
                         session.trust_env = False
-                        sent = session.post(url, headers=headers, json=candidate, timeout=request_timeout)
-                else:
-                    sent = requests.post(url, headers=headers, json=candidate, timeout=request_timeout)
-                if sent.status_code >= 400:
-                    body_preview = (sent.text or "")[:2000]
-                    raise requests.HTTPError(
-                        f"{sent.status_code} {sent.reason} for url {sent.url}: {body_preview}",
-                        response=sent,
-                    )
-                return sent
+                        return post(session.post)
+                return post(requests.post)
 
             try:
                 result = _execute_candidate(
@@ -473,12 +526,15 @@ class _AnthropicLaneMixin:
                     _candidate_before_dispatch(candidate, request),
                 )
                 note_wire_send_succeeded(last_physical_attempt_capture())
+                prior_capture = strongest_dispatch_capture(prior_capture, last_physical_attempt_capture())
                 return result
-            except UsageAccountingError:
+            except UsageAccountingError as exc:
                 self._pop_effort_clamp_disclosure()
                 note_wire_send_failed()
+                preserve_prior_dispatch(exc, prior_capture)
                 raise
-            except Exception:
+            except Exception as exc:
+                prior_capture = strongest_dispatch_capture(prior_capture, getattr(exc, "physical_attempt_capture", None))
                 note_wire_send_failed()
                 raise
 

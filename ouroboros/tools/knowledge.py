@@ -1,5 +1,7 @@
 """Persistent topic-based knowledge files with an auto-maintained index."""
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import hashlib
 import logging
 import os
@@ -199,7 +201,7 @@ def _knowledge_read(ctx: ToolContext, topic: str) -> str:
     try:
         sanitized_topic = _sanitize_topic(topic)
     except ValueError as e:
-        return f"⚠️ Invalid topic: {e}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Invalid topic: {e}")))
 
     # The improvement backlog always resolves to the ONE global store, regardless
     # of project scope or a forked child drive (C10.1) — never a project copy.
@@ -214,7 +216,7 @@ def _knowledge_read(ctx: ToolContext, topic: str) -> str:
     try:
         path, sanitized_topic = _safe_path(ctx, topic)
     except ValueError as e:
-        return f"⚠️ Invalid topic: {e}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Invalid topic: {e}")))
 
     if not path.exists():
         return f"Topic '{sanitized_topic}' not found. Use knowledge_list to see available topics."
@@ -246,10 +248,10 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
     try:
         sanitized_topic = _sanitize_topic(topic)
     except ValueError as e:
-        return f"⚠️ Invalid topic: {e}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Invalid topic: {e}")))
 
     if mode not in ("overwrite", "append"):
-        return f"⚠️ Invalid mode '{mode}'. Use 'overwrite' or 'append'."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Invalid mode '{mode}'. Use 'overwrite' or 'append'.")))
 
     # The improvement backlog is ONE global, immune store (C10.1 Fix A): route the
     # WHOLE write — not just the path — to the global backlog regardless of project
@@ -263,9 +265,9 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
         merged = merge_backlog_text(root, content)
         if merged < 0:
             return (
-                "⚠️ Refused: the improvement-backlog write contained no parseable item "
+                _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Refused: the improvement-backlog write contained no parseable item "
                 "blocks, so the global immune backlog was left intact (never wiped). "
-                "Write `### ibl-<id>` blocks with `- summary: …` lines."
+                "Write `### ibl-<id>` blocks with `- summary: …` lines.")))
             )
         _record_backlog_history(backlog_path(root), sanitized_topic, mode, str(getattr(ctx, "task_id", "") or ""))
         return f"✅ Knowledge '{sanitized_topic}' merged into the global backlog ({merged} item(s))."
@@ -273,7 +275,7 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
     try:
         path, sanitized_topic = _safe_path(ctx, topic)
     except ValueError as e:
-        return f"⚠️ Invalid topic: {e}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Invalid topic: {e}")))
 
     _ensure_dir(ctx)
     with _knowledge_write_lock(_knowledge_dir(ctx)):

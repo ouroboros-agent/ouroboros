@@ -590,15 +590,12 @@ def load_extension(
             f"{conflict_names}. Disable the conflicting skill first."
         )
     # Light mode permits reviewed extensions; stale review and other gates remain.
-    gate = runtime_state.get("review_gate") or skill_review_gate(
-        skill.review.status,
-        stale=skill.review.content_hash != current_hash,
-    )
+    gate = runtime_state.get("review_gate") or skill.review.gate_for(current_hash)
     if not gate.get("executable_review", False):
         return (
             f"skill {skill.name!r} must carry a fresh executable review "
             f"(status={skill.review.status!r}, "
-            f"stale={skill.review.content_hash != current_hash}, "
+            f"stale={skill.review.is_stale_for(current_hash)}, "
             f"reason={gate.get('blocking_reason')})"
         )
     if runtime_state["reason"] == "disabled":

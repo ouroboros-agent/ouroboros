@@ -1,3 +1,4 @@
+import { setInertCardPresentation } from './task_phase_chip.js';
 import { escapeHtmlAttr } from './utils.js';
 import { taskSourceDownloadUrl } from './api_client.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
@@ -41,9 +42,9 @@ const finiteCount = (value) => {
 };
 
 export function setReviewAnchor(record, enabled, writePhase) {
-    if (!record || Boolean(record.reviewAnchor) === enabled) return false;
+    if (!record || (record.historicalUnavailable || record.historicalUnconfirmed) || Boolean(record.reviewAnchor) === enabled) return false;
     record.reviewAnchor = enabled;
-    record.phaseEl.hidden = enabled;
+    setInertCardPresentation(record, enabled);
     if (enabled) {
         record.titleEl.textContent = record.suggestedName || 'Reviews';
         record.inlineTypingEl.style.display = 'none';
@@ -559,6 +560,15 @@ function planWaveDetail(wave) {
     }
     if (wave.findings_texts_truncated) lines.push('Some finding texts were truncated at capture.');
     if (wave.spec_body_truncated) lines.push('Spec body was truncated at capture.');
+    const author = wave.author_disposition;
+    if (author && typeof author === 'object' && text(author.disposition)) {
+        lines.push(
+            `Author finish: ${text(author.disposition)}${text(author.reviewer_signal) ? ` · reviewer signal=${text(author.reviewer_signal)}` : ''}`
+            + `${text(author.rationale) ? ` · ${text(author.rationale)}` : ''}`
+            + `${text(author.subject_hash) ? ` · subject_hash=${text(author.subject_hash)}` : ''}`
+            + `${text(author.source) ? ` · source=${text(author.source)}` : ''}`,
+        );
+    }
     return lines.filter(Boolean).join('\n');
 }
 
@@ -768,12 +778,36 @@ export function formatReviewProjection(projection) {
     return lines.join('\n');
 }
 
+function authorDispositionText(author, label = 'Author finish') {
+    if (!author || typeof author !== 'object' || !text(author.disposition)) return '';
+    return [
+        `${label}: ${text(author.disposition)}`,
+        text(author.reviewer_signal) ? `reviewer signal=${text(author.reviewer_signal)}` : '',
+        text(author.rationale),
+        text(author.subject_hash) ? `subject_hash=${text(author.subject_hash)}` : '',
+        text(author.source) ? `source=${text(author.source)}` : '',
+    ].filter(Boolean).join(' · ');
+}
+
 export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
     const owner = text(ownerTaskId || detail?.task_id);
     const projection = detail?.review_projection;
     const panels = (Array.isArray(projection?.panels) ? projection.panels : [])
         .filter((panel) => text(panel?.surface) === 'task_acceptance');
     if (!owner || !panels.length) return null;
+    const acceptanceDecision = detail?.outcome_axes?.review?.acceptance_decision
+        || detail?.review_status?.acceptance_decision;
+    const decisionAuthor = acceptanceDecision?.author_disposition;
+    // A task's final author subject can differ from every historical panel:
+    // Advisory may finish edited h2 after the critic reviewed h1. Keep this
+    // decision at task level; it never belongs to a panel merely by recency.
+    const authorDecisionText = authorDispositionText(decisionAuthor)
+        || authorDispositionText({
+            disposition: acceptanceDecision?.agent_disposition,
+            rationale: acceptanceDecision?.agent_rationale
+                || acceptanceDecision?.author_rationale || acceptanceDecision?.rationale,
+            source: acceptanceDecision?.source,
+        }, 'Author stance (unbound)');
     const attempts = panels.map((panel, index) => {
         const verdict = text(panel?.aggregate_signal || 'UNKNOWN');
         return {
@@ -796,7 +830,8 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
             execution: null,
             detailRef: { surface: 'task_acceptance', url: panel.applied_source_status === 'available'
                 ? taskSourceDownloadUrl(owner, panel.applied_source_ref) : '' },
-            detailText: `${formatReviewProjection({ panels: [panel] })}\nCost unavailable`.trim(),
+            detailText: [formatReviewProjection({ panels: [panel] }),
+                authorDispositionText(panel.author_disposition), 'Cost unavailable'].filter(Boolean).join('\n'),
         };
     });
     const latest = attempts.at(-1);
@@ -812,6 +847,7 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
         tone: statusTone('terminal', latest?.verdict),
         verdict: text(latest?.verdict),
         summary: text(latest?.summary),
+        authorDecisionText,
         activeCount: 0,
         attemptCount: attempts.length,
         countIsAuthoritative: true,
@@ -1310,6 +1346,7 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                 </button>
                 <div class="chat-review-attempts"${groupExpanded ? '' : ' hidden'}>
                     <div class="chat-review-group-cost">Cost unavailable</div>
+                    ${group.authorDecisionText ? `<div class="chat-review-attempt-detail" data-review-author-decision><span>Task author decision</span><br><span>${escapeHtmlText(group.authorDecisionText)}</span></div>` : ''}
                     ${initiator}${attempts}
                 </div>
             </div>`;

@@ -8,9 +8,10 @@ Extracted from loop.py to keep the main loop orchestrator focused.
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import contextlib
 import hashlib
-import os
 import pathlib
 import queue
 import time
@@ -191,7 +192,7 @@ def transient_retry_max(default_retries: int) -> int:
         default_value = int(SETTINGS_DEFAULTS.get("OUROBOROS_TRANSIENT_RETRY_MAX", _TRANSIENT_RETRY_DEFAULT))
     except Exception:
         default_value = _TRANSIENT_RETRY_DEFAULT
-    raw = os.environ.get("OUROBOROS_TRANSIENT_RETRY_MAX", "").strip()
+    raw = runtime_setting("OUROBOROS_TRANSIENT_RETRY_MAX", "").strip()
     try:
         value = int(raw) if raw else default_value
     except ValueError:
@@ -826,7 +827,9 @@ def _remember_llm_call(
     provider: str,
     request_ref: Dict[str, Any],
     response_ref: Dict[str, Any],
-) -> None:
+    reported_model: Any = None,
+    use_local: Optional[bool] = None,
+) -> Dict[str, Any]:
     call_meta = {
         "llm_call_id": llm_call_id,
         "execution_id": execution_id,
@@ -836,11 +839,14 @@ def _remember_llm_call(
         "model": model,
         "resolved_model": display_model,
         "provider": provider,
+        "reported_model": reported_model.strip() if isinstance(reported_model, str) and reported_model.strip() else None,
+        "use_local": use_local,
         "request_ref": request_ref.get("manifest_ref") if request_ref else None,
         "response_ref": response_ref.get("manifest_ref") if response_ref else None,
     }
     usage["_last_llm_call_meta"] = call_meta
     usage.setdefault("llm_call_refs", []).append(call_meta)
+    return call_meta
 
 
 def _normalize_usage_cost(
@@ -933,13 +939,15 @@ def _record_llm_call_error(
     repeats = _transport_death_repeats(ctx.accumulated_usage, ctx.round_id)
     backoff = None
     if classification.kind == "provider_outcome_unknown":
-        # Decided BEFORE the durable rows are written so `retry_same_request`
-        # is the truth of what happens next: a bounded paid repeat (a NEW
-        # attempt with its own ledger row) of a typed transport death while
-        # this round's budget, the attempt loop AND the owner deadline (the
-        # backoff plus the admission reserve the next iteration re-checks) all
-        # have room; otherwise the no-resend terminal. Counted here, at the
-        # grant, so the counter never names a repeat that was not sent.
+        ctx.accumulated_usage["_pending_transport_outcome"] = {
+            **custody_fields, "model": ctx.model, "operation_id": str(getattr(error, "operation_id", "") or ""),
+            "route": dict(getattr(error, "route", {}) or {}), "outcome": "unknown",
+            "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
+        }
+        # The caller chooses this existing repeat rail. Ordinary managed tasks
+        # set it to zero: their transport episode requires upstream recovery
+        # before a marked NEW attempt. Other callers retain their bounded rail;
+        # grant before logging, and uncount a grant refused before dispatch.
         if (
             is_retryable_transport_death(error)
             and repeats < ctx.transport_death_retries and ctx.attempt < ctx.transient_budget - 1
@@ -1369,15 +1377,15 @@ def call_llm_with_retry(
                 "model_account_override": model_account_override,
                 "reasoning_effort": effort,
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
+                "stream": True, "caller_deadline_ts": (None if deadline_ts is None
+                    else float(deadline_ts) - float(transport_reserve_sec or 0.0)),
                 "use_local": use_local,
                 # These are optional host hints, not required tools. This
                 # transport has neither provider-owned web tools nor a bypass
                 # knob; ordinary Ouroboros web tools stay in the schema.
                 "allow_server_web_search": bool(allow_server_web_search) and provider_for_model(model) != "claudexor",
                 "bypass_response_cache": response_cache_bypass_requested and provider_for_model(model) != "claudexor",
-                "timeout": _main_transport_timeout(
-                    model, deadline_ts, reserve_sec=transport_reserve_sec,
-                ),
+                "timeout": _main_transport_timeout(model, deadline_ts, reserve_sec=transport_reserve_sec),
             }
             request_ref = persist_observed_call(
                 drive_root,
@@ -1466,7 +1474,7 @@ def call_llm_with_retry(
                 display_model=display_model,
                 provider=provider,
                 request_ref=request_ref,
-                response_ref=response_ref,
+                response_ref=response_ref, reported_model=usage.get("resolved_model"), use_local=bool(use_local),
             )
             category = task_type if task_type in ("evolution", "consciousness", "review", "summarize") else "task"
             emit_llm_usage_event(
@@ -1496,7 +1504,6 @@ def call_llm_with_retry(
                 _emit_main_llm_call_state(event_queue, call_identity, "failed")
                 if event_type == "provider_incomplete_response" and not usage.get("provider_error"):
                     response_cache_bypass_requested = True
-                # fenced like any other class while the round holds an unresolved attempt
                 if not permanent_body_error and attempt < transient_budget - 1 and TRANSPORT_DEATHS_KEY not in accumulated_usage:
                     if _sleep_within_deadline(
                         min(2.0 ** attempt, _TRANSIENT_BACKOFF_CAP_SEC), deadline_ts

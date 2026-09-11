@@ -235,9 +235,9 @@ def _build_advisory_prompt(
         # precedent (plan_review_runtime's retrieving-session task and its
         # DEVELOPMENT.md "Core Governance Artifacts" row), NOT BIBLE P3
         # retrieving-scope. The advisory session pack deliberately contains
-        # only the staged diff, the changed-file pack, and PUBLIC repository
-        # documents — no redacted-class evidence — so the pointer form leaks
-        # nothing the api form redacts.
+        # the staged diff, changed-file pack and public repository documents.
+        # Selected task execution evidence is separately redacted and bound to
+        # its canonical source before either retrieving delivery runs.
         bible = _car()._mandatory_read_pointer(repo_dir, "BIBLE.md")
         checklists = _car()._mandatory_read_pointer(repo_dir, "docs/CHECKLISTS.md", section=checklist_name)
         dev_guide = _car()._mandatory_read_pointer(repo_dir, "docs/DEVELOPMENT.md")
@@ -361,6 +361,7 @@ def _build_advisory_prompt(
         "## ARCHITECTURE.md (System structure — critical for version sync and module checks)\n\n"
         f"{arch_doc}\n\n{skill_host_context}\n\n{blocking_history}\n\n"
         f"{build_rebuttal_section(str(prompt_context.get('review_rebuttal') or ''))}\n"
+        f"{prompt_context.get('task_evidence_section') or ''}\n"
         f"## Commit message\n\n{commit_message}\n\n"
         f"## Changed files (git status --porcelain)\n\n{changed_files}\n\n"
         "## Current touched files (full content — read these with read_file for deeper inspection)\n\n"

@@ -97,12 +97,14 @@ function isTruthySetting(value) {
 
 // A loading, validation or editor owner may update its own status. A later
 // message from anyone else drops that ownership, protecting the newer result.
-function setStatus(text, tone = 'ok', owner = '') {
+function setStatus(text, tone = 'ok', owner = '', subject = '') {
     const status = byId('settings-status');
     status.textContent = text;
     status.dataset.tone = tone;
     if (owner) status.dataset.owner = owner;
     else delete status.dataset.owner;
+    if (subject) status.dataset.subject = subject;
+    else delete status.dataset.subject;
 }
 
 function setButtonBusy(button, busy) {
@@ -110,6 +112,32 @@ function setButtonBusy(button, busy) {
     button.disabled = busy;
     if (busy) button.setAttribute('aria-busy', 'true');
     else button.removeAttribute('aria-busy');
+}
+
+function policyValueLabel(value) {
+    const labels = {
+        light: 'Light', advanced: 'Advanced', pro: 'Pro', cyber_pro: 'Cyber Pro',
+        full: 'Full', off: 'Off', advisory: 'Advisory', blocking: 'Blocking',
+    };
+    return labels[String(value || '').trim().toLowerCase()] || String(value || 'Unknown');
+}
+
+function syncPolicyState(root, meta) {
+    const state = meta?.policy_state;
+    if (!state) return;
+    const render = (key, text) => {
+        const node = root?.querySelector(`[data-policy-state="${key}"]`);
+        if (node) node.textContent = text;
+    };
+    const access = state.access || {};
+    render('access', access.restart_required
+        ? `Saved: ${policyValueLabel(access.configured)} · Current process: ${policyValueLabel(access.current_process || access.effective)} · After restart: ${policyValueLabel(access.configured)} · Restart required`
+        : `Current process: ${policyValueLabel(access.current_process || access.effective)} · After restart: ${policyValueLabel(access.configured)}`);
+    const suffix = (item) => item.active_task_snapshot
+        ? `Saved: ${policyValueLabel(item.configured)} · Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)} · Current task keeps its start snapshot`
+        : `Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)}`;
+    render('supervisor', suffix(state.supervisor || {}));
+    render('review', suffix(state.review || {}));
 }
 
 function readInt(id, fallback) {
@@ -408,11 +436,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     initReviewerSlots({ onChange: () => onSettingsEdited() });
     initSubagentsSection({
         onChange: () => onSettingsEdited(),
-        // The roster's section line and the footer message it owns read one
-        // verdict: when the judged rows come clean, the footer clears with the
-        // line and the tint — unless someone else has written the footer since.
+        // A judged roster may clear only the validation footer it authored.
+        // A cadence or other field error keeps its typed subject and survives.
         onJudged: (clean) => {
-            if (clean && byId('settings-status').dataset.owner === 'subagents') setStatus('', 'ok');
+            const status = byId('settings-status');
+            if (clean && status.dataset.owner === 'validation'
+                    && status.dataset.subject === 'subagents') setStatus('', 'ok');
         },
         isOuterDraftClean: () => !settingsDirty,
         onGeneratedApply: () => {
@@ -616,6 +645,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         resetSecretClearFlags(page);
         syncEffortSegments(page);
         syncRuntimeModeBridgeState();
+        syncPolicyState(page, s?._meta);
         syncPostTaskEvolutionUi();
         refreshSafetySkipCounter();  // fire-and-forget; fills the 24h audited-skip note
     }
@@ -836,20 +866,25 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         collectCustomSecrets().errors.forEach(({ index, field, message }) => {
             if (rows[index]?.dataset.judged === '1') fields.push({ input: rows[index].querySelector(`[data-custom-secret-${field}]`), message });
         });
-        const messages = [
-            ...fields.map(({ message }) => message),
-            ...modelRoles.validateAll(),
-            ...validateSubagentsDraft().map((error) => `Available subagents: ${error}`),
-            ...validateReviewerSlots(),
-        ].filter(Boolean);
-        return { fields, messages };
+        const groups = [
+            ['fields', fields.map(({ message }) => message)],
+            ['models', modelRoles.validateAll()],
+            ['subagents', validateSubagentsDraft().map((error) => `Available subagents: ${error}`)],
+            ['reviewers', validateReviewerSlots()],
+        ];
+        const messages = groups.flatMap(([, rows]) => rows).filter(Boolean);
+        const subject = groups.find(([, rows]) => rows.some(Boolean))?.[0] || '';
+        return { fields, messages, subject };
     }
 
     function renderValidation() {
-        const { fields, messages } = collectValidation();
+        const { fields, messages, subject } = collectValidation();
         paintSettingsFieldErrors(page, fields);
-        if (byId('settings-status').dataset.owner === 'validation') setStatus(validationSummary(messages), 'warn', 'validation');
-        return messages;
+        if (byId('settings-status').dataset.owner === 'validation') {
+            if (messages.length) setStatus(validationSummary(messages), 'warn', 'validation', subject);
+            else setStatus('', 'ok');
+        }
+        return { messages, subject };
     }
 
     async function confirmDiscardSettings(action) {
@@ -862,12 +897,11 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
 
     async function saveRuntimeModeViaNativeBridgeIfNeeded(nextMode) {
         const currentMode = currentSettings?.OUROBOROS_RUNTIME_MODE || 'advanced';
+        if (nextMode === currentMode) return null;
         const bridge = window.pywebview?.api?.request_runtime_mode_change;
         // Only the browser-side confirm is migrated to the in-house dialog; the
         // desktop pywebview bridge path above stays exactly as it was.
-        const result = nextMode === currentMode
-            ? (bridge ? await bridge(nextMode) : await apiClient.ownerRuntimeMode(nextMode))
-            : bridge
+        const result = bridge
             ? await bridge(nextMode)
             : ((await openConfirmDialog({
                 title: 'Change runtime mode',
@@ -1181,9 +1215,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         modelRoles.noteSaveAttempt();
         page.querySelectorAll('[data-custom-secret-row]').forEach((row) => { row.dataset.judged = '1'; });
         validationAttempted = true;
-        const errors = renderValidation();
+        const { messages: errors, subject } = renderValidation();
         if (errors.length) {
-            setStatus(validationSummary(errors), 'warn', 'validation');
+            setStatus(validationSummary(errors), 'warn', 'validation', subject);
             return;
         }
         const body = collectBody();

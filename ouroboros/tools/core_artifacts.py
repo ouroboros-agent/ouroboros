@@ -523,6 +523,7 @@ def _escalate(
         canonical_root, task_id,
         quiz_id=quiz_id, question=payload["question"],
         options=[row["label"] for row in payload["options"]],
+        option_details=[row.get("detail", "") for row in payload["options"]],
         stake=payload["stake"], assumption=payload["assumption"],
         wait_for_answer=wait_for_answer,
     )

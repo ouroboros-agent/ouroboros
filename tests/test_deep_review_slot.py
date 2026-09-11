@@ -11,8 +11,6 @@ its own effort outranks the surface key.
 import asyncio
 import json
 import ntpath
-import os
-import types
 
 import pytest
 
@@ -975,11 +973,10 @@ def test_a_registry_refused_read_never_inherits_the_previous_reads_extent(review
     assert deep_self_review._repo_relative("BIBLE.md/../BIBLE.md", review_repo) == "BIBLE.md/../BIBLE.md"
     assert deep_self_review._repo_relative("./docs//ARCHITECTURE.md", review_repo) == "docs/ARCHITECTURE.md"
     assert deep_self_review._repo_relative(str(review_repo / "BIBLE.md"), review_repo) == "BIBLE.md"
-    # The key is POSIX on EVERY host OS (a Windows runner's `os.path` IS ntpath,
-    # whose normpath renders `docs\ARCHITECTURE.md`): with the module's OS-native
-    # path module swapped for ntpath, relative and backslash spellings still fold
-    # onto the POSIX mandatory-read key, and `..` still stays as spelled.
-    monkeypatch.setattr(deep_self_review, "os", types.SimpleNamespace(path=ntpath, environ=os.environ))
+    # Feed an actual Windows-normalized spelling through the POSIX receipt owner.
+    # It uses posixpath directly and no longer imports an OS-native path module.
+    windows_path = ntpath.normpath("./docs//ARCHITECTURE.md")
+    assert deep_self_review._repo_relative(windows_path, review_repo) == "docs/ARCHITECTURE.md"
     assert deep_self_review._repo_relative("./docs//ARCHITECTURE.md", review_repo) == "docs/ARCHITECTURE.md"
     assert deep_self_review._repo_relative(".\\docs\\ARCHITECTURE.md", review_repo) == "docs/ARCHITECTURE.md"
     assert deep_self_review._repo_relative("a\\..\\BIBLE.md", review_repo) == "a/../BIBLE.md"

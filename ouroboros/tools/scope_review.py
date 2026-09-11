@@ -301,7 +301,7 @@ def _call_scope_llm(
     session_root: str = "",
     slot_effort: str = "",
     session_target: str = "",
-    session_profile: str = "", retry_key: str = "", subagent_id: str = "", use_local: bool | None = None,
+    session_profile: str = "", retry_key: str = "", subagent_id: str = "", use_local: bool | None = None, task_evidence: dict = None,
 ) -> tuple:
     """Execute the scope review call synchronously — api pack or agent session.
 
@@ -334,8 +334,15 @@ def _call_scope_llm(
     try:
         from ouroboros.review_substrate import ReviewRequest, run_review_request
 
+        from ouroboros.review_evidence import commit_review_evidence_refs
+        evidence = task_evidence or {}
+        policy = {"output_contract": SCOPE_RETRIEVING_OUTPUT_CONTRACT} if retrieves else {}
+        if retrieves and not delegated and evidence:
+            policy["native_data_root"] = evidence["data_root"]
         request = ReviewRequest(
             surface="scope_review",
+            evidence={"task_execution": evidence} if evidence else {},
+            evidence_refs=commit_review_evidence_refs(evidence),
             goal=SCOPE_USER_TURN,
             messages=messages,
             task_id=str(getattr(ctx, "task_id", "") or "scope_review") if ctx is not None else "scope_review", retry_key=str(retry_key or ""),
@@ -347,7 +354,7 @@ def _call_scope_llm(
             session_root=session_root if retrieves else "",
             reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
             deadline_at=_owner_deadline_at(ctx),
-            policy={"output_contract": SCOPE_RETRIEVING_OUTPUT_CONTRACT} if retrieves else {},
+            policy=policy,
         )
         row = scope_reviewer_slots([scope_model], effort=scope_effort)[0]
         slot = replace(
@@ -380,6 +387,7 @@ def _call_scope_llm(
             "operation_id": str(actor.get("operation_id") or ""),
             "operation_state": str(actor.get("operation_state") or "settled"),
             "late_result_pending": bool(actor.get("late_result_pending")),
+            "recovery_binding": dict(actor.get("recovery_binding") or {}),
             "pending_invocation_id": str(actor.get("pending_invocation_id") or usage.get("pending_invocation_id") or ""),
             "delegated_run_id": str(actor.get("delegated_run_id") or usage.get("delegated_run_id") or ""),
             "failure_code": str(actor.get("failure_code") or ""),
@@ -685,7 +693,7 @@ def run_scope_review(
         route=route, session_task=session_task, session_root=str(repo_dir),
         slot_effort=slot_effort, session_target=session_target,
         session_profile=session_profile, retry_key=retry_key, subagent_id=subagent_id,
-        use_local=prepared.get("use_local"),
+        use_local=prepared.get("use_local"), task_evidence=prepared.get("task_evidence"),
     )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     host_route = _usage.get("model_role_route") or {}

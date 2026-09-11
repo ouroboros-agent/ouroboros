@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import contextlib
+import functools
+import inspect
 import logging
 import math
 import os
@@ -10,6 +13,75 @@ import time
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+
+
+def caller_deadline_scoped(function):
+    """Carry caller-owned absolute bounds through preparation and all recovery sends.
+
+    The caller subtracts its finalization reserve once. Relative socket timeouts
+    never create an execution deadline; absent bounds preserve existing defaults.
+    """
+    signature = inspect.signature(function)
+
+    @contextlib.contextmanager
+    def scope(args, kwargs):
+        from ouroboros.model_wait import calendar_scope, execution_deadline_scope
+
+        values = signature.bind(*args, **kwargs).arguments
+        with contextlib.ExitStack() as stack:
+            calendar = values.get("caller_deadline_ts")
+            execution = values.get("caller_execution_deadline")
+            if calendar is not None:
+                stack.enter_context(calendar_scope(datetime.fromtimestamp(
+                    float(calendar), timezone.utc).isoformat()))
+            if execution is not None:
+                stack.enter_context(execution_deadline_scope(float(execution)))
+            yield
+
+    if inspect.iscoroutinefunction(function):
+        @functools.wraps(function)
+        async def asynchronous(*args, **kwargs):
+            with scope(args, kwargs):
+                return await function(*args, **kwargs)
+        return asynchronous
+
+    @functools.wraps(function)
+    def synchronous(*args, **kwargs):
+        with scope(args, kwargs):
+            return function(*args, **kwargs)
+    return synchronous
+
+
+def physical_dispatch_timeout(explicit: Any = None) -> Any:
+    """Narrow every socket phase at dispatch, keeping unset transport defaults.
+
+    Phase timeouts are not a total wall-clock bound. The existing caller retains
+    custody if an already-dispatched request outlives its logical wait.
+    """
+    from ouroboros.llm_attempt import require_physical_dispatch_window
+
+    remaining = require_physical_dispatch_window()
+    if remaining is None:
+        return explicit
+    import httpx
+
+    if isinstance(explicit, httpx.Timeout):
+        return httpx.Timeout(**{
+            phase: remaining if value is None else min(value, remaining)
+            for phase, value in explicit.as_dict().items()
+        })
+    return min(llm_transport_timeout_sec(explicit), remaining)
+
+
+def caller_deadline_arguments(deadline_at: Any, execution_deadline: Any, *, reserve_sec: float = 0.0) -> dict:
+    """Project an existing caller's two clocks into the optional LLM arguments."""
+    deadline = parse_deadline_ts(deadline_at)
+    values = {}
+    if deadline is not None:
+        values["caller_deadline_ts"] = deadline.timestamp() - reserve_sec
+    if execution_deadline is not None:
+        values["caller_execution_deadline"] = execution_deadline
+    return values
 
 
 def parse_deadline_ts(value: Any) -> Optional[datetime]:

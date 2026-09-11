@@ -63,16 +63,17 @@ from ouroboros.workspace_patch_capture import (  # noqa: F401
 log = logging.getLogger(__name__)
 
 
+class _RefPublicationChanged(Exception):
+    """Retry preparation outside the result lock against the new CURRENT refs."""
+
+
 HEADLESS_TASKS_DIR = pathlib.Path("state") / "headless_tasks"
 ARTIFACTS_DIR = pathlib.Path("task_results") / "artifacts"
 TASK_DRIVES_DIR = pathlib.Path("task_drives")
 
 
-# The PURE patch/snapshot eligibility rules (env/cache dirs, junk artifacts,
-# incidental lockfiles, credential-shaped names) live in their own module (size
-# gate); re-exported here (same objects) because project_sources, coop_checkpoint
-# and the tests address them on THIS surface. The I/O checks and the combined
-# `untracked_capture_veto_reason` predicate stay below, beside the git helpers.
+# Pure patch rules keep their original identities on this facade; file I/O and
+# untracked_capture_veto_reason remain owned by workspace_patch_capture.
 from ouroboros.workspace_patch_rules import (  # noqa: F401
     _ANY_SEGMENT_EXCLUDE_DIRS,
     _LOCKFILE_MANIFESTS,
@@ -124,14 +125,10 @@ def write_workspace_preflight_artifact(
 
 def prepare_task_drive(parent_drive_root: pathlib.Path, task_id: str, memory_mode: str,
                        project_id: str = "") -> Optional[pathlib.Path]:
-    """Create an isolated child drive for external runs.
+    """Create a forked or empty execution drive; other modes keep the parent.
 
-    ``forked`` copies stable identity/world/registry context (and, for non-project
-    tasks, the global knowledge tree). ``empty`` starts with a blank data root that
-    ``Memory.ensure_files`` will initialize. Any other value keeps the parent drive
-    shared and returns ``None``. A project-scoped task (``project_id`` set, Phase 3b)
-    is NOT seeded with the global knowledge tree — it uses the per-project store —
-    so its forked child stays isolated from ``memory/knowledge``.
+    Forks copy identity/world/registry and global knowledge except on Project
+    tasks, which copy only the shared patterns file. Memory initializes empties.
     """
 
     mode = str(memory_mode or "shared").strip().lower()
@@ -160,11 +157,8 @@ def prepare_task_drive(parent_drive_root: pathlib.Path, task_id: str, memory_mod
 
 
 def _resolve_retention_days(retention_days: Optional[int]) -> int:
-    """Unified GC retention for terminal task drives (see ouroboros/retention.py).
-    Explicit ``retention_days`` (tests/special cases) is honored as-is and bypasses
-    the owner knob; ``age_cutoff`` floors at 0, so an explicit 0 prunes everything
-    before ``now`` (uniform with the worktree/service prunes). Only the default
-    (None) path reads the clamped owner knob."""
+    """Only None reads the owner knob; explicit days reach age_cutoff unchanged.
+    That shared owner floors at zero, which prunes everything before now."""
     from ouroboros.retention import get_gc_retention_days
 
     if retention_days is None:
@@ -186,6 +180,15 @@ def _timestamp_from_result(result: Dict[str, Any], fallback: float) -> float:
             continue
     return fallback
 
+
+def _effective_task_result(parent: pathlib.Path, task_id: str) -> Dict[str, Any]:
+    """Prune reads the projected result; a projection failure reads canonical."""
+    try:
+        from ouroboros.task_status import load_effective_task_result
+
+        return load_effective_task_result(parent, task_id) or {}
+    except Exception:
+        return load_task_result(parent, task_id) or {}
 
 
 def _live_unpromoted_child_refs(
@@ -251,12 +254,7 @@ def prune_headless_task_drives(
         try:
             validate_task_id(task_id)
             dir_mtime = task_dir.stat().st_mtime
-            try:
-                from ouroboros.task_status import load_effective_task_result
-
-                result = load_effective_task_result(parent, task_id) or {}
-            except Exception:
-                result = load_task_result(parent, task_id) or {}
+            result = _effective_task_result(parent, task_id)
             status = str(result.get("status") or "").lower()
             if status not in _FINAL_STATUSES:
                 report["skipped"].append({"task_id": task_id, "reason": "parent_not_terminal", "status": status})
@@ -323,12 +321,7 @@ def prune_task_drives(
         try:
             validate_task_id(task_id)
             dir_mtime = task_dir.stat().st_mtime
-            try:
-                from ouroboros.task_status import load_effective_task_result
-
-                result = load_effective_task_result(parent, task_id) or {}
-            except Exception:
-                result = load_task_result(parent, task_id) or {}
+            result = _effective_task_result(parent, task_id)
             status = str(result.get("status") or "").lower()
             if status not in _FINAL_STATUSES:
                 report["skipped"].append({"task_id": task_id, "reason": "task_not_terminal", "status": status})
@@ -352,10 +345,8 @@ def prune_task_trees(
     retention_days: Optional[int] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Best-effort startup prune for ephemeral task-tree coordination ledgers
-    (``data/task_trees/<root_task_id>/blackboard.jsonl``). A tree's ledger is removed once
-    its ROOT task is terminal (or has no surviving result) and older than the GC retention
-    window — swarm-run coordination is transient, distinct from durable project memory."""
+    """Prune ephemeral task-tree ledgers once the root is terminal or absent and
+    older than GC retention; durable project memory is outside this plane."""
 
     from ouroboros.retention import age_cutoff
 
@@ -373,12 +364,7 @@ def prune_task_trees(
         report["scanned"] += 1
         try:
             dir_mtime = tree_dir.stat().st_mtime
-            try:
-                from ouroboros.task_status import load_effective_task_result
-
-                result = load_effective_task_result(parent, root_id) or {}
-            except Exception:
-                result = load_task_result(parent, root_id) or {}
+            result = _effective_task_result(parent, root_id)
             status = str(result.get("status") or "").lower()
             if status and status not in _FINAL_STATUSES:
                 report["skipped"].append({"root_task_id": root_id, "reason": "root_not_terminal", "status": status})
@@ -394,11 +380,8 @@ def prune_task_trees(
 
 
 def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) -> bool:
-    """Immediately remove a subagent's child drive (used on cancel/timeout).
-
-    Completion wins (phase A, owner 4=A): callers run this only AFTER the settled
-    publication (result copied back, salvage preserved on the canonical drive), so
-    removal drops bounded scratch, never a kept answer. Returns whether it removed.
+    """Remove scratch after settled copyback/salvage, preserving completion wins.
+    Pending live refs retain their source. Returns whether any drive was removed.
     """
     parent = pathlib.Path(parent_drive_root)
     try:
@@ -433,102 +416,201 @@ def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) ->
 
 def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Copy a child-drive task result back to the parent data root."""
-    task_id = str(task.get("id") or "")
-    if not task_id:
-        return None
-    canonical_existing = load_task_result(parent_drive_root, task_id) or {}
-    # Cancellation is authoritative before any child-root read or artifact copy.
-    if cancellation_blocks_child_result(canonical_existing):
-        return canonical_existing
-    child_drive = _child_drive_from_task(task)
-    if child_drive is None:
-        return None
-    child_result = load_task_result(child_drive, task_id)
-    if not isinstance(child_result, dict):
-        return None
-    # Canonical terminal results must not retain child-local forensic/source
-    # pointers that the startup GC is about to delete. Bulk copies stay outside
-    # the result lock; review refs wait for CURRENT publication selection below.
-    # Interrupted copies retain their existing pending custody for GC/retry.
-    from ouroboros.observability import _rewrite_child_ref_tree, promote_child_task_refs
+    from ouroboros.observability import child_ref_promotion_scope
+    with child_ref_promotion_scope():
+        task_id = str(task.get("id") or "")
+        if not task_id:
+            return None
+        canonical_existing = load_task_result(parent_drive_root, task_id) or {}
+        # Cancellation is authoritative before any child-root read or artifact copy.
+        if cancellation_blocks_child_result(canonical_existing):
+            return canonical_existing
+        child_drive = _child_drive_from_task(task)
+        if child_drive is None:
+            return None
+        child_result = load_task_result(child_drive, task_id)
+        if not isinstance(child_result, dict):
+            return None
+        # Bulk refs precede publication/GC; review refs first select CURRENT below.
+        from ouroboros.observability import promote_child_task_refs
 
-    review_fields = {key: value for key, value in child_result.items() if key == "review_projection"}
-    child_result, ref_promotion = promote_child_task_refs(
-        pathlib.Path(parent_drive_root), child_drive, task_id,
-        {key: value for key, value in child_result.items() if key != "review_projection"},
+        review_fields = {key: value for key, value in child_result.items() if key == "review_projection"}
+        child_result, ref_promotion = promote_child_task_refs(
+            pathlib.Path(parent_drive_root), child_drive, task_id,
+            {key: value for key, value in child_result.items() if key != "review_projection"})
+        child_result.update(review_fields)
+        _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
+        child_status = str(child_result.pop("status", None) or "completed")
+        child_result.pop("task_id", None)
+        child_result["child_ref_promotion"] = ref_promotion
+        if isinstance(child_result.get("artifacts"), list):
+            try:
+                from ouroboros.outcomes import artifact_bundle_from_result
+                child_result["artifact_bundle"] = artifact_bundle_from_result(child_result)
+            except Exception:
+                child_result.pop("artifact_bundle", None)
+        child_result.setdefault("headless_child_drive_root", str(child_drive))
+        if (child_status in _FINAL_STATUSES and _workspace_root_from_task(task) is not None
+                and not task_is_readonly_subagent(task)):
+            artifact_status = str(canonical_existing.get("artifact_status") or "").strip().lower()
+            if artifact_status in ARTIFACT_TERMINAL_STATUSES | {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}:
+                child_result["artifacts"] = _merge_artifacts(
+                    list(canonical_existing.get("artifacts") or []), list(child_result.get("artifacts") or []))
+                child_result.update({key: canonical_existing[key] for key in _ARTIFACT_LIFECYCLE_FIELDS
+                                if key in canonical_existing})
+            else:
+                child_result["artifact_status"] = ARTIFACT_STATUS_FINALIZING
+            child_result["child_status"] = child_status
+
+        return retry_child_task_refs(parent_drive_root, child_drive, task_id,
+                                     replica={**child_result, "status": child_status})
+
+
+def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: str,
+                          *, replica: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One optimistic publisher for pending CURRENT refs and prepared copyback.
+
+    Normal copyback supplies its already-copied replica; only its selected review
+    still needs I/O. Retry has no replica and never reads an old child body. A
+    changed CURRENT basis repeats preparation under the same file-I/O memo.
+    """
+    from ouroboros.observability import (
+        _has_pending_ref_promotion, _rewrite_child_ref_tree,
+        child_ref_promotion_scope, promote_child_task_ref_patch,
     )
-    child_result.update(review_fields)
-    # W2 receipt-level handoff: the child's durable verify_and_record receipts ride
-    # the SAME finalization copy-back as its artifacts (fail-soft, never blocks).
-    _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
-    workspace_task = (
+    with child_ref_promotion_scope():
+        while True:
+            source = load_task_result(parent, task_id, strict=True) or {}
+            if replica is None and not source:
+                raise ValueError("pending child-ref authority is missing")
+            if replica is None:
+                if not _has_pending_ref_promotion(source.get("child_ref_promotion")):
+                    return source
+                patch = promote_child_task_ref_patch(parent, child, task_id, source)
+                basis = {key: source.get(key) for key in patch}
+            else:
+                source = {**source, **project_replica_task_result_fields(source, replica)}
+                review = source.get("review_projection")
+                promotion = copy.deepcopy(replica["child_ref_promotion"])
+                prepared = _rewrite_child_ref_tree(review, pathlib.Path(parent), child, task_id, promotion)
+                if promotion["pending_refs"]:
+                    promotion["status"] = "incomplete"
+                patch = {"child_ref_promotion": promotion}
+                if isinstance(review, dict):
+                    patch["review_projection"] = prepared
+                basis = {"review_projection": review}
+
+            def project(current: dict, _incoming: dict) -> dict:
+                selected = {**current, **project_replica_task_result_fields(current, replica)} if replica is not None else current
+                if {key: selected.get(key) for key in basis} != basis:
+                    raise _RefPublicationChanged()
+                return {**(selected if replica is not None else {}), **patch, "status": selected["status"]}
+
+            try:
+                return write_task_result(parent, task_id, source["status"],
+                                         _field_projector=project, strict_existing_dict=True,
+                                         **{key: value for key, value in (replica or {}).items() if key != "status"})
+            except _RefPublicationChanged:
+                continue
+
+
+def _child_result_adopted(child: pathlib.Path, result: Dict[str, Any]) -> bool:
+    promotion = result.get("child_ref_promotion")
+    source = str(result.get("headless_child_drive_root") or "")
+    return bool(
+        "result" in result and isinstance(promotion, dict)
+        and type(promotion.get("schema_version")) is int and promotion["schema_version"] == 1
+        and promotion.get("status") in {"complete", "incomplete"}
+        and source and pathlib.Path(source).resolve(strict=False) == child.resolve(strict=False)
+    )
+
+
+def terminal_task_files_ready(canonical_root: pathlib.Path, task: Dict[str, Any], result: Any) -> bool:
+    """Read-only CURRENT readiness, not proof that every ref is available.
+    Split tasks require adopted body facts, not an early terminal checkpoint.
+    """
+    task_id = str(task.get("id") or task.get("task_id") or "")
+    if not isinstance(result, dict) or not task_id or str(result.get("task_id") or "") != task_id:
+        return False
+    if str(result.get("status") or "") not in _FINAL_STATUSES:
+        return False
+    if cancellation_blocks_child_result(result):
+        return True
+    try:
+        child = _child_drive_from_task(task)
+        if child is not None and child.resolve(strict=False) != pathlib.Path(canonical_root).resolve(strict=False):
+            if not _child_result_adopted(child, result):
+                return False
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return not (
         _workspace_root_from_task(task) is not None and not task_is_readonly_subagent(task)
+        and str(result.get("artifact_status") or "") in {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}
     )
-    child_status = str(child_result.get("status") or "completed")
-    existing = canonical_existing if workspace_task and child_status in _FINAL_STATUSES else {}
-    existing_artifact_status = str((existing or {}).get("artifact_status") or "").strip().lower()
-    preserve_parent_artifacts = existing_artifact_status in {
-        ARTIFACT_STATUS_PENDING,
-        ARTIFACT_STATUS_FINALIZING,
-        *ARTIFACT_TERMINAL_STATUSES,
-    }
-    payload = {
-        key: value
-        for key, value in child_result.items()
-        if key not in {"task_id", "status"}
-    }
-    payload["child_ref_promotion"] = ref_promotion
-    if isinstance(payload.get("artifacts"), list):
+
+
+def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, Any]) -> Dict[str, Any]:
+    """Finish one file-save attempt without turning an I/O failure into a worker crash.
+
+    The dispatcher re-reads CURRENT; returned result is diagnostic. Pending refs
+    keep existing custody. terminal_source_present is True after a strict terminal
+    read, False for absence/nonterminal, None for unknown; later write failure
+    preserves that observation and never manufactures a completed source.
+    """
+    task_id = str(task.get("id") or task.get("task_id") or "")
+    report: Dict[str, Any] = {"task_id": task_id, "result": None, "error": "", "terminal_source_present": None}
+    try:
+        root = pathlib.Path(canonical_root)
+        current = load_task_result(root, task_id, strict=True) or {}
+        child = _child_drive_from_task(task)
+        cancelled = cancellation_blocks_child_result(current)
+        adopted = not cancelled and child is not None and _child_result_adopted(child, current)
+        source = current
+        if child is not None and not adopted and not cancelled:
+            source = load_task_result(child, task_id, strict=True)
+        report["terminal_source_present"] = bool(source and str(source.get("status") or "") in _FINAL_STATUSES)
+        if not report["terminal_source_present"]:
+            raise ValueError("terminal task source is missing or not settled")
+        if adopted and child is not None:
+            current = retry_child_task_refs(root, child, task_id)
+        elif child is not None and not cancelled:
+            current = copy_child_task_result(root, {**task, "id": task_id}) or current
+        if str(current.get("status") or "") not in _FINAL_STATUSES:
+            raise ValueError("terminal task result is missing or not settled")
+        if not task_is_readonly_subagent(task) and current.get("artifact_status") not in ARTIFACT_TERMINAL_STATUSES:
+            finalize_task_artifacts(root, {**task, "id": task_id})
+        report["result"] = load_task_result(root, task_id, strict=True)
+    except Exception as exc:
+        from ouroboros.observability import redact_projection
+        report["error"] = str(redact_projection(f"{type(exc).__name__}: {exc}").value)
+        log.warning("Terminal file preparation failed for %s: %s", task_id, report["error"])
+        # Only a real terminal source may stamp an artifact failure; absent/nonterminal source follows crash recovery.
+        if report["terminal_source_present"] is not True:
+            return report
         try:
-            from ouroboros.outcomes import artifact_bundle_from_result
-
-            payload["artifact_bundle"] = artifact_bundle_from_result(payload)
+            existing = load_task_result(canonical_root, task_id, strict=True)
+            if existing:
+                from ouroboros.outcomes import artifact_bundle_from_result
+                fields = dict(artifact_status=ARTIFACT_STATUS_FAILED, artifact_error=report["error"],
+                              artifact_finalized_at=utc_now_iso())
+                provisional = {**existing, **fields}
+                provisional.pop("artifact_bundle", None)
+                fields["artifact_bundle"] = artifact_bundle_from_result(provisional)
+                report["result"] = write_task_result(
+                    canonical_root, task_id, existing["status"],
+                    _field_projector=lambda live, fields: {**fields, "status": live["status"]},
+                    strict_existing_dict=True, **fields,
+                )
         except Exception:
-            payload.pop("artifact_bundle", None)
-    if preserve_parent_artifacts:
-        payload["artifacts"] = _merge_artifacts(
-            list((existing or {}).get("artifacts") or []),
-            list(payload.get("artifacts") or []),
-        )
-        for key in _ARTIFACT_LIFECYCLE_FIELDS:
-            if key in (existing or {}):
-                payload[key] = (existing or {}).get(key)
-    payload.setdefault("headless_child_drive_root", str(child_drive))
-    if workspace_task and child_status in _FINAL_STATUSES:
-        if not preserve_parent_artifacts and existing_artifact_status not in ARTIFACT_TERMINAL_STATUSES:
-            payload["artifact_status"] = ARTIFACT_STATUS_FINALIZING
-        payload["child_status"] = child_status
-
-    def _project(current: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
-        projected = project_replica_task_result_fields(current, incoming)
-        review = projected.get("review_projection", current.get("review_projection"))
-        if isinstance(review, dict):
-            promotion = copy.deepcopy(ref_promotion)
-            projected["review_projection"] = _rewrite_child_ref_tree(
-                review, pathlib.Path(parent_drive_root), child_drive, task_id, promotion,
-            )
-            projected["child_ref_promotion"] = promotion
-        return projected
-
-    return write_task_result(
-        parent_drive_root,
-        task_id,
-        child_status,
-        _field_projector=_project,
-        **payload,
-    )
+            log.warning("Terminal file failure could not be persisted for %s", task_id, exc_info=True)
+    return report
 
 
 def _publish_child_verification_receipts(
     parent_drive_root: pathlib.Path, task_id: str, child_drive: pathlib.Path
 ) -> None:
-    """Publish the child's durable ``verification_receipts.jsonl`` to the canonical root.
-
-    Ordinary ``verify_and_record`` receipts live under the CHILD's isolated
-    drive, while actor-first ``delegation_zero_run`` is canonical immediately.
-    Publish the union so a whole-file refresh cannot erase that canonical-only
-    lifecycle fact. Exact-row de-duplication makes task_done + reaper/cancel
-    re-entry idempotent. Fail-soft: logged, never blocks finalization."""
+    """Union child verification receipts with canonical delegation_zero_run rows.
+    Exact-row dedup makes re-entry idempotent; failures log without blocking."""
     try:
         from ouroboros.outcome_receipt_store import publish_verification_receipt_union
 
@@ -566,7 +648,7 @@ def _copy_child_artifacts_to_parent(
             continue
         try:
             src.resolve(strict=False).relative_to(parent_dir.resolve(strict=False))
-            dest = src
+            dest = src.resolve(strict=False)
         except ValueError:
             dest = parent_dir / src.name
             if dest.exists() and dest.resolve(strict=False) != src.resolve(strict=False):
@@ -595,10 +677,7 @@ def _copy_child_artifacts_to_parent(
 
 
 def task_is_readonly_subagent(task: Dict[str, Any]) -> bool:
-    """A local-readonly live subagent produces no durable owner-facing artifacts, so the
-    ``task_done`` finalize path (and the reaper that honors a self-finalized result) skip
-    artifact finalization for it. Single SSOT gate so every call site reads the same rule
-    instead of re-deriving it (a re-derivation drift is what stranded the reaper path)."""
+    """The shared completion/reaper exception: readonly children need no artifacts."""
     if not isinstance(task, dict):
         return False
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
@@ -614,12 +693,8 @@ def task_is_readonly_subagent(task: Dict[str, Any]) -> bool:
 def _build_deliverable_manifest(
     workspace_root: pathlib.Path, task_id: str, project_id: str
 ) -> Dict[str, Any]:
-    """Best-effort automatic genesis listing with explicit per-entry read gaps.
-
-    VCS/environment junk is excluded as before. Symlinks are recorded without
-    following them; missing/unreadable/changing files leave a gap, not a failed
-    delivery. This listing is not custody: actual artifact copies remain strict.
-    Hashing streams even for files above the old64MiB projection bound.
+    """List genesis outputs with streamed hashes, junk excluded, symlinks unfollowed.
+    Read/change gaps are disclosed, not delivery failures; actual copies stay strict.
     """
     from ouroboros.artifacts import stream_artifact_file
 
@@ -649,6 +724,12 @@ def _build_deliverable_manifest(
         "complete": gap_count == 0, "gap_count": gap_count,
         "truncated": False, "contents": contents,
     }
+
+
+def _file_artifact(kind: str, path: pathlib.Path, **facts: Any) -> Dict[str, Any]:
+    """One row shape for an artifact written straight into the task artifact dir."""
+    return {"kind": kind, "name": path.name, "path": str(path),
+            "size": path.stat().st_size if path.exists() else 0, **facts}
 
 
 def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -700,26 +781,16 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
                 manifest,
                 trailing_newline=True,
             )
-            artifacts.append({
-                "kind": "workspace_patch_manifest",
-                "name": "workspace_patch.json",
-                "path": str(manifest_path),
-                "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
-                "workspace_root": str(workspace_root),
-            })
+            artifacts.append(_file_artifact("workspace_patch_manifest", manifest_path,
+                                            workspace_root=str(workspace_root)))
 
     child_drive = _child_drive_from_task(task)
     if child_drive is not None:
         try:
             export_path = artifact_dir / "memory_export.json"
             atomic_write_json(export_path, build_memory_export(child_drive, task), trailing_newline=True)
-            artifacts.append({
-                "kind": "memory_export",
-                "name": "memory_export.json",
-                "path": str(export_path),
-                "size": export_path.stat().st_size if export_path.exists() else 0,
-                "memory_mode": str(task.get("memory_mode") or ""),
-            })
+            artifacts.append(_file_artifact("memory_export", export_path,
+                                            memory_mode=str(task.get("memory_mode") or "")))
         except Exception as exc:
             if workspace_root is not None:
                 artifact_status = ARTIFACT_STATUS_FAILED
@@ -739,18 +810,14 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
             manifest_path = artifact_dir / "deliverable_manifest.json"
             dm = _build_deliverable_manifest(workspace_root, task_id, str(task.get("project_id") or ""))
             atomic_write_json(manifest_path, dm, trailing_newline=True)
-            artifacts.append({
-                "kind": "deliverable_manifest",
-                "name": "deliverable_manifest.json",
-                "path": str(manifest_path),
-                "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
-                "file_count": int(dm.get("file_count") or 0),
-                "truncated": bool(dm.get("truncated")),
-                "complete": dm["complete"], "gap_count": dm["gap_count"],
-                "errors": ([f"Automatic workspace listing is partial: {dm['gap_count']} read gaps."]
-                           if dm["gap_count"] else []),
-                "workspace_root": str(workspace_root),
-            })
+            artifacts.append(_file_artifact(
+                "deliverable_manifest", manifest_path,
+                file_count=int(dm.get("file_count") or 0), truncated=bool(dm.get("truncated")),
+                complete=dm["complete"], gap_count=dm["gap_count"],
+                errors=([f"Automatic workspace listing is partial: {dm['gap_count']} read gaps."]
+                        if dm["gap_count"] else []),
+                workspace_root=str(workspace_root),
+            ))
         except Exception as exc:
             artifact_status = ARTIFACT_STATUS_FAILED
             artifact_error = f"Deliverable manifest failed: {type(exc).__name__}: {exc}"
@@ -850,26 +917,20 @@ def build_memory_export(child_drive_root: pathlib.Path, task: Dict[str, Any]) ->
 def _copy_stable_memory(parent: pathlib.Path, child: pathlib.Path, *, project_id: str = "") -> None:
     parent_memory = parent / "memory"
     child_memory = child / "memory"
-    for rel in ("identity.md", "WORLD.md", "registry.md"):
+    project = bool(str(project_id or "").strip())
+    # Projects inherit shared patterns, never the global knowledge topics/index.
+    paths = ["identity.md", "WORLD.md", "registry.md"]
+    if project:
+        paths.append("knowledge/patterns.md")
+    for rel in paths:
         src = parent_memory / rel
         if src.is_file():
             dst = child_memory / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-    # Project-scoped tasks use the per-project knowledge store, so do NOT seed the
-    # forked child with the global knowledge TOPICS/index (keeps it isolated from
-    # memory/knowledge). identity/WORLD/registry carry for P1 continuity, and the
-    # global Pattern Register (general cross-project error patterns) still carries.
-    if str(project_id or "").strip():
-        src_patterns = parent_memory / "knowledge" / "patterns.md"
-        if src_patterns.is_file():
-            dst_patterns = child_memory / "knowledge" / "patterns.md"
-            dst_patterns.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_patterns, dst_patterns)
-        return
     src_knowledge = parent_memory / "knowledge"
     dst_knowledge = child_memory / "knowledge"
-    if src_knowledge.is_dir():
+    if not project and src_knowledge.is_dir():
         shutil.copytree(src_knowledge, dst_knowledge, dirs_exist_ok=True)
 
 
@@ -893,21 +954,14 @@ def _merge_artifacts(
     drop_kinds: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
 
-    merged: List[Dict[str, Any]] = []
     drop = drop_kinds or set()
     key_for = lambda item: (
         str(item.get("kind") or ""),
         str(item.get("name") or pathlib.Path(str(item.get("path") or "")).name),
     )
     keys = {key_for(item) for item in new_items if isinstance(item, dict)}
-    for item in existing:
-        if not isinstance(item, dict):
-            continue
-        key = key_for(item)
-        if key[0] not in drop and key not in keys:
-            merged.append(item)
-    merged.extend(new_items)
-    return merged
+    return [item for item in existing if isinstance(item, dict)
+            and key_for(item)[0] not in drop and key_for(item) not in keys] + new_items
 
 
 __all__ = [
@@ -918,6 +972,8 @@ __all__ = [
     "build_memory_export",
     "build_workspace_patch",
     "copy_child_task_result",
+    "prepare_terminal_task_files",
+    "terminal_task_files_ready",
     "finalize_task_artifacts",
     "task_is_readonly_subagent",
     "prepare_task_drive",

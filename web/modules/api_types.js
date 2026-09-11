@@ -31,6 +31,7 @@
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
  * @property {Object<string, {project_id: string, chat_id: number}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4)
  * @property {ActiveDirectTurn[]=} active_direct_turns  // active direct/ephemeral chat turns snapshot
+ * @property {boolean=} active_chat_activities_complete
  * @property {ActiveChatActivity[]=} active_chat_activities  // combined snapshot: direct/ephemeral turns + root managed queue tasks
  */
 
@@ -49,6 +50,7 @@
 
 /**
  * @typedef {Object} ActiveChatActivity
+ * @property {Object=} required_question  // read-only pointer to the current required Project quiz
  * @property {Object.<string,Object>=} model_waits
  * @property {number=} task_attempt
  * @property {string} activity_id
@@ -129,6 +131,15 @@
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract
  * @property {AvailableSubagentsSettingsMeta=} available_subagents
+ * @property {SettingsPolicyState=} policy_state
+ */
+
+/**
+ * @typedef {Object} SettingsPolicyState
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,restart_required:boolean,applies:string}} access
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} supervisor
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} review
+ * @property {boolean} running_task_snapshot
  */
 
 /**
@@ -234,6 +245,11 @@
 
 /**
  * @typedef {Object} ChatOutbound
+ * @property {string=} quiz_id
+ * @property {string=} quiz_state
+ * @property {number=} project_chat_id
+ * @property {string=} source_status
+ * @property {string=} owner_wait_state
  * @property {"chat"} type
  * @property {"user"|"assistant"|"system"} role
  * @property {string} content
@@ -244,6 +260,10 @@
  * @property {Object=} origin_message_ref
  *   Host-captured inbound identity for a correlated operation's terminal reply.
  * @property {boolean=} ephemeral_decision
+ * @property {number=} tool_calls
+ * @property {number=} rounds
+ * @property {string=} suggested_name
+ * @property {Object=} model_execution
  * @property {string=} task_phase
  *   "finalizing" on a root's early final answer: post-task synthesis still
  *   runs, so the frame is not the task's terminal conclusion.
@@ -577,6 +597,8 @@
  * @property {string} action
  * @property {string=} target
  * @property {string=} target_label
+ * @property {string=} project_id
+ * @property {number=} project_chat_id
  * @property {string} status
  * @property {Array<Object>=} options
  * @property {AttachmentManifestEntry[]=} attachment_manifest
@@ -607,6 +629,8 @@
  * @typedef {Object} TaskOutcomeHistoryFields
  * @property {"working"|"done"|"warn"|"error"|"cancelled"=} outcome_phase  // canonical display phase; "working" is not terminal
  * @property {boolean=} outcome_final  // true only after the canonical task outcome settles; false marks a pre-finalization narrative
+ * @property {{status: string, phase: string, ts: string, provenance: string, model_execution?: Object}=} historical_terminal
+ * @property {Object=} model_execution
  */
 
 /**
@@ -745,7 +769,9 @@
  * @property {string=} payload_root
  * @property {string=} review_status
  * @property {boolean=} review_stale
- * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, author_accepted: (boolean|undefined), reviewed_content_hash: (string|undefined), author_disposition: (Object|undefined), preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {string=} reviewed_content_hash
+ * @property {Object=} author_disposition
  * @property {boolean=} executable_review
  * @property {string=} review_profile
  * @property {boolean=} official_hub_verified

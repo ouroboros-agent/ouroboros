@@ -29,6 +29,16 @@ const EFFORT_FIELDS = [
     ['s-effort-consciousness', 'Consciousness', 'high'],
 ];
 
+// Runtime mode is one axis of the owner policy contract. Keep the Settings
+// presentation in the same vocabulary as the onboarding setup contract; the
+// saved value is still handled by settings.js and the owner endpoint.
+const RUNTIME_MODE_OPTIONS = [
+    { value: 'light', label: 'Light' },
+    { value: 'advanced', label: 'Advanced' },
+    { value: 'pro', label: 'Pro' },
+    { value: 'cyber_pro', label: 'Cyber Pro' },
+];
+
 function providerCard({ id, title, icon, hint, body, open = false }) {
     return `
         <details class="settings-provider-card" data-provider-card="${id}" ${open ? 'open' : ''}>
@@ -410,6 +420,7 @@ export function renderSettingsPage() {
                                     { value: 'blocking', label: 'Blocking' },
                                 ],
                             })}
+                            <div class="settings-inline-note" data-policy-state="review" role="status" aria-live="polite"></div>
                         </div>
                     </div>
 
@@ -533,20 +544,21 @@ export function renderSettingsPage() {
                             <code>Full</code> &mdash; every guarded tool call gets the LLM safety check.
                             <code>Light</code> keeps the LLM check only for integration-policy tools; conditional shell/verify fall to the deterministic guards. Light is the default for new DESKTOP setups (authored by the first-run wizard); existing installs, web and Docker keep Full.
                             <code>Off</code> makes no LLM safety calls. In every mode the deterministic registry sandbox, protected-path policy, and light-mode guards STAY ON &mdash; the LLM supervisor is a layer, not the floor. Lowering coverage emits a durable audit event per waved-through call.
-                            <br><strong>Human controlled:</strong> saved via the owner endpoint (the agent cannot lower its own supervision); applies on the next task.
+                            <br><strong>Configuration authority:</strong> outside Cyber Pro, the agent cannot lower its own supervision. Cyber Pro also lets the agent configure Supervisor coverage. Changes apply on the next task.
                         </div>
                         <div class="settings-effort-card">
                             <label>Safety Supervisor</label>
                             <input id="s-safety-mode" type="hidden" value="full">
                             ${renderSegmentedField({
                                 target: 's-safety-mode',
-                                title: 'Owner-only. Lowering coverage prompts for confirmation.',
+                                title: 'Lowering coverage here prompts for confirmation.',
                                 options: [
                                     { value: 'full', label: 'Full' },
                                     { value: 'light', label: 'Light' },
                                     { value: 'off', label: 'Off' },
                                 ],
                             })}
+                            <div class="settings-inline-note" data-policy-state="supervisor" role="status" aria-live="polite"></div>
                             <div id="s-safety-skip-counter" class="settings-section-copy"></div>
                         </div>
                     </div>
@@ -576,28 +588,26 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Runtime Mode</h3>
+                        <h3>Access</h3>
                         <div class="settings-section-copy">
                             Separate axis from Review Enforcement. Controls how far Ouroboros is allowed to self-modify.
                             <code>Light</code> blocks repo self-modification but allows reviewed + enabled skills to run.
                             <code>Advanced</code> is the default &mdash; self-modify the evolutionary layer; protected core/contract/release files stay guarded by the shared runtime-mode policy.
                             <code>Pro</code> can edit protected core/contract/release surfaces, but commits still go through the normal triad + scope review gate; Advanced remains limited to the evolutionary layer.
+                            <code>Cyber Pro</code> grants the full host and configuration authority, including credentials, models, Supervisor configuration and protected rewrites. Review scope and enforcement stay owner-controlled. Review Enforcement remains independent, so <code>Blocking</code> stays available in Cyber Pro.
                             <br><strong>Human controlled:</strong> desktop builds ask the launcher for native confirmation before saving a mode change.
                             Web/Docker sessions save mode changes through the owner endpoint; the new mode takes effect after restart.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Runtime Mode</label>
+                            <label>Access level</label>
                             <input id="s-runtime-mode" type="hidden" value="advanced">
                             ${renderSegmentedField({
                                 target: 's-runtime-mode',
                                 modifier: 'data-runtime-mode-group',
-                                title: 'Runtime mode changes require native launcher confirmation and restart.',
-                                options: [
-                                    { value: 'light', label: 'Light' },
-                                    { value: 'advanced', label: 'Advanced' },
-                                    { value: 'pro', label: 'Pro' },
-                                ],
+                                title: 'Access changes take effect after restart.',
+                                options: RUNTIME_MODE_OPTIONS,
                             })}
+                            <div class="settings-inline-note" data-policy-state="access" role="status" aria-live="polite"></div>
                         </div>
                     </div>
 
@@ -609,7 +619,7 @@ export function renderSettingsPage() {
                         <h3>Post-Task Self-Evolution</h3>
                         <div class="settings-section-copy">
                             After an eligible task, Ouroboros can optionally run one reviewed self-improvement cycle: the worker asks a light model whether to promote a backlog item, writes a durable request, and the supervisor starts a one-shot campaign later on an idle tick if all gates pass.
-                            <br><strong>Human controlled:</strong> the agent cannot self-enable this (shell/browser/settings self-elevation is blocked). These controls apply on the next task.
+                            <br><strong>Configuration authority:</strong> outside Cyber Pro, only the owner can enable this. Cyber Pro also lets the agent configure it; selecting Cyber Pro does not enable evolution automatically. Changes apply on the next task.
                         </div>
                         <div class="settings-effort-card">
                             <label>Self-Improvement Trigger</label>

@@ -90,11 +90,14 @@ def _run(tmp_path, task_id, chat_id, delegation_role="subagent"):
     }
     ctx.RUNNING[task_id] = {"task": task}
     _seed(tmp_path, task_id, chat_id, delegation_role)
+    from ouroboros.headless import prepare_terminal_task_files
     from supervisor.events import _handle_task_done
+    assert not prepare_terminal_task_files(tmp_path, task)["error"]
     evt = {
         "type": "task_done", "task_id": task_id, "task_type": "task",
         "worker_id": 0, "chat_id": chat_id,
         "ts": "2026-08-29T00:00:00Z",
+        "_files_prepared_attempt": int(task.get("_attempt") or 1),
     }
     _handle_task_done(evt, ctx)
     events_file = tmp_path / "logs" / "events.jsonl"

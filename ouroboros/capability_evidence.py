@@ -27,7 +27,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import pathlib
 import re
 import threading
@@ -42,6 +41,7 @@ from ouroboros.utils import (
     read_json_dict,
     utc_now_iso,
 )
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -1067,8 +1067,8 @@ def _openai_compatible_metadata_window(
         import httpx
 
         if api_key is None:
-            from ouroboros.config import load_settings
-            api_key = str((load_settings() or {}).get("OPENAI_COMPATIBLE_API_KEY") or "")
+            from ouroboros.config import runtime_settings
+            api_key = str((runtime_settings() or {}).get("OPENAI_COMPATIBLE_API_KEY") or "")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         resp = httpx.get(str(base_url).rstrip("/") + "/models", headers=headers, timeout=5.0)
         resp.raise_for_status()
@@ -1107,8 +1107,8 @@ def _provider_metadata_window(
     if p in {"openai-compatible", "minimax"}:
         if p == "minimax" and api_key is None:
             try:
-                from ouroboros.config import load_settings
-                api_key = str((load_settings() or {}).get("MINIMAX_API_KEY") or "")
+                from ouroboros.config import runtime_settings
+                api_key = str((runtime_settings() or {}).get("MINIMAX_API_KEY") or "")
             except Exception:
                 api_key = ""
         return _openai_compatible_metadata_window(model, base_url, allow_fetch, api_key=api_key)
@@ -1150,12 +1150,12 @@ _PROBE_CANARIES = ["OBOCANARYBEGIN7Q", "OBOCANARYMID7Q", "OBOCANARYEND7Q"]
 
 
 def _generative_probe_enabled() -> bool:
-    return (os.environ.get("OUROBOROS_GENERATIVE_PROBE", "1") or "").strip().lower() not in {"", "0", "false", "no", "off"}
+    return (runtime_setting("OUROBOROS_GENERATIVE_PROBE", "1") or "").strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _generative_probe_pad_chars() -> int:
     try:
-        return max(200_000, int(os.environ.get("OUROBOROS_GENERATIVE_PROBE_CHARS", "5000000") or "5000000"))
+        return max(200_000, int(runtime_setting("OUROBOROS_GENERATIVE_PROBE_CHARS", "5000000") or "5000000"))
     except (ValueError, TypeError):
         return 5_000_000
 

@@ -320,6 +320,43 @@ def test_schedule_followup_root_id_falls_back_to_task_id_never_the_string_none(t
     assert record["task"]["metadata"]["origin_root_task_id"] == "root-3"
 
 
+def test_schedule_followup_preserves_source_project_and_chat(tmp_path):
+    ctx = _ctx(tmp_path, task_id="project-task")
+    ctx.project_id = "memory-atlas"
+    ctx.current_chat_id = 233966548
+
+    assert _followup(ctx).startswith("FOLLOWUP_SCHEDULED")
+    from supervisor.queue import list_scheduled_tasks
+
+    record = list_scheduled_tasks(pathlib.Path(tmp_path / "data").resolve())["tasks"][0]
+    assert record["task"]["chat_id"] == 233966548
+    assert record["task"]["project_id"] == "memory-atlas"
+    from supervisor.queue_schedules import _task_from_schedule
+    from ouroboros.project_facts import resolve_project_id
+
+    queued = _task_from_schedule(record)
+    assert queued["project_id"] == "memory-atlas"
+    assert resolve_project_id(queued) == "memory-atlas"
+    assert queued["chat_id"] == 233966548
+
+
+def test_schedule_followup_of_an_unscoped_task_invents_no_project_address(tmp_path):
+    """Preserving a source address must not become a new addressing policy: an
+    unscoped task's follow-up keeps the existing owner-chat default."""
+    from supervisor.queue import list_scheduled_tasks
+    from supervisor.queue_schedules import _task_from_schedule
+    from ouroboros.project_facts import resolve_project_id
+
+    assert _followup(_ctx(tmp_path, task_id="plain-task")).startswith("FOLLOWUP_SCHEDULED")
+    record = list_scheduled_tasks(pathlib.Path(tmp_path / "data").resolve())["tasks"][0]
+    assert "project_id" not in record["task"]
+    assert "chat_id" not in record["task"]
+
+    queued = _task_from_schedule(record)
+    assert resolve_project_id(queued) == ""
+    assert queued["chat_id"] == 0  # the existing owner_chat_id default, unchanged
+
+
 # ------------------------------------------------- gateway + digest + queue GC
 
 

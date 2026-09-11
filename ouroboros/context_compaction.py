@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import pathlib
 from typing import Any, Dict, List, Literal, Mapping, MutableSet, Optional, Sequence, Tuple
 
@@ -25,6 +24,7 @@ from ouroboros.context_budget import (
     _UnsafeVisual,
 )
 from ouroboros.anthropic_native_custody import anthropic_tool_unit_active, custody_private_key
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -387,7 +387,7 @@ def _summarizer_spec() -> Dict[str, Any]:
     from ouroboros.config import get_light_model
 
     model = str(get_light_model() or "")
-    use_local = os.environ.get("USE_LOCAL_LIGHT", "").strip().lower() in {"1", "true", "yes", "on"}
+    use_local = runtime_setting("USE_LOCAL_LIGHT", "").strip().lower() in {"1", "true", "yes", "on"}
     route: Dict[str, Any] = {"model": model, "use_local": use_local}
     if use_local:
         route.update({"provider": "local", "resolved_model": model})

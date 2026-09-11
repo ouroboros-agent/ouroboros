@@ -19,11 +19,11 @@ Doctrine:
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
 import threading
 from dataclasses import replace
 from typing import Any, Callable, Dict, Optional, Sequence
+import contextvars
 
 log = logging.getLogger("ouroboros.project_naming")
 
@@ -33,9 +33,11 @@ def _light_use_local(explicit: Optional[bool]) -> bool:
     otherwise follow the runtime ``USE_LOCAL_LIGHT`` flag — naming runs on the LIGHT model,
     so it must route local/remote like every other light-lane caller (e.g. the safety
     check at ``ouroboros/safety.py::_resolve_safety_routing``) instead of hardcoding remote."""
+    from ouroboros.config import runtime_setting
+
     if explicit is not None:
         return bool(explicit)
-    return str(os.environ.get("USE_LOCAL_LIGHT", "") or "").lower() in ("true", "1")
+    return str(runtime_setting("USE_LOCAL_LIGHT", "") or "").lower() in ("true", "1")
 
 # Mirror gateway ``_MAX_DERIVED_NAME`` so heuristic and LLM names share one cap.
 MAX_PROJECT_NAME = 60
@@ -94,11 +96,13 @@ def _light_naming_model() -> str:
 def _naming_timeout_sec() -> float:
     """Provider-call transport timeout for the naming LIGHT call. SSOT: config
     SETTINGS_DEFAULTS (no duplicated literal — the default IS the SSOT value)."""
+    from ouroboros.config import runtime_setting
+
     from ouroboros.config import SETTINGS_DEFAULTS
 
     default = SETTINGS_DEFAULTS["OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC"]
     try:
-        return float(os.environ.get("OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", default))
+        return float(runtime_setting("OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", default))
     except (TypeError, ValueError):
         return float(default)
 
@@ -106,17 +110,21 @@ def _naming_timeout_sec() -> float:
 def _naming_async_timeout_sec() -> float:
     """Gateway HARD wait for the inline turn-into-project name. SSOT: config
     SETTINGS_DEFAULTS (no duplicated literal — the default IS the SSOT value)."""
+    from ouroboros.config import runtime_setting
+
     from ouroboros.config import SETTINGS_DEFAULTS
 
     default = SETTINGS_DEFAULTS["OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC"]
     try:
-        return float(os.environ.get("OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC", default))
+        return float(runtime_setting("OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC", default))
     except (TypeError, ValueError):
         return float(default)
 
 
 def _project_naming_usage_scope(drive_root: Optional[Any], task_id: str):
     """Bind a naming send to its task tree even from a daemon/gateway thread."""
+    from ouroboros.config import runtime_setting
+
     from ouroboros.usage_accounting import UsageScope, current_usage_scope
 
     active = current_usage_scope()
@@ -140,7 +148,7 @@ def _project_naming_usage_scope(drive_root: Optional[Any], task_id: str):
 
     global_limit = resolve_total_budget_usd()
     try:
-        root_limit = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+        root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
     except (TypeError, ValueError):
         root_limit = 0.0
     return UsageScope(
@@ -293,6 +301,8 @@ def spawn_proactive_namer(
     write. Skips cleanly unless ``drive_root`` is a real directory (test safety: a stub /
     MagicMock drive must never materialise a stray path — chat_observed persists BEFORE the
     LLM call). Fail-soft."""
+    from ouroboros.settings_integrity import copy_task_settings_context
+
     body = " ".join(str(text or "").split())
     if not body:
         return
@@ -334,7 +344,9 @@ def spawn_proactive_namer(
                     if _detached.is_set():
                         _refresh_detached_once()
 
-            inner = threading.Thread(target=_call, name=f"namer-call-{task_id}", daemon=True)
+            settings_context = contextvars.Context()
+            copy_task_settings_context(settings_context)
+            inner = threading.Thread(target=settings_context.run, args=(_call,), name=f"namer-call-{task_id}", daemon=True)
             inner.start()
             if not _finished.wait(timeout=max(0.0, _naming_timeout_sec() + 30.0)):
                 _detached.set()
@@ -380,7 +392,9 @@ def spawn_proactive_namer(
             log.debug("proactive namer failed for %s", task_id, exc_info=True)
 
     try:
-        threading.Thread(target=_work, name=f"namer-{task_id}", daemon=True).start()
+        settings_context = contextvars.Context()
+        copy_task_settings_context(settings_context)
+        threading.Thread(target=settings_context.run, args=(_work,), name=f"namer-{task_id}", daemon=True).start()
     except Exception:
         log.debug("proactive namer thread spawn failed for %s", task_id, exc_info=True)
 

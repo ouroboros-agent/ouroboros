@@ -207,20 +207,14 @@ def test_owner_attest_allows_verified_ouroboroshub(monkeypatch, tmp_path):
 def test_extensions_review_fields_expose_verified_hub_attestable_hint(monkeypatch):
     import ouroboros.gateway.extensions as ext
     import ouroboros.skill_review as sr
-
-    class _Review:
-        status = "pending"
-        review_profile = ""
-
-        def is_stale_for(self, content_hash):
-            return False
+    from ouroboros.skill_loader import SkillReviewState
 
     class _Skill:
         name = "hub"
         source = "ouroboroshub"
         is_self_authored = False
         content_hash = "hash"
-        review = _Review()
+        review = SkillReviewState(status="pending", content_hash="hash")
 
     calls = {"count": 0}
 

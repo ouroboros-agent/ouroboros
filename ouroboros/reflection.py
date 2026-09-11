@@ -503,13 +503,13 @@ def generate_reflection(
         "task_id": task.get("id", ""),
         "task_type": str(task.get("type", "")),
         "goal": goal,
-        "rounds": int(usage_dict.get("rounds", 0)),
+        "rounds": None if usage_dict.get("loop_evidence_unavailable") else int(usage_dict.get("rounds", 0)),
         "cost_usd": (
             round(float(usage_dict["cost"]), 4)
             if usage_dict.get("cost") is not None
             else None
         ),
-        "error_count": error_count,
+        "error_count": None if llm_trace.get("loop_evidence_unavailable") else error_count,
         "key_markers": markers,
         "review_evidence": review_evidence or {},
         "reflection": reflection_text,

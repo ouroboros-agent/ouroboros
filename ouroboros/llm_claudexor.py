@@ -41,12 +41,13 @@ log = logging.getLogger(__name__)
 
 
 def model_catalog(source: str, credential_profile_id: str | None = None, *,
-                  requested_model: str | None = None) -> dict:
+                  requested_model: str | None = None, timeout_sec: float | None = None) -> dict:
     """Metadata-only transport; the capability evidence owner interprets the envelope."""
     gateway = read_owned_gateway()
     try:
         hint = {"requested_model": requested_model} if requested_model is not None else {}
-        return gateway.list_source_models(source, credential_profile_id, **hint)
+        return gateway.list_source_models(source, credential_profile_id, **hint,
+                                          **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
     finally:
         gateway.close()
 
@@ -218,10 +219,14 @@ class _ModelInvocation:
         self.defer_close = False
         self.io_active = False
         self.io_lock = threading.Lock()
+        self.outage_episode = None
 
     def check_control(self):
         """The caller supplies deadline/cancel policy; this seam transports it."""
         reason = self.interrupt_reason or (self.poll_control() if self.poll_control else None)
+        if not reason:
+            waiter = current_model_wait()
+            reason = waiter.control_reason() if waiter is not None else None
         if not reason:
             return
         cancellation = "not_requested"
@@ -301,6 +306,8 @@ class _ModelInvocation:
                 else:
                     detail = self.gateway.get_model_operation(self.operation_id, timeout_sec=min(self.timeout, _READ_TIMEOUT_SEC))
                 self.detail = detail
+                if self.outage_episode is not None:
+                    self._control_outage(recovered=True)
                 if detail.get("state") not in {"queued", "running"}:
                     self.detail = detail
                     response = detail.get("response") or {}
@@ -337,9 +344,55 @@ class _ModelInvocation:
                     raise self.error({"code": error.code, "message": str(error)}, detail, unknown=True) from None
                 if outage_started is None:
                     outage_started = time.monotonic()
+                if self._control_outage():
+                    continue
                 if time.monotonic() - outage_started >= self.timeout:
                     raise self.error({"code": "model_control_unreachable", "message": "Control connection lost; the same model operation may still finish."}, detail, unknown=True) from None
             time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, self.timeout))
+
+    def _control_outage(self, *, recovered: bool = False) -> bool:
+        """Managed calls keep the same accepted operation through local HTTP loss."""
+        from ouroboros.loop_transport import (
+            TransportWaitEpisode, emit_network_wait_event,
+            managed_transport_continuation,
+        )
+        waiter = current_model_wait()
+        ctx = getattr(waiter, "tool_context", None)
+        if not managed_transport_continuation(ctx):
+            return False
+        if recovered:
+            emit_network_wait_event(self.root / "logs", task_id=self.task_id, phase="recovered",
+                elapsed_sec=self.outage_episode.waited_sec, redials=0, model=self.target["usage_model"],
+                detail="same_model_operation_rejoined", outcome_custody={"operation_id": self.operation_id})
+            self.outage_episode = None
+            return True
+        if self.outage_episode is None:
+            self.outage_episode = TransportWaitEpisode(started_monotonic=time.monotonic())
+        episode = self.outage_episode
+        backoff = min(config.NETWORK_WAIT_BACKOFF_START_SEC * 2 ** min(episode.wait_iterations, 4),
+                      config.NETWORK_WAIT_BACKOFF_MAX_SEC)
+        emit_network_wait_event(self.root / "logs", task_id=self.task_id, phase="waiting",
+            elapsed_sec=episode.waited_sec, redials=0, model=self.target["usage_model"],
+            next_sleep_sec=backoff, detail="same_model_operation_pending",
+            outcome_custody={"operation_id": self.operation_id, "invocation_id": self.invocation_id})
+        episode.wait_iterations += 1
+        try:
+            replacement = read_owned_gateway()
+        except ClaudexorUnavailable:
+            replacement = None
+        if replacement is not None:
+            previous, self.gateway = self.gateway, replacement
+            if previous is not None:
+                previous.close()
+        def controlled():
+            self.check_control()
+            return False
+        # Unlike an owner-mail peek, check_control's exception must propagate.
+        deadline = time.monotonic() + backoff
+        while time.monotonic() < deadline:
+            controlled()
+            time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, max(0, deadline - time.monotonic())))
+        return True
 
     def retain(self, raw: bytes) -> None:
         try:

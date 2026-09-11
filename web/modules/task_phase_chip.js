@@ -83,8 +83,37 @@ export function setLiveCardPhase(record, phase = 'working', text = '', className
 // remains unfinished without pretending the paused role is doing computation.
 export function setLiveCardTypingVisible(record, visible) {
     if (!record?.inlineTypingEl) return false;
-    const display = visible && !record.modelWaiting ? '' : 'none';
+    const display = visible && !record.modelWaiting && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
     if (record.inlineTypingEl.style.display === display) return false;
     record.inlineTypingEl.style.display = display;
     return Boolean(record.inlineTypingEl.isConnected);
+}
+
+// Shared inert anatomy; the caller retains the reason (review or missing
+// historical outcome), and no runtime lifecycle status is invented.
+export function setInertCardPresentation(record, enabled) {
+    if (!record?.phaseEl) return;
+    record.phaseEl.hidden = enabled;
+    if (record.root?.dataset) record.root.dataset.inert = enabled ? '1' : '0';
+    setLiveCardTypingVisible(record, !enabled && !record.finished);
+}
+
+export function setHistoricalUnavailable(record, enabled) {
+    if (!record || (Boolean(record.historicalUnavailable) === enabled && !record.historicalUnconfirmed)) return false;
+    record.historicalUnavailable = enabled;
+    record.historicalUnconfirmed = false;
+    setInertCardPresentation(record, enabled || Boolean(record.reviewAnchor));
+    if (!enabled && !record.reviewAnchor) {
+        const desired = desiredLiveCardPhase(record);
+        setLiveCardPhase(record, desired.phase, desired.text, desired.className);
+    }
+    return true;
+}
+
+export function setHistoricalUnconfirmed(record) {
+    if (!record || record.finished || record.reviewAnchor || record.historicalUnavailable
+            || record.historicalUnconfirmed) return false;
+    record.historicalUnconfirmed = true;
+    setInertCardPresentation(record, true);
+    return true;
 }

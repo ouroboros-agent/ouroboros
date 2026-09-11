@@ -9,7 +9,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | domain | name | modules | proposed |
 |---|---|---:|---:|
 | D01 | Agent core & main loop | 30 | 0 |
-| D02 | LLM client, routing & providers | 35 | 0 |
+| D02 | LLM client, routing & providers | 36 | 0 |
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 20 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 28 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 12 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 9 | 0 |
-| **total** | | **528** | **0** |
+| **total** | | **529** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -52,7 +52,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
 | **D14** | · | ✓ | · | ✓ | ✓ | ✓ | · | · | ✓ | ✓ | ✓ | ✓ | · | · | · | ✓ | · | ✓ | ✓ | · |
 | **D15** | ✓ | ✓ | ✓ | ✓ | · | · | · | · | ✓ | · | · | ✓ | · | · | · | ✓ | · | ✓ | ✓ | · |
 | **D16** | · | ✓ | · | · | · | ✓ | · | · | · | · | · | ✓ | · | ✓ | · | · | · | ✓ | · | · |
-| **D17** | ✓ | · | · | ✓ | · | · | · | · | · | · | · | · | · | · | ✓ | ✓ | · | ✓ | ✓ | · |
+| **D17** | ✓ | · | · | ✓ | · | ✓ | · | · | · | · | · | · | · | · | ✓ | ✓ | · | ✓ | ✓ | · |
 | **D18** | · | · | · | · | · | · | · | · | ✓ | ✓ | · | ✓ | · | · | · | · | · | · | · | · |
 | **D19** | · | · | · | · | · | · | · | · | · | · | · | · | · | ✓ | · | · | · | ✓ | · | · |
 | **D20** | · | · | · | ✓ | ✓ | · | · | · | · | · | · | · | · | ✓ | ✓ | · | ✓ | ✓ | ✓ | · |
@@ -65,7 +65,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
 
 ## Hidden coupling (classified out of the strict graph)
 
-- lazy-only cross-domain pairs: **95**
+- lazy-only cross-domain pairs: **97**
   - D01->D08
   - D01->D10
   - D01->D11
@@ -114,10 +114,12 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D10->D15
   - D10->D17
   - D11->D06
+  - D11->D13
   - D11->D15
   - D12->D05
   - D12->D06
   - D12->D10
+  - D12->D13
   - D12->D15
   - D12->D16
   - D12->D17
@@ -143,8 +145,8 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D17->D02
   - D17->D03
   - D17->D05
-  - D17->D06
   - D17->D07
+  - D17->D08
   - D17->D09
   - D17->D12
   - D18->D01
@@ -222,6 +224,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/llm_pricing.py`
 - `ouroboros/llm_probe.py`
 - `ouroboros/llm_routing.py`
+- `ouroboros/llm_stream.py`
 - `ouroboros/local_model.py`
 - `ouroboros/local_model_autostart.py`
 - `ouroboros/model_concurrency.py`

@@ -10,6 +10,8 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
+import tempfile
 import signal  # noqa: F401
 import stat  # noqa: F401
 import subprocess
@@ -30,7 +32,7 @@ from ouroboros.runtime_mode_policy import (
     is_protected_runtime_path,  # noqa: F401
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
-from ouroboros.shell_parse import is_absolute_path_text, recover_stringified_argv  # noqa: F401
+from ouroboros.shell_parse import POSIX_SHELL_HEADS, is_absolute_path_text, recover_stringified_argv  # noqa: F401
 from ouroboros.tools.tool_result import _publish_process_result, _wrap_run_script_process_result
 from ouroboros.tools.verify import check_exit_masking  # noqa: F401 -- ONE exit-masking sensor shared with verify_and_record (pinned here); its disclosure lives in shell_audit
 from ouroboros.tools.registry import (
@@ -164,7 +166,7 @@ _SHELL_OPERATORS = frozenset(["&&", "||", "|", ";", ">", ">>", "<", "<<"])
 _GLUED_REDIRECT_RE = re.compile(
     r'^(?:(?:\d+>>?|>>?&?\d*|\d*>&\d*|&>>?)(?:\S.*)?|\d+<\S*|<<\S*|<)$'
 )
-_SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"})
+_SHELL_INTERPRETERS = POSIX_SHELL_HEADS | frozenset({"fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"})
 _ENV_REF_PATTERN = re.compile(r'\$(?:\{[A-Z][A-Z0-9_]*\}|[A-Z][A-Z0-9_]*)')
 
 
@@ -625,35 +627,46 @@ def _run_script(
             root = pathlib.Path(ctx.drive_root) / "tmp_scripts"
     root.mkdir(parents=True, exist_ok=True)
     suffix = ".py" if "python" in pathlib.PurePath(interp).name else ".sh"
+    run_dir = None
     script_path = root / f"script_{uuid.uuid4().hex}{suffix}"
-    script_path.write_text(body, encoding="utf-8")
     try:
-        os.chmod(script_path, 0o600)
-    except OSError:
-        pass
-    script_arg = str(script_path)
-    if executor_active:
-        executor = executor_ref_from_ctx(ctx)
-        if executor is not None and executor.kind != "local":
-            try:
-                script_arg = executor_map_host_path(executor, script_path)
-            except Exception as exc:
-                script_path.unlink(missing_ok=True)
-                return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not map temp script path: {type(exc).__name__}: {exc}"
-    argv = [interp, script_arg, *[str(item) for item in (args or [])]]
-    try:
+        if active_workspace_script:
+            run_dir = pathlib.Path(tempfile.mkdtemp(prefix="script_", dir=root))
+            # Ignore only this invocation's files, not neighbouring user work.
+            (run_dir / ".gitignore").write_text("*\n", encoding="utf-8")
+            script_path = run_dir / f"script{suffix}"
+        script_path.write_text(body, encoding="utf-8")
+        try:
+            os.chmod(script_path, 0o600)
+        except OSError:
+            pass
+        script_arg = str(script_path)
+        if executor_active:
+            executor = executor_ref_from_ctx(ctx)
+            if executor is not None and executor.kind != "local":
+                try:
+                    script_arg = executor_map_host_path(executor, script_path)
+                except Exception as exc:
+                    return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not map temp script path: {type(exc).__name__}: {exc}"
+        argv = [interp, script_arg, *[str(item) for item in (args or [])]]
         result = _run_shell(
             ctx, argv, cwd=cwd, outputs=outputs, scratch=scratch,
             _resolved_binding=binding, timeout_sec=timeout_sec, timeout=timeout,
         )
     finally:
         try:
-            script_path.unlink(missing_ok=True)
-            script_path.parent.rmdir()
-            if active_workspace_script:
-                script_path.parent.parent.rmdir()
-        except OSError:
-            pass
+            if run_dir is not None:
+                shutil.rmtree(run_dir)
+            else:
+                script_path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Could not remove run_script scratch %s (%s)", run_dir or script_path, type(exc).__name__)
+        # These shared parents may contain another run or a user's file.
+        for parent in (root, root.parent) if active_workspace_script else (root,):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
     if pathlib.PurePath(interp).name in {"sh", "bash"}:
         result = _masked_green_disclosure(ctx, result, [interp, "-c", body])
     # POST-exec body audit: stat-confirmed user_files writes performed by the script
@@ -740,7 +753,7 @@ def get_tools() -> List[ToolEntry]:
             "name": "run_script",
             "description": (
                 "Run a short task-scoped temporary script with a declared interpreter. "
-                "Use for multi-line diagnostics or harness helpers; generated script files live under the task drive. "
+                "Use for multi-line diagnostics or harness helpers; generated scripts use a private run directory inside the mapped workspace or the task drive. "
                 "The underlying command result echoes the resolved cwd."
             ),
             "parameters": {"type": "object", "properties": {

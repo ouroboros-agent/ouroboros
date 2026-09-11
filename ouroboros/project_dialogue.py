@@ -35,6 +35,36 @@ def _row_chat_id(row: Dict[str, Any]) -> int:
         return 0
 
 
+def project_question_pointer(row: Dict[str, Any], block: Any, project: Any,
+                             owner_wait: Any = None) -> Optional[Dict[str, Any]]:
+    """Read projection of one required Project question; never another ask."""
+    quiz = row.get("quiz") if isinstance(row.get("quiz"), dict) else row
+    task_id, quiz_id = str(row.get("task_id") or ""), str(quiz.get("quiz_id") or "")
+    block = block if isinstance(block, dict) else {}
+    project = project if isinstance(project, dict) else {}
+    if (not task_id or not quiz_id or not project.get("id") or not project.get("chat_id")
+            or not (quiz.get("wait_for_answer") is True or block.get("wait_for_answer") is True)):
+        return None
+    state = str(block.get("state") or "")
+    known = block.get("quiz_id") == quiz_id and state in {"open", "answered", "expired_terminal", "superseded"}
+    waiting = owner_wait if isinstance(owner_wait, dict) else {}
+    wait_state = str(waiting.get("state") or "") if waiting.get("quiz_id") == quiz_id else ""
+    name = str(project.get("name") or "Project")
+    lead = ("Question status unavailable" if not known else "Question answered" if state == "answered"
+            else "Question expired" if state in {"expired_terminal", "superseded"}
+            else "Question" if wait_state == "resumed" else "Answer needed")
+    return {
+        "role": "system", "system_type": "project_question_pointer", "task_id": task_id,
+        "quiz_id": quiz_id, "quiz_state": state if known else "unknown",
+        "project_id": str(project["id"]), "project_name": name,
+        "project_chat_id": int(project["chat_id"]), "chat_id": 1,
+        "ts": str(block.get("asked_at") or row.get("ts") or ""),
+        "text": f"{lead} in {name}", "is_progress": False, "markdown": False,
+        **({"owner_wait_state": wait_state} if wait_state else {}),
+        **({"source_status": "unavailable"} if not known else {}),
+    }
+
+
 def _chat_paths(drive_root: Any) -> List[pathlib.Path]:
     root = pathlib.Path(drive_root)
     archives = sorted(
@@ -285,6 +315,8 @@ def append_chat_annotation(
     action: str,
     target: str = "",
     target_label: str = "",
+    project_id: str = "",
+    project_chat_id: int = 0,
     status: str,
     routing_token: str = "",
     reason: str = "",
@@ -321,6 +353,8 @@ def append_chat_annotation(
     }
     if str(target_label or ""):
         row["target_label"] = str(target_label)[:200]
+    if project_id and project_chat_id:
+        row.update(project_id=str(project_id), project_chat_id=int(project_chat_id))
     if str(routing_token or ""):
         row["routing_token"] = str(routing_token)[:128]
     if str(reason or ""):
@@ -752,6 +786,8 @@ def _append_terminal_task_projection(
             "reason_code": reason, "result_ref": result_ref,
             "text": f"{text} {details}",
         }
+        if isinstance(effective.get("model_execution"), dict):
+            row["model_execution"] = dict(effective["model_execution"])
         appended = append_canonical_task_summary(drive_root, row)
         if not appended:
             return {"status": str(current.get("status") or status)}
@@ -768,6 +804,24 @@ def _append_terminal_task_projection(
         drive_root, tid, status, _field_projector=_append_once,
     )
     return appended
+
+
+def historical_terminal_projection(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Small immutable lifecycle observation, never revived review/cost truth."""
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    if (entry.get("type") != "task_summary"
+            or entry.get("summary_kind") not in {"terminal_result_projection", "terminal_root_projection"}
+            or entry.get("outcome_authority") != "canonical_task_result_after_finalization"
+            or entry.get("outcome_final") is not True
+            or not entry.get("task_id") or entry.get("status") not in SETTLED_STATUSES
+            or entry.get("outcome_phase") not in {"done", "warn", "error", "cancelled"}):
+        return None
+    projection = {"status": entry["status"], "phase": entry["outcome_phase"],
+                  "ts": str(entry.get("ts") or ""), "provenance": entry["outcome_authority"]}
+    if isinstance(entry.get("model_execution"), dict):
+        projection["model_execution"] = dict(entry["model_execution"])
+    return projection
 
 
 def append_terminal_task_projection(
@@ -997,6 +1051,7 @@ __all__ = [
     "outcome_phase",
     "owner_message_ref_is_valid",
     "project_origin_rows",
+    "project_question_pointer",
     "project_recent_dialogue",
     "routing_options_with_labels",
     "routing_target_label",

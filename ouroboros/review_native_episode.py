@@ -38,7 +38,7 @@ import tempfile
 from typing import Any, Dict, List, Optional
 
 from ouroboros.config import get_finalization_grace_sec
-from ouroboros.deadline_utils import owner_deadline_exhausted, review_transport_timeout
+from ouroboros.deadline_utils import caller_deadline_arguments, owner_deadline_exhausted, review_transport_timeout
 from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
 from ouroboros.review_verdict_extraction import canonicalize_session_verdict
 from ouroboros.triad_review import default_output_contract, review_output_shape
@@ -587,6 +587,8 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                     transport = remaining if transport is None else min(float(transport), remaining)
                 if transport is not None:
                     chat_kwargs["timeout"] = transport
+                chat_kwargs.update(caller_deadline_arguments(deadline_at, logical_deadline,
+                                   reserve_sec=get_finalization_grace_sec()))
                 preparation_scope = (self._waiter.register_reprepare(f"reviewer:{slot.slot_id}", functools.partial(self._reprepare_model_call, messages=messages))
                                      if self._waiter else contextlib.nullcontext())
                 with bind_api_review_paid_stamp(self.assignment.dispatch_stamp), preparation_scope:

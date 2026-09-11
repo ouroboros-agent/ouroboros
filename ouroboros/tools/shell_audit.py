@@ -7,6 +7,7 @@ import re
 from typing import List, TYPE_CHECKING
 
 from ouroboros.shell_parse import (
+    POSIX_SHELL_HEADS,
     collect_leading_env,
     embedded_absolute_path_tokens,
     is_absolute_path_text,
@@ -50,7 +51,6 @@ if TYPE_CHECKING:
 _UNDECLARED_OUTPUTS_MARKER = "⚠️ ARTIFACT_OUTPUT_UNDECLARED"
 _UNDECLARED_OUTPUT_SCAN_MAX_FILES = 5000
 _UNDECLARED_OUTPUT_METADATA_COMMANDS = frozenset({"chmod", "chown", "mkdir", "rm"})
-_SHELL_WRAPPER_COMMANDS = frozenset({"sh", "bash", "zsh"})
 
 
 def _redirect_targets_for_audit(argv: list[str]) -> set[str]:
@@ -70,7 +70,7 @@ def _writer_targets_for_output_audit(argv: list[str]) -> set[str]:
         except Exception:
             command_argv = list(segment)
         command = pathlib.PurePath(command_argv[0]).name.lower().removesuffix(".exe") if command_argv else ""
-        if command in _SHELL_WRAPPER_COMMANDS:
+        if command in POSIX_SHELL_HEADS:
             body = shell_command_string(command_argv)
             if body:
                 targets.update(_writer_targets_for_output_audit(shell_argv_with_inline(body)))

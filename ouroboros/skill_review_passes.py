@@ -158,10 +158,8 @@ def _skill_review_retry_key(
 ) -> str:
     """Identity of one physical Skill Review wave/chunk.
 
-    The key is process-local custody, not a restart index.  A lifecycle retry
-    with a new wave id therefore remains a new operation; within one live wave,
-    the same frozen chunk joins/replays while distinct waves and chunks cannot
-    borrow one another's reviewer actor.
+    The lifecycle owner may explicitly resume this logical wave from its
+    recorded roster. Distinct logical waves/chunks never borrow actors.
     """
     skill = str(skill_name or "")
     wave = str(wave_id or "")
@@ -184,6 +182,40 @@ def _skill_review_retry_key(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     return f"skill_review:{digest}"
+
+
+def _reserve_skill_wave(ctx, drive_root, skill, file_packs, models, row_plan, attribution,
+                        content_hash, contract_fp, rebuttal_sha):
+    """Write the complete chunk/operation roster before the first paid dispatch."""
+    from ouroboros.observability import new_call_id
+    from ouroboros.review_dispatch import slot_id_for_row
+    from ouroboros.skill_review_runner import review_job_state_path
+    from ouroboros.utils import update_json_locked
+
+    wave_id = str(attribution.get("review_wave_id") or "")
+    if not wave_id or ctx is None:
+        return None  # Legacy pass-only callers have no lifecycle/paid wave.
+    ids = list((row_plan or {}).get("slot_ids") or [])
+    ids += [slot_id_for_row(i + 1) for i in range(len(ids), len(models))]
+    resume = getattr(ctx, "_skill_review_resume", None)
+    if resume:
+        return resume
+    wave = {"wave_id": wave_id, "binding": getattr(ctx, "_skill_review_wave_binding", {}),
+            "chunks": [{"retry_key": _skill_review_retry_key(
+                skill_name=skill.name, wave_id=wave_id, content_hash=content_hash,
+                contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
+                pack=pack, chunk_index=i, chunk_count=len(file_packs)),
+                "operations": {slot: new_call_id(f"skill_review_{slot}") for slot in ids}}
+                for i, pack in enumerate(file_packs)]}
+    job_id = str(getattr(ctx, "_skill_review_lifecycle_job_id", "") or "")
+    if job_id:
+        def reserve(current):
+            if current.get("job_id") != job_id or current.get("status") != "running":
+                raise RuntimeError("review was not persisted because its lifecycle no longer owns this wave")
+            return {**current, "review_wave": wave}
+        update_json_locked(review_job_state_path(drive_root, skill.name), reserve,
+                           strict_existing_dict=True)
+    return wave
 
 
 def run_skill_review_passes(
@@ -219,6 +251,11 @@ def run_skill_review_passes(
     )
 
     attribution = dict(usage_attribution or {})
+    try:
+        wave = _reserve_skill_wave(ctx, drive_root, skill, file_packs, models, row_plan,
+                                   attribution, content_hash, review_contract_fingerprint, rebuttal_sha256)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return "", {}, "", f"Skill Review roster unavailable: {exc}"
 
     def _run(
         content: str,
@@ -256,10 +293,27 @@ def run_skill_review_passes(
                 "surface": "skill_review",
                 "usage_attribution": attribution,
             })
-        return run_review(
-            ctx, content=content, prompt=prompt, models=models,
-            stable_prefix_len=stable_prefix_len, **delivery,
-        )
+        if wave is None:
+            return run_review(ctx, content=content, prompt=prompt, models=models,
+                              stable_prefix_len=stable_prefix_len, **delivery)
+        chunk = wave["chunks"][chunk_index]
+        if chunk["retry_key"] != retry_key:
+            raise RuntimeError("Skill Review chunk identity changed before reconciliation")
+        names = ("_review_reserved_operations", "_review_frozen_rows", "_review_reconcile_only")
+        prior = {name: getattr(ctx, name, None) for name in names}
+        ctx._review_reserved_operations = {"skill_review": chunk["operations"]}
+        ctx._review_reconcile_only = bool(getattr(ctx, "_skill_review_resume", None))
+        if ctx._review_reconcile_only:
+            ctx._review_frozen_rows = {"skill_review": {
+                slot: {"slot_id": slot, "operation_id": operation,
+                       "operation_state": "in_flight", "late_result_pending": True}
+                for slot, operation in chunk["operations"].items()}}
+        try:
+            return run_review(ctx, content=content, prompt=prompt, models=models,
+                              stable_prefix_len=stable_prefix_len, **delivery)
+        finally:
+            for name, value in prior.items():
+                setattr(ctx, name, value)
 
     if len(file_packs) == 1:
         prompt, stable_prefix_len, advisory_evidence = build_prompt(

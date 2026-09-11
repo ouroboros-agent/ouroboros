@@ -492,11 +492,11 @@ def measure_main_fit(
 def _context_route(task: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Resolve the same effective settings and account identity on success or failure."""
     from ouroboros.capability_evidence import model_account_options
-    from ouroboros.config import load_settings
+    from ouroboros.config import runtime_settings
     from ouroboros.gateway.settings import _active_main_route
     from ouroboros.server_runtime import apply_runtime_provider_defaults
 
-    settings, _changed, _keys = apply_runtime_provider_defaults(load_settings())
+    settings, _changed, _keys = apply_runtime_provider_defaults(runtime_settings())
     local_override = task.get("use_local_model")
     route = _active_main_route(
         settings, model_override=str(task.get("model") or "").strip(),

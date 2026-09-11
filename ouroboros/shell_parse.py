@@ -32,7 +32,7 @@ EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"|\\\\[^\s'\"),;\]\\/]+[\\/][^\s'\"),;\]]+"
     r")"
 )
-_SHELLS = {"sh", "bash", "zsh"}
+POSIX_SHELL_HEADS = frozenset({"sh", "bash", "zsh", "dash", "ash"})
 
 
 def recover_stringified_argv(text: Any) -> List[str] | None:
@@ -577,7 +577,7 @@ def local_shell_subject(raw_cmd: Any, _depth: int = 0) -> Any:
             result.append(leading or ";")
         argv = shell_argv(segment)
         head = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
-        if head in _SHELLS:
+        if head in POSIX_SHELL_HEADS:
             body = shell_command_string(argv)
             local = local_shell_subject(body, _depth + 1) if body else body
             if local != body:
@@ -680,7 +680,7 @@ def sudo_noninteractive_violation(raw_cmd: Any) -> bool:
         _env, command = collect_leading_env(segment)
         while command:
             head = pathlib.PurePath(str(command[0])).name.lower()
-            if head in _SHELLS:
+            if head in POSIX_SHELL_HEADS:
                 inline = shell_command_string(command)
                 if inline and sudo_noninteractive_violation(inline):
                     return True
@@ -719,7 +719,7 @@ def shell_command_string(argv: List[str]) -> str:
 
 def shell_argv_with_inline(raw_cmd: Any) -> List[str]:
     argv = shell_argv(raw_cmd)
-    if argv and pathlib.PurePath(argv[0]).name.lower() in _SHELLS:
+    if argv and pathlib.PurePath(argv[0]).name.lower() in POSIX_SHELL_HEADS:
         inline = shell_command_string(argv)
         if inline:
             return argv + shell_argv(inline)

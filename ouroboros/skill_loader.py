@@ -19,11 +19,9 @@ from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.skill_review_status import STATUS_BLOCKERS, STATUS_CLEAN, STATUS_PENDING, STATUS_WARNINGS, VALID_SKILL_REVIEW_STATUSES, aggregate_skill_review_status, normalize_skill_review_status, skill_review_gate
 from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
-
-
-# Constants
 
 _MANIFEST_NAMES = ("SKILL.md", "skill.json")
 # Only metadata/cache names are skipped. Non-metadata dotfiles remain hashed
@@ -53,14 +51,9 @@ def review_status_allows_execution(status: str) -> bool:
 
 GRANTS_FILENAME = "grants.json"
 SELF_AUTHORED_MARKER_FILENAME = ".self_authored.json"
-# CPL4-C10: every per-skill owner-state document the runtime authors carries
-# the shared ABI-2 stamp on write (review.json, enabled.json, grants.json,
-# review_job.json, owner_attestation.json, accepted_rebuttals.json). Readers
-# keep legacy-0 tolerance: unstamped files are never retrofitted on read.
+# Stamp every authored skill owner-state document (CPL4-C10 / ABI-2);
+# legacy-0 readers never retrofit a stamp on read.
 SKILL_OWNER_STATE_SCHEMA_VERSION = 1
-
-
-# Dataclasses
 
 
 @dataclass
@@ -78,13 +71,18 @@ class SkillReviewState:
     raw_actor_records: List[Dict[str, Any]] = field(default_factory=list)
     advisory_result: Dict[str, Any] = field(default_factory=dict)
     review_profile: str = ""
+    # Reviewer identity and current author acceptance are independent evidence.
+    author_disposition: Dict[str, Any] = field(default_factory=dict)
+    reviewed_content_hash: str = ""  # Original reviewer hash on earlier author-finish records.
 
     def is_stale_for(self, current_hash: str) -> bool:
-        if not current_hash:
-            return True
-        if not self.content_hash:
-            return True
-        return self.content_hash != current_hash
+        return not current_hash or (self.reviewed_content_hash or self.content_hash) != current_hash
+
+    def gate_for(self, current_hash: str, *, enforcement: Optional[str] = None) -> Dict[str, Any]:
+        return {**skill_review_gate(self.status, stale=self.is_stale_for(current_hash),
+                                   enforcement=enforcement, findings=self.findings,
+                                   author_disposition=self.author_disposition, current_hash=current_hash),
+                "reviewed_content_hash": self.reviewed_content_hash or self.content_hash}
 
     def to_dict(self) -> Dict[str, Any]:
         data = {
@@ -101,6 +99,10 @@ class SkillReviewState:
             data["review_profile"] = str(self.review_profile)
         if self.advisory_result:
             data["advisory_result"] = dict(self.advisory_result)
+        if self.author_disposition:
+            data["author_disposition"] = dict(self.author_disposition)
+        if self.reviewed_content_hash:
+            data["reviewed_content_hash"] = str(self.reviewed_content_hash)
         has_review_verdicts = any(
             str(f.get("verdict") or "").upper() in {"PASS", "FAIL"}
             for f in self.findings
@@ -136,9 +138,7 @@ class LoadedSkill:
         if not self.manifest.is_script():
             # instruction has no payload; extension runs through PluginAPI.
             return False
-        if not review_status_allows_execution(self.review.status):
-            return False
-        if self.review.is_stale_for(self.content_hash):
+        if not self.review.gate_for(self.content_hash)["executable_review"]:
             return False
         from ouroboros.tools.skill_exec import _resolve_runtime_binary, _resolve_script_path
 
@@ -168,9 +168,6 @@ class _SkillLocationCandidate:
     name: str
     location: str
     skill_dir: pathlib.Path
-
-
-# Disk paths
 
 
 def _skills_state_root(drive_root: pathlib.Path) -> pathlib.Path:
@@ -251,9 +248,6 @@ def is_self_authored_skill_dir(
         and str(state_data.get("task_id") or "") == str(data.get("task_id") or "")
         and str(state_data.get("created_at") or "") == str(data.get("created_at") or "")
     )
-
-
-# Manifest discovery
 
 
 class _ManifestUnreadable(RuntimeError):
@@ -495,9 +489,6 @@ def compute_content_hash(
     return reduce_skill_content_hash(file_digests)
 
 
-# State persistence
-
-
 def load_enabled(drive_root: pathlib.Path, name: str) -> bool:
     state = read_json_dict(skill_state_dir(drive_root, name) / "enabled.json")
     if not isinstance(state, dict):
@@ -623,6 +614,9 @@ def load_review_state(
         if isinstance(data.get("advisory_result"), dict)
         else {}
     )
+    author_disposition = validate_author_disposition(
+        data.get("author_disposition"),
+    ) or {}
     try:
         prompt_chars = int(data.get("prompt_chars") or 0)
     except (TypeError, ValueError):
@@ -643,6 +637,8 @@ def load_review_state(
         raw_actor_records=[r for r in raw_actor_records if isinstance(r, dict)],
         advisory_result=dict(advisory_result),
         review_profile=review_profile,
+        author_disposition=author_disposition,
+        reviewed_content_hash=str(data.get("reviewed_content_hash") or ""),
     )
 
 
@@ -835,7 +831,7 @@ def grant_status_for_skill(drive_root: pathlib.Path, skill: LoadedSkill) -> Dict
     granted_permissions = [perm for perm in requested_permissions if perm in persisted_permissions]
     missing = [key for key in requested if key not in set(granted)]
     missing_permissions = [perm for perm in requested_permissions if perm not in set(granted_permissions)]
-    review_ready = review_status_allows_execution(skill.review.status) and not skill.review.is_stale_for(skill.content_hash)
+    review_ready = skill.review.gate_for(skill.content_hash)["executable_review"]
     # Scripts receive core keys via _scrub_env; extensions via PluginAPI.
     # Instruction skills cannot receive core keys.
     eligible_type = skill.manifest.is_script() or skill.manifest.is_extension()
@@ -883,9 +879,7 @@ def auto_grant_if_enabled(drive_root: pathlib.Path, skill: LoadedSkill) -> AutoG
         return outcome
     if skill.load_error:
         return outcome
-    if skill.review.is_stale_for(skill.content_hash):
-        return outcome
-    if not review_status_allows_execution(skill.review.status):
+    if not skill.review.gate_for(skill.content_hash)["executable_review"]:
         return outcome
     if normalize_skill_review_status(skill.review.status) == _REVIEW_STATUS_PENDING:
         return outcome
@@ -907,9 +901,6 @@ def auto_grant_if_enabled(drive_root: pathlib.Path, skill: LoadedSkill) -> AutoG
         requested_permissions=requested_permissions,
         granted_permissions=list(requested_permissions),
     )
-
-
-# Discovery / loading
 
 
 def _safe_listdir(root: pathlib.Path) -> List[pathlib.Path]:
@@ -1495,7 +1486,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
     available = blocked_by_grants = pending_review = blocker_review = warning_review = broken = 0
     for s in skills:
         stale = s.review.is_stale_for(s.content_hash)
-        gate = skill_review_gate(s.review.status, stale=stale, findings=s.review.findings)
+        gate = s.review.gate_for(s.content_hash)
         if s.identity_collision:
             # Readiness probes include lifecycle/dependency state. A collision
             # has no unique lifecycle identity, so its UI projection must stay
@@ -1514,7 +1505,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
         blocked_by_grants += int(s.available_for_execution and not grants_usable)
         pending_review += int(
             s.review.status in (_REVIEW_STATUS_PENDING, "")
-            or (review_status_allows_execution(s.review.status) and stale)
+            or (stale and not gate["executable_review"])
         )
         blocker_review += int(s.review.status == _REVIEW_STATUS_FAIL)
         warning_review += int(s.review.status == _REVIEW_STATUS_ADVISORY)
@@ -1534,6 +1525,8 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
             "review_status": s.review.status,
             "review_stale": stale,
             "review_gate": gate,
+            "author_disposition": dict(s.review.author_disposition),
+            "reviewed_content_hash": gate["reviewed_content_hash"],
             "executable_review": gate["executable_review"],
             "available_for_execution": runnable,
             "runnable_via_skill_exec": s.available_for_execution,

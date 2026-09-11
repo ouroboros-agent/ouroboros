@@ -389,7 +389,21 @@ def _is_stale_orphan_running_task(
     task_id: str,
     result: Dict[str, Any],
     events_index: Optional[_EventsTailIndex] = None,
+    queue_snapshot: Optional[Dict[str, Any]] = None,
 ) -> bool:
+    # Direct-chat actors are deliberately absent from PENDING/RUNNING.  The
+    # process-local registry is the authoritative owner for that execution;
+    # queue snapshots and pooled worker_boot rows cannot prove it dead.
+    try:
+        from supervisor.active_activity import get_direct_activity_registry
+
+        if get_direct_activity_registry().get(str(task_id or "")) is not None:
+            return False
+    except Exception:
+        # This helper is also imported by worker-side readers where the server's
+        # direct registry is not available.  Absence of that optional observation
+        # is not itself evidence of liveness, so retain the existing pooled path.
+        pass
     status = str(result.get("status") or "").lower()
     # ``interrupted`` is the transient pre-requeue marker (A.11): a record still
     # carrying it with no queued retry after a worker restart is the same orphan
@@ -414,6 +428,22 @@ def _is_stale_orphan_running_task(
     except Exception:
         pass
     if heartbeat and time.time() - heartbeat < _ORPHAN_RUNNING_GRACE_SECONDS:
+        return False
+    # A stale/missing snapshot cannot prove that a pooled owner is gone (the
+    # GR7-1a polarity ``task_has_live_queue_ownership`` already uses).  The
+    # destructive reconciler must keep the old row until a fresh snapshot or a
+    # separate positive recovery fact exists.  A batch caller passes the
+    # snapshot it already read, like ``events_index`` above.
+    try:
+        snapshot = (
+            queue_snapshot if isinstance(queue_snapshot, dict)
+            else _load_queue_snapshot(pathlib.Path(drive_root))
+        )
+        if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
+            return False
+        if _snapshot_is_stale(snapshot):
+            return False
+    except Exception:
         return False
     if events_index is None:
         events_index = _EventsTailIndex(pathlib.Path(drive_root))
@@ -511,7 +541,7 @@ def load_effective_task_result(
     )
 
 
-def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
+def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset()) -> int:
     """Durably finalize on-disk RUNNING task results the effective-status
     projection already considers terminal.
 
@@ -540,7 +570,7 @@ def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
         return 0
     for row in running:
         task_id = str(row.get("task_id") or row.get("id") or "")
-        if not task_id:
+        if not task_id or task_id in exclude_task_ids:
             continue
         try:
             effective = load_effective_task_result(root, task_id)
@@ -737,7 +767,8 @@ def effective_task_result(
 
     parent_status = str(merged.get("status") or "").lower()
     if parent_status not in FINAL_STATUSES:
-        queue_status, queue_task = _queue_task_status(_load_queue_snapshot(pathlib.Path(drive_root)), task_id)
+        queue_snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
+        queue_status, queue_task = _queue_task_status(queue_snapshot, task_id)
         if queue_status and queue_status != "unknown":
             merged["status"] = _merge_queue_status(parent_status, queue_status)
             for key in (
@@ -769,7 +800,10 @@ def effective_task_result(
                         bundle,
                         "task ended before artifact finalization",
                     )
-            elif _is_stale_orphan_running_task(pathlib.Path(drive_root), task_id, merged, _events_index):
+            elif _is_stale_orphan_running_task(
+                pathlib.Path(drive_root), task_id, merged, _events_index,
+                queue_snapshot=queue_snapshot,
+            ):
                 orphan_reason = (
                     "interrupted_retry_lost"
                     if parent_status == STATUS_INTERRUPTED
@@ -1189,12 +1223,14 @@ def format_subagent_absorption_message(
     omitted = 0
     from ouroboros.cost_projection import cost_display
 
+    from ouroboros.task_finalization import terminal_host_notice_text
+
     for child in terminal:
         cid = str(child.get("task_id") or child.get("id") or "")
         role = str(child.get("role") or "")
         result = provider_terminal_body(
             str(child.get("result") or "").strip(),
-            str(child.get("terminal_host_notice") or ""),
+            terminal_host_notice_text(child),
         )
         terminal_status = str(child.get("child_status") or "")
         status_suffix = (

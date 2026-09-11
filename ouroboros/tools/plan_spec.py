@@ -45,6 +45,16 @@ PACKET_PRIOR_CYCLES_CHARS = 60_000
 
 FINDING_CLASSES = ("blocking", "note", "need_evidence")
 AGGREGATES = ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED")
+
+AUTHOR_DISPOSITION_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "description": "Optional advisory author finish bound to the exact review fingerprint; it never manufactures reviewer PASS or releases a blocking gate.",
+    "properties": {
+        "disposition": {"type": "string", "enum": ["accepted", "rejected", "partial", "deferred"]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["disposition", "rationale"],
+}
 DISPOSITION_DECISIONS = ("accept", "reject", "defer")
 
 _SPEC_STRING_LISTS = ("in_scope", "non_goals", "invariants", "affected_resources", "evidence")
@@ -787,9 +797,9 @@ def closure_after_disposition(
     GREEN → closed. Notes are optional advice, so a note-only REVIEW_REQUIRED
     wave closes without dispositions. Need_evidence still requires a disposition
     (accept|reject|defer + rationale). REVISE_PLAN → NEVER closed by
-    disposition (blocking needs a changed spec → new cycle, or reject-with-
-    rationale → next paid delta cycle). DEGRADED → not closable by disposition
-    (rerun the wave). Advisory enforcement never flips ``closed``: the caller
+    disposition. A subsequent paid delta review may consider a changed spec or
+    justified rejection when another paid cycle is available. DEGRADED is not
+    closable by disposition. Advisory enforcement never flips ``closed``: the caller
     may proceed with the wave open under loud disclosure — this function only
     reports. Control-line invariants (``tools.plan_render
     ._parse_plan_review_control``): GREEN ⇒ closed, REVISE_PLAN ⇒ not closed.
@@ -839,18 +849,16 @@ def closure_after_disposition(
             notes.append("no_findings_recorded: REVIEW_REQUIRED without findings closes vacuously")
         if any(f.get("class") == "blocking" for f in items):
             notes.append(
-                "blocking_finding_below_quorum_stays_open: revise the spec or let the next "
-                "paid delta cycle judge the rejection"
+                "blocking_finding_below_quorum_stays_open: blocking findings remain open after disposition"
             )
     elif verdict == "REVISE_PLAN":
         closed = False
         notes.append(
-            "revise_plan_not_closable_by_disposition: blocking findings need a changed spec "
-            "(new cycle) or reject-with-rationale judged in the next paid delta cycle"
+            "revise_plan_not_closable_by_disposition: disposition does not close blocking findings"
         )
     elif verdict == "DEGRADED":
         closed = False
-        notes.append("degraded_not_closable_by_disposition: fewer parseable reviewer slots than quorum — rerun the wave")
+        notes.append("degraded_not_closable_by_disposition: fewer parseable reviewer slots than quorum; disposition does not close the wave")
     else:
         closed = False
         notes.append(f"unknown_aggregate:{verdict or '<empty>'}")

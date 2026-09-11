@@ -50,7 +50,9 @@ def main(argv: list[str]) -> int:
     try:
         items = json.loads(raw)
     except json.JSONDecodeError:
-        items = extract_json_array(raw)
+        items = extract_json_array(raw, validate_fn=lambda candidate: not normalize_scope_items(candidate)[1])
+        if items is None:
+            items = extract_json_array(raw)
         if items is None:
             print("invalid: no JSON array found in the receipt "
                   "(bare, fenced, or embedded)", file=sys.stderr)

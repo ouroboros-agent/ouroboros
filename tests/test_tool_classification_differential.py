@@ -251,6 +251,17 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     # same defect class the 329 OSWorld rows measured, on the composition seam.
     "compose:reported:route": Delta(False, "ok", True, "tool_reported_failure", "A.24", "a tool that reported its own failure is a failure, even behind an appended host note"),
     "compose:reported:route+safety": Delta(False, "ok", True, "tool_reported_failure", "A.24", "a tool that reported its own failure is a failure, even behind two appended host notes"),
+    # Owner's recovered transport WORK-ORDER B7 / #744: these producers now
+    # publish existing codes for known refusals. No text-adapter policy changed.
+    "native:LEGACY_BLOCKED:CHILD_RESULT_STALE": Delta(False, "ok", True, "blocked", "A.B7", "join_ledger refuses a disposition when the inspected child result changed"),
+    "native:LEGACY_BLOCKED:TASK_CANCEL_PENDING": Delta(False, "ok", True, "blocked", "A.B7", "forward_to_worker refuses a new steering write during cancellation"),
+    "native:LEGACY_BLOCKED:TASK_NOT_ACTIVE": Delta(False, "ok", True, "blocked", "A.B7", "forward_to_worker refuses delivery to a task that is not running"),
+    "native:LEGACY_UNAVAILABLE:CHILD_RESULT_STALE": Delta(False, "ok", True, "unavailable", "A.B7", "join_ledger has no current child result to bind, unlike a changed result's policy denial"),
+    "native:LEGACY_UNAVAILABLE:TASK_NOT_FOUND": Delta(False, "ok", True, "unavailable", "A.B7", "forward_to_worker has no registered target for this task id"),
+    "native:TOOL_ARG_ERROR:CHILD_RESULT_DISPOSITION_INVALID": Delta(False, "ok", True, "argument_error", "A.B7", "join_ledger rejects malformed disposition arguments before recording them"),
+    "native:TOOL_ARG_ERROR:ERROR": Delta(False, "ok", True, "argument_error", "A.B7", "both commit entry points reject an empty commit message before attempting a commit"),
+    "native:TOOL_ARG_ERROR:REJECTED": Delta(False, "ok", True, "argument_error", "A.B7", "scratchpad and identity writers reject empty or malformed content before writing"),
+    "native:TOOL_ERROR:TASK_MESSAGE_UNWRITTEN": Delta(False, "ok", True, "error", "A.B7", "forward_to_worker failed to persist the requested message"),
 })
 
 # Deltas the classifier WOULD produce for which no producer exists, recorded so a
@@ -314,6 +325,18 @@ def test_every_approved_delta_names_an_owner_item() -> None:
         assert delta.owner_item.startswith("A."), subject
         assert delta.reason.strip(), subject
         assert (delta.old_is_error, delta.old_status) != (delta.new_is_error, delta.new_status), subject
+
+
+def test_native_golden_answers_have_identical_retired_text_inputs() -> None:
+    """The old pair ignores native codes; aliases must retain its exact input."""
+    corpus = {case.key: case for case in build_corpus()}
+    golden = _golden()
+    for key, native in corpus.items():
+        if not key.startswith("native:"):
+            continue
+        plain = corpus[f"ident:{key.split(':', 2)[2]}:plain"]
+        assert (native.tool, native.text) == (plain.tool, plain.text)
+        assert golden[key] == golden[plain.key]
 
 
 def test_every_delta_without_a_producer_is_named_with_its_reason() -> None:

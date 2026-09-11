@@ -50,6 +50,19 @@ log = logging.getLogger(__name__)
 _SKILL_OWNER_STATE_FILENAMES = SKILL_OWNER_STATE_FILENAMES
 
 
+def _raw_owner_secret_access_allowed(ctx: ToolContext) -> bool:
+    """Cyber Pro owner mode may inspect explicitly selected home-file bytes."""
+    if is_restricted_subagent_profile(ctx):
+        return False
+    try:
+        from ouroboros.config import get_runtime_mode
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        return runtime_mode_at_least(get_runtime_mode(), "cyber_pro")
+    except Exception:
+        return False
+
+
 def _direct_resource_binding(
     ctx: ToolContext,
     supplied: Any,
@@ -501,9 +514,9 @@ def _profile_roots_hint(ctx: ToolContext, operation: str) -> str:
     model turns a dead-end error into a self-correcting retry instead of a
     probe loop over blocked roots (v6.70.0)."""
     try:
-        from ouroboros.tool_access import _POLICY
+        from ouroboros.tool_access import _POLICY, _effective_policy_profile
 
-        policy = _POLICY.get(active_tool_profile(ctx), {})
+        policy = _POLICY.get(_effective_policy_profile(active_tool_profile(ctx)), {})
         visible = sorted(root for root, ops in policy.items() if operation in ops)
         return f" Roots your profile can {operation}: {', '.join(visible) or '(none)'}."
     except Exception:
@@ -699,10 +712,13 @@ def _read_file(
         ))
     try:
         content = read_text(target)
+        raw_owner_secret_access = _raw_owner_secret_access_allowed(ctx)
         rendered = _render_line_slice(_root_display_path(normalized, path), content,
                                       max_lines=max_lines, start_line=start_line, start_char=start_char,
-                                      extent=extent, mask_secrets=is_restricted_subagent_profile(ctx))
-        if normalized == "user_files":
+                                      extent=extent, mask_secrets=(
+                                          is_restricted_subagent_profile(ctx) and not raw_owner_secret_access
+                                      ))
+        if normalized == "user_files" and not raw_owner_secret_access:
             # Egress seam for owner-home reads (#447 X1/В23): the file may be
             # read, but raw credential bytes never enter model context/history —
             # the masked form (***) may. Masking happens on the rendered slice;

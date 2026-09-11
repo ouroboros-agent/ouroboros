@@ -38,10 +38,14 @@ def _build_skill_review_history_section(
     if not history:
         return ""
     lines = ["\n## Previous skill review attempts (anti-thrashing context)\n"]
-    for idx, entry in enumerate(history[-3:], start=1):
+    for entry in history[-3:]:
         content_hash = str(entry.get("content_hash") or "")[:12]
         status = entry.get("status", "?")
-        lines.append(f"### Attempt {idx}: status={status}, content_hash={content_hash}")
+        ordinal = entry.get("review_round", "unknown")
+        snapshot = entry.get("snapshot_attempt", "unknown")
+        revised = entry.get("snapshot_revised", "unknown")
+        lines.append(f"### Review round {ordinal}, snapshot attempt {snapshot}: "
+                     f"status={status}, content_hash={content_hash}, snapshot_revised={revised}")
         fail_findings = entry.get("fail_findings") or []
         if fail_findings:
             lines.append("FAIL findings (concrete reasons):")

@@ -189,10 +189,8 @@ def _lock_identity(target: "int | pathlib.Path") -> tuple:
     return (info.st_ino, info.st_dev, info.st_mtime_ns)
 
 
-# What a kernel refusal MEANS. Held by someone (flock's EWOULDBLOCK): stand down and re-contend.
-# No kernel locks on this filesystem (EOPNOTSUPP/ENOSYS; LockFileEx winerrors mapped below) or no
-# lock service (ENOLCK: lockd-less NFS, exhausted lock table): the name tier, errno RECORDED so a
-# caller may refuse it (the monetary lock does). Anything else fails closed.
+# Contention retries; unsupported locks/ENOLCK select the recorded name tier.
+# Other errors fail closed (ARCHITECTURE §1 "Platform substrate").
 _LOCK_HELD_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK})
 _LOCK_UNSUPPORTED_ERRNOS = frozenset({errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS})
 _WIN32_LOCK_ERRNOS = {33: errno.EAGAIN, 1: errno.ENOSYS, 50: errno.EOPNOTSUPP}  # violation = held; invalid function / not supported = no byte-range locks here
@@ -201,18 +199,10 @@ _KERNEL_LOCK_TIER_LOCK = threading.Lock()  # one probe per directory, one verdic
 
 
 def kernel_file_locks_enforced(lock_path: pathlib.Path) -> bool:
-    """Capability predicate: are locks in ``lock_path``'s directory kernel-enforced (flock /
-    LockFileEx held on the fd) or name-only?  Decided ONCE per directory under one module
-    lock (racing threads share one probe and verdict) by locking a scratch file there — never
-    by a refusal on a live acquisition.  The kernel's "this filesystem cannot" and ENOLCK ("no
-    lock service") select the name tier, the errno recorded beside the verdict so a caller may
-    refuse that tier; an unprobeable directory answers enforced for that call and is probed
-    again next time (not cached); every other answer is the enforced tier, where a refused live
-    lock fails closed.  Name-tier locks run the O_EXCL name protocol alone (re-check-then-unlink
-    eviction, no kernel exclusion): disclosed best effort — the monetary compaction pass refuses to run there, appends continue.
-    Windows answers this probe like POSIX since 7.0: the LockFileEx range sits beyond the owner
-    stamp (:data:`_WIN32_LOCK_OFFSET`), so a mandatory hold no longer refuses a contender the read
-    that lets it judge the hold — the defect that made this predicate answer False there."""
+    """Probe and cache kernel-lock capability per directory, never on a live refusal.
+
+    Unprobeable directories stay enforced and retry later; unsupported/ENOLCK
+    select the recorded name-only tier. See ARCHITECTURE §1 "Platform substrate"."""
     directory = os.path.realpath(str(pathlib.Path(lock_path).parent))
     with _KERNEL_LOCK_TIER_LOCK:
         tier, refused = _KERNEL_LOCK_TIER.get(directory, (None, None))
@@ -251,31 +241,11 @@ def acquire_exclusive_file_lock(
     owner_aware_stale: bool = False,
     refuse_name_tier_errnos: frozenset = frozenset(),
 ) -> Optional[int]:
-    """Acquire a portable lockfile.  On the enforced tier
-    (:func:`kernel_file_locks_enforced`) the returned descriptor HOLDS a
-    kernel lock (flock / LockFileEx): exclusion rests on the fd, not on the
-    O_EXCL name alone, and a kernel refusal that is not contention fails
-    CLOSED — no descriptor, our own file removed.  The name tier is selected
-    by that predicate, never by a refusal (``refuse_name_tier_errnos``: probe answers,
-    ENOLCK, on which THIS caller fails closed there instead).  On either tier a won lock is
-    returned only while the path PROVABLY still names it: an evicted creator
-    re-contends, and a descriptor whose own identity cannot be read is not a
-    hold either — that fails closed too, taking our stamp off the path with it.
+    """Acquire a descriptor-owned lock whose path still names the held inode.
 
-    Authority streams opt into ``owner_aware_stale`` so elapsed time alone
-    never steals a lock from a live writer; a dead/malformed legacy owner
-    still recovers through the stale-age path.  POSIX evicts a stale lock
-    only UNDER a held flock on the very fd it judged, re-checking that the
-    path still names that inode: of two racing reclaimers at most one can
-    evict.  Windows takes the SAME kernel hold on the judged fd before it may
-    evict, but cannot unlink an open file, so it unlinks after closing its
-    probe — the hold it just released is what proves nobody else holds the
-    file, and the identity re-check plus Windows' own refusal to delete a file
-    the new owner holds open is what keeps the shape exclusive across that gap
-    (it does not give the POSIX "at most one may evict" by the kernel alone:
-    two reclaimers may both re-check, and the loser's unlink is refused by the
-    winner's open handle rather than by the lock).  The name tier re-checks
-    then unlinks with no hold at all: best effort, disclosed."""
+    Kernel errors fail closed except contention; owner-aware stale recovery
+    cannot evict a live writer. Name-tier refusal is caller policy. Platform
+    eviction/release ordering and limitations: ARCHITECTURE §1 "Platform substrate"."""
     lock_path = pathlib.Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     enforced = kernel_file_locks_enforced(lock_path)
@@ -300,13 +270,7 @@ def acquire_exclusive_file_lock(
                     log.warning("Kernel lock refused at %s (errno %s): no lock taken", lock_path, exc.errno)
                     return None
             else:
-                # A creator stalled between its create and its lock (SIGSTOP, suspend,
-                # clock skew) is judged abandoned — aged, with no hold yet to refuse the
-                # evictor — and evicted: its lock lands on an unlinked inode. Not a hold.
-                # An identity we cannot READ (ESTALE/EIO) is no proof either — two empty
-                # answers would compare equal — so it fails closed, and the file we
-                # stamped with our LIVE pid goes with it: left behind, no owner-aware
-                # reclaimer could ever remove it. Only bytes still exactly ours are ours.
+                # Only a readable fd/path identity proves the creator still owns this name.
                 won = _lock_identity(fd)[:2]
                 if won and won == _lock_identity(lock_path)[:2]:
                     return fd
@@ -335,10 +299,7 @@ def acquire_exclusive_file_lock(
                     stale = bool(judged) and (time.time() - judged[2] / 1e9) > stale_sec and not (
                         owner_aware_stale and owner_pid > 0 and pid_is_alive(owner_pid)
                     )
-                    # Evict ONLY the exact file just judged abandoned, and only
-                    # while flock-holding it: between judgement and unlink the
-                    # owner may release and a third writer re-create the lock —
-                    # removing THAT file puts two writers on one authority.
+                    # Judge and evict the same inode under a kernel hold.
                     if stale and enforced:
                         try:
                             file_lock_exclusive_nb(probe)
@@ -370,14 +331,9 @@ def acquire_exclusive_file_lock(
 
 
 def refresh_exclusive_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int]) -> bool:
-    """Renew a HELD lock's staleness clock; report whether it is still OURS.
+    """Refresh only our held inode; False requires abandoning protected work.
 
-    A critical section that legitimately outlives ``stale_sec`` (a monetary
-    compaction pass) keeps the lockfile young for acquirers that judge by age
-    alone.  The return value is an OWNERSHIP verdict, not a courtesy: ``False``
-    means the path no longer names the descriptor we hold (evicted, deleted,
-    replaced — however atomically), so the caller must abandon its work rather
-    than finish beside a second writer.  A stolen lock is never refreshed."""
+    Extends the stale-age clock without renewing a stolen/replaced lock."""
     if lock_fd is None:
         return False
     held = _lock_identity(lock_fd)
@@ -392,15 +348,10 @@ def refresh_exclusive_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int])
 
 
 def _unlink_lock_path(lock_path: pathlib.Path, held: Optional[tuple]) -> None:
-    """Unlink a lock file while the path still names ``held`` (``None``: unconditionally).
-    Windows refuses to delete a file any other handle has open (CPython opens without
-    FILE_SHARE_DELETE), and the name protocol's contenders open the lock on every poll to
-    read its identity and owner stamp — a refusal at the owner's release is therefore
-    routine and TRANSIENT (each such handle lives microseconds), so it is retried for a
-    bounded window rather than swallowed: a swallowed refusal orphaned the lock with the
-    owner's LIVE pid stamped in it, which no owner-aware acquirer would ever evict (the
-    Windows matrices after the C6 merge, last 33663258606 on 35b82db0: monetary writers
-    refused until restart, chat appends falling to the unlocked lane).  POSIX never refuses for a reader, so it does not retry."""
+    """Unlink only the held identity (None means unconditional path-only cleanup).
+
+    Retry transient Windows sharing refusal within the bounded release window;
+    leave a replaced path alone. See ARCHITECTURE §1 "Platform substrate"."""
     deadline = time.monotonic() + 2.0
     while True:
         try:
@@ -420,16 +371,10 @@ def _unlink_lock_path(lock_path: pathlib.Path, held: Optional[tuple]) -> None:
 
 
 def release_exclusive_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int]) -> None:
-    """Release a lock acquired by :func:`acquire_exclusive_file_lock`: unlink
-    OUR lock file or nothing at all (a hold evicted as stale and re-taken must
-    not delete the new owner's lock on its way out).  POSIX unlinks BEFORE the
-    close — under the still-held kernel lock on the enforced tier, so no
-    reclaimer can be evicting the same file between re-check and unlink.
-    Windows cannot unlink an open file: it releases the kernel hold FIRST (a
-    handle closed with an outstanding lock leaves the release undefined), then
-    closes, then re-checks the path — protected by the new owner's open
-    handle — retrying a contender's transient sharing refusal
-    (:func:`_unlink_lock_path`)."""
+    """Release only this descriptor's lock path, never a successor's.
+
+    POSIX unlinks under the hold; Windows unlocks/closes before identity-checked
+    unlink. See ARCHITECTURE §1 "Platform substrate" for the sharing gap."""
     lock_path = pathlib.Path(lock_path)
     if lock_fd is None:
         return
@@ -587,11 +532,9 @@ def file_unlock(fd: int) -> None:
 
 
 def pid_is_alive(pid: int) -> bool:
-    """Return whether a PID appears alive without exposing os.kill to callers.
+    """Observe process presence; access denial remains alive, not signal authority.
 
-    Only a positive "no such process" is dead: EPERM means the process EXISTS
-    and merely refuses our signal (another uid's pid on a shared host, a pid
-    recycled onto one) — alive, like Windows' access-denied answer below."""
+    Windows uses OpenProcess/GetExitCodeProcess, never a signal-zero probe."""
 
     if pid <= 0:
         return False
@@ -632,10 +575,9 @@ def pid_is_alive(pid: int) -> bool:
 
 
 def pid_is_signalable(pid: int) -> bool:
-    """The KILL-decision question, distinct from :func:`pid_is_alive`: can THIS
-    process signal ``pid``?  POSIX answers with signal 0 — EPERM (another
-    user's process, pid 1) is "not ours", unlike the liveness reading where it is
-    "alive"; Windows has no signal probe, so liveness stands in for it."""
+    """Whether this caller can signal a PID: POSIX signal-zero, Windows presence.
+
+    This is distinct from identity/ownership and from an access-denied live PID."""
     if pid <= 0:
         return False
     if IS_WINDOWS:
@@ -648,23 +590,14 @@ def pid_is_signalable(pid: int) -> bool:
 
 
 def pid_provably_gone(pid: int) -> bool:
-    """True only when the OS positively answers that ``pid`` does not exist: the
-    negation of :func:`pid_is_alive`, which reads EPERM — the process EXISTS and
-    merely refuses our signal — and anything else undeterminable as still present;
-    a killed-process check gets that fail-safe answer under the name that says what it proves."""
+    """Positive absence from the platform presence reader; denial is not death."""
     return not pid_is_alive(pid)
 
 
 # Windows locking via LockFileEx: unlike msvcrt.locking(), works on empty files.
 
-# WHERE the lock is taken, and why it is not the whole file.  A Win32 byte-range lock is
-# MANDATORY: bytes inside it cannot even be READ by another handle.  The whole-file range this
-# used to take (offset 0, length 0xFFFFFFFFFFFFFFFF) therefore refused every contender the read
-# of the owner stamp the lock protocol needs to judge a hold, and every wait ran to its timeout
-# (the C6 Windows matrix, run 33654743857: eight monetary writers answered "lock unavailable").
-# So the hold is ONE byte at an offset no lock file can reach — the common Win32 idiom — leaving
-# the stamp bytes [0, 512) readable by anyone.  A lock file this long is not writable by this
-# protocol (its stamp is one short line), and a lock BEYOND end-of-file is legal on Windows.
+# Keep mandatory LockFileEx bytes beyond the readable owner stamp.
+# Range/release rationale: ARCHITECTURE §1 "Platform substrate".
 _WIN32_LOCK_OFFSET = 0x7FFFFFFF00000000
 _WIN32_LOCK_LENGTH = 1
 
@@ -695,9 +628,7 @@ def _win32_overlapped_class():
 
 
 def _win32_lock(fd: int, *, exclusive: bool = True, blocking: bool = True) -> None:
-    """Lock a file descriptor using Win32 LockFileEx, on the one byte at
-    :data:`_WIN32_LOCK_OFFSET` — never the whole file, whose stamp bytes a
-    mandatory lock would make unreadable to the contenders that must judge it."""
+    """Lock the fixed out-of-stamp byte range with LockFileEx (including empty files)."""
     import ctypes
     from ctypes import wintypes
     import msvcrt as _msvcrt
@@ -722,14 +653,9 @@ def _win32_lock(fd: int, *, exclusive: bool = True, blocking: bool = True) -> No
 
 
 def _win32_lock_error(err: int) -> OSError:
-    """The OSError a refused LockFileEx raises. ERROR_LOCK_VIOLATION means HELD BY SOMEONE
-    (busy: re-contend); ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED are what a redirector
-    answers when the volume takes no byte-range locks AT ALL, and read as the unsupported
-    errnos — without them the name tier is unreachable on Windows and a lock-less volume
-    fails every monetary append closed instead of degrading to it. Anything else keeps its
-    winerror-derived errno (access denied, sharing violation -> EACCES) and fails closed.
-    The 4-argument form derives errno FROM the winerror on Windows and ignores the one
-    passed, so a classified code carries its own errno instead."""
+    """Map contention/unsupported Win32 codes explicitly; preserve all other errors.
+
+    Four-argument OSError derives errno from winerror, hence the explicit mapping."""
     code = _WIN32_LOCK_ERRNOS.get(err)
     if code is None:
         return OSError(0, f"LockFileEx failed (error {err})", None, err)
@@ -739,13 +665,9 @@ def _win32_lock_error(err: int) -> OSError:
 
 
 def _win32_unlock(fd: int) -> None:
-    """Release the fixed range _win32_lock takes on this descriptor, if any.
+    """Release the fixed range best-effort before closing the handle.
 
-    The range is a constant, so the OVERLAPPED is rebuilt rather than remembered
-    per fd: no map to leak, and none to answer for a descriptor number the
-    process has since recycled onto another file.  An fd holding nothing is
-    ERROR_NOT_LOCKED, which this ignores like every other refusal — a release
-    is best effort by construction, and the handle's close is the backstop."""
+    Rebuild OVERLAPPED; no recycled-fd map. ERROR_NOT_LOCKED needs no recovery."""
     import ctypes
     from ctypes import wintypes
     import msvcrt as _msvcrt
@@ -765,32 +687,25 @@ def _win32_unlock(fd: int) -> None:
 
 # Process management.
 
-def kill_process_tree(proc: subprocess.Popen) -> None:
-    """Force-kill a subprocess and its entire process tree.
+def kill_process_tree(proc: subprocess.Popen, *, exclude_pids: "set[int] | None" = None) -> None:
+    """Capture descendants before termination and spare retained branches.
 
-    POSIX SIGKILLs the process group first, then sweeps by PID descendants
-    that escaped into their own session/group — collected BEFORE the kill,
-    because a dead parent's children are reparented and the ppid links vanish.
-    """
+    POSIX kills the group only when it contains no spared PID, then escaped
+    descendants. Windows uses selective PID termination when exclusions exist."""
     pid = proc.pid
-    if IS_WINDOWS:
+    if IS_WINDOWS and not exclude_pids:
         try:
             _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
                         capture_output=True, timeout=10)
         except Exception:
             pass
         return
-    descendants: list[int] = []
-    try:
-        _collect_descendants(pid, descendants)
-    except Exception:
-        descendants = []
-    try:
-        pgid = os.getpgid(pid)
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    for dpid in [*reversed(descendants), pid]:
+    targets, spared = _tree_kill_targets(pid, exclude_pids)
+    if not IS_WINDOWS:
+        pgid = process_group_id(pid)
+        if pgid > 0 and not any(process_group_id(p) == pgid for p in spared):
+            kill_process_group_id(pgid)
+    for dpid in targets:
         force_kill_pid(dpid)
 
 
@@ -806,9 +721,11 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-def terminate_process_group_id(pgid: int) -> None:
+def terminate_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
     """Gracefully terminate a Unix process group by id."""
     if IS_WINDOWS:
+        return
+    if _group_has_spared_process(pgid, exclude_pids):
         return
     try:
         os.killpg(int(pgid), signal.SIGTERM)
@@ -816,9 +733,11 @@ def terminate_process_group_id(pgid: int) -> None:
         pass
 
 
-def kill_process_group_id(pgid: int) -> None:
+def kill_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
     """Force-kill a Unix process group by id."""
     if IS_WINDOWS:
+        return
+    if _group_has_spared_process(pgid, exclude_pids):
         return
     try:
         os.killpg(int(pgid), signal.SIGKILL)
@@ -861,25 +780,26 @@ def current_process_group_id() -> int:
         return 0
 
 
+def _group_has_spared_process(pgid: int, roots: "set[int] | None") -> bool:
+    for pid in roots or ():
+        if any(process_group_id(p) == pgid for p in [pid, *collect_descendant_pids(pid)]):
+            return True
+    return False
+
+
 _BOOT_ID = ""  # full hex of the /proc boot id; empty until a successful read, then latched
 
 
 def process_start_time(pid: int) -> str:
-    """Best-effort stable start-time token for (pid, start_time) fingerprints.
+    """Stable birth token: Linux boot-qualified ticks, legacy fallback, or Windows FILETIME.
 
-    A bare pid is not an identity (kernels reuse pids) and boot-relative ticks RECUR across
-    reboots, so a bare tick + a recycled pid + the same command line is a real collision;
-    refusing that kill is the job. Linux mints IN THIS ORDER: ``"<ticks>.<boot_hex>"`` when the
-    boot id is readable (no subprocess); else the ``ps`` wall-clock token, which does not recur
-    across boots in practice; and only once ``ps`` has ALSO failed, ``"<ticks>."`` as a
-    disclosed last resort — two of THOSE from different boots do string-match, hence last, not
-    first. No ``/proc``: legacy throughout; Windows and a dead pid return "". Disclosed: the
-    FORM changes if the boot id starts or stops being readable mid-generation, so a row
-    recorded across it can mismatch its own live process — safe: it prunes, never kills, and
-    the cheap reap path skips live rows."""
+    Mint order, cross-boot limits and downgrade-compatible ledger fields:
+    ARCHITECTURE §1 "Platform substrate"."""
     global _BOOT_ID
-    if pid <= 0 or os.name == "nt":
+    if pid <= 0:
         return ""
+    if IS_WINDOWS:
+        return _windows_process_start_time(pid)
     if not (ticks := _proc_start_ticks(pid)):
         return process_start_time_legacy(pid)  # no /proc here (macOS, BSD): ps is the only source
     if not _BOOT_ID:  # a failed read is transient: retry next call, never downgrade the generation
@@ -894,12 +814,13 @@ def process_start_time(pid: int) -> str:
 
 
 def process_start_time_legacy(pid: int) -> str:
-    """The historical ``ps -o lstart=`` token (bare ``/proc`` ticks when ``ps`` fails). Two jobs:
-    the DOWNGRADE-SAFE spelling the custody ledger keeps writing into ``fingerprint.start_time``
-    (an N−1 reader understands it), and the compatibility comparison a boot-qualified current
-    token falls back to (see ``process_custody._legacy_start_matches``)."""
-    if pid <= 0 or os.name == "nt":
+    """Legacy ps wall-clock token (bare ticks as last resort); Windows FILETIME.
+
+    Used for downgrade-safe ledger writes and _legacy_start_matches comparison."""
+    if pid <= 0:
         return ""
+    if IS_WINDOWS:
+        return _windows_process_start_time(pid)
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
                              capture_output=True, text=True, timeout=5)
@@ -923,9 +844,14 @@ def _proc_start_ticks(pid: int) -> int:
 
 
 def process_command(pid: int) -> str:
-    """Return a best-effort command line for a Unix process."""
+    """Return the live command line, canonically quoting native Windows argv."""
     if IS_WINDOWS:
-        return ""
+        try:
+            import psutil
+
+            return subprocess.list2cmdline(psutil.Process(int(pid)).cmdline())
+        except Exception:
+            return ""
     try:
         # -ww: unlimited width. BSD ps truncates to the terminal/128 cols
         # otherwise, and consumers match exact argv tokens — a packaged
@@ -953,18 +879,10 @@ def force_kill_pid(pid: int) -> None:
 
 
 def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
-    """Force-kill a PID tree recursively.
+    """Kill a captured PID tree, sparing excluded roots and their descendants.
 
-    ``exclude_pids`` are spared along with their own descendants, keeping
-    ``service_teardown=keep`` services reachable for a verifier when a worker is
-    force-killed; spared children reparent to init and fall to the custody reaper.
-    """
-    exclude = {int(p) for p in (exclude_pids or set())}
-    if IS_WINDOWS:
-        # exclude_pids is a POSIX-only nicety: descendant enumeration relies on
-        # `pgrep -P`, which Windows lacks, so honouring exclusions here would
-        # enumerate nothing and LEAK the worker's whole tree (only the root would
-        # die). taskkill /T always tree-kills; sparing is unsupported on Windows.
+    The caller owns daemon/service retention policy; this helper only signals."""
+    if IS_WINDOWS and not exclude_pids:
         try:
             _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
                         capture_output=True, timeout=10)
@@ -972,17 +890,53 @@ def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
             pass
         return
 
-    descendants: list[int] = []
-    _collect_descendants(pid, descendants)
+    targets, _ = _tree_kill_targets(pid, exclude_pids)
+    for dpid in targets:
+        force_kill_pid(dpid)
+
+
+def _tree_kill_targets(pid: int, exclude_pids: "set[int] | None") -> tuple[list[int], set[int]]:
+    """Capture before signalling; a spared root keeps its entire branch alive."""
+    exclude = {int(p) for p in (exclude_pids or ())}
+    if IS_WINDOWS:
+        children = _windows_process_children()
+        descendants = _snapshot_descendants(pid, children)
+        spared = exclude | {p for root in exclude for p in _snapshot_descendants(root, children)}
+        return [p for p in [*descendants, pid] if p not in spared], spared
+    descendants = collect_descendant_pids(pid)
     spared: set[int] = set()
     for ep in exclude:
         spared.add(ep)
-        sub: list[int] = []
-        _collect_descendants(ep, sub)
-        spared.update(sub)
-    for dpid in [*reversed(descendants), pid]:
-        if dpid not in spared:
-            force_kill_pid(dpid)
+        spared.update(collect_descendant_pids(ep))
+    return [p for p in [*descendants, pid] if p not in spared], spared
+
+
+def _windows_process_children() -> dict[int, list[int]]:
+    """One PID/PPID observation for both the target and retained subtrees."""
+    import psutil
+
+    children: dict[int, list[int]] = {}
+    for process in psutil.process_iter(["pid", "ppid"]):
+        parent = process.info.get("ppid")
+        if parent is not None:
+            children.setdefault(int(parent), []).append(process.pid)
+    return children
+
+
+def _snapshot_descendants(pid: int, children: dict[int, list[int]]) -> list[int]:
+    """Children before parents, excluding the root itself."""
+    result: list[int] = []
+    seen = {pid}
+
+    def visit(parent: int) -> None:
+        for child in children.get(parent, ()):
+            if child not in seen:
+                seen.add(child)
+                visit(child)
+                result.append(child)
+
+    visit(pid)
+    return result
 
 
 def _collect_descendants(pid: int, result: list[int]) -> None:
@@ -1000,10 +954,13 @@ def _collect_descendants(pid: int, result: list[int]) -> None:
         pass
 
 
-def collect_descendant_pids(pid: int) -> List[int]:
-    """Public: all descendant PIDs of ``pid`` (depth-first, children last).
-
-    Keeps tree discovery in the platform layer, off the private recursive helper."""
+def collect_descendant_pids(pid: int, *, exclude_pids: "set[int] | None" = None) -> List[int]:
+    """Descendant PIDs in postorder, excluding retained branches when requested."""
+    if exclude_pids:
+        targets, _ = _tree_kill_targets(int(pid), exclude_pids)
+        return [target for target in targets if target != int(pid)]
+    if IS_WINDOWS:
+        return _snapshot_descendants(int(pid), _windows_process_children())
     result: List[int] = []
     try:
         _collect_descendants(int(pid), result)
@@ -1041,22 +998,9 @@ def kill_processes_referencing(marker: str) -> None:
 
 
 def tcp_keepalive_socket_options() -> List[tuple]:
-    """Cross-platform TCP keepalive options for long-lived remote sockets.
+    """Platform-guarded TCP keepalive options from config; unknown options are omitted.
 
-    A NAT/VPN gateway that silently drops an idle connection's mapping leaves
-    the local socket half-open: without keepalive probes the process only
-    learns at the (deliberately long) transport read timeout. Kernel probes
-    detect the dead peer within minutes instead.
-
-    Every platform gets ``SO_KEEPALIVE``; the probe-tuning constants — idle
-    threshold, probe interval, probe count — are set only where the platform
-    exposes them (Linux spells the idle threshold ``TCP_KEEPIDLE``, Darwin
-    spells it ``TCP_KEEPALIVE``; both take ``TCP_KEEPINTVL``/``TCP_KEEPCNT``,
-    which CPython exports on Darwin too, against XNU's 75 s × 8 defaults),
-    each behind its own ``hasattr`` guard so the tuning degrades per option on
-    an older interpreter. Every other platform (Windows included) keeps
-    ``SO_KEEPALIVE`` alone.
-    """
+    Dead-socket rationale and per-platform fallback: ARCHITECTURE §6 transport."""
     import socket
 
     from ouroboros.config import (
@@ -1131,13 +1075,9 @@ def interpreter_is_embedded(interpreter: str) -> bool:
 
 
 def pip_install_target_args(interpreter: str) -> List[str]:
-    """Extra pip flags so an install never writes INSIDE the packaged bundle.
+    """Use the embedded interpreter's userbase; never add --user for a dev venv.
 
-    The embedded interpreter's own ``site-packages`` would break the code
-    signature (and a read-only install outright): ``--user`` redirects to the
-    ``PYTHONUSERBASE`` user site set by ``launcher_bootstrap``.  A dev venv or
-    system python gets NO flag — ``--user`` is refused inside a virtualenv.
-    """
+    Bundle-signature and target policy: ARCHITECTURE §1 CLI / Headless Boundary."""
     return ["--user"] if interpreter_is_embedded(interpreter) else []
 
 
@@ -1195,15 +1135,9 @@ BUNDLE_DIR_ENV = "OUROBOROS_BUNDLE_DIR"
 
 
 def bundled_resource_ancestor_bases(executable: "str | pathlib.Path | None" = None) -> List[pathlib.Path]:
-    """Bundle roots recoverable from an embedded interpreter path.
+    """Recover bundle roots from embedded-interpreter ancestors for older launchers.
 
-    Managed updates replace the server checkout but not the frozen launcher.
-    Launchers predating ``OUROBOROS_BUNDLE_DIR`` still start the updated server
-    with ``.../Resources/python-standalone/...`` (macOS) or
-    ``.../_internal/python-standalone/...`` (portable builds).  The interpreter
-    path therefore remains a durable, cross-platform pointer to the old app's
-    resource root.
-    """
+    Search Resources/_internal too; managed checkout is not the packaged root."""
     try:
         start = pathlib.Path(executable or sys.executable).resolve()
     except (OSError, ValueError):
@@ -1224,17 +1158,9 @@ def bundled_resource_ancestor_bases(executable: "str | pathlib.Path | None" = No
 
 
 def bundled_resource_bases() -> List[pathlib.Path]:
-    """Roots to search for a resource shipped INSIDE the packaged bundle.
+    """Resource lookup SSOT: explicit bundle root, frozen root, ancestors, source.
 
-    SSOT for every bundled-payload lookup, because the consumer is usually NOT
-    the frozen launcher: a packaged install runs the server/CLI as a SEPARATE
-    child of the embedded interpreter out of the launcher-managed repo under
-    the data dir — no ``sys._MEIPASS``, a ``__file__`` parent that is the
-    managed repo — so both historical bases miss and every bundled payload
-    silently reads as absent. The launcher therefore hands the bundle root
-    down by value in ``OUROBOROS_BUNDLE_DIR``, searched FIRST; the other bases
-    serve the frozen process itself and the dev/source layout (payloads sit at
-    the repo root, two levels up from this module)."""
+    Managed child and old-launcher rationale: ARCHITECTURE §1 CLI / Headless Boundary."""
     bases: List[pathlib.Path] = []
     env_base = str(os.environ.get(BUNDLE_DIR_ENV) or "").strip()
     if env_base:
@@ -1271,13 +1197,7 @@ def _resolve_bundled_payload(candidates_for: Callable[[pathlib.Path], List[pathl
 
 
 def resolve_bundled_node() -> Optional[str]:
-    """Return the path to the bundled, signed Node.js runtime if present.
-
-    The packaged app ships an official notarized node under ``node-standalone``
-    (re-signed under the hardened runtime by the build's signing pass). Prefer it
-    over a PATH (e.g. Homebrew) node, which macOS code-signing enforcement can
-    SIGKILL when launched from the packaged process tree.
-    """
+    """Locate the bundled signed Node; callers own health and PATH preference (§1)."""
     return _resolve_bundled_payload(embedded_node_candidates)
 
 
@@ -1343,19 +1263,22 @@ def create_new_session() -> None:
         os.setsid()
 
 
-def subprocess_new_group_kwargs() -> dict:
+def subprocess_new_group_kwargs(*, breakaway_from_job: bool = False, suspended: bool = False) -> dict:
     """Return subprocess kwargs for killable process-group/session isolation."""
     if IS_WINDOWS:
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+        if breakaway_from_job:
+            flags |= _windows_breakaway_flags()
+        if suspended:
+            flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
+        return {"creationflags": flags}
     return {"start_new_session": True}
 
 
 def install_shutdown_signal_handlers(handler) -> None:
-    """Register ``handler`` for the signals that ask a console process to shut
-    down: SIGINT everywhere, SIGTERM on POSIX. The platform-specific signal
-    surface lives HERE, never in callers (checklist 15). The handler must only
-    set a flag/event — real teardown belongs on the caller's main thread, not
-    inside a signal frame."""
+    """Install SIGINT and POSIX SIGTERM handlers that only set a flag/event.
+
+    The caller's main thread owns teardown, never the signal frame."""
     signal.signal(signal.SIGINT, handler)
     if not IS_WINDOWS:
         signal.signal(signal.SIGTERM, handler)
@@ -1396,14 +1319,9 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-    # `use_last_error=True` so `ctypes.get_last_error()` reads the code the CALL set: without it
-    # ctypes does not snapshot the thread's last error, and the failure text below would quote
-    # whatever ctypes' own bookkeeping left behind. Same pattern as the file-lock helpers above.
+    # Snapshot the actual call error; declare full-width HANDLE ABI (ARCHITECTURE §1).
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
-    # Explicit ABI declarations: without restype=HANDLE, ctypes truncates 64-bit
-    # HANDLEs to c_int — a job/process handle above 2^31 comes back corrupted and
-    # every later Job Object call silently operates on garbage.
     _kernel32.CreateJobObjectW.restype = ctypes.wintypes.HANDLE
     _kernel32.CreateJobObjectW.argtypes = (ctypes.wintypes.LPVOID, ctypes.wintypes.LPCWSTR)
     _kernel32.SetInformationJobObject.restype = ctypes.wintypes.BOOL
@@ -1412,6 +1330,21 @@ if IS_WINDOWS:
     )
     _kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
     _kernel32.OpenProcess.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+    _kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
+    _kernel32.GetProcessTimes.argtypes = (
+        ctypes.wintypes.HANDLE, *(ctypes.POINTER(ctypes.wintypes.FILETIME),) * 4,
+    )
+    _kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
+    _kernel32.GetCurrentProcess.argtypes = ()
+    _kernel32.IsProcessInJob.restype = ctypes.wintypes.BOOL
+    _kernel32.IsProcessInJob.argtypes = (
+        ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.BOOL),
+    )
+    _kernel32.QueryInformationJobObject.restype = ctypes.wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = (
+        ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID,
+        ctypes.wintypes.DWORD, ctypes.POINTER(ctypes.wintypes.DWORD),
+    )
     _kernel32.AssignProcessToJobObject.restype = ctypes.wintypes.BOOL
     _kernel32.AssignProcessToJobObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE)
     _kernel32.TerminateJobObject.restype = ctypes.wintypes.BOOL
@@ -1423,6 +1356,8 @@ if IS_WINDOWS:
     # ints (or None for NULL), and an int never equals a ctypes instance.
     _INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1).value
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x800
+    _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
     _JOBOBJECTINFOCLASS_EXTENDED = 9
     _PROCESS_SET_QUOTA = 0x0100
     _PROCESS_TERMINATE = 0x0001
@@ -1463,7 +1398,44 @@ if IS_WINDOWS:
         ]
 
 
-def create_kill_on_close_job() -> Optional[Any]:
+def _windows_process_start_time(pid: int) -> str:
+    handle = _kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        created, exited, kernel, user = (ctypes.wintypes.FILETIME() for _ in range(4))
+        if not _kernel32.GetProcessTimes(
+            handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user),
+        ):
+            return ""
+        return f"win-filetime:{(created.dwHighDateTime << 32) | created.dwLowDateTime}"
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def _windows_breakaway_flags() -> int:
+    """Request breakaway from a permitting immediate Job; retain old-launcher spawn.
+
+    This reads Job capability, never psutil/stop readiness (ARCHITECTURE §1/§9)."""
+    in_job = ctypes.wintypes.BOOL()
+    if _kernel32.IsProcessInJob(_kernel32.GetCurrentProcess(), None, ctypes.byref(in_job)):
+        if not in_job.value:
+            return 0
+        info = _ExtendedLimitInfo()
+        if _kernel32.QueryInformationJobObject(
+            None, _JOBOBJECTINFOCLASS_EXTENDED, ctypes.byref(info), ctypes.sizeof(info), None,
+        ):
+            flags = info.BasicLimitInformation.LimitFlags
+            if flags & _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK:
+                return 0
+            if flags & _JOB_OBJECT_LIMIT_BREAKAWAY_OK:
+                return getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    log.warning("The current Windows Job does not confirm breakaway; shared daemon survival "
+                "after launcher close requires an updated launcher or a permitting Job")
+    return 0
+
+
+def create_kill_on_close_job(*, allow_breakaway: bool = False) -> Optional[Any]:
     """Create a Windows kill-on-close Job Object, or None."""
     if not IS_WINDOWS:
         return None
@@ -1474,6 +1446,8 @@ def create_kill_on_close_job() -> Optional[Any]:
             return None
         info = _ExtendedLimitInfo()
         info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if allow_breakaway:
+            info.BasicLimitInformation.LimitFlags |= _JOB_OBJECT_LIMIT_BREAKAWAY_OK
         ok = _kernel32.SetInformationJobObject(
             handle, _JOBOBJECTINFOCLASS_EXTENDED, ctypes.byref(info), ctypes.sizeof(info),
         )
@@ -1510,10 +1484,7 @@ def assign_pid_to_job(job_handle: Any, pid: int) -> bool:
 
 
 def terminate_job(job_handle: Any, exit_code: int = 1) -> str:
-    """Terminate all processes in a Job Object; "" on success, else the reason it is unproven.
-
-    A FALSE Win32 BOOL is a failure exactly like a raised call, and swallowing either let
-    ``ProcessContainer.reap`` report a clean teardown while job members were still running."""
+    """Terminate Job members; a false Win32 BOOL or exception is an unconfirmed stop."""
     if not IS_WINDOWS or job_handle is None:
         return ""
     try:
@@ -1526,10 +1497,7 @@ def terminate_job(job_handle: Any, exit_code: int = 1) -> str:
 
 
 def close_job(job_handle: Any) -> str:
-    """Close a Job Object handle (triggers kill-on-close if set); "" on success, else the reason.
-
-    The handle is the last thing holding kill-on-close, so a close that did not happen leaves
-    survivors AND leaks the handle; the caller reports it rather than discarding it."""
+    """Close the Job handle; return a reason when kill-on-close remains unconfirmed."""
     if not IS_WINDOWS or job_handle is None:
         return ""
     try:
@@ -1547,8 +1515,7 @@ def resume_process(pid: int) -> bool:
         return False
     try:
         _ntdll = ctypes.windll.ntdll  # type: ignore[attr-defined]
-        # Same 64-bit ABI rule as the kernel32 block: an undeclared HANDLE
-        # argument is truncated to c_int, corrupting handles above 2^31.
+        # Full-width HANDLE, as in the kernel32 declarations above.
         _ntdll.NtResumeProcess.restype = ctypes.c_int32
         _ntdll.NtResumeProcess.argtypes = (ctypes.wintypes.HANDLE,)
         handle = _kernel32.OpenProcess(_PROCESS_SUSPEND_RESUME, False, pid)
@@ -1566,14 +1533,8 @@ def resume_process(pid: int) -> bool:
         return False
 
 
-# Node runtime health/policy moved to ouroboros/node_runtime.py (its own module:
-# the policy outgrew a cross-platform primitives file). The re-export is a PEP
-# 562 module __getattr__ rather than an eager from-import: node_runtime imports
-# this module at module level, and an eager import back from HERE re-entered a
-# partially initialized node_runtime whenever node_runtime was imported first
-# (triad finding, all three phase-C reviewers). Lazy resolution keeps both
-# import orders sound while every importer keeps its
-# `from ouroboros.platform_layer import <name>` spelling unchanged.
+# Preserve import order without the node_runtime -> platform_layer eager cycle.
+# PEP 562 re-exports retain callers' spellings (ARCHITECTURE §1 "Platform substrate").
 _NODE_RUNTIME_REEXPORTS = (
     "NodeRuntimeHealth",
     "node_runtime_health",

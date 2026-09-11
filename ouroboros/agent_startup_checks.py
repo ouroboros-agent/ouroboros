@@ -25,6 +25,7 @@ from ouroboros.utils import (
     update_json_locked,
     utc_now_iso,
 )
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +94,11 @@ def task_result_authority_projection(
         for key, value in row.items()
         if key not in _TASK_RESULT_PROCESS_EVIDENCE_FIELDS
     }
+    from ouroboros.task_finalization import terminal_host_notice_text
+
+    notice = terminal_host_notice_text(row)
+    if notice:
+        authority["terminal_host_notice"] = notice
     contract = row.get("task_contract")
     if isinstance(contract, dict):
         authority["task_contract"] = copy.deepcopy(contract)
@@ -912,7 +918,7 @@ def verify_system_state(env: Any, git_sha: str) -> None:
         issues += 1
         log.warning("WORLD.md missing — environment profile not available")
 
-    configured_model = os.environ.get("OUROBOROS_MODEL", "")
+    configured_model = runtime_setting("OUROBOROS_MODEL", "")
     checks["model"] = {"configured": configured_model or "(not set)"}
     if not configured_model:
         issues += 1

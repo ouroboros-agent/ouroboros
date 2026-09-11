@@ -2159,7 +2159,7 @@ body.resizing-panels { user-select: none; }
     }
 
     /* A COLLAPSED nested child keeps its one-line identity row — status chip ·
-       `role · model` · `N notes` · chevron — over its metadata row (DESIGN.md
+       role · `N notes` · chevron — over its model/executor metadata (DESIGN.md
        §5) instead of dropping the title to a third band once its own inline
        width crosses this threshold (#623). The title is already nowrap/ellipsis
        here; it keeps the same 160px demand the mobile readability floor uses,
@@ -2188,8 +2188,8 @@ body.resizing-panels { user-select: none; }
 }
 
 /* A nested child is subordinate to its root: quieter ink, and collapsed it is
-   an identity row (chip · role · model · notes + chevron; the `Show details`
-   label is the root's) over its metadata row (harness chip with the run count,
+   an identity row (chip · role · notes + chevron; the `Show details`
+   label is the root's) over its metadata row (model, harness chip with the run count,
    cost, last update, docked Reviews count). Only its narration line waits for
    expansion. The title stays on one line and stays IN the identity row at every
    width (the narrow-regime rule above gives it a 160px demand and lets the side

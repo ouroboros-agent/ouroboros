@@ -202,7 +202,11 @@ def test_active_chat_activity_contract_mirrors_direct_turn_shape():
     from ouroboros.gateway.contracts import ActiveChatActivity, ActiveDirectTurn, StateResponse
     import pathlib
 
-    assert ActiveChatActivity.__annotations__ == ActiveDirectTurn.__annotations__
+    fields = ActiveChatActivity.__annotations__
+    assert {key: value for key, value in fields.items() if key != "required_question"} == ActiveDirectTurn.__annotations__
+    assert set(fields) - set(ActiveDirectTurn.__annotations__) == {"required_question"}
+    from typing import get_type_hints
+    assert "NotRequired" in str(get_type_hints(ActiveChatActivity, include_extras=True)["required_question"])
     assert "active_chat_activities" in StateResponse.__annotations__
     api_types = (
         pathlib.Path(__file__).resolve().parents[1] / "web" / "modules" / "api_types.js"

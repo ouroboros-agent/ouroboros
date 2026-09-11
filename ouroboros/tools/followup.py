@@ -18,6 +18,8 @@ records.
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import uuid
 from typing import Any, Dict, List
 
@@ -38,7 +40,8 @@ def get_tools() -> List[ToolEntry]:
                 "name": "schedule_followup",
                 "description": (
                     "Register a deferred follow-up task that the supervisor scheduler "
-                    "enqueues as an ordinary root task. Supply exactly one trigger: run_at "
+                    "enqueues as an ordinary root task. Root tasks only; subagents report "
+                    "the proposed follow-up to their parent. Supply exactly one trigger: run_at "
                     "for a one-shot ISO 8601 instant (naive = UTC), or cron for a recurring "
                     "5-field expression with an optional IANA timezone. Write the objective "
                     "in your own words — it becomes each future task's text verbatim. The "
@@ -110,57 +113,57 @@ def _pending_followups(records: List[Dict[str, Any]], task_id: str) -> List[Dict
 def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     if _is_delegated_subagent(ctx):
         return (
-            "ERROR: FOLLOWUP_SUBAGENT_REFUSED: a delegated subagent holds narrower-than-parent "
+            _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("ERROR: FOLLOWUP_SUBAGENT_REFUSED: a delegated subagent holds narrower-than-parent "
             "authority and may not mint future root tasks. Report the wait instant to your "
-            "parent instead; the parent (or the owner) decides whether to schedule a follow-up."
+            "parent instead; the parent (or the owner) decides whether to schedule a follow-up.")))
         )
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not task_id:
-        return "ERROR: FOLLOWUP_TASK_ID_REQUIRED: a durable follow-up must belong to a real task."
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: FOLLOWUP_TASK_ID_REQUIRED: a durable follow-up must belong to a real task.")))
     run_at_raw = str(params.get("run_at") or "").strip()
     cron = str(params.get("cron") or "").strip()
     if bool(run_at_raw) == bool(cron):
         return (
-            "ERROR: FOLLOWUP_TRIGGER_REQUIRED: supply exactly one of run_at (one-shot) "
-            "or cron (recurring)."
+            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_TRIGGER_REQUIRED: supply exactly one of run_at (one-shot) "
+            "or cron (recurring).")))
         )
     timezone = str(params.get("timezone") or "").strip()
     if run_at_raw:
         if timezone:
             return (
-                "ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT: timezone applies only to recurring "
-                "cron follow-ups; run_at is an absolute instant."
+                _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT: timezone applies only to recurring "
+                "cron follow-ups; run_at is an absolute instant.")))
             )
         instant = parse_deadline_ts(run_at_raw)
         if instant is None:
             return (
-                f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
-                "instant. Example: 2026-08-19T12:20:00+03:00 (naive times read as UTC)."
+                _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
+                "instant. Example: 2026-08-19T12:20:00+03:00 (naive times read as UTC).")))
             )
         trigger = {"type": "once", "run_at": instant.isoformat()}
     else:
         from ouroboros.schedule_contract import cron_error, timezone_error
 
         if error := cron_error(cron):
-            return f"ERROR: FOLLOWUP_CRON_INVALID: {error}"
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_CRON_INVALID: {error}")))
         if error := timezone_error(timezone):
-            return f"ERROR: FOLLOWUP_TIMEZONE_INVALID: {error}"
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TIMEZONE_INVALID: {error}")))
         trigger = {"type": "cron", "expr": cron}
     objective = str(params.get("objective") or "").strip()
     if not objective:
-        return "ERROR: FOLLOWUP_OBJECTIVE_REQUIRED: write the future task's objective in plain language."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_OBJECTIVE_REQUIRED: write the future task's objective in plain language.")))
     # Typed refusal, never a silent cut: the text rides VERBATIM into the future
     # task, so truncating it here would silently change what that task is.
     if len(objective) > _MAX_OBJECTIVE_CHARS:
         return (
-            f"ERROR: FOLLOWUP_TEXT_TOO_LONG: objective is {len(objective)} chars; the limit is "
-            f"{_MAX_OBJECTIVE_CHARS}. Shorten it — nothing was truncated and nothing was scheduled."
+            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: objective is {len(objective)} chars; the limit is "
+            f"{_MAX_OBJECTIVE_CHARS}. Shorten it — nothing was truncated and nothing was scheduled.")))
         )
     context = str(params.get("context") or "").strip()
     if len(context) > _MAX_CONTEXT_CHARS:
         return (
-            f"ERROR: FOLLOWUP_TEXT_TOO_LONG: context is {len(context)} chars; the limit is "
-            f"{_MAX_CONTEXT_CHARS}. Shorten it — nothing was truncated and nothing was scheduled."
+            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: context is {len(context)} chars; the limit is "
+            f"{_MAX_CONTEXT_CHARS}. Shorten it — nothing was truncated and nothing was scheduled.")))
         )
     from ouroboros.tool_access import canonical_data_root
     from supervisor.queue import list_scheduled_tasks, upsert_scheduled_task
@@ -168,7 +171,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     try:
         drive_root = canonical_data_root(ctx)
     except Exception as exc:
-        return f"ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: {exc}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: {exc}")))
     records = [r for r in (list_scheduled_tasks(drive_root).get("tasks") or []) if isinstance(r, dict)]
     pending = _pending_followups(records, task_id)
     if len(pending) >= _MAX_PENDING_FOLLOWUPS:
@@ -183,12 +186,20 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             f"{record.get('id')} ({_trigger_label(record)})" for record in pending
         )
         return (
-            f"ERROR: FOLLOWUP_CAP_REACHED: this task already holds {len(pending)} pending "
+            _publish_tool_result(ctx, ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=(f"ERROR: FOLLOWUP_CAP_REACHED: this task already holds {len(pending)} pending "
             f"follow-up(s) of the {_MAX_PENDING_FOLLOWUPS} allowed: {listing}. Wait for a "
-            "one-shot to fire, or the owner can disable/delete records from the Schedules surface."
+            "one-shot to fire, or the owner can disable/delete records from the Schedules surface.")))
         )
     metadata_src = getattr(ctx, "task_metadata", None)
     root_task_id = metadata_src.get("root_task_id") if isinstance(metadata_src, dict) else None
+    project_id = str(
+        getattr(ctx, "project_id", "")
+        or (metadata_src.get("project_id") if isinstance(metadata_src, dict) else "")
+        or ""
+    ).strip()
+    source_chat_id = getattr(ctx, "current_chat_id", None)
+    if source_chat_id in (None, "") and isinstance(metadata_src, dict):
+        source_chat_id = metadata_src.get("chat_id")
     record = {
         "id": f"followup-{task_id}-{uuid.uuid4().hex[:6]}",
         "name": f"Follow-up of task {task_id}",
@@ -202,6 +213,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             "text": objective,
             "description": objective,
             **({"context": context} if context else {}),
+            **({"project_id": project_id} if project_id else {}),
             "metadata": {
                 "source": FOLLOWUP_SOURCE,
                 "origin_task_id": task_id,
@@ -209,6 +221,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
                 # to task_id, never become the literal string "None".
                 "origin_root_task_id": str(root_task_id or "") or task_id,
             },
+            **({"chat_id": source_chat_id} if source_chat_id not in (None, "") else {}),
         },
     }
     presence = metadata_src.get("presence") if isinstance(metadata_src, dict) else None
@@ -219,7 +232,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     try:
         stored = upsert_scheduled_task(record, drive_root=drive_root)
     except Exception as exc:
-        return f"ERROR: FOLLOWUP_PERSIST_FAILED: {type(exc).__name__}: {exc}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"ERROR: FOLLOWUP_PERSIST_FAILED: {type(exc).__name__}: {exc}")))
     if trigger["type"] == "once":
         timing = f"once at/after {trigger['run_at']}"
         lifecycle = "fires exactly once"

@@ -108,6 +108,8 @@ from ouroboros.runtime_limits import (
     WS_RELAY_BURST,  # noqa: F401
     WS_RELAY_REFILL_PER_SEC,  # noqa: F401
     CLAUDEXOR_MODEL_POLL_INTERVAL_SEC,  # noqa: F401
+    CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC,  # noqa: F401
+    CLAUDEXOR_STOP_EXIT_WAIT_SEC,  # noqa: F401
     DELEGATE_WAIT_CEILING_SEC,  # noqa: F401
     DELEGATE_WAIT_WINDOW_MAX_SEC,  # noqa: F401
     MAX_ACTIVE_SUBAGENTS_HARD_CAP,  # noqa: F401
@@ -120,6 +122,7 @@ from ouroboros.runtime_limits import (
     get_claudexor_quota_refresh_timeout_sec,  # noqa: F401
     get_delegate_wait_max_sec,  # noqa: F401
     get_delegate_wait_sec,  # noqa: F401
+    get_finalization_grace_sec,  # noqa: F401
     get_direct_turn_stop_wait_sec,  # noqa: F401
     get_llm_transport_read_timeout_sec,  # noqa: F401
     get_max_active_subagents_per_root,  # noqa: F401
@@ -178,6 +181,9 @@ PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state
 from ouroboros import settings_integrity as _settings_integrity  # noqa: E402
 SETTINGS_INTEGRITY_ENV = _settings_integrity.SETTINGS_INTEGRITY_ENV
 SettingsIntegrityError = _settings_integrity.SettingsIntegrityError
+from ouroboros.settings_integrity import (  # noqa: E402, F401 — public config read seam
+    runtime_setting, runtime_settings, runtime_environ, task_settings_scope,
+)
 
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
@@ -273,7 +279,7 @@ def reset_runtime_mode_baseline_for_tests() -> None:
 
 def get_post_task_evolution_enabled() -> bool:
     """V4 envelope: is owner-enabled post-task self-evolution on? Default OFF."""
-    raw = str(os.environ.get(
+    raw = str(runtime_setting(
         "OUROBOROS_POST_TASK_EVOLUTION",
         SETTINGS_DEFAULTS["OUROBOROS_POST_TASK_EVOLUTION"],
     ) or "").strip().lower()
@@ -296,7 +302,7 @@ def get_post_task_evolution_cadence() -> str:
     """Cadence for post-task evolution: 'off' | 'llm' | 'every_n:<k>'. Default 'llm'.
     Unknown/malformed values normalize to 'llm' so a typo can never silently force
     an evolution cycle after every task."""
-    raw = str(os.environ.get(
+    raw = str(runtime_setting(
         "OUROBOROS_POST_TASK_EVOLUTION_CADENCE",
         SETTINGS_DEFAULTS["OUROBOROS_POST_TASK_EVOLUTION_CADENCE"],
     ) or "").strip().lower()
@@ -306,7 +312,7 @@ def get_post_task_evolution_cadence() -> str:
 def get_evolution_persistent_objective() -> str:
     """Optional owner-set standing steer APPENDED to each evolution cycle's
     objective. Never overrides the LLM-first promotion; empty = pure LLM choice."""
-    return str(os.environ.get(
+    return str(runtime_setting(
         "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE",
         SETTINGS_DEFAULTS["OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE"],
     ) or "").strip()
@@ -325,13 +331,18 @@ def get_allow_mutative_subagents(write_surface: str = "") -> bool:
     Gates only SCHEDULING: light-mode self-repo writes stay blocked by the
     runtime sandbox regardless."""
     key = "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS"
-    raw = os.environ.get(key, SETTINGS_DEFAULTS.get(key, ""))
+    raw = runtime_setting(key, SETTINGS_DEFAULTS.get(key, ""))
     text = str(raw or "").strip().lower()
     if text in {"1", "true", "yes", "on"}:
         return True
     if text in {"0", "false", "no", "off"}:
         return False
-    if get_runtime_mode() in {"advanced", "pro"}:
+    # Runtime modes are ordered in settings_scales.  Keep this scheduling
+    # decision on the shared rank seam so a higher-power mode such as Cyber Pro
+    # cannot silently fall through to Light's self-worktree default.
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+    if runtime_mode_at_least(get_runtime_mode(), "advanced"):
         return True
     surface = str(write_surface or "").strip().lower()
     # Unset + light (or unknown mode): allowed for the external build surfaces,
@@ -344,7 +355,7 @@ def get_allow_mutative_subagents(write_surface: str = "") -> bool:
 def get_subagent_worktree_root() -> str:
     """Filesystem root for acting self_worktree checkouts (outside repo/ and data/)."""
     raw = str(
-        os.environ.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
+        runtime_setting("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
@@ -356,7 +367,7 @@ def get_subagent_projects_root() -> str:
     Outside repo/ and data/. Unlike self_worktree checkouts, genesis projects are
     durable deliverables and are never age-pruned by the GC retention sweep."""
     raw = str(
-        os.environ.get("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "")
+        runtime_setting("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "")
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "projects"))
@@ -368,7 +379,7 @@ def get_deliverables_root() -> str:
     outside data/, and never GC-pruned. An explicit placement (Desktop/..., Downloads/..., or any
     path WITH a directory) is always honored as given. Override with OUROBOROS_DELIVERABLES_ROOT."""
     raw = str(
-        os.environ.get("OUROBOROS_DELIVERABLES_ROOT", "")
+        runtime_setting("OUROBOROS_DELIVERABLES_ROOT", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_DELIVERABLES_ROOT", "")
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "Deliverables"))
@@ -376,7 +387,7 @@ def get_deliverables_root() -> str:
 
 def get_task_review_mode() -> str:
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
-    raw = (os.environ.get("OUROBOROS_TASK_REVIEW_MODE", default_val) or default_val).strip().lower()
+    raw = (runtime_setting("OUROBOROS_TASK_REVIEW_MODE", default_val) or default_val).strip().lower()
     return raw if raw in {"off", "auto", "required"} else default_val
 
 
@@ -426,7 +437,7 @@ def get_safety_mode() -> str:
     protected paths and light-mode guards run regardless (BIBLE P3: the LLM supervisor is a
     layer, not the floor)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"])
-    return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default_val) or default_val)
+    return normalize_safety_mode(runtime_setting("OUROBOROS_SAFETY_MODE", default_val) or default_val)
 
 
 def get_context_mode() -> str:
@@ -435,7 +446,7 @@ def get_context_mode() -> str:
     get_owner_context_mode instead so a bare env Low cannot author owner intent. No boot-pin:
     hot-applies on the next task; the key is dropped from the agent-reachable /api/settings POST (P1)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
-    return normalize_context_mode(os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val)
+    return normalize_context_mode(runtime_setting("OUROBOROS_CONTEXT_MODE", default_val) or default_val)
 
 
 def get_owner_context_mode() -> str:
@@ -445,7 +456,7 @@ def get_owner_context_mode() -> str:
     ambiguity is normalized before env projection, so this matters only for env-only runs."""
     if get_context_mode() != "low":
         return "max"
-    return "low" if owner_declared_low(os.environ.get("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")) else "max"
+    return "low" if owner_declared_low(runtime_setting("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")) else "max"
 
 
 def _settings_file_value(key: str, default: str) -> str:
@@ -519,6 +530,10 @@ def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool =
 
     ``full -> light -> off`` is a strictly decreasing coverage ladder; any downward step is
     owner-only (mirrors the context-mode ratchet, BIBLE P3)."""
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+    if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
+        return
     previous_mode = normalize_safety_mode(_settings_file_value("OUROBOROS_SAFETY_MODE", "full"))
     next_mode = normalize_safety_mode(settings.get("OUROBOROS_SAFETY_MODE", previous_mode))
     if _SAFETY_MODE_RANK[next_mode] < _SAFETY_MODE_RANK[previous_mode] and not allow_safety_lowering:
@@ -578,7 +593,7 @@ def resolve_data_skills_dir(data_dir: pathlib.Path) -> Optional[pathlib.Path]:
 
 def get_ouroboroshub_catalog_url() -> str:
     """Return the official OuroborosHub static catalog URL."""
-    return str(load_settings().get("OUROBOROS_HUB_CATALOG_URL") or SETTINGS_DEFAULTS["OUROBOROS_HUB_CATALOG_URL"]).strip()
+    return str(runtime_settings().get("OUROBOROS_HUB_CATALOG_URL") or SETTINGS_DEFAULTS["OUROBOROS_HUB_CATALOG_URL"]).strip()
 
 
 def get_ouroboroshub_skills_dir() -> pathlib.Path:
@@ -589,7 +604,7 @@ def get_ouroboroshub_skills_dir() -> pathlib.Path:
 
 def get_clawhub_registry_url() -> str:
     """Return the normalized ClawHub registry URL; callers enforce host allowlists."""
-    raw = (os.environ.get("OUROBOROS_CLAWHUB_REGISTRY_URL", "") or "").strip()
+    raw = (runtime_setting("OUROBOROS_CLAWHUB_REGISTRY_URL", "") or "").strip()
     default_url = "https://clawhub.ai/api/v1"
     if not raw:
         return default_url
@@ -937,50 +952,36 @@ def get_mcp_tool_timeout_sec() -> int:
     return parsed if parsed > 0 else int(SETTINGS_DEFAULTS["MCP_TOOL_TIMEOUT_SEC"])
 
 
-def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
-    """Grace window in seconds: env, else the ``settings`` argument, else the
-    shipped default — the ``_clamped_number_setting`` shape. Deliberately NO
-    ``load_settings()`` fallback: a READ must never persist settings, and that
-    call runs the context-mode compatibility migration, which can WRITE a
-    normalized file under read-only observers (``task_pacing._reserve_sec``)."""
-    raw = os.environ.get("OUROBOROS_FINALIZATION_GRACE_SEC")
-    if raw is None and isinstance(settings, dict):
-        raw = settings.get("OUROBOROS_FINALIZATION_GRACE_SEC")
-    try:
-        parsed = int(raw)
-    except (TypeError, ValueError):
-        parsed = int(FINALIZATION_GRACE_DEFAULT_SEC)
-    return max(0, min(parsed, 300))
-
-
-def apply_settings_to_env(settings: dict) -> None:
+def apply_settings_to_env(settings: dict, *, environ=None) -> None:
     """Push settings into environment variables for supervisor modules."""
-    env_keys = settings_env_keys()
-    # Disk-authored ratchets PROJECT ONLY WHAT THE FILE ACTUALLY SAYS: a default standing in for an absent
-    # key is not an owner decision, so overwriting/popping the env entry would clobber a legitimately
-    # forwarded value (harbor_installed_agent runs with NO settings.json; server_runner documents the same
-    # "settings.json over env" clobber). Silence stays silent. ONE fail-closed exception: env may not author
-    # the explicit-false owner-Low provenance claim, which would switch the BIBLE P3 scope gate off.
-    unauthored = {k for k in _DISK_AUTHORED_SETTINGS if not _settings_file_value(k, "")}
-    for k in env_keys:
-        val = settings.get(k)
-        if k in unauthored and not owner_declared_low(
-                os.environ.get(k) if k == "OUROBOROS_CONTEXT_MODE_AUTO_LOW" else ""):
-            continue
-        if k == "OUROBOROS_RETURN_REASONING" and val == "":
-            os.environ[k] = ""
-            continue
-        if val is None or val == "":
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = str(val)
-    # Reviewer-model floors moved into the structured-slot projection (6.1):
-    from ouroboros.reviewer_slot_config import project_reviewer_slots_into_env
-    project_reviewer_slots_into_env()
-    if not os.environ.get("OUROBOROS_REVIEW_ENFORCEMENT"):
-        os.environ["OUROBOROS_REVIEW_ENFORCEMENT"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
-    if not os.environ.get("OUROBOROS_TASK_REVIEW_MODE"):
-        os.environ["OUROBOROS_TASK_REVIEW_MODE"] = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
+    with _settings_integrity.SETTINGS_ENV_LOCK:
+        environ = os.environ if environ is None else environ
+        env_keys = settings_env_keys()
+        # Disk-authored ratchets PROJECT ONLY WHAT THE FILE ACTUALLY SAYS: a default standing in for an absent
+        # key is not an owner decision, so overwriting/popping the env entry would clobber a legitimately
+        # forwarded value (harbor_installed_agent runs with NO settings.json; server_runner documents the same
+        # "settings.json over env" clobber). Silence stays silent. ONE fail-closed exception: env may not author
+        # the explicit-false owner-Low provenance claim, which would switch the BIBLE P3 scope gate off.
+        unauthored = {k for k in _DISK_AUTHORED_SETTINGS if not _settings_file_value(k, "")}
+        for k in env_keys:
+            val = settings.get(k)
+            if k in unauthored and not owner_declared_low(
+                    environ.get(k) if k == "OUROBOROS_CONTEXT_MODE_AUTO_LOW" else ""):
+                continue
+            if k == "OUROBOROS_RETURN_REASONING" and val == "":
+                environ[k] = ""
+                continue
+            if val is None or val == "":
+                environ.pop(k, None)
+            else:
+                environ[k] = str(val)
+        # Reviewer-model floors moved into the structured-slot projection (6.1):
+        from ouroboros.reviewer_slot_config import project_reviewer_slots_into_env
+        project_reviewer_slots_into_env(environ=environ)
+        if not environ.get("OUROBOROS_REVIEW_ENFORCEMENT"):
+            environ["OUROBOROS_REVIEW_ENFORCEMENT"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
+        if not environ.get("OUROBOROS_TASK_REVIEW_MODE"):
+            environ["OUROBOROS_TASK_REVIEW_MODE"] = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
 
 
 # PID lock: platform_layer uses OS-released locks on Unix and Windows.

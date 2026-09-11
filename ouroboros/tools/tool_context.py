@@ -92,6 +92,9 @@ class ToolContext:
     # Conversation messages for safety checks.
     messages: Optional[List[Dict[str, Any]]] = None
 
+    # Borrowed loop trace; restored when the owning loop exits.
+    _execution_trace: Optional[Dict[str, Any]] = field(default=None, repr=False)
+
     # Structured task constraints, e.g. skill repair payload confinement.
     task_constraint: Optional[TaskConstraint] = None
     task_contract: Dict[str, Any] = field(default_factory=dict)

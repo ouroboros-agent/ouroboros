@@ -39,18 +39,16 @@ def test_scrub_repo_from_pythonpath_drops_only_repo_entry():
     assert "PYTHONPATH" not in scrub_repo_from_pythonpath({"PYTHONPATH": repo + "/"}, repo)
 
 
-def test_shell_env_for_cwd_scrubs_external_keeps_repo():
+def test_shell_env_for_cwd_scrubs_external_keeps_repo(tmp_path):
     from ouroboros.tools.shell import _shell_env_for_cwd
 
-    repo = Path(tempfile.mkdtemp())
-    (repo / "sub").mkdir()
-    ext = Path(tempfile.mkdtemp())
+    repo, ext = tmp_path / "repo", tmp_path / "external"
+    (repo / "sub").mkdir(parents=True)
+    ext.mkdir()
     ctx = types.SimpleNamespace(repo_dir=str(repo))
-    # a command inside the repo inherits os.environ (None -> no scrub)
-    assert _shell_env_for_cwd(ctx, repo / "sub") is None
-    # a command outside the repo gets a scrubbed env (dict, not None)
-    env = _shell_env_for_cwd(ctx, ext)
-    assert isinstance(env, dict)
+    # An explicit environment also carries the admitted task's settings.
+    assert _shell_env_for_cwd(ctx, repo / "sub") == dict(os.environ)
+    assert isinstance(_shell_env_for_cwd(ctx, ext), dict)
 
 
 # ── R5: effect-based artifact-audit gate ──────────────────────────────────────

@@ -13,6 +13,7 @@ like the hurry projection):
     "owner_quiz": {
         "<quiz_id>": {
             "quiz_id", "question", "options": [label, ...], "stake",
+            "option_details"?: [detail, ...],
             "assumption", "state": open|answered|expired_terminal,
             "asked_at", "answered_at"?, "answered_index"?, "request_id"?,
             "comment"?, "reconciled_at"?,
@@ -21,7 +22,7 @@ like the hurry projection):
 
 Structural expiry only (owner decision 30=A): a quiz dies with its author —
 ``reconcile_terminal`` runs on the task-done seam; there is no host TTL.
-The writer mutates ONLY the ``owner_quiz`` key via ``update_json_locked``
+The writers mutate ``owner_quiz`` and its paired terminal ``owner_wait`` via ``update_json_locked``
 (never ``write_task_result`` — its status-regression guard can drop the
 write), so concurrent terminal writers merge around it.
 """
@@ -109,16 +110,23 @@ def record_asked(
     quiz_id: str, question: str, options: List[str],
     stake: str = "", assumption: str = "",
     wait_for_answer: bool = False,
+    option_details: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Worker-side projection write at ask time.
 
     The stored option labels are the ingress's validation authority: an
     ``option_index`` outside this list is refused, and the answer echoes the
     verbatim label back to the asking task."""
+    if option_details is not None and (
+        not isinstance(option_details, list) or len(option_details) != len(options)
+        or not all(isinstance(value, str) for value in option_details)
+    ):
+        raise ValueError("option_details must preserve the labels' length and order")
     stamp = utc_now_iso()
     block = {
         "quiz_id": str(quiz_id), "question": str(question or ""),
         "options": [str(label) for label in options],
+        **({"option_details": list(option_details)} if option_details is not None else {}),
         "stake": str(stake or ""), "assumption": str(assumption or ""),
         "state": STATE_OPEN, "asked_at": stamp,
         **({"wait_for_answer": True} if wait_for_answer else {}),
@@ -215,15 +223,53 @@ def reconcile_terminal(drive_root: Any, task_id: str) -> List[str]:
     answered block."""
     stamp = utc_now_iso()
     expired: List[str] = []
+    terminal_quizzes: List[str] = []
 
     def _mutator(quizzes: Dict[str, Dict[str, Any]]) -> Any:
         for key, block in quizzes.items():
-            if str(block.get("state") or STATE_OPEN) == STATE_OPEN:
+            state = str(block.get("state") or STATE_OPEN)
+            if state == STATE_OPEN:
                 block.update({"state": STATE_EXPIRED_TERMINAL, "reconciled_at": stamp})
                 expired.append(str(key))
+                terminal_quizzes.append(str(key))
+            elif state in (STATE_EXPIRED_TERMINAL, STATE_ANSWERED):
+                # A previous call may have committed quiz expiry before the
+                # paired task-result repair failed. Keep the second pass
+                # idempotent; an accepted answer can also await worker capacity
+                # when the task ends. Neither case rewrites the quiz's answer.
+                terminal_quizzes.append(str(key))
         return True if expired else _KEEP
 
     _mutate_projection(drive_root, task_id, _mutator)
+    if terminal_quizzes:
+        from ouroboros.task_results import (
+            require_writable_task_result_schema,
+            stamp_task_result_schema,
+        )
+
+        def _close_owner_wait(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            require_writable_task_result_schema(current)
+            wait = current.get("owner_wait")
+            if not isinstance(wait, dict) or str(wait.get("state") or "") != "waiting":
+                return None
+            quiz_id = str(wait.get("quiz_id") or "")
+            if quiz_id not in terminal_quizzes:
+                return None
+            updated = dict(current)
+            updated["owner_wait"] = {
+                **wait,
+                "state": STATE_EXPIRED_TERMINAL,
+                "reconciled_at": stamp,
+            }
+            return stamp_task_result_schema(updated)
+
+        # The quiz and its waiting continuation share the same task-result
+        # authority. Close the paired wait after the quiz projection so a
+        # terminal task cannot replay as both expired and still waiting.
+        update_json_locked(
+            _quiz_result_path(drive_root, task_id),
+            _close_owner_wait,
+        )
     return expired
 
 

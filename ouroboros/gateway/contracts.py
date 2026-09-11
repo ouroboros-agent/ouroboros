@@ -125,6 +125,15 @@ class ChatOutbound(TypedDict):
     # completed/failed/cancelled/rejected_duplicate.
     task_terminal_status: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
+    tool_calls: NotRequired[int]
+    rounds: NotRequired[int]
+    suggested_name: NotRequired[str]
+    model_execution: NotRequired[Dict[str, Any]]
+    quiz_id: NotRequired[str]
+    quiz_state: NotRequired[str]
+    project_chat_id: NotRequired[int]
+    source_status: NotRequired[str]
+    owner_wait_state: NotRequired[str]
     task_incident: NotRequired[str]
     # A cancellation fault names the PHYSICAL task it could not settle when that
     # differs from the displayed (logical) task id.
@@ -479,6 +488,8 @@ class MessageAnnotationOutbound(TypedDict):
     chat_id: NotRequired[int]
     target: NotRequired[str]
     target_label: NotRequired[str]
+    project_id: NotRequired[str]
+    project_chat_id: NotRequired[int]
     options: NotRequired[List[Dict[str, Any]]]
     attachment_manifest: NotRequired[List[AttachmentManifestEntry]]
     # #198: the exact refusal-attempt identity — the picker card composes its
@@ -703,6 +714,8 @@ class ActiveChatActivity(ActiveDirectTurn):
     both; managed rows carry an empty ``client_message_id``.
     """
 
+    required_question: NotRequired[Dict[str, Any]]
+
 
 class StateResponse(TypedDict):
     """Shape of ``GET /api/state`` (happy path)."""
@@ -750,6 +763,7 @@ class StateResponse(TypedDict):
     # tasks). Additive beside active_direct_turns, which stays unchanged for
     # compatibility; new clients hydrate from this field.
     active_chat_activities: NotRequired[List[ActiveChatActivity]]
+    active_chat_activities_complete: NotRequired[bool]
 
 
 class SettingsNetworkMeta(TypedDict):
@@ -776,12 +790,30 @@ class AvailableSubagentsSettingsMeta(TypedDict, total=False):
     candidate: Optional[Dict[str, Any]]
 
 
+class SettingsPolicyAxis(TypedDict, total=False):
+    """Configured/effective owner policy values shown by Settings."""
+
+    configured: str
+    effective: str
+    restart_required: bool
+    pending: bool
+    applies: Literal["restart", "next_task"]
+
+
+class SettingsPolicyState(TypedDict):
+    access: SettingsPolicyAxis
+    supervisor: SettingsPolicyAxis
+    review: SettingsPolicyAxis
+    running_task_snapshot: bool
+
+
 class SettingsMeta(SettingsNetworkMeta, total=False):
     """Complete ``GET /api/settings`` ``_meta`` block."""
 
     custom_secret_keys: list[str]
     setup_contract: Dict[str, Any]
     available_subagents: AvailableSubagentsSettingsMeta
+    policy_state: SettingsPolicyState
 
 
 class SettingsSaveResponse(TypedDict, total=False):
@@ -1498,6 +1530,8 @@ __all__ = [
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "AvailableSubagentsSettingsMeta",
+    "SettingsPolicyAxis",
+    "SettingsPolicyState",
     "SettingsMeta",
     "SettingsSaveResponse",
     "OwnerRuntimeModeResponse",

@@ -523,6 +523,7 @@ PROMPT_NON_TOOL_IDENTIFIERS = frozenset({
     # safety policy class names (ouroboros/safety.py TOOL_POLICY values) and
     # owner-setting values named as policy
     "check_conditional", "check", "off", "low",
+    "cyber_pro",
     # package managers / interpreters named as acquisition or process choices
     "pip", "pip3", "uv", "brew", "apt", "python", "python3", "sudo", "grep", "env",
     # git branches / remotes / skill buckets / write surfaces named as policy

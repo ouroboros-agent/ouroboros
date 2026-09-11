@@ -76,13 +76,15 @@ def test_stop_arriving_in_real_backoff_keeps_only_actual_physical_attempts(
     assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
     assert ("owner requested Wrap up" if owner_grace else "owner requested Stop") in usage["terminal_provider_notice"]
     assert "no terminal provider outcome" in usage["terminal_provider_notice"]
-    assert [row["reason_code"] for row in _events(execution / "logs", "llm_not_dispatched")] == ["finalize_control_pending"]
+    assert [row["reason_code"] for row in _events(execution / "logs", "llm_not_dispatched")] == ([] if owner_grace else ["finalize_control_pending"])
     assert not _events(execution / "logs", "llm_retry_deadline_exhausted")
-    assert mid not in ctx._loop_mailbox_seen_ids
-    assert mid not in owner_mailbox.acknowledged_task_message_ids(execution, "t-death", attempt_key=1)
     if owner_grace:
-        assert not cancel_intents.active_intent(canonical, "t-death").get("control_drained_at")
+        # Managed unknown waits use the ordinary round-top owner drain; no paid
+        # repeat was granted, and the current finalize intent is consumed there.
+        assert cancel_intents.active_intent(canonical, "t-death").get("control_drained_at")
     else:
+        assert mid not in ctx._loop_mailbox_seen_ids
+        assert mid not in owner_mailbox.acknowledged_task_message_ids(execution, "t-death", attempt_key=1)
         assert getattr(ctx, "_skip_post_task_synthesis", False)  # same Stop-now contract after loop exit
         from ouroboros import agent_task_pipeline
 

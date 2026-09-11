@@ -5,6 +5,8 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
 
 def _patch_queue(queue_module, workers_module, monkeypatch, tmp_path, workers):
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
@@ -415,16 +417,29 @@ def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monk
     workers = {4: SimpleNamespace(busy_task_id=None, proc=_FakeProc(), reaping=True)}
     _patch_queue(q, w, monkeypatch, tmp_path, workers)
     monkeypatch.setattr(q, "_kept_service_pids", lambda: set(), raising=False)
+    # A prior server lifespan can legitimately close the process-global bus.
+    # This fixture owns its publication collector, not a new supervisor bus.
+    monkeypatch.setattr(w, "_EVENT_Q_SHUTDOWN", True)
+    with pytest.raises(RuntimeError, match="supervisor event bus is shutting down"):
+        w.get_event_q()
+    emitted = []
+    monkeypatch.setattr(w, "get_event_q", lambda: SimpleNamespace(put=emitted.append))
 
     calls = []
-    monkeypatch.setattr(headless, "finalize_task_artifacts",
-                        lambda root, task: (calls.append(str(task.get("id"))), [])[1])
+    def finalize(root, task):
+        calls.append(str(task["id"]))
+        write_task_result(root, task["id"], "completed", artifact_status="ready",
+                          artifact_finalized_at="fixture")
+        return []
+    monkeypatch.setattr(headless, "finalize_task_artifacts", finalize)
 
     def _run(task, artifact_status):
         # Pre-write the worker's own terminal result so the reaper's post-kill re-check honors
         # it (self_status set) instead of clobbering it — the branch crit#2 lives in.
         write_task_result(tmp_path, str(task["id"]), "completed", artifact_status=artifact_status)
-        q._reap_timed_out_task({"worker_id": 4, "proc": None, "task_id": task["id"],
+        task["workspace_root"] = str(tmp_path / "workspace")
+        q._reap_timed_out_task({"worker_id": 4, "proc": workers[4].proc, "worker": workers[4],
+                                "drive_root": str(tmp_path), "task_id": task["id"],
                                 "task": task, "task_type": "task",
                                 "terminal_reason": "idle_timeout", "attempt": 1})
 
@@ -442,6 +457,10 @@ def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monk
     _run({"id": "wt3", "type": "task", "delegation_role": "subagent",
           "task_constraint": {"mode": "local_readonly_subagent"}}, "finalizing")
     assert calls == [], "a readonly subagent has no durable artifacts to finalize"
+    terminals = [event for event in emitted if event.get("type") == "task_done"]
+    assert [event["task_id"] for event in terminals] == ["wt1", "wt2", "wt3"]
+    assert all(event["status"] == "completed" and event["chat_id"] == 0 for event in terminals)
+    assert all(event["_files_prepared_attempt"] == 1 and event["worker_id"] == 4 for event in terminals)
 
 
 def test_task_is_readonly_subagent_gate():
@@ -499,7 +518,7 @@ def test_reaper_fails_closed_when_worker_not_confirmed_dead(tmp_path, monkeypatc
     write_task_result(tmp_path, "wedged1", STATUS_RUNNING, result="in progress")
 
     q._reap_timed_out_task({
-        "worker_id": 5, "proc": _AliveProc(), "task_id": "wedged1",
+        "worker_id": 5, "proc": slot.proc, "worker": slot, "drive_root": str(tmp_path), "task_id": "wedged1",
         "task": {"id": "wedged1", "type": "task", "chat_id": 7}, "task_type": "task",
         "terminal_reason": "idle_timeout", "attempt": 1,
         "owner_chat_id": 7,

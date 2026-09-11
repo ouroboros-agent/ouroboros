@@ -185,6 +185,8 @@ def _review_projection(loaded: Any, *, stale: bool | None = None) -> Dict[str, A
         "status": normalize_skill_review_status(loaded.review.status),
         "stale": (loaded.review.is_stale_for(loaded.content_hash) if stale is None else bool(stale)),
         "profile": str(getattr(loaded.review, "review_profile", "") or ""),
+        "reviewed_content_hash": loaded.review.reviewed_content_hash or loaded.review.content_hash,
+        "author_disposition": dict(loaded.review.author_disposition),
     }
 
 

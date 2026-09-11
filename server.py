@@ -81,6 +81,8 @@ from ouroboros.server_liveness import (  # noqa: F401
 )
 from ouroboros.server_maintenance import (  # noqa: F401
     _LAST_CANCEL_INTENT_SWEEP,
+    _migrate_startup_cancel_latches,
+    _startup_worker_pids,
     _installed_skill_names,
     _periodic_supervisor_maintenance,
     _periodic_zombie_reconcile,
@@ -168,6 +170,21 @@ def _has_active_evolution_transaction() -> bool:
 
 
 def _restart_current_process(host: str, port: int) -> None:
+    # Every direct restart reaches this seam, including an assisted update whose
+    # native waits were already moved to PENDING before its resolver ran.
+    try:
+        from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV, arm_active_planned_restart_transaction
+        from ouroboros.server_restart import _RESTARTABLE_UPDATE_PHASES
+        from supervisor.update_merge import read_update_tx_strict
+
+        if any((DATA_DIR / "state" / name).exists() for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
+            os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+        else:
+            status, tx = read_update_tx_strict()
+            if status == "valid" and tx.get("phase") in _RESTARTABLE_UPDATE_PHASES:
+                arm_active_planned_restart_transaction(DATA_DIR)
+    except Exception:
+        log.warning("Direct restart transaction could not be armed; continuation remains unconfirmed", exc_info=True)
     _restart_current_process_impl(
         host, port, repo_dir=REPO_DIR, log=log,
         owner_initiated=_owner_restart_requested.is_set(),
@@ -571,6 +588,7 @@ def _run_supervisor(settings: dict) -> None:
         except Exception:
             log.debug("Failed to stop previous consciousness instance", exc_info=True)
         _consciousness = None
+    prior_worker_pids: set[int] | None = None
     try:
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
 
@@ -628,6 +646,8 @@ def _run_supervisor(settings: dict) -> None:
         import types
         import queue as _queue_mod
 
+        _migrate_startup_cancel_latches(DATA_DIR)
+        prior_worker_pids = _startup_worker_pids(DATA_DIR)
         restored_pending = restore_pending_from_snapshot()
         kill_workers(preserve_pending=True)
         spawn_workers(max_workers)
@@ -638,40 +658,17 @@ def _run_supervisor(settings: dict) -> None:
             pre_adopt_planned_handoffs(DATA_DIR, list(PENDING))
         except Exception:
             log.debug("Planned delegate pre-adoption failed", exc_info=True)
-        _resume_interrupted_project_deletions()
-        # Original startup order preserved: drive prunes, custody sweep (reap
-        # orphaned processes), THEN worktree prune.
-        _startup_prune_sweeps()
         _startup_custody_sweep()
+        recovered_files = _run_startup_task_recovery(
+            DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+            prior_worker_pids=prior_worker_pids,
+        )
+        _resume_interrupted_project_deletions()
+        _startup_prune_sweeps(preserve_task_sources=bool(
+            recovered_files["unresolved"] or recovered_files["protected"] or recovered_files["errors"]))
         _startup_worktree_prune()
 
         _prune_delegated_snapshots()
-
-        try:
-            from ouroboros.observability import prune_observability_blobs
-            from ouroboros.tools.services import prune_service_logs
-
-            observability_report = prune_observability_blobs(DATA_DIR)
-            service_report = prune_service_logs(DATA_DIR)
-            if (
-                observability_report.get("enabled")
-                or observability_report.get("manifest_count")
-                or observability_report.get("blob_count")
-                or observability_report.get("deleted_manifests")
-                or observability_report.get("deleted_blobs")
-                or observability_report.get("errors")
-                or service_report.get("deleted_dirs")
-                or service_report.get("deleted_files")
-                or service_report.get("errors")
-            ):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "runtime_artifact_prune",
-                    "observability": observability_report,
-                    "services": service_report,
-                })
-        except Exception:
-            log.debug("Runtime artifact prune failed", exc_info=True)
 
         if restored_pending > 0:
             st_boot = load_state()
@@ -720,6 +717,22 @@ def _run_supervisor(settings: dict) -> None:
         _supervisor_error = f"Supervisor init failed: {exc}"
         _consciousness = None
         log.critical("Supervisor initialization failed", exc_info=True)
+        try:
+            # Provider-configured lifespan normally relies on this supervisor
+            # owner for boot recovery. If initialization itself fails, keep the
+            # same custody pass instead of serving with orphan RUNNING rows.
+            recovery_pids = prior_worker_pids
+            if recovery_pids is None:
+                try:
+                    recovery_pids = _startup_worker_pids(DATA_DIR)
+                except Exception:
+                    recovery_pids = None
+            _run_startup_task_recovery(
+                DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+                prior_worker_pids=recovery_pids,
+            )
+        except Exception:
+            log.critical("Startup recovery after supervisor initialization failure failed", exc_info=True)
         _supervisor_ready.set()
         _supervisor_thread = None
         return
@@ -1271,11 +1284,11 @@ async def lifespan(app):
     # Startup-only: after the prior process generation is gone, finalize orphaned
     # RUNNING results and resolve an indeterminate post-task synthesis phase.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    _run_startup_task_recovery(
-        lifespan_drive_root,
-        REPO_DIR,
-        skip_live_data=pytest_default_real_data_dir,
-    )
+    if not has_startup_ready_provider(settings):
+        _run_startup_task_recovery(
+            lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
+            prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
+        )
 
     # Reload enabled+reviewed extensions across restarts.
     try:

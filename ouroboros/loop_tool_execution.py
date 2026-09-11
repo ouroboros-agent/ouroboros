@@ -1233,7 +1233,7 @@ def handle_tool_calls(
 def _maybe_auto_attach_image(
     exec_result: Dict[str, Any],
     tools: Optional[ToolRegistry],
-) -> None:
+) -> Optional[Dict[str, str]]:
     """Same-round image attachment for tool results that explicitly offer one.
 
     A successful result whose JSON carries ``auto_attach_image: <local path>`` — a
@@ -1274,6 +1274,7 @@ def _maybe_auto_attach_image(
     raw = exec_result.get("result")
     if not isinstance(raw, str) or '"auto_attach_image"' not in raw:
         return
+    observation = None
     try:
         parsed = json.loads(raw)
         path = parsed.get("auto_attach_image") if isinstance(parsed, dict) else None
@@ -1282,13 +1283,16 @@ def _maybe_auto_attach_image(
         ctx = getattr(tools, "_ctx", None)
         if ctx is None:
             return
+        observation = {"status": "unavailable"}
         from ouroboros.tools.vision import attach_local_image_to_context
 
         ok, note = attach_local_image_to_context(ctx, path)
+        observation["status"] = "attached" if ok else "unavailable"
         if not ok:
             log.debug("auto-attach skipped for %s: %s", path, note)
     except Exception:  # noqa: BLE001 - attachment is an enhancement, never a failure
         log.debug("auto-attach image failed", exc_info=True)
+    return observation
 
 
 def reclaim_trace_refs(tool_ctx: Any) -> Dict[str, Any]:
@@ -1338,6 +1342,9 @@ def process_tool_results(
             error_count += 1
 
         ctx = getattr(tools, "_ctx", None) if tools is not None else None
+        from ouroboros.task_pacing import record_tool_activity
+
+        record_tool_activity(ctx, exec_result)
         result_source_ref = (
             _persist_truncated_tool_source(
                 ctx, fn_name, str(exec_result["tool_call_id"]), exec_result["result"],
@@ -1433,25 +1440,11 @@ def process_tool_results(
                         llm_trace["acceptance_decision"] = _dec
                     agent_decision = parsed.get("agent_decision") if isinstance(parsed.get("agent_decision"), dict) else {}
                     if agent_decision:
-                        # v6.78.0 (P4.1, owner Q23=A): the HOST is the only writer of the
-                        # acceptance verdict. The agent's stance is MERGED as its own
-                        # `agent_disposition`/`agent_rationale` (already projected and
-                        # already carried forward across host writes) and can no longer
-                        # overwrite `status`/`source`/`rationale`. A merge, not a fresh
-                        # dict: assigning a new dict here would clobber an earlier host
-                        # verdict even after dropping the three keys.
-                        _dec = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
-                        _dec.setdefault("source", "agent_task_acceptance_review_tool")
-                        _dec["agent_disposition"] = str(agent_decision.get("disposition") or "")
-                        # DISCLOSED bound (BIBLE P1): the agent's stance is reviewer-facing
-                        # evidence, so a clipped rationale carries its own omission note
-                        # rather than ending mid-argument as if that were all it said.
-                        _dec["agent_rationale"] = truncate_review_artifact(
-                            str(agent_decision.get("rationale") or ""), limit=500,
-                        )
+                        from ouroboros.loop_acceptance import merge_agent_acceptance_stance
+
+                        merge_agent_acceptance_stance(llm_trace, agent_decision, ctx)
                         if parsed.get("dissent_noted"):
-                            _dec["dissent_noted"] = True
-                        llm_trace["acceptance_decision"] = _dec
+                            llm_trace["acceptance_decision"]["dissent_noted"] = True
                         # v6.54.4 obligations layer: apply the agent's per-obligation
                         # dispositions onto the host-collected per-task obligations.
                         ob_dispositions = agent_decision.get("obligation_dispositions")
@@ -1480,8 +1473,11 @@ def process_tool_results(
     # tool messages answering the same assistant turn: the user(image) injection
     # then preserves tool-result contiguity BY CONSTRUCTION instead of relying on
     # the transport's adjacency repair to fix an interleaving we created ourselves.
+    by_call = {row["tool_call_id"]: row for row in llm_trace["tool_calls"][-len(results):]}
     for exec_result in results:
-        _maybe_auto_attach_image(exec_result, tools)
+        observation = _maybe_auto_attach_image(exec_result, tools)
+        if observation:
+            by_call[exec_result["tool_call_id"]]["image_attachment"] = observation
 
     return error_count
 

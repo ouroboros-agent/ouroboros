@@ -29,7 +29,7 @@ from ouroboros.process_interpreters import (
     apply_env_path_prepend,
     interpreter_path_overlay,
 )
-from ouroboros.shell_parse import normalize_check_argv
+from ouroboros.shell_parse import POSIX_SHELL_HEADS, normalize_check_argv, shell_tokens_typed
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
     active_tool_profile,
@@ -123,7 +123,6 @@ _normalize_check = normalize_check_argv
 # Shell stages that, as the LAST stage of a pipeline, almost always exit 0 even when an earlier
 # real command failed — so the pipeline's exit (POSIX: the last stage's) MASKS the true result.
 _EXIT_MASK_FILTER_CMDS = frozenset({"tail", "head", "grep", "egrep", "fgrep", "sed", "awk", "cat", "tee", "tr", "sort", "uniq", "wc", "true", ":"})
-_SHELL_C_HEADS = frozenset({"sh", "bash", "dash", "ash", "zsh"})
 
 
 def _check_has_exit_masking(argv: List[str]) -> tuple[bool, list[str]]:
@@ -136,33 +135,33 @@ def _check_has_exit_masking(argv: List[str]) -> tuple[bool, list[str]]:
     informs the advisory reviewer + the agent, P5-clean (it decides nothing). Returns (masked, reasons)."""
     if not argv or len(argv) < 3:
         return False, []
-    if pathlib.PurePath(str(argv[0])).name.lower() not in _SHELL_C_HEADS or str(argv[1]) not in ("-c", "-lc"):
+    if pathlib.PurePath(str(argv[0])).name.lower() not in POSIX_SHELL_HEADS or str(argv[1]) not in ("-c", "-lc"):
         return False, []
-    text = str(argv[2])
-    # Operator-aware tokenization (shlex with `punctuation_chars`) so `|`/`||` are split out as
-    # standalone tokens EVEN WHEN glued to words (`pytest -q|tail`, `make test||true`) — plain
-    # shlex.split is whitespace-only and would miss the no-space forms. Quotes are still respected,
-    # so a quoted literal (e.g. a grep pattern `'| tail'`) is NOT flagged.
-    try:
-        lexer = shlex.shlex(text, posix=True, punctuation_chars="|&<>;")
-        lexer.whitespace_split = True
-        toks = list(lexer)
-    except ValueError:
+    typed = shell_tokens_typed(str(argv[2]))
+    if typed is None:
         return False, []
+    # Strip only syntactic grouping, including punctuation glued to a pipe
+    # (``)|(``). Quoted/escaped parentheses and operators remain literal data.
+    toks: list[tuple[str, bool]] = []
+    for token, operator in typed:
+        if operator:
+            toks.extend((part, True) for part in token.replace("(", " ").replace(")", " ").split())
+        else:
+            toks.append((token, False))
     reasons: list[str] = []
     for i, tok in enumerate(toks[:-1]):
-        if tok == "||" and toks[i + 1] in ("true", ":"):
+        if tok == ("||", True) and toks[i + 1] in (("true", False), (":", False)):
             reasons.append("|| true")
             break
-    pipe_positions = [i for i, tok in enumerate(toks) if tok == "|"]
+    pipe_positions = [i for i, tok in enumerate(toks) if tok == ("|", True)]
     if pipe_positions:
         nxt = pipe_positions[-1] + 1
-        last_stage = pathlib.PurePath(toks[nxt]).name.lower() if nxt < len(toks) else ""
+        last_stage = pathlib.PurePath(toks[nxt][0]).name.lower() if nxt < len(toks) and not toks[nxt][1] else ""
         if last_stage in _EXIT_MASK_FILTER_CMDS:
             reasons.append(f"pipeline_{last_stage}")
-    if len(toks) >= 2 and toks[-1] in {"true", ":"} and toks[-2] == ";":
-        reasons.append(f"{toks[-2]} true")
-    if len(toks) >= 3 and toks[-2:] == ["exit", "0"] and toks[-3] in {";", "||"}:
+    if len(toks) >= 2 and toks[-1] in (("true", False), (":", False)) and toks[-2] == (";", True):
+        reasons.append("; true")
+    if len(toks) >= 3 and toks[-2:] == [("exit", False), ("0", False)] and toks[-3] in ((";", True), ("||", True)):
         reasons.append("exit 0")
     seen: set = set()
     ordered = [r for r in reasons if not (r in seen or seen.add(r))]

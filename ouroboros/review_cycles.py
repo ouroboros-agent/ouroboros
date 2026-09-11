@@ -55,7 +55,6 @@ only through the environment is not migrated and no longer binds. No new state f
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
 from typing import Any, Optional
 
@@ -64,6 +63,7 @@ from ouroboros.config import SETTINGS_DEFAULTS
 # enforcement" (owner D10/D27) — SSOT beside the acceptance-decision vocabulary.
 from ouroboros.outcomes import REASON_REVIEW_CYCLES_EXHAUSTED  # noqa: F401 — re-export
 from ouroboros.utils import append_jsonl, emit_log_event, utc_now_iso
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ def review_max_cycles() -> Optional[int]:
     Env-or-default like every other getter; a malformed value fails CLOSED to
     the shipped default (bounded) and is reported once per process."""
     default_text = str(SETTINGS_DEFAULTS[REVIEW_MAX_CYCLES_KEY])
-    raw = os.environ.get(REVIEW_MAX_CYCLES_KEY, "") or default_text
+    raw = runtime_setting(REVIEW_MAX_CYCLES_KEY, "") or default_text
     try:
         return parse_review_max_cycles(raw)
     except (TypeError, ValueError):
@@ -149,7 +149,7 @@ def review_max_cycles_source() -> str:
     present in the environment (``config.apply_settings_to_env`` projects saved
     settings there, so an owner edit and an env override are the same fact),
     else ``shipped_default``. Provenance only — never a second parse."""
-    return "owner_setting" if os.environ.get(REVIEW_MAX_CYCLES_KEY, "") else "shipped_default"
+    return "owner_setting" if runtime_setting(REVIEW_MAX_CYCLES_KEY, "") else "shipped_default"
 
 
 def acceptance_max_improvement_passes_from_cycles() -> Optional[int]:

@@ -196,9 +196,14 @@ def preflight_failed(findings: Any) -> bool:
 
 def skill_review_gate(
     status: str, *, stale: bool = False, enforcement: Optional[str] = None,
-    findings: Any = None,
+    findings: Any = None, author_disposition: Any = None, current_hash: str = "",
 ) -> Dict[str, Any]:
     """Structured, agent-facing explanation of whether a review is executable.
+
+    A current author acceptance admits changed bytes only in Advisory; stale
+    still describes the original reviewer evidence, never the author hash.
+    Author fields are optional and appear only with a valid author disposition;
+    callers without one retain the frozen gate key set.
 
     Deterministic hard-gate failures (e.g. skill_preflight) are persisted as
     STATUS_PENDING by `_run_deterministic_preflight`, so they are non-executable
@@ -216,6 +221,11 @@ def skill_review_gate(
     actions: the cheap Re-review (which reruns the preflight) stays primary,
     with Repair offered based on the last recorded preflight.
     """
+    from ouroboros.review_records import validate_author_disposition
+
+    author = validate_author_disposition(author_disposition)
+    author_current = bool(current_hash and author and author["subject_hash"] == current_hash
+                          and author["enforcement"] == "advisory")
     raw_status = normalize_skill_review_status(status)
     if enforcement is None:
         try:
@@ -228,6 +238,10 @@ def skill_review_gate(
         executable = False
         reason = "review_pending"
         summary = "Review is pending or did not produce an executable verdict."
+    elif author_current and enforcement == "advisory":
+        executable = True
+        reason = "author_accepted_advisory"
+        summary = "The author accepted the current payload under Advisory; the original reviewer verdict and hash are unchanged."
     elif stale:
         executable = False
         reason = "review_stale"
@@ -256,6 +270,8 @@ def skill_review_gate(
     return {
         "status": raw_status or STATUS_PENDING,
         "stale": bool(stale),
+        **({"author_accepted": reason == "author_accepted_advisory",
+            "author_disposition": author} if author else {}),
         "executable_review": bool(executable),
         "blocking_reason": reason,
         "review_enforcement": enforcement,

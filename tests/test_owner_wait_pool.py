@@ -45,6 +45,7 @@ def pool(tmp_path, monkeypatch):
     monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", tmp_path / "state/queue_snapshot.json")
     monkeypatch.setattr(queue, "ACCEPTANCE_FENCES", {})
     monkeypatch.setattr(queue, "BUDGET_ROOT_FENCES", {})
+    monkeypatch.setattr(queue, "_reap_queue", stdqueue.Queue())
     monkeypatch.setattr(workers, "WORKERS", slots)
     monkeypatch.setattr(workers, "MAX_WORKERS", 1)
     monkeypatch.setattr(workers, "CRASH_TS", [])
@@ -190,6 +191,57 @@ def test_ordinary_pool_does_not_grow_to_configured_max(pool, monkeypatch):
     assert set(workers.WORKERS) == {0} and not pool.created
 
 
+def exhausted_replacement(pool):
+    park(pool)
+    worker_owner_wait.maintain_owner_wait_capacity()
+    replacement = workers.WORKERS[1]
+    replacement.proc.alive = False
+    replacement.readiness_exhausted = True
+    return replacement
+
+
+def test_same_stack_reclaims_exhausted_replacement_without_new_spawn(pool):
+    replacement = exhausted_replacement(pool)
+    worker_owner_wait.maintain_owner_wait_capacity()
+    assert workers.worker_pool_admission_state()["available"]
+    assert len(pool.created) == 1 and replacement.active_capacity
+    worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
+    worker_owner_wait.maintain_owner_wait_capacity()
+    assert workers.WORKERS == {0: pool.original}
+    assert pool.original.active_capacity and len(pool.created) == 1
+    assert pool.original.in_q.get_nowait()["phase"] == "resume_granted"
+    assert workers.RUNNING["owner"] is pool.meta and pool.meta["attempt"] == 3
+    assert replacement.in_q.closed
+
+
+@pytest.mark.parametrize("failure", ["state", "snapshot", "command"])
+def test_exhausted_reservation_and_original_rollback_together(pool, monkeypatch, failure):
+    replacement = exhausted_replacement(pool)
+    worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
+    if failure == "state":
+        original = worker_owner_wait.set_owner_wait
+        calls = []
+
+        def fail_first(*a, **k):
+            calls.append(True)
+            if len(calls) == 1:
+                raise OSError("state unavailable")
+            return original(*a, **k)
+
+        monkeypatch.setattr(worker_owner_wait, "set_owner_wait", fail_first)
+    elif failure == "snapshot":
+        monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **k: False)
+    else:
+        def fail_command(*a, **k):
+            raise OSError("command unavailable")
+        monkeypatch.setattr(worker_owner_wait, "_command", fail_command)
+    worker_owner_wait.maintain_owner_wait_capacity()
+    assert not pool.original.active_capacity and replacement.active_capacity
+    assert len(pool.created) == 1 and workers.WORKERS[1] is replacement
+    assert pool.original.in_q.empty() and pool.meta["owner_wait"]["state"] == "waiting"
+    assert load_task_result(pool.root, "owner")["owner_wait"]["state"] == "waiting"
+
+
 def test_wait_lends_capacity_to_real_assignment(pool, monkeypatch):
     from supervisor import evolution_lifecycle, state
 
@@ -238,8 +290,10 @@ def test_parked_crash_terminalizes_without_replaying_completed_effects(pool, mon
         "accounted_upper_bound_usd": 2.0,
     })
     respawn_ids, disabled = workers._ensure_workers_healthy_locked(queue)
-    assert not disabled and respawn_ids == [0]
-    workers.respawn_worker(0)
+    assert not disabled and respawn_ids == []
+    from supervisor.worker_health import recover_confirmed_dead_worker
+
+    recover_confirmed_dead_worker(queue._reap_queue.get_nowait())
     saved = load_task_result(pool.root, "owner")
     assert saved["status"] == "failed" and saved["reason_code"] == "worker_crash_owner_wait"
     assert saved["owner_wait"]["source_ref"] == pool.wait["source_ref"]
@@ -388,7 +442,10 @@ def test_native_continuation_crash_never_replays_original_work(pool, monkeypatch
             assert pool.original.in_q.get_nowait()["phase"] == "resume_granted"
     pool.original.proc.alive, pool.original.proc.exitcode = False, 1
     respawn_ids, disabled = workers._ensure_workers_healthy_locked(queue)
-    assert not disabled and respawn_ids == [0]
+    assert not disabled and respawn_ids == []
+    from supervisor.worker_health import recover_confirmed_dead_worker
+
+    recover_confirmed_dead_worker(queue._reap_queue.get_nowait())
     assert not workers.PENDING, "Original input was requeued after completed effects were checkpointed"
     saved = load_task_result(pool.root, "owner")
     assert saved["status"] == "failed" and saved["reason_code"] == "worker_crash_owner_wait"

@@ -18,7 +18,7 @@ import threading
 from typing import List
 
 from ouroboros.platform_layer import kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
-from ouroboros.config import SETTINGS_DEFAULTS, load_settings
+from ouroboros.config import SETTINGS_DEFAULTS, load_settings, runtime_environ
 from ouroboros.tools.registry import ToolContext
 from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.workspace_executor import executor_ref_from_ctx
@@ -72,26 +72,27 @@ def kill_all_tracked_subprocesses():
         _active_subprocesses.clear()
 
 
-def _shell_env_for_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> "dict | None":
+def _shell_env_for_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> dict:
     """For a command whose cwd is OUTSIDE the Ouroboros system repo (an external
     workspace / target project, e.g. SWE-bench dig-direct ``/app``), return an
     env copy with the repo dir scrubbed from ``PYTHONPATH`` so the target cannot
     shadow-import Ouroboros's own modules (R2). ``ctx.repo_dir`` stays pinned to
     the Ouroboros repo even in workspace mode, so this is the authoritative
-    in-repo test. Returns ``None`` for commands inside the system repo (Ouroboros
-    tooling legitimately imports itself) so they inherit ``os.environ``."""
+    in-repo test. Every child receives the task environment; in-repo commands
+    retain the repository Python path."""
+    env = runtime_environ()
     try:
         system_repo = pathlib.Path(getattr(ctx, "repo_dir")).resolve(strict=False)
         wd = pathlib.Path(work_dir).resolve(strict=False)
     except Exception:
-        return None
+        return env
     try:
         in_repo = wd == system_repo or wd.is_relative_to(system_repo)
     except AttributeError:  # pragma: no cover - py<3.9
         in_repo = str(wd) == str(system_repo) or str(wd).startswith(str(system_repo) + os.sep)
     if in_repo:
-        return None
-    return scrub_repo_from_pythonpath(dict(os.environ), system_repo)
+        return env
+    return scrub_repo_from_pythonpath(env, system_repo)
 
 
 def _resolve_effective_timeout(

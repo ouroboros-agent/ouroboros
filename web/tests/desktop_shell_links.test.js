@@ -9,6 +9,7 @@ import {
     downloadBlobViaHostBridge,
     installDesktopShellLinkInterceptor,
     openViaHostBridge,
+    openExternalViaHostBridge,
 } from '../modules/ui_helpers.js';
 
 const BASE = 'http://127.0.0.1:8765/';
@@ -583,4 +584,31 @@ test('direct old-shell download propagates an unavailable copy fallback', async 
         globalThis.fetch = async () => { throw new Error('must not fetch'); };
         await assert.rejects(() => downloadViaHostBridge('/api/tasks/task/artifacts/data.bin', 'data.bin', { streaming: true }), /Desktop file download is unavailable/);
     } finally { Object.assign(globalThis, prior); }
+});
+
+
+test('external host handoff preserves browser activation and accepts noopener null', async () => {
+    const calls = [];
+    const win = { open(...args) { calls.push(args); return null; } };
+    const result = openExternalViaHostBridge('https://example.com', { win, doc: {} });
+    assert.deepEqual(calls, [['https://example.com/', '_blank', 'noopener']], 'physical handoff occurs before yielding');
+    assert.equal((await result).ok, true);
+    for (const url of ['javascript:alert(1)', 'file:///tmp/x', '/relative', 'blob:https://example.com/x']) {
+        await assert.rejects(openExternalViaHostBridge(url, { win, doc: {} }), /Unsupported/);
+    }
+    assert.equal(calls.length, 1);
+});
+
+test('Telegram host uses the ready SDK and never queues an unavailable click', async () => {
+    const calls = [];
+    const win = { open(...args) { calls.push(['browser', ...args]); } };
+    const doc = { documentElement: { dataset: { ouroborosHost: 'telegram' } } };
+    await assert.rejects(openExternalViaHostBridge('https://example.com', { win, doc }), /not ready/);
+    win.Telegram = { WebApp: { openLink(url) { calls.push(['telegram', url]); } } };
+    assert.deepEqual(calls, [], 'SDK arrival does not replay a prior click');
+    const result = openExternalViaHostBridge('https://example.com', { win, doc });
+    assert.deepEqual(calls, [['telegram', 'https://example.com/']]);
+    assert.equal((await result).host, 'telegram');
+    await openExternalViaHostBridge('mailto:owner@example.com', { win, doc });
+    assert.deepEqual(calls.at(-1), ['browser', 'mailto:owner@example.com', '_blank', 'noopener']);
 });

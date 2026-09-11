@@ -5,9 +5,10 @@ split); loop.py re-exports every name."""
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import logging
 import contextlib
-import os
 import pathlib
 import queue
 import time
@@ -107,7 +108,7 @@ def _run_cross_model_fallback_chain(
 
     _cooled(active_model, active_use_local)
     primary_context_usage = _snapshot_context_fit_usage(accumulated_usage)
-    fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
+    fallback_use_local = runtime_setting("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
     attempt_cap = _fcd.attempts_per_model()
     configured_chain = parse_fallback_chain()
     msg = None
@@ -432,7 +433,7 @@ def _dispatch_round_model(
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
 ) -> Tuple[Any, float]:
     from ouroboros.model_wait import current_model_wait
-    from ouroboros.loop_transport import transport_repeat_stop_requested
+    from ouroboros.loop_transport import managed_transport_continuation, transport_repeat_stop_requested
     from ouroboros.owner_mailbox import OwnerMailboxPeek
 
     mailbox_peek = OwnerMailboxPeek()
@@ -447,6 +448,7 @@ def _dispatch_round_model(
         context_fit_plan=plan, overrides=waiter.overrides if waiter else None)
     binding = (waiter.register_reprepare(role, lambda kwargs: _reprepare_waiting_main(ctx, kwargs))
                if waiter is not None else contextlib.nullcontext())
+    previous_call = ctx.accumulated_usage.get("_last_llm_call_meta")
     with binding:
         result = _loop().call_llm_with_retry(
             ctx.llm, ctx.messages, ctx.active_model, ctx.tool_schemas,
@@ -456,7 +458,8 @@ def _dispatch_round_model(
             deadline_ts=_loop()._task_deadline_epoch(ctx.tools),
             transport_reserve_sec=task_pacing.get_finalization_grace_sec(),
             attempt_cap=attempt_cap,
-            transport_death_retries=_TRANSPORT_DEATH_RETRIES if attempt_cap is None else 0,
+            transport_death_retries=(_TRANSPORT_DEATH_RETRIES if attempt_cap is None
+                                     and not managed_transport_continuation(ctx.tools._ctx) else 0),
             stop_retry_check=(lambda: transport_repeat_stop_requested(ctx.tools._ctx, mailbox_peek=mailbox_peek)) if attempt_cap is None else None,
             allow_server_web_search=_loop()._server_web_allowed_by_task(ctx.tools._ctx),
             physical_context=(_physical_context_for_fit(disposition) if disposition is not None else None),
@@ -472,6 +475,13 @@ def _dispatch_round_model(
             use_local=ctx.active_use_local, preferred_mode=ctx.active_context_mode,
             tool_schemas=ctx.tool_schemas, model_role=role, model_route=observed,
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
+    call = ctx.accumulated_usage.get("_last_llm_call_meta")
+    execution_id = ctx.accumulated_usage.get("execution_id")
+    if (result[0] is not None and isinstance(call, dict) and call is not previous_call
+            and execution_id and call.get("execution_id") == execution_id
+            and call.get("round_id") == f"{execution_id}:round:{ctx.round_idx}"
+            and call.get("llm_call_id")):
+        call["usable_solve_response"] = True
     return result
 
 

@@ -261,8 +261,8 @@ def get_tools() -> List[ToolEntry]:
                 "inherit it), and you verify their combined files with integrate_subagent_patch. Use genesis only when EACH child "
                 "should own its OWN standalone durable repo (e.g. best-of-N separate builds). "
                 "Harness-delegated work uses a private snapshot; integrate_delegated_patch handles that separate patch. "
-                "Mutative children still cannot commit, run "
-                "review/runtime/skills lifecycle, enable tools, or write cognitive memory. Nested delegation "
+                "Mutative children cannot commit, enable tools or write cognitive memory. Cyber-effective "
+                "children inherit selected review, skill and runtime tools; explicit task restrictions remain. Nested delegation "
                 "is allowed within configured depth/cap limits — use delegation_intent / may_mutate / "
                 "may_fan_out to tell a child to recurse further, so a 'maximum subagents / grandchildren' "
                 "request propagates structurally instead of collapsing into one flat layer. "
@@ -350,7 +350,7 @@ def get_tools() -> List[ToolEntry]:
         }, _update_identity),
         ToolEntry("toggle_evolution", {
             "name": "toggle_evolution",
-            "description": "Enable or disable evolution mode. When enabled, Ouroboros runs continuous self-improvement cycles. Enabling requires runtime_mode 'advanced' or 'pro'; it is refused in 'light' mode.",
+            "description": "Enable or disable evolution mode. When enabled, Ouroboros runs continuous self-improvement cycles. Enabling requires runtime_mode 'advanced', 'pro', or 'cyber_pro'; it is refused in 'light' mode.",
             "parameters": {"type": "object", "properties": {
                 "enabled": {"type": "boolean", "description": "true to enable, false to disable"},
                 "objective": {"type": "string", "default": "", "description": "Optional Evolution Campaign objective when enabling."},

@@ -143,7 +143,10 @@ def copy_wait_context() -> contextvars.Context:
     Copying every ContextVar also transfers a previous physical capture and
     the parent's Main fit authority. Those belong to their original call.
     """
+    from ouroboros.settings_integrity import copy_task_settings_context
+
     copied = contextvars.Context()
+    copy_task_settings_context(copied)
     for variable in (_CURRENT, _REPREPARE, _CALENDAR, _LOGICAL):
         copied.run(variable.set, variable.get())
     return copied
@@ -169,6 +172,17 @@ def calendar_scope(deadline_at: str) -> Iterator[None]:
         yield
     finally:
         _CALENDAR.reset(token)
+
+
+def dispatch_deadline_remaining_sec() -> float | None:
+    """Read inherited calendar and quota-adjusted execution bounds, without a floor."""
+    from ouroboros.deadline_utils import seconds_until
+
+    remaining = [value for bound in _CALENDAR.get()
+                 if (value := seconds_until(bound)) is not None]
+    remaining.extend(max(0.0, deadline - monotonic_now(slot))
+                     for deadline, slot in _LOGICAL.get())
+    return min(remaining) if remaining else None
 
 
 def mutate_wait(root: Any, task_id: str, wait_id: str, transform: Callable) -> dict:

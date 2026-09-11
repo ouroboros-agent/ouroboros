@@ -7,6 +7,7 @@ class Classes {
     constructor() { this.values = new Set(); }
     set(value) { this.values = new Set(String(value || '').split(/\s+/).filter(Boolean)); }
     add(...values) { values.forEach((value) => this.values.add(value)); }
+    remove(...values) { values.forEach((value) => this.values.delete(value)); }
     contains(value) { return this.values.has(value); }
     toggle(value, force) {
         const enabled = force === undefined ? !this.contains(value) : Boolean(force);
@@ -67,7 +68,7 @@ function countPropertyWrites(target, key) {
     return () => writes;
 }
 
-function fixture({ fetchImpl, renderMarkdown, onDomWrite } = {}) {
+function fixture({ fetchImpl, renderMarkdown, onDomWrite, fetchDetail } = {}) {
     const prior = { document: globalThis.document, crypto: globalThis.crypto };
     globalThis.document = { createElement: (tag) => new NodeStub(tag) };
     if (!globalThis.crypto || !globalThis.crypto.randomUUID) {
@@ -88,6 +89,7 @@ function fixture({ fetchImpl, renderMarkdown, onDomWrite } = {}) {
         enhanceMarkdown: renderMarkdown ? () => {} : null,
         showToast: (text, tone) => toasts.push({ text, tone }),
         onDomWrite,
+        fetchDetail,
     });
     return { decision, toasts, calls, restore: () => {
         globalThis.document = prior.document;
@@ -102,6 +104,103 @@ const WS_MSG = {
     options: [{ label: 'Yes' }, { label: 'No', detail: 'wait for CI' }],
     ts: '2026-08-31T10:00:00Z',
 };
+
+test('Project pointer uses task/quiz identity and retains a reordered answer without a second quiz', () => {
+    const fx = fixture();
+    try {
+        fx.decision.applyQuizStateFrame({}, { task_id: 't-1', quiz_id: 'qz-1', state: 'answered' });
+        const row = { task_id: 't-1', quiz_id: 'qz-1', project_id: 'p1', project_chat_id: 23,
+            project_name: 'Storage', quiz_state: 'open' };
+        const pointer = fx.decision.buildQuestionPointer(row);
+        assert.equal(pointer.children[0].textContent, 'Question answered in Storage');
+        assert.equal(pointer.children[1].textContent, 'View question');
+        assert.equal(pointer.querySelectorAll('.chat-quiz-option').length, 0);
+        const labelWrites = countPropertyWrites(pointer.children[0], 'textContent');
+        assert.equal(fx.decision.buildQuestionPointer({ ...row, ts: 'later' }), null);
+        assert.equal(labelWrites(), 0, 'unchanged pointer projection preserves selected text');
+        fx.decision.applyQuizStateFrame({}, { task_id: 'another-task', quiz_id: 'qz-1', state: 'expired_terminal' });
+        assert.equal(pointer.children[0].textContent, 'Question answered in Storage');
+        const next = fx.decision.buildQuestionPointer({ ...row, quiz_id: 'next' });
+        assert.equal(next.children[0].textContent, 'Answer needed in Storage');
+        fx.decision.buildQuestionPointer({ ...row, quiz_id: 'next', owner_wait_state: 'resumed' });
+        assert.equal(next.children[0].textContent, 'Question in Storage');
+        fx.decision.buildQuestionPointer({ ...row, quiz_id: 'next', quiz_state: 'unknown' });
+        assert.equal(next.children[0].textContent, 'Question status unavailable in Storage');
+    } finally { fx.restore(); }
+});
+
+test('targeted detail preserves normalized option details, single-flight, and the existing answer form', async () => {
+    let calls = 0;
+    const block = { ...WS_MSG, options: ['Yes', 'No'], option_details: ['Immediate release', 'Wait for CI'], asked_at: WS_MSG.ts };
+    const fx = fixture({ fetchDetail: async () => {
+        calls += 1;
+        return { task_id: 't-1', project_id: 'p1', owner_quiz: { 'qz-1': block } };
+    } });
+    try {
+        const [question, same] = await Promise.all([
+            fx.decision.readQuestion('t-1', 'qz-1', 'p1'), fx.decision.readQuestion('t-1', 'qz-1', 'p1'),
+        ]);
+        assert.equal(calls, 1);
+        assert.deepEqual(question, same);
+        const card = fx.decision.buildQuizCard(question);
+        assert.deepEqual(card.querySelectorAll('.chat-quiz-option-detail').map((node) => node.textContent),
+            ['Immediate release', 'Wait for CI']);
+        const field = card.querySelector('.chat-quiz-comment');
+        field.value = 'keep my draft';
+        assert.equal(fx.decision.buildQuizCard({ ...question, ts: 'later-history' }), null);
+        assert.equal(card.querySelector('.chat-quiz-comment'), field);
+        card.querySelectorAll('.chat-quiz-option')[1].click();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(JSON.parse(fx.calls[0].init.body).option_index, 1);
+        assert.equal(JSON.parse(fx.calls[0].init.body).comment, 'keep my draft');
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(await fx.decision.readQuestion('t-1', 'qz-1', 'wrong-project'), null);
+    } finally { fx.restore(); }
+});
+
+test('initial pointer waits for its exact source and legacy labels disclose missing details', async () => {
+    const fx = fixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1', owner_quiz: {
+        'qz-1': { ...WS_MSG, state: 'expired_terminal', options: ['Yes', 'No'] },
+    } }) });
+    try {
+        const pointer = fx.decision.buildQuestionPointer({ task_id: 't-1', quiz_id: 'qz-1',
+            project_id: 'p1', project_chat_id: 23, project_name: 'Storage', quiz_state: 'open' });
+        assert.equal(pointer.children[0].textContent, 'Question status unavailable in Storage');
+        await fx.decision.refreshQuestions();
+        assert.equal(pointer.children[0].textContent, 'Question expired in Storage');
+        const question = await fx.decision.readQuestion('t-1', 'qz-1', 'p1');
+        const card = fx.decision.buildQuizCard(question);
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((button) => button.disabled));
+        assert.match(card.querySelector('.chat-quiz-details-unavailable').textContent, /not retained/);
+    } finally { fx.restore(); }
+});
+
+test('a late targeted question read cannot steal a newer navigation or a hidden room', async () => {
+    const pending = new Map();
+    const fx = fixture({ fetchDetail: (taskId) => new Promise((resolve) => pending.set(taskId, resolve)) });
+    const appended = [];
+    const append = (msg) => { appended.push(msg.task_id); fx.decision.buildQuizCard(msg); };
+    let visible = true;
+    const detail = (taskId) => ({ task_id: taskId, project_id: 'p1', owner_quiz: {
+        'qz-1': { ...WS_MSG, options: ['Yes', 'No'], option_details: ['', 'Wait for CI'] },
+    } });
+    try {
+        const old = fx.decision.revealQuestion('old', 'qz-1', 'p1', 23, append, () => visible);
+        const next = fx.decision.revealQuestion('new', 'qz-1', 'p1', 23, append, () => visible);
+        await Promise.resolve();
+        pending.get('new')(detail('new'));
+        assert.equal(await next, true);
+        pending.get('old')(detail('old'));
+        assert.equal(await old, false);
+        assert.deepEqual(appended, ['new']);
+        const hidden = fx.decision.revealQuestion('hidden', 'qz-1', 'p1', 23, append, () => visible);
+        await Promise.resolve();
+        visible = false;
+        pending.get('hidden')(detail('hidden'));
+        assert.equal(await hidden, false);
+        assert.deepEqual(appended, ['new']);
+    } finally { fx.restore(); }
+});
 
 test('required question renders waiting identically from live and stored frames', () => {
     const fx = fixture();

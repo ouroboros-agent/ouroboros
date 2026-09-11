@@ -153,6 +153,58 @@ def _mask_mcp_servers_payload(servers: Any) -> list:
     return out
 
 
+def _build_policy_state(settings: Dict[str, Any]) -> dict:
+    """Project configured versus process-effective owner policy for Settings UI.
+
+    Persisted values are the pending choices.  Runtime access is boot-bound;
+    Supervisor and Review are hot-reloaded for the next task through the
+    existing settings path.  The projection deliberately carries no authority
+    and writes no second state record.
+    """
+    from ouroboros import config as _config
+    from ouroboros.review_model_routes import get_review_enforcement
+
+    configured_access = _config.normalize_runtime_mode(
+        settings.get("OUROBOROS_RUNTIME_MODE"))
+    effective_access = _config.get_runtime_mode()
+    configured_supervisor = _config.normalize_safety_mode(
+        settings.get("OUROBOROS_SAFETY_MODE"))
+    effective_supervisor = _config.get_safety_mode()
+    configured_review = str(
+        settings.get("OUROBOROS_REVIEW_ENFORCEMENT") or "advisory").strip().lower()
+    effective_review = get_review_enforcement()
+    running_task_snapshot = bool(_has_started_agent_tasks())
+    return {
+        "access": {
+            "configured": configured_access,
+            "effective": effective_access,
+            "current_process": effective_access,
+            "next_task": configured_access,
+            "restart_required": configured_access != effective_access,
+            "applies": "restart",
+        },
+        "supervisor": {
+            "configured": configured_supervisor,
+            "effective": effective_supervisor,
+            "current_process": effective_supervisor,
+            "next_task": configured_supervisor,
+            "pending": configured_supervisor != effective_supervisor or running_task_snapshot,
+            "applies": "next_task",
+            "active_task_snapshot": running_task_snapshot,
+        },
+        "review": {
+            "configured": configured_review if configured_review in {"advisory", "blocking"} else "advisory",
+            "effective": effective_review,
+            "current_process": effective_review,
+            "next_task": configured_review if configured_review in {"advisory", "blocking"} else "advisory",
+            "pending": configured_review != effective_review or running_task_snapshot,
+            "applies": "next_task",
+            "active_task_snapshot": running_task_snapshot,
+        },
+        "running_task_snapshot": running_task_snapshot,
+    }
+
+
 def _rehydrate_mcp_servers_payload(incoming: Any, current: Any) -> list:
     if not isinstance(incoming, list):
         return []
@@ -182,46 +234,10 @@ def _rehydrate_mcp_servers_payload(incoming: Any, current: Any) -> list:
     return out
 
 
-_IMMEDIATE_KEYS = frozenset({
-    "TOTAL_BUDGET",
-    # The OUTER per-call tool cap reads settings.json BEFORE env on every tool
-    # call in every process (loop_tool_execution.py), so a saved change bites
-    # the currently running task's next tool call. The inner shell subprocess
-    # timeout still prefers the worker env (next task) — disclosed residual.
-    "OUROBOROS_TOOL_TIMEOUT_SEC",
-    "GITHUB_TOKEN",
-    "GITHUB_REPO",
-    "OUROBOROS_UPDATE_CHANNEL",
-    # The save handler hot-reconfigures MCP itself before responding
-    # (_apply_settings_save_side_effects), and worker processes re-check the
-    # settings mtime on their next tool-schema read; a reconfigure failure is
-    # surfaced as a save warning instead of silently keeping the claim.
-    "MCP_ENABLED",
-    "MCP_SERVERS",
-    "MCP_TOOL_TIMEOUT_SEC",
-})
-
-_RESTART_REQUIRED_KEYS = frozenset({
-    "OUROBOROS_MAX_WORKERS",
-    "OUROBOROS_SERVER_HOST",
-    # The host-service port is bound once at server startup.
-    "OUROBOROS_HOST_SERVICE_PORT",
-    # Pooled workers load the extension registry once at spawn and never
-    # reload it per task; the save-time server reload keeps the skills UI
-    # fresh, but agent tasks see the new repo only after a restart.
-    "OUROBOROS_SKILLS_REPO_PATH",
-    "LOCAL_MODEL_SOURCE",
-    "LOCAL_MODEL_FILENAME",
-    "LOCAL_MODEL_PORT",
-    "LOCAL_MODEL_N_GPU_LAYERS",
-    "LOCAL_MODEL_CONTEXT_LENGTH",
-    "LOCAL_MODEL_CHAT_FORMAT",
-    # Background cognition reads these at consciousness __init__, so a change
-    # only takes effect after restart (Phase 4 Evolution settings group).
-    "OUROBOROS_BG_WAKEUP_MIN",
-    "OUROBOROS_BG_WAKEUP_MAX",
-    "OUROBOROS_BG_MAX_ROUNDS",
-})
+from ouroboros.settings_scales import (
+    IMMEDIATE_SETTINGS as _IMMEDIATE_KEYS,
+    RESTART_REQUIRED_SETTINGS as _RESTART_REQUIRED_KEYS,
+)
 
 
 def _classify_settings_changes(
@@ -247,52 +263,23 @@ def _effect_buckets(all_changed: list) -> tuple:
     immediate_changed = [k for k in all_changed if k in _IMMEDIATE_KEYS]
     next_task_changed = [
         k for k in all_changed
-        if k not in _IMMEDIATE_KEYS and k not in _RESTART_REQUIRED_KEYS
+        if k not in _IMMEDIATE_KEYS and k not in _RESTART_REQUIRED_KEYS and k != "OUROBOROS_RUNTIME_MODE"
     ]
     return immediate_changed, next_task_changed
 
 
 def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     merged = {k: v for k, v in current.items()}
+    from ouroboros.config import get_runtime_mode
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+    skipped = {"OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW"} | _ENDPOINT_AUTHORED_SETTINGS
+    if not runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
+        skipped |= {"OUROBOROS_RUNTIME_MODE", "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "OUROBOROS_SAFETY_MODE"}
+    # Context/review scope stays owner-controlled. Cyber may configure other
+    # controls through this same writer; install-time provenance remains host-owned.
     for key in _SETTINGS_DEFAULTS:
-        # Owner-only keys: loopback HTTP settings cannot set them. Runtime mode is
-        # a privilege scope; context mode is a cognitive-horizon knob the agent
-        # must not lower itself (BIBLE P1). Both flow through dedicated owner endpoints.
-        #
-        # NOTE (v6.21.0): OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is also owner-controlled,
-        # but intentionally rides this generic owner path (it is NOT merge-skipped) so
-        # the Settings UI can set it without dedicated-endpoint ceremony. The agent
-        # cannot self-elevate it: shell (_detect_mutative_toggle_self_change), browser
-        # JS (_blocks_mutative_toggle_js), and data_write to settings.json
-        # (DATA_WRITE_BLOCKED) all block agent-originated changes, and it defaults to
-        # ON in advanced/pro anyway (self-enable is only meaningful in light, which
-        # sandboxes live-repo writes regardless). Owner-decided tradeoff; do not
-        # "promote" it to the skip-list without owner sign-off (it would break the UI).
-        # NOTE: OUROBOROS_POST_TASK_EVOLUTION (the V4 envelope enable) intentionally
-        # rides this generic owner path too (like ALLOW_MUTATIVE_SUBAGENTS), so the
-        # Phase 4 Evolution settings UI can toggle it On/Off. The agent cannot
-        # self-enable it: shell (_detect_evolution_owner_control_self_change), browser JS
-        # (_blocks_post_task_evolution_js), the POST /api/settings route guard, and
-        # data_write to settings.json (DATA_WRITE_BLOCKED) all block agent-originated
-        # changes, and SAFETY.md forbids it. Owner-decided tradeoff; do not merge-skip it
-        # (it would break the UI toggle).
-        if key in {
-            "OUROBOROS_RUNTIME_MODE",
-            "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS",
-            "OUROBOROS_CONTEXT_MODE",
-            # One-window false provenance tombstone. Generic settings never authors
-            # context intent; the dedicated owner endpoint writes the pair atomically.
-            "OUROBOROS_CONTEXT_MODE_AUTO_LOW",
-            # v6.54.3: LLM-safety-supervisor coverage (full/light/off) is likewise an
-            # immune-system control — a generic settings write must not lower it. It
-            # flows ONLY through the dedicated audited owner endpoint
-            # (api_owner_safety_mode); save_settings additionally ratchets lowering.
-            "OUROBOROS_SAFETY_MODE",
-            # The install-time facts join from config's ENDPOINT_AUTHORED_SETTINGS just
-            # below: POST /api/onboarding/complete alone writes them, beside what they
-            # record. This blocks the REQUEST BODY; the same set keeps them off the
-            # environment in both directions, so no other route can author them either.
-        } | _ENDPOINT_AUTHORED_SETTINGS:
+        if key in skipped:
             continue
         if key not in body:
             continue
@@ -435,7 +422,7 @@ def _api_owner_runtime_mode_sync(request: Request, body: Any) -> JSONResponse:
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     if raw_mode not in set(_config.VALID_RUNTIME_MODES):
-        return unsaved_error("'mode' must be one of: light, advanced, pro", 400)
+        return unsaved_error("'mode' must be one of: light, advanced, pro, cyber_pro", 400)
     # The digest is taken BEFORE the read that decides, so a write landing between the
     # two is refused rather than silently reverted by this request's write.
     digest = settings_document_digest()
@@ -813,11 +800,9 @@ def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
 async def api_owner_safety_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected LLM-safety-supervisor coverage (full | light | off).
 
-    Owner-only + audited (v6.54.3): safety coverage is an immune-system control, so
-    it is merge-skipped from the generic /api/settings path and its lowering is
-    ratcheted in save_settings — ONLY this dedicated, audited endpoint may lower it.
-    The deterministic registry sandbox, protected paths, and light-mode guards run
-    in every mode (BIBLE P3: the LLM supervisor is a layer, not the floor)."""
+    This dedicated owner path is audited. Ordinary modes skip this control in
+    generic settings saves; Cyber also has audited configuration authority there.
+    The independent Access and review-scope/enforcement controls remain in force."""
     body = await _json_body_or_empty(request)
     # Off the event loop, under the document lock (held inside): a slow
     # generic save must not be able to freeze the loop THROUGH this
@@ -999,6 +984,19 @@ async def api_settings_get(request: Request) -> JSONResponse:
     except (ValueError, OSError):
         port = _default_port(request)
     meta = _build_network_meta(_current_bind_host(request), port)
+    # Keep the three owner-facing policy axes honest after reload.  The values
+    # on the document are the pending/configured choices; process state is the
+    # effective value this server can currently report.  Runtime access is
+    # restart-bound, while Supervisor and Review are picked up for new tasks by
+    # the existing settings effect path.  This is presentation metadata only,
+    # not a second policy store.
+    try:
+        meta["policy_state"] = _build_policy_state(settings)
+    except Exception:
+        # A settings read must stay available even if an optional projection
+        # helper is unavailable during startup.  The persisted values remain
+        # the ordinary response fields and are still masked below.
+        log.debug("Could not build settings policy-state projection", exc_info=True)
     meta["custom_secret_keys"] = sorted(
         key for key in settings
         if key not in SECRET_SETTING_KEYS
@@ -1189,6 +1187,53 @@ def _check_reviewer_slots_against_incoming_roster(body: dict) -> str:
     )
 
 
+def _network_settings_error(request: Request, current: dict, old_settings: dict) -> JSONResponse | None:
+    """Validate the existing save-time bind/password contract before persistence."""
+    try:
+        from ouroboros.server_auth import is_loopback_host
+        desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
+        desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
+        trust_unauth = _trust_nonlocal_bind_without_password_enabled()
+        allowed_saved_hosts = {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"}
+        if desired_host and desired_host not in allowed_saved_hosts:
+            return unsaved_error(
+                "Server Bind Host in Settings supports localhost or wildcard "
+                "binds only (127.0.0.1 or 0.0.0.0). Specific LAN IP binds "
+                "are manual/env-only so the desktop launcher can keep using "
+                "a reliable loopback health check.",
+                400,
+            )
+        if desired_host and not is_loopback_host(desired_host) and not desired_password and not trust_unauth:
+            return unsaved_error(
+                "Setting a non-localhost Server Bind Host through the web UI "
+                "requires a Network Password in the same save. For manual "
+                "trusted-lab/Docker setups, stop Ouroboros and edit "
+                "settings.json or environment variables directly.",
+                400,
+            )
+        current_effective_host = (
+            str(_current_bind_host(request) or "").strip()
+            or str(os.environ.get("OUROBOROS_SERVER_HOST") or "").strip()
+        )
+        old_password = str(old_settings.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
+        if (
+            current_effective_host
+            and not is_loopback_host(current_effective_host)
+            and old_password
+            and not desired_password
+            and not trust_unauth
+        ):
+            return unsaved_error(
+                "Cannot clear Network Password while the running server is "
+                "still bound to a non-localhost interface. First save a "
+                "loopback Server Bind Host and restart, then clear the password.",
+                400,
+            )
+    except Exception:
+        log.warning("Could not validate network bind settings", exc_info=True)
+    return None
+
+
 def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
     # Everything below the write is a POST-commit step. The broad handler at the
     # bottom used to answer a failure there with "400, nothing saved" while the
@@ -1281,6 +1326,13 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                 old_settings.get("MCP_SERVERS"),
             )
         current = _merge_settings_payload(old_effective_settings, body)
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        requested_runtime_mode = _norm_runtime_mode(current.get("OUROBOROS_RUNTIME_MODE"))
+        runtime_authored = "OUROBOROS_RUNTIME_MODE" in body and runtime_mode_at_least(current_runtime_mode, "cyber_pro")
+        runtime_changed = runtime_authored and requested_runtime_mode != pending_runtime_mode
+        if runtime_authored:
+            pending_runtime_mode = requested_runtime_mode
         minimax_region = str(current.get("MINIMAX_REGION") or "").strip().lower()
         if minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
             return unsaved_error("MINIMAX_REGION must be global_en or cn_zh.", 400)
@@ -1293,48 +1345,9 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         current["OUROBOROS_SKILLS_REPO_PATH"] = str(
             current.get("OUROBOROS_SKILLS_REPO_PATH") or ""
         ).strip()
-        try:
-            from ouroboros.server_auth import is_loopback_host
-            desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
-            desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
-            trust_unauth = _trust_nonlocal_bind_without_password_enabled()
-            allowed_saved_hosts = {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"}
-            if desired_host and desired_host not in allowed_saved_hosts:
-                return unsaved_error(
-                    "Server Bind Host in Settings supports localhost or wildcard "
-                    "binds only (127.0.0.1 or 0.0.0.0). Specific LAN IP binds "
-                    "are manual/env-only so the desktop launcher can keep using "
-                    "a reliable loopback health check.",
-                    400,
-                )
-            if desired_host and not is_loopback_host(desired_host) and not desired_password and not trust_unauth:
-                return unsaved_error(
-                    "Setting a non-localhost Server Bind Host through the web UI "
-                    "requires a Network Password in the same save. For manual "
-                    "trusted-lab/Docker setups, stop Ouroboros and edit "
-                    "settings.json or environment variables directly.",
-                    400,
-                )
-            current_effective_host = (
-                str(_current_bind_host(request) or "").strip()
-                or str(os.environ.get("OUROBOROS_SERVER_HOST") or "").strip()
-            )
-            old_password = str(old_settings.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
-            if (
-                current_effective_host
-                and not is_loopback_host(current_effective_host)
-                and old_password
-                and not desired_password
-                and not trust_unauth
-            ):
-                return unsaved_error(
-                    "Cannot clear Network Password while the running server is "
-                    "still bound to a non-localhost interface. First save a "
-                    "loopback Server Bind Host and restart, then clear the password.",
-                    400,
-                )
-        except Exception:
-            log.warning("Could not validate network bind settings", exc_info=True)
+        network_error = _network_settings_error(request, current, old_settings)
+        if network_error is not None:
+            return network_error
         current, provider_defaults_changed, provider_default_keys = apply_runtime_provider_defaults(current)
         if str(current.get("LOCAL_MODEL_SOURCE", "") or "").strip() and not has_startup_ready_provider(current):
             return unsaved_error("Local-only setups must route at least one model to the local runtime.", 400)
@@ -1343,6 +1356,9 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             if str(current.get(k, "") or "") != str(old_effective_settings.get(k, "") or "")
         ]
         restart_keys = _classify_settings_changes(old_effective_settings, current)
+        if runtime_changed:
+            all_changed.append("OUROBOROS_RUNTIME_MODE")
+            restart_keys.append("OUROBOROS_RUNTIME_MODE")
 
         # Snapshot BEFORE the save lands: only a task already started at that
         # moment keeps the previous configuration. Measuring after the write
@@ -1361,7 +1377,13 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         # persistent Low/Max untouched and exact-route fitting happens at task dispatch.
         _owner_write_settings(
             settings_to_save,
+            authored_keys=("OUROBOROS_SAFETY_MODE",) if "OUROBOROS_SAFETY_MODE" in all_changed else (),
             boundary=boundary)
+        control_changes = {key: {"old": raw_old_settings.get(key), "new": settings_to_save.get(key)}
+                           for key in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_SAFETY_MODE", "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS")
+                           if key in all_changed}
+        if control_changes:
+            _owner_audit(request, "settings_controls", {"changes": control_changes})
         boundary.at("environment projection")
         _apply_settings_to_env(current)
         boundary.at("supervisor start")

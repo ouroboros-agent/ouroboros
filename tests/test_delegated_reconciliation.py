@@ -13,6 +13,9 @@ points) — this file now owns the full reconciliation theme.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+
+import pytest
 from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
 from ouroboros.gateways import claudexor as cx
 
@@ -26,11 +29,27 @@ from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture 
 )
 
 
-def test_the_startup_sweep_reconciles_delegated_runs_too(monkeypatch):
-    """Nothing is running yet at supervisor startup, so every open delegated run is by
-    definition ownerless. The only server-side test covered the PERIODIC tick, so the
-    startup half could be deleted without a single failure — and it is the half that
-    catches the runs the generation that died was watching."""
+@pytest.fixture
+def startup_owners(tmp_path, monkeypatch):
+    from ouroboros import post_task_checkpoint, server_maintenance
+    from supervisor import active_activity, queue, workers
+
+    monkeypatch.setattr(server_maintenance, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(queue, "RUNNING", {})
+    monkeypatch.setattr(queue, "PENDING", [])
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(post_task_checkpoint, "POST_TASK_SYNTHESIS_INFLIGHT", {})
+    registry = active_activity.DirectActivityRegistry()
+    monkeypatch.setattr(active_activity, "_DIRECT_ACTIVITY_REGISTRY", registry)
+    return queue, workers, post_task_checkpoint, registry
+
+
+def test_the_startup_sweep_reconciles_delegated_runs_too(monkeypatch, startup_owners):
+    """A fresh generation has no surviving queue, direct or post-task owners.
+
+    Startup must reconcile with that actual empty set, without inheriting another
+    test's queue. An in-process revival with live owners is covered separately.
+    """
     import ouroboros.server_maintenance as sm
     import ouroboros.delegate_custody as dc
     import ouroboros.process_custody as pc
@@ -44,17 +63,70 @@ def test_the_startup_sweep_reconciles_delegated_runs_too(monkeypatch):
     assert seen["live"] == set(), "an empty live set is the point: nothing survived the restart"
 
 
-def test_both_custody_surfaces_see_the_same_live_task_set(monkeypatch):
+def test_startup_revival_keeps_actual_current_owners(tmp_path, monkeypatch, startup_owners):
+    from ouroboros import delegate_custody as dc, process_custody as pc, server_maintenance as sm
+
+    queue, workers, post_task, registry = startup_owners
+    queue.RUNNING["queue-live"] = {"task": {"id": "queue-live"}}
+    workers.WORKERS[7] = SimpleNamespace(busy_task_id="worker-live")
+    registry.register("native-live", 1)
+    post_task.POST_TASK_SYNTHESIS_INFLIGHT[(str(tmp_path.resolve()), "post-live")] = None
+    expected = {"queue-live", "worker-live", "native-live", "post-live"}
+    for task_id in expected:
+        dc.record_started(tmp_path, dc.RunCustody(
+            run_id=f"run-{task_id}", task_id=task_id, route_id="r", model="m",
+            project_id="p", project_owned=False, root_task_id=task_id, ledger_root=str(tmp_path),
+        ))
+    seen = {}
+    transport = _LiveRunStub()
+    real_reconcile = dc.reconcile_orphaned_runs
+    def reconcile(root, **kwargs):
+        seen["delegated"] = kwargs["running_task_ids"]
+        kwargs["gateway_factory"] = lambda: transport
+        outcomes = real_reconcile(root, **kwargs)
+        seen["outcomes"] = outcomes
+        return outcomes
+    monkeypatch.setattr(dc, "reconcile_orphaned_runs", reconcile)
+    monkeypatch.setattr(pc, "reap_orphaned_processes",
+                        lambda root, **kw: seen.__setitem__("processes", kw["running_task_ids"]) or [])
+    monkeypatch.setattr(sm, "_installed_skill_names", lambda: None)
+    sm._startup_custody_sweep()
+    assert seen["processes"] == seen["delegated"] == expected
+    assert seen["outcomes"] == []
+    assert transport.cancels == []
+    assert {row.run_id for row in dc.open_runs(tmp_path)} == {f"run-{task_id}" for task_id in expected}
+
+
+def test_both_custody_surfaces_see_the_same_live_task_set(tmp_path, monkeypatch, startup_owners):
     """The periodic sweep must hand the delegated reconciler the SAME live task set the
     process reaper gets. Two copies of "is the owner still running" is exactly how one
     custody surface ends up reaping while its twin does not."""
     import time
+    import threading
 
     import ouroboros.server_maintenance as sm
     import ouroboros.delegate_custody as dc
     import ouroboros.process_custody as pc
     import supervisor.queue as queue
+    import supervisor.task_lifecycle as lifecycle
 
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    lock = threading.Lock()
+    monkeypatch.setattr(sm, "_CANCEL_INTENT_SWEEP_LOCK", lock)
+    monkeypatch.setattr(sm, "_LAST_CANCEL_INTENT_SWEEP", [0.0])
+    entered, release = threading.Event(), threading.Event()
+    threads = []
+    def tracked_thread(**kwargs):
+        thread = threading.Thread(**kwargs)
+        threads.append(thread)
+        return thread
+    monkeypatch.setattr(sm, "threading", SimpleNamespace(Thread=tracked_thread))
+    real_sweep = lifecycle.sweep_cancel_intents
+    def delayed_sweep():
+        entered.set()
+        assert release.wait(5), "test must release its maintenance work"
+        return real_sweep()
+    monkeypatch.setattr(lifecycle, "sweep_cancel_intents", delayed_sweep)
     seen = {}
     monkeypatch.setattr(pc, "reap_orphaned_processes",
                         lambda root, **kw: seen.__setitem__("processes", kw.get("running_task_ids")) or [])
@@ -68,8 +140,19 @@ def test_both_custody_surfaces_see_the_same_live_task_set(monkeypatch):
     from supervisor.active_activity import get_direct_activity_registry
 
     get_direct_activity_registry().register("native-live", 1)
-    sm._periodic_supervisor_maintenance([0.0], [time.time()])
-    assert seen["processes"] == seen["delegated"] == {"t-live", "native-live"}, seen
+    try:
+        sm._periodic_supervisor_maintenance([0.0], [time.time()])
+        assert seen["processes"] == seen["delegated"] == {"t-live", "native-live"}, seen
+        assert entered.wait(2) and len(threads) == 1
+        assert threads[0].name == "terminal-maintenance" and threads[0].is_alive()
+    finally:
+        # The actual maintenance owner finishes before monkeypatch restores its
+        # root, lock and dependent functions, including when an assertion fails.
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+    assert not lock.locked(), "the real maintenance finally released its latch"
 
 
 def test_an_orphaned_delegated_run_is_reconciled_when_its_owner_is_gone(tmp_path, monkeypatch):

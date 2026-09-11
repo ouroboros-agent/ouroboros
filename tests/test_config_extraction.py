@@ -23,6 +23,9 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    "IMMEDIATE_SETTINGS": settings_scales,
+    "RESTART_REQUIRED_SETTINGS": settings_scales,
+    "get_finalization_grace_sec": runtime_limits,
     "NETWORK_WAIT_BACKOFF_MAX_SEC": runtime_limits,
     "MODEL_ACCOUNTS_KEY": model_slots,
     "MODEL_CONTEXT_WINDOWS_KEY": model_slots,
@@ -32,6 +35,8 @@ _ADDED_OWNERS = {
     "task_model_binding": model_slots,
     "apply_model_role_override": model_slots,
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
+    "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
+    "CLAUDEXOR_STOP_EXIT_WAIT_SEC": runtime_limits,
 }
 
 _MOVED_OWNERS = {

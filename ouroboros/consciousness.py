@@ -54,6 +54,7 @@ from ouroboros.utils import (
     truncate_for_log,
     utc_now_iso,
 )
+from ouroboros.config import runtime_setting
 
 _OBSERVATIONS_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
 _OBSERVATION_SOURCE_REF = (
@@ -777,7 +778,7 @@ class BackgroundConsciousness:
         model = self._model
 
         tools = self._tool_schemas()
-        _use_local_consciousness = os.environ.get("USE_LOCAL_CONSCIOUSNESS", "").lower() in ("true", "1")
+        _use_local_consciousness = runtime_setting("USE_LOCAL_CONSCIOUSNESS", "").lower() in ("true", "1")
         effort = resolve_effort("consciousness")
         total_cost = 0.0
         cost_final = True

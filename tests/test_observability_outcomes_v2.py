@@ -304,11 +304,12 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
 
     runtime_error = derive_loop_outcome(
         "⚠️ Error during processing: RuntimeError: boom",
-        {"rounds": 1},
+        {"rounds": 1, "execution_status": "infra_failed", "reason_code": "task_exception"},
         {"tool_calls": []},
     )
     assert runtime_error["outcome_axes"]["execution"]["status"] == EXECUTION_INFRA_FAILED
     assert runtime_error["reason_code"] == "task_exception"
+    assert runtime_error["failure"]["kind"] == "runtime"
 
     deep_unavailable = derive_loop_outcome(
         "❌ Deep self-review unavailable: no key",
@@ -1312,3 +1313,78 @@ def test_refreshing_an_omitted_ledger_stub_is_an_identity():
         assert refresh_verification_ledger_artifacts(
             dict(stub), {"status": status, "artifacts": [], "errors": []},
         ) == stub
+
+
+def test_task_exception_publishes_the_loop_s_accumulated_evidence(monkeypatch, tmp_path):
+    """The outer agent catch owns the terminal projection, not the evidence.
+
+    A lifecycle failure after real rounds must publish the loop's accumulated
+    trace and usage — never a ``0 calls`` projection built from the untouched
+    pre-loop defaults — and must not call an internal error a provider failure.
+    """
+    from ouroboros import agent as agent_module
+    from ouroboros import agent_task_pipeline
+    from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.task_results import STATUS_FAILED, load_task_result
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    drive.mkdir()
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    monkeypatch.setattr(agent_module, "build_llm_messages", lambda **_kwargs: ([], {}))
+    # The durable result is written before post-task cognition starts; the
+    # reflection thread is not this seam's subject.
+    monkeypatch.setattr(
+        agent_task_pipeline, "_run_post_task_processing_async", lambda *_a, **_kw: None)
+
+    def die_after_real_work(**_kwargs):
+        # Exactly what ``run_llm_loop`` attaches on an unexpected exit: the SAME
+        # in-memory accumulators the loop was filling.
+        exc = RuntimeError("owner wait refused a terminal continuation")
+        exc._ouroboros_loop_usage = {
+            "rounds": 7, "prompt_tokens": 4321, "completion_tokens": 210,
+            "execution_id": "exec_lifecycle_failure",
+        }
+        exc._ouroboros_loop_trace = {
+            "reasoning_notes": ["planned the edit"],
+            "tool_calls": [{
+                "tool": "write_file", "tool_call_id": "call-1", "result": "ok",
+                "trace_ref": {"call_id": "tool_write_file_1"},
+            }],
+        }
+        raise exc
+
+    monkeypatch.setattr(agent_module, "run_llm_loop", die_after_real_work)
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    events = agent._handle_task_scoped({
+        "id": "lifecycle-fail", "type": "task", "chat_id": 1, "text": "do it",
+        "drive_root": str(drive), "budget_drive_root": str(drive),
+    })
+
+    stored = load_task_result(drive, "lifecycle-fail")
+    assert stored["status"] == STATUS_FAILED
+    assert stored["reason_code"] == "task_exception"
+    # The published trace counts the call that really happened.
+    assert stored["trace_summary"].startswith("## Tool trace (1 calls")
+    assert stored["trace_refs"]["execution_id"] == "exec_lifecycle_failure"
+    assert [ref["call_id"] for ref in stored["trace_refs"]["tool_call_refs"]] == [
+        "tool_write_file_1"]
+    # The loop's own tally rides the honest loop plane; an internal lifecycle
+    # error is a runtime failure, not a provider one.
+    assert stored["loop_outcome"]["usage"]["total_rounds"] == 7
+    assert stored["loop_outcome"]["usage"]["prompt_tokens"] == 4321
+    assert stored["loop_outcome"]["usage"]["completion_tokens"] == 210
+    execution = stored["outcome_axes"]["execution"]
+    assert execution["status"] == EXECUTION_INFRA_FAILED
+    assert execution["failure"] == {"kind": "runtime", "reason_code": "task_exception"}
+    # The original exception stays the evidence of what failed.
+    assert "RuntimeError: owner wait refused a terminal continuation" in stored["result"]
+    error_events = [
+        json.loads(line)
+        for line in (drive / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    task_error = next(row for row in error_events if row.get("type") == "task_error")
+    assert "owner wait refused a terminal continuation" in task_error["error"]
+    assert "die_after_real_work" in task_error["traceback"]
+    assert any(event.get("type") == "task_done" for event in events)

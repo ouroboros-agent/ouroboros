@@ -501,6 +501,8 @@ def test_lifecycle_fault_produces_a_terminal_frame_and_clears_fences(tmp_path, m
 
 
 def test_lifecycle_fault_persistence_failure_retains_ownership(tmp_path, monkeypatch):
+    import queue
+    import supervisor.queue as q
     import ouroboros.task_results as tr
     from ouroboros.utils import append_jsonl
     from supervisor.events import _handle_task_done
@@ -509,6 +511,9 @@ def test_lifecycle_fault_persistence_failure_retains_ownership(tmp_path, monkeyp
         raise RuntimeError("disk full")
 
     monkeypatch.setattr(tr, "write_task_result", _boom)
+    jobs = queue.Queue()
+    monkeypatch.setattr(q, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(q, "_reap_queue", jobs)
     running = {"f2": {"task": {"id": "f2"}}}
     slot = types.SimpleNamespace(busy_task_id="f2", reaping=False)
     frames: list = []
@@ -525,6 +530,7 @@ def test_lifecycle_fault_persistence_failure_retains_ownership(tmp_path, monkeyp
         "GR3-6: failed persistence RETAINS lifecycle ownership (no slot release)"
     )
     assert [e for e in frames if e.get("type") == "task_done"] == []
+    assert jobs.qsize() == 1, "failed publication retains an actual off-drain retry owner"
 
 
 # --------------------------------------------------------------------------
