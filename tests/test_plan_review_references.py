@@ -55,7 +55,10 @@ def test_plan_reference_uses_shared_best_effort_log_event_seam(monkeypatch):
     }
 
 
-def test_plan_reference_defaults_unbound_context_to_main_chat(monkeypatch):
+def test_review_references_without_a_room_live_in_the_hidden_partition(monkeypatch):
+    """Doctrine, not a default: a run with no owner-visible room keeps its
+    review rows in the hidden partition. Main was a hard fallback, which put
+    plan-review rows of unrelated runs into the owner's conversation."""
     events: queue.Queue = queue.Queue()
     ctx = SimpleNamespace(event_queue=events)
     state = {"current_attempt": {"fingerprint": "review-fingerprint"}, "waves": []}
@@ -68,7 +71,7 @@ def test_plan_reference_defaults_unbound_context_to_main_chat(monkeypatch):
     )
     plan_review_references._emit_plan_review_reference(ctx, "task-1", state)
 
-    assert calls[0]["chat_id"] == 1
+    assert calls[0]["chat_id"] == plan_review_references.HIDDEN_CHAT_ID == 0
 
 
 def test_plan_reference_preserves_explicit_panel_chat_zero(monkeypatch):
@@ -85,6 +88,51 @@ def test_plan_reference_preserves_explicit_panel_chat_zero(monkeypatch):
     plan_review_references._emit_plan_review_reference(ctx, "task-1", state)
 
     assert calls[0]["chat_id"] == 0
+
+
+def test_review_reference_addresses_the_bound_project_chat(tmp_path):
+    """The binding outranks the context chat on BOTH rails: a task turned into a
+    project mid-run keeps its origin chat on ctx, so a row addressed from ctx
+    alone lands outside the room that holds the work."""
+    from ouroboros.projects_registry import bind_task_to_project
+
+    binding = bind_task_to_project(
+        tmp_path, "task-bound", "review-ref-proj", 7373, origin={"absent": "system"},
+    )
+    task_results.write_task_result(tmp_path, "task-bound", "running", result="running")
+    events: queue.Queue = queue.Queue()
+    ctx = SimpleNamespace(event_queue=events, current_chat_id=1, drive_root=tmp_path)
+
+    plan_review_references._record_plan_review_attempt_with_reference(
+        ctx, tmp_path, "task-bound", fingerprint="a" * 64, status="open",
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert binding["project_chat_id"] == 7373
+    assert rows[0]["chat_id"] == 7373
+    assert _reference_rows(events)[0]["chat_id"] == 7373
+
+
+def test_review_reference_still_emits_when_the_bindings_read_fails(tmp_path, monkeypatch):
+    """A broken bindings store must not cost the invalidation: the row is still
+    emitted, addressed to the hidden partition instead of guessing Main."""
+    import supervisor.log_addressing as log_addressing
+
+    def fail_resolve(*_args, **_kwargs):
+        raise TypeError("bindings unreadable")
+
+    monkeypatch.setattr(log_addressing, "resolve_project_chat", fail_resolve)
+    events: queue.Queue = queue.Queue()
+    ctx = SimpleNamespace(event_queue=events, current_chat_id=23, drive_root=tmp_path)
+    state = {"current_attempt": {"fingerprint": "review-fingerprint"}, "waves": []}
+
+    plan_review_references._emit_plan_review_reference(ctx, "task-1", state)
+
+    assert _reference_rows(events)[0]["chat_id"] == plan_review_references.HIDDEN_CHAT_ID
 
 
 def test_attempt_helper_publishes_immediately_after_the_canonical_write(monkeypatch):

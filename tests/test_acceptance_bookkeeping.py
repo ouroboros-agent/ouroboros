@@ -92,7 +92,10 @@ def test_terminal_pipeline_routes_review_and_downloads_without_bookkeeping_deliv
         assert effective["artifact_bundle"]["status"] == expected_artifacts
 
     reference = next(row for row in captured if row.get("type") == "review_reference")
-    assert reference["chat_id"] == chat_id  # Env intentionally carries no current_chat_id.
+    # Env intentionally carries no current_chat_id. The binding is resolved AT
+    # EMISSION, so a BOUND task's durable row already carries its project chat
+    # instead of the chat the task was born in; an unbound task keeps that chat.
+    assert reference["chat_id"] == (project_chat if project_bound else chat_id)
     assert reference["type"] not in WORKER_LOG_SINK_SUPPRESSED_TYPES
     live = []
     supervisor = SimpleNamespace(RUNNING={"applied": {"task": task}}, DRIVE_ROOT=tmp_path,
