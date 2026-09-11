@@ -228,3 +228,35 @@ def test_a_retirement_that_landed_is_not_replayed_as_still_owned(tmp_path, monke
     assert removed == ["prj-ours"]
     assert replayed.project_owned is False, "a retirement that landed must replay as landed"
     assert replayed.ledger_recorded is False and replayed.settled is False
+
+
+def test_loop_exit_release_spares_a_live_run_until_the_owner_has_a_verdict(tmp_path):
+    """Owner B1-A, inverted floor: the loop's own release point (``release_task_runs``,
+    trigger ``loop_exit``) reaches the reconciler BEFORE the owner's durable result is
+    written, so a live run is left live (``left_live``, no cancel) for the next sweep;
+    once the owner's result is a deliberate terminal the same release cancels it, and
+    an infra death (``infra_failed``) never does."""
+    import ouroboros.delegate_custody as dc
+    from ouroboros.outcomes import infra_failed_axes
+    from ouroboros.task_results import write_task_result
+
+    dc._CUSTODY.clear()
+    for run_id, task in (("run-a", "t-verdict"), ("run-b", "t-infra")):
+        dc.record_started(tmp_path, dc.RunCustody(
+            run_id=run_id, task_id=task, route_id="r", model="m", project_id="p",
+            project_owned=False, root_task_id=task, ledger_root=str(tmp_path)))
+    live = _LiveRunStub()
+
+    assert [row["action"] for row in dc.release_task_runs(tmp_path, "t-verdict", gateway_factory=lambda: live)] == ["left_live"]
+    dc._CUSTODY.clear()
+    write_task_result(tmp_path, "t-verdict", "completed", result="answer")
+    assert [row["action"] for row in dc.release_task_runs(tmp_path, "t-verdict", gateway_factory=lambda: live)] == ["cancelled"]
+    dc._CUSTODY.clear()
+    write_task_result(tmp_path, "t-infra", "failed", reason_code="provider_unavailable",
+                      outcome_axes=infra_failed_axes("provider_unavailable"))
+    assert [row["action"] for row in dc.release_task_runs(tmp_path, "t-infra", gateway_factory=lambda: live)] == ["left_live"]
+    dc._CUSTODY.clear()
+    assert live.cancels == [("run-a", "owner_task_gone")]
+    reconciled = [row for row in (json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines())
+                  if row.get("type") == dc.RECONCILED]
+    assert [row["action"] for row in reconciled] == ["left_live", "cancelled", "left_live"]

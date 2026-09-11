@@ -159,35 +159,69 @@ def test_an_orphaned_delegated_run_is_reconciled_when_its_owner_is_gone(tmp_path
     """The predicate is the one `process_custody.reap_orphaned_processes` already owns:
     the owning task is no longer in the supervisor's live set. A delegated run has no
     pid, so the process reaper cannot see it — but it is still spending quota and still
-    writing to a workspace."""
+    writing to a workspace.
+
+    The floor is INVERTED (owner B1-A): a live orphan is cancelled only behind a
+    DELIBERATE owner terminal. An owner that died of the provider, one whose result
+    is unreadable, and one whose result was never written all leave the run live
+    (``left_live``, no cancel POST); the next sweep settles a spared run once the
+    daemon reports it terminal."""
     import ouroboros.delegate_custody as dc
+    from ouroboros.outcomes import infra_failed_axes
+    from ouroboros.task_results import write_task_result
 
     live = _LiveRunStub(run_id="run-orphan")
     finished = _LiveRunStub(run_id="run-done")
     finished.get_run = lambda rid: {"lastSeq": 2, "summary": {"state": "succeeded", "spendUsd": 0.0}}
 
-    for stub, task in ((live, "t-gone"), (finished, "t-also-gone")):
+    for run_id, task in (("run-orphan", "t-gone"), ("run-done", "t-also-gone"),
+                         ("run-spared", "t-provider-died"), ("run-garbled", "t-garbled"),
+                         ("run-silent", "t-never-wrote")):
         dc.record_started(tmp_path, dc.RunCustody(
-            run_id=stub.run_id, task_id=task, route_id="r", model="m",
+            run_id=run_id, task_id=task, route_id="r", model="m",
             project_id="p", project_owned=False, root_task_id=task, ledger_root=str(tmp_path)))
     dc.record_started(tmp_path, dc.RunCustody(
         run_id="run-alive", task_id="t-running", route_id="r", model="m",
         project_id="p", project_owned=False, root_task_id="t-running", ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
+    # The owner verdicts: a deliberate completion, a provider death, an unreadable row.
+    write_task_result(tmp_path, "t-gone", "completed", result="verdict")
+    write_task_result(tmp_path, "t-provider-died", "failed", reason_code="provider_unavailable",
+                      outcome_axes=infra_failed_axes("provider_unavailable"))
+    (tmp_path / "task_results").mkdir(exist_ok=True)
+    (tmp_path / "task_results" / "t-garbled.json").write_text("{not json", encoding="utf-8")
+    terminal_ids = {"run-done"}
 
     class _Router(_LiveRunStub):
         def get_run(self, rid, **_kw):
-            return (finished if rid == "run-done" else live).get_run(rid)
+            return (finished if rid in terminal_ids else live).get_run(rid)
         def cancel_run(self, rid, reason=""):
             return live.cancel_run(rid, reason)
 
     outcomes = dc.reconcile_orphaned_runs(tmp_path, {"t-running"}, gateway_factory=_Router)
     dc._CUSTODY.clear()
     by_run = {row["run_id"]: row for row in outcomes}
-    assert set(by_run) == {"run-orphan", "run-done"}, "a live owner's run must be left alone"
+    assert set(by_run) == {"run-orphan", "run-done", "run-spared", "run-garbled", "run-silent"}, \
+        "a live owner's run must be left alone"
     assert by_run["run-orphan"]["action"] == "cancelled"
-    assert live.cancels == [("run-orphan", "owner_task_gone")]
+    assert live.cancels == [("run-orphan", "owner_task_gone")], "only the deliberate terminal cancels"
     assert by_run["run-done"]["action"] == "settle_attempted" and by_run["run-done"]["settled"] is True
+    for spared in ("run-spared", "run-garbled", "run-silent"):
+        assert by_run[spared]["action"] == "left_live" and by_run[spared]["state"] == "running", spared
+    # run-orphan stays open too: the stub answers "running" to the verify read, so its
+    # cancel is merely REQUESTED (the pre-existing receipt vocabulary), not settled.
+    assert {row.run_id for row in dc.open_runs(tmp_path)} == {
+        "run-alive", "run-orphan", "run-spared", "run-garbled", "run-silent"}
+
+    # The spared run settles itself on the sweep that finds it terminal.
+    terminal_ids.add("run-spared")
+    again = {row["run_id"]: row for row in dc.reconcile_orphaned_runs(tmp_path, {"t-running"}, gateway_factory=_Router)}
+    dc._CUSTODY.clear()
+    assert again["run-spared"]["action"] == "settle_attempted" and again["run-spared"]["settled"] is True
+    assert again["run-silent"]["action"] == "left_live"
+    # The requested-not-confirmed cancel is re-asked each sweep (unchanged); no spared
+    # run was ever asked.
+    assert live.cancels == [("run-orphan", "owner_task_gone")] * 2
 
     # Unknown liveness reconciles nothing: never mass-cancel on missing information.
     live.cancels.clear()
@@ -267,8 +301,13 @@ def test_a_terminalizing_parent_releases_the_run_it_still_holds(tmp_path):
     """The in-process twin of reconciliation. A parent that finishes while its delegated
     run is still going used to leave it mutating until the next 10-minute sweep; the
     loop's own resource-release point now settles or cancels it like any held resource.
-    A task that delegated nothing must pay nothing for this."""
+    A task that delegated nothing must pay nothing for this.
+
+    Inverted floor (B1-A): the release cancels only behind the parent's DELIBERATE
+    durable terminal. Without one (the ordinary loop-exit shape: the result is written
+    after this point) the run is left live and disclosed as open for the next sweep."""
     import ouroboros.delegate_custody as dc
+    from ouroboros.task_results import load_task_result, write_task_result
 
     live = _LiveRunStub(run_id="run-held")
     dc._CUSTODY.clear()
@@ -279,6 +318,13 @@ def test_a_terminalizing_parent_releases_the_run_it_still_holds(tmp_path):
     assert dc.release_task_runs(tmp_path, "t-someone-else", gateway_factory=lambda: live) == []
     assert live.cancels == [], "another task's run is not this task's to release"
 
+    unwritten = dc.release_task_runs(tmp_path, "t-parent", gateway_factory=lambda: live)
+    dc._CUSTODY.clear()
+    assert [row["action"] for row in unwritten] == ["left_live"]
+    assert live.cancels == [], "no verdict yet: the run outlives the loop exit"
+    assert load_task_result(tmp_path, "t-parent")["delegated_runs_unreconciled"] == ["run-held"]
+
+    write_task_result(tmp_path, "t-parent", "completed", result="done on purpose")
     outcomes = dc.release_task_runs(tmp_path, "t-parent", gateway_factory=lambda: live)
     dc._CUSTODY.clear()
     assert [row["action"] for row in outcomes] == ["cancelled"]

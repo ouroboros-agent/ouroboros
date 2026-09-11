@@ -302,6 +302,37 @@ def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool
         return False
 
 
+def _owner_terminal_is_deliberate(drive_root: Any, task_id: str) -> bool:
+    """Whether the run's owning task ended ON PURPOSE (owner answer B1-A, the floor
+    INVERTED: cancel only behind a verdict).
+
+    True only when the owner's durable result is readable, truly terminal, and its
+    execution axis says the task finished by its own decision: a completed, degraded
+    or best-effort answer, a failure the agent itself declared, or a cancellation.
+    A provider or transport death, a worker crash (``infra_failed``), an interrupted
+    row, a missing, unreadable or still-running result all answer False and SPARE
+    the run: an undignified nanny death must not kill a healthy paid run, and
+    "unknown" is exactly the case the answer is about. No reason-code table and no
+    special crash branch: the axis the finalizers already write is the class. The
+    spared run's own ``maxSeconds`` stays its damage limit (ARCHITECTURE, custody).
+    """
+    from ouroboros.outcomes import (
+        EXECUTION_BEST_EFFORT, EXECUTION_CANCELLED, EXECUTION_DEGRADED, EXECUTION_FAILED,
+        EXECUTION_OK, normalize_outcome_axes,
+    )
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+    try:
+        result = load_task_result(drive_root, str(task_id or ""))
+    except Exception:
+        return False
+    if not isinstance(result, dict) or str(result.get("status") or "") not in _TRULY_TERMINAL_STATUSES:
+        return False
+    execution = str((normalize_outcome_axes(result).get("execution") or {}).get("status") or "")
+    return execution in {EXECUTION_OK, EXECUTION_DEGRADED, EXECUTION_BEST_EFFORT,
+                         EXECUTION_FAILED, EXECUTION_CANCELLED}
+
+
 def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[str, Any]:
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.tools.delegate_integration import capture_stranded_patch
@@ -339,6 +370,16 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         # The C1 half: a TERMINAL DETAIL proves the run is over, so the sweep — its
         # last terminal observer — captures the diff eagerly here.
         result.update(capture_stranded_patch(drive_root, custody))
+    elif not _owner_terminal_is_deliberate(drive_root, custody.task_id):
+        # The inverted floor (B1-A): a live run outlives every owner terminal that
+        # was not a verdict. At the loop's own release point the owner's result is
+        # usually not written yet, so the run stays live until the next sweep
+        # re-reads the durable result; it settles itself through the terminal arm
+        # above when it ends, and its snapshot work becomes an undisposed_patches
+        # obligation like any other.
+        result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "left_live",
+                  "state": str(_custody().summary_of(detail).get("state") or ""),
+                  **_custody().output_disposition(custody)}
     else:
         cancelled = _custody().cancel_and_verify(drive_root, gateway, custody, "owner_task_gone")
         result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "cancelled",

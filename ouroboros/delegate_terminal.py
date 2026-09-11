@@ -17,7 +17,11 @@ def terminal_reconcile_task(
     gateway_factory: Optional[Callable[[], Any]] = None,
     trigger: str = "terminal_boundary",
 ) -> Dict[str, Any]:
-    """Reconcile durable starts, then re-audit runs, invocations, and patches."""
+    """Reconcile durable starts, then re-audit runs, invocations, and patches.
+
+    A still-live run is cancelled only behind a deliberate owner terminal
+    (``delegate_custody_reconcile._owner_terminal_is_deliberate``); otherwise it
+    is left live and disclosed as open, for the sweep to re-judge."""
 
     mine = str(task_id or "")
     result: Dict[str, Any] = {

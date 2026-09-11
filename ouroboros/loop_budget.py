@@ -555,7 +555,10 @@ def _cleanup_loop_resources(
         # A delegated run is a resource this task HOLDS, like a service or
         # an executor: a terminalized parent leaving one running has a
         # mutating process nothing is watching. The durable reconciler still
-        # covers a worker dying before here; this is the ordinary path.
+        # covers a worker dying before here; this is the ordinary path. The
+        # run is cancelled only behind a DELIBERATE owner terminal (B1-A); the
+        # durable result is usually not written yet at this point, so a live
+        # run is left to the next sweep, which re-reads it.
         release_task_runs(custody_root(ctx.tools._ctx), ctx.task_id)
     except Exception:
         log.debug("Failed to release delegated runs for task %s", ctx.task_id, exc_info=True)
