@@ -332,11 +332,24 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
     except Exception:
         pass
 
+    # Both delegated-run obligations below read the SAME rotated custody chain,
+    # so one traversal serves both instead of a full replay each (I18). A failed
+    # read leaves the state None and each block replays for itself exactly as
+    # before, under its own fail-soft arm.
+    custody_root = None
+    custody_state = None
+    try:
+        from ouroboros.delegate_custody import replay as replay_custody
+
+        custody_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        custody_state = replay_custody(custody_root)
+    except Exception:
+        custody_state = None
+
     try:
         from ouroboros.delegate_custody import settled_unread_outputs
 
-        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
-        for run in settled_unread_outputs(drive_root):
+        for run in settled_unread_outputs(custody_root, custody_state):
             # Owner doctrine D7, made load-bearing: a delegated result that was paid for
             # and never read to EOF is the launched-never-collected class. Not CRITICAL —
             # nothing is live and nothing is mutating — but it stays visible until the
@@ -368,8 +381,7 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
     try:
         from ouroboros.delegate_custody import undisposed_patches
 
-        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
-        for run in undisposed_patches(drive_root):
+        for run in undisposed_patches(custody_root, custody_state):
             # C1: a settled mutating run's work lives in its private snapshot (and its
             # captured patch, once one exists) until someone explicitly applies or
             # rejects it. The GC preserves the material, but preserved-and-invisible is

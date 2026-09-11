@@ -67,6 +67,14 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
     compare the audit against the stored disclosure first (a no-op refresh must
     not append custody events every boot).
     """
+    if snapshot is None:
+        # An unshared audit replayed the rotated chain once per projection plus
+        # a private pass for terminal_runs; one snapshot serves them all (I18).
+        # A failed read leaves the audit's own fail-closed arms untouched.
+        try:
+            snapshot = custody_audit_snapshot(drive_root)
+        except Exception:
+            log.debug("Custody audit snapshot unavailable for %s", mine, exc_info=True)
     state = snapshot.get("state") if snapshot is not None else None
     pending = snapshot.get("pending") if snapshot is not None else None
     # The keyword rides only when a snapshot is really shared, so the
@@ -120,10 +128,9 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
     terminal_runs = []
     try:
         if not audit_failure:
-            observed = state if state is not None else custody.replay(drive_root)
             terminal_runs = sorted((
                 {"run_id": str(row.run_id), "state": str(row.terminal_state)}
-                for row in observed.values()
+                for row in state.values()
                 if row.task_id == mine and row.settled and row.terminal_state in custody.TERMINAL_STATES
             ), key=lambda row: row["run_id"])
     except Exception:
