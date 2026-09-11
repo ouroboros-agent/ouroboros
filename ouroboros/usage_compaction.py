@@ -151,6 +151,33 @@ NAME_TIER_REFUSAL = (
 )
 _NAME_TIER_REFUSED: set = set()  # data roots whose refusal event this process already wrote
 
+# A policy abort leaves the ledger byte-identical and the pass simply runs
+# again later, so the REASON is the only thing that outlives it — and it lived
+# in an INFO log line alone. The health tripwire above the ledger's warn size
+# then names a symptom (the file is large) and predicts this case without
+# being able to say which one it is: broken compaction, an unfoldable residue,
+# or the name tier. So every abort records the same typed row the name-tier
+# refusal does: ONE ``usage_ledger_compaction_skipped`` per process per (data
+# root, reason) — keyed by the reason so a new cause is never hidden behind an
+# old one, and never one row per pass.
+_SKIPPED_REASONS: set = set()  # (data root, reason) pairs this process already wrote
+
+
+def _record_skip(root: pathlib.Path, reason: str) -> None:
+    """Log a policy abort and durably record its typed reason, once per cause."""
+    log.info("usage-ledger compaction skipped: %s", reason)
+    told = (str(root.resolve(strict=False)), reason)  # one data root, however it is spelled
+    if told in _SKIPPED_REASONS:
+        return
+    try:  # only a row that LANDED is "already told": append_jsonl reports its
+        if append_jsonl(root / "logs" / "events.jsonl", {  # exhausted retries as
+            "type": "usage_ledger_compaction_skipped", "ts": utc_now_iso(),  # False
+            "reason": reason,
+        }):
+            _SKIPPED_REASONS.add(told)
+    except Exception:
+        log.exception("Failed to emit usage_ledger_compaction_skipped event")
+
 
 def _fsync_dir(path: pathlib.Path) -> None:
     """fsync a directory so entries created in it survive a power loss.
@@ -828,7 +855,7 @@ def compact_usage_ledger_locked(
                 raise _Abort("decimal money totals mismatch")
         _beat(heartbeat)
     except _Abort as abort:
-        log.info("usage-ledger compaction skipped: %s", abort.reason)
+        _record_skip(root, abort.reason)
         return None
     except (UsageLedgerCorrupt, DecimalException, ValueError, TypeError, KeyError) as exc:
         # Never let a compaction defect become a monetary failure: abort clean.
@@ -865,7 +892,7 @@ def compact_usage_ledger_locked(
             return None
         _swap_ledger_fsync(ledger_path, candidate, raw, beat)
     except _Abort as abort:
-        log.info("usage-ledger compaction skipped: %s", abort.reason)
+        _record_skip(root, abort.reason)
         return None
     try:
         append_jsonl(

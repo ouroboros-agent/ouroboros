@@ -156,6 +156,46 @@ def test_lost_folded_weight_still_aborts_on_the_non_money_fingerprint(
     assert (data_root / ua.LEDGER_REL).read_bytes() == before_bytes
 
 
+def _skip_events(data_root):
+    path = data_root / "logs" / "events.jsonl"
+    if not path.exists():
+        return []
+    return [
+        row for row in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        if row.get("type") == "usage_ledger_compaction_skipped"
+    ]
+
+
+def test_a_policy_abort_records_its_typed_reason_once_per_cause(data_root, monkeypatch):
+    """An abort leaves the ledger byte-identical and the pass runs again later,
+    so the reason has to outlive the pass: one typed event per process per
+    cause, which is what lets the ledger's size tripwire be diagnosed instead
+    of just observed."""
+    ua.reserve_attempt(ua.AttemptRequest(  # in-flight only: nothing folds
+        model="openai/gpt-5.2", provider="openai", reservation_usd=1.0,
+        drive_root=data_root, task_id="open", root_task_id="root", source="test",
+    ))
+
+    assert _compact(data_root) is None
+    assert _compact(data_root) is None  # same cause again: still ONE row
+    assert [row["reason"] for row in _skip_events(data_root)] == ["nothing foldable"]
+    assert _skip_events(data_root)[0]["ts"]
+
+    for cost in _DRIFT_COSTS:
+        _settle(data_root, cost=cost, cost_final=True)
+    _rewrite_one_group_row(
+        monkeypatch,
+        lambda row: row.update({"cost_usd": format(Decimal(row["cost_usd"]) + Decimal("0.01"), "f")}),
+    )
+
+    assert _compact(data_root) is None
+    assert _compact(data_root) is None
+    # A NEW cause is never hidden behind the one already told.
+    assert [row["reason"] for row in _skip_events(data_root)] == [
+        "nothing foldable", "decimal money totals mismatch",
+    ]
+
+
 def test_fingerprint_carries_no_money_but_keeps_limits_and_counts(data_root):
     """The projection shape itself: no money key anywhere in it, while the
     per-root ``root_limit_usd`` and every count axis stay compared."""
