@@ -74,22 +74,31 @@ def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any) -> bool:
     in-task ``ensure_project_scope`` and the UI ``api_project_from_task`` — so they cannot
     drift apart again. The caller MUST hold the queue lock. Returns True if any in-memory
     task dict was updated; a no-op (False) when the task is neither running nor pending
-    (then the durable bind alone is correct — there is no live lane to occupy)."""
+    (then the durable bind alone is correct — there is no live lane to occupy).
+
+    FILL-ONLY: a task already carrying a DIFFERENT project keeps it and False comes
+    back. The durable binding is the one truth about a task's project (owner decision
+    B4=A); this in-memory copy must never be what moves a task between projects, which
+    is how a second, empty project acquired a live lane."""
     key = str(tid or "")
     project = str(pid or "").strip()
     if not key or not project:
         return False
-    updated = False
+    rows = []
     meta = running.get(key) if hasattr(running, "get") else None
     rtask = _as_task(meta) if isinstance(meta, dict) else None
     if isinstance(rtask, dict):
-        rtask["project_id"] = project
-        updated = True
+        rows.append(rtask)
     for item in (pending or ()):
         ptask = _as_task(item)
         if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
-            ptask["project_id"] = project
-            updated = True
+            rows.append(ptask)
+    if any(str(row.get("project_id") or "").strip() not in ("", project) for row in rows):
+        return False
+    updated = False
+    for row in rows:
+        row["project_id"] = project
+        updated = True
     return updated
 
 

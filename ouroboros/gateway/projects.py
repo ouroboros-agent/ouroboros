@@ -609,6 +609,8 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             PROJECT_NAME_MAX,
             bind_task_to_project,
             create_project,
+            get_project,
+            project_id_for_task,
             touch_project,
         )
 
@@ -625,6 +627,27 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                 status_code=400,
             )
         drive_root = request_drive_root(request)
+        # The durable binding is read BEFORE any side effect (owner decision B4=A):
+        # naming can call a model, create_project mints a registry row and the lease
+        # mark hands it a lane - all of which used to happen before the immutable bind
+        # refused a task that already belonged somewhere else. The refusal NAMES that
+        # project, so no surface has to invent an explanation (there is no reload
+        # affordance in the desktop shell, the Telegram mini app or the mobile layout).
+        # An UNREADABLE store is disclosed once and the conversion proceeds as it would
+        # for an unbound task.
+        try:
+            bound = str(project_id_for_task(drive_root, task_id, strict=True) or "")
+        except Exception:
+            bound = ""
+            log.warning("project_binding_unreadable: convert of task %s continues as unbound",
+                        task_id, exc_info=True)
+        if bound and bound != sanitize_project_id(raw_id):
+            bound_name = str((get_project(drive_root, bound) or {}).get("name") or "").strip() or bound
+            return JSONResponse(
+                {"error": f"This task already belongs to {bound_name} (id={bound}); "
+                          "open it there or start a new task."},
+                status_code=409,
+            )
         # Auto-name from the task's own title/objective when the caller sends none
         # (the one-click convert path), so no human input and no extra LLM call
         # are needed (owner P1). An explicit name still wins. Order: explicit name ->

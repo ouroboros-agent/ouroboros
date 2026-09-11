@@ -70,9 +70,16 @@ def _origin_from_task_record(task_id: str) -> Optional[dict]:
     return None
 
 
-def _report_binding_failure(task_id: str, project_id: str, exc: Exception, *, path: str) -> None:
+def _report_binding_failure(
+    task_id: str, project_id: str, exc: Exception, *, path: str, reason: str = "",
+) -> None:
     """A failed durable bind is LOUD (BIBLE P1: silent linkage loss is memory
-    loss): warning log + typed events.jsonl row; the task itself keeps running."""
+    loss): warning log + typed events.jsonl row; the task itself keeps running.
+
+    ``reason`` names a REFUSAL that never reached the bind (today only
+    ``project_scope_conflict``: the task is already bound elsewhere, so no second
+    project is created); the row is otherwise the same shape a raising bind writes.
+    """
     log.warning("bind_task_to_project failed for %s/%s (%s)", task_id, project_id, path, exc_info=True)
     try:
         append_jsonl(_pool().DRIVE_ROOT / "logs" / "events.jsonl", {
@@ -82,6 +89,7 @@ def _report_binding_failure(task_id: str, project_id: str, exc: Exception, *, pa
             "project_id": str(project_id or ""),
             "bind_path": path,
             "error": f"{type(exc).__name__}: {exc}",
+            **({"reason": reason} if reason else {}),
         })
     except Exception:
         log.debug("project_binding_failed event write failed", exc_info=True)
@@ -643,7 +651,41 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
         return
     name = str(evt.get("project_name") or "").strip()
     try:
-        from ouroboros.projects_registry import bind_task_to_project, create_project, touch_project
+        from ouroboros.projects_registry import (
+            bind_task_to_project,
+            create_project,
+            project_id_for_task,
+            touch_project,
+            update_project,
+        )
+
+        # The durable binding is the AUTHORITY, read BEFORE any side effect (owner
+        # decision B4=A). create_project runs before bind_task_to_project here, so a
+        # task already bound elsewhere used to mint a second project, mark the lease,
+        # broadcast it and announce it in chat before the immutable bind refused.
+        # An UNREADABLE store is disclosed once and treated as "no binding": the work
+        # continues as it did before this read existed.
+        try:
+            bound = str(project_id_for_task(_pool().DRIVE_ROOT, tid, strict=True) or "")
+        except Exception:
+            bound = ""
+            log.warning("project_binding_unreadable: ensure_project_scope for task %s continues "
+                        "as unbound", tid, exc_info=True)
+        if bound and bound != pid:
+            # Bound elsewhere: the request is a RENAME of the project this task already
+            # belongs to, never a second project. Nothing else happens - no create, no
+            # lease mark, no broadcast, no announcement.
+            if name:
+                try:
+                    update_project(_pool().DRIVE_ROOT, bound, name=name)
+                except Exception:
+                    log.warning("ensure_project_scope: rename of %s to %r failed", bound, name, exc_info=True)
+            _report_binding_failure(
+                tid, pid,
+                ValueError(f"task is already bound to project {bound!r}; it stays there"),
+                path="ensure_project_scope", reason="project_scope_conflict",
+            )
+            return
 
         project = create_project(_pool().DRIVE_ROOT, pid, name=name, origin="ensure_project_scope")
         touch_project(_pool().DRIVE_ROOT, pid)
@@ -670,7 +712,11 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
         try:
             bind_task_to_project(_pool().DRIVE_ROOT, tid, pid, proj_chat or None, origin=origin)
         except Exception as exc:
+            # A refused bind leaves the task where it was: stop before the lease
+            # mark, the broadcast and the announcement (the promote path already
+            # rejects this way), instead of publishing a project the task is not in.
             _report_binding_failure(tid, pid, exc, path="ensure_project_scope")
+            return
         # Make the one-writer-per-project lease recognize THIS already-running task
         # as a lane occupant: project_lease reads task["project_id"] from the
         # supervisor RUNNING map, which (unlike the promote path that sets it at

@@ -157,3 +157,77 @@ def test_ui_conversion_persists_pending_scope_across_restart(tmp_path, monkeypat
     pending_list.clear()
     assert queue.restore_pending_from_snapshot() == 1
     assert pending_list[0]["project_id"] == pid
+
+
+def test_mark_task_project_is_fill_only_over_a_different_project():
+    """B4=A: the durable binding is the one truth about a task's project, so this
+    in-memory copy may FILL an empty value or repeat the same one, never move a task
+    from one project to another (that is how a second, empty project got a lane)."""
+    from ouroboros.project_lease import mark_task_project
+
+    running = {"t1": {"task": {"id": "t1", "project_id": "token-atlas"}}}
+    pending = [{"id": "t2", "project_id": "token-atlas"}]
+
+    assert mark_task_project(running, pending, "t1", "token-observatory") is False
+    assert running["t1"]["task"]["project_id"] == "token-atlas"
+    assert mark_task_project(running, pending, "t2", "token-observatory") is False
+    assert pending[0]["project_id"] == "token-atlas"
+    # Same value stays the idempotent commit point both convert paths rely on.
+    assert mark_task_project(running, pending, "t1", "token-atlas") is True
+
+
+def test_ui_conversion_of_a_bound_task_refuses_before_any_side_effect(tmp_path, monkeypatch):
+    """B4=A + R14: converting a task that already belongs to a project creates no
+    second project, marks no lane and broadcasts nothing, and the refusal NAMES the
+    project (id + display name) in one human sentence - the only text the toast has
+    on the desktop shell, the Telegram mini app and the mobile layout."""
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import bind_task_to_project, create_project, list_projects
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    create_project(tmp_path, "token-atlas", name="Token Atlas")
+    bind_task_to_project(tmp_path, "tbound", "token-atlas", origin={"absent": "system"})
+    monkeypatch.setitem(workers.RUNNING, "tbound", {"task": {"id": "tbound", "project_id": "token-atlas"}})
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tbound", "id": "task-tbound", "objective_hint": "build it"},
+    )))
+    body = json.loads(resp.body.decode("utf-8"))
+
+    assert resp.status_code == 409
+    assert "Token Atlas" in body["error"] and "token-atlas" in body["error"]
+    assert "open it there or start a new task" in body["error"]
+    assert [p["id"] for p in list_projects(tmp_path)] == ["token-atlas"]
+    assert workers.RUNNING["tbound"]["task"]["project_id"] == "token-atlas"
+
+
+def test_ui_conversion_with_an_unreadable_bindings_store_proceeds_and_discloses(
+    tmp_path, monkeypatch, caplog,
+):
+    """Proportionality (D6-6): an unreadable store is not a measured incident. The
+    conversion runs as it would for an unbound task and says once that it could not
+    read the bindings; only a READABLE binding elsewhere refuses."""
+    import json
+    import logging
+
+    from ouroboros.gateway.projects import api_project_from_task
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
+    monkeypatch.setitem(workers.RUNNING, "tbroken", {"task": {"id": "tbroken", "project_id": ""}})
+
+    with caplog.at_level(logging.WARNING):
+        resp = asyncio.run(api_project_from_task(_request(
+            tmp_path, {"task_id": "tbroken", "id": "task-tbroken", "objective_hint": "build it"},
+        )))
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body.decode("utf-8"))["project"]["id"] == "task-tbroken"
+    assert "project_binding_unreadable" in caplog.text

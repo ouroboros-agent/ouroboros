@@ -136,6 +136,9 @@ def test_supervisor_handler_creates_binds_updates_running_and_broadcasts(monkeyp
     from supervisor import workers
 
     calls = {"create": None, "bind": None, "touch": None, "broadcast": None}
+    # Hermetic (R13): the handler now reads the durable binding first, and
+    # workers.DRIVE_ROOT here is the LIVE data root.
+    monkeypatch.setattr(reg, "project_id_for_task", lambda dr, tid, **kw: "")
     monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: calls.__setitem__("create", (pid, kw)) or {"id": pid, "chat_id": 7})
     monkeypatch.setattr(
         reg,
@@ -159,3 +162,108 @@ def test_supervisor_handler_creates_binds_updates_running_and_broadcasts(monkeyp
     assert calls["bind"] == ("t1", "cyber-racing", 7, {"absent": "mid_task_no_origin"})
     assert running["t1"]["task"]["project_id"] == "cyber-racing"  # F1: lease lane occupancy
     assert calls["broadcast"] == {"type": "projects_changed", "project_id": "cyber-racing", "chat_id": 7}
+
+
+def test_supervisor_handler_refuses_before_side_effects_when_bound_elsewhere(monkeypatch, tmp_path):
+    """B4=A: create precedes bind, so a task bound elsewhere used to leave a project
+    row, a lease mark, a broadcast and a chat announcement behind before the immutable
+    bind refused. The refusal is now first, and the requested name is carried to the
+    project the task actually belongs to."""
+    import json
+
+    import ouroboros.projects_registry as reg
+    import supervisor.message_bus as mb
+    from supervisor import workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    calls = {"create": None, "bind": None, "touch": None, "broadcast": None, "rename": None,
+             "announce": None}
+    monkeypatch.setattr(reg, "project_id_for_task", lambda dr, tid, **kw: "token-atlas")
+    monkeypatch.setattr(reg, "create_project", lambda *a, **kw: calls.__setitem__("create", a))
+    monkeypatch.setattr(reg, "bind_task_to_project", lambda *a, **kw: calls.__setitem__("bind", a))
+    monkeypatch.setattr(reg, "touch_project", lambda *a, **kw: calls.__setitem__("touch", a))
+    monkeypatch.setattr(reg, "update_project",
+                        lambda dr, pid, **kw: calls.__setitem__("rename", (pid, kw)))
+    monkeypatch.setattr(mb, "get_bridge", lambda: calls.__setitem__("broadcast", True))
+    monkeypatch.setattr(workers, "_announce_created_project",
+                        lambda *a, **kw: calls.__setitem__("announce", True))
+
+    running = {"t1": {"task": {"id": "t1", "project_id": "token-atlas"}}}
+    workers.ensure_project_scope(
+        {"task_id": "t1", "project_id": "token-observatory", "project_name": "Token Observatory"},
+        SimpleNamespace(RUNNING=running),
+    )
+
+    assert calls["create"] is None and calls["bind"] is None and calls["touch"] is None
+    assert calls["broadcast"] is None and calls["announce"] is None
+    assert calls["rename"] == ("token-atlas", {"name": "Token Observatory"})
+    assert running["t1"]["task"]["project_id"] == "token-atlas"
+    rows = [json.loads(line) for line in
+            (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert rows[-1]["type"] == "project_binding_failed"
+    assert rows[-1]["reason"] == "project_scope_conflict"
+    assert rows[-1]["project_id"] == "token-observatory"
+
+
+def test_supervisor_handler_stops_when_the_bind_raises(monkeypatch, tmp_path):
+    """A refused bind must not be followed by the lease mark, the broadcast and the
+    announcement: the task is not in that project, so nothing may say it is."""
+    import ouroboros.projects_registry as reg
+    import supervisor.message_bus as mb
+    from supervisor import workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    calls = {"broadcast": None, "announce": None}
+
+    def _raise(*_a, **_kw):
+        raise ValueError("project binding is immutable")
+
+    monkeypatch.setattr(reg, "project_id_for_task", lambda dr, tid, **kw: "")
+    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: {"id": pid, "chat_id": 7})
+    monkeypatch.setattr(reg, "touch_project", lambda *a, **kw: None)
+    monkeypatch.setattr(reg, "bind_task_to_project", _raise)
+    monkeypatch.setattr(mb, "get_bridge", lambda: calls.__setitem__("broadcast", True))
+    monkeypatch.setattr(workers, "_announce_created_project",
+                        lambda *a, **kw: calls.__setitem__("announce", True))
+
+    running = {"t1": {"task": {"id": "t1", "project_id": ""}}}
+    workers.ensure_project_scope(
+        {"task_id": "t1", "project_id": "cyber-racing", "project_name": "Cyber Racing"},
+        SimpleNamespace(RUNNING=running),
+    )
+
+    assert running["t1"]["task"]["project_id"] == ""
+    assert calls["broadcast"] is None and calls["announce"] is None
+
+
+def test_supervisor_handler_treats_an_unreadable_store_as_unbound(monkeypatch, tmp_path, caplog):
+    """Proportionality (D6-6): an unreadable bindings file behaves like "no binding"
+    and is disclosed once; it does not stop the conversion."""
+    import ouroboros.projects_registry as reg
+    import supervisor.message_bus as mb
+    from supervisor import workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
+    bound = {}
+    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: {"id": pid, "chat_id": 7})
+    monkeypatch.setattr(reg, "touch_project", lambda *a, **kw: None)
+    monkeypatch.setattr(reg, "bind_task_to_project",
+                        lambda dr, tid, pid, chat=None, *, origin: bound.update({"pid": pid}))
+    monkeypatch.setattr(mb, "get_bridge", lambda: SimpleNamespace(broadcast=lambda payload: None))
+    monkeypatch.setattr(workers, "_announce_created_project", lambda *a, **kw: None)
+
+    running = {"t1": {"task": {"id": "t1", "project_id": ""}}}
+    with caplog.at_level(logging.WARNING):
+        workers.ensure_project_scope(
+            {"task_id": "t1", "project_id": "cyber-racing", "project_name": "Cyber Racing"},
+            SimpleNamespace(RUNNING=running),
+        )
+
+    assert bound == {"pid": "cyber-racing"}
+    assert running["t1"]["task"]["project_id"] == "cyber-racing"
+    assert "project_binding_unreadable" in caplog.text
