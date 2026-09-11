@@ -354,7 +354,7 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
     """Reuse the caller's material/cycle identity and the exact configured roster."""
     import hashlib
     import json
-    from dataclasses import asdict
+    from dataclasses import asdict, is_dataclass
     from ouroboros.review_execution import review_output_contract
 
     def digest(value):
@@ -362,8 +362,11 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
                                          default=str).encode("utf-8")).hexdigest()
 
     supplied = dict(getattr(request, "reconciliation_identity", None) or {})
-    roster = [{k: v for k, v in asdict(slot).items()
-               if k not in {"timeout_sec", "transport_timeout_sec"}} for slot in slots]
+    roster = []
+    for slot in slots:
+        values = asdict(slot) if is_dataclass(slot) else dict(getattr(slot, "__dict__", {}) or {})
+        roster.append({k: v for k, v in values.items()
+                       if k not in {"timeout_sec", "transport_timeout_sec"}})
     return {
         "subject_hash": digest(request.retry_key or {
             "subject": request.subject, "goal": request.goal, "scope": request.scope,
