@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from ouroboros.gateway.tasks import api_task_get, api_tasks_list
 from ouroboros.task_results import write_task_result
+from ouroboros.utils import utc_now_iso
 
 
 def _request(data, **params):
@@ -41,9 +42,12 @@ def _write_raw(data, task_id, **fields):
 
 
 def _seed_queue_snapshot(data):
+    # A FRESH ``ts``: an empty snapshot only proves a running row is orphaned
+    # while it is still current — an undated or out-of-date snapshot fails open
+    # toward liveness (GR7-1a), and the orphan projection would never run.
     (data / "state").mkdir(parents=True, exist_ok=True)
     (data / "state" / "queue_snapshot.json").write_text(
-        '{"pending": [], "running": []}', encoding="utf-8"
+        json.dumps({"ts": utc_now_iso(), "pending": [], "running": []}), encoding="utf-8"
     )
 
 

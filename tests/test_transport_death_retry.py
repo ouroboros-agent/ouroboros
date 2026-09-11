@@ -536,6 +536,59 @@ def test_primary_round_dispatch_recovers_after_two_deaths(tmp_path, monkeypatch,
     assert TRANSPORT_DEATHS_KEY not in usage
 
 
+def _tool_round(name, args, call_id):
+    return (
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        }]},
+        {"prompt_tokens": 11, "completion_tokens": 2},
+    )
+
+
+def test_unexpected_loop_error_carries_accumulated_evidence_to_owner_projection(
+    tmp_path, monkeypatch,
+):
+    """The outer agent catch must not turn a failed multi-round loop into 0 calls.
+
+    Round 1 runs the REAL tool executor, so ``llm_trace`` holds a recorded call
+    with its durable trace ref; round 2's executor then dies. The loop owns that
+    accumulated evidence, so it must reach the raiser instead of being replaced
+    by an empty projection.
+    """
+    real_handle_tool_calls = loop_mod.handle_tool_calls
+    executed = {"count": 0}
+
+    def explode_after_the_first_batch(*args, **kwargs):
+        executed["count"] += 1
+        if executed["count"] == 1:
+            return real_handle_tool_calls(*args, **kwargs)
+        raise RuntimeError("tool executor crashed after the provider response")
+
+    monkeypatch.setattr(loop_mod, "handle_tool_calls", explode_after_the_first_batch)
+    llm = _ScriptedLLM(
+        _tool_round("write_file", {"root": "task_drive", "path": "a.txt", "content": "a"}, "call-1"),
+        _tool_round("write_file", {"root": "task_drive", "path": "b.txt", "content": "b"}, "call-2"),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        run_llm_loop(**_loop_kwargs(tmp_path, llm, []))
+
+    # The ORIGINAL exception propagates: same object, same traceback, no
+    # wrapper that would hide where the lifecycle actually failed.
+    assert str(caught.value) == "tool executor crashed after the provider response"
+    assert [entry.name for entry in caught.traceback][-1] == "explode_after_the_first_batch"
+    usage = getattr(caught.value, "_ouroboros_loop_usage")
+    trace = getattr(caught.value, "_ouroboros_loop_trace")
+    assert usage["rounds"] == 2
+    assert usage["prompt_tokens"] == 22
+    assert usage["completion_tokens"] == 4
+    assert TRANSPORT_DEATHS_KEY not in usage
+    # Durable evidence for the completed batch survives the failure.
+    assert [call["tool_call_id"] for call in trace["tool_calls"]] == ["call-1"]
+    assert trace["tool_calls"][0]["trace_ref"]["call_id"]
+
+
 @pytest.mark.parametrize("turn_flag", [None, "is_direct_chat", "is_ephemeral_turn"])
 def test_counter_survives_the_wait_episodes_free_redial_of_the_same_round(tmp_path, monkeypatch, no_sleep, turn_flag):
     """death → released ConnectError → wait episode → free redial → death →

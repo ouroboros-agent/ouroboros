@@ -190,6 +190,14 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
         )
     metadata_src = getattr(ctx, "task_metadata", None)
     root_task_id = metadata_src.get("root_task_id") if isinstance(metadata_src, dict) else None
+    project_id = str(
+        getattr(ctx, "project_id", "")
+        or (metadata_src.get("project_id") if isinstance(metadata_src, dict) else "")
+        or ""
+    ).strip()
+    source_chat_id = getattr(ctx, "current_chat_id", None)
+    if source_chat_id in (None, "") and isinstance(metadata_src, dict):
+        source_chat_id = metadata_src.get("chat_id")
     record = {
         "id": f"followup-{task_id}-{uuid.uuid4().hex[:6]}",
         "name": f"Follow-up of task {task_id}",
@@ -203,6 +211,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             "text": objective,
             "description": objective,
             **({"context": context} if context else {}),
+            **({"project_id": project_id} if project_id else {}),
             "metadata": {
                 "source": FOLLOWUP_SOURCE,
                 "origin_task_id": task_id,
@@ -210,6 +219,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
                 # to task_id, never become the literal string "None".
                 "origin_root_task_id": str(root_task_id or "") or task_id,
             },
+            **({"chat_id": source_chat_id} if source_chat_id not in (None, "") else {}),
         },
     }
     presence = metadata_src.get("presence") if isinstance(metadata_src, dict) else None

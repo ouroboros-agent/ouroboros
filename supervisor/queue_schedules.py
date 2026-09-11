@@ -255,7 +255,7 @@ def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
         "delegation_role": "root",
         "metadata": metadata,
     }
-    for key in ("attachments", "context", "expected_output", "constraints", "deadline_at"):
+    for key in ("attachments", "context", "expected_output", "constraints", "deadline_at", "project_id"):
         if key in template:
             task[key] = template[key]
     allowed_resources = normalize_allowed_resources(template.get("allowed_resources") or metadata.get("allowed_resources") or {})
@@ -373,9 +373,12 @@ def check_scheduled_tasks() -> None:
             record["last_task_id"] = task["id"]
             record_scheduled_admission(task, admitted, record)
             if trigger_type == "once":
-                if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
-                    # Consumed ONLY when admission succeeded (durable receipt, never re-fired); a
-                    # refused admission left the record enabled with last_error → next tick retries.
+                refused = isinstance(admitted, dict) and admitted.get("_admission_blocked")
+                permanent = (refused == "project_routing_fence"
+                             and admitted.get("_project_lifecycle") == "tombstoned")
+                if not refused or permanent:
+                    # A consumed receipt includes a permanent target refusal;
+                    # keep its failed task and last_error. Transient refusals retry.
                     record["enabled"] = False
                     record["completed_at"] = now.isoformat()
                     record["next_run_at"] = ""

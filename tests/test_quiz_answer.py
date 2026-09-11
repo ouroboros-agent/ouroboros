@@ -84,6 +84,47 @@ def test_structural_expiry_flips_open_only(tmp_path):
     assert reconcile_terminal(tmp_path, "t1") == []
 
 
+def test_structural_expiry_closes_the_paired_owner_wait(tmp_path):
+    record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"])
+    path = _result_path(tmp_path, "t1")
+    row = json.loads(path.read_text())
+    row["owner_wait"] = {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"}
+    path.write_text(json.dumps(row))
+
+    assert reconcile_terminal(tmp_path, "t1") == ["q1"]
+    updated = json.loads(path.read_text())
+    assert updated["owner_quiz"]["q1"]["state"] == STATE_EXPIRED_TERMINAL
+    assert updated["owner_wait"]["state"] == STATE_EXPIRED_TERMINAL
+    assert updated["owner_wait"]["reconciled_at"]
+
+
+def test_structural_expiry_repairs_wait_after_partial_pair_write_failure(tmp_path, monkeypatch):
+    import ouroboros.owner_quiz as owner_quiz
+    from ouroboros.utils import update_json_locked as real_update_json_locked
+
+    record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"])
+    path = _result_path(tmp_path, "t1")
+    row = json.loads(path.read_text())
+    row["owner_wait"] = {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"}
+    path.write_text(json.dumps(row))
+    calls = {"count": 0}
+
+    def fail_pair_write(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated paired projection failure")
+        return real_update_json_locked(*args, **kwargs)
+
+    monkeypatch.setattr(owner_quiz, "update_json_locked", fail_pair_write)
+    with pytest.raises(OSError):
+        reconcile_terminal(tmp_path, "t1")
+    assert json.loads(path.read_text())["owner_quiz"]["q1"]["state"] == STATE_EXPIRED_TERMINAL
+
+    monkeypatch.setattr(owner_quiz, "update_json_locked", real_update_json_locked)
+    assert reconcile_terminal(tmp_path, "t1") == []
+    assert json.loads(path.read_text())["owner_wait"]["state"] == STATE_EXPIRED_TERMINAL
+
+
 def test_projection_survives_concurrent_result_fields(tmp_path):
     record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"] * 2)
     path = _result_path(tmp_path, "t1")

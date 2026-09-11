@@ -536,7 +536,10 @@ def reap_orphaned_workers() -> int:
 
 
 @_serialized_worker_lifecycle
-def kill_workers_for_update(*, result_reason: str, terminal_status: str = "interrupted") -> List[str]:
+def kill_workers_for_update(
+    *, result_reason: str, terminal_status: str = "interrupted",
+    preserve_running_task_ids: Optional[set[str]] = None,
+) -> List[str]:
     """Stop the current pool and return anything whose death could not be proven."""
     with _queue_lock:
         fenced = list(_pool().WORKERS.values())
@@ -547,6 +550,7 @@ def kill_workers_for_update(*, result_reason: str, terminal_status: str = "inter
             terminal_status=terminal_status,
             disable_reason="managed_update",
             preserve_pending=True,
+            preserve_running_task_ids=set(preserve_running_task_ids or ()),
         )
         if kill_ok is False:
             teardown_error = "teardown:queue_snapshot_persist_failed"

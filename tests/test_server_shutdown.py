@@ -1,5 +1,9 @@
+import json
+import os
 import threading
 from types import SimpleNamespace
+
+import pytest
 
 
 def _stop_restart_watcher(server):
@@ -88,6 +92,154 @@ def test_pre_transaction_update_quiesce_also_preserves_pending(monkeypatch):
     )
 
     assert server._managed_update_pending_kwargs() == {"preserve_pending": True}
+
+
+def test_managed_update_quiesce_passes_owner_wait_handoffs(monkeypatch, tmp_path):
+    import ouroboros.gateway.control as control
+    import ouroboros.owner_wait as owner_wait
+    import ouroboros.delegate_recovery as delegate_recovery
+    import supervisor.git_ops as git_ops
+    import supervisor.workers as workers
+
+    captured = {}
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda _reason: None)
+    monkeypatch.setattr(workers, "drain_repo_writers", lambda: [])
+    monkeypatch.setattr(owner_wait, "prepare_owner_wait_handoffs", lambda *_args: {"waiting"})
+    monkeypatch.setattr(
+        delegate_recovery,
+        "prepare_planned_restart_handoffs",
+        lambda *_args, **kwargs: set(kwargs["additional_task_ids"]),
+    )
+
+    def fake_kill(**kwargs):
+        captured.update(kwargs)
+        return ["worker:still-running"]
+
+    monkeypatch.setattr(workers, "kill_workers_for_update", fake_kill)
+
+    blockers = control._quiesce_repo_writers("smart")
+
+    assert blockers == ["worker:still-running"]
+    assert captured["preserve_running_task_ids"] == {"waiting"}
+
+
+def test_manual_rollback_quiesce_keeps_cancellation_semantics(monkeypatch, tmp_path):
+    """A rollback returns the tree to an OLDER runtime, so no owner wait may be
+    handed to it: the pool stop keeps its ordinary interrupt/cancel semantics."""
+    import ouroboros.gateway.control as control
+    import ouroboros.delegate_recovery as delegate_recovery
+    import ouroboros.owner_wait as owner_wait
+    import supervisor.git_ops as git_ops
+    import supervisor.workers as workers
+
+    captured = {}
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda _reason: None)
+    monkeypatch.setattr(workers, "drain_repo_writers", lambda: [])
+    monkeypatch.setattr(
+        owner_wait, "prepare_owner_wait_handoffs",
+        lambda *_args: pytest.fail("a rollback must not park an owner wait"),
+    )
+    monkeypatch.setattr(
+        delegate_recovery, "prepare_planned_restart_handoffs",
+        lambda *_args, **_kwargs: pytest.fail("a rollback must not prepare a handoff"),
+    )
+    monkeypatch.setattr(workers, "kill_workers_for_update", lambda **kwargs: captured.update(kwargs) or [])
+    monkeypatch.setattr(
+        "ouroboros.tools.services.kill_all_services", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "ouroboros.process_custody.quiesce_custodied_services", lambda *_a: (True, []))
+
+    assert control._quiesce_repo_writers("manual_rollback") == []
+    assert captured["preserve_running_task_ids"] == set()
+    assert captured["terminal_status"] == "interrupted"
+
+
+def test_failed_owner_wait_handoff_blocks_the_update_instead_of_killing_the_pool(
+    monkeypatch, tmp_path,
+):
+    """Custody preparation is the gate: if it cannot park the wait, the pool is
+    never stopped and repo-writer admission re-opens."""
+    import ouroboros.gateway.control as control
+    import ouroboros.owner_wait as owner_wait
+    import supervisor.git_ops as git_ops
+    import supervisor.workers as workers
+
+    reopened = []
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda _reason: None)
+    monkeypatch.setattr(workers, "drain_repo_writers", lambda: [])
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda: reopened.append(True))
+
+    def refuse(*_args):
+        raise OSError("owner wait source bytes are unreadable")
+
+    monkeypatch.setattr(owner_wait, "prepare_owner_wait_handoffs", refuse)
+    monkeypatch.setattr(
+        workers, "kill_workers_for_update",
+        lambda **_kwargs: pytest.fail("the pool must not stop after a failed handoff"),
+    )
+
+    blockers = control._quiesce_repo_writers("smart")
+
+    assert blockers == ["owner_wait_handoff:OSError: owner wait source bytes are unreadable"]
+    assert reopened == [True]
+
+
+def test_managed_update_restart_arms_prepared_transaction_for_direct_reexec(
+    monkeypatch, tmp_path,
+):
+    import ouroboros.delegate_recovery as delegate_recovery
+    import ouroboros.gateway.control as control
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+    import server
+
+    prepared = {
+        "transaction_id": "tx-owner-wait",
+        "status": "prepared",
+        "supervisor_pid": os.getpid(),
+    }
+    tx_dir = tmp_path / "state" / "delegate_recovery_transactions"
+    tx_dir.mkdir(parents=True)
+    (tx_dir / "active.json").write_text(
+        '{"transaction_id":"tx-owner-wait"}', encoding="utf-8",
+    )
+    (tx_dir / "tx-owner-wait.json").write_text(
+        json.dumps(prepared), encoding="utf-8",
+    )
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server, "_restart_current_process_impl", lambda *_a, **_kw: None)
+    monkeypatch.setattr(update_merge, "read_update_tx_strict", lambda: ("valid", {"phase": "pending_boot_smoke"}))
+    monkeypatch.delenv(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, raising=False)
+
+    request = type("Request", (), {"app": type("App", (), {"state": type("State", (), {
+        "request_restart": lambda _self, owner=False: None,
+    })()})()})()
+    response = control._restart_response(request, strategy="auto_merge", plan={})
+
+    assert response.status_code == 200
+    assert delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV not in os.environ
+    server._restart_current_process("127.0.0.1", 8765)
+    assert os.environ[delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV] == "tx-owner-wait"
+
+
+def test_failed_managed_update_restart_disarms_transaction_token(monkeypatch, tmp_path):
+    import ouroboros.delegate_recovery as delegate_recovery
+    import ouroboros.gateway.control as control
+
+    monkeypatch.setenv(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, "stale-tx")
+    request = type("Request", (), {"app": type("App", (), {"state": type("State", (), {
+        "request_restart": None,
+    })()})()})()
+
+    response = control._restart_response(request, strategy="auto_merge", plan={})
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["status"] == "restart_required"
+    assert delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV not in os.environ
 
 
 def test_ordinary_restart_disarms_orphan_update_intent(monkeypatch):

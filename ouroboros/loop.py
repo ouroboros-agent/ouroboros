@@ -646,6 +646,9 @@ def run_llm_loop(
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="budget")
         return _handle_budget_exceeded(
             exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
+    except Exception as exc:
+        exit_ctx.attach_exception_evidence(exc)
+        raise
     finally:
         # No stale active latch behind an in-process exit (a crash skips this frame, keeping the latch for recovery).
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="loop_exit")

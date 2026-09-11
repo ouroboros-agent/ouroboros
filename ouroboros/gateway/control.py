@@ -405,9 +405,33 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
     if blocked:
         open_repo_writer_admission()
         return [f"active:{label}" for label in blocked]
+    preserve_running_task_ids: set[str] = set()
+    if reason != "manual_rollback":
+        try:
+            import uuid
+
+            from ouroboros.delegate_recovery import prepare_planned_restart_handoffs
+            from ouroboros.owner_wait import prepare_owner_wait_handoffs
+            from supervisor import workers as worker_state
+
+            restart_transaction_id = uuid.uuid4().hex
+            owner_wait_ids = prepare_owner_wait_handoffs(
+                DRIVE_ROOT, worker_state.RUNNING, restart_transaction_id,
+            )
+            preserve_running_task_ids = prepare_planned_restart_handoffs(
+                DRIVE_ROOT,
+                worker_state.RUNNING,
+                restart_transaction_id=restart_transaction_id,
+                additional_task_ids=owner_wait_ids,
+            )
+        except Exception as exc:
+            open_repo_writer_admission()
+            log.warning("Managed update owner-wait handoff preparation failed", exc_info=True)
+            return [f"owner_wait_handoff:{type(exc).__name__}: {exc}"]
     survivors = kill_workers_for_update(
         result_reason="Task interrupted by an owner-requested managed update.",
         terminal_status="interrupted",
+        preserve_running_task_ids=preserve_running_task_ids,
     )
     if survivors:
         return survivors
@@ -482,6 +506,13 @@ def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONRes
     else:
         restart_error = "restart callback is unavailable" if not restarting else ""
     if not restarting:
+        try:
+            from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV
+            import os
+
+            os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+        except Exception:
+            log.warning("failed to disarm managed update restart transaction", exc_info=True)
         return JSONResponse(
             {
                 "status": "restart_required",

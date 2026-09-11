@@ -349,9 +349,12 @@ def test_owner_restart_copy_is_explicit_about_stopped_task():
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
     # Checkout gate first (a refusal leaves the server intact), then the durable
     # no-resume intent, then the owned-work stop, then the owner's stop notice.
-    notice = source.index("Stopping active task. New settings apply to the next message.")
-    assert (source.index("_safe_restart_serialized(") < source.index("owner_restart_no_resume.flag")
-            < source.index("_stop_owned_work(ctx)") < notice)
+    owner_restart = source.split('elif lowered.startswith("/restart"):', 1)[1].split(
+        'elif lowered == "/review"', 1
+    )[0]
+    notice = owner_restart.index("Stopping active task. New settings apply to the next message.")
+    assert (owner_restart.index("_safe_restart_serialized(") < owner_restart.index("owner_restart_no_resume.flag")
+            < owner_restart.index("_stop_owned_work(ctx)") < notice)
     stop = _read("ouroboros/server_restart.py").split("def _stop_owned_work", 1)[1]
     assert (stop.index("request_cancel(") < stop.index("ctx.kill_workers(")
             < stop.index("reconcile_orphaned_runs(") < stop.index("stop_outcome()"))

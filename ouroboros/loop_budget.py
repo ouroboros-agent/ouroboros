@@ -354,6 +354,19 @@ class _LoopExitContext:
     trace_ctx: Any = None
     previous_execution_trace: Any = None
 
+    def attach_exception_evidence(self, exc: Exception) -> None:
+        """The caller owns terminal projection; this loop owns its evidence.
+
+        Keep the same in-memory objects on the original exception so a lifecycle
+        failure cannot erase a completed multi-round trace. A failed attachment
+        leaves the caller's explicit unknown projection, never a new exception.
+        """
+        try:
+            setattr(exc, "_ouroboros_loop_usage", self.accumulated_usage)
+            setattr(exc, "_ouroboros_loop_trace", self.llm_trace)
+        except Exception:
+            log.debug("Loop exception evidence could not be attached", exc_info=True)
+
 
 def _handle_budget_exceeded(
     exc: BudgetExceeded,

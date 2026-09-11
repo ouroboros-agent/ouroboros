@@ -170,6 +170,21 @@ def _has_active_evolution_transaction() -> bool:
 
 
 def _restart_current_process(host: str, port: int) -> None:
+    # Every direct restart reaches this seam, including an assisted update whose
+    # native waits were already moved to PENDING before its resolver ran.
+    try:
+        from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV, arm_active_planned_restart_transaction
+        from ouroboros.server_restart import _RESTARTABLE_UPDATE_PHASES
+        from supervisor.update_merge import read_update_tx_strict
+
+        if any((DATA_DIR / "state" / name).exists() for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
+            os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+        else:
+            status, tx = read_update_tx_strict()
+            if status == "valid" and tx.get("phase") in _RESTARTABLE_UPDATE_PHASES:
+                arm_active_planned_restart_transaction(DATA_DIR)
+    except Exception:
+        log.warning("Direct restart transaction could not be armed; continuation remains unconfirmed", exc_info=True)
     _restart_current_process_impl(
         host, port, repo_dir=REPO_DIR, log=log,
         owner_initiated=_owner_restart_requested.is_set(),

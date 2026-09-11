@@ -111,8 +111,8 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
         "task_id": str(evt.get("task_id") or ""),
         "task_type": str(evt.get("task_type") or ""),
         "duration_sec": round(float(evt.get("duration_sec") or 0.0), 3),
-        "tool_calls": int(evt.get("tool_calls") or 0),
-        "tool_errors": int(evt.get("tool_errors") or 0),
+        "tool_calls": None if evt.get("tool_calls") is None else int(evt["tool_calls"]),
+        "tool_errors": None if evt.get("tool_errors") is None else int(evt["tool_errors"]),
         "outcome_axes": normalize_outcome_axes(evt),
         "reason_code": str(evt.get("reason_code") or ""),
     }

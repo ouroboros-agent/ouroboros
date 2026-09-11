@@ -102,6 +102,32 @@ def _active_restart_transaction_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / "delegate_recovery_transactions" / "active.json"
 
 
+def arm_active_planned_restart_transaction(drive_root: Any) -> str:
+    """Pass a prepared restart transaction to a direct re-exec successor.
+
+    Launcher-managed exits acknowledge the same durable transaction by waiting
+    for exit code 42.  A direct server re-exec has no launcher, so it carries
+    the already-created transaction id through the existing one-shot
+    environment handoff consumed by ``_ack_direct_exec_successor``.
+    """
+    try:
+        active = json.loads(_active_restart_transaction_path(drive_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(active, dict):
+        return ""
+    transaction_id = str(active.get("transaction_id") or "")
+    row = _read_restart_transaction(drive_root, transaction_id) if transaction_id else {}
+    if (
+        not transaction_id
+        or row.get("status") != "prepared"
+        or int(row.get("supervisor_pid") or 0) != os.getpid()
+    ):
+        return ""
+    os.environ[PLANNED_RESTART_TRANSACTION_ENV] = transaction_id
+    return transaction_id
+
+
 def _read_restart_transaction(drive_root: Any, transaction_id: str) -> dict[str, Any]:
     try:
         data = json.loads(
@@ -994,6 +1020,7 @@ __all__ = [
     "CAUSE_WORKER_CRASH",
     "NO_RESUME_CAUSES",
     "PLANNED_RESTART_TRANSACTION_ENV",
+    "arm_active_planned_restart_transaction",
     "acknowledge_observed_restart_exit",
     "adopt_handoff",
     "authority_fingerprint_from_context",

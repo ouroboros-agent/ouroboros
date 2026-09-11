@@ -1609,7 +1609,10 @@ def test_effective_status_repairs_stale_running_infra_failure_when_queue_empty(t
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
 
     effective = load_effective_task_result(tmp_path, "providerfail")
 
@@ -1662,7 +1665,10 @@ def test_effective_status_repairs_orphan_running_after_worker_restart(tmp_path, 
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "cc4db6fa"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -1698,7 +1704,10 @@ def test_reconcile_durably_finalizes_orphaned_running_task(tmp_path, monkeypatch
         result="Task is running.", ts="2026-05-28T00:00:00+00:00",
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "orphan1"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -3396,6 +3405,80 @@ def test_handle_text_response_keeps_full_reasoning_note():
     _, _, updated = _handle_text_response(content, llm_trace, {})
 
     assert updated["reasoning_notes"] == [content]
+
+
+def _orphan_shaped_running_task(tmp_path, task_id, *, snapshot_ts):
+    """The exact fixture the pooled orphan reconciler accepts as proof of death:
+    an aged ``running`` row, an empty queue snapshot and a LATER worker boot."""
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.utils import append_jsonl
+
+    write_task_result(
+        tmp_path, task_id, STATUS_RUNNING,
+        result="Task is running.", ts="2026-05-28T00:00:00+00:00",
+    )
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        json.dumps({"ts": snapshot_ts, "pending": [], "running": []}), encoding="utf-8",
+    )
+    events = tmp_path / "logs" / "events.jsonl"
+    append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": task_id})
+    append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
+
+
+def test_orphan_reconcile_never_terminalizes_a_live_direct_activity(tmp_path, monkeypatch):
+    """A direct-chat actor is deliberately absent from PENDING/RUNNING, so a
+    FOREIGN ``worker_boot`` plus a fresh empty snapshot cannot prove it dead."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result
+    from ouroboros.task_status import (
+        load_effective_task_result, reconcile_orphaned_running_tasks,
+    )
+    from supervisor import active_activity
+    from supervisor.active_activity import (
+        DirectActivityRegistry, get_direct_activity_registry,
+    )
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    # Reliable fixture isolation for a process-global (DEVELOPMENT.md, parallel
+    # pass): monkeypatch reverses exactly this singleton, so the real
+    # ``get_direct_activity_registry`` seam is still the one under test.
+    monkeypatch.setattr(active_activity, "_DIRECT_ACTIVITY_REGISTRY", DirectActivityRegistry())
+    _orphan_shaped_running_task(tmp_path, "direct-live", snapshot_ts="2027-01-15T08:00:00+00:00")
+
+    registry = get_direct_activity_registry()
+    registry.register("direct-live", chat_id=1)
+    assert reconcile_orphaned_running_tasks(tmp_path) == 0
+    assert load_effective_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
+    assert load_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
+
+    # Non-vacuous: the SAME evidence is an ordinary orphan once the actor is gone,
+    # so the guard — not the fixture — is what kept the live row alive.
+    registry.unregister("direct-live")
+    assert reconcile_orphaned_running_tasks(tmp_path) == 1
+    healed = load_task_result(tmp_path, "direct-live")
+    assert healed["reason_code"] == "orphaned_running_after_worker_restart"
+
+
+def test_orphan_reconcile_does_not_use_a_stale_snapshot_as_death_proof(tmp_path, monkeypatch):
+    """GR7-1a polarity for the DESTRUCTIVE reconciler: an out-of-date snapshot
+    cannot prove a pooled owner is gone, but a fresh one still can."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    _orphan_shaped_running_task(tmp_path, "pooled-live", snapshot_ts="2026-05-28T00:00:03+00:00")
+
+    assert reconcile_orphaned_running_tasks(tmp_path) == 0
+    assert load_task_result(tmp_path, "pooled-live")["status"] == STATUS_RUNNING
+
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        json.dumps({"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}),
+        encoding="utf-8",
+    )
+    assert reconcile_orphaned_running_tasks(tmp_path) == 1
+    assert load_task_result(tmp_path, "pooled-live")["reason_code"] == (
+        "orphaned_running_after_worker_restart"
+    )
 
 
 def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
