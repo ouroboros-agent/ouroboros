@@ -191,7 +191,7 @@ def test_applied_options_without_mismatch_emit_no_owner_line(honored):
     assert progress == []
 
 
-def test_effort_mismatch_emits_one_typed_owner_line_per_task(tmp_path, monkeypatch):
+def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path, monkeypatch):
     progress = []
     applied_values = iter(("medium", "low"))
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
@@ -211,7 +211,7 @@ def test_effort_mismatch_emits_one_typed_owner_line_per_task(tmp_path, monkeypat
             "applied_options": {"reasoningEffort": next(applied_values)},
             "options_honored": "mismatch",
         }
-        usage["_model_route"] = {"credentialProfileId": "account-a"}
+        usage["_model_route"] = {"credentialProfileId": "account-a", "model": "codex=model"}
         return {"role": "assistant", "content": "done"}, 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", call)
@@ -225,7 +225,7 @@ def test_effort_mismatch_emits_one_typed_owner_line_per_task(tmp_path, monkeypat
     assert "Claudexor account account-a" in text
     assert incident == {
         "task_incident": "model_effort_mismatch",
-        "toast_once": "task-7:model_effort_mismatch",
+        "toast_once": "task-7:model_effort_mismatch:codex=model",
     }
 
 

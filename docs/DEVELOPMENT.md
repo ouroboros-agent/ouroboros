@@ -2149,8 +2149,8 @@ Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_
   by their caller according to transport capability; explicit unsupported options
   refuse, rather than being silently removed and retried. Record submitted model
   options beside the engine's applied options on the usage row; an absent report
-  stays unknown, while the first mismatch in a task also emits one typed owner
-  line. A mismatch is disclosure, never a dispatch gate.
+  stays unknown, while the first mismatch of each model in a task also emits one typed owner
+  line (keyed by task and model, never per round). A mismatch is disclosure, never a dispatch gate.
 - The engine's active-turn token is one of those transport facts, so the CALLER
   owns its slot (`llm_claudexor.ModelTurnState` on the loop context, a wake-scoped
   one in Background Consciousness) and the engine boundary is its only writer.

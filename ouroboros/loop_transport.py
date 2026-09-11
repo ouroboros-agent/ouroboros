@@ -780,24 +780,29 @@ def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
 def emit_model_effort_mismatch(
     accumulated_usage: Dict[str, Any], *, task_id: str, emit_progress: Optional[Callable[..., None]],
 ) -> None:
-    """Disclose the first engine-applied option mismatch of a task."""
+    """Disclose an engine-applied option mismatch once per task and model.
+
+    One line per (task, model), never per round: a second mismatch on the same
+    model in the same task stays in the durable usage rows only.
+    """
     options = accumulated_usage.get("_options")
+    route = accumulated_usage.get("_model_route") or {}
+    model = str(route.get("model") or "")
+    notified = accumulated_usage.setdefault("_options_mismatch_notified", [])
     if (emit_progress is None or not isinstance(options, dict)
-            or options.get("options_honored") != "mismatch"
-            or accumulated_usage.get("_options_mismatch_notified")):
+            or options.get("options_honored") != "mismatch" or model in notified):
         return
     requested = options.get("requested_options") or {}
     applied = options.get("applied_options") or {}
     requested_effort = str(requested.get("reasoningEffort") or "unknown")
     applied_effort = str(applied.get("reasoningEffort") or "unknown")
-    route = accumulated_usage.get("_model_route") or {}
     account = str(route.get("credentialProfileId") or "")
-    accumulated_usage["_options_mismatch_notified"] = True
+    notified.append(model)
     emit_progress(
         f"⚠️ Claudexor served at {applied_effort} effort while {requested_effort} was requested"
         f"{f' (Claudexor account {account})' if account else ''}.",
         incident={"task_incident": "model_effort_mismatch",
-                  "toast_once": f"{task_id}:model_effort_mismatch"},
+                  "toast_once": ":".join(part for part in (task_id, "model_effort_mismatch", model) if part)},
     )
 
 
