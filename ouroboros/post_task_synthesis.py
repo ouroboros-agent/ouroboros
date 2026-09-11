@@ -176,11 +176,32 @@ def _apply_reflection_memory_actions(
         return 0
 
 
-def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> str:
-    """Return compact evidence from child/subagent results for parent experience review."""
+def _child_failure_classes(rows: Any) -> list:
+    """The sorted TYPED execution classes of the children that did not end clean.
+
+    Read off the same ``outcome_axes`` the evidence walk already normalized, so
+    the root's reflection can carry what its subtree did without a second
+    collector, a second walk, or children reflecting on their own."""
+    from ouroboros.outcomes import EXECUTION_OK
+
+    classes = set()
+    for row in rows or []:
+        axes = row.get("outcome_axes") if isinstance(row, dict) else None
+        execution = axes.get("execution") if isinstance(axes, dict) else None
+        status = str(execution.get("status") or "").strip() if isinstance(execution, dict) else ""
+        if status and status != EXECUTION_OK:
+            classes.add(status)
+    return sorted(classes)
+
+
+def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> tuple:
+    """Compact evidence from child/subagent results for parent experience review.
+
+    Returns the prompt text AND the rows it was rendered from: the caller needs
+    the typed child outcomes, and one walk is the only walk (P7)."""
     task_id = str(task.get("id") or "")
     if not task_id:
-        return ""
+        return "", []
     try:
         from ouroboros.cost_projection import resolve_cost_pair
         from ouroboros.task_results import list_task_results
@@ -205,11 +226,11 @@ def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> s
                 "result": _truncate_with_notice(item.get("result", ""), 1600),
             })
         if not rows:
-            return ""
-        return _truncate_with_notice(json.dumps(rows, ensure_ascii=False, indent=2), limit)
+            return "", []
+        return _truncate_with_notice(json.dumps(rows, ensure_ascii=False, indent=2), limit), rows
     except Exception:
         log.debug("Failed to collect child task evidence", exc_info=True)
-        return ""
+        return "", []
 
 
 def _pre_synthesis_usage_snapshot(
@@ -473,7 +494,7 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
             cost_usd=synthesis_cost,
         ):
             trace_summary = build_trace_summary(llm_trace)
-            child_evidence = _child_task_evidence(env, task)
+            child_evidence, child_rows = _child_task_evidence(env, task)
             try:
                 reflection_usage = dict(usage)
                 # Reflection's legacy durable cost_usd field now records this
@@ -486,6 +507,7 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
                     child_evidence=child_evidence,
                     usage_snapshot_text=_synthesis_usage_snapshot_text(usage),
                     sealed_final_text=sealed_final_prompt_section(sealed_final),
+                    child_failure_classes=_child_failure_classes(child_rows),
                 )
                 entry = {**entry, **presence_provenance_fields(task)}
                 append_reflection_routed(env, task, entry)

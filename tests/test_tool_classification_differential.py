@@ -507,7 +507,10 @@ def test_every_outcome_bucket_is_partitioned() -> None:
 # form of "one adapter plus an inventory of residual string producers".
 _RESIDUAL_TEXT_INSPECTIONS: Mapping[str, tuple[int, str]] = MappingProxyType({
     "ouroboros/outcomes.py": (5, "the FINAL ANSWER and service-teardown text, for which no ToolResult exists"),
-    "ouroboros/reflection.py": (6, "markers emitted INSIDE a result body, which a first-line parser cannot see"),
+    # ouroboros/reflection.py held six (all of them `_ERROR_MARKERS`) until owner
+    # item I24 replaced that scan with the typed codes the trace already carries.
+    # The row is gone rather than zeroed: a module absent from this inventory may
+    # hold none at all, which is exactly the claim now.
     "ouroboros/memory.py": (1, "tools.jsonl rows appended by consciousness carry neither status nor code"),
     "ouroboros/skill_review_prompt.py": (2, "skill review verdict text, not a tool result"),
     "ouroboros/tools/github.py": (12, "private helper-failure checks between two functions of one tool"),

@@ -32,33 +32,7 @@ log = logging.getLogger(__name__)
 NONTRIVIAL_ROUNDS_THRESHOLD: int = 15
 NONTRIVIAL_COST_THRESHOLD: float = 5.0
 
-_ERROR_MARKERS = frozenset({
-    "REVIEW_BLOCKED",
-    "TESTS_FAILED",
-    "COMMIT_BLOCKED",
-    "REVIEW_MAX_ITERATIONS",
-    "TOOL_ERROR",
-    "TOOL_TIMEOUT",
-    "SHELL_EXIT_ERROR",
-    "SHELL_ERROR",
-})
-
 REFLECTIONS_FILENAME = "task_reflections.jsonl"
-
-
-def _marker_scan_view(result_str: str) -> str:
-    """Bounded head+tail view of a tool result for _ERROR_MARKERS scanning — the SCAN
-    is bounded, the stored artifact stays whole (this is not content truncation).
-    Post evidence-parity the trace carries full-window results (15k-80k+), so doc
-    reads (ARCHITECTURE.md, DEVELOPMENT.md, this file) embed the marker strings
-    literally mid-body; the pre-parity trace copy was truncate_for_log's 350-char
-    head + 350-char tail, so mirroring that exact view keeps the historical scan
-    surface: prefix-emitted runtime markers AND late tail markers (a blocked-commit
-    or preflight verdict at the end of a long result) are caught, mid-file doc
-    content is not."""
-    if len(result_str) <= 700:
-        return result_str
-    return result_str[:350] + "\n…\n" + result_str[-350:]
 
 
 def _trace_call_errored(tc: Dict[str, Any]) -> bool:
@@ -204,33 +178,12 @@ def should_generate_reflection(
     if cost_usd is not None and cost_usd >= NONTRIVIAL_COST_THRESHOLD:
         return True
 
-    tool_calls = llm_trace.get("tool_calls") or []
-    for tc in tool_calls:
-        if not isinstance(tc, dict):
-            continue
-        if _trace_call_errored(tc):
+    for tc in (llm_trace.get("tool_calls") or []):
+        if isinstance(tc, dict) and _trace_call_errored(tc):
             return True
-        result_str = _marker_scan_view(str(tc.get("result", "")))
-        for marker in _ERROR_MARKERS:
-            if marker in result_str:
-                return True
 
     return False
 
-
-def _has_error_evidence(llm_trace: Dict[str, Any]) -> bool:
-    """Return True when the trace contains tool errors or blocking markers."""
-    tool_calls = llm_trace.get("tool_calls") or []
-    for tc in tool_calls:
-        if not isinstance(tc, dict):
-            continue
-        if _trace_call_errored(tc):
-            return True
-        result_str = _marker_scan_view(str(tc.get("result", "")))
-        for marker in _ERROR_MARKERS:
-            if marker in result_str:
-                return True
-    return False
 
 def _collect_error_details(llm_trace: Dict[str, Any], cap: int = 3000) -> str:
     """Extract error tool results from the trace, up to *cap* chars."""
@@ -241,11 +194,9 @@ def _collect_error_details(llm_trace: Dict[str, Any], cap: int = 3000) -> str:
     for tc in tool_calls:
         if not isinstance(tc, dict):
             continue
-        result_str = str(tc.get("result", ""))
-        is_error = _trace_call_errored(tc)
-        is_relevant = is_error or any(m in _marker_scan_view(result_str) for m in _ERROR_MARKERS)
-        if not is_relevant:
+        if not _trace_call_errored(tc):
             continue
+        result_str = str(tc.get("result", ""))
         tool_name = tc.get("tool", "unknown")
         facts = []
         status = str(tc.get("status") or "").strip()
@@ -307,13 +258,23 @@ def _tool_usage_profile(llm_trace: Dict[str, Any]) -> str:
 
 
 def _detect_markers(llm_trace: Dict[str, Any]) -> List[str]:
-    """Return list of error marker strings found in the trace."""
+    """Return the sorted TYPED codes of the calls that went wrong.
+
+    This used to scan every result body for eight hand-listed words (P5: a
+    keyword gate standing in for a fact the record already holds). Every call
+    carries ``tool_result_code`` beside its status, so the same question is
+    answered from the typed record instead: no bounded view to tune, no doc read
+    that mentions a marker mid-body classifying a clean task as errored, and no
+    typed failure invisible because nobody added its word to the list. A legacy
+    row written before the code existed falls back to its recorded status, kept
+    verbatim rather than dressed up as a code it never had."""
     found: set = set()
     for tc in (llm_trace.get("tool_calls") or []):
-        result_str = _marker_scan_view(str(tc.get("result", "") if isinstance(tc, dict) else ""))
-        for marker in _ERROR_MARKERS:
-            if marker in result_str:
-                found.add(marker)
+        if not isinstance(tc, dict) or not _trace_call_errored(tc):
+            continue
+        code = str(tc.get("tool_result_code") or "").strip() or str(tc.get("status") or "").strip()
+        if code:
+            found.add(code)
     return sorted(found)
 
 
@@ -386,6 +347,7 @@ def generate_reflection(
     child_evidence: str = "",
     usage_snapshot_text: str = "",
     sealed_final_text: str = "",
+    child_failure_classes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Call the light LLM and return a JSONL-ready reflection entry."""
     from ouroboros.config import get_light_model
@@ -409,7 +371,7 @@ def generate_reflection(
     except Exception:
         review_evidence_text = "(review evidence unavailable)"
 
-    if _has_error_evidence(llm_trace) or markers:
+    if error_count or markers:
         prompt_template = _REFLECTION_PROMPT_ERROR_FULL
     else:
         prompt_template = _REFLECTION_PROMPT_NONTRIVIAL_FULL
@@ -511,6 +473,11 @@ def generate_reflection(
         ),
         "error_count": None if llm_trace.get("loop_evidence_unavailable") else error_count,
         "key_markers": markers,
+        # The typed execution classes of the children this root collected. A root
+        # whose OWN calls all succeeded can still own a failed subtree, and that
+        # is the common shape: children do not reflect, so the register would
+        # never hear about them otherwise.
+        "child_failure_classes": list(child_failure_classes or []),
         "review_evidence": review_evidence or {},
         "reflection": reflection_text,
         "backlog_candidates": backlog_candidates,
@@ -577,6 +544,23 @@ def apply_memory_actions(env: Any, actions: List[Dict[str, Any]], *, project_id:
     return applied
 
 
+def _admits_pattern_register(entry: Dict[str, Any]) -> bool:
+    """Whether a reflection carries error evidence the Pattern Register must see.
+
+    ONE typed gate for both writers below. ``key_markers`` alone used to decide
+    it, and while that field was a substring scan the register was structurally
+    blind twice over: a typed failure whose word nobody had listed did not open
+    it, and a root whose own calls all succeeded while its CHILDREN failed did
+    not either (children do not reflect, ARCHITECTURE Post-task reflection).
+
+    Deliberately NOT "reason_code is non-empty": that opens on every terminal."""
+    return bool(
+        (entry.get("error_count") or 0) > 0
+        or entry.get("key_markers")
+        or entry.get("child_failure_classes")
+    )
+
+
 def append_reflection(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
     """Persist a reflection entry to the JSONL file."""
     reflections_path = drive_root / "logs" / REFLECTIONS_FILENAME
@@ -587,7 +571,7 @@ def append_reflection(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
     except Exception:
         log.warning("Failed to save execution reflection", exc_info=True)
 
-    if entry.get("key_markers"):
+    if _admits_pattern_register(entry):
         try:
             _update_patterns(drive_root, entry)
         except Exception:
@@ -628,7 +612,7 @@ def append_reflection_routed(env: Any, task: Dict[str, Any], entry: Dict[str, An
     except Exception:
         project_write_failed = True
         log.warning("Failed to save project execution reflection", exc_info=True)
-    if entry.get("key_markers"):
+    if _admits_pattern_register(entry):
         try:
             _update_patterns(canonical, entry)
         except Exception:

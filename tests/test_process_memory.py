@@ -38,20 +38,33 @@ class TestReflectionTrigger:
         assert should_generate_reflection(trace) is True
 
     def test_review_blocked_marker_triggers_reflection(self):
+        """Same contract, typed source (owner item I24): a blocked review opens
+        reflection because the call carries the refusal's own status, not because
+        the word appears in its body."""
         from ouroboros.reflection import should_generate_reflection
         trace = {"tool_calls": [
             {"tool": "commit_reviewed", "args": {}, "is_error": False,
+             "status": "review_blocked", "tool_result_code": "REVIEW_BLOCKED",
              "result": "⚠️ REVIEW_BLOCKED (attempt 1/3): reviewer flagged version sync"},
         ]}
         assert should_generate_reflection(trace) is True
 
     def test_tests_failed_marker_triggers_reflection(self):
+        """The commit that carried a failing-test verdict is typed as blocked too;
+        a genuinely successful commit whose output merely quotes a test name is
+        not, which is the half the old substring scan could not express."""
         from ouroboros.reflection import should_generate_reflection
-        trace = {"tool_calls": [
-            {"tool": "commit_reviewed", "args": {}, "is_error": False,
-             "result": "OK: committed\n\n⚠️ TESTS_FAILED: VERSION not in README"},
+        blocked = {"tool_calls": [
+            {"tool": "commit_reviewed", "args": {}, "is_error": True,
+             "status": "review_blocked", "tool_result_code": "REVIEW_BLOCKED",
+             "result": "⚠️ REVIEW_BLOCKED: TESTS_FAILED: VERSION not in README"},
         ]}
-        assert should_generate_reflection(trace) is True
+        assert should_generate_reflection(blocked) is True
+        quoted = {"tool_calls": [
+            {"tool": "commit_reviewed", "args": {}, "is_error": False, "status": "ok",
+             "result": "OK: committed test_tests_failed_marker_triggers_reflection"},
+        ]}
+        assert should_generate_reflection(quoted) is False
 
     def test_empty_trace_no_reflection(self):
         from ouroboros.reflection import should_generate_reflection
@@ -116,16 +129,28 @@ class TestHelperFunctions:
     """_detect_markers and _collect_error_details must extract structured info."""
 
     def test_detect_markers_finds_all(self):
+        """Owner item I24: the markers are the TYPED codes of the calls that went
+        wrong, not eight hand-listed words matched against result bodies. The
+        contract is unchanged — every failure class in the trace is named once,
+        sorted — but a typed failure nobody thought to add to a list is now
+        included, and the second call below (a refusal the host classified as a
+        policy denial) is named by its own code."""
         from ouroboros.reflection import _detect_markers
         trace = {"tool_calls": [
-            {"tool": "commit_reviewed", "is_error": True,
-             "result": "⚠️ REVIEW_BLOCKED: test"},
-            {"tool": "run_command", "is_error": False,
-             "result": "⚠️ TESTS_FAILED: something"},
+            {"tool": "commit_reviewed", "is_error": True, "status": "review_blocked",
+             "tool_result_code": "REVIEW_BLOCKED", "result": "⚠️ REVIEW_BLOCKED: test"},
+            {"tool": "run_command", "is_error": True, "status": "non_zero_exit",
+             "tool_result_code": "SHELL_EXIT_ERROR", "result": "⚠️ SHELL_EXIT_ERROR: 2 failed"},
         ]}
-        markers = _detect_markers(trace)
-        assert "REVIEW_BLOCKED" in markers
-        assert "TESTS_FAILED" in markers
+        assert _detect_markers(trace) == ["REVIEW_BLOCKED", "SHELL_EXIT_ERROR"]
+
+    def test_detect_markers_falls_back_to_a_legacy_rows_status(self):
+        """A row written before the typed code existed still names its class."""
+        from ouroboros.reflection import _detect_markers
+        trace = {"tool_calls": [
+            {"tool": "run_command", "is_error": True, "status": "timeout", "result": "boom"},
+        ]}
+        assert _detect_markers(trace) == ["timeout"]
 
     def test_detect_markers_empty_trace(self):
         from ouroboros.reflection import _detect_markers
@@ -183,40 +208,39 @@ class TestHelperFunctions:
         assert "signal=SIGKILL" in details
 
     def test_marker_mid_body_of_ok_result_is_not_error_evidence(self):
-        """v6.71.1 round-2: evidence-parity widened trace results to 15k-80k+, so a
-        read_file of ARCHITECTURE.md embeds marker strings literally MID-BODY. The
-        scan mirrors the pre-parity head+tail (350+350) view — a mid-file doc
-        mention (outside both head and tail) must not classify the task as errored."""
-        from ouroboros.reflection import _detect_markers, _has_error_evidence, should_generate_reflection
+        """The contract this kept with a bounded head+tail view: a read of a doc
+        that MENTIONS a marker (evidence-parity widened trace results to 15k-80k+)
+        must not classify a clean task as errored. Typed codes hold it by
+        construction — the text is never scanned — so the whole class is gone,
+        including the mentions that landed inside the old 350+350 window."""
+        from ouroboros.reflection import _detect_markers, should_generate_reflection
         trace = {"tool_calls": [
             {"tool": "read_file", "is_error": False, "status": "ok",
-             "result": ("doc body " * 100) + "⚠️ SHELL_EXIT_ERROR appears in prose" + (" more doc" * 100)},
+             "result": "⚠️ SHELL_EXIT_ERROR appears in prose " + ("doc body " * 100)},
         ]}
-        assert len(trace["tool_calls"][0]["result"]) > 1400
-        assert _has_error_evidence(trace) is False
         assert _detect_markers(trace) == []
         assert should_generate_reflection(trace) is False
 
-    def test_marker_at_result_head_is_detected(self):
-        from ouroboros.reflection import _detect_markers, _has_error_evidence
-        trace = {"tool_calls": [
-            {"tool": "run_command", "is_error": False, "status": "ok",
+    def test_a_typed_failure_is_detected_wherever_its_text_sits(self):
+        """The other half of the same contract: a real failure is named from its
+        own typed record, so neither a head marker nor a late tail verdict has to
+        land inside a scan window to be seen."""
+        from ouroboros.reflection import _detect_markers, should_generate_reflection
+        head = {"tool_calls": [
+            {"tool": "run_command", "is_error": True, "status": "non_zero_exit",
+             "tool_result_code": "SHELL_EXIT_ERROR",
              "result": "⚠️ SHELL_EXIT_ERROR: command exited with exit_code=1." + ("x" * 2000)},
         ]}
-        assert _has_error_evidence(trace) is True
-        assert _detect_markers(trace) == ["SHELL_EXIT_ERROR"]
+        assert _detect_markers(head) == ["SHELL_EXIT_ERROR"]
+        assert should_generate_reflection(head) is True
 
-    def test_marker_in_result_tail_is_detected(self):
-        """A late verdict marker (e.g. TESTS_FAILED at the end of a long blocked-commit
-        output) sat in the retained tail of the pre-parity trace copy — the bounded
-        scan must keep catching it (triad round-1 regression_surface finding)."""
-        from ouroboros.reflection import _detect_markers, _has_error_evidence
-        trace = {"tool_calls": [
-            {"tool": "commit_reviewed", "is_error": False, "status": "ok",
+        tail = {"tool_calls": [
+            {"tool": "commit_reviewed", "is_error": True, "status": "review_blocked",
+             "tool_result_code": "REVIEW_BLOCKED",
              "result": ("preflight log line\n" * 300) + "⚠️ TESTS_FAILED: 2 failed in suite"},
         ]}
-        assert _has_error_evidence(trace) is True
-        assert _detect_markers(trace) == ["TESTS_FAILED"]
+        assert _detect_markers(tail) == ["REVIEW_BLOCKED"]
+        assert should_generate_reflection(tail) is True
 
     def test_collect_error_details_keeps_breadth_across_large_errors(self):
         """v6.71.1 round-2: one oversized first error must not monopolize the 3000
@@ -351,6 +375,7 @@ class TestHelperFunctions:
 
         error_trace = {"tool_calls": [
             {"tool": "commit_reviewed", "args": {}, "is_error": False,
+             "status": "review_blocked", "tool_result_code": "REVIEW_BLOCKED",
              "result": "⚠️ REVIEW_BLOCKED: tests_affected"},
         ]}
         generate_reflection(
@@ -424,8 +449,8 @@ class TestReflectionContextLoading:
         """Reflection entries must include required fields."""
         from ouroboros.reflection import _detect_markers, _collect_error_details
         trace = {"tool_calls": [
-            {"tool": "commit_reviewed", "is_error": True,
-             "result": "⚠️ REVIEW_BLOCKED: test"},
+            {"tool": "commit_reviewed", "is_error": True, "status": "review_blocked",
+             "tool_result_code": "REVIEW_BLOCKED", "result": "⚠️ REVIEW_BLOCKED: test"},
         ]}
         markers = _detect_markers(trace)
         assert "REVIEW_BLOCKED" in markers
@@ -613,3 +638,64 @@ def test_append_reflection_routed_non_project_task_uses_canonical_drive(tmp_path
     rows = [json.loads(line) for line in canonical_log.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["reflection"] == "plain reflection"
     assert not (mirror / "logs" / "task_reflections.jsonl").exists()
+
+
+def test_pattern_register_admission_is_typed_not_a_marker_scan(tmp_path, monkeypatch):
+    """Owner item I24: the Pattern Register opens on typed error evidence.
+
+    The gate used to be ``key_markers`` alone, and while that field was a
+    substring scan the register was blind twice over: a typed failure whose word
+    nobody had listed never opened it, and a root whose own calls all succeeded
+    while its CHILDREN failed never did either. Children do not reflect
+    (ARCHITECTURE, Post-task reflection), so the root's collected child classes
+    are the only way their failures reach the register at all.
+
+    A clean non-trivial task (reflected on for rounds/cost, no failure anywhere)
+    still must NOT open it, which is why the gate is not "reason_code is set":
+    that opens on every terminal."""
+    import ouroboros.reflection as reflection
+
+    seen = []
+    monkeypatch.setattr(reflection, "_update_patterns", lambda root, entry: seen.append(entry))
+
+    base = {"ts": "2026-09-11T00:00:00Z", "task_id": "t", "reflection": "text"}
+
+    reflection.append_reflection(tmp_path, {**base, "key_markers": [], "error_count": 2})
+    assert len(seen) == 1, "an errored call with no typed code still admits"
+
+    reflection.append_reflection(tmp_path, {
+        **base, "key_markers": [], "error_count": 0, "child_failure_classes": ["failed"],
+    })
+    assert len(seen) == 2, "a root whose only failures are its children admits"
+
+    reflection.append_reflection(tmp_path, {
+        **base, "key_markers": ["SHELL_EXIT_ERROR"], "error_count": 1,
+    })
+    assert len(seen) == 3, "typed codes still admit"
+
+    reflection.append_reflection(tmp_path, {
+        **base, "key_markers": [], "error_count": 0, "child_failure_classes": [],
+    })
+    assert len(seen) == 3, "a clean non-trivial task does not open the register"
+
+    # loop_evidence_unavailable stores error_count=None; that is not evidence.
+    reflection.append_reflection(tmp_path, {**base, "key_markers": [], "error_count": None})
+    assert len(seen) == 3
+
+
+def test_child_failure_classes_reach_the_root_reflection(tmp_path):
+    """The typed child classes come from the walk the evidence collector already
+    does: one collector, one walk, no second register writer, and children still
+    do not reflect on their own."""
+    from ouroboros.post_task_synthesis import _child_failure_classes
+
+    rows = [
+        {"task_id": "c1", "outcome_axes": {"execution": {"status": "ok"}}},
+        {"task_id": "c2", "outcome_axes": {"execution": {"status": "failed"}}},
+        {"task_id": "c3", "outcome_axes": {"execution": {"status": "infra_failed"}}},
+        {"task_id": "c4", "outcome_axes": {"execution": {"status": "failed"}}},
+        {"task_id": "c5"},
+    ]
+    assert _child_failure_classes(rows) == ["failed", "infra_failed"]
+    assert _child_failure_classes([]) == []
+    assert _child_failure_classes(None) == []
