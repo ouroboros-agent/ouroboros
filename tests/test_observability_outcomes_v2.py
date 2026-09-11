@@ -428,6 +428,53 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
     assert real_error["reason_code"] == "tool_failure"
 
 
+def test_a_listing_miss_then_a_success_elsewhere_leaves_execution_ok(tmp_path):
+    """Owner item I27: a read-only discovery miss does not colour the outcome.
+
+    The live case listed a folder whose name carried a non-breaking space, got a
+    first-class LIST_FILES_ERROR, found the right spelling on the very next call
+    and STILL finished as tool_failure / "Done with warnings": the recovery scan
+    credits a later success only for the SAME target signature, and a differently
+    spelled path can never match it. The producer names the miss instead, so no
+    failure is recorded to recover from and the scan stays untouched.
+
+    Run through the real registry, so this pins the producer and the outcome
+    together rather than a hand-written trace row."""
+    from ouroboros.loop_tool_execution import _typed_execution_failure
+    from ouroboros.project_dialogue import completion_status_label
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    (repo / "ML Conf 2").mkdir(parents=True)
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    tools = ToolRegistry(repo_dir=repo, drive_root=drive)
+
+    # The exact live shape: a NON-BREAKING space instead of a space.
+    nbsp_spelling = "ML\u00a0Conf 2"
+    miss = tools.execute_result("list_files", {"path": nbsp_spelling})
+    assert miss.text.startswith("⚠️ LIST_FILES_NOT_FOUND:")
+    assert (miss.status, miss.code) == ("ok", "LEGACY_WARNING")
+    assert _typed_execution_failure(True, miss) is False
+    found = tools.execute_result("list_files", {"path": "ML Conf 2"})
+    assert found.status == "ok" and not found.text.startswith("⚠️")
+
+    outcome = derive_loop_outcome(
+        "FINAL ANSWER: the deck folder is empty",
+        {"rounds": 2},
+        {"tool_calls": [
+            {"tool": "list_files", "args": {"path": nbsp_spelling}, "result": miss.text,
+             "status": miss.status, "is_error": _typed_execution_failure(True, miss)},
+            {"tool": "list_files", "args": {"path": "ML Conf 2"}, "result": found.text,
+             "status": found.status, "is_error": _typed_execution_failure(True, found)},
+        ]},
+    )
+    assert outcome["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert outcome["outcome_axes"]["execution"]["reason_code"] != "tool_failure"
+    assert outcome["failure"] is None
+    assert completion_status_label({"status": "completed", **outcome}, {}) == "Done"
+
+
 def test_forced_finalization_with_answer_is_best_effort():
     """Deadline/budget/round-limit forced finalization with a REAL extracted
     model answer is the typed best_effort shelf, not a failure. Structural

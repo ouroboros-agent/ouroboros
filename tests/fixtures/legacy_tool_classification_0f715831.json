@@ -1395,6 +1395,14 @@
    "is_error": true,
    "status": "error"
   },
+  "ident:LIST_FILES_NOT_FOUND:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:LIST_FILES_NOT_FOUND:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
   "ident:LOCAL_READONLY_SUBAGENT_BLOCKED:named": {
    "is_error": true,
    "status": "blocked"
@@ -2944,6 +2952,10 @@
    "status": "ok"
   },
   "native:LEGACY_WARNING:DATA_NOT_YET_CREATED": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:LEGACY_WARNING:LIST_FILES_NOT_FOUND": {
    "is_error": false,
    "status": "ok"
   },

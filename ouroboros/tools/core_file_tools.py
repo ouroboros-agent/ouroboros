@@ -196,6 +196,18 @@ class _ListingFailure(Exception):
     reasoning. _list_files renders this as a leading ⚠️ LIST_FILES_ERROR."""
 
 
+class _ListingMiss(_ListingFailure):
+    """The read-only DISCOVERY case: the named directory is simply not there.
+
+    A confinement refusal and a miss are different outcomes. Looking for a
+    directory that does not exist (or naming a file where a directory was
+    expected) is what discovery IS, and colouring the whole task's execution
+    axis for it made a later success on a differently-spelled path unable to
+    credit the recovery. _list_files renders this as its own result with a
+    leading ⚠️ LIST_FILES_NOT_FOUND and warning severity — still an explicit,
+    marked refusal to list, never an error string inside an ok-shaped listing."""
+
+
 def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]:
     target = (root / safe_relpath(rel)).resolve()
     # CONFINE to the root before any iterdir: a resolved target that escapes (e.g. an
@@ -206,9 +218,9 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]
     except ValueError:
         raise _ListingFailure(f"Path escapes root: {rel}") from None
     if not target.exists():
-        raise _ListingFailure(f"Directory not found: {rel}")
+        raise _ListingMiss(f"Directory not found: {rel}")
     if not target.is_dir():
-        raise _ListingFailure(f"Not a directory: {rel}")
+        raise _ListingMiss(f"Not a directory: {rel}")
     items = []
     # A hard iterdir/permission/race failure PROPAGATES: _list_files renders it
     # as a first-class "⚠️ LIST_FILES_ERROR" tool error, never an ok-shaped JSON
@@ -224,9 +236,9 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]
 
 def _list_user_files_dir(ctx: ToolContext, root: pathlib.Path, target: pathlib.Path, max_entries: int = 500) -> List[str]:
     if not target.exists():
-        raise _ListingFailure(f"Directory not found: {target}")
+        raise _ListingMiss(f"Directory not found: {target}")
     if not target.is_dir():
-        raise _ListingFailure(f"Not a directory: {target}")
+        raise _ListingMiss(f"Not a directory: {target}")
     items: List[str] = []
     hidden = 0
     # A hard iterdir/permission/race failure PROPAGATES to the first-class
@@ -839,6 +851,12 @@ def _list_files(
             elif normalized in {"task_drive", "skill_payload", "artifact_store", "user_files"}:
                 items = _filter_subagent_secret_listing(items, binding.base_path, ctx=ctx)
         return json.dumps(items, ensure_ascii=False, indent=2)
+    except _ListingMiss as exc:
+        # A miss is discovery, not a failed tool: the same warning severity the
+        # absent-memory-file read already uses (DATA_NOT_YET_CREATED below).
+        return _publish_tool_result(ctx, ToolResult(
+            status="ok", code="LEGACY_WARNING", text=f"⚠️ LIST_FILES_NOT_FOUND: {exc}",
+        ))
     except _ListingFailure as exc:
         return _publish_tool_result(ctx, ToolResult(
             status="error", code="LEGACY_TOOL_ERROR", text=f"⚠️ LIST_FILES_ERROR: {exc}",

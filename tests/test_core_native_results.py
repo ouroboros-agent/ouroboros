@@ -122,23 +122,28 @@ def _readonly_ctx(repo: pathlib.Path, drive: pathlib.Path) -> ToolContext:
             "initialization if that is the task. Use list_files with "
             "root=runtime_data to confirm what currently exists.",
         ),
+        # Owner item I27: a read-only discovery MISS is named as a miss. The ⚠️
+        # marker and the sentence survive; only the severity separates "there is
+        # nothing at that path" from "the listing itself failed", so a later
+        # success on a differently-spelled path is no longer preceded by a
+        # recorded tool failure nobody can recover from.
         (
             "list_files",
             {"path": "nope"},
-            "LEGACY_TOOL_ERROR",
-            "⚠️ LIST_FILES_ERROR: Directory not found: nope",
+            "LEGACY_WARNING",
+            "⚠️ LIST_FILES_NOT_FOUND: Directory not found: nope",
         ),
         (
             "list_files",
             {"path": "sample.txt"},
-            "LEGACY_TOOL_ERROR",
-            "⚠️ LIST_FILES_ERROR: Not a directory: sample.txt",
+            "LEGACY_WARNING",
+            "⚠️ LIST_FILES_NOT_FOUND: Not a directory: sample.txt",
         ),
         (
             "list_files",
             {"path": "nope", "root": "runtime_data"},
-            "LEGACY_TOOL_ERROR",
-            "⚠️ LIST_FILES_ERROR: Directory not found: nope",
+            "LEGACY_WARNING",
+            "⚠️ LIST_FILES_NOT_FOUND: Directory not found: nope",
         ),
         # Owner item A.20, and the only approved TEXT change in the lane: this refusal
         # shipped without the warning marker, so the adapter answered ok and the model
