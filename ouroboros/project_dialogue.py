@@ -838,6 +838,9 @@ def append_terminal_task_projection(
         return False
 
 
+SALVAGE_EXCERPT_LABEL = "Preserved intermediate output (not a final answer)"
+
+
 def _completion_excerpt(result: Dict[str, Any]) -> str:
     """One plain-text excerpt for BOTH lifecycle writers (event + task_summary).
 
@@ -845,14 +848,29 @@ def _completion_excerpt(result: Dict[str, Any]) -> str:
     line-anchored heading/list patterns need the original newlines, and a
     flatten-first order would glue a ``##`` mid-line where no pattern (and no
     renderer) can treat it as markup again.
+
+    Host-salvaged bytes are LABELLED, not hidden. They are real applied work, so
+    a row that dropped them left a bare headline and a reason code over a task
+    that had in fact produced something. The label says what the bytes are while
+    the caller's own pointer keeps owning the untruncated copy. When a peer
+    receipt already published that text in this chat (the stop receipt, whose
+    durable ``cancel_receipt`` block this row can see), the label stands alone so
+    one salvage is not quoted a third time.
     """
-    if str(result.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE:
-        return ""
+    body = ""
     for key in ("summary", "result", "error"):
-        text = " ".join(strip_markdown(str(result.get(key) or "")).split())
-        if text:
-            return text if len(text) <= 240 else text[:239].rstrip() + "…"
-    return ""
+        body = " ".join(strip_markdown(str(result.get(key) or "")).split())
+        if body:
+            break
+    if not body:
+        return ""
+    excerpt = body if len(body) <= 240 else body[:239].rstrip() + "…"
+    if str(result.get("terminal_origin") or "") != TERMINAL_ORIGIN_HOST_SALVAGE:
+        return excerpt
+    receipt = result.get("cancel_receipt")
+    if isinstance(receipt, dict) and receipt:
+        return f"{SALVAGE_EXCERPT_LABEL}."
+    return f"{SALVAGE_EXCERPT_LABEL}: {excerpt}"
 
 
 def _custody_debt_reason(reason: str, result: Dict[str, Any], event: Dict[str, Any]) -> tuple:

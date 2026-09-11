@@ -395,3 +395,48 @@ def test_fast_settled_reentry_delivers_idempotently_and_settles_with_the_claim(
     assert int(settle_row.get("generation") or 0) >= 1, (
         "the settle must ride the claimed generation, not an unfenced removal"
     )
+
+
+def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path):
+    """Owner item spam L: the stop receipt OWNS the preserved paragraph.
+
+    A cancel used to put the same salvaged text in the chat three times: the
+    receipt quoted it, the terminal task row quoted it again, and the project
+    summary quoted it a third time. The receipt keeps its bounded preview and
+    its durable full-copy facts; the rows that follow name what the bytes are
+    and point at the untruncated copy instead of repeating it.
+    """
+    from ouroboros.project_dialogue import (
+        SALVAGE_EXCERPT_LABEL, append_terminal_task_projection,
+    )
+    from supervisor import terminal_delivery as td
+
+    salvage = "Rewrote the atlas builder and reran the suite."
+    preserved = tmp_path / "full.txt"
+    preserved.write_text(salvage, encoding="utf-8")
+    write_task_result(
+        tmp_path, "stopped-one", "cancelled", result=salvage, chat_id=7,
+        terminal_origin="host_salvage", reason_code="owner_requested_cancel",
+    )
+    queue = _CaptureQueue()
+    assert td.deliver_unreviewed_salvage(
+        tmp_path, {"chat_id": 7}, "stopped-one", outcome="cancelled",
+        salvaged_text=salvage, preserved_path=str(preserved), event_queue=queue,
+    ) is True
+    (receipt,) = queue.events
+    assert salvage in receipt["text"]
+
+    stored = load_task_result(tmp_path, "stopped-one")
+    assert stored["cancel_receipt"]["salvage"]["preserved"] is True
+    assert append_terminal_task_projection(
+        tmp_path, "stopped-one", {"id": "stopped-one", "chat_id": 7}, stored,
+        {"status": "cancelled", "chat_id": 7},
+    )
+    row = next(
+        json.loads(line)
+        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+    assert f"{SALVAGE_EXCERPT_LABEL}." in row["text"]
+    assert salvage not in row["text"]
+    assert 'get_task_result(task_id="stopped-one")' in row["text"]

@@ -194,9 +194,17 @@ def test_task_result_persists_origin_and_full_host_salvage(tmp_path):
     assert stored["terminal_salvage_path"] == str(path)
 
 
-def test_project_completion_host_salvage_uses_neutral_details_copy(tmp_path, monkeypatch):
+def test_project_completion_host_salvage_labels_its_bytes(tmp_path, monkeypatch):
+    """The Main row over a salvaged task says what survived, in bounded form.
+
+    It used to fall back to the neutral pointer copy, which read as "nothing
+    here" over work that had actually been applied. The untruncated bytes still
+    never enter the row: they stay with ``get_task_result``.
+    """
     from ouroboros.projects_registry import bind_task_to_project, create_project
-    from ouroboros.project_dialogue import enqueue_project_completion_summary
+    from ouroboros.project_dialogue import (
+        SALVAGE_EXCERPT_LABEL, enqueue_project_completion_summary,
+    )
 
     project = create_project(tmp_path, "salvage", name="Salvage Project")
     bind_task_to_project(
@@ -223,8 +231,12 @@ def test_project_completion_host_salvage_uses_neutral_details_copy(tmp_path, mon
         {"status": "failed", "reason_code": "provider_unavailable"},
     )
     assert len(queued) == 1
-    assert raw not in queued[0]["text"]
-    assert queued[0]["text"].endswith("Open the Project for details.")
+    text = queued[0]["text"]
+    assert raw not in text
+    assert "Open the Project for details." not in text
+    assert f"Reason: provider_unavailable. {SALVAGE_EXCERPT_LABEL}: RAW PATCH" in text
+    labelled = text.split(f"{SALVAGE_EXCERPT_LABEL}: ", 1)[1]
+    assert len(labelled) <= 240 and labelled.endswith("…")
 
 
 def test_provider_death_arms_always_carry_terminal_origin(monkeypatch):
@@ -413,12 +425,28 @@ def test_provider_death_arms_are_not_downgraded_by_the_forced_sink(monkeypatch):
         assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE, kind
 
 
-def test_a_notice_keeps_its_completion_excerpt_unlike_a_salvage():
-    """Only salvage hides its text behind the neutral details copy."""
-    from ouroboros.project_dialogue import _completion_excerpt
+def test_a_notice_speaks_for_itself_while_a_salvage_is_labelled():
+    """The notice/salvage distinction survives, the blank card does not.
+
+    A host NOTICE's own words ARE the answer, so they stand unlabelled. A
+    SALVAGE is preserved intermediate output: dropping it left a bare headline
+    and a reason code over work that had actually been applied, so the row now
+    names what the bytes are beside the pointer both writers already append. A
+    peer stop receipt that already published the untruncated copy in this chat
+    (its durable ``cancel_receipt`` block) reduces the row to the label alone.
+    """
+    from ouroboros.project_dialogue import SALVAGE_EXCERPT_LABEL, _completion_excerpt
 
     assert _completion_excerpt({"result": "x", "terminal_origin": "host_notice"}) == "x"
-    assert _completion_excerpt({"result": "x", "terminal_origin": "host_salvage"}) == ""
+    assert _completion_excerpt(
+        {"result": "x", "terminal_origin": "host_salvage"},
+    ) == f"{SALVAGE_EXCERPT_LABEL}: x"
+    assert _completion_excerpt({
+        "result": "x", "terminal_origin": "host_salvage",
+        "cancel_receipt": {"delivery_id": "cancel:t:1"},
+    }) == f"{SALVAGE_EXCERPT_LABEL}."
+    # Nothing to preserve is still nothing to label.
+    assert _completion_excerpt({"result": "", "terminal_origin": "host_salvage"}) == ""
 
 
 def test_a_non_provider_rail_with_a_complete_candidate_stays_model_final(tmp_path, monkeypatch):

@@ -581,3 +581,41 @@ def test_terminal_row_reports_the_depth_request_only_when_one_exists(tmp_path):
     assert "Depth" not in rows["flat-root"]["text"]
     for marker in ("#", "**", "`"):
         assert marker not in rows["swarm-root"]["text"]
+
+
+def test_a_host_salvage_row_is_never_a_bare_headline_and_reason(tmp_path):
+    """Owner item I26: the blank Failed card over applied work.
+
+    ``result`` ALREADY held the salvaged text, so the row had the bytes and
+    published only a headline plus a reason code. The row now labels those
+    bytes, states its execution cause, and keeps pointing at the untruncated
+    copy; the markdown contract of this module still holds over the label.
+    """
+    from ouroboros.project_dialogue import (
+        SALVAGE_EXCERPT_LABEL, append_terminal_task_projection,
+    )
+
+    salvage = "## Applied\nRewrote the atlas builder and reran the suite."
+    task = {"id": "salvaged-root", "chat_id": 3, "role": "root"}
+    result = {
+        "task_id": "salvaged-root", "status": "failed", "result": salvage,
+        "terminal_origin": "host_salvage", "reason_code": "context_overflow",
+        "outcome_axes": {"execution": {"status": "failed"}},
+    }
+    done = {"chat_id": 3, "status": "failed", "outcome_axes": result["outcome_axes"]}
+    assert append_terminal_task_projection(tmp_path, "salvaged-root", task, result, done)
+
+    row = next(
+        json.loads(line)
+        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+    assert row["outcome"] == "Failed"
+    assert (
+        f"{SALVAGE_EXCERPT_LABEL}: Applied Rewrote the atlas builder and reran the suite."
+        in row["text"]
+    )
+    assert "Reason: context_overflow." in row["text"]
+    assert row["text"].endswith('Details: get_task_result(task_id="salvaged-root")')
+    for marker in ("#", "**", "`"):
+        assert marker not in row["text"]
