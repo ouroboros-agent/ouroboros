@@ -44,6 +44,7 @@ OPTIONAL_REQUEST_FIELDS = OPTIONAL_SAMPLING_FIELDS + (
     "output_config",
     "thinking",
     "parallel_tool_calls",
+    "stream", "stream_options",
 )
 NESTED_REASONING_FIELD = "extra_body.reasoning"
 NESTED_THINKING_FIELD = "extra_body.thinking"

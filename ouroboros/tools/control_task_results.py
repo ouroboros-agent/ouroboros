@@ -69,13 +69,15 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
             custody["unreconciled_omitted"] = len(unreconciled) - 10
             omitted_any = True
         if envelope:
-            open_ids = envelope.get("open_run_ids")
-            open_ids = [str(item) for item in open_ids] if isinstance(open_ids, list) else []
             custody["trigger"] = str(envelope.get("trigger") or "")
-            custody["open_run_ids"] = open_ids[:10]
-            if len(open_ids) > 10:
-                custody["open_run_ids_omitted"] = len(open_ids) - 10
-                omitted_any = True
+            custody["audit_status"] = str(envelope.get("audit_status") or "unknown")
+            for field in ("open_run_ids", "pending_invocation_ids", "undisposed_patch_run_ids", "terminal_runs"):
+                values = envelope.get(field)
+                values = list(values) if isinstance(values, list) else []
+                custody[field] = values[:10]
+                if len(values) > 10:
+                    custody[field + "_omitted"] = len(values) - 10
+                    omitted_any = True
         if omitted_any:
             # A bound must name a source the actor can resolve (BIBLE P1).
             # Retry lineage unions the ORIGINAL row's disclosure into this
@@ -264,9 +266,9 @@ def _get_task_result(
         )
     if trace:
         output += f"\n\n[SUBTASK_TRACE]\n{trace}\n[/SUBTASK_TRACE]"
-    from ouroboros.task_finalization import provider_terminal_body
+    from ouroboros.task_finalization import provider_terminal_body, terminal_host_notice_text
 
-    return provider_terminal_body(output, str(data.get("terminal_host_notice") or ""))
+    return provider_terminal_body(output, terminal_host_notice_text(data))
 
 
 def _wait_attention_poll(
@@ -728,8 +730,11 @@ def _wait_for_tasks(
             }
             # The result hash binds this limitation too; keep its host authorship
             # separate from the unchanged model answer, including an empty answer.
-            if "terminal_host_notice" in data:
-                projected["terminal_host_notice"] = data["terminal_host_notice"]
+            from ouroboros.task_finalization import terminal_host_notice_text
+
+            notice = terminal_host_notice_text(data)
+            if notice:
+                projected["terminal_host_notice"] = notice
             if data.get("duplicate_of"):
                 projected["duplicate_of"] = str(data.get("duplicate_of"))
             # A capability reduction is a SEMANTIC handoff fact, not forensics: it is

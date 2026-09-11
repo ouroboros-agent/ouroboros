@@ -328,9 +328,10 @@ def test_pre_call_wrap_keeps_the_existing_transport_episode_no_call(main_call, m
     assert trace["forced_finalization"]["source"] == "transport_unavailable_no_resend"
 
 
-def test_pre_call_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, monkeypatch):
+@pytest.mark.parametrize("interactive", [False, True])
+def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, monkeypatch, interactive):
     import httpx
-    from ouroboros import loop_llm_call
+    from ouroboros import loop_llm_call, loop_transport
     from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
     from supervisor.owner_stop import owner_stop_control_id
     from tests.test_transport_death_retry import _LedgerLLM, _ledger, _loop_kwargs, _no_chain
@@ -349,8 +350,8 @@ def test_pre_call_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, 
     monkeypatch.setattr(loop, "_run_cross_model_fallback_chain", _no_chain)
     posted = []
 
-    def release_repeat_after_control_check(_seconds, _deadline, **kwargs):
-        assert not kwargs["wake_check"]() and not posted
+    def release_wait_after_control_check(_seconds, wake_check):
+        assert not wake_check() and not posted
         posted.append(True)
         intent = cancel_intents.request_cancel(tmp_path, "t-death",
             requested_stop_policy=cancel_intents.STOP_POLICY_FINALIZE)
@@ -359,16 +360,25 @@ def test_pre_call_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, 
             msg_id=owner_stop_control_id(intent), kind=owner_mailbox.KIND_FINALIZE_NOW)
         return True
 
-    monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline", release_repeat_after_control_check)
+    if interactive:
+        monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline",
+                            lambda seconds, deadline, **kw: release_wait_after_control_check(seconds, kw["wake_check"]))
+    else:
+        monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
     kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
+    kwargs["tools"]._ctx.is_direct_chat = interactive
     with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
-            event_queue=None, worker_slot_held=True) as owner:
+            event_queue=None, worker_slot_held=not interactive) as owner:
         owner.tool_context = kwargs["tools"]._ctx
         _text, usage, trace = loop.run_llm_loop(**kwargs)
     assert posted and llm.calls == 1
     assert [row["state"] for row in _ledger(tmp_path)] == ["reserved", "dispatched", "unresolved"]
     assert loop_llm_call.provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
-    assert trace["forced_finalization"]["control_reason"] == "finalize_requested"
+    if interactive:
+        assert trace["forced_finalization"]["control_reason"] == "finalize_requested"
+    else:
+        assert "owner requested Wrap up" in _text
+        assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
 
 
 @pytest.mark.parametrize("stop,expected_reason", [

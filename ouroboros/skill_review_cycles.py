@@ -573,11 +573,14 @@ def install_skill_dispatch_stamp(
     from ouroboros.review_dispatch import ReviewPaidStamp
     from ouroboros.skill_review_history import write_dispatch_marker
 
-    wave_id = (
+    resume = getattr(ctx, "_skill_review_resume", None)
+    wave_id = str((resume or {}).get("wave_id") or "") or (
         str(getattr(ctx, "_skill_review_lifecycle_job_id", "") or "") or uuid.uuid4().hex
     )
 
     def _write() -> None:
+        if resume:
+            raise RuntimeError("Late Skill Review reconciliation cannot dispatch another panel")
         write_dispatch_marker(
             drive_root,
             skill_name,
@@ -589,11 +592,67 @@ def install_skill_dispatch_stamp(
             rebuttal_sha256=rebuttal_sha,
         )
 
-    stamp = ReviewPaidStamp(_write)
+    stamp = ReviewPaidStamp(_write, fail_closed=bool(resume))
     stamp.wave_id = wave_id
     previous = getattr(ctx, "_review_paid_stamp", None)
     ctx._review_paid_stamp = stamp
     return stamp, previous
+
+
+def skill_review_wave_binding(ctx, skill, drive_root, content_hash, contract_fp, rebuttal_sha, file_packs):
+    """Material and authority of one logical wave, independent of its waiter."""
+    metadata = getattr(ctx, "task_metadata", {}) or {}
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    return {
+        "skill": skill.name, "skill_root": str(skill.skill_dir.resolve()),
+        "state_root": str(pathlib.Path(drive_root).resolve()),
+        "task_id": task_id, "root_task_id": str(metadata.get("root_task_id") or task_id),
+        "task_attempt": getattr(ctx, "task_attempt", None),
+        "group_id": str(getattr(ctx, "_skill_review_group_id", "") or f"manual:{skill.name}"),
+        "content_hash": content_hash, "review_contract_fingerprint": contract_fp,
+        "rebuttal_sha256": rebuttal_sha,
+        "chunks": [hashlib.sha256(pack.encode("utf-8", errors="surrogatepass")).hexdigest()
+                   for pack in file_packs],
+    }
+
+
+def select_skill_review_resume(ctx, skill, drive_root, binding):
+    """Only the immediately preceding, unsuperseded logical wave can resume.
+
+    Called by an explicitly admitted lifecycle, never a poll/startup sweep.
+    Selection grants CAS reconciliation, not a verdict or physical dispatch.
+    """
+    ctx._skill_review_resume = None
+    ctx._skill_review_wave_binding = binding
+    job_id = str(getattr(ctx, "_skill_review_lifecycle_job_id", "") or "")
+    if not job_id or not binding["review_contract_fingerprint"]:
+        return False
+    from ouroboros.skill_review_runner import review_job_state_path
+    from ouroboros.utils import update_json_locked
+
+    rows = load_history(drive_root, skill.name, limit=1)
+    if not rows:
+        return False
+    previous = rows[-1]
+    wave = previous.get("review_wave")
+    if (previous.get("job_status") == "cancelled"
+            or previous.get("status") not in {"pending", "timeout", "failed", "interrupted"}
+            or not isinstance(wave, dict) or wave.get("binding") != binding
+            or not wave.get("wave_id") or not wave.get("chunks")
+            or not (previous.get("paid") or previous.get("review_resume_of") == wave["wave_id"])):
+        return False
+    def bind(current):
+        if (current.get("job_id") != job_id or current.get("status") != "running"
+                or current.get("review_predecessor_job_id") != previous.get("job_id")
+                or current.get("content_hash") != binding["content_hash"]):
+            return None
+        return {**current, "review_resume_of": wave["wave_id"], "review_wave": wave}
+    current = update_json_locked(review_job_state_path(drive_root, skill.name), bind,
+                                 strict_existing_dict=True)
+    if current.get("job_id") == job_id and current.get("review_resume_of") == wave["wave_id"]:
+        ctx._skill_review_resume = wave
+        return True
+    return False
 
 
 def review_wave_budget_block(

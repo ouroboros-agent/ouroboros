@@ -30,12 +30,15 @@ def test_run_plan_review_script_runs_the_engine_on_the_new_envelope(monkeypatch,
 
     async def fake_run_slots(ctx, slots, *, system_prompt, user_content, session_task="",
                              session_root="", output_contract="", slot_messages=None,
-                             session_threads=None, retry_key=""):
+                             session_threads=None, retry_key="", reconcile_only=False,
+                             reconciliation_identity=None):
         captured["task_id"] = ctx.task_id
         captured["slots"] = [s.slot_id for s in slots]
         captured["system_prompt"] = system_prompt
         captured["user_content"] = user_content
         captured["retry_key"] = retry_key
+        captured["reconcile_only"] = reconcile_only
+        captured["reconciliation_identity"] = reconciliation_identity
         return [{
             "slot_id": s.slot_id, "model": s.model, "request_model": s.model, "route": "api_chat",
             "host_file_read_attestation": "host_assembled_packet",
@@ -77,6 +80,8 @@ def test_run_plan_review_script_runs_the_engine_on_the_new_envelope(monkeypatch,
     assert captured["task_id"] == "plan-review-cli"
     assert captured["slots"] == ["slot_1"]
     assert captured["retry_key"].startswith("plan_review:")
+    assert captured["reconcile_only"] is False
+    assert captured["reconciliation_identity"]["epoch"] == captured["retry_key"]
     assert "Implement the accepted phase." in captured["user_content"]
     assert "tests green" in captured["user_content"]
     assert "inspect the existing SSOT" in captured["user_content"]

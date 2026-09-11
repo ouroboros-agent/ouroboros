@@ -27,7 +27,11 @@ from ouroboros.llm_attempt import (
     _is_provider_policy_refusal,
     _is_structured_context_overflow_body,
     _is_structured_context_overflow_exception,
+    preserve_prior_dispatch,
+    strongest_dispatch_capture,
 )
+from ouroboros.deadline_utils import physical_dispatch_timeout
+from ouroboros.llm_stream import consume_stream, consume_stream_async
 from ouroboros.reasoning_artifacts import (
     pop_reasoning_pin_note,
     transcript_has_sealed_reasoning,
@@ -55,6 +59,8 @@ class _RecoveryLadderMixin:
         exc: BaseException,
     ) -> Optional[Dict[str, Any]]:
         """Remove only an explicitly rejected cache control or affinity once."""
+        if getattr(exc, "stream_incomplete", False):
+            return None
         if _is_structured_context_overflow_exception(exc) or _is_provider_policy_refusal(exc):
             return None
         provider = str(target.get("provider") or "").strip().lower()
@@ -140,6 +146,8 @@ class _RecoveryLadderMixin:
         exc: Exception,
     ) -> Optional[Dict[str, Any]]:
         """Strip replayed reasoning once for a non-overflow OpenRouter 400."""
+        if getattr(exc, "stream_incomplete", False):
+            return None
         if _is_structured_context_overflow_exception(exc) or _is_provider_policy_refusal(exc):
             return None
         if not target.get("supports_openrouter_extensions"):
@@ -351,25 +359,39 @@ class _RecoveryLadderMixin:
     ) -> Any:
         # Discard a prior aborted ladder's pin note.
         pop_reasoning_pin_note()
+        transport_timeout = kwargs.get("timeout")
+        prior_capture = None
 
         def _send(candidate: Dict[str, Any]) -> Any:
+            nonlocal prior_capture
+            # Socket policy is not model input; seal only the provider payload.
+            candidate = {key: value for key, value in candidate.items() if key != "timeout"}
             candidate = _finalized_physical_candidate(target, candidate, "chat.completions")
             request = _attempt_request(target, candidate)
+
+            def dispatch():
+                timeout = physical_dispatch_timeout(transport_timeout)
+                response = create_fn(**candidate, **({"timeout": timeout} if timeout is not None else {}))
+                return consume_stream(response, expected_choices=candidate.get("n", 1)) if candidate.get("stream") else response
+
             try:
                 result = _execute_candidate(
                     request,
-                    lambda: create_fn(**candidate),
+                    dispatch,
                     _candidate_before_dispatch(candidate, request),
                 )
                 note_wire_send_succeeded(last_physical_attempt_capture())
+                prior_capture = strongest_dispatch_capture(prior_capture, last_physical_attempt_capture())
                 self._stage_reasoning_pin_disclosure(candidate)
                 return result
-            except UsageAccountingError:
+            except UsageAccountingError as exc:
                 # Admission failure cannot leave its disclosure for a later call.
                 self._pop_effort_clamp_disclosure()
                 note_wire_send_failed()
+                preserve_prior_dispatch(exc, prior_capture)
                 raise
-            except Exception:
+            except Exception as exc:
+                prior_capture = strongest_dispatch_capture(prior_capture, getattr(exc, "physical_attempt_capture", None))
                 note_wire_send_failed()
                 raise
 
@@ -496,25 +518,38 @@ class _RecoveryLadderMixin:
     ) -> Any:
         # Discard a prior aborted ladder's pin note.
         pop_reasoning_pin_note()
+        transport_timeout = kwargs.get("timeout")
+        prior_capture = None
 
         async def _send(candidate: Dict[str, Any]) -> Any:
+            nonlocal prior_capture
+            candidate = {key: value for key, value in candidate.items() if key != "timeout"}
             candidate = _finalized_physical_candidate(target, candidate, "chat.completions")
             request = _attempt_request(target, candidate)
+
+            async def dispatch():
+                timeout = physical_dispatch_timeout(transport_timeout)
+                response = await create_fn(**candidate, **({"timeout": timeout} if timeout is not None else {}))
+                return await consume_stream_async(response, expected_choices=candidate.get("n", 1)) if candidate.get("stream") else response
+
             try:
                 result = await _execute_candidate_async(
                     request,
-                    lambda: create_fn(**candidate),
+                    dispatch,
                     _candidate_before_dispatch(candidate, request),
                 )
                 note_wire_send_succeeded(last_physical_attempt_capture())
+                prior_capture = strongest_dispatch_capture(prior_capture, last_physical_attempt_capture())
                 self._stage_reasoning_pin_disclosure(candidate)
                 return result
-            except UsageAccountingError:
+            except UsageAccountingError as exc:
                 # Sync-driver parity: central UAE discard (triad r4).
                 self._pop_effort_clamp_disclosure()
                 note_wire_send_failed()
+                preserve_prior_dispatch(exc, prior_capture)
                 raise
-            except Exception:
+            except Exception as exc:
+                prior_capture = strongest_dispatch_capture(prior_capture, getattr(exc, "physical_attempt_capture", None))
                 note_wire_send_failed()
                 raise
 

@@ -334,3 +334,44 @@ def stamp_review_paid_on_dispatch(ctx: Any) -> None:
     invoke_review_paid_stamp(
         getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
     )
+
+
+def review_operation_binding(request: Any, slot: Any, operation_id: str) -> dict:
+    """Bind one physical result to its existing task, material and panel owners."""
+    from ouroboros.review_custody import _attempt_key
+
+    return {
+        **dict(getattr(request, "reconciliation_identity", {}) or {}),
+        "task_id": str(getattr(request, "task_id", "") or ""),
+        "surface": str(getattr(request, "surface", "") or ""),
+        "slot_id": str(getattr(slot, "slot_id", "") or ""),
+        "operation_id": str(operation_id or ""),
+        "request_key": _attempt_key(request, slot),
+    }
+
+
+def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: str, contract: Any = "") -> dict:
+    """Reuse the caller's material/cycle identity and the exact configured roster."""
+    import hashlib
+    import json
+    from dataclasses import asdict
+    from ouroboros.review_execution import review_output_contract
+
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                         default=str).encode("utf-8")).hexdigest()
+
+    supplied = dict(request.reconciliation_identity or {})
+    roster = [{k: v for k, v in asdict(slot).items()
+               if k not in {"timeout_sec", "transport_timeout_sec"}} for slot in slots]
+    return {
+        "subject_hash": digest(request.retry_key or {
+            "subject": request.subject, "goal": request.goal, "scope": request.scope,
+            "evidence": request.evidence, "evidence_refs": request.evidence_refs,
+            "messages": request.messages, "slot_messages": request.slot_messages,
+        }),
+        "review_contract": str(contract or digest({"rendered": review_output_contract(request), "policy": request.policy})),
+        "roster_hash": digest(roster), "epoch": str(request.retry_key or ""),
+        **supplied,
+        "root_task_id": str(root_task_id), "task_attempt": request.task_attempt,
+    }

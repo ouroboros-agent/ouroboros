@@ -64,6 +64,8 @@ from ouroboros.tools.plan_review_runtime import (
     publish_rendered_wave as _publish_rendered_wave,
     plan_payload_roots as _plan_payload_roots,
     plan_review_slots as _plan_review_slots,
+    plan_reviewer_config_fingerprint as _plan_reviewer_config_fingerprint,
+    plan_health_epoch as _plan_health_epoch,
     plan_wave_replay_decision as _plan_wave_replay_decision,
     plan_wave_has_in_flight as _plan_wave_has_in_flight,
     plan_wave_progress_line as _plan_wave_progress_line,
@@ -110,10 +112,7 @@ def _plan_task_tool_timeout_sec() -> float:
     # lifetime, which is deliberately much longer than an API transport read.
     # The outer ToolEntry must cover either route plus one finalization grace
     # window; it is a settlement envelope, never a cognition cutoff.
-    return max(
-        _plan_review_wrapper_timeout_sec(),
-        float(get_task_abs_ceiling_sec()),
-    ) + get_finalization_grace_sec()
+    return max(_plan_review_wrapper_timeout_sec(), float(get_task_abs_ceiling_sec())) + get_finalization_grace_sec()
 _TASK_EVIDENCE_RESULT_CHARS = 6_000
 
 
@@ -675,26 +674,24 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         slots, resume=resume if resume_in_flight else None, replay_snapshot=replay_snapshot,
         prompt_chars=len(system_prompt) + len(user_content), quorum=quorum,
     )
-    if fanout["error"]:
-        if not resume_in_flight:
-            return _plan_unavailable(ctx, fanout["error"], "review_context_unavailable")
-        return _publish_rendered_wave(
-            ctx, existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
-            cached=True, reminder="\n".join(x for x in (reminder, fanout["error"]) if x),
-        )
-    callable_slots = fanout["callable_slots"]
-    health_skip_rows, oversize_rows = fanout["health_skip_rows"], fanout["oversize_rows"]
-    health_evidence = fanout["health_evidence"]
-    if resume_in_flight and callable_slots:
+    pending_note = fanout["error"]
+    callable_slots = fanout.get("callable_slots") or []
+    if not pending_note and resume_in_flight and callable_slots:
+        from ouroboros.review_custody import _freeze_roster_rows
+        ctx._review_frozen_rows = {"plan_review": _freeze_roster_rows(
+            ctx, "plan_review", resume.get("dispatched_rows") or [])}
         pending_note = _plan_in_flight_custody_error(
             retry_key=retry_key, task_id=str(task_id), active_root=active_root,
             callable_slots=list(callable_slots), ctx=ctx,
         )
-        if pending_note:
-            return _publish_rendered_wave(
-                ctx, existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
-                cached=True, reminder="\n".join(x for x in (reminder, pending_note) if x),
-            )
+    if pending_note:
+        if not resume_in_flight:
+            return _plan_unavailable(ctx, pending_note, "review_context_unavailable")
+        return _publish_rendered_wave(
+            ctx, existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
+            cached=True, reminder="\n".join(x for x in (reminder, pending_note) if x))
+    health_skip_rows, oversize_rows = fanout["health_skip_rows"], fanout["oversize_rows"]
+    health_evidence = fanout["health_evidence"]
     admission = None if resume_in_flight else review_wave_budget_gate(
         ctx, surface="plan_review", models=[str(s.model) for s in callable_slots],
         prompt_chars=len(system_prompt) + len(user_content), max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
@@ -721,6 +718,14 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         slot_messages=slot_messages,
         session_threads=session_threads,
         retry_key=retry_key,
+        reconcile_only=resume_in_flight,
+        reconciliation_identity={
+            "subject_hash": fingerprint,
+            "roster_hash": _plan_reviewer_config_fingerprint(configured_slots),
+            "epoch": retry_key,
+            "health_epoch": (existing.get("health_epoch") or []) if resume_in_flight else
+                _plan_health_epoch(health_evidence),
+        },
     ) if callable_slots else []
     # excluded slots stay configured rows: they count in the quorum denominator
     rows = list(rows) + oversize_rows + health_skip_rows
@@ -990,6 +995,3 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
     )
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=cycles_paid,
                                   enforcement=enforcement, notes=list(closure["notes"]))
-
-
-# ------------------------------------------------------------------------ rendering

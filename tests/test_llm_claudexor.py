@@ -544,10 +544,11 @@ def test_async_tools_and_capture_remain_in_callers_context(setup):
     assert len(gateway.operations) == 1 and ledger(root)[-1]["state"] == "settled"
 
 
-def test_legacy_async_tools_still_refuse_before_provider_io(setup):
+def test_gigachat_async_tools_still_refuse_before_provider_io(setup, monkeypatch):
     _, gateway, client = setup
-    with pytest.raises(ValueError, match="does not support tool calls"):
-        asyncio.run(client.chat_async([], "openai::some-model", tools=[{"type": "function"}]))
+    monkeypatch.setattr(client, "_resolve_remote_target", lambda _: {"provider": "gigachat"})
+    with pytest.raises(ValueError, match="does not support GigaChat tool calls"):
+        asyncio.run(client.chat_async([], "gigachat::some-model", tools=[{"type": "function"}]))
     assert not gateway.creates
 
 

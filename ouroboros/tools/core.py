@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import ast
 import fnmatch
 import json
@@ -1218,11 +1220,11 @@ def _forward_to_worker(
     data = load_effective_task_result(status_drive_root, tid)
     status = str(data.get("status") or "").lower()
     if not data:
-        return f"⚠️ TASK_NOT_FOUND: task {tid} is not registered."
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=(f"⚠️ TASK_NOT_FOUND: task {tid} is not registered.")))
     if status in FINAL_STATUSES:
-        return f"⚠️ TASK_NOT_ACTIVE: task {tid} is already {status}."
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is already {status}.")))
     if status != STATUS_RUNNING:
-        return f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, not running."
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, not running.")))
     # AR2-6: no NEW steering writes while a cancellation is pending. The
     # effective status honestly stays ``running`` (cancel_state=pending rides
     # beside it), so the checks above pass — consult the same predicate the
@@ -1233,9 +1235,9 @@ def _forward_to_worker(
 
         if cancel_pending(status_drive_root, tid):
             return (
-                f"⚠️ TASK_CANCEL_PENDING: task {tid} has a pending cancellation — the "
+                _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_CANCEL_PENDING: task {tid} has a pending cancellation — the "
                 "supervisor is tearing it down; the message was NOT delivered. Wait for "
-                "the settled outcome or start a new task."
+                "the settled outcome or start a new task.")))
             )
     except Exception:
         log.debug("forward_to_worker cancel-pending check failed for %s", tid, exc_info=True)
@@ -1272,7 +1274,7 @@ def _forward_to_worker(
         msg_id=uuid.uuid4().hex,
     )
     if not written:
-        return f"⚠️ TASK_MESSAGE_UNWRITTEN: message to task {tid} was not persisted."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ TASK_MESSAGE_UNWRITTEN: message to task {tid} was not persisted.")))
     return f"Message forwarded to task {tid}"
 
 

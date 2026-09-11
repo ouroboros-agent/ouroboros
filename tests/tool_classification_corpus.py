@@ -40,6 +40,11 @@ commit, this reproduces that commit's fixture byte for byte.
 this module in the current tree never touches it. The composers it calls live in the
 old tree too, and their composed bytes are identical in both, which is what makes one
 corpus definition legitimate across the two checkouts.
+
+Native cases use the exact plain-identifier input, varying only the typed code.
+The retired pair ignores that code, so a new native key can reuse the existing
+plain case's recorded answer after verifying identical tool/text inputs. This
+does not recapture or replace any old answer and still needs an approved delta.
 """
 
 from __future__ import annotations
@@ -494,7 +499,7 @@ def build_corpus(root: pathlib.Path | None = None) -> tuple[Case, ...]:
             key=f"native:{code}:{identifier}",
             subject=f"native:{code}:{identifier}",
             tool="read_file",
-            text=f"⚠️ {identifier}: detail line",
+            text=f"⚠️ {identifier}{_DETAIL_SHAPES[0][1]}",
             code=code,
         ))
 

@@ -787,7 +787,7 @@ _emit_external_wait_lease = progress.emit_external_wait_lease
 
 
 def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None,
-                   since_seq: Optional[int] = None) -> str:
+                   since_seq: Optional[int] = None, *, observation_only: bool = False) -> str:
     """Time-bounded, progress-aware wait (docs/DEVELOPMENT.md "Timeout & Wait Control").
 
     HOLDS the window it was given. It returns early only on a terminal state or a
@@ -808,9 +808,11 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     return where the outer clamp delivers a thread-kill. Only "no deadline set" is left
     unclamped; a SPENT deadline clamps to the floor, the window is measured from before
     the connection, and every call is BOUNDED by what it has left (``progress.poll_bound``)
-    so no read can outrun it as the 60s default could. Only the LAST poll of a spent
-    window may go unanswered gracefully; a daemon that fails while the window still has
-    time is the typed refusal it was, never a wait reported as quiet.
+    so no read can outrun it as the 60s default could. The internal supervision
+    observer instead makes one read under the ordinary transport bound narrowed by
+    the real task deadline; its three-second beat is not a network deadline. A read
+    timeout there retains unknown observation and the same run, without model wake.
+    Legacy caller-sized waits preserve their last-poll expiry contract.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
     from ouroboros.gateways.claudexor import (
@@ -840,11 +842,22 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     # the window it was clamped into had begun.
     started = time.monotonic()
     deadline = started + window
-    try:
-        gateway = ClaudexorGateway()
-        gateway.handshake(timeout_sec=progress.poll_bound(deadline - time.monotonic()))
-    except ClaudexorUnavailable as exc:
+    from ouroboros.gateways.claudexor import _READ_TIMEOUT_SEC
+
+    def read_window() -> float:
+        return (float(window_within_deadline(ctx, int(_READ_TIMEOUT_SEC)))
+                if observation_only else deadline - time.monotonic())
+
+    def read_failure(exc: ClaudexorUnavailable) -> str:
+        if observation_only and exc.observation_timeout:
+            return json.dumps({
+                "status": "observation_pending", "run_id": rid,
+                "reason": "observation_read_timeout", "detail": str(exc),
+                "waited_sec": time.monotonic() - started,
+            })
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
+
+    gateway = None
 
     # The GRANTED shape replays from the durable custody row (R1 item 2): the run
     # was admitted under host-derived authority recorded on its STARTED row, and a
@@ -874,10 +887,17 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     # blank a newer grant made by this task's next wait.
     _lease_id = uuid.uuid4().hex
     _emit_external_wait_lease(
-        ctx, rid, _external_wait_lease_until(ctx, window, _started_at, _run_max_seconds),
+        ctx, rid, _external_wait_lease_until(
+            ctx, max(window, read_window()) if observation_only else window, _started_at, _run_max_seconds),
         lease_id=_lease_id)
     try:
-        detail = progress.bounded_poll(gateway, rid, deadline - time.monotonic())
+        gateway = ClaudexorGateway()
+        gateway.handshake(timeout_sec=progress.poll_bound(read_window()))
+        if observation_only:
+            _emit_external_wait_lease(
+                ctx, rid, _external_wait_lease_until(ctx, read_window(), _started_at, _run_max_seconds),
+                lease_id=_lease_id)
+        detail = progress.bounded_poll(gateway, rid, read_window())
         baseline = int(since_seq) if since_seq is not None else int(detail.get("lastSeq") or 0)
         seen = progress.WindowObservations()
         seen.observe_baseline(detail, baseline)
@@ -967,7 +987,8 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                                                 ))
             def _expired() -> str:
                 rendered = progress.rendered_window(
-                    run_id=rid, state=state, last_seq=last_seq, window=window,
+                    run_id=rid, state=state, last_seq=last_seq,
+                    window=(time.monotonic() - started) if observation_only else window,
                     elapsed_seconds=(None if _started_at is None else max(0, int(
                         (_dt.datetime.now(tz=_dt.timezone.utc) - _started_at).total_seconds()))),
                     max_seconds=_run_max_seconds or None,
@@ -979,7 +1000,9 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 _horizon = cache_horizon_note(ctx, time.monotonic() - started)
                 return f"{rendered}\n\n{_horizon}" if _horizon else rendered
 
-            if time.monotonic() >= deadline:
+            if observation_only or time.monotonic() >= deadline:
+                if observation_only:
+                    time.sleep(max(0.0, deadline - time.monotonic()))
                 return _expired()
             time.sleep(min(_POLL_INTERVAL_SEC, max(0.0, deadline - time.monotonic())))
             # BOUNDED whether or not the window is spent: a poll STARTED a moment before
@@ -998,10 +1021,11 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 return _expired()   # unanswered AT expiry: expire on what is already held
             detail = fresh
     except ClaudexorUnavailable as exc:
-        return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
+        return read_failure(exc)
     finally:
         _emit_external_wait_lease(ctx, rid, 0.0, lease_id=_lease_id)
-        gateway.close()
+        if gateway is not None:
+            gateway.close()
 
 
 _CANCEL_NOTES = {

@@ -44,34 +44,11 @@ _TYPED_MARKER = re.compile(r"^⚠️ +[A-Z][A-Z0-9_]{2,}(?=[\s:(]|$)")
 # lint exists for, left in place because the file belongs to another package of the
 # autonomy sprint (issue #739 names the follow-up); the count may only shrink.
 ALLOWED: dict[str, tuple[int, str]] = {
-    "ouroboros/tools/control_runtime.py": (
-        4, "runtime-control refusals (empty message, unknown model/effort) as prose; #739 follow-up",
-    ),
     "ouroboros/tools/control_task_results.py": (
-        1, "prompt-cache horizon refusal as prose; #739 follow-up",
-    ),
-    "ouroboros/tools/followup.py": (
-        13, "`ERROR: FOLLOWUP_*` refusals — typed words in a prose shape the adapter records ok; #739 follow-up",
-    ),
-    "ouroboros/tools/health.py": (
-        1, "codebase-health computation failure as prose; #739 follow-up",
-    ),
-    "ouroboros/tools/join_ledger.py": (
-        7, "child-result verbs (peek/discard/cancel/override) refuse as lowercase prose; P1 territory, #739 follow-up",
-    ),
-    "ouroboros/tools/knowledge.py": (
-        6, "invalid topic/mode refusals as prose; #739 follow-up",
-    ),
-    "ouroboros/tools/memory_tools.py": (
-        2, "invalid source_id refusals as prose; #739 follow-up",
-    ),
-    "ouroboros/tools/presence.py": (
-        14, "`ERROR: PRESENCE_*` refusals — Presence is outside this package; #739 follow-up",
-    ),
-    "ouroboros/tools/review_helpers.py": (
-        1, "unexpected test-runner error as prose; #739 follow-up",
+        1, "legitimate cache-horizon warning after a successful wait; no operation was refused",
     ),
 }
+
 
 
 def _static_head(node: ast.expr) -> tuple[str, bool] | None:

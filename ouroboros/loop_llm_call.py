@@ -933,13 +933,15 @@ def _record_llm_call_error(
     repeats = _transport_death_repeats(ctx.accumulated_usage, ctx.round_id)
     backoff = None
     if classification.kind == "provider_outcome_unknown":
-        # Decided BEFORE the durable rows are written so `retry_same_request`
-        # is the truth of what happens next: a bounded paid repeat (a NEW
-        # attempt with its own ledger row) of a typed transport death while
-        # this round's budget, the attempt loop AND the owner deadline (the
-        # backoff plus the admission reserve the next iteration re-checks) all
-        # have room; otherwise the no-resend terminal. Counted here, at the
-        # grant, so the counter never names a repeat that was not sent.
+        ctx.accumulated_usage["_pending_transport_outcome"] = {
+            **custody_fields, "model": ctx.model, "operation_id": str(getattr(error, "operation_id", "") or ""),
+            "route": dict(getattr(error, "route", {}) or {}), "outcome": "unknown",
+            "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
+        }
+        # The caller chooses this existing repeat rail. Ordinary managed tasks
+        # set it to zero: their transport episode requires upstream recovery
+        # before a marked NEW attempt. Other callers retain their bounded rail;
+        # grant before logging, and uncount a grant refused before dispatch.
         if (
             is_retryable_transport_death(error)
             and repeats < ctx.transport_death_retries and ctx.attempt < ctx.transient_budget - 1
@@ -1369,15 +1371,15 @@ def call_llm_with_retry(
                 "model_account_override": model_account_override,
                 "reasoning_effort": effort,
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
+                "stream": True, "caller_deadline_ts": (None if deadline_ts is None
+                    else float(deadline_ts) - float(transport_reserve_sec or 0.0)),
                 "use_local": use_local,
                 # These are optional host hints, not required tools. This
                 # transport has neither provider-owned web tools nor a bypass
                 # knob; ordinary Ouroboros web tools stay in the schema.
                 "allow_server_web_search": bool(allow_server_web_search) and provider_for_model(model) != "claudexor",
                 "bypass_response_cache": response_cache_bypass_requested and provider_for_model(model) != "claudexor",
-                "timeout": _main_transport_timeout(
-                    model, deadline_ts, reserve_sec=transport_reserve_sec,
-                ),
+                "timeout": _main_transport_timeout(model, deadline_ts, reserve_sec=transport_reserve_sec),
             }
             request_ref = persist_observed_call(
                 drive_root,

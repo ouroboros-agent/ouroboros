@@ -1,5 +1,7 @@
 """Codebase health tool — complexity metrics and self-assessment."""
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import logging
 import pathlib
 
@@ -144,7 +146,7 @@ def _codebase_health(ctx: ToolContext) -> str:
 
     except Exception as e:
         log.warning("codebase_health failed: %s", e, exc_info=True)
-        return f"⚠️ Failed to compute codebase health: {e}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ Failed to compute codebase health: {e}")))
 
 
 def get_tools():

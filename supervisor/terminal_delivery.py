@@ -692,6 +692,8 @@ def build_completed_result_event(
     chat_id = lineage_chat_id(pathlib.Path(drive_root), task_row, tid)
     if not tid or not core_text or not chat_id:
         return None
+    from ouroboros.task_finalization import terminal_host_notice_text
+
     event = {
         "type": "send_message",
         "chat_id": chat_id,
@@ -701,7 +703,8 @@ def build_completed_result_event(
         # copy that drops the format renders as a different message.
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
-        **({"terminal_host_notice": stored["terminal_host_notice"]} if (stored or {}).get("terminal_host_notice") else {}),
+        **({"terminal_host_notice": terminal_host_notice_text(stored or {})}
+           if terminal_host_notice_text(stored or {}) else {}),
     }
     return project_terminal_result_event(
         pathlib.Path(drive_root), task_row, tid,

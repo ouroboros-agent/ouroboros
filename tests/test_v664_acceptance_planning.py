@@ -989,7 +989,11 @@ def test_clean_acceptance_requires_per_criterion_evidence(tmp_path):
         drive_root=tmp_path,
         llm=_CriterionLLM(structured=True, status="missing"),
     )
-    assert missing.aggregate_signal == "DEGRADED"
+    assert missing.aggregate_signal == "PASS"
+    from ouroboros.review_substrate import task_acceptance_is_clean
+    assert task_acceptance_is_clean(missing) is False
+    assert all(actor["semantic_verdict"] == "PASS" for actor in missing.actors)
+    assert all(actor["parsed"]["outcome_tier"] == "solved" for actor in missing.actors)
     clean = run_review_request(
         request, slots=slots, drive_root=tmp_path, llm=_CriterionLLM(structured=True),
     )

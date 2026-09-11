@@ -325,7 +325,9 @@ def test_admission_refusal_after_a_granted_repeat_keeps_the_unknown_fence(tmp_pa
     monkeypatch.setattr(call_mod, "owner_deadline_exhausted", exhausted_after_the_grant)
     llm = _ScriptedLLM(_death, _death, _death)
     notes = []
-    _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, notes))
+    kwargs = _loop_kwargs(tmp_path, llm, notes)
+    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    _result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 1  # the refused repeat and the forced-final rail both dispatched nothing
     assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
@@ -512,7 +514,9 @@ def test_primary_round_dispatch_exhaustion_takes_the_unknown_no_resend_terminal(
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, _death, _death, _death)
     notes = []
-    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, notes))
+    kwargs = _loop_kwargs(tmp_path, llm, notes)
+    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 3  # zero further dials of any kind: no forced-final resend
     assert usage.get("execution_status") == "infra_failed"
@@ -524,6 +528,8 @@ def test_primary_round_dispatch_exhaustion_takes_the_unknown_no_resend_terminal(
 
 def test_primary_round_dispatch_recovers_after_two_deaths(tmp_path, monkeypatch, no_sleep):
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable", lambda *a, **kw: {"kind": "upstream_http", "status_code": 200})
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda *a: False)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, _death)
@@ -534,9 +540,11 @@ def test_primary_round_dispatch_recovers_after_two_deaths(tmp_path, monkeypatch,
     assert llm.calls == 3
     assert usage.get("reason_code") is None
     assert TRANSPORT_DEATHS_KEY not in usage
+    assert no_sleep == []  # Managed attempts wait for upstream proof, never use the paid-repeat backoff.
+    assert usage["transport_recovery"]["old_outcome"] == "unknown"
 
 
-@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn_flag", ["is_direct_chat", "is_ephemeral_turn"])
 def test_counter_survives_the_wait_episodes_free_redial_of_the_same_round(tmp_path, monkeypatch, no_sleep, turn_flag):
     """death → released ConnectError → wait episode → free redial → death →
     death: the round stays bounded by two paid repeats in total (sol s1). The
@@ -752,7 +760,9 @@ def test_repeat_failing_with_another_class_ends_the_round_on_the_unknown_termina
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, lambda: _status_failure(status), _death, _death)
     notes = []
-    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, notes))
+    kwargs = _loop_kwargs(tmp_path, llm, notes)
+    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 2  # no burst, no forced-final dial, no chain candidate
     assert [(row["error_kind"], row["retry_same_request"]) for row in _events(tmp_path, "llm_api_error")] == [
@@ -780,7 +790,9 @@ def test_repeat_returning_an_empty_response_ends_the_round_and_keeps_the_record(
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, EMPTY_RESPONSE, _death, _death, _death)
     notes = []
-    _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, notes))
+    kwargs = _loop_kwargs(tmp_path, llm, notes)
+    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    _result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 2  # the empty repeat is not retried; the third death never happens
     assert len(_events(tmp_path, "provider_incomplete_response")) == 1
@@ -858,6 +870,8 @@ def test_native_subagent_child_primary_dispatch_opts_in(tmp_path, monkeypatch, n
     """A native API subagent child runs the ordinary run_llm_loop: its rounds are
     primary rounds of its own loop and get the bounded transport-death rail."""
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable", lambda *a, **kw: {"kind": "upstream_http", "status_code": 200})
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda *a: False)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, _death)
@@ -869,6 +883,8 @@ def test_native_subagent_child_primary_dispatch_opts_in(tmp_path, monkeypatch, n
     assert llm.calls == 3
     assert usage.get("reason_code") is None
     assert TRANSPORT_DEATHS_KEY not in usage
+    assert no_sleep == []  # Managed attempts wait for upstream proof, never use the paid-repeat backoff.
+    assert usage["transport_recovery"]["old_outcome"] == "unknown"
 
 
 def _overflow_failure():
@@ -893,7 +909,9 @@ def test_repeat_failing_as_context_overflow_takes_the_unknown_terminal(tmp_path,
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, _overflow_failure, _death, _death)
     notes = []
-    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, notes))
+    kwargs = _loop_kwargs(tmp_path, llm, notes)
+    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 2
     assert usage["_last_llm_error_kind"] == "context_overflow"
@@ -990,7 +1008,9 @@ def test_proxy_tunnel_failure_keeps_the_base_unknown_terminal(data_root, tmp_pat
         return exc
 
     loop_llm = _ScriptedLLM(scripted, scripted)
-    _result, loop_usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, loop_llm, []))
+    kwargs = _loop_kwargs(tmp_path, loop_llm, [])
+    kwargs["tools"]._ctx.is_direct_chat = True
+    _result, loop_usage, trace = run_llm_loop(**kwargs)
     assert loop_llm.calls == 1
     assert _events(tmp_path, "network_wait") == []
     assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"

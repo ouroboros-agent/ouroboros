@@ -131,7 +131,9 @@ def test_boot_backfill_fixes_row_settled_in_a_previous_generation(tmp_path):
     payload = output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
     custody = json.loads(payload)["delegated_custody"]
     assert custody == {
-        "unreconciled": [], "trigger": "boot_backfill", "open_run_ids": [],
+        "unreconciled": [], "trigger": "boot_backfill", "audit_status": "ok",
+        "open_run_ids": [], "pending_invocation_ids": [], "undisposed_patch_run_ids": [],
+        "terminal_runs": [{"run_id": "run-1", "state": "succeeded"}],
     }
 
 

@@ -57,6 +57,7 @@ from ouroboros.config import (
 )
 from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, _TRANSIENT_BACKOFF_CAP_SEC
+from ouroboros.llm_probe import upstream_transport_reachable
 from ouroboros.owner_mailbox import OwnerMailboxPeek
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -85,6 +86,7 @@ class TransportWaitEpisode:
 
     wait_cause: str = "transport_unavailable"
     started_monotonic: float = 0.0
+    started_at: float = field(default_factory=time.time)
     interactive: bool = False
     ephemeral: bool = False
     wait_bound_sec: Optional[float] = None
@@ -93,6 +95,8 @@ class TransportWaitEpisode:
     last_note_monotonic: float = 0.0
     local_pass_used: bool = False
     final_redial_done: bool = False
+    outcome_custody: Dict[str, Any] = field(default_factory=dict)
+    continuation_granted: bool = False
     mailbox_peek: OwnerMailboxPeek = field(default_factory=OwnerMailboxPeek, repr=False)
 
     @property
@@ -136,6 +140,7 @@ def emit_network_wait_event(
     next_sleep_sec: Optional[float] = None,
     window_remaining_sec: Optional[float] = None,
     detail: str = "",
+    outcome_custody: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Durable episode evidence in events.jsonl (typed rows; no keyword scans).
 
@@ -159,9 +164,67 @@ def emit_network_wait_event(
             **({"window_remaining_sec": round(float(window_remaining_sec), 1)}
                if window_remaining_sec is not None else {}),
             **({"detail": detail} if detail else {}),
+            **({"outcome_custody": dict(outcome_custody)} if outcome_custody else {}),
         })
     except Exception:
         log.debug("Failed to append network_wait event", exc_info=True)
+
+
+def managed_transport_continuation(ctx: Any) -> bool:
+    """Owner-selected continuation applies to ordinary managed cognition."""
+    return bool(ctx is not None and getattr(ctx, "task_id", "")
+                and not getattr(ctx, "is_direct_chat", False)
+                and not getattr(ctx, "is_ephemeral_turn", False)
+                and not getattr(ctx, "exact_model_route", False))
+
+
+def continue_unknown_transport(episode: TransportWaitEpisode, *, llm: Any, tools: Any,
+                               messages: list, accumulated_usage: dict, drive_logs: Any,
+                               task_id: str, model: str, emit_progress: Callable) -> bool:
+    """Grant one NEW attempt only after upstream recovery, retaining old custody."""
+    from ouroboros.config import get_llm_transport_read_timeout_sec
+    from ouroboros.deadline_utils import dispatch_window_remaining_sec
+    remaining = dispatch_window_remaining_sec(deadline_ts=task_deadline_epoch(tools), reserve_sec=get_finalization_grace_sec())
+    if remaining is not None and remaining <= 0:
+        return False
+    timeout = float(get_llm_transport_read_timeout_sec())
+    if remaining is not None:
+        timeout = min(timeout, remaining)
+    from ouroboros.model_slots import task_model_binding
+    from ouroboros.model_wait import current_model_wait
+    ctx, waiter = tools._ctx, current_model_wait()
+    if transport_repeat_stop_requested(ctx) or (waiter is not None and waiter.control_reason()):
+        return False
+    role, account = task_model_binding({"model_role": getattr(ctx, "model_role", ""),
+        "task_metadata": getattr(ctx, "task_metadata", {})},
+        context_fit_plan=getattr(ctx, "context_fit_plan", None), overrides=waiter.overrides if waiter else None)
+    observed = upstream_transport_reachable(llm, model, timeout=timeout, model_role=role,
+        account_override=account, observed_after=episode.started_at,
+        expected_route=episode.outcome_custody.get("route"))
+    remaining = dispatch_window_remaining_sec(deadline_ts=task_deadline_epoch(tools), reserve_sec=get_finalization_grace_sec())
+    if (not observed or remaining == 0.0 or transport_repeat_stop_requested(ctx)
+            or (waiter is not None and waiter.control_reason())):
+        return False
+    previous = dict(episode.outcome_custody)
+    message = (
+        "[Transport recovery] Upstream connectivity is available again. Continue from the recorded work "
+        "in a NEW physical model attempt. The previous attempt's outcome and any unreported cost remain "
+        "unknown; do not treat it as failed, free, completed, or an instruction to repeat completed tools. "
+        f"Previous physical attempt: {previous.get('physical_attempt_id') or 'unreported'}; "
+        f"operation: {previous.get('operation_id') or 'unreported'}."
+    )
+    messages.append({"role": "user", "content": "[SYSTEM NOTICE]\n" + message})
+    accumulated_usage["transport_recovery"] = {"previous_attempt": previous, "connectivity": observed,
+                                               "continuation": "new_physical_attempt", "old_outcome": "unknown"}
+    accumulated_usage.pop(TRANSPORT_DEATHS_KEY, None)
+    accumulated_usage.pop("_pending_transport_outcome", None)
+    episode.continuation_granted = True
+    emit_network_wait_event(drive_logs, task_id=task_id, phase="recovered",
+        elapsed_sec=episode.waited_sec, redials=episode.redials, model=model,
+        detail="new_attempt_after_unknown_outcome", outcome_custody=previous)
+    emit_progress("🌐 Connection restored — continuing from saved work in a new attempt. "
+                  "The prior result and unreported cost remain unknown; another charge is possible.", incident=None)
+    return True
 
 
 def _use_local_fallback_configured() -> bool:
@@ -233,12 +296,22 @@ def reconcile_transport_wait(
     latch for the wait/terminal step. A failed local fallback pass
     (``after_local_pass``) never clears the latched remote cause.
     """
+    if episode is not None and episode.continuation_granted:
+        episode = None  # This new physical outcome owns a fresh outage episode.
+    if (episode is not None and not after_local_pass and episode.wait_cause != "provider_outcome_unknown"
+            and error_kind == "provider_outcome_unknown" and managed_transport_continuation(ctx)):
+        emit_network_wait_event(drive_logs, task_id=task_id, phase="ended", elapsed_sec=episode.waited_sec,
+            redials=episode.redials, model=model, detail="redial_outcome_unknown")
+        episode = None  # A formerly free redial crossed dispatch; it now needs upstream proof.
     if episode is None:
-        if msg_present or error_kind != "transport_unavailable":
+        unknown = error_kind == "provider_outcome_unknown" and managed_transport_continuation(ctx)
+        if msg_present or (error_kind != "transport_unavailable" and not unknown):
             return None
         ephemeral = bool(getattr(ctx, "is_ephemeral_turn", False))
         interactive = ephemeral or bool(getattr(ctx, "is_direct_chat", False))
         episode = TransportWaitEpisode(
+            wait_cause="provider_outcome_unknown" if unknown else "transport_unavailable",
+            outcome_custody=dict((getattr(ctx, "_accumulated_usage", {}) or {}).get("_pending_transport_outcome") or {}),
             started_monotonic=time.monotonic(),
             interactive=interactive,
             ephemeral=ephemeral,
@@ -252,8 +325,10 @@ def reconcile_transport_wait(
         # Interactive notes keep their existing wording; direct-turn Stop is
         # separately handled through its typed mailbox control.
         emit_progress(
-            "🌐 Could not establish a provider connection — waiting and "
-            "redialing automatically (failed attempts are $0)."
+            ("🌐 Provider connection was lost after dispatch. The outcome and any unreported cost remain unknown. "
+             "Waiting for connectivity, then continuing from saved work with a new attempt; another charge is possible."
+             if unknown else "🌐 Could not establish a provider connection — waiting and "
+             "redialing automatically (failed attempts are $0).")
             + ("" if interactive else " Stop cancels."),
             incident=episode.incident(task_id, "entered", "warn"),
         )
@@ -284,6 +359,7 @@ def reconcile_transport_wait(
     if (
         not after_local_pass
         and error_kind not in ("transport_unavailable", "deadline_exhausted")
+        and not (error_kind == "provider_outcome_unknown" and episode.wait_cause == "provider_outcome_unknown")
     ):
         # The redial got past the connect phase and failed differently: the
         # transport is provably passable, so ordinary failure policy resumes.

@@ -99,6 +99,8 @@ class ReviewRequest:
     deadline_at: str = ""
     retry_key: str = ""
     reconcile_only: bool = False
+    # Existing surface fingerprints, carried only to physical provenance.
+    reconciliation_identity: Dict[str, Any] = field(default_factory=dict)
     task_attempt: Any = None
     default_temperature: float | None = None
 
@@ -147,6 +149,7 @@ class ReviewActorRecord:
     operation_id: str = ""
     operation_state: str = "settled"
     late_result_pending: bool = False
+    recovery_binding: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

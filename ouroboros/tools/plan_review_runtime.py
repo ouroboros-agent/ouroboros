@@ -304,6 +304,8 @@ async def run_plan_review_slots(
     slot_messages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     session_threads: Optional[Dict[str, str]] = None,
     retry_key: str = "",
+    reconcile_only: bool = False,
+    reconciliation_identity: Optional[dict] = None,
 ) -> list[dict]:
     """ONE ``ReviewRequest`` fanned across the configured rows through the substrate.
 
@@ -334,6 +336,8 @@ async def run_plan_review_slots(
         session_root=session_root,
         session_threads=dict(session_threads or {}),
         retry_key=str(retry_key or ""),
+        reconcile_only=reconcile_only,
+        reconciliation_identity=dict(reconciliation_identity or {}),
         # The paid cycle's identity (plan fingerprint + cycle) owns its cache
         # split: a revised plan under the same task/model/slot starts cold.
         usage_attribution={"review_wave_id": str(retry_key or "")} if retry_key else {},
@@ -436,6 +440,7 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "auth_route_receipt": usage.get("auth_route_receipt") or {},
         "profile_continuity_receipt": usage.get("profile_continuity_receipt") or {},
         "applied_profile": str(usage.get("applied_profile") or ""),
+        "recovery_binding": dict(actor.get("recovery_binding") or {}),
         "operation_id": str(actor.get("operation_id") or ""),
         "operation_state": str(actor.get("operation_state") or "settled"),
         "late_result_pending": bool(actor.get("late_result_pending")),
@@ -472,6 +477,7 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
             or str(row.get("operation_state") or "settled") != "settled" \
             or pending_invocation_id or delegated_run_id:
         facts.update({
+            "recovery_binding": dict(row.get("recovery_binding") or {}),
             "operation_id": str(row.get("operation_id") or ""),
             "operation_state": str(row.get("operation_state") or "settled"),
             "late_result_pending": bool(row.get("late_result_pending")),

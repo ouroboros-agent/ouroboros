@@ -323,6 +323,7 @@ def in_flight_resume_inputs(
         "retry_key": str(existing.get("retry_key") or "")
         or f"plan_review:{existing.get('request_fingerprint')}:{cycle_index}",
         "dispatched_slot_ids": sorted(dispatched_ids),
+        "dispatched_rows": [dict(row) for row in actor_rows if row["slot_id"] in dispatched_ids],
         "frozen_rows": frozen_rows,
         "health_evidence": health_evidence,
     }
