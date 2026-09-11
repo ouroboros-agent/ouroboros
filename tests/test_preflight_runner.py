@@ -207,6 +207,24 @@ def test_lane_expr_matches_pyproject():
     assert markexpr.group(1) == LANE_EXCLUSION_EXPR
 
 
+def test_default_addopts_carry_the_durations_report():
+    """`addopts` is prepended to EVERY argv, so this one line is the single home of
+    the per-test timing report: the default local run, both CI jobs, and both gate
+    passes (which run with the candidate worktree as cwd and read its pyproject).
+    Without it the suite has no timing evidence on any surface, and a budget
+    conversation about the gate is an argument about remembered numbers.
+
+    Pinned with their values: `--durations=0` alone would print every test on
+    every local run of every install, and a bare `--durations=25` without the
+    floor turns a fast suite into twenty-five sub-second rows."""
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    addopts = re.search(r"^addopts\s*=\s*\"(.*)\"\s*$", pyproject, re.MULTILINE)
+    assert addopts, "pyproject.toml addopts line not found"
+    flags = addopts.group(1)
+    assert "--durations=25" in flags, f"addopts carries no slowest-test report: {flags!r}"
+    assert "--durations-min=1.0" in flags, f"addopts reports durations without a floor: {flags!r}"
+
+
 def _ci_pytest_suite_commands(job: str) -> list[tuple[str, str]]:
     """The `(markexpr, trailing_flags)` of ONE ci.yml job's full-suite pytest runs.
 
