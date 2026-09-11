@@ -1208,8 +1208,8 @@ class TestOneCeilingPerTree:
         ceiling_binds = task_pacing._headroom_phrase(40.0, 10.0, 2.0)
         wallet_binds = task_pacing._headroom_phrase(3.0, 40.0, 2.0)
 
-        assert ceiling_binds == "$8.00 budget left (in-task cost ceiling binds)"
-        assert wallet_binds == "$3.00 budget left (wallet binds)"
+        assert ceiling_binds == "$8.00 unreserved budget left (in-task cost ceiling binds)"
+        assert wallet_binds == "$3.00 unreserved shared budget left (wallet binds)"
         assert task_pacing._headroom_phrase(None, None, None) == "budget left unknown"
 
     def test_acceptance_rails_use_global_wallet_and_tree_spend(self, monkeypatch, tmp_path):
@@ -1233,7 +1233,7 @@ class TestOneCeilingPerTree:
             )
 
         assert "$2.00 spent this task" in line
-        assert "$1.00 budget left (wallet binds)" in line
+        assert "$1.00 unreserved shared budget left (wallet binds)" in line
 
 
 class TestGlobalBudgetDefault:

@@ -217,6 +217,8 @@ class UsageScope:
     global_limit_usd: Optional[float] = None
     root_limit_usd: Optional[float] = None
     root_cost_ceiling_usd: Optional[float] = None
+    global_limit_source: str = ""
+    global_limit_revision: Optional[str] = None
 @dataclass(frozen=True)
 class PhysicalAttemptContext:
     profile: Literal["owner_max", "owner_low", "task_local_low"]
@@ -264,6 +266,8 @@ class AttemptRequest:
     # the raw base64 basis because budget reservation wants the conservative
     # over-count (owner decision 3=A: the two consumers intentionally split).
     prompt_tokens_bounded_estimate: int = 0
+    global_limit_source: str = ""
+    global_limit_revision: Optional[str] = None
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str
@@ -397,6 +401,10 @@ def _release_physical_dispatch_claim(attempt_id: str) -> None:
                 state.used -= 1
 def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     bound = _CURRENT_SCOPE.get() or UsageScope()
+    limit_owner = request if request.global_limit_usd is not None else bound
+    limit_source = limit_owner.global_limit_source or (
+        "attempt_request" if limit_owner is request else "usage_scope"
+    )
     scope = UsageScope(
         drive_root=request.drive_root or bound.drive_root,
         task_id=str(request.task_id or bound.task_id or ""),
@@ -410,11 +418,15 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
         ),
         root_limit_usd=(request.root_limit_usd if request.root_limit_usd is not None else bound.root_limit_usd),
         root_cost_ceiling_usd=bound.root_cost_ceiling_usd,
+        global_limit_source=limit_source if limit_owner.global_limit_usd is not None else "",
+        global_limit_revision=limit_owner.global_limit_revision if limit_owner.global_limit_usd is not None else None,
     )
     if not scope.root_task_id and scope.task_id:
         scope = replace(scope, root_task_id=scope.task_id)
     if request.global_limit_usd is None and scope.global_limit_usd is not None:
-        request = replace(request, global_limit_usd=scope.global_limit_usd)
+        request = replace(request, global_limit_usd=scope.global_limit_usd,
+                          global_limit_source=scope.global_limit_source,
+                          global_limit_revision=scope.global_limit_revision)
     if not request.task_id and scope.task_id:
         # The reservation below keys the task's observed cache split off this id.
         request = replace(request, task_id=scope.task_id, root_task_id=scope.root_task_id)
@@ -888,7 +900,12 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "category": scope.category,
                     "source": scope.source,
                     **{key: str(getattr(scope, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
-                    "global_limit_usd": request.global_limit_usd,
+                    # The value checked above, including a resolver fallback, is
+                    # the applied limit. A scope snapshot is not a held share.
+                    "global_limit_usd": None if global_limit == float("inf") else global_limit,
+                    "global_limit_unbounded": global_limit == float("inf"),
+                    "global_limit_source": scope.global_limit_source or "settings_budget_resolver",
+                    "global_limit_revision": scope.global_limit_revision,
                     "root_limit_usd": scope.root_limit_usd,
                     **_candidate_request_fields(request),
                 }
@@ -1074,6 +1091,9 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             "source": str(current.get("source") or "llm"),
             **{key: str(current.get(key) or "") for key in REVIEW_ATTRIBUTION_KEYS},
             "global_limit_usd": current.get("global_limit_usd"),
+            **{key: current.get(key) for key in (
+                "global_limit_source", "global_limit_revision", "global_limit_unbounded",
+            ) if key in current},
             "root_limit_usd": current.get("root_limit_usd"),
             **{key: current.get(key) for key in _CANDIDATE_ROW_FIELDS if key in current},
             **fields,

@@ -302,6 +302,9 @@ class ReviewCoordinator:
             review_skill=str(review_meta.get("review_skill") or base_scope.review_skill or ""),
             review_wave_id=str(review_meta.get("review_wave_id") or base_scope.review_wave_id or ""),
             global_limit_usd=global_limit,
+            global_limit_source=(base_scope.global_limit_source if base_scope.global_limit_usd is not None
+                                 else "settings_budget_resolver"),
+            global_limit_revision=(base_scope.global_limit_revision if base_scope.global_limit_usd is not None else None),
             root_limit_usd=root_limit,
         )
 

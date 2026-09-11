@@ -1338,6 +1338,9 @@ def process_tool_results(
             error_count += 1
 
         ctx = getattr(tools, "_ctx", None) if tools is not None else None
+        from ouroboros.task_pacing import record_tool_activity
+
+        record_tool_activity(ctx, exec_result)
         result_source_ref = (
             _persist_truncated_tool_source(
                 ctx, fn_name, str(exec_result["tool_call_id"]), exec_result["result"],
