@@ -190,6 +190,7 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
     STILL-RUNNING undecided children — genuinely orphaned by finalizing
     mid-flight — are reported. Never raises."""
     try:
+        from ouroboros.project_dialogue import canonical_task_summary_receipt
         from ouroboros.task_status import FINAL_STATUSES
 
         children = _loop()._direct_child_results(ctx)
@@ -200,6 +201,12 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
                 "integrated", "irrelevant", "deferred", "discarded", "cancelled",
             }:
                 return False  # explicitly handled
+            if canonical_task_summary_receipt(c):
+                # The child's own terminal row already reached this chat, so it
+                # was not orphaned SILENTLY: naming it here is a second telling of
+                # one event. The receipt is the child's durable fact, never a scan
+                # of chat text.
+                return False
             # completed children were already surfaced via the reminder
             return include_terminal or str(c.get("status") or "").strip().lower() not in FINAL_STATUSES
 
@@ -241,7 +248,11 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             more = f" (+{len(undecided) - 10} more)" if len(undecided) > 10 else ""
             lead = "finalized under a hard limit with" if include_terminal else "finalized with"
             detail = (
-                "running ones may be incomplete, completed ones may be UNREAD"
+                # A child that FAILED or was CANCELLED is neither running nor
+                # completed: the two-way clause described it as something it is
+                # not, while its own label already carries the real lifecycle.
+                "running ones may be incomplete, finished ones (completed, failed "
+                "or cancelled) may be UNREAD"
                 if include_terminal else
                 "still-running children not absorbed or discarded"
             )
@@ -864,6 +875,20 @@ def _forced_swarm_router_result(
     elif status == "rejected":
         detail = str(attempt.get("reason") or "admission rejected")
         text = f"⚠️ Swarm could not admit a new managed task ({detail}). No retry was emitted."
+    elif str(ctx.accumulated_usage.get("reason_code") or "") == reason_code:
+        # One event is disclosed once, at its own layer. When the rail that ended
+        # the router IS the execution reason the provider terminal already holds,
+        # the owner read the same death twice: this sentence restated the cause
+        # the [Host status] block beside it was about to state in its own words.
+        # The row keeps only what that block cannot carry - the swarm stopped
+        # before publishing - plus the model that actually ran, so the delivered
+        # body carries exactly one warning block.
+        model = str(getattr(ctx, "active_model", "") or "")
+        text = (
+            "Swarm stopped before publishing: no managed root was admitted and no "
+            "inline work was published"
+            + (f"; the model that ran was {model}." if model else ".")
+        )
     else:
         text = (
             f"⚠️ Swarm reached the task-wide rail `{reason_code}` before a managed-root "

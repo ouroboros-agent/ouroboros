@@ -508,6 +508,23 @@ def append_canonical_task_summary(drive_root: Any, row: Dict[str, Any]) -> bool:
     return append_jsonl(path, dict(row))
 
 
+def canonical_task_summary_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
+    """The receipt proving this task's own terminal row reached the canonical chat.
+
+    ``_append_terminal_task_projection`` stamps it on the task result in the same
+    write that appends the row, so another composer can tell that a task already
+    spoke for itself without scanning chat text (BIBLE P5). Empty when no row was
+    appended for that task.
+    """
+    tid = str(result.get("task_id") or result.get("id") or "").strip()
+    receipt = result.get("canonical_terminal_projection")
+    if not tid or not isinstance(receipt, dict):
+        return {}
+    if str(receipt.get("summary_id") or "") != f"task-terminal:{tid}":
+        return {}
+    return dict(receipt)
+
+
 def append_authored_task_summary(
     canonical_root: Any, result_root: Any, row: Dict[str, Any], *, status: str = "",
 ) -> bool:

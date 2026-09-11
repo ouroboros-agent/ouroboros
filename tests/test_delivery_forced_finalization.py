@@ -2732,3 +2732,42 @@ def test_web_forbidding_contract_keeps_the_forced_call_web_free(tmp_path, monkey
     loop._handle_round_limit(limit_ctx)
 
     assert seen["allow_server_web_search"] is False
+
+
+def test_orphan_note_names_failed_children_and_skips_already_delivered_ones(monkeypatch):
+    """Owner item spam G: the note described children it could not describe.
+
+    The two-way clause said running children may be incomplete and completed
+    ones may be unread, so a FAILED or CANCELLED child was told about as
+    something it is not. And a child whose own terminal row had already reached
+    this chat was listed again, which is one event told twice: that child was
+    not orphaned SILENTLY, so the parent's note has nothing to add.
+    """
+    import ouroboros.loop as loop
+
+    children = [
+        {"task_id": "failed1", "status": "failed"},
+        {"task_id": "rowdone1", "status": "completed",
+         "canonical_terminal_projection": {
+             "summary_id": "task-terminal:rowdone1",
+             "summary_kind": "terminal_result_projection",
+             "written_at": "2026-09-11T00:00:00Z",
+         }},
+        {"task_id": "undelivered1", "status": "completed"},
+    ]
+    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: [dict(c) for c in children])
+    monkeypatch.setattr(loop, "_child_disposition_state", lambda _child: "")
+    monkeypatch.setattr(loop, "_claimed_child_dispositions", lambda _ctx: {})
+
+    note = loop._forced_orphan_note(SimpleNamespace())
+
+    assert "finished ones (completed, failed or cancelled) may be UNREAD" in note
+    assert "failed1 [failed]" in note
+    assert "undelivered1 [completed]" in note
+    assert "rowdone1" not in note
+    assert "2 child task(s) not explicitly absorbed" in note
+    # A receipt that does not belong to the child it sits on proves nothing.
+    mismatched = [dict(children[1], canonical_terminal_projection={
+        "summary_id": "task-terminal:someone-else"})]
+    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: mismatched)
+    assert "rowdone1 [completed]" in loop._forced_orphan_note(SimpleNamespace())

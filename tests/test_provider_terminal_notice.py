@@ -340,3 +340,61 @@ def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, m
     assert text == RAW
     assert secret not in usage["_last_llm_error"] + usage["terminal_provider_notice"] + notices[0]
     assert "***" in notices[0]
+
+
+def test_a_swarm_rail_on_the_provider_reason_leaves_one_warning_block(tmp_path, monkeypatch):
+    """One event is disclosed once, at its own layer (owner item spam K).
+
+    A routing turn that hit the task-wide rail restated the rail reason in its
+    own sentence while the provider terminal was about to state the very same
+    execution reason in the [Host status] block beside it, so the owner read one
+    death twice. When the two reasons are equal the row keeps only what that
+    block cannot carry (the swarm stopped before publishing, and which model
+    actually ran) and the delivered body carries exactly one warning block.
+    """
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *_a, **_k: None)
+    usage = {"_last_llm_error_kind": "provider_outcome_unknown",
+             loop_llm_call.TRANSPORT_DEATHS_KEY: {"round_id": "round", "count": 1,
+                                                  "error_kind": "provider_outcome_unknown"}}
+    _loop, registry, ctx, trace = _forced_test_context(tmp_path, usage=usage)
+    registry._ctx.is_ephemeral_turn = True
+    registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
+    registry._ctx._swarm_handoff_attempt = {"status": "not_attempted", "task_id": ""}
+
+    text, usage, trace = loop._handle_provider_unavailable(
+        ctx, error_kind="provider_outcome_unknown",
+        wait_cause="transport_unavailable", waited_sec=125.0,
+    )
+
+    assert usage["reason_code"] == "provider_unavailable"
+    assert "Swarm stopped before publishing" in text
+    assert "the model that ran was test-model" in text
+    # The cause is stated once, by the layer that owns it.
+    assert "`provider_unavailable`" not in text
+    assert "⚠️" not in text
+
+    pending = []
+    pipeline.emit_task_results(
+        SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), None, None, pending,
+        {"id": "parent1", "type": "task", "chat_id": 7, "text": "route it",
+         "_is_direct_chat": True, "_ephemeral_turn": True},
+        text, usage, trace, start_time=0.0, drive_logs=tmp_path / "logs",
+    )
+    body = next(row for row in pending if row["type"] == "send_message")["text"]
+    assert body.count("[Host status]") == 1
+    assert body.count("⚠️") == 1
+    assert usage["terminal_provider_notice"] in body
+
+
+def test_a_rail_the_provider_did_not_cause_keeps_naming_itself(tmp_path):
+    """The dedup is exact-reason, not "any rail": a routing turn stopped by a
+    different rail still names that rail, because no other layer states it."""
+    _loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    registry._ctx.is_ephemeral_turn = True
+    registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
+    registry._ctx._swarm_handoff_attempt = {"status": "not_attempted", "task_id": ""}
+    ctx.accumulated_usage["reason_code"] = "provider_unavailable"
+
+    text, _usage, _trace = loop._forced_swarm_router_result(ctx, trace, "round_limit")
+
+    assert "⚠️ Swarm reached the task-wide rail `round_limit`" in text
