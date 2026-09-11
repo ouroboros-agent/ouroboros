@@ -22,6 +22,10 @@ import re
 from typing import Any, Dict
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_.-]")
+# A character a slug cannot carry: whitespace maps to "-" deterministically, so it
+# is not loss; anything else disappears and two different names can collapse onto
+# one id (see project_id_from_display_name).
+_LOSSY = re.compile(r"[^a-zA-Z0-9_.\-\s]")
 # Windows reserved device names (case-insensitive, incl. extension variants like
 # "con.md"): never allow these as a project dir component.
 _RESERVED_NAMES = frozenset(
@@ -49,14 +53,27 @@ def project_id_from_display_name(value: Any) -> str:
     emoji-only name like 'динозавры' still creates a project instead of failing —
     the Russian-speaking owner's common case). The real display name is stored
     separately on the registry, so the user always sees their own name, never the
-    id. Returns "" only for a truly empty name."""
-    slug = sanitize_project_id(value)
-    if slug:
-        return slug
+    id. Returns "" only for a truly empty name.
+
+    Two rules keep a LOSSY name from producing a misleading or COLLIDING id: runs
+    of ``-`` collapse (a Cyrillic word between two Latin ones minted
+    ``mlconf--------------------ouroboros``), and when the name held any character
+    the slug could not carry, a short digest of the whole raw name is appended — two
+    different Cyrillic titles otherwise normalized onto the same id and silently
+    shared one project. Only NEWLY minted ids are affected: ``sanitize_project_id``
+    is untouched, so every existing id, lookup and derived project chat stays
+    exactly as it is."""
     raw = str(value or "").strip()
     if not raw:
         return ""
-    return "proj_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    slug = re.sub(r"-{2,}", "-", sanitize_project_id(raw)).strip("-.")
+    if not slug:
+        return "proj_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    if _LOSSY.search(raw):
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        # The slug never starts with "-" or ".", so the truncated head stays usable.
+        slug = f"{slug[:63 - len(digest)].strip('-.')}-{digest}"
+    return slug
 
 
 def explicit_project_id_ok(raw: Any) -> bool:
