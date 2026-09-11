@@ -222,7 +222,11 @@ relabel the whole still-working task. A failed child keeps a compact factual
 authoritative status. Internal reason codes belong in details and diagnostics,
 not compact headlines. Where a card does show a cause, it says it in the owner's
 words while the record keeps the machine code; a cause with no sentence yet stays
-raw rather than borrowing a wrong one.
+raw rather than borrowing a wrong one. A terminal whose preserved output was
+never reviewed shows that output labelled rather than hidden: a short labelled
+excerpt beside the pointer to the full copy, so a `Failed` card over applied work
+is never a bare headline. Where a stop receipt already carries the same text in
+that chat, the card keeps the label and the pointer alone.
 
 | Role | Foreground | Background | Border |
 | --- | --- | --- | --- |
