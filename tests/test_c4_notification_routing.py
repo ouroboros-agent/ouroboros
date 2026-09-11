@@ -201,6 +201,40 @@ class TestReaperIncidentChat:
         assert _incident_chat_id({}, 1) == 1
         assert _incident_chat_id(None, 1) == 1
 
+    def test_project_binding_beats_the_row_chat(self, tmp_path):
+        """A reaper incident is a DIRECT send, so the binding must win HERE: a
+        task converted into a project mid-run keeps its origin chat on the row."""
+        from types import SimpleNamespace
+
+        from ouroboros.projects_registry import bind_task_to_project
+        from supervisor.task_reaper import _incident_chat_id
+
+        bind_task_to_project(tmp_path, "root-inc", "reap-proj", 5150, origin={"absent": "system"})
+        ctx = SimpleNamespace(DRIVE_ROOT=tmp_path)
+
+        assert _incident_chat_id({"id": "root-inc", "chat_id": 1}, 1, ctx) == 5150
+        # A child is never bound itself; it inherits the room through lineage.
+        assert _incident_chat_id(
+            {"id": "child-inc", "root_task_id": "root-inc", "chat_id": 1}, 1, ctx
+        ) == 5150
+        # An unbound task keeps today's order: its own chat, owner as fallback.
+        assert _incident_chat_id({"id": "unbound-inc", "chat_id": 7}, 1, ctx) == 7
+        assert _incident_chat_id({"id": "unbound-inc"}, 1, ctx) == 1
+
+    def test_a2a_binding_falls_through_to_the_task_chat(self, tmp_path):
+        """Suppression still applies to the new first candidate: a synthetic
+        (negative) bound chat is skipped, it does not silence the notice."""
+        from types import SimpleNamespace
+
+        from ouroboros.projects_registry import bind_task_to_project
+        from supervisor.task_reaper import _incident_chat_id
+
+        bind_task_to_project(tmp_path, "a2a-inc", "a2a-proj", -1001, origin={"absent": "system"})
+        ctx = SimpleNamespace(DRIVE_ROOT=tmp_path)
+
+        assert _incident_chat_id({"id": "a2a-inc", "chat_id": 7}, 1, ctx) == 7
+        assert _incident_chat_id({"id": "a2a-inc"}, 1, ctx) == 1
+
     def test_negative_task_chat_never_reaches_a_human_stream(self):
         from supervisor.task_reaper import _incident_chat_id
 
@@ -209,3 +243,35 @@ class TestReaperIncidentChat:
         # all — reported as None, not as the panel.
         assert _incident_chat_id({"chat_id": -42}, 0) is None
         assert _incident_chat_id({"chat_id": "junk"}, -3) is None
+
+
+class TestCascadeDeliveryRow:
+    """A cancel cascade whose root already left the live maps borrows a live
+    descendant's row for its lineage chat. Reading that chat for TRUTH skipped
+    every descendant homed in the hidden partition (chat 0), so the cascade
+    silently had no row and the notice went nowhere."""
+
+    def _queue(self, pending, running):
+        from supervisor import queue as real_queue
+
+        class _Q:
+            PENDING = pending
+            RUNNING = running
+            _is_descendant_of = staticmethod(real_queue._is_descendant_of)
+
+        return _Q
+
+    def test_a_descendant_homed_in_the_partition_is_returned(self):
+        from supervisor.cancel_publication import _cascade_delivery_row_locked
+
+        child = {"id": "kid", "root_task_id": "root-9", "chat_id": 0}
+        assert _cascade_delivery_row_locked(self._queue([child], {}), "root-9") == child
+        assert _cascade_delivery_row_locked(
+            self._queue([], {"kid": {"task": child}}), "root-9"
+        ) == child
+
+    def test_a_descendant_without_a_chat_is_still_skipped(self):
+        from supervisor.cancel_publication import _cascade_delivery_row_locked
+
+        child = {"id": "kid", "root_task_id": "root-9"}
+        assert _cascade_delivery_row_locked(self._queue([child], {}), "root-9") == {}

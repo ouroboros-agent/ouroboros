@@ -39,7 +39,7 @@ def _routing_project_address(ctx: Any, target: str, status: str) -> Dict[str, An
 
         binding = project_binding_for_task(ctx.DRIVE_ROOT, target) or {}
         project = get_project(ctx.DRIVE_ROOT, str(binding.get("project_id") or ""))
-        if project and project.get("chat_id") and project.get("lifecycle") not in {"deleting", "deleted"}:
+        if project and project.get("chat_id") is not None and project.get("lifecycle") not in {"deleting", "deleted"}:
             return {"project_id": project["id"], "project_chat_id": int(project["chat_id"])}
     except Exception:
         log.debug("Routing destination projection unavailable", exc_info=True)

@@ -20,8 +20,8 @@ from typing import Any, Dict, Optional
 
 from ouroboros.outcomes import EXECUTION_INFRA_FAILED, terminal_outcome_axes
 from ouroboros.utils import append_jsonl, utc_now_iso
-from supervisor.events import HOST_NARRATION
-from supervisor.message_bus import send_with_budget
+from supervisor.events import HOST_NARRATION, _bound_project_chat_id
+from supervisor.message_bus import notification_chat_route, send_with_budget
 
 log = logging.getLogger(__name__)
 
@@ -1006,10 +1006,11 @@ def _emit_cancel_suppressed_retry_task_done(
         return False
 
 
-def _incident_chat_id(task: Any, owner_chat_id: int) -> Optional[int]:
-    """C4: an incident notice belongs to the TASK'S OWN chat; the owner chat is
-    only the absent-binding fallback (the same precedence queue.py already uses
-    for grace episodes).
+def _incident_chat_id(task: Any, owner_chat_id: int, ctx: Any = None) -> Optional[int]:
+    """C4: an incident notice belongs to the TASK'S OWN chat, and a DURABLE project binding
+    outranks even that (this send is DIRECT, so nothing re-addresses it downstream, while a
+    task converted into a project mid-run keeps its origin chat on the row); the owner chat
+    is only the absent-binding fallback (the same precedence queue.py uses for grace episodes).
 
     Routed through the ONE notification normalizer, so membership decides instead
     of truthiness: chat **0 is the Skill Review panel** and a task bound there
@@ -1017,12 +1018,11 @@ def _incident_chat_id(task: Any, owner_chat_id: int) -> Optional[int]:
     AND then refused to send, because `if owner_chat_id:` drops 0 as well). A
     negative (A2A/internal) chat is suppressed and falls through to the owner
     fallback; ``None`` means there is no deliverable route at all."""
-    from supervisor.message_bus import notification_chat_route
-
+    row = task if isinstance(task, dict) else {}
     return notification_chat_route(
-        task.get("chat_id") if isinstance(task, dict) else None,
-        # A 0/absent owner chat is "not configured", not the panel — only an
-        # explicit TASK binding routes to 0.
+        _bound_project_chat_id(ctx, row.get("id"), row.get("parent_task_id"), row.get("root_task_id")) or None,
+        row.get("chat_id"),
+        # A 0/absent owner chat is "not configured", not the panel — only an explicit TASK binding routes to 0.
         owner_chat_id or None,
     )
 
@@ -1355,7 +1355,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         return
     if not confirmed:
         _hold_wedged_worker(task_id, task_type, worker_id, terminal_reason, runtime_sec,
-                            _incident_chat_id(task, owner_chat_id))
+                            _incident_chat_id(task, owner_chat_id, _q))
         return
 
     workers_mod._reconcile_confirmed_dead_review_owner(
@@ -1550,7 +1550,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
             log.debug("Reaper: failed to log task_terminal_timeout for %s", task_id, exc_info=True)
 
         # Notification failures cannot hold the slot; route to its task's chat.
-        incident_chat_id = _incident_chat_id(task, owner_chat_id)
+        incident_chat_id = _incident_chat_id(task, owner_chat_id, _q)
         if incident_chat_id is not None:
             try:
                 if requeued:

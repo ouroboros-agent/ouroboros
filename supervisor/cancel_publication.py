@@ -522,11 +522,11 @@ def _cascade_delivery_row_locked(q: Any, task_id: str) -> Dict[str, Any]:
     (Moved verbatim from ``task_lifecycle.py`` at its module-size boundary.)
     """
     for task in q.PENDING:
-        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):
+        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id") is not None:
             return dict(task)
     for meta in q.RUNNING.values():
         task = meta.get("task") if isinstance(meta, dict) else None
-        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):
+        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id") is not None:
             return dict(task)
     return {}
 

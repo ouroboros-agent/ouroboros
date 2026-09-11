@@ -17,6 +17,7 @@ from ouroboros.outcomes import (
     EXECUTION_INFRA_FAILED,
     terminal_outcome_axes,
 )
+from supervisor.log_addressing import resolve_project_chat
 from supervisor.queue import _queue_lock
 
 
@@ -289,7 +290,16 @@ def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
     # Signal crashes are terminal infrastructure failures for every task type.
     is_crash_signal = isinstance(exitcode, int) and exitcode < 0
     crash_signal = -exitcode if is_crash_signal else None
-    chat_id = _pool().coerce_chat_identity(task.get("chat_id"), 0)
+    # The crash toast is a DIRECT send - nothing re-addresses it downstream - so
+    # the task's durable project binding has to win here, or a task converted
+    # into a project mid-run is told about its crash in the chat it was born in.
+    chat_id = _pool().coerce_chat_identity(
+        resolve_project_chat(
+            _pool().DRIVE_ROOT, task_id, task.get("parent_task_id"), task.get("root_task_id")
+        )
+        or task.get("chat_id"),
+        0,
+    )
     attempt = int(task.get("_attempt") or 1)
     replay_unsafe = (not getattr(w, "active_capacity", True)
                      or has_owner_wait_checkpoint(meta, attempt))
