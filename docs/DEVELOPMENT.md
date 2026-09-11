@@ -530,7 +530,12 @@ filtered down to the answer.
 - **House precedents — reuse these shapes:** chat log rotation with
   archive-aware readers (`supervisor/state.py::rotate_chat_log_if_needed`);
   the compact `containment_faults.jsonl` projection maintained beside an
-  unbounded event log (`ouroboros/delegate_custody.py`); the fingerprint-keyed
+  unbounded event log (`ouroboros/delegate_custody.py`); one shared custody replay
+  per context build and per terminal audit (`delegate_terminal.custody_audit_snapshot`,
+  consumed by `context_health.build_health_invariants` and `_audit_task_custody`): several
+  projections of the same growing store share ONE traversal instead of replaying per reader,
+  which bounds the multiplier, not the scan: the read stays O(history) until a compact
+  projection replaces it; the fingerprint-keyed
   render cache in `ouroboros/_usage_rows_memo.py` — a projection cached while
   its input is unchanged, invalidated only by advance/refold, never by TTL.
   Interactive result discovery reuses `gateway/task_list_scan.py`'s compact
@@ -2100,9 +2105,9 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
 - Stream consumption completes inside physical accounting. Preserve indexed tools, native signatures, complete final framing and cumulative usage snapshots. An EOF/error/cancellation retains private wire evidence and cannot produce a usable partial answer. Only a structural parameter rejection uses the existing wire recovery; never infer a retry from missing stream text or ping cadence. Compatible async tool calls now use the same normalizer/validation path; local, GigaChat and Claudexor retain their separate wire contracts.
 - Late reviewer reuse resolves the exact operation's complete producer receipt from existing CAS, with original task/root/attempt, slot/route, subject, contract, roster/epoch and delegated invocation where present. The current surface remains the sole wave writer and reducer. No source file existence, preview or matching prompt prose alone grants authority; missing/partial/error/mismatched custody never buys another same-operation dispatch.
 - Managed unknown-outcome recovery uses the existing network-wait owner, with non-generating upstream observations and an explicit new-attempt notice after connectivity returns. Keep old outcome/cost unknown and apply current budget/Stop/deadline before dispatch. Subscription catalogs prove reachability only with generic `provenance="provider_http"` plus `observedAt` after wait entry and exact source/model/effective account; legacy/static catalogs remain unknown. A control-channel outage first rejoins the same accepted operation. Non-generating HEAD uses the existing connection allowance for every socket phase, narrowed by the owner remainder, rather than inheriting a cognitive read window without its lease. No scheduler, provider/model table, paid readiness probe or automatic manual-restart recovery is introduced.
-- `delegate_wait` supervision's three-second observation beat is separate from its HTTP read allowance. A typed read timeout is a quiet observation hole, with actual elapsed time; received auth/protocol failures and owner controls remain meaningful. After terminal cleanup, use the current custody host notice alongside the original answer/narrative. Genuine builtin refusals publish typed non-success at their producer; successful warnings and existing review/Git warning buckets keep their semantics. Acceptance JSON validity and completion cleanliness remain separate decisions.
+- `delegate_wait` supervision's three-second observation beat is separate from its HTTP read allowance. A typed read-only-retryable transport failure (read timeout, connect error or timeout, pool timeout, read/write error, protocol error) is a quiet observation hole carrying its typed reason and the actual elapsed time; the beat does not slow, no durable counter or outage latch is kept, and the outage is disclosed to the owner once per episode with one recovery line. Received auth/protocol failures and owner controls remain meaningful. After terminal cleanup, use the current custody host notice alongside the original answer/narrative. Genuine builtin refusals publish typed non-success at their producer; successful warnings and existing review/Git warning buckets keep their semantics. Acceptance JSON validity and completion cleanliness remain separate decisions.
 
-Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_lineage.py`, `test_terminal_custody_notice.py`, `test_delegate_observation_transport.py`, `test_transport_b_stream_deadlines.py`, `test_transport_unknown_continuation.py`, `test_builtin_refusal_results.py` and `test_v671_acceptance_convergence.py`. Use the ordinary isolated preflight runner; full provider/renderer smoke remains separate from local fake-provider evidence.
+Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_lineage.py`, `test_terminal_custody_notice.py`, `test_delegate_observation_transport.py`, `test_delegate_hold.py`, `test_configured_session_wake_rail.py`, `test_health_invariants_ownership.py`, `test_transport_b_stream_deadlines.py`, `test_transport_unknown_continuation.py`, `test_builtin_refusal_results.py` and `test_v671_acceptance_convergence.py`. Use the ordinary isolated preflight runner; full provider/renderer smoke remains separate from local fake-provider evidence.
 
 ### LLM call rules
 
@@ -2428,7 +2433,9 @@ by "Provider Independence" above. Call-site imperatives:
   before it clears the row. A logical timeout with a live paid worker is
   custody/reconciliation-pending, never permission for a blind paid retry;
   late results settle the original attempt and stay bound to its retry
-  identity.
+  identity. Symmetrically, an owner terminal that is not a deliberate
+  verdict is not permission to cancel the live paid run that owner held: the
+  sweep spares it, discloses it, and lets its own bound limit the damage.
 - Once the owner deadline minus finalization reserve is spent, an unstarted
   review row is a typed `$0 not_dispatched` actor — no worker, paid stamp, or
   active lease; an already-paid in-flight wave stays eligible for exact
