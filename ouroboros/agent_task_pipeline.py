@@ -497,9 +497,7 @@ def emit_task_results(
     if getattr(ctx, "_skip_post_task_synthesis", False):   # "Stop now": paid root predicates see it
         task["_skip_post_task_synthesis"] = True
     _presence = is_presence_task(task)
-    _typed_routing_action = (
-        str(getattr(ctx, "_typed_routing_action_emitted", "") or "").strip()
-    )
+    _typed_routing_action = str(getattr(ctx, "_typed_routing_action_emitted", "") or "").strip()
     _message_meta = subagent_message_meta(task, task_id=str(task.get("id") or ""))
     n_tool_calls = len(llm_trace.get("tool_calls", []))
     if _ephemeral:

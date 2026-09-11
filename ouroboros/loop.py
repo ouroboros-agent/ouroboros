@@ -608,10 +608,7 @@ def run_llm_loop(
             from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
 
             tool_calls = msg.get("tool_calls") or []
-            tools._ctx._request_wire_custom_receipts = accumulated_usage.pop(
-                CUSTOM_RECEIPTS_USAGE_KEY,
-                (),
-            )
+            tools._ctx._request_wire_custom_receipts = accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, ())
             content = msg.get("content")
             _latch_final_answer_marker(llm_trace, content, current_tool_calls=tool_calls)
             # Every metered response counts as nanny progress.
