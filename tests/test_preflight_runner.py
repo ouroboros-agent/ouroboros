@@ -120,7 +120,7 @@ def two_pass_env(monkeypatch, preflight_timeout_diagnostics):
     """Deterministic env for the real-spawn two-pass tests."""
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", raising=False)
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_SERIAL", raising=False)
-    # Private seam (scrubbed before the candidate ever sees it), clamped at the
+    # Operator lever (scrubbed before the candidate ever sees it), clamped at the
     # >=2 floor: the fixture repos below hold 1-3 probe tests, so a full `-n auto`
     # fan-out would spend minutes on worker startup for nothing.
     monkeypatch.setenv("OUROBOROS_PREFLIGHT_TEST_WORKERS", "2")
@@ -466,7 +466,7 @@ def test_plugin_verification_ignores_the_candidate_working_directory(tmp_path):
 def test_worker_count_can_never_fall_below_two(monkeypatch):
     """A "parallel" pass on ONE worker exercises no concurrency at all, yet the
     argv still says `-n` and the green return is accepted as proof. The count is
-    therefore clamped: the private test seam may only lower it TO the floor."""
+    therefore clamped: the operator lever may only lower it TO the floor."""
     from ouroboros import preflight_runner as pr
 
     monkeypatch.setenv(pr._PREFLIGHT_WORKERS_ENV, "1")
@@ -1023,7 +1023,7 @@ def test_temp_root_is_swept_between_passes_not_only_at_teardown(tmp_path, two_pa
 
 
 def test_second_pass_never_starts_once_the_total_budget_is_gone(tmp_path, two_pass_env, stub_passes):
-    """The gate budget (1800s today) is TOTAL. Clamping an exhausted remainder up to one second
+    """The configured gate budget is TOTAL. Clamping an exhausted remainder up to one second
     (`max(1, int(...))`) let the serial pass start AFTER the deadline and run for
     another whole second; integer truncation could also gift most of a second
     back. An exhausted budget must return without spawning anything."""
@@ -3055,7 +3055,7 @@ def test_both_lanes_empty_blocks(tmp_path, two_pass_env):
 
 @requires_preflight_plugins
 def test_pass2_timeout_names_serial_pass(tmp_path, two_pass_env):
-    """The gate budget (1800s today) is TOTAL; pass 2 gets the remainder and its timeout must
+    """The configured gate budget is TOTAL; pass 2 gets the remainder and its timeout must
     name the pass so a hung serial test is not mistaken for a hung parallel one."""
     from ouroboros.preflight_runner import run_hermetic_pytest
 
