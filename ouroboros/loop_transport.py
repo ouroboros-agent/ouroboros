@@ -270,7 +270,7 @@ def reconcile_transport_wait(
     drive_logs: pathlib.Path,
     task_id: str,
     model: str,
-    emit_progress: Optional[Callable[..., None]],
+    emit_progress: Callable[..., None],
     after_local_pass: bool = False,
 ) -> Optional[TransportWaitEpisode]:
     """Reconcile the episode latch with one dispatch outcome.
@@ -504,7 +504,7 @@ def transport_wait_step(
     drive_logs: pathlib.Path,
     task_id: str,
     model: str,
-    emit_progress: Optional[Callable[..., None]],
+    emit_progress: Callable[..., None],
     incoming_messages: Optional[queue.Queue],
     owner_msg_seen: Optional[set],
 ) -> bool:
