@@ -128,8 +128,13 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
     terminal_runs = []
     try:
         if not audit_failure:
+            # The LEAF's own identity, already on the replayed row (zero extra
+            # reads): without it a nanny terminal names only the role the host
+            # played and the reader asks why the leaf's model was broken (I9).
             terminal_runs = sorted((
-                {"run_id": str(row.run_id), "state": str(row.terminal_state)}
+                {"run_id": str(row.run_id), "state": str(row.terminal_state),
+                 "model": str(row.model), "profile_id": str(row.profile_id),
+                 "selected_subagent_id": str(row.selected_subagent_id)}
                 for row in state.values()
                 if row.task_id == mine and row.settled and row.terminal_state in custody.TERMINAL_STATES
             ), key=lambda row: row["run_id"])
@@ -182,7 +187,12 @@ def terminal_custody_notice(result: Mapping[str, Any]) -> str:
         return ""
     lines = []
     if non_success:
-        shown = "; ".join(f"{row.get('run_id')}: {row.get('state')}" for row in non_success[:10])
+        # The leaf's model when the replayed row carried one, never a live join
+        # and never a guess: an older row without it simply says less.
+        shown = "; ".join(
+            f"{row.get('run_id')}: {row.get('state')}"
+            + (f" on {row.get('model')}" if row.get("model") else "")
+            for row in non_success[:10])
         omitted = len(non_success) - 10
         lines.append("Confirmed delegated terminal receipts: " + shown
                      + (f" (+{omitted} more in task details)" if omitted > 0 else "") + ".")

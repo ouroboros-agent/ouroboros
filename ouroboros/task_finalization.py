@@ -527,6 +527,10 @@ def model_execution_projection(usage: Dict[str, Any]) -> Dict[str, Any] | None:
         "used_local": call.get("use_local"),
         "provider": call.get("provider"),
         "llm_call_id": call.get("llm_call_id"),
+        # The host's OWN last typed failure, beside the model it was running.
+        # A nanny that died on its own lane used to be reported by the reviewer
+        # role it played, so its death read as the delegated leaf's fault (I9).
+        "last_llm_error_kind": usage.get("_last_llm_error_kind") or None,
         "source": "usable_solve_response" if call else "not_observed",
     }
 

@@ -17,6 +17,8 @@ def _cancelled_with_patch(tmp_path):
                       continuation_narrative={"text": text})
     assert custody.emit(tmp_path, custody.STARTED, {
         "run_id": "run-one", "task_id": "root", "route": "fixture",
+        "model": "fixture-model", "profile_id": "fixture-profile",
+        "selected_subagent_id": "fixture-actor",
         "snapshot_id": "snapshot-one", "shape": {},
     })
     assert custody.emit(tmp_path, custody.SETTLED, {
@@ -32,7 +34,10 @@ def test_cleanup_receipt_is_carried_before_final_delivery_without_rewriting_answ
     audit = stored["delegate_terminal_reconciliation"]
     assert audit["open_run_ids"] == audit["pending_invocation_ids"] == []
     assert audit["undisposed_patch_run_ids"] == ["run-one"]
-    assert audit["terminal_runs"] == [{"run_id": "run-one", "state": "cancelled"}]
+    assert audit["terminal_runs"] == [{
+        "run_id": "run-one", "state": "cancelled", "model": "fixture-model",
+        "profile_id": "fixture-profile", "selected_subagent_id": "fixture-actor",
+    }]
     before = copy.deepcopy(stored)
     usage = {"terminal_origin": "model_final", "terminal_host_notice": "Budget stop retained."}
     event = prepare_terminal_send_event(
@@ -42,7 +47,9 @@ def test_cleanup_receipt_is_carried_before_final_delivery_without_rewriting_answ
     )
     assert event["text"] == text
     assert event["terminal_host_notice"].startswith("Budget stop retained.")
-    assert "run-one: cancelled" in event["terminal_host_notice"]
+    # The leaf's own model rides the replayed row, so the nanny's terminal is
+    # not read as a verdict about the role the host played (I9).
+    assert "run-one: cancelled on fixture-model" in event["terminal_host_notice"]
     assert "Pending patch decisions: run-one" in event["terminal_host_notice"]
     assert load_task_result(tmp_path, "root") == before
 
@@ -91,7 +98,8 @@ def test_custody_notice_is_bounded_and_does_not_duplicate_on_public_projection()
            "delegate_terminal_reconciliation": {
                "audit_status": "ok", "open_run_ids": [], "pending_invocation_ids": [],
                "undisposed_patch_run_ids": [f"run-{i}" for i in range(12)],
-               "terminal_runs": [{"run_id": f"run-{i}", "state": "cancelled"} for i in range(12)],
+               "terminal_runs": [{"run_id": f"run-{i}", "state": "cancelled",
+                                  "model": "leaf-model"} for i in range(12)],
            }}
     public = public_task_result(row)
     assert "+2 more in task details" in public["terminal_host_notice"]
