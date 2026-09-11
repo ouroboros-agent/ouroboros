@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # annotation-only imports (inert at runtime)
     from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.llm_claudexor import ModelTurnState
     from typing import Any
     from typing import Callable
     from typing import Dict
@@ -81,6 +82,13 @@ class ToolContext:
     # CW2 (v6.34.0): the loop publishes the effective context mode each round so
     # switch_model can refuse switching to a sub-1M route while the transcript is max-sized.
     active_context_mode: str = ""
+
+    # The active-turn transport slot every model call of ONE loop invocation
+    # shares (ordinary rounds, fallback candidates and forced finalization).
+    # `run_llm_loop` mints a fresh empty one at entry, so a next loop — and a
+    # cold restart — begins a new turn even where the transcript is identical.
+    # Opaque transport only: mechanism in `llm_claudexor.ModelTurnState`.
+    model_turn_state: Optional[ModelTurnState] = None
 
     # Per-task browser state.
     browser_state: BrowserState = field(default_factory=BrowserState)

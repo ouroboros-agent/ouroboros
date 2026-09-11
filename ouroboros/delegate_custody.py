@@ -949,6 +949,10 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 prompt_tokens=disclosed_tokens(summary.get("inputTokens")),
                 completion_tokens=disclosed_tokens(summary.get("outputTokens")),
                 cached_tokens=disclosed_tokens(summary.get("cachedInputTokens")),
+                # The harness's own normalized input split when it reports one.
+                # An engine that reports none leaves the row exactly as before,
+                # and the ledger writer decides what is usable.
+                input_token_usage=summary.get("inputTokenUsage"),
                 spend_usd=spend,
                 spend_estimated=estimated,
                 credential_profile_id=applied_profile,

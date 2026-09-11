@@ -914,3 +914,75 @@ def test_async_cancellation_leaves_io_owner_to_cancel_and_close(setup):
         release.set()
     assert gateway.cancels == [("op-0", "host_cancelled")]
     assert ledger(root)[-1]["state"] == "unresolved" and not gateway.acks
+
+
+TURN = {"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "opaque-turn-state"}}
+EARLIER = {"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "earlier-turn"}}
+
+
+@pytest.fixture
+def turn_engine(monkeypatch):
+    """A serving engine whose strict request schema accepts the active-turn field."""
+    monkeypatch.setattr(transport, "owned_engine_version",
+                        lambda: transport.config.CLAUDEXOR_MODEL_TURN_STATE_MIN_VERSION)
+
+
+@pytest.mark.parametrize("version,opted", [("3.10.4", True), ("4.0.0", True), ("3.10.3", False), ("", False)])
+def test_active_turn_is_offered_only_where_the_request_schema_accepts_it(setup, monkeypatch, version, opted):
+    _, gateway, client = setup
+    monkeypatch.setattr(transport, "owned_engine_version", lambda: version)
+    slot = transport.ModelTurnState()
+    client.chat([{"role": "user", "content": "hi"}], MODEL, model_turn_state=slot)
+    payload = gateway.uploads[-1][0]
+    # Absent is the legacy stateless shape; explicit null opts into an empty turn.
+    assert ("nativeContinuation" in payload) is opted
+    assert payload.get("nativeContinuation") is None and slot.envelope is None
+
+
+def test_request_carries_a_copy_of_the_slot_value(turn_engine):
+    slot = transport.ModelTurnState(deepcopy(TURN))
+    payload = transport._request({"source": "codex", "resolved_model": "exact-model"}, [], None,
+                                 {"model_turn_state": slot})
+    assert payload["nativeContinuation"] == TURN
+    payload["nativeContinuation"]["payload"]["turnState"] = "mutated inside the frozen request"
+    assert slot.envelope == TURN
+
+
+def test_dispatched_result_replaces_the_slot_and_the_next_send_replays_it(setup, turn_engine):
+    _, gateway, client = setup
+    gateway.results = [{**result(), "nativeContinuation": deepcopy(TURN)} for _ in range(2)]
+    gateway.dispatch = ["response_received"] * 2
+    slot = transport.ModelTurnState()
+    client.chat([{"role": "user", "content": "hi"}], MODEL, model_turn_state=slot)
+    assert slot.envelope == TURN and gateway.uploads[0][0]["nativeContinuation"] is None
+    client.chat([{"role": "user", "content": "hi"}], MODEL, model_turn_state=slot)
+    assert gateway.uploads[-1][0]["nativeContinuation"] == TURN
+
+
+def test_a_result_without_an_envelope_leaves_the_turn_stateless(setup, turn_engine):
+    _, gateway, client = setup
+    slot = transport.ModelTurnState(deepcopy(EARLIER))
+    client.chat([{"role": "user", "content": "hi"}], MODEL, model_turn_state=slot)
+    assert gateway.uploads[-1][0]["nativeContinuation"] == EARLIER and slot.envelope is None
+
+
+@pytest.mark.parametrize("dispatch,outcome", [("not_started", "completed"), ("unknown", "unknown")])
+def test_a_not_dispatched_or_unknown_outcome_never_touches_the_slot(setup, turn_engine, dispatch, outcome):
+    _, gateway, client = setup
+    gateway.results = [{**result(outcome=outcome), "nativeContinuation": deepcopy(TURN)}]
+    gateway.dispatch = [dispatch]
+    slot = transport.ModelTurnState(deepcopy(EARLIER))
+    with pytest.raises(transport.ClaudexorModelError):
+        client.chat([{"role": "user", "content": "hi"}], MODEL, model_turn_state=slot)
+    assert slot.envelope == EARLIER
+
+
+def test_the_active_turn_token_never_reaches_usage_the_ledger_or_ordinary_logs(setup, turn_engine):
+    root, gateway, client = setup
+    gateway.results = [{**result(), "nativeContinuation": deepcopy(TURN)}]
+    slot = transport.ModelTurnState()
+    _, usage = client.chat([{"role": "user", "content": "hi"}], MODEL, model_turn_state=slot)
+    assert slot.envelope == TURN and repr(slot) == "ModelTurnState(active=True)"
+    token = TURN["payload"]["turnState"]
+    assert token not in json.dumps(usage, default=str) and token not in json.dumps(ledger(root))
+    assert all(token not in path.read_text(encoding="utf-8") for path in (root / "logs").glob("*.jsonl"))

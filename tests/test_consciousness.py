@@ -255,5 +255,64 @@ class TestBackgroundConsciousnessCost(unittest.TestCase):
         self.assertFalse(thought["cost_final"])
 
 
+
+class TestWakeScopedTransportState(unittest.TestCase):
+    """One Background wake is one cache identity and one active transport turn."""
+
+    def _make(self):
+        from ouroboros.consciousness import BackgroundConsciousness
+
+        tmpdir = pathlib.Path(tempfile.mkdtemp())
+        drive_root, repo_dir = tmpdir / "drive", tmpdir / "repo"
+        (drive_root / "logs").mkdir(parents=True)
+        repo_dir.mkdir()
+        with patch.object(BackgroundConsciousness, "_build_registry", return_value=MagicMock()):
+            bc = BackgroundConsciousness(drive_root=drive_root, repo_dir=repo_dir,
+                                         event_queue=None, owner_chat_id_fn=lambda: None)
+        bc._running = True
+        return bc
+
+    def test_each_wake_owns_one_slot_and_key_and_clears_both(self):
+        bc = self._make()
+        seen = []
+
+        def scoped():
+            seen.append((bc._model_turn_state, bc._wake_cache_affinity, bc._model_wait.owner_id))
+            return True
+
+        with patch.object(bc, "_think_scoped", side_effect=scoped):
+            self.assertTrue(bc._think())
+            self.assertTrue(bc._think())
+        first, second = seen
+        # The cache identity IS the wake's existing model-wait owner id.
+        self.assertEqual(first[1], first[2])
+        self.assertEqual(second[1], second[2])
+        self.assertIsNone(first[0].envelope)
+        self.assertIsNot(first[0], second[0])
+        self.assertNotEqual(first[1], second[1])
+        self.assertIsNone(bc._model_turn_state)
+        self.assertEqual(bc._wake_cache_affinity, "")
+
+    def test_a_wake_round_sends_its_own_key_and_slot(self):
+        bc = self._make()
+        sent = []
+
+        def observed(_llm, **kwargs):
+            sent.append((kwargs, bc._wake_cache_affinity, bc._model_turn_state, bc._model_wait.owner_id))
+            return {"content": "thought"}, {"cost": None}
+
+        with (
+            patch.object(bc, "_build_context", return_value="context"),
+            patch.object(bc, "_tool_schemas", return_value=[]),
+            patch.object(bc, "_check_budget", return_value=True),
+            patch("ouroboros.llm_observability.chat_observed", side_effect=observed),
+        ):
+            self.assertTrue(bc._think())
+        self.assertEqual(len(sent), 1)
+        kwargs, key, slot, owner_id = sent[0]
+        self.assertEqual(kwargs["cache_affinity"], owner_id)
+        self.assertEqual(key, owner_id)
+        self.assertIs(kwargs["model_turn_state"], slot)
+
 if __name__ == "__main__":
     unittest.main()

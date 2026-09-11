@@ -268,3 +268,164 @@ def test_same_round_delivery_uses_the_route_changed_inside_model_call(tmp_path, 
         drive_logs=tmp_path / "logs", emit_progress=lambda _text, **_kwargs: None,
         incoming_messages=queue.Queue(), task_id="route-delivery", drive_root=tmp_path)
     assert value == "finished"
+
+
+TURN = {"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "live-turn"}}
+
+
+@pytest.fixture
+def turn_engine(monkeypatch):
+    """A serving engine whose strict request schema accepts the active-turn field."""
+    from ouroboros import config, llm_claudexor
+
+    monkeypatch.setattr(llm_claudexor, "owned_engine_version",
+                        lambda: config.CLAUDEXOR_MODEL_TURN_STATE_MIN_VERSION)
+
+
+def _slot(envelope=None):
+    from ouroboros.llm_claudexor import ModelTurnState
+
+    return ModelTurnState(deepcopy(envelope) if envelope else None)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_same_route_wait_and_reprepare_update_the_original_slot(main_call, turn_engine, asynchronous):
+    """Both real reprepare routes deep-copy their kwargs and must keep ONE owner.
+
+    The synchronous case goes through the live quota wait, the asynchronous one
+    through the proven-un-sent account repair and its thread offload.
+    """
+    ctx, gateway, controller, _events, _decide, _observations = main_call
+    landed = {**result(route=ROUTE_B if asynchronous else ROUTE), "nativeContinuation": deepcopy(TURN)}
+    gateway.results = [_failed("invalid_continuation", ROUTE_B) if asynchronous
+                       else _failed("subscription_window_exhausted"), landed]
+    gateway.dispatch = ["not_started", "response_received"]
+    slot = _slot()
+    ctx.tools._ctx.model_turn_state = slot
+    if asynchronous:
+        disposition = loop._measure_round_main_fit(ctx, automatic_pass_used=False)
+        with controller.register_reprepare("main", lambda values: _reprepare_waiting_main(ctx, values)):
+            with ua.bind_physical_attempt_context(loop._physical_context_for_fit(disposition)):
+                asyncio.run(ctx.llm.chat_async(ctx.messages, MODEL, model_role="main", model_turn_state=slot))
+    else:
+        assert _dispatch(ctx)[0]
+    # The slot the loop still owns is the one the durable result must have replaced.
+    assert ctx.tools._ctx.model_turn_state is slot and slot.envelope == TURN
+    assert len(gateway.operations) == 2 and gateway.uploads[-1][0]["nativeContinuation"] is None
+
+
+def test_a_helper_call_cannot_overwrite_the_running_loop_slot(setup, turn_engine):
+    _root, gateway, client = setup
+    gateway.results = [{**result(), "nativeContinuation": deepcopy(TURN)}]
+    slot = _slot({"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "main-turn"}})
+    client.chat([{"role": "user", "content": "compact this"}], MODEL, model_role="light")
+    assert slot.envelope["payload"]["turnState"] == "main-turn"
+    assert "nativeContinuation" not in gateway.uploads[-1][0]
+
+
+@pytest.mark.parametrize("destination,use_local", [("openai::alternate", False), ("local-model", True)])
+def test_leaving_this_transport_ends_the_turn_and_returning_does_not_revive_it(
+    setup, turn_engine, monkeypatch, destination, use_local,
+):
+    _root, gateway, client = setup
+    answer = ({"role": "assistant", "content": "elsewhere"}, {"cost": None, "provider": "other"})
+    subscription, remote = {"on": False}, client._chat_remote
+    monkeypatch.setattr(client, "_chat_remote",
+                        lambda *args, **kwargs: remote(*args, **kwargs) if subscription["on"] else deepcopy(answer))
+    monkeypatch.setattr(client, "_chat_local", lambda *_args, **_kwargs: deepcopy(answer))
+    slot = _slot(TURN)
+    client.chat([{"role": "user", "content": "hi"}], destination, use_local=use_local, model_turn_state=slot)
+    assert slot.envelope is None
+    subscription["on"] = True
+    client.chat([{"role": "user", "content": "hi"}], MODEL, model_turn_state=slot)
+    assert gateway.uploads[-1][0]["nativeContinuation"] is None
+
+
+def _run_loop(tmp_path, monkeypatch, rounds, registry=None):
+    """Drive one real run_llm_loop invocation, recording the slot every round saw."""
+    from ouroboros.tools.registry import ToolRegistry
+
+    seen, replies = [], iter(rounds)
+
+    def call_round(call):
+        slot = call.tools._ctx.model_turn_state
+        seen.append((slot, deepcopy(slot.envelope)))
+        reply = next(replies)
+        return reply(call) if callable(reply) else reply
+
+    def tools_then_steering(calls, _tools, _logs, _task, _executor, messages, *_args):
+        messages.append({"role": "tool", "tool_call_id": calls[0]["id"], "content": "done"})
+        # Owner steering and host notices arrive as user turns INSIDE one loop;
+        # they must never be read as the start of a new transport turn (P5).
+        messages.append({"role": "user", "content": "[SYSTEM NOTICE]\nkeep going"})
+
+    monkeypatch.setattr(loop, "_call_round_model", call_round)
+    monkeypatch.setattr(loop, "_no_tool_final_answer",
+                        lambda _content, limit, trace, *_args: ("finished", limit.accumulated_usage, trace))
+    monkeypatch.setattr(loop, "handle_tool_calls", tools_then_steering)
+    registry = registry if registry is not None else ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    loop.run_llm_loop(
+        messages=[{"role": "user", "content": "go"}], tools=registry,
+        llm=SimpleNamespace(default_model=lambda: MODEL), drive_logs=tmp_path / "logs",
+        emit_progress=lambda _text, **_kwargs: None, incoming_messages=queue.Queue(),
+        task_id="turn-loop", drive_root=tmp_path)
+    return registry, seen
+
+
+def test_every_round_of_one_loop_shares_its_slot_and_a_next_loop_starts_empty(tmp_path, monkeypatch):
+    def tool_round(call):
+        call.tools._ctx.model_turn_state.envelope = deepcopy(TURN)  # the engine answered
+        return ({"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]}, 0, "max")
+
+    final_round = ({"role": "assistant", "content": "finished"}, 0, "max")
+    registry, seen = _run_loop(tmp_path, monkeypatch, [tool_round, final_round])
+    (first_slot, first_value), (second_slot, second_value) = seen
+    assert first_slot is second_slot and first_value is None and second_value == TURN
+    # A next loop over the SAME context and history — the shape a cold restart
+    # takes — opens a new turn instead of replaying the finished one.
+    _registry, again = _run_loop(tmp_path, monkeypatch, [final_round], registry=registry)
+    assert again[0][0] is not first_slot and again[0][1] is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_legacy_shaped_exchange_leaves_a_live_turn_untouched(setup, monkeypatch, asynchronous):
+    """A legacy result is SILENCE about the turn, not a disclaimer (BIBLE P1).
+
+    The version floor can be closed while the caller already holds a token: an
+    engine this process has never proven, a slot armed by an earlier proven one.
+    Such a request asks nothing about the turn and its result answers nothing,
+    so adopting its absent field would discard a token the engine never dropped.
+    """
+    from ouroboros import llm_claudexor
+
+    _root, gateway, client = setup
+    monkeypatch.setattr(llm_claudexor, "owned_engine_version", lambda: "")
+    slot, messages = _slot(TURN), [{"role": "user", "content": "hi"}]
+    if asynchronous:
+        asyncio.run(client.chat_async(messages, MODEL, model_turn_state=slot))
+    else:
+        client.chat(messages, MODEL, model_turn_state=slot)
+    assert "nativeContinuation" not in gateway.uploads[-1][0]
+    assert slot.envelope == TURN
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_an_opted_in_exchange_still_adopts_and_then_clears_the_turn(setup, turn_engine, asynchronous):
+    """Both entrypoints keep the opt-in contract the legacy guard sits beside."""
+    _root, gateway, client = setup
+    gateway.results = [{**result(), "nativeContinuation": deepcopy(TURN)}, result()]
+    gateway.dispatch = ["response_received"] * 2
+    slot, messages = _slot(), [{"role": "user", "content": "hi"}]
+
+    def send():
+        if asynchronous:
+            asyncio.run(client.chat_async(messages, MODEL, model_turn_state=slot))
+        else:
+            client.chat(messages, MODEL, model_turn_state=slot)
+
+    send()
+    assert slot.envelope == TURN and gateway.uploads[0][0]["nativeContinuation"] is None
+    send()
+    # The engine answered without an envelope: the turn is stateless, not stale.
+    assert gateway.uploads[-1][0]["nativeContinuation"] == TURN and slot.envelope is None

@@ -23,6 +23,7 @@ from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_
 from ouroboros.observability import new_execution_id  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 from ouroboros.tools.registry import ToolRegistry
+from ouroboros.llm_claudexor import ModelTurnState
 from ouroboros.model_wait import ModelWaitInterrupted
 from ouroboros.context import build_user_content  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 from ouroboros.context_budget import ContextReclaimRequest  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
@@ -368,9 +369,9 @@ def run_llm_loop(
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Run the tool loop."""
     ctx = tools._ctx
-    ctx._delivery_candidate, ctx._delivery_candidate_revision = None, 0
-    ctx._delivery_control_required = False
+    ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
     ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
+    ctx.model_turn_state = ModelTurnState()  # one loop invocation is one active transport turn
     _initialize_owner_directives(ctx, messages)
     task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
     active_model = task_model_override or llm.default_model()

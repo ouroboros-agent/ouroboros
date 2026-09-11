@@ -194,6 +194,7 @@ class LLMClient(
         model_poll_control: Any = None,
         model_operation_observer: Any = None,
         model_account_override: str | None = None,
+        model_turn_state: Any = None,
         default_temperature: Optional[float] = None,
         stream: bool = False,
         caller_deadline_ts: Optional[float] = None,
@@ -208,10 +209,17 @@ class LLMClient(
 
         ``default_temperature`` is a host hint, unlike explicit ``temperature``.
         Resolve it on this invocation's effective route after any model wait:
-        raw model operations defer to provider defaults; explicit values win."""
+        raw model operations defer to provider defaults; explicit values win.
+
+        ``model_turn_state`` is the caller's optional active-turn transport slot
+        (``llm_claudexor.ModelTurnState``); this seam is where a dispatch that
+        leaves that transport ends the turn."""
+        from ouroboros.llm_claudexor import turn_state_for_route
+
         messages = self._normalize_system_message_placement(messages)
         with capture_attempt_ids() as attempt_ids:
             if use_local:
+                turn_state_for_route(model_turn_state, "local")
                 message, usage = self._chat_local(
                     messages, tools, max_tokens, tool_choice, timeout=timeout,
                 )
@@ -234,6 +242,7 @@ class LLMClient(
                     model_poll_control=model_poll_control,
                     model_operation_observer=model_operation_observer,
                     model_account_override=model_account_override,
+                    model_turn_state=turn_state_for_route(model_turn_state, target.get("provider")),
                     **({"stream": True} if stream else {}),
                 )
             usage["ledger_attempt_ids"] = list(attempt_ids)
@@ -259,6 +268,7 @@ class LLMClient(
         model_poll_control: Any = None,
         model_operation_observer: Any = None,
         model_account_override: str | None = None,
+        model_turn_state: Any = None,
         use_local: bool = False,
         default_temperature: Optional[float] = None,
         stream: bool = False,
@@ -267,10 +277,14 @@ class LLMClient(
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Async remote chat; no_proxy keeps forked macOS workers off OS proxy APIs.
 
-        Host temperature hints follow ``chat``'s effective-route contract."""
+        Host temperature hints and the active-turn transport slot follow
+        ``chat``'s effective-route contract."""
+        from ouroboros.llm_claudexor import turn_state_for_route
+
         messages = self._normalize_system_message_placement(messages)
         no_proxy = no_proxy or in_worker_process()
         if use_local:
+            turn_state_for_route(model_turn_state, "local")
             from ouroboros.usage_accounting import adopt_physical_attempt_capture, last_physical_attempt_capture
 
             def local_call():
@@ -290,6 +304,7 @@ class LLMClient(
         target = self._resolve_remote_target(model)
         if temperature is None and target.get("provider") != "claudexor":
             temperature = default_temperature
+        carried_turn_state = turn_state_for_route(model_turn_state, target.get("provider"))
         if target.get("provider") == "claudexor":
             from ouroboros.llm_claudexor import chat_claudexor_async
 
@@ -302,6 +317,7 @@ class LLMClient(
                     model_poll_control=model_poll_control,
                     model_operation_observer=model_operation_observer,
                     model_account_override=model_account_override,
+                    model_turn_state=carried_turn_state,
                 )
             result[1]["ledger_attempt_ids"] = list(attempt_ids)
             return result

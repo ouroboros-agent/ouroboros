@@ -1323,7 +1323,7 @@ def call_llm_with_retry(
     transport_reserve_sec: Optional[float] = None, transport_death_retries: int = 0,
     initial_messages: Optional[List[Dict[str, Any]]] = None,
     stop_retry_check: Optional[Callable[[], bool]] = None,
-    model_role: str = "main",
+    model_role: str = "main", model_turn_state: Any = None,
     model_account_override: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
     """Call one model with bounded retries and deadline-aware transport."""
@@ -1373,7 +1373,7 @@ def call_llm_with_retry(
                 "messages": send_messages,
                 "tools": tools,
                 "model": model,
-                "model_role": model_role,
+                "model_role": model_role, "model_turn_state": model_turn_state,
                 "model_account_override": model_account_override,
                 "reasoning_effort": effort,
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,

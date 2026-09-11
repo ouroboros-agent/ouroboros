@@ -469,3 +469,8 @@ Older releases are preserved in this repository's history. Older 6.x rows (inclu
 [MIT License](LICENSE)
 
 Created by [Anton Razzhigaev](https://t.me/abstractDL) & Andrew Kaznacheev
+
+Thanks to [Praxis Relay](https://github.com/josephsteuerjr/praxis-relay) and
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) for the open-source
+ideas and implementations that informed Ouroboros's subscription-backed model
+transport through Claudexor.

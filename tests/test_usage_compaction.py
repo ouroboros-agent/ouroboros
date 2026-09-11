@@ -898,3 +898,22 @@ def test_verify_abort_on_foreign_noncanonical_literal(data_root):
     before_bytes = path.read_bytes()
     assert _compact(data_root) is None
     assert path.read_bytes() == before_bytes
+
+
+def test_a_session_row_carrying_normalized_counters_survives_compaction(data_root):
+    """The optional input split rides an idempotency-bearing row, so the pass
+    retains its content rather than folding it into a baseline group."""
+    counters = {"total_tokens": 270, "cache_read_tokens": 130, "cache_write_tokens": None}
+    _seed_mixed_ledger(data_root)
+    ua.record_subscription_session("sess-counters", drive_root=data_root, route="claudexor:codex",
+                                   model="fable", task_id="t7", root_task_id="root", spend_usd=0.25,
+                                   input_token_usage=counters)
+    before = next(row for row in _ledger_rows(data_root) if row.get("session_id_sha256")
+                  and row.get("input_token_usage"))
+    assert _compact(data_root) is not None
+    after = next(row for row in _ledger_rows(data_root)
+                 if row.get("attempt_id") == before["attempt_id"])
+    resequenced = ("seq", "pre_compaction_seq")  # the pass renumbers, never rewrites
+    assert {key: value for key, value in after.items() if key not in resequenced} == \
+           {key: value for key, value in before.items() if key not in resequenced}
+    assert after["input_token_usage"] == counters

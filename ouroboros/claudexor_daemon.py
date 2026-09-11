@@ -315,6 +315,9 @@ class OwnedClaudexorDaemon:
         self._proc: Optional[subprocess.Popen] = None
         self._last_error = ""
         self._engine_version = ""
+        # Liveness bookkeeping above; the PROVEN serving version below. Only a
+        # successful handshake writes it, so a failed probe cannot retract it.
+        self._proven_engine_version = ""
         self._engine_build_sha = ""
         self._generation = 0
         self._stopping = False
@@ -361,6 +364,7 @@ class OwnedClaudexorDaemon:
                     else gateway.handshake(timeout_sec=timeout_sec)
                 )
                 self._engine_version = gateway.engine_version
+                self._proven_engine_version = str(gateway.engine_version or "")
                 engine = handshake.get("engine") if isinstance(handshake.get("engine"), dict) else {}
                 self._engine_build_sha = str(engine.get("sha") or "")
                 # Reachable-recovering is still "running" (the handshake proves
@@ -386,6 +390,27 @@ class OwnedClaudexorDaemon:
             ):
                 return None, _TRANSPORT_UNREACHABLE, f"{exc.code}: {exc}"
             return None, "stale", f"{exc.code}: {exc}"
+
+    @property
+    def engine_version(self) -> str:
+        """Serving version PROVEN by the last SUCCESSFUL handshake here, else ''.
+
+        A request-shape floor reads this before it has a gateway, so a FAILED
+        probe leaves it exactly as it was: a handshake timeout, a token refusal
+        or a momentarily unreachable socket is silence about the engine, never
+        evidence that a version it already served is gone. Blanking it there
+        would flip a running caller's request shape between the candidate it
+        was priced on and the send, which is a different bug wearing this
+        field's clothes. Only another successful handshake replaces the value,
+        and that is exactly how a deliberate stop or a planned restart on a new
+        pin publishes its engine: the next ``ensure_owned_gateway`` re-proves
+        the serving version, and until then the last proven one stands. Engine
+        DOWNGRADE is not a supported direction, so a supported replacement can
+        only prove the same version or a newer one. ``_engine_version`` stays
+        the liveness projection — current probe, blanked on failure — which is
+        what status and the pin comparison read.
+        """
+        return self._proven_engine_version
 
     def _alive_endpoint(self, *, timeout_sec: Optional[float] = None) -> Optional[Any]:
         """Endpoint of a LIVE daemon on our home, or None. Never spawns."""
@@ -954,6 +979,22 @@ def warm_owned_daemon() -> bool:
     return True
 
 
+def owned_engine_version() -> str:
+    """The serving version proven by the last SUCCESSFUL handshake, no new I/O.
+
+    A feature floor that must be decided BEFORE a gateway exists (the model
+    lane freezes its request bytes before it connects) reads the version the
+    previous ensure/handshake already proved, and keeps reading the same answer
+    while probes fail — several callers probe this singleton concurrently, so a
+    transient failure must not change one caller's request shape mid-turn.
+    Empty means no handshake has succeeded in this process yet, and every floor
+    then fails CLOSED — a process's first model call sends the legacy shape
+    rather than probing the control plane again or trusting the next-spawn pin,
+    which a live daemon may intentionally lag.
+    """
+    return get_owned_daemon().engine_version
+
+
 def read_owned_gateway() -> Any:
     """Connect to the owned engine for metadata, without starting or repairing it.
 
@@ -1066,6 +1107,7 @@ __all__ = [
     "attach_login_shell",
     "resolve_attach_login_argv",
     "ensure_owned_gateway",
+    "owned_engine_version",
     "read_owned_gateway",
     "get_owned_daemon",
     "warm_owned_daemon",
