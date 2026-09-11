@@ -46,7 +46,7 @@ def test_managed_unknown_waits_for_upstream_then_adds_new_input(tmp_path, monkey
     assert recovered[0]["outcome_custody"] == previous
 
 
-@pytest.mark.parametrize("flag", ["is_direct_chat", "is_ephemeral_turn", "exact_model_route"])
+@pytest.mark.parametrize("flag", ["is_direct_chat", "is_ephemeral_turn"])
 def test_unknown_policy_does_not_expand_other_execution_classes(tmp_path, flag):
     ctx = SimpleNamespace(task_id="t", **{flag: True})
     assert transport.reconcile_transport_wait(None, ctx, msg_present=False,
@@ -217,3 +217,9 @@ def test_upstream_head_uses_connection_window_in_every_socket_phase(monkeypatch,
     # allowance, retaining a shorter owner remainder on every socket phase.
     bound = min(remaining, llm._no_proxy_timeout(remaining).connect)
     assert requests[0].extensions["timeout"] == dict(connect=bound, read=bound, write=bound, pool=bound)
+
+
+def test_unknown_policy_keeps_configured_session_nanny_out_of_managed_continuation(tmp_path):
+    ctx = SimpleNamespace(task_id="t", exact_model_route=True, _configured_subagent_route_kind="agent_session")
+    from ouroboros import loop_transport
+    assert loop_transport.reconcile_transport_wait(None, ctx, msg_present=False, error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m", emit_progress=lambda *a, **kw: pytest.fail("unexpected automatic continuation")) is None
