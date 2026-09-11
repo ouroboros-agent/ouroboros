@@ -20,7 +20,11 @@ from ouroboros.task_results import (
     STATUS_REJECTED_DUPLICATE,
     validate_task_id,
 )
-from ouroboros.task_status import load_effective_task_result, wait_for_effective_tasks
+from ouroboros.task_status import (
+    SETTLED_STATUSES,
+    load_effective_task_result,
+    wait_for_effective_tasks,
+)
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import truncate_review_artifact
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
@@ -490,6 +494,13 @@ def _count_live_sibling_children(ctx: ToolContext, status_drive_root: Path, *, e
 
 
 _UNMINTED_WAIT_GRACE_SEC = 30.0
+# The wait ceilings as READABLE facts, for the tool schemas and the expiry
+# disclosure. The literals stay inside ``min(int(timeout_sec), N)`` below —
+# test_cache_optimization scrapes the clamp out of the function source and a
+# named constant there would leave it nothing to find; the test beside it
+# asserts the two spellings agree.
+_WAIT_TASK_CLAMP_SEC = 3600
+_WAIT_TASKS_CLAMP_SEC = 7200
 
 
 def _unminted_wait_ids(ctx: ToolContext, status_drive_root: Path, task_ids: List[str]) -> List[str]:
@@ -799,6 +810,28 @@ def _wait_for_tasks(
             # set instead of re-polling phantoms. Carries children_roster plus
             # the disclosed children_roster_omitted count (never a silent cap).
             waited.update(_children_roster_projection(ctx, status_drive_root))
+    # Disclosed, not silent: the window ended while children were still live.
+    # FACTS only, and deliberately no advisory note — how wide a window to ask
+    # for next is the mind's call (unlike the short-circuit above, whose note
+    # names a broken wait SET); the long-term orientation lives in the schema
+    # description the model reads BEFORE it chooses a window. An id this tree
+    # never minted is disclosed as unknown, never counted as a live child.
+    projected = waited.get("tasks")
+    if (waited.get("timed_out") and not waited.get("all_terminal")
+            and isinstance(projected, dict) and projected):
+        live_ids = [
+            tid for tid in normalized_ids
+            if not (projected.get(tid) or {}).get("unknown_task_id")
+            and str((projected.get(tid) or {}).get("status") or "").strip().lower()
+            not in SETTLED_STATUSES
+        ]
+        if live_ids:
+            waited["wait_expired_with_live_children"] = {
+                "reason": "timeout_expired_before_terminal",
+                "requested_timeout_sec": float(timeout),
+                "max_timeout_sec": float(_WAIT_TASKS_CLAMP_SEC),
+                "live_task_ids": live_ids,
+            }
     horizon_note = cache_horizon_note(ctx, waited.get("elapsed_sec"))
     if horizon_note:
         waited["cache_horizon_note"] = horizon_note
