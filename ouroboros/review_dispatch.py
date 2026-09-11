@@ -361,7 +361,7 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                          default=str).encode("utf-8")).hexdigest()
 
-    supplied = dict(request.reconciliation_identity or {})
+    supplied = dict(getattr(request, "reconciliation_identity", None) or {})
     roster = [{k: v for k, v in asdict(slot).items()
                if k not in {"timeout_sec", "transport_timeout_sec"}} for slot in slots]
     return {
