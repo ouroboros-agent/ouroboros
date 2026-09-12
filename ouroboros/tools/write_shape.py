@@ -373,17 +373,17 @@ def _shell_write_indicator_scan(
             if indicator == ">":
                 if not allow_bare_redirect:
                     continue
-                if interpreter_lane:
-                    # Token-level only: a real redirect is its own shell token or
-                    # glued into an operand; a '>' inside a located inline-code
-                    # body is not a write channel.
-                    if any(
-                        _REDIRECT_SHAPE_TOKEN_RE.match(tok)
-                        or (not _in_located_body(tok) and _MIDTOKEN_REDIRECT_RE.search(tok))
-                        for tok in filtered_tokens
-                    ):
-                        return True
-                    continue
+                # Token-level only, in BOTH lanes: a real redirect is its own shell
+                # token or glued into an operand, so a comparison (`x >= 1`, `a->b`)
+                # is not a write channel. A '>' inside a located inline-code body is
+                # not one either (that set is empty outside the interpreter lane).
+                if any(
+                    _REDIRECT_SHAPE_TOKEN_RE.match(tok)
+                    or (not _in_located_body(tok) and _MIDTOKEN_REDIRECT_RE.search(tok))
+                    for tok in filtered_tokens
+                ):
+                    return True
+                continue
             if exclude_prose_words and indicator in _PROSE_WORD_INDICATORS:
                 continue
             if interpreter_lane:
