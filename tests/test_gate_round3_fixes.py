@@ -16,6 +16,7 @@ GR3-11 import coherence (the fail_tasks half was retired with the
 
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 import time
@@ -415,16 +416,21 @@ def test_final_answer_is_owed_before_the_durable_result_write(tmp_path):
     assert [r["task_id"] for r in owed] == ["ord1"]
     assert owed[0]["text"] == "the answer"
     # Replay behavior is covered by the outbox suite; here the ORDERING is
-    # pinned at the pipeline source (owed registration before the store):
+    # pinned to call sites inside the pipeline, independently of indentation:
     source = (
         pathlib.Path(__file__).resolve().parents[1]
         / "ouroboros" / "agent_task_pipeline.py"
     ).read_text(encoding="utf-8")
-    register_at = source.index(
-        "register_final_answer_owed(task, send_event, env_drive_root=env.drive_root)"
-    )
-    store_call_at = source.index("        _store_task_result(")
-    assert register_at < store_call_at, (
+    pipeline = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "emit_task_results")
+    calls = {
+        name: [node.lineno for node in ast.walk(pipeline)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == name]
+        for name in ("register_final_answer_owed", "_store_task_result")
+    }
+    assert all(len(lines) == 1 for lines in calls.values()), calls
+    assert calls["register_final_answer_owed"][0] < calls["_store_task_result"][0], (
         "GR3-5: the owed registration must precede the durable result write"
     )
 
