@@ -417,6 +417,13 @@ def _interrupted_running_row(root, task_id, *, chat_id=1, age_sec=120.0, **field
                       ts=stamp.isoformat().replace("+00:00", "Z"), **fields)
     append_jsonl(root / "logs" / "events.jsonl",
                  {"ts": utc_now_iso(), "type": "worker_boot", "worker_id": 1})
+    _snapshot_naming_running(root, task_id, chat_id=chat_id)
+
+
+def _snapshot_naming_running(root, task_id, *, chat_id=1):
+    """The snapshot a shutdown left behind, naming one row as still running."""
+    from ouroboros.utils import utc_now_iso
+
     (root / "state").mkdir(parents=True, exist_ok=True)
     (root / "state" / "queue_snapshot.json").write_text(json.dumps({
         "ts": utc_now_iso(), "pending": [], "acceptance_fences": [], "budget_root_fences": [],
@@ -649,3 +656,77 @@ def test_a_worker_that_survived_the_shutdown_is_killed_before_the_terminal_is_wr
     # before spawn_workers over an empty pool (server.py:658-660). See
     # test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody.
     assert stored["result"] == terminal[0]["result"] == LIVE_WORKER_CANCEL
+
+
+@pytest.mark.serial
+def test_the_fence_is_the_same_on_either_side_of_the_reap(roots):
+    """Restore never consults process liveness, so whether the previous
+    generation's worker died before or after the fence was minted must not change
+    anything the owner sees.
+
+    This is the real boot shape: the pool is empty when restore runs (workers_init
+    creates no process and spawn_workers comes after kill_workers, server.py
+    :658-660), so the worker that outlived SIGTERM is an orphan of the previous
+    generation, not a slot this process owns. The live order (restore, then
+    kill_workers) stays exactly as it is, pinned by
+    tests/test_server_shutdown.py::test_supervisor_startup_restores_queue_before_worker_reset.
+    """
+    import time
+
+    from ouroboros import cancel_intents
+    from supervisor import queue as queue_module, task_lifecycle, workers
+    root, _ = roots
+
+    def reap(proc):
+        proc.terminate()
+        proc.join(timeout=5)
+        assert not proc.is_alive()
+
+    def boot(task_id, *, reap_first):
+        survivor = _LiveProc()
+        _interrupted_running_row(root, task_id)
+        if reap_first:
+            reap(survivor)
+        notice: list = []
+        restored = queue_module.restore_pending_from_snapshot(terminalized=notice)
+        alive_at_mint = survivor.is_alive()
+        workers.kill_workers(preserve_pending=True)
+        if not reap_first:
+            reap(survivor)
+        minted = cancel_intents.active_intent(root, task_id) or {}
+        outcome = task_lifecycle.sweep_cancel_intents(now=time.time() + 60).get(task_id)
+        settled = load_task_result(root, task_id)
+        # A later boot re-reading the same pre-restart snapshot must not fence a
+        # row custody already settled, and must not touch its terminal text.
+        _snapshot_naming_running(root, task_id)
+        replay: list = []
+        queue_module.restore_pending_from_snapshot(terminalized=replay)
+        return alive_at_mint, {
+            "restored_pending": restored,
+            "boot_notice": len(notice),
+            "fence_reason": (minted.get("reason"), minted.get("source")),
+            "outcome": outcome,
+            "status": settled.get("status"),
+            "result": settled.get("result"),
+            "replay_notice": replay,
+            "replay_intent": cancel_intents.active_intent(root, task_id),
+            "replay_result": (load_task_result(root, task_id) or {}).get("result"),
+        }
+
+    alive_at_mint, after_the_fence = boot("reaped-after-restore", reap_first=False)
+    dead_at_mint, before_the_fence = boot("reaped-before-restore", reap_first=True)
+
+    # The two compositions really are the two sides of the reap.
+    assert (alive_at_mint, dead_at_mint) == (True, False)
+    assert after_the_fence == before_the_fence
+    assert after_the_fence == {
+        "restored_pending": 0,
+        "boot_notice": 1,
+        "fence_reason": ("server_shutdown", "snapshot_restore"),
+        "outcome": "cancelled",
+        "status": "cancelled",
+        "result": SERVER_STOPPED_CANCEL,
+        "replay_notice": [],
+        "replay_intent": None,
+        "replay_result": SERVER_STOPPED_CANCEL,
+    }
