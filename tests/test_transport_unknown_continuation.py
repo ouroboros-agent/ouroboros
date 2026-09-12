@@ -160,8 +160,9 @@ def test_managed_continuation_keeps_old_money_and_mints_one_new_attempt(tmp_path
     assert ua.usage_projection(tmp_path)["unresolved_upper_bound_usd"] == 1.0
 
 
-@pytest.mark.parametrize("axis", ["matching", "before_wait", "source", "profile", "fingerprint", "model", "local"])
-def test_catalog_reachability_binds_effective_account_and_wait_start(monkeypatch, axis):
+@pytest.mark.parametrize("reported_model", ["absent", None, "test"])
+@pytest.mark.parametrize("axis", ["matching", "empty", "before_wait", "source", "profile", "fingerprint", "model", "local"])
+def test_catalog_reachability_binds_effective_account_and_wait_start(monkeypatch, axis, reported_model):
     import time
     from ouroboros import llm_claudexor
     started = time.time() - 10
@@ -174,14 +175,61 @@ def test_catalog_reachability_binds_effective_account_and_wait_start(monkeypatch
     if axis == "fingerprint": catalog["accountFingerprint"] = "foreign"
     if axis == "model": catalog["models"] = [{"id": "foreign"}]
     if axis == "local": catalog["provenance"] = "local_cache"
+    if axis == "empty": catalog = {}
+    route = {"source": "codex", "credentialProfileId": "effective-profile", "accountFingerprint": "account-a"}
+    if reported_model != "absent": route["model"] = reported_model
+    inv = llm_claudexor._ModelInvocation({}, {}, {})
+    inv.operation_id = "old-unknown-operation"
+    error = inv.error({"code": "transport_unknown", "retryable": False},
+                      {"dispatch": {"state": "unknown", "route": route}}, unknown=True)
+    reads = []
     def read(source, account, **kwargs):
         assert (source, account, kwargs["requested_model"]) == ("codex", "effective-profile", "test")
+        reads.append(kwargs)
         return catalog
     monkeypatch.setattr(llm_claudexor, "model_catalog", read)
     result = transport.upstream_transport_reachable(None, "claudexor::codex=test", timeout=3,
         account_override="", observed_after=started,
-        expected_route={"source": "codex", "model": "test", "credentialProfileId": "effective-profile", "accountFingerprint": "account-a"})
+        expected_route=error.route)
     assert bool(result) is (axis == "matching")
+    assert len(reads) == 1
+    assert error.route == route and error.code == "model_outcome_unknown" and not error.retryable
+    assert error.operation_id == "old-unknown-operation"
+
+
+@pytest.mark.parametrize("axis", ["source", "model", "profile"])
+def test_explicit_unknown_operation_route_mismatch_refuses_before_catalog(monkeypatch, axis):
+    from ouroboros import llm_claudexor
+    route = {"source": "codex", "model": None, "credentialProfileId": "effective-profile"}
+    route[{"source": "source", "model": "model", "profile": "credentialProfileId"}[axis]] = "foreign"
+    monkeypatch.setattr(llm_claudexor, "model_catalog", lambda *a, **kw: pytest.fail("mismatched route was probed"))
+    assert not transport.upstream_transport_reachable(None, "claudexor::codex=test", timeout=3,
+        account_override="effective-profile", expected_route=route)
+
+
+def test_null_reported_model_recovers_without_rewriting_unknown_custody(tmp_path, monkeypatch):
+    from ouroboros import llm_claudexor
+    previous = {"physical_attempt_id": "old-paid-attempt", "operation_id": "old-operation", "outcome": "unknown",
+                "route": {"source": "codex", "model": None, "credentialProfileId": "profile-a",
+                          "accountFingerprint": "account-a"}}
+    episode = transport.TransportWaitEpisode(wait_cause="provider_outcome_unknown", outcome_custody=previous)
+    def catalog(source, profile, **kwargs):
+        assert (source, profile, kwargs["requested_model"]) == ("codex", "profile-a", "test")
+        return {"source": source, "credentialProfileId": profile, "accountFingerprint": "account-a",
+                "provenance": "provider_http", "observedAt": datetime.now(timezone.utc).isoformat(),
+                "models": [{"id": "test"}]}
+    monkeypatch.setattr(llm_claudexor, "model_catalog", catalog)
+    monkeypatch.setattr("ouroboros.model_slots.task_model_binding", lambda *a, **kw: ("main", "profile-a"))
+    monkeypatch.setattr(llm_claudexor, "chat_claudexor", lambda *a, **kw: pytest.fail("metadata must not generate"))
+    ctx = SimpleNamespace(task_id="t", task_metadata={})
+    usage, messages = {}, []
+    assert transport.continue_unknown_transport(episode, llm=None, tools=SimpleNamespace(_ctx=ctx),
+        messages=messages, accumulated_usage=usage, drive_logs=tmp_path, task_id="t",
+        model="claudexor::codex=test", emit_progress=lambda *a, **kw: None)
+    assert messages[0]["role"] == "user" and "NEW physical model attempt" in messages[0]["content"]
+    assert usage["transport_recovery"]["previous_attempt"] == previous
+    assert usage["transport_recovery"]["old_outcome"] == "unknown"
+    assert previous["route"]["model"] is None and episode.outcome_custody == previous
 
 
 def test_stop_before_unknown_probe_preserves_no_send_boundary(tmp_path, monkeypatch):

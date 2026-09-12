@@ -420,7 +420,7 @@ def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
             effective = expected_route or {}
             effective_profile = effective.get("credentialProfileId")
             if (effective.get("source", source) != source
-                    or effective.get("model", native_model) != native_model
+                    or effective.get("model") not in (None, native_model)
                     or (account and effective_profile and account != effective_profile)):
                 return {}
             account = account or effective_profile
