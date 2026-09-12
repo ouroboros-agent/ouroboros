@@ -193,6 +193,29 @@ def _stray_server_note(env: Any) -> str:
     return note
 
 
+def _plan_review_note(env: Any, task_id: str) -> str:
+    """Read this task's recorded wave; its timestamp is a snapshot, not a live lease."""
+    if not task_id:
+        return ""
+    try:
+        from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
+
+        root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        wave = current_plan_review_wave(load_plan_review_state(root, task_id)) or {}
+        if wave.get("closed") or not wave.get("custody_pending"):
+            return ""
+        pending = sum(1 for actor in wave.get("actors") or [] if isinstance(actor, dict)
+                      and actor.get("operation_state") in {"pending_dispatch", "in_flight"})
+        return (
+            f"PLAN REVIEW WAVE OPEN: {str(wave.get('request_fingerprint') or '?')[:8]}, "
+            f"{pending} reviewer slot(s) recorded pending at {wave.get('reviewed_at') or '?'}. "
+            "Work may still be running or awaiting collection."
+        )
+    except (OSError, ValueError, TimeoutError):
+        log.warning("Unable to read plan-review health for %s", task_id, exc_info=True)
+        return ""
+
+
 def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") -> str:
     """Render the health-invariant WARNING block for one reader's context.
 
@@ -339,6 +362,9 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
     except Exception:
         pass
 
+    plan_note = _plan_review_note(env, task_id)
+    if plan_note:
+        checks.append(plan_note)
     # Both delegated-run obligations below read the SAME rotated custody chain,
     # so one traversal serves both instead of a full replay each (I18). A failed
     # read leaves the state None and each block replays for itself exactly as

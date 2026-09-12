@@ -502,6 +502,10 @@ def force_plan_decision(
         enforcement = get_review_enforcement()
     hurry_armed = latched(ctx) is not None
     effective = "advisory" if hurry_armed else enforcement
+    if str(effective or "").lower() == "blocking" and isinstance(state, dict):
+        from ouroboros.tools.plan_review_collect import collect_before_gate
+
+        state = collect_before_gate(ctx, state)
     decision = {
         "required": True,
         "self_opened": not bool(metadata.get("force_plan")),
@@ -547,6 +551,12 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
             "dispositions remain available; a disposition does not close blocking findings "
             "or a degraded wave. Existing in-flight custody can still settle."
         )
+    if decision.get("custody_pending"):
+        return (
+            f"{tag} Plan review is OPEN: reviewer work is still running or awaiting collection. "
+            "The recorded wave retains those results; no final reviewer quorum is established yet. "
+            "Implementation stays held while the review is open."
+        )
     if decision.get("reviewer_slots_degraded"):
         # B2: facts, never a retry coach (P5). The replay promise is CONDITIONAL —
         # wording SSOT: plan_render._degraded_replay_note (a free replay exists only
@@ -589,7 +599,9 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
     if not decision.get("required") or decision.get("status") == "closed":
         return ""
     outcome = str(decision.get("outcome") or "")
-    if decision.get("reviewer_slots_degraded"):
+    if decision.get("custody_pending") or decision.get("review_late_result_pending"):
+        outcome = f"{outcome or 'open'}; reviewer work is running or awaiting collection"
+    elif decision.get("reviewer_slots_degraded"):
         outcome = f"{outcome or 'open'}; no parseable reviewer quorum"
     subject = "Blocking plan review" if decision.get("enforcement") == "blocking" else "Plan review"
     # The wave is still OPEN at finalization, so the verb says so: "remained"

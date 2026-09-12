@@ -2516,6 +2516,10 @@ by "Provider Independence" above. Call-site imperatives:
   (`ReviewRequest.drain_deadline`): the wrapper returns while its workers run,
   but custody is not abandoned — the workers settle into process-local custody
   and announce the wave through the task mailbox (`plan_review_collect`).
+  Before its effective blocking verdict, `owner_hurry.force_plan_decision`
+  collects once at zero wait and projects the returned state. Context health
+  only reads the canonical wave; its pending count/time describe the recorded
+  snapshot, not live worker progress. Neither path dispatches a second panel.
 - Every physical LLM/review/VLM/tool operation that can outlive a logical
   wait emits typed `cognitive_operation` start and terminal facts; the
   supervisor uses the active-operation map only to spare the idle rail, and a
