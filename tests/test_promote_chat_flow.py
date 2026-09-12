@@ -2998,6 +2998,8 @@ def test_steer_refusal_names_the_room_when_the_task_belongs_to_another_chat(tmp_
     ({}, "target_unknown", "may have finished"),
     ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "delegation_role": "subagent",
                             "title": "Review"}}}, "subagent_target", "delegated helper"),
+    ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
+                            "title": "Chat"}}}, "direct_chat_turn", "conversation turn has already"),
 ])
 def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
         tmp_path, monkeypatch, running, reason, phrase):
@@ -3007,15 +3009,23 @@ def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
     assert sent and phrase in sent[0]
 
 
-def test_steer_receipt_keeps_the_renderable_fallback_reason():
-    """`control_routing` renders `reason or 'target_not_steerable'`, and the tool
-    corpus holds that literal: the typed reasons are added beside it, never in
-    place of the default a missing reason still resolves to."""
-    import inspect
+def test_the_steer_tool_renders_the_typed_reason_and_still_defaults_without_one(monkeypatch):
+    """The fallback belongs to the RENDERER, not to the emitter: every refusal the
+    handler emits now carries its own typed reason, and a receipt that carries
+    none (another producer, an older row) still renders the documented default."""
+    from ouroboros.tools import control_routing
 
-    from supervisor import steering
+    answers = iter([
+        ("live", {"status": "needs_manual_target", "reason": "chat_mismatch"}),
+        ("live", {"status": "needs_manual_target"}),
+    ])
+    monkeypatch.setattr(control_routing, "_emit_and_wait_for_routing",
+                        lambda _ctx, _evt: next(answers))
+    ctx = types.SimpleNamespace(pending_events=[], event_queue=None, current_chat_id=1,
+                                task_metadata={})
 
-    assert 'reason=refusal or "target_not_steerable"' in inspect.getsource(steering._handle_steer_task)
+    assert "(chat_mismatch)" in control_routing._steer_task(ctx, "t1", "go")
+    assert "(target_not_steerable)" in control_routing._steer_task(ctx, "t1", "go")
 
 
 def _loud_workspace_failure(tmp_path, monkeypatch, ws_error: str, **kwargs):

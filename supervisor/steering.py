@@ -195,7 +195,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         _emit_routing_receipt(
             ctx, evt, action="steer_task", target=target, target_label=target_label,
             status="needs_manual_target",
-            reason=refusal or "target_not_steerable",
+            reason=refusal,
         )
         if not client_message_id and chat_id:
             try:
