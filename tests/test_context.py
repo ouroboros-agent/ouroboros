@@ -66,27 +66,61 @@ class TestCacheHitRateInvariant:
         result = build_health_invariants(env)
         assert "LOW CACHE HIT RATE" in result
 
+    def _emit_producer_rounds(self, tmp_path, reported, count=6):
+        """Rounds in the PRODUCER's exact shape.
+
+        `loop_llm_call.call_llm_with_retry` is the only emitter of `llm_round`,
+        so a synthesized row proves nothing about what the health line reads:
+        the first version of this rule was inert because the producer stamped
+        `cached_tokens` on every event, including rounds where the provider had
+        reported no cache at all. `reported=None` is a provider that says
+        nothing about caching.
+        """
+        from ouroboros.loop_llm_call import call_llm_with_retry
+
+        class _LLM:
+            def chat(self, **_kwargs):
+                usage = {"provider": "openrouter", "resolved_model": "m",
+                         "prompt_tokens": 1000, "completion_tokens": 10, "cost": 0.0}
+                if reported is not None:
+                    usage["cached_tokens"] = reported
+                return {"content": "ok"}, usage
+
+        for index in range(count):
+            call_llm_with_retry(
+                _LLM(), [{"role": "user", "content": "hi"}], "m", None, "medium", 1,
+                tmp_path / "logs", "cache-probe", index, None, {}, "task", False,
+            )
+
     def test_no_provider_reported_a_cache_leaves_the_share_unknown(self, tmp_path):
-        """Absence is not a measured zero: rounds that never carried
-        cached_tokens used to render as an honest 0% and read as a caching
-        regression nobody had measured."""
+        """Absence is not a measured zero: a run whose provider never reported a
+        cache rendered as an honest 0% and read as a caching regression nobody
+        had measured."""
         from ouroboros.context_health import _compute_cache_hit_rate
 
-        lines = [json.dumps({"type": "llm_round", "prompt_tokens": 1000}) for _ in range(15)]
-        env = self._make_env(tmp_path, lines)
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, None)
         assert _compute_cache_hit_rate(env) is None
         assert "cache hit rate" not in build_health_invariants(env).lower()
 
     def test_an_explicitly_reported_zero_is_still_a_real_zero(self, tmp_path):
         from ouroboros.context_health import _compute_cache_hit_rate
 
-        lines = [
-            json.dumps({"type": "llm_round", "prompt_tokens": 1000, "cached_tokens": 0})
-            for _ in range(15)
-        ]
-        env = self._make_env(tmp_path, lines)
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, 0)
         assert _compute_cache_hit_rate(env) == 0.0
         assert "LOW CACHE HIT RATE" in build_health_invariants(env)
+
+    def test_a_window_with_some_reporting_rounds_still_reports(self, tmp_path):
+        """One reporter is a measurement, so the window is not unknown. The
+        denominator stays the whole measured window, as it always has."""
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, None, count=3)
+        self._emit_producer_rounds(tmp_path, 600, count=3)
+        rate = _compute_cache_hit_rate(env)
+        assert rate is not None and 0.0 < rate < 1.0
 
 
 def test_health_invariants_reports_remote_context_overflow(tmp_path):

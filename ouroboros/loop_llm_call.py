@@ -1539,7 +1539,7 @@ def call_llm_with_retry(
                 "model_category": infer_model_category(display_model),
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
-                "cached_tokens": cached_tokens,
+                "cached_tokens": (cached_tokens if "cached_tokens" in usage else None),
                 "cache_write_tokens": cache_write_tokens,
                 "prompt_cache_ttl": prompt_cache_ttl,
                 "cache_hit_rate": cache_hit_rate,

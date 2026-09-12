@@ -499,10 +499,13 @@ def _compute_cache_hit_rate(env: Any) -> Optional[float]:
             usage = ev.get("usage", ev)
             pt = int(usage.get("prompt_tokens", 0))
             if pt > 0:
+                # An absent key and an explicit null both mean the provider
+                # reported no cache for that round; only a number is a report.
+                cached = usage.get("cached_tokens")
                 total_prompt += pt
-                total_cached += int(usage.get("cached_tokens", 0))
+                total_cached += int(cached or 0)
                 count += 1
-                reported += 1 if "cached_tokens" in usage else 0
+                reported += 1 if cached is not None else 0
     except Exception:
         return None
     # Nobody reporting a cache is not a cache that missed: without the key the
