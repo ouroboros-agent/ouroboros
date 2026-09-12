@@ -807,6 +807,27 @@ def test_lifespan_teardown_stops_and_joins_the_loop_before_the_bus_goes_down():
     assert source[finally_idx + len("    finally:\n"):stop_idx].strip() == ""
 
 
+def test_terminal_custody_precedes_every_best_effort_wait_in_the_teardown():
+    """The one IRREVERSIBLE durable write of the teardown goes first.
+
+    An external SIGKILL arrives about ten seconds after SIGTERM, while the
+    extension-reconcile and host-service waits ahead of kill_workers were worth
+    roughly thirty-nine seconds: an interrupted task was simply never
+    terminalized. Order is now stop flag, bounded join, terminal custody, then
+    the optional waits and the kill-all sweeps."""
+    import inspect
+    import server
+
+    teardown = inspect.getsource(server.lifespan).split("\n    finally:\n", 1)[1]
+    stop_idx = teardown.index("_supervisor_stop.set()")
+    join_idx = teardown.index("supervisor_thread.join(timeout=2)")
+    kill_idx = teardown.index("kill_workers(")
+    extension_idx = teardown.index("extension_reconcile_task.cancel()")
+    host_idx = teardown.index("host_service_listener.close()")
+    sweeps_idx = teardown.index("kill_all_tracked_subprocesses()")
+    assert stop_idx < join_idx < kill_idx < extension_idx < host_idx < sweeps_idx
+
+
 def test_supervisor_revival_clears_a_stale_stop_flag(monkeypatch):
     import server
 

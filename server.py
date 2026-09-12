@@ -1353,27 +1353,6 @@ async def lifespan(app):
         yield
     finally:
         _supervisor_stop.set()  # first: the loop must know a teardown owns what follows
-        if extension_reconcile_task is not None:
-            extension_reconcile_task.cancel()
-            with suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(extension_reconcile_task, timeout=30)
-        if host_service_server is not None:
-            try:
-                host_service_server.should_exit = True
-            except Exception:
-                pass
-        if host_service_task is not None:
-            with suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(host_service_task, timeout=5)
-            if not host_service_task.done():
-                host_service_task.cancel()
-                with suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                    await asyncio.wait_for(host_service_task, timeout=2)
-        host_service_listener.close()
-        ws_heartbeat_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await ws_heartbeat_task
-
         log.info("Server shutting down...")
         # Let the loop leave its current tick BEFORE workers are killed and the
         # bridge/Manager go down: a tick still running would otherwise respawn
@@ -1383,33 +1362,8 @@ async def lifespan(app):
         supervisor_thread = _supervisor_thread
         if supervisor_thread is not None and supervisor_thread.is_alive():
             supervisor_thread.join(timeout=2)
-        try:
-            from ouroboros.local_model import get_manager
-            get_manager().stop_server()
-        except Exception:
-            pass
-        try:
-            from ouroboros.tools.shell import kill_all_tracked_subprocesses
-            kill_all_tracked_subprocesses()
-        except Exception:
-            pass
-        try:
-            from ouroboros.workspace_executor import kill_all_foreground
-            kill_all_foreground(lifespan_drive_root)
-        except Exception:
-            pass
-        try:
-            from ouroboros.tools.services import kill_all_services
-            kill_all_services(lifespan_drive_root)
-        except Exception:
-            pass
-        try:
-            from ouroboros.extension_companion import get_global_supervisor
-            supervisor = get_global_supervisor()
-            if supervisor is not None:
-                supervisor.stop_all()
-        except Exception:
-            pass
+        # Terminal custody FIRST: this is the teardown's one irreversible durable
+        # write and every wait below it is best effort (ARCHITECTURE, Shutdown).
         try:
             restart_requested = _restart_requested.is_set()
             # Record an explicit shutdown cause so a task interrupted by the
@@ -1436,6 +1390,54 @@ async def lifespan(app):
                 **_restart_cleanup_kwargs(),
                 **_managed_update_pending_kwargs(),
             )
+        except Exception:
+            pass
+        if extension_reconcile_task is not None:
+            extension_reconcile_task.cancel()
+            with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(extension_reconcile_task, timeout=30)
+        if host_service_server is not None:
+            try:
+                host_service_server.should_exit = True
+            except Exception:
+                pass
+        if host_service_task is not None:
+            with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(host_service_task, timeout=5)
+            if not host_service_task.done():
+                host_service_task.cancel()
+                with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                    await asyncio.wait_for(host_service_task, timeout=2)
+        host_service_listener.close()
+        ws_heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await ws_heartbeat_task
+
+        try:
+            from ouroboros.local_model import get_manager
+            get_manager().stop_server()
+        except Exception:
+            pass
+        try:
+            from ouroboros.tools.shell import kill_all_tracked_subprocesses
+            kill_all_tracked_subprocesses()
+        except Exception:
+            pass
+        try:
+            from ouroboros.workspace_executor import kill_all_foreground
+            kill_all_foreground(lifespan_drive_root)
+        except Exception:
+            pass
+        try:
+            from ouroboros.tools.services import kill_all_services
+            kill_all_services(lifespan_drive_root)
+        except Exception:
+            pass
+        try:
+            from ouroboros.extension_companion import get_global_supervisor
+            supervisor = get_global_supervisor()
+            if supervisor is not None:
+                supervisor.stop_all()
         except Exception:
             pass
         if _restart_requested.is_set():
