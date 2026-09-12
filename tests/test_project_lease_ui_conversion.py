@@ -174,6 +174,10 @@ def test_mark_task_project_is_fill_only_over_a_different_project():
     assert pending[0]["project_id"] == "token-atlas"
     # Same value stays the idempotent commit point both convert paths rely on.
     assert mark_task_project(running, pending, "t1", "token-atlas") is True
+    # The ONE exception: a conversion that owns the durable binding for that project
+    # moves the in-memory copy onto it, because the copy follows the truth.
+    assert mark_task_project(running, pending, "t1", "token-observatory", authority="binding") is True
+    assert running["t1"]["task"]["project_id"] == "token-observatory"
 
 
 def test_ui_conversion_of_a_bound_task_refuses_before_any_side_effect(tmp_path, monkeypatch):
@@ -231,3 +235,53 @@ def test_ui_conversion_with_an_unreadable_bindings_store_proceeds_and_discloses(
     assert resp.status_code == 200
     assert json.loads(resp.body.decode("utf-8"))["project"]["id"] == "task-tbroken"
     assert "project_binding_unreadable" in caplog.text
+
+
+def test_ui_conversion_of_a_scoped_but_unbound_task_moves_its_lane(tmp_path, monkeypatch):
+    """A bare-workspace promote stamps a DERIVED proj_<hash> on the row without a
+    durable binding and keeps the originating chat, so the Main card still offers
+    "Turn into project". Fill-only alone left that conversion half-done: the durable
+    bind landed while RUNNING/PENDING kept the derived id and the snapshot was
+    skipped, so the new project's one-writer lane stayed free."""
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.project_lease import candidate_is_leasable, running_project_ids
+    from ouroboros.projects_registry import project_binding_for_task
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    snap = tmp_path / "state" / "queue_snapshot.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    derived = "proj_deadbeef1234"
+    running = {"tws": {"task": {"id": "tws", "project_id": derived}}}
+    pending = [{"id": "tpend", "project_id": derived, "type": "task", "chat_id": 5}]
+    for mod in (workers, queue):
+        monkeypatch.setattr(mod, "RUNNING", running)
+        monkeypatch.setattr(mod, "PENDING", pending)
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snap)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tws", "id": "task-tws", "objective_hint": "workspace work"},
+    )))
+    pid = json.loads(resp.body.decode("utf-8"))["project"]["id"]
+
+    assert resp.status_code == 200
+    assert (project_binding_for_task(tmp_path, "tws") or {}).get("project_id") == pid
+    assert running["tws"]["task"]["project_id"] == pid       # the lane followed the binding
+    leased = running_project_ids(running.values())
+    assert leased == {pid}
+    assert candidate_is_leasable({"id": "other", "project_id": pid}, leased) is False
+    assert snap.exists()                                      # the mark reached the snapshot
+
+    resp_pending = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tpend", "id": "task-tpend", "objective_hint": "queued work"},
+    )))
+    assert resp_pending.status_code == 200
+    assert pending[0]["project_id"] == "task-tpend"
+    saved = json.loads(snap.read_text(encoding="utf-8"))
+    assert saved["pending"][0]["task"]["project_id"] == "task-tpend"

@@ -62,7 +62,7 @@ def candidate_is_leasable(candidate: Dict[str, Any], running_ids: Set[str]) -> b
     return _task_project_id(candidate) not in running_ids
 
 
-def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any) -> bool:
+def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authority: str = "") -> bool:
     """Set a task's ``project_id`` wherever it currently lives in the supervisor queue
     state — the live RUNNING map (``{tid: {"task": {...}}}``) AND the PENDING list (bare
     task dicts) — so a POST-HOC project conversion/scope makes it a one-writer lane
@@ -76,10 +76,17 @@ def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any) -> bool:
     task dict was updated; a no-op (False) when the task is neither running nor pending
     (then the durable bind alone is correct — there is no live lane to occupy).
 
-    FILL-ONLY: a task already carrying a DIFFERENT project keeps it and False comes
-    back. The durable binding is the one truth about a task's project (owner decision
-    B4=A); this in-memory copy must never be what moves a task between projects, which
-    is how a second, empty project acquired a live lane."""
+    FILL-ONLY by default: a task already carrying a DIFFERENT project keeps it and
+    False comes back. The durable binding is the one truth about a task's project
+    (owner decision B4=A); this in-memory copy must never be what moves a task
+    between projects, which is how a second, empty project acquired a live lane.
+
+    ``authority="binding"`` is the ONE exception, for a conversion that owns the
+    durable binding for ``pid`` itself: there the in-memory copy FOLLOWS the truth
+    instead of contradicting it. Without it a project-SCOPED but unbound task (a
+    bare-workspace promote carries a derived ``proj_<hash>``) converted durably
+    while its lane stayed on the old id, so the new project's one-writer lane was
+    left free and a concurrent task in it became assignable."""
     key = str(tid or "")
     project = str(pid or "").strip()
     if not key or not project:
@@ -93,7 +100,9 @@ def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any) -> bool:
         ptask = _as_task(item)
         if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
             rows.append(ptask)
-    if any(str(row.get("project_id") or "").strip() not in ("", project) for row in rows):
+    if authority != "binding" and any(
+        str(row.get("project_id") or "").strip() not in ("", project) for row in rows
+    ):
         return False
     updated = False
     for row in rows:

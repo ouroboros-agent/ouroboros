@@ -740,7 +740,13 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             from supervisor.workers import PENDING, RUNNING
 
             with _queue_lock:
-                marked = mark_task_project(RUNNING, PENDING, task_id, str(project["id"]))
+                # This conversion OWNS the binding it is about to write (a task bound
+                # elsewhere was already refused above), so the in-memory copy follows
+                # it even when the row carries a derived project id from a
+                # bare-workspace promote; fill-only alone left that lane behind.
+                marked = mark_task_project(
+                    RUNNING, PENDING, task_id, str(project["id"]), authority="binding",
+                )
             # Persist the snapshot so a still-PENDING converted task survives a restart
             # STILL scoped: restore_pending_from_snapshot rebuilds PENDING from
             # state/queue_snapshot.json (assignment reads task['project_id'] from there,
