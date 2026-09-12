@@ -29,9 +29,12 @@ _ALLOWED_EXTENSIONS = frozenset({
     ".html", ".htm", ".css", ".scss", ".sass", ".svg", ".csv", ".tsv", ".sql", ".graphql", ".gql",
     ".lock", ".license", ".png", ".jpg", ".jpeg", ".gif", ".webp",
     ".wasm", ".mp3", ".ogg", ".wav", ".mp4", ".webm", ".woff", ".woff2", ".ttf", ".otf",
-    # Text certificates and detached signatures the reviewer reads like any
-    # other payload; binary key containers keep no entry here.
-    ".pem", ".asc",
+    # Owner rule (2026-09-11): a suffix never refuses an archive. Certificates,
+    # detached signatures and key containers are inert data like the images,
+    # audio and fonts above, so they stage and the reviewer reads them. What
+    # still refuses: the exact credential leaves in `_is_sensitive` and the
+    # loadable binaries in `_is_loadable_binary`.
+    ".pem", ".asc", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx", ".gpg",
 })
 
 _ALLOWED_BARE_BASENAMES = frozenset({
