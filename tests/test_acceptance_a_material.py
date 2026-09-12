@@ -584,3 +584,25 @@ def test_the_degraded_terminal_keeps_its_wording_and_its_causes(monkeypatch, tmp
         "Task acceptance review: DEGRADED (no valid quorum; not recorded as PASS)."
         " Causes: s1 window_exhausted"
     )
+
+
+def test_a_revision_with_no_recorded_causes_still_names_the_verdict(monkeypatch, tmp_path):
+    """A row that names neither cause nor verdict says less than before.
+
+    `degraded_reasons` is empty for the ordinary case: a FAIL verdict that built
+    an improvement capsule and reached the revision branch. Removing the
+    aggregate word there left "improvement note fed back for pass N." and
+    nothing else, which is strictly less than the line it replaced. The verdict
+    returns when, and only when, the wave recorded no causes of its own.
+    """
+    _no_fence(monkeypatch)
+    emitted: list = []
+    trace: dict = {"tool_calls": [], "review_runs": []}
+    ctx = _ctx(tmp_path, trace=trace, passes_done=1)
+    ctx.emit_progress = lambda message, *, incident=None: emitted.append(message)
+
+    assert _apply_task_acceptance_result(ctx, _fail_result(), record_run=False) is True
+
+    assert trace["acceptance_decision"]["status"] == ACCEPTANCE_REVISION_REQUESTED
+    (line,) = emitted
+    assert line == "Task acceptance review: improvement note fed back for pass 2 (FAIL)."
