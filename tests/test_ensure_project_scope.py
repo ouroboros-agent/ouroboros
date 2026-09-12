@@ -63,7 +63,11 @@ def test_bound_task_renames_its_project_instead_of_creating_a_second(tmp_path):
     """B4=A: the durable binding is the one truth. A task already bound to a
     project that asks to be scoped to a differently named one keeps its project
     and carries the requested name to it - the empty second project that split
-    token-observatory off token-atlas is exactly what this refuses."""
+    token-observatory off token-atlas is exactly what this refuses.
+
+    The event keeps the REQUESTED id: the supervisor handler reads the same
+    binding and owns the rename turn. Rewriting the id here made that branch
+    unreachable, so no rename ever happened while this text claimed one had."""
     from ouroboros.projects_registry import bind_task_to_project, list_projects
     from ouroboros.tools.control import _ensure_project_scope
 
@@ -72,13 +76,63 @@ def test_bound_task_renames_its_project_instead_of_creating_a_second(tmp_path):
     out = _ensure_project_scope(ctx, project_name="Token Observatory")
 
     assert "token-atlas" in out and "no second project" in out
-    assert "Token Observatory" in out
+    assert "Token Observatory" in out and "rename" in out
     assert ctx.project_id == "token-atlas"
     evs = [e for e in ctx.pending_events if e.get("type") == "ensure_project_scope"]
     assert len(evs) == 1
-    assert evs[0]["project_id"] == "token-atlas"
+    assert evs[0]["project_id"] == "token-observatory"
     assert evs[0]["project_name"] == "Token Observatory"
     assert [p["id"] for p in list_projects(tmp_path)] == ["token-atlas"]
+
+
+def test_bound_task_scope_text_claims_no_rename_when_the_name_is_unchanged(tmp_path):
+    """The text must be TRUE: a request that names the project it is already called
+    says nothing about a rename."""
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from ouroboros.tools.control import _ensure_project_scope
+
+    # The bound project already carries the requested display name, while the id the
+    # name derives to is a different one.
+    create_project(tmp_path, "token-atlas", name="Token Observatory")
+    bind_task_to_project(tmp_path, "t1", "token-atlas", 5150, origin={"absent": "system"})
+
+    out = _ensure_project_scope(_ctx(), project_name="Token Observatory")
+
+    assert "no second project" in out
+    assert "rename" not in out
+
+
+def test_bound_task_rename_reaches_the_registry_through_the_real_handler(tmp_path, monkeypatch):
+    """The two halves joined: real tool -> real event -> real supervisor handler.
+    Each half was green on its own while the rename never happened in production."""
+    import ouroboros.projects_registry as reg
+    import supervisor.message_bus as mb
+    from ouroboros.projects_registry import bind_task_to_project, create_project, get_project
+    from ouroboros.tools.control import _ensure_project_scope
+    from supervisor import workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    project = create_project(tmp_path, "token-atlas", name="Token Atlas")
+    bind_task_to_project(tmp_path, "t1", "token-atlas", project["chat_id"], origin={"absent": "system"})
+    broadcasts: list = []
+    announced: list = []
+    monkeypatch.setattr(mb, "get_bridge",
+                        lambda: SimpleNamespace(broadcast=lambda payload: broadcasts.append(payload)))
+    monkeypatch.setattr(workers, "_announce_created_project",
+                        lambda *a, **kw: announced.append(True))
+
+    ctx = _ctx()
+    out = _ensure_project_scope(ctx, project_name="Token Observatory")
+    event = [e for e in ctx.pending_events if e.get("type") == "ensure_project_scope"][0]
+    running = {"t1": {"task": {"id": "t1", "project_id": "token-atlas"}}}
+    workers.ensure_project_scope(event, SimpleNamespace(RUNNING=running, PENDING=[]))
+
+    assert get_project(tmp_path, "token-atlas")["name"] == "Token Observatory"
+    assert [p["id"] for p in reg.list_projects(tmp_path)] == ["token-atlas"]
+    assert broadcasts == [] and announced == []
+    assert running["t1"]["task"]["project_id"] == "token-atlas"
+    assert "rename" in out  # the text was true
 
 
 def test_binding_outranks_a_stale_ctx_scope_and_stays_idempotent(tmp_path):

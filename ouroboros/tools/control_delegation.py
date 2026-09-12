@@ -912,12 +912,14 @@ def _ensure_project_scope(ctx: ToolContext, project_name: str = "", project_id: 
         return (f"⚠️ TOOL_ERROR (ensure_project_scope): this task is already scoped to project "
                 f"'{current}'; it cannot be re-scoped to '{pid}'.")
     # Bound elsewhere: the request becomes a RENAME of the project this task already
-    # belongs to (B4=A), never a second project.
-    pid = bound or pid
+    # belongs to (B4=A), never a second project. The event keeps the REQUESTED id,
+    # because the supervisor handler reads the same binding and owns that turn:
+    # rewriting the id here made its rename branch unreachable and the rename
+    # silently disappeared while this text claimed it had happened.
     # Scope the REST of this task immediately so journal_write and per-project
     # knowledge target the project now; the emitted event makes the supervisor
     # create the registry project, bind THIS task durably, and broadcast.
-    ctx.project_id = pid
+    ctx.project_id = bound or pid
     evt = {
         "type": "ensure_project_scope",
         "task_id": tid,
@@ -937,9 +939,17 @@ def _ensure_project_scope(ctx: ToolContext, project_name: str = "", project_id: 
 
     mode = _emit_control_event(ctx, evt)
     if bound:
-        named = f"; the name '{display_name}' was applied to that project instead" if display_name else ""
-        return (f"OK: this task is durably bound to project '{pid}', so it stays there and no "
-                f"second project was created{named} ({mode}).")
+        from ouroboros.projects_registry import get_project
+
+        # Say only what is true: a rename is claimed exactly when one was requested
+        # AND the bound project does not already carry that name.
+        bound_name = str((get_project(DATA_DIR, bound) or {}).get("name") or "")
+        renaming = bool(display_name) and display_name != bound_name
+        named = (f"; the requested name '{display_name}' was sent to that project as a rename"
+                 if renaming else "")
+        return (f"OK: this task is durably bound to project '{bound}'"
+                f"{f' ({bound_name})' if bound_name else ''}, so it stays there and no second "
+                f"project was created{named} ({mode}).")
     return (
         f"OK: created/attached project '{display_name or pid}' (id={pid}) and scoped this "
         f"task into it ({mode}). journal_write and project knowledge now target this "

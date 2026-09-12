@@ -80,7 +80,9 @@ def _report_binding_failure(
     ``project_scope_conflict``: the task is already bound elsewhere, so no second
     project is created); the row is otherwise the same shape a raising bind writes.
     """
-    log.warning("bind_task_to_project failed for %s/%s (%s)", task_id, project_id, path, exc_info=True)
+    # A refusal carries no live traceback, so only a real bind failure logs one.
+    log.warning("%s for %s/%s (%s)", reason or "bind_task_to_project failed",
+                task_id, project_id, path, exc_info=not reason)
     try:
         append_jsonl(_pool().DRIVE_ROOT / "logs" / "events.jsonl", {
             "ts": utc_now_iso(),
@@ -677,7 +679,11 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
             # lease mark, no broadcast, no announcement.
             if name:
                 try:
-                    update_project(_pool().DRIVE_ROOT, bound, name=name)
+                    from ouroboros.projects_registry import get_project
+
+                    row = get_project(_pool().DRIVE_ROOT, bound) or {}
+                    if str(row.get("name") or "") != name:
+                        update_project(_pool().DRIVE_ROOT, bound, name=name)
                 except Exception:
                     log.warning("ensure_project_scope: rename of %s to %r failed", bound, name, exc_info=True)
             _report_binding_failure(
