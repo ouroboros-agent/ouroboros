@@ -11,8 +11,6 @@ import json
 import pathlib
 from typing import Any
 
-from ouroboros.dialogue_provenance import dialogue_author
-from ouroboros.memory import Memory, _history_timestamp
 from ouroboros.project_dialogue import (
     bound_room_chat, entry_matches_source_ref, project_origin_rows,
     room_membership, source_refs_for_project,
@@ -40,6 +38,8 @@ def _chat_id(row: dict) -> int:
 
 
 def _row_projection(row: dict, stream: str, ordinal: int, root: Any = None) -> dict:
+    from ouroboros.dialogue_provenance import dialogue_author
+
     result = {key: row[key] for key in _ROW_FACTS if key in row}
     result.update(stream=stream, source_ordinal=ordinal)
     result["text"] = str(row.get("content", row.get("text", "")) or "")
@@ -69,6 +69,8 @@ def _row_projection(row: dict, stream: str, ordinal: int, root: Any = None) -> d
 
 
 def _progress_source(root: pathlib.Path, matches) -> tuple[list, dict]:
+    from ouroboros.memory import Memory
+
     live = root / "logs" / "progress.jsonl"
     rows, gaps, generations = [], [], []
     try:
@@ -99,6 +101,8 @@ def read_room_source(drive_root: Any, chat_id: int, *, task_id: str = "",
     message text while making line ranges stable within the captured bytes.
     Missing generations remain explicit coverage facts, never invented history.
     """
+    from ouroboros.memory import Memory, _history_timestamp
+
     root, chat_id = pathlib.Path(drive_root), int(chat_id)
     projects = {int(p["chat_id"]): p for p in list_reserved_projects(root)}
     if chat_id < 0:

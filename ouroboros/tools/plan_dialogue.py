@@ -5,7 +5,6 @@ import json
 import pathlib
 from typing import Any
 
-from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes, task_artifact_dir_path
 from ouroboros.dialogue_evidence import own_room_chat, read_room_source, task_room_record
 from ouroboros.projects_registry import all_task_bindings, list_reserved_projects
 from ouroboros.task_results import load_plan_review_state
@@ -43,6 +42,8 @@ def related_rooms(ctx: Any, root: pathlib.Path, own_chat: int | None) -> list[di
 
 
 def _source_view(root: pathlib.Path, task_id: str, source: dict, ref: dict | None) -> dict:
+    from ouroboros.artifacts import task_artifact_dir_path
+
     view = {key: source[key] for key in ("chat_id", "label", "captured_at", "coverage", "sha256", "bytes", "text", "secrets_redacted") if key in source}
     view["locator"] = f"chat:{source['chat_id']}@{source['sha256']}"
     view["lines"] = source["text"].count("\n")
@@ -60,6 +61,8 @@ def attach_own_dialogue(ctx: Any, root: pathlib.Path, manifest: dict,
     itself mint another paid plan envelope. Health/roster/cycle rails stay with
     the existing engine, which still decides whether any dispatch is earned.
     """
+    from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
+
     task_id = str(getattr(ctx, "task_id", "") or "")
     state = load_plan_review_state(root, task_id)
     recorded = next((wave for wave in reversed(state.get("waves") or [])
@@ -95,6 +98,8 @@ def attach_own_dialogue(ctx: Any, root: pathlib.Path, manifest: dict,
 
 def plan_chat_reader(root: pathlib.Path, task_id: str):
     """Resolve snapshot-qualified chat ranges only through recorded task custody."""
+    from ouroboros.artifacts import read_actor_source_bytes
+
     def read(locator: str):
         chat, sep, digest = locator.partition("@")
         try:
