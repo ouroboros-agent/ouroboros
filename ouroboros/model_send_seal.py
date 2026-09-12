@@ -443,8 +443,11 @@ def reconcile_model_send_seals(
     THROUGH THE SEALING SEAM (its ledger ``candidate_manifest_ref`` carries
     ``model_send_seal_version``) must still resolve to its durable seal. An
     orphan on either side is a typed durable fact — the sweep deletes no seals
-    and fabricates no attempts. Fail-soft: an unreadable ledger is UNKNOWN
-    accounting state and skips every conclusion. Manifests promoted from a
+    and fabricates no attempts. "No attempt row" is asked of the live replay
+    UNION the compaction archive, never of the live file alone, because a
+    folded attempt is absent from it by design. Fail-soft: an unreadable
+    ledger is UNKNOWN accounting state and skips every conclusion, and so is
+    an archive that cannot be read. Manifests promoted from a
     child drive (``promoted_call_manifest``) are excluded — their attempt rows
     legitimately live in the child's ledger, not this one.
     """
@@ -480,6 +483,32 @@ def reconcile_model_send_seals(
     return report
 
 
+def _attempt_row_exists(root: pathlib.Path, attempt_id: str, live_ids: set) -> bool:
+    """Does an accounting attempt row for this seal exist ANYWHERE it may live?
+
+    The live replay alone is not that question once the ledger compacts: a
+    terminal attempt is folded out of the live file and into an archive
+    segment BY DESIGN, and reading its absence there as "no attempt row"
+    turns every folded attempt into a durable orphan_seal fact on the CPL-5
+    monetary/dispatch invariant. ``usage_attempt_recorded`` is the join
+    primitive the compaction design mandates for exactly this verdict (live
+    replay UNION archive, ``docs/v7next/DESIGN_USAGE_COMPACTION.md`` §10); it
+    reuses that lane's own segment and chain caches, so a bulk sweep pays
+    stat-checked walks rather than a re-read per seal. An archive that cannot
+    be read is UNKNOWN accounting state, which is this sweep's existing
+    skip-pass case: unknown never becomes an accusation.
+    """
+    if attempt_id in live_ids:
+        return True
+    try:
+        from ouroboros.usage_compaction import usage_attempt_recorded
+
+        return usage_attempt_recorded(root, attempt_id, live_ids)
+    except Exception:
+        log.debug("model_send reconciliation: archived history unknown", exc_info=True)
+        return True
+
+
 def _reconcile_seal_directions(
     root: pathlib.Path,
     finals: Dict[str, Dict[str, Any]],
@@ -487,6 +516,7 @@ def _reconcile_seal_directions(
     report: Dict[str, Any],
     max_manifests: int,
 ) -> None:
+    live_ids = set(finals)
     for manifest_path in _seal_manifest_paths(root, max_manifests):
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -499,7 +529,7 @@ def _reconcile_seal_directions(
             continue
         report["seals"] += 1
         attempt_id = str(seal.get("attempt_id") or manifest.get("call_id") or "")
-        if attempt_id and attempt_id not in finals:
+        if attempt_id and not _attempt_row_exists(root, attempt_id, live_ids):
             report["orphan_seals"] += 1
             _write({
                 "type": VIOLATION_EVENT_TYPE,

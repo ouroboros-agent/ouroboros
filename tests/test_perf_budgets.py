@@ -277,6 +277,92 @@ def test_chat_history_reads_bounded_progress_tail_with_zero_artifact_work(
     assert artifact_counters == {"collect": 0, "copy": 0, "disposition": 0}
 
 
+def _install_ledger_read_counters(monkeypatch):
+    """Count full ledger replays and the two projections the live branches use."""
+    counters: dict = {"full_reads": [], "projections": [], "breakdowns": []}
+    real_full_read = usage_ledger._read_records_locked
+    real_projection = ua.usage_projection
+    real_breakdown = ua.usage_breakdown
+
+    def counted_full_read(target_root):
+        counters["full_reads"].append(str(target_root))
+        return real_full_read(target_root)
+
+    def counted_projection(*args, **kwargs):
+        counters["projections"].append(kwargs)
+        return real_projection(*args, **kwargs)
+
+    def counted_breakdown(*args, **kwargs):
+        counters["breakdowns"].append(kwargs)
+        return real_breakdown(*args, **kwargs)
+
+    monkeypatch.setattr(usage_ledger, "_read_records_locked", counted_full_read)
+    # usage_accounting re-binds the substrate name at import; the memo resolves
+    # it in its own namespace, so the counter must cover both bindings.
+    monkeypatch.setattr(ua, "_read_records_locked", counted_full_read)
+    monkeypatch.setattr(ua, "usage_projection", counted_projection)
+    monkeypatch.setattr(ua, "usage_breakdown", counted_breakdown)
+    return counters
+
+
+def test_live_root_surfaces_replay_the_ledger_zero_times_when_warm(
+    tmp_path, monkeypatch,
+):
+    """The two surfaces a project chat actually opens on a LIVE root: chat
+    history (which projects a non-final root's subtree cost for the newest
+    progress row) and GET /api/tasks/{id} (which derives cost_breakdown). The
+    sibling budgets above seed a COMPLETED task, so neither live branch runs
+    there. Warm, each surface asks its projection exactly ONCE and the
+    memo/render cache answers it: ZERO full ledger replays under the monetary
+    lock, which is what made an oversized ledger cost seconds per open."""
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.gateway.tasks import _task_get_response
+    from ouroboros.task_results import write_task_result
+
+    root = _seeded_accounting_root(tmp_path, monkeypatch)
+    (root / "logs" / "chat.jsonl").write_text(
+        json.dumps({"ts": "2026-08-08T00:00:00Z", "direction": "in", "text": "hello"}) + "\n",
+        encoding="utf-8",
+    )
+    with (root / "logs" / "progress.jsonl").open("w", encoding="utf-8") as handle:
+        for i in range(5):
+            handle.write(json.dumps({
+                "ts": f"2026-08-08T00:00:{i:02d}Z", "content": f"step-{i}", "task_id": "root-1",
+            }) + "\n")
+    # NON-final: `live` in history.py is `status not in FINAL_STATUSES`.
+    write_task_result(root, "root-1", "running", result="working", ts="2026-08-08T00:00:00Z")
+
+    history = make_chat_history_endpoint(root)
+    request = types.SimpleNamespace(
+        path_params={"task_id": "root-1"},
+        query_params={},
+        app=types.SimpleNamespace(state=types.SimpleNamespace(drive_root=root)),
+    )
+    counters = _install_ledger_read_counters(monkeypatch)
+    asyncio.run(history(request))  # cold: fills the rows memo
+    assert len(counters["full_reads"]) == 1  # cold memo fill = one full replay
+    counters["full_reads"].clear()
+    counters["projections"].clear()
+
+    messages = json.loads(asyncio.run(history(request)).body)["messages"]
+    live_rows = [m for m in messages if m.get("cost_with_children_partial")]
+
+    assert live_rows  # the live-root branch really ran (not a vacuous budget)
+    assert live_rows[-1]["cost_accounting_status"] == "available"
+    assert counters["full_reads"] == []  # warm: ZERO full ledger replays
+    assert len(counters["projections"]) == 1  # one live-root projection, cached
+    assert counters["projections"][0]["root_task_id"] == "root-1"
+
+    counters["projections"].clear()
+    payload = json.loads(_task_get_response(request).body)
+
+    assert payload["cost_breakdown"]["authority"] == "physical_attempt_ledger"
+    assert counters["full_reads"] == []  # warm: ZERO full ledger replays
+    assert len(counters["breakdowns"]) == 1  # one subtree breakdown, cached
+    assert counters["breakdowns"][0]["root_task_id"] == "root-1"
+    assert counters["projections"] == []  # the detail path reads no projection
+
+
 def test_logs_tail_reads_bounded_events_tail(tmp_path, monkeypatch):
     """/api/logs/{name} with a satisfiable limit reads a byte tail of a large
     events log, never the whole file."""
