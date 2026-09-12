@@ -125,14 +125,15 @@ Monetary equality is defined **on decimals, never on float accumulation**:
 - Before committing, the compactor replays the candidate bytes through the
   PRODUCTION aggregation (`_final_rows` → `_summary`, per-root summaries with
   `min` limits, `_breakdown_bucket` global and per model/provider/category/
-  task/root axis) and requires the rendered dicts to be **equal** to the same
-  render of the source rows. Any inequality — including a sub-microdollar
-  float-rounding boundary — aborts the compaction and leaves the ledger
-  byte-identical. Compaction is an optimization; correctness never trades.
+  task/root axis) and requires the **non-money** rendered dicts to equal the
+  corresponding source projection. The separate `decimal_totals` check
+  requires exact money equality. Either mismatch aborts the compaction and
+  leaves the ledger byte-identical; float accumulation is not an additional
+  equality gate.
 
-So: the decimal ledger-level sums are exactly preserved by construction, and
-the float projection the budget enforcement actually reads is proven equal by
-replay before the swap, else no swap.
+The stored decimal money and non-money projections are preserved before the
+swap. Existing readers still accumulate and round floats, so their displayed
+money can differ across a fold even when the exact ledger sums are identical.
 
 ## 6. seq policy
 
@@ -668,10 +669,11 @@ tests/fixtures_usage_compaction.py)
    subscription sessions, per-root limits, every axis shape. The float dollars
    those renders carry are deliberately NOT part of that equality (R2-37).
    Readers round money at six places, so one history summed per row and summed
-   per group can land on either side of that boundary, and a displayed value
-   may move by up to 1e-6, a ten-thousandth of a cent, across a fold (pinned
-   in `tests/test_usage_compaction_fingerprint.py`, where `settled_usd`
-   2.467588 becomes 2.467589 while the exact decimal sum is unchanged).
+   per group can land on either side of that boundary. The regression fixture
+   in `tests/test_usage_compaction_fingerprint.py` observes a 1e-6 USD shift,
+   a ten-thousandth of a cent: `settled_usd` 2.467588 becomes 2.467589 while
+   the exact decimal sum is unchanged. This observation is not a universal
+   float-drift bound enforced by the compactor.
    Comparing the float view as well would abort correct folds forever instead
    of protecting a cent; the money itself stays exact by the decimal check
    that runs beside it. A sum needing more than the ambient 28 digits
@@ -688,7 +690,7 @@ tests/fixtures_usage_compaction.py)
    candidate temp is fsync'd BEFORE the rename (without it the renamed inode
    can hold unwritten data — neither the old ledger nor the approved new one)
    and the ledger's directory after it.
-4. **Budget sees the same numbers**: root/global enforcement thresholds are
+4. **Budget limits are preserved**: root/global enforcement thresholds are
    unchanged across compaction.
 5. **CPL-5 join survives**: every pre-compaction `attempt_id` remains
    resolvable through live ∪ archive, across chained compactions; a tampered
@@ -777,6 +779,5 @@ tests/fixtures_usage_compaction.py)
 - Folding subscription/external/legacy/review-attributed rows (disclosed
   residuals, §3).
 - Any GC of archive segments or the quarantine file (append-only, never).
-- The CPL-5 sweep implementation itself (not on this base; §10 records its
-  contract).
+- Changes to the CPL-5 sweep beyond the archive-aware membership join in §10.
 - Changing `USAGE_LEDGER_WARN_BYTES` or the lock timeouts.
