@@ -1874,10 +1874,10 @@ both critical. The imperatives:
   performs identically (a crash inside that repair itself — a torn quarantine
   sink — is a known residual, issue #586), the empty
   `state/` directory the reader's lock lives in on a never-initialized root,
-  and removal of a stale `usage_attempts.lock` older than the reader's 90 s
-  stale window (`usage_ledger._locked` →
-  `platform_layer.acquire_exclusive_file_lock`, whose stale-age branch unlinks
-  the lock file and retries) — each pinned by a regression; every ledger
+  and recovery of `usage_attempts.lock` through `usage_ledger._locked` →
+  `platform_layer.acquire_exclusive_file_lock`: confirmed owner death permits
+  immediate kernel/inode recovery, while unknown metadata retains the 90 s
+  stale grace. The caller's 45 s acquisition budget is unchanged — each pinned by a regression; every ledger
   state, an absent file included, is answered through the canonical reader.
 - `task_constraint` boolean parsing is strict (`"false"` is false); deadlines
   only narrow, delegation budgets only reduce, absent depth requests stay
