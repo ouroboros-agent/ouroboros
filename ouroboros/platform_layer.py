@@ -296,9 +296,9 @@ def acquire_exclusive_file_lock(
                     for field in os.read(probe, 512).decode("utf-8", "replace").split():
                         if field.startswith("pid=") and field[4:].isdigit():
                             owner_pid = int(field[4:])
-                    stale = bool(judged) and (time.time() - judged[2] / 1e9) > stale_sec and not (
-                        owner_aware_stale and owner_pid > 0 and pid_is_alive(owner_pid)
-                    )
+                    stale = bool(judged) and (time.time() - judged[2] / 1e9) > stale_sec
+                    if judged and owner_aware_stale and owner_pid > 0:
+                        stale = not pid_is_alive(owner_pid)  # Proven death needs no age grace.
                     # Judge and evict the same inode under a kernel hold.
                     if stale and enforced:
                         try:
@@ -1078,6 +1078,11 @@ def pip_install_target_args(interpreter: str) -> List[str]:
     """Use the embedded interpreter's userbase; never add --user for a dev venv.
 
     Bundle-signature and target policy: ARCHITECTURE §1 CLI / Headless Boundary."""
+    invocation = pathlib.Path(interpreter)
+    if invocation.parent.name.lower() in {"bin", "scripts"} and (
+        invocation.parent.parent / "pyvenv.cfg"
+    ).is_file():
+        return []  # Resolve only after Python's lexical venv selection is known.
     return ["--user"] if interpreter_is_embedded(interpreter) else []
 
 

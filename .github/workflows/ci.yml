@@ -1,7 +1,7 @@
 # Ouroboros CI — Five-tier cross-platform testing and release pipeline
 #
 # Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests (~1 min)
-# Tier 2 (Full):        Push to ouroboros-stable / manual / tag                       → Full 3-OS matrix          (~5 min)
+# Tier 2 (Full):        Every PR → Windows/macOS; stable / manual / tag → full 3-OS matrix (~5 min)
 # Tier 2.5 (Integration): Push to main / ouroboros / ouroboros-stable / manual / tag  → Real-provider tests       (~2 min)
 # Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
@@ -53,10 +53,9 @@ on:
   # Only fork-safe jobs match pull_request refs, including narrow Publish UI proof.
   pull_request:
     branches: [ouroboros]
-  # A plain dispatch (the pre-tag 3-OS matrix: `gh workflow run CI --ref <branch>`)
-  # never spends money: the paid e2e-live lane runs only when its opt-in input is
-  # set (`-f e2e_live=true`). Inputs do not change `github.event_name`, so every
-  # job gated on the bare `workflow_dispatch` event is unaffected by this block.
+  # Plain dispatch retains the provider and skill-review jobs and can spend
+  # money. The separate paid e2e-live stand additionally requires its opt-in
+  # input (`-f e2e_live=true`); all other dispatch gates stay unchanged.
   workflow_dispatch:
     inputs:
       e2e_live:
@@ -197,17 +196,18 @@ jobs:
         run: python -m pytest tests/test_devtools_benchmarks.py devtools/benchmarks -m "not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" --timeout=300 --timeout-method=thread -q --tb=short
 
   # ──────────────────────────────────────────────────────────────────
-  # Tier 2: Full matrix (stable branch, manual, or tag push)
+  # Tier 2: Ordinary tests on PR Windows/macOS; full 3-OS stable/manual/tag matrix
   # ──────────────────────────────────────────────────────────────────
   full-test:
     if: |
       github.ref == 'refs/heads/ouroboros-stable'
       || github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v')
+      || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["windows-latest","macos-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     env:
       # Same contract as quick-test: this job provisions the parallel-pass
@@ -243,7 +243,7 @@ jobs:
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
         run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
       # Same size-ratchet enforcement contract as quick-test (see its comment).
-      # full-test triggers: stable pushes carry event.before; dispatch runs leave
+      # PRs carry their base SHA; stable pushes carry event.before; dispatch runs leave
       # the env empty and tag pushes carry an all-zeros before — both degrade to
       # the tip's parent manifest (never a skip: a skip would let a recreated
       # branch grandfather debt in one green run).
