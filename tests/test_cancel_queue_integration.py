@@ -849,22 +849,32 @@ def _restart_snapshot(qenv, monkeypatch, *, running: list, pending: list = (), t
     return path
 
 
+SERVER_STOPPED_CANCEL = "Task cancelled: the server stopped while this task was still running."
+
+
 def test_snapshot_restore_fences_a_surviving_running_row_for_custody(qenv, monkeypatch):
     """Q11=A: work the window killed ends as Cancelled — through the ONE settle
     owner. Restore only mints the durable intent; the terminal write, the kill and
-    the reconcile stay with cancellation custody a watchdog window later."""
+    the reconcile stay with cancellation custody a watchdog window later, and the
+    card states the same fact the boot line states."""
     import time
 
     from supervisor import task_lifecycle
 
     write_task_result(qenv.drive, "interrupted-root", STATUS_RUNNING, chat_id=1)
+    write_task_result(qenv.drive, "interrupted-child", STATUS_RUNNING, chat_id=1,
+                      parent_task_id="interrupted-root", root_task_id="interrupted-root",
+                      delegation_role="subagent")
     _restart_snapshot(qenv, monkeypatch, running=[
         {"id": "interrupted-root", "task": {"id": "interrupted-root", "chat_id": 1}},
+        {"id": "interrupted-child", "task": {"id": "interrupted-child", "chat_id": 1,
+                                             "delegation_role": "subagent",
+                                             "parent_task_id": "interrupted-root"}},
     ])
 
     fenced: list = []
     assert qenv.q.restore_pending_from_snapshot(terminalized=fenced) == 0
-    assert fenced == ["interrupted-root"]
+    assert fenced == ["interrupted-root", "interrupted-child"]
 
     # Restore is NOT a terminal writer: the row is untouched, the intent is durable.
     assert load_task_result(qenv.drive, "interrupted-root")["status"] == STATUS_RUNNING
@@ -874,22 +884,25 @@ def test_snapshot_restore_fences_a_surviving_running_row_for_custody(qenv, monke
     rows = [json.loads(line) for line in
             (qenv.drive / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()]
     restore_rows = [row for row in rows if row["type"] == "queue_restored_from_snapshot"]
-    assert restore_rows[-1]["terminalized_running"] == ["interrupted-root"]
+    assert restore_rows[-1]["terminalized_running"] == ["interrupted-root", "interrupted-child"]
     assert restore_rows[-1]["restored_pending"] == 0
 
-    # A second boot before custody ran re-reads the same row and mints nothing new.
+    # A second boot before custody ran re-reads the same rows and mints nothing new.
     second: list = []
     assert qenv.q.restore_pending_from_snapshot(terminalized=second) == 0
     assert second == []
     assert ci.active_intent(qenv.drive, "interrupted-root")["request_id"] == intent["request_id"]
 
-    # The existing watchdog half terminalizes it; the text is custody's own.
+    # The existing watchdog half terminalizes them, and its text names the cause
+    # the fence carried: a card that says "was neither queued nor running" would
+    # contradict the very fact that minted the intent.
     outcomes = task_lifecycle.sweep_cancel_intents(now=time.time() + 60)
-    assert outcomes["interrupted-root"] == "cancelled"
-    settled = load_task_result(qenv.drive, "interrupted-root")
-    assert settled["status"] == STATUS_CANCELLED
-    assert settled["result"].startswith("Task cancelled")
-    assert ci.active_intent(qenv.drive, "interrupted-root") is None
+    assert outcomes == {"interrupted-root": "cancelled", "interrupted-child": "cancelled"}
+    for task_id in ("interrupted-root", "interrupted-child"):
+        settled = load_task_result(qenv.drive, task_id)
+        assert settled["status"] == STATUS_CANCELLED
+        assert settled["result"] == SERVER_STOPPED_CANCEL
+        assert ci.active_intent(qenv.drive, task_id) is None
 
 
 def test_snapshot_restore_leaves_owned_and_terminal_running_rows_alone(qenv, monkeypatch):
@@ -951,7 +964,11 @@ def test_snapshot_restore_fence_expires_the_open_quiz_and_closes_the_owner_wait(
 
     assert task_lifecycle.sweep_cancel_intents(now=time.time() + 60)[task_id] == "cancelled"
 
-    assert load_task_result(qenv.drive, task_id)["status"] == STATUS_CANCELLED
+    stored = load_task_result(qenv.drive, task_id)
+    assert stored["status"] == STATUS_CANCELLED
+    # The lost quiz carries its cause in the cancel text, which is why no new
+    # "lost to a restart" quiz state exists.
+    assert stored["result"] == SERVER_STOPPED_CANCEL
     # Custody publishes the terminal event; the supervisor's task-done seam
     # (events_task_done -> reconcile_terminal_task_projections) is what closes
     # the per-task owner-control projections, exactly as for any other terminal.
