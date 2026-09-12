@@ -17,8 +17,6 @@ from ouroboros.project_facts import filter_out_project_store as _filter_out_proj
 from ouroboros.project_facts import project_store_access_block as _project_store_access_block
 from ouroboros.protected_artifacts import block_reason_for_path
 from ouroboros.credential_shapes import (  # noqa: F401 — historical facade surface (tools/core re-exports)
-    CREDENTIAL_FILE_SUFFIXES,
-    CREDENTIAL_NAME_RE,
     SUBAGENT_CREDENTIAL_FILE_NAMES as _SUBAGENT_SECRET_FILE_NAMES,
 )
 from ouroboros.tool_access import (

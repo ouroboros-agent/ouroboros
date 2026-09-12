@@ -12,8 +12,6 @@ from ouroboros.credential_shapes import (
     BENIGN_DOT_NAMES,
     CREDENTIAL_COMPONENT_NAMES,
     CREDENTIAL_FILE_NAMES,
-    CREDENTIAL_FILE_SUFFIXES,
-    CREDENTIAL_NAME_RE,
 )
 from ouroboros.tool_access import (
     _path_is_relative_to_casefold,
@@ -61,11 +59,7 @@ def lexical_user_files_block_reason(candidate: pathlib.Path) -> str:
         if part.startswith(".") and lower not in BENIGN_DOT_NAMES:
             return "path is hidden or credential-like (non-allowlisted hidden component)"
     name = pathlib.PurePath(str(candidate)).name.lower()
-    if (
-        name in CREDENTIAL_FILE_NAMES
-        or CREDENTIAL_NAME_RE.search(name)
-        or name.endswith(CREDENTIAL_FILE_SUFFIXES)
-    ):
+    if name in CREDENTIAL_FILE_NAMES:
         return "path name is credential-like"
     return ""
 

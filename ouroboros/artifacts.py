@@ -177,13 +177,11 @@ def stage_task_attachments(
             return False
 
     # SSOT secret detection: reuse the shared credential-shape vocabulary so a
-    # credential SOURCE (e.g. ~/.ssh/id_rsa, credentials.json, *.pem) is never copied in.
+    # credential SOURCE (e.g. ~/.ssh/id_rsa, credentials.json) is never copied in.
     from ouroboros.credential_shapes import (
         BENIGN_DOT_NAMES,
         CREDENTIAL_COMPONENT_NAMES,
         CREDENTIAL_FILE_NAMES,
-        CREDENTIAL_FILE_SUFFIXES,
-        CREDENTIAL_NAME_RE,
     )
 
     # G10 (capinv-447): BOTH attachment routes get ONE policy. A path-selected
@@ -227,10 +225,6 @@ def stage_task_attachments(
         name_lower = name.lower()
         if name_lower in CREDENTIAL_FILE_NAMES:
             return f"credential-shaped file name {name!r}"
-        if CREDENTIAL_NAME_RE.search(name):
-            return f"credential-shaped token in file name {name!r}"
-        if name_lower.endswith(CREDENTIAL_FILE_SUFFIXES):
-            return f"private key / certificate suffix on {name!r}"
         return ""
 
     try:

@@ -161,9 +161,11 @@ def test_block_reason_protects_runtime_and_credentials_even_in_external(tmp_path
     # for READS too (location boundary, not a name shape).
     assert user_files_path_block_reason(ext, child / "memory" / "identity.md")
     assert user_files_path_block_reason(ext, child / "memory" / "identity.md", operation="read")
-    # Credential-like names: mutation stays shape-denied; root reads are
-    # location-only (capinv-447 / В23=A — bytes are masked at egress instead).
-    assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem")
+    # A credential-shaped NAME outside a credential location no longer refuses
+    # mutation either: the fence is the location (~/.ssh, ~/.aws, ...) and the
+    # exact credential leaves, never the suffix. Root reads stay location-only
+    # (capinv-447 / В23=A — bytes are masked at egress instead).
+    assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem") == ""
     assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem", operation="read") == ""
 
 
@@ -362,9 +364,10 @@ def test_external_workspace_shell_can_write_configured_deliverable_only_at_top_l
 
     outside = tmp_path / "outside"
     outside.mkdir()
+    # Exact credential leaves and real credential directories only: a suffix
+    # such as token.pem is ordinary owner output and is no longer refused.
     targets = [
         deliverables / ".env",
-        deliverables / "token.pem",
         deliverables / ".ssh" / "key",
     ]
     try:
@@ -418,7 +421,6 @@ def test_nested_deliverables_keeps_target_policy_before_workspace_root(
     for target in (
         deliverables / ".hidden" / "file",
         deliverables / ".ssh" / "key",
-        deliverables / "token.pem",
     ):
         blocked = _shell_guard_text(reg,
             {"cmd": ["touch", str(target)], "cwd": str(workspace)}, "advanced",

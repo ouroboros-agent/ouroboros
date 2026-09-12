@@ -1,7 +1,7 @@
 """Credential leaf shapes and physical owner locations (leaf module).
 
-Single source for the credential-name dictionaries and the name regex that
-previously lived as three inline copies (tool_access + two in tools/core).
+Single source for the credential-name dictionaries that previously lived as
+three inline copies (tool_access + two in tools/core).
 
 Consumers: MUTATION-side user_files gates (write/edit/shell targets), the
 Deliverables/output lexical guards, attachment-staging ingest, and the child
@@ -15,7 +15,6 @@ decisions without importing this module.
 from __future__ import annotations
 
 import pathlib
-import re
 
 # Conservative directory shapes for capture/ingest, not root authorization.
 CREDENTIAL_COMPONENT_NAMES = frozenset({
@@ -98,13 +97,6 @@ SUBAGENT_CREDENTIAL_FILE_NAMES = frozenset({
     "tokens.json",
 })
 
-CREDENTIAL_NAME_RE = re.compile(
-    r"(?:^|[._-])(api[_-]?key|credential|password|secret|token)(?:[._-]|$)", re.I
-)
-
-CREDENTIAL_FILE_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
-
-
 def owner_credential_locations(home: pathlib.Path) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
     """The existing host credential locations, independent of project names.
 
@@ -139,6 +131,6 @@ def user_files_mutation_shape_reason(resolved: pathlib.Path, home: pathlib.Path)
     if any(part.lower() in {".git", ".hg", ".svn"} for part in parts):
         return "path is hidden or credential-like (VCS control directory)"
     name_lower = resolved.name.lower()
-    if name_lower in (CREDENTIAL_FILE_NAMES - {"settings.json"}) or name_lower.endswith(CREDENTIAL_FILE_SUFFIXES):
+    if name_lower in (CREDENTIAL_FILE_NAMES - {"settings.json"}):
         return "path name is credential-like"
     return ""
