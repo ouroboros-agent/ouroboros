@@ -302,38 +302,14 @@ async def answer_decision(
                 "— retry to preserve and deliver it to the task",
                 503, task_id=task_id, reason_code="quiz_history_write_failed",
             )
-        if not outcome.get("ok"):
-            error = str(outcome.get("error") or "quiz_answer_refused")
-            state = str(outcome.get("state") or "")
-            if error == "quiz_not_found":
-                return _refused("quiz not found", 404, task_id=task_id,
-                                  reason_code=error)
-            status = 409
-            payload: Dict[str, Any] = {
-                "ok": False, "error": error, "decision_id": decision_id,
-            }
-            # The truthful lifecycle state settles the card client-side: a
-            # closed quiz on a SETTLED task reads as expired, an already
-            # answered one as answered.
-            payload["state"] = state or ("expired_terminal" if task is None else "")
-            refused_block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
-            if isinstance(refused_block.get("answered_index"), int):
-                # The loser of a first-wins race settles honestly: the card
-                # learns the WINNING option, never a false expiry.
-                payload["answered_index"] = refused_block["answered_index"]
-            if str(refused_block.get("comment") or ""):
-                payload["comment"] = str(refused_block["comment"])
-            if error in {"option_out_of_range", "answer_empty"}:
-                status = 400
-            return status, payload
-        if task is not None:
+        if task is not None and block.get("state") == "answered":
             from supervisor.queue import _task_drive_for_task
 
             from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, write_owner_message
 
-            # EVERY accepted request appends the control — fresh, same-id
-            # retry, or a duplicate after a mailbox write failure (the hurry
-            # heal semantics): the msg_id is stable per quiz, so the drain
+            # Every proven winning answer can heal its delivery, including a
+            # competing new request after a partial write. The loser still
+            # receives 409 below; the msg_id is stable per quiz, so the drain
             # dedupes a doubled line while a LOST control is healed by any
             # retry instead of being unrecoverable (the drain reads only the
             # mailbox, never the projection).
@@ -363,6 +339,30 @@ async def answer_decision(
                     "be written — retry to deliver it to the task",
                     503, task_id=task_id, reason_code="mailbox_write_failed",
                 )
+        if not outcome.get("ok"):
+            error = str(outcome.get("error") or "quiz_answer_refused")
+            state = str(outcome.get("state") or "")
+            if error == "quiz_not_found":
+                return _refused("quiz not found", 404, task_id=task_id,
+                                  reason_code=error)
+            status = 409
+            payload: Dict[str, Any] = {
+                "ok": False, "error": error, "decision_id": decision_id,
+            }
+            # The truthful lifecycle state settles the card client-side: a
+            # closed quiz on a SETTLED task reads as expired, an already
+            # answered one as answered.
+            payload["state"] = state or ("expired_terminal" if task is None else "")
+            refused_block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
+            if isinstance(refused_block.get("answered_index"), int):
+                # The loser of a first-wins race settles honestly: the card
+                # learns the WINNING option, never a false expiry.
+                payload["answered_index"] = refused_block["answered_index"]
+            if str(refused_block.get("comment") or ""):
+                payload["comment"] = str(refused_block["comment"])
+            if error in {"option_out_of_range", "answer_empty"}:
+                status = 400
+            return status, payload
         try:
             from supervisor.message_bus import get_bridge
 

@@ -182,12 +182,21 @@ def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
     counts as committed money whose spend only its collection proves (a wave of typed $0
     refusals leaves the cap untouched). Nothing is written here: no superseding reference,
     no cycles_exhausted. The pending wave stays the current, collectible wave and the
-    text names its $0 collection. The identical envelope is never held (it resumes)."""
+    text names its $0 collection. The identical envelope is never held (it resumes).
+    Already-paid lost-only custody at a spent cap reaches the existing exhausted
+    exit; this does not assert worker death or clear its unknown late outcome."""
     if cap is None:
         return ""
+    def paid_lost_at_cap(wave):
+        actors = wave.get("actors")
+        return (wave.get("paid") is True and int(state.get("cycles_paid") or 0) >= int(cap)
+                and isinstance(actors, list) and bool(actors)
+                and all(isinstance(actor, dict) and actor.get("operation_state") == "custody_lost"
+                        for actor in actors))
+
     pending = [
         w for w in state.get("waves") or []
-        if isinstance(w, dict) and w.get("custody_pending")
+        if isinstance(w, dict) and w.get("custody_pending") and not paid_lost_at_cap(w)
         and str(w.get("request_fingerprint") or "") != str(fingerprint or "")
     ]
     unproven = sum(1 for w in pending if not w.get("paid"))

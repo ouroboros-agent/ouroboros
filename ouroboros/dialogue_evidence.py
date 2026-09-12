@@ -13,7 +13,7 @@ from typing import Any
 
 from ouroboros.project_dialogue import (
     bound_room_chat, entry_matches_source_ref, project_origin_rows,
-    room_membership, source_refs_for_project,
+    room_membership, source_refs_for_project, latest_chat_annotations,
 )
 from ouroboros.projects_registry import all_task_bindings, list_reserved_projects
 from ouroboros.utils import jsonl_archive_segments, jsonl_generation_signature, utc_now_iso
@@ -62,7 +62,7 @@ def _row_projection(row: dict, stream: str, ordinal: int, root: Any = None) -> d
             result["attachment_gap"] = type(exc).__name__
     if isinstance(attachments, list):
         result["attachments"] = [
-            {key: item[key] for key in ("name", "filename", "original_filename", "mime", "size", "sha256") if key in item}
+            {key: item[key] for key in ("label", "name", "filename", "original_filename", "mime", "size", "sha256", "status", "reason") if key in item}
             for item in attachments if isinstance(item, dict)
         ]
     return result
@@ -113,7 +113,14 @@ def read_room_source(drive_root: Any, chat_id: int, *, task_id: str = "",
     rows, coverage = Memory(root).read_chat_generations(predicate=lambda row: matches(_chat_id(row), row))
     if chat_id not in projects and chat_id not in {0, 1} and not rows:
         return None
-    source_rows = [_row_projection(row, "chat", index, root) for index, row in enumerate(rows, 1)]
+    annotations = latest_chat_annotations(root)
+    source_rows = []
+    for index, row in enumerate(rows, 1):
+        annotation = annotations.get(str(row.get("client_message_id") or ""), {})
+        if (row.get("direction") == "in" and not row.get("attachment_manifest")
+                and not row.get("attachment_manifest_ref") and isinstance(annotation.get("attachment_manifest"), list)):
+            row = {**row, "attachment_manifest": annotation["attachment_manifest"]}
+        source_rows.append(_row_projection(row, "chat", index, root))
     # Pre-existing accepted blocks are another retained projection of the same
     # quiz producer. Recover them where still available; never call an old ask
     # currently open merely because its lifecycle projection was evicted.

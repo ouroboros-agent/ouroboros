@@ -104,3 +104,42 @@ def test_paid_same_author_retry_discloses_its_recorded_snapshot(harness, monkeyp
     assert first['dialogue_source_ref'] == second['dialogue_source_ref']
     assert 'Later messages are not claimed reviewed' in output
     assert first['dialogue_source_ref']['sha256'] in output
+
+
+def test_paid_lost_only_wave_at_cap_uses_existing_exhausted_exit(harness, monkeypatch):
+    from ouroboros import review_substrate
+    from ouroboros.task_results import plan_review_gate_projection
+    from tests.test_plan_review_engine import DECK_SPEC
+
+    monkeypatch.setenv('OUROBOROS_REVIEW_MAX_CYCLES', '1')
+    sends = []
+    def missing(request, **kwargs):
+        sends.append(request.reconcile_only)
+        return SimpleNamespace(actors=[])
+    monkeypatch.setattr(review_substrate, 'run_review_request', missing)
+    ctx = harness.make_ctx()
+    _call(ctx)
+    state = _state(harness)
+    assert state['cycles_paid'] == 1 and state['waves'][-1]['custody_pending']
+    result = _call(ctx, spec={**DECK_SPEC, 'in_scope': ['A revised plan']})
+    assert 'PLAN_REVIEW_CYCLES_EXHAUSTED' in result
+    state = _state(harness)
+    assert state['cycles_paid'] == 1 and sends == [False]
+    assert state['waves'][-1]['custody_pending'] is True
+    assert {actor['operation_state'] for actor in state['waves'][-1]['actors']} == {'custody_lost'}
+    gate = plan_review_gate_projection(state, 'blocking')
+    assert gate['allow'] and gate['status'] == 'cycles_exhausted'
+
+
+@pytest.mark.parametrize('paid,cycles,actors', [
+    (False, 0, [{'operation_state': 'custody_lost'}]),
+    (True, 1, []), (True, 1, [{}]), (True, 1, [None]),
+    (True, 1, [{'operation_state': 'custody_lost'}, {'operation_state': 'in_flight'}]),
+    (False, 0, [{'operation_state': 'pending_dispatch'}]),
+])
+def test_uncertain_or_running_panels_keep_committed_capacity(paid, cycles, actors):
+    from ouroboros.tools.plan_review_collect import in_flight_hold
+
+    state = {'cycles_paid': cycles, 'current_attempt': {'fingerprint': 'original'},
+             'waves': [{'request_fingerprint': 'original', 'custody_pending': True, 'paid': paid, 'actors': actors}]}
+    assert in_flight_hold(state, fingerprint='revised', cap=1)

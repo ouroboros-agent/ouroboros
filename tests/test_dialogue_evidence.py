@@ -108,3 +108,31 @@ def test_steered_delivery_joins_exact_source_id_and_keeps_changed_text(tmp_path)
     assert write_owner_message(tmp_path, 'Use B', 'root', msg_id='unrelated-id')
     distinct = read_room_source(tmp_path, 1, task_id='root')
     assert distinct['text'].count('Use B') == 2
+
+
+def test_incoming_attachment_names_follow_the_existing_history_annotation(tmp_path):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from ouroboros.artifacts import stage_task_attachments
+    from ouroboros.dialogue_evidence import read_room_source, _row_projection
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.project_dialogue import append_chat_annotation
+    from supervisor.message_bus import log_chat
+
+    upload = tmp_path / 'board-forecast.pdf'
+    upload.write_bytes(b'%PDF-1.4\nBINARY_PAYLOAD_NOT_DIALOGUE\n')
+    manifest = stage_task_attachments(tmp_path, 'prior-task', [str(upload)])
+    assert manifest[0]['label'] == 'board-forecast.pdf'
+    log_chat('in', 1, 0, 'Use the attached forecast', source='web',
+             client_message_id='owner-upload', drive_root=tmp_path)
+    append_chat_annotation(tmp_path, 'owner-upload', action='new_task', target='prior-task',
+                           status='scheduled', attachment_manifest=manifest)
+    history = asyncio.run(make_chat_history_endpoint(tmp_path)(
+        SimpleNamespace(query_params={'n_human': '20', 'thread': '1'})))
+    owner = next(row for row in json.loads(history.body)['messages'] if row.get('client_message_id') == 'owner-upload')
+    source = read_room_source(tmp_path, 1)
+    assert source['rows'][0]['attachments'][0]['label'] == owner['chat_annotation']['attachment_manifest'][0]['label']
+    assert 'BINARY_PAYLOAD_NOT_DIALOGUE' not in source['text']
+    direct = _row_projection({'direction': 'in', 'attachment_manifest': manifest}, 'mailbox', 1, tmp_path)
+    assert direct['attachments'][0]['label'] == 'board-forecast.pdf'

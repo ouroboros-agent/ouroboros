@@ -248,3 +248,42 @@ def test_competing_request_history_failure_is_retryable_without_changing_winner(
     assert status == 409 and response['answered_index'] == 0
     [fact] = _facts(runtime)
     assert fact['quiz']['comment'] == 'Winning choice'
+
+
+@pytest.mark.parametrize('new_request_id', [False, True])
+def test_history_failure_retry_delivers_winner_to_task(runtime, monkeypatch, new_request_id):
+    _ask(runtime, 'redelivery')
+    original = message_bus.log_chat
+    def fail(*args, **kwargs):
+        if kwargs.get('record_type') == 'quiz_answer':
+            raise OSError('history unavailable')
+        return original(*args, **kwargs)
+    monkeypatch.setattr(message_bus, 'log_chat', fail)
+    status, result = _answer(runtime, 'redelivery', request_id='winner', index=0, comment='Winning words')
+    assert status == 503 and result['reason_code'] == 'quiz_history_write_failed'
+    assert not drain_owner_entries(runtime.root, runtime.task['id'], include_acknowledged=True)
+    monkeypatch.setattr(message_bus, 'log_chat', original)
+    status, result = _answer(runtime, 'redelivery', request_id='new-id' if new_request_id else 'winner',
+                             index=1, comment='Losing retry payload')
+    assert status == (409 if new_request_id else 200)
+    [message] = drain_owner_entries(runtime.root, runtime.task['id'], include_acknowledged=True)
+    assert 'Winning words' in message['text'] and 'Losing retry payload' not in message['text']
+    assert _answer(runtime, 'redelivery', request_id='another-competitor', index=1)[0] == 409
+    assert len(drain_owner_entries(runtime.root, runtime.task['id'], include_acknowledged=True)) == 1
+
+
+def test_new_request_delivery_failure_keeps_retryable_winning_answer(runtime, monkeypatch):
+    from ouroboros.owner_quiz import record_answered
+    from ouroboros import owner_mailbox
+
+    _ask(runtime, 'mailbox-heal')
+    record_answered(runtime.root, runtime.task['id'], quiz_id='mailbox-heal', option_index=0,
+                    request_id='winner', comment='Only this answer')
+    original = owner_mailbox.write_owner_message
+    monkeypatch.setattr(owner_mailbox, 'write_owner_message', lambda *a, **kw: False)
+    status, result = _answer(runtime, 'mailbox-heal', request_id='new-id', index=1)
+    assert status == 503 and result['reason_code'] == 'mailbox_write_failed'
+    monkeypatch.setattr(owner_mailbox, 'write_owner_message', original)
+    assert _answer(runtime, 'mailbox-heal', request_id='another-id', index=1)[0] == 409
+    [message] = drain_owner_entries(runtime.root, runtime.task['id'], include_acknowledged=True)
+    assert 'Only this answer' in message['text']
