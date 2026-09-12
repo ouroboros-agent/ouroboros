@@ -475,6 +475,27 @@ def _restore_rows(root, row_type):
             if line.strip() and json.loads(line).get("type") == row_type]
 
 
+def test_a_running_row_with_no_durable_result_is_never_fenced(roots):
+    """Custody settles an intent for an id with no durable row as not_found and
+    writes nothing, so fencing that row would put a cancellation in the boot line
+    that never happens."""
+    from ouroboros import cancel_intents
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "has-a-row")
+    snapshot = json.loads((root / "state" / "queue_snapshot.json").read_text(encoding="utf-8"))
+    snapshot["running"].append({"id": "never-recorded", "task": {"id": "never-recorded", "chat_id": 1}})
+    (root / "state" / "queue_snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == ["has-a-row"]
+    assert cancel_intents.active_intent(root, "never-recorded") is None
+    unrecorded = _restore_rows(root, "queue_restore_running_row_without_result")
+    assert unrecorded and unrecorded[-1]["task_ids"] == ["never-recorded"]
+
+
 def test_a_fail_closed_restore_still_records_the_rows_it_fenced(roots):
     """The two fail-closed exits return before the restore ledger row, so the
     boot line named fenced ids that no durable row recorded. The fence happens

@@ -219,8 +219,10 @@ def _fence_snapshot_running_rows(rows: Any, *, restored_ids: "set[str]") -> "lis
     then writes the terminal with its own text — expiring an open quiz and
     closing the paired owner wait through the task-done seam. A second writer
     here would race that surviving worker; an intent cannot. An UNREADABLE
-    cancel authority mints nothing: the unknown is disclosed, never fenced.
-    Returns the fenced task ids.
+    cancel authority mints nothing: the unknown is disclosed, never fenced, and
+    neither is a row with no durable result — custody would settle that intent as
+    not_found and write nothing, leaving the boot notice naming a cancellation
+    that never happens. Returns the fenced task ids.
     """
     from ouroboros.cancel_intents import has_active_intent, request_cancel
     from ouroboros.task_results import (
@@ -229,12 +231,16 @@ def _fence_snapshot_running_rows(rows: Any, *, restored_ids: "set[str]") -> "lis
 
     fenced: list[str] = []
     unreadable: list[str] = []
+    unrecorded: list[str] = []
     for row in rows if isinstance(rows, list) else []:
         task_id = str(row.get("id") or "") if isinstance(row, dict) else ""
         if not task_id or task_id in restored_ids:
             continue
         try:
             stored = load_task_result(_queue().DRIVE_ROOT, task_id, strict=True) or {}
+            if not stored:
+                unrecorded.append(task_id)
+                continue
             status = str(stored.get("status") or "")
             if status in _TRULY_TERMINAL_STATUSES or status == STATUS_CANCEL_REQUESTED:
                 continue
@@ -251,12 +257,13 @@ def _fence_snapshot_running_rows(rows: Any, *, restored_ids: "set[str]") -> "lis
             continue
         if not intent.get("already_settled"):
             fenced.append(task_id)
-    if unreadable:
-        _queue().append_jsonl(
-            _queue().DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {"ts": utc_now_iso(), "type": "queue_restore_running_fence_unreadable",
-             "task_ids": unreadable},
-        )
+    for kind, task_ids in (("queue_restore_running_fence_unreadable", unreadable),
+                           ("queue_restore_running_row_without_result", unrecorded)):
+        if task_ids:
+            _queue().append_jsonl(
+                _queue().DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {"ts": utc_now_iso(), "type": kind, "task_ids": task_ids},
+            )
     return fenced
 
 
