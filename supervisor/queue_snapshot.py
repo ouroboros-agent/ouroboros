@@ -348,6 +348,10 @@ def restore_pending_from_snapshot(
                 {"ts": utc_now_iso(), "type": "queue_restore_invalid_budget_root_fences",
                  "action": "fail_closed_no_restore"},
             )
+            # The fence was already minted above, and the boot notice names it:
+            # a fail-closed exit may skip the restore, never the record of what
+            # it handed to cancellation custody.
+            _record_queue_restore(restored=restored, terminalized_running=fenced_running)
             return restored
         if malformed_fences:
             affected = [str(task.get("id") or "") for task in snapshot_pending if task.get("id")]
@@ -377,6 +381,7 @@ def restore_pending_from_snapshot(
                         )
             except Exception:
                 log.warning("Failed to terminalize tasks from invalid acceptance-fence snapshot", exc_info=True)
+            _record_queue_restore(restored=restored, terminalized_running=fenced_running)
             return restored
 
         skipped_terminal, invalid_depth_restore = 0, []

@@ -445,6 +445,32 @@ def test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody(roots, monk
     assert stored["status"] == "cancelled" and stored["result"] == SERVER_STOPPED_CANCEL
 
 
+def _restore_rows(root, row_type):
+    path = root / "logs" / "supervisor.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line).get("type") == row_type]
+
+
+def test_a_fail_closed_restore_still_records_the_rows_it_fenced(roots):
+    """The two fail-closed exits return before the restore ledger row, so the
+    boot line named fenced ids that no durable row recorded. The fence happens
+    either way, so its record must too."""
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "ghost-in-a-broken-snapshot")
+    snapshot = json.loads((root / "state" / "queue_snapshot.json").read_text(encoding="utf-8"))
+    snapshot["acceptance_fences"] = ["not-a-fence-object"]
+    (root / "state" / "queue_snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == ["ghost-in-a-broken-snapshot"]
+    assert _restore_rows(root, "queue_restore_invalid_acceptance_fences")
+    recorded = _restore_rows(root, "queue_restored_from_snapshot")
+    assert recorded and recorded[-1]["terminalized_running"] == ["ghost-in-a-broken-snapshot"]
+
+
 def test_the_boot_healer_still_settles_a_running_row_nothing_owns(roots):
     """The skip is the intent, not the shape: an orphan with no cancel intent is
     reconciled exactly as before."""
