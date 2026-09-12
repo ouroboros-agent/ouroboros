@@ -464,6 +464,9 @@ def _dispatch_round_model(
             allow_server_web_search=_loop()._server_web_allowed_by_task(ctx.tools._ctx),
             physical_context=(_physical_context_for_fit(disposition) if disposition is not None else None),
             candidate_predicate=candidate_predicate, model_role=role, model_account_override=account,
+            # The loop's own active-turn slot: a reprepared send keeps this exact
+            # owner because the slot survives kwargs deep-copying by identity.
+            model_turn_state=getattr(ctx.tools._ctx, "model_turn_state", None),
         )
     observed = ctx.accumulated_usage.get("_model_route")
     if (plan is not None and isinstance(observed, dict)

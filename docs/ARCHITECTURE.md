@@ -1222,7 +1222,7 @@ Late review completion is retained in the existing operation-addressed prompt/re
 
 Main remote completions use transport streaming, assembled inside the physical send closure before accounting settles. Compatible choices/tool-call fragments and native blocks, reasoning/signatures, usage snapshots and terminal framing produce the same normalized response shape as JSON. Partial streams never yield usable tool calls or answers; their exact wire bytes and partial assembly remain in private CAS through the existing `physical_stream` manifest and attempt ID. A complete response with absent final usage still has unknown money. Comments/pings do not define cognitive deadlines. Every recovery candidate checks inherited calendar and quota-adjusted execution bounds before reservation, after preparation and at dispatch; HTTP phase bounds remain distinct from an overall logical wait.
 
-An ordinary managed task whose provider outcome becomes unknown now stays in the existing transport-wait episode. The old attempt and unreported cost remain unknown. After non-generating upstream observation, a user-role `[SYSTEM NOTICE]` supplies explicit recovery input for one new physical attempt; existing budget, cancellation, owner deadline and absolute ceiling still apply. Finished tools are retained. Direct/ephemeral turns and configured session-nanny custody retain their own contracts; manual Restart/Panic gains no resume authority. Direct remote endpoints are observed through HEAD with the same no-proxy policy. The metadata HEAD reuses the ordinary connection allowance for every socket phase, narrowed by the owner remainder; it holds no cognitive in-flight lease. Subscription metadata qualifies only when the existing catalog reports generic `provenance="provider_http"` and an original `observedAt` after wait entry for the selected source/model and effective profile/account fingerprint. Cached reuse never advances that timestamp; a local handshake, static or pre-outage catalog, or timestamp without provider provenance cannot prove recovery. The pinned 3.10.2 raw-model adapter is Codex; capability discovery remains authoritative rather than a new core provider table. Loss of the Claudexor control connection first keeps reading the same accepted model operation, including across endpoint rediscovery, without creating another operation.
+An ordinary managed task whose provider outcome becomes unknown now stays in the existing transport-wait episode. The old attempt and unreported cost remain unknown. After non-generating upstream observation, a user-role `[SYSTEM NOTICE]` supplies explicit recovery input for one new physical attempt; existing budget, cancellation, owner deadline and absolute ceiling still apply. Finished tools are retained. Direct/ephemeral turns and configured session-nanny custody retain their own contracts; manual Restart/Panic gains no resume authority. Direct remote endpoints are observed through HEAD with the same no-proxy policy. The metadata HEAD reuses the ordinary connection allowance for every socket phase, narrowed by the owner remainder; it holds no cognitive in-flight lease. Subscription metadata qualifies only when the existing catalog reports generic `provenance="provider_http"` and an original `observedAt` after wait entry for the selected source/model and effective profile/account fingerprint. Cached reuse never advances that timestamp; a local handshake, static or pre-outage catalog, or timestamp without provider provenance cannot prove recovery. The pinned 3.10.4 raw-model adapter is Codex; capability discovery remains authoritative rather than a new core provider table. Loss of the Claudexor control connection first keeps reading the same accepted model operation, including across endpoint rediscovery, without creating another operation.
 
 Terminal task delivery and later inspection derive a bounded host notice from the existing delegated-custody audit after cleanup. Confirmed terminal cancellations, live runs, unresolved invocation IDs and undisposed patches stay distinct. The host notice accompanies unchanged model text and continuation narrative, so a later cancellation does not rewrite historical authorship or the answer hash. A valid acceptance PASS with partial/missing/rejected criteria remains a parseable contributing verdict; only the existing clean/applied host decision can authorize objective completion.
 
@@ -1393,6 +1393,32 @@ Model-purpose resources are not valid Agent attachments. Private continuation
 envelopes remain in canonical history but are excluded from public/summarizer
 projections; reuse is bound to the actual source/model/profile/account identity.
 
+Beside that assistant-level history the engine keeps ONE live turn per model
+client session, and its opaque token is transport rather than content: it
+belongs to the caller that is running, not to any stored message. So the caller
+owns a single mutable slot (`llm_claudexor.ModelTurnState`) that rides the
+ordinary `LLMClient.chat` parameters to the engine boundary, and that boundary
+is the only writer — a dispatched durable result replaces the slot's value,
+while a not-dispatched or unknown outcome, or a legacy-shaped exchange that
+never carried the field, leaves it untouched, because holding state never
+licenses another generation and silence about a turn never ends one. WHY a slot
+rather than the transcript:
+the live turn survives compaction that drops the messages and outlives a body
+that fails after its headers, so reading the last stored assistant envelope
+would rebuild the wrong lifetime. One `run_llm_loop` invocation is one turn
+(rounds, owner steering, acceptance follow-up, forced finalization, quota waits
+and reprepares all continue it; a next loop and a cold restart start empty), and
+one Background Consciousness wake is another, keyed by that wake's existing
+model-wait owner id. A dispatch that leaves this transport for a direct API or
+local route ends the turn at the caller and never revives it on return, while
+the engine alone compares route identity. Opting in at all requires a serving
+engine at `config.CLAUDEXOR_MODEL_TURN_STATE_MIN_VERSION`, read from the last
+SUCCESSFUL handshake (a failed probe never un-proves it, so concurrent status
+polling of that singleton cannot change the shape a running caller sends), so an
+older or not-yet-observed engine keeps the legacy request shape instead of
+risking a schema refusal. The token is never usage, an event, a
+progress note or a task card; mechanism in the `llm_claudexor.py` docstring.
+
 Model roles own account pins and context assertions through
 `OUROBOROS_MODEL_ACCOUNTS` and `OUROBOROS_MODEL_CONTEXT_WINDOWS`; ordered fallback
 entries use their original ordinal. Reviewers and configured actors reuse their
@@ -1502,6 +1528,8 @@ Read-only children can read/list the existing project-scoped knowledge store wit
 | undisclosed | `cost_usd: null`, increments `unknown_unmetered` | drops `cost_final` for the projection |
 
 An undisclosed spend contributes `0.0` to `accounted_usd` — inventing a conservative bound would fabricate a number the harness never gave (BIBLE P1) — so a `TOTAL_BUDGET` fence cannot stop spend it was never told about; the honest consequence is loss of finality, not a guessed charge.
+
+**What a delegated run READ.** Harnesses count input tokens with incompatible conventions, so `settle_run` carries the engine's own normalized split — `summary.inputTokenUsage` — onto the `subscription_session` row as the optional `input_token_usage` object: `total_tokens`, `cache_read_tokens`, `cache_write_tokens`, each a nonnegative integer or `null` for unknown. `record_subscription_session` is the one validator and the one writer: all three keys are required together, and a partial, extra-keyed, negative or fractional object is unknown as a WHOLE rather than repaired field by field, because a repaired counter reads exactly like a measured one. An engine that reports nothing leaves the row as it was, and the object stays OUT of the idempotent row identity, so an engine that starts reporting it never rewrites or duplicates a session already settled without it. The legacy `prompt_tokens`/`cached_tokens` axes keep their own meanings and their own harness-specific semantics, and compaction never folds these idempotency-bearing rows, so the object survives verbatim. Direct physical attempts already carry canonical prompt/read/write counters and take no copy of this one.
 
 **The nanny model.** An `agent_session` subagent is an ordinary recursive task-tree child acting as a **nanny** supervising at most one active bounded external leaf. The task node keeps lineage, authority, deadline, budget, acceptance, cancellation, and descendants; the harness process remains a non-recursive tool leaf — session rows never flatten the task tree into harness processes. The nanny is the host: verification receipts stay host-authored, and harness output is a claim to check, never proof. A nanny-to-nanny chain through `schedule_subagent` is the host-attested realization of a nested subscription swarm, each level one metered supervisor task plus one free harness run; `schedule_subagent.requested_depth` is the typed ABSOLUTE request counted from the root, recorded as telemetry that never narrows the configured caps, while the legacy `depth_remaining` envelope keeps its narrowing semantics — two semantics, both disclosed on the contract, and the root's `swarm_efficiency.depth` block plus its terminal summary row report requested, permitted and achieved with the typed status. Harness-agnostic by construction: the row holds an opaque Claudexor target, Ouroboros asks for an access profile derived from task authority and lets Claudexor choose the mechanism; no harness-name branch selects a capability or fallback in core dispatch, and login-wire asymmetries stay presentation adapters in `gateway/claudexor_accounts.py`.
 

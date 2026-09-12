@@ -868,3 +868,55 @@ def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_
     assert custody_a.project_owned is False
     assert "delegate_run_project_retired" in _event_types(tmp_path)
     dc._CUSTODY.clear()
+
+
+_ABSENT = object()   # the engine reported no normalized split at all
+_COMPLETE_COUNTERS = {"total_tokens": 270, "cache_read_tokens": 130, "cache_write_tokens": None}
+
+
+def _settled_session_row(root, reported, run_id="run-counters"):
+    """Settle one terminal run and return its subscription-session ledger row."""
+    import ouroboros.delegate_custody as dc
+
+    summary = {"state": "succeeded", "spendUsd": 0.0, "inputTokens": 300, "cachedInputTokens": 130}
+    entry = dc.RunCustody(run_id=run_id, task_id="t-a", route_id="claudexor:codex", model="m",
+                          project_id="p", project_owned=False, ledger_root=str(root))
+    dc.settle_run(root, _LiveRunStub(), entry,
+                  {"summary": summary if reported is _ABSENT else {**summary, "inputTokenUsage": reported}})
+    rows = [json.loads(line) for line
+            in (root / "state" / "usage_attempts.jsonl").read_text().splitlines()
+            if '"subscription_session"' in line]
+    assert rows
+    return rows[-1]
+
+
+@pytest.mark.parametrize("reported,expected", [
+    (_COMPLETE_COUNTERS, _COMPLETE_COUNTERS),
+    ({"total_tokens": None, "cache_read_tokens": None, "cache_write_tokens": None},
+     {"total_tokens": None, "cache_read_tokens": None, "cache_write_tokens": None}),
+    (_ABSENT, None),                                                    # an engine that reports nothing
+    (None, None),
+    ({"total_tokens": 10, "cache_read_tokens": 4}, None),               # partial: unknown as a whole
+    ({**_COMPLETE_COUNTERS, "extra_tokens": 1}, None),
+    ({"total_tokens": -1, "cache_read_tokens": 0, "cache_write_tokens": 0}, None),
+    ({"total_tokens": 1.5, "cache_read_tokens": 0, "cache_write_tokens": 0}, None),
+    ({"total_tokens": True, "cache_read_tokens": 0, "cache_write_tokens": 0}, None),
+    ({"total_tokens": "270", "cache_read_tokens": 0, "cache_write_tokens": 0}, None),
+    ("270/130", None),
+])
+def test_normalized_session_counters_are_carried_whole_or_not_at_all(tmp_path, reported, expected):
+    """A repaired counter would read exactly like a measured one (BIBLE P1)."""
+    row = _settled_session_row(tmp_path, reported)
+    assert row.get("input_token_usage") == expected
+    # The legacy axes and the settled cash keep their own meanings either way.
+    assert row["prompt_tokens"] == 300 and row["cached_tokens"] == 130
+    assert row["cost_usd"] == 0.0 and row["cost_final"] is True
+
+
+def test_a_newly_reported_split_never_rewrites_an_already_settled_session(tmp_path):
+    first = _settled_session_row(tmp_path, _ABSENT)
+    again = _settled_session_row(tmp_path, _COMPLETE_COUNTERS)
+    assert "input_token_usage" not in first and again == first
+    rows = [line for line in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
+            if '"subscription_session"' in line]
+    assert len(rows) == 1, "an optional statistic must not duplicate a settled paid run"

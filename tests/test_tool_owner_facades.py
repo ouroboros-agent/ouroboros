@@ -77,6 +77,7 @@ def test_tool_descriptor_owner_facades_preserve_identity():
         ("task_model_override", None),
         ("task_use_local_override", None),
         ("active_context_mode", ""),
+        ("model_turn_state", None),
         ("browser_state", "factory:BrowserState"),
         ("event_queue", None),
         ("task_id", None),

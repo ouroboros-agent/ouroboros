@@ -6,6 +6,34 @@ private observability CAS before ACK. Re-reading a lost HTTP reply rejoins the
 same operation; it never buys another inference. A live typed operation is not
 an idle socket: only continuous loss of the control connection spends the
 transport timeout. Task deadlines and cancellation retain their outer owners.
+
+ACTIVE-TURN TRANSPORT SLOT. The engine's upstream keeps one logical turn per
+model client session and hands back an opaque continuation for it. That token
+is transport, not content: it belongs to the LIVE caller, not to the assistant
+history, so ``ModelTurnState`` is one mutable slot the caller owns and this
+module reads. ``_request`` deep-copies the slot's value into the frozen request
+as top-level ``nativeContinuation`` (``None`` on an opted-in empty slot), and a
+DISPATCHED durable result replaces the slot's value through ``adopt_turn_state``
+— a not-dispatched or unknown outcome, or an exchange that never carried the
+field at all, leaves it exactly as it was, because holding state is never a
+reason to infer another generation. A candidate priced ahead of its send — the
+wrap-up a forced finalization is admitted against — reads that SAME slot, so
+the admitted request and the dispatched one carry identical bytes. The engine
+alone compares route identity and starts fresh when it changes; the caller
+clears the slot through ``turn_state_for_route`` when its dispatch leaves this
+transport, and does not revive it on return. Opting in at all needs a serving
+engine whose strict request schema accepts the field
+(``CLAUDEXOR_MODEL_TURN_STATE_MIN_VERSION`` against ``owned_engine_version()``,
+the version proven by the last SUCCESSFUL handshake — a failed probe never
+un-proves it, so concurrent status polling cannot flip this shape between a
+priced candidate and its send); an older or not-yet-observed version sends the
+legacy shape, so a process's FIRST model call carries no slot, captures no
+token, and reads that legacy answer as silence about the turn rather than as a
+turn that ended. The value never leaves this transport: it is not usage, not
+an event, not a task card, and its ``repr`` says only whether a turn is active.
+The assistant-level
+``message.nativeContinuation`` and its ``native_continuation_reset`` semantics
+are a separate, unchanged contract.
 """
 
 from __future__ import annotations
@@ -22,9 +50,9 @@ from typing import Any
 from ouroboros import config
 from ouroboros._usage_response import provider_cost_value
 from ouroboros.anthropic_native_custody import scrub_native_custody
-from ouroboros.claudexor_daemon import ensure_owned_gateway, read_owned_gateway
+from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_engine_version, read_owned_gateway
 from ouroboros.deadline_utils import llm_transport_timeout_sec
-from ouroboros.gateways.claudexor import ClaudexorUnavailable, _READ_TIMEOUT_SEC
+from ouroboros.gateways.claudexor import ClaudexorUnavailable, engine_at_least, _READ_TIMEOUT_SEC
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
 from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepared_call_scope
@@ -136,6 +164,71 @@ def _usage(result: dict) -> tuple[dict, float | None, bool]:
     return usage, cost, cost is not None and knowledge == "exact"
 
 
+class ModelTurnState:
+    """One caller-owned slot holding the engine's current active-turn envelope.
+
+    A reprepared send is the SAME logical turn, so the slot survives the
+    existing deep copy of a call's keyword arguments by identity: the copy IS
+    this object, which is what lets a quota wait, a connection rejoin or a
+    context rebuild update the ORIGINAL owner instead of a fork. Nothing else
+    is stored here — no route comparison, no expiry, no history.
+    """
+
+    __slots__ = ("envelope",)
+
+    def __init__(self, envelope: dict | None = None):
+        self.envelope = envelope
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __repr__(self) -> str:
+        # This reaches private call logs; the opaque value itself never does.
+        return f"ModelTurnState(active={self.envelope is not None})"
+
+
+def turn_state_for_route(slot: ModelTurnState | None, provider: str) -> ModelTurnState | None:
+    """Keep the slot only while the dispatch stays on this transport.
+
+    A send that leaves for a direct API or local route ends the active turn at
+    the caller, and returning later starts a fresh one rather than reviving a
+    token the engine no longer owns.
+    """
+    if slot is None:
+        return None
+    if str(provider or "") != "claudexor":
+        slot.envelope = None
+        return None
+    return slot
+
+
+def _requested_turn_state(slot: ModelTurnState | None) -> tuple[bool, dict | None]:
+    """(opted in, value to send) for one request, honoring the engine schema floor."""
+    if slot is None or not engine_at_least(
+        owned_engine_version(), config.CLAUDEXOR_MODEL_TURN_STATE_MIN_VERSION
+    ):
+        return False, None
+    return True, copy.deepcopy(slot.envelope)
+
+
+def adopt_turn_state(slot: ModelTurnState | None, payload: dict, result: dict) -> None:
+    """Take the active-turn envelope from a DISPATCHED durable result.
+
+    Only this seam writes the slot, and only for a result the engine proved
+    terminal on a request that ASKED about the turn. A legacy-shaped exchange —
+    the shape the version floor sends whenever the serving engine is unproven —
+    carries no ``nativeContinuation`` field either way, so its result is SILENCE
+    about the turn, not a disclaimer that one ended: it leaves a live token
+    exactly where it was (BIBLE P1). Within an opted-in request an absent result
+    field leaves the turn with no state rather than inventing one, while a
+    not-dispatched or unknown outcome never reaches here at all.
+    """
+    if slot is None or "nativeContinuation" not in payload:
+        return
+    envelope = result.get("nativeContinuation")
+    slot.envelope = copy.deepcopy(envelope) if isinstance(envelope, dict) else None
+
+
 def _request(target: dict, messages: list, tools: list | None, parameters: dict) -> dict:
     from ouroboros.llm_messages import _MessageShapingMixin
 
@@ -187,8 +280,12 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
         ("reasoning_effort", "reasoningEffort"), ("temperature", "temperature"),
         ("cache_affinity", "cacheKey"),
     ) if parameters.get(key) is not None and parameters.get(key) != ""}
+    opted_in, turn_state = _requested_turn_state(parameters.get("model_turn_state"))
     return {"source": target["source"], "model": target["resolved_model"], "account": account,
             "messages": prepared, "tools": copy.deepcopy(tools or []),
+            # Absent is the legacy stateless shape; explicit null opts into an
+            # active turn that has no captured state yet.
+            **({"nativeContinuation": turn_state} if opted_in else {}),
             "toolChoice": copy.deepcopy(parameters.get("tool_choice", "auto")), "options": options}
 
 
@@ -574,6 +671,8 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 request, before = _accounted_request(invocation)
                 result = execute_physical_attempt(request, invocation.receive, extractor=_usage, before_dispatch=before)
                 invocation.capture = last_physical_attempt_capture()
+                adopt_turn_state((prepared or parameters).get("model_turn_state"),
+                                 invocation.payload, result)
                 return invocation.finish(result)
         except ClaudexorModelNotDispatched as error:
             if invocation.response_ref:
@@ -615,6 +714,8 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 result = await execute_physical_attempt_async(
                     request, receive, extractor=_usage, before_dispatch=prepare)
                 invocation.capture = last_physical_attempt_capture()
+                adopt_turn_state((prepared or parameters).get("model_turn_state"),
+                                 invocation.payload, result)
                 return await invocation.offload(invocation.finish, result)
         except ClaudexorModelNotDispatched as error:
             if invocation.response_ref:

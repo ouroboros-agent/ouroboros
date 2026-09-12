@@ -635,6 +635,9 @@ def _call_forced_model_once(
         candidate_predicate=candidate_predicate,
         model_role=role,
         model_account_override=account,
+        # A forced final belongs to the loop invocation that is finishing, so it
+        # continues that same active turn instead of opening a new one.
+        model_turn_state=getattr(owner_ctx, "model_turn_state", None),
     )
     ctx.accumulated_usage["_forced_response_meta"] = response_meta
     return str((final_msg or {}).get("content") or "").strip()

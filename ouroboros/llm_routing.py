@@ -102,9 +102,13 @@ class _ProviderRoutingMixin:
         model_poll_control: Any = None,
         model_operation_observer: Any = None,
         model_account_override: str | None = None,
+        model_turn_state: Any = None,
         stream: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
+        """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup.
+
+        ``model_turn_state`` arrives route-resolved: only the subscription
+        transport below ever receives a live active-turn slot."""
         if target.get("provider") == "claudexor":
             from ouroboros.llm_claudexor import chat_claudexor
 
@@ -117,6 +121,7 @@ class _ProviderRoutingMixin:
                 model_poll_control=model_poll_control,
                 model_operation_observer=model_operation_observer,
                 model_account_override=model_account_override,
+                model_turn_state=model_turn_state,
             )
         if target.get("provider") == "anthropic":
             return self._chat_anthropic(

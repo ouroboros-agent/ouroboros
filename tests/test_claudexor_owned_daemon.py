@@ -3994,3 +3994,72 @@ def test_handshake_records_the_engine_build_sha_beside_its_version():
     unstamped = _handshake({"version": cx.CLAUDEXOR_MIN_VERSION})
     assert unstamped.engine_version == cx.CLAUDEXOR_MIN_VERSION
     assert unstamped.engine_build_sha == ""
+
+
+def test_a_failed_probe_never_un_proves_the_serving_engine_version(monkeypatch, tmp_path):
+    """The request-shape floor reads a PROVEN version, not the liveness field.
+
+    ``status_dict`` polls this singleton from the same server process that runs
+    the model lanes, so a transient handshake failure used to blank the version
+    a live caller had already been served — silently downgrading that caller's
+    request shape between a priced candidate and its send. Public status still
+    goes stale on every failure; the proven version only ever moves forward, on
+    another SUCCESSFUL handshake, which is how a deliberate stop or a planned
+    restart on a new pin publishes its engine.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateways import claudexor as gw
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+    _write_descriptor(config_dir)
+    monkeypatch.setattr(owned, "verify_owned_home", lambda **_kw: "")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(runtime, "get_runtime_manager",
+                        lambda: SimpleNamespace(status=lambda **_kw: {"state": "ready"}))
+
+    class Serving:
+        engine_version = "3.10.4"
+
+        def __init__(self, _endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def handshake(self, **_kw):
+            return {"engine": {"sha": "a" * 40}}
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", Serving)
+    manager = owned.OwnedClaudexorDaemon()
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: manager)
+    assert manager._classify_liveness()[1] == "running"
+    assert owned.owned_engine_version() == "3.10.4" and manager._engine_version == "3.10.4"
+
+    class Timeout(Serving):
+        def handshake(self, **_kw):
+            raise gw.ClaudexorUnavailable("daemon_unreachable", "handshake timed out")
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", Timeout)
+    # The Accounts/Agents poll itself: it drives the failing probe.
+    assert manager.status_dict()["engine_version"] == ""
+    assert manager._engine_version == "" and owned.owned_engine_version() == "3.10.4"
+
+    # The other failure branch (no descriptor) cannot retract it either.
+    (config_dir / "daemon" / "control-api.json").unlink()
+    assert manager._classify_liveness() == (None, "not_provisioned", "")
+    assert owned.owned_engine_version() == "3.10.4"
+
+    class Replacement(Serving):
+        engine_version = "3.11.0"
+
+    _write_descriptor(config_dir)
+    monkeypatch.setattr(gw, "ClaudexorGateway", Replacement)
+    assert manager._classify_liveness()[1] == "running"
+    assert owned.owned_engine_version() == "3.11.0"

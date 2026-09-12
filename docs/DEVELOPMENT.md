@@ -2114,6 +2114,22 @@ Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_
   existing private CAS owns the exact result. Optional host hints must be chosen
   by their caller according to transport capability; explicit unsupported options
   refuse, rather than being silently removed and retried.
+- The engine's active-turn token is one of those transport facts, so the CALLER
+  owns its slot (`llm_claudexor.ModelTurnState` on the loop context, a wake-scoped
+  one in Background Consciousness) and the engine boundary is its only writer.
+  Give a new caller a fresh slot when its logical turn begins and clear it when
+  its dispatch leaves this transport; never derive the turn from message roles,
+  prose or the last stored assistant envelope (BIBLE P5), never persist the token
+  into a checkpoint — a cold restart starts empty — and never let a reprepare,
+  thread offload or kwargs copy fork the owner. Update it from a dispatched
+  durable result of a request that actually carried the field — a legacy-shaped
+  exchange is silence about the turn, not proof one ended — and never put it in
+  usage, events, progress or task cards. Gate opting in on the version proven by
+  the last SUCCESSFUL engine handshake, not on the next-spawn pin and not on a
+  liveness projection a failed probe can blank, so concurrent status polling
+  cannot change the shape a running caller sends (mechanism: the
+  `llm_claudexor.py` docstring; ARCHITECTURE "Caller-owned subscription model
+  calls").
 - Pass model_role and the captured account explicitly at every helper/reviewer
   seam. Main and Light may have identical model names and different pins. Account
   context evidence stays source/profile/fingerprint-bound. Manual context sizing
@@ -2248,7 +2264,13 @@ by "Provider Independence" above. Call-site imperatives:
   (`tests/test_gateway_usage_accounting.py`). Skill Review waves attribute
   every canonical usage row with the exact wave/slot identity; pre-marker
   waves stay "exact attribution unavailable" and are never reconstructed by
-  time/model (`tests/test_skill_review_usage_accounting.py`).
+  time/model (`tests/test_skill_review_usage_accounting.py`). The engine's
+  normalized input split rides that same row as the optional
+  `input_token_usage` object, validated only in `record_subscription_session`:
+  an unreported or incomplete object stays unknown as a whole rather than being
+  clamped or repaired, it is outside the row's idempotent identity so a replay
+  keeps the original bytes, and an optional-statistic problem never fails or
+  retries a completed paid run (`tests/test_delegated_run_custody.py`).
 - `cost_final` on a projection is a COUNT of open rows (`non_final_rows`),
   never a truthiness test on a dollar sum. A spent subscription window is
   `subscription_window_exhausted` — a TRANSIENT class carrying `reset_at` —

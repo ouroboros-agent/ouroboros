@@ -642,8 +642,13 @@ def prospective_wrapup_attempt_request(
     reasoning_effort: str, tools: Optional[list[Dict[str, Any]]] = None,
     allow_server_web_search: bool = False, prompt_tokens: int = 0,
     model_role: str = "main", model_account_override: Optional[str] = None,
+    model_turn_state: Any = None,
 ) -> Any:
-    """Build the conservative request facts from the prospective wire payload."""
+    """Build the conservative request facts from the prospective wire payload.
+
+    ``model_turn_state`` is the caller's active-turn transport slot. A candidate
+    that a forced send is admitted against must be priced from the SAME slot
+    value the send will carry, or the two payloads differ by that field alone."""
     from ouroboros.llm import _attempt_request, _finalized_physical_candidate
     from ouroboros.loop_llm_call import MAIN_LOOP_MAX_TOKENS
     from ouroboros.request_wire_recovery import request_wire_call_scope
@@ -662,7 +667,8 @@ def prospective_wrapup_attempt_request(
         from ouroboros.llm_claudexor import _request
 
         candidate = _request(target, messages, tools, {"reasoning_effort": reasoning_effort,
-            "model_role": model_role, "model_account_override": model_account_override})
+            "model_role": model_role, "model_account_override": model_account_override,
+            "model_turn_state": model_turn_state})
         return _merge_scope(replace(_attempt_request(target, candidate),
             force_unknown_reservation=True, max_completion_tokens=MAIN_LOOP_MAX_TOKENS))[0]
     with request_wire_call_scope():
@@ -682,7 +688,10 @@ def prospective_wrapup_attempt_request(
 def prepared_wrapup_candidate(
     ctx: Any, messages: list[Dict[str, Any]], *, allow_server_web_search: bool,
 ) -> Tuple[Any, list[Dict[str, Any]]]:
-    """Prepare the exact first-send transcript and price that same payload."""
+    """Prepare the exact first-send transcript and price that same payload.
+
+    The forced send this candidate admits continues the loop's active transport
+    turn, so the candidate is built from that same owner slot."""
     from ouroboros.loop_llm_call import _prepare_main_messages
     from ouroboros.model_slots import task_model_binding
     from ouroboros.model_wait import current_model_wait
@@ -712,6 +721,7 @@ def prepared_wrapup_candidate(
         prompt_tokens=int(ctx.accumulated_usage.get("_context_prompt_estimate") or 0),
         model_role=role,
         model_account_override=account,
+        model_turn_state=getattr(owner_ctx, "model_turn_state", None),
     )
     return request, send_messages
 

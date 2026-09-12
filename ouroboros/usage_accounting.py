@@ -995,6 +995,34 @@ def _append_single_settled_row(
             return attempt_id
         _append_rows_locked(root, records, [row])
     return attempt_id
+
+
+_INPUT_TOKEN_USAGE_KEYS = ("total_tokens", "cache_read_tokens", "cache_write_tokens")
+
+
+def _normalized_input_token_usage(raw: Any) -> Optional[Dict[str, Any]]:
+    """The three normalized input counters, or ``None`` when unusable as a whole.
+
+    All three keys are required together, and each is a nonnegative integer or
+    ``None`` for unknown. A partial, extra-keyed, negative, boolean or
+    fractional object is unknown ENTIRELY — never repaired field by field and
+    never clamped to zero, because a repaired counter would read as a measured
+    one (BIBLE P1).
+    """
+    if not isinstance(raw, dict) or set(raw) != set(_INPUT_TOKEN_USAGE_KEYS):
+        return None
+    normalized: Dict[str, Any] = {}
+    for key in _INPUT_TOKEN_USAGE_KEYS:
+        value = raw[key]
+        if value is None:
+            normalized[key] = None
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        else:
+            normalized[key] = value
+    return normalized
+
+
 def record_subscription_session(
     session_id: str,
     *,
@@ -1014,12 +1042,20 @@ def record_subscription_session(
     spend_estimated: bool = False,
     credential_profile_id: str = "",
     access_profile: str = "",
+    input_token_usage: Dict[str, Any] | None = None,
     review_skill: str = "", review_wave_id: str = "", review_slot_id: str = "",
 ) -> str:
     """Record one idempotent session; model observation is not session identity.
 
     A later model disclosure replays the existing row byte-for-byte, without
     repricing or rewriting it. Custody carries the newly observed actor facts.
+
+    ``input_token_usage`` is the harness's optional NORMALIZED input split
+    (total, cache read, cache write). It is validated here, the one place that
+    persists it, and it is deliberately outside the idempotent identity: an
+    engine that starts reporting it must not rewrite or duplicate a row already
+    settled without it. Unreported or unusable stays absent — the legacy
+    ``prompt_tokens``/``cached_tokens`` axes keep their own meanings.
     """
     stable_id, route_id = str(session_id or "").strip(), str(route or "").strip()
     if not stable_id or not route_id:
@@ -1029,6 +1065,7 @@ def record_subscription_session(
     ensure_legacy_imported(root)
     identity = hashlib.sha256(stable_id.encode("utf-8")).hexdigest()
     attempt_id = f"session-{identity[:24]}"
+    input_counters = _normalized_input_token_usage(input_token_usage)
     attribution = {"review_skill": review_skill, "review_wave_id": review_wave_id, "review_slot_id": review_slot_id}
     row = {
         "kind": "subscription_session",
@@ -1057,6 +1094,8 @@ def record_subscription_session(
         "credential_profile_id": str(credential_profile_id or ""),
         "access_profile": str(access_profile or ""),
         "session_id_sha256": identity,
+        # Present only when the harness reported a complete, valid object.
+        **({"input_token_usage": input_counters} if input_counters is not None else {}),
         # CPL-5 lane-level disclosure: a delegated/harness session never hands
         # the host the final wire bytes, so it carries this typed limit instead
         # of a fake model_send seal (design note §4, provider_side_transform).

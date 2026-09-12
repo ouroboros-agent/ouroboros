@@ -230,3 +230,19 @@ def test_agent_restores_once_before_runtime_and_cold_dispatch_keeps_role_and_pin
     saved = json.loads(read_actor_source_bytes(case.root, "t-wait", wait["source_ref"]))
     assert saved["model_wait"]["auto_continue"]["fallback:0"] is False
     assert saved["model_wait"]["overrides"]["vision"]["model"] == "vision-selected"
+
+
+def test_the_active_turn_token_never_enters_a_cold_owner_wait_checkpoint(saved_wait):
+    """A live transport turn is process state; a cold restart opens a new one."""
+    from ouroboros.llm_claudexor import ModelTurnState
+
+    case = saved_wait
+    token = "opaque-turn-in-flight"
+    case.ctx.model_turn_state = ModelTurnState(
+        {"route": {}, "format": "codex.turn.v1", "payload": {"turnState": token}})
+    case.ctx._owner_wait_requested = "question"
+    wait = owner_wait.checkpoint_owner_wait(
+        case.ctx, case.ctx.context_fit_plan.messages_for("max"), {"tool_calls": []}, {"cost": 2.0}, 1, [], set())
+    stored = read_actor_source_bytes(case.root, case.ctx.task_id, wait["source_ref"]).decode("utf-8")
+    assert token not in json.dumps(wait) and token not in stored
+    assert "model_turn_state" not in stored

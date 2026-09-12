@@ -716,10 +716,17 @@ class BackgroundConsciousness:
 
     def _think(self) -> bool:
         """Bind each wakeup to the global ledger and its background sub-budget."""
+        from ouroboros.llm_claudexor import ModelTurnState
         from ouroboros.usage_accounting import UsageScope, usage_scope
 
         total_budget = resolve_total_budget_usd()
         root_limit = total_budget * (self._bg_budget_pct / 100.0) if total_budget else None
+        # One wake is one logical turn AND one cache identity: the existing
+        # per-wake owner id names both, so the awareness loop's rounds share a
+        # prefix with each other and with nothing else.
+        wake_id = uuid.uuid4().hex
+        self._wake_cache_affinity = wake_id
+        self._model_turn_state = ModelTurnState()
 
         with usage_scope(UsageScope(
             drive_root=self._drive_root,
@@ -730,7 +737,7 @@ class BackgroundConsciousness:
             global_limit_usd=total_budget,
             root_limit_usd=root_limit,
         )), task_model_wait_scope(
-            task={"id": "bg-consciousness", "model_wait_owner_id": uuid.uuid4().hex,
+            task={"id": "bg-consciousness", "model_wait_owner_id": wake_id,
                   "chat_id": getattr(self, "_owner_chat_id_fn", lambda: None)()},
             drive_root=self._drive_root, event_queue=getattr(self, "_event_queue", None), worker_slot_held=False,
             row_mutator=lambda key, transform: mutate_live_wait(wait, key, transform),
@@ -743,6 +750,8 @@ class BackgroundConsciousness:
                     return self._think_scoped()
             finally:
                 self._model_wait = None
+                self._model_turn_state = None
+                self._wake_cache_affinity = ""
 
     def _prepare_model_call(self, kwargs: dict) -> dict:
         """Keep the same call through foreground pause, then recheck its route."""
@@ -821,6 +830,8 @@ class BackgroundConsciousness:
                     reasoning_effort=effort,
                     max_tokens=65536,
                     use_local=_use_local_consciousness,
+                    cache_affinity=getattr(self, "_wake_cache_affinity", ""),
+                    model_turn_state=getattr(self, "_model_turn_state", None),
                 )
                 route = usage.get("model_role_route") or {}
                 model, _use_local_consciousness = route.get("model", model), route.get("use_local", _use_local_consciousness)
