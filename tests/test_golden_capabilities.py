@@ -84,7 +84,11 @@ def test_root_reads_credential_named_user_file_known_formats_masked_not_refused(
     formats plus PEM blocks are still masked at egress. Owner answer 5=A
     removed the 40-character opaque-run rule, so key material of an UNKNOWN
     format (a bare AWS secret access key: no SECRET_TOKEN_PATTERN matches it)
-    now reaches the reader raw. Stated here rather than quietly dropped."""
+    now reaches the reader raw. Stated here rather than quietly dropped.
+
+    The rendered notice is asserted too: with a MIXED known+unknown input the
+    sentence the model reads has to match what actually happened, so the old
+    "raw credentials never enter model context" promise may not appear."""
     ctx, home = user_files_ctx
     (home / ".aws" / "credentials").write_text(
         "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE + PEM_BLOCK, encoding="utf-8",
@@ -96,6 +100,8 @@ def test_root_reads_credential_named_user_file_known_formats_masked_not_refused(
     assert "PRIVATE KEY" not in out                      # PEM block masked whole
     assert "SECRET_BYTES_MASKED" in out                  # disclosure, not silence
     assert "wJalrXUtnFEMI" in out                        # unknown format: delivered raw
+    assert "raw credentials never enter model context" not in out   # withdrawn promise
+    assert "secrets in unrecognized formats are not detected" in out
 
 
 def test_root_lists_and_searches_credential_named_user_files(user_files_ctx):

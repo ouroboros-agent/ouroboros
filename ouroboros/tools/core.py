@@ -974,9 +974,10 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         masked_text, masked = mask_secret_bytes(result_text)
         if masked:
             masked_text += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) in these "
-                "matches were replaced with ***; raw credentials never enter model "
-                "context. Reference them by location, not value."
+                f"\n⚠️ SECRET_BYTES_MASKED: {masked} span(s) in these matches matched "
+                "a recognized credential format or a PEM block and were replaced with "
+                "***; secrets in unrecognized formats are not detected. Reference the "
+                "masked ones by location, not value."
             )
         return masked_text
 

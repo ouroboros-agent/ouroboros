@@ -97,9 +97,9 @@ def _mask_user_files_text(ctx: ToolContext, fp: pathlib.Path, text: str) -> str:
     masked, count = mask_secret_bytes(text)
     if count:
         masked += (
-            f"\n⚠️ SECRET_BYTES_MASKED: {count} secret-shaped span(s) in this "
-            "extraction were replaced with ***; raw credentials never enter "
-            "model context."
+            f"\n⚠️ SECRET_BYTES_MASKED: {count} span(s) in this extraction matched "
+            "a recognized credential format or a PEM block and were replaced with "
+            "***; secrets in unrecognized formats are not detected."
         )
     return masked
 

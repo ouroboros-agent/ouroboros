@@ -483,8 +483,9 @@ def _query_code(
         masked, count = mask_secret_bytes(text)
         if count:
             masked += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {count} secret-shaped span(s) were "
-                "replaced with ***; raw credentials never enter model context."
+                f"\n⚠️ SECRET_BYTES_MASKED: {count} span(s) matched a recognized "
+                "credential format or a PEM block and were replaced with ***; "
+                "secrets in unrecognized formats are not detected."
             )
         return masked
 

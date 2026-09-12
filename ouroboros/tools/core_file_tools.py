@@ -718,17 +718,20 @@ def _read_file(
                                       ))
         if normalized == "user_files" and not raw_owner_secret_access:
             # Egress seam for owner-home reads (#447 X1/В23): the file may be
-            # read, but raw credential bytes never enter model context/history —
-            # the masked form (***) may. Masking happens on the rendered slice;
-            # the search egress applies the same seam to its match lines.
+            # read; bytes in a recognized credential format or a PEM block leave
+            # as the masked form (***), and secrets in unrecognized formats are
+            # not detected at all (owner answer 5=A removed the opaque-run rule).
+            # Masking happens on the rendered slice; the search egress applies
+            # the same seam to its match lines.
             from ouroboros.secret_masking import mask_secret_bytes
 
             rendered, masked = mask_secret_bytes(rendered)
             if masked:
                 rendered += (
-                    f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) in this "
-                    "view were replaced with ***; raw credentials never enter model "
-                    "context. Reference them by location, not value."
+                    f"\n⚠️ SECRET_BYTES_MASKED: {masked} span(s) in this view matched a "
+                    "recognized credential format or a PEM block and were replaced with "
+                    "***; secrets in unrecognized formats are not detected. Reference "
+                    "the masked ones by location, not value."
                 )
         if normalized == "task_drive":
             # D7 coverage acknowledgement: what counts as read is what the DELIVERY

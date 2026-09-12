@@ -176,9 +176,9 @@ def mask_secret_bytes(text: str, *, preserve_layout: bool = False) -> Tuple[str,
     """Mask secret-shaped byte spans in final tool output; return (text, count).
 
     Egress seam for owner-home (``user_files``) content: the root agent may
-    read the file, but raw credential bytes never enter model context/history —
-    the masked form (``***``) may (#447 X1/В23). Coverage: the known entropy
-    formats above and PEM private-key blocks, in every scope.
+    read the file, and bytes in a recognized credential format or a PEM
+    private-key block leave as ``***`` (#447 X1/В23). Coverage is exactly those
+    two, so secrets in unrecognized formats are not detected, in every scope.
     Readers that mask before selecting a line/character window set
     ``preserve_layout``: replacement keeps character positions and line breaks,
     so a window inside a key cannot lose its header or shift later source.
