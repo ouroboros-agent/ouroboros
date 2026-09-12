@@ -1015,8 +1015,8 @@ def _settle_review_attempt(
     if entry.released_early:  # plan review's event route: progress line + the settled-wave frame
         from ouroboros.tools.plan_review_collect import announce_released_settlement
 
-        announce_released_settlement(usage_ctx, request=request, task_id=task_id, slot=slot,
-                                     actor=actor, settled_wave=dict(released_wave.get("slots") or {}))
+        announce_released_settlement(usage_ctx, request=request, task_id=task_id, slot=slot, actor=actor,
+                                     settled_wave=dict(released_wave.get("slots") or {}), roster_size=int(released_wave.get("total") or 0))
     if late and not pending_invocation and not custody_lost and usage_ctx is not None:
         try:
             from ouroboros.tools.review_helpers import emit_review_event

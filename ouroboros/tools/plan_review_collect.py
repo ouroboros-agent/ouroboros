@@ -24,13 +24,16 @@ log = logging.getLogger(__name__)
 
 def announce_released_settlement(
     usage_ctx: Any, *, request: Any, task_id: str, slot: Any, actor: Any,
-    settled_wave: Dict[str, str],
+    settled_wave: Dict[str, str], roster_size: int = 0,
 ) -> None:
     """One progress line per settled released slot (derived from the terminal
     ``cognitive_operation`` fact the worker just emitted) and, when the LAST
     released slot of a plan-review wave settles, ONE system frame in the task's
     mailbox. ``settled_wave`` is ``{slot_id: status}`` for the whole released set
-    when this settlement completed it, otherwise empty."""
+    when this settlement completed it, otherwise empty; ``roster_size`` is the
+    wave's total slot count, so the frame says "N of M reviewer slot(s) settled".
+    The frame carries counts only, never an aggregate: the collector is the sole
+    wave writer and reducer, so the verdict is computed there, not here."""
     if str(getattr(request, "surface", "") or "") != "plan_review":
         return
     fingerprint = str((getattr(request, "reconciliation_identity", {}) or {}).get("subject_hash") or "")
@@ -50,8 +53,9 @@ def announce_released_settlement(
     try:
         write_task_message(
             pathlib.Path(str(usage_ctx.drive_root)),
-            f"Plan review wave {fingerprint[:8] or '?'}: {len(settled_wave)} released reviewer "
-            f"slot(s) settled ({ok} ok, {len(settled_wave) - ok} failed); not yet collected "
+            f"Plan review wave {fingerprint[:8] or '?'}: {len(settled_wave)} of "
+            f"{max(int(roster_size or 0), len(settled_wave))} reviewer slot(s) settled "
+            f"({ok} ok, {len(settled_wave) - ok} failed); not yet collected "
             f"(review_fingerprint {fingerprint}).",
             task_id, source_task_id=task_id, provenance="system",
         )

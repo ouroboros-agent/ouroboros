@@ -110,7 +110,7 @@ def test_drain_deadline_releases_pending_dispatch_rows_and_the_last_settlement_w
     frames = _mailbox_entries(tmp_path, request.task_id)
     assert len(frames) == 1
     assert frames[0]["provenance"] == "system" and frames[0]["kind"] == "task_message"
-    assert "Plan review wave ffffffff: 2 released reviewer slot(s) settled (2 ok, 0 failed)" in frames[0]["text"]
+    assert "Plan review wave ffffffff: 2 of 2 reviewer slot(s) settled (2 ok, 0 failed)" in frames[0]["text"]
     assert "not yet collected" in frames[0]["text"]
     assert not custody._RELEASED_WAVES
     # Collection: the same cycle replays both settled actors with no second send.
@@ -254,7 +254,7 @@ def test_fresh_dispatch_returns_at_the_barrier_and_the_resubmitted_envelope_coll
         executor.release.set()
     [frame] = _mailbox_entries(harness.drive, "task-1")
     assert frame["provenance"] == "system"
-    assert frame["text"].startswith(f"Plan review wave {wave['request_fingerprint'][:8]}: 3 released")
+    assert frame["text"].startswith(f"Plan review wave {wave['request_fingerprint'][:8]}: 3 of 3 reviewer slot(s) settled (3 ok, 0 failed)")
     # The frame reaches the model as a system task message, never as an owner directive.
     from ouroboros.loop_round_limits import _drain_incoming_messages
     import queue
@@ -390,5 +390,5 @@ def test_a_slot_settling_during_the_barrier_release_never_splits_the_wave_into_t
             event.set()
     frames = _mailbox_entries(tmp_path, request.task_id)
     assert len(frames) == 1, [f["text"] for f in frames]
-    assert "2 released reviewer slot(s) settled (1 ok, 1 failed)" in frames[0]["text"]
+    assert "2 of 2 reviewer slot(s) settled (1 ok, 1 failed)" in frames[0]["text"]
     assert not custody._RELEASED_WAVES
