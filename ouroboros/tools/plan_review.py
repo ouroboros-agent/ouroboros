@@ -57,6 +57,7 @@ from ouroboros.tools.plan_review_runtime import (
     plan_fanout_inputs as _plan_fanout_inputs,
     plan_in_flight_custody_error as _plan_in_flight_custody_error,
     plan_deadline_skip as _plan_deadline_skip,
+    REVIEWER_EFFORT_SCHEMA as _REVIEWER_EFFORT_SCHEMA,
     publish_plan_review_projection as _publish_plan_review_projection,
     publish_rendered_wave as _publish_rendered_wave,
     plan_payload_roots as _plan_payload_roots,
@@ -118,6 +119,7 @@ class _PlanRequest:
     goal: str
     plan: str
     spec: Any
+    reviewer_effort: str = ""  # the envelope's declared panel strength ('' = the owner's setting)
 
 _SPEC_SCHEMA = {
     "type": "object",
@@ -242,7 +244,7 @@ def get_tools():
                     "when another paid cycle is available. Cycles are bounded by the owner's Max review cycles; an unchanged "
                     "envelope replays the recorded result for free (a locator a reviewer asked for "
                     "with need_evidence is attached by the host next time and makes the envelope "
-                    "new). Under blocking enforcement an "
+                    "new; a different reviewer_effort re-dispatches a paid panel). Under blocking enforcement an "
                     "open review holds finalization; under advisory you may proceed with the "
                     "review open and the host discloses it. Declare evidence reviewers need; "
                     "declare affected_resources so a self-modification gets the constitutional pack."
@@ -253,9 +255,10 @@ def get_tools():
                         "goal": {"type": "string", "description": "Why — the outcome the work serves."},
                         "plan": {"type": "string", "description": "Accompanying prose: how you intend to do it (context for reviewers; the spec is what is judged)."},
                         "spec": _SPEC_SCHEMA,
+                        "reviewer_effort": _REVIEWER_EFFORT_SCHEMA,
                         "review_disposition": _DISPOSITION_SCHEMA,
                     },
-                    # Two exclusive modes: goal+plan+spec (review) or review_disposition alone.
+                    # Two exclusive modes: goal+plan+spec (+ optional reviewer_effort) or review_disposition alone.
                     "required": [],
                 },
             },
@@ -294,7 +297,7 @@ def _typed_refusal(ctx: ToolContext, code: str, text: str) -> str:
 def _handle_plan_task(ctx: ToolContext, **params) -> str:
     raw_disposition = params.get("review_disposition")
     # The registry refuses unknown params; a vacuous envelope field carries no plan.
-    envelope_fields = [k for k in ("goal", "plan", "spec") if not _vacuous(k, params.get(k))]
+    envelope_fields = [k for k in ("goal", "plan", "spec", "reviewer_effort") if not _vacuous(k, params.get(k))]
     if raw_disposition is not None and not _vacuous_disposition(raw_disposition):
         if envelope_fields:
             return _typed_refusal(
@@ -317,6 +320,7 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         )
     request = _PlanRequest(
         goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
+        reviewer_effort=str(params.get("reviewer_effort") or "").strip().lower(),
     )
     try:  # the ToolEntry envelope is the outer settlement bound (plan_review_collect.run_plan_coroutine)
         return _collect.run_plan_coroutine(_run_plan_review_async(ctx, request))
@@ -437,6 +441,8 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
     spec, errors = plan_spec.normalize_spec(raw_spec if isinstance(raw_spec, dict) else None)
     if not request.plan.strip():
         errors = ["plan: required non-empty prose", *errors]
+    if request.reviewer_effort and request.reviewer_effort not in _REVIEWER_EFFORT_SCHEMA["enum"]:
+        errors.append(f"reviewer_effort: not on the effort scale {list(_REVIEWER_EFFORT_SCHEMA['enum'])}")
     if errors:
         return {"error": "ERROR: PLAN_SPEC_INVALID: " + "; ".join(errors) + ". No reviewer was called.",
                 "code": "TOOL_ARG_ERROR"}
@@ -531,6 +537,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     previous_override: Optional[dict] = None
     replay_snapshot: Any = _PLAN_NO_SNAPSHOT
     resume_in_flight = False
+    # The declaration wraps the builder ONLY when non-empty: zero-arg stubs of the builder stay valid.
+    slots_fn = (lambda: _plan_review_slots(default_effort=request.reviewer_effort)) if request.reviewer_effort else _plan_review_slots
     existing = plan_review_wave(state, fingerprint)
     if existing is not None and not isinstance(existing.get("spec"), dict):
         existing = None  # C-09: a COMPACTED row (no frozen spec) is never authority
@@ -563,7 +571,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid,
                                           enforcement=enforcement, cached=True, reminder=reminder)
         elif not resume_in_flight:  # stale ⇒ identical envelope re-dispatches fresh
-            stale, replay_snapshot = _plan_wave_replay_decision(_plan_review_slots, existing)
+            stale, replay_snapshot = _plan_wave_replay_decision(slots_fn, existing)
             if not stale:
                 if enforcement == "advisory":
                     # Still-OPEN wave: re-invoke the emitter so a durable append that FAILED
@@ -596,7 +604,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         return _plan_unavailable(
             ctx, f"ERROR: Invalid reviewer-slot configuration blocks plan review — {err}. "
             "Fix Review lanes on the Agents tab in Settings.", "reviewer_slot_config_invalid")
-    slots = _plan_review_slots()
+    slots = slots_fn()
     if not slots:
         return _plan_unavailable(
             ctx, "ERROR: No review models configured. Configure Review lanes "
@@ -702,7 +710,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         constitutional=constitutional, constitutional_note=constitutional_note,
         cycle_index=cycle_index, retry_key=retry_key, enforcement=enforcement, cap=cap,
         quorum=quorum, configured_slots=configured_slots,
-        health_evidence=health_evidence,
+        health_evidence=health_evidence, reviewer_effort=request.reviewer_effort,
     )
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(

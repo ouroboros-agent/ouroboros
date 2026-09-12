@@ -148,6 +148,11 @@ class ReviewSlot:
     subagent_id: str = ""
     # Host sampling hint, resolved at dispatch; an explicit temperature wins.
     default_temperature: float | None = None
+    # The effort this row runs at because the CALLER declared it for one order
+    # (plan review's ``reviewer_effort``): '' when the row's own effort, a
+    # compound route slug or the surface setting applied. Disclosure for the
+    # last-execution projection; identity already rides ``effort``.
+    declared_effort: str = ""
 
     @property
     def native_retrieval(self) -> bool:

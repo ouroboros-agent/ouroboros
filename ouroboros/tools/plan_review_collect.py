@@ -93,6 +93,7 @@ def prepared_from_wave(ctx: Any, exact: Dict[str, Any]) -> tuple[Any, Dict[str, 
     spec = dict(exact.get("spec") or {})
     request = _PlanRequest(
         goal=str(spec.get("goal") or ""), plan=str(exact.get("plan_prose") or ""), spec=spec,
+        reviewer_effort=str(exact.get("reviewer_effort") or ""),  # the same roster the wave dispatched with
     )
     prepared = {
         "spec": spec, "system_root": system_root, "active_root": active_root,

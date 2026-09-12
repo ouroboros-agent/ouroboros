@@ -282,6 +282,10 @@ def _render_wave(
     findings = list(wave.get("findings") or [])
     findings_total = int(wave.get("findings_total") or len(findings))
     finding_page = findings[:MAX_FINDINGS_PER_SLOT]
+    if wave.get("reviewer_effort"):
+        actor_lines.append(
+            f"- declared reviewer effort: {wave['reviewer_effort']} (this envelope's order; an explicit "
+            "per-row effort or a compound route slug outranks it)")
     lines += [
         "", "### Reviewer slots", "", *actor_lines,
         "", "### Findings (per slot; finding_id = slot:id)", "", "```json",

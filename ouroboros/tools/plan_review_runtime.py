@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
+from ouroboros.config import EFFORT_SCALE
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.llm import LLMClient
 from ouroboros.review_execution_projection import review_executions_from_actor_usage
@@ -39,7 +40,23 @@ from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compat
     persist_wave as persist_plan_review_wave_artifact,
     read_wave as read_plan_review_wave_artifact,
 )
-PLAN_REVIEW_EFFORT = "high"
+# The one caller-facing strength axis of a review panel: the plan envelope may
+# declare the panel's effort for THIS order as the default rung of each row's
+# ladder (explicit per-row effort and compound route slugs still outrank it; the
+# owner's review-effort setting applies when nothing is declared). Owner
+# decision 2026-09-11 (batch 1/Q6, batch 2/Q3=A): the setting is the default,
+# Ouroboros may order stronger or weaker; a different strength is a different
+# envelope and re-dispatches a paid panel within OUROBOROS_REVIEW_MAX_CYCLES.
+REVIEWER_EFFORT_SCHEMA = {
+    "type": "string", "enum": list(EFFORT_SCALE),
+    "description": (
+        "Optional reviewer-panel strength for THIS order (the default rung of each "
+        "reviewer row's effort ladder; an explicit per-row effort or a compound route "
+        "slug still wins; omitted = the owner's review-effort setting). A different "
+        "strength is a different envelope: it re-dispatches a paid panel within "
+        "OUROBOROS_REVIEW_MAX_CYCLES, while the same strength replays free."
+    ),
+}
 # ``None`` means no plan-local cognition cutoff.  The substrate settles against
 # the owner deadline or shared transport bound, keeping the historical 560s
 # number from being reused as an HTTP timeout.
@@ -262,17 +279,21 @@ def record_raw_plan_request_attempt(
     return fingerprint
 
 
-def plan_review_slots() -> list:
+def plan_review_slots(default_effort: str = "") -> list:
     """The configured commit-triad rows as plan-review ``ReviewSlot`` objects:
     the shared ``triad_delivery_slots`` builder (one reader of the triad rows
     for plan, skill and acceptance review) with plan review's own slot
-    properties — timeout, output budget, temperature, and ``PLAN_REVIEW_EFFORT``
-    as the effort default. Both delivery kinds ride; slot ids are the rows' own.
+    properties — timeout, output budget, temperature — and the envelope's
+    declared ``reviewer_effort`` as the rows' default rung (``''`` = the owner's
+    review-effort setting, exactly like the commit triad). The declaration is an
+    ARGUMENT of this builder only, never a contextvar: the commit gate, scope,
+    acceptance and skill review keep reading the untouched rows. Both delivery
+    kinds ride; slot ids are the rows' own.
     """
     from ouroboros.reviewer_slot_config import triad_delivery_slots
 
     return triad_delivery_slots(
-        role_hint="plan reviewer", default_effort=PLAN_REVIEW_EFFORT,
+        role_hint="plan reviewer", default_effort=str(default_effort or ""),
         timeout_sec=PLAN_REVIEW_SLOT_TIMEOUT_SEC, max_tokens=PLAN_REVIEW_MAX_TOKENS,
         default_temperature=0.2,
     )
@@ -499,7 +520,7 @@ def synthesize_plan_review_wave(
     fingerprint: str, previous: Optional[dict], manifest: dict, manifest_hash: str,
     constitutional: bool, constitutional_note: str, cycle_index: int, retry_key: str,
     enforcement: str, cap: Any, quorum: int, configured_slots: list,
-    health_evidence: Any,
+    health_evidence: Any, reviewer_effort: str = "",
 ) -> tuple[dict, set[str], dict]:
     """Validate raw actor rows and build one durable plan-review wave."""
     from ouroboros.tools import plan_spec
@@ -559,6 +580,7 @@ def synthesize_plan_review_wave(
         "paid": any(_row_has_physical_dispatch(row) for row in slot_records),
         "health_epoch": plan_health_epoch(health_evidence),
         "reviewer_config_fingerprint": plan_reviewer_config_fingerprint(configured_slots),
+        "reviewer_effort": str(reviewer_effort or ""),  # the envelope's declared panel strength ('' = setting)
         **plan_quorum_unreachable_facts(slot_records, quorum=quorum), "reviewed_at": utc_now_iso(),
     }
     # A partially-settled paid cycle is not yet allowed to mutate the next
@@ -676,6 +698,8 @@ def plan_wave_progress_line(
         line += f"; slot reasons: {reasons}"
     if (wave or {}).get("custody_pending"):
         line += "; late result pending (reviewer slots still in flight, not yet collected)"
+    if (wave or {}).get("reviewer_effort"):
+        line += f"; declared reviewer effort {wave['reviewer_effort']}"
     return line
 
 

@@ -623,3 +623,26 @@ def test_two_step_wave_emits_one_advisory_open_event_and_keeps_the_paid_identity
     trace = {"tool_calls": [{"plan_review_outcome": "DEGRADED"}, {"plan_review_outcome": "DEGRADED"}],
              "acceptance_obligations": []}
     assert acceptance_paid_identity("cand", trace) == acceptance_paid_identity("cand", {"tool_calls": [], "acceptance_obligations": []})
+
+
+def test_collection_rebuilds_the_roster_the_wave_was_dispatched_with(harness, monkeypatch):
+    """A declared effort is roster identity; the collection reuses the wave's
+    recorded declaration, so it finds the same roster instead of refusing."""
+    import dataclasses
+
+    from ouroboros.tools import plan_review as pr
+
+    def build(default_effort=""):
+        return [dataclasses.replace(slot, effort=default_effort or slot.effort, declared_effort=default_effort)
+                for slot in harness.state["slots"]]
+
+    monkeypatch.setattr(pr, "_plan_review_slots", build)
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    _call(ctx, reviewer_effort="xhigh")
+    wave = _state(harness)["waves"][-1]
+    assert wave["custody_pending"] is True and wave["reviewer_effort"] == "xhigh"
+    collected = _collect(ctx, wave["request_fingerprint"])
+    assert _control(collected) == {"outcome": "GREEN", "closed": True}
+    assert calls[1]["retry_key"] == calls[0]["retry_key"]
