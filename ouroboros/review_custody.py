@@ -1058,9 +1058,10 @@ def _register_released_roster(
             entry.released_early = True
             released_ids.add(slot_id)
         if released_ids:
-            _RELEASED_WAVES[_wave_key(request)] = {
-                "slots": {slot_id: "" for slot_id in released_ids}, "total": len(slots),
-            }
+            # A collection re-releases the wave: merging keeps the recorded outcomes.
+            roster = _RELEASED_WAVES.setdefault(_wave_key(request), {"slots": {}, "total": len(slots)})
+            for slot_id in released_ids:
+                roster["slots"].setdefault(slot_id, "")
     return released_ids
 
 
