@@ -757,7 +757,8 @@ block repo commits and vice versa.
 
 Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
 work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
-SPEC, the task objective, the evidence the agent declared (attached bounded, with every absence
+SPEC, the task objective, the verbatim owner requirements and decisions (source per row, the same
+corpus task acceptance reads), the evidence the agent declared (attached bounded, with every absence
 named), and — for a self-modification plan — BIBLE.md and ARCHITECTURE.md in full (inline for
 an api reviewer; a retrieving reviewer reads both in full with its own tools, the pack names them
 as mandatory reads); every other plan gets the heading-derived navigation maps of BIBLE.md and

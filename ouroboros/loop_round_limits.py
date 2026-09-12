@@ -115,10 +115,22 @@ def _drain_incoming_messages(
                 continue
             dmsg = entry.get("text") or ""
             if kind == KIND_TASK_MESSAGE:
+                # A principal's words to this task are premises every review reads
+                # (plan and acceptance share one corpus); a host system frame and a
+                # descendant's escalation are not the principal's directives.
+                if str(entry.get("provenance") or "ancestor_task") not in {"system", "descendant_task"}:
+                    _loop()._record_owner_directive(
+                        owner_ctx, source="principal_task_message", content=dmsg,
+                        msg_id=str(entry.get("msg_id") or ""),
+                    )
                 deliver_task_message(entry, task_id, event_queue, lambda text: _loop()._append_or_merge_user_message(messages, text))
                 acknowledge_transcript_entry(drive_root, task_id, entry)
                 continue
             if kind == KIND_QUIZ_ANSWER:
+                _loop()._record_owner_directive(
+                    owner_ctx, source="owner_quiz_answer", content=dmsg,
+                    msg_id=str(entry.get("msg_id") or ""),
+                )
                 deliver_quiz_answer(entry, task_id, event_queue, lambda text: _loop()._append_or_merge_user_message(messages, text))
                 acknowledge_transcript_entry(drive_root, task_id, entry)
                 continue

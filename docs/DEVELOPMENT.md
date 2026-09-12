@@ -897,6 +897,21 @@ documents — only actual provider overflow may use a task-local Low projection,
 followed by at most one same-route strictly-smaller call, and this never
 changes owner mode or P3 commit/scope review.
 
+### Invariant: One premise surface for every review
+
+Every review of a task's work reads the principal's words from ONE producer:
+plan review (the intention) and task acceptance (the result) both render
+`review_evidence._accept_owner_directives`, the task-local `_owner_directives`
+corpus that `loop_round_limits` fills as frames arrive (the initial turn, owner
+follow-ups, owner quiz answers, a parent's task messages to a child; host
+`system` frames and a descendant's escalations are not directives). Each
+consumer redacts at its own boundary and bounds its display with the cut
+disclosed; none summarizes or paraphrases. A second collector, a paraphrase in
+place of the rows, or a new review surface that receives none of them is a
+regression. Enforcement: `tests/test_plan_review_w3.py`
+(`test_plan_and_acceptance_read_the_same_owner_directive_producer`) and
+`tests/test_loop_misc.py` (capture of both frame kinds).
+
 ### Invariant: Compaction must earn its rewrite
 
 Context compaction is a deficit-requested materializer, not an independent

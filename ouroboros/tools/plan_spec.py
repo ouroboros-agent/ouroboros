@@ -42,6 +42,8 @@ MAX_FINDING_TEXT_CHARS = 2000
 PACKET_PRIOR_FINDING_SUMMARY_CHARS = 400
 PACKET_EXPLORATION_CHARS = 12_000
 PACKET_PRIOR_CYCLES_CHARS = 60_000
+# The principal's verbatim requirements and decisions in the reviewer packet (newest rows kept).
+PACKET_DIRECTIVES_CHARS = 16_000
 
 FINDING_CLASSES = ("blocking", "note", "need_evidence")
 AGGREGATES = ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED")

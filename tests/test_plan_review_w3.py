@@ -781,3 +781,85 @@ def test_one_free_collection_before_the_blocking_gate(harness, monkeypatch):
     assert verdict["custody_pending"] is False and verdict["status"] == "closed" and verdict["allow"] is True
     assert collect_before_gate(ctx, collected) is collected  # nothing pending: no second send
     assert len(calls) == 2
+
+
+# ------------------------------------------------------------- verbatim principal directives (P1-6)
+
+
+def _dry_run_packet(ctx, spec=None):
+    request = pr._PlanRequest(goal="Ship the deck", plan="Outline first, then draft each slide.", spec=spec or DECK_SPEC)
+    return pr.build_plan_review_packet_for_dry_run(ctx, request)
+
+
+def test_packet_carries_the_principals_verbatim_words_after_the_exploration_log(harness):
+    """The reviewers read the principal's exact words (source per row), redacted like every
+    owner text, in the mutable tail: the cache-stable prefix and the wave fingerprint are
+    byte-identical with or without the corpus (the corpus is context, not the subject)."""
+    from ouroboros.tools.plan_packet import plan_user_stable_len
+
+    ctx = harness.make_ctx()
+    bare = _dry_run_packet(ctx)
+    assert ("## OWNER REQUIREMENTS AND DECISIONS (verbatim; source per row)\n\n(none recorded by the host)"
+            in bare["user_content"])
+    ctx._owner_directives = [
+        {"source": "initial_user", "content": "Ship the deck by Friday; key sk-abcdefghijklmnopqrstuvwxyz1234", "msg_id": "t:1"},
+        {"source": "owner_quiz_answer", "content": "[Owner quiz answer] quiz q1\nThe owner chose option 2: postgres"},
+    ]
+    packet = _dry_run_packet(ctx)
+    text = packet["user_content"]
+    heading = text.index("## OWNER REQUIREMENTS AND DECISIONS")
+    assert text.index("## ROOT EXPLORATION LOG") < heading < text.index("## PRIOR CYCLES")
+    section = text[heading:text.index("## PRIOR CYCLES")]
+    assert "[initial_user · t:1]\nShip the deck by Friday; key ***REDACTED***" in section
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in text
+    assert "[owner_quiz_answer]\n[Owner quiz answer] quiz q1\nThe owner chose option 2: postgres" in section
+    stable = plan_user_stable_len(text)
+    assert stable == plan_user_stable_len(bare["user_content"]) and text[:stable] == bare["user_content"][:stable]
+    assert packet["fingerprint"] == bare["fingerprint"]  # never part of the review's identity
+
+
+def test_directive_corpus_keeps_the_newest_rows_and_discloses_the_cut():
+    from ouroboros.tools.plan_packet import _render_directives
+    from ouroboros.tools.plan_spec import PACKET_DIRECTIVES_CHARS
+
+    rows = [{"source": "owner_mailbox", "content": f"row {i:02d} " + "x" * 2_000, "msg_id": f"m{i}"} for i in range(20)]
+    text = _render_directives(rows)
+    kept = [i for i in range(20) if f"[owner_mailbox · m{i}]\nrow {i:02d} " in text]
+    assert kept and kept == list(range(20 - len(kept), 20))  # the newest rows, contiguous
+    assert text.startswith(f"⚠️ OMISSION NOTE: {20 - len(kept)} older row(s) omitted to fit {PACKET_DIRECTIVES_CHARS} chars")
+    assert "[owner_mailbox · m0]" not in text and len(text) <= PACKET_DIRECTIVES_CHARS + 200
+    assert _render_directives(rows[:2]).startswith("[owner_mailbox · m0]\nrow 00 ")  # no cut, no note
+    # One oversized newest row is still bounded head-first with the marker visible.
+    huge = _render_directives([{"source": "initial_user", "content": "y" * 40_000}])
+    assert huge.startswith("[initial_user]\nyyyy") and f"OMISSION NOTE: truncated at {PACKET_DIRECTIVES_CHARS} chars" in huge
+
+
+def test_plan_and_acceptance_read_the_same_owner_directive_producer(harness):
+    """DEVELOPMENT invariant: one premise surface for every review. The rows the
+    acceptance packet renders as owner_requirements_and_decisions are the rows the
+    plan packet renders, from the same producer over the same task-local corpus."""
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+
+    ctx = harness.make_ctx()
+    ctx._owner_directives = [
+        {"source": "initial_user", "content": "Build the deck", "msg_id": "t:1"},
+        {"source": "principal_task_message", "content": "Parent: use the Q3 numbers only", "msg_id": "pm-1"},
+    ]
+    acceptance = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=harness.drive, task_id="task-1")
+    rows = acceptance["owner_requirements_and_decisions"]
+    assert [r["content"] for r in rows] == ["Build the deck", "Parent: use the Q3 numbers only"]
+    plan = _dry_run_packet(ctx)["user_content"]
+    for row in rows:
+        assert f"[{row['source']} · {row['msg_id']}]\n{row['content']}" in plan
+
+
+def test_task_objective_carries_the_contract_context_redacted(harness):
+    from ouroboros.tools.plan_review_runtime import _task_objective
+
+    ctx = harness.make_ctx()
+    assert _task_objective(ctx) == "Deliver the thing"
+    ctx.task_contract = {"objective": "Deliver the thing",
+                         "context": "Owner said: token sk-abcdefghijklmnopqrstuvwxyz1234; audience is the board"}
+    text = _task_objective(ctx)
+    assert text == "Deliver the thing\n\nContract context: Owner said: token ***REDACTED***; audience is the board"
+    assert "## TASK OBJECTIVE\n\n" + text + "\n" in _dry_run_packet(ctx)["user_content"]

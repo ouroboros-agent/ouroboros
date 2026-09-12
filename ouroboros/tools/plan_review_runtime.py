@@ -84,7 +84,13 @@ def _task_objective(ctx: ToolContext) -> str:
     if not isinstance(contract, dict) or not contract:
         contract = metadata.get("task_contract") if isinstance(metadata, dict) else {}
     contract = contract if isinstance(contract, dict) else {}
-    return str(contract.get("objective") or contract.get("description") or "")
+    objective = str(contract.get("objective") or contract.get("description") or "")
+    context = str(contract.get("context") or "").strip()
+    if context:  # the contract's context rides with the objective, redacted like every owner text
+        from ouroboros.observability import redact_projection
+
+        objective += f"\n\nContract context: {redact_projection(context).value}"
+    return objective
 
 
 def _governance_text(system_root: pathlib.Path, rel_path: str) -> str:
@@ -159,12 +165,22 @@ def build_plan_review_packet(
         if previous and previous.get("spec_body_truncated")
         else plan_spec.spec_delta(previous.get("spec"), spec) if previous else None
     )
+    # The principal's verbatim words come from the ONE producer the acceptance
+    # packet reads, redacted at this consumer exactly as there (review_evidence).
+    from ouroboros import review_evidence
+    from ouroboros.observability import redact_projection
+
+    directive_corpus = redact_projection(review_evidence._accept_owner_directives(
+        ctx, getattr(ctx, "budget_drive_root", None) or getattr(ctx, "drive_root", None),
+        str(getattr(ctx, "task_id", "") or ""),
+    )).value
     user_content = build_plan_review_user_content(
         manifest=manifest, objective=_task_objective(ctx), goal=spec["goal"],
         plan_prose=request.plan, spec=spec, prior_cycles=prior,
         dispositions=list((previous or {}).get("dispositions") or []), spec_delta=delta,
         root_exploration_log=root_exploration_log(ctx),
-        **_packet_kwargs(build_plan_review_user_content, cycle_index=cycle_index),
+        **_packet_kwargs(build_plan_review_user_content, cycle_index=cycle_index,
+                         directive_corpus=directive_corpus),
     )
     return system_prompt, user_content, _session_task_text(system(True), user_content, str(active_root))
 
