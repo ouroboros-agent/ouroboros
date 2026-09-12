@@ -114,6 +114,10 @@ def _run_cross_model_fallback_chain(
     attempt_cap = _fcd.attempts_per_model()
     waiter = current_model_wait()
     configured_chain = parse_fallback_chain()
+    # The notice names the model that was actually just tried. `active_model`
+    # stays the primary until a candidate succeeds, so a second switch would
+    # otherwise read "primary -> B" beside B's predecessor's failure reason.
+    previous_model, previous_tag = active_model, " (local)" if active_use_local else ""
     msg = None
     # ABI-4: the candidate ladder arrives as typed ResolvedModelTarget values;
     # `.model_id` is read once here and crosses to strings only at the LLM
@@ -131,7 +135,6 @@ def _run_cross_model_fallback_chain(
         deadline = _loop()._task_deadline_epoch(tools)
         if deadline and time.time() >= deadline:
             break
-        ptag = " (local)" if active_use_local else ""
         ftag = " (local)" if fallback_use_local else ""
         # Name the account the dispatch will actually use: a task-local wait
         # override replaces the configured one for this role, or selects Auto,
@@ -144,7 +147,7 @@ def _run_cross_model_fallback_chain(
         account_route = provider_for_model(fallback_model) == "claudexor"
         account_note = f"; account: {fallback_account or 'Auto'}" if account_route else ""
         reason = str(accumulated_usage.get("_last_llm_error_kind") or "")
-        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}"
+        emit_progress(f"⚡ Fallback: {previous_model}{previous_tag} → {fallback_model}{ftag}"
                       f"{account_note}"
                       f"{f'; reason: {reason}' if reason else ''}{'; pinned account: siblings were not tried' if account_route and fallback_account else ''}",
                       incident={"task_incident": "model_lane_switch", "toast_once": f"{task_id}:model_lane_switch:{round_idx}:{fallback_model}"})
@@ -218,6 +221,7 @@ def _run_cross_model_fallback_chain(
         if str(accumulated_usage.get("_last_llm_error_kind") or "") in ("provider_outcome_unknown", "deadline_exhausted", "transport_unavailable"):
             break
         _cooled(fallback_model, fallback_use_local)
+        previous_model, previous_tag = fallback_model, ftag
     return (
         msg,
         active_model,
