@@ -231,8 +231,15 @@ def test_a_rejected_attachment_line_shows_the_rule_not_only_the_code():
 @pytest.mark.parametrize("argv", [
     ["grep", "-n", "x >= 1", "f"],
     ["rg", "a->b", "."],
+    # `>=` as its OWN token: the redirect grammar used to accept it because the
+    # token pattern only refused a following `&`, `|` or `-`.
+    ["rg", ">=", "."],
 ])
 def test_a_comparison_sign_no_longer_makes_an_inspection_a_write(argv):
+    """Disclosed micro-residual of closing the standalone `>=` token: a redirect
+    whose TARGET name begins with `=` (`cmd >=out`, writing the file `=out`) is
+    no longer reported as write shape. No product path names a file that way,
+    and the comparison form it buys back is the one owners actually type."""
     from ouroboros.tools.write_shape import non_interpreter_write_shape
 
     assert non_interpreter_write_shape(argv, argv, argv[0]) is False
@@ -241,6 +248,8 @@ def test_a_comparison_sign_no_longer_makes_an_inspection_a_write(argv):
 @pytest.mark.parametrize("argv", [
     ["tee", "f"],
     ["grep", "-n", "x", "f", ">", "out.txt"],
+    ["cmd", ">", "out"],
+    ["cmd", ">>", "out"],
     # `>&` is a stdout+stderr redirect, never a comparison: a standalone token
     # of it stays a write channel in both lanes.
     ["ls", ">&", "out.txt"],
@@ -256,6 +265,12 @@ def test_a_standalone_stdout_stderr_redirect_token_is_write_shaped_as_a_string()
     from ouroboros.tools.write_shape import shell_has_write_indicator
 
     assert shell_has_write_indicator("cmd >& out.txt") is True
+
+
+def test_a_standalone_comparison_token_is_not_write_shaped_as_a_string():
+    from ouroboros.tools.write_shape import shell_has_write_indicator
+
+    assert shell_has_write_indicator("rg '>=' .") is False
 
 
 @pytest.mark.parametrize("argv", [

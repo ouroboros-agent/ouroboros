@@ -135,7 +135,7 @@ _COMMAND_WORD_BOUNDARY_RES = {
 _TRUNCATE_BOUNDARY_RE = re.compile(r"truncate(?![a-z])")
 # `>&` opens a stdout+stderr redirect whether or not a target is glued to it
 # (`>&`, `>&1`, `>&file`); it is never a comparison, unlike `>=`, `->` and `=>`.
-_REDIRECT_SHAPE_TOKEN_RE = re.compile(r"^(?:(?:&|\d?)>>?(?=$|[^&|-])|>&)")
+_REDIRECT_SHAPE_TOKEN_RE = re.compile(r"^(?:(?:&|\d?)>>?(?=$|[^&|=-])|>&)")
 _MIDTOKEN_REDIRECT_RE = re.compile(r"(?<![<>=&|'\"-])>{1,2}(?![>=&])")
 
 # LIGHT_SHELL_WRITER_COMMANDS members that are PURE FILTERS in their default
