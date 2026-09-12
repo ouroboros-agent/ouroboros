@@ -82,19 +82,21 @@ def test_attach_snapshot_init_excludes_credential_shaped_files(tmp_path):
     (folder / "deploy.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
     error, skipped = attach_snapshot_init(folder)
     assert error == ""
-    assert sorted(skipped) == [".env", "deploy.pem"]
+    # The .pem suffix alone no longer unstages a file; this lane gains the
+    # content check in PS-5, which is what a real key header will trip.
+    assert sorted(skipped) == [".env"]
     tracked = subprocess.run(
         ["git", "ls-files"], cwd=str(folder), capture_output=True, text=True
     ).stdout.split()
     assert "app.py" in tracked
-    assert ".env" not in tracked and "deploy.pem" not in tracked
+    assert ".env" not in tracked
     # The secret files still EXIST on disk, untouched.
     assert (folder / ".env").read_text(encoding="utf-8") == "API_KEY=hunter2\n"
     # And stay untracked (info/exclude), so later commits don't sweep them either.
     status = subprocess.run(
         ["git", "status", "--porcelain"], cwd=str(folder), capture_output=True, text=True
     ).stdout
-    assert ".env" not in status and "deploy.pem" not in status
+    assert ".env" not in status
 
 
 # --- clone URL forms + typed errors ----------------------------------------------

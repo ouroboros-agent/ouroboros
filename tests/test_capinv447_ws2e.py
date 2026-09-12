@@ -288,7 +288,9 @@ def test_export_component_policy_matches_patch_policy():
     assert _sensitive_output_component_reason((".env.example",)) == ""
     assert "dotenv secret" in _sensitive_output_component_reason((".env",))
     assert "credential filename" in _sensitive_output_component_reason(("keys", "id_rsa"))
-    assert "private key" in _sensitive_output_component_reason(("server.pem",))
+    # A key/certificate SUFFIX carries no authority any more: exporting
+    # server.pem is ordinary owner output (owner answer Q6 of batch 2).
+    assert _sensitive_output_component_reason(("server.pem",)) == ""
 
 
 def test_single_declared_dotfile_output_is_exportable(tmp_path):
