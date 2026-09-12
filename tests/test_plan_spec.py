@@ -765,7 +765,7 @@ def test_user_content_sections_in_order_with_omissions_and_prior_cycles(tmp_path
     manifest = plan_evidence.resolve_evidence(CODE_SPEC["evidence"], active_root=root, allowed_roots=[root])
     first = _packet(CODE_SPEC, manifest, log="ran: ls -la")
     order = ["## TASK OBJECTIVE", "## SPEC", "## PLAN PROSE", "## EVIDENCE", "### OMISSIONS",
-             "## ROOT EXPLORATION LOG", "## OWNER REQUIREMENTS AND DECISIONS", "## PRIOR CYCLES"]
+             "## OWN ROOM DIALOGUE", "## RELATED ROOMS", "## ROOT EXPLORATION LOG", "## PRIOR CYCLES"]
     positions = [first.index(h) for h in order]
     assert positions == sorted(positions)
     assert "OBJECTIVE-TEXT" in first and "PROSE-TEXT" in first and "ran: ls -la" in first

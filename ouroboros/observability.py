@@ -709,25 +709,26 @@ def _promote_task_source_ref(
     source = _task_artifact_dir(child_root, task_id, create=False).joinpath(
         *rel.parts
     )
-    # These two owned JSON formats publish typed refs. Inspect their closure
-    # even when the outer source was already copied by an earlier attempt.
-    if name_match.group(2) == "json" and name_match.group(1) in {
+    # Inspect owned JSON closure even when an earlier attempt copied the outer source.
+    plan_wave_source = name_match.group(1).startswith("plan-review-wave-")
+    if name_match.group(2) == "json" and (plan_wave_source or name_match.group(1) in {
         "acceptance", "acceptance_tool_trajectory",
-    }:
+    }):
         try:
             payload = json.loads(raw)
         except (ValueError, UnicodeError):
             payload = None
-        if (isinstance(payload, list) and name_match.group(1) == "acceptance_tool_trajectory") or (
+        meta = payload.get("artifact_meta") if isinstance(payload, dict) else None
+        plan_wave = plan_wave_source and isinstance(meta, dict) and meta.get("kind") == "plan_review_wave"
+        if plan_wave or (isinstance(payload, list) and name_match.group(1) == "acceptance_tool_trajectory") or (
             isinstance(payload, dict) and isinstance(payload.get("request"), dict)
             and payload["request"].get("surface") == "task_acceptance"
         ):
             rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state)
             if rewritten != payload:
                 raw = json.dumps(rewritten, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    # Relative task_source addresses normally stay identical, preserving exact
-    # checkpoint bytes. Absolute observability refs or unavailable dependencies
-    # require a newly addressed source, never an overwrite of the old checkpoint.
+    # Preserve bytes for relative refs. Rebased absolute refs or unavailable
+    # dependencies mint a new source; never overwrite the old checkpoint.
     changed = hashlib.sha256(raw).hexdigest() != expected_sha
     target_ref = ref
     try:

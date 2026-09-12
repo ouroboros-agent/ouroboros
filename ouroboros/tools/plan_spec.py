@@ -42,8 +42,6 @@ MAX_FINDING_TEXT_CHARS = 2000
 PACKET_PRIOR_FINDING_SUMMARY_CHARS = 400
 PACKET_EXPLORATION_CHARS = 12_000
 PACKET_PRIOR_CYCLES_CHARS = 60_000
-# The principal's verbatim requirements and decisions in the reviewer packet (newest rows kept).
-PACKET_DIRECTIVES_CHARS = 16_000
 
 FINDING_CLASSES = ("blocking", "note", "need_evidence")
 AGGREGATES = ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED")
@@ -431,7 +429,7 @@ def _is_url(locator: str) -> bool:
 
 
 def _is_path_locator(locator: str) -> bool:
-    return bool(locator) and not _is_url(locator) and not locator.startswith(_TASK_LOCATOR_PREFIX)
+    return bool(locator) and not _is_url(locator) and not locator.startswith((_TASK_LOCATOR_PREFIX, "chat:"))
 
 def _resolve_locator_path(locator: str, root: pathlib.Path) -> tuple[Optional[pathlib.Path], str]:
     """Relative → under ``root``; absolute (or ``file://`` absolute) as-is. Returns
@@ -484,7 +482,7 @@ def resolve_constitutional(
     the system repository. The active binding alone does NOT decide (owner
     decision D29: a plan bound to the system repo that declares no system path
     is not constitutional). Skill-payload paths under ``payload_roots`` are
-    exempt (data plane, as today). URLs and ``task:`` locators never make it
+    exempt (data plane, as today). URLs and ``task:``/``chat:`` locators never make it
     true. Returns ``(constitutional, note)`` — the note names the deciding
     locator for disclosure.
     """
@@ -570,7 +568,7 @@ _PLAN_FINDING_ELEMENT_SCHEMA = """\
   "id": "<short local id, e.g. f1>",
   "class": "blocking" | "note" | "need_evidence",
   "breaks": "<spec id — REQUIRED for blocking: goal | claim_N | invariant_N | decision_N | deferred_N>",
-  "locator": "<for a need_evidence DOCUMENT request: an absolute path, or one relative to the subject workspace root; add ::lines=A-B, ::bytes=A-B, ::tail=N or ::symbol=Name (.py only) for one range; task:<id> = a prior task's result; a URL may be named; the host never fetches it. Leave it out for the other form: a need_evidence that asks the AUTHOR a question names the spec id in `breaks` and needs no locator>",
+  "locator": "<for a need_evidence DOCUMENT request: an absolute path, or one relative to the subject workspace root; add ::lines=A-B, ::bytes=A-B, ::tail=N or ::symbol=Name (.py only) for one range; task:<id> = a prior task's result; chat:<id> = a room dialogue, chat:<id>@<sha256> = an exact recorded room snapshot; a URL may be named; the host never fetches it. Leave it out for the other form: a need_evidence that asks the AUTHOR a question names the spec id in `breaks` and needs no locator>",
   "summary": "<what is wrong or missing, concretely>",
   "recommendation": "<the smallest change to the SPEC that resolves it>"
 }"""

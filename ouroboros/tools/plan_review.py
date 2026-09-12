@@ -33,7 +33,7 @@ import json
 import logging
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, List, Optional
 
 from ouroboros.config import (
     adaptive_quorum,
@@ -44,7 +44,7 @@ from ouroboros.config import (
 )
 from ouroboros.review_cycles import emit_review_cycles_exhausted, review_max_cycles
 from ouroboros.task_results import (
-    load_plan_review_state, load_task_result, mark_current_plan_review_unavailable,
+    load_plan_review_state, mark_current_plan_review_unavailable,
     plan_review_wave, current_plan_review_wave, record_plan_review_dispositions,
     plan_review_notes_are_annotatable,
 )
@@ -73,6 +73,8 @@ from ouroboros.tools.plan_review_runtime import (
     synthesize_plan_review_wave as _synthesize_plan_review_wave,
     build_plan_review_packet as _build_packet,
 )
+from ouroboros.tools.plan_evidence import task_evidence_reader as _task_evidence_reader
+from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs
 from ouroboros.tools.plan_review_artifacts import (
     attach_continuation_restart_delta as _attach_continuation_restart_delta,
     authority_wave as _authority_wave,
@@ -96,7 +98,7 @@ from ouroboros.tools.review_synthesis import (
     PLAN_REVIEW_CONTROL_PREFIX,
 )
 from ouroboros.tools.tool_result import TOOL_CODE_SPECS, ToolResult, _publish_tool_result
-from ouroboros.utils import truncate_review_artifact, utc_now_iso
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +114,6 @@ def _plan_task_tool_timeout_sec() -> float:
     # The outer ToolEntry must cover either route plus one finalization grace
     # window; it is a settlement envelope, never a cognition cutoff.
     return max(_plan_review_wrapper_timeout_sec(), float(get_task_abs_ceiling_sec())) + get_finalization_grace_sec()
-_TASK_EVIDENCE_RESULT_CHARS = 6_000
 
 @dataclass(frozen=True)
 class _PlanRequest:
@@ -381,27 +382,6 @@ def _plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, cons
                "constitutional": bool(constitutional)}
     return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
-def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
-    """Task-result projection; the evidence resolver hashes, budgets and redacts it."""
-    def _read(task_id: str) -> Optional[str]:
-        try:
-            record = load_task_result(root, task_id)
-        except Exception:
-            return None
-        if not isinstance(record, dict):
-            return None
-        projection = {
-            "task_id": task_id,
-            "status": record.get("status"),
-            "reason_code": record.get("reason_code"),
-            "ts": record.get("ts"),
-            "result": truncate_review_artifact(str(record.get("result") or ""), limit=_TASK_EVIDENCE_RESULT_CHARS),
-        }
-        if "terminal_host_notice" in record:
-            projection["terminal_host_notice"] = str(record["terminal_host_notice"] or "")
-        return json.dumps(projection, ensure_ascii=False, indent=2, default=str)
-    return _read
-
 # W3 host attachment is bounded like the agent's own evidence list (MAX_LIST_ITEMS honoured
 # locators per task); what the cap drops is a NAMED `reviewer_request_cap` omission, never silent.
 _REVIEWER_REQUEST_CAP = plan_spec.MAX_LIST_ITEMS
@@ -430,7 +410,7 @@ def _reviewer_requested_locators(ctx: ToolContext, state_root: pathlib.Path) -> 
             seen.append(loc)
     return seen, dropped
 
-def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: pathlib.Path) -> dict:
+def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: pathlib.Path, *, persist: bool = False) -> dict:
     """The ONE preamble the paid path and the dry-run seam share: normalize the spec (with the
     envelope's goal injected), resolve the subject roots, derive `constitutional`, attach the
     declared evidence, compose the fingerprint. Returns ``{"error": ...}`` on refusal — a second
@@ -478,6 +458,7 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         host_locators + declared_evidence, active_root=active_root,
         allowed_roots=[active_root, system_root],
         resolve_task=_task_evidence_reader(state_root), deny_paths=_evidence_deny_paths(ctx),
+        resolve_chat=plan_chat_reader(state_root, str(ctx.task_id)),
     )
     manifest["declared"] = declared_evidence  # the AGENT's list; requests below (tagged+hashed)
     if reviewer_requested:
@@ -486,6 +467,9 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         manifest["reviewer_requested_dropped"] = list(request_dropped)
         manifest.setdefault("omissions", []).extend(
             {"locator": loc, "reason": "reviewer_request_cap"} for loc in request_dropped)
+    manifest_hash = plan_evidence.evidence_manifest_hash(manifest)
+    author_fingerprint = _plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
+    manifest = attach_own_dialogue(ctx, state_root, manifest, author_fingerprint, persist=persist)
     manifest_hash = plan_evidence.evidence_manifest_hash(manifest)
     fingerprint = _plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
     return {
@@ -503,7 +487,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         state_root, task_id = _planning_state_location(ctx)
     except ValueError as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
-    prepared = collect if collect is not None else _prepare_plan_inputs(ctx, request, state_root)
+    prepared = collect if collect is not None else _prepare_plan_inputs(ctx, request, state_root, persist=True)
     if prepared.get("error"):
         if "PLAN_SPEC_INVALID" in prepared["error"]:
             try:
@@ -646,10 +630,15 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     slots, slot_messages, session_threads, continuation_restarted = _continuation_state(
         state_root, task_id, previous, slots, manifest, user_content=user_content,
     )
+    delivery = dialogue_slot_inputs(slots, system_prompt=system_prompt, user_content=user_content,
+        session_task=session_task, manifest=manifest, slot_messages=slot_messages,
+        native_mandatory_chars=len(system_prompt) + len(user_content))
+    slot_messages = delivery["slot_messages"]
     quorum = adaptive_quorum(len(slots))
     fanout = _plan_fanout_inputs(
         slots, resume=resume if resume_in_flight else None, replay_snapshot=replay_snapshot,
         prompt_chars=len(system_prompt) + len(user_content), quorum=quorum,
+        slot_prompt_chars=delivery["slot_prompt_chars"],
     )
     pending_note = fanout["error"]
     callable_slots = fanout.get("callable_slots") or []
@@ -692,8 +681,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         ctx, callable_slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, session_root=str(active_root),
         output_contract=plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT,
-        slot_messages=slot_messages,
-        session_threads=session_threads,
+        slot_messages=slot_messages, slot_session_tasks=delivery["slot_session_tasks"],
+        native_mandatory_read_chars=delivery["native_mandatory_read_chars"], session_threads=session_threads,
         retry_key=retry_key,
         reconcile_only=resume_in_flight,
         release_at_dispatch=collect is not None or not resume_in_flight,  # return at the barrier; a collect never waits
@@ -721,7 +710,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
         system_prompt=system_prompt, user_content=user_content, dispatched=existing if resume_in_flight else None,
-        session_task=session_task, slot_messages=slot_messages,
+        session_task=session_task, slot_messages=slot_messages, slot_session_tasks=delivery["slot_session_tasks"],
     )
     try:
         stored = _record_exact_wave(

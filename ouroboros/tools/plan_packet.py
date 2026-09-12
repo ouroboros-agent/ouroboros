@@ -5,11 +5,10 @@ evidence): the system prompt carries the findings-only stance, the domain-free
 rubric, the blocking rule, the convergence rule (cycle ≥2), the checklist
 section verbatim, and the governance pack (W3: BIBLE.md + ARCHITECTURE.md in full for a
 self-modification plan, their navigation maps otherwise); the user content carries
-TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE (+ OMISSIONS) · ROOT EXPLORATION
-LOG · OWNER REQUIREMENTS AND DECISIONS (the principal's verbatim words, the same
-corpus the acceptance packet carries) · PRIOR CYCLES in that order. Current
-chosen inputs stay complete; history, exploration and the directive corpus
-retain disclosed display bounds. The
+TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE · OWN ROOM DIALOGUE · RELATED
+ROOM POINTERS · ROOT EXPLORATION LOG · PRIOR CYCLES in that order. The full
+redacted dialogue uses task source custody and route-sized projections; only
+exploration and prior-cycle summaries retain independent display bounds. The
 ``PLAN_REVIEW_CONTROL_JSON`` control line is NOT emitted here (Phase C owns it).
 """
 
@@ -19,7 +18,6 @@ import json
 from typing import Any, Mapping, Optional
 
 from ouroboros.tools.plan_spec import (
-    PACKET_DIRECTIVES_CHARS,
     PACKET_EXPLORATION_CHARS,
     bounded_json,
     PACKET_PRIOR_CYCLES_CHARS,
@@ -269,40 +267,6 @@ def _render_evidence(manifest: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _render_directives(rows: Optional[list]) -> str:
-    """The principal's words VERBATIM, one row per host-attested source (the same
-    producer task acceptance reads: ``review_evidence._accept_owner_directives``).
-    Nothing is summarized; the newest rows survive the bound and the cut is named."""
-    rows = [r for r in (rows or []) if isinstance(r, Mapping) and str(r.get("content") or "").strip()]
-    if not rows:
-        return "(none recorded by the host)\n"
-
-    def label(row: Mapping) -> str:
-        """The row's own typed source. A parent's own message keeps its plain label; a
-        sibling's words the parent relayed name both ends, as the dialogue renderer does,
-        so a reviewer never reads a peer's proposal as the principal's directive."""
-        relayed = str(row.get("relayed_from_task_id") or "")
-        relay = f" · from task {relayed} relayed by {row.get('source_task_id') or 'ancestor'}" if relayed else ""
-        return (f"[{row.get('source') or 'owner'}{relay}"
-                f"{' · ' + str(row['msg_id']) if row.get('msg_id') else ''}]")
-
-    rendered = [f"{label(r)}\n{r.get('content')}" for r in rows]
-    kept: list[str] = []
-    used = 0
-    for row in reversed(rendered):  # newest first; the newest row always survives
-        if kept and used + len(row) > PACKET_DIRECTIVES_CHARS:
-            break
-        kept.append(row)
-        used += len(row) + 2
-    kept.reverse()
-    omitted = len(rendered) - len(kept)
-    head = (
-        f"⚠️ OMISSION NOTE: {omitted} older row(s) omitted to fit {PACKET_DIRECTIVES_CHARS} chars; "
-        "the full corpus stays in the task's acceptance evidence.\n\n"
-    ) if omitted else ""
-    return head + bounded_text("\n\n".join(kept), PACKET_DIRECTIVES_CHARS) + "\n"
-
-
 def plan_user_stable_len(user_content: str) -> int:
     """Byte offset where the cache-stable prefix ends (I-14).
 
@@ -328,16 +292,15 @@ def build_plan_review_user_content(
     spec_delta: Optional[dict],
     root_exploration_log: Optional[str],
     cycle_index: int = 1,
-    directive_corpus: Optional[list] = None,
 ) -> str:
-    """Deterministic reviewer packet: TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE
-    (+ OMISSIONS) [cache-stable prefix] · ROOT EXPLORATION LOG · OWNER REQUIREMENTS AND
-    DECISIONS (``directive_corpus``: the principal's verbatim rows, source per row) ·
-    PRIOR CYCLES (all reviewers' prior findings as a compact blocking-first projection +
-    agent dispositions + spec delta on cycle ≥2). Current objective, spec and plan prose
-    stay complete; the caller's per-slot fit decides whether the actual route can receive
-    them. Exploration, the directive corpus and prior cycles retain their disclosed
-    projection bounds."""
+    """Keep operative inputs complete and attach the exact recorded room source.
+
+    The delivery layer selects a newest source range only when the actual route
+    cannot fit the complete dialogue beside governance and the operative plan.
+    Exploration and prior cycles retain their existing disclosed display bounds.
+    """
+    from ouroboros.tools.plan_dialogue import render_dialogue
+
     view = spec_with_ids(spec)
     if goal and not view.get("goal"):
         view["goal"] = goal
@@ -346,9 +309,9 @@ def build_plan_review_user_content(
         "## SPEC (ids are the only valid `breaks` targets)\n\n" + _json_block(view) + "\n",
         "## PLAN PROSE\n\n" + (plan_prose or "(none)") + "\n",
         "## EVIDENCE\n\n" + _render_evidence(manifest),
+        render_dialogue(manifest),
         "## ROOT EXPLORATION LOG\n\n"
         + (bounded_text(root_exploration_log, PACKET_EXPLORATION_CHARS) or "(not provided by host)") + "\n",
-        "## OWNER REQUIREMENTS AND DECISIONS (verbatim; source per row)\n\n" + _render_directives(directive_corpus),
     ]
     if prior_cycles:
         sections.append(_render_prior_cycles(prior_cycles, dispositions, spec_delta))

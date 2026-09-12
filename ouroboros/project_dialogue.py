@@ -193,6 +193,8 @@ def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
         if chat_id in project_chat_ids:
             return not lifecycle and (bound == chat_id or entry_chat == chat_id
                                       or entry_matches_source_ref(row, source_refs))
+        if chat_id != 1:
+            return entry_chat == chat_id and not bound
         if entry_chat == HIDDEN_CHAT_ID:
             return False
         if lifecycle:

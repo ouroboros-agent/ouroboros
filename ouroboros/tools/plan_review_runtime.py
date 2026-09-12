@@ -110,6 +110,8 @@ def _session_task_text(system_prompt: str, user_content: str, session_root: str)
         "repository documents you MAY read raw, and MUST read in full when the pack marks them "
         "MANDATORY FULL READS (a self-modification plan), even if the agent also declared them as "
         "evidence. Retrieve any OTHER repository context with your own tools.\n\n"
+        + "The own-room source handle is the canonical redacted dialogue. Read omitted ranges "
+        "from that artifact only; raw chat/mailbox logs do not replace the redacted source.\n\n"
         + system_prompt + "\n\n" + user_content
     )
 
@@ -165,22 +167,12 @@ def build_plan_review_packet(
         if previous and previous.get("spec_body_truncated")
         else plan_spec.spec_delta(previous.get("spec"), spec) if previous else None
     )
-    # The principal's verbatim words come from the ONE producer the acceptance
-    # packet reads, redacted at this consumer exactly as there (review_evidence).
-    from ouroboros import review_evidence
-    from ouroboros.observability import redact_projection
-
-    directive_corpus = redact_projection(review_evidence._accept_owner_directives(
-        ctx, getattr(ctx, "budget_drive_root", None) or getattr(ctx, "drive_root", None),
-        str(getattr(ctx, "task_id", "") or ""),
-    )).value
     user_content = build_plan_review_user_content(
         manifest=manifest, objective=_task_objective(ctx), goal=spec["goal"],
         plan_prose=request.plan, spec=spec, prior_cycles=prior,
         dispositions=list((previous or {}).get("dispositions") or []), spec_delta=delta,
         root_exploration_log=root_exploration_log(ctx),
-        **_packet_kwargs(build_plan_review_user_content, cycle_index=cycle_index,
-                         directive_corpus=directive_corpus),
+        **_packet_kwargs(build_plan_review_user_content, cycle_index=cycle_index),
     )
     return system_prompt, user_content, _session_task_text(system(True), user_content, str(active_root))
 
@@ -340,6 +332,8 @@ async def run_plan_review_slots(
     session_root: str = "",
     output_contract: str = "",
     slot_messages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    slot_session_tasks: Optional[Dict[str, str]] = None,
+    native_mandatory_read_chars: int = 0,
     session_threads: Optional[Dict[str, str]] = None,
     retry_key: str = "",
     reconcile_only: bool = False,
@@ -370,6 +364,7 @@ async def run_plan_review_slots(
             system_prompt, user_content, plan_user_stable_len(user_content),
         ),
         slot_messages=dict(slot_messages or {}),
+        slot_session_tasks=dict(slot_session_tasks or {}),
         task_id=str(getattr(ctx, "task_id", "") or "plan_review"),
         call_type="plan_review",
         max_tokens=PLAN_REVIEW_MAX_TOKENS,
@@ -385,7 +380,9 @@ async def run_plan_review_slots(
         # The paid cycle's identity (plan fingerprint + cycle) owns its cache
         # split: a revised plan under the same task/model/slot starts cold.
         usage_attribution={"review_wave_id": str(retry_key or "")} if retry_key else {},
-        policy={"output_contract": output_contract} if output_contract else {},
+        policy={"output_contract": output_contract,
+                "native_data_root": str(getattr(ctx, "budget_drive_root", None) or ctx.drive_root),
+                "native_mandatory_read_chars": native_mandatory_read_chars},
     )
     loop = asyncio.get_running_loop()
     wait_context = copy_wait_context()
@@ -1215,7 +1212,7 @@ def plan_quorum_unreachable_facts(slot_records: List[dict], *, quorum: int) -> D
     }
 
 
-def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list, list[dict], str]:
+def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int, slot_prompt_chars: Optional[dict] = None) -> tuple[list, list[dict], str]:
     """``(callable_slots, oversize_rows, error)`` for ONE shared packet fanned across
     mixed-window slots — the review organ's calibrated per-slot input caps
     (`review_synthesis.per_slot_input_token_limits`, Capability Evidence windows) against
@@ -1240,6 +1237,7 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list,
     estimated = max(1, (max(0, int(prompt_chars)) + 3) // 4)  # utils.estimate_tokens on the packet
     callable_slots, oversize = [], []
     for slot in slots:
+        estimated = max(1, (int((slot_prompt_chars or {}).get(str(slot.slot_id), prompt_chars)) + 3) // 4)
         cap = 0 if slot_retrieves(slot) else int(limits[str(slot.slot_id)])
         if slot_retrieves(slot) or estimated <= cap:
             callable_slots.append(slot)
@@ -1269,7 +1267,7 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list,
 
 def plan_fanout_inputs(
     slots: list, *, resume: Optional[dict], replay_snapshot: Any,
-    prompt_chars: int, quorum: int,
+    prompt_chars: int, quorum: int, slot_prompt_chars: Optional[dict] = None,
 ) -> dict:
     """Freeze a paid resume's actors, or prepare one fresh health/fit fan-out."""
     if resume is not None:
@@ -1296,7 +1294,7 @@ def plan_fanout_inputs(
     )
     live_slots, health_skip_rows = plan_health_skip_rows(slots, health_evidence)
     callable_slots, oversize_rows, fit_error = plan_slot_fit(
-        live_slots, prompt_chars=prompt_chars, quorum=quorum)
+        live_slots, prompt_chars=prompt_chars, quorum=quorum, slot_prompt_chars=slot_prompt_chars)
     return {
         "callable_slots": callable_slots, "health_skip_rows": health_skip_rows,
         "oversize_rows": oversize_rows, "health_evidence": health_evidence,

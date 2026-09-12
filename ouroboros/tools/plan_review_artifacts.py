@@ -24,7 +24,7 @@ class PlanReviewSourceUnavailable(ValueError):
 
 
 def persist_wave(drive_root: Any, task_id: str, wave: Dict[str, Any]) -> Dict[str, Any]:
-    from ouroboros.artifacts import store_task_artifact_bytes
+    from ouroboros.artifacts import store_actor_source_bytes
     from ouroboros.observability import redact_projection
     from ouroboros.utils import utc_now_iso
 
@@ -50,12 +50,10 @@ def persist_wave(drive_root: Any, task_id: str, wave: Dict[str, Any]) -> Dict[st
     raw = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     ).encode("utf-8")
-    digest = sha256(raw).hexdigest()
     cycle = int(wave.get("cycle_index") or 0)
-    return store_task_artifact_bytes(
-        drive_root, task_id,
-        f"plan-review-wave-{cycle:04d}-{fingerprint}-{digest[:12]}.json",
-        raw, kind="plan_review_wave",
+    return store_actor_source_bytes(
+        drive_root, task_id, category="context_checkpoints",
+        source_id=f"plan-review-wave-{cycle:04d}-{fingerprint}", data=raw, extension="json",
     )
 
 
@@ -64,12 +62,16 @@ def read_wave(drive_root: Any, task_id: str, ref: Dict[str, Any]) -> Dict[str, A
 
     if not isinstance(ref, dict) or ref.get("root") != "artifact_store":
         raise ValueError("invalid plan-review wave artifact ref")
-    name = pathlib.Path(str(ref.get("path") or "")).name
-    if not name or name != str(ref.get("path") or ""):
-        raise ValueError("invalid plan-review wave artifact path")
-    raw = (task_artifact_dir_path(drive_root, task_id, create=False) / name).read_bytes()
-    if len(raw) != int(ref.get("bytes") or -1) or sha256(raw).hexdigest() != str(ref.get("sha256") or ""):
-        raise ValueError("plan-review wave artifact digest mismatch")
+    if ref.get("kind") == "task_source":
+        from ouroboros.artifacts import read_actor_source_bytes
+        raw = read_actor_source_bytes(drive_root, task_id, ref)
+    else:
+        name = pathlib.Path(str(ref.get("path") or "")).name
+        if not name or name != str(ref.get("path") or ""):
+            raise ValueError("invalid plan-review wave artifact path")
+        raw = (task_artifact_dir_path(drive_root, task_id, create=False) / name).read_bytes()
+        if len(raw) != int(ref.get("bytes") or -1) or sha256(raw).hexdigest() != str(ref.get("sha256") or ""):
+            raise ValueError("plan-review wave artifact digest mismatch")
     value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("plan-review wave artifact is not an object")
@@ -115,11 +117,21 @@ def authority_wave(drive_root: Any, task_id: str, hot_wave: Optional[dict]) -> O
         if (not isinstance(spec, dict) or exact.get("spec_body_truncated")
                 or spec_hash(spec) != exact.get("spec_hash")):
             raise PlanReviewSourceUnavailable("PLAN_REVIEW_SOURCE_UNAVAILABLE: artifact has no complete spec")
+    dialogue_ref = hot_wave.get("dialogue_source_ref") or exact.get("dialogue_source_ref")
+    if dialogue_ref:
+        from ouroboros.artifacts import read_actor_source_bytes
+        read_actor_source_bytes(drive_root, task_id, dialogue_ref)
     restored = {
         **exact, **hot_wave,
         "spec": copy.deepcopy(spec), "goal": spec.get("goal") or "",
         "findings": list(exact.get("findings") or []),
     }
+    if dialogue_ref and isinstance(restored.get("evidence_manifest_full"), dict):
+        from ouroboros.artifacts import task_artifact_dir_path
+        restored["evidence_manifest_full"] = copy.deepcopy(restored["evidence_manifest_full"])
+        own = restored["evidence_manifest_full"].get("own_dialogue")
+        if isinstance(own, dict):
+            own.update(source_ref=dialogue_ref, file=str(task_artifact_dir_path(drive_root, task_id, create=False) / dialogue_ref["path"]))
     restored.pop("spec_in_artifact", None)
     restored.pop("spec_body_truncated", None)
     return restored
@@ -392,7 +404,14 @@ def record_exact_wave(
         extension="json",
     )
     wave["spec_source_ref"] = source
-    exact = {**exact, "spec_source_ref": source}
+    manifest = exact.get("evidence_manifest_full") or {}
+    own = manifest.get("own_dialogue") or {}
+    identity = {"author_request_fingerprint": manifest.get("author_request_fingerprint", ""),
+                "dialogue_chat_id": own.get("chat_id")}
+    if own.get("source_ref"):
+        identity["dialogue_source_ref"] = own["source_ref"]
+    wave.update(identity)
+    exact = {**exact, **identity, "spec_source_ref": source}
     wave["wave_artifact"] = persist_wave(state_root, task_id, exact)
     stored = record_plan_review_wave(
         state_root, task_id, hot_index_wave(wave, page_size=page_size),
@@ -506,6 +525,7 @@ def exact_wave(
     wave: dict, *, plan_prose: str, manifest: dict, slots: List[Any], rows: List[dict],
     system_prompt: str, user_content: str, session_task: str,
     slot_messages: Dict[str, List[Dict[str, Any]]], dispatched: Optional[dict] = None,
+    slot_session_tasks: Optional[dict] = None,
 ) -> dict:
     """``dispatched`` = the exact wave a reconciliation is resuming over.
 
@@ -525,6 +545,7 @@ def exact_wave(
         str(r.get("slot_id") or ""): r
         for r in ((dispatched or {}).get("reviewer_outputs") or []) if isinstance(r, dict)
     }
+    native_slots = {str(slot.slot_id) for slot in slots if bool(getattr(slot, "native_retrieval", False))}
     outputs = []
     for row in rows:
         sid, route = str(row.get("slot_id") or ""), str(row.get("route") or "")
@@ -537,10 +558,11 @@ def exact_wave(
                 [dict(m) for m in recorded["request_messages"]]
                 if isinstance(recorded.get("request_messages"), list) and recorded["request_messages"]
                 else list(slot_messages[sid]) if sid in slot_messages else common
-            ) if route == "api_chat" else [],
+            ) if route == "api_chat" and sid not in native_slots else [],
             "session_task": (
-                str(recorded.get("session_task") or "") or session_task
-            ) if route == "agent_session" else "",
+                str(recorded.get("session_task") or "") or (slot_session_tasks or {}).get(sid) or session_task
+            ) if route == "agent_session" or sid in native_slots else "",
+            "delivery_class": "native_retrieving" if sid in native_slots else route,
             "review_thread_id": str(row.get("review_thread_id") or ""),
             "review_turn_id": str(row.get("review_turn_id") or ""),
             "review_thread_receipt": row.get("review_thread_receipt") or {},

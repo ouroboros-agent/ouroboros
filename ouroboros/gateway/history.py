@@ -667,7 +667,8 @@ def _make_thread_filter(
 
     from ouroboros.project_dialogue import bound_room_chat, room_membership
 
-    belongs = room_membership(thread_id, project_chat_ids, project_source_refs, bindings_by_task)
+    belongs = room_membership(thread_id if thread_id in project_chat_ids else 1,
+                              project_chat_ids, project_source_refs, bindings_by_task)
 
     def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
         if _question_project_chat(entry):

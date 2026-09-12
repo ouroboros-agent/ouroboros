@@ -799,7 +799,14 @@ requiring the same free disposition without expanding request memory or paid cyc
 DEVELOPMENT.md is not resident in a plan-review packet; it is one such request
 away. Packet composition, bounds, and wave/replay mechanics: ARCHITECTURE
 "Plan construction and review" and `ouroboros/tools/plan_packet.py` /
-`plan_spec.py`.
+`plan_spec.py`. Planning room evidence comes from `dialogue_evidence.py` over
+`Memory.read_chat_generations` and the shared `project_dialogue.room_membership`;
+`plan_dialogue.py` binds its redacted source to author-request identity. Do not
+substitute the bounded post-consolidation reader or acceptance directive ledger.
+An identical replay keeps the recorded source; real plan/evidence changes capture
+current discussion. Follow the per-delivery context/source contract in ARCHITECTURE:
+API window fit, native mandatory-read bound, and delegated harness-owned reading
+with full immutable files and honest coverage. No independent dialogue byte cap.
 
 Exact-wave custody is fail-closed: the evidence continuation uses a fresh
 full-packet dispatch only when no exact artifact reference exists. An unreadable

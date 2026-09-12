@@ -757,9 +757,15 @@ block repo commits and vice versa.
 
 Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
 work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
-SPEC, the task objective, the verbatim owner requirements and decisions (source per row, the same
-corpus task acceptance reads), the evidence the agent declared (attached bounded, with every absence
-named), and — for a self-modification plan — BIBLE.md and ARCHITECTURE.md in full (inline for
+SPEC, the task objective, the complete retained own-room discussion (both speakers, explanations,
+options, quiz recommendations and accepted answers, attachment names and addressed mailbox provenance),
+and declared evidence (attached bounded, with every absence named). Own dialogue uses an exact
+redacted snapshot outside those evidence bounds; when the route cannot hold it all, the newest part
+and exact accessible omitted ranges remain. Related rooms are pointers, not unsolicited content.
+Replay refers to the recorded snapshot and does not claim later messages reviewed. An agent reviewer
+can read the full artifact; its declared reading is not host-attested coverage. Missing generations
+and unavailable rooms remain gaps. For a self-modification plan, BIBLE.md and ARCHITECTURE.md are
+required in full (inline for
 an api reviewer; a retrieving reviewer reads both in full with its own tools, the pack names them
 as mandatory reads); every other plan gets the heading-derived navigation maps of BIBLE.md and
 ARCHITECTURE.md and may request more with `need_evidence` (the host attaches it on the next cycle,
