@@ -2427,9 +2427,10 @@ by "Provider Independence" above. Call-site imperatives:
   frame without one — never parse `toast_once` or the text for it; `OuroborosAgent._emit_progress` is the
   production implementation and a test fake mirrors it
   (`lambda text, *, incident=None: ...`). A cross-model lane switch is the
-  second owner note carrying this pair; it names both models, the selected
-  account when that route has accounts, and the typed failure reason when the
-  round record has one. The applied-option mismatch line is the third, and it
+  second owner note carrying this pair; it names both models, the account the
+  send's own binding selects when that route has accounts (a task-local wait
+  override included, never the configured value alone), and the typed failure
+  reason when the round record has one. The applied-option mismatch line is the third, and it
   rides the same loop-level callable: the frozen `ToolContext.emit_progress_fn`
   takes one argument and never carries the pair.
 - Timeout contract classes differ; keep the axes separate. A transport

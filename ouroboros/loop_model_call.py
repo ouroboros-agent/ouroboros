@@ -99,7 +99,8 @@ def _run_cross_model_fallback_chain(
     """Try fallbacks; unknown dispatch stops the chain."""
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.config import fallback_candidate_targets
-    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, parse_fallback_chain
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, parse_fallback_chain, task_model_binding
+    from ouroboros.model_wait import current_model_wait
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
     from ouroboros.provider_models import provider_for_model
 
@@ -111,6 +112,7 @@ def _run_cross_model_fallback_chain(
     primary_context_usage = _snapshot_context_fit_usage(accumulated_usage)
     fallback_use_local = runtime_setting("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
     attempt_cap = _fcd.attempts_per_model()
+    waiter = current_model_wait()
     configured_chain = parse_fallback_chain()
     msg = None
     # ABI-4: the candidate ladder arrives as typed ResolvedModelTarget values;
@@ -131,7 +133,14 @@ def _run_cross_model_fallback_chain(
             break
         ptag = " (local)" if active_use_local else ""
         ftag = " (local)" if fallback_use_local else ""
-        fallback_account = str(model_role_option(MODEL_ACCOUNTS_KEY, fallback_role) or "")
+        # Name the account the dispatch will actually use: a task-local wait
+        # override replaces the configured one for this role, or selects Auto,
+        # so the same binding must speak here as at the send.
+        _bound_role, bound_account = task_model_binding(
+            {"model_role": fallback_role, "task_metadata": getattr(tools._ctx, "task_metadata", {})},
+            overrides=waiter.overrides if waiter else None)
+        fallback_account = (bound_account.strip() if bound_account is not None
+                            else str(model_role_option(MODEL_ACCOUNTS_KEY, fallback_role) or ""))
         account_route = provider_for_model(fallback_model) == "claudexor"
         account_note = f"; account: {fallback_account or 'Auto'}" if account_route else ""
         reason = str(accumulated_usage.get("_last_llm_error_kind") or "")

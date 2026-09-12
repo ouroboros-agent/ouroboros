@@ -170,6 +170,45 @@ def test_fallback_notice_carries_lane_switch_incident_reason_and_pin(tmp_path, m
     }
 
 
+@pytest.mark.parametrize("override,expected_account,pinned", [
+    ("", "Auto", False), ("account-b", "account-b", True),
+])
+def test_fallback_notice_names_the_account_the_task_override_binds(
+    tmp_path, monkeypatch, override, expected_account, pinned,
+):
+    """A task-local wait override, not the configured value, is what the send uses."""
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+    from ouroboros.model_wait import task_model_wait_scope
+
+    fallback = "claudexor::codex=fallback"
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", fallback)
+    monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", '{"fallback":["account-a"]}')
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    monkeypatch.setattr(loop, "_call_round_model", lambda _ctx: ({"role": "assistant"}, 0, "max"))
+    progress = []
+
+    with task_model_wait_scope(task={"id": "task-7", "_attempt": 1}, drive_root=tmp_path,
+                               event_queue=None, worker_slot_held=True) as wait:
+        wait.overrides["fallback:0"] = {"model": fallback, "use_local": False,
+                                        "model_account_override": override}
+        loop_model_call._run_cross_model_fallback_chain(
+            llm=None, ctx=SimpleNamespace(active_model="primary", active_use_local=False),
+            tools=SimpleNamespace(_ctx=SimpleNamespace()), messages=[], active_model="primary",
+            active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+            drive_logs=tmp_path / "logs", task_id="task-7", round_idx=3, event_queue=None,
+            accumulated_usage={}, task_type="task",
+            emit_progress=lambda text, *, incident=None: progress.append(text),
+            context_fit_plan=None, active_context_mode="max",
+        )
+
+    assert len(progress) == 1 and f"account: {expected_account}" in progress[0]
+    assert "account-a" not in progress[0]
+    assert ("pinned account: siblings were not tried" in progress[0]) is pinned
+
+
 def test_api_fallback_notice_omits_inapplicable_account_clause(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from ouroboros import fallback_cooldown, loop, loop_model_call
