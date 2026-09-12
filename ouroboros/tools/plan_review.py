@@ -720,7 +720,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
-        system_prompt=system_prompt, user_content=user_content,
+        system_prompt=system_prompt, user_content=user_content, dispatched=existing if resume_in_flight else None,
         session_task=session_task, slot_messages=slot_messages,
     )
     try:

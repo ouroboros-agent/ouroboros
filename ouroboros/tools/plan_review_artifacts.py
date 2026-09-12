@@ -505,23 +505,42 @@ def continuation_inputs(
 def exact_wave(
     wave: dict, *, plan_prose: str, manifest: dict, slots: List[Any], rows: List[dict],
     system_prompt: str, user_content: str, session_task: str,
-    slot_messages: Dict[str, List[Dict[str, Any]]],
+    slot_messages: Dict[str, List[Dict[str, Any]]], dispatched: Optional[dict] = None,
 ) -> dict:
+    """``dispatched`` = the exact wave a reconciliation is resuming over.
+
+    A reconcile-only cycle (the $0 collection and the identical-envelope resume)
+    physically sends nothing: it re-records the wave the reviewers already answered.
+    The packet is rebuilt from the LIVE task context on that path, so a directive that
+    arrived after the dispatch would otherwise be written into the reviewers' recorded
+    request and, through ``continuation_inputs``, into the prior history of the next
+    paid cycle. The recorded request of each slot that already has one is therefore
+    carried forward byte for byte; only a slot with no recorded request (a roster row
+    the dispatched wave never had) falls back to the rebuilt packet."""
     from ouroboros.tools.plan_packet import plan_user_stable_len
     from ouroboros.tools.review_synthesis import build_plan_review_messages
 
     common = build_plan_review_messages(system_prompt, user_content, plan_user_stable_len(user_content))
+    sent = {
+        str(r.get("slot_id") or ""): r
+        for r in ((dispatched or {}).get("reviewer_outputs") or []) if isinstance(r, dict)
+    }
     outputs = []
     for row in rows:
         sid, route = str(row.get("slot_id") or ""), str(row.get("route") or "")
+        recorded = sent.get(sid) or {}
         outputs.append({
             "slot_id": sid, "model": str(row.get("model") or ""),
             "request_model": str(row.get("request_model") or ""), "route": route,
             "text": str(row.get("text") or ""), "error": str(row.get("error") or ""),
             "request_messages": (
-                list(slot_messages[sid]) if sid in slot_messages else common
+                [dict(m) for m in recorded["request_messages"]]
+                if isinstance(recorded.get("request_messages"), list) and recorded["request_messages"]
+                else list(slot_messages[sid]) if sid in slot_messages else common
             ) if route == "api_chat" else [],
-            "session_task": session_task if route == "agent_session" else "",
+            "session_task": (
+                str(recorded.get("session_task") or "") or session_task
+            ) if route == "agent_session" else "",
             "review_thread_id": str(row.get("review_thread_id") or ""),
             "review_turn_id": str(row.get("review_turn_id") or ""),
             "review_thread_receipt": row.get("review_thread_receipt") or {},

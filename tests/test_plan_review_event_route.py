@@ -392,3 +392,54 @@ def test_a_slot_settling_during_the_barrier_release_never_splits_the_wave_into_t
     assert len(frames) == 1, [f["text"] for f in frames]
     assert "2 of 2 reviewer slot(s) settled (1 ok, 1 failed)" in frames[0]["text"]
     assert not custody._RELEASED_WAVES
+
+
+def test_a_collection_records_the_dispatched_packet_not_one_rebuilt_from_the_live_corpus(harness, monkeypatch):
+    """Owner-forwarded audit, finding 1: a $0 collection must not rewrite the history of
+    what the reviewers saw. An owner directive that arrives AFTER every slot was dispatched
+    is a live directive of the task, but it was in no physically sent packet: it must appear
+    in no artifact of that wave and in no prior history the next paid cycle continues from."""
+    import copy
+    import json
+
+    from ouroboros.tools.plan_review import _handle_plan_task
+    from ouroboros.tools.plan_review_artifacts import authority_wave, continuation_inputs
+
+    executor = _HeldExecutor()
+    sent = []
+
+    def factory(assignment, **_kw):
+        if not assignment.request.reconcile_only:
+            sent.append(copy.deepcopy(assignment.request.messages))
+        return executor
+
+    monkeypatch.setattr("ouroboros.review_substrate._review_route_executor", factory)
+    ctx = harness.make_ctx()
+    ctx._owner_directives = [{"source": "initial_user", "content": "Original scope: make the chart blue."}]
+    late = "OWNER CHANGE ARRIVED AFTER DISPATCH: make the chart red."
+    try:
+        _call(ctx)
+        assert _wait_until(lambda: executor.execute_calls == 3)
+        before = authority_wave(harness.drive, "task-1", _state(harness)["waves"][-1])
+        fp = before["request_fingerprint"]
+        before_messages = copy.deepcopy(before["reviewer_outputs"][0]["request_messages"])
+        assert late not in json.dumps(sent) and late not in json.dumps(before_messages)
+        ctx._owner_directives.append({"source": "owner_mailbox", "content": late, "msg_id": "later-1"})
+        executor.release.set()
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
+        collected = _handle_plan_task(ctx, review_disposition={"review_fingerprint": fp, "items": []})
+    finally:
+        executor.release.set()
+    assert _control(collected) == {"outcome": "GREEN", "closed": True}
+    after = authority_wave(harness.drive, "task-1", _state(harness)["waves"][-1])
+    after_messages = after["reviewer_outputs"][0]["request_messages"]
+    assert after["request_fingerprint"] == fp and executor.execute_calls == 3
+    assert late not in json.dumps(sent), "no dispatched reviewer saw the later owner directive"
+    assert late not in json.dumps(after_messages), "the collection re-recorded the dispatched packet"
+    assert after_messages == before_messages
+    # The next paid cycle continues from that same recorded history, never from the rebuild.
+    _slots, history, _threads, cause = continuation_inputs(
+        harness.drive, "task-1", after, harness.state["slots"], user_content="Next paid review turn")
+    assert cause == "" and history
+    assert late not in json.dumps(history["s1"][:-2]), "the late directive entered the prior history"
+    assert history["s1"][:-2] == before_messages
