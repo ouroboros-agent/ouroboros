@@ -814,13 +814,14 @@ def test_symlink_escape_excluded_from_pack(tmp_path):
 
 
 def test_sensitive_files_fail_closed_on_load(tmp_path):
-    """Phase 3 round 20: a skill that ships a sensitive-shape file
-    (`.env`, `credentials.json`, `.pem`, ...) fails to load. Rationale:
+    """Phase 3 round 20: a skill that ships an exact credential file
+    (`.env`, `credentials.json`, `id_rsa`, ...) fails to load. Rationale:
     silently excluding the file from hash/review would let a reviewed
     skill ``open('.env').read()`` at runtime to exfiltrate credentials
     that the reviewer never saw. The loader fails closed via
     ``SkillPayloadUnreadable``; the user must rename / relocate the
-    file out of the skill directory."""
+    file out of the skill directory. The message names only what still
+    blocks: a certificate loads since PS-6, so it must not appear there."""
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
     repo_root = tmp_path / "skills"
@@ -838,7 +839,9 @@ def test_sensitive_files_fail_closed_on_load(tmp_path):
     loaded = load_skill(skill_dir, drive_root)
     assert loaded is not None
     assert loaded.load_error
-    assert "sensitive" in loaded.load_error.lower()
+    assert "credential filename" in loaded.load_error.lower()
+    assert "credentials.json" in loaded.load_error and "id_rsa" in loaded.load_error
+    assert ".pem" not in loaded.load_error
     assert loaded.available_for_execution is False
 
 

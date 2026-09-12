@@ -391,8 +391,8 @@ def _iter_payload_files(
                 raise SkillPayloadUnreadable(
                     str(path.relative_to(resolved_root)),
                     RuntimeError(
-                        "sensitive-shape filename present in skill tree "
-                        "(e.g. .env / credentials.json / .pem). Rename "
+                        "exact credential filename present in skill tree "
+                        "(e.g. .env / credentials.json / id_rsa / .netrc). Rename "
                         "or relocate the file outside the skill checkout."
                     ),
                 )
