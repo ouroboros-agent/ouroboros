@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -120,8 +122,22 @@ def test_same_request_retry_after_rotation_preserves_winning_source(runtime, ini
     assert before[0]["quiz"].get("answered_index") == initial_index
 
 
-def test_competing_answers_preserve_only_the_recorded_winner(runtime):
+@pytest.mark.parametrize("force_overlap", [False, True])
+def test_competing_answers_preserve_only_the_recorded_winner(runtime, monkeypatch, force_overlap):
+    from ouroboros.dialogue_evidence import read_room_source
+    from ouroboros.gateway.history import make_chat_history_endpoint
+
     _ask(runtime, "race")
+    if force_overlap:
+        original = message_bus.log_chat
+        barrier = threading.Barrier(2, timeout=10)
+
+        def append_after_both_history_checks(*args, **kwargs):
+            if kwargs.get("record_type") == "quiz_answer":
+                barrier.wait()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(message_bus, "log_chat", append_after_both_history_checks)
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(lambda index: _answer(
             runtime, "race", request_id=f"request-{index}", index=index,
@@ -129,9 +145,27 @@ def test_competing_answers_preserve_only_the_recorded_winner(runtime):
         ), [0, 1]))
     assert sorted(status for status, _ in outcomes) == [200, 409]
     winner = quiz_states(runtime.root, runtime.task["id"])["race"]
-    [fact] = _facts(runtime)
+    # Concurrent healing may append the same source twice; the dialogue reader
+    # owns identity deduplication, while every physical row must keep the winner.
+    facts = _facts(runtime)
+    assert facts and all(fact["quiz"] == winner for fact in facts)
+    assert {fact["client_message_id"] for fact in facts} == {"quiz_answer:task-quiz:race"}
+    if force_overlap:
+        assert len(facts) == 2
+    source = read_room_source(runtime.root, 1, task_id=runtime.task["id"])
+    [fact] = [row for row in source["rows"] if row.get("type") == "quiz_answer"]
     assert fact["quiz"] == winner
     assert fact["quiz"]["comment"] == f"Owner choice {winner['answered_index']}"
+    response = asyncio.run(make_chat_history_endpoint(runtime.root)(
+        SimpleNamespace(query_params={"n_human": "100", "thread": "1"})))
+    messages = json.loads(response.body)["messages"]
+    [card] = [row for row in messages if row.get("msg_type") == "quiz"]
+    assert card["quiz"]["answered_index"] == winner["answered_index"]
+    assert card["quiz"]["comment"] == winner["comment"]
+    assert not [row for row in messages if row.get("system_type") == "quiz_answer"]
+    assert len([frame for frame in runtime.frames if frame.get("type") == "quiz_state"]) == 1
+    [delivery] = drain_owner_entries(runtime.root, runtime.task["id"], include_acknowledged=True)
+    assert delivery["text"] == fact["text"]
 
 
 def test_retry_heals_history_write_failure_from_the_winning_block(runtime, monkeypatch):
