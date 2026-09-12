@@ -1431,7 +1431,7 @@ def call_llm_with_retry(
             )
             host_route = usage.get("model_role_route") or {}
             model, use_local = host_route.get("model", model), host_route.get("use_local", use_local)
-            accumulated_usage["_model_route"], accumulated_usage["_options"] = dict((usage.get("claudexor") or {}).get("route") or {}), ({key: (usage.get("claudexor") or {}).get(key) for key in ("requested_options", "applied_options", "options_honored")} if usage.get("claudexor") else {})
+            accumulated_usage["_model_route"], accumulated_usage["_options"] = dict((usage.get("claudexor") or {}).get("route") or {}), ({key: (usage.get("claudexor") or {}).get(key) for key in ("requested_options", "applied_options", "options_honored", "route")} if usage.get("claudexor") else {})
             context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
             _take_custom_receipts(usage, msg, accumulated_usage)
             for stale in ("_last_llm_error", "_last_llm_error_kind", "_last_llm_retry_same_request",

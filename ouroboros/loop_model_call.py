@@ -491,7 +491,8 @@ def _dispatch_round_model(
             use_local=ctx.active_use_local, preferred_mode=ctx.active_context_mode,
             tool_schemas=ctx.tool_schemas, model_role=role, model_route=observed,
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
-    emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id, emit_progress=ctx.emit_progress)
+    emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id,
+                               emit_progress=getattr(ctx, "emit_progress", None))
     call = ctx.accumulated_usage.get("_last_llm_call_meta")
     execution_id = ctx.accumulated_usage.get("execution_id")
     if (result[0] is not None and isinstance(call, dict) and call is not previous_call

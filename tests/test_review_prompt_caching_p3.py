@@ -61,8 +61,11 @@ def test_main_loop_projects_claudexor_options_outside_the_route(tmp_path):
                         logs, "task", 1, queue.Queue(), usage)
 
     assert usage["_model_route"] == {"credentialProfileId": "account-a"}
+    # The options carry the route that reported them, so a later round that
+    # rewrites `_model_route` alone cannot be paired with these values.
     assert usage["_options"] == {
         "requested_options": {"reasoningEffort": "high"},
         "applied_options": {"reasoningEffort": "medium"},
         "options_honored": "mismatch",
+        "route": {"credentialProfileId": "account-a"},
     }

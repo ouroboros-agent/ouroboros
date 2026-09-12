@@ -783,14 +783,18 @@ def emit_model_effort_mismatch(
     """Disclose an engine-applied option mismatch once per task and model.
 
     One line per (task, model), never per round: a second mismatch on the same
-    model in the same task stays in the durable usage rows only.
+    model in the same task stays in the durable usage rows only. The options
+    must belong to the route the record now names: an error round rewrites
+    `_model_route` from its own failure, and that model must never inherit an
+    earlier route's applied options.
     """
     options = accumulated_usage.get("_options")
     route = accumulated_usage.get("_model_route") or {}
     model = str(route.get("model") or "")
     notified = accumulated_usage.setdefault("_options_mismatch_notified", [])
     if (emit_progress is None or not isinstance(options, dict)
-            or options.get("options_honored") != "mismatch" or model in notified):
+            or options.get("options_honored") != "mismatch" or model in notified
+            or (options.get("route") or {}) != route):
         return
     requested = options.get("requested_options") or {}
     applied = options.get("applied_options") or {}

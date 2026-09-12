@@ -203,14 +203,17 @@ def _mismatch_round_context(tmp_path, monkeypatch, *, emit_progress, applied_val
         emit_progress=emit_progress,
     )
 
+    route = {"credentialProfileId": "account-a", "model": "codex=model"}
+
     def call(_llm, _messages, _model, _tools, _effort, _retries, _logs, _tid,
              _round, _queue, usage, *_args, **_kwargs):
         usage["_options"] = {
             "requested_options": {"reasoningEffort": "high"},
             "applied_options": {"reasoningEffort": next(applied_values)},
             "options_honored": "mismatch",
+            "route": dict(route),
         }
-        usage["_model_route"] = {"credentialProfileId": "account-a", "model": "codex=model"}
+        usage["_model_route"] = dict(route)
         return {"role": "assistant", "content": "done"}, 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", call)
@@ -235,6 +238,50 @@ def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path,
         "task_incident": "model_effort_mismatch",
         "toast_once": "task-7:model_effort_mismatch:codex=model",
     }
+
+
+def test_failed_round_route_never_borrows_the_previous_applied_options(tmp_path, monkeypatch):
+    """Only the route that reported applied options can be named in its line."""
+    from ouroboros.llm_claudexor import ClaudexorModelError
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    usage, progress = {}, []
+    route_a = {"model": "MODEL-A", "credentialProfileId": "acct-a", "source": "codex"}
+    route_b = {"model": "MODEL-B", "credentialProfileId": "acct-b", "source": "claude"}
+
+    def served(route, requested, applied):
+        return {"role": "assistant", "content": "done"}, {"claudexor": {
+            "route": dict(route), "options_honored": "mismatch",
+            "requested_options": {"reasoningEffort": requested},
+            "applied_options": {"reasoningEffort": applied}}}
+
+    def failed(route):
+        raise ClaudexorModelError({"code": "model_operation_failed", "message": "engine down",
+                                   "context": {"httpStatus": 503}}, route=route)
+
+    rounds = [lambda: served(route_a, "xhigh", "low"), lambda: failed(route_b),
+              lambda: served(route_b, "high", "medium")]
+    lines_after = []
+
+    for index, step in enumerate(rounds):
+        monkeypatch.setattr(loop_llm_call, "_send_main_candidate",
+                            lambda *_args, _step=step, **_kwargs: _step())
+        loop_llm_call.call_llm_with_retry(
+            SimpleNamespace(), [], "MODEL", [], "xhigh", 1, logs, "task-1", index, None, usage,
+            "task", attempt_cap=1, initial_messages=[])
+        loop_transport.emit_model_effort_mismatch(
+            usage, task_id="task-1",
+            emit_progress=lambda text, *, incident=None: progress.append((text, incident)))
+        lines_after.append(len(progress))
+        if index == 1:  # the failed round names its own route and carries no applied options
+            assert usage["_model_route"] == route_b and usage["_options"]["route"] == route_a
+
+    assert lines_after == [1, 1, 2]  # the failed round adds nothing; MODEL-B speaks for itself
+    assert [incident["toast_once"] for _text, incident in progress] == [
+        "task-1:model_effort_mismatch:MODEL-A", "task-1:model_effort_mismatch:MODEL-B"]
+    assert progress[1][0] == ("⚠️ Claudexor served at medium effort while high was requested"
+                              " (Claudexor account acct-b).")
 
 
 def test_mismatch_round_never_calls_the_one_argument_tool_context_emitter(tmp_path, monkeypatch):
