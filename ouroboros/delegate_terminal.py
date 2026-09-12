@@ -16,12 +16,15 @@ def terminal_reconcile_task(
     *,
     gateway_factory: Optional[Callable[[], Any]] = None,
     trigger: str = "terminal_boundary",
+    deliberate_terminal: str = "",
 ) -> Dict[str, Any]:
     """Reconcile durable starts, then re-audit runs, invocations, and patches.
 
     A still-live run is cancelled only behind a deliberate owner terminal
     (``delegate_custody_reconcile._owner_terminal_is_deliberate``); otherwise it
-    is left live and disclosed as open, for the sweep to re-judge."""
+    is left live and disclosed as open, for the sweep to re-judge.
+    ``deliberate_terminal`` carries that verdict from a caller that has not
+    written its terminal result yet, which is every kill boundary."""
 
     mine = str(task_id or "")
     result: Dict[str, Any] = {
@@ -37,6 +40,7 @@ def terminal_reconcile_task(
     try:
         result["outcomes"] = custody.reconcile_task_runs(
             drive_root, mine, gateway_factory=gateway_factory,
+            deliberate_terminal=deliberate_terminal,
         )
     except Exception:
         log.warning("Terminal delegated custody reconciliation failed for %s", mine, exc_info=True)

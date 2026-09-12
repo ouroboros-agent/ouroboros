@@ -446,3 +446,65 @@ def test_reconciliation_default_transport_is_the_ensured_owned_daemon(tmp_path, 
     empty.mkdir()
     assert dc.reconcile_orphaned_runs(empty, set()) == []
     assert not ensured
+
+
+def test_the_kill_boundary_states_its_own_verdict_before_it_writes_it(tmp_path):
+    """An owner cancellation still cancels the paid run, at the kill boundary.
+
+    The A4 ordering audits custody BEFORE the terminal write, so the durable
+    result the inverted floor reads does not exist yet and the run would have
+    survived until the next periodic sweep (up to ten minutes of paid work).
+    The killing caller already knows the verdict, so it states it. A host bound
+    that has no verdict passes nothing and still spares the run (owner B1-A).
+    """
+    import ouroboros.delegate_custody as dc
+
+    def _started(run_id: str, task_id: str) -> None:
+        dc._CUSTODY.clear()
+        dc.record_started(tmp_path, dc.RunCustody(
+            run_id=run_id, task_id=task_id, route_id="r", model="m",
+            project_id="p", project_owned=False, root_task_id=task_id,
+            ledger_root=str(tmp_path)))
+        dc._CUSTODY.clear()
+
+    _started("run-owner-cancelled", "t-owner-cancel")
+    deliberate = _LiveRunStub(run_id="run-owner-cancelled")
+    outcomes = dc.reconcile_task_runs(
+        tmp_path, "t-owner-cancel", gateway_factory=lambda: deliberate,
+        deliberate_terminal="cancelled",
+    )
+    assert [row["action"] for row in outcomes] == ["cancelled"]
+    assert deliberate.cancels == [("run-owner-cancelled", "owner_task_gone")]
+
+    _started("run-no-verdict", "t-no-verdict")
+    spared = _LiveRunStub(run_id="run-no-verdict")
+    outcomes = dc.reconcile_task_runs(
+        tmp_path, "t-no-verdict", gateway_factory=lambda: spared,
+    )
+    assert [row["action"] for row in outcomes] == ["left_live"]
+    assert spared.cancels == []
+    dc._CUSTODY.clear()
+
+
+def test_the_supervisor_kill_path_carries_the_cancellation_verdict(tmp_path, monkeypatch):
+    """End to end over the supervisor seam the finder probed: the cancel kill
+    path passes its own terminal into the audit, a reap passes nothing."""
+    import types
+
+    import ouroboros.delegate_terminal as delegate_terminal
+    from supervisor.cancel_publication import _audit_delegated_runs_on_kill
+
+    seen: list = []
+    monkeypatch.setattr(
+        delegate_terminal, "terminal_reconcile_task",
+        lambda root, tid, **kw: seen.append(kw.get("deliberate_terminal", "")) or {
+            "task_id": tid, "trigger": kw.get("trigger", ""), "outcomes": [],
+            "unreconciled": [], "audit_status": "ok",
+        },
+    )
+    q = types.SimpleNamespace(DRIVE_ROOT=str(tmp_path))
+
+    _audit_delegated_runs_on_kill(q, "t1", deliberate_terminal="cancelled")
+    _audit_delegated_runs_on_kill(q, "t1", trigger="reaper_deadline_exceeded")
+
+    assert seen == ["cancelled", ""]

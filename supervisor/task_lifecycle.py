@@ -1140,7 +1140,13 @@ def _finish_captured_running(
 
     _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
 
-    custody_audit = _audit_delegated_runs_on_kill(q, task_id)
+    # The verdict this function is about to write, stated to the audit that runs
+    # before the write (A4 ordering): an owner cancellation is a DELIBERATE
+    # terminal, so its live delegated runs are cancelled here instead of
+    # surviving until the next periodic sweep.
+    custody_audit = _audit_delegated_runs_on_kill(
+        q, task_id, deliberate_terminal=STATUS_CANCELLED,
+    )
     unreconciled = list(custody_audit.get("unreconciled") or [])
 
     # A terminal checkpoint can precede split-drive adoption and artifact capture.

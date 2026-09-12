@@ -410,6 +410,7 @@ def _custody_disclosure_fields(
 
 def _audit_delegated_runs_on_kill(
     q: Any, task_id: str, *, trigger: str = "cancel_publication",
+    deliberate_terminal: str = "",
 ) -> Dict[str, Any]:
     """Settle this task's open DELEGATED runs after its worker is dead; disclose
     what stayed open. Returns the FULL audit mapping (R2) — ``unreconciled``
@@ -439,7 +440,16 @@ def _audit_delegated_runs_on_kill(
     ``delegated_runs_unreconciled`` surface (result field, typed event,
     delivery note, ``audit_failed`` flavor), and periodic reconciliation
     remains the eventual closer. A pending-invocation audit failure surfaces
-    the same way. GR6-4 closes the quiet corner of the same class: a custody
+    the same way.
+
+    ``deliberate_terminal`` is the terminal status this caller is about to write
+    when the kill IS the task's own deliberate end (an owner cancellation). The
+    A4 ordering audits custody before that write, so the durable result the
+    inverted cancel floor reads does not exist yet; without this the owner's
+    cancel would leave the paid run live until the next periodic sweep. A host
+    bound (deadline, reap) passes nothing and keeps sparing the run.
+
+    GR6-4 closes the quiet corner of the same class: a custody
     log that EXISTS but cannot be OPENED used to replay as empty (audits as
     "cleanly reconciled") because ``_iter_rows`` swallows its own ``OSError``
     — the audit now probes readability first and reports the typed
@@ -453,6 +463,7 @@ def _audit_delegated_runs_on_kill(
 
         audit = terminal_reconcile_task(
             pathlib.Path(q.DRIVE_ROOT), task_id, trigger=trigger,
+            deliberate_terminal=deliberate_terminal,
         )
     except Exception:
         log.warning(
