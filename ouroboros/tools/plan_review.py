@@ -632,7 +632,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     )
     delivery = dialogue_slot_inputs(slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, manifest=manifest, slot_messages=slot_messages,
-        native_mandatory_chars=len(system_prompt) + len(user_content))
+        native_mandatory_chars=len(system_prompt) + len(user_content), data_root=state_root,
+        frozen=existing if resume_in_flight else None)
     slot_messages = delivery["slot_messages"]
     quorum = adaptive_quorum(len(slots))
     fanout = _plan_fanout_inputs(
@@ -683,7 +684,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         session_task=session_task, session_root=str(active_root),
         output_contract=plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT,
         slot_messages=slot_messages, slot_session_tasks=delivery["slot_session_tasks"],
-        native_mandatory_read_chars=delivery["native_mandatory_read_chars"], session_threads=session_threads,
+        request_policy=delivery["request_policy"], session_threads=session_threads,
         retry_key=retry_key,
         reconcile_only=resume_in_flight,
         release_at_dispatch=collect is not None or not resume_in_flight,  # return at the barrier; a collect never waits
@@ -712,7 +713,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
         system_prompt=system_prompt, user_content=user_content, dispatched=existing if resume_in_flight else None,
         session_task=session_task, slot_messages=slot_messages, slot_session_tasks=delivery["slot_session_tasks"],
-        dialogue_delivery=delivery["dialogue_delivery"],
+        dialogue_delivery=delivery["dialogue_delivery"], request_policy=delivery["request_policy"],
+        slot_prompt_chars=delivery["slot_prompt_chars"],
     )
     try:
         stored = _record_exact_wave(

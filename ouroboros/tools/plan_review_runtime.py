@@ -334,6 +334,7 @@ async def run_plan_review_slots(
     slot_messages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     slot_session_tasks: Optional[Dict[str, str]] = None,
     native_mandatory_read_chars: int = 0,
+    request_policy: Optional[dict] = None,
     session_threads: Optional[Dict[str, str]] = None,
     retry_key: str = "",
     reconcile_only: bool = False,
@@ -380,7 +381,7 @@ async def run_plan_review_slots(
         # The paid cycle's identity (plan fingerprint + cycle) owns its cache
         # split: a revised plan under the same task/model/slot starts cold.
         usage_attribution={"review_wave_id": str(retry_key or "")} if retry_key else {},
-        policy={"output_contract": output_contract,
+        policy=dict(request_policy) if request_policy is not None else {"output_contract": output_contract,
                 "native_data_root": str(getattr(ctx, "budget_drive_root", None) or ctx.drive_root),
                 "native_mandatory_read_chars": native_mandatory_read_chars},
     )

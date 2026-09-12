@@ -521,11 +521,43 @@ def continuation_inputs(
     return slots, slot_messages, session_threads, ""
 
 
+def frozen_delivery_inputs(wave: dict, slots: list) -> dict:
+    """Reuse exact request policy and per-slot inputs; never re-fit live context."""
+    policy, sizes = wave.get("request_policy"), wave.get("slot_prompt_chars")
+    if not isinstance(policy, dict) or not isinstance(sizes, dict):
+        raise PlanReviewSourceUnavailable(
+            "PLAN_REVIEW_SOURCE_UNAVAILABLE: original request policy/fit was not recorded; "
+            "current values cannot stand in for the paid request")
+    outputs = {str(row.get("slot_id") or ""): row for row in wave.get("reviewer_outputs") or []}
+    actors = {str(row.get("slot_id") or ""): row for row in wave.get("actors") or []}
+    messages, tasks = {}, {}
+    for slot in slots:
+        sid = str(slot.slot_id)
+        if actors.get(sid, {}).get("operation_state") == "not_dispatched":
+            continue  # A frozen zero-send refusal has no paid input to rejoin.
+        row = outputs.get(sid)
+        if not isinstance(row, dict) or sid not in sizes:
+            raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded slot inputs missing: {sid}")
+        if bool(getattr(slot, "retrieves", False)):
+            if not row.get("session_task"):
+                raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded retrieving task missing: {sid}")
+            tasks[sid] = str(row["session_task"])
+        else:
+            if not row.get("request_messages"):
+                raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded packet missing: {sid}")
+            messages[sid] = copy.deepcopy(row["request_messages"])
+    return {"request_policy": copy.deepcopy(policy), "slot_messages": messages,
+            "slot_session_tasks": tasks, "slot_prompt_chars": dict(sizes),
+            "dialogue_delivery": copy.deepcopy(wave.get("dialogue_delivery") or {}),
+            "native_mandatory_read_chars": int(policy.get("native_mandatory_read_chars") or 0)}
+
+
 def exact_wave(
     wave: dict, *, plan_prose: str, manifest: dict, slots: List[Any], rows: List[dict],
     system_prompt: str, user_content: str, session_task: str,
     slot_messages: Dict[str, List[Dict[str, Any]]], dispatched: Optional[dict] = None,
     slot_session_tasks: Optional[dict] = None, dialogue_delivery: Optional[dict] = None,
+    request_policy: Optional[dict] = None, slot_prompt_chars: Optional[dict] = None,
 ) -> dict:
     """``dispatched`` = the exact wave a reconciliation is resuming over.
 
@@ -574,5 +606,7 @@ def exact_wave(
     return {
         **wave, "plan_prose": plan_prose, "evidence_manifest_full": manifest,
         "dialogue_delivery": dispatched.get("dialogue_delivery", {}) if dispatched is not None else dialogue_delivery or {},
+        "request_policy": copy.deepcopy(dispatched["request_policy"] if dispatched is not None else request_policy),
+        "slot_prompt_chars": copy.deepcopy(dispatched["slot_prompt_chars"] if dispatched is not None else slot_prompt_chars),
         "slots": [slot_row(slot) for slot in slots], "reviewer_outputs": outputs,
     }

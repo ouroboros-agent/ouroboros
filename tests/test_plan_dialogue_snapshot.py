@@ -197,3 +197,41 @@ def test_budget_prices_the_actual_window_fitted_inputs(harness, monkeypatch):
         prompt_chars=captured[0]['prompt_chars'], max_completion_tokens=PLAN_REVIEW_MAX_TOKENS, remaining_usd_override=1.0)
     assert admission['fits'] is True and admission['estimated_wave_usd'] == 0.3
     assert len(substrate.calls) == 1
+
+
+def test_free_collection_reuses_policy_after_live_exploration_changes(harness, monkeypatch):
+    from tests.test_plan_review_event_route import _install_real_substrate, _wait_until, _mailbox_entries
+    from ouroboros.tools import plan_review_runtime
+    from tests.test_plan_review_engine import _control
+    live = ['Read the initial discussion.']
+    monkeypatch.setattr(plan_review_runtime, 'root_exploration_log', lambda _ctx: live[0])
+    executor = _install_real_substrate(monkeypatch)  # Only the model executor is fake; custody is real.
+    ctx = harness.make_ctx()
+    ctx.current_chat_id = 1
+    try:
+        _call(ctx)
+        first = _state(harness)['waves'][-1]
+        from ouroboros.tools.plan_review_artifacts import read_wave
+        sent = read_wave(harness.drive, ctx.task_id, first['wave_artifact'])
+        assert sent['request_policy']['native_mandatory_read_chars'] > 0
+        assert _wait_until(lambda: executor.execute_calls == 3)
+        live[0] += ' Processed an owner clarification and waited for the panel.'
+        executor.release.set()
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) == 1)
+        collected = _collect(ctx, first['request_fingerprint'])
+        assert _control(collected) == {'outcome': 'GREEN', 'closed': True}
+        assert executor.execute_calls == 3 and _state(harness)['cycles_paid'] == 1
+        assert 'custody is unavailable' not in collected
+        settled = read_wave(harness.drive, ctx.task_id, _state(harness)['waves'][-1]['wave_artifact'])
+        assert settled['request_policy'] == sent['request_policy']
+        assert settled['slot_prompt_chars'] == sent['slot_prompt_chars']
+        assert [row['request_messages'] for row in settled['reviewer_outputs']] == [row['request_messages'] for row in sent['reviewer_outputs']]
+    finally:
+        executor.release.set()
+
+
+def test_missing_recorded_policy_does_not_infer_current_paid_contract():
+    import pytest
+    from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs, PlanReviewSourceUnavailable
+    with pytest.raises(PlanReviewSourceUnavailable, match='original request policy/fit was not recorded'):
+        frozen_delivery_inputs({'reviewer_outputs': []}, [])

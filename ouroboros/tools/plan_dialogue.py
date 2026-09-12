@@ -162,11 +162,16 @@ def fit_dialogue_text(packet: str, own: dict, capacity_chars: int) -> tuple[str,
 
 def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                          session_task: str, manifest: dict, slot_messages: dict,
-                         native_mandatory_chars: int) -> dict:
-    """Project the exact source using each existing delivery's context seam."""
+                         native_mandatory_chars: int, data_root: Any = "",
+                         frozen: dict | None = None) -> dict:
+    """Project a fresh request, or reuse the recorded delivery at collection."""
+    if frozen is not None:
+        from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs
+        return frozen_delivery_inputs(frozen, slots)
     from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS, slot_retrieves, slot_is_session
     from ouroboros.tools.review_synthesis import build_plan_review_messages, per_slot_input_token_limits
     from ouroboros.tools.plan_packet import plan_user_stable_len
+    from ouroboros.tools.plan_spec import PLAN_FINDINGS_ARRAY_CONTRACT
     from ouroboros.review_native_episode import review_native_transcript_bound, native_landing_at
     from ouroboros.reviewer_window import reviewer_window_binding
     from ouroboros.review_execution import _messages_char_count
@@ -218,4 +223,7 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                                          "native_retrieving" if slot_retrieves(slot) else "packet")
     return {"slot_messages": messages, "slot_session_tasks": tasks, "slot_prompt_chars": lengths,
             "dialogue_delivery": coverage,
-            "native_mandatory_read_chars": native_mandatory_chars}
+            "native_mandatory_read_chars": native_mandatory_chars,
+            "request_policy": {"output_contract": PLAN_FINDINGS_ARRAY_CONTRACT,
+                               "native_data_root": str(data_root),
+                               "native_mandatory_read_chars": native_mandatory_chars}}
