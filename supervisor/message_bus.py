@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from ouroboros.artifacts import store_chat_media_bytes
-from ouroboros.cost_projection import carry_cost_meta
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_LINKS, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_QUIZ, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
@@ -647,8 +646,8 @@ class LocalChatBridge:
     ) -> bool:
         """Send typing indicator to UI/event subscribers.
 
-        ``kind`` is stamped only for registry-tracked direct/ephemeral turns
-        (``direct_chat``/``ephemeral_decision``); queued managed tasks emit
+        ``kind`` is stamped only for registry-tracked direct turns
+        (``direct_chat``); queued managed tasks emit
         typing without it, so the client knows the /api/state snapshot has no
         deletion authority over their entries.
         """
@@ -1310,14 +1309,6 @@ def log_chat(
                     record[key] = meta[key]
         if "task_terminal_status" in meta:
             record["task_terminal_status"] = str(meta.get("task_terminal_status") or "")
-        if meta.get("ephemeral_decision"):
-            # A transient turn has no task_result: its final chat row carries
-            # the same outcome/accounting facts as the live terminal frame.
-            for key in ("ephemeral_decision", "outcome_axes", "reason_code",
-                        "tool_calls", "rounds", "suggested_name", "model_execution"):
-                if key in meta:
-                    record[key] = meta[key]
-            record.update(carry_cost_meta(meta))
         if isinstance(meta.get("origin_message_ref"), dict):
             record["origin_message_ref"] = dict(meta["origin_message_ref"])
         if filename:

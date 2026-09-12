@@ -116,8 +116,9 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
         "outcome_axes": normalize_outcome_axes(evt),
         "reason_code": str(evt.get("reason_code") or ""),
     }
-    if bool(evt.get("ephemeral_decision")):
-        payload["ephemeral_decision"] = True
+    if "tool_call_counts" in evt:
+        counts = evt["tool_call_counts"]
+        payload["tool_call_counts"] = dict(counts) if isinstance(counts, dict) else None
     if evt.get("chat_id") is not None:
         payload["chat_id"] = evt["chat_id"]
     _address_ctx(ctx, payload)

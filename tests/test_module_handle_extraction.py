@@ -308,7 +308,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_delivery_evidence_state", "_emit_checkpoint_event",
         "_finalize_forced_services", "_finalize_task_services",
         "_force_plan_disclosure", "_forced_fallback_result",
-        "_forced_final_answer", "_forced_swarm_router_result",
+        "_forced_final_answer",
         "_hold_delivery_for_skill_action", "_live_delivery_candidate",
         "_loop_tree_accounting", "_merge_finalization_trace", "_note_nanny_delegate_activity",
         "_prepare_forced_prompt", "_prepare_post_tool_budget_context",
@@ -341,7 +341,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "DeliveryCandidate", "_LoopExitContext",
         "_append_or_merge_user_message", "_call_forced_model_once",
         "_child_disposition_state", "_claimed_child_dispositions",
-        "_compose_delivery_suffix", "_current_delivery_candidate",
+        "_current_delivery_candidate",
         "_degrade_retained_delivery_candidate", "_delivery_evidence_state",
         "_delivery_replace_required", "_direct_child_results",
         "_drain_forced_owner_directives", "_drain_incoming_messages",
@@ -350,7 +350,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_force_plan_disclosure", "_force_plan_reminder",
         "_forced_delegation_note", "_forced_fallback_result",
         "_forced_final_answer", "_forced_orphan_note",
-        "_forced_swarm_router_result", "_forced_unaccepted_binding",
+        "_forced_unaccepted_binding",
         "_live_delivery_candidate", "_load_direct_child_results",
         "_merge_finalization_trace", "_resolve_forced_delivery_control_body",
         "_project_child_result_dispositions", "_publish_delivery_candidate",
@@ -360,7 +360,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_server_web_allowed_by_task",
         "_service_finalization_evidence",
         "_supersede_task_acceptance_for_owner_followup",
-        "_swarm_handoff_attempt", "call_llm_with_retry",
+        "call_llm_with_retry",
         # Upstream e10b3cf3 replaced this leaf's inline dangling-revision write
         # with the acceptance leaf's `terminalize_dangling_revision`, so the raw
         # decision writer is no longer read here.

@@ -292,7 +292,7 @@ def _managed_task_finalizing(drive_root: Any, task_id: str) -> bool:
 
 
 def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *, direct_turns=None, availability=None) -> list:
-    """Direct/ephemeral turns plus ROOT managed queue tasks as ONE activity list.
+    """Direct turns plus ROOT managed queue tasks as ONE activity list.
 
     Additive beside ``active_direct_turns`` (kept unchanged for compatibility):
     the client hydrates managed-task visibility from the queue authority —
@@ -387,8 +387,6 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
 
         projects = {str(row["id"]): row for row in list_reserved_projects(drive_root)}
         for activity in activities:
-            if activity.get("kind") == "ephemeral_decision":
-                continue
             facts = _task_activity_facts(drive_root, str(activity.get("activity_id") or ""))
             wait = facts.get("owner_wait", {})
             if not wait.get("quiz_id"):

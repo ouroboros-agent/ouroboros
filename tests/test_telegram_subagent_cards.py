@@ -124,7 +124,7 @@ def test_terminal_host_notice_preserves_answer_and_silent_reply_chain(tmp_path, 
     event = prepare_terminal_send_event(tmp_path, task, answer, {
         "terminal_origin": "model_final", "terminal_host_notice": notice,
     }, {"type": "send_message", "task_id": task["id"], "chat_id": 1,
-        "text": answer, "log_text": answer, "format": "markdown"}, ephemeral=False, presence=False)
+        "text": answer, "log_text": answer, "format": "markdown"}, presence=False)
     register_final_answer_owed(task, event, env_drive_root=tmp_path)
     delivery_id = event["delivery_id"]
     delivery._handle_send_message(event, host)

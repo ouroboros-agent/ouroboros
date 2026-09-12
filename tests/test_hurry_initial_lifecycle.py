@@ -262,10 +262,8 @@ def test_storage_failure_does_not_write_hurry(pool, monkeypatch, failure):
     assert not _mailbox_path(pool.root, tid).exists()
 
 
-@pytest.mark.parametrize("ephemeral", [False, True])
-def test_direct_fallback_never_initializes_lifecycle(pool, monkeypatch, ephemeral):
-    task = {"id": "direct", "type": "task", "chat_id": 1, "_is_direct_chat": True,
-            "_ephemeral_turn": ephemeral}
+def test_direct_fallback_never_initializes_lifecycle(pool, monkeypatch):
+    task = {"id": "direct", "type": "task", "chat_id": 1, "_is_direct_chat": True}
     monkeypatch.setattr(workers, "direct_chat_turn", lambda task_id: task)
     monkeypatch.setattr(results, "write_task_result", lambda *a, **k: pytest.fail("direct lifecycle initialized"))
     assert _hurry(pool.root, "direct").status_code == 200
@@ -280,7 +278,7 @@ def test_actual_direct_actor_admission_keeps_its_existing_contract(pool, monkeyp
     actor = SimpleNamespace(_busy=True, _accepting_owner_messages=accepting,
                             _current_task_id="actor", _current_task_metadata={}, _current_task_text="work")
     get_direct_activity_registry().register("actor", 1, actor=actor,
-                                           kind="direct_chat" if accepting else "ephemeral_decision")
+                                           kind="direct_chat")
     monkeypatch.setattr(results, "write_task_result", lambda *a, **k: pytest.fail("direct seed"))
     assert _hurry(pool.root, "actor").status_code == (200 if accepting else 404)
     row = results.load_task_result(pool.root, "actor") or {}

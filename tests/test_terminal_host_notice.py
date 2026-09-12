@@ -142,7 +142,7 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
     assert trace["review_runs"][0]["superseded_by_revision"] is True
 
 
-def _emit_terminal(tmp_path, monkeypatch, *, ephemeral=False, project=False, child=False, notice=NOTICE, answer=ANSWER):
+def _emit_terminal(tmp_path, monkeypatch, *, direct=False, project=False, child=False, notice=NOTICE, answer=ANSWER):
     from ouroboros.task_finalization import set_terminal_host_notice
 
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *_a, **_kw: None)
@@ -155,8 +155,8 @@ def _emit_terminal(tmp_path, monkeypatch, *, ephemeral=False, project=False, chi
         row = create_project(tmp_path, "notice-project", name="Research")
         bind_task_to_project(tmp_path, task["id"], row["id"], row["chat_id"], origin={"absent": "system"})
         task.update(project_id=row["id"], chat_id=row["chat_id"])
-    if ephemeral:
-        task.update(_ephemeral_turn=True, _is_direct_chat=True)
+    if direct:
+        task.update(_is_direct_chat=True)
     usage = {"terminal_origin": "model_final"}
     set_terminal_host_notice(usage, notice)
     pending = []
@@ -320,25 +320,22 @@ def test_child_notice_hash_extension_preserves_legacy_hash_and_telemetry_exclusi
         assert _child_result_sha256({**row, **telemetry}) == _child_result_sha256(row)
 
 
-@pytest.mark.parametrize("ephemeral", [False, True])
+@pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("project", [False, True])
-def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch, ephemeral, project):
+def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch, direct, project):
     from ouroboros.gateway.history import make_chat_history_endpoint
     from ouroboros.utils import append_jsonl
     from supervisor import events_chat_delivery as delivery, message_bus
     from supervisor.terminal_delivery import build_completed_result_event, pending_deliveries
 
-    task, event = _emit_terminal(tmp_path, monkeypatch, ephemeral=ephemeral, project=project)
+    task, event = _emit_terminal(tmp_path, monkeypatch, direct=direct, project=project)
     assert event["text"] == event["log_text"] == ANSWER
-    if not ephemeral:
-        stored = load_task_result(tmp_path, task["id"])
-        assert stored["result"] == ANSWER and stored["terminal_host_notice"] == NOTICE
-        replay = build_completed_result_event(tmp_path, task, task["id"], stored)
-        assert replay["text"] == ANSWER and replay["terminal_host_notice"] == NOTICE
-        assert replay["delivery_id"] == event["delivery_id"]
-        assert pending_deliveries(tmp_path)[0]["terminal_host_notice"] == NOTICE
-    else:
-        assert load_task_result(tmp_path, task["id"]) is None
+    stored = load_task_result(tmp_path, task["id"])
+    assert stored["result"] == ANSWER and stored["terminal_host_notice"] == NOTICE
+    replay = build_completed_result_event(tmp_path, task, task["id"], stored)
+    assert replay["text"] == ANSWER and replay["terminal_host_notice"] == NOTICE
+    assert replay["delivery_id"] == event["delivery_id"]
+    assert pending_deliveries(tmp_path)[0]["terminal_host_notice"] == NOTICE
 
     bridge = message_bus.LocalChatBridge({})
     frames = []
@@ -352,8 +349,7 @@ def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch
     ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
                           send_with_budget=message_bus.send_with_budget)
     delivery._handle_send_message(event, ctx)
-    if not ephemeral:  # A transient turn has no terminal outbox identity of its own.
-        delivery._handle_send_message(event, ctx)
+    delivery._handle_send_message(event, ctx)
     chats = [row for row in frames if row.get("type") == "chat"]
     assert [(row["role"], row["content"]) for row in chats] == [("assistant", ANSWER), ("system", NOTICE)]
     assert all(row["chat_id"] == task["chat_id"] for row in chats)

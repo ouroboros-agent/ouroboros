@@ -520,9 +520,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         return
     ctx.consciousness.inject_observation(f"Message from my human: {incoming.get('log_text') or ''}")
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
-    swarm_intent = bool(
-        isinstance(task_metadata, dict) and task_metadata.get("force_plan")
-    )
+    task_metadata = {**(task_metadata or {}), "client_message_id": client_message_id}
     # The turn's origin identity rides UNCONDITIONALLY (not only when the
     # decision lane runs): a bare direct turn with no projects/roots yet — the
     # first-ever project creation — must still carry it so promote/route/bind
@@ -553,7 +551,47 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         and not isinstance(task_metadata.get("client_surface"), dict)
     ):
         task_metadata = {**task_metadata, "client_surface": {"channel": _ingress_source}}
-    if project_id and not swarm_intent:
+    if task_metadata.get("force_plan"):
+        from supervisor.worker_chat_lane import owner_conversation_admitted
+        from supervisor.state import budget_remaining, load_state
+        from supervisor.events import _handle_promote_chat_to_task
+        from ouroboros.gateway.routing_decision import _derived_identity
+
+        if not owner_conversation_admitted(chat_id):
+            return
+        try:
+            remaining = budget_remaining(load_state(), strict=True)
+        except Exception:
+            ctx.send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.")
+            return
+        if remaining <= 0:
+            try:
+                ctx.send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.")
+            except Exception:
+                pass
+            return
+        routing_token, task_id = (
+            _derived_identity(client_message_id, "swarm", 0)
+            if client_message_id else (uuid.uuid4().hex, uuid.uuid4().hex[:16])
+        )
+        event = {
+            "type": "promote_chat_to_task", "task_id": task_id,
+            "routing_token": routing_token, "objective": text or image_caption,
+            "chat_id": chat_id, "project_id": project_id,
+            "client_message_id": client_message_id, "task_constraint": task_constraint,
+            "force_plan": True, "force_plan_source": task_metadata.get("force_plan_source"),
+            "attachment_uploads": list(task_metadata.get("chat_attachment_uploads") or []),
+        }
+        if isinstance(task_metadata.get("client_surface"), dict):
+            event["client_surface"] = dict(task_metadata["client_surface"])
+        if isinstance(origin_ref, dict) and origin_ref:
+            event["source_ref"] = dict(origin_ref)
+            event["source_text"] = task_metadata["origin_message_text"]
+        else:
+            event["origin_suppressed"] = True
+        _handle_promote_chat_to_task(event, ctx)
+        return
+    if project_id:
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,
@@ -594,7 +632,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
     except Exception:
         log.warning("Unable to inspect Projects for owner routing", exc_info=True)
         has_projects = True
-    needs_decision_lane = swarm_intent or bool(project_id) or has_projects or bool(global_roots)
+    needs_decision_lane = bool(project_id) or has_projects or bool(global_roots)
     if needs_decision_lane:
         task_metadata = _decision_turn_metadata(ctx, chat_id, client_message_id, task_metadata)
 
@@ -610,13 +648,5 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         finally:
             ctx.consciousness.resume()
 
-    if swarm_intent:
-        threading.Thread(
-            target=ctx.handle_chat_ephemeral,
-            args=(chat_id, text or image_caption, image_data),
-            kwargs={"task_constraint": task_constraint, "task_metadata": task_metadata},
-            daemon=True,
-        ).start()
-    else:
-        ctx.consciousness.pause()
-        threading.Thread(target=_run_direct, daemon=True).start()
+    ctx.consciousness.pause()
+    threading.Thread(target=_run_direct, daemon=True).start()

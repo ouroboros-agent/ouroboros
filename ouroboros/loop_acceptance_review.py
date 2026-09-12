@@ -1192,7 +1192,6 @@ def _run_task_acceptance_review_once(
         llm_trace,
         bool(getattr(tools._ctx, "is_direct_chat", False)),
         is_root_task=bool(lineage["is_root_task"]),
-        is_ephemeral_turn=bool(getattr(tools._ctx, "is_ephemeral_turn", False)),
         task_contract=(
             tools._ctx.task_contract
             if isinstance(getattr(tools._ctx, "task_contract", None), dict)

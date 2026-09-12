@@ -45,7 +45,6 @@ def _task_acceptance_eligible(
     is_direct_chat: bool,
     *,
     is_root_task: bool = True,
-    is_ephemeral_turn: bool = False,
     task_contract: Optional[Dict[str, Any]] = None,
 ) -> tuple[bool, str]:
     """Return ``(host_should_review, trigger_reason)``.
@@ -54,15 +53,13 @@ def _task_acceptance_eligible(
     ``auto`` also honors an agent's explicit review-tool request, so read-only
     research remains reviewable without classifying its prose or tool counts.
     Queue membership alone qualifies only in ``required``. Child reviews stay
-    advisory, ephemeral control turns are excluded, and ``off`` never reviews.
+    advisory, and ``off`` never reviews.
     Eligibility uses typed contracts and runtime facts, never message content.
     """
     if mode == "off":
         return False, "off"
     if not is_root_task:
         return False, "skipped_child_advisory"
-    if is_ephemeral_turn:
-        return False, "skipped_ephemeral_control"
     if mode in {"auto", "required"}:
         prefix = "required" if mode == "required" else "auto"
         if turn_has_reviewable_effects(llm_trace):
@@ -934,7 +931,6 @@ def _record_forced_acceptance_bypass(
             llm_trace,
             bool(getattr(tools_ctx, "is_direct_chat", False)),
             is_root_task=bool(lineage["is_root_task"]),
-            is_ephemeral_turn=bool(getattr(tools_ctx, "is_ephemeral_turn", False)),
             task_contract=(
                 tools_ctx.task_contract
                 if isinstance(getattr(tools_ctx, "task_contract", None), dict)

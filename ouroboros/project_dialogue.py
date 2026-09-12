@@ -771,8 +771,7 @@ def _append_terminal_task_projection(
     task = task if isinstance(task, dict) else {}
     result = result if isinstance(result, dict) else {}
     event = task_done_event if isinstance(task_done_event, dict) else {}
-    if not tid or any(bool(row.get("_ephemeral") or row.get("ephemeral_decision"))
-                      for row in (task, result, event)):
+    if not tid:
         return False
     lineage = resolve_task_lineage(
         tid,
@@ -1070,7 +1069,7 @@ def enqueue_project_completion_summary(
     task = task if isinstance(task, dict) else {}
     result = result if isinstance(result, dict) else {}
     if not tid or any(
-        bool(row.get("_ephemeral") or row.get("ephemeral_decision") or row.get("_is_direct_chat"))
+        bool(row.get("_is_direct_chat"))
         for row in (evt, task, result, task_done_event) if isinstance(row, dict)
     ):
         return False

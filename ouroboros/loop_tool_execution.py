@@ -69,10 +69,6 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
     tool_ctx = getattr(tools, "_ctx", None)
     event_queue = getattr(tool_ctx, "event_queue", None)
     enriched = dict(payload)
-    if bool(getattr(tool_ctx, "is_ephemeral_turn", False)):
-        # Structural marker for Web presentation. Tool logs still exist for
-        # observability, but a short routing/answer decision is not a task card.
-        enriched["ephemeral_decision"] = True
     meta = _tool_task_metadata(tools)
     for key in ("parent_task_id", "root_task_id"):
         if meta.get(key) and not enriched.get(key):

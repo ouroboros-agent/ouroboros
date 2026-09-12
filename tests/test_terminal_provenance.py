@@ -14,7 +14,7 @@ def test_progress_thought_keeps_full_content_and_existing_authorship():
         _event_queue=events,
         _current_chat_id=7,
         _current_task_id="thought-task",
-        tools=SimpleNamespace(_ctx=SimpleNamespace(is_ephemeral_turn=False)),
+        tools=SimpleNamespace(_ctx=SimpleNamespace()),
         _subagent_progress_meta=lambda _event: {},
     )
     thought = "long visible reasoning\n" + ("x" * 20_000)

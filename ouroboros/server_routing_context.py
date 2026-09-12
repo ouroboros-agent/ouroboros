@@ -354,7 +354,6 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     steer delivery). P5-clean: surfaces state only; the agent picks the target by
     judgment among answer / steer_task / promote_chat_to_task / route_to_project."""
     md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
-    swarm_intent = bool(md.get("force_plan"))
     addressable_here = _addressable_root_tasks(ctx, chat_id)
     running_here = [row for row in addressable_here if row.get("status") == "running"]
     project_id = str(md.get("project_id") or "").strip() or _project_id_for_registered_chat(
@@ -374,7 +373,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     except Exception:
         log.warning("Unable to build Main routing manifest", exc_info=True)
         main_manifest = {"error": "routing_manifest_unavailable"} if is_main_lane else {}
-    if not swarm_intent and not addressable_here and not client_message_id and not main_manifest:
+    if not addressable_here and not client_message_id and not main_manifest:
         return task_metadata
     if addressable_here:
         md["current_chat"] = {
@@ -401,7 +400,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         if is_main_lane and isinstance(main_manifest, dict)
         else addressable_here
     )
-    manual_options = [] if swarm_intent else [
+    manual_options = [
         {
             "action": "steer_task",
             "task_id": row["task_id"],
@@ -412,14 +411,14 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         for row in option_roots
         if isinstance(row, dict) and row.get("task_id")
     ]
-    if not swarm_intent and is_main_lane and isinstance(main_manifest, dict):
+    if is_main_lane and isinstance(main_manifest, dict):
         manual_options.extend({
             "action": "new_task_in_project",
             "project_id": str(row.get("project_id") or ""),
             "project_name": str(row.get("name") or row.get("project_id") or "Project"),
             "label": f"New task in {str(row.get('name') or 'Project')}",
         } for row in list(main_manifest.get("projects") or []) if isinstance(row, dict))
-    elif project_id and not swarm_intent:
+    elif project_id:
         manual_options.append({
             "action": "new_task_in_project",
             "project_id": project_id,
@@ -428,21 +427,14 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     routing_contract = {
         "llm_first": True,
         "source_lane": "main" if is_main_lane else "project",
-        "valid_actions": (
-            (["promote_chat_to_task", "route_to_project"] if is_main_lane else ["promote_chat_to_task"])
-            if swarm_intent else
-            [
-                "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
-                "needs_manual_target",
-            ]
-        ),
-        "on_uncertain_or_invalid_target": (
-            "promote_chat_to_task" if swarm_intent else "needs_manual_target"
-        ),
+        "valid_actions": [
+            "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
+            "needs_manual_target",
+        ],
+        "on_uncertain_or_invalid_target": "needs_manual_target",
         "manual_options": manual_options,
     }
-    if not swarm_intent:
-        routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
+    routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
     receipt = _message_routing_receipt(ctx, client_message_id)
     if receipt:
         # DISCLOSURE, not a gate (owner decision B5=A): one owner message became a

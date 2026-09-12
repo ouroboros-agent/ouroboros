@@ -477,8 +477,6 @@ def force_plan_decision(
     metadata = getattr(ctx, "task_metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
     not_required = {"required": False, "allow": True, "status": "not_required"}
-    if bool(getattr(ctx, "is_ephemeral_turn", False)):
-        return not_required
     from ouroboros.task_results import (
         current_plan_review_wave, load_plan_review_state, plan_review_gate_projection,
     )

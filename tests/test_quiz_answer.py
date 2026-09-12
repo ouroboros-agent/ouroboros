@@ -433,12 +433,6 @@ def test_escalate_invalid_payload_is_typed(tmp_path):
     assert out.startswith("⚠️ QUIZ_ASSUMPTION_REQUIRED")
 
 
-def test_escalate_absent_from_ephemeral_allowlist():
-    """A decision turn cannot escalate — the structural default-deny refusal
-    comes free, exactly like forward_to_worker."""
-    from ouroboros.tools.registry import _EPHEMERAL_ALLOWED_TOOLS
-
-    assert "escalate" not in _EPHEMERAL_ALLOWED_TOOLS
 
 
 def test_escalate_in_all_three_tool_profiles():
@@ -901,7 +895,7 @@ def test_recommended_option_rides_the_card_the_projection_and_the_parent_frame(t
 
 def test_escalate_refusals_are_typed_per_branch_and_a_headless_root_still_asks(tmp_path):
     """Verification only: the three real refusal branches as the predicate is written.
-    Background consciousness is refused; a live direct conversation (ephemeral, or with
+    Background consciousness is refused; a live direct conversation (including one with
     no continuation owner) is refused; REQUIRED waiting without a live continuation owner
     is refused. A headless root without owner_wait_callback is NOT refused for an optional
     question: it mints the ordinary card and continues under its assumption."""

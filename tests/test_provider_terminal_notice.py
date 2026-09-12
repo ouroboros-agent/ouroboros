@@ -42,7 +42,7 @@ def _terminal(tmp_path, *, current, task_id="parent1"):
     return text, usage, trace
 
 
-@pytest.mark.parametrize("mode", ["managed", "direct", "ephemeral"])
+@pytest.mark.parametrize("mode", ["managed", "direct"])
 @pytest.mark.parametrize("current", [False, True])
 def test_pipeline_delivery_and_rebuild_keep_raw_bytes_and_known_wait_custody(tmp_path, monkeypatch, mode, current):
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *_a, **_k: None)
@@ -50,20 +50,11 @@ def test_pipeline_delivery_and_rebuild_keep_raw_bytes_and_known_wait_custody(tmp
     task = {"id": "parent1", "type": "task", "chat_id": 7, "text": "finish the task"}
     if mode != "managed":
         task["_is_direct_chat"] = True
-    if mode == "ephemeral":
-        task["_ephemeral_turn"] = True
     pending = []
     pipeline.emit_task_results(SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), None, None,
         pending, task, text, usage, trace, start_time=0.0, drive_logs=tmp_path / "logs")
     sent = next(row for row in pending if row["type"] == "send_message")
     notice = usage["terminal_provider_notice"]
-    if mode == "ephemeral":
-        assert load_task_result(tmp_path, "parent1") is None
-        assert Path(usage["terminal_salvage_path"]).read_text(encoding="utf-8") == RAW
-        assert RAW in sent["text"] and sent["text"].count("[Host status]") == 1
-        assert notice in sent["text"] and "task details" not in sent["text"]
-        assert sent["log_text"] == sent["text"]
-        return
     stored = load_task_result(tmp_path, "parent1")
     assert stored["result"] == RAW and stored["terminal_provider_notice"] == notice
     assert stored["status"] == "failed"  # same provider-outage category
@@ -340,29 +331,3 @@ def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, m
     assert text == RAW
     assert secret not in usage["_last_llm_error"] + usage["terminal_provider_notice"] + notices[0]
     assert "***" in notices[0]
-
-
-def test_every_swarm_rail_names_itself_including_the_pre_stamped_ones(tmp_path):
-    """A routing turn stopped by a rail states which rail, always.
-
-    A dedup that suppressed this sentence when the rail equalled the usage's
-    already-stamped reason_code looked like it was removing a duplicate of the
-    provider terminal's [Host status] block. It was not: every non-provider rail
-    stamps reason_code before calling this composer too (loop_budget just before
-    the call, loop_round_limits before the fallback that calls it), and those
-    rails have no provider notice at all, so the owner lost both the warning
-    marker and the name of the rail that ended the task.
-    """
-    for rail in ("budget_exhausted", "deadline_local", "finalization_grace",
-                 "owner_requested_finalization", "provider_unavailable"):
-        _loop, registry, ctx, trace = _forced_test_context(tmp_path)
-        registry._ctx.is_ephemeral_turn = True
-        registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
-        registry._ctx._swarm_handoff_attempt = {"status": "not_attempted", "task_id": ""}
-        # Exactly what loop_budget.py and loop_round_limits.py do before the call.
-        ctx.accumulated_usage.update(execution_status="failed", reason_code=rail)
-
-        text, _usage, _trace = loop._forced_swarm_router_result(ctx, trace, rail)
-
-        assert f"\u26a0\ufe0f Swarm reached the task-wide rail `{rail}`" in text, rail
-        assert "No inline work was published." in text, rail

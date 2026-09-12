@@ -1,9 +1,8 @@
-"""Contracts for INTERACTIVE transport-wait episodes (direct-chat and ephemeral
-decision turns): the raw idle-timeout bound measured from episode entry, its
+"""Contracts for INTERACTIVE transport-wait episodes (direct-chat turns):
+the raw idle-timeout bound measured from episode entry, its
 None-aware minimum with an explicit deadline, the final free redial at that
 bound, the untouched managed rails, the mailbox wake of a direct turn, notes
-that promise no cancellation, and the typed incident toast that is an ephemeral
-turn's only visible wait surface. Shared fixtures live in
+that preserve ordinary progress and incident delivery. Shared fixtures live in
 ``tests/test_loop_transport_wait.py``.
 """
 
@@ -82,7 +81,7 @@ def _run_until_terminal(episode, tmp_path, tools, notes, task_id="t-i", limit=50
 
 # ------------------------------------------------------------ the idle bound
 
-@pytest.mark.parametrize("flag", ["is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("flag", ["is_direct_chat"])
 def test_interactive_bound_is_the_raw_idle_getter_measured_from_entry(tmp_path, monkeypatch, flag):
     """The bound is the RAW configured idle timeout — the queue's effective idle
     rail (max(idle, per-call ceiling + 120)) belongs to managed records these
@@ -117,7 +116,7 @@ def test_malformed_task_metadata_keeps_the_interactive_bound(tmp_path, monkeypat
     clock = _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
     notes = _NoteRecorder()
-    ctx = SimpleNamespace(task_metadata=metadata, task_attempt=None, is_ephemeral_turn=True)
+    ctx = SimpleNamespace(task_metadata=metadata, task_attempt=None, is_direct_chat=True)
     episode = _enter(tmp_path, ctx, notes)
     _run_until_terminal(episode, tmp_path, SimpleNamespace(_ctx=ctx), notes)
 
@@ -173,7 +172,7 @@ def test_explicit_deadline_longer_than_the_bound_yields_the_interactive_detail(t
     clock = _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
     deadline = datetime.now(timezone.utc) + timedelta(seconds=get_finalization_grace_sec() + 3600)
-    ctx = _ctx(is_ephemeral_turn=True)
+    ctx = _ctx(is_direct_chat=True)
     ctx.task_metadata = {"deadline_at": deadline.isoformat()}
     notes = _NoteRecorder()
     episode = _enter(tmp_path, ctx, notes)
@@ -377,9 +376,8 @@ def test_direct_turn_mailbox_message_wakes_the_sleep_and_reaches_the_round_top(t
 # --------------------------------------------- owner notes and the toast seam
 
 def test_interactive_notes_promise_no_cancellation_and_the_managed_note_still_does(tmp_path, monkeypatch):
-    """There is no Stop contract for an in-process turn, so none of its notes
-    (entry, periodic, exhaustion) may promise one; a managed task keeps the
-    promise its cancel authority honors."""
+    """Direct turns retain their plain wait notes and their separate Stop
+    control; a managed task keeps the cancellation promise in its notes."""
     clock = _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
     managed = _NoteRecorder()
@@ -387,7 +385,7 @@ def test_interactive_notes_promise_no_cancellation_and_the_managed_note_still_do
     assert managed.texts[0].endswith("Stop cancels.")
     assert managed.incidents == [None]
 
-    for flag in ("is_direct_chat", "is_ephemeral_turn"):
+    for flag in ("is_direct_chat",):
         notes = _NoteRecorder()
         ctx = _ctx(**{flag: True})
         episode = _enter(tmp_path, ctx, notes, task_id=f"t-{flag}")
@@ -412,7 +410,6 @@ def test_direct_turn_waits_with_plain_notes_and_no_toast_pair(tmp_path, monkeypa
     episode = _enter(tmp_path, ctx, notes, task_id="direct1")
 
     assert episode.interactive is True
-    assert episode.ephemeral is False
     assert episode.wait_bound_sec == 60.0
     _run_until_terminal(episode, tmp_path, SimpleNamespace(_ctx=ctx), notes, task_id="direct1")
     assert len(notes.texts) >= 2
@@ -420,12 +417,12 @@ def test_direct_turn_waits_with_plain_notes_and_no_toast_pair(tmp_path, monkeypa
     assert _read_network_wait_events(tmp_path)[-1]["detail"] == INTERACTIVE_DETAIL
 
 
-@pytest.mark.parametrize("flags", [{}, {"is_direct_chat": True}, {"is_ephemeral_turn": True}])
+@pytest.mark.parametrize("flags", [{}, {"is_direct_chat": True}])
 def test_error_kind_change_closure_is_an_interactive_note(tmp_path, monkeypatch, flags):
     """A redial that reaches the provider and fails differently closes the
     episode with a durable row for every episode; the owner note naming the
     fresh kind is an interactive turn's only closure surface, so a managed
-    episode gets none (only the ephemeral note carries the recovered toast pair)."""
+    episode gets none."""
     _FakeClock(monkeypatch)
     ctx = _ctx(**flags)
     notes = _NoteRecorder()
@@ -442,21 +439,15 @@ def test_error_kind_change_closure_is_an_interactive_note(tmp_path, monkeypatch,
     assert "got past the connect phase and failed as provider_transient" in notes.texts[-1]
     assert "ordinary failure policy resumes" in notes.texts[-1]
     incident = notes.incidents[-1]
-    if flags.get("is_ephemeral_turn"):
-        assert incident["task_incident"] == "network_wait"
-        assert incident["toast_once"].startswith("t-kind:network_wait:recovered:")
-        # #628: the connection is back but the round still failed — a warning.
-        assert incident["toast_tone"] == "warn"
-    else:
-        assert incident is None
+    assert incident is None
 
 
-@pytest.mark.parametrize("flags", [{}, {"is_direct_chat": True}, {"is_ephemeral_turn": True}])
+@pytest.mark.parametrize("flags", [{}, {"is_direct_chat": True}])
 def test_local_fallback_adoption_closure_is_an_interactive_note(tmp_path, monkeypatch, flags):
     """Adopting the local fallback route closes the episode with a durable row
     for every episode; the owner note saying the remote connection is still
     down is an interactive turn's only closure surface, so a managed episode
-    gets none (only the ephemeral note carries the ended toast pair)."""
+    gets none."""
     _FakeClock(monkeypatch)
     ctx = _ctx(**flags)
     notes = _NoteRecorder()
@@ -473,12 +464,7 @@ def test_local_fallback_adoption_closure_is_an_interactive_note(tmp_path, monkey
     assert "still unavailable" in notes.texts[-1]
     assert "local fallback model" in notes.texts[-1]
     incident = notes.incidents[-1]
-    if flags.get("is_ephemeral_turn"):
-        assert incident["task_incident"] == "network_wait"
-        assert incident["toast_once"].startswith("t-local:network_wait:ended:")
-        assert incident["toast_tone"] == "warn"  # #628: degraded, not an alarm
-    else:
-        assert incident is None
+    assert incident is None
 
 
 @pytest.mark.parametrize("closure", ["recovered", "local_fallback_adopted", "error_kind_changed"])
@@ -512,59 +498,15 @@ def test_managed_episode_owner_texts_are_byte_identical_to_base(tmp_path, monkey
     }[closure]
 
 
-def test_ephemeral_episode_entry_recovery_and_exhaustion_carry_distinct_incident_toasts(tmp_path, monkeypatch):
-    """An ephemeral turn's episode-boundary notes carry the `task_incident`
-    toast keyed by `toast_once`: entry, recovery, and exhaustion each carry the
-    pair, every key is a distinct one-shot — two episodes of one turn that
-    START INSIDE THE SAME WALL SECOND do not collide — periodic notes carry
-    none, and each pair names its valence (#628: a recovery is not an alarm)."""
-    clock = _FakeClock(monkeypatch)
-    monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
-    ctx = _ctx(is_ephemeral_turn=True)
-    notes = _NoteRecorder()
-    episode = _enter(tmp_path, ctx, notes, task_id="eph1")
-
-    entered = notes.incidents[0]
-    assert entered["task_incident"] == "network_wait"
-    assert entered["toast_once"].startswith("eph1:network_wait:entered:")
-    assert entered["toast_tone"] == "warn"
-    assert loop_transport.reconcile_transport_wait(
-        episode, ctx, msg_present=True, error_kind="", drive_logs=tmp_path,
-        task_id="eph1", model="m", emit_progress=notes,
-    ) is None
-    recovered = notes.incidents[-1]
-    assert recovered["task_incident"] == "network_wait"
-    assert recovered["toast_once"].startswith("eph1:network_wait:recovered:")
-    assert recovered["toast_tone"] == "ok"
-    assert "restored" in notes.texts[-1]
-
-    clock.now += 0.2  # the second episode starts inside the same wall second
-    second = _enter(tmp_path, ctx, notes, task_id="eph1")
-    assert int(second.started_monotonic) == int(episode.started_monotonic)
-    second.last_note_monotonic = clock.now - 10_000.0  # force a periodic note too
-    _run_until_terminal(second, tmp_path, SimpleNamespace(_ctx=ctx), notes, task_id="eph1")
-    ended = notes.incidents[-1]
-    assert ended["task_incident"] == "network_wait"
-    assert ended["toast_once"].startswith("eph1:network_wait:ended:")
-    assert ended["toast_tone"] == "error"
-    keys = [inc["toast_once"] for inc in notes.incidents if inc]
-    assert [key.split(":")[2] for key in keys] == ["entered", "recovered", "entered", "ended"]
-    assert len(set(keys)) == len(keys)
-    periodic = [text for text, inc in zip(notes.texts, notes.incidents) if inc is None]
-    assert periodic and all("Still waiting" in text for text in periodic)
-
-
-def test_agent_progress_seam_projects_the_incident_onto_the_ephemeral_frame():
-    """The typed pair rides `progress_meta` next to `ephemeral_decision` — the
-    frame shape the browser's toast dedupe reads — and a plain note carries
-    none of it."""
+def test_agent_progress_seam_projects_an_explicit_incident():
+    """Explicit incidents retain their typed projection; ordinary notes stay plain."""
     from ouroboros.agent import OuroborosAgent
 
     events = queue.Queue()
     agent = SimpleNamespace(
         _last_progress_ts=None, _event_queue=events, _current_chat_id=7,
         _current_task_id="eph1",
-        tools=SimpleNamespace(_ctx=SimpleNamespace(is_ephemeral_turn=True)),
+        tools=SimpleNamespace(_ctx=SimpleNamespace(is_direct_chat=True)),
         _subagent_progress_meta=lambda _event: {},
     )
     OuroborosAgent._emit_progress(
@@ -575,18 +517,15 @@ def test_agent_progress_seam_projects_the_incident_onto_the_ephemeral_frame():
     assert event["is_progress"] is True
     assert event["task_id"] == "eph1"
     assert event["progress_meta"] == {
-        "ephemeral_decision": True,
         "task_incident": "network_wait",
         "toast_once": "eph1:network_wait:entered:1",
     }
     OuroborosAgent._emit_progress(agent, "plain note")
-    assert "task_incident" not in events.get_nowait()["progress_meta"]
+    assert "task_incident" not in events.get_nowait().get("progress_meta", {})
 
 
-def test_ephemeral_turn_end_to_end_emits_entry_and_exhaustion_incidents(tmp_path, monkeypatch):
-    """Through the real round gate: an ephemeral turn's episode entry and its
-    waited-out exhaustion reach the progress seam with the typed pair, and the
-    turn ends on the chat-turn terminal."""
+def test_direct_turn_end_to_end_keeps_plain_wait_notes(tmp_path, monkeypatch):
+    """The native turn waits through the real round gate and keeps ordinary notes."""
     fake_call, _calls = _transport_failing_call(fail_times=99)
     _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
@@ -594,15 +533,12 @@ def test_ephemeral_turn_end_to_end_emits_entry_and_exhaustion_incidents(tmp_path
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.is_ephemeral_turn = True
+    registry._ctx.is_direct_chat = True
     notes = _NoteRecorder()
     kwargs = _loop_kwargs(tmp_path, registry, [])
     kwargs["emit_progress"] = notes
     result, usage, _trace = run_llm_loop(**kwargs)
 
-    incidents = [inc for inc in notes.incidents if inc]
-    assert [inc["toast_once"].split(":")[2] for inc in incidents] == ["entered", "ended"]
-    assert all(inc["task_incident"] == "network_wait" for inc in incidents)
-    assert [inc["toast_tone"] for inc in incidents] == ["warn", "error"]
+    assert notes.texts and all(inc is None for inc in notes.incidents)
     assert usage.get("reason_code") == "provider_unavailable"
     assert "this turn waited and redialed for" in result

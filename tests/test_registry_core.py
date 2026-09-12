@@ -39,7 +39,6 @@ def test_registry_core_extraction_preserves_only_proven_facades():
         "system_repo_dir_for",
     }
     guard_names = {
-        "_EPHEMERAL_ALLOWED_TOOLS",
         "_GITHUB_TOKEN_TOOLS",
         "_WEB_TOOLS",
         "_authorized_managed_update_resolver",
@@ -88,7 +87,7 @@ def test_registry_core_extraction_preserves_only_proven_facades():
 
     # Reduced Repair guards are gone; ordinary development keeps the same
     # registry authority as the other top-level tasks.
-    assert len(proven) == 28
+    assert len(proven) == 27
     # Tip adaptation of the reference pin: this tree's facade deliberately keeps
     # the broad HISTORICAL import surface (importers and monkeypatch targets are
     # not migrated in this window), so the reference's exact-32-name equality

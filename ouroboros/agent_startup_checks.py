@@ -295,14 +295,12 @@ def persist_early_origin_stub(
 ) -> None:
     """Merge-persist ingress authority before the convertible task card exists.
 
-    Ephemeral/origin-less turns write nothing. A storage failure is loud but
+    Origin-less turns write nothing. A storage failure is loud but
     non-fatal: the owner's task outlives its start message, and the subsequent
     full RUNNING write will encounter the same storage fault. ``write_result``
     preserves the existing agent test seam while production uses the canonical
     task-result writer.
     """
-    if bool(task.get("_ephemeral_turn")):
-        return
     ref = task.get("origin_message_ref")
     if not (isinstance(ref, dict) and ref):
         return

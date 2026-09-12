@@ -132,11 +132,9 @@ def test_file_failure_does_not_crash_worker_or_replay_task(worker, monkeypatch, 
     assert load_task_result(worker.root, "file-root") is None, "a stamp is not a saved result"
 
 
-@pytest.mark.parametrize("kind", ["ephemeral", "direct", "foreign_done", "owner_wait"])
+@pytest.mark.parametrize("kind", ["direct", "foreign_done", "owner_wait"])
 def test_only_own_pooled_terminal_prepares_files(worker, monkeypatch, kind):
-    if kind == "ephemeral":
-        worker.task["_ephemeral_turn"] = True
-    elif kind == "direct":
+    if kind == "direct":
         worker.task["_is_direct_chat"] = True
     elif kind == "foreign_done":
         worker.events[-1]["task_id"] = "another-task"

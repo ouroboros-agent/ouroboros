@@ -149,7 +149,7 @@ def test_live_direct_chat_turn_is_owned_and_admitted_by_every_owner_control(tmp_
     assert queue.resume_budget_paused_task(TURN_ID)["error"] == "task_not_pending"
 
 
-def test_ephemeral_decision_turn_is_not_an_owner_addressable_task(tmp_path, monkeypatch):
+def test_closed_conversation_admission_is_not_owner_addressable(tmp_path, monkeypatch):
     _isolate_queue(monkeypatch, tmp_path)
     _live_chat_agent(monkeypatch, accepting=False)
     from supervisor.queue_transitions import task_has_live_ownership

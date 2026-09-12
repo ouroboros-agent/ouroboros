@@ -183,8 +183,8 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
 
     tid = str(evt.get("task_id") or uuid.uuid4().hex[:16])
     admission_token = str(evt.get("routing_token") or "").strip()
-    objective = str(evt.get("objective") or "").strip()
-    if not objective:
+    objective = str(evt.get("objective") or "")
+    if not objective.strip():
         return {"status": "needs_manual_target", "reason": "empty_objective", "task_id": tid}
     # Reject before project/source/workspace side effects. enqueue_task repeats
     # the check atomically for the tiny race before queue insertion.

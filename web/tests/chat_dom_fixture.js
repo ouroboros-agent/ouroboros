@@ -83,6 +83,7 @@ export class ElementStub {
     appendChild(node) { return this.insertBefore(node, null); }
     append(...nodes) { nodes.forEach((node) => this.appendChild(node)); }
     prepend(node) { return this.insertBefore(node, this.children[0] || null); }
+    before(node) { return this.parentNode?.insertBefore(node, this); }
     insertAdjacentElement(_position, node) { const list = this.parentNode?.children || []; return this.parentNode?.insertBefore(node, list[list.indexOf(this) + 1] || null); }
     insertBefore(node, before) {
         if (node?.isDocumentFragment) {
@@ -137,8 +138,8 @@ export class ElementStub {
             return this.children.filter((child) => Object.hasOwn(child.dataset, key));
         }
         if (selector.startsWith('.')) {
-            const className = selector.slice(1).split(/[ :>\[]/)[0];
-            return this.children.filter((child) => child.classList.contains(className));
+            const classes = selector.slice(1).split(/[ :>\[]/)[0].split('.');
+            return this.children.filter((child) => classes.every((name) => child.classList.contains(name)));
         }
         return [];
     }

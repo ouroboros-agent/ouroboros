@@ -454,7 +454,7 @@ def test_chat_ws_subscriptions_flow_through_disposer_helper():
     assert chat.count("ws.on(") == 1
 
 
-def test_ephemeral_decision_progress_marker_survives_history_replay(tmp_path):
+def test_legacy_decision_progress_remains_readable_in_history(tmp_path):
     from ouroboros.gateway.history import make_chat_history_endpoint
 
     logs = tmp_path / "logs"
@@ -478,12 +478,13 @@ def test_ephemeral_decision_progress_marker_survives_history_replay(tmp_path):
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"chat_id": "1"})))
     messages = json.loads(response.body.decode("utf-8"))["messages"]
     progress = next(message for message in messages if message.get("task_id") == "decision-1")
-    assert progress["ephemeral_decision"] is True
+    assert progress.get("is_progress") is True
+    assert progress.get("text") or progress.get("content")
 
 
-def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_path, monkeypatch):
+def test_direct_routing_keeps_annotation_and_final_in_history_projection(tmp_path, monkeypatch):
     """Finalization→supervisor→chat-log keeps one durable answer beside the
-    routing annotation; progress remains marked for Web card suppression."""
+    routing annotation and ordinary readable progress."""
     from ouroboros import agent_task_pipeline as pipeline
     from ouroboros.gateway.history import make_chat_history_endpoint
     from ouroboros.project_dialogue import append_chat_annotation
@@ -500,7 +501,6 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
     )
     monkeypatch.setattr(message_bus, "_send_markdown", lambda *args, **kwargs: (True, ""))
     for name in (
-        "_store_task_result",
         "_run_chat_consolidation",
         "_run_scratchpad_consolidation",
         "_run_post_task_processing_async",
@@ -524,7 +524,7 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
 
     pending_events = []
     pipeline.emit_task_results(
-        env=SimpleNamespace(drive_root=tmp_path),
+        env=SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path),
         memory=object(),
         llm=object(),
         pending_events=pending_events,
@@ -534,7 +534,7 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
             "chat_id": 1,
             "text": "Start the robot task",
             "_is_direct_chat": True,
-            "_ephemeral_turn": True,
+            "_skip_post_task_synthesis": True,
         },
         text="The robot task was submitted as robot01.",
         usage={"rounds": 2, "cost": 0.01},
@@ -560,7 +560,6 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
         "log_text": "Submitting the robot task",
         "format": "markdown",
         "is_progress": True,
-        "progress_meta": {"ephemeral_decision": True},
     }, event_ctx)
     final_event = next(event for event in pending_events if event["type"] == "send_message")
     _handle_send_message(final_event, event_ctx)
@@ -581,80 +580,26 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
     ]
     assert len(finals) == 1
     progress = next(message for message in messages if message.get("is_progress"))
-    assert progress["ephemeral_decision"] is True
+    assert progress.get("is_progress") is True
+    assert progress.get("text") or progress.get("content")
 
 
-def test_ephemeral_decision_web_frames_render_activity_without_task_claim_or_second_receipt():
-    """#691: a decision (ephemeral) turn's work is VISIBLE on the ordinary live
-    card — its progress, tool events and typed conclusion go through the same
-    paths a direct turn uses — while the marker still keeps every task claim
-    off it: no "Turn into project" (the factory gate), no blanket suppression,
-    and exactly one inline answer receipt."""
+def test_web_frames_keep_reference_order_and_one_authored_reply():
+    """Real references precede activity rendering; task controls stay host-attested."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
     chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
-
-    assert "const ephemeralDecisionTaskIds = new Set();" in chat
-    register = chat[
-        chat.index("function registerEphemeralDecisionFrame"):
-        chat.index("function clearPendingReconnectBanner")
-    ]
-    # The marker is remembered, and that is ALL the register does: no card
-    # removal, no task-state wipe, no suppression verdict for the callers.
-    assert "ephemeralDecisionTaskIds.add(taskId);" in register
-    assert "record.root?.remove();" not in register
-    assert "liveCardRecords.delete" not in register
-    assert "return ephemeral" not in chat
-    assert "registerEphemeralDecisionFrameMutation" not in chat
-    disposal = chat[chat.index("function disposeLiveCard("):chat.index("function registerEphemeralDecisionFrame")]
-    assert "liveCardRecords.get(id)?.root?.remove();" in disposal
-
-    card_factory = chat[
-        chat.index("function createLiveCardRecord"):
-        chat.index("function getLiveCardRecord")
-    ]
-    assert "!ephemeralDecisionTaskIds.has(normalizedGroupId)" in card_factory
-
-    # The shared reference handler remembers the marker BEFORE model-wait or
-    # review references can create a card. Ordinary frames then continue to
-    # the same telemetry/progress paths without an ephemeral suppression gate.
-    reference = chat[
-        chat.index("function handleCardReference"):
-        chat.index("function createLiveCardRecord")
-    ]
-    assert reference.index("registerEphemeralDecisionFrame(row);") < reference.index(
-        "isModelWaitReference(row)"
-    ) < reference.index("reviewReferenceFromRow(row)")
-    logs = chat[
-        chat.index("function updateLiveCardFromLogEvent"):
-        chat.index("function addMessage")
-    ]
-    assert logs.index("handleCardReference(evt)") < logs.index(
-        "const taskId = getLogTaskGroupId(evt)"
-    )
+    reference = chat[chat.index("function handleCardReference"):chat.index("function createLiveCardRecord")]
+    assert reference.index("isModelWaitReference(row)") < reference.index("reviewReferenceFromRow(row)")
+    logs = chat[chat.index("function updateLiveCardFromLogEvent"):chat.index("function addMessage")]
+    assert logs.index("handleCardReference(evt)") < logs.index("const taskId = getLogTaskGroupId(evt)")
     assert logs.index("handleCardReference(evt)") < logs.index("applyEventTelemetry")
     history = chat[chat.index("async function syncHistory"):chat.index("function cancelHistoryPaint")]
     assert history.index("handleCardReference(msg)") < history.index("updateLiveCardFromProgressMessage(msg,")
-    summary = chat[chat.index("function appendTaskSummaryToLiveCard"):chat.index("function setSubagentParent")]
-    assert summary.index("registerEphemeralDecisionFrame(msg);") < summary.index("getTaskUiState(")
-
-    fanout = chat[
-        chat.index("onWs('chat'"):
-        chat.index("onWs('message_annotation'")
-    ]
+    fanout = chat[chat.index("onWs('chat'"):chat.index("onWs('message_annotation'")]
     assert fanout.index("handleCardReference(msg)") < fanout.index("updateLiveCardFromProgressMessage(msg,")
-    assert "ephemeralDecisionTaskIds.has(explicitTaskId)" in fanout
-    assert "kind: 'ephemeral_decision'" in fanout
-    assert "if (isEphemeral) return" not in fanout
-    # One receipt: the toast dedupe still runs on the progress path and the
-    # final answer is still added exactly by the ordinary bubble path.
     assert "showTaskIncidentToast(msg);" in fanout
     assistant_fanout = fanout[fanout.index("const explicitTaskId"):]
-    # The final-answer bubble path (the one that renders an ephemeral turn's
-    # answer) exists exactly once; the other addMessage there is the typed
-    # system/pointer row of a duplicate lifecycle acknowledgement.
     assert assistant_fanout.count("addMessage(msg.content, msg.role") == 1
-    # Authority is never granted by display: Cancel needs the host-attested
-    # marker, which an ephemeral frame never carries.
     assert "msg.cancelable === true" in fanout

@@ -559,9 +559,6 @@ def test_policy_hidden_reason_pins_get_schema_by_name(tmp_path):
                 mode="acting_subagent", allow_enable=False, surface="external_workspace",
             ),
         )
-        ephemeral = ToolContext(repo_dir=system_repo, drive_root=data)
-        ephemeral.is_ephemeral_turn = True
-        yield "ephemeral", ephemeral
         disabled = ToolContext(repo_dir=system_repo, drive_root=data)
         disabled.task_contract = {"disabled_tools": ["write_file", "delegate_start"]}
         yield "contract_disabled", disabled

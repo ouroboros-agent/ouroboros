@@ -634,7 +634,7 @@ def _run_supervisor(settings: dict) -> None:
         from supervisor.workers import (
             init as workers_init, get_event_q, WORKERS, PENDING, RUNNING,
             spawn_workers, kill_workers, assign_tasks, ensure_workers_healthy,
-            handle_chat_direct, handle_chat_ephemeral, auto_resume_after_restart,
+            handle_chat_direct, auto_resume_after_restart,
         )
 
         max_workers = int(settings.get("OUROBOROS_MAX_WORKERS", 10))
@@ -730,7 +730,7 @@ def _run_supervisor(settings: dict) -> None:
             safe_restart=safe_restart, kill_workers=kill_workers, spawn_workers=spawn_workers,
             sort_pending=sort_pending, consciousness=_consciousness,
             handle_chat_direct=handle_chat_direct,
-            handle_chat_ephemeral=handle_chat_ephemeral, request_restart=_request_restart_exit,
+            request_restart=_request_restart_exit,
         )
     except Exception as exc:
         _supervisor_error = f"Supervisor init failed: {exc}"

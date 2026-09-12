@@ -47,7 +47,7 @@ def _ctx_over(waves: list, current: str) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         task_id="hurry-custody", budget_drive_root=str(root), drive_root=str(root),
         repo_dir=root, system_repo_dir=root,
-        task_metadata={"force_plan": True}, is_ephemeral_turn=False,
+        task_metadata={"force_plan": True},
     )
 
 

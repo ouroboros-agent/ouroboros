@@ -55,12 +55,12 @@ def no_sleep(monkeypatch):
     return sleeps
 
 
-@pytest.mark.parametrize("turn_flag", ["is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn_flag", ["is_direct_chat"])
 @pytest.mark.parametrize("deaths", [2, 3])
 def test_interactive_turn_death_takes_the_repeat_rail_and_never_enters_a_wait_episode(
     tmp_path, monkeypatch, no_sleep, turn_flag, deaths,
 ):
-    """A direct-chat or ephemeral turn whose DISPATCHED request died with a typed
+    """A direct-chat turn whose DISPATCHED request died with a typed
     transport death is on the paid repeat rail (its round dispatch is primary),
     never in the free wait episode: `provider_outcome_unknown` is not the
     episode's `transport_unavailable`, so no `network_wait` event exists, the
@@ -98,7 +98,6 @@ def test_interactive_turn_death_takes_the_repeat_rail_and_never_enters_a_wait_ep
 
 @pytest.mark.parametrize("turn,with_record", [
     ("managed", False), ("is_direct_chat", True), ("is_direct_chat", False),
-    ("is_ephemeral_turn", True), ("is_ephemeral_turn", False),
 ])
 def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unknown_source(
     tmp_path, monkeypatch, no_sleep, turn, with_record,
@@ -281,7 +280,7 @@ def _overflowing_local_pass(spend_window):
     return failing_chain, chain_calls
 
 
-@pytest.mark.parametrize("turn", ["managed", "is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn", ["managed", "is_direct_chat"])
 def test_latched_wait_cause_outranks_the_overflow_a_failed_local_pass_left(tmp_path, monkeypatch, turn):
     """outage latched → the episode's one local-only pass fails with a context
     overflow → the binding window (a managed task's deadline, an interactive

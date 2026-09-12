@@ -15,7 +15,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict
 
-from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.control_events import (
     _PROMOTE_CONFIRM_TIMEOUT_SEC,
     _emit_and_wait_for_routing,
@@ -115,23 +114,6 @@ def _attach_client_surface(ctx: ToolContext, evt: Dict[str, Any]) -> None:
         evt["client_surface"] = dict(fact)
 
 
-def _attach_swarm_intent(ctx: ToolContext, evt: Dict[str, Any]) -> None:
-    """Carry host-attested Swarm intent into the admitted managed root."""
-
-    if not swarm_router_turn(ctx):
-        return
-    metadata = getattr(ctx, "task_metadata", {})
-    evt["force_plan"] = True
-    evt["force_plan_source"] = str(
-        metadata.get("force_plan_source") or "operator"
-    ).strip() or "operator"
-
-
-def _cached_swarm_handoff(ctx: ToolContext) -> str:
-    attempt = getattr(ctx, "_swarm_handoff_attempt", None)
-    return str(attempt.get("response") or "") if swarm_router_turn(ctx) and isinstance(attempt, dict) else ""
-
-
 def _finish_swarm_handoff(
     ctx: ToolContext,
     evt: Dict[str, Any],
@@ -140,11 +122,11 @@ def _finish_swarm_handoff(
     status: str,
     reason: str = "",
 ) -> str:
-    """Latch one immutable admission attempt; repeated calls emit nothing."""
+    """Preserve the first Presence admission receipt for its terminal consumers."""
 
     metadata = getattr(ctx, "task_metadata", {})
     presence_turn = isinstance(metadata, dict) and bool(metadata.get("presence"))
-    if (swarm_router_turn(ctx) or presence_turn) and not isinstance(
+    if presence_turn and not isinstance(
         getattr(ctx, "_swarm_handoff_attempt", None), dict
     ):
         ctx._swarm_handoff_attempt = {
@@ -189,42 +171,11 @@ def _promote_chat_to_task(
     goal = str(objective or "").strip()
     if not goal:
         return "⚠️ TOOL_ARG_ERROR (promote_chat_to_task): objective is required"
-    cached = _cached_swarm_handoff(ctx)
-    if cached:
-        return cached
     from ouroboros.project_facts import (
         explicit_project_id_ok,
         project_id_from_display_name,
         sanitize_project_id,
     )
-
-    scope_override_note = ""
-    if swarm_router_turn(ctx):
-        # The model chooses admission; the host-owned room chooses scope — but
-        # room scope wins only on a GENUINE conflict (room already bound to a
-        # project). In a projectless room an explicitly passed project_name OR
-        # project_id is INHERITED (Q9-A): silently clearing them made the
-        # saga's first root run projectless, so its work landed in an
-        # off-registry tree that no later task could see.
-        room_pid = str(getattr(ctx, "project_id", "") or "")
-        if room_pid:
-            explicit = str(project_name or "").strip() or str(project_id or "").strip()
-            explicit_pid = (
-                project_id_from_display_name(project_name)
-                if str(project_name or "").strip()
-                else sanitize_project_id(project_id or "")
-            )
-            if explicit and explicit_pid != room_pid:
-                # An explicit owner input lost to the room binding — disclose
-                # it in the response, never drop silently (the silent drop was
-                # the saga defect).
-                scope_override_note = (
-                    f" Explicit project {explicit!r} was ignored: this room is "
-                    f"bound to project {room_pid!r}."
-                )
-            project_id = room_pid
-            project_name = ""
-        workspace_root = workspace = source = ""
 
     display_name = str(project_name or "").strip()
     pid = ""
@@ -317,7 +268,6 @@ def _promote_chat_to_task(
             "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task): "
             + predecessor_error
         )
-    _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
     mode, confirmation = _emit_and_wait_for_routing(ctx, evt)
     if display_name:
@@ -336,7 +286,7 @@ def _promote_chat_to_task(
             f"OK: task {tid}{scope_note} accepted and durably scheduled ({mode}).{source_confirmation} "
             "The task now runs independently, and follow-up chat can steer it. "
             "Use wait_task/get_task_result if its result "
-            "is needed in this conversation." + scope_override_note
+            "is needed in this conversation."
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")
     if confirmation_status in {"rejected", "needs_manual_target"}:
@@ -425,14 +375,6 @@ def _route_to_project(
     msg = str(message or "")
     if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
-    cached = _cached_swarm_handoff(ctx)
-    if cached:
-        return cached
-    if swarm_router_turn(ctx) and str(getattr(ctx, "project_id", "") or "").strip():
-        return (
-            "⚠️ SWARM_PROJECT_SCOPE_OWNED: this Project-room Swarm must create its new "
-            "root with promote_chat_to_task in the current Project."
-        )
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
@@ -536,7 +478,6 @@ def _route_to_project(
     }
     _attach_origin_from_metadata(ctx, evt)
     evt.update(predecessor_event)
-    _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     name = str(proj.get("name") or pid)
@@ -572,20 +513,14 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     Project rooms are limited to ``current_chat.addressable_root_tasks``; Main
     may also choose a Project-bound root from ``main_routing_manifest.root_tasks``.
 
-    When the chat is busy, a new message runs as a short-lived decision turn that
-    sees the running tasks of the current chat as structural context and picks the
-    one to steer. This verb just transports the message to that task's owner-mailbox
+    A conversation sees the running tasks as structural context and chooses
+    which one to steer. This verb transports the message to that task's owner-mailbox
     (the running task drains it at its next safe checkpoint). LLM-first (BIBLE P5):
     the code never decides which task a message belongs to — it only validates the
     transport (task exists, same chat, idempotent delivery) and the supervisor
     performs the mailbox write on the task's active drive. When unsure which task
     (or none) fits, spawn a fresh task with ``promote_chat_to_task`` instead.
     """
-    if swarm_router_turn(ctx):
-        return (
-            "⚠️ SWARM_NEW_ROOT_REQUIRED: explicit Swarm cannot steer an existing task; "
-            "use promote_chat_to_task or, from Main, route_to_project."
-        )
     target = str(task_id or "").strip()
     msg = str(message or "").strip()
     if not target:

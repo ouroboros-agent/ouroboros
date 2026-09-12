@@ -3,7 +3,7 @@ and durable owner-message persistence through the REAL routing chain.
 
 Pins the four server seams of the continuity contract:
 
-1. ``gateway.state._chat_activities_snapshot_safe`` unites direct/ephemeral
+1. ``gateway.state._chat_activities_snapshot_safe`` unites direct
    registry turns with ROOT managed queue tasks (``queued``/``working``/
    ``finalizing``), deriving ``finalizing`` from the durable
    ``root_phase_checkpoint``.
@@ -268,7 +268,7 @@ def test_typing_start_registry_kind_outranks_queue_stamp():
     from supervisor.events import _handle_typing_start
 
     get_direct_activity_registry().register(
-        "turn-1", chat_id=4, kind="ephemeral_decision", client_message_id="cmid-9",
+        "turn-1", chat_id=4, kind="direct_chat", client_message_id="cmid-9",
     )
     ctx = SimpleNamespace(
         bridge=_BridgeProbe(),
@@ -279,7 +279,7 @@ def test_typing_start_registry_kind_outranks_queue_stamp():
         ctx,
     )
 
-    assert ctx.bridge.calls[0]["kind"] == "ephemeral_decision"
+    assert ctx.bridge.calls[0]["kind"] == "direct_chat"
 
 
 def test_typing_start_addresses_the_bound_project_chat(tmp_path):
@@ -317,7 +317,7 @@ def test_typing_start_addresses_the_bound_project_chat_for_a_direct_turn(tmp_pat
         tmp_path, "turn-bound", "typing-turn-proj", 4343, origin={"absent": "system"}
     )
     get_direct_activity_registry().register(
-        "turn-bound", chat_id=1, kind="ephemeral_decision", client_message_id="cmid-4",
+        "turn-bound", chat_id=1, kind="direct_chat", client_message_id="cmid-4",
     )
     ctx = SimpleNamespace(bridge=_BridgeProbe(), DRIVE_ROOT=tmp_path, RUNNING={})
     _handle_typing_start(
@@ -326,7 +326,7 @@ def test_typing_start_addresses_the_bound_project_chat_for_a_direct_turn(tmp_pat
     )
 
     assert ctx.bridge.calls[0]["chat_id"] == 4343
-    assert ctx.bridge.calls[0]["kind"] == "ephemeral_decision"
+    assert ctx.bridge.calls[0]["kind"] == "direct_chat"
 
 
 # ---------------------------------------------------------------------------
@@ -387,20 +387,6 @@ def test_completed_checkpoint_suppresses_finalizing_marker(tmp_path, monkeypatch
     assert "task_phase" not in (send.get("progress_meta") or {})
 
 
-def test_ephemeral_final_keeps_decision_meta_without_phase_marker(tmp_path, monkeypatch):
-    events = _emit_final(tmp_path, monkeypatch, {
-        "id": "eph-1", "type": "task", "chat_id": 1, "text": "2+2?",
-        "_is_direct_chat": True, "_ephemeral_turn": True,
-    })
-
-    send = next(evt for evt in events if evt["type"] == "send_message")
-    # The ephemeral final carries its own conclusion and outcome, without
-    # a post-task finalizing hold or managed-task authority.
-    assert send["progress_meta"]["ephemeral_decision"] is True
-    assert send["progress_meta"]["task_terminal_status"] == "completed"
-    done = next(evt for evt in events if evt["type"] == "task_done")
-    assert send["progress_meta"]["outcome_axes"] == done["outcome_axes"]
-    assert "task_phase" not in send["progress_meta"]
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +612,6 @@ def test_owner_project_message_survives_into_history_with_annotation(tmp_path, m
         update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
         consciousness=_Consciousness(),
         get_chat_agent=lambda: types.SimpleNamespace(_busy=False),
-        handle_chat_ephemeral=lambda *a, **k: pytest.fail("mailbox delivery must not run a turn"),
         handle_chat_direct=lambda *a, **k: pytest.fail("mailbox delivery must not run a turn"),
         send_with_budget=lambda *a, **k: pytest.fail("routing receipts must not create bubbles"),
     )

@@ -46,7 +46,7 @@ def test_managed_unknown_waits_for_upstream_then_adds_new_input(tmp_path, monkey
     assert recovered[0]["outcome_custody"] == previous
 
 
-@pytest.mark.parametrize("flag", ["is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("flag", ["is_direct_chat"])
 def test_unknown_policy_does_not_expand_other_execution_classes(tmp_path, flag):
     ctx = SimpleNamespace(task_id="t", **{flag: True})
     assert transport.reconcile_transport_wait(None, ctx, msg_present=False,

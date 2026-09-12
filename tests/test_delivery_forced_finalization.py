@@ -257,57 +257,35 @@ def test_blocking_open_plan_round_rail_preserves_useful_candidate(tmp_path, monk
     assert usage["reason_code"] == "round_limit"
 
 
-def test_forced_swarm_router_uses_cached_unconfirmed_receipt(tmp_path, monkeypatch):
+def test_forced_managed_swarm_runs_the_ordinary_final_model_call(tmp_path, monkeypatch):
     loop, registry, limit_ctx, _trace = _forced_test_context(tmp_path)
-    registry._ctx.is_ephemeral_turn = True
     registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
-    registry._ctx._swarm_handoff_attempt = {
-        "task_id": "swarm-task-1",
-        "routing_token": "route-token",
-        "status": "unconfirmed",
-        "reason": "confirmation_timeout",
-        "response": "PROMOTE_UNCONFIRMED",
-    }
+    calls = []
     monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("forced router fallback must not start a new model round")
-        ),
+        loop, "call_llm_with_retry",
+        lambda *_args, **_kwargs: calls.append("forced") or (
+            {"role": "assistant", "content": "Verified work before the limit."}, 0.0),
     )
-
     text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
-
-    assert "swarm-task-1" in text
-    assert "admission was not confirmed" in text
-    assert "No second routing event was emitted" in text
+    assert calls == ["forced"]
+    assert text == "Verified work before the limit."
     assert usage["reason_code"] == "round_limit"
+    assert "Plan review is open" in usage["terminal_host_notice"]
 
 
-def test_forced_swarm_router_keeps_confirmed_handoff_successful(tmp_path, monkeypatch):
+def test_presence_handoff_does_not_replace_ordinary_forced_finalization(tmp_path, monkeypatch):
     loop, registry, limit_ctx, _trace = _forced_test_context(tmp_path)
-    registry._ctx.is_ephemeral_turn = True
-    registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
+    registry._ctx.task_metadata["presence"] = {"binding_id": "presence-binding"}
     registry._ctx._swarm_handoff_attempt = {
-        "task_id": "swarm-task-1",
-        "routing_token": "route-token",
-        "status": "scheduled",
-        "reason": "",
-        "response": "OK: task swarm-task-1 accepted and durably scheduled",
+        "task_id": "presence-work", "routing_token": "route-token", "status": "scheduled",
+        "reason": "", "response": "OK: task presence-work accepted and durably scheduled",
     }
-    monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("forced router fallback must not start a new model round")
-        ),
-    )
-
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_args, **_kwargs: (
+        {"role": "assistant", "content": "Current verified Presence work."}, 0.0))
     text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
-
-    assert "Swarm admitted managed task swarm-task-1" in text
-    assert usage.get("execution_status") != "failed"
-    assert usage.get("reason_code") != "round_limit"
+    assert text == "Current verified Presence work."
+    assert registry._ctx._swarm_handoff_attempt["task_id"] == "presence-work"
+    assert usage["reason_code"] == "round_limit"
 
 
 def test_physical_budget_exit_discloses_stale_candidate_after_service_teardown(

@@ -425,10 +425,9 @@ def _escalate(
     if not task_id:
         return "⚠️ ESCALATE_UNAVAILABLE: escalate requires an active task context."
     if bool(getattr(ctx, "is_direct_chat", False)) and (
-            bool(getattr(ctx, "is_ephemeral_turn", False))
-            or not callable(getattr(ctx, "owner_wait_callback", None))):
+            not callable(getattr(ctx, "owner_wait_callback", None))):
         # Native conversations with a live continuation owner are addressable
-        # through the same decision ingress. Transient control turns are not.
+        # through the same decision ingress.
         return ("⚠️ ESCALATE_UNAVAILABLE: this is a live owner conversation — "
                 "ask the question directly in your reply instead of a card.")
     parent_task_id = str(meta.get("parent_task_id") or "").strip()

@@ -57,7 +57,6 @@ from ouroboros.subagent_runtime import (
     select_subagent_snapshot,  # noqa: F401
 )
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE  # noqa: F401
-from ouroboros.tool_policy import swarm_router_turn  # noqa: F401
 from ouroboros.tools.registry import ToolContext, ToolEntry  # noqa: F401
 from ouroboros.utils import append_jsonl, atomic_write_json, truncate_review_artifact, utc_now_iso, run_cmd  # noqa: F401
 
@@ -432,8 +431,6 @@ from ouroboros.tools.control_routing import (  # noqa: E402, F401 -- intentional
     _attach_client_surface,
     _attach_origin_from_metadata,
     _attach_predecessor_authority_from_metadata,
-    _attach_swarm_intent,
-    _cached_swarm_handoff,
     _finish_swarm_handoff,
     _list_projects,
     _predecessor_selector_error,

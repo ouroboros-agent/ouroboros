@@ -51,7 +51,6 @@ _ARCHIVE_BACKFILL_CAP = 3
 
 
 _PROGRESS_META_FIELDS = (
-    "ephemeral_decision",
     "subagent_event",
     "subagent_task_id",
     "root_task_id",
@@ -328,18 +327,19 @@ def _read_progress_history_entries(live, adir, want, counts_toward_quota, *, inc
 
 
 def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> None:
-    """Copy terminal chat facts for task summaries and transient turns."""
-    if entry.get("type") != "task_summary" and not entry.get("ephemeral_decision"):
+    """Copy terminal chat facts for task summaries."""
+    if entry.get("type") != "task_summary":
         return
-    if entry.get("ephemeral_decision"):
-        rec["ephemeral_decision"] = True
     if isinstance(entry.get("model_execution"), dict):
         rec["model_execution"] = dict(entry["model_execution"])
     if entry.get("suggested_name"):
         rec["suggested_name"] = str(entry["suggested_name"])
-    for key in ("tool_calls", "rounds"):
+    for key in ("tool_calls", "rounds", "tool_errors"):
         if key in entry:
             rec[key] = None if entry[key] is None else int(entry[key])
+    if "tool_call_counts" in entry:
+        counts = entry["tool_call_counts"]
+        rec["tool_call_counts"] = dict(counts) if isinstance(counts, dict) else None
     if entry.get("type") == "task_summary" or isinstance(entry.get("outcome_axes"), dict):
         rec["outcome_axes"] = normalize_outcome_axes(entry)
     if "reason_code" in entry:
@@ -347,7 +347,7 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     if isinstance(entry.get("review_projection"), dict):
         rec["review_projection"] = dict(entry.get("review_projection") or {})
     # The chat row carries the flat task-scope cost snapshot written by
-    # agent_task_pipeline; transient turns have no later durable task record.
+    # the task-summary producer.
     # _annotate_terminal_task_truth later OVERRIDES these with the persisted
     # task_results values when the result file survives (row = fallback only).
     # ABI-3: CONVERTED, not copied — a stored legacy row's pair resolves

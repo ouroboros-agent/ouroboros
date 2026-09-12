@@ -48,8 +48,6 @@ _MOVED_OWNERS = {
     "_wait_for_routing_annotation": control_events,
     "_attach_client_surface": control_routing,
     "_attach_origin_from_metadata": control_routing,
-    "_attach_swarm_intent": control_routing,
-    "_cached_swarm_handoff": control_routing,
     "_finish_swarm_handoff": control_routing,
     "_list_projects": control_routing,
     "_promote_chat_to_task": control_routing,

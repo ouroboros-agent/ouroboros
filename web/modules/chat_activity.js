@@ -536,7 +536,7 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
 // so their absence from a snapshot is authoritative conclusion. Typing frames
 // without a kind stamp (legacy frames, subagents) stay exempt — they are
 // concluded by their own final/summary frames, as before.
-const SNAPSHOT_AUTHORITATIVE_KINDS = new Set(['direct_chat', 'ephemeral_decision', 'managed_task']);
+const SNAPSHOT_AUTHORITATIVE_KINDS = new Set(['direct_chat', 'managed_task']);
 
 /**
  * One request/apply clock for every /api/state consumer on a page. Responses
@@ -819,7 +819,7 @@ export function routingAnnotationText(annotation) {
 /**
  * Reconcile the client's active-activity map against one /api/state snapshot
  * (owner decision 1A). The snapshot is authoritative ONLY over kinds it
- * enumerates (direct/ephemeral registry turns and queue-listed managed roots)
+ * enumerates (direct registry turns and queue-listed managed roots)
  * that existed before it was requested; it must never delete (a) an activity
  * registered by a WS typing frame AFTER the request started (the barrier), or
  * (b) a kind-less typing entry (legacy frames, subagents), which no snapshot

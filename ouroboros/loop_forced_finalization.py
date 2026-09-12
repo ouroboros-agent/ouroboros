@@ -1,7 +1,7 @@
 """Forced finalization of a task that ran out of road: orphan notes, child claims
 and the absorption gate, forced children acceptance, swarm-action enforcement,
 forced services and owner-directive drain, the one forced model call, stale and
-fallback candidates, the swarm router and the forced final answer.
+fallback candidates and the forced final answer.
 Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros.loop_llm_call import forced_response_is_incomplete, forced_response_parts
 from ouroboros.outcomes import REASON_DELIVERY_CONTROL_DEGRADED
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE, TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_MODEL_FINAL, set_terminal_host_notice
-from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.usage_accounting import BudgetExceeded
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
@@ -476,20 +475,7 @@ def _enforce_swarm_actions(
     llm_trace: Dict[str, Any],
     emit_progress: Callable[[str], None],
 ) -> bool:
-    """Hold normal finalization while routing or blocking plan work is open."""
-
-    if swarm_router_turn(tools._ctx) and not _loop()._swarm_handoff_attempt(tools._ctx):
-        if content.strip():
-            messages.append({"role": "assistant", "content": content})
-        reminder = (
-            "[SWARM_ROUTING_INTENT] Admit exactly one new managed root now with "
-            "promote_chat_to_task, or from Main route_to_project for a clearly matching "
-            "existing Project. Do not answer inline or steer an existing task."
-        )
-        _loop()._append_or_merge_user_message(messages, reminder)
-        llm_trace["reasoning_notes"].append(reminder)
-        emit_progress("Swarm routing action required before final response.")
-        return True
+    """Hold normal finalization while blocking plan work is open."""
 
     decision = _loop()._force_plan_decision(tools._ctx, llm_trace)
     if decision.get("required"):
@@ -764,9 +750,6 @@ def _forced_fallback_result(
     provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Compose fallback."""
-    router_result = _loop()._forced_swarm_router_result(ctx, llm_trace, reason_code)
-    if router_result is not None:
-        return router_result
     tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     plan_suffix = (
         _loop()._force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
@@ -865,65 +848,6 @@ def _forced_fallback_result(
     return composed, ctx.accumulated_usage, llm_trace
 
 
-def _forced_swarm_router_result(
-    ctx: _RoundLimitContext,
-    llm_trace: Dict[str, Any],
-    reason_code: str,
-) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
-    """Use deterministic routing text only when a real rail ends the router."""
-
-    tools = getattr(ctx, "tools", None)
-    if tools is None or not swarm_router_turn(tools._ctx):
-        return None
-    attempt = _loop()._swarm_handoff_attempt(tools._ctx)
-    status = str(attempt.get("status") or "not_attempted")
-    task_id = str(attempt.get("task_id") or "")
-    if status == "scheduled":
-        text = f"✅ Swarm admitted managed task {task_id}. Work continues in that task."
-    elif status == "unconfirmed":
-        text = (
-            f"⚠️ Swarm attempted managed task {task_id}, but admission was not confirmed. "
-            "No second routing event was emitted; keep the task id for reconciliation."
-        )
-    elif status == "rejected":
-        detail = str(attempt.get("reason") or "admission rejected")
-        text = f"⚠️ Swarm could not admit a new managed task ({detail}). No retry was emitted."
-    else:
-        # This row names the rail whatever the rail is. A stamped reason_code
-        # cannot stand in for "a provider terminal already says this": every
-        # non-provider rail stamps it too (loop_budget before the router call,
-        # loop_round_limits before the fallback), and those rails have no
-        # [Host status] block, so suppressing the sentence deleted the only
-        # statement of the cause the owner had.
-        text = (
-            f"⚠️ Swarm reached the task-wide rail `{reason_code}` before a managed-root "
-            "admission attempt completed. No inline work was published."
-        )
-    full_text = _loop()._compose_delivery_suffix(text, _loop()._forced_orphan_note(ctx))
-    candidate = _loop()._replace_delivery_candidate(
-        tools, ctx, llm_trace, full_text, control=f"forced_swarm_router:{reason_code}",
-    )
-    if status != "scheduled":
-        candidate.degraded = True
-        candidate.degraded_reason = reason_code
-    _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
-    if status == "scheduled":
-        # The short acknowledgement hit a rail, but the requested managed work
-        # was already durably admitted. Keep that successful handoff truthful.
-        ctx.accumulated_usage.pop("execution_status", None)
-        ctx.accumulated_usage.pop("reason_code", None)
-    else:
-        ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
-    _loop()._record_forced_finalization(
-        ctx,
-        llm_trace,
-        reason_code=reason_code,
-        source="host_swarm_routing_fallback",
-        candidate=candidate,
-    )
-    return candidate.full_text, ctx.accumulated_usage, llm_trace
-
-
 def _resolve_forced_delivery_control(
     tools_ctx: Any,
     extracted: str,
@@ -974,9 +898,6 @@ def _forced_final_answer(
             ctx, llm_trace, fallback_text, reason_code,
             source=f"{reason_code}_window_elapsed",
         )
-    router_result = _loop()._forced_swarm_router_result(ctx, llm_trace, reason_code)
-    if router_result is not None:
-        return router_result
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     _loop()._append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""

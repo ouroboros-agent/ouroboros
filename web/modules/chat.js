@@ -522,9 +522,8 @@ export function createChatInstance({
     // A task_named frame can arrive before the card's record exists; buffer it.
     const pendingSuggestedNames = new Map();
     const taskUiStates = new Map();
-    // Decision turns keep activity ordering and render progress cards.
-    const ephemeralDecisionTaskIds = new Set();
-    // Server-confirmed in-flight direct/ephemeral/managed activities.
+    const ADDRESSING_ONLY_TOOLS = new Set(['promote_chat_to_task', 'route_to_project', 'steer_task']);
+    // Server-confirmed in-flight direct/managed activities.
     const activeDirectActivities = new Map();
     // Local user submissions awaiting server confirmation (clientMessageId
     // -> { clientMessageId, timestamp }).
@@ -595,14 +594,6 @@ export function createChatInstance({
     try {
         pendingReconnectBannerText = reconnectBannerText(new URL(window.location.href).searchParams.get('_ouro_reason') || '');
     } catch {}
-    // An ephemeral (decision) turn's id is remembered ONLY so the card factory
-    // never offers "Turn into project" (#691): its work renders on the ordinary
-    // live card with host-attested authority (no `cancelable`, no Cancel).
-    function registerEphemeralDecisionFrame(frame) {
-        const taskId = taskKey(frame?.task_id);
-        if (taskId && frame?.ephemeral_decision) ephemeralDecisionTaskIds.add(taskId);
-    }
-
     function clearPendingReconnectBanner() {
         try {
             const url = new URL(window.location.href);
@@ -812,6 +803,7 @@ export function createChatInstance({
         const taskState = {
             taskId,
             toolCalls: 0,
+            addressingToolCalls: 0,
             forceCard: false,
             cardVisible: false,
             completed: false,
@@ -930,16 +922,33 @@ export function createChatInstance({
         return changed;
     }
 
-    function markTaskToolCall(taskId, count = 1, minimumOnly = false, rawTs = '') {
+    function markTaskToolCall(taskId, count = 1, {
+        minimumOnly = false, tool = '', metrics = {}, history = false, rawTs = '', suppressDomInsert = false,
+    } = {}) {
+        if (minimumOnly && !(metrics.tool_errors > 0) && retiredTaskIds.has(taskId) && !liveCardRecords.has(taskId)) return false;
         const taskState = getTaskUiState(taskId, true);
         if (!taskState) return false;
         const safeCount = Math.max(0, Number(count) || 0);
-        if (minimumOnly) {
-            taskState.toolCalls = Math.max(taskState.toolCalls, safeCount);
-        } else {
-            taskState.toolCalls += safeCount;
+        const counts = metrics.tool_call_counts;
+        const entries = counts && typeof counts === 'object' && !Array.isArray(counts) ? Object.entries(counts) : [];
+        const complete = Number.isInteger(count) && count > 0 && Number.isInteger(metrics.tool_errors)
+            && metrics.tool_errors >= 0 && entries.length > 0
+            && entries.every(([, n]) => Number.isInteger(n) && n > 0)
+            && entries.reduce((sum, [, n]) => sum + n, 0) === count;
+        if (complete) taskState.addressingToolCalls = entries.reduce((sum, [name, n]) =>
+            sum + (ADDRESSING_ONLY_TOOLS.has(name) ? n : 0), 0);
+        if (metrics.tool_errors > 0 || (history && !complete && (safeCount > 0 || metrics.rounds > 1))) {
+            taskState.forceCard = true;
         }
-        return revealBufferedCardIfNeeded(taskState, { rawTs });
+        if (!minimumOnly && ADDRESSING_ONLY_TOOLS.has(tool)) {
+            taskState.addressingToolCalls += safeCount;
+            return false;
+        }
+        // Counts on the event retain their full cost/outcome meaning.
+        taskState.toolCalls = minimumOnly
+            ? Math.max(taskState.toolCalls, safeCount - taskState.addressingToolCalls)
+            : taskState.toolCalls + safeCount;
+        return revealBufferedCardIfNeeded(taskState, { rawTs, suppressDomInsert });
     }
 
     function forceTaskCard(taskId, rawTs = '') {
@@ -1004,6 +1013,7 @@ export function createChatInstance({
                 taskState.cardVisible = false;
                 taskState.bufferedLiveUpdates = [];
                 taskState.toolCalls = 0;
+                taskState.addressingToolCalls = 0;
                 taskState.forceCard = false;
                 const oldRec = liveCardRecords.get(resolvedTaskId);
                 if (oldRec) {
@@ -1364,7 +1374,6 @@ export function createChatInstance({
     }
 
     function handleCardReference(row) {
-        registerEphemeralDecisionFrame(row);
         if (isModelWaitReference(row)) {
             const changed = modelWaits.observe(row.task_id, row);
             return row.outcome_axes ? appendTaskSummaryToLiveCard(row) || changed : changed;
@@ -1409,8 +1418,6 @@ export function createChatInstance({
             isMain
             && !options.isSubagent
             && !alreadyBound
-            && !ephemeralDecisionTaskIds.has(normalizedGroupId)
-            && activeDirectActivities.get(normalizedGroupId)?.kind !== 'ephemeral_decision'
         )
             ? `<div class="chat-live-actions"><button type="button" class="btn btn-xs btn-default" data-turn-into-project>Turn into project</button></div>`
             : '';
@@ -1873,8 +1880,7 @@ export function createChatInstance({
         // A coined project name takes the title slot (the activity headline stays in the
         // timeline); a child's title is its lineage identity; otherwise the activity headline.
         const title = record.suggestedName || (record.isSubagent ? childTitle(record)
-            : (record.finished ? record.lastHumanHeadline || (ephemeralDecisionTaskIds.has(nextGroupId)
-                ? 'Conversation activity' : 'Task activity') : activeHeadline));
+            : (record.finished ? record.lastHumanHeadline || 'Task activity' : activeHeadline));
         if (record.titleEl.textContent !== title) record.titleEl.textContent = title;
         // The collapsed line is a compact presentation projection, while the
         // complete latest activity remains independently reachable through the
@@ -2039,8 +2045,7 @@ export function createChatInstance({
         if (record.isSubagent) record.titleEl.textContent = childTitle(record);
         else if (!record.suggestedName && !record.lastHumanHeadline
                 && record.titleEl.textContent !== presentation.headline) {
-            record.titleEl.textContent = ephemeralDecisionTaskIds.has(record.groupId)
-                ? 'Conversation activity' : 'Task activity';
+            record.titleEl.textContent = 'Task activity';
         }
         settleLiveCard(record, activePhase, wasFinished);
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
@@ -2052,7 +2057,6 @@ export function createChatInstance({
     function appendTaskSummaryToLiveCard(msg, { suppressDomInsert = false } = {}) {
         const taskId = msg?.task_id || activeLiveGroupId || '';
         const rawTs = msg?.ts || new Date().toISOString();
-        registerEphemeralDecisionFrame(msg);
         if (!taskId) {
             return finishLiveCard(taskId, 'done');
         }
@@ -2069,7 +2073,10 @@ export function createChatInstance({
         if (!taskState) {
             return finishLiveCard(taskId, taskTerminalPhase(msg)) || changed;
         }
-        if (hasAcceptanceReview || hadToolCalls) taskState.forceCard = true;
+        if (hadToolCalls) changed = markTaskToolCall(taskId, Number(msg.tool_calls), {
+            minimumOnly: true, metrics: msg, rawTs, suppressDomInsert,
+        }) || changed;
+        if (hasAcceptanceReview) taskState.forceCard = true;
         changed = revealBufferedCardIfNeeded(taskState, { suppressDomInsert, rawTs }) || changed;
         if (!taskState.cardVisible) {
             if (!finalizing) markAssistantReply(taskId);
@@ -2347,9 +2354,6 @@ export function createChatInstance({
     function updateLiveCardFromLogEvent(evt) {
         if (!evt) return false;
         const eventType = evt.type || evt.event || '';
-        // An ephemeral turn's task_done has no durable status; its conclusion is
-        // the typed `completed` its final frame is stamped with (#691).
-        if (eventType === 'task_done' && evt.ephemeral_decision && !evt.status) evt = { ...evt, status: 'completed' };
         const reference = handleCardReference(evt);
         if (reference !== undefined) return reference;
         if (!isGroupedTaskEvent(evt)) return false;
@@ -2370,9 +2374,9 @@ export function createChatInstance({
         // Tool counts and the error shapes that force a visible card are
         // classified the same way for a subagent child and for its owner.
         const applyEventTelemetry = () => {
-            if (eventType === 'tool_call_started') return markTaskToolCall(taskId, 1, false, rawTs);
+            if (eventType === 'tool_call_started') return markTaskToolCall(taskId, 1, { tool: evt.tool, rawTs });
             if ((eventType === 'task_metrics_event' || eventType === 'task_eval') && Number.isFinite(Number(evt.tool_calls))) {
-                return markTaskToolCall(taskId, Number(evt.tool_calls), true, rawTs);
+                return markTaskToolCall(taskId, Number(evt.tool_calls), { minimumOnly: true, metrics: evt, rawTs });
             }
             if (
                 eventType === 'tool_call_timeout'
@@ -2700,10 +2704,15 @@ export function createChatInstance({
                     modelWaits.resetViews();
                     for (const id of liveCardRecords.keys()) disposeLiveCard(id, true);
                     for (const taskState of taskUiStates.values()) {
-                        if (taskState?.cleanupTimer) clearTimeout(taskState.cleanupTimer);
+                        if (taskState.addressingToolCalls) {
+                            // Rebuild presentation, keeping observed starts and cleanup.
+                            taskState.cardVisible = false;
+                            taskState.bufferedLiveUpdates = [];
+                        } else {
+                            if (taskState.cleanupTimer) clearTimeout(taskState.cleanupTimer);
+                            taskUiStates.delete(taskState.taskId);
+                        }
                     }
-                    taskUiStates.clear();
-                    ephemeralDecisionTaskIds.clear();
                     // Rebuild replays the durable truth: stale name buffers and
                     // cancelable markers from the previous connection are dropped
                     // and re-learned from history rows (P3 growth caps).
@@ -2749,16 +2758,16 @@ export function createChatInstance({
                         if (msg.historical_terminal && historyCard) historyCard.historicalTerminal = msg.historical_terminal;
                         continue;
                     }
-                    if (msg.system_type === 'task_summary' || (msg.ephemeral_decision && msg.tool_calls > 0)) {
-                        // Historical cards only for non-trivial tasks.
-                        const hadToolCalls = (msg.tool_calls || 0) > 0;
-                        const hadMultipleRounds = (msg.rounds || 0) > 1;
+                    if (msg.system_type === 'task_summary') {
                         const severity = taskOutcomeSeverity(msg);
                         const needsVisibleTerminal = severity === 'error' || severity === 'warn' || severity === 'cancelled';
-                        if (hadToolCalls || hadMultipleRounds || needsVisibleTerminal) {
+                        if (needsVisibleTerminal) {
                             const taskState = getTaskUiState(taskId, true);
                             if (taskState) taskState.forceCard = true;
                         }
+                        markTaskToolCall(taskId, Number(msg.tool_calls), {
+                            minimumOnly: true, metrics: msg, history: true, suppressDomInsert: true,
+                        });
                         // Pass 2 inserts this in the right transcript position.
                         appendTaskSummaryToLiveCard(msg, { suppressDomInsert: true });
                     }
@@ -3958,18 +3967,6 @@ export function createChatInstance({
                 return Boolean(added);
             }
             learnSubagentLineage(msg);
-            const isEphemeral = Boolean(explicitTaskId) && ephemeralDecisionTaskIds.has(explicitTaskId);
-            // Late duplicate progress cannot resurrect a concluded activity.
-            if (isEphemeral && !concludedDirectActivities.has(explicitTaskId)) {
-                const existing = activeDirectActivities.get(explicitTaskId) || {};
-                activeDirectActivities.set(explicitTaskId, {
-                    activityId: explicitTaskId,
-                    kind: 'ephemeral_decision',
-                    phase: 'thinking',
-                    startedAt: existing.startedAt || Date.now(),
-                    clientMessageId: existing.clientMessageId || '',
-                });
-            }
             if (msg.is_progress) {
                 showTaskIncidentToast(msg);
                 if (
@@ -4229,7 +4226,6 @@ export function createChatInstance({
             cancelableTaskIds.clear();
             missingManagedTaskIds.clear();
             managedTaskDetailReads.clear();
-            ephemeralDecisionTaskIds.clear();
             retiredTaskIds.clear();
             pendingUserBubbles.clear();
             localEchoJournal.clear();

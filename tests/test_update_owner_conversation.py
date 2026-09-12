@@ -132,8 +132,7 @@ def test_direct_lane_refuses_while_the_tree_is_being_materialized(tx_repo, monke
     assert len(notices) == 1 and LOCK_NOTICE in notices[0]
 
 
-def test_ephemeral_lane_runs_the_turn_while_the_resolver_holds_the_repo(tx_repo, monkeypatch):
-    import ouroboros.agent as agent_mod
+def test_native_turn_reaches_execution_while_the_resolver_holds_the_repo(tx_repo, monkeypatch):
     import supervisor.state as state
 
     tx = _write_tx("assisted_resolution")
@@ -141,20 +140,18 @@ def test_ephemeral_lane_runs_the_turn_while_the_resolver_holds_the_repo(tx_repo,
     _wire_gate(monkeypatch, update_merge.assisted_writer_gate_reason(tx), notices)
     monkeypatch.setattr(state, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
-    monkeypatch.setattr(workers, "get_event_q", lambda: None)
-    monkeypatch.setattr(agent_mod, "make_agent", lambda **_k: "ephemeral-agent")
     monkeypatch.setattr(
         lane, "_run_chat_task",
-        lambda agent, chat_id, text, image_data, **kw: turns.append((agent, text, kw.get("ephemeral"))),
+        lambda agent, chat_id, text, image_data, **kw: turns.append((agent, text, kw)),
     )
 
-    lane.handle_chat_ephemeral(1, "why did the merge conflict?")
+    lane.handle_chat_direct(1, "why did the merge conflict?")
 
-    assert turns == [(None, "why did the merge conflict?", True)]  # construction belongs to registered execution
+    assert turns == [(None, "why did the merge conflict?", {"task_constraint": None, "task_metadata": None})]  # construction belongs to registered execution
     assert notices == []
 
 
-def test_ephemeral_lane_refuses_during_a_destructive_window(tx_repo, monkeypatch):
+def test_native_execution_refuses_during_a_destructive_window(tx_repo, monkeypatch):
     import supervisor.state as state
 
     _write_tx("assisted_resolution")
@@ -164,7 +161,7 @@ def test_ephemeral_lane_refuses_during_a_destructive_window(tx_repo, monkeypatch
     monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
     monkeypatch.setattr(lane, "_run_chat_task", lambda *a, **k: turns.append(a))
 
-    lane.handle_chat_ephemeral(1, "hello?")
+    lane.handle_chat_direct(1, "hello?")
 
     assert turns == []
     assert len(notices) == 1 and LOCK_NOTICE in notices[0]

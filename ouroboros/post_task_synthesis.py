@@ -41,6 +41,29 @@ def _atp():
     return agent_task_pipeline
 
 
+def task_tool_metrics(llm_trace: dict) -> dict:
+    """Project recorded calls once; unknown names never become an empty census."""
+    unavailable = bool(llm_trace.get("loop_evidence_unavailable"))
+    calls = llm_trace.get("tool_calls") or []
+    metrics = {
+        "tool_calls": None if unavailable else len(calls),
+        "tool_errors": None if unavailable else sum(
+            1 for call in calls if isinstance(call, dict) and call.get("is_error")),
+        "tool_call_counts": None,
+    }
+    if unavailable or llm_trace.get("recovered_post_task_synthesis") or not isinstance(llm_trace.get("tool_calls"), list):
+        return metrics
+    counts: dict[str, int] = {}
+    for call in calls:
+        name = call.get("tool") if isinstance(call, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return metrics
+        name = name.strip()
+        counts[name] = counts.get(name, 0) + 1
+    metrics["tool_call_counts"] = counts
+    return metrics
+
+
 def build_trace_summary(llm_trace: dict) -> str:
     """Return a compact human-readable summary of tool calls and agent notes."""
     if llm_trace.get("loop_evidence_unavailable"):
@@ -322,7 +345,8 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
         task_id = str(task.get("id") or "unknown")
         canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
         summary_id = f"task-narrative:{task_id}"
-        n_tool_calls = None if llm_trace.get("loop_evidence_unavailable") else len(llm_trace.get("tool_calls", []) or [])
+        tool_metrics = task_tool_metrics(llm_trace)
+        n_tool_calls = tool_metrics["tool_calls"]
         rounds = None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0)
         round_text = "round count unknown" if rounds is None else f"{rounds}r"
         cost_text = _synthesis_cost_text(usage)
@@ -342,7 +366,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 "project_id": str(task.get("project_id") or ""), "chat_id": int(task.get("chat_id") or 0), "delegation_role": str(task.get("delegation_role") or ""), "role": str(task.get("role") or ""),
                 "status": str(stored_result.get("status") or "completed"), "outcome": completion_status_label(stored_result, usage), "outcome_phase": outcome_phase(stored_result, usage),
                 "outcome_final": False, "outcome_authority": "pre_finalization_narrative_context",
-                "text": value, "tool_calls": n_tool_calls, "rounds": rounds, "outcome_axes": outcome_axes, "reason_code": reason_code,
+                "text": value, **tool_metrics, "rounds": rounds, "outcome_axes": outcome_axes, "reason_code": reason_code,
                 "result_ref": result_ref, "source_coverage": {"task_result": result_ref}, **_summary_row_cost_fields(usage), **presence_fields,
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
             }

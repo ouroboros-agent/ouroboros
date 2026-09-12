@@ -340,20 +340,18 @@ def test_project_thread_note_names_project(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 2.5 Decision-turn outcome contract
+# 2.5 Ordinary turn context
 # ---------------------------------------------------------------------------
 
-def test_ephemeral_turn_gets_decision_rule(tmp_path):
+@pytest.mark.parametrize("obsolete_marker", [False, True])
+def test_runtime_has_no_disappeared_routing_actor_rules(tmp_path, obsolete_marker):
     from ouroboros.context import build_runtime_section
 
     env = SimpleNamespace(repo_dir=str(tmp_path), drive_root=str(tmp_path / "data"))
-    section = build_runtime_section(env, {"_ephemeral_turn": True, "id": "t"})
-    assert "decision_turn_rule" in section
-    assert "promise" in section
-    assert "final no-tool response MUST be self-contained" in section
-    assert "not durable conversation history" in section
-    plain = build_runtime_section(env, {"id": "t"})
-    assert "decision_turn_rule" not in plain
+    section = build_runtime_section(env, {"_ephemeral_turn": obsolete_marker, "id": "t"})
+    assert "decision_turn_rule" not in section
+    assert "promoted_task_toolset" not in section
+
 
 
 def test_system_prompt_separates_routing_annotation_from_final_reply():
@@ -609,16 +607,14 @@ def test_health_invariants_stray_probe_is_ttl_cached(tmp_path, monkeypatch):
     assert calls["n"] == 1  # TTL cache: one live probe, not one per turn
 
 
-def test_ephemeral_turn_producer_sets_flag():
-    """context keys decision_turn_rule on task['_ephemeral_turn'] — pin that the
-    chat-turn producer actually sets it (integration seam, run-2 gate finding)."""
+def test_native_chat_lane_has_no_ephemeral_entry_point():
+    """Swarm admission must not regain a separate model-owning actor."""
     import inspect
-
-    # v7next D08: the chat-turn producer lives in supervisor/worker_chat_lane.py
     from supervisor import worker_chat_lane
 
-    src = inspect.getsource(worker_chat_lane)
-    assert 'task["_ephemeral_turn"] = True' in src
+    assert not hasattr(worker_chat_lane, "handle_chat_ephemeral")
+    assert "ephemeral" not in inspect.signature(worker_chat_lane._run_chat_task).parameters
+
 
 
 def test_actor_records_carry_response_ref_end_to_end(tmp_path):

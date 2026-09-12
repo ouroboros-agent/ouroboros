@@ -163,7 +163,7 @@ invariants stated once, and the memory contract. What does NOT belong there:
 how a tool or mechanism works. A tool's parameters, signatures, recipes,
 typed outcomes, and "when to choose it" live in its `get_tools()` schema — each
 profile receives its own visible schema set on every round (delegated, repair,
-ephemeral, credential and contract filters narrow it), so the schema is the SSOT
+credential and contract filters narrow it), so the schema is the SSOT
 of the per-tool contract and a prompt sentence about it is a second copy that
 drifts, while SYSTEM.md stays the cross-tool selection policy; mechanism
 documentation lives in ARCHITECTURE or here;
@@ -889,9 +889,7 @@ supersedes prior authority, so a newer attempt cannot fall back to an older
 GREEN. Wave recording, free replays, DEGRADED semantics, structurally dead
 slots, and `quorum_unreachable` release live in ARCHITECTURE "Plan
 construction and review"; paid cycles are bounded by the shared
-`OUROBOROS_REVIEW_MAX_CYCLES`. The short-lived Swarm router admits one new
-root and transfers the intent; it never runs `plan_task`, steers an existing
-task, or publishes the work inline.
+`OUROBOROS_REVIEW_MAX_CYCLES`.
 
 **Context mode (Low / Max).** `OUROBOROS_CONTEXT_MODE` controls the
 Architecture projection in the agent's own context: Max keeps `ARCHITECTURE.md`
@@ -1996,7 +1994,7 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
 - The intent and delivery registries read STRICT to rows: a malformed row
   refuses the mutation (bytes kept), and enforcement reads disclose once and
   quarantine. `task_done` validates through the DURABLE result
-  unconditionally for every non-ephemeral event; only `interrupted` keeps its
+  unconditionally for every event; only `interrupted` keeps its
   restore-path exemption, and the legacy `cancel_requested` status survives
   on a read-path only.
 - `stop_policy` is an axis on the durable intent (absence = IMMEDIATE;
@@ -2230,9 +2228,7 @@ Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_
   typed errors through the tracked image child. The shared waiting card has
   revision fences and distinguishes accepted, applied and saved; a browser fixture
   must not invent a different acknowledgement protocol than the real ingress.
-  Cover ephemeral waits through the real turn/scope producer and both decision
-  transports. Preserve no-task-record cleanup and the separate control-only
-  activity identity through live delivery and fresh/reloaded browser hydration.
+
 
 Accounting and transport mechanism — attempt lifecycle, pricing lookup, lock
 discipline, snapshots, projections — lives in ARCHITECTURE "Budget tracking"
@@ -2458,26 +2454,20 @@ by "Provider Independence" above. Call-site imperatives:
   `terminal_provider_notice`. Existing receipts and secondary notices consume
   those same facts: attempted repeats, the last provider error, and an unknown
   dispatched outcome. A retained answer must not hide wait or unknown-attempt
-  evidence or invite a blind rerun. Ephemeral and message/deferred Presence
+  evidence or invite a blind rerun. Message/deferred Presence
   responses render one host-labelled status section; cached Presence output
   is already rendered. Preserve silent/tool-delivered authority and never
-  promise task details for an ephemeral turn with no task result. Carry the
+  change raw answer bytes in the Presence renderer. Carry the
   actual control reason through wait termination: owner Wrap up is distinct
   from deadline/budget finalization and still sends no new summary request.
-- The transport-wait episode's owner notes always pass `incident=` — the
-  typed `task_incident`/`toast_once` pair (plus the optional `toast_tone`
-  valence the call site stamps: warn/ok/error) on an ephemeral turn's
-  episode-boundary notes (entry, recovery/closure, exhaustion), `None` on
-  every other note — so any `emit_progress` callable handed to `run_llm_loop`
-  must accept the `incident=` keyword; the browser's `showTaskIncidentToast`
-  reads the tone through `normalizeTone` and keeps the alarm tone for a
-  frame without one — never parse `toast_once` or the text for it; `OuroborosAgent._emit_progress` is the
-  production implementation and a test fake mirrors it
-  (`lambda text, *, incident=None: ...`). A cross-model lane switch is the
-  second owner note carrying this pair; it names both models, the account the
+- Transport-wait notes use the ordinary progress seam with `incident=None`.
+  Explicit incidents from other producers keep their typed `task_incident`,
+  `toast_once` and optional `toast_tone` presentation. Never infer urgency or
+  valence from a task's prose (`tests/test_loop_transport_wait_interactive.py`).
+  A cross-model lane switch carries the same incident pair; it names both models, the account the
   send's own binding selects when that route has accounts (a task-local wait
   override included, never the configured value alone), and the typed failure
-  reason when the round record has one. The applied-option mismatch line is the third, and it
+  reason when the round record has one. The applied-option mismatch line also
   rides the same loop-level callable: the frozen `ToolContext.emit_progress_fn`
   takes one argument and never carries the pair.
 - Timeout contract classes differ; keep the axes separate. A transport
@@ -2704,7 +2694,7 @@ by "Provider Independence" above. Call-site imperatives:
   not an old child body. One operation-scoped memo may reuse verified work; it
   must not cache failure as success or survive as a second store.
 - Pooled terminal file preparation belongs to `headless.prepare_terminal_task_files`
-  at the worker's own non-ephemeral task_done boundary, after blocking post-task
+  at the worker's own task_done boundary, after blocking post-task
   work and before releasing the slot. Earlier answer/metrics delivery stays early.
   `_files_prepared_attempt` is a private attempt observation, not a saved-result
   receipt. The event owner re-reads CURRENT and uses `terminal_task_files_ready`;
@@ -2864,7 +2854,7 @@ commit review.
   channel and branch topology live in ARCHITECTURE "8. Git Branching, CI,
   and Build" (`ouroboros/update_channels.py`).
 - A preflight chooses one exact official target SHA. Apply binds to the
-  disclosed base/target, closes new writers, drains direct/ephemeral turns,
+  disclosed base/target, closes new writers, drains direct turns,
   stops workers and tracked services, then re-plans before mutation. Write
   the update transaction before mutation; reopen writers only after a
   verified abort/rollback or a healthy restart. Delayed evolution cleanup

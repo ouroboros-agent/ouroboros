@@ -9,6 +9,10 @@ import types
 
 import pytest
 
+from tests.test_swarm_host_admission import host as _swarm_host
+
+swarm_host = _swarm_host
+
 
 @pytest.fixture(autouse=True)
 def _isolated_projects_root(tmp_path_factory, monkeypatch):
@@ -25,6 +29,39 @@ def _confirm_promote(monkeypatch):
         "ouroboros.tools.control_events._wait_for_promotion_admission",
         lambda *_args, **_kwargs: {"status": "scheduled"},
     )
+
+
+def test_first_main_conversation_promotion_keeps_its_original_message_annotation(swarm_host):
+    """No project/active-root facts are needed to transport the ingress id."""
+    import server
+    from ouroboros.tools.control import _promote_chat_to_task
+    from supervisor.events import _handle_promote_chat_to_task
+    from tests.test_swarm_host_admission import incoming_case, rows
+
+    host = swarm_host
+    case = incoming_case(host, "main")
+    case.incoming["task_metadata"].update(force_plan=False, force_plan_source="")
+    observed = []
+
+    def direct(chat_id, text, _image=None, *, task_metadata, **_kwargs):
+        observed.append(task_metadata)
+        ctx = types.SimpleNamespace(
+            current_chat_id=chat_id, drive_root=host.root, task_metadata=task_metadata,
+            pending_events=[], event_queue=types.SimpleNamespace(
+                put_nowait=lambda event: _handle_promote_chat_to_task(event, host.ctx)),
+        )
+        result = _promote_chat_to_task(ctx, text, workspace="none", predecessor_task_id="")
+        assert result.startswith("OK: task"), result
+
+    host.ctx.handle_chat_direct = direct
+    server._route_owner_message(host.bridge, host.ctx, case.incoming)
+    assert len(observed) == 1 and not host.attempts
+    assert len(host.pending) == 1
+    [annotation] = rows(host.root / "logs/chat_annotations.jsonl")
+    assert annotation["client_message_id"] == case.client_message_id
+    assert annotation["status"] == "scheduled"
+    assert annotation["target"] == host.pending[0]["id"]
+    assert host.pending[0]["origin_message_ref"] == case.ref
 
 
 def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
@@ -164,7 +201,7 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     assert preview["authority_source"]["arguments"] == {
         "task_id": predecessor_id, "include_authority": True,
     }
-    router_ctx = _swarm_ctx(
+    router_ctx = _managed_swarm_ctx(
         tmp_path,
         project_id="cat-tower",
         current_chat_id=int(project["chat_id"]),
@@ -180,7 +217,7 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     ).startswith("OK: task")
     event = router_ctx.pending_events[0]
     assert event["predecessor_authority_source"] == preview["authority_source"]
-    fresh_router = _swarm_ctx(
+    fresh_router = _managed_swarm_ctx(
         tmp_path, project_id="cat-tower", current_chat_id=int(project["chat_id"]),
         task_metadata={
             "force_plan": True, "force_plan_source": "swarm",
@@ -269,7 +306,7 @@ def test_main_promotion_selects_only_manifested_canonical_predecessor(tmp_path, 
             json.dumps(row), encoding="utf-8",
         )
     manifest = {"final_results": [server._task_result_ground_truth(row) for row in rows]}
-    selected = _swarm_ctx(tmp_path, task_metadata={
+    selected = _managed_swarm_ctx(tmp_path, task_metadata={
         "force_plan": True, "force_plan_source": "swarm",
         "main_routing_manifest": manifest,
     })
@@ -283,7 +320,7 @@ def test_main_promotion_selects_only_manifested_canonical_predecessor(tmp_path, 
         manifest["final_results"][1]["authority_source"]
     )
 
-    fresh = _swarm_ctx(tmp_path, task_metadata={
+    fresh = _managed_swarm_ctx(tmp_path, task_metadata={
         "force_plan": True, "force_plan_source": "swarm",
         "main_routing_manifest": manifest,
     })
@@ -301,7 +338,7 @@ def test_main_promotion_selects_only_manifested_canonical_predecessor(tmp_path, 
     for forged_source in forged_sources:
         forged_manifest = json.loads(json.dumps(manifest))
         forged_manifest["final_results"][1]["authority_source"] = forged_source
-        forged = _swarm_ctx(tmp_path, task_metadata={
+        forged = _managed_swarm_ctx(tmp_path, task_metadata={
             "force_plan": True, "force_plan_source": "swarm",
             "main_routing_manifest": forged_manifest,
         })
@@ -311,7 +348,7 @@ def test_main_promotion_selects_only_manifested_canonical_predecessor(tmp_path, 
         assert refused_forgery.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE")
         assert forged.pending_events == []
 
-    missing = _swarm_ctx(tmp_path, task_metadata={
+    missing = _managed_swarm_ctx(tmp_path, task_metadata={
         "force_plan": True, "force_plan_source": "swarm",
         "main_routing_manifest": manifest,
     })
@@ -527,59 +564,46 @@ def test_real_presence_promotion_rejection_cleans_promoted_attachment_copy(
     assert original_path.is_file()
 
 
-def _swarm_ctx(tmp_path, **overrides):
+def _managed_swarm_ctx(tmp_path, **overrides):
     values = {
         "pending_events": [],
         "event_queue": None,
         "current_chat_id": 1,
         "drive_root": tmp_path,
         "project_id": "",
-        "is_ephemeral_turn": True,
         "task_metadata": {"force_plan": True, "force_plan_source": "swarm"},
     }
     values.update(overrides)
     return types.SimpleNamespace(**values)
 
 
-def test_ephemeral_swarm_promotion_carries_intent_and_pins_host_scope(tmp_path, monkeypatch):
+def test_presence_promotion_keeps_its_host_scope_and_records_handoff(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
     _confirm_promote(monkeypatch)
-    ctx = _swarm_ctx(tmp_path, project_id="alpha")
-
+    presence = {"binding_id": "presence-binding"}
+    ctx = _managed_swarm_ctx(tmp_path, project_id="alpha", task_metadata={"presence": presence})
     out = _promote_chat_to_task(
-        ctx,
-        "Audit and fix the issue",
-        project_id="beta",
-        project_name="Injected Project",
-        workspace_root="/tmp/foreign",
-        workspace="none",
-        source="https://example.invalid/repo.git",
-        predecessor_task_id="",
+        ctx, "Audit and fix the issue", project_id="beta", project_name="Injected Project",
+        workspace_root="/tmp/foreign", workspace="none",
+        source="https://example.invalid/repo.git", predecessor_task_id="",
     )
-
     assert out.startswith("OK: task")
     evt = ctx.pending_events[0]
-    assert evt["force_plan"] is True
-    assert evt["force_plan_source"] == "swarm"
-    assert evt["project_id"] == "alpha"
-    assert evt["project_name"] == evt["workspace_root"] == evt["workspace"] == evt["source"] == ""
-    # The override of an explicit owner input is DISCLOSED, never silent.
-    assert "Explicit project 'Injected Project' was ignored" in out
-    assert "bound to project 'alpha'" in out
+    assert evt["presence"] == presence
+    assert evt["project_id"] == evt["project_name"] == evt["workspace_root"] == evt["workspace"] == evt["source"] == ""
+    assert "force_plan" not in evt
     assert ctx._swarm_handoff_attempt["status"] == "scheduled"
+    assert ctx._swarm_handoff_attempt["task_id"] == evt["task_id"]
 
 
-def test_ephemeral_swarm_projectless_room_inherits_explicit_project_name(tmp_path, monkeypatch):
-    """Q9-A: in a PROJECTLESS room the router turn INHERITS an explicitly passed
-    project_name — room scope wins only on a genuine conflict (room already bound
-    to a project). Clearing the name here made the saga's first root run
-    projectless and strand its work in an off-registry tree."""
+def test_managed_swarm_can_choose_a_named_project_for_later_work(tmp_path, monkeypatch):
+    """The admitted root chooses the ordinary project and source selectors."""
     from ouroboros.project_facts import project_id_from_display_name
     from ouroboros.tools.control import _promote_chat_to_task
 
     _confirm_promote(monkeypatch)
-    ctx = _swarm_ctx(tmp_path)  # project_id="" — projectless main chat
+    ctx = _managed_swarm_ctx(tmp_path)  # project_id="" — projectless main chat
 
     out = _promote_chat_to_task(
         ctx,
@@ -595,18 +619,19 @@ def test_ephemeral_swarm_projectless_room_inherits_explicit_project_name(tmp_pat
     evt = ctx.pending_events[0]
     assert evt["project_name"] == "Slime Lab Escape"
     assert evt["project_id"] == project_id_from_display_name("Slime Lab Escape")
-    # The host still owns the rest of the scope surface on a router turn.
-    assert evt["workspace_root"] == evt["workspace"] == evt["source"] == ""
+    assert evt["workspace_root"] == "/tmp/foreign"
+    assert evt["source"] == "https://example.invalid/repo.git"
+    assert "force_plan" not in evt
 
 
-def test_ephemeral_swarm_projectless_room_inherits_explicit_project_id(tmp_path, monkeypatch):
+def test_managed_swarm_can_choose_an_existing_project_for_later_work(tmp_path, monkeypatch):
     """Q9-A sibling parameter: in a PROJECTLESS room an explicitly passed
     project_id is honored, not silently dropped (the same saga failure shape as
     the project_name drop)."""
     from ouroboros.tools.control import _promote_chat_to_task
 
     _confirm_promote(monkeypatch)
-    ctx = _swarm_ctx(tmp_path)  # project_id="" — projectless main chat
+    ctx = _managed_swarm_ctx(tmp_path)  # project_id="" — projectless main chat
 
     out = _promote_chat_to_task(ctx, "Continue the racer build", project_id="racer", predecessor_task_id="")
 
@@ -617,29 +642,16 @@ def test_ephemeral_swarm_projectless_room_inherits_explicit_project_id(tmp_path,
     assert evt["project_id"] == "racer"
 
 
-def test_ephemeral_swarm_room_scope_override_matrix(tmp_path, monkeypatch):
-    """Room=A + explicit project B (id or name): A wins WITH a disclosure
-    sentence in the response; explicit input equal to the room binding is not a
-    conflict and produces no disclosure."""
+def test_managed_swarm_promotes_in_current_project_without_explicit_target(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
     _confirm_promote(monkeypatch)
-    for kwargs, shown in (
-        ({"project_id": "beta"}, "beta"),
-        ({"project_name": "Beta Project"}, "Beta Project"),
-    ):
-        ctx = _swarm_ctx(tmp_path, project_id="alpha")
-        out = _promote_chat_to_task(ctx, "Audit the issue", predecessor_task_id="", **kwargs)
-        assert out.startswith("OK: task")
-        assert ctx.pending_events[0]["project_id"] == "alpha"
-        assert f"Explicit project {shown!r} was ignored" in out
-        assert "bound to project 'alpha'" in out
-
-    ctx = _swarm_ctx(tmp_path, project_id="alpha")
-    out = _promote_chat_to_task(ctx, "Audit the issue", project_id="alpha", predecessor_task_id="")
+    ctx = _managed_swarm_ctx(tmp_path, project_id="alpha")
+    out = _promote_chat_to_task(ctx, "Audit the issue", predecessor_task_id="")
     assert out.startswith("OK: task")
     assert ctx.pending_events[0]["project_id"] == "alpha"
-    assert "ignored" not in out
+    assert "force_plan" not in ctx.pending_events[0]
+    assert not hasattr(ctx, "_swarm_handoff_attempt")
 
 
 def test_promoted_named_project_from_projectless_chat_provisions_workspace(tmp_path, monkeypatch):
@@ -848,25 +860,22 @@ def test_worker_admits_promoted_presence_with_same_verified_ceiling(tmp_path, mo
     assert task["task_contract"]["capability_ceiling"]["digest"] == ceiling.digest
 
 
-def test_ephemeral_swarm_unconfirmed_promotion_reuses_one_task_id(tmp_path, monkeypatch):
+def test_presence_unconfirmed_promotion_records_handoff_for_reconciliation(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_events._wait_for_promotion_admission",
         lambda *_args, **_kwargs: {"status": "unconfirmed", "reason": "confirmation_timeout"},
     )
-    ctx = _swarm_ctx(tmp_path)
-
-    first = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
-    second = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
-
-    assert first == second
-    assert first.startswith("PROMOTE_UNCONFIRMED")
+    ctx = _managed_swarm_ctx(tmp_path, task_metadata={"presence": {"binding_id": "presence-binding"}})
+    out = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
+    assert out.startswith("PROMOTE_UNCONFIRMED")
     assert len(ctx.pending_events) == 1
     assert ctx._swarm_handoff_attempt["task_id"] == ctx.pending_events[0]["task_id"]
+    assert ctx._swarm_handoff_attempt["status"] == "unconfirmed"
 
 
-def test_ephemeral_swarm_receipt_error_after_emit_keeps_one_attempt(tmp_path, monkeypatch):
+def test_promotion_receipt_error_after_emit_propagates(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
     monkeypatch.setattr(
@@ -874,33 +883,24 @@ def test_ephemeral_swarm_receipt_error_after_emit_keeps_one_attempt(tmp_path, mo
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("receipt unavailable")),
     )
     event_queue = queue.Queue()
-    ctx = _swarm_ctx(tmp_path, event_queue=event_queue)
-
-    first = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
-    second = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
-
-    assert first == second
-    assert first.startswith("PROMOTE_UNCONFIRMED")
+    ctx = _managed_swarm_ctx(tmp_path, event_queue=event_queue)
+    with pytest.raises(OSError, match="receipt unavailable"):
+        _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
     assert event_queue.qsize() == 1
-    event = event_queue.get_nowait()
-    assert ctx._swarm_handoff_attempt["task_id"] == event["task_id"]
-    assert ctx._swarm_handoff_attempt["reason"] == "admission_confirmation_failed"
+    assert event_queue.get_nowait()["type"] == "promote_chat_to_task"
+    assert not hasattr(ctx, "_swarm_handoff_attempt")
 
 
-def test_ephemeral_swarm_rejected_promotion_is_latched_without_event(tmp_path, monkeypatch):
+def test_presence_rejected_promotion_records_handoff_without_event(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_routing._promotion_pool_disabled_from_snapshot",
         lambda _ctx: "crash_storm",
     )
-    ctx = _swarm_ctx(tmp_path)
-
-    first = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
-    second = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
-
-    assert first == second
-    assert first.startswith("PROMOTE_REJECTED")
+    ctx = _managed_swarm_ctx(tmp_path, task_metadata={"presence": {"binding_id": "presence-binding"}})
+    out = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
+    assert out.startswith("PROMOTE_REJECTED")
     assert ctx.pending_events == []
     assert ctx._swarm_handoff_attempt["status"] == "rejected"
 
@@ -909,7 +909,7 @@ def test_managed_swarm_does_not_recursively_propagate_routing_intent(tmp_path, m
     from ouroboros.tools.control import _promote_chat_to_task
 
     _confirm_promote(monkeypatch)
-    ctx = _swarm_ctx(tmp_path, is_ephemeral_turn=False)
+    ctx = _managed_swarm_ctx(tmp_path)
 
     _promote_chat_to_task(ctx, "A later task chosen during execution", predecessor_task_id="")
 
@@ -917,14 +917,19 @@ def test_managed_swarm_does_not_recursively_propagate_routing_intent(tmp_path, m
     assert not hasattr(ctx, "_swarm_handoff_attempt")
 
 
-def test_ephemeral_swarm_rejects_steer_without_emitting_event(tmp_path):
+def test_managed_swarm_can_steer_through_the_ordinary_receipt_path(tmp_path, monkeypatch):
     from ouroboros.tools.control import _steer_task
 
-    ctx = _swarm_ctx(tmp_path)
+    monkeypatch.setattr(
+        "ouroboros.tools.control_events._wait_for_routing_annotation",
+        lambda *_args, **_kwargs: {"status": "delivered"},
+    )
+    ctx = _managed_swarm_ctx(tmp_path)
     out = _steer_task(ctx, "existing-root", "do this there")
-
-    assert "cannot steer an existing task" in out
-    assert ctx.pending_events == []
+    assert "durably confirmed" in out
+    assert ctx.pending_events[0]["type"] == "steer_task"
+    assert ctx.pending_events[0]["target_task_id"] == "existing-root"
+    assert not hasattr(ctx, "_swarm_handoff_attempt")
 
 
 def test_promote_tool_rejects_dirty_project_id(tmp_path):
@@ -1874,7 +1879,6 @@ def test_busy_project_chat_runs_native_with_routing_context(tmp_path, monkeypatc
         consciousness=_Consciousness(),
         get_chat_agent=lambda: types.SimpleNamespace(_busy=True),
         handle_chat_direct=_direct,
-        handle_chat_ephemeral=lambda *a, **k: (_ for _ in ()).throw(AssertionError("ordinary turn became ephemeral")),
         enqueue_task=lambda task: enqueued.append(task),
         send_with_budget=lambda *a, **k: None,
     )
@@ -2894,32 +2898,19 @@ def test_promote_provisioning_failure_loud_fails_not_silent_fileless(tmp_path, m
     assert enqueued == []
 
 
-def test_swarm_intent_survives_admission_to_the_finalization_read(tmp_path, monkeypatch):
-    """rc-phaseC propagation pin: `force_plan_source="swarm"` attached at chat
-    admission rides the promote event into the admitted root's task["metadata"]
-    and is the exact fact build_swarm_efficiency reads at finalization — so a
-    Swarm-button root that fanned out nothing finalizes with the
-    no_fanout_observed block instead of a silent None."""
-    import supervisor.workers as workers
+def test_swarm_intent_survives_admission_to_the_finalization_read(swarm_host):  # noqa: F811 -- imported fixture
+    """Host-admitted Swarm intent survives through the actual efficiency reader."""
+    import server
     from ouroboros.agent_task_pipeline import _build_swarm_efficiency
-    from ouroboros.tools.control import _promote_chat_to_task
+    from tests.test_swarm_host_admission import incoming_case
 
-    _confirm_promote(monkeypatch)
-    router_ctx = _swarm_ctx(tmp_path)
-    assert _promote_chat_to_task(router_ctx, "Build it with a swarm", predecessor_task_id="").startswith("OK: task")
-    evt = router_ctx.pending_events[0]
-    assert evt["force_plan_source"] == "swarm"
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    admitted = []
-    outcome = workers.promote_chat_to_task(evt, _promote_ctx(admitted))
-    assert outcome["status"] == "scheduled"
-    task = admitted[0]
+    case = incoming_case(swarm_host, "main")
+    server._route_owner_message(swarm_host.bridge, swarm_host.ctx, case.incoming)
+    assert swarm_host.attempts == []
+    assert len(swarm_host.pending) == 1
+    task = swarm_host.pending[0]
     assert task["metadata"]["force_plan_source"] == "swarm"
-
-    # Deliberately NO logs/events.jsonl: a fresh drive root has none, and the
-    # zero-fanout block must still be returned (the reader is fail-soft).
-    block = _build_swarm_efficiency(types.SimpleNamespace(drive_root=str(tmp_path)), task)
+    block = _build_swarm_efficiency(types.SimpleNamespace(drive_root=str(swarm_host.root)), task)
     assert block == {
         "intent_source": "swarm",
         "planned": None,

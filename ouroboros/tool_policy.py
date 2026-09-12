@@ -10,17 +10,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Protocol
 
 
-def swarm_router_turn(ctx: Any) -> bool:
-    """Return whether *ctx* is the host-attested short-lived Swarm router."""
-
-    metadata = getattr(ctx, "task_metadata", {})
-    return bool(
-        isinstance(metadata, dict)
-        and metadata.get("force_plan")
-        and getattr(ctx, "is_ephemeral_turn", False)
-    )
-
-
 class ToolSchemaProvider(Protocol):
     """Minimal registry contract needed by the loop/discovery helpers."""
 
@@ -33,7 +22,7 @@ def initial_tool_schemas(registry: ToolSchemaProvider) -> List[Dict[str, Any]]:
 
     Visibility is selected by the registry context: ordinary top-level tasks
     expose all available first-party built-ins plus live extension/MCP schemas;
-    delegated-child, repair, ephemeral, credential, resource, and contract
+    delegated-child, repair, credential, resource, and contract
     filters narrow independently. No enabled schema is silently skipped here.
     """
 

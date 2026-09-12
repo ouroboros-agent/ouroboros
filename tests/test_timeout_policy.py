@@ -989,8 +989,8 @@ def test_forced_finalization_does_not_rebase_existing_grace(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(loop_mod, "_finalize_forced_services", lambda *_args: None)
     monkeypatch.setattr(
-        loop_mod, "_forced_swarm_router_result",
-        lambda *_args: ("routed", {}, {}),
+        loop_mod, "_call_forced_model_once",
+        lambda *_args: "The final answer.",
     )
     loop_mod._forced_final_answer(
         ctx, prompt="finish", fallback_text="fallback",

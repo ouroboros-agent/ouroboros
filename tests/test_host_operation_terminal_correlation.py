@@ -12,9 +12,8 @@ from tests.test_cancel_cascade_v664 import _fake_worker, _install_worker, _isola
 from tests.test_host_service_operations import CHAT, MSG, _client, _headers, _inbound, _origin_ref, _receipt
 
 
-@pytest.mark.parametrize("ephemeral", [True, False])
 @pytest.mark.parametrize("host_operation", [True, False])
-def test_actual_final_producer_preserves_named_reply_and_rejoin(tmp_path, monkeypatch, ephemeral, host_operation):
+def test_actual_final_producer_preserves_named_reply_and_rejoin(tmp_path, monkeypatch, host_operation):
     bridge = message_bus.LocalChatBridge()
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "_BRIDGE", bridge)
@@ -25,9 +24,9 @@ def test_actual_final_producer_preserves_named_reply_and_rejoin(tmp_path, monkey
     body = {"chat_id": CHAT, "client_message_id": MSG, "text": "answer once"}
     assert client.post("/chat/inject", headers=_headers(), json=body).status_code == 202
     ref = bridge.get_updates(0, timeout=0)[0]["message"]["accepted_source_ref"]
-    task_id = f"inline-{ephemeral}-{host_operation}"
+    task_id = f"inline-{host_operation}"
     task = {"id": task_id, "type": "task", "chat_id": CHAT, "text": "answer once",
-            "_is_direct_chat": True, "_ephemeral_turn": ephemeral,
+            "_is_direct_chat": True,
             "origin_message_ref": ref, "metadata": {"_host_operation": host_operation}}
     from ouroboros.agent import OuroborosAgent
 
@@ -45,22 +44,15 @@ def test_actual_final_producer_preserves_named_reply_and_rejoin(tmp_path, monkey
     assert final["progress_meta"].get("origin_message_ref") == (ref if host_operation else None)
     if host_operation:
         assert final["progress_meta"]["origin_message_ref"] is not ref
-    if ephemeral:
-        assert not (tmp_path / "task_results" / f"{task_id}.json").exists()
-        assert final["progress_meta"]["task_terminal_status"] == "completed"
-    else:
-        assert final["progress_meta"]["task_phase"] == "finalizing"
+    assert final["progress_meta"]["task_phase"] == "finalizing"
     _handle_send_message(final, SimpleNamespace(
         DRIVE_ROOT=tmp_path, send_with_budget=message_bus.send_with_budget, append_jsonl=lambda *a, **k: None,
     ))
     result = client.get(f"/chat/operations/{CHAT}:{MSG}", headers=_headers()).json()
-    if host_operation or not ephemeral:  # Managed records already carry their exact origin.
-        assert result["status"] == "completed" and result["text"] == "The exact requested answer."
-        rejoined = client.post("/chat/inject", headers=_headers(), json={**body, "wait_for_response": True})
-        assert rejoined.status_code == 200 and rejoined.json()["rejoined"]
-        assert rejoined.json()["response"] == result["text"]
-    else:
-        assert result["status"] == "pending" and "text" not in result
+    assert result["status"] == "completed" and result["text"] == "The exact requested answer."
+    rejoined = client.post("/chat/inject", headers=_headers(), json={**body, "wait_for_response": True})
+    assert rejoined.status_code == 200 and rejoined.json()["rejoined"]
+    assert rejoined.json()["response"] == result["text"]
     assert bridge._inbox.empty()
 
 

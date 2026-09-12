@@ -1072,10 +1072,9 @@ test('history rebuild keeps a lineage-known branch nested, never appended top-le
 });
 
 // ---------------------------------------------------------------------------
-// #691: a decision (ephemeral) turn's tool work shows on the ordinary live card,
-// concludes truthfully, merges its accounting, and claims no task authority.
+// Direct-turn tool work, typed conclusions and accounting keep the ordinary card.
 // ---------------------------------------------------------------------------
-test('an ephemeral decision turn renders its tool work on a card without task authority (#691)', async () => {
+test('a direct turn renders tool work and needs host authority for Cancel', async () => {
     const { prior, mount } = installDom(async () => ({ ok: true, json: async () => ({ active_direct_turns: [] }) }));
     const handlers = new Map();
     const ws = {
@@ -1096,7 +1095,7 @@ test('an ephemeral decision turn renders its tool work on a card without task au
         });
         const messages = globalThis.document.byId.get('chat-messages');
         handlers.get('log')({ chat_id: 1, data: {
-            type: 'task_started', task_id: 'eph-1', ephemeral_decision: true, ts: '2026-09-05T10:00:00Z',
+            type: 'task_started', task_id: 'eph-1', ts: '2026-09-05T10:00:00Z',
         } });
         assert.equal(walkCard(messages, 'eph-1'), null, 'a plain start mints no card');
         handlers.get('log')({ chat_id: 1, data: {
@@ -1104,10 +1103,10 @@ test('an ephemeral decision turn renders its tool work on a card without task au
         } });
         const card = walkCard(messages, 'eph-1');
         assert.ok(card, 'real tool work reveals the ordinary live card');
-        assert.equal(card.querySelector('[data-turn-into-project]'), null, 'no task claim: no Convert');
+        assert.ok(card.querySelector('[data-turn-into-project]'), 'ordinary Main work can become a project');
         assert.equal(card.querySelector('[data-cancel-run]'), null, 'no host cancelable marker: no Cancel');
         handlers.get('chat')({
-            chat_id: 1, role: 'assistant', is_progress: true, ephemeral_decision: true,
+            chat_id: 1, role: 'assistant', is_progress: true,
             content: 'Comparing the reset windows…', ts: '2026-09-05T10:00:02Z', task_id: 'eph-1',
         });
         assert.equal(card.dataset.finished, '0');
@@ -1125,20 +1124,20 @@ test('an ephemeral decision turn renders its tool work on a card without task au
             && n.classList.contains('assistant') && !n.classList.contains('progress')
             && /resets on Monday/.test(n.innerHTML));
         assert.equal(receipts.length, 1);
-        // The blank-status ephemeral task_done carries the accounting facts; it
+        // The typed task_done carries the accounting facts; it
         // must merge them without reopening the finished card.
         handlers.get('log')({ chat_id: 1, data: {
-            type: 'task_done', task_id: 'eph-1', status: '', ephemeral_decision: true,
+            type: 'task_done', task_id: 'eph-1', status: 'completed',
             ts: '2026-09-05T10:22:01Z', outcome_axes: { execution: { status: 'degraded' } },
             reason_code: 'tool_failure', accounted_upper_bound_usd: 2.700732,
             cost_accounting_status: 'available', cost_final: true,
         } });
         assert.equal(card.dataset.finished, '1');
         assert.match(card.querySelector('[data-live-meta]').innerHTML, /\$2\.70/);
-        assert.equal(card.querySelector('[data-turn-into-project]'), null);
-        // An ephemeral turn WITHOUT tool work or progress stays a plain answer.
+        assert.ok(card.querySelector('[data-turn-into-project]'));
+        // A direct turn without tool work or progress stays a plain answer.
         handlers.get('log')({ chat_id: 1, data: {
-            type: 'task_started', task_id: 'eph-2', ephemeral_decision: true, ts: '2026-09-05T11:00:00Z',
+            type: 'task_started', task_id: 'eph-2', ts: '2026-09-05T11:00:00Z',
         } });
         handlers.get('chat')({
             chat_id: 1, role: 'assistant', content: 'Just a short answer.',
@@ -1152,17 +1151,17 @@ test('an ephemeral decision turn renders its tool work on a card without task au
 });
 
 for (const [execution, phase] of [['ok', 'done'], ['degraded', 'warn'], ['failed', 'error'], ['infra_failed', 'error']]) {
-test(`history replay of an ephemeral turn preserves ${execution} (#691)`, async () => {
+test(`history replay of a direct turn preserves ${execution}`, async () => {
     const rows = [
         { chat_id: 1, role: 'user', content: 'compare the reset windows', text: 'compare the reset windows',
           ts: '2026-09-05T10:00:00Z' },
-        { chat_id: 1, role: 'assistant', is_progress: true, ephemeral_decision: true,
+        { chat_id: 1, role: 'assistant', is_progress: true,
           content: 'Reading the account snapshots…', ts: '2026-09-05T10:00:02Z', task_id: 'eph-h' },
-        { chat_id: 1, role: 'assistant', is_progress: true, ephemeral_decision: true,
+        { chat_id: 1, role: 'assistant', is_progress: true,
           content: 'Comparing the reset windows…', ts: '2026-09-05T10:05:00Z', task_id: 'eph-h' },
         { chat_id: 1, role: 'assistant', content: 'The earliest window resets on Monday.',
           text: 'The earliest window resets on Monday.', ts: '2026-09-05T10:22:00Z', task_id: 'eph-h',
-          task_terminal_status: 'completed', ephemeral_decision: true,
+          task_terminal_status: 'completed',
           outcome_axes: { execution: { status: execution } }, reason_code: execution === 'ok' ? 'final_message' : 'tool_failure',
           accounted_upper_bound_usd: execution === 'ok' ? 0.75 : null,
           cost_final: execution === 'ok', unknown_unmetered: execution === 'ok' ? 0 : 1, cost_accounting_status: 'available' },
@@ -1197,7 +1196,7 @@ test(`history replay of an ephemeral turn preserves ${execution} (#691)`, async 
         assert.equal(card.querySelector('[data-live-phase]').dataset.phase, phase);
         assert.doesNotMatch(card.querySelector('[data-live-meta]').innerHTML, /\$0(?:\.00)?(?:\s|<|$)/);
         if (execution === 'ok') assert.match(card.querySelector('[data-live-meta]').innerHTML, /\$0\.75/);
-        assert.equal(card.querySelector('[data-turn-into-project]'), null);
+        assert.ok(card.querySelector('[data-turn-into-project]'));
         assert.equal(card.querySelector('[data-cancel-run]'), null);
         assert.equal(messages.children.filter((n) => /resets on Monday/.test(n.innerHTML)).length, 1);
     } finally {
@@ -1295,13 +1294,13 @@ for (const order of ['final-first', 'done-first', 'cold']) {
     test(`routing activity retains counts/model and one completion note: ${order}`, async () => {
         const final = { chat_id: 1, role: 'assistant', text: 'Routed to the project.',
             content: 'Routed to the project.', task_id: 'routing-facts', ts: '2026-09-09T10:00:00Z',
-            task_terminal_status: 'completed', ephemeral_decision: true, tool_calls: 2, rounds: 2,
+            task_terminal_status: 'completed', tool_calls: 2, rounds: 2,
             reason_code: 'final_message', outcome_axes: { execution: { status: 'ok' } },
             model_execution: { source: 'usable_solve_response', requested_model: 'provider/model-a',
                 used_model: 'provider/model-b', reported_model: 'model-b-provider', provider: 'provider', used_local: false } };
-        const done = { ...final, type: 'task_done', status: '', ts: '2026-09-09T10:00:01Z' };
+        const done = { ...final, type: 'task_done', status: 'completed', ts: '2026-09-09T10:00:01Z' };
         const { prior, mount } = installDom(async (url) => ({ ok: true, json: async () =>
-            String(url).startsWith('/api/chat/history') ? { messages: order === 'cold' ? [final] : [] }
+            String(url).startsWith('/api/chat/history') ? { messages: order === 'cold' ? [{ ...final, system_type: 'task_summary' }] : [] }
                 : { active_direct_turns: [] } }));
         const handlers = new Map();
         const ws = { on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
@@ -1314,7 +1313,7 @@ for (const order of ['final-first', 'done-first', 'cold']) {
             if (order === 'cold') await instance.refreshHistory({ revision: 1 });
             else {
                 handlers.get('log')({ chat_id: 1, data: { type: 'tool_call_started', task_id: 'routing-facts',
-                    ephemeral_decision: true, tool: 'route_to_project', ts: '2026-09-09T09:59:59Z' } });
+                    tool: 'route_to_project', ts: '2026-09-09T09:59:59Z' } });
                 if (order === 'final-first') handlers.get('chat')(final);
                 handlers.get('log')({ chat_id: 1, data: done });
                 handlers.get('chat')(final);
@@ -1322,7 +1321,7 @@ for (const order of ['final-first', 'done-first', 'cold']) {
             const card = walkCard(globalThis.document.byId.get('chat-messages'), 'routing-facts');
             assert.ok(card);
             assert.equal(card.dataset.finished, '1');
-            assert.equal(card.querySelector('[data-live-title]').textContent, 'Conversation activity');
+            assert.equal(card.querySelector('[data-live-title]').textContent, 'Task activity');
             assert.match(card.querySelector('[data-live-meta]').innerHTML, /2 tool calls/);
             assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
             if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });

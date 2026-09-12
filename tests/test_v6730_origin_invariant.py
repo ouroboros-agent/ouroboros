@@ -343,9 +343,6 @@ def test_ingress_captures_origin_and_threads_it_into_turn_metadata(tmp_path, mon
 
     captured = {}
 
-    def _ephemeral(chat_id, text, image_data=None, *, task_constraint=None, task_metadata=None):
-        captured["metadata"] = task_metadata
-
     def _direct(chat_id, text, image_data=None, *, task_constraint=None, task_metadata=None):
         captured["metadata"] = task_metadata
 
@@ -359,7 +356,6 @@ def test_ingress_captures_origin_and_threads_it_into_turn_metadata(tmp_path, mon
             inject_observation=lambda _t: None, pause=lambda: None, resume=lambda: None,
         ),
         get_chat_agent=lambda: SimpleNamespace(_busy=False),
-        handle_chat_ephemeral=_ephemeral,
         handle_chat_direct=_direct,
         send_with_budget=lambda *_a, **_k: None,
     )
@@ -516,7 +512,7 @@ def test_ensure_worker_reads_origin_from_running_map(tmp_path, monkeypatch):
 
 def test_early_origin_stub_persists_before_card_exposure(tmp_path):
     """Triad r7: a direct-chat task's origin is DURABLE before task_started can
-    expose a convertible card; ephemeral turns and origin-less tasks write nothing."""
+    expose a convertible card; origin-less tasks write nothing."""
     import inspect
 
     from ouroboros.agent import OuroborosAgent, _persist_early_origin_stub
@@ -529,10 +525,6 @@ def test_early_origin_stub_persists_before_card_exposure(tmp_path):
     record = load_task_result(tmp_path, "direct-1")
     assert record["origin_message_ref"] == _ref()
     assert record["origin_message_text"] == OWNER_TEXT
-    _persist_early_origin_stub(tmp_path, {
-        "id": "eph-1", "_ephemeral_turn": True, "origin_message_ref": _ref(),
-    })
-    assert load_task_result(tmp_path, "eph-1") is None
     _persist_early_origin_stub(tmp_path, {"id": "no-origin-1", "chat_id": 1})
     assert load_task_result(tmp_path, "no-origin-1") is None
     # And the stub runs BEFORE the task_started emission in the task handler.

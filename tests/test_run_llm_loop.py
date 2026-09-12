@@ -432,7 +432,6 @@ def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypat
 def test_force_plan_decision_does_not_treat_trace_marker_as_authority(tmp_path, monkeypatch):
     ctx = SimpleNamespace(
         task_metadata={"force_plan": True},
-        is_ephemeral_turn=False,
         task_id="root1",
         drive_root=tmp_path,
         budget_drive_root=str(tmp_path),

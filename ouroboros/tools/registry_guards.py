@@ -1,4 +1,4 @@
-"""Host-owned pre-dispatch guards: capability/resource, ephemeral, managed-update and skill-payload constraints.
+"""Host-owned pre-dispatch guards: capability/resource, managed-update and skill-payload constraints.
 
 Every span is extracted VERBATIM from the parent's tip bytes by
 scripts/v7next_transplant.py (D18/D33 module-handle split, proof-checked);
@@ -542,49 +542,6 @@ def _payload_dispatch_constraint(
     if task_constraint and task_constraint.has_selected_skill:
         return task_constraint, None
     return synthesized or task_constraint, None
-
-
-_EPHEMERAL_ALLOWED_TOOLS = frozenset({
-    # read / inspect
-    "read_file", "query_code", "search_code", "list_files", "web_search", "browse_page",
-    "chat_history", "recent_tasks", "get_task_result", "vcs_diff", "vcs_status",
-    "analyze_screenshot", "vlm_query",
-    # decide / route / spawn-owner-task / reply
-    "route_to_project", "promote_chat_to_task", "steer_task", "list_projects", "send_photo",
-})
-
-
-def _ephemeral_block_result(
-    ctx: Any,
-    name: str,
-    ext_tool: Any = None,
-    is_mcp: bool = False,
-    *,
-    extension_unavailable: bool = False,
-) -> ToolResult | None:
-    """CW3: a short ephemeral decision turn may call ONLY the allowlisted read/decision
-    built-ins (_EPHEMERAL_ALLOWED_TOOLS); every other built-in (durable/control/review/
-    skill mutator, run_command) fails closed. Default-deny, so a new mutator can never
-    silently become reachable. The owner's dynamic surfaces are not gated here (issue
-    #722, owner-approved 2026-09-08): configured MCP tools and enabled, granted,
-    reviewed extension tools ride every lane behind their own gates (extension
-    liveness, acting-child grants, the network resource guard), exactly as on a managed
-    task — the model decides inline vs promote_chat_to_task; a dead extension name
-    (``extension_unavailable``) keeps its EXTENSION_UNAVAILABLE answer instead of the
-    allowlist text. The turn answers inline or promote_chat_to_task's the durable work
-    into a supervised task."""
-    if not getattr(ctx, "is_ephemeral_turn", False) or ext_tool or extension_unavailable or is_mcp:
-        return None
-    if name not in _EPHEMERAL_ALLOWED_TOOLS:
-        text = (
-            f"⚠️ EPHEMERAL_TURN_RESTRICTED: '{name}' is not in the decision-turn allowlist "
-            "(read/inspect + answer/route/spawn/steer only) — a short same-route turn must "
-            "not do durable/control/review/skill work or run shell. Answer inline, or "
-            "promote_chat_to_task to do it in a supervised task."
-        )
-    else:
-        return None
-    return ToolResult(status="blocked", code="ACCESS_BLOCKED", text=text)
 
 
 def _blocked_path_note(path_text: Any, spelled: Any = "") -> str:

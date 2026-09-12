@@ -985,7 +985,7 @@ function chatView({
 export function taskTerminalSummary(evt = {}) {
     const terminal = evt.task_phase !== 'finalizing' && evt.outcome_final !== false
         && (evt.outcome_final === true || evt.system_type === 'task_summary'
-            || taskDoneIsTerminal(evt) || (evt.type === 'task_done' && evt.ephemeral_decision === true));
+            || taskDoneIsTerminal(evt));
     const outcome = taskTerminalPhase(evt);
     const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');
     const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]

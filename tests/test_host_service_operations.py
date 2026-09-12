@@ -185,7 +185,7 @@ def test_operation_read_reports_pending_then_the_durable_answer(tmp_path):
     assert done["status"] == "completed" and done["text"] == "the answer" and done["task_id"] == "40cc86d9"
 
 
-def test_operation_read_reports_a_live_direct_or_ephemeral_turn(tmp_path, monkeypatch):
+def test_operation_read_reports_a_live_direct_turn(tmp_path, monkeypatch):
     _isolate_queue(monkeypatch, tmp_path, [])
     from supervisor.active_activity import get_direct_activity_registry
 
@@ -194,11 +194,6 @@ def test_operation_read_reports_a_live_direct_or_ephemeral_turn(tmp_path, monkey
     registry = get_direct_activity_registry()
     registry.clear()
     try:
-        registry.register("40cc86d9", CHAT, client_message_id=MSG, kind="ephemeral_decision", origin_message_ref=_origin_ref(tmp_path))
-        state = client.get(f"/chat/operations/{operation_ref(CHAT, MSG)}", headers=_headers()).json()
-        assert state["status"] == "running" and state["phase"] == "ephemeral_decision"
-        assert state["task_id"] == "40cc86d9" and state["cancel_supported"] is False
-        registry.clear()
         registry.register("40cc86d9", CHAT, client_message_id=MSG, kind="direct_chat", origin_message_ref=_origin_ref(tmp_path))
         state = client.get(f"/chat/operations/{operation_ref(CHAT, MSG)}", headers=_headers()).json()
         assert state["phase"] == "direct_chat" and state["cancel_supported"] is True
@@ -250,7 +245,6 @@ def _isolate_queue(monkeypatch, tmp_path, tasks):
 
 
 def test_cancel_before_any_addressable_work_is_disclosed_not_faked(tmp_path, monkeypatch):
-    from supervisor.active_activity import get_direct_activity_registry
 
     _isolate_queue(monkeypatch, tmp_path, [])
     client = _client(tmp_path)
@@ -260,14 +254,6 @@ def test_cancel_before_any_addressable_work_is_disclosed_not_faked(tmp_path, mon
     queued = client.post("/chat/cancel", headers=_headers(), json={"operation_ref": ref})
     assert queued.status_code == 409
     assert queued.json()["outcome"] == "cancel_unsupported" and queued.json()["reason"] == "not_started"
-    registry = get_direct_activity_registry()
-    registry.clear()
-    try:
-        registry.register("40cc86d9", CHAT, client_message_id=MSG, kind="ephemeral_decision", origin_message_ref=_origin_ref(tmp_path))
-        deciding = client.post("/chat/cancel", headers=_headers(), json={"operation_ref": ref})
-    finally:
-        registry.clear()
-    assert deciding.status_code == 409 and deciding.json()["reason"] == "decision_turn_in_flight"
     assert client.post("/chat/cancel", headers=_headers(), json={"operation_ref": "junk"}).status_code == 400
     assert client.post("/chat/cancel", headers=_headers(), json=["not", "an", "object"]).status_code == 400
 
