@@ -302,3 +302,43 @@ def test_the_wait_set_cap_refusal_names_the_configured_cap(tmp_path):
         "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids is capped at "
         f"{MAX_ACTIVE_SUBAGENTS_HARD_CAP}."
     )
+
+
+def test_a_refused_steer_is_seen_as_a_refusal_without_degrading_execution():
+    """Owner item I23, owner answer batch #3, 6g = A.
+
+    Both steer refusals are PLAIN sentences (``control_routing`` publishes no
+    typed result for them), so the identifier table is the only reader that can
+    classify them - and it recorded them status=ok, which left the task's own
+    trace saying the message had been delivered. They are now is_error=True, so
+    the agent SEES the refusal it must react to, and they route to the
+    policy-denial bucket rather than ``unresolved``, so the execution health axis
+    is NOT degraded: the host refused, the agent did not fail. Asserted through
+    the classifier and the bucket collector, never by table membership.
+    """
+    from ouroboros._outcome_tool_errors import _classify_tool_errors
+    from ouroboros.loop_tool_execution import _typed_execution_failure, _typed_result_metadata
+
+    refusals = (
+        "⚠️ STEER_REJECTED: task t-1 was not steered (target_not_steerable).",
+        "⚠️ STEER_UNCONFIRMED: mailbox delivery to task t-1 was not durably confirmed "
+        "(queue). Do not report the message as delivered.",
+    )
+    rows = []
+    for text in refusals:
+        typed = LegacyTextResultAdapter.from_text("steer_task", text)
+        assert typed.code == "TOOL_REPORTED_FAILURE"
+        is_error = _typed_execution_failure(True, typed)
+        assert is_error is True
+        status = _typed_result_metadata("steer_task", text, is_error, typed)["status"]
+        assert status == "tool_reported_failure"
+        rows.append({"tool": "steer_task", "status": status, "is_error": is_error,
+                     "result": text})
+
+    buckets = _classify_tool_errors({"tool_calls": rows})
+    assert [row["tool"] for row in buckets["policy_denials"]] == ["steer_task", "steer_task"]
+    assert buckets["unresolved"] == []
+    # A confirmed steer is untouched: it was never an error and stays out of every
+    # error bucket.
+    delivered = "✉️ Steering task t-1: mailbox delivery is durably confirmed (queue)."
+    assert LegacyTextResultAdapter.from_text("steer_task", delivered).code == "OK"

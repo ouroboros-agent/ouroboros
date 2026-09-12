@@ -381,7 +381,6 @@ def test_route_owner_message_stamps_channel_for_non_web_ingress(monkeypatch):
                 inject_observation=lambda *_: None, pause=lambda: None, resume=lambda: None
             ),
             get_chat_agent=lambda: SimpleNamespace(_busy=True),
-            handle_chat_ephemeral=lambda *a, **kw: captured.append(kw.get("task_metadata")),
             handle_chat_direct=lambda *a, **kw: captured.append(kw.get("task_metadata")),
         )
 

@@ -73,42 +73,27 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     if metadata.get("force_plan"):
         source = str(metadata.get("force_plan_source") or "operator").strip() or "operator"
-        if bool(task.get("_ephemeral_turn")):
-            plan_notice = (
-                "[SWARM_ROUTING_INTENT]\n"
-                f"Source: {source}.\n"
-                "Route this request into exactly one NEW managed root; do not execute it, answer it "
-                "inline, or steer an existing task. In Main, either promote_chat_to_task in Main or "
-                "route_to_project when an existing Project clearly fits. In a Project room, use "
-                "promote_chat_to_task and keep the host-owned current Project. The managed task, not "
-                "this short routing turn, owns plan_task and the work. After the routing tool returns, "
-                "write a short acknowledgement from its exact receipt; claim admission only when the "
-                "receipt says durably scheduled, and do not retry an unconfirmed/rejected attempt.\n"
-                "[/SWARM_ROUTING_INTENT]\n\n"
-            )
-        else:
-            from ouroboros.config import get_review_enforcement
+        from ouroboros.config import get_review_enforcement
 
-            review_enforcement = get_review_enforcement()
-            plan_notice = (
-                "[SWARM_INITIATIVE]\n"
-                f"Source: {source}.\n"
-                f"Resolved review enforcement: {review_enforcement}.\n"
-                "First call plan_task with the goal, the plan prose and a typed spec (in_scope, non_goals, "
-                "acceptance_claims, invariants, decisions, deferred, affected_resources, evidence). Then follow "
-                "OUROBOROS_REVIEW_ENFORCEMENT. Under blocking, continue analysis, evidence gathering, and "
-                "non-mutating preparation while review is open, but begin implementation only after review closes "
-                "or a real task-wide rail fires. Under advisory, you may proceed by judgment with explicit "
-                "disclosure. When the work decomposes into independent parts, fan out subagents within the "
-                "configured caps and reconcile them. State the chosen execution shape explicitly in the plan's "
-                "decisions or acceptance claims — delegation required, optional, or intentionally not used — so "
-                "reviewers can judge it. Parallel children each work from your base snapshot and cannot see each "
-                "other's edits; their patches integrate independently, so two children writing the same region of "
-                "the same file conflict at integration — expected mechanics, not a failure. Give children disjoint "
-                "write regions, or explicitly plan the parent-synthesis step that resolves the expected overlap. "
-                "Planning or reviewer unavailability must not replace useful work with a terminal planning error.\n"
-                "[/SWARM_INITIATIVE]\n\n"
-            )
+        review_enforcement = get_review_enforcement()
+        plan_notice = (
+            "[SWARM_INITIATIVE]\n"
+            f"Source: {source}.\n"
+            f"Resolved review enforcement: {review_enforcement}.\n"
+            "Plan review applies to this work (BIBLE P3); whether to ask, explore or plan first is "
+            "your judgment. Under blocking, continue analysis, evidence gathering, and "
+            "non-mutating preparation while review is open, but begin implementation only after review closes "
+            "or a real task-wide rail fires. Under advisory, you may proceed by judgment with explicit "
+            "disclosure. When the work decomposes into independent parts, fan out subagents within the "
+            "configured caps and reconcile them. State the chosen execution shape explicitly in the plan's "
+            "decisions or acceptance claims — delegation required, optional, or intentionally not used — so "
+            "reviewers can judge it. Parallel children each work from your base snapshot and cannot see each "
+            "other's edits; their patches integrate independently, so two children writing the same region of "
+            "the same file conflict at integration — expected mechanics, not a failure. Give children disjoint "
+            "write regions, or explicitly plan the parent-synthesis step that resolves the expected overlap. "
+            "Planning or reviewer unavailability must not replace useful work with a terminal planning error.\n"
+            "[/SWARM_INITIATIVE]\n\n"
+        )
         text = plan_notice + str(text or "")
     image_b64 = task.get("image_base64")
     attachment_image_blocks = _build_attachment_image_blocks(task)
@@ -299,26 +284,7 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     return out
 
 
-# v6.70.0 LLM-first outcome contract for ephemeral decision turns (no gate): a
-# decision turn once ANSWERED a side-effect request with a promise ("I'll open
-# the PR") while its read-only toolset could not do the work and no task
-# existed — the owner watched a placebo. State the rule where the decision is
-# made instead of policing prose afterwards.
-_DECISION_TURN_OUTCOME_RULE = (
-    "This is a short DECISION turn: built-in tools are read/inspect only; the "
-    "owner's configured MCP tools and enabled extension tools are callable here. A request "
-    "carrying an external side effect (submit/publish/repair/commit/install/"
-    "write) MUST either become a real supervised task via promote_chat_to_task "
-    "or be explicitly declined in the answer. Ending this turn with a promise "
-    "of future work that no tool call actually scheduled is a forbidden "
-    "outcome — an unscheduled promise reads to the owner as work in motion. "
-    "After any routing tool call, the final no-tool response MUST be self-contained: "
-    "state what was attempted and the outcome known to you, because prose from the "
-    "tool-call round is transient progress and is not durable conversation history."
-)
-
-# Hoisted verbatim from ``build_runtime_section`` (same pattern as
-# ``_DECISION_TURN_OUTCOME_RULE``) to keep that builder under the hard method gate.
+# The owner-surface note is shared by the runtime-section builder.
 _OWNER_CLIENT_NOTE = (
     "owner_client is the client surface that SENT the message that started/steered "
     "this work. Provenance: browser observables are CLIENT-REPORTED (the owner's own "
@@ -339,7 +305,6 @@ _OWNER_CLIENT_NOTE = (
 from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported public surface
     _delegation_capability_fact,
     _project_room_fact,
-    _promoted_task_toolset,
     _runtime_budget_info,
 )
 
@@ -571,28 +536,14 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         runtime_data["owner_client"] = dict(_owner_client)
         runtime_data["owner_client_note"] = _OWNER_CLIENT_NOTE
     _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
-    _swarm_router = bool(_meta.get("force_plan")) and bool(task.get("_ephemeral_turn"))
     if _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):
         runtime_data["current_chat"] = _current_chat
         runtime_data["current_chat_rule"] = (
-            "Existing roots are context only for this Swarm turn; admit a new root and never steer them."
-            if _swarm_router else
             "addressable_root_tasks are RUNNING/PENDING roots in THIS chat. If a new message continues or "
             "redirects one of them, steer_task(task_id, message) it rather than spawning a duplicate; "
             "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
             "message in a project room defaults to that project unless it clearly says otherwise."
         )
-    if _swarm_router:
-        # The router turn authors objectives/contracts for a task it will never
-        # run. Give it the bounded LIVE top-level tool catalog as a structural fact;
-        # the model still writes the contract itself (P5) — no contract text is
-        # ever scanned or gated.
-        try:
-            runtime_data["promoted_task_toolset"] = _promoted_task_toolset(env)
-        except Exception:
-            log.debug("Failed to build promoted-task toolset digest", exc_info=True)
-    if bool(task.get("_ephemeral_turn")) and not _swarm_router:
-        runtime_data["decision_turn_rule"] = _DECISION_TURN_OUTCOME_RULE
     _main_manifest = (
         _meta.get("main_routing_manifest")
         if isinstance(_meta.get("main_routing_manifest"), dict)

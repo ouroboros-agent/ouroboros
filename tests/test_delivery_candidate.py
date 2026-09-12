@@ -914,3 +914,47 @@ def test_forced_fallback_rejects_stale_delivery_candidate(tmp_path, monkeypatch)
         hashlib.sha256(text.encode("utf-8")).hexdigest()
     )
     assert returned_trace["forced_finalization"]["source"] == "host_fallback"
+
+
+def test_quiz_answer_and_parent_message_supersede_a_paid_acceptance_verdict(tmp_path, monkeypatch):
+    """P1-6(g), pinned at the production seam (loop_delivery's post-answer admission
+    drain): an owner quiz answer at a root and a parent's task message to a child grow
+    the directive corpus, so a paid acceptance verdict is superseded for owner follow-up;
+    a host system frame (a settled plan wave) changes nothing."""
+    import threading
+
+    from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, write_owner_message, write_task_message
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    def run(write_followups):
+        loop, registry, ctx, trace = _forced_test_context(tmp_path / str(len(superseded_runs)))
+        drive = ctx.drive_root
+        monkeypatch.setattr(loop, "_compute_subagent_handoff", lambda *_a, **_k: None)
+        monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_k: False)
+        monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_k: False)
+        superseded = []
+        monkeypatch.setattr(loop, "_supersede_task_acceptance_for_owner_followup",
+                            lambda *a, **k: superseded.append((a, k)))
+        registry._ctx._task_acceptance_reviewed = True
+        registry._ctx.owner_message_admission_lock = threading.Lock()
+        registry._ctx.owner_message_admission_agent = SimpleNamespace(
+            _accepting_owner_messages=True, _busy=True, _current_task_id="parent1")
+        registry._ctx.budget_drive_root = str(drive)
+        registry._ctx.task_attempt = 1
+        write_followups(drive)
+        result = loop._no_tool_final_answer("Final answer.", ctx, trace, registry, queue.Queue(), set(), lambda _m: None)
+        superseded_runs.append(superseded)
+        # A grown corpus forces another round (None); an unchanged one delivers the answer.
+        return superseded, [row["source"] for row in getattr(registry._ctx, "_owner_directives", [])], result
+
+    superseded_runs: list = []
+    quiz = "[Owner quiz answer] quiz q1 — asked t0, answered t1.\nThe owner chose option 2: postgres"
+    calls, sources, result = run(lambda drive: write_owner_message(drive, quiz, task_id="parent1", msg_id="qa-1", kind=KIND_QUIZ_ANSWER))
+    assert len(calls) == 1 and sources == ["owner_quiz_answer"] and result is None
+    calls, sources, result = run(lambda drive: write_task_message(drive, "Use the Q3 numbers only", "parent1",
+                                                                  source_task_id="root-0", msg_id="pm-1"))
+    assert len(calls) == 1 and sources == ["principal_task_message"] and result is None
+    calls, sources, result = run(lambda drive: write_task_message(
+        drive, "Plan review wave abcd1234: 3 released reviewer slot(s) settled", "parent1",
+        source_task_id="parent1", provenance="system", msg_id="sys-1"))
+    assert calls == [] and sources == [] and result is not None

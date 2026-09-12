@@ -273,7 +273,7 @@ def test_user_files_root_blocks_workspace_parent_reads_home_secrets(tmp_path, mo
     assert not (home / "Ouroboros" / "AGENTS.md").exists()
 
 
-def test_user_files_root_blocks_case_insensitive_home_secret_writes(tmp_path, monkeypatch):
+def test_user_files_root_blocks_case_insensitive_credential_leaf_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     home = pathlib.Path.home()
@@ -283,14 +283,17 @@ def test_user_files_root_blocks_case_insensitive_home_secret_writes(tmp_path, mo
 
     # READS of credential-shaped paths are allowed for root (capinv-447 / В23=A)...
     library = registry.execute("read_file", {"root": "user_files", "path": "library/Keychains/login.keychain-db"})
-    # ...while credential-shaped WRITES keep the shape deny, case-insensitively.
+    # ...while a write to an exact credential LEAF keeps its deny, case-insensitively.
     creds = registry.execute("write_file", {"root": "user_files", "path": "Desktop/Credentials.json", "content": "{}"})
+    # A key/certificate SUFFIX is not a credential: the write lands (owner
+    # answer Q6 of batch 2 - refusal authority is leaves and locations, not names).
     pem = registry.execute("write_file", {"root": "user_files", "path": "Desktop/id_rsa.PEM", "content": "secret"})
 
     assert "USER_FILES_PATH_BLOCKED" not in library
     assert "keychain marker" in library
     assert "credential-like" in creds
-    assert "credential-like" in pem
+    assert "credential-like" not in pem
+    assert (home / "Desktop" / "id_rsa.PEM").read_text(encoding="utf-8") == "secret"
 
 
 def test_list_files_user_files_blocks_ouroboros_control_plane(tmp_path, monkeypatch):

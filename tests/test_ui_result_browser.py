@@ -56,12 +56,28 @@ def _seed_history(root):
     log_chat("out", 1, 1, "The accepted report is available.", task_id="parent1", drive_root=root)
 
     pending = []
-    transient = {"id": "routing-history", "type": "task", "chat_id": 1, "_ephemeral_turn": True}
-    pipeline.emit_task_results(env, None, None, pending, transient, "The work continues in the Project.",
-        {"rounds": 2}, {"tool_calls": [{"name": "read_file"}, {"name": "route_to_project"}], "reasoning_notes": []},
+    direct = {"id": "routing-history", "type": "task", "chat_id": 1,
+              "text": "Read the evidence and route the follow-up into its Project.",
+              "_is_direct_chat": True, "_skip_post_task_synthesis": True}
+    direct_trace = {"tool_calls": [{"tool": "read_file"}, {"tool": "route_to_project"}], "reasoning_notes": []}
+    pipeline.emit_task_results(env, None, None, pending, direct, "The work continues in the Project.",
+        {"rounds": 2}, direct_trace,
         start_time=0.0, drive_logs=logs)
     final = next(row for row in pending if row["type"] == "send_message")
-    log_chat("out", 1, 1, final["text"], task_id=transient["id"], message_meta=final["progress_meta"], drive_root=root)
+    log_chat("out", 1, 1, final["text"], task_id=direct["id"], message_meta=final.get("progress_meta", {}), drive_root=root)
+    # Ordinary native history receives counts from its normal authored summary,
+    # not from the removed ephemeral final-frame metadata producer. Only the
+    # summary model answer is a fixture; all summary/history writers are real.
+    from ouroboros.post_task_synthesis import _run_task_summary
+    from ouroboros.gateway.history import _assemble_history_response
+    with pytest.MonkeyPatch.context() as summary_model:
+        summary_model.setattr("ouroboros.llm_observability.chat_observed", lambda *_a, **_k: (
+            {"content": "Read the evidence and routed the follow-up into its Project."}, {},
+        ))
+        _run_task_summary(env, None, direct, {"rounds": 2}, direct_trace, logs)
+    summaries = [row for row in json.loads(_assemble_history_response(root, 1, 50, 200))["messages"]
+                 if row.get("task_id") == direct["id"] and row.get("system_type") == "task_summary"]
+    assert len(summaries) == 1 and summaries[0]["tool_calls"] == 2
     return {"preserved_path": str(preserved), "preserved_bytes": preserved.read_bytes()}
 
 

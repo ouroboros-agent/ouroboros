@@ -131,7 +131,15 @@ test('a decision with no reason code still reaches the acceptance branch', () =>
 });
 
 test('a hard failure keeps explaining itself by its execution reason', () => {
-    const failed = { ...A4, status: 'failed', reason_code: 'delegated_custody_unreconciled' };
+    // The row carries the debt the code names: the host renderer
+    // (project_dialogue._completion_verdict) states this cause only while
+    // delegated_runs_unreconciled is non-empty, because the debt heals from the
+    // write side while the stored reason_code may not be rewritten. The fixture
+    // keeps the two twins describing the same record.
+    const failed = {
+        ...A4, status: 'failed', reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: ['run-a1'],
+    };
     assert.equal(taskReasonDetail(failed), 'Reason: delegated_custody_unreconciled');
 });
 
@@ -143,4 +151,88 @@ test('a multi-line rationale is flattened into one sentence', () => {
         },
     };
     assert.equal(taskReasonDetail(noisy), 'Acceptance: revision_requested — Two lines here.');
+});
+
+// The custody overlay stamps `delegated_custody_unreconciled` as the row's
+// reason_code while a delegated run is still unreconciled. The debt then heals
+// from the WRITE side while the stored code may not be rewritten, so the code
+// outlives the fact. The host renderer already selects on the row's own debt
+// list (project_dialogue._custody_debt_reason); these cases mirror
+// tests/test_terminal_truth_projection_p5.py so the card and the plain rows
+// name the same cause on the same record.
+
+test('a healed custody debt yields the current execution reason on the card', () => {
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: [],
+        outcome_axes: { execution: { status: 'degraded', reason_code: 'tool_failure' } },
+    }), 'Reason: tool_failure');
+});
+
+test('an open custody debt is still named on the card', () => {
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: ['run-a1'],
+        outcome_axes: { execution: { status: 'ok' } },
+    }), 'Reason: delegated_custody_unreconciled');
+});
+
+test('a real debt beside a real execution cause is one card line', () => {
+    assert.equal(taskReasonDetail({
+        status: 'failed',
+        reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: ['run-a1', 'run-b2'],
+        outcome_axes: { execution: { status: 'failed', reason_code: 'provider_unavailable' } },
+    }), 'Reason: provider_unavailable (delegated_custody_unreconciled)');
+});
+
+// A LIVE task_done event carries the row's own debt list too
+// (agent_task_pipeline._custody_debt_event_fields), so the card reads the SAME
+// list the durable row holds and the stamped code is never a second source. A
+// record that carries no readable list therefore states nothing about the debt,
+// exactly as project_dialogue._custody_debt_reason reads the same record.
+
+test('a live event carrying an open debt list names the debt through the list', () => {
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: ['run-a1'],
+        outcome_axes: { execution: { status: 'ok', reason_code: 'tool_failure' } },
+    }), 'Reason: tool_failure (delegated_custody_unreconciled)');
+});
+
+test('a record carrying no debt list states nothing about the debt', () => {
+    assert.equal(taskReasonDetail({
+        status: 'failed',
+        reason_code: 'delegated_custody_unreconciled',
+        outcome_axes: { execution: { status: 'failed', reason_code: 'provider_unavailable' } },
+    }), 'Reason: provider_unavailable');
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        outcome_axes: { execution: { status: 'ok' } },
+    }), '');
+});
+
+test('a debt list of an unreadable shape carries no readable debt', () => {
+    // The host reads the same value the same way: only a list is a debt list.
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: 'run-a1',
+        outcome_axes: { execution: { status: 'ok' } },
+    }), '');
+});
+
+test('a healed debt with no execution cause states nothing on the card', () => {
+    // The warn headline still comes from the frozen objective warning; inventing
+    // a Reason line here is exactly the false statement this rule removes.
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: [],
+        outcome_axes: { execution: { status: 'ok' } },
+    }), '');
 });

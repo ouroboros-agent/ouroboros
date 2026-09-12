@@ -203,8 +203,8 @@ test('computeDerivedChatStatus: online idle state by default', () => {
 test('computeHydratedDirectActivities: filters turns by chatId', () => {
     const turns = [
         { activity_id: 'act-main-1', chat_id: 1, kind: 'direct_chat', phase: 'thinking' },
-        { activity_id: 'act-proj-2', chat_id: 2, kind: 'ephemeral_decision', phase: 'thinking' },
-        { activity_id: 'act-main-2', chat_id: 1, kind: 'ephemeral_decision', phase: 'thinking' },
+        { activity_id: 'act-proj-2', chat_id: 2, kind: 'direct_chat', phase: 'thinking' },
+        { activity_id: 'act-main-2', chat_id: 1, kind: 'direct_chat', phase: 'thinking' },
     ];
 
     const mapChat1 = computeHydratedDirectActivities(new Map(), turns, 1);
@@ -293,14 +293,14 @@ test('computeHydratedDirectActivities: snapshot has no deletion authority over m
         ['managed-1', { activityId: 'managed-1', kind: '', phase: 'thinking', startedAt: 100 }],
         // Registry-tracked direct turn absent from the snapshot: concluded.
         ['direct-1', { activityId: 'direct-1', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
-        ['eph-1', { activityId: 'eph-1', kind: 'ephemeral_decision', phase: 'thinking', startedAt: 100 }],
+        ['direct-2', { activityId: 'direct-2', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
     ]);
 
     const updated = computeHydratedDirectActivities(initialMap, [], 1, 1_000);
     assert.equal(updated.size, 1);
     assert.ok(updated.has('managed-1'));
     assert.ok(!updated.has('direct-1'));
-    assert.ok(!updated.has('eph-1'));
+    assert.ok(!updated.has('direct-2'));
 });
 
 test('computeHydratedDirectActivities: a concluded turn is never resurrected by a snapshot captured while it still ran', () => {

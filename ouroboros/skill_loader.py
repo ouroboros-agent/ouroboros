@@ -391,9 +391,10 @@ def _iter_payload_files(
                 raise SkillPayloadUnreadable(
                     str(path.relative_to(resolved_root)),
                     RuntimeError(
-                        "sensitive-shape filename present in skill tree "
-                        "(e.g. .env / credentials.json / .pem). Rename "
-                        "or relocate the file outside the skill checkout."
+                        "exact credential filename or .env-tail filename present "
+                        "in skill tree (e.g. .env / prod.env / credentials.json / "
+                        "id_rsa / .netrc). Rename or relocate the file outside "
+                        "the skill checkout."
                     ),
                 )
             # Symlink escape guard: resolve the final path and re-check

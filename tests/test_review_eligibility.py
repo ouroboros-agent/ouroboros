@@ -192,14 +192,12 @@ def test_direct_meta_only_activity_remains_pure_conversation():
         ) == (False, "skipped_conversation")
 
 
-def test_ephemeral_routing_turn_is_not_an_acceptance_deliverable():
+def test_addressing_only_direct_turn_does_not_request_acceptance():
     assert _task_acceptance_eligible(
         "required",
         {"tool_calls": [_call("route_to_project")]},
         True,
-        is_ephemeral_turn=True,
-        task_contract={"expected_output": "route decision"},
-    ) == (False, "skipped_ephemeral_control")
+    ) == (False, "skipped_conversation")
 
 
 def test_required_with_effect_is_eligible():
@@ -311,23 +309,19 @@ def test_agent_requested_readonly_review_reaches_host_dispatch(
     assert trace["acceptance_decision"]["reason"] == "review_degraded"
 
 
-@pytest.mark.parametrize("mode,direct,child,ephemeral,expected", [
-    ("off", False, False, False, 0),
-    ("auto", False, True, False, 0),
-    ("auto", False, False, True, 0),
-    ("required", False, True, False, 0),
-    ("required", True, False, True, 0),
-    ("required", True, False, False, 0),
-    ("required", False, False, False, 1),
-], ids=["off", "auto-child", "auto-ephemeral", "required-child", "required-ephemeral",
-        "required-direct", "required-queued"])
+@pytest.mark.parametrize("mode,direct,child,expected", [
+    ("off", False, False, 0),
+    ("auto", False, True, 0),
+    ("required", False, True, 0),
+    ("required", True, False, 0),
+    ("required", False, False, 1),
+], ids=["off", "auto-child", "required-child", "required-direct", "required-queued"])
 def test_agent_request_preserves_existing_mode_and_lineage_boundaries(
-    monkeypatch, host_acceptance, mode, direct, child, ephemeral, expected,
+    monkeypatch, host_acceptance, mode, direct, child, expected,
 ):
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", mode)
     ctx, run, requests = host_acceptance
     ctx.is_direct_chat = direct
-    ctx.is_ephemeral_turn = ephemeral
     if child:
         ctx.task_metadata = {"root_task_id": "parent", "parent_task_id": "parent", "delegation_role": "worker"}
     trace = {"tool_calls": [_call("task_acceptance_review")]}

@@ -5,7 +5,24 @@ from types import SimpleNamespace
 import pytest
 
 import ouroboros.agent_task_pipeline as pipeline
-from ouroboros.cost_projection import carry_cost_meta
+
+
+def test_direct_project_completion_writes_the_real_last_result_pointer(tmp_path, monkeypatch):
+    from ouroboros.projects_registry import create_project, get_project
+
+    project = create_project(tmp_path, "room-proof", name="Room proof")
+    task = {"id": "native-room-result", "type": "task", "chat_id": project["chat_id"],
+            "project_id": project["id"], "text": "Inspect the room", "_is_direct_chat": True}
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *a, **k: None)
+    pending = []
+    pipeline.emit_task_results(
+        SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), None, None,
+        pending, task, "Room evidence retained.", {"rounds": 1},
+        {"tool_calls": [], "reasoning_notes": []}, 0.0, tmp_path / "logs",
+    )
+    assert get_project(tmp_path, project["id"])["last_task_result_id"] == task["id"]
+    assert pipeline.load_task_result(tmp_path, task["id"])["result"] == "Room evidence retained."
+    assert not any(event["type"] == "project_digest" for event in pending)
 
 
 def test_emit_task_results_queues_restart_after_final_events(tmp_path, monkeypatch):
@@ -221,55 +238,11 @@ def test_task_result_and_task_done_mirror_authoritative_review_status(tmp_path, 
     assert done["review_status"] == stored["review_status"]
 
 
-def test_emit_task_results_ephemeral_turn_skips_all_durable_memory(tmp_path, monkeypatch):
-    """WS10 idempotency contract (claudexor B5): an ephemeral same-route turn must
-    write NO durable memory — not chat/scratchpad consolidation, not reflection/
-    evolution — while still delivering its reply."""
-    store_calls = []
-    monkeypatch.setattr(pipeline, "_store_task_result", lambda *args, **kwargs: store_calls.append(1))
-    memory_calls = []
-    monkeypatch.setattr(pipeline, "_run_chat_consolidation", lambda *args, **kwargs: memory_calls.append("chat"))
-    monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *args, **kwargs: memory_calls.append("scratchpad"))
-    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: memory_calls.append("post_task"))
-
-    pending_events = []
-    drive_logs = tmp_path / "logs2"
-    drive_logs.mkdir(parents=True)
-    pipeline.emit_task_results(
-        env=SimpleNamespace(drive_root=tmp_path),
-        memory=object(),
-        llm=object(),
-        pending_events=pending_events,
-        task={"id": "eph-1", "type": "task", "chat_id": 1, "text": "2+2?", "_is_direct_chat": True, "_ephemeral_turn": True},
-        text="4",
-        usage={"rounds": 1, "cost": 0.01},
-        llm_trace={"tool_calls": [], "reasoning_notes": []},
-        start_time=0.0,
-        drive_logs=drive_logs,
-        ctx=SimpleNamespace(pending_restart_reason=""),
-    )
-    assert "send_message" in [evt["type"] for evt in pending_events]  # reply still delivered
-    inline = next(evt for evt in pending_events if evt["type"] == "send_message")
-    done = next(evt for evt in pending_events if evt["type"] == "task_done")
-    assert inline["progress_meta"] == {
-        "ephemeral_decision": True, "task_terminal_status": "completed",
-        "tool_calls": 0, "rounds": 1,
-        "outcome_axes": done["outcome_axes"], "reason_code": done["reason_code"],
-        **carry_cost_meta({key: value for key, value in done.items()
-                           if key not in {"accounted_upper_bound_usd_with_children", "cost_with_children_partial"}}),
-    }
-    assert memory_calls == []  # NO durable memory writes for an ephemeral turn
-    assert store_calls == []  # CW3: no durable task_result for a transient decision turn
-    # CW3: task_done carries _ephemeral so the supervisor handler skips the missing-result fallback.
-    done = next(evt for evt in pending_events if evt["type"] == "task_done")
-    assert done.get("_ephemeral") is True
-    assert done.get("ephemeral_decision") is True
 
 
-def test_ephemeral_typed_routing_delivers_nonempty_final_and_keeps_receipt_metadata(tmp_path, monkeypatch):
+def test_direct_typed_routing_delivers_nonempty_final_and_keeps_receipt_metadata(tmp_path, monkeypatch):
     """A typed receipt annotates the owner message; normalized final model prose
     remains one durable assistant reply for every routing action."""
-    monkeypatch.setattr(pipeline, "_store_task_result", lambda *args, **kwargs: None)
     monkeypatch.setattr(pipeline, "_run_chat_consolidation", lambda *args, **kwargs: None)
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *args, **kwargs: None)
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: None)
@@ -289,12 +262,11 @@ def test_ephemeral_typed_routing_delivers_nonempty_final_and_keeps_receipt_metad
             llm=object(),
             pending_events=pending_events,
             task={
-                "id": f"eph-{action}",
+                "id": f"direct-{action}",
                 "type": "task",
                 "chat_id": 1,
                 "text": "route this",
                 "_is_direct_chat": True,
-                "_ephemeral_turn": True,
             },
             text=f"Receipt prose for {action}",
             usage={"rounds": 1, "cost": 0.01},
@@ -311,13 +283,15 @@ def test_ephemeral_typed_routing_delivers_nonempty_final_and_keeps_receipt_metad
         assert sends[0]["text"] == f"Receipt prose for {action}"
         assert sends[0]["log_text"] == f"Receipt prose for {action}"
         done = next(evt for evt in pending_events if evt["type"] == "task_done")
-        assert sends[0]["progress_meta"]["ephemeral_decision"] is True
-        assert sends[0]["progress_meta"]["task_terminal_status"] == "completed"
-        assert sends[0]["progress_meta"]["outcome_axes"] == done["outcome_axes"]
-        assert sends[0]["progress_meta"]["reason_code"] == done["reason_code"]
+        assert "ephemeral_decision" not in sends[0].get("progress_meta", {})
+        stored = pipeline.load_task_result(tmp_path, f"direct-{action}")
+        assert stored["status"] == "completed"
+        assert stored["_is_direct_chat"] is True
+        assert done["status"] == stored["status"]
         done = next(evt for evt in pending_events if evt["type"] == "task_done")
         assert pending_events.index(sends[0]) < pending_events.index(done)
-        assert done["ephemeral_decision"] is True
+        assert "ephemeral_decision" not in done
+        assert "_ephemeral" not in done
         assert done["typed_routing_action"] == action
 
 
@@ -719,3 +693,49 @@ def test_terminal_event_reports_failed_bundle_over_older_capture_status(tmp_path
     terminal = next(item for item in pending if item["type"] == "task_done")
     assert terminal["artifact_status"] == artifact_status
     assert terminal["status"] == "completed"
+
+
+def test_task_done_carries_the_custody_debt_list_the_row_holds(tmp_path, monkeypatch):
+    """P5 S1: one debt rule on every surface, from one source.
+
+    The owner-facing Reason line names the custody warning only while the row's
+    own ``delegated_runs_unreconciled`` list is non-empty. The durable row
+    carries that list; the live ``task_done`` event did not, so the card had to
+    guess from the stamped code alone and the browser and the host rendered the
+    same record differently. The event now copies the stored list whenever the
+    row has one, and absent stays absent: a record with no list states nothing
+    about the debt, on either surface.
+    """
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: None)
+    from ouroboros.task_results import write_task_result
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+    write_task_result(tmp_path, "custody-open", "running", delegated_runs_unreconciled=["run-a1"])
+
+    owed_events = []
+    pipeline.emit_task_results(
+        env=env, memory=object(), llm=object(), pending_events=owed_events,
+        task={"id": "custody-open", "root_task_id": "custody-open", "type": "task",
+              "chat_id": 1, "text": "delegate"},
+        text="done", usage={"rounds": 1, "cost": 0.0},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0, drive_logs=drive_logs, ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+    owed = next(row for row in owed_events if row["type"] == "task_done")
+    stored = pipeline.load_task_result(tmp_path, "custody-open")
+    assert owed["delegated_runs_unreconciled"] == ["run-a1"] == stored["delegated_runs_unreconciled"]
+    assert owed["reason_code"] == "delegated_custody_unreconciled"
+
+    plain_events = []
+    pipeline.emit_task_results(
+        env=env, memory=object(), llm=object(), pending_events=plain_events,
+        task={"id": "custody-none", "root_task_id": "custody-none", "type": "task",
+              "chat_id": 1, "text": "no delegation"},
+        text="done", usage={"rounds": 1, "cost": 0.0},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0, drive_logs=drive_logs, ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+    plain = next(row for row in plain_events if row["type"] == "task_done")
+    assert "delegated_runs_unreconciled" not in plain

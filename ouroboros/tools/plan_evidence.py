@@ -16,6 +16,7 @@ import codecs
 import ast
 from hashlib import sha256
 import pathlib
+import json
 import re
 import stat
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -69,7 +70,7 @@ def _split_selector(locator: str) -> tuple[str, Optional[dict], Optional[str]]:
     return locator, None, None
 
 
-def _selected_payload(raw: bytes, selector: dict, path: Optional[pathlib.Path] = None) -> tuple[Optional[dict], Optional[str]]:
+def _selected_payload(raw: bytes, selector: dict, path: Optional[pathlib.Path] = None, *, physical_lf: bool = False) -> tuple[Optional[dict], Optional[str]]:
     digest = sha256(raw).hexdigest()
     kind = selector["kind"]
     selected: bytes
@@ -87,6 +88,9 @@ def _selected_payload(raw: bytes, selector: dict, path: Optional[pathlib.Path] =
         except UnicodeDecodeError:
             return None, "binary"
         lines = text.splitlines(keepends=True)
+        if physical_lf:
+            parts = text.split("\n")
+            lines = [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
         if kind == "line_range":
             start, end = int(selector["start"]), int(selector["end"])
             if start > len(lines) or end > len(lines):
@@ -236,6 +240,7 @@ def resolve_evidence(
     per_item_bytes: int = EVIDENCE_PER_ITEM_BYTES,
     total_bytes: int = EVIDENCE_TOTAL_BYTES,
     resolve_task: Optional[Callable[[str], Optional[str]]] = None,
+    resolve_chat: Optional[Callable[[str], Optional[dict | str]]] = None,
     hash_bytes_limit: int = EVIDENCE_HASH_BYTES_LIMIT,
     deny_paths: Iterable[str | pathlib.Path] = (),
 ) -> dict:
@@ -287,7 +292,7 @@ def resolve_evidence(
         for key in ("selector", "selection_sha256", "selection_bytes"):
             if key in payload:
                 row[key] = payload[key]
-        if redacted:
+        if redacted or payload.get("secrets_redacted"):
             row["secrets_redacted"] = True
         attached.append(row)
         if "selector" not in payload and payload["bytes"] > per_item:
@@ -308,21 +313,39 @@ def resolve_evidence(
         if _is_url(source_locator):
             omissions.append({"locator": locator, "reason": "url_not_fetched"})
             continue
-        if source_locator.startswith(_TASK_LOCATOR_PREFIX):
-            if resolve_task is None:
+        if source_locator.startswith((_TASK_LOCATOR_PREFIX, "chat:")):
+            kind = "task" if source_locator.startswith(_TASK_LOCATOR_PREFIX) else "chat"
+            reader = resolve_task if kind == "task" else resolve_chat
+            if reader is None:
                 omissions.append({"locator": locator, "reason": "unsupported_locator"})
                 continue
-            text = resolve_task(source_locator[len(_TASK_LOCATOR_PREFIX):].strip())
+            try:
+                source = reader(source_locator.split(":", 1)[1].strip())
+            except (OSError, ValueError) as exc:
+                omissions.append({"locator": locator, "reason": f"{kind}_unreadable:{type(exc).__name__}"})
+                continue
+            text = source.get("text") if isinstance(source, dict) else source
             if text is None:
-                payload, reason = None, "task_not_found"
+                payload, reason = None, f"{kind}_not_found"
             elif selector:
-                payload, reason = _selected_payload(str(text).encode("utf-8"), selector)
+                payload, reason = _selected_payload(str(text).encode("utf-8"), selector, physical_lf=kind == "chat")
             else:
                 payload, reason = _payload_from_text(str(text), per_item)
             if payload is None:
                 omissions.append({"locator": locator, "reason": reason})
             else:
-                attach(locator, "task", payload)
+                if isinstance(source, dict):
+                    payload["secrets_redacted"] = bool(source.get("secrets_redacted"))
+                attach(locator, kind, payload)
+                if isinstance(source, dict) and source.get("coverage"):
+                    coverage = source["coverage"]
+                    omissions.extend({"locator": locator, "reason": f"chat_history_gap:{gap['kind']}"}
+                                     for section in coverage.values() if isinstance(section, dict)
+                                     for gap in section.get("gaps", []))
+                    omissions.extend({"locator": locator, "reason": f"chat_history_gap:{coverage[key]}"}
+                                     for key in ("room_gap", "ordering_gap") if coverage.get(key))
+                    if coverage.get("mailbox", {}).get("complete") is False:
+                        omissions.append({"locator": locator, "reason": "chat_history_gap:mailbox_incomplete"})
             continue
         path, reason = _resolve_locator_path(source_locator, active)
         if path is None:
@@ -361,6 +384,8 @@ def evidence_manifest_hash(manifest: Mapping[str, Any]) -> str:
     reviewers requested (W3: a request for something already declared still changes
     what the next wave is about) — NEVER the text."""
     return _canonical_hash({
+        **({"own_dialogue": {key: manifest["own_dialogue"].get(key) for key in ("chat_id", "sha256", "bytes", "gap")}}
+           if "own_dialogue" in manifest else {}),
         "declared": list(manifest.get("declared") or []),
         "reviewer_requested": list(manifest.get("reviewer_requested") or []),
         "attached": [
@@ -372,3 +397,27 @@ def evidence_manifest_hash(manifest: Mapping[str, Any]) -> str:
             for o in manifest.get("omissions") or []
         ],
     })
+
+
+def task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
+    """Task-result projection; the evidence resolver hashes, budgets and redacts it."""
+    from ouroboros.task_results import load_task_result
+    from ouroboros.utils import truncate_review_artifact
+    def _read(task_id: str) -> Optional[str]:
+        try:
+            record = load_task_result(root, task_id)
+        except Exception:
+            return None
+        if not isinstance(record, dict):
+            return None
+        projection = {
+            "task_id": task_id,
+            "status": record.get("status"),
+            "reason_code": record.get("reason_code"),
+            "ts": record.get("ts"),
+            "result": truncate_review_artifact(str(record.get("result") or ""), limit=6_000),
+        }
+        if "terminal_host_notice" in record:
+            projection["terminal_host_notice"] = str(record["terminal_host_notice"] or "")
+        return json.dumps(projection, ensure_ascii=False, indent=2, default=str)
+    return _read

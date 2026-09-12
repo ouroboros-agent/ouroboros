@@ -9,8 +9,16 @@ from tests.test_plan_review_engine import harness, _call, _control, _state  # no
 pytestmark = pytest.mark.serial
 
 def test_plan_first_dispatch_then_author_repeat_keeps_exact_raw_wave(harness, monkeypatch):  # noqa: F811
+    """The plan-first dispatch now returns at the P1-2 barrier (owner batch 2, Q2=A):
+    the fresh envelope hands control back with the wave open and its rows
+    ``pending_dispatch``, the settlement thread writes one mailbox frame, and the
+    identical envelope collects the wave once. Only then does the recovered
+    regression hold: the exact raw wave survives that collection and the author's
+    repeated disposition neither re-sends nor rewrites it.
+    """
     from ouroboros.tools import plan_review
     from ouroboros.tools.plan_review_artifacts import read_wave
+    from tests.test_plan_review_event_route import _mailbox_entries, _wait_until
 
     h = harness
     h.state["enforcement"] = "advisory"
@@ -22,9 +30,18 @@ def test_plan_first_dispatch_then_author_repeat_keeps_exact_raw_wave(harness, mo
     transport = AccountedFakeLLM(h.drive, reply=raw)
     monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda: transport)
     ctx = h.make_ctx()
-    first = _control(_call(ctx))
+    barrier = _control(_call(ctx))
+    assert barrier == {"outcome": "DEGRADED", "closed": False}
+    open_wave = _state(h)["waves"][-1]
+    assert open_wave["custody_pending"] is True and open_wave["paid"] is False
+    assert {actor["operation_state"] for actor in open_wave["actors"]} == {"pending_dispatch"}
+    assert _wait_until(lambda: len(_mailbox_entries(h.drive, ctx.task_id)) == 1)
+    dispatched = len(transport.calls)
+    first = _control(_call(ctx))  # the identical envelope collects the settled wave
     assert first["outcome"] == "REVISE_PLAN"
+    assert len(transport.calls) == dispatched  # collected once, no second send
     wave = _state(h)["waves"][-1]
+    assert wave["request_fingerprint"] == open_wave["request_fingerprint"]
     assert wave["paid"] and transport.calls
     fingerprint = wave["request_fingerprint"]
     request = {"review_fingerprint": fingerprint, "items": [],

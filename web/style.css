@@ -6972,6 +6972,12 @@ textarea.chat-input {
     color: var(--text-meta);
 }
 .chat-quiz-option:disabled .chat-quiz-option-detail { color: var(--text-disabled); }
+.chat-quiz-option-recommended {
+    margin-left: var(--space-2, 8px);
+    font-size: var(--type-meta);
+    font-weight: 600;
+    color: var(--status-ok-fg);
+}
 /* Free answer: the owner's own words when no offered option fits. */
 .chat-quiz-comment-box {
     display: flex;

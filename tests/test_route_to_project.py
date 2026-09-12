@@ -91,50 +91,37 @@ def test_main_route_to_existing_project_explicitly_selects_predecessor_or_stays_
     assert "predecessor_task_id" in route_tool.schema["parameters"]["properties"]
 
 
-def test_main_swarm_route_carries_intent_and_emits_only_once(tmp_path, monkeypatch):
+def test_managed_swarm_routes_distinct_work_without_a_conversation_latch(tmp_path, monkeypatch):
     create_project(tmp_path, "racer", name="Racer")
     monkeypatch.setattr(
-        "ouroboros.tools.control._wait_for_promotion_admission",
-        lambda *_args, **_kwargs: {"status": "unconfirmed", "reason": "confirmation_timeout"},
+        "ouroboros.tools.control_events._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: {"status": "scheduled"},
     )
     events = []
-    ctx = _ctx(
-        tmp_path,
-        events,
-        task_metadata={
-            "client_message_id": "swarm-route-1",
-            "force_plan": True,
-            "force_plan_source": "swarm",
-        },
-        is_ephemeral_turn=True,
-        project_id="",
-    )
-
-    first = _route_to_project(ctx, "racer", "Audit and fix this in Racer", predecessor_task_id="")
-    second = _route_to_project(ctx, "racer", "Audit and fix this in Racer", predecessor_task_id="")
-
-    assert first == second
-    assert len(events) == 1
-    assert events[0]["force_plan"] is True
-    assert events[0]["force_plan_source"] == "swarm"
-    assert ctx._swarm_handoff_attempt["task_id"] == events[0]["task_id"]
+    ctx = _ctx(tmp_path, events, project_id="", task_metadata={
+        "client_message_id": "swarm-root-1", "force_plan": True, "force_plan_source": "swarm",
+    })
+    first = _route_to_project(ctx, "racer", "Audit Racer", predecessor_task_id="")
+    second = _route_to_project(ctx, "racer", "Research a separate design", predecessor_task_id="")
+    assert "durably scheduled" in first and "durably scheduled" in second
+    assert len(events) == 2
+    assert events[0]["task_id"] != events[1]["task_id"]
+    assert all("force_plan" not in event for event in events)
+    assert not hasattr(ctx, "_swarm_handoff_attempt")
 
 
-def test_project_swarm_route_to_other_project_is_rejected_without_event(tmp_path):
+def test_managed_swarm_uses_ordinary_project_routing(tmp_path, monkeypatch):
     create_project(tmp_path, "beta", name="Beta")
-    events = []
-    ctx = _ctx(
-        tmp_path,
-        events,
-        task_metadata={"force_plan": True, "force_plan_source": "swarm"},
-        is_ephemeral_turn=True,
-        project_id="alpha",
+    monkeypatch.setattr(
+        "ouroboros.tools.control_events._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: {"status": "scheduled"},
     )
-
+    events = []
+    ctx = _ctx(tmp_path, events, project_id="alpha", task_metadata={"force_plan": True})
     out = _route_to_project(ctx, "beta", "Audit and fix this in Beta", predecessor_task_id="")
-
-    assert "SWARM_PROJECT_SCOPE_OWNED" in out
-    assert events == []
+    assert "durably scheduled" in out
+    assert events[0]["project_id"] == "beta"
+    assert "force_plan" not in events[0]
 
 
 def test_route_to_missing_project_emits_typed_manual_target(tmp_path):

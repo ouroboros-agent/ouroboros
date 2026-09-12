@@ -112,12 +112,6 @@ class ToolContext:
 
     # True inside handle_chat_direct, not a queued worker task.
     is_direct_chat: bool = False
-    # CW3 (v6.34.0): a SHORT-LIVED same-route "decision" turn (run while the chat
-    # agent is busy). It may answer / route / spawn / steer, but is barred from
-    # durable cognitive-memory / evolution / settings / control-plane mutators
-    # (the WS10 ephemeral contract) — enforced in schemas()/execute().
-    is_ephemeral_turn: bool = False
-
     # Pre-commit review state.
     _review_advisory: List[Any] = field(default_factory=list)
     _review_iteration_count: int = 0

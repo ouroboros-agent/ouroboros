@@ -253,8 +253,7 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
                 if (
                     e2.get("type") == "task_done"
                     and e2.get("task_id") == task.get("id")
-                    and not (task.get("_ephemeral_turn") or task.get("_is_direct_chat")
-                             or e2.get("_ephemeral") or e2.get("ephemeral_decision"))
+                    and not task.get("_is_direct_chat")
                 ):
                     # Earlier frames (including the answer) keep their order.
                     # Do not release this slot until its first save attempt ends.

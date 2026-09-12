@@ -307,6 +307,13 @@ _PRODUCER_SHAPES = (
     ("review_blocked_untyped_text", "commit_reviewed", "review rejection text without any marker", "REVIEW_BLOCKED", ()),
     ("executor_crash", "write_file", "⚠️ TOOL_ERROR (write_file): RuntimeError: boom", "EXECUTOR_ERROR", ()),
     ("outer_timeout", "read_file", "⚠️ TOOL_TIMEOUT (read_file): exceeded 120s limit.", "TOOL_TIMEOUT", (("timeout_sec", 120),)),
+    # tools/core_file_tools.py, owner item I27. The discovery miss interpolates
+    # the exception into its text and publishes it under `list_files`, so the
+    # sentence the owner actually reads is exercised by no other case: the
+    # identifier rows carry a synthetic detail under `read_file`, and the
+    # harvested (code, first line) pair reuses that same input by construction.
+    ("list_files_not_found", "list_files",
+     "⚠️ LIST_FILES_NOT_FOUND: Directory not found: notes/ML Conf 2", "LEGACY_WARNING", ()),
     # tools/extension_dispatch.py — every terminal interpolates the tool name, so
     # all four were outside the harvest while carrying real status changes.
     ("extension_handler_error", "ext_1_demo_screenshot", "⚠️ TOOL_ERROR (ext_1_demo_screenshot): extension tool failed: RuntimeError: boom", "EXTENSION_ERROR", (("dynamic_provider", True),)),

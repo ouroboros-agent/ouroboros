@@ -1,8 +1,8 @@
 """The runtime section's FACT builders: what the host can honestly say it knows.
 
-Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the four
+Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the
 facts the runtime section renders keep one home: the project room a task sits in,
-the budget rails it runs under, the toolset a promoted task materialized, and the
+the budget rails it runs under, and the
 configured delegation route with its honestly-labeled historical observations.
 Each returns a plain projection and reads no context state, so nothing here can
 change what the section MEANS — only what it reports. ``context`` re-exports every
@@ -109,52 +109,6 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
     return budget_info
 
 
-def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
-    """The LIVE built-in toolset available to an ordinary promoted task.
-
-    Workspace focus changes the default target, not the top-level principal's
-    tool names. The projection therefore asks the real registry once and keeps
-    credential omissions typed instead of maintaining a second static catalog.
-    Dynamic extension/MCP availability remains task-time state.
-    """
-    from types import SimpleNamespace
-
-    from ouroboros.tools.registry import ToolRegistry, _builtin_tool_availability
-
-    registry = ToolRegistry(pathlib.Path(env.repo_dir), pathlib.Path(getattr(env, "drive_root", ".")))
-
-    probe = SimpleNamespace(
-        task_id="promote_toolset_probe",
-        task_metadata={},
-        task_contract={},
-        task_constraint=None,
-        is_workspace_mode=lambda: False,
-        is_ephemeral_turn=False,
-    )
-    registry.set_context(probe)
-    top_level_tools = set(registry.available_tools())
-    # Typed omissions: registered built-ins that live availability removes right
-    # now (credential gates). Named with their reason so the router can tell
-    # "does not exist" from "exists but currently unavailable".
-    unavailable = {}
-    for name in registry._entries:
-        available, reason, detail = _builtin_tool_availability(name, probe)
-        if not available:
-            unavailable[name] = f"{reason}: {detail}" if detail else reason
-    return {
-        "top_level_tools": sorted(top_level_tools),
-        **({"unavailable_builtin_tools": dict(sorted(unavailable.items()))} if unavailable else {}),
-        "rule": (
-            "LIVE built-in tool availability, evaluated by the real tool "
-            "registry at promote time. Project focus changes the default root, "
-            "not this ordinary top-level toolset. unavailable_builtin_tools "
-            "exist but are currently unusable (e.g. missing credentials) — do "
-            "not demand them. Dynamic extension/MCP tools are NOT listed (their "
-            "availability is unknowable at promote time). If an objective/"
-            "expected_output demands specific BUILT-IN tools, demand only names "
-            "listed here."
-        ),
-    }
 
 
 def _delegation_capability_fact() -> Optional[Dict[str, Any]]:

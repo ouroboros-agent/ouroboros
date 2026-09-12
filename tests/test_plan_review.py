@@ -508,7 +508,7 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         from ouroboros.tools.plan_review import get_tools
         tool = next(t for t in get_tools() if t.name == "plan_task")
         params = tool.schema["parameters"]["properties"]
-        self.assertEqual(set(params), {"plan", "goal", "spec", "review_disposition"})
+        self.assertEqual(set(params), {"plan", "goal", "spec", "reviewer_effort", "review_disposition"})
         spec = params["spec"]["properties"]
         self.assertEqual(set(spec), {
             "in_scope", "non_goals", "acceptance_claims", "invariants", "decisions",

@@ -653,6 +653,10 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
         "gateway/task_decision.py verbatim-comment refusal (400) — refuses instead of truncating",
     ),
     "option_index_invalid": (False, "gateway/task_decision.py ingress refusal (400)"),
+    "quiz_history_write_failed": (
+        False,
+        "gateway/task_decision.py retryable owner-answer history append refusal (503); never a task terminal or trial truncation",
+    ),
     "mailbox_write_failed": (
         False,
         "gateway/task_hurry.py fail-closed hurry ingress refusal (503); never a task terminal",

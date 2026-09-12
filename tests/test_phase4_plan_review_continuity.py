@@ -952,9 +952,9 @@ def test_degraded_progress_line_discloses_untrusted_counts(_harness) -> None:
     _harness.progress.clear()
     _call(_harness.make_ctx())
 
-    assert (
-        "📐 plan_task: DEGRADED (0/3 parseable reviewers; counts are untrusted) — "
-        "0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
+    assert (  # the failed slots' typed reasons ride the line, deduplicated: three identical reasons name it ONCE
+        "📐 plan_task: DEGRADED (0/3 parseable reviewers; counts are untrusted) — 0 blocking / 0 note / "
+        "0 need_evidence; cycles paid 1/2; slot reasons: no findings JSON array found (prose-only or unparseable response)"
     ) in _harness.progress
 
 

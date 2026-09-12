@@ -614,11 +614,8 @@ def reserve_task_admission(
             if reserved == token:
                 return {"status": "already_reserved", "reason": ""}
             return {"status": "blocked", "reason": "duplicate_task_id"}
-        if tid in queue.RUNNING or any(
-            isinstance(row, dict) and str(row.get("id") or "") == tid
-            for row in queue.PENDING
-        ):
-            return {"status": "blocked", "reason": "duplicate_task_id"}
+        # A confirmed admission remains replayable while its task is still live.
+        # Only the durable token proves this is that same admission.
         try:
             from ouroboros.task_results import load_task_result
 
@@ -639,6 +636,11 @@ def reserve_task_admission(
                     "task_status": str(existing.get("status") or ""),
                     "promotion_admission": dict(admission),
                 }
+            return {"status": "blocked", "reason": "duplicate_task_id"}
+        if tid in queue.RUNNING or any(
+            isinstance(row, dict) and str(row.get("id") or "") == tid
+            for row in queue.PENDING
+        ):
             return {"status": "blocked", "reason": "duplicate_task_id"}
         if require_worker_pool:
             try:

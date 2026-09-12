@@ -433,12 +433,6 @@ def test_escalate_invalid_payload_is_typed(tmp_path):
     assert out.startswith("⚠️ QUIZ_ASSUMPTION_REQUIRED")
 
 
-def test_escalate_absent_from_ephemeral_allowlist():
-    """A decision turn cannot escalate — the structural default-deny refusal
-    comes free, exactly like forward_to_worker."""
-    from ouroboros.tools.registry import _EPHEMERAL_ALLOWED_TOOLS
-
-    assert "escalate" not in _EPHEMERAL_ALLOWED_TOOLS
 
 
 def test_escalate_in_all_three_tool_profiles():
@@ -861,3 +855,82 @@ def test_quiz_state_frame_carries_the_comment_only_when_recorded():
         (False, None), (True, "neither — use duckdb"), (False, None),
     ]
     assert frames[0]["answered_index"] == 1 and "answered_index" not in frames[1]
+
+
+def test_recommended_option_rides_the_card_the_projection_and_the_parent_frame(tmp_path, monkeypatch):
+    """Owner batch 1 Q7=B / В8=A: the asker marks ONE option as its recommendation. The
+    shared validator carries the flag only when it is literally true, the owner card and
+    the durable projection keep it (the web badge and the Telegram star read them), and a
+    subagent's frame to its parent names it."""
+    from ouroboros.owner_quiz import quiz_states
+    from ouroboros.tools.core_artifacts import validate_quiz_payload
+
+    payload = validate_quiz_payload("Which db?", [
+        {"label": "sqlite", "detail": "cheap, single file", "recommended": True},
+        {"label": "postgres", "recommended": "yes"}, "mysql",
+    ], "", "sqlite meanwhile")
+    assert payload["options"] == [
+        {"label": "sqlite", "detail": "cheap, single file", "recommended": True}, {"label": "postgres"}, {"label": "mysql"},
+    ]
+    ctx = _tool_ctx(tmp_path)
+    out = _escalate(ctx, question="Which db?", options=payload["options"], assumption="sqlite meanwhile")
+    assert out.startswith("OK: quiz ")
+    [event] = [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    assert event["options"][0]["recommended"] is True and "recommended" not in event["options"][1]
+    [block] = quiz_states(tmp_path, "root-1").values()
+    assert block["recommended_index"] == 0 and block["options"] == ["sqlite", "postgres", "mysql"]
+    plain = _escalate(_tool_ctx(tmp_path, task_id="root-2"), question="?", options=["a", "b"], assumption="a")
+    assert plain.startswith("OK: quiz ")
+    assert "recommended_index" not in list(quiz_states(tmp_path, "root-2").values())[0]
+    # The subagent hop: the parent's frame names the recommended option.
+    import ouroboros.task_status as ts
+    from ouroboros.owner_mailbox import drain_owner_entries
+
+    monkeypatch.setattr(ts, "load_effective_task_result", lambda root, tid: {"status": "running"})
+    child = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
+    _escalate(child, question="Which db?", options=payload["options"], assumption="sqlite meanwhile")
+    [frame] = drain_owner_entries(tmp_path, "root-1", set())
+    assert "1. sqlite — cheap, single file [recommended]\n2. postgres\n3. mysql" in frame["text"]
+
+
+def test_escalate_refusals_are_typed_per_branch_and_a_headless_root_still_asks(tmp_path):
+    """Verification only: the three real refusal branches as the predicate is written.
+    Background consciousness is refused; a live direct conversation (including one with
+    no continuation owner) is refused; REQUIRED waiting without a live continuation owner
+    is refused. A headless root without owner_wait_callback is NOT refused for an optional
+    question: it mints the ordinary card and continues under its assumption."""
+    background = _tool_ctx(tmp_path, task_id="bg", role="background")
+    out = _escalate(background, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("⚠️ ESCALATE_UNAVAILABLE: background consciousness cannot escalate")
+    direct = _tool_ctx(tmp_path)
+    direct.is_direct_chat = True
+    out = _escalate(direct, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("⚠️ ESCALATE_UNAVAILABLE: this is a live owner conversation")
+    headless = _tool_ctx(tmp_path)  # a queued root: not a direct chat, no owner_wait_callback
+    assert _escalate(headless, question="?", options=["a", "b"], assumption="a").startswith("OK: quiz ")
+    required = _escalate(headless, question="?", options=["a", "b"], assumption="", wait_for_answer=True)
+    assert required == ("⚠️ ESCALATE_UNAVAILABLE: required owner waiting needs a root task with a live "
+                        "continuation owner.")
+
+
+def test_two_recommended_options_are_refused_and_one_survives_live_and_replay_alike(tmp_path):
+    """Fix cycle 2, 2d: a two-recommendation payload is a typed refusal before any card
+    or projection exists; a single recommendation is the same option on the live card
+    (event) and in the durable block the replay reads (recommended_index)."""
+    from ouroboros.owner_quiz import quiz_states
+
+    ctx = _tool_ctx(tmp_path)
+    out = _escalate(ctx, question="Which db?",
+                    options=[{"label": "sqlite", "recommended": True}, {"label": "postgres", "recommended": True}],
+                    assumption="sqlite meanwhile")
+    assert out == "⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended."
+    assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    assert quiz_states(tmp_path, "root-1") == {}
+    out = _escalate(ctx, question="Which db?",
+                    options=[{"label": "sqlite"}, {"label": "postgres", "recommended": True}],
+                    assumption="sqlite meanwhile")
+    assert out.startswith("OK: quiz ")
+    [event] = [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    live = [index for index, option in enumerate(event["options"]) if option.get("recommended")]
+    [block] = quiz_states(tmp_path, "root-1").values()
+    assert live == [1] and block["recommended_index"] == 1  # live and replay agree on the one option

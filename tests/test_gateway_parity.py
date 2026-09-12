@@ -654,3 +654,21 @@ def test_max_link_actions_pinned_across_python_and_js():
     match = re.search(r"^export const MAX_LINK_ACTIONS = (\d+);", text, flags=re.MULTILINE)
     assert match, "api_types.js missing MAX_LINK_ACTIONS"
     assert int(match.group(1)) == _MAX_LINK_ACTIONS
+
+
+def test_quiz_option_recommendation_is_an_additive_optional_field_in_both_languages():
+    """The asker marks its recommendation on the option itself (owner batch 1, Q7=B):
+    QuizOption grows by ONE optional field in the frozen gateway contract and its
+    api_types.js typedef mirror; nothing is renamed or removed and no version moves."""
+    from ouroboros.gateway.contracts import QuizOption
+
+    optional = {
+        name for name, annotation in QuizOption.__annotations__.items()
+        if (getattr(annotation, "__forward_arg__", None) or str(annotation)).startswith("NotRequired[")
+    }
+    assert set(QuizOption.__annotations__) == {"label", "detail", "recommended"} and optional == {"detail", "recommended"}
+    text = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
+        encoding="utf-8"
+    )
+    option_decl = re.search(r"@typedef \{Object\} QuizOption\b([\s\S]*?)\*/", text)
+    assert option_decl and "@property {boolean=} recommended" in option_decl.group(1)

@@ -729,10 +729,12 @@ def _delivery_slot(
 
     # ABI-4: the local-route fact is read off the typed target constructed at
     # the review seam, not re-derived per model string here.
+    own_effort = _row_own_effort(row)
     return ReviewSlot(
         slot_id=row.slot_id,
         model=row.target_id,
         effort=row_effort(row, effort_surface, default=default_effort),
+        declared_effort=default_effort if default_effort and not own_effort else "",
         role_hint=role_hint,
         use_local=(row.use_local if row.use_local is not None else resolved_review_model_target(row.target_id).provider_route == "local"),
         route=(ReviewRouteKind.AGENT_SESSION if row.is_session
@@ -854,6 +856,20 @@ def commit_triad_delivery() -> Dict[str, Any]:
     }
 
 
+def _row_own_effort(row: ConfiguredReviewerSlot) -> str:
+    """The effort the ROW itself carries: its explicit field, else a Cursor/Agy
+    compound slug's encoded effort; '' when the row leaves it to its caller."""
+    if row.effort:
+        return row.effort
+    if row.is_session:
+        return compound_session_effort(RouteSpec(
+            kind=SHARED_ROUTE_KIND_SESSION,
+            target_id=row.session_target or row.target_id,
+            credential_profile_id=row.profile_id,
+        )) or ""
+    return ""
+
+
 def row_effort(
     row: ConfiguredReviewerSlot,
     surface: str,
@@ -865,18 +881,11 @@ def row_effort(
     An explicit row field wins.  When it is absent, a Cursor/Agy compound model
     slug already carries the requested effort and therefore wins over the
     surface default.  Ordinary rows retain the existing surface default (or a
-    caller's established local default, as Plan Review does).
+    caller's declared default, as a plan review order may carry).
     """
-    if row.effort:
-        return row.effort
-    if row.is_session:
-        encoded = compound_session_effort(RouteSpec(
-            kind=SHARED_ROUTE_KIND_SESSION,
-            target_id=row.session_target or row.target_id,
-            credential_profile_id=row.profile_id,
-        ))
-        if encoded:
-            return encoded
+    own = _row_own_effort(row)
+    if own:
+        return own
     if default:
         return default
     from ouroboros.config import resolve_effort
@@ -1070,6 +1079,8 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
             slot = slots_by_id.get(getattr(actor, "slot_id", ""))
             if slot is None:
                 continue
+            if str(getattr(actor, "operation_state", "") or "") == "pending_dispatch":
+                continue  # released at the dispatch barrier: still running, recorded when it settles
             usage = dict(getattr(actor, "usage", {}) or {})
             route_kind = str(getattr(getattr(slot, "route", None), "value", "") or "api_chat")
             delegated_route = str(usage.get("delegated_route") or "")
@@ -1103,7 +1114,11 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
                 "requested": {
                     "route_kind": route_kind,
                     "model": str(getattr(slot, "model", "") or ""),
-                    "effort": str(getattr(slot, "effort", "") or ""),
+                    # The ROW's effort. A caller-declared one-off (plan review's
+                    # reviewer_effort) is disclosed separately, never shown as the
+                    # row's saved configuration.
+                    "effort": "" if getattr(slot, "declared_effort", "") else str(getattr(slot, "effort", "") or ""),
+                    **({"declared_effort": str(slot.declared_effort)} if getattr(slot, "declared_effort", "") else {}),
                     "session_target": str(getattr(slot, "session_target", "") or ""),
                     "profile_id": str(getattr(slot, "session_profile", "") or ""),
                     # Actor binding, when the row is a configured-subagent

@@ -169,21 +169,6 @@ def test_reaper_delivered_child_terminal_stamps_parent_activity(sent_and_ctx):
     )
 
 
-def test_ephemeral_decision_turn_gets_no_duplicate_outage_ping(sent_and_ctx):
-    """An ephemeral direct-chat decision turn already shows its failure inline;
-    the provider-outage owner ping must stay silent and leave the registry
-    untouched."""
-    sent, make_ctx = sent_and_ctx
-    root_task = {"id": "rootH", "chat_id": 7}
-
-    events_mod._finish_task_done_dispatch(
-        {"_ephemeral": True}, make_ctx({"rootH": {"task": root_task, "worker_id": 0}}),
-        task_id="rootH", worker_id=0, task=root_task, final_task_result={},
-        task_done_event=_provider_death_event("rootH"),
-    )
-
-    assert not _outage_lines(sent)
-    assert "rootH" not in events_mod._PROVIDER_DEATH_NOTIFIED
 
 
 def test_subagent_provider_death_never_pings_the_owner(sent_and_ctx):

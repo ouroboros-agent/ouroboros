@@ -533,7 +533,6 @@ def test_enforce_swarm_actions_task_local_advisory_matrix(tmp_path, monkeypatch,
 
     latched_ctx = _acceptance_ctx(tmp_path, latched=True)
     latched_ctx.task_metadata = {"force_plan": True}
-    latched_ctx.is_ephemeral_turn = False
     held, trace = _swarm_held(latched_ctx)
     assert held is (not hurry_allows)
     decision = trace["force_plan_decision"]
@@ -544,7 +543,6 @@ def test_enforce_swarm_actions_task_local_advisory_matrix(tmp_path, monkeypatch,
     # WITHOUT the latch the same blocking install always holds these states.
     unlatched_ctx = _acceptance_ctx(tmp_path, latched=False)
     unlatched_ctx.task_metadata = {"force_plan": True}
-    unlatched_ctx.is_ephemeral_turn = False
     held_unlatched, _t = _swarm_held(unlatched_ctx)
     assert held_unlatched is True
     # Durable review state was never touched (the monkeypatched loader is the

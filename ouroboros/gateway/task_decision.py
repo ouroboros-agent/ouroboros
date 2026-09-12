@@ -135,6 +135,43 @@ def _refused(message: str, status: int, **extra: Any) -> Tuple[int, Dict[str, An
     return status, payload
 
 
+def _record_quiz_answer_history(
+    drive_root: pathlib.Path, task_id: str, task: Optional[Dict[str, Any]],
+    block: Dict[str, Any], *, duplicate: bool,
+) -> None:
+    """Keep the winning answer in canonical dialogue beyond quiz/mailbox GC.
+
+    A retry reads the existing generation owner before healing a missing row.
+    Concurrent retry duplicates retain one exact source identity; dialogue's
+    identity projection, not another transaction or durable flag, deduplicates them.
+    """
+    from ouroboros.memory import Memory
+    from supervisor.log_addressing import address_task_event
+    from supervisor.message_bus import log_chat
+
+    source_id = f"quiz_answer:{task_id}:{block['quiz_id']}"
+    if duplicate:
+        rows, _coverage = Memory(drive_root).read_chat_generations(predicate=lambda row: (
+            row.get("type") == "quiz_answer" and row.get("task_id") == task_id
+            and row.get("client_message_id") == source_id
+        ))
+        if rows:
+            return
+    if task is None:
+        from ouroboros.task_results import load_task_result
+
+        task = load_task_result(drive_root, task_id) or {}
+    address = address_task_event({task_id: {"task": task}}, drive_root, {"task_id": task_id})
+    index = block.get("answered_index")
+    log_chat(
+        "system", address.get("chat_id"), 0,
+        _quiz_answer_frame(block, index if isinstance(index, int) else None, str(block.get("comment") or "")),
+        ts=str(block["answered_at"]), source="owner_quiz_answer", task_id=task_id,
+        client_message_id=source_id, record_type="quiz_answer", quiz=dict(block),
+        message_meta=address, drive_root=drive_root, require_write=True,
+    )
+
+
 async def answer_decision(
     drive_root: pathlib.Path, body: Any, *, get_background_model_wait: Any = None,
 ) -> Tuple[int, Dict[str, Any]]:
@@ -251,39 +288,28 @@ async def answer_decision(
             quiz_id=quiz_id, option_index=raw_index,
             request_id=request_id, comment=comment,
         )
-        if not outcome.get("ok"):
-            error = str(outcome.get("error") or "quiz_answer_refused")
-            state = str(outcome.get("state") or "")
-            if error == "quiz_not_found":
-                return _refused("quiz not found", 404, task_id=task_id,
-                                  reason_code=error)
-            status = 409
-            payload: Dict[str, Any] = {
-                "ok": False, "error": error, "decision_id": decision_id,
-            }
-            # The truthful lifecycle state settles the card client-side: a
-            # closed quiz on a SETTLED task reads as expired, an already
-            # answered one as answered.
-            payload["state"] = state or ("expired_terminal" if task is None else "")
-            refused_block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
-            if isinstance(refused_block.get("answered_index"), int):
-                # The loser of a first-wins race settles honestly: the card
-                # learns the WINNING option, never a false expiry.
-                payload["answered_index"] = refused_block["answered_index"]
-            if str(refused_block.get("comment") or ""):
-                payload["comment"] = str(refused_block["comment"])
-            if error in {"option_out_of_range", "answer_empty"}:
-                status = 400
-            return status, payload
         block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
-        if task is not None:
+        try:
+            if block.get("state") == "answered":
+                _record_quiz_answer_history(
+                    drive_root, task_id, task, block,
+                    duplicate=bool(outcome.get("duplicate") or not outcome.get("ok")),
+                )
+        except Exception:
+            log.warning("Quiz answer history write failed for %s", quiz_id, exc_info=True)
+            return _refused(
+                "the answer was recorded but its dialogue history could not be written "
+                "— retry to preserve and deliver it to the task",
+                503, task_id=task_id, reason_code="quiz_history_write_failed",
+            )
+        if task is not None and block.get("state") == "answered":
             from supervisor.queue import _task_drive_for_task
 
             from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, write_owner_message
 
-            # EVERY accepted request appends the control — fresh, same-id
-            # retry, or a duplicate after a mailbox write failure (the hurry
-            # heal semantics): the msg_id is stable per quiz, so the drain
+            # Every proven winning answer can heal its delivery, including a
+            # competing new request after a partial write. The loser still
+            # receives 409 below; the msg_id is stable per quiz, so the drain
             # dedupes a doubled line while a LOST control is healed by any
             # retry instead of being unrecoverable (the drain reads only the
             # mailbox, never the projection).
@@ -313,6 +339,30 @@ async def answer_decision(
                     "be written — retry to deliver it to the task",
                     503, task_id=task_id, reason_code="mailbox_write_failed",
                 )
+        if not outcome.get("ok"):
+            error = str(outcome.get("error") or "quiz_answer_refused")
+            state = str(outcome.get("state") or "")
+            if error == "quiz_not_found":
+                return _refused("quiz not found", 404, task_id=task_id,
+                                  reason_code=error)
+            status = 409
+            payload: Dict[str, Any] = {
+                "ok": False, "error": error, "decision_id": decision_id,
+            }
+            # The truthful lifecycle state settles the card client-side: a
+            # closed quiz on a SETTLED task reads as expired, an already
+            # answered one as answered.
+            payload["state"] = state or ("expired_terminal" if task is None else "")
+            refused_block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
+            if isinstance(refused_block.get("answered_index"), int):
+                # The loser of a first-wins race settles honestly: the card
+                # learns the WINNING option, never a false expiry.
+                payload["answered_index"] = refused_block["answered_index"]
+            if str(refused_block.get("comment") or ""):
+                payload["comment"] = str(refused_block["comment"])
+            if error in {"option_out_of_range", "answer_empty"}:
+                status = 400
+            return status, payload
         try:
             from supervisor.message_bus import get_bridge
 

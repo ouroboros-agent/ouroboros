@@ -23,8 +23,8 @@ class FakeBridge:
         pass
 
 
-def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(monkeypatch):
-    calls = {"inject": 0, "ephemeral": [], "direct": [], "promote": [], "sent": []}
+def test_constrained_repair_promotes_managed_task_before_busy_direct_lane(monkeypatch):
+    calls = {"inject": 0, "direct": [], "promote": [], "sent": []}
     agent = SimpleNamespace(_busy=True, inject_message=lambda *a, **k: calls.__setitem__("inject", calls["inject"] + 1))
     ctx = SimpleNamespace(
         load_state=lambda: {"owner_id": 1},
@@ -34,7 +34,6 @@ def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(mon
         get_chat_agent=lambda: agent,
         send_with_budget=lambda chat_id, text: calls["sent"].append((chat_id, text)),
         handle_chat_direct=lambda cid, txt, img, task_constraint=None, task_metadata=None: calls["direct"].append(task_constraint),
-        handle_chat_ephemeral=lambda cid, txt, img, task_constraint=None, task_metadata=None: calls["ephemeral"].append(task_constraint),
     )
     monkeypatch.setattr(
         "supervisor.events._handle_promote_chat_to_task",
@@ -61,7 +60,6 @@ def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(mon
 
     assert calls["inject"] == 0
     assert calls["direct"] == []
-    assert calls["ephemeral"] == []
     assert len(calls["promote"]) == 1
     event = calls["promote"][0]
     assert event["type"] == "promote_chat_to_task"
@@ -122,7 +120,7 @@ def test_repair_ui_copy_does_not_promise_a_removed_decision_round():
 
 
 def test_ordinary_busy_message_uses_native_lane(monkeypatch):
-    calls = {"ephemeral": [], "direct": []}
+    calls = {"direct": []}
     bridge = FakeBridge()
     bridge.get_updates = lambda offset, timeout=1: [{
         "update_id": 2,
@@ -140,7 +138,6 @@ def test_ordinary_busy_message_uses_native_lane(monkeypatch):
         consciousness=SimpleNamespace(inject_observation=lambda *_: None, pause=lambda: None, resume=lambda: None),
         get_chat_agent=lambda: SimpleNamespace(_busy=True),
         handle_chat_direct=lambda *args, **kwargs: calls["direct"].append((args, kwargs)),
-        handle_chat_ephemeral=lambda *args, **kwargs: calls["ephemeral"].append((args, kwargs)),
     )
 
     class ImmediateThread:
@@ -156,7 +153,6 @@ def test_ordinary_busy_message_uses_native_lane(monkeypatch):
 
     server._process_bridge_updates(bridge, 0, ctx)
 
-    assert calls["ephemeral"] == []
     assert len(calls["direct"]) == 1
 
 

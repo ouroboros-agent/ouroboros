@@ -325,7 +325,7 @@ def validate_quiz_payload(
             "QUIZ_OPTIONS_INVALID",
             f"provide 2..{_MAX_QUIZ_OPTIONS} options.",
         )
-    cleaned: List[Dict[str, str]] = []
+    cleaned: List[Dict[str, Any]] = []
     for item in options:
         if isinstance(item, str):
             item = {"label": item}
@@ -339,10 +339,16 @@ def validate_quiz_payload(
             raise QuizValidationError(
                 "QUIZ_OPTIONS_INVALID", "each option needs a non-empty label."
             )
-        option: Dict[str, str] = {"label": label[:120]}
+        option: Dict[str, Any] = {"label": label[:120]}
         if detail:
             option["detail"] = detail[:500]
+        if item.get("recommended") is True:  # the asker's recommendation rides with its option
+            option["recommended"] = True
         cleaned.append(option)
+    if sum(1 for option in cleaned if option.get("recommended")) > 1:
+        # One recommendation: the durable record keeps one index, so every surface
+        # (live card, replay, Telegram, parent frame) must be able to show the same one.
+        raise QuizValidationError("QUIZ_RECOMMENDED_INVALID", "mark at most one option as recommended.")
     assumption_text = str(assumption or "").strip()
     if not isinstance(wait_for_answer, bool):
         raise QuizValidationError("QUIZ_WAIT_INVALID", "wait_for_answer must be a boolean.")
@@ -419,10 +425,9 @@ def _escalate(
     if not task_id:
         return "⚠️ ESCALATE_UNAVAILABLE: escalate requires an active task context."
     if bool(getattr(ctx, "is_direct_chat", False)) and (
-            bool(getattr(ctx, "is_ephemeral_turn", False))
-            or not callable(getattr(ctx, "owner_wait_callback", None))):
+            not callable(getattr(ctx, "owner_wait_callback", None))):
         # Native conversations with a live continuation owner are addressable
-        # through the same decision ingress. Transient control turns are not.
+        # through the same decision ingress.
         return ("⚠️ ESCALATE_UNAVAILABLE: this is a live owner conversation — "
                 "ask the question directly in your reply instead of a card.")
     parent_task_id = str(meta.get("parent_task_id") or "").strip()
@@ -492,6 +497,7 @@ def _escalate(
         lines = [f"ESCALATION (decision requested): {payload['question']}", "Options:"]
         lines += [
             f"{i + 1}. {row['label']}" + (f" — {row['detail']}" if row.get("detail") else "")
+            + (" [recommended]" if row.get("recommended") else "")
             for i, row in enumerate(payload["options"])
         ]
         if payload["stake"]:
@@ -524,6 +530,7 @@ def _escalate(
         quiz_id=quiz_id, question=payload["question"],
         options=[row["label"] for row in payload["options"]],
         option_details=[row.get("detail", "") for row in payload["options"]],
+        recommended_index=next((i for i, row in enumerate(payload["options"]) if row.get("recommended")), None),
         stake=payload["stake"], assumption=payload["assumption"],
         wait_for_answer=wait_for_answer,
     )

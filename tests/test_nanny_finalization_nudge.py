@@ -425,7 +425,6 @@ def _forced_run(tmp_path, nanny, tool_calls):
     ctx.llm_trace = {"reasoning_notes": [], "tool_calls": tool_calls}
     with patch("ouroboros.loop._call_forced_model_once", return_value=("done", {})), \
          patch("ouroboros.loop._finalize_forced_services"), \
-         patch("ouroboros.loop._forced_swarm_router_result", return_value=None), \
          patch("ouroboros.loop._drain_forced_owner_directives", return_value=False):
         _forced_final_answer(ctx, prompt="wrap up", fallback_text="fb",
                              reason_code="round_limit")

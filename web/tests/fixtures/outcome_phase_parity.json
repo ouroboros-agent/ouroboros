@@ -162,6 +162,41 @@
       "phase": "warn",
       "headline": "Done with warnings",
       "acceptance_clause": ""
+    },
+    {
+      "name": "an open custody debt names the rail cause and the debt in one line",
+      "record": {
+        "status": "failed",
+        "reason_code": "delegated_custody_unreconciled",
+        "delegated_runs_unreconciled": ["run-a1"],
+        "outcome_axes": {"execution": {"status": "failed", "reason_code": "provider_unavailable"}}
+      },
+      "phase": "error",
+      "headline": "Failed",
+      "acceptance_clause": "Reason: provider_unavailable (delegated_custody_unreconciled)."
+    },
+    {
+      "name": "a healed custody debt names the current execution cause alone",
+      "record": {
+        "status": "failed",
+        "reason_code": "delegated_custody_unreconciled",
+        "delegated_runs_unreconciled": [],
+        "outcome_axes": {"execution": {"status": "failed", "reason_code": "provider_unavailable"}}
+      },
+      "phase": "error",
+      "headline": "Failed",
+      "acceptance_clause": "Reason: provider_unavailable."
+    },
+    {
+      "name": "a record carrying no debt list states nothing about the debt",
+      "record": {
+        "status": "failed",
+        "reason_code": "delegated_custody_unreconciled",
+        "outcome_axes": {"execution": {"status": "failed", "reason_code": "provider_unavailable"}}
+      },
+      "phase": "error",
+      "headline": "Failed",
+      "acceptance_clause": "Reason: provider_unavailable."
     }
   ]
 }

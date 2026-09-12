@@ -579,10 +579,7 @@ def test_hold_on_self_opened_plan_under_blocking_and_advisory_disclosure(harness
     advisory = force_plan_decision(ctx, {}, enforcement="advisory")
     assert advisory["allow"] is True and advisory["status"] == "advisory_open"
     assert "advisory enforcement" in plan_review_disclosure(advisory)
-    # An ephemeral turn never holds; a real rail always releases.
-    ctx.is_ephemeral_turn = True
-    assert force_plan_decision(ctx, {}, enforcement="blocking")["status"] == "not_required"
-    ctx.is_ephemeral_turn = False
+    # A real rail releases the hold while preserving the open-review disclosure.
     railed = force_plan_decision(ctx, {}, hard_rail="round_limit", enforcement="blocking")
     assert railed["allow"] is True and railed["status"] == "rail_degraded"
 

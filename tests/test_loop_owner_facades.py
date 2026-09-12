@@ -102,7 +102,7 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_enforce_swarm_actions _finalize_forced_services _drain_forced_owner_directives "
         "_call_forced_model_once _publish_model_forced_candidate "
         "_publish_stale_forced_candidate _forced_fallback_result "
-        "_forced_swarm_router_result _resolve_forced_delivery_control "
+        "_resolve_forced_delivery_control "
         "_forced_final_answer"
     ),
 }

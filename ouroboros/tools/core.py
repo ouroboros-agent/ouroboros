@@ -964,21 +964,21 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
 
     def _mask_user_files_matches(result_text: str) -> str:
         # Same egress seam as _read_file (#447 В23): a search over the owner's
-        # home surfaces file CONTENT in the match lines, so raw credential
-        # bytes must be masked here too — on BOTH the rg path and the Python
-        # fallback. Names/paths stay; values become ***.
+        # home surfaces file CONTENT in the match lines, so bytes in a
+        # recognized credential format or a PEM block are masked here too, on
+        # BOTH the rg path and the Python fallback; secrets in unrecognized
+        # formats are not detected. Names/paths stay; masked values become ***.
         if normalized != "user_files" and not subagent_readonly:
             return result_text
         if normalized == "user_files" and _raw_owner_secret_access_allowed(ctx):
             return result_text
-        masked_text, masked = mask_secret_bytes(
-            result_text, mask_opaque=normalized not in {"active_workspace", "system_repo"},
-        )
+        masked_text, masked = mask_secret_bytes(result_text)
         if masked:
             masked_text += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) in these "
-                "matches were replaced with ***; raw credentials never enter model "
-                "context. Reference them by location, not value."
+                f"\n⚠️ SECRET_BYTES_MASKED: {masked} span(s) in these matches matched "
+                "a recognized credential format or a PEM block and were replaced with "
+                "***; secrets in unrecognized formats are not detected. Reference the "
+                "masked ones by location, not value."
             )
         return masked_text
 
@@ -1444,6 +1444,8 @@ def get_tools() -> List[ToolEntry]:
             "name": "escalate",
             "description": (
                 "Escalate a decision up the responsibility chain instead of guessing. "
+                "List 2-6 real options, mark your recommendation with recommended=true on that option, "
+                "and let each option's detail name what it gains and what it costs. "
                 "A root task asks the OWNER (a typed quiz card with option buttons); "
                 "a subagent asks its PARENT task (a typed mailbox frame the parent "
                 "answers with forward_to_worker or escalates higher, verbatim). "
@@ -1458,6 +1460,7 @@ def get_tools() -> List[ToolEntry]:
                 "options": {"type": "array", "items": {"type": "object", "properties": {
                     "label": {"type": "string", "description": "Short option label (button text, max 120)"},
                     "detail": {"type": "string", "description": "Optional one-line consequence of this option (max 500)"},
+                    "recommended": {"type": "boolean", "description": "True on the ONE option you recommend"},
                 }, "required": ["label"]}, "description": "2-6 mutually exclusive options"},
                 "stake": {"type": "string", "description": "What depends on this decision (optional, max 500)"},
                 "assumption": {"type": "string", "description": "For optional clarification, the assumption you continue under (max 500); may be empty for required waiting."},

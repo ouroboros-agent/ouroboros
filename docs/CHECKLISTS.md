@@ -413,12 +413,13 @@ review pack:
   `.idea`, `.vscode`, `.tox`, `__pycache__`, `node_modules`, `.DS_Store`
   (silently excluded — a byte-flip in a cache file does not
   invalidate a PASS review).
-- **Sensitive file shapes HARD-BLOCK the skill**: `.env` and its explicitly
-  listed runtime variants in the shared `_SENSITIVE_NAMES` policy, `.pem`,
-  `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `credentials.json`,
-  `service-account.json`, `secrets.yaml`, `secrets.json`,
-  `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`. (Allowlist
-  reused from `ouroboros.tools.review_helpers._SENSITIVE_EXTENSIONS`
+- **Exact credential file names HARD-BLOCK the skill**: the shared
+  `_SENSITIVE_NAMES` policy (`.env` and its explicitly listed runtime
+  variants, `credentials.json`, `service-account.json`, `secrets.yaml`,
+  `secrets.json`, `id_rsa` and the other SSH private-key names,
+  `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`) plus the `.env` tail in
+  `_SENSITIVE_EXTENSIONS`, which covers spellings such as `prod.env`.
+  (Reused from `ouroboros.tools.review_helpers._SENSITIVE_EXTENSIONS`
   + `_SENSITIVE_NAMES`.) The loader raises `SkillPayloadUnreadable`
   on first discovery and the skill shows up in `list_skills` with a
   non-empty `load_error` — neither reviewable nor executable until
@@ -426,6 +427,12 @@ review pack:
   tree. Rationale: silently excluding the file would leave it
   runtime-reachable via `open('.env').read()`, so a reviewed skill
   could still exfiltrate credentials the reviewer never saw.
+  `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `.kdbx`, `.gpg` and
+  `.asc` are NOT credential shapes: they are ordinary reviewed payload and are
+  SHOWN to the reviewer. A name rule never bought what the rationale above
+  promises anyway, since a real `.env` renamed to `config.txt` walks straight
+  through it, while a public certificate or a release signature used to break
+  the whole skill (owner decision, 2026-09-11).
   `.env.example` is ordinary reviewed payload: its bytes remain in the
   freshness hash and the existing publication scan.
 - Symlinks whose targets resolve outside `skill_dir` (confinement
@@ -750,8 +757,15 @@ block repo commits and vice versa.
 
 Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
 work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
-SPEC, the task objective, the evidence the agent declared (attached bounded, with every absence
-named), and — for a self-modification plan — BIBLE.md and ARCHITECTURE.md in full (inline for
+SPEC, the task objective, the complete retained own-room discussion (both speakers, explanations,
+options, quiz recommendations and accepted answers, attachment names and addressed mailbox provenance),
+and declared evidence (attached bounded, with every absence named). Own dialogue uses an exact
+redacted snapshot outside those evidence bounds; when the route cannot hold it all, the newest part
+and exact accessible omitted ranges remain. Related rooms are pointers, not unsolicited content.
+Replay refers to the recorded snapshot and does not claim later messages reviewed. An agent reviewer
+can read the full artifact; its declared reading is not host-attested coverage. Missing generations
+and unavailable rooms remain gaps. For a self-modification plan, BIBLE.md and ARCHITECTURE.md are
+required in full (inline for
 an api reviewer; a retrieving reviewer reads both in full with its own tools, the pack names them
 as mandatory reads); every other plan gets the heading-derived navigation maps of BIBLE.md and
 ARCHITECTURE.md and may request more with `need_evidence` (the host attaches it on the next cycle,
@@ -765,8 +779,8 @@ Such advice is an optional `note`; Ouroboros decides whether to adopt it without
 disposition. A premise challenge, preference or repetition alone does not earn blocking
 authority. Independently demonstrated failures still follow the height rule below. No
 compulsory competing plan or finding quota: those create endless rewrite/review cycles.
-The agent authors the plan (P0); reviewers contribute criticism; the host aggregates and
-enforces the actual blocking contract.
+Ouroboros authors the plan and is the addressee of everything this review produces (P0);
+reviewers contribute criticism; the host aggregates and enforces the actual blocking contract.
 
 ### The spec you are reviewing
 
@@ -788,7 +802,7 @@ rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec 
 | 2 | load-bearing decisions | Are the decisions that are expensive to reverse explicit, with their rejected alternatives and why? |
 | 3 | constraints and invariants | Are the real constraints named — budget, deadline, safety, irreversibility, commitments to others? |
 | 4 | deferrals | Is anything deferred that will be expensive to change once the work has started? |
-| 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator) instead of inventing a gap. |
+| 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator or a spec item id) instead of inventing a gap. |
 | 6 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
 
 ### Height rule — what may block
@@ -801,7 +815,9 @@ structurally unverifiable, that is blocking against the claim, not a `need_evide
 - `blocking` — requires `breaks: <spec id>`. Without a valid id the host demotes it to a note and
   discloses the demotion.
 - `note` — optional advice retained in the review; no disposition is required to proceed.
-- `need_evidence` — a typed request `{locator, why}`. It never blocks by itself and the same
+- `need_evidence` — a typed request `{locator, why}` for a document the host can attach, or
+  `{breaks: <spec id>, why}` for a question only the author can answer (Ouroboros answers it in
+  its disposition, escalates it, or defers it openly). It never blocks by itself and the same
   locator is remembered only once per task; repeating a valid request or filling the bounded
   request memory does not turn it into optional advice. It retains its free disposition,
   without another remembered locator or paid call. The host attaches a remembered locator on the next cycle

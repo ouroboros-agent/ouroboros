@@ -137,10 +137,61 @@ def test_compound_session_effort_precedes_surface_defaults(monkeypatch):
     assert [row.effort for row in config.triad] == ["", ""]
     assert commit_triad_delivery()["efforts"] == ["xhigh", "low"]
     assert [slot.effort for slot in structured_scope_review_slots()] == ["max"]
-    assert [slot.effort for slot in plan_review_runtime.plan_review_slots()] == [
-        "xhigh",
-        plan_review_runtime.PLAN_REVIEW_EFFORT,
+    # The owner's review-effort setting reaches the plan panel exactly like the
+    # commit triad (no plan-local constant overrides it any more).
+    assert [slot.effort for slot in plan_review_runtime.plan_review_slots()] == ["xhigh", "low"]
+    assert [slot.declared_effort for slot in plan_review_runtime.plan_review_slots()] == ["", ""]
+
+
+def test_declared_plan_effort_is_the_default_rung_and_touches_no_other_surface(monkeypatch):
+    """The envelope's reviewer_effort fills only the rows that leave effort to the
+    caller: a compound slug and an explicit per-row effort still win. It travels as
+    an argument of the plan builder alone, so the commit gate, scope, acceptance and
+    skill-review identities are byte-identical before and after a declaration."""
+    from ouroboros.skill_review_cycles import skill_review_contract_fingerprint
+    from ouroboros.tools import plan_review_runtime
+    from ouroboros.tools.commit_gate import commit_review_contract_fingerprint
+
+    payload = _payload()
+    payload["triad"] = [
+        {"slot_id": "cursor-row", "route": {"kind": "agent_session", "target_id": "cursor=cursor-grok-4.6-xhigh-fast"}},
+        {"slot_id": "plain-row", "route": {"kind": "agent_session", "target_id": "codex=gpt-5.6-sol"}},
+        {"slot_id": "pinned-row", "route": {"kind": "api_chat", "target_id": "openai/gpt-5.6-sol"}, "effort": "low"},
     ]
+    monkeypatch.setenv(REVIEWER_SLOTS_ENV, json.dumps(payload))
+    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "medium")
+    before = (commit_triad_delivery(), [s.effort for s in structured_scope_review_slots()],
+              commit_review_contract_fingerprint(),
+              skill_review_contract_fingerprint(["m"], delivery=commit_triad_delivery()))
+    declared = plan_review_runtime.plan_review_slots(default_effort="max")
+    assert [s.effort for s in declared] == ["xhigh", "max", "low"]
+    assert [s.declared_effort for s in declared] == ["", "max", ""]
+    assert [s.effort for s in plan_review_runtime.plan_review_slots()] == ["xhigh", "medium", "low"]
+    after = (commit_triad_delivery(), [s.effort for s in structured_scope_review_slots()],
+             commit_review_contract_fingerprint(),
+             skill_review_contract_fingerprint(["m"], delivery=commit_triad_delivery()))
+    assert before == after and before[0]["efforts"] == ["xhigh", "medium", "low"]
+
+
+def test_last_execution_projection_keeps_a_declared_effort_apart_from_the_row(tmp_path, monkeypatch):
+    """«Выполняется как» must not show the agent's one-off panel strength as the
+    row's saved configuration: requested.effort is the ROW's effort ('' when the
+    declaration filled it) and the declaration rides its own field."""
+    from types import SimpleNamespace
+
+    from ouroboros import reviewer_slot_config
+    from ouroboros.review_substrate import ReviewSlot
+
+    monkeypatch.setattr(reviewer_slot_config, "_last_execution_path", lambda: tmp_path / "last.json")
+    slots = {
+        "declared": ReviewSlot(slot_id="declared", model="m/a", effort="max", declared_effort="max"),
+        "own": ReviewSlot(slot_id="own", model="m/b", effort="low"),
+    }
+    actors = [SimpleNamespace(slot_id=sid, status="ok", usage={}) for sid in slots]
+    reviewer_slot_config.record_reviewer_slot_executions("plan_review", actors, slots)
+    last = reviewer_slot_config.reviewer_slot_last_executions()
+    assert last["declared"]["requested"]["effort"] == "" and last["declared"]["requested"]["declared_effort"] == "max"
+    assert last["own"]["requested"]["effort"] == "low" and "declared_effort" not in last["own"]["requested"]
 
 
 def test_compound_effort_stabilizes_replay_identity_against_global_drift(monkeypatch):

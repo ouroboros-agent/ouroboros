@@ -30,9 +30,11 @@ def test_run_plan_review_script_runs_the_engine_on_the_new_envelope(monkeypatch,
 
     async def fake_run_slots(ctx, slots, *, system_prompt, user_content, session_task="",
                              session_root="", output_contract="", slot_messages=None,
+                             slot_session_tasks=None, request_policy=None,
                              session_threads=None, retry_key="", reconcile_only=False,
-                             reconciliation_identity=None):
+                             reconciliation_identity=None, release_at_dispatch=False):
         captured["task_id"] = ctx.task_id
+        captured["release_at_dispatch"] = release_at_dispatch
         captured["slots"] = [s.slot_id for s in slots]
         captured["system_prompt"] = system_prompt
         captured["user_content"] = user_content

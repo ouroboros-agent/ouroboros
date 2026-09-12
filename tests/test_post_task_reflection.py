@@ -111,8 +111,14 @@ def test_update_improvement_backlog_appends_candidates(tmp_path):
     assert "Reduce recurring task friction around REVIEW_BLOCKED" in text
 
 
-def test_run_reflection_returns_entry_when_generated(tmp_path):
+def test_run_reflection_returns_entry_when_generated(tmp_path, monkeypatch):
     captured = {}
+    # Entry generation/persistence is the subject; the Pattern Register has a
+    # separate model call and must not consume a real provider in this test.
+    monkeypatch.setattr(
+        "ouroboros.reflection._update_patterns",
+        lambda root, entry: captured.update(pattern_root=root, pattern_entry=entry),
+    )
 
     class FakeLlm:
         def chat(self, *, messages, model, reasoning_effort, max_tokens, model_role):
@@ -135,9 +141,10 @@ def test_run_reflection_returns_entry_when_generated(tmp_path):
     entry = pipeline._run_reflection(
         env,
         FakeLlm(),
-        {"id": "task-reflect", "type": "task", "text": "Fix it"},
+        {"id": "task-reflect", "type": "task", "text": "Fix it", "drive_root": str(tmp_path)},
         {"rounds": 2, "cost": 0.01},
-        {"tool_calls": [{"tool": "commit_reviewed", "is_error": False, "result": "⚠️ REVIEW_BLOCKED"}]},
+        {"tool_calls": [{"tool": "commit_reviewed", "is_error": True, "status": "error",
+                         "tool_result_code": "REVIEW_BLOCKED", "result": "⚠️ REVIEW_BLOCKED"}]},
         {"recent_attempts": [], "open_obligations": [{"item": "tests_affected", "reason": "Fix the failing test before commit"}]},
     )
 
@@ -147,3 +154,7 @@ def test_run_reflection_returns_entry_when_generated(tmp_path):
     assert entry["reflection"] == "Reflection text."
     assert len(entry["backlog_candidates"]) == 1
     assert entry["backlog_candidates"][0]["summary"] == "Reduce recurring task friction around REVIEW_BLOCKED"
+    stored = [json.loads(line) for line in
+              (tmp_path / "logs" / "task_reflections.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert stored == [entry]
+    assert captured["pattern_root"] == tmp_path and captured["pattern_entry"] == entry

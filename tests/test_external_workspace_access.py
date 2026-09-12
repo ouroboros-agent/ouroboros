@@ -161,9 +161,11 @@ def test_block_reason_protects_runtime_and_credentials_even_in_external(tmp_path
     # for READS too (location boundary, not a name shape).
     assert user_files_path_block_reason(ext, child / "memory" / "identity.md")
     assert user_files_path_block_reason(ext, child / "memory" / "identity.md", operation="read")
-    # Credential-like names: mutation stays shape-denied; root reads are
-    # location-only (capinv-447 / В23=A — bytes are masked at egress instead).
-    assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem")
+    # A credential-shaped NAME outside a credential location no longer refuses
+    # mutation either: the fence is the location (~/.ssh, ~/.aws, ...) and the
+    # exact credential leaves, never the suffix. Root reads stay location-only
+    # (capinv-447 / В23=A — bytes are masked at egress instead).
+    assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem") == ""
     assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem", operation="read") == ""
 
 
@@ -362,9 +364,10 @@ def test_external_workspace_shell_can_write_configured_deliverable_only_at_top_l
 
     outside = tmp_path / "outside"
     outside.mkdir()
+    # Exact credential leaves and real credential directories only: a suffix
+    # such as token.pem is ordinary owner output and is no longer refused.
     targets = [
         deliverables / ".env",
-        deliverables / "token.pem",
         deliverables / ".ssh" / "key",
     ]
     try:
@@ -415,10 +418,10 @@ def test_nested_deliverables_keeps_target_policy_before_workspace_root(
         {"cmd": ["touch", str(deliverables / "ordinary.txt")], "cwd": str(workspace)},
         "advanced",
     ) is None
+    # A dotted component is no longer a refusal of its own: only a real
+    # credential/control directory (.ssh, .aws, .gnupg, VCS) still blocks.
     for target in (
-        deliverables / ".hidden" / "file",
         deliverables / ".ssh" / "key",
-        deliverables / "token.pem",
     ):
         blocked = _shell_guard_text(reg,
             {"cmd": ["touch", str(target)], "cwd": str(workspace)}, "advanced",
@@ -596,13 +599,22 @@ def test_nested_deliverables_keeps_target_policy_before_workspace_root(
 
     from ouroboros.tools.shell import _resolve_declared_output, _run_shell
 
+    # A dotted directory is ordinary owner output now: only real credential and
+    # control directories, and the escape checks below, refuse a declared output.
     declared_hidden, hidden_reason = _resolve_declared_output(
         ctx,
         str(deliverables / ".hidden" / "file"),
         workspace,
         cwd_root="active_workspace",
     )
-    assert declared_hidden is None and "hidden" in hidden_reason.lower()
+    assert declared_hidden is not None and hidden_reason == ""
+    declared_ssh, ssh_reason = _resolve_declared_output(
+        ctx,
+        str(deliverables / ".ssh" / "key"),
+        workspace,
+        cwd_root="active_workspace",
+    )
+    assert declared_ssh is None and "credential" in ssh_reason.lower()
     declared_link, link_reason = _resolve_declared_output(
         ctx,
         str(link / "declared.txt"),

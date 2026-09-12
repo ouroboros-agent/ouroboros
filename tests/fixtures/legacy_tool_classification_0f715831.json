@@ -1395,6 +1395,14 @@
    "is_error": true,
    "status": "error"
   },
+  "ident:LIST_FILES_NOT_FOUND:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:LIST_FILES_NOT_FOUND:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
   "ident:LOCAL_READONLY_SUBAGENT_BLOCKED:named": {
    "is_error": true,
    "status": "blocked"
@@ -2947,6 +2955,10 @@
    "is_error": false,
    "status": "ok"
   },
+  "native:LEGACY_WARNING:LIST_FILES_NOT_FOUND": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:LEGACY_WARNING:NOT_FOUND": {
    "is_error": false,
    "status": "ok"
@@ -3116,6 +3128,10 @@
    "status": "ok"
   },
   "shape:git_error_untyped_text": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "shape:list_files_not_found": {
    "is_error": false,
    "status": "ok"
   },

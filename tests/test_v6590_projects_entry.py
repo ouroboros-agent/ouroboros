@@ -68,18 +68,24 @@ def test_attach_snapshot_init_is_opt_in_and_idempotent(tmp_path):
     assert count == "1"
 
 
-def test_attach_snapshot_init_excludes_credential_shaped_files(tmp_path):
+def test_attach_snapshot_init_excludes_key_material_by_content_not_by_suffix(tmp_path):
     """Triad r4 security critical: an attach snapshot must never bake `.env`/keys
-    into git history. Credential-shaped files are unstaged (same SSOT classifier
-    as workspace patch / coop checkpoint), disclosed in the returned list, and
-    kept untracked via .git/info/exclude — the owner's files are never edited."""
+    into git history. What proves a key is the CONTENT (the same PEM head read
+    the workspace patch and the coop checkpoint use) plus the exact credential
+    leaves; a `.key` deck of the owner's stays in the snapshot. Excluded files
+    are disclosed in the returned list and kept untracked via .git/info/exclude
+    — the owner's files are never edited."""
     from ouroboros.project_sources import attach_snapshot_init
 
     folder = tmp_path / "with_secrets"
     folder.mkdir()
     (folder / "app.py").write_text("print('ok')\n", encoding="utf-8")
     (folder / ".env").write_text("API_KEY=hunter2\n", encoding="utf-8")
-    (folder / "deploy.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
+    (folder / "deploy.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+    (folder / "deck.key").write_text("Keynote deck, no key material\n", encoding="utf-8")
     error, skipped = attach_snapshot_init(folder)
     assert error == ""
     assert sorted(skipped) == [".env", "deploy.pem"]
@@ -87,6 +93,7 @@ def test_attach_snapshot_init_excludes_credential_shaped_files(tmp_path):
         ["git", "ls-files"], cwd=str(folder), capture_output=True, text=True
     ).stdout.split()
     assert "app.py" in tracked
+    assert "deck.key" in tracked
     assert ".env" not in tracked and "deploy.pem" not in tracked
     # The secret files still EXIST on disk, untouched.
     assert (folder / ".env").read_text(encoding="utf-8") == "API_KEY=hunter2\n"

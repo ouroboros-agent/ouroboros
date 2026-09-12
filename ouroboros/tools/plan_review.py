@@ -28,15 +28,11 @@ host's loud disclosure. Domain-neutral: a spec with zero paths is first-class.
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
-import contextvars
-from hashlib import sha256
 import json
 import logging
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, List, Optional
 
 from ouroboros.config import (
     adaptive_quorum,
@@ -47,11 +43,11 @@ from ouroboros.config import (
 )
 from ouroboros.review_cycles import emit_review_cycles_exhausted, review_max_cycles
 from ouroboros.task_results import (
-    load_plan_review_state, load_task_result, mark_current_plan_review_unavailable,
+    load_plan_review_state, mark_current_plan_review_unavailable,
     plan_review_wave, current_plan_review_wave, record_plan_review_dispositions,
     plan_review_notes_are_annotatable,
 )
-from ouroboros.tools import plan_evidence, plan_spec
+from ouroboros.tools import plan_evidence, plan_review_collect as _collect, plan_spec
 from ouroboros.tools.plan_render import _next_step, _quote_control_lines, _render_wave  # noqa: F401 — engine renderers
 from ouroboros.tools.plan_review_runtime import (
     PLAN_NO_SNAPSHOT as _PLAN_NO_SNAPSHOT,
@@ -60,6 +56,7 @@ from ouroboros.tools.plan_review_runtime import (
     plan_fanout_inputs as _plan_fanout_inputs,
     plan_in_flight_custody_error as _plan_in_flight_custody_error,
     plan_deadline_skip as _plan_deadline_skip,
+    REVIEWER_EFFORT_SCHEMA as _REVIEWER_EFFORT_SCHEMA,
     publish_plan_review_projection as _publish_plan_review_projection,
     publish_rendered_wave as _publish_rendered_wave,
     plan_payload_roots as _plan_payload_roots,
@@ -68,13 +65,19 @@ from ouroboros.tools.plan_review_runtime import (
     plan_health_epoch as _plan_health_epoch,
     plan_wave_replay_decision as _plan_wave_replay_decision,
     plan_wave_has_in_flight as _plan_wave_has_in_flight,
+    plan_no_dispatch_line as _plan_no_dispatch_line,
     plan_wave_progress_line as _plan_wave_progress_line,
+    effective_plan_slots as _effective_plan_slots,
     root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
     run_plan_review_slots as _run_plan_review_slots,
     synthesize_plan_review_wave as _synthesize_plan_review_wave,
     build_plan_review_packet as _build_packet,
 )
+from ouroboros.tools.plan_spec import plan_fingerprint as _plan_fingerprint
+from ouroboros.tools.plan_evidence import task_evidence_reader as _task_evidence_reader
+from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs
 from ouroboros.tools.plan_review_artifacts import (
+    PlanReviewSourceUnavailable,
     attach_continuation_restart_delta as _attach_continuation_restart_delta,
     authority_wave as _authority_wave,
     continuation_state as _continuation_state,
@@ -97,7 +100,7 @@ from ouroboros.tools.review_synthesis import (
     PLAN_REVIEW_CONTROL_PREFIX,
 )
 from ouroboros.tools.tool_result import TOOL_CODE_SPECS, ToolResult, _publish_tool_result
-from ouroboros.utils import truncate_review_artifact, utc_now_iso
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -113,13 +116,13 @@ def _plan_task_tool_timeout_sec() -> float:
     # The outer ToolEntry must cover either route plus one finalization grace
     # window; it is a settlement envelope, never a cognition cutoff.
     return max(_plan_review_wrapper_timeout_sec(), float(get_task_abs_ceiling_sec())) + get_finalization_grace_sec()
-_TASK_EVIDENCE_RESULT_CHARS = 6_000
 
 @dataclass(frozen=True)
 class _PlanRequest:
     goal: str
     plan: str
     spec: Any
+    reviewer_effort: str = ""  # the envelope's declared panel strength ('' = the owner's setting)
 
 _SPEC_SCHEMA = {
     "type": "object",
@@ -201,7 +204,9 @@ _DISPOSITION_SCHEMA = {
     "additionalProperties": False,
     "description": (
         "Disposition mode only (send ONLY this field): answer the findings of the wave "
-        "named by review_fingerprint. note/need_evidence findings close at $0; a blocking "
+        "named by review_fingerprint. While that wave is still open with reviewer slots in "
+        "flight, this call first COLLECTS what has settled at $0 without waiting (items may be "
+        "[]); to wait longer, re-submit the same envelope. note/need_evidence findings close at $0; a blocking "
         "finding stays open. A subsequent paid delta review may consider a changed spec or "
         "justified rejection when another paid cycle is available. Recording a disposition "
         "consumes no cycle and never closes REVISE_PLAN."
@@ -242,7 +247,7 @@ def get_tools():
                     "when another paid cycle is available. Cycles are bounded by the owner's Max review cycles; an unchanged "
                     "envelope replays the recorded result for free (a locator a reviewer asked for "
                     "with need_evidence is attached by the host next time and makes the envelope "
-                    "new). Under blocking enforcement an "
+                    "new; a different reviewer_effort re-dispatches a paid panel). Under blocking enforcement an "
                     "open review holds finalization; under advisory you may proceed with the "
                     "review open and the host discloses it. Declare evidence reviewers need; "
                     "declare affected_resources so a self-modification gets the constitutional pack."
@@ -253,9 +258,10 @@ def get_tools():
                         "goal": {"type": "string", "description": "Why — the outcome the work serves."},
                         "plan": {"type": "string", "description": "Accompanying prose: how you intend to do it (context for reviewers; the spec is what is judged)."},
                         "spec": _SPEC_SCHEMA,
+                        "reviewer_effort": _REVIEWER_EFFORT_SCHEMA,
                         "review_disposition": _DISPOSITION_SCHEMA,
                     },
-                    # Two exclusive modes: goal+plan+spec (review) or review_disposition alone.
+                    # Two exclusive modes: goal+plan+spec (+ optional reviewer_effort) or review_disposition alone.
                     "required": [],
                 },
             },
@@ -294,7 +300,7 @@ def _typed_refusal(ctx: ToolContext, code: str, text: str) -> str:
 def _handle_plan_task(ctx: ToolContext, **params) -> str:
     raw_disposition = params.get("review_disposition")
     # The registry refuses unknown params; a vacuous envelope field carries no plan.
-    envelope_fields = [k for k in ("goal", "plan", "spec") if not _vacuous(k, params.get(k))]
+    envelope_fields = [k for k in ("goal", "plan", "spec", "reviewer_effort") if not _vacuous(k, params.get(k))]
     if raw_disposition is not None and not _vacuous_disposition(raw_disposition):
         if envelope_fields:
             return _typed_refusal(
@@ -317,27 +323,10 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         )
     request = _PlanRequest(
         goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
+        reviewer_effort=str(params.get("reviewer_effort") or "").strip().lower(),
     )
-    # The ToolEntry envelope is the outer settlement bound. The substrate
-    # owns each review slot's logical window and late-result custody; nesting a
-    # second asyncio.wait_for here only cancels the coroutine while its
-    # executor worker keeps running, then asyncio.run waits for that worker
-    # during shutdown and defeats the apparent timeout. Let the existing
-    # tool-timeout callback own the late settlement instead.
-    try:
-        try:
-            asyncio.get_running_loop()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                # copy_context: the registry's tool-result sidecar is a ContextVar,
-                # and the published native plan result must reach the dispatching
-                # thread's slot (D02) — a bare pool thread would publish into the void.
-                return pool.submit(
-                    contextvars.copy_context().run,
-                    asyncio.run,
-                    _run_plan_review_async(ctx, request),
-                ).result()
-        except RuntimeError:
-            return asyncio.run(_run_plan_review_async(ctx, request))
+    try:  # the ToolEntry envelope is the outer settlement bound (plan_review_collect.run_plan_coroutine)
+        return _collect.run_plan_coroutine(_run_plan_review_async(ctx, request))
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
         return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")
@@ -388,34 +377,6 @@ def _evidence_deny_paths(ctx: ToolContext) -> list[str]:
         pass
     return out
 
-def _plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
-    """Identity of one review request (F4): goal, prose, canonical spec, evidence identity,
-    the constitutional fact — never the exploration log (it changes no obligation)."""
-    payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
-               "constitutional": bool(constitutional)}
-    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-
-def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
-    """Task-result projection; the evidence resolver hashes, budgets and redacts it."""
-    def _read(task_id: str) -> Optional[str]:
-        try:
-            record = load_task_result(root, task_id)
-        except Exception:
-            return None
-        if not isinstance(record, dict):
-            return None
-        projection = {
-            "task_id": task_id,
-            "status": record.get("status"),
-            "reason_code": record.get("reason_code"),
-            "ts": record.get("ts"),
-            "result": truncate_review_artifact(str(record.get("result") or ""), limit=_TASK_EVIDENCE_RESULT_CHARS),
-        }
-        if "terminal_host_notice" in record:
-            projection["terminal_host_notice"] = str(record["terminal_host_notice"] or "")
-        return json.dumps(projection, ensure_ascii=False, indent=2, default=str)
-    return _read
-
 # W3 host attachment is bounded like the agent's own evidence list (MAX_LIST_ITEMS honoured
 # locators per task); what the cap drops is a NAMED `reviewer_request_cap` omission, never silent.
 _REVIEWER_REQUEST_CAP = plan_spec.MAX_LIST_ITEMS
@@ -444,7 +405,7 @@ def _reviewer_requested_locators(ctx: ToolContext, state_root: pathlib.Path) -> 
             seen.append(loc)
     return seen, dropped
 
-def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: pathlib.Path) -> dict:
+def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: pathlib.Path, *, persist: bool = False) -> dict:
     """The ONE preamble the paid path and the dry-run seam share: normalize the spec (with the
     envelope's goal injected), resolve the subject roots, derive `constitutional`, attach the
     declared evidence, compose the fingerprint. Returns ``{"error": ...}`` on refusal — a second
@@ -455,6 +416,8 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
     spec, errors = plan_spec.normalize_spec(raw_spec if isinstance(raw_spec, dict) else None)
     if not request.plan.strip():
         errors = ["plan: required non-empty prose", *errors]
+    if request.reviewer_effort and request.reviewer_effort not in _REVIEWER_EFFORT_SCHEMA["enum"]:
+        errors.append(f"reviewer_effort: not on the effort scale {list(_REVIEWER_EFFORT_SCHEMA['enum'])}")
     if errors:
         return {"error": "ERROR: PLAN_SPEC_INVALID: " + "; ".join(errors) + ". No reviewer was called.",
                 "code": "TOOL_ARG_ERROR"}
@@ -490,6 +453,7 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         host_locators + declared_evidence, active_root=active_root,
         allowed_roots=[active_root, system_root],
         resolve_task=_task_evidence_reader(state_root), deny_paths=_evidence_deny_paths(ctx),
+        resolve_chat=plan_chat_reader(state_root, str(ctx.task_id)),
     )
     manifest["declared"] = declared_evidence  # the AGENT's list; requests below (tagged+hashed)
     if reviewer_requested:
@@ -498,6 +462,9 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         manifest["reviewer_requested_dropped"] = list(request_dropped)
         manifest.setdefault("omissions", []).extend(
             {"locator": loc, "reason": "reviewer_request_cap"} for loc in request_dropped)
+    manifest_hash = plan_evidence.evidence_manifest_hash(manifest)
+    author_fingerprint = _plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
+    manifest = attach_own_dialogue(ctx, state_root, manifest, author_fingerprint, persist=persist)
     manifest_hash = plan_evidence.evidence_manifest_hash(manifest)
     fingerprint = _plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
     return {
@@ -509,12 +476,13 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
 
 # --------------------------------------------------------------------------- review
 
-async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str:
+async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, collect: Optional[dict] = None) -> str:
+    """``collect`` = the recorded inputs of an open wave being collected at $0 (window 0)."""
     try:
         state_root, task_id = _planning_state_location(ctx)
     except ValueError as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
-    prepared = _prepare_plan_inputs(ctx, request, state_root)
+    prepared = collect if collect is not None else _prepare_plan_inputs(ctx, request, state_root, persist=True)
     if prepared.get("error"):
         if "PLAN_SPEC_INVALID" in prepared["error"]:
             try:
@@ -535,10 +503,16 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         state = load_plan_review_state(state_root, task_id)
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
+    if collect is None:  # I3 reconcile-before-supersede: collect an in-flight wave at $0 first
+        state = await _collect.collect_before_supersede(ctx, state_root=state_root, task_id=task_id, state=state, fingerprint=fingerprint)
     enforcement = get_review_enforcement()
     cap = review_max_cycles()
     cycles_paid = int(state.get("cycles_paid") or 0)
-    # C-01: every envelope supersedes prior authority BEFORE any cap/rail exit.
+    # A revised envelope over an in-flight wave at the cap is held BEFORE any superseding
+    # reference: the pending wave stays current and collectible, nothing is written as spent.
+    if collect is None and (hold := _collect.in_flight_hold(state, fingerprint=fingerprint, cap=cap)):
+        return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_IN_FLIGHT: {hold}")
+    # C-01: the hold above is the ONE exit before the supersede; every other cap/rail exit follows it.
     try:
         _record_plan_review_attempt_with_reference(ctx, state_root, task_id, fingerprint=fingerprint)
     except (OSError, TimeoutError, ValueError) as exc:
@@ -546,6 +520,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     previous_override: Optional[dict] = None
     replay_snapshot: Any = _PLAN_NO_SNAPSHOT
     resume_in_flight = False
+    # The declaration wraps the builder ONLY when non-empty: zero-arg stubs of the builder stay valid.
+    slots_fn = (lambda: _plan_review_slots(default_effort=request.reviewer_effort)) if request.reviewer_effort else _plan_review_slots
     existing = plan_review_wave(state, fingerprint)
     if existing is not None and not isinstance(existing.get("spec"), dict):
         existing = None  # C-09: a COMPACTED row (no frozen spec) is never authority
@@ -578,7 +554,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid,
                                           enforcement=enforcement, cached=True, reminder=reminder)
         elif not resume_in_flight:  # stale ⇒ identical envelope re-dispatches fresh
-            stale, replay_snapshot = _plan_wave_replay_decision(_plan_review_slots, existing)
+            stale, replay_snapshot = _plan_wave_replay_decision(slots_fn, existing)
             if not stale:
                 if enforcement == "advisory":
                     # Still-OPEN wave: re-invoke the emitter so a durable append that FAILED
@@ -599,7 +575,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         except (OSError, TimeoutError, ValueError) as exc:
             return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}")
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
-    if cap is not None and cycles_paid >= cap and not resume_in_flight:
+    if cap is not None and cycles_paid >= cap and not resume_in_flight:  # PAID (proven) cycles only
         return _cycles_exhausted(ctx, state, state_root, task_id, cap=cap, cycles_paid=cycles_paid,
                                  enforcement=enforcement, reminder=reminder,
                                  request_fingerprint=fingerprint)
@@ -611,7 +587,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         return _plan_unavailable(
             ctx, f"ERROR: Invalid reviewer-slot configuration blocks plan review — {err}. "
             "Fix Review lanes on the Agents tab in Settings.", "reviewer_slot_config_invalid")
-    slots = _plan_review_slots()
+    slots = slots_fn()
     if not slots:
         return _plan_unavailable(
             ctx, "ERROR: No review models configured. Configure Review lanes "
@@ -641,6 +617,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             )
     cycle_index = int(resume.get("cycle_index") or cycles_paid + 1)
     retry_key = str(resume.get("retry_key") or f"plan_review:{fingerprint}:{cycle_index}")
+    slots = _effective_plan_slots(slots)
     system_prompt, user_content, session_task = _build_packet(
         ctx, spec=spec, request=request, manifest=manifest, constitutional=constitutional,
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
@@ -649,10 +626,16 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     slots, slot_messages, session_threads, continuation_restarted = _continuation_state(
         state_root, task_id, previous, slots, manifest, user_content=user_content,
     )
+    delivery = dialogue_slot_inputs(slots, system_prompt=system_prompt, user_content=user_content,
+        session_task=session_task, manifest=manifest, slot_messages=slot_messages,
+        native_mandatory_chars=len(system_prompt) + len(user_content), data_root=state_root,
+        frozen=existing if resume_in_flight else None, session_root=str(active_root), task_id=task_id)
+    slot_messages = delivery["slot_messages"]
     quorum = adaptive_quorum(len(slots))
     fanout = _plan_fanout_inputs(
         slots, resume=resume if resume_in_flight else None, replay_snapshot=replay_snapshot,
         prompt_chars=len(system_prompt) + len(user_content), quorum=quorum,
+        slot_prompt_chars=delivery["slot_prompt_chars"],
     )
     pending_note = fanout["error"]
     callable_slots = fanout.get("callable_slots") or []
@@ -674,7 +657,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     health_evidence = fanout["health_evidence"]
     admission = None if resume_in_flight else review_wave_budget_gate(
         ctx, surface="plan_review", models=[str(s.model) for s in callable_slots],
-        prompt_chars=len(system_prompt) + len(user_content), max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
+        prompt_chars=[delivery["slot_prompt_chars"][str(s.slot_id)] for s in callable_slots],
+        max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
     )
     if admission is not None:
         fence, remedy = review_wave_binding_fence(admission)
@@ -695,10 +679,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         ctx, callable_slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, session_root=str(active_root),
         output_contract=plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT,
-        slot_messages=slot_messages,
-        session_threads=session_threads,
+        slot_messages=slot_messages, slot_session_tasks=delivery["slot_session_tasks"],
+        request_policy=delivery["request_policy"], session_threads=session_threads,
         retry_key=retry_key,
         reconcile_only=resume_in_flight,
+        release_at_dispatch=collect is not None or not resume_in_flight,  # return at the barrier; a collect never waits
         reconciliation_identity={
             "subject_hash": fingerprint,
             "roster_hash": _plan_reviewer_config_fingerprint(configured_slots),
@@ -716,13 +701,16 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         constitutional=constitutional, constitutional_note=constitutional_note,
         cycle_index=cycle_index, retry_key=retry_key, enforcement=enforcement, cap=cap,
         quorum=quorum, configured_slots=configured_slots,
-        health_evidence=health_evidence,
+        health_evidence=health_evidence, reviewer_effort=request.reviewer_effort,
+        dispositions=list((existing or {}).get("dispositions") or []) if resume_in_flight else None,
     )
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
-        system_prompt=system_prompt, user_content=user_content,
-        session_task=session_task, slot_messages=slot_messages,
+        system_prompt=system_prompt, user_content=user_content, dispatched=existing if resume_in_flight else None,
+        session_task=session_task, slot_messages=slot_messages, slot_session_tasks=delivery["slot_session_tasks"],
+        dialogue_delivery=delivery["dialogue_delivery"], request_policy=delivery["request_policy"],
+        slot_prompt_chars=delivery["slot_prompt_chars"],
     )
     try:
         stored = _record_exact_wave(
@@ -734,6 +722,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             # D2/B2: the durable authority stayed the paid predecessor (this attempt
             # dispatched nothing); the tool answer still describes the attempt that ran.
             stored = wave
+            ctx.emit_progress_fn(_plan_no_dispatch_line(wave))
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}")
     try:
@@ -764,7 +753,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             task_id=task_id, cycles_paid=paid_now, cap=cap, enforcement=enforcement,
             fingerprint=fingerprint)
     ctx.emit_progress_fn(_plan_wave_progress_line(
-        aggregate, agg["counts"], cycles_paid=paid_now, cap=cap))
+        aggregate, agg["counts"], cycles_paid=paid_now, cap=cap, wave=wave))
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder)
 
 def _last_paid_wave(state: dict) -> Optional[dict]:
@@ -913,6 +902,14 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             f"claimed={fingerprint}). Re-call plan_task with the spec you want reviewed. "
             "No plan attempt was recorded.",
         )
+    if wave.get("custody_pending"):  # collection = the $0 custody reconcile of the addressed wave (window 0)
+        try:
+            text, state, wave = _collect.collect_wave_sync(ctx, state_root=root, task_id=task_id, wave=wave)
+        except PlanReviewSourceUnavailable as exc:
+            return _plan_unavailable(ctx, str(exc), "plan_review_exact_artifact_unavailable")
+        if not disposition.get("items"):  # a pure $0 peek; items are applied even while slots run
+            return text
+        cycles_paid = int(state.get("cycles_paid") or 0)
     if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
         return _publish_rendered_wave(ctx, wave, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                       cached=True,

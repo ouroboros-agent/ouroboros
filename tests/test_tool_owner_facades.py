@@ -87,7 +87,6 @@ def test_tool_descriptor_owner_facades_preserve_identity():
         ("task_contract", "factory:dict"),
         ("task_depth", 0),
         ("is_direct_chat", False),
-        ("is_ephemeral_turn", False),
         ("_review_advisory", "factory:list"),
         ("_review_iteration_count", 0),
         ("_review_history", "factory:list"),

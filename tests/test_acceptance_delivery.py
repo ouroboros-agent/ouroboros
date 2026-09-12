@@ -114,7 +114,6 @@ def _capture_panel(monkeypatch):
 def test_triad_delivery_slots_is_the_one_builder_shared_by_plan_and_commit_vectors(structured_env):
     from ouroboros.reviewer_slot_config import commit_triad_delivery
     from ouroboros.tools.plan_review_runtime import (
-        PLAN_REVIEW_EFFORT,
         PLAN_REVIEW_MAX_TOKENS,
         plan_review_slots,
     )
@@ -129,8 +128,7 @@ def test_triad_delivery_slots_is_the_one_builder_shared_by_plan_and_commit_vecto
     assert all(s.role_hint == "task acceptance" for s in acceptance)
     # Effort: explicit row → row; compound/none → the caller's default (plan) or the
     # roster row's own effort (actor row).
-    assert [s.effort for s in plan] == ["high", "xhigh", "medium"]
-    assert plan[0].effort != PLAN_REVIEW_EFFORT or PLAN_REVIEW_EFFORT == "high"
+    assert [s.effort for s in plan] == ["high", "xhigh", "medium"]  # the review setting, as for every triad surface
     # The commit/skill vectors are a projection of the same slots.
     vectors = commit_triad_delivery()
     assert vectors["slot_ids"] == [s.slot_id for s in acceptance]

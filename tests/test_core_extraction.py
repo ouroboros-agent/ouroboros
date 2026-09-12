@@ -116,8 +116,11 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
+    # Rolled for P1-9 (owner Q7=B): the escalate description states the ABCD rule and
+    # QuizOption gained the optional `recommended` boolean. Diffing the whole catalog
+    # base to head shows exactly those two edits and nothing else.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "7d7e86522b2413f1a13e41dfcf16bc167c60a7bc04df4a31fcd59c2ac2285208"
+        "8f80432a654edbe9487969d381cbee8528140a23d36323562a971363246925a9"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

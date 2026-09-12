@@ -560,6 +560,23 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     return True
 
 
+def _slot_cause_clause(result: Any) -> str:
+    """The bounded chat preview of the causes the wave actually recorded.
+
+    Chat preview only; the structured acceptance decision keeps every complete
+    cause. Shared so a revision explains itself with the same facts as a
+    degraded verdict instead of printing the aggregate word as if that word
+    were the reason.
+    """
+    reasons = list(getattr(result, "degraded_reasons", []) or [])
+    note = "; ".join(
+        truncate_review_artifact(str(r), limit=300).replace("\n", " ") for r in reasons[:4]
+    )
+    if len(reasons) > 4:
+        note += f" (+{len(reasons) - 4} more in the task result)"
+    return f" Causes: {note}" if note else ""
+
+
 def _apply_task_acceptance_result(
     ctx: _TaskAcceptanceContext,
     result: Any,
@@ -695,8 +712,18 @@ def _apply_task_acceptance_result(
             if isinstance(run, dict) and run.get("authority") == "host_root":
                 run["feedback_delivered"] = True
                 break
+        # The aggregate word is not an explanation: printing DEGRADED alone read
+        # as "no valid quorum" while a capsule was in fact fed back for one more
+        # bounded pass. Name the pass being started and the recorded causes; a
+        # wave that recorded none says THAT, so the verdict is a label beside a
+        # stated absence rather than standing in for the reason.
+        causes = _slot_cause_clause(result)
+        verdict = str(result.aggregate_signal or "").strip()
         ctx.emit_progress(
-            f"Task acceptance review: {result.aggregate_signal} — improvement note fed back."
+            f"Task acceptance review: improvement note fed back for pass "
+            f"{ctx.passes_done + 1}"
+            + (f" (verdict {verdict}; no causes recorded)." if verdict and not causes else ".")
+            + causes
         )
         return True
 
@@ -724,17 +751,9 @@ def _apply_task_acceptance_result(
             "open_obligations": [str(item.get("id")) for item in open_obligations],
         })
         # Show the slot failure causes beside the verdict, not only in task_results.
-        _degraded_reasons = list(getattr(result, "degraded_reasons", []) or [])
-        # Chat preview only; the structured decision keeps every complete cause.
-        _reason_note = "; ".join(
-            truncate_review_artifact(str(r), limit=300).replace("\n", " ")
-            for r in _degraded_reasons[:4]
-        )
-        if len(_degraded_reasons) > 4:
-            _reason_note += f" (+{len(_degraded_reasons) - 4} more in the task result)"
         ctx.emit_progress(
             "Task acceptance review: DEGRADED (no valid quorum; not recorded as PASS)."
-            + (f" Causes: {_reason_note}" if _reason_note else "")
+            + _slot_cause_clause(result)
         )
         return False
     if capsule and open_obligations:
@@ -1173,7 +1192,6 @@ def _run_task_acceptance_review_once(
         llm_trace,
         bool(getattr(tools._ctx, "is_direct_chat", False)),
         is_root_task=bool(lineage["is_root_task"]),
-        is_ephemeral_turn=bool(getattr(tools._ctx, "is_ephemeral_turn", False)),
         task_contract=(
             tools._ctx.task_contract
             if isinstance(getattr(tools._ctx, "task_contract", None), dict)

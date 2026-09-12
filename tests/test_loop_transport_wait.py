@@ -237,9 +237,9 @@ def test_transport_outage_waits_redials_free_rounds_and_recovers(tmp_path, monke
     assert any("restored" in note for note in notes)  # mandatory recovery note
 
 
-@pytest.mark.parametrize("flag", ["is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("flag", ["is_direct_chat"])
 def test_interactive_turns_wait_redial_free_and_terminalize_at_the_idle_bound(tmp_path, monkeypatch, flag):
-    """Direct-chat and ephemeral decision turns are wait-eligible: they redial
+    """Direct-chat turns are wait-eligible: they redial
     for free until the RAW configured task idle timeout — their only rail, as
     they carry no deadline and no queue rails — is spent, then take the
     deterministic no-resend terminal whose detail names that bound and whose
@@ -334,54 +334,50 @@ def test_deadline_refusal_during_episode_takes_transport_no_resend_terminal(tmp_
     assert trace.get("forced_finalization", {}).get("source") == "transport_unavailable_no_resend"
 
 
-def test_scheduled_swarm_handoff_stays_truthful_on_transport_terminal(tmp_path, monkeypatch):
-    """An ephemeral router turn waits out its idle bound on an outage, but the
-    requested managed work was already durably admitted: the no-resend terminal
-    stamp must not clobber the router's deliberate execution_status/reason_code
-    clear — the successful handoff stays truthful."""
-    calls = {"n": 0}
+
+
+def test_presence_handoff_retains_work_ref_when_transport_terminal_fails(tmp_path, monkeypatch):
+    """A Presence handoff remains available while the current turn reports its outage."""
+    from ouroboros import agent_task_pipeline as pipeline
+    from ouroboros.task_results import load_task_result
+
     _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
-
-    def fake_call(_llm, _messages, _model, _tools, _effort, _max_retries, _drive_logs,
-                  _task_id, _round_idx, _event_queue, accumulated_usage, *_a, **_k):
-        calls["n"] += 1
-        accumulated_usage["_last_llm_error_kind"] = "transport_unavailable"
-        accumulated_usage["_last_llm_error"] = "Connection error."
-        # Mirror _record_llm_call_error's stamps so the test proves the router
-        # pop clears them rather than them never having been set.
-        accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
-        return None, 0.0
-
+    fake_call, calls = _transport_failing_call(fail_times=99)
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async",
+                        lambda *_a, **_k: pytest.fail("Presence fixture must not buy post-task work"))
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.is_ephemeral_turn = True
-    registry._ctx.task_metadata = {"force_plan": True, "force_plan_source": "swarm"}
-    registry._ctx._swarm_handoff_attempt = {
-        "task_id": "swarm-task-1",
-        "routing_token": "route-token",
-        "status": "scheduled",
-        "reason": "",
-        "response": "OK: task swarm-task-1 accepted and durably scheduled",
-    }
-    notes = []
-    result, usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
+    registry._ctx.is_direct_chat = True
+    registry._ctx.task_metadata = {"presence": {"binding_id": "presence-binding"}}
+    registry._ctx._swarm_handoff_attempt = {"status": "scheduled", "task_id": "presence-work"}
+    registry._ctx._presence_completion = {"outcome": "deferred", "message": "Work is continuing."}
+    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, []))
+    assert calls["n"] >= 2
+    assert usage["execution_status"] == "infra_failed" and usage["reason_code"] == "provider_unavailable"
+    task = {"id": "presence-turn", "type": "task", "chat_id": 7, "text": "Investigate",
+            "_is_direct_chat": True, "_presence_turn": True, "_skip_post_task_synthesis": True,
+            "metadata": dict(registry._ctx.task_metadata)}
+    events = []
+    pipeline.emit_task_results(SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), None, None,
+        events, task, result, usage, trace, 0.0, tmp_path / "logs", ctx=registry._ctx)
+    delivery = next(row for row in events if row["type"] == "presence_result")
+    assert delivery["outcome"] == "deferred" and delivery["work_ref"] == "presence-work"
+    assert delivery["text"].count("[Host status]") == 1
+    stored = load_task_result(tmp_path, task["id"])
+    assert stored["status"] == "failed" and stored["reason_code"] == "provider_unavailable"
+    assert stored["metadata"]["presence_work_ref"] == "presence-work"
 
-    assert "Swarm admitted managed task swarm-task-1" in result
-    assert calls["n"] >= 2  # the ephemeral turn waited and redialed before the terminal
-    assert usage.get("execution_status") is None
-    assert usage.get("reason_code") is None
 
-
-@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat"])
 def test_outage_first_observed_mid_chain_latches_episode_and_recovers(tmp_path, monkeypatch, turn_flag):
     """Primary fails generically (429-class), the chain walks, and a REMOTE
     candidate dies pre-dispatch: the post-chain reconcile must latch an episode
     from the FRESH kind — wait, redial, recover — instead of the generic
     terminal dialing a forced-final call over the proven-dead egress. The latch
-    is turn-kind independent: a direct-chat or ephemeral turn waits and
+    is turn-kind independent: a direct-chat turn waits and
     recovers the same way, and never remote-fallbacks over the dead egress."""
     calls = {"n": 0}
 
@@ -427,7 +423,7 @@ def test_outage_first_observed_mid_chain_latches_episode_and_recovers(tmp_path, 
     assert phases[-1] == "recovered"
 
 
-@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat"])
 def test_mid_chain_latch_that_never_recovers_takes_the_no_resend_terminal(tmp_path, monkeypatch, turn_flag):
     """The mid-chain latch drives the same terminal as a primary-first outage:
     free redials until the binding window (a managed task's deadline, an

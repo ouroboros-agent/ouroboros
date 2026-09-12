@@ -1473,7 +1473,7 @@ def _render_attachment_lines(attachments: Any) -> str:
         label = str(item.get("label") or f"attachment {ordinal + 1}").strip()
         if status == "rejected":
             reason = str(item.get("reason") or "staging_failed").strip()
-            lines.append(f"- {label}: rejected (reason={reason}, ordinal={ordinal})")
+            lines.append(f"- {label}: rejected (reason={reason}, ordinal={ordinal})" + (f" rule: {rule}" if (rule := str(item.get("rule") or "").strip()) else ""))
             continue
         relpath = str(item.get("relpath") or "").strip()
         root = str(item.get("root") or "artifact_store").strip() or "artifact_store"

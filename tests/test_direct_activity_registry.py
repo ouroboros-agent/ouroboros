@@ -20,20 +20,20 @@ def test_registry_basic_lifecycle():
         chat_id=1,
         client_message_id="msg-101",
         project_id="proj-alpha",
-        kind="ephemeral_decision",
+        kind="direct_chat",
         phase="thinking",
     )
     assert entry.activity_id == "act-1"
     assert entry.chat_id == 1
     assert entry.client_message_id == "msg-101"
     assert entry.project_id == "proj-alpha"
-    assert entry.kind == "ephemeral_decision"
+    assert entry.kind == "direct_chat"
     assert entry.phase == "thinking"
 
     snap = registry.snapshot()
     assert len(snap) == 1
     assert snap[0]["activity_id"] == "act-1"
-    assert snap[0]["kind"] == "ephemeral_decision"
+    assert snap[0]["kind"] == "direct_chat"
     # Snapshot shape is the exact ActiveDirectTurn contract — no extra keys.
     assert set(snap[0].keys()) == {
         "activity_id",
@@ -57,7 +57,7 @@ def test_registry_basic_lifecycle():
 def test_registry_multi_chat_isolation():
     registry = DirectActivityRegistry()
     registry.register("act-main", chat_id=1, kind="direct_chat")
-    registry.register("act-proj-2", chat_id=2, project_id="proj-2", kind="ephemeral_decision")
+    registry.register("act-proj-2", chat_id=2, project_id="proj-2", kind="direct_chat")
     registry.register("act-proj-3", chat_id=3, project_id="proj-3", kind="direct_chat")
 
     assert len(registry.snapshot()) == 3
@@ -96,7 +96,7 @@ def test_track_direct_activity_context_manager():
 
     # Guaranteed cleanup on exception
     with pytest.raises(RuntimeError, match="deliberate failure"):
-        with track_direct_activity("act-cm-fail", chat_id=1, kind="ephemeral_decision"):
+        with track_direct_activity("act-cm-fail", chat_id=1, kind="direct_chat"):
             assert len(registry.snapshot(chat_id=1)) == 1
             raise RuntimeError("deliberate failure")
 

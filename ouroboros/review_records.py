@@ -148,6 +148,11 @@ class ReviewSlot:
     subagent_id: str = ""
     # Host sampling hint, resolved at dispatch; an explicit temperature wins.
     default_temperature: float | None = None
+    # The effort this row runs at because the CALLER declared it for one order
+    # (plan review's ``reviewer_effort``): '' when the row's own effort, a
+    # compound route slug or the surface setting applied. Disclosure for the
+    # last-execution projection; identity already rides ``effort``.
+    declared_effort: str = ""
 
     @property
     def native_retrieval(self) -> bool:
@@ -187,6 +192,10 @@ class ReviewRequest:
     deadline_at: str = ""
     retry_key: str = ""
     reconcile_only: bool = False
+    # Absolute ``time.monotonic()`` instant after which the coordinator stops
+    # waiting for workers still in flight and returns their typed
+    # ``pending_dispatch`` rows; ``None`` waits each slot's own logical window.
+    drain_deadline: Optional[float] = None
     # Existing surface fingerprints, carried only to physical provenance.
     reconciliation_identity: Dict[str, Any] = field(default_factory=dict)
     task_attempt: Any = None

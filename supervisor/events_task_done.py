@@ -222,13 +222,12 @@ def _finish_task_done_dispatch(
     # resolver, so open owner-quiz/hurry projections settle on EVERY dispatched
     # terminal transition (ingress lazy-heal covers producers that bypass it,
     # e.g. orphaned-RUNNING reconciliation).
-    if not bool(evt.get("_ephemeral")):
-        try:
-            from supervisor.queue_transitions import reconcile_terminal_task_projections
+    try:
+        from supervisor.queue_transitions import reconcile_terminal_task_projections
 
-            reconcile_terminal_task_projections(ctx.DRIVE_ROOT, str(task_id))
-        except Exception:
-            log.debug("terminal projection reconcile failed for %s", task_id, exc_info=True)
+        reconcile_terminal_task_projections(ctx.DRIVE_ROOT, str(task_id))
+    except Exception:
+        log.debug("terminal projection reconcile failed for %s", task_id, exc_info=True)
 
     append_terminal_task_projection(
         ctx.DRIVE_ROOT, str(task_id or ""), task, final_task_result, task_done_event,
@@ -402,10 +401,6 @@ def _finish_task_done_dispatch(
             exc_info=True,
         )
 
-    if bool(evt.get("_ephemeral")):
-        # An ephemeral direct-chat decision turn shows its failure inline —
-        # no duplicate provider-outage owner ping.
-        return
     _events()._maybe_notify_provider_death(ctx, task_id, task, final_task_result, task_done_event)
     try:
         results_dir = pathlib.Path(ctx.DRIVE_ROOT) / "task_results"
@@ -624,7 +619,7 @@ def _resolve_lifecycle_fault(
 def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> bool:
     """AR2-3 / GR2-3 (§8-A1): validate ``task_done`` through the DURABLE result.
 
-    UNCONDITIONAL for every non-ephemeral task_done: the durable post-copy-back
+    UNCONDITIONAL for every task_done: the durable post-copy-back
     result must be settled (or the formalized ``interrupted`` transient),
     regardless of what the event's own status field says. The original AR2-3
     check gated on a settled event CLAIM — and the PRIMARY producer
@@ -633,13 +628,12 @@ def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> boo
     running/absent row sailed through to publication. A blank status is now
     validated exactly like a settled claim: the worker asserted "done" and the
     disk must agree. Refused + forensic row; the existing fault-resolution
-    path decides slot fate. Two exemptions stand: ephemeral turns (their event
-    IS their terminal outcome — no durable lifecycle) and an ``interrupted``
+    path decides slot fate. The exemption is an ``interrupted``
     event status (its owner is the snapshot restore/requeue path). Never
     raises.
     """
     try:
-        if bool(evt.get("_ephemeral")) or not task_id:
+        if not task_id:
             return False
         evt_status = str(evt.get("status") or "").strip().lower()
         from ouroboros.task_results import STATUS_INTERRUPTED
@@ -724,16 +718,15 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     # (the incident's shape: the cancel latch published as a terminal) is a
     # durable LIFECYCLE FAULT — recorded loudly, RUNNING/worker state NOT
     # released (the row stays visible for custody/watchdog to settle honestly),
-    # never a crash. Two deliberate exemptions: ephemeral direct-chat decision
-    # turns (no durable task-result lifecycle — their event IS their terminal
-    # outcome), and ``interrupted`` — the FORMALIZED transient the update/restart
+    # never a crash. The deliberate exemption is ``interrupted`` — the
+    # FORMALIZED transient the update/restart
     # teardown publishes for this generation (A1.11): its owner is the snapshot
     # restore/requeue path, and the effective-status orphan reconcile terminal-
     # izes a retry-less leftover, so it can never wedge the way the latch did.
     # The durable half of the same law (AR2-3) runs after the child copy-back:
     # a SETTLED event claim over a NON-settled durable row is refused too.
     _evt_status = str(evt.get("status") or "").strip().lower()
-    if _evt_status and not bool(evt.get("_ephemeral")):
+    if _evt_status:
         from ouroboros.task_results import STATUS_INTERRUPTED as _INTERRUPTED
         from ouroboros.task_status import SETTLED_STATUSES as _SETTLED
 
@@ -758,7 +751,7 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             _events()._resolve_lifecycle_fault(evt, ctx, _evt_status)
             return
     recovery = meta.get("_terminal_file_recovery") or {}
-    if task and not (evt.get("_ephemeral") or task.get("_is_direct_chat") or _evt_status == STATUS_INTERRUPTED):
+    if task and not (task.get("_is_direct_chat") or _evt_status == STATUS_INTERRUPTED):
         if prepared_attempt is None or (recovery and not recovery.get("event_sent")):
             from supervisor.task_reaper import enqueue_terminal_file_recovery
 
@@ -791,7 +784,7 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             return
         try:
             final_task_result = load_task_result(ctx.DRIVE_ROOT, str(task_id), strict=True) or {}
-            if not evt.get("_ephemeral") and _evt_status != STATUS_INTERRUPTED:
+            if _evt_status != STATUS_INTERRUPTED:
                 from ouroboros.headless import terminal_task_files_ready
 
                 if not terminal_task_files_ready(
@@ -844,8 +837,6 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         "artifact_status": artifact_status,
         **terminal_cost,
     }
-    if bool(evt.get("ephemeral_decision") or evt.get("_ephemeral")):
-        task_done_event["ephemeral_decision"] = True
     if str(evt.get("typed_routing_action") or "").strip():
         task_done_event["typed_routing_action"] = str(evt.get("typed_routing_action") or "").strip()
     if isinstance(artifact_bundle, dict):
@@ -858,8 +849,6 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     if review_projection := _events()._task_done_review_projection(final_task_result, evt):
         task_done_event["review_projection"] = review_projection
     model_execution = final_task_result.get("model_execution")
-    if evt.get("_ephemeral"):
-        model_execution = evt.get("model_execution")
     if isinstance(model_execution, dict):
         task_done_event["model_execution"] = model_execution
     try:

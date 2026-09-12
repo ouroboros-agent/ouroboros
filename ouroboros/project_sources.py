@@ -121,12 +121,13 @@ def is_git_worktree_root(path: pathlib.Path) -> bool:
 
 
 def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:
-    """Unstage credential-shaped files after ``git add -A`` and keep them untracked
+    """Unstage credential files after ``git add -A`` and keep them untracked
     via `.git/info/exclude` (local-only — the owner's folder files are never edited).
-    Same `_sensitive_untracked_reason` SSOT the workspace patch and coop checkpoint
-    use (triad r4: an attach snapshot must not bake `.env`/keys into history).
-    Returns the skipped relative paths for disclosure."""
-    from ouroboros.headless import _sensitive_untracked_reason
+    Same two checks the workspace patch and the coop checkpoint apply: the exact
+    credential leaves of `_sensitive_untracked_reason` and the private-key content
+    evidence of `pem_private_key_reason` (triad r4: an attach snapshot must not
+    bake `.env`/keys into history). Returns the skipped paths for disclosure."""
+    from ouroboros.headless import _sensitive_untracked_reason, pem_private_key_reason
 
     staged = subprocess.run(
         ["git", "diff", "--cached", "--name-only", "-z"],
@@ -134,7 +135,7 @@ def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:
     )
     skipped = [
         rel for rel in (staged.stdout or "").split("\0")
-        if rel and _sensitive_untracked_reason(rel)
+        if rel and (_sensitive_untracked_reason(rel) or pem_private_key_reason(path, rel))
     ]
     if not skipped:
         return []

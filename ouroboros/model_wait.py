@@ -254,15 +254,11 @@ class TaskModelWait:
     def mutate_row(self, wait_id: str, transform: Callable) -> dict:
         if self.row_mutator is not None:
             return self.row_mutator(wait_id, transform)
-        if self.task.get("_ephemeral_turn"):
-            return mutate_live_wait(self, wait_id, transform)
         return mutate_wait(self.canonical_root, self.task_id, wait_id, transform)
 
     def read_rows(self) -> dict:
         if self.rows_reader is not None:
             return self.rows_reader()
-        if self.task.get("_ephemeral_turn"):
-            return self.snapshot()["model_waits"]
         from ouroboros.task_results import load_task_result
         return (load_task_result(self.canonical_root, self.task_id, strict=True) or {}).get("model_waits", {})
 
@@ -416,8 +412,6 @@ class TaskModelWait:
             public = {key: copy.deepcopy(value) for key, value in row.items() if not key.startswith("_")}
             event = {"type": "task_model_wait", "ts": utc_now_iso(), "task_id": self.task_id,
                      **public, "quota_clock": clock_projection, "is_progress": False}
-            if self.task.get("_ephemeral_turn"):
-                event["ephemeral_decision"] = True
             if self.owner_id:
                 event["model_wait_owner_id"] = self.owner_id
         # The owner's projection precedes notification. The handler owns the
@@ -575,12 +569,6 @@ class TaskModelWait:
     def close(self) -> None:
         with self.lock:
             self.closed = True
-            if self.task.get("_ephemeral_turn"):
-                # This turn has no durable task_done cleanup. Decisions hold this
-                # same lock for their final live check and mailbox write.
-                from ouroboros.owner_mailbox import cleanup_task_mailbox
-
-                cleanup_task_mailbox(pathlib.Path(self.drive_root), self.task_id)
 
 
 @contextlib.contextmanager
@@ -591,12 +579,7 @@ def task_model_wait_scope(*, task: dict, drive_root: Any, event_queue: Any,
                             worker_slot_held=worker_slot_held, **owner_hooks)
     token = _CURRENT.set(context)
     try:
-        with contextlib.ExitStack() as stack:
-            if task.get("_ephemeral_turn"):
-                from supervisor.active_activity import get_direct_activity_registry
-
-                stack.enter_context(get_direct_activity_registry().bind_model_wait(context))
-            yield context
+        yield context
     finally:
         context.close()
         _CURRENT.reset(token)

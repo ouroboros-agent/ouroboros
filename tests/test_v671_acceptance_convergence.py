@@ -664,3 +664,43 @@ def test_solved_partial_pass_preserves_judgment_without_clean_objective(tmp_path
     assert review["status"] == "pass"
     assert review["outcome_tier"] == objective["outcome_tier"] == "solved"
     assert objective["status"] == "best_effort"
+
+
+def test_a_quiz_answer_unbinds_the_advisory_author_finish(tmp_path, monkeypatch):
+    """P1-6(g), the second consumer: the advisory author finish is bound to the
+    directive count captured with the intent; an owner quiz answer drained afterwards
+    grows the corpus, so the intent no longer binds and no finish is minted."""
+    import queue
+
+    import pytest
+
+    from ouroboros import loop as loop_mod
+    from ouroboros.loop_acceptance_review import _finish_advisory_author
+    from ouroboros.loop_delivery import delivery_evidence_fingerprint
+    from ouroboros.loop_round_limits import _drain_incoming_messages
+    from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, write_owner_message
+    from tests.test_acceptance_delivery import _acceptance_ctx
+
+    ctx = _acceptance_ctx(tmp_path)
+    ctx.tools._ctx._owner_directives = [{"source": "initial_user", "content": "goal"}]
+    binding = ctx.review_binding["binding_hash"]
+    ctx.llm_trace["review_runs"] = [{"authority": "host_root", "feedback_delivered": True,
+                                     "binding_hash": binding, "aggregate_signal": "FAIL"}]
+    ctx.llm_trace["acceptance_decision"] = {
+        "agent_disposition": "accepted", "agent_rationale": "done",
+        "agent_finish_intent": {"review_binding_hash": binding, "tool_count": 0, "owner_directives": 1,
+                                "evidence_fingerprint": delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)},
+    }
+    monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "advisory")
+
+    def _bound(*_a, **_k):
+        raise RuntimeError("intent bound: the finish proceeds")
+
+    monkeypatch.setattr(loop_mod, "_end_task_acceptance_fence", _bound)
+    with pytest.raises(RuntimeError, match="intent bound"):
+        _finish_advisory_author(ctx)  # the captured count matches: the finish proceeds
+    write_owner_message(tmp_path, "[Owner quiz answer] quiz q1\nThe owner chose option 1: ship", task_id="root-delivery",
+                        msg_id="qa-1", kind=KIND_QUIZ_ANSWER)
+    _drain_incoming_messages(ctx.messages, queue.Queue(), tmp_path, "root-delivery", None, set(), owner_ctx=ctx.tools._ctx)
+    assert [row["source"] for row in ctx.tools._ctx._owner_directives] == ["initial_user", "owner_quiz_answer"]
+    assert _finish_advisory_author(ctx) is False  # premises changed: no author finish on the old intent

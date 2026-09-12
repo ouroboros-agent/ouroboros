@@ -24,7 +24,7 @@ class PlanReviewSourceUnavailable(ValueError):
 
 
 def persist_wave(drive_root: Any, task_id: str, wave: Dict[str, Any]) -> Dict[str, Any]:
-    from ouroboros.artifacts import store_task_artifact_bytes
+    from ouroboros.artifacts import store_actor_source_bytes
     from ouroboros.observability import redact_projection
     from ouroboros.utils import utc_now_iso
 
@@ -50,12 +50,10 @@ def persist_wave(drive_root: Any, task_id: str, wave: Dict[str, Any]) -> Dict[st
     raw = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     ).encode("utf-8")
-    digest = sha256(raw).hexdigest()
     cycle = int(wave.get("cycle_index") or 0)
-    return store_task_artifact_bytes(
-        drive_root, task_id,
-        f"plan-review-wave-{cycle:04d}-{fingerprint}-{digest[:12]}.json",
-        raw, kind="plan_review_wave",
+    return store_actor_source_bytes(
+        drive_root, task_id, category="context_checkpoints",
+        source_id=f"plan-review-wave-{cycle:04d}-{fingerprint}", data=raw, extension="json",
     )
 
 
@@ -64,12 +62,16 @@ def read_wave(drive_root: Any, task_id: str, ref: Dict[str, Any]) -> Dict[str, A
 
     if not isinstance(ref, dict) or ref.get("root") != "artifact_store":
         raise ValueError("invalid plan-review wave artifact ref")
-    name = pathlib.Path(str(ref.get("path") or "")).name
-    if not name or name != str(ref.get("path") or ""):
-        raise ValueError("invalid plan-review wave artifact path")
-    raw = (task_artifact_dir_path(drive_root, task_id, create=False) / name).read_bytes()
-    if len(raw) != int(ref.get("bytes") or -1) or sha256(raw).hexdigest() != str(ref.get("sha256") or ""):
-        raise ValueError("plan-review wave artifact digest mismatch")
+    if ref.get("kind") == "task_source":
+        from ouroboros.artifacts import read_actor_source_bytes
+        raw = read_actor_source_bytes(drive_root, task_id, ref)
+    else:
+        name = pathlib.Path(str(ref.get("path") or "")).name
+        if not name or name != str(ref.get("path") or ""):
+            raise ValueError("invalid plan-review wave artifact path")
+        raw = (task_artifact_dir_path(drive_root, task_id, create=False) / name).read_bytes()
+        if len(raw) != int(ref.get("bytes") or -1) or sha256(raw).hexdigest() != str(ref.get("sha256") or ""):
+            raise ValueError("plan-review wave artifact digest mismatch")
     value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("plan-review wave artifact is not an object")
@@ -115,11 +117,21 @@ def authority_wave(drive_root: Any, task_id: str, hot_wave: Optional[dict]) -> O
         if (not isinstance(spec, dict) or exact.get("spec_body_truncated")
                 or spec_hash(spec) != exact.get("spec_hash")):
             raise PlanReviewSourceUnavailable("PLAN_REVIEW_SOURCE_UNAVAILABLE: artifact has no complete spec")
+    dialogue_ref = hot_wave.get("dialogue_source_ref") or exact.get("dialogue_source_ref")
+    if dialogue_ref:
+        from ouroboros.artifacts import read_actor_source_bytes
+        read_actor_source_bytes(drive_root, task_id, dialogue_ref)
     restored = {
         **exact, **hot_wave,
         "spec": copy.deepcopy(spec), "goal": spec.get("goal") or "",
         "findings": list(exact.get("findings") or []),
     }
+    if dialogue_ref and isinstance(restored.get("evidence_manifest_full"), dict):
+        from ouroboros.artifacts import task_artifact_dir_path
+        restored["evidence_manifest_full"] = copy.deepcopy(restored["evidence_manifest_full"])
+        own = restored["evidence_manifest_full"].get("own_dialogue")
+        if isinstance(own, dict):
+            own.update(source_ref=dialogue_ref, file=str(task_artifact_dir_path(drive_root, task_id, create=False) / dialogue_ref["path"]))
     restored.pop("spec_in_artifact", None)
     restored.pop("spec_body_truncated", None)
     return restored
@@ -219,8 +231,9 @@ def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
     if physical_state in POSITIVE_PHYSICAL_ATTEMPT_STATES:
         return True
     # With no physical capture, an explicit $0 state wins over the synthetic
-    # operation id assigned before provider admission.
-    if operation_state == "not_dispatched" or status == "not_dispatched":
+    # operation id assigned before provider admission; a slot released at the
+    # dispatch barrier (``pending_dispatch``) is unproven, hence $0 until settled.
+    if operation_state in {"not_dispatched", "pending_dispatch"} or status == "not_dispatched":
         return False
     # Pre-B1 rows and a current substrate omission may lack an operation id.
     # Absence is not proof of $0: only the explicit states above authorize that
@@ -283,9 +296,12 @@ def in_flight_resume_inputs(
             "The prior paid cycle's exact reviewer rows do not match its frozen roster. "
             "Refusing to guess which physical calls own custody."
         )}
+    # The cycle's own physical set: rows proven dispatched plus rows released at
+    # the dispatch barrier (awaiting their worker's report) — never re-dispatched.
     dispatched_ids = {
         str(row.get("slot_id") or "") for row in actor_rows
         if _row_has_physical_dispatch(row)
+        or str(row.get("operation_state") or "") == "pending_dispatch"
     }
     if not dispatched_ids or any(
         (str(row.get("operation_state") or "") == "in_flight"
@@ -388,7 +404,14 @@ def record_exact_wave(
         extension="json",
     )
     wave["spec_source_ref"] = source
-    exact = {**exact, "spec_source_ref": source}
+    manifest = exact.get("evidence_manifest_full") or {}
+    own = manifest.get("own_dialogue") or {}
+    identity = {"author_request_fingerprint": manifest.get("author_request_fingerprint", ""),
+                "dialogue_chat_id": own.get("chat_id")}
+    if own.get("source_ref"):
+        identity["dialogue_source_ref"] = own["source_ref"]
+    wave.update(identity)
+    exact = {**exact, **identity, "spec_source_ref": source}
     wave["wave_artifact"] = persist_wave(state_root, task_id, exact)
     stored = record_plan_review_wave(
         state_root, task_id, hot_index_wave(wave, page_size=page_size),
@@ -498,26 +521,80 @@ def continuation_inputs(
     return slots, slot_messages, session_threads, ""
 
 
+def frozen_delivery_inputs(wave: dict, slots: list) -> dict:
+    """Reuse exact request policy and per-slot inputs; never re-fit live context."""
+    policy, sizes = wave.get("request_policy"), wave.get("slot_prompt_chars")
+    if not isinstance(policy, dict) or not isinstance(sizes, dict):
+        raise PlanReviewSourceUnavailable(
+            "PLAN_REVIEW_SOURCE_UNAVAILABLE: original request policy/fit was not recorded; "
+            "current values cannot stand in for the paid request")
+    outputs = {str(row.get("slot_id") or ""): row for row in wave.get("reviewer_outputs") or []}
+    actors = {str(row.get("slot_id") or ""): row for row in wave.get("actors") or []}
+    messages, tasks = {}, {}
+    for slot in slots:
+        sid = str(slot.slot_id)
+        if actors.get(sid, {}).get("operation_state") == "not_dispatched":
+            continue  # A frozen zero-send refusal has no paid input to rejoin.
+        row = outputs.get(sid)
+        if not isinstance(row, dict) or sid not in sizes:
+            raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded slot inputs missing: {sid}")
+        if bool(getattr(slot, "retrieves", False)):
+            if not row.get("session_task"):
+                raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded retrieving task missing: {sid}")
+            tasks[sid] = str(row["session_task"])
+        else:
+            if not row.get("request_messages"):
+                raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded packet missing: {sid}")
+            messages[sid] = copy.deepcopy(row["request_messages"])
+    return {"request_policy": copy.deepcopy(policy), "slot_messages": messages,
+            "slot_session_tasks": tasks, "slot_prompt_chars": dict(sizes),
+            "dialogue_delivery": copy.deepcopy(wave.get("dialogue_delivery") or {}),
+            "native_mandatory_read_chars": int(policy.get("native_mandatory_read_chars") or 0)}
+
+
 def exact_wave(
     wave: dict, *, plan_prose: str, manifest: dict, slots: List[Any], rows: List[dict],
     system_prompt: str, user_content: str, session_task: str,
-    slot_messages: Dict[str, List[Dict[str, Any]]],
+    slot_messages: Dict[str, List[Dict[str, Any]]], dispatched: Optional[dict] = None,
+    slot_session_tasks: Optional[dict] = None, dialogue_delivery: Optional[dict] = None,
+    request_policy: Optional[dict] = None, slot_prompt_chars: Optional[dict] = None,
 ) -> dict:
+    """``dispatched`` = the exact wave a reconciliation is resuming over.
+
+    A reconcile-only cycle (the $0 collection and the identical-envelope resume)
+    physically sends nothing: it re-records the wave the reviewers already answered.
+    The packet is rebuilt from the LIVE task context on that path, so a directive that
+    arrived after the dispatch would otherwise be written into the reviewers' recorded
+    request and, through ``continuation_inputs``, into the prior history of the next
+    paid cycle. The recorded request of each slot that already has one is therefore
+    carried forward byte for byte; only a slot with no recorded request (a roster row
+    the dispatched wave never had) falls back to the rebuilt packet."""
     from ouroboros.tools.plan_packet import plan_user_stable_len
     from ouroboros.tools.review_synthesis import build_plan_review_messages
 
     common = build_plan_review_messages(system_prompt, user_content, plan_user_stable_len(user_content))
+    sent = {
+        str(r.get("slot_id") or ""): r
+        for r in ((dispatched or {}).get("reviewer_outputs") or []) if isinstance(r, dict)
+    }
+    native_slots = {str(slot.slot_id) for slot in slots if bool(getattr(slot, "native_retrieval", False))}
     outputs = []
     for row in rows:
         sid, route = str(row.get("slot_id") or ""), str(row.get("route") or "")
+        recorded = sent.get(sid) or {}
         outputs.append({
             "slot_id": sid, "model": str(row.get("model") or ""),
             "request_model": str(row.get("request_model") or ""), "route": route,
             "text": str(row.get("text") or ""), "error": str(row.get("error") or ""),
             "request_messages": (
-                list(slot_messages[sid]) if sid in slot_messages else common
-            ) if route == "api_chat" else [],
-            "session_task": session_task if route == "agent_session" else "",
+                [dict(m) for m in recorded["request_messages"]]
+                if isinstance(recorded.get("request_messages"), list) and recorded["request_messages"]
+                else list(slot_messages[sid]) if sid in slot_messages else common
+            ) if route == "api_chat" and sid not in native_slots else [],
+            "session_task": (
+                str(recorded.get("session_task") or "") or (slot_session_tasks or {}).get(sid) or session_task
+            ) if route == "agent_session" or sid in native_slots else "",
+            "delivery_class": "native_retrieving" if sid in native_slots else route,
             "review_thread_id": str(row.get("review_thread_id") or ""),
             "review_turn_id": str(row.get("review_turn_id") or ""),
             "review_thread_receipt": row.get("review_thread_receipt") or {},
@@ -528,5 +605,8 @@ def exact_wave(
         })
     return {
         **wave, "plan_prose": plan_prose, "evidence_manifest_full": manifest,
+        "dialogue_delivery": dispatched.get("dialogue_delivery", {}) if dispatched is not None else dialogue_delivery or {},
+        "request_policy": copy.deepcopy(dispatched["request_policy"] if dispatched is not None else request_policy),
+        "slot_prompt_chars": copy.deepcopy(dispatched["slot_prompt_chars"] if dispatched is not None else slot_prompt_chars),
         "slots": [slot_row(slot) for slot in slots], "reviewer_outputs": outputs,
     }

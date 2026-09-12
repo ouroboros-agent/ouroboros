@@ -603,6 +603,21 @@ _PEM_PRIVATE_KEY_RE = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_HEAD_READ_BYTES = 4096
 
 
+def pem_private_key_reason(root: pathlib.Path, rel: str) -> str:
+    """Reason a file carries private-key CONTENT, or ``""`` when it does not.
+
+    The bounded head read is the evidence every git lane shares: the patch,
+    the cooperative checkpoint and the attached-folder snapshot. Unreadable
+    heads are treated as ordinary content (fail-soft: git still decides).
+    """
+    try:
+        with (root / rel).open("rb") as fh:
+            head = fh.read(_PEM_HEAD_READ_BYTES)
+    except OSError:
+        return ""
+    return "private key material (PEM private-key header)" if _PEM_PRIVATE_KEY_RE.search(head) else ""
+
+
 def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str, *, file_outputs: Optional[List[str]] = None) -> str:
     """Reason to drop an untracked file from the workspace patch when it is a
     build/runtime BINARY, exceeds the per-file size cap, or carries a PEM
@@ -615,13 +630,8 @@ def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str, *, file_outputs
         size = (root / rel).lstat().st_size
     except OSError:
         return ""  # unreadable/symlink races: include and let git decide
-    try:
-        with (root / rel).open("rb") as fh:
-            head = fh.read(_PEM_HEAD_READ_BYTES)
-    except OSError:
-        head = b""
-    if _PEM_PRIVATE_KEY_RE.search(head):
-        return "private key material (PEM private-key header)"
+    if reason := pem_private_key_reason(root, rel):
+        return reason
     if size > _PATCH_MAX_UNTRACKED_FILE_BYTES:
         if file_outputs is not None:
             file_outputs.append(rel)
@@ -646,9 +656,11 @@ def untracked_capture_veto_reason(root: pathlib.Path, rel: str) -> str:
     The delegated-run baseline snapshot
     (``subagent_worktrees.provision_execution_snapshot``) asks the SAME three
     checks, in the SAME order, that ``write_workspace_patch_artifacts`` applies
-    to untracked files: sensitive/credential-shaped names first, then the
-    static junk rules, then the binary/size veto. One combined predicate here so
-    the snapshot and the patch cannot drift apart about eligibility.
+    to untracked files: the dotenv spellings and exact credential leaves first,
+    then the static junk rules, then the blob veto, which reads the head bytes
+    for a PEM private-key header before the size cap and the binary check. One
+    combined predicate here so the snapshot and the patch cannot drift apart
+    about eligibility.
     Returns the human-readable reason, or "" when the file is eligible.
     """
     reason = _sensitive_untracked_reason(rel)

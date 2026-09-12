@@ -266,3 +266,19 @@ def test_history_replays_quiz_row_with_state(tmp_path):
     assert rec["quiz"]["quiz_id"] == "qz-3"
     assert rec["quiz"]["state"] == "open"
     assert rec["system_type"] == "quiz"  # typed row: replay never reads it as a bare final
+
+
+def test_at_most_one_recommended_option_for_both_callers(monkeypatch, tmp_path):
+    """Fix cycle 2, 2d: the durable record keeps ONE recommended index, so the shared
+    validator refuses a second recommendation for the tool and the bus alike, with the
+    same typed shape as its other refusals; one recommendation passes through intact."""
+    with pytest.raises(QuizValidationError) as err:
+        validate_quiz_payload("q", [{"label": "a", "recommended": True}, {"label": "b", "recommended": True}], "", "assume")
+    assert err.value.code == "QUIZ_RECOMMENDED_INVALID" and "at most one" in str(err.value)
+    one = validate_quiz_payload("q", [{"label": "a"}, {"label": "b", "recommended": True}], "", "assume")
+    assert one["options"] == [{"label": "a"}, {"label": "b", "recommended": True}]
+    bridge = _make_bridge(monkeypatch)
+    ok, error = bridge.send_quiz(
+        1, quiz_id="qz", question="q", task_id="t-1",
+        options=[{"label": "a", "recommended": True}, {"label": "b", "recommended": True}], assumption="x")
+    assert ok is False and error == "mark at most one option as recommended."

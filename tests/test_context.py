@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 
 from ouroboros.context import build_health_invariants, build_runtime_section
 
@@ -65,6 +66,131 @@ class TestCacheHitRateInvariant:
         env = self._make_env(tmp_path, lines)
         result = build_health_invariants(env)
         assert "LOW CACHE HIT RATE" in result
+
+    def _emit_producer_rounds(self, tmp_path, reported, count=6):
+        """Rounds in the PRODUCER's exact shape.
+
+        `loop_llm_call.call_llm_with_retry` is the only emitter of `llm_round`,
+        so a synthesized row proves nothing about what the health line reads:
+        the first version of this rule was inert because the producer stamped
+        `cached_tokens` on every event, including rounds where the provider had
+        reported no cache at all. `reported=None` is a provider that says
+        nothing about caching.
+        """
+        from ouroboros.loop_llm_call import call_llm_with_retry
+
+        class _LLM:
+            def chat(self, **_kwargs):
+                usage = {"provider": "openrouter", "resolved_model": "m",
+                         "prompt_tokens": 1000, "completion_tokens": 10, "cost": 0.0}
+                if reported is not None:
+                    usage["cached_tokens"] = reported
+                return {"content": "ok"}, usage
+
+        for index in range(count):
+            call_llm_with_retry(
+                _LLM(), [{"role": "user", "content": "hi"}], "m", None, "medium", 1,
+                tmp_path / "logs", "cache-probe", index, None, {}, "task", False,
+            )
+
+    def test_no_provider_reported_a_cache_leaves_the_share_unknown(self, tmp_path):
+        """Absence is not a measured zero: a run whose provider never reported a
+        cache rendered as an honest 0% and read as a caching regression nobody
+        had measured."""
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, None)
+        assert _compute_cache_hit_rate(env) is None
+        assert "cache hit rate" not in build_health_invariants(env).lower()
+
+    def test_an_explicitly_reported_zero_is_still_a_real_zero(self, tmp_path):
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, 0)
+        assert _compute_cache_hit_rate(env) == 0.0
+        assert "LOW CACHE HIT RATE" in build_health_invariants(env)
+
+    def test_a_window_with_fewer_than_five_reporting_rounds_stays_unknown(self, tmp_path):
+        """The five-round threshold counts MEASUREMENTS, not rounds. Three
+        reporters beside three silent rounds are still too thin a sample to
+        publish a share, so the invariant says nothing rather than a number the
+        window cannot support."""
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, None, count=3)
+        self._emit_producer_rounds(tmp_path, 600, count=3)
+        assert _compute_cache_hit_rate(env) is None
+
+    def test_silent_rounds_stay_out_of_the_reporters_denominator(self, tmp_path):
+        """A mixed install reads the reporters' own ratio.
+
+        Charging a silent round's prompt tokens to the denominator turned a
+        provider that never measured a cache into measured misses: the share
+        collapsed and "LOW CACHE HIT RATE" fired for a regression no round had
+        measured. Five reporters at 600 cached of 1000 prompt are 60%, whatever
+        the silent rounds beside them spent."""
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, None, count=3)
+        self._emit_producer_rounds(tmp_path, 600, count=5)
+        assert _compute_cache_hit_rate(env) == 0.6
+
+    @pytest.mark.parametrize("reports, expected_rate", [
+        ([None] * 6, None),
+        ([0] * 6, 0.0),
+        ([600] * 6, 0.6),
+        ([None] * 10 + [600] * 5, 0.6),
+    ], ids=["unknown", "measured_zero", "measured_hit", "mixed"])
+    def test_nullable_adapter_cache_reaches_durable_and_live_rounds(
+        self, tmp_path, reports, expected_rate,
+    ):
+        """The real adapter uses a present null key for an unreported cache.
+
+        Omitted-key fixtures alone missed the producer turning that null into
+        zero. Both round events must preserve the measurement before health
+        computes its share over the reporting rounds.
+        """
+        from queue import Queue
+        from ouroboros.context_health import _compute_cache_hit_rate
+        from ouroboros.llm_claudexor import _usage
+        from ouroboros.loop_llm_call import call_llm_with_retry
+
+        env = self._make_env(tmp_path, [])
+        events = Queue()
+        accumulated = {}
+
+        class LLM:
+            def chat(self, **_kwargs):
+                counters = {"input_tokens": 1000, "output_tokens": 10}
+                if reported is not None:
+                    counters["cached_input_tokens"] = reported
+                usage, cost, final = _usage({"usage": counters})
+                usage.update(provider="claudexor", resolved_model="claudexor/probe",
+                             cost=cost, cost_final=final)
+                return {"content": "Completed synthetic round."}, usage
+
+        for index, reported in enumerate(reports, 1):
+            message, _cost = call_llm_with_retry(
+                LLM(), [{"role": "user", "content": "Check the report."}],
+                "claudexor/probe", None, "medium", 1, tmp_path / "logs",
+                "nullable-cache", index, events, accumulated,
+            )
+            assert message["content"] == "Completed synthetic round."
+        rows = [json.loads(line) for line in (tmp_path / "logs/events.jsonl").read_text().splitlines()
+                if line.strip()]
+        durable = [row["cached_tokens"] for row in rows if row.get("type") == "llm_round"]
+        live = []
+        while not events.empty():
+            event = events.get_nowait()
+            if event.get("type") == "log_event" and event["data"].get("type") == "llm_round_finished":
+                live.append(event["data"]["cached_tokens"])
+        assert durable == reports
+        assert live == reports
+        assert _compute_cache_hit_rate(env) == expected_rate
 
 
 def test_health_invariants_reports_remote_context_overflow(tmp_path):

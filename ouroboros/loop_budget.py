@@ -60,9 +60,6 @@ def _check_budget_limits(
         accumulated_usage["reason_code"] = "budget_exhausted"
         if ctx.round_idx <= 1:
             trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
-            router_result = _loop()._forced_swarm_router_result(ctx, trace, "budget_exhausted")
-            if router_result is not None:
-                return router_result
             tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
             suffix = (
                 _loop()._force_plan_disclosure(tool_ctx, trace, forced_reason="budget_exhausted")

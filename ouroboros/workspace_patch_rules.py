@@ -121,14 +121,6 @@ def _sensitive_untracked_reason(rel: str) -> str:
         return "dotenv secret"
     if lower in _SENSITIVE_KEY_NAMES or lower in _SENSITIVE_FILENAMES:
         return "credential filename"
-    parts = lower.replace(".", " ").replace("-", " ").replace("_", " ").split()
-    if (
-        any(part in {"secret", "secrets", "credential", "credentials", "token"} for part in parts)
-        or ("service" in parts and "account" in parts)
-    ) and lower.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".txt")):
-        return "credential-like filename"
-    if lower.endswith((".pem", ".key", ".p12", ".pfx")):
-        return "private key or certificate"
     return ""
 
 

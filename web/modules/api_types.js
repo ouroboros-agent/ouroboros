@@ -467,6 +467,7 @@
  * @typedef {Object} QuizOption
  * @property {string} label
  * @property {string=} detail
+ * @property {boolean=} recommended
  */
 
 /**

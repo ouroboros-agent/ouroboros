@@ -1,8 +1,7 @@
 """The runtime section and the user content the context builder emits.
 
 Split verbatim out of ``tests/test_context.py`` by theme. This module owns the
-force-plan notice that must not rewrite the user's text, the ephemeral force plan that
-only routes, the light-mode rule and filesystem affordances the runtime section states,
+force-plan notice that must not rewrite the user's text, the light-mode rule and filesystem affordances the runtime section states,
 the workspace rules that preserve system review/commit authority, the host routing
 manifest and manual contract, the improvement backlog digest, and the runtime_env
 block.
@@ -46,6 +45,11 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     assert content.startswith("[SWARM_INITIATIVE]")
     assert "Source: swarm." in content
     assert f"Resolved review enforcement: {enforcement}." in content
+    # The obligation is constitutional (BIBLE P3) and the gate is structural
+    # (owner_hurry.force_plan_decision); the ORDER of asking, exploring and
+    # planning belongs to the mind (BIBLE P5/P13), never to a prompt choreography.
+    assert "First call plan_task" not in content
+    assert "whether to ask, explore or plan first is your judgment" in content
     assert "Under blocking" in content
     assert "non-mutating preparation" in content
     assert "begin implementation only after review closes" in content
@@ -61,17 +65,19 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 
-def test_ephemeral_force_plan_is_routing_only_and_transfers_work():
+@pytest.mark.parametrize("obsolete_marker", [False, True])
+def test_managed_force_plan_has_only_the_initiative_context(obsolete_marker):
+    text = "  Investigate the alternatives.\nAsk about the actual constraints.\n"
     content = build_user_content({
-        "text": "Fix the marketplace retry flow.",
-        "_ephemeral_turn": True,
+        "text": text, "id": "managed-root", "root_task_id": "managed-root",
+        "_ephemeral_turn": obsolete_marker,
         "metadata": {"force_plan": True, "force_plan_source": "swarm"},
     })
+    assert content.startswith("[SWARM_INITIATIVE]")
+    assert content.count("[SWARM_INITIATIVE]") == 1
+    assert "SWARM_ROUTING_INTENT" not in content
+    assert content.endswith(text)
 
-    assert content.startswith("[SWARM_ROUTING_INTENT]")
-    assert "exactly one NEW managed root" in content
-    assert "do not execute it" in content
-    assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 
 def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch):

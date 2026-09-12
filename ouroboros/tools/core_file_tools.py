@@ -17,8 +17,6 @@ from ouroboros.project_facts import filter_out_project_store as _filter_out_proj
 from ouroboros.project_facts import project_store_access_block as _project_store_access_block
 from ouroboros.protected_artifacts import block_reason_for_path
 from ouroboros.credential_shapes import (  # noqa: F401 — historical facade surface (tools/core re-exports)
-    CREDENTIAL_FILE_SUFFIXES,
-    CREDENTIAL_NAME_RE,
     SUBAGENT_CREDENTIAL_FILE_NAMES as _SUBAGENT_SECRET_FILE_NAMES,
 )
 from ouroboros.tool_access import (
@@ -120,7 +118,7 @@ def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_lin
     if mask_secrets:
         from ouroboros.secret_masking import mask_secret_bytes
 
-        content, masked = mask_secret_bytes(content, mask_opaque=False, preserve_layout=True)
+        content, masked = mask_secret_bytes(content, preserve_layout=True)
     start_raw, max_raw = _coerce_line_window(start_line, max_lines)
     max_raw = max(1, max_raw)
     lines = content.splitlines(keepends=True)
@@ -190,12 +188,25 @@ def _is_skill_owner_state_target(target: pathlib.Path, data_root: pathlib.Path) 
 
 
 class _ListingFailure(Exception):
-    """A failed list_files state that must surface as a FIRST-CLASS tool error.
+    """A CONFINEMENT refusal: the resolved target escapes its root.
 
-    v6.54.3 (review round 4): path-escape / not-found / not-a-directory used to
-    return warning strings INSIDE an ok-shaped JSON list — the exact
-    error-inside-success shape the TB2.1 post-mortem showed silently poisoning
-    reasoning. _list_files renders this as a leading ⚠️ LIST_FILES_ERROR."""
+    v6.54.3 (review round 4): a refusal to list used to return a warning string
+    INSIDE an ok-shaped JSON list — the exact error-inside-success shape the
+    TB2.1 post-mortem showed silently poisoning reasoning. _list_files renders
+    this as a leading ⚠️ LIST_FILES_ERROR, a first-class tool error. Discovery
+    misses are the ``_ListingMiss`` subclass below and are NOT errors."""
+
+
+class _ListingMiss(_ListingFailure):
+    """The read-only DISCOVERY case: the named directory is simply not there.
+
+    A confinement refusal and a miss are different outcomes. Looking for a
+    directory that does not exist (or naming a file where a directory was
+    expected) is what discovery IS, and colouring the whole task's execution
+    axis for it made a later success on a differently-spelled path unable to
+    credit the recovery. _list_files renders this as its own result with a
+    leading ⚠️ LIST_FILES_NOT_FOUND and warning severity — still an explicit,
+    marked refusal to list, never an error string inside an ok-shaped listing."""
 
 
 def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]:
@@ -208,9 +219,9 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]
     except ValueError:
         raise _ListingFailure(f"Path escapes root: {rel}") from None
     if not target.exists():
-        raise _ListingFailure(f"Directory not found: {rel}")
+        raise _ListingMiss(f"Directory not found: {rel}")
     if not target.is_dir():
-        raise _ListingFailure(f"Not a directory: {rel}")
+        raise _ListingMiss(f"Not a directory: {rel}")
     items = []
     # A hard iterdir/permission/race failure PROPAGATES: _list_files renders it
     # as a first-class "⚠️ LIST_FILES_ERROR" tool error, never an ok-shaped JSON
@@ -226,9 +237,9 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]
 
 def _list_user_files_dir(ctx: ToolContext, root: pathlib.Path, target: pathlib.Path, max_entries: int = 500) -> List[str]:
     if not target.exists():
-        raise _ListingFailure(f"Directory not found: {target}")
+        raise _ListingMiss(f"Directory not found: {target}")
     if not target.is_dir():
-        raise _ListingFailure(f"Not a directory: {target}")
+        raise _ListingMiss(f"Not a directory: {target}")
     items: List[str] = []
     hidden = 0
     # A hard iterdir/permission/race failure PROPAGATES to the first-class
@@ -414,7 +425,7 @@ def _data_read(
                 if is_restricted_subagent_profile(ctx):
                     from ouroboros.secret_masking import mask_secret_bytes
 
-                    content, masked = mask_secret_bytes(content, mask_opaque=False, preserve_layout=True)
+                    content, masked = mask_secret_bytes(content, preserve_layout=True)
                     if masked:
                         content += f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) replaced with *."
                 return content
@@ -720,17 +731,20 @@ def _read_file(
                                       ))
         if normalized == "user_files" and not raw_owner_secret_access:
             # Egress seam for owner-home reads (#447 X1/В23): the file may be
-            # read, but raw credential bytes never enter model context/history —
-            # the masked form (***) may. Masking happens on the rendered slice;
-            # the search egress applies the same seam to its match lines.
+            # read; bytes in a recognized credential format or a PEM block leave
+            # as the masked form (***), and secrets in unrecognized formats are
+            # not detected at all (owner answer 5=A removed the opaque-run rule).
+            # Masking happens on the rendered slice; the search egress applies
+            # the same seam to its match lines.
             from ouroboros.secret_masking import mask_secret_bytes
 
             rendered, masked = mask_secret_bytes(rendered)
             if masked:
                 rendered += (
-                    f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) in this "
-                    "view were replaced with ***; raw credentials never enter model "
-                    "context. Reference them by location, not value."
+                    f"\n⚠️ SECRET_BYTES_MASKED: {masked} span(s) in this view matched a "
+                    "recognized credential format or a PEM block and were replaced with "
+                    "***; secrets in unrecognized formats are not detected. Reference "
+                    "the masked ones by location, not value."
                 )
         if normalized == "task_drive":
             # D7 coverage acknowledgement: what counts as read is what the DELIVERY
@@ -838,6 +852,12 @@ def _list_files(
             elif normalized in {"task_drive", "skill_payload", "artifact_store", "user_files"}:
                 items = _filter_subagent_secret_listing(items, binding.base_path, ctx=ctx)
         return json.dumps(items, ensure_ascii=False, indent=2)
+    except _ListingMiss as exc:
+        # A miss is discovery, not a failed tool: the same warning severity the
+        # absent-memory-file read already uses (DATA_NOT_YET_CREATED below).
+        return _publish_tool_result(ctx, ToolResult(
+            status="ok", code="LEGACY_WARNING", text=f"⚠️ LIST_FILES_NOT_FOUND: {exc}",
+        ))
     except _ListingFailure as exc:
         return _publish_tool_result(ctx, ToolResult(
             status="error", code="LEGACY_TOOL_ERROR", text=f"⚠️ LIST_FILES_ERROR: {exc}",

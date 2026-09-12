@@ -400,6 +400,30 @@ export function taskReasonPhrase(code) {
     return TASK_REASON_PHRASES[raw] || raw;
 }
 
+// The custody overlay stamps this code as the row's reason_code while a
+// delegated run is still unreconciled, and the debt then heals from the WRITE
+// side while the stored code may not be rewritten. So the code outlives the
+// fact, and the debt list the record CARRIES is the only fresh truth. ONE rule
+// from ONE source on every surface: a non-empty list names the debt beside the
+// execution reason, while an empty list or none at all leaves the execution
+// reason standing alone. Nothing is inferred from absence, because the live
+// task_done event carries the stored list too (agent_task_pipeline
+// ._custody_debt_event_fields), so a record without one is a record that states
+// nothing about the debt. The browser twin of
+// project_dialogue._custody_debt_reason: the debt is a warning BESIDE the rail
+// cause, never a replacement, and any other code passes through untouched.
+const CUSTODY_DEBT_REASON = 'delegated_custody_unreconciled';
+
+function custodyDebtReason(record) {
+    const raw = String(record?.reason_code || '');
+    if (raw !== CUSTODY_DEBT_REASON) return [raw, ''];
+    const debt = record?.delegated_runs_unreconciled;
+    return [
+        String(record?.outcome_axes?.execution?.reason_code || ''),
+        Array.isArray(debt) && debt.length ? CUSTODY_DEBT_REASON : '',
+    ];
+}
+
 export function taskReasonDetail(evt) {
     // An owner-requested stop is a success and carries its own marker instead.
     if (taskStoppedWithSummary(evt)) return '';
@@ -416,11 +440,17 @@ export function taskReasonDetail(evt) {
         return `Acceptance: ${decision.status}${rationale ? ` — ${rationale}` : ''}`;
     }
     if (!evt?.reason_code || evt.reason_code === 'final_message') return '';
+    // A healed debt is never restored: naming it again would state a debt the
+    // same record shows as empty. The current execution reason speaks when
+    // there is one, otherwise the row states no cause and leaves the headline
+    // to the frozen outcome axis that owns it.
+    const [reason, custody] = custodyDebtReason(record);
+    if (!reason) return custody ? `Reason: ${custody}` : '';
     const receiptVeto = record.outcome_axes?.objective?.receipt_veto;
-    if (receiptVeto?.reason === evt.reason_code && receiptVeto.detail) {
-        return `Reason: ${String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')}`;
-    }
-    return `Reason: ${taskReasonPhrase(evt.reason_code)}`;
+    const cause = receiptVeto?.reason === reason && receiptVeto.detail
+        ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
+        : taskReasonPhrase(reason);
+    return `Reason: ${cause}${custody ? ` (${custody})` : ''}`;
 }
 
 // S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the
@@ -955,7 +985,7 @@ function chatView({
 export function taskTerminalSummary(evt = {}) {
     const terminal = evt.task_phase !== 'finalizing' && evt.outcome_final !== false
         && (evt.outcome_final === true || evt.system_type === 'task_summary'
-            || taskDoneIsTerminal(evt) || (evt.type === 'task_done' && evt.ephemeral_decision === true));
+            || taskDoneIsTerminal(evt));
     const outcome = taskTerminalPhase(evt);
     const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');
     const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]

@@ -113,17 +113,15 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
         from ouroboros.agent_task_pipeline import build_trace_summary
         from ouroboros.task_results import STATUS_FAILED, write_task_result
 
-        # Ephemeral decision turns leave no durable task result, including errors.
-        if not bool(task.get("_ephemeral_turn")):
-            loop_outcome = derive_loop_outcome(text, usage, llm_trace)
-            write_task_result(
-                env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
-                result=text, reason_code="task_exception", loop_outcome=loop_outcome,
-                outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
-                    "task_exception", review_trigger="agent_exception"),
-                trace_summary=build_trace_summary(llm_trace),
-                trace_refs=loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace),
-            )
+        loop_outcome = derive_loop_outcome(text, usage, llm_trace)
+        write_task_result(
+            env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
+            result=text, reason_code="task_exception", loop_outcome=loop_outcome,
+            outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
+                "task_exception", review_trigger="agent_exception"),
+            trace_summary=build_trace_summary(llm_trace),
+            trace_refs=loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace),
+        )
     except Exception:
         log.debug("Failed to persist task exception projection", exc_info=True)
     return text, usage, llm_trace
@@ -369,13 +367,7 @@ class OuroborosAgent:
         `resolve_dispatch_axes` moments earlier, so model, effort, route, tool
         profile, effective executor and `capability_delta` all land in a single
         atomic record instead of being minted by whichever surface writes next.
-
-        CW3: a transient ephemeral decision turn writes NO durable task_result
-        (running OR final) — only its inline answer + card resolution flow via
-        emit_task_results.
         """
-        if bool(task.get("_ephemeral_turn")):
-            return
         try:
             started = getattr(self, "_task_started_ts", None)
             write_task_result(
@@ -460,7 +452,6 @@ class OuroborosAgent:
         if (
             str(task.get("id") or "").strip()
             and not bool(task.get("_is_direct_chat"))
-            and not bool(task.get("_ephemeral_turn"))
             and str(task_metadata.get("delegation_role") or "").lower() != "subagent"
         ):
             try:
@@ -632,7 +623,6 @@ class OuroborosAgent:
             task_id=str(task.get("id") or ""),
             task_depth=int(task.get("depth", 0)),
             is_direct_chat=bool(task.get("_is_direct_chat")),
-            is_ephemeral_turn=bool(task.get("_ephemeral_turn")),
             task_constraint=normalize_task_constraint(task.get("task_constraint")),
             task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
         )
@@ -675,11 +665,6 @@ class OuroborosAgent:
                 ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
         if bool(task.get("_presence_turn")):
             ctx.inline_max_rounds = int(task_metadata.get("inline_max_rounds") or 10)
-        # NOTE: the ephemeral decision turn is INTENTIONALLY kept on the SAME route as the
-        # main chat (no light-lane override): a busy-chat ephemeral turn can produce the
-        # owner-facing answer inline (WS10), so silently lowering its model would be a P1
-        # owner-invisible cognitive-horizon cut. The #4 self-DoS class is handled by the
-        # per-model concurrency semaphore (ouroboros/model_concurrency.py), not by routing.
         self.tools.set_context(ctx)
 
         dispatch, _preflight_amended = self._run_delegate_preflight(drive_logs, task, dispatch)
@@ -846,9 +831,7 @@ class OuroborosAgent:
                 if isinstance(task.get("metadata"), dict)
                 else {}
             )
-            self._accepting_owner_messages = bool(
-                task.get("_is_direct_chat") and not task.get("_ephemeral_turn")
-            )
+            self._accepting_owner_messages = bool(task.get("_is_direct_chat"))
         authority_refusal = validate_task_authority_sources(self.env, task)
         if not authority_refusal:
             _persist_early_origin_stub(self.env.drive_root, task)
@@ -858,10 +841,6 @@ class OuroborosAgent:
             task_type=self._current_task_type,
             task_text=str(task.get("text") or "")[:200],
             direct_chat=bool(task.get("_is_direct_chat")),
-            # A busy-chat decision turn is transport/presentation control, not a
-            # user task card.  This earliest ordered frame lets Web suppress the
-            # card before tool activity can reveal it.
-            ephemeral_decision=bool(task.get("_ephemeral_turn")),
         )
         drive_logs = self.env.drive_path("logs")
         heartbeat_stop = self._start_task_heartbeat_loop(str(task.get("id") or ""))
@@ -941,7 +920,7 @@ class OuroborosAgent:
                     llm_trace = {"reasoning_notes": ["deep_self_review_error"], "tool_calls": []}
             else:
                 with self._owner_message_admission_lock:
-                    if task.get("_is_direct_chat") and not task.get("_ephemeral_turn"):
+                    if task.get("_is_direct_chat"):
                         self._accepting_owner_messages = True
                 try:
                     text, usage, llm_trace = run_llm_loop(
@@ -1105,7 +1084,7 @@ class OuroborosAgent:
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
                        executor_observation: Optional[Dict[str, Any]] = None) -> None:
         """Owner-visible note; ``incident`` is the typed ``task_incident``/``toast_once``
-        pair the browser toasts once — an ephemeral turn's only visible wait surface."""
+        pair the browser toasts once."""
         self._last_progress_ts = time.time()
         if self._event_queue is None or self._current_chat_id is None:
             return
@@ -1117,8 +1096,6 @@ class OuroborosAgent:
                 "ts": utc_now_iso(),
             }
             progress_meta: Dict[str, Any] = {}
-            if bool(getattr(getattr(self.tools, "_ctx", None), "is_ephemeral_turn", False)):
-                progress_meta["ephemeral_decision"] = True
             progress_meta.update(incident or {})
             progress_meta.update(self._subagent_progress_meta("progress"))
             if executor_observation is not None:

@@ -98,7 +98,7 @@ for op in ("read", "list", "search"):
 assert "ouroboros.credential_shapes" not in sys.modules, "read decision imported shapes"
 # Non-vacuity: the MUTATION branch does consult the shapes, so the hook fires.
 try:
-    ta.user_files_path_block_reason(ctx, pathlib.Path(home) / "x.pem", operation="write")
+    ta.user_files_path_block_reason(ctx, pathlib.Path(home) / "credentials.json", operation="write")
 except ImportError:
     print("OK")
 else:
@@ -139,9 +139,6 @@ def test_child_secret_shape_contract_preserved():
 def test_shape_vocabulary_is_single_sourced():
     from ouroboros import credential_shapes as cs
 
-    assert cs.CREDENTIAL_NAME_RE.search("api_key.json")
-    assert cs.CREDENTIAL_NAME_RE.search("my-token")
-    assert not cs.CREDENTIAL_NAME_RE.search("README.md")
     assert "settings.json" in cs.SUBAGENT_CREDENTIAL_FILE_NAMES
     assert ".ssh" in cs.CREDENTIAL_COMPONENT_NAMES
     assert cs.user_files_mutation_shape_reason(

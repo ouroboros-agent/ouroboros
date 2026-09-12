@@ -177,13 +177,10 @@ def stage_task_attachments(
             return False
 
     # SSOT secret detection: reuse the shared credential-shape vocabulary so a
-    # credential SOURCE (e.g. ~/.ssh/id_rsa, credentials.json, *.pem) is never copied in.
+    # credential SOURCE (e.g. ~/.ssh/id_rsa, credentials.json) is never copied in.
     from ouroboros.credential_shapes import (
-        BENIGN_DOT_NAMES,
         CREDENTIAL_COMPONENT_NAMES,
         CREDENTIAL_FILE_NAMES,
-        CREDENTIAL_FILE_SUFFIXES,
-        CREDENTIAL_NAME_RE,
     )
 
     # G10 (capinv-447): BOTH attachment routes get ONE policy. A path-selected
@@ -202,14 +199,14 @@ def stage_task_attachments(
 
     def _secret_source_reason(src: pathlib.Path) -> str:
         """Rule-named reason the source must not be staged, or ``""``."""
+        from ouroboros.workspace_patch_rules import _sensitive_untracked_reason
+
         if _uploads_root is not None:
             try:
                 src.relative_to(_uploads_root)
             except ValueError:
                 pass
             else:
-                from ouroboros.workspace_patch_rules import _sensitive_untracked_reason
-
                 original = _upload_name_re.sub("", src.name)
                 reason = _sensitive_untracked_reason(original)
                 return f"uploaded file name {original!r}: {reason}" if reason else ""
@@ -217,21 +214,12 @@ def stage_task_attachments(
             part_lower = part.lower()
             if part_lower in CREDENTIAL_COMPONENT_NAMES:
                 return f"credential/control directory component {part!r}"
-            # DEFAULT-DENY dotted components: a non-allowlisted dotted SOURCE component is
-            # potentially credential-bearing, so an enumerated-blocklist gap (e.g.
-            # ~/.terraform.d/credentials.tfrc.json) can't auto-stage a secret. Owner-
-            # supplied attachments only — defense-in-depth, not a live agent-exfil path.
-            if part.startswith(".") and part_lower not in BENIGN_DOT_NAMES:
-                return f"non-allowlisted hidden path component {part!r}"
         name = src.name
         name_lower = name.lower()
         if name_lower in CREDENTIAL_FILE_NAMES:
             return f"credential-shaped file name {name!r}"
-        if CREDENTIAL_NAME_RE.search(name):
-            return f"credential-shaped token in file name {name!r}"
-        if name_lower.endswith(CREDENTIAL_FILE_SUFFIXES):
-            return f"private key / certificate suffix on {name!r}"
-        return ""
+        reason = _sensitive_untracked_reason(name)
+        return f"file name {name!r}: {reason}" if reason else ""
 
     try:
         artifact_root = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)

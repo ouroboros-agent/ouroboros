@@ -6,9 +6,8 @@ accumulated_usage stamps the transport ACTUALLY leaves behind (reason_code
    ``reason_code="provider_unavailable"`` + ``infra_failed`` pair — exactly what
    fires the supervisor's "provider outage — NOT completed" owner notice
    (supervisor/events.py keys on that reason_code).
-2. A SCHEDULED swarm-router handoff (admission durably succeeded) must NOT be
-   clobbered with infra_failed by the rail's stamp gate — the router deliberately
-   pops execution_status/reason_code to keep the successful handoff truthful.
+2. A scheduled Presence handoff remains addressable through its work_ref,
+   while failure of the current turn retains its honest infrastructure outcome.
 """
 import time
 from types import SimpleNamespace
@@ -91,13 +90,12 @@ def test_wall_exhausted_body_429_empty_is_infra_not_a_model_failure(tmp_path, mo
     assert usage["reason_code"] == "provider_unavailable"
 
 
-def test_scheduled_swarm_handoff_survives_the_no_call_rail(tmp_path):
-    """A durably admitted managed task is a SUCCESS the router deliberately keeps
-    truthful by popping execution_status/reason_code; the rail's stamp gate must
-    not overwrite it with infra_failed/provider_unavailable."""
+def test_scheduled_presence_handoff_survives_the_no_call_rail(tmp_path):
+    """Presence keeps the admitted child and discloses the current provider outage."""
+    from ouroboros.presence_runner import build_presence_result_event
     tools_ctx = SimpleNamespace(
-        task_metadata={"force_plan": True},
-        is_ephemeral_turn=True,
+        task_metadata={"presence": {"binding_id": "presence-binding"}},
+        _presence_completion={"outcome": "deferred"},
         _swarm_handoff_attempt={"status": "scheduled", "task_id": "t-child-1"},
     )
     accumulated = {
@@ -110,6 +108,14 @@ def test_scheduled_swarm_handoff_survives_the_no_call_rail(tmp_path):
         _rail_ctx(tmp_path, accumulated, tools=SimpleNamespace(_ctx=tools_ctx)),
     )
 
-    assert "Swarm admitted managed task" in text
-    assert usage.get("execution_status") != "infra_failed"
-    assert usage.get("reason_code") != "provider_unavailable"
+    assert text == "PARTIAL RESULT."
+    assert usage["execution_status"] == "infra_failed"
+    assert usage["reason_code"] == "provider_unavailable"
+    terminal = build_presence_result_event(
+        {"id": "presence-turn"}, text, tools_ctx,
+        provider_notice=usage["terminal_provider_notice"],
+    )
+    assert terminal["work_ref"] == "t-child-1"
+    assert terminal["outcome"] == "deferred"
+    assert terminal["text"].startswith("PARTIAL RESULT.")
+    assert terminal["text"].count(usage["terminal_provider_notice"]) == 1

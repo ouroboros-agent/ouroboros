@@ -166,6 +166,44 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
     return rows
 
 
+def bound_room_chat(bindings: Dict[str, int], row: Dict[str, Any]) -> int:
+    """Resolve a row's immutable task binding in delivery lineage order."""
+    for field in ("task_id", "parent_task_id", "root_task_id"):
+        chat = bindings.get(str(row.get(field) or "").strip())
+        if chat:
+            return int(chat)
+    return 0
+
+
+def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
+                    bindings: Dict[str, int]):
+    """Canonical room membership shared by history and evidence readers.
+
+    Presentation-only hiding and cross-room question pointers belong to the UI
+    caller. A room source retains the actual cognitive result as well.
+    """
+    from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
+
+    def matches(entry_chat: int, entry: Optional[dict] = None) -> bool:
+        row = entry if isinstance(entry, dict) else {}
+        if is_a2a_chat_id(entry_chat):
+            return False
+        bound = bound_room_chat(bindings, row)
+        lifecycle = row.get("type") in {"project_started", "project_completion_summary"}
+        if chat_id in project_chat_ids:
+            return not lifecycle and (bound == chat_id or entry_chat == chat_id
+                                      or entry_matches_source_ref(row, source_refs))
+        if chat_id != 1:
+            return entry_chat == chat_id and not bound
+        if entry_chat == HIDDEN_CHAT_ID:
+            return False
+        if lifecycle:
+            return entry_chat not in project_chat_ids
+        return entry_chat not in project_chat_ids and not bound
+
+    return matches
+
+
 def project_recent_dialogue(
     memory: Any, project_chat_id: int, max_entries: int,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
@@ -177,14 +215,10 @@ def project_recent_dialogue(
     except Exception:
         bound = {}
     refs = source_refs_for_project(memory.drive_root, project_chat_id)
-    ref_keys = {key for ref in refs if (key := _source_ref_identity(ref)) is not None}
+    matches = room_membership(project_chat_id, {project_chat_id}, refs, bound)
     entries, coverage = memory.read_unconsolidated_chat(
         memory.load_dialogue_meta(), max_entries,
-        predicate=lambda row: (
-            _row_chat_id(row) == project_chat_id
-            or bound.get(str(row.get("task_id") or "")) == project_chat_id
-            or bool(_entry_source_identities(row) & ref_keys)
-        ),
+        predicate=lambda row: matches(_row_chat_id(row), row),
     )
     present_ref_keys = set()
     for entry in entries:
@@ -508,6 +542,39 @@ def append_canonical_task_summary(drive_root: Any, row: Dict[str, Any]) -> bool:
     return append_jsonl(path, dict(row))
 
 
+def canonical_task_summary_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
+    """The receipt proving this task's own terminal row reached the canonical chat.
+
+    ``_append_terminal_task_projection`` stamps it on the task result in the same
+    write that appends the row, so another composer can tell that a task already
+    spoke for itself without scanning chat text (BIBLE P5). Empty when no row was
+    appended for that task.
+    """
+    tid = str(result.get("task_id") or result.get("id") or "").strip()
+    receipt = result.get("canonical_terminal_projection")
+    if not tid or not isinstance(receipt, dict):
+        return {}
+    if str(receipt.get("summary_id") or "") != f"task-terminal:{tid}":
+        return {}
+    return dict(receipt)
+
+
+def canonical_task_summary_reached_chat(result: Dict[str, Any], chat_id: Any) -> bool:
+    """Did this task's own terminal row already reach THAT chat?
+
+    Every settled task gets a receipt, so "a receipt exists" answers nothing: it
+    is true of every completed, failed and cancelled child alike. The question a
+    second writer actually has is whether the reader it is about to address has
+    already been told, and only the row's own chat answers that. A receipt
+    written before the chat was recorded says nothing either, so it never
+    silences anybody.
+    """
+    row_chat = canonical_task_summary_receipt(result).get("chat_id")
+    if row_chat is None or chat_id is None:
+        return False
+    return str(row_chat) == str(chat_id)
+
+
 def append_authored_task_summary(
     canonical_root: Any, result_root: Any, row: Dict[str, Any], *, status: str = "",
 ) -> bool:
@@ -704,8 +771,7 @@ def _append_terminal_task_projection(
     task = task if isinstance(task, dict) else {}
     result = result if isinstance(result, dict) else {}
     event = task_done_event if isinstance(task_done_event, dict) else {}
-    if not tid or any(bool(row.get("_ephemeral") or row.get("ephemeral_decision"))
-                      for row in (task, result, event)):
+    if not tid:
         return False
     lineage = resolve_task_lineage(
         tid,
@@ -756,7 +822,8 @@ def _append_terminal_task_projection(
         reason = str(effective.get("reason_code") or event.get("reason_code") or "")
         phase = outcome_phase(effective, event)
         outcome = OUTCOME_PHASE_HEADLINE[phase]
-        excerpt = _completion_excerpt(effective)
+        row_chat_id = int(event.get("chat_id") or task.get("chat_id") or 0)
+        excerpt = _completion_excerpt(effective, chat_id=row_chat_id)
         details = f'Details: get_task_result(task_id="{tid}")'
         text = (
             f"{outcome}. role={role}; parent={parent_id or 'unknown'}; "
@@ -777,7 +844,7 @@ def _append_terminal_task_projection(
             "summary_id": summary_id, "task_id": tid,
             "parent_task_id": parent_id, "root_task_id": root_id,
             "project_id": project_id,
-            "chat_id": int(event.get("chat_id") or task.get("chat_id") or 0),
+            "chat_id": row_chat_id,
             "delegation_role": str(effective.get("delegation_role") or task.get("delegation_role") or ""),
             "role": role, "status": str(effective.get("status") or status),
             "outcome": outcome, "outcome_phase": phase, "outcome_final": True,
@@ -795,7 +862,7 @@ def _append_terminal_task_projection(
             "status": str(current.get("status") or status),
             "canonical_terminal_projection": {
                 "summary_id": summary_id, "summary_kind": summary_kind,
-                "written_at": row["ts"],
+                "written_at": row["ts"], "chat_id": row_chat_id,
             },
             "canonical_terminal_projection_ready": None,
         }
@@ -838,21 +905,80 @@ def append_terminal_task_projection(
         return False
 
 
-def _completion_excerpt(result: Dict[str, Any]) -> str:
+SALVAGE_EXCERPT_LABEL = "Preserved intermediate output (not a final answer)"
+
+
+def _stop_receipt_reached_chat(result: Dict[str, Any], chat_id: Any) -> bool:
+    """Did the stop receipt publish these bytes into the chat THIS row targets?
+
+    Only the successful sender records the destination: a task's admission chat
+    or an enqueued receipt cannot prove delivery after lineage rebinding. Main
+    keeps its excerpt unless it received that receipt itself. A legacy receipt
+    without delivery evidence keeps the bytes too.
+    """
+    receipt = result.get("cancel_receipt")
+    if not isinstance(receipt, dict) or not receipt or chat_id is None:
+        return False
+    lineage = receipt.get("delivered_chat_id")
+    return lineage is not None and str(lineage) == str(chat_id)
+
+
+def _completion_excerpt(result: Dict[str, Any], *, chat_id: Any = None) -> str:
     """One plain-text excerpt for BOTH lifecycle writers (event + task_summary).
 
     Markdown markers are stripped BEFORE whitespace flattening: the stripper's
     line-anchored heading/list patterns need the original newlines, and a
     flatten-first order would glue a ``##`` mid-line where no pattern (and no
     renderer) can treat it as markup again.
+
+    Host-salvaged bytes are LABELLED, not hidden. They are real applied work, so
+    a row that dropped them left a bare headline and a reason code over a task
+    that had in fact produced something. The label says what the bytes are while
+    the caller's own pointer keeps owning the untruncated copy. ``chat_id`` is
+    the row's destination: only there can the stop receipt already have
+    published the same text, and only there does the label stand alone.
     """
-    if str(result.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE:
-        return ""
+    body = ""
     for key in ("summary", "result", "error"):
-        text = " ".join(strip_markdown(str(result.get(key) or "")).split())
-        if text:
-            return text if len(text) <= 240 else text[:239].rstrip() + "…"
-    return ""
+        body = " ".join(strip_markdown(str(result.get(key) or "")).split())
+        if body:
+            break
+    if not body:
+        return ""
+    excerpt = body if len(body) <= 240 else body[:239].rstrip() + "…"
+    if str(result.get("terminal_origin") or "") != TERMINAL_ORIGIN_HOST_SALVAGE:
+        return excerpt
+    if _stop_receipt_reached_chat(result, chat_id):
+        return f"{SALVAGE_EXCERPT_LABEL}."
+    return f"{SALVAGE_EXCERPT_LABEL}: {excerpt}"
+
+
+def _custody_debt_reason(reason: str, result: Dict[str, Any], event: Dict[str, Any]) -> tuple:
+    """Split a stored custody-debt code into (execution reason, custody clause).
+
+    The custody overlay stamps ``delegated_custody_unreconciled`` as the row's
+    reason_code, and the debt then HEALS from the write side while
+    ``docs/ARCHITECTURE.md`` forbids that refresh rewriting reason_code. So the
+    stored code outlives the fact: nine of fourteen terminal rows named a debt
+    the same record showed as empty. Render time holds the only fresh truth, and
+    the fresh truth is the row's own ``delegated_runs_unreconciled`` list.
+
+    The debt is a WARNING BESIDE the rail cause, never a replacement: when both
+    are real the caller states them in one line. Any other reason code passes
+    through untouched."""
+    from ouroboros.outcomes import WARN_DELEGATED_CUSTODY_UNRECONCILED
+
+    if reason != WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        return reason, ""
+    debt: Any = None
+    execution_reason = ""
+    for source in (result, event):
+        if debt is None and isinstance(source.get("delegated_runs_unreconciled"), list):
+            debt = source["delegated_runs_unreconciled"]
+        axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+        execution_reason = execution_reason or str(execution.get("reason_code") or "")
+    return execution_reason, (WARN_DELEGATED_CUSTODY_UNRECONCILED if debt else "")
 
 
 def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
@@ -877,6 +1003,13 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
                 decision = holder["acceptance_decision"]
     status = str(decision.get("status") or "").strip()
     reason = str(result.get("reason_code") or event.get("reason_code") or "")
+    # A healed debt is never restored here. The objective warning the overlay
+    # froze keeps the headline at "Done with warnings" and the refresh may not
+    # rewrite it, but that is the axis speaking about what was true at write
+    # time; naming the code again would state a debt the same record shows as
+    # empty. The current execution reason speaks when there is one, otherwise
+    # the row states no cause and leaves the headline to the axis that owns it.
+    reason, custody = _custody_debt_reason(reason, result, event)
     if (reason != REASON_OWNER_REQUESTED_FINALIZATION and status != ACCEPTANCE_ACCEPTED
             and status and outcome_phase(result, event) in {"done", "warn"}):
         clause = f"Acceptance: {status}"
@@ -886,6 +1019,10 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     elif reason and reason != REASON_OWNER_REQUESTED_FINALIZATION:
         detail = veto.get("detail") if veto.get("reason") == reason else ""
         clause = f"Reason: {' '.join(strip_markdown(str(detail)).split()) if detail else reason}"
+        if custody:
+            clause += f" ({custody})"
+    elif custody:
+        clause = f"Reason: {custody}"
     else:
         return ""
     return clause if clause.endswith((".", "!", "?", "…")) else clause + "."
@@ -932,7 +1069,7 @@ def enqueue_project_completion_summary(
     task = task if isinstance(task, dict) else {}
     result = result if isinstance(result, dict) else {}
     if not tid or any(
-        bool(row.get("_ephemeral") or row.get("ephemeral_decision") or row.get("_is_direct_chat"))
+        bool(row.get("_is_direct_chat"))
         for row in (evt, task, result, task_done_event) if isinstance(row, dict)
     ):
         return False
@@ -970,9 +1107,15 @@ def enqueue_project_completion_summary(
             # Offering "Open the Project" would reproduce the reported defect —
             # a Main row leading into an empty room.
             return False
-        excerpt = _completion_excerpt(result)
+        excerpt = _completion_excerpt(result, chat_id=1)
         verdict = _completion_verdict(result, task_done_event)
         lead = f"{verdict} " if verdict else ""
+        # This writer's only pointer is the invitation below, so a salvage may
+        # never displace it: preserved bytes named with no way to reach them are
+        # worse than the plain invitation. Both salvage forms keep it, the
+        # labelled excerpt and the label that stands alone.
+        if excerpt.startswith(SALVAGE_EXCERPT_LABEL):
+            excerpt = f"{excerpt} Open the Project for details."
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
             "text": (f"{snapshot['target_label']} · "

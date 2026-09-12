@@ -5,9 +5,10 @@ evidence): the system prompt carries the findings-only stance, the domain-free
 rubric, the blocking rule, the convergence rule (cycle ≥2), the checklist
 section verbatim, and the governance pack (W3: BIBLE.md + ARCHITECTURE.md in full for a
 self-modification plan, their navigation maps otherwise); the user content carries
-TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE (+ OMISSIONS) · ROOT EXPLORATION
-LOG · PRIOR CYCLES in that order. Current chosen inputs stay complete; history
-and exploration retain disclosed display bounds. The
+TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE · OWN ROOM DIALOGUE · RELATED
+ROOM POINTERS · ROOT EXPLORATION LOG · PRIOR CYCLES in that order. The full
+redacted dialogue uses task source custody and route-sized projections; only
+exploration and prior-cycle summaries retain independent display bounds. The
 ``PLAN_REVIEW_CONTROL_JSON`` control line is NOT emitted here (Phase C owns it).
 """
 
@@ -41,7 +42,10 @@ _RUBRIC = (
     "4. Deferrals — is an expensive-to-reverse decision hiding inside `deferred`?",
     "5. Evidence sufficiency — is the attached evidence enough to judge 1–4? If not, ask for "
     "exactly what is missing with a `need_evidence` finding naming its locator (the host attaches "
-    "what its evidence policy allows on the next cycle and names every absence); do not invent a gap.",
+    "what its evidence policy allows on the next cycle and names every absence). When what is "
+    "missing is the AUTHOR's judgment rather than a document, ask the author: a `need_evidence` "
+    "finding whose `breaks` names the spec id the question is about, no locator needed; Ouroboros "
+    "answers it in its disposition or escalates it. Do not invent a gap.",
 )
 
 _BLOCKING_RULE = (
@@ -105,7 +109,11 @@ def build_plan_review_system_prompt(
         "and suggest a simpler or more general alternative when useful. Express this advice as "
         "optional `note` findings; Ouroboros decides whether to adopt it, without a required "
         "disposition. A preference, premise challenge, or repeated suggestion alone is never "
-        "a blocker. Independently demonstrated failures still follow the blocking rule below.\n\n"
+        "a blocker. Independently demonstrated failures still follow the blocking rule below. "
+        "A question the plan leaves open is returned to its author, not filed as advice: "
+        "`need_evidence` with the spec id in `breaks` asks Ouroboros, who authors the plan and is "
+        "the addressee of everything this review produces, to answer, escalate, or defer it openly "
+        "in its disposition.\n\n"
         "## Rubric (domain-free)\n\n" + "\n".join(_RUBRIC) + "\n",
     ]
     if constitutional:
@@ -213,7 +221,7 @@ def _render_prior_cycles(prior_cycles: list[dict], dispositions: list[dict], spe
         cycle = cycle if isinstance(cycle, Mapping) else {}
         lines.append(
             f"### Cycle {cycle.get('cycle_index', '?')} — aggregate {cycle.get('aggregate', '?')}: "
-            "findings (blocking first; summaries bounded)\n\n"
+            f"findings (blocking first; summaries bounded to {PACKET_PRIOR_FINDING_SUMMARY_CHARS} chars)\n\n"
             + _json_block(_prior_findings_projection(cycle), PACKET_PRIOR_CYCLES_CHARS) + "\n"
         )
     lines.append("### Agent dispositions\n\n" + _json_block(dispositions or [], PACKET_PRIOR_CYCLES_CHARS) + "\n")
@@ -285,12 +293,14 @@ def build_plan_review_user_content(
     root_exploration_log: Optional[str],
     cycle_index: int = 1,
 ) -> str:
-    """Deterministic reviewer packet: TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE
-    (+ OMISSIONS) [cache-stable prefix] · ROOT EXPLORATION LOG · PRIOR CYCLES (all reviewers' prior
-    findings as a compact blocking-first projection + agent dispositions + spec
-    delta on cycle ≥2). Current objective, spec and plan prose stay complete;
-    the caller's per-slot fit decides whether the actual route can receive them.
-    Exploration and prior cycles retain their disclosed projection bounds."""
+    """Keep operative inputs complete and attach the exact recorded room source.
+
+    The delivery layer selects a newest source range only when the actual route
+    cannot fit the complete dialogue beside governance and the operative plan.
+    Exploration and prior cycles retain their existing disclosed display bounds.
+    """
+    from ouroboros.tools.plan_dialogue import render_dialogue
+
     view = spec_with_ids(spec)
     if goal and not view.get("goal"):
         view["goal"] = goal
@@ -299,6 +309,7 @@ def build_plan_review_user_content(
         "## SPEC (ids are the only valid `breaks` targets)\n\n" + _json_block(view) + "\n",
         "## PLAN PROSE\n\n" + (plan_prose or "(none)") + "\n",
         "## EVIDENCE\n\n" + _render_evidence(manifest),
+        render_dialogue(manifest),
         "## ROOT EXPLORATION LOG\n\n"
         + (bounded_text(root_exploration_log, PACKET_EXPLORATION_CHARS) or "(not provided by host)") + "\n",
     ]

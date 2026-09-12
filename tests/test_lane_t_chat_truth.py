@@ -1,4 +1,4 @@
-"""Lane T: typed direct/ephemeral conclusions (#369) and honest budget pause (#322)."""
+"""Lane T: typed direct conclusions (#369) and honest budget pause (#322)."""
 
 import types
 
@@ -36,25 +36,14 @@ class TestStampRootFinalPhase:
         assert "progress_meta" not in evt
 
 
-class TestEphemeralTerminalStamp:
-    def test_ephemeral_final_carries_typed_conclusion(self, tmp_path):
-        from ouroboros.task_finalization import prepare_terminal_send_event
-
-        evt = {"type": "send_message", "task_id": "e1"}
-        out = prepare_terminal_send_event(
-            tmp_path, {"id": "e1", "_ephemeral_turn": True}, "answer", {},
-            evt, ephemeral=True, presence=False,
-        )
-        # The final concludes the activity even when its task_done is missed;
-        # the pipeline adds the outcome facts before delivery.
-        assert out["progress_meta"]["task_terminal_status"] == "completed"
+class TestPresenceTerminalStamp:
 
     def test_presence_frames_stay_unstamped(self, tmp_path):
         from ouroboros.task_finalization import prepare_terminal_send_event
 
         evt = {"type": "send_message", "task_id": "p1"}
         out = prepare_terminal_send_event(
-            tmp_path, {"id": "p1"}, "answer", {}, evt, ephemeral=True, presence=True,
+            tmp_path, {"id": "p1"}, "answer", {}, evt, presence=True,
         )
         assert "progress_meta" not in out
 

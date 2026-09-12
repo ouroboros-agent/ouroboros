@@ -964,6 +964,24 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         return ""
 
 
+def _publish_post_commit_test_fact(ctx, result: str, test_warning: str) -> str:
+    """Carry "the post-commit tests failed" as a TYPED fact beside the text.
+
+    A commit whose post-commit verification failed is PRESERVED and reported as
+    a success with a warning appended, so nothing about the call is an error and
+    nothing may make it one. The failing tests are still the most reflection
+    worthy thing the task did, and a reader that had to find the word in the
+    result body was a keyword gate standing in for a fact the producer holds
+    here. The text is returned byte-identical, which the registry's publication
+    rule requires.
+    """
+    if test_warning:
+        _publish_tool_result(ctx, ToolResult(
+            status="ok", code="OK", text=result, meta={"post_commit_tests": "failed"},
+        ))
+    return result
+
+
 def _format_commit_result(ctx, commit_message, push_status, test_warning):
     result = f"OK: committed to {ctx.branch_dev}: {commit_message}{push_status}"
     if test_warning:
@@ -1122,7 +1140,7 @@ def _publish_reviewed_commit(
                 result += f"\n⚠️ WARNING: untracked files remain: {files}"
         except Exception:
             pass
-    return result + ci_note
+    return _publish_post_commit_test_fact(ctx, result + ci_note, test_warning)
 
 
 def _repo_commit_push(ctx: ToolContext, commit_message: str,
@@ -1415,7 +1433,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                    block_reason="managed_update_smoke_failed", block_details=_msg_pc,
                                    duration_sec=time.time() - _commit_start)
             return _msg_pc
-        return _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc
+        return _publish_post_commit_test_fact(
+            ctx,
+            _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc,
+            test_warning_ref[0],
+        )
     if not evolution_claim:
         push_status = _auto_push(ctx.repo_dir)
     return _publish_reviewed_commit(

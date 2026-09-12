@@ -29,8 +29,12 @@ const terminalCases = [
     ['Done with warnings', {
         status: 'completed', outcome_axes: { execution: { status: 'degraded' } },
     }, { phase: 'warn', headline: 'Done with warnings' }],
+    // The debt list rides along: the host twin states this cause only while the
+    // row still owes it, so a fixture without it would describe a record the
+    // durable writers no longer render this way.
     ['Failed', {
         status: 'failed', reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: ['run-a1'],
     }, { phase: 'error', headline: 'Failed' }],
     ['Cancelled', { status: 'cancelled' }, { phase: 'cancelled', headline: 'Cancelled' }],
 ];

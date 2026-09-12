@@ -43,7 +43,7 @@ def test_cleanup_receipt_is_carried_before_final_delivery_without_rewriting_answ
     event = prepare_terminal_send_event(
         tmp_path, {"id": "root", "chat_id": 1}, text, usage,
         {"type": "send_message", "task_id": "root", "chat_id": 1, "text": text},
-        ephemeral=False, presence=False,
+        presence=False,
     )
     assert event["text"] == text
     assert event["terminal_host_notice"].startswith("Budget stop retained.")

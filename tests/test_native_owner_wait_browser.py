@@ -109,7 +109,7 @@ def test_native_owner_wait_retains_form_and_remains_addressable(
                         **({"project_id": project["id"]} if in_project else {})}))
                     task = wait_until(lambda: next((row["task"] for row in oracle.events("task_received")
                         if (row.get("task", {}).get("metadata", {}).get("origin_message_ref") or {}).get("client_message_id") == message_id), None), 90)
-                    assert task and task.get("_is_direct_chat") and not task.get("_ephemeral_turn")
+                    assert task and task.get("_is_direct_chat")
                     return task["id"]
 
                 task_id = submit(f"[{marker}] Fill and save the form, then wait for my answer before submitting.", in_project=bool(project))

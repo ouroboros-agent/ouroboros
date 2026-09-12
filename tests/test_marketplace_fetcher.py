@@ -171,7 +171,6 @@ def test_stage_rejects_symlink_member():
         "id_rsa",
         "aws-credentials.json",
         ".npmrc",
-        "config.pem",
     ],
 )
 def test_stage_rejects_sensitive_filenames(name):
@@ -181,6 +180,58 @@ def test_stage_rejects_sensitive_filenames(name):
     ])
     with pytest.raises(FetchError, match="sensitive"):
         stage(archive, slug="x", version="1.0.0")
+
+
+def test_stage_accepts_a_certificate_and_a_release_signature():
+    """Owner answer 4=A: a certificate and an .asc release signature are the
+    motivating case, so a hub archive carrying them stages instead of being
+    rejected whole. Both are text the reviewer reads."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        ("config.pem", b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+        ("sig.asc", b"-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END PGP SIGNATURE-----\n"),
+    ])
+    staged = stage(archive, slug="owner/x", version="1.0.0")
+    try:
+        assert (staged.staging_dir / "config.pem").is_file()
+        assert (staged.staging_dir / "sig.asc").is_file()
+    finally:
+        staged.cleanup()
+
+
+def test_stage_accepts_a_certificate_and_a_binary_key_container():
+    """Owner answer 4=A: a suffix never refuses an archive, so a hub payload
+    carrying a certificate and a Keynote deck named `deck.key` stages whole.
+    Key containers are inert data next to the images, audio and fonts the
+    allowlist already admits; loadable binaries stay refused."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        ("config.pem", b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+        ("assets/deck.key", b"PK\x03\x04binary deck"),
+    ])
+    staged = stage(archive, slug="owner/x", version="1.0.0")
+    try:
+        assert (staged.staging_dir / "config.pem").is_file()
+        assert (staged.staging_dir / "assets" / "deck.key").is_file()
+    finally:
+        staged.cleanup()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["vault.p12", "vault.pfx", "store.jks", "store.keystore", "vault.kdbx", "sig.gpg"],
+)
+def test_stage_accepts_the_remaining_key_container_suffixes(name):
+    """The rest of the owner-approved suffix list stages the same way."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        (name, b"\x00binary container"),
+    ])
+    staged = stage(archive, slug="owner/x", version="1.0.0")
+    try:
+        assert (staged.staging_dir / name).is_file()
+    finally:
+        staged.cleanup()
 
 
 @pytest.mark.parametrize(

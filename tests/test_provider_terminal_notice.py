@@ -42,7 +42,7 @@ def _terminal(tmp_path, *, current, task_id="parent1"):
     return text, usage, trace
 
 
-@pytest.mark.parametrize("mode", ["managed", "direct", "ephemeral"])
+@pytest.mark.parametrize("mode", ["managed", "direct"])
 @pytest.mark.parametrize("current", [False, True])
 def test_pipeline_delivery_and_rebuild_keep_raw_bytes_and_known_wait_custody(tmp_path, monkeypatch, mode, current):
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *_a, **_k: None)
@@ -50,20 +50,11 @@ def test_pipeline_delivery_and_rebuild_keep_raw_bytes_and_known_wait_custody(tmp
     task = {"id": "parent1", "type": "task", "chat_id": 7, "text": "finish the task"}
     if mode != "managed":
         task["_is_direct_chat"] = True
-    if mode == "ephemeral":
-        task["_ephemeral_turn"] = True
     pending = []
     pipeline.emit_task_results(SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), None, None,
         pending, task, text, usage, trace, start_time=0.0, drive_logs=tmp_path / "logs")
     sent = next(row for row in pending if row["type"] == "send_message")
     notice = usage["terminal_provider_notice"]
-    if mode == "ephemeral":
-        assert load_task_result(tmp_path, "parent1") is None
-        assert Path(usage["terminal_salvage_path"]).read_text(encoding="utf-8") == RAW
-        assert RAW in sent["text"] and sent["text"].count("[Host status]") == 1
-        assert notice in sent["text"] and "task details" not in sent["text"]
-        assert sent["log_text"] == sent["text"]
-        return
     stored = load_task_result(tmp_path, "parent1")
     assert stored["result"] == RAW and stored["terminal_provider_notice"] == notice
     assert stored["status"] == "failed"  # same provider-outage category

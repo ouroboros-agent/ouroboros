@@ -243,7 +243,10 @@ def test_workspace_patch_excludes_sensitive_untracked_file_but_keeps_tracked_dif
     assert "_authToken" not in patch_text
 
 
-def test_workspace_patch_excludes_public_pem_and_disclosed_keeps_tracked_work(tmp_path):
+def test_workspace_patch_keeps_public_pem_because_a_suffix_is_not_key_material(tmp_path):
+    """A public certificate is ordinary work: the suffix no longer refuses it,
+    and nothing is reported as sensitive. Real key material is caught by the
+    content check pinned in the next test (owner answer 3=A)."""
     repo = tmp_path / "repo"
     _init_repo_with_file(repo)
     (repo / "tracked.txt").write_text("new\n", encoding="utf-8")
@@ -253,13 +256,11 @@ def test_workspace_patch_excludes_public_pem_and_disclosed_keeps_tracked_work(tm
     artifacts, manifest = write_workspace_patch_artifacts(repo, artifact_dir, task={})
 
     assert manifest["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
-    assert manifest["sensitive_blocked"] == [
-        {"path": "public.pem", "reason": "private key or certificate"}
-    ]
+    assert manifest["sensitive_blocked"] == []
     assert any(item["kind"] == "workspace_patch" for item in artifacts)
     patch_text = (artifact_dir / "workspace.patch").read_text(encoding="utf-8")
     assert "tracked.txt" in patch_text
-    assert "public.pem" not in patch_text
+    assert "public.pem" in patch_text
 
 
 def test_workspace_patch_excludes_private_key_material_by_content(tmp_path):

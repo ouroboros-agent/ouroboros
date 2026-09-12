@@ -91,8 +91,7 @@ def test_interleaved_same_chat_answers_are_matched_by_task_origin(tmp_path):
     assert b["status"] == "pending" and "text" not in b
 
 
-@pytest.mark.parametrize("lane", ["_handle_chat_direct_locked", "handle_chat_ephemeral"])
-def test_pre_task_budget_refusal_remains_an_exact_failed_operation(tmp_path, monkeypatch, lane):
+def test_pre_task_budget_refusal_remains_an_exact_failed_operation(tmp_path, monkeypatch):
     from supervisor import state, worker_chat_lane, workers
 
     bridge = message_bus.LocalChatBridge()
@@ -106,7 +105,7 @@ def test_pre_task_budget_refusal_remains_an_exact_failed_operation(tmp_path, mon
         "chat_id": CHAT, "client_message_id": MSG, "text": "do work",
     }).status_code == 202
     ref = bridge.get_updates(0, timeout=0)[0]["message"]["accepted_source_ref"]
-    getattr(worker_chat_lane, lane)(CHAT, "do work", task_metadata={"origin_message_ref": ref, "_host_operation": True})
+    worker_chat_lane._handle_chat_direct_locked(CHAT, "do work", task_metadata={"origin_message_ref": ref, "_host_operation": True})
     result = client.get(f"/chat/operations/{CHAT}:{MSG}", headers=_headers()).json()
     assert result["status"] == "failed" and "Budget exhausted" in result["text"]
 
@@ -124,9 +123,8 @@ def test_ordinary_main_and_transport_refusals_keep_their_original_envelope(monke
     assert sent == [((chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings."), {})]
 
 
-@pytest.mark.parametrize("ephemeral", [False, True])
 @pytest.mark.parametrize("host_operation", [False, True])
-def test_chat_crash_preserves_only_the_host_accepted_operation(tmp_path, monkeypatch, ephemeral, host_operation):
+def test_chat_crash_preserves_only_the_host_accepted_operation(tmp_path, monkeypatch, host_operation):
     from queue import SimpleQueue
     from ouroboros import project_naming
     from supervisor import worker_chat_lane, workers
@@ -149,7 +147,7 @@ def test_chat_crash_preserves_only_the_host_accepted_operation(tmp_path, monkeyp
     }).status_code == 202
     ref = bridge.get_updates(0, timeout=0)[0]["message"]["accepted_source_ref"]
     worker_chat_lane._run_chat_task(
-        CrashingAgent(), CHAT, "do work", ephemeral=ephemeral,
+        CrashingAgent(), CHAT, "do work",
         task_metadata={"origin_message_ref": ref, "_host_operation": host_operation},
     )
     rows = list(iter_jsonl_objects(tmp_path / "logs/chat.jsonl"))

@@ -941,8 +941,7 @@ def _operation_state(ctx: HostServiceContext, rows: list, inbound: Dict[str, Any
     when the host session that accepted the message is gone and nothing else
     answers. ``cancel_supported`` is true only for work THIS message started
     that the cancellation owner can address: a promoted task or a live direct
-    turn; an ephemeral decision turn (pre-promotion) and a message steered into
-    a pre-existing task are disclosed, not cancelled.
+    turn; a message steered into a pre-existing task is disclosed, not cancelled.
     """
     from ouroboros.project_dialogue import latest_chat_annotations, entry_matches_source_ref, owner_message_ref_is_valid
     from ouroboros.task_results import load_task_result
@@ -1057,7 +1056,6 @@ def _cancel_owned_operation(
         return 200, {"ok": True, "outcome": "already_terminal", **base}
     if not state.get("cancel_supported") or not state.get("task_id"):
         reason_code = state.get("reason") or {
-            "ephemeral_decision": "decision_turn_in_flight",
             "lost": "host_restarted_before_answer",
         }.get(str(state.get("phase") or state["status"]), "not_started")
         return 409, {"ok": False, "outcome": "cancel_unsupported", "reason": reason_code, **base}
@@ -1154,9 +1152,8 @@ async def _api_chat_cancel(request: Request) -> JSONResponse:
     the browser Stop uses — and the answer is its typed outcome: ``cancelled``,
     ``already_terminal``, ``unresolved`` (custody did not settle; the work is
     still live) or ``cancel_unsupported`` (nothing this request started is
-    addressable yet: still queued, an ephemeral decision turn in flight, or a
-    message the decision lane delivered into a pre-existing task). Never a
-    ``cancelled`` that did not happen.
+    addressable yet: still queued, or a message delivered into a pre-existing
+    task). Never a ``cancelled`` that did not happen.
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:

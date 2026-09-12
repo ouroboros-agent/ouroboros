@@ -306,7 +306,7 @@ def run_chat_viewport_smoke(
                 assert state["remaining"] <= 6 and state["dotHidden"], state
                 assert button.evaluate("node => document.activeElement === node")
 
-                # A duplicate is a no-op. Transient work is visible activity
+                # A duplicate is a no-op. Ordinary direct work is visible activity
                 # under #691 and keeps the reader's history position.
                 duplicate = {
                     "type": "chat", "role": "user", "chat_id": 1,
@@ -322,23 +322,23 @@ def run_chat_viewport_smoke(
                 _emit_ws_frame(page, duplicate)
                 state = jump_state(page)
                 assert state["remaining"] > 48 and state["dotHidden"], state
-                before_transient = state["scrollTop"]
+                before_direct = state["scrollTop"]
                 _emit_ws_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
-                    "ephemeral_decision": True, "chat_id": 1,
-                    "task_id": "vp-transient-decision", "content": "Transient work",
+                    "chat_id": 1,
+                    "task_id": "vp-direct-work", "content": "Ordinary direct work",
                     "ts": "2026-08-03T10:02:23+00:00",
                 })
-                transient = page.locator('[data-task-id="vp-transient-decision"]')
-                assert transient.count() == 1
+                direct = page.locator('[data-task-id="vp-direct-work"]')
+                assert direct.count() == 1
                 state = jump_state(page)
                 assert not state["dotHidden"] and state["dotCount"] == 1, state
-                assert abs(state["scrollTop"] - before_transient) <= 6, state
+                assert abs(state["scrollTop"] - before_direct) <= 6, state
                 _emit_ws_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True, "chat_id": 1,
-                    "task_id": "vp-transient-decision", "content": "More transient work",
+                    "task_id": "vp-direct-work", "content": "More ordinary direct work",
                 })
-                assert transient.count() == 1 and not jump_state(page)["dotHidden"]
+                assert direct.count() == 1 and not jump_state(page)["dotHidden"]
 
                 # Browser visibility is a lifecycle seam. A hidden pinned
                 # reader re-follows; a hidden history reader keeps its saved
@@ -997,8 +997,8 @@ def run_chat_viewport_smoke(
                 set_remaining(page, 300)
                 healing_anchor = visible_card_anchor(page)
                 _emit_ws_frame(page, {
-                    "type": "chat", "role": "assistant", "is_progress": True, "ephemeral_decision": True,
-                    "chat_id": 1, "task_id": "vp-threshold-freeze-0", "content": "Late decision marker",
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "vp-threshold-freeze-0", "content": "Late ordinary work",
                 })
                 assert abs(card_top(page, healing_anchor["id"]) - healing_anchor["top"]) <= 6
                 assert page.locator('[data-task-id="vp-threshold-freeze-0"]').count() == 1 and not jump_state(page)["dotHidden"]

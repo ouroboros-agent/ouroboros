@@ -157,7 +157,7 @@ def stamp_root_final_phase(
 def prepare_terminal_send_event(
     env_drive_root: Any, task: Dict[str, Any], text: str,
     usage: Dict[str, Any], send_event: Dict[str, Any],
-    *, ephemeral: bool, presence: bool,
+    *, presence: bool,
 ) -> Dict[str, Any]:
     """Preserve raw host salvage, then build the one live/replay projection."""
     if model_execution := model_execution_projection(usage):
@@ -167,35 +167,27 @@ def prepare_terminal_send_event(
         send_event.setdefault("progress_meta", {}).update(correlation.get("progress_meta", {}))
     # Loop cleanup may have cancelled a run after the last model observation.
     # Read the audit it already persisted before constructing this delivery.
-    if not ephemeral:
-        from ouroboros.task_results import load_task_result
+    from ouroboros.task_results import load_task_result
 
-        try:
-            current = load_task_result(
-                pathlib.Path(task.get("budget_drive_root") or env_drive_root), str(task.get("id") or ""),
-            ) or {}
-        except Exception:
-            log.warning("Current delegated receipt was unavailable at final delivery", exc_info=True)
-            current = {}
-        if isinstance(current.get("delegate_terminal_reconciliation"), dict):
-            usage["delegate_terminal_reconciliation"] = current["delegate_terminal_reconciliation"]
+    try:
+        current = load_task_result(
+            pathlib.Path(task.get("budget_drive_root") or env_drive_root), str(task.get("id") or ""),
+        ) or {}
+    except Exception:
+        log.warning("Current delegated receipt was unavailable at final delivery", exc_info=True)
+        current = {}
+    if isinstance(current.get("delegate_terminal_reconciliation"), dict):
+        usage["delegate_terminal_reconciliation"] = current["delegate_terminal_reconciliation"]
     origin = str(usage.get("terminal_origin") or "")
     notice = str(usage.get("terminal_provider_notice") or "")
     host_notice = terminal_host_notice_text(usage)
     if host_notice and not presence:
         send_event["terminal_host_notice"] = host_notice
-    if ephemeral and not presence:
-        if task.get("suggested_name"):
-            send_event.setdefault("progress_meta", {})["suggested_name"] = str(task["suggested_name"])
-        # This final concludes the transient activity even if task_done is
-        # missed. emit_task_results adds its computed outcome/accounting facts
-        # before dispatch: completed means the turn ended, not that it succeeded.
-        send_event.setdefault("progress_meta", {})["task_terminal_status"] = "completed"
     if origin not in _STAMPED_TERMINAL_ORIGINS:
         return send_event
     canonical_root = pathlib.Path(task.get("budget_drive_root") or env_drive_root)
     preserved_path = ""
-    if text and (origin == TERMINAL_ORIGIN_HOST_SALVAGE or (ephemeral and notice)):
+    if text and origin == TERMINAL_ORIGIN_HOST_SALVAGE:
         try:
             from ouroboros.observability import preserve_salvaged_output
 
@@ -207,13 +199,6 @@ def prepare_terminal_send_event(
         usage["terminal_salvage_path"] = preserved_path
     if presence:
         return send_event  # Presence's existing body renderer owns its delivery outcome.
-    if ephemeral:
-        if notice:
-            body = ("Preserved intermediate output (not a final answer):\n" + text
-                    if origin == TERMINAL_ORIGIN_HOST_SALVAGE and text else text)
-            body = provider_terminal_body(body, notice)
-            send_event.update(text=body, log_text=body)
-        return send_event  # no task-details promise on a turn with no durable task row
     from supervisor.terminal_delivery import project_terminal_result_event
 
     return project_terminal_result_event(
@@ -309,7 +294,7 @@ def register_final_answer_owed(
 ) -> None:
     """GR2-5 (§8-A2, ONE outbox for EVERY root): owe the final answer durably.
 
-    Called immediately BEFORE durable result persistence for every non-ephemeral
+    Called immediately BEFORE durable result persistence for every
     ROOT (``agent_task_pipeline.emit_task_results`` registers, then stores), so a
     crash in that window leaves an owed row the boot replay delivers instead of
     a persisted result nobody was told about — the cancel lanes are the ones that

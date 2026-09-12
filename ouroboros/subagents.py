@@ -17,7 +17,11 @@ cheapest model to the strongest reasoning and no rule reconciled them). And a
 harness route carries its OWN effort, so a parent asking ``low`` against a route
 pinned to ``xhigh`` had no rule for who wins. It is removed rather than ranked
 against the lane (BIBLE P2: remove the class). The owner still controls effort
-exactly as before, through ``config.resolve_effort(task_type)``.
+exactly as before, through ``config.resolve_effort(task_type)``. The ONE
+caller-facing strength axis lives elsewhere: a plan review order may declare
+its reviewer panel's effort as the default rung of each row's ladder
+(``plan_task.reviewer_effort`` → ``plan_review_runtime.plan_review_slots``);
+that is a review panel, not a subagent.
 """
 
 from __future__ import annotations
@@ -885,9 +889,10 @@ SUBAGENT_INTENT_FIELDS: tuple[str, ...] = (
 # a load never fails over one (BIBLE P1: no silent loss, and no crash either).
 LEGACY_SUBAGENT_FIELDS: Dict[str, str] = {
     "reasoning_effort": (
-        "effort is no longer an owner-facing axis: it is derived from the owner's "
-        "configured effort for this task type, because a public effort was a second "
-        "knob for the question model_lane already answers"
+        "effort is not a subagent axis: it is derived from the owner's configured "
+        "effort for this task type, because a public effort was a second knob for "
+        "the question model_lane already answers (a plan review order declares its "
+        "panel's strength through plan_task.reviewer_effort instead)"
     ),
 }
 

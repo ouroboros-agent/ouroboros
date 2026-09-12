@@ -50,11 +50,10 @@ BINARY_EXTENSIONS = frozenset({
 _FILE_SIZE_LIMIT = 1_048_576  # 1 MB per file
 
 
-_SENSITIVE_EXTENSIONS = frozenset({
-    ".env", ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore",
-    # Credential vaults / encrypted blobs.
-    ".kdbx", ".gpg", ".asc",
-})
+# Only the dotenv tail: a suffix does not prove credential content, and a real
+# .env renamed to config.txt walks past a suffix rule anyway. Certificates,
+# signatures and .key payloads are ordinary reviewed content (owner answer 4=A).
+_SENSITIVE_EXTENSIONS = frozenset({".env"})
 
 
 _SENSITIVE_NAMES = frozenset({

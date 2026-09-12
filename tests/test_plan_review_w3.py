@@ -696,3 +696,173 @@ def test_the_plan_spec_schema_discloses_both_halves_of_the_constitutional_trigge
     assert "system repository" in props["affected_resources"]["description"]
     evidence = props["evidence"]["description"]
     assert "system repository" in evidence and "EXISTING" in evidence
+
+
+# ------------------------------------------------------------- in-flight honesty (P1-4)
+
+
+def _actor(slot_id, *, ok=False, failure_code="", error=""):
+    return {"slot_id": slot_id, "model": "m", "ok": ok, "failure_code": failure_code, "error": error}
+
+
+def test_progress_line_dedups_typed_reasons_and_names_the_late_result():
+    from ouroboros.tools.plan_review_runtime import plan_wave_progress_line
+
+    counts = {"parseable": 0, "configured": 6, "blocking": 0, "note": 0, "need_evidence": 0}
+    same = [_actor(f"s{i}", failure_code="subscription_window_exhausted") for i in range(3)]
+    distinct = [_actor("d1", failure_code="credential_pool_exhausted"), _actor("d2", error="transport died"),
+                _actor("d3", error="x" * 400), _actor("d4", failure_code="deadline_exhausted")]
+    line = plan_wave_progress_line("DEGRADED", counts, cycles_paid=1, cap=2,
+                                   wave={"actors": same + distinct, "custody_pending": True})
+    assert line.count("subscription_window_exhausted") == 1  # three identical reasons -> one
+    assert "credential_pool_exhausted; transport died" in line
+    assert "(+1 more in the task result)" in line and "deadline_exhausted" not in line  # first four shown
+    assert "OMISSION NOTE" in line and "\n" not in line  # bounded, one line
+    assert line.endswith("late result pending (reviewer slots still in flight, not yet collected)")
+    # Every other aggregate renders byte-identically to the plain form.
+    plain = plan_wave_progress_line("GREEN", {**counts, "parseable": 6}, cycles_paid=1, cap=2)
+    assert plain == plan_wave_progress_line("GREEN", {**counts, "parseable": 6}, cycles_paid=1, cap=2,
+                                            wave={"actors": same, "custody_pending": False})
+    assert plain == "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
+
+
+def test_refused_redispatch_emits_a_separate_no_dispatch_line(harness, monkeypatch):
+    import ouroboros.review_substrate as review_substrate
+    from types import SimpleNamespace
+
+    harness.install({"s1": "", "s2": "", "s3": ""})  # every slot dies at dispatch time: paid, empty epoch
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx)) == {"outcome": "DEGRADED", "closed": False}
+    assert _state(harness)["cycles_paid"] == 1
+
+    def zero_send(request, *, slots, drive_root, llm, usage_ctx=None):
+        return SimpleNamespace(actors=[{
+            "slot_id": slot.slot_id, "model": slot.model, "status": "not_dispatched", "raw_text": "",
+            "error": "agent session slot has no session task", "failure_code": "session_task_missing",
+            "usage": {}, "prompt_ref": {}, "response_ref": {}, "operation_id": f"op-{slot.slot_id}",
+            "operation_state": "not_dispatched", "late_result_pending": False,
+        } for slot in slots])
+
+    monkeypatch.setattr(review_substrate, "run_review_request", zero_send)
+    harness.progress.clear()
+    _call(ctx)  # stale empty-epoch wave re-dispatches; every row refuses pre-send at $0
+    assert _state(harness)["cycles_paid"] == 1
+    no_dispatch = [line for line in harness.progress if line.startswith("📐 plan_task: no new reviewer cycle dispatched")]
+    assert no_dispatch == ["📐 plan_task: no new reviewer cycle dispatched: session_task_missing"]
+    assert harness.progress[-1].startswith("📐 plan_task: DEGRADED") and "session_task_missing" in harness.progress[-1]
+
+
+def test_gate_projection_carries_custody_pending_before_the_aggregate():
+    from ouroboros.task_results import plan_review_gate_projection
+    from tests.test_plan_review import _force_plan_gate_state
+
+    state = _force_plan_gate_state("degraded")
+    assert plan_review_gate_projection(state, "blocking")["custody_pending"] is False
+    state["waves"][0]["custody_pending"] = True
+    decision = plan_review_gate_projection(state, "blocking")
+    assert decision["custody_pending"] is True and decision["reviewer_slots_degraded"] is True
+    assert decision["allow"] is False  # the in-flight aggregate stays DEGRADED and holds
+
+
+def test_one_free_collection_before_the_blocking_gate(harness, monkeypatch):
+    from ouroboros.task_results import plan_review_gate_projection
+    from ouroboros.tools.plan_review_collect import collect_before_gate
+    from tests.test_plan_review_reconciliation import _install_barrier_substrate
+
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    _call(ctx)
+    state = _state(harness)
+    assert plan_review_gate_projection(state, "blocking")["custody_pending"] is True
+    collected = collect_before_gate(ctx, state)
+    assert [c["reconcile_only"] for c in calls] == [False, True]  # exactly one $0 collection
+    verdict = plan_review_gate_projection(collected, "blocking")
+    assert verdict["custody_pending"] is False and verdict["status"] == "closed" and verdict["allow"] is True
+    assert collect_before_gate(ctx, collected) is collected  # nothing pending: no second send
+    assert len(calls) == 2
+
+
+# ------------------------------------------------------------- verbatim principal directives (P1-6)
+
+
+def _dry_run_packet(ctx, spec=None):
+    request = pr._PlanRequest(goal="Ship the deck", plan="Outline first, then draft each slide.", spec=spec or DECK_SPEC)
+    return pr.build_plan_review_packet_for_dry_run(ctx, request)
+
+
+def test_packet_uses_full_dialogue_and_keeps_acceptance_directives(harness):
+    """Full planning dialogue replaces the old 16K display; acceptance keeps its ledger."""
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+    from ouroboros.owner_mailbox import write_task_message
+    from ouroboros.utils import append_jsonl
+
+    ctx = harness.make_ctx()
+    ctx.current_chat_id = 1
+    ctx._owner_directives = [{"source": "initial_user", "content": "Build the deck", "msg_id": "t:1"}]
+    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1,
+                 "text": "Build the deck; key sk-abcdefghijklmnopqrstuvwxyz1234"})
+    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "out", "chat_id": 1,
+                 "text": "Option A is faster but less flexible. " + "detail " * 6000})
+    write_task_message(harness.drive, "Proposal from sibling: use a different format", task_id=ctx.task_id,
+                       source_task_id="parent-9", provenance="peer_via_ancestor", relayed_from_task_id="sibling-7")
+    packet = _dry_run_packet(ctx)["user_content"]
+    assert "## OWNER REQUIREMENTS AND DECISIONS" not in packet
+    assert "Option A is faster but less flexible. " + "detail " * 6000 in packet
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in packet
+    assert "from task sibling-7, relayed by ancestor parent-9" in packet
+    rows = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=harness.drive,
+                                          task_id=ctx.task_id)["owner_requirements_and_decisions"]
+    assert rows[0]["content"] == "Build the deck"
+    assert not (harness.drive / "task_results" / "artifacts").exists()  # dry-run stays read-only
+
+
+def test_task_objective_carries_the_contract_context_redacted(harness):
+    from ouroboros.tools.plan_review_runtime import _task_objective
+
+    ctx = harness.make_ctx()
+    assert _task_objective(ctx) == "Deliver the thing"
+    ctx.task_contract = {"objective": "Deliver the thing",
+                         "context": "Owner said: token sk-abcdefghijklmnopqrstuvwxyz1234; audience is the board"}
+    text = _task_objective(ctx)
+    assert text == "Deliver the thing\n\nContract context: Owner said: token ***REDACTED***; audience is the board"
+    assert "## TASK OBJECTIVE\n\n" + text + "\n" in _dry_run_packet(ctx)["user_content"]
+
+
+# ------------------------------------------------------------- the reviewer's question to the author (P1-7)
+
+
+def test_reviewer_question_holds_the_wave_until_a_free_disposition_and_its_answer_rides_the_next_cycle(harness):
+    """Owner batch 2, Q4=A: a reviewer returns an open question to the author as
+    `need_evidence` with the spec id in `breaks` (no locator); the wave holds until the
+    author's $0 disposition (accept = answered, reject, defer = deferred openly); the
+    answer reaches the reviewers only on the next PAID cycle, disclosed in the next step."""
+    question = json.dumps([_finding("q1", "need_evidence", breaks="claim_1", summary="Why exactly 5 slides?")])
+    sub = harness.install({"s1": question, "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    assert _control(first) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    wave = _state(harness)["waves"][-1]
+    [finding] = wave["findings"]
+    assert finding["class"] == "need_evidence" and finding["breaks"] == "claim_1" and finding["locator"] == ""
+    assert _state(harness).get("need_evidence_seen", []) == []  # a question is not a locator the host attaches
+    assert "a question addressed to you by spec id" in first and "defer = deferred openly" in first
+    answered = pr._handle_plan_task(ctx, review_disposition={
+        "review_fingerprint": wave["request_fingerprint"],
+        "items": [{"finding_id": "s1:q1", "decision": "accept", "rationale": "The board asked for five."}]})
+    assert _control(answered) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert len(sub.calls) == 1 and _state(harness)["cycles_paid"] == 1  # $0: no reviewer call, no cycle
+    _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})  # the next PAID cycle carries the answer
+    assert len(sub.calls) == 2
+    user2 = _user_text(sub.calls[1]["request"].messages[1]["content"])
+    assert "The board asked for five." in user2 and "s1:q1" in user2
+    assert "summaries bounded to 400 chars" in user2  # the carry-forward cut is named where it applies
+
+
+def test_escalate_is_available_wherever_planning_runs():
+    from ouroboros.tool_capabilities import (
+        ACTING_SUBAGENT_TOOL_NAMES, CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
+    )
+
+    assert all("escalate" in names for names in
+               (CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES, ACTING_SUBAGENT_TOOL_NAMES))

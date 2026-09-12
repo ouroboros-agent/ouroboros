@@ -23,7 +23,7 @@ Machine extraction of `docs/ARCHITECTURE.md` §11.1 (the frozen-ABI SSOT), regen
 | 14 | `StateResponse.active_direct_turns` | `ouroboros/gateway/contracts.py` (ok)<br>`supervisor/active_activity.py` (ok)<br>`web/modules/chat_activity.js` (ok) | `tests/test_gateway_parity.py` (ok) |
 | 15 | `project_thread` | `supervisor/message_bus.py` (ok)<br>`ouroboros/projects_registry.py` (ok) | `tests/test_message_bus.py` (ok)<br>`web/tests/chat_thread_routing.test.js` (ok) |
 | 16 | `task_id` | `ouroboros/gateway/contracts.py` (ok)<br>`ouroboros/tools/core.py` (ok)<br>`ouroboros/event_bus.py` (ok) | `tests/test_contracts.py` (ok) |
-| 17 | `QuizOption {label, detail?}` | `ouroboros/gateway/contracts.py` (ok)<br>`ouroboros/gateway/task_decision.py` (ok)<br>`ouroboros/owner_quiz.py` (ok)<br>`ouroboros/tools/core.py` (ok) | `tests/test_gateway_parity.py` (ok)<br>`tests/test_quiz_display.py` (ok)<br>`tests/test_quiz_answer.py` (ok)<br>`web/tests/chat_decision.test.js` (ok) |
+| 17 | `QuizOption {label, detail?, recommended?}` | `ouroboros/gateway/contracts.py` (ok)<br>`ouroboros/gateway/task_decision.py` (ok)<br>`ouroboros/owner_quiz.py` (ok)<br>`ouroboros/tools/core.py` (ok) | `tests/test_gateway_parity.py` (ok)<br>`tests/test_quiz_display.py` (ok)<br>`tests/test_quiz_answer.py` (ok)<br>`web/tests/chat_decision.test.js` (ok) |
 | 18 | `UpdateMergePlan` | `ouroboros/gateway/contracts.py` (ok) | `tests/test_update_apply_routing.py` (ok) |
 | 19 | `ChatOutbound.review_projection` | `ouroboros/gateway/contracts.py` (ok) | `tests/test_review_substrate_v2.py` (ok)<br>`web/tests/review_truth.test.js` (ok) |
 | 20 | `preflight_failed` | `ouroboros/skill_review_status.py` (ok) | `tests/test_skill_preflight_repair.py` (ok)<br>`web/tests/skill_preflight_repair.test.js` (ok) |

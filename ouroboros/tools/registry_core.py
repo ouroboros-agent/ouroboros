@@ -79,7 +79,6 @@ from ouroboros.tools.tool_result import (
     _replace_tool_result,
 )
 from ouroboros.tools.registry_guards import (
-    _EPHEMERAL_ALLOWED_TOOLS,
     _builtin_tool_availability,
     _disabled_tools,
     _resource_allowed,
@@ -678,7 +677,6 @@ class ToolRegistry:
         acting_subagent = self._is_acting_subagent()
         acting_grants = self._acting_tool_grants() if acting_subagent else set()
         local_readonly_subagent = self._is_local_readonly_subagent()
-        ephemeral_turn = bool(getattr(self._ctx, "is_ephemeral_turn", False))
         disabled_tools = _disabled_tools(self._ctx)
         # Rebuild from the load-time facts, never from empty: a rebuilt schema
         # list must not erase module_load_failed omissions (H3, capinv-447).
@@ -698,7 +696,6 @@ class ToolRegistry:
             if entry.name not in unavailable_tools
             if not local_readonly_subagent or self._readonly_tool_allowed(entry.name)
             if not acting_subagent or entry.name in acting_tool_names_for_context(self._ctx)
-            if not ephemeral_turn or entry.name in _EPHEMERAL_ALLOWED_TOOLS  # CW3: default-deny allowlist
             for schema in self._schemas_for_entry(entry)
         ]
         if disabled_tools:
@@ -711,9 +708,8 @@ class ToolRegistry:
                 "details": {name: unavailable_tools[name] for name in sorted(unavailable_tools)},
             })
         # Live (enabled, granted, reviewed) extension tool schemas join normal tool
-        # discovery on every lane, the ephemeral decision turn included (issue #722,
-        # owner-approved 2026-09-08): liveness, acting-child grants and the network
-        # resource gate are their only filters, exactly as on a managed task.
+        # discovery: liveness, acting-child grants and the network resource
+        # gate remain their filters.
         extension_schemas: List[Dict[str, Any]] = []
         if not _resource_allowed(self._ctx, "network"):
             self._capability_omissions.append({"surface": "extensions", "reason": "resource_blocked", "resource": "network=false"})
@@ -751,9 +747,7 @@ class ToolRegistry:
 
         if not core_only:
             mcp_schemas = []
-            # Owner-configured MCP tools ride every lane, the ephemeral decision turn
-            # included (issue #722, owner-approved 2026-09-08): the network resource
-            # gate is their only lane filter, exactly as on a managed task.
+            # Owner-configured MCP tools retain the network resource gate.
             if not _resource_allowed(self._ctx, "network"):
                 self._capability_omissions.append({"surface": "mcp", "reason": "resource_blocked", "resource": "network=false"})
             else:
@@ -822,8 +816,6 @@ class ToolRegistry:
                 continue
             if acting_subagent and e.name not in acting_tool_names_for_context(self._ctx):
                 continue
-            if ephemeral_turn and e.name not in _EPHEMERAL_ALLOWED_TOOLS:
-                continue  # CW3: the core/initial envelope is allowlisted too, not just schemas(core_only=False)
             if (
                 (local_readonly_subagent and self._readonly_tool_allowed(e.name))
                 or (acting_subagent and e.name in acting_tool_names_for_context(self._ctx))
@@ -870,8 +862,6 @@ class ToolRegistry:
         available, reason, _detail = _builtin_tool_availability(requested, self._ctx)
         if not available:
             return f"unavailable ({reason})"
-        if getattr(self._ctx, "is_ephemeral_turn", False) and requested not in _EPHEMERAL_ALLOWED_TOOLS:
-            return "hidden on this ephemeral decision turn (allowlist)"
         acting_subagent = self._is_acting_subagent()
         if self._is_local_readonly_subagent() and not self._readonly_tool_allowed(requested):
             return "hidden by the read-only subagent profile"
@@ -907,8 +897,6 @@ class ToolRegistry:
                         "details": {requested: detail},
                     })
                 return None
-            if getattr(self._ctx, "is_ephemeral_turn", False) and requested not in _EPHEMERAL_ALLOWED_TOOLS:
-                return None  # CW3: allowlist-consistent with schemas()/execute() (so enable_tools can't surface a denied tool)
             if local_readonly_subagent and not self._readonly_tool_allowed(requested):
                 return None
             if acting_subagent and requested not in acting_tool_names_for_context(self._ctx):
@@ -1120,10 +1108,6 @@ class ToolRegistry:
             except Exception:
                 _mcp_is_name = None
         is_mcp = bool(_mcp_is_name and _mcp_is_name(name))
-        _eph = registry_guards._ephemeral_block_result(  # CW3: built-in allowlist; extension/MCP tools ride every lane
-            self._ctx, name, ext_tool, is_mcp, extension_unavailable=extension_unavailable)
-        if _eph is not None:
-            return _eph
         _resource_gate = registry_guards._capability_resource_guard_result(
             self._ctx, name, args, ext_tool, is_mcp)
         if _resource_gate is not None:

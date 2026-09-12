@@ -1168,7 +1168,7 @@ def plan_review_gate_projection(
                     "status": "cycles_exhausted" if wave.get("cycles_exhausted") else "open",
                     "outcome": outcome, "closed": False,
                     "fingerprint": str(wave.get("request_fingerprint") or ""),
-                    "reviewer_slots_degraded": outcome == "DEGRADED",
+                    "reviewer_slots_degraded": outcome == "DEGRADED", "custody_pending": bool(wave.get("custody_pending")),
                 }
                 if wave.get("quorum_unreachable"):
                     # B2b typed fact: the wave's own rows prove the quorum cannot be
@@ -1231,6 +1231,7 @@ def plan_review_gate_projection(
         "outcome": str(control.get("outcome") or ""),
         "closed": closed,
         "reviewer_slots_degraded": bool(control.get("reviewer_slots_degraded")),
+        "custody_pending": bool(control.get("custody_pending")),  # reviewers still working: read before aggregate
         "quorum_unreachable": bool(control.get("quorum_unreachable")),
         "earliest_reset": str(control.get("earliest_reset") or ""),
         "reason": str(hard_rail or control.get("reason") or ""),
@@ -1402,6 +1403,7 @@ def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         **({"author_disposition": copy.deepcopy(wave["author_disposition"])}
            if isinstance(wave.get("author_disposition"), dict) else {}),
         **({"spec_source_ref": copy.deepcopy(wave["spec_source_ref"])} if wave.get("spec_source_ref") else {}),
+        **{key: copy.deepcopy(wave[key]) for key in ("dialogue_source_ref", "dialogue_chat_id", "author_request_fingerprint") if key in wave},
         **({"reviewed_at": str(wave["reviewed_at"])} if wave.get("reviewed_at") else {}),
     }
 
@@ -1421,7 +1423,7 @@ _PLAN_REVIEW_IDENTITY_KEYS = frozenset({
     "previous_fingerprint", "spec_hash", "evidence_manifest_hash", "plan_prose_hash", "sha256",
     "model", "request_model", "route", "host_file_read_attestation", "reason", "decision", "kind",
     "goal", "acceptance_claims", "cycle_index", "series_id", "schema_version", "retry_key",
-    "wave_artifact", "spec_source_ref",
+    "wave_artifact", "spec_source_ref", "dialogue_source_ref", "dialogue_chat_id", "author_request_fingerprint",
 })
 
 
@@ -1477,7 +1479,7 @@ def record_plan_review_wave(
         # like any other paid wave: it replaces the predecessor and charges its cycle.
         # The degraded_retries counter therefore now counts only nothing-dispatched
         # attempts; the caller still renders the attempt it was handed.
-        if not wave.get("paid") and any(w.get("paid") for w in previous):
+        if not wave.get("paid") and not wave.get("custody_pending") and any(w.get("paid") for w in previous):
             for w in state.get("waves") or []:
                 if str(w.get("request_fingerprint") or "") == fingerprint and w.get("paid"):
                     w["degraded_retries"] = int(w.get("degraded_retries") or 0) + 1
@@ -1509,7 +1511,7 @@ def record_plan_review_wave(
             state["need_evidence_seen"] = sorted({str(s) for s in need_evidence_seen if str(s)})
         full_from = max(0, len(waves) - _PLAN_REVIEW_FULL_WAVES)
         waves = [
-            (_compact_plan_review_wave(w) if idx < full_from and not w.get("compact") else w)
+            (_compact_plan_review_wave(w) if idx < full_from and not w.get("compact") and not w.get("custody_pending") else w)
             for idx, w in enumerate(waves)
         ]
         overflow = max(0, len(waves) - _PLAN_REVIEW_MAX_WAVES)

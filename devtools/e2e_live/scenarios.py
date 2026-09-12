@@ -779,9 +779,6 @@ def sw1_stub_script(_clone: pathlib.Path) -> dict:
             "expected_output": "A short listing."}}
 
     return {
-        "router": [{"tool": "promote_chat_to_task", "arguments": {
-            "objective": SW1_OBJECTIVE, "title": "SW1 swarm survey", "predecessor_task_id": ""}},
-            {"final": "Routed the Swarm request into a managed task."}],
         "agent": [
             {"tool": "plan_task", "arguments": {
                 "goal": "Survey the repository with two parallel scouts.",

@@ -1296,6 +1296,8 @@ def _persist_cancel_receipt(
                 return None  # no durable row yet — never mint a block-only file
             merged = dict(current.get("cancel_receipt") or {}) if isinstance(
                 current.get("cancel_receipt"), dict) else {}
+            if block["delivery_id"] != merged.get("delivery_id"):
+                merged.pop("delivered_chat_id", None)
             for key, value in block.items():
                 if (
                     key == "salvage"
@@ -1315,6 +1317,30 @@ def _persist_cancel_receipt(
         update_json_locked(task_result_path(pathlib.Path(drive_root), tid), _mutate)
     except Exception:
         log.debug("cancel-receipt persistence failed for %s", tid, exc_info=True)
+
+
+def record_cancel_receipt_delivery(
+    drive_root: Any, task_id: str, delivery_id: str, chat_id: int,
+) -> None:
+    """Record the actual sent destination on the matching existing receipt.
+
+    This write is separate from delivery registration. A failed write leaves
+    destination evidence unknown; it never authorizes suppressing an excerpt.
+    """
+    try:
+        from ouroboros.task_results import task_result_path
+
+        def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            receipt = current.get("cancel_receipt")
+            if (str(current.get("task_id") or "") != task_id
+                    or not isinstance(receipt, dict)
+                    or not delivery_id or receipt.get("delivery_id") != delivery_id):
+                return None
+            return {**current, "cancel_receipt": {**receipt, "delivered_chat_id": chat_id}}
+
+        update_json_locked(task_result_path(pathlib.Path(drive_root), task_id), _mutate)
+    except Exception:
+        log.debug("cancel-receipt delivery evidence failed for %s", task_id, exc_info=True)
 
 
 def build_unreviewed_salvage_event(

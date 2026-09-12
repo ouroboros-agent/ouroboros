@@ -491,6 +491,20 @@ def _stamp_project_room_pointer(task: Dict[str, Any], env: Any) -> None:
     )
 
 
+def _custody_debt_event_fields(stored_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry the row's own custody debt list onto the live terminal event.
+
+    The stamped code outlives the fact, so the owner-facing Reason line names
+    the custody warning only while the record's own ``delegated_runs_unreconciled``
+    list is non-empty (docs/ARCHITECTURE.md, terminal composition). Both
+    renderers read that list off the record in front of them, and the card reads
+    this event rather than the durable row, so the event carries a copy of the
+    stored list. A row holding no list states nothing about the debt: absence
+    stays absence instead of becoming a second, guessed rule on one surface.
+    """
+    debt = stored_result.get("delegated_runs_unreconciled")
+    return {"delegated_runs_unreconciled": list(debt)} if isinstance(debt, list) else {}
+
 def emit_task_results(
     env: Any, memory: Any, llm: Any,
     pending_events: List[Dict[str, Any]],
@@ -512,21 +526,14 @@ def emit_task_results(
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
     reason_code = str(loop_outcome.get("reason_code") or "")
-    # Explicit ephemeral routing delivers an inline answer and card facts
-    # without task-result, evaluation or cognitive post-task writes. Ordinary
-    # Main/Project work uses the native durable-result path.
-    _ephemeral = bool(task.get("_ephemeral_turn"))
     _root_outbox = _is_root_post_task(task)   # durable outbox (no model call): pre-marker predicate
     if getattr(ctx, "_skip_post_task_synthesis", False):   # "Stop now": paid root predicates see it
         task["_skip_post_task_synthesis"] = True
     _presence = is_presence_task(task)
     _typed_routing_action = str(getattr(ctx, "_typed_routing_action_emitted", "") or "").strip()
     _message_meta = subagent_message_meta(task, task_id=str(task.get("id") or ""))
-    n_tool_calls = None if llm_trace.get("loop_evidence_unavailable") else len(llm_trace.get("tool_calls", []))
-    if _ephemeral:
-        _message_meta.update(ephemeral_decision=True, outcome_axes=outcome_axes,
-                             reason_code=reason_code, tool_calls=n_tool_calls,
-                             rounds=None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0))
+    from ouroboros.post_task_synthesis import task_tool_metrics
+    tool_metrics = task_tool_metrics(llm_trace)
     send_event = {
         "type": "send_message", "chat_id": task["chat_id"],
         "text": text or "\u200b", "log_text": text or "",
@@ -537,13 +544,9 @@ def emit_task_results(
         # Final frames carry their own durable identity; replay must not depend
         # on a nearby progress row that may age out independently.
         send_event["progress_meta"] = dict(_message_meta)
-    send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, ephemeral=_ephemeral, presence=_presence)
+    send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, presence=_presence)
     pending_events.append(build_presence_result_event(task, text, ctx, provider_notice=terminal_notice_text(usage)) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
-    n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
-                        if isinstance(tc, dict) and tc.get("is_error"))
-    if llm_trace.get("loop_evidence_unavailable"):
-        n_tool_errors = None
     try:
         from supervisor.state import reconstruct_task_cost
 
@@ -563,40 +566,34 @@ def emit_task_results(
         }
     # SSOT cost naming (C2/ABI-3): the honest names on every terminal frame
     # this pipeline emits; the seam also strips any legacy alias spelling.
-    from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
+    from ouroboros.cost_projection import with_cost_aliases
 
     task_cost_fields = with_cost_aliases(task_cost_fields)
-    if not _ephemeral and _is_root_post_task(task) and not _root_post_task_already_completed(env, task):
+    if _is_root_post_task(task) and not _root_post_task_already_completed(env, task):
         task_cost_fields["cost_final"] = False
-    if _ephemeral:
-        # Chat retains the terminal facts: this turn has no task_result or synthesis.
-        send_event["progress_meta"].update(carry_cost_meta(task_cost_fields))
-    if not _ephemeral:
-        try:
-            append_jsonl(drive_logs / "events.jsonl", {
-                "ts": utc_now_iso(), "type": "task_eval", "ok": execution_status not in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED},
-                "task_id": task.get("id"), "task_type": task.get("type"),
-                "outcome_axes": outcome_axes,
-                "reason_code": reason_code,
-                "review_eligibility": str(loop_outcome.get("review_eligibility") or ""),
-                "review_trigger": str(loop_outcome.get("review_trigger") or ""),
-                "duration_sec": duration_sec,
-                "tool_calls": n_tool_calls,
-                "tool_errors": n_tool_errors,
-                "response_len": len(text),
-            })
-        except Exception:
-            log.warning("Failed to log task eval event", exc_info=True)
-            pass
+    try:
+        append_jsonl(drive_logs / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "task_eval", "ok": execution_status not in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED},
+            "task_id": task.get("id"), "task_type": task.get("type"),
+            "outcome_axes": outcome_axes,
+            "reason_code": reason_code,
+            "review_eligibility": str(loop_outcome.get("review_eligibility") or ""),
+            "review_trigger": str(loop_outcome.get("review_trigger") or ""),
+            "duration_sec": duration_sec,
+            **tool_metrics,
+            "response_len": len(text),
+        })
+    except Exception:
+        log.warning("Failed to log task eval event", exc_info=True)
+        pass
 
     pending_events.append({
         "type": "task_metrics",
         "task_id": task.get("id"), "task_type": task.get("type"),
-        "ephemeral_decision": _ephemeral,
         "outcome_axes": outcome_axes,
         "reason_code": reason_code,
         "duration_sec": duration_sec,
-        "tool_calls": n_tool_calls, "tool_errors": n_tool_errors,
+        **tool_metrics,
         **task_cost_fields,
         **({"resource_limit": dict(usage.get("resource_limit") or {})}
            if isinstance(usage.get("resource_limit"), dict) else {}),
@@ -615,32 +612,27 @@ def emit_task_results(
     except Exception:
         log.debug("Failed to collect review evidence", exc_info=True)
 
-    if not _ephemeral:
-        # GR2-5 (§8-A2, ONE outbox for EVERY root) + GR3-5 (ordering closes the
-        # persist→register crash window): the final answer enters the durable
-        # outbox — the owed row embeds the full payload — immediately BEFORE
-        # the durable result write, regardless of the blocking/nonblocking
-        # post-task split below. Registered-then-crashed leaves an owed row
-        # boot replay delivers (projection-over-replay: no boot scan of
-        # task_results is ever needed); the old stored-then-crashed order left
-        # a terminal result nobody would ever deliver. The nonblocking lane
-        # used to buffer the send with no delivery_id and no owed registration
-        # at all. Seam + dedup: ouroboros/task_finalization.py.
-        if _root_outbox and not _presence:
-            stamp_root_final_phase(  # the stamp names the SAME word the durable row below settles to
-                send_event, task, terminal_status=_durable_terminal_status(env, task, execution_status),
-                post_task_open=not task.get("_skip_post_task_synthesis") and not _root_post_task_already_completed(env, task),
-            )
-            register_final_answer_owed(task, send_event, env_drive_root=env.drive_root)
-        _store_task_result(
-            env, task, text, usage, llm_trace, review_evidence=review_evidence,
-            loop_outcome=loop_outcome, cost_fields=task_cost_fields,
+    # GR2-5 (§8-A2, ONE outbox for EVERY root) + GR3-5 (ordering closes the
+    # persist→register crash window): the final answer enters the durable
+    # outbox — the owed row embeds the full payload — immediately BEFORE
+    # the durable result write, regardless of the blocking/nonblocking
+    # post-task split below. Registered-then-crashed leaves an owed row
+    # boot replay delivers (projection-over-replay: no boot scan of
+    # task_results is ever needed); the old stored-then-crashed order left
+    # a terminal result nobody would ever deliver. The nonblocking lane
+    # used to buffer the send with no delivery_id and no owed registration
+    # at all. Seam + dedup: ouroboros/task_finalization.py.
+    if _root_outbox and not _presence:
+        stamp_root_final_phase(  # the stamp names the SAME word the durable row below settles to
+            send_event, task, terminal_status=_durable_terminal_status(env, task, execution_status),
+            post_task_open=not task.get("_skip_post_task_synthesis") and not _root_post_task_already_completed(env, task),
         )
-        stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
-    else:
-        # No durable task_result file for a transient decision turn; the card still
-        # resolves via task_done below (with empty artifact/review status).
-        stored_result = {}
+        register_final_answer_owed(task, send_event, env_drive_root=env.drive_root)
+    _store_task_result(
+        env, task, text, usage, llm_trace, review_evidence=review_evidence,
+        loop_outcome=loop_outcome, cost_fields=task_cost_fields,
+    )
+    stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
     artifact_bundle = stored_result.get("artifact_bundle") if isinstance(stored_result.get("artifact_bundle"), dict) else {}
     review_projection = stored_result.get("review_projection") or {}
     pending_events.append({
@@ -648,27 +640,18 @@ def emit_task_results(
         "task_id": task.get("id"),
         "task_type": task.get("type"),
         # GR2-3c: the DURABLE status rides the event for honesty — the
-        # supervisor validates every non-ephemeral task_done against the
-        # durable row either way, but a stamped status makes the event
-        # self-describing instead of a blank assertion. Ephemeral turns keep
-        # a blank status (they have no durable lifecycle).
+        # supervisor validates every task_done against the durable row;
+        # a stamped status makes the event self-describing.
         "status": str(stored_result.get("status") or ""),
-        # CW3: tells the supervisor's task_done handler to NOT synthesize a durable
-        # missing-result task_result for a transient decision turn (which has none).
-        "_ephemeral": _ephemeral,
         "_is_direct_chat": bool(task.get("_is_direct_chat")),
-        # Presentation marker only. The supervisor's typed routing event remains
-        # the action/receipt authority; the visible transient card gets no
-        # managed-task controls (including "Turn into project").
-        "ephemeral_decision": _ephemeral,
-        **({"typed_routing_action": _typed_routing_action} if _ephemeral and _typed_routing_action else {}),
+        **({"typed_routing_action": _typed_routing_action} if _typed_routing_action else {}),
         **({"model_execution": send_event["progress_meta"]["model_execution"]}
            if "model_execution" in send_event.get("progress_meta", {}) else {}),
         # Carry the thread so the terminal card finalizes in its project panel
         # (per-thread fan-out), not just the main chat.
         "chat_id": int(task.get("chat_id") or 0),
-        "outcome_axes": outcome_axes,
-        "reason_code": reason_code,
+        "outcome_axes": outcome_axes, "reason_code": reason_code,
+        **_custody_debt_event_fields(stored_result),
         "artifact_status": artifact_bundle.get("status") or stored_result.get("artifact_status") or "",
         "artifact_bundle": artifact_bundle,
         "review_status": stored_result.get("review_status") if isinstance(stored_result.get("review_status"), dict) else {},
@@ -703,12 +686,6 @@ def emit_task_results(
         post_usage = dict(usage or {})
         post_usage["outcome_axes"] = outcome_axes
         post_usage["reason_code"] = reason_code
-        # Ephemeral same-route turns (the "turn=decision" anti-freeze path while the
-        # main agent is busy) are PROHIBITED from ALL durable memory: not only
-        # reflection/evolution (below) but chat/scratchpad consolidation and project
-        # letters-home too — the locked main path owns those (v6.33.0 WS10
-        # idempotency contract; claudexor B5). ``_ephemeral`` is computed once near
-        # the top of this function (it also gates the durable task-record writes).
         from ouroboros.project_facts import resolve_project_id
 
         _project_scoped = bool(resolve_project_id(task))
@@ -720,7 +697,7 @@ def emit_task_results(
         # observation and stall the global chat lock). Only real pooled project
         # tasks get the letters-home + blocking treatment.
         _is_direct_chat = bool(task.get("_is_direct_chat"))
-        _project_task = _project_scoped and not _is_direct_chat and not _ephemeral
+        _project_task = _project_scoped and not _is_direct_chat
         if _project_task:
             # Letters home (v6.32.0): record the cycle in the project's own
             # journal and emit a concise completion digest for consciousness
@@ -768,7 +745,7 @@ def emit_task_results(
                 })
             except Exception:
                 log.debug("project digest emission failed", exc_info=True)
-        elif _project_scoped and not _ephemeral:
+        elif _project_scoped:
             _stamp_project_room_pointer(task, env)
         budget_drive_root = str(task.get("budget_drive_root") or "").strip()
         split_drive = bool(
@@ -783,7 +760,7 @@ def emit_task_results(
             parent_env = SimpleNamespace(repo_dir=env.repo_dir, drive_root=pathlib.Path(budget_drive_root), drive_path=lambda rel: pathlib.Path(budget_drive_root) / rel)
             parent_task = {**task, "drive_root": budget_drive_root, "child_drive_root": str(env.drive_root)}
 
-        if not _ephemeral and not _root_post_task_already_completed(env, task):
+        if not _root_post_task_already_completed(env, task):
             _dispatch_root_post_task(
                 env, task, str(send_event.get("text") or ""), event_queue, pending_events,
                 post_usage, llm_trace, review_evidence, drive_logs,

@@ -172,35 +172,22 @@ _PEM_PRIVATE_KEY_RE = re.compile(
     re.DOTALL,
 )
 
-# EGRESS-ONLY long-opaque-run rule (never used by observability redaction — a
-# different false-positive budget). Line-oriented egresses (search match lines,
-# a read slice that starts past the PEM header) surface key MATERIAL without
-# the block markers or provider prefixes the patterns above key on: a PEM body
-# line is 64 unbroken base64 chars, an AWS secret key is 40. Any unbroken run
-# of 40+ base64/hex-ish chars in owner-home output is treated as opaque
-# credential material. Known accepted FP: long hashes/data-URI fragments in
-# owner files get masked too — the disclosure note tells the agent to
-# reference them by location.
-_LONG_OPAQUE_RUN_RE = re.compile(r"[A-Za-z0-9+/=_\-]{40,}")
-
-
-def mask_secret_bytes(
-    text: str, *, mask_opaque: bool = True, preserve_layout: bool = False,
-) -> Tuple[str, int]:
+def mask_secret_bytes(text: str, *, preserve_layout: bool = False) -> Tuple[str, int]:
     """Mask secret-shaped byte spans in final tool output; return (text, count).
 
     Egress seam for owner-home (``user_files``) content: the root agent may
-    read the file, but raw credential bytes never enter model context/history —
-    the masked form (``***``) may (#447 X1/В23). Coverage: the known entropy
-    formats above, PEM private-key blocks, and any unbroken 40+ char opaque run
-    (closes line-oriented egresses — search match lines, mid-file read slices).
-    Repository source callers disable only the opaque fallback: ordinary long
-    identifiers, hashes and source bodies must remain readable. Known token
-    formats and PEM private-key blocks are masked in either scope.
+    read the file, and bytes in a recognized credential format or a PEM
+    private-key block leave as ``***`` (#447 X1/В23). Coverage is exactly those
+    two, so secrets in unrecognized formats are not detected, in every scope.
     Readers that mask before selecting a line/character window set
     ``preserve_layout``: replacement keeps character positions and line breaks,
     so a window inside a key cannot lose its header or shift later source.
-    Disclosed residual: a dictionary-word password has no shape to match.
+    Disclosed residuals: a dictionary-word password has no shape to match, and
+    key material of an unknown format reaching an egress without its PEM header
+    or provider prefix (a bare 40-character AWS secret, a mid-block base64 line)
+    is delivered raw. The owner removed the 40-character opaque-run rule that
+    used to cover that case, knowing it is a relaxation and not a repair
+    (answer 5=A, 2026-09-11): search and read now show the same bytes.
     """
     out = str(text or "")
     count = 0
@@ -221,8 +208,6 @@ def mask_secret_bytes(
     out = _PEM_PRIVATE_KEY_RE.sub(_mask, out)
     for rule, pattern in SECRET_TOKEN_PATTERNS:
         out = pattern.sub(_mask_url if rule == "url_credentials" else _mask, out)
-    if mask_opaque:
-        out = _LONG_OPAQUE_RUN_RE.sub(_mask, out)
     return out, count
 
 

@@ -865,3 +865,60 @@ def test_review_retry_rail_honors_logical_root_cancel_from_physical_retry_leaf(
 
     assert calls == [1]
     assert result.actors[0]["raw_text"] == raw_text
+
+
+def test_a_collection_while_a_released_slot_runs_keeps_the_settled_roster(tmp_path):
+    """Fix cycle 4, J2: a $0 collection (drain window 0, reconcile_only) while released
+    slots are still running re-registers the released wave. The outcomes already recorded
+    for that wave must survive the re-registration: otherwise the roster shrinks to the
+    still-pending slots and the final settled-wave frame under-counts, while the frame
+    promises fewer than the roster size only when a slot timed out before the release.
+    One frame is still written for the wave, once every roster slot has an outcome."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    import ouroboros.review_custody as custody
+    from ouroboros.review_substrate import ReviewSlot
+    from tests.test_plan_review_event_route import (
+        _custody_kwargs,
+        _held_worker,
+        _mailbox_entries,
+    )
+
+    slots = [ReviewSlot(slot_id=f"s{index}", model=f"m/{index}", timeout_sec=30.0)
+             for index in (1, 2, 3)]
+    release = {slot.slot_id: threading.Event() for slot in slots}
+    entered = {slot.slot_id: threading.Event() for slot in slots}
+    _calls, run_slot = _held_worker(slots, {}, release, entered)
+    progress = []
+    ctx = SimpleNamespace(drive_root=tmp_path, emit_progress_fn=progress.append)
+    request, kwargs = _custody_kwargs(
+        tmp_path, surface="plan_review", retry_key="plan_review:" + "e" * 64 + ":1",
+        slots=slots, run_slot=run_slot, ctx=ctx)
+    request.drain_deadline = time.monotonic()
+    deadline = time.time() + 10
+    try:
+        first = custody.run_custodied_review_slots(**kwargs)
+        assert {actor.operation_state for actor in first} == {"pending_dispatch"}
+        assert all(entered[slot.slot_id].wait(10) for slot in slots)
+        release["s1"].set()
+        release["s2"].set()
+        while len(progress) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert _mailbox_entries(tmp_path, request.task_id) == []  # s3 is still running
+        request.reconcile_only, request.drain_deadline = True, time.monotonic()
+        collected = custody.run_custodied_review_slots(**kwargs)
+        assert sorted((actor.slot_id, actor.status) for actor in collected) == [
+            ("s1", "ok"), ("s2", "ok"), ("s3", "error")]
+        assert _mailbox_entries(tmp_path, request.task_id) == []  # the collection writes no frame
+        release["s3"].set()
+        while not _mailbox_entries(tmp_path, request.task_id) and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        for event in release.values():
+            event.set()
+    frames = _mailbox_entries(tmp_path, request.task_id)
+    assert len(frames) == 1, [frame["text"] for frame in frames]
+    assert "3 of 3 reviewer slot(s) settled (3 ok, 0 failed)" in frames[0]["text"]
+    assert not custody._RELEASED_WAVES

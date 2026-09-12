@@ -31,6 +31,12 @@ def _posix(rendered: str) -> str:
 
 
 AWS_SECRET_LINE = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+GITHUB_TOKEN_LINE = "token = ghp_abcdefghijklmnopqrstuvwxyz123456\n"
+PEM_BLOCK = (
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt\n"
+    "-----END OPENSSH PRIVATE KEY-----\n"
+)
 
 
 @pytest.fixture()
@@ -73,23 +79,47 @@ def repo_ctx(tmp_path):
 # masked at egress instead of the file being refused at ingress).
 # ---------------------------------------------------------------------------
 
-def test_root_reads_credential_named_user_file_masked_not_refused(user_files_ctx):
-    ctx, _home = user_files_ctx
+def test_root_reads_credential_named_user_file_known_formats_masked_not_refused(user_files_ctx):
+    """The read is never refused for the file's name, and known credential
+    formats plus PEM blocks are still masked at egress. Owner answer 5=A
+    removed the 40-character opaque-run rule, so key material of an UNKNOWN
+    format (a bare AWS secret access key: no SECRET_TOKEN_PATTERN matches it)
+    now reaches the reader raw. Stated here rather than quietly dropped.
+
+    The rendered notice is asserted too: with a MIXED known+unknown input the
+    sentence the model reads has to match what actually happened, so the old
+    "raw credentials never enter model context" promise may not appear."""
+    ctx, home = user_files_ctx
+    (home / ".aws" / "credentials").write_text(
+        "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE + PEM_BLOCK, encoding="utf-8",
+    )
     out = _read_file(ctx, ".aws/credentials", root="user_files")
     assert not out.startswith("⚠️"), out[:200]          # the read itself succeeds
     assert "[default]" in out                            # non-secret content survives
-    assert "wJalrXUtnFEMI" not in out                    # raw key bytes never egress
+    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in out   # known format masked
+    assert "PRIVATE KEY" not in out                      # PEM block masked whole
     assert "SECRET_BYTES_MASKED" in out                  # disclosure, not silence
+    assert "wJalrXUtnFEMI" in out                        # unknown format: delivered raw
+    assert "raw credentials never enter model context" not in out   # withdrawn promise
+    assert "secrets in unrecognized formats are not detected" in out
 
 
 def test_root_lists_and_searches_credential_named_user_files(user_files_ctx):
-    ctx, _home = user_files_ctx
+    """Names are never hidden and search reaches the file; its match lines carry
+    the same masking the read applies, on the same known formats (5=A: an
+    unknown-format secret is shown by both tools alike)."""
+    ctx, home = user_files_ctx
+    (home / ".aws" / "credentials").write_text(
+        "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE, encoding="utf-8",
+    )
     listing = _list_files(ctx, path=".aws", root="user_files")
     assert ".aws/credentials" in _posix(listing)         # the name is not hidden
-    found = _code_search(ctx, "aws_secret_access_key", root="user_files", path=".aws")
+    found = _code_search(ctx, "token", root="user_files", path=".aws")
     assert ".aws/credentials" in _posix(found)           # search reaches the file
-    assert "wJalrXUtnFEMI" not in found                  # match lines are masked
+    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in found  # match lines are masked
     assert "SECRET_BYTES_MASKED" in found
+    raw = _code_search(ctx, "aws_secret_access_key", root="user_files", path=".aws")
+    assert "wJalrXUtnFEMI" in raw                        # same bytes as the read shows
 
 
 @pytest.mark.parametrize("operation", ["read", "list", "search"])

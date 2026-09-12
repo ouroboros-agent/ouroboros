@@ -472,21 +472,22 @@ def _query_code(
             )
         return f"No results for op `{op}` `{label}`. {_empty_hint(op, label)}"
     def _mask_user_files_rows(text: str) -> str:
-        # Same egress seam as read_file/search (#447 В23): query_code snippets
-        # over the owner's home must not carry raw credential bytes.
+        # Same egress seam as read_file/search (#447 В23): in query_code
+        # snippets over the owner's home, bytes in a recognized credential
+        # format or a PEM block are masked; secrets in unrecognized formats
+        # are not detected.
         from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile
 
         if normalized_root != "user_files" and not is_restricted_subagent_profile(ctx):
             return text
         from ouroboros.secret_masking import mask_secret_bytes
 
-        masked, count = mask_secret_bytes(
-            text, mask_opaque=normalized_root not in {"active_workspace", "system_repo"},
-        )
+        masked, count = mask_secret_bytes(text)
         if count:
             masked += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {count} secret-shaped span(s) were "
-                "replaced with ***; raw credentials never enter model context."
+                f"\n⚠️ SECRET_BYTES_MASKED: {count} span(s) matched a recognized "
+                "credential format or a PEM block and were replaced with ***; "
+                "secrets in unrecognized formats are not detected."
             )
         return masked
 

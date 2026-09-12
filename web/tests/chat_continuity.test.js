@@ -277,10 +277,10 @@ test('typed terminal status is the phase authority even without a legacy status 
     assert.equal(taskTerminalPhase({ task_terminal_status: 'completed' }), 'done');
 });
 
-test('removed direct/ephemeral rows come back as conclusions of record (#369)', () => {
+test('removed direct rows come back as conclusions of record (#369)', () => {
     const existing = new Map([
         ['direct-turn', { activityId: 'direct-turn', kind: 'direct_chat', phase: 'thinking', startedAt: 100, clientMessageId: 'cm-1' }],
-        ['eph-turn', { activityId: 'eph-turn', kind: 'ephemeral_decision', phase: 'thinking', startedAt: 100 }],
+        ['direct-second', { activityId: 'direct-second', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
         ['done-before', { activityId: 'done-before', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
         ['still-live', { activityId: 'still-live', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
     ]);
@@ -293,7 +293,7 @@ test('removed direct/ephemeral rows come back as conclusions of record (#369)', 
         result.concludedDirectActivities,
         [
             { activityId: 'direct-turn', clientMessageId: 'cm-1' },
-            { activityId: 'eph-turn', clientMessageId: '' },
+            { activityId: 'direct-second', clientMessageId: '' },
         ],
     );
     // Already-concluded and still-live rows are never re-concluded.

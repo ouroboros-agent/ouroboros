@@ -187,7 +187,8 @@ export function createChatDecision({
         // producer's original list — a wrong answer, not a degraded card.
         const raw = Array.isArray(src.options) ? src.options : [];
         const normalized = raw.map((option, index) => (typeof option === 'string'
-            ? { label: option, ...(src.option_details?.[index] ? { detail: src.option_details[index] } : {}) } : option));
+            ? { label: option, ...(src.option_details?.[index] ? { detail: src.option_details[index] } : {}),
+                ...(src.recommended_index === index ? { recommended: true } : {}) } : option));
         const corrupt = normalized.some(
             (option) => !option || typeof option !== 'object' || !String(option.label || '').trim());
         const options = corrupt ? [] : normalized.slice(0, MAX_QUIZ_OPTIONS);
@@ -208,6 +209,15 @@ export function createChatDecision({
             comment: String(src.comment || ''),
             detailsUnavailable: src.option_details === undefined && raw.every((option) => typeof option === 'string'),
         };
+    }
+
+    function appendRecommendedBadge(button) {
+        // The asker's recommendation (the "A" option) is a badge on that option, every surface alike.
+        if (button.querySelector('.chat-quiz-option-recommended')) return;
+        const badge = document.createElement('span');
+        badge.className = 'chat-quiz-option-recommended';
+        badge.textContent = 'recommended';
+        button.append(badge);
     }
 
     function statusText(state) {
@@ -368,6 +378,7 @@ export function createChatDecision({
                         const line = document.createElement('span');
                         line.className = 'chat-quiz-option-detail'; line.textContent = detail; button.append(line);
                     }
+                    if (quiz.options[index]?.recommended === true) appendRecommendedBadge(button);
                 });
                 existing.querySelector('.chat-quiz-details-unavailable')?.remove();
             }
@@ -430,6 +441,7 @@ export function createChatDecision({
             label.className = 'chat-quiz-option-label';
             label.textContent = String(option.label || '');
             btn.append(label);
+            if (option.recommended === true) appendRecommendedBadge(btn);
             const detailText = String(option.detail || '');
             if (detailText) {
                 const detail = document.createElement('span');

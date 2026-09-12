@@ -597,7 +597,7 @@ def test_unexpected_loop_error_carries_accumulated_evidence_to_owner_projection(
     assert trace["tool_calls"][0]["trace_ref"]["call_id"]
 
 
-@pytest.mark.parametrize("turn_flag", ["is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn_flag", ["is_direct_chat"])
 def test_counter_survives_the_wait_episodes_free_redial_of_the_same_round(tmp_path, monkeypatch, no_sleep, turn_flag):
     """death → released ConnectError → wait episode → free redial → death →
     death: the round stays bounded by two paid repeats in total (sol s1). The

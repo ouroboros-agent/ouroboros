@@ -237,10 +237,12 @@ SCRATCHPAD_MAX_CONTENT_CHARS = 60_000
 # starving concurrent workers (the 2026-07-23 lock-timeout incident). Warn at
 # exactly that measured degradation point. Since CPL4-C6, size-triggered
 # compaction (config.USAGE_LEDGER_COMPACT_BYTES, usage_compaction.py) should
-# hold the file far below this — like the rotation-log warns, this fires only
-# if compaction is broken, the unfoldable residue itself grows this large, or
-# the lock directory takes no kernel locks and compaction refuses on the name
-# tier (typed usage_ledger_compaction_refused event, once per process).
+# hold the file far below this. Growth can reflect a large unfoldable residue
+# or compaction that is broken, refused, or skipped. The name tier (no kernel
+# locks) emits usage_ledger_compaction_refused once per process per data root;
+# a policy abort (_Abort) emits usage_ledger_compaction_skipped once per process
+# per (data root, reason). The two snapshot-race exits before archive/swap only
+# log warnings, without a typed event.
 USAGE_LEDGER_WARN_BYTES = 20_000_000
 # events/tools/supervisor/task_reflections logs are ROTATION-BOUNDED since the
 # CPL4-C1..C4 rotation train (same 800KB rotator and supervisor tick as

@@ -325,3 +325,18 @@ def test_owner_commands_keep_dispatch_when_replying_to_quiz(tmp_path, monkeypatc
     injected = _run_poller(plugin, api, monkeypatch, posts)
     assert posts == []
     assert [row["text"] for row in injected] == [command]
+
+
+def test_recommended_option_is_starred_in_the_button_caption(tmp_path, monkeypatch):
+    plugin = _load_plugin()
+    _settings(tmp_path)
+    monkeypatch.setattr(plugin, "TelegramClient", Client)
+    api = Api(tmp_path)
+    event = {**_EVENT, "options": [{"label": "sqlite"}, {"label": "postgres", "detail": "scales", "recommended": True}]}
+    asyncio.run(plugin._make_quiz(api)(event))
+    state = json.loads((tmp_path / "quiz_state.json").read_text(encoding="utf-8"))
+    (token, record), = state["quizzes"].items()
+    assert record["options"] == ["sqlite", "★ postgres"]
+    assert "1. sqlite\n2. ★ postgres" in record["text"]
+    keyboard = plugin.telegram_quiz.quiz_keyboard(token, record["options"])
+    assert [row[0]["text"] for row in keyboard] == ["1. sqlite", "2. ★ postgres"]
