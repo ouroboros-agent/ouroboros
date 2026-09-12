@@ -413,12 +413,13 @@ review pack:
   `.idea`, `.vscode`, `.tox`, `__pycache__`, `node_modules`, `.DS_Store`
   (silently excluded — a byte-flip in a cache file does not
   invalidate a PASS review).
-- **Sensitive file shapes HARD-BLOCK the skill**: `.env` and its explicitly
-  listed runtime variants in the shared `_SENSITIVE_NAMES` policy, `.pem`,
-  `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `credentials.json`,
-  `service-account.json`, `secrets.yaml`, `secrets.json`,
-  `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`. (Allowlist
-  reused from `ouroboros.tools.review_helpers._SENSITIVE_EXTENSIONS`
+- **Exact credential file names HARD-BLOCK the skill**: the shared
+  `_SENSITIVE_NAMES` policy (`.env` and its explicitly listed runtime
+  variants, `credentials.json`, `service-account.json`, `secrets.yaml`,
+  `secrets.json`, `id_rsa` and the other SSH private-key names,
+  `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`) plus the `.env` tail in
+  `_SENSITIVE_EXTENSIONS`, which covers spellings such as `prod.env`.
+  (Reused from `ouroboros.tools.review_helpers._SENSITIVE_EXTENSIONS`
   + `_SENSITIVE_NAMES`.) The loader raises `SkillPayloadUnreadable`
   on first discovery and the skill shows up in `list_skills` with a
   non-empty `load_error` — neither reviewable nor executable until
@@ -426,6 +427,12 @@ review pack:
   tree. Rationale: silently excluding the file would leave it
   runtime-reachable via `open('.env').read()`, so a reviewed skill
   could still exfiltrate credentials the reviewer never saw.
+  `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `.kdbx`, `.gpg` and
+  `.asc` are NOT credential shapes: they are ordinary reviewed payload and are
+  SHOWN to the reviewer. A name rule never bought what the rationale above
+  promises anyway, since a real `.env` renamed to `config.txt` walks straight
+  through it, while a public certificate or a release signature used to break
+  the whole skill (owner decision, 2026-09-11).
   `.env.example` is ordinary reviewed payload: its bytes remain in the
   freshness hash and the existing publication scan.
 - Symlinks whose targets resolve outside `skill_dir` (confinement

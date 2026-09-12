@@ -171,7 +171,6 @@ def test_stage_rejects_symlink_member():
         "id_rsa",
         "aws-credentials.json",
         ".npmrc",
-        "config.pem",
     ],
 )
 def test_stage_rejects_sensitive_filenames(name):
@@ -180,6 +179,21 @@ def test_stage_rejects_sensitive_filenames(name):
         (name, b"secret"),
     ])
     with pytest.raises(FetchError, match="sensitive"):
+        stage(archive, slug="x", version="1.0.0")
+
+
+def test_stage_rejects_pem_through_the_extension_allowlist_not_the_sensitive_rule():
+    """Owner answer 4=A removed the key/certificate suffixes from the shared
+    sensitive-shape list, so this archive is no longer "sensitive". The
+    marketplace still refuses it, through its OWN independent extraction
+    allowlist (_ALLOWED_EXTENSIONS), which this phase does not touch. Pinned so
+    the residual is visible: a hub archive carrying a certificate stays
+    rejected, with a different reason."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        ("config.pem", b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+    ])
+    with pytest.raises(FetchError, match="disallowed extension"):
         stage(archive, slug="x", version="1.0.0")
 
 

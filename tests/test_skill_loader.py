@@ -842,6 +842,34 @@ def test_sensitive_files_fail_closed_on_load(tmp_path):
     assert loaded.available_for_execution is False
 
 
+def test_certificate_and_key_suffixed_payload_loads_and_is_reviewable(tmp_path):
+    """Owner answer 4=A: a certificate or a .key payload no longer breaks the
+    whole skill. The file loads, it is part of the content hash, and the
+    reviewer sees it instead of it being hidden behind a name rule."""
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    repo_root = tmp_path / "skills"
+    skill_dir = _write_skill(
+        repo_root,
+        "certy",
+        manifest=_valid_script_manifest("certy"),
+        scripts={"main.py": "print('ok')\n"},
+    )
+    (skill_dir / "cert.pem").write_text(
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", encoding="utf-8"
+    )
+    (skill_dir / "deck.key").write_text("Keynote deck bytes\n", encoding="utf-8")
+
+    from ouroboros.skill_loader import _iter_payload_files
+
+    assert compute_content_hash(skill_dir, manifest_scripts=[{"name": "main.py"}])
+    reviewed = {p.name for p in _iter_payload_files(skill_dir, manifest_scripts=[{"name": "main.py"}])}
+    assert {"cert.pem", "deck.key"} <= reviewed
+    loaded = load_skill(skill_dir, drive_root)
+    assert loaded is not None
+    assert loaded.load_error == ""
+
+
 def test_sanitized_name_collision_surfaces_as_load_error(tmp_path):
     """Phase 3 round 12 regression: ``skills/hello world/`` and
     ``skills/hello_world/`` both sanitise to the same identity. The
