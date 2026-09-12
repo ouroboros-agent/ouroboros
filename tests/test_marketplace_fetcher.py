@@ -182,16 +182,31 @@ def test_stage_rejects_sensitive_filenames(name):
         stage(archive, slug="x", version="1.0.0")
 
 
-def test_stage_rejects_pem_through_the_extension_allowlist_not_the_sensitive_rule():
-    """Owner answer 4=A removed the key/certificate suffixes from the shared
-    sensitive-shape list, so this archive is no longer "sensitive". The
-    marketplace still refuses it, through its OWN independent extraction
-    allowlist (_ALLOWED_EXTENSIONS), which this phase does not touch. Pinned so
-    the residual is visible: a hub archive carrying a certificate stays
-    rejected, with a different reason."""
+def test_stage_accepts_a_certificate_and_a_release_signature():
+    """Owner answer 4=A: a certificate and an .asc release signature are the
+    motivating case, so a hub archive carrying them stages instead of being
+    rejected whole. Both are text the reviewer reads."""
     archive = _zip_with([
         ("SKILL.md", SKILL_MD_BYTES),
         ("config.pem", b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+        ("sig.asc", b"-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END PGP SIGNATURE-----\n"),
+    ])
+    staged = stage(archive, slug="owner/x", version="1.0.0")
+    try:
+        assert (staged.staging_dir / "config.pem").is_file()
+        assert (staged.staging_dir / "sig.asc").is_file()
+    finally:
+        staged.cleanup()
+
+
+def test_stage_still_refuses_binary_key_containers_by_extension():
+    """Disclosed residual: the extraction allowlist is a content-TYPE gate for
+    hub archives, not a credential-name rule, and it still admits no binary key
+    container (.key, .p12, .pfx, .jks, .keystore, .kdbx, .gpg). Widening it to
+    binaries is an owner decision, not part of removing the name gates."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        ("assets/deck.key", b"PK\x03\x04binary deck"),
     ])
     with pytest.raises(FetchError, match="disallowed extension"):
         stage(archive, slug="x", version="1.0.0")

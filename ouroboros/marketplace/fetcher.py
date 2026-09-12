@@ -29,6 +29,9 @@ _ALLOWED_EXTENSIONS = frozenset({
     ".html", ".htm", ".css", ".scss", ".sass", ".svg", ".csv", ".tsv", ".sql", ".graphql", ".gql",
     ".lock", ".license", ".png", ".jpg", ".jpeg", ".gif", ".webp",
     ".wasm", ".mp3", ".ogg", ".wav", ".mp4", ".webm", ".woff", ".woff2", ".ttf", ".otf",
+    # Text certificates and detached signatures the reviewer reads like any
+    # other payload; binary key containers keep no entry here.
+    ".pem", ".asc",
 })
 
 _ALLOWED_BARE_BASENAMES = frozenset({
