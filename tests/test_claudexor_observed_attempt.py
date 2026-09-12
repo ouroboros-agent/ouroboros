@@ -140,6 +140,21 @@ def test_model_invocation_records_requested_and_applied_options(applied, expecte
     assert observed["options_honored"] == expected
 
 
+def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
+    """The recorded state covers every submitted option, not the thinking horizon alone."""
+    requested = {"reasoningEffort": "xhigh", "cacheKey": "execution-a"}
+    invocation = _ModelInvocation(
+        {"usage_model": "claudexor::codex=model"}, {"options": requested}, {}
+    )
+
+    _message, usage = invocation.finish({
+        "outcome": "completed", "message": {"role": "assistant", "content": "done"},
+        "appliedOptions": {"reasoningEffort": "xhigh", "cacheKey": "engine-b"},
+    })
+
+    assert usage["claudexor"]["options_honored"] == "mismatch"
+
+
 def _continuation(profile="profile-a", source="codex", model="gpt-6"):
     return [{
         "role": "assistant",

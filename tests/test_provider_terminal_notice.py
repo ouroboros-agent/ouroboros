@@ -191,6 +191,28 @@ def test_applied_options_without_mismatch_emit_no_owner_line(honored):
     assert progress == []
 
 
+def test_owner_line_speaks_only_for_a_changed_reasoning_effort():
+    """A mismatch on another submitted option is durable, never an effort claim."""
+    progress = []
+    route = {"credentialProfileId": "acct-a", "model": "codex=model"}
+    usage = {"_model_route": dict(route), "_options": {
+        "options_honored": "mismatch", "route": dict(route),
+        "requested_options": {"reasoningEffort": "high", "cacheKey": "execution-a"},
+        "applied_options": {"reasoningEffort": "high", "cacheKey": "engine-b"}}}
+
+    def emit(text, *, incident=None):
+        progress.append(text)
+
+    loop_transport.emit_model_effort_mismatch(usage, task_id="task-7", emit_progress=emit)
+    assert progress == [] and usage["_options"]["options_honored"] == "mismatch"
+
+    # The silent round spent no dedupe slot: a real effort change still speaks.
+    usage["_options"]["applied_options"] = {"reasoningEffort": "low", "cacheKey": "engine-b"}
+    loop_transport.emit_model_effort_mismatch(usage, task_id="task-7", emit_progress=emit)
+    assert progress == ["⚠️ Claudexor served at low effort while high was requested"
+                        " (Claudexor account acct-a)."]
+
+
 def _mismatch_round_context(tmp_path, monkeypatch, *, emit_progress, applied_values):
     """A Main round whose subscription answer reports a lowered effort."""
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)

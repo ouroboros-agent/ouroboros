@@ -780,13 +780,16 @@ def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
 def emit_model_effort_mismatch(
     accumulated_usage: Dict[str, Any], *, task_id: str, emit_progress: Optional[Callable[..., None]],
 ) -> None:
-    """Disclose an engine-applied option mismatch once per task and model.
+    """Disclose an engine-applied reasoning-effort change once per task and model.
 
     One line per (task, model), never per round: a second mismatch on the same
     model in the same task stays in the durable usage rows only. The options
     must belong to the route the record now names: an error round rewrites
     `_model_route` from its own failure, and that model must never inherit an
-    earlier route's applied options.
+    earlier route's applied options. The durable state stays generic over every
+    submitted option; this line speaks only for the thinking horizon, so an
+    engine that echoes another option differently never reaches the owner as an
+    effort claim.
     """
     options = accumulated_usage.get("_options")
     route = accumulated_usage.get("_model_route") or {}
@@ -796,10 +799,10 @@ def emit_model_effort_mismatch(
             or options.get("options_honored") != "mismatch" or model in notified
             or (options.get("route") or {}) != route):
         return
-    requested = options.get("requested_options") or {}
-    applied = options.get("applied_options") or {}
-    requested_effort = str(requested.get("reasoningEffort") or "unknown")
-    applied_effort = str(applied.get("reasoningEffort") or "unknown")
+    requested_effort = (options.get("requested_options") or {}).get("reasoningEffort")
+    applied_effort = (options.get("applied_options") or {}).get("reasoningEffort")
+    if requested_effort is None or applied_effort is None or requested_effort == applied_effort:
+        return
     account = str(route.get("credentialProfileId") or "")
     notified.append(model)
     emit_progress(

@@ -1431,7 +1431,7 @@ sizing assertion, not a provider unlock or a scope-review acknowledgement. Unkno
 capacity stays unknown; input size, response reservation and capacity are separate.
 Each model operation records its submitted options beside the engine's applied
 options; an absent applied-options report remains explicitly unknown, while the
-first mismatch in a task also produces one typed owner-visible notice.
+first changed reasoning effort in a task also produces one typed owner-visible notice.
 An account change rebinds preparation before another physical send.
 Ordinary sends, prospective wrap-up payloads and forced final replies share the
 same acting-role/account binding. Prospective subscription accounting uses the
