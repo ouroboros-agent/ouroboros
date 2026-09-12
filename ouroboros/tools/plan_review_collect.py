@@ -150,6 +150,19 @@ async def collect_before_supersede(
     return load_plan_review_state(state_root, task_id)
 
 
+def committed_cycles(state: Dict[str, Any]) -> int:
+    """``cycles_paid`` plus every open wave whose panel is dispatched but not yet
+    collected (``custody_pending`` and unpaid). The money is committed at the
+    dispatch barrier, so the shared cap counts such a wave BEFORE the collection
+    proves its sends; otherwise a revised envelope submitted while reviewers are
+    still running would buy another full panel under a spent cap."""
+    pending = sum(
+        1 for w in state.get("waves") or []
+        if isinstance(w, dict) and w.get("custody_pending") and not w.get("paid")
+    )
+    return int(state.get("cycles_paid") or 0) + pending
+
+
 def collect_before_gate(ctx: Any, state: Dict[str, Any]) -> Dict[str, Any]:
     """ONE free collection before a blocking finalization verdict (owner batch 3,
     6e=A): when the current wave still has custody pending, collect what has

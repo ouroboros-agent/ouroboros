@@ -592,8 +592,9 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         except (OSError, TimeoutError, ValueError) as exc:
             return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}")
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
-    if cap is not None and cycles_paid >= cap and not resume_in_flight:
-        return _cycles_exhausted(ctx, state, state_root, task_id, cap=cap, cycles_paid=cycles_paid,
+    # A panel dispatched at the barrier is committed money: the cap counts it before its collection.
+    if cap is not None and _collect.committed_cycles(state) >= cap and not resume_in_flight:
+        return _cycles_exhausted(ctx, state, state_root, task_id, cap=cap, cycles_paid=_collect.committed_cycles(state),
                                  enforcement=enforcement, reminder=reminder,
                                  request_fingerprint=fingerprint)
     # #116: a malformed structured reviewer-slot config must refuse loudly here

@@ -16,7 +16,7 @@ import time
 from types import SimpleNamespace
 
 
-from tests.test_plan_review_engine import CLEAN, _call, _control, _state
+from tests.test_plan_review_engine import CLEAN, DECK_SPEC, _call, _control, _state
 from tests.test_plan_review_engine import harness as _engine_harness
 
 harness = _engine_harness  # noqa: F811 - pytest fixture re-export
@@ -291,3 +291,27 @@ def test_barrier_wave_replaces_a_stale_paid_predecessor_and_pays_only_at_collect
     record_plan_review_wave(tmp_path, "t", collected)
     state = load_plan_review_state(tmp_path, "t")
     assert state["cycles_paid"] == 2 and state["waves"][-1]["closed"] is True
+
+
+def test_in_flight_panels_count_toward_the_cycle_cap_at_dispatch(harness, monkeypatch):
+    """Fix cycle 1, F1: a dispatched panel commits its cycle at the barrier. Under
+    OUROBOROS_REVIEW_MAX_CYCLES=1 a revised envelope submitted while the first panel is
+    still in flight buys no second panel: it is refused with the typed cap state."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    executor = _install_real_substrate(monkeypatch)
+    ctx = harness.make_ctx()
+    try:
+        first = _call(ctx)
+        assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+        assert _wait_until(lambda: executor.execute_calls == 3)
+        second = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})
+        assert second.startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED: 1 of 1 paid plan-review cycles are spent")
+        assert "REVIEW CUSTODY PENDING" in second  # the committed in-flight wave is the live obligation
+        third = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]})
+        assert executor.execute_calls == 3, "no panel beyond the cap was dispatched"
+        assert third.startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED")
+        assert _state(harness)["cycles_paid"] == 0  # committed, not yet proven paid
+        assert any(line.startswith("📐 plan_task: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
+    finally:
+        executor.release.set()
+    assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
