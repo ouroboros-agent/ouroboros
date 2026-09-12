@@ -756,3 +756,45 @@ def test_child_failure_classes_reach_the_root_reflection(tmp_path):
     assert _child_failure_classes(rows) == ["failed", "infra_failed"]
     assert _child_failure_classes([]) == []
     assert _child_failure_classes(None) == []
+
+
+def test_only_a_genuinely_failed_child_admits_the_register(tmp_path):
+    """"Not ok" is not "failed".
+
+    A child the parent cancelled in an ordinary cascade, one that soft-landed
+    best_effort on a rail, and a degraded one all end non-ok with nothing having
+    gone wrong. Admitting them opened the Pattern Register - a paid light-model
+    rewrite - on a clean root, with an empty markers line and nothing to learn.
+    Built through the real normalizer, because the raw rows the walk reads carry
+    only a status.
+    """
+    from ouroboros.outcomes import normalize_outcome_axes
+    from ouroboros.post_task_synthesis import _child_failure_classes
+    from ouroboros.reflection import _admits_pattern_register
+
+    def _classes(item):
+        return _child_failure_classes([{"outcome_axes": normalize_outcome_axes(item)}])
+
+    for benign in (
+        {"task_id": "c", "status": "cancelled"},
+        {"task_id": "c", "status": "completed",
+         "outcome_axes": {"execution": {"status": "best_effort"}}},
+        {"task_id": "c", "status": "completed",
+         "outcome_axes": {"execution": {"status": "degraded"}}},
+        {"task_id": "c", "status": "completed"},
+    ):
+        classes = _classes(benign)
+        assert classes == [], benign
+        assert _admits_pattern_register(
+            {"error_count": 0, "key_markers": [], "child_failure_classes": classes},
+        ) is False, benign
+
+    for failure in (
+        {"task_id": "c", "status": "failed", "outcome_axes": {"execution": {"status": "failed"}}},
+        {"task_id": "c", "status": "failed",
+         "outcome_axes": {"execution": {"status": "infra_failed"}}},
+    ):
+        classes = _classes(failure)
+        assert classes and _admits_pattern_register(
+            {"error_count": 0, "key_markers": [], "child_failure_classes": classes},
+        ) is True, failure

@@ -177,19 +177,27 @@ def _apply_reflection_memory_actions(
 
 
 def _child_failure_classes(rows: Any) -> list:
-    """The sorted TYPED execution classes of the children that did not end clean.
+    """The sorted TYPED execution FAILURE classes among the children.
 
     Read off the same ``outcome_axes`` the evidence walk already normalized, so
     the root's reflection can carry what its subtree did without a second
-    collector, a second walk, or children reflecting on their own."""
-    from ouroboros.outcomes import EXECUTION_OK
+    collector, a second walk, or children reflecting on their own.
 
+    Only genuine failures count. "Not ok" is a much wider set: a child the parent
+    cancelled in an ordinary cascade, one that soft-landed ``best_effort`` on a
+    rail, a ``degraded`` one, and an ``interrupted`` one that is not even
+    terminal all end non-ok without anything having gone wrong, and admitting
+    them opened the Pattern Register - a paid rewrite of the register - on clean
+    roots with nothing to learn."""
+    from ouroboros.outcomes import EXECUTION_FAILED, EXECUTION_INFRA_FAILED
+
+    failures = {EXECUTION_FAILED, EXECUTION_INFRA_FAILED}
     classes = set()
     for row in rows or []:
         axes = row.get("outcome_axes") if isinstance(row, dict) else None
         execution = axes.get("execution") if isinstance(axes, dict) else None
         status = str(execution.get("status") or "").strip() if isinstance(execution, dict) else ""
-        if status and status != EXECUTION_OK:
+        if status in failures:
             classes.add(status)
     return sorted(classes)
 
