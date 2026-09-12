@@ -341,3 +341,54 @@ def test_the_barrier_records_no_failed_last_execution_for_running_slots(harness,
     assert _control(_call(ctx)) == {"outcome": "GREEN", "closed": True}  # the collection
     last = reviewer_slot_config.reviewer_slot_last_executions()
     assert {sid: row["status"] for sid, row in last.items()} == {"s1": "ok", "s2": "ok", "s3": "ok"}
+
+
+def test_a_slot_settling_during_the_barrier_release_never_splits_the_wave_into_two_frames(tmp_path, monkeypatch):
+    """Fix cycle 2, 2b: the released roster is registered atomically before any
+    slot can complete it. A slot that settles (an immediate typed refusal) while the
+    coordinator is still minting the other released rows must not complete a one-slot
+    roster and mint a second frame when the next slot settles."""
+    import ouroboros.review_custody as custody
+    from ouroboros.review_substrate import ReviewSlot
+
+    slots = [ReviewSlot(slot_id="s1", model="m/a", timeout_sec=30.0),
+             ReviewSlot(slot_id="s2", model="m/b", timeout_sec=30.0)]
+    release = {s.slot_id: threading.Event() for s in slots}
+    entered = {s.slot_id: threading.Event() for s in slots}
+    calls, run_slot = _held_worker(
+        slots, {"s1": {"status": "not_dispatched", "raw_text": "",
+                       "error": "daemon unreachable before physical review dispatch",
+                       "operation_state": "not_dispatched"}}, release, entered)
+    progress = []
+    ctx = SimpleNamespace(drive_root=tmp_path, emit_progress_fn=progress.append)
+    request, kwargs = _custody_kwargs(
+        tmp_path, surface="plan_review", retry_key="plan_review:" + "d" * 64 + ":1",
+        slots=slots, run_slot=run_slot, ctx=ctx)
+    request.drain_deadline = time.monotonic()
+    original = custody._late_or_timeout_actor
+
+    def interleaved(slot, entry, timeout, error_actor, *, released_early=False):
+        actor = original(slot, entry, timeout, error_actor, released_early=released_early)
+        if released_early and slot.slot_id == "s1":
+            # s1 settles right after its own row is minted, before s2's row exists.
+            assert entered["s1"].wait(10)
+            release["s1"].set()
+            assert _wait_until(lambda: any("reviewer slot s1 settled" in line for line in progress))
+        return actor
+
+    monkeypatch.setattr(custody, "_late_or_timeout_actor", interleaved)
+    try:
+        first = custody.run_custodied_review_slots(**kwargs)
+        assert {a.operation_state for a in first} == {"pending_dispatch"}
+        assert _mailbox_entries(tmp_path, request.task_id) == []  # s2 still running: no frame yet
+        assert entered["s2"].wait(10)
+        release["s2"].set()
+        assert _wait_until(lambda: len(_mailbox_entries(tmp_path, request.task_id)) >= 1)
+        time.sleep(0.2)
+    finally:
+        for event in release.values():
+            event.set()
+    frames = _mailbox_entries(tmp_path, request.task_id)
+    assert len(frames) == 1, [f["text"] for f in frames]
+    assert "2 released reviewer slot(s) settled (1 ok, 1 failed)" in frames[0]["text"]
+    assert not custody._RELEASED_WAVES

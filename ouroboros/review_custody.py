@@ -54,8 +54,9 @@ _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
 # not the full actor/prompt, until process exit.
 _NO_RESEND: Dict[str, str] = {}
 _PENDING_STATES = {"in_flight", "custody_lost", "pending_dispatch"}
-# Slots released at a caller's drain deadline, per wave: {slot_id: settled status or ''}.
-_RELEASED_WAVES: Dict[str, Dict[str, str]] = {}
+# Slots released at a caller's drain deadline, per wave: {"slots": {slot_id: settled
+# status or ''}, "total": roster size}; registered whole (_register_released_roster).
+_RELEASED_WAVES: Dict[str, Dict[str, Any]] = {}
 _PHYSICAL_CAPTURE_STATES = frozenset({"", *POSITIVE_PHYSICAL_ATTEMPT_STATES})
 _POSITIVE_CAPTURE_STATES = POSITIVE_PHYSICAL_ATTEMPT_STATES
 
@@ -802,7 +803,6 @@ def _late_or_timeout_actor(
     slot: Any, entry: Any, timeout: float, error_actor: Callable[..., Any],
     *, released_early: bool = False,
 ) -> Any:
-    slot_id = str(getattr(slot, "slot_id", "") or "")
     if entry is not None:
         with _ACTIVE_LOCK:
             if entry.event.is_set() and entry.actor is not None:
@@ -811,8 +811,7 @@ def _late_or_timeout_actor(
                 except Exception:
                     return entry.actor
             if released_early:
-                entry.released_early = True
-                _RELEASED_WAVES.setdefault(entry.wave_key, {}).setdefault(slot_id, "")
+                entry.released_early = True  # the roster itself was registered by the caller
             else:
                 entry.timed_out = True
     if released_early and entry is not None:
@@ -993,11 +992,11 @@ def _settle_review_attempt(
             or (explicit_retry and entry.released_early
                 and str(getattr(actor, "operation_state", "") or "") == "not_dispatched")
         )
-        released_wave: Dict[str, str] = {}
+        released_wave: Dict[str, Any] = {}
         if entry.released_early and entry.wave_key in _RELEASED_WAVES:
-            wave_slots = _RELEASED_WAVES[entry.wave_key]
-            wave_slots[str(getattr(slot, "slot_id", "") or "")] = str(actor.status or "settled")
-            if all(wave_slots.values()):
+            roster = _RELEASED_WAVES[entry.wave_key]
+            roster["slots"][str(getattr(slot, "slot_id", "") or "")] = str(actor.status or "settled")
+            if all(roster["slots"].values()):
                 released_wave = _RELEASED_WAVES.pop(entry.wave_key)
         if replayable and usage_ctx is not None and (late or explicit_retry):
             settled = getattr(usage_ctx, "_review_settled_attempts", None)
@@ -1017,7 +1016,7 @@ def _settle_review_attempt(
         from ouroboros.tools.plan_review_collect import announce_released_settlement
 
         announce_released_settlement(usage_ctx, request=request, task_id=task_id, slot=slot,
-                                     actor=actor, settled_wave=released_wave)
+                                     actor=actor, settled_wave=dict(released_wave.get("slots") or {}))
     if late and not pending_invocation and not custody_lost and usage_ctx is not None:
         try:
             from ouroboros.tools.review_helpers import emit_review_event
@@ -1039,6 +1038,30 @@ def _settle_review_attempt(
 
 def _wave_key(request: Any) -> str:
     return "|".join(str(getattr(request, key, "") or "") for key in ("surface", "task_id", "retry_key"))
+
+
+def _register_released_roster(
+    request: Any, slots: List[Any], slot_entries: Dict[str, Any], returned_ids: set,
+    slot_deadlines: Dict[str, float], monotonic_now: Callable[[str], float],
+) -> set:
+    """Register the WHOLE released roster under ONE lock hold before any released row is
+    minted: a slot settling at once then finds the complete roster and cannot split the
+    wave into two frames. A settled slot or one past its own window is not released."""
+    released_ids: set = set()
+    with _ACTIVE_LOCK:
+        for slot in slots:
+            slot_id = str(getattr(slot, "slot_id", "") or "")
+            entry = slot_entries.get(slot_id)
+            if (slot_id in returned_ids or entry is None or entry.event.is_set()
+                    or slot_deadlines.get(slot_id, 0.0) <= monotonic_now(slot_id)):
+                continue
+            entry.released_early = True
+            released_ids.add(slot_id)
+        if released_ids:
+            _RELEASED_WAVES[_wave_key(request)] = {
+                "slots": {slot_id: "" for slot_id in released_ids}, "total": len(slots),
+            }
+    return released_ids
 
 
 def _pending_checkpoint(usage_ctx: Any, request: Any, slot_id: str, operation_id: str) -> Any:
@@ -1333,6 +1356,9 @@ def run_custodied_review_slots(
             pending.remove(actor.slot_id)
 
     returned_ids = {str(getattr(actor, "slot_id", "") or "") for actor in actors}
+    released_ids = _register_released_roster(
+        request, slots, slot_entries, returned_ids, slot_deadlines, monotonic_now,
+    ) if drain_deadline is not None else set()
     for slot in slots:
         slot_id = str(getattr(slot, "slot_id", "") or "")
         if slot_id in returned_ids:
@@ -1341,11 +1367,8 @@ def run_custodied_review_slots(
         timeout = slot_windows.get(slot_id)
         if timeout is None:
             timeout = _logical_timeout(slot, request, usage_meta)
-        released = (
-            drain_deadline is not None and entry is not None
-            and slot_deadlines.get(slot_id, 0.0) > monotonic_now(slot_id)
-        )
-        actors.append(_late_or_timeout_actor(slot, entry, timeout, error_actor, released_early=released))
+        actors.append(_late_or_timeout_actor(slot, entry, timeout, error_actor,
+                                             released_early=slot_id in released_ids))
     return actors
 
 
