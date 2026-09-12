@@ -96,16 +96,21 @@ rules have no automated surface — review-only.
   Positional GitHub policy inspects direct `gh` and shell-wrapper segments;
   remote `ssh ... gh auth` is an inherited residual, not classified as local auth.
 - Do not infer credential authority from ordinary source/config directory
-  names. Restricted repository reads/searches use the existing byte masker with
-  `mask_opaque=False`: preserve ordinary long source while masking known token
-  formats and PEM keys. Keep owner-home opaque masking enabled. A runtime data
+  names. Reads and searches share ONE byte masker in every scope: known token
+  formats and PEM private-key blocks are masked, ordinary long source, hashes
+  and identifiers are preserved, so search and read deliver the same bytes to
+  the owner. A runtime data
   directory inside a project retains its actual secret/control path rules,
   including a forked child's canonical parent (`core_secret_paths.restricted_data_roots`).
   Prepare invariant credential/root locations once per list/search/query call
   through `make_subagent_secret_target_check`; never retain that predicate across
   calls. Target resolution and owner-state/file-identity checks remain per target.
-  Task/artifact source names and public PEM certificates carry no credential
-  authority. Restricted file readers mask complete private-key blocks before
+  A file NAME never refuses owner input or owner output: not on attachment
+  ingest, not on export or Deliverables, not on a `user_files` mutation, and not
+  in the git lanes. Refusal authority belongs to the exact credential leaves, the
+  enumerated physical stores and, in the git lanes, content evidence
+  (`workspace_patch_capture.pem_private_key_reason`). Restricted file readers
+  mask complete private-key blocks before
   selecting a window, preserving character positions and line breaks. The
   owner credential fence covers the enumerated locations in
   `credential_shapes.owner_credential_locations`, credential leaves and VCS

@@ -1,0 +1,262 @@
+"""The owner's own files survive every gate that used to judge their NAME.
+
+Capability-preservation acceptance for the phase that removed the credential
+suffix tables, the name regex, the dotted-component default-deny and the
+reviewer suffix list (owner answers Q6 of batch 2 and 3=A / 4=A / 5=A of batch
+3). Every gate here refused ordinary owner work before: a Keynote deck named
+``deck.key``, a report inside ``~/.codex``, a document in ``~/Library``.
+
+The point of the module is the POSITIVE path on product-shaped geometry, with
+the surviving refusals asserted beside it: real key material is still caught,
+now on content evidence, and a real credential directory is still refused with
+the rule named in the row the owner sees.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import subprocess
+import zipfile
+from io import BytesIO
+from types import SimpleNamespace
+
+import pytest
+
+
+def _keynote_shaped_bytes() -> bytes:
+    """A few KB of real zip container, the shape a .key deck actually has."""
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("Index/Document.iwa", b"\x00\x01\x02\x03" * 512)
+        archive.writestr("Metadata/BuildVersionHistory.plist", "<plist/>")
+        archive.writestr("preview.jpg", b"\xff\xd8\xff\xe0" + b"\x11" * 2048)
+    return buffer.getvalue()
+
+
+PEM_PRIVATE_KEY = (
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt\n"
+    "-----END OPENSSH PRIVATE KEY-----\n"
+)
+
+
+def _init_repo(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=str(path), check=True)
+    (path / "README.md").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(path), check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@local", "commit", "-qm", "init"],
+        cwd=str(path), check=True,
+    )
+
+
+# --- (a) ingress: the owner attaches their own files -------------------------
+
+
+def test_owner_attaches_a_key_deck_and_files_from_dotted_and_library_folders(tmp_path):
+    from ouroboros.artifacts import stage_task_attachments
+
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    (home / "Library" / "Mobile Documents").mkdir(parents=True)
+    deck = home / "Desktop" / "custom.key"
+    deck.parent.mkdir(parents=True)
+    deck.write_bytes(_keynote_shaped_bytes())
+    report = home / ".codex" / "report.md"
+    report.write_text("# findings\n", encoding="utf-8")
+    icloud = home / "Library" / "Mobile Documents" / "deck.pdf"
+    icloud.write_bytes(b"%PDF-1.4\n" + b"0" * 1024)
+
+    drive = tmp_path / "data"
+    drive.mkdir()
+    manifest = stage_task_attachments(
+        drive, "task-owner-files", [str(deck), str(report), str(icloud)],
+    )
+
+    assert [row["status"] for row in manifest] == ["staged", "staged", "staged"], manifest
+    for row in manifest:
+        assert row["mime"] and row["abs_path"]
+        assert pathlib.Path(row["abs_path"]).is_file()
+    assert {row["label"] for row in manifest} == {"custom.key", "report.md", "deck.pdf"}
+
+
+def test_a_real_credential_directory_is_still_refused_and_names_its_rule(tmp_path):
+    from ouroboros.artifacts import stage_task_attachments
+
+    ssh = tmp_path / "home" / ".ssh"
+    ssh.mkdir(parents=True)
+    key = ssh / "id_rsa"
+    key.write_text(PEM_PRIVATE_KEY, encoding="utf-8")
+
+    drive = tmp_path / "data"
+    drive.mkdir()
+    manifest = stage_task_attachments(drive, "task-owner-ssh", [str(key)])
+
+    assert manifest[0]["status"] == "rejected"
+    assert manifest[0]["reason"] == "secret_source"
+    assert manifest[0]["rule"] == "credential/control directory component '.ssh'"
+
+
+# --- (b) export: the same deck declared as a process output ------------------
+
+
+def test_owner_declares_a_key_deck_as_a_process_output(tmp_path):
+    from ouroboros.tools.shell_outputs import _protected_output_source_reason
+
+    ctx = SimpleNamespace(repo_dir=str(tmp_path / "repo"), drive_root=str(tmp_path / "data"))
+    project = tmp_path / "project"
+    project.mkdir()
+    deck = project / "deck.key"
+    deck.write_bytes(_keynote_shaped_bytes())
+
+    assert _protected_output_source_reason(ctx, deck, "task_drive", set()) == ""
+    dotenv = project / ".env"
+    dotenv.write_text("TOKEN=x\n", encoding="utf-8")
+    assert "credential-like output .env" in _protected_output_source_reason(
+        ctx, dotenv, "task_drive", set(),
+    )
+
+
+# --- (c) delegated snapshot: transport rules stay, name authority is gone ----
+
+
+def test_delegated_snapshot_keeps_a_text_deck_and_states_the_binary_boundary(tmp_path):
+    from ouroboros.workspace_patch_capture import untracked_capture_veto_reason
+
+    root = tmp_path / "run"
+    _init_repo(root)
+    (root / "deck.key").write_text("Keynote outline, plain text\n", encoding="utf-8")
+    assert untracked_capture_veto_reason(root, "deck.key") == ""
+
+    # The honest boundary: the name stopped mattering, the TRANSPORT rules of the
+    # patch did not. A binary deck is still excluded, as "binary file" and never
+    # as "private key or certificate".
+    binary = tmp_path / "binary-run"
+    _init_repo(binary)
+    (binary / "deck.key").write_bytes(_keynote_shaped_bytes())
+    reason = untracked_capture_veto_reason(binary, "deck.key")
+    assert reason == "binary file"
+
+
+# --- (d) negative control: key material under an innocent name ---------------
+
+
+def test_key_material_under_an_innocent_name_is_vetoed_in_the_patch_lane(tmp_path):
+    from ouroboros.workspace_patch_capture import untracked_capture_veto_reason
+    from ouroboros.headless import write_workspace_patch_artifacts
+
+    root = tmp_path / "repo"
+    _init_repo(root)
+    (root / "notes.txt").write_text(PEM_PRIVATE_KEY, encoding="utf-8")
+    (root / "deck.key").write_text("Keynote outline, plain text\n", encoding="utf-8")
+
+    assert untracked_capture_veto_reason(root, "notes.txt") == (
+        "private key material (PEM private-key header)"
+    )
+    _artifacts, manifest = write_workspace_patch_artifacts(root, tmp_path / "artifacts", task={})
+    excluded = {item["path"]: item["reason"] for item in manifest["untracked_excluded"]}
+    assert excluded == {"notes.txt": "private key material (PEM private-key header)"}
+
+
+def test_key_material_under_an_innocent_name_is_vetoed_in_the_attach_snapshot_lane(tmp_path):
+    from ouroboros.project_sources import attach_snapshot_init
+
+    folder = tmp_path / "attached"
+    folder.mkdir()
+    (folder / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (folder / "deck.key").write_text("Keynote outline, plain text\n", encoding="utf-8")
+    (folder / "notes.txt").write_text(PEM_PRIVATE_KEY, encoding="utf-8")
+
+    error, skipped = attach_snapshot_init(folder)
+    assert error == ""
+    assert skipped == ["notes.txt"]
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=str(folder), capture_output=True, text=True,
+    ).stdout.split()
+    assert "deck.key" in tracked and "notes.txt" not in tracked
+
+
+@pytest.mark.serial
+def test_key_material_under_an_innocent_name_is_vetoed_in_the_coop_checkpoint_lane(
+    tmp_path, monkeypatch,
+):
+    from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
+    from ouroboros.task_results import write_task_result
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects_root))
+    data = tmp_path / "data"
+    (data / "logs").mkdir(parents=True)
+    tree = projects_root / "coop_root1"
+    _init_repo(tree)
+    write_task_result(data, "root1", "failed", reason_code="budget_exhausted", title="Deck")
+    write_task_result(
+        data, "child1", "failed",
+        delegation_role="subagent", parent_task_id="root1", root_task_id="root1",
+        task_constraint={"mode": "acting_subagent", "surface": "external_workspace",
+                         "write_root": str(tree)},
+    )
+    (tree / "deck.key").write_text("Keynote outline, plain text\n", encoding="utf-8")
+    (tree / "notes.txt").write_text(PEM_PRIVATE_KEY, encoding="utf-8")
+
+    receipts = checkpoint_commit_coop_roots(data, "root1", title="Deck")
+    assert [receipt["skipped_sensitive"] for receipt in receipts] == [
+        [{"path": "notes.txt", "reason": "private key material (PEM private-key header)"}]
+    ]
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"], cwd=str(tree),
+        capture_output=True, text=True,
+    ).stdout.split()
+    assert "deck.key" in committed and "notes.txt" not in committed
+
+
+# --- (e) what the owner reads, and the inspection carve ----------------------
+
+
+def test_a_rejected_attachment_line_shows_the_rule_not_only_the_code():
+    from ouroboros.gateway.tasks import _render_attachment_lines
+
+    rendered = _render_attachment_lines([
+        {"ordinal": 0, "status": "rejected", "reason": "secret_source", "label": "id_rsa",
+         "rule": "credential/control directory component '.ssh'"},
+        {"ordinal": 1, "status": "rejected", "reason": "source_missing", "label": "missing"},
+    ])
+    assert "rule: credential/control directory component '.ssh'" in rendered
+    assert "- missing: rejected (reason=source_missing, ordinal=1)" in rendered
+    assert "rule:" not in rendered.splitlines()[-1]
+
+
+@pytest.mark.parametrize("argv", [
+    ["grep", "-n", "x >= 1", "f"],
+    ["rg", "a->b", "."],
+])
+def test_a_comparison_sign_no_longer_makes_an_inspection_a_write(argv):
+    from ouroboros.tools.write_shape import non_interpreter_write_shape
+
+    assert non_interpreter_write_shape(argv, argv, argv[0]) is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["tee", "f"],
+    ["grep", "-n", "x", "f", ">", "out.txt"],
+])
+def test_a_real_write_channel_is_still_write_shaped(argv):
+    from ouroboros.tools.write_shape import non_interpreter_write_shape
+
+    assert non_interpreter_write_shape(argv, argv, argv[0]) is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["grep", "-n", "a > b", "f"],
+    ["rg", "actual>0", "tests/"],
+])
+def test_disclosed_residual_a_quoted_operand_with_a_redirect_shape_stays_write_shaped(argv):
+    """shlex strips the quotes before any guard sees the line, so the redirect
+    grammar still matches inside the operand. Only the comparison forms (>=,
+    ->, =>, >&) were closed. Asserted as EXPECTED behaviour so the remaining
+    gap is visible rather than assumed fixed."""
+    from ouroboros.tools.write_shape import non_interpreter_write_shape
+
+    assert non_interpreter_write_shape(argv, argv, argv[0]) is True
