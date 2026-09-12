@@ -239,6 +239,11 @@ def _fence_snapshot_running_rows(rows: Any, *, restored_ids: "set[str]") -> "lis
         try:
             stored = load_task_result(_queue().DRIVE_ROOT, task_id, strict=True) or {}
             if not stored:
+                # Admission writes the durable scheduled row (task_admission.py
+                # :536-543), so even a failed RUNNING mirror leaves a readable
+                # row this loop fences; reaching here means the admission record
+                # is missing or was deleted, and custody cannot settle an id it
+                # has no record of, so the row is logged and never fenced.
                 unrecorded.append(task_id)
                 continue
             status = str(stored.get("status") or "")

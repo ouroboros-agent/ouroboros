@@ -490,7 +490,12 @@ def _restore_rows(root, row_type):
 def test_a_running_row_with_no_durable_result_is_never_fenced(roots):
     """Custody settles an intent for an id with no durable row as not_found and
     writes nothing, so fencing that row would put a cancellation in the boot line
-    that never happens."""
+    that never happens.
+
+    A failed RUNNING mirror is not this branch: admission writes the durable
+    scheduled row, so that row stays readable and is fenced like any other. This
+    branch is a missing or deleted admission record, logged and never fenced.
+    """
     from ouroboros import cancel_intents
     from supervisor import queue as queue_module
     root, _ = roots
