@@ -61,7 +61,7 @@ def test_saved_body_and_sources_precede_orphan_reader_and_actual_prune(roots, mo
     root, repo = roots
     child = _terminal(root, family=family)
     seen = []
-    def orphan_reader(_root, *, exclude_task_ids):
+    def orphan_reader(_root, *, exclude_task_ids, expired_quizzes=None):
         row = load_task_result(root, "saved", strict=True)
         assert row["result"] == "full retained answer"
         manifest = observability.read_call_manifest_ref(root, row["trace_refs"]["response"], task_id="saved")
@@ -443,6 +443,30 @@ def test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody(roots, monk
     assert task_lifecycle.sweep_cancel_intents(now=time.time() + 60)["ghost-fenced"] == "cancelled"
     stored = load_task_result(root, "ghost-fenced")
     assert stored["status"] == "cancelled" and stored["result"] == SERVER_STOPPED_CANCEL
+
+
+def test_the_healer_tells_rendered_cards_their_question_expired(roots, monkeypatch):
+    """The durable projection is only half of it: the seam that normally expires a
+    quiz also sends the live frame, and the surfaces Ouroboros runs on have no
+    reload affordance. A healed terminal owes the same frame."""
+    from ouroboros import owner_quiz
+    from supervisor import message_bus, queue as queue_module
+    root, repo = roots
+
+    write_task_result(root, "ghost-asked", "running", chat_id=1)
+    owner_quiz.record_asked(root, "ghost-asked", quiz_id="q9", question="Which folder?",
+                            options=["A", "B"], wait_for_answer=True)
+    _interrupted_running_row(root, "ghost-asked")
+    queue_module.persist_queue_snapshot(reason="startup")
+    frames: list = []
+    monkeypatch.setattr(message_bus, "get_bridge",
+                        lambda: SimpleNamespace(send_quiz_state=lambda *args: frames.append(args)))
+
+    _recovery(root, repo)
+
+    assert load_task_result(root, "ghost-asked")["status"] == "failed"
+    assert owner_quiz.quiz_states(root, "ghost-asked")["q9"]["state"] == "expired_terminal"
+    assert frames == [("q9", "ghost-asked", "expired_terminal")]
 
 
 def _restore_rows(root, row_type):

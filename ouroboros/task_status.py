@@ -544,7 +544,10 @@ def load_effective_task_result(
     )
 
 
-def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset()) -> int:
+def reconcile_orphaned_running_tasks(
+    drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset(),
+    expired_quizzes: Optional[List[Any]] = None,
+) -> int:
     """Durably finalize on-disk RUNNING task results the effective-status
     projection already considers terminal.
 
@@ -562,6 +565,10 @@ def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: froze
     reconciled. The monotonic guard in ``write_task_result`` additionally protects
     a genuinely newer terminal/cancel write. Idempotent; safe at boot and on a
     periodic supervisor tick.
+
+    ``expired_quizzes`` collects ``(task_id, quiz_id)`` for every question this
+    sweep expired, so the supervisor-side caller can send the same live frame the
+    task-done seam sends. This module stays free of a supervisor import.
     """
     from ouroboros.task_results import list_task_results, write_task_result
 
@@ -627,7 +634,9 @@ def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: froze
         try:
             from ouroboros.owner_quiz import reconcile_terminal as reconcile_quiz
 
-            reconcile_quiz(root, task_id)
+            expired = reconcile_quiz(root, task_id)
+            if expired_quizzes is not None:
+                expired_quizzes.extend((task_id, quiz_id) for quiz_id in expired)
         except Exception:
             log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
     return healed
