@@ -78,36 +78,40 @@ def test_every_other_reason_code_passes_through_untouched() -> None:
     assert _completion_verdict({"status": "completed"}, {}) == ""
 
 
-def test_a_healed_debt_never_leaves_a_warning_headline_without_a_cause() -> None:
-    """Headline and Reason describe the same record.
+def test_a_healed_debt_is_never_resurrected_by_its_own_frozen_warning() -> None:
+    """Once the debt list is empty the code is gone, whatever the axes still say.
 
     The overlay stamps BOTH the top-level reason code and an objective warning,
-    and the refresh may not rewrite either. Suppressing the code once the debt
-    heals therefore produced a row headed "Done with warnings" that stated no
-    cause at all, which is a worse lie than the stale code it removed: the
-    warning is still what the record holds. Built through the real overlay, not
-    a hand-written axes dict.
+    and the refresh may rewrite neither. That frozen warning is what keeps the
+    headline at "Done with warnings" after the debt heals, and it is NOT licence
+    to restore the code beside it: a Reason line naming a debt the same record
+    shows as empty is exactly the false statement this rule removes. The current
+    execution reason speaks when there is one; otherwise the row states no cause
+    and leaves the headline to the axis that owns it. Built through the real
+    overlay, not a hand-written axes dict.
     """
     from ouroboros.outcomes import custody_debt_axes
     from ouroboros.project_dialogue import OUTCOME_PHASE_HEADLINE, outcome_phase
 
     axes = custody_debt_axes({"lifecycle": {"status": "completed"},
                               "execution": {"status": "ok", "reason_code": ""}})
-    for debt in ([], ["run-a1"]):
-        row = _row(outcome_axes=axes, delegated_runs_unreconciled=debt)
-        assert OUTCOME_PHASE_HEADLINE[outcome_phase(row, {})] == "Done with warnings"
-        assert _completion_verdict(row, {}) == (
-            f"Reason: {WARN_DELEGATED_CUSTODY_UNRECONCILED}."
-        )
+    healed = _row(outcome_axes=axes, delegated_runs_unreconciled=[])
+    # The frozen warning still heads the row; the healed debt says nothing.
+    assert OUTCOME_PHASE_HEADLINE[outcome_phase(healed, {})] == "Done with warnings"
+    assert _completion_verdict(healed, {}) == ""
 
-    # A row whose axes healed too reads as clean, so it states nothing: that is
-    # the false Reason line this rule removes, and it stays removed.
+    # While the debt is real the row names it, headline and cause agreeing.
+    owed = _row(outcome_axes=axes, delegated_runs_unreconciled=["run-a1"])
+    assert OUTCOME_PHASE_HEADLINE[outcome_phase(owed, {})] == "Done with warnings"
+    assert _completion_verdict(owed, {}) == f"Reason: {WARN_DELEGATED_CUSTODY_UNRECONCILED}."
+
+    # A row whose axes healed too reads as clean and also states nothing.
     clean = _row(outcome_axes={"execution": {"status": "ok"}},
                  delegated_runs_unreconciled=[])
     assert OUTCOME_PHASE_HEADLINE[outcome_phase(clean, {})] == "Done"
     assert _completion_verdict(clean, {}) == ""
 
-    # An execution cause still wins over the healed debt.
+    # A current execution cause is what a healed row renders when it has one.
     railed = _row(outcome_axes=custody_debt_axes(
         {"execution": {"status": "failed", "reason_code": "provider_unavailable"}}),
         delegated_runs_unreconciled=[])

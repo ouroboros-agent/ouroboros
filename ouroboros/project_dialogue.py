@@ -970,15 +970,14 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
             if isinstance(holder, dict) and isinstance(holder.get("acceptance_decision"), dict):
                 decision = holder["acceptance_decision"]
     status = str(decision.get("status") or "").strip()
-    stored_reason = str(result.get("reason_code") or event.get("reason_code") or "")
-    reason, custody = _custody_debt_reason(stored_reason, result, event)
-    if not reason and not custody and stored_reason and outcome_phase(result, event) != "done":
-        # The debt healed, but the objective warning it stamped is still what
-        # makes this row a warning: a warn headline with no cause at all is less
-        # honest than the code the record still holds. A row whose axes healed
-        # too reads as clean and says nothing, which is the false line this
-        # whole rule exists to remove.
-        reason = stored_reason
+    reason = str(result.get("reason_code") or event.get("reason_code") or "")
+    # A healed debt is never restored here. The objective warning the overlay
+    # froze keeps the headline at "Done with warnings" and the refresh may not
+    # rewrite it, but that is the axis speaking about what was true at write
+    # time; naming the code again would state a debt the same record shows as
+    # empty. The current execution reason speaks when there is one, otherwise
+    # the row states no cause and leaves the headline to the axis that owns it.
+    reason, custody = _custody_debt_reason(reason, result, event)
     if (reason != REASON_OWNER_REQUESTED_FINALIZATION and status != ACCEPTANCE_ACCEPTED
             and status and outcome_phase(result, event) in {"done", "warn"}):
         clause = f"Acceptance: {status}"
