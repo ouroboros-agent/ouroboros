@@ -495,6 +495,45 @@ def test_a_fail_closed_restore_still_records_the_rows_it_fenced(roots):
     assert recorded and recorded[-1]["terminalized_running"] == ["ghost-in-a-broken-snapshot"]
 
 
+def test_the_healer_gates_a_root_on_its_real_liveness_evidence(roots):
+    """Assignment now mirrors RUNNING for roots, so this sweep decides their fate
+    too and its REAL gates have to be exercised, not a monkeypatched projection:
+    live queue ownership, an unusable snapshot and the grace window each keep the
+    row, and only the boot shape (fresh snapshot without it, stale heartbeat, a
+    worker booted after it) settles it."""
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "root-ghost", root_task_id="root-ghost",
+                             result="Assigned to a worker.")
+
+    # The snapshot the shutdown left still names it: that is live ownership.
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "root-ghost")["status"] == "running"
+
+    # No snapshot at all cannot prove a dead owner either (the work order's
+    # "with no snapshot" case is a refusal, not the reconciling one).
+    (root / "state" / "queue_snapshot.json").unlink()
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "root-ghost")["status"] == "running"
+
+    # The boot re-persist leaves a fresh snapshot without the row.
+    queue_module.persist_queue_snapshot(reason="startup")
+    assert reconcile_orphaned_running_tasks(root) == 1
+    healed = load_task_result(root, "root-ghost")
+    assert healed["status"] == "failed"
+    assert healed["reason_code"] == "orphaned_running_after_worker_restart"
+
+    # A root assigned seconds ago is never reconciled: the grace window holds
+    # even once the snapshot no longer names it.
+    _interrupted_running_row(root, "root-just-assigned", age_sec=1.0,
+                             result="Assigned to a worker.")
+    queue_module.persist_queue_snapshot(reason="startup")
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "root-just-assigned")["status"] == "running"
+
+
 def test_the_boot_healer_still_settles_a_running_row_nothing_owns(roots):
     """The skip is the intent, not the shape: an orphan with no cancel intent is
     reconciled exactly as before."""
