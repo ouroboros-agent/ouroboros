@@ -875,21 +875,13 @@ def _forced_swarm_router_result(
     elif status == "rejected":
         detail = str(attempt.get("reason") or "admission rejected")
         text = f"⚠️ Swarm could not admit a new managed task ({detail}). No retry was emitted."
-    elif str(ctx.accumulated_usage.get("reason_code") or "") == reason_code:
-        # One event is disclosed once, at its own layer. When the rail that ended
-        # the router IS the execution reason the provider terminal already holds,
-        # the owner read the same death twice: this sentence restated the cause
-        # the [Host status] block beside it was about to state in its own words.
-        # The row keeps only what that block cannot carry - the swarm stopped
-        # before publishing - plus the model that actually ran, so the delivered
-        # body carries exactly one warning block.
-        model = str(getattr(ctx, "active_model", "") or "")
-        text = (
-            "Swarm stopped before publishing: no managed root was admitted and no "
-            "inline work was published"
-            + (f"; the model that ran was {model}." if model else ".")
-        )
     else:
+        # This row names the rail whatever the rail is. A stamped reason_code
+        # cannot stand in for "a provider terminal already says this": every
+        # non-provider rail stamps it too (loop_budget before the router call,
+        # loop_round_limits before the fallback), and those rails have no
+        # [Host status] block, so suppressing the sentence deleted the only
+        # statement of the cause the owner had.
         text = (
             f"⚠️ Swarm reached the task-wide rail `{reason_code}` before a managed-root "
             "admission attempt completed. No inline work was published."

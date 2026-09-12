@@ -1092,11 +1092,12 @@ with `get_task_result` and the stop receipt, so a card over applied work is
 never a bare headline and a reason code. When a peer receipt already
 published those bytes in this chat, its typed `cancel_receipt` on the task
 result reduces the row to that label beside its pointer: one salvage, one
-paragraph per chat. One event is disclosed once, at the layer that owns it,
-so a routing turn stopped by the rail that IS the provider terminal's own
-execution reason states only what the provider notice cannot carry, and the
-forced orphan note skips a child whose own terminal row already reached this
-chat and names the finished ones as finished rather than as completed.
+paragraph per chat. One event is disclosed once, at the layer that owns it, so the forced orphan
+note names the finished children as finished rather than as completed and
+skips a child whose own terminal row already reached this chat. A rail that
+ended a routing turn is always named by that turn's own row: a stamped
+execution reason is not evidence that another layer states it, because every
+rail stamps one.
 
 The delivery-control protocol is resolved here and only here (DEVELOPMENT keeps the rule and points here). The candidate carries sticky loop-local provenance that its lineage has seen a host-issued delivery-control episode (`_arm_delivery_control`); with no such episode, exact JSON is ordinary text. In a marked lineage, both the ordinary and the forced resolver intercept recognizable whole-body envelopes and balanced trailing protocol attempts — valid `keep` resolves to the retained candidate, valid `replace` to `full_answer`, and anything malformed preserves the retained candidate. Both resolvers strip one whole-body fence and treat a balanced protocol object at the very END of prose as a protocol attempt (`utils.extract_trailing_json_object` + `loop_delivery._parse_delivery_control_body`) — the trailing-object rule deliberately refuses substring scanning, because quoted protocol literals mid-prose are legitimate text. The ordinary resolver takes one repair round then degraded-preserve; the forced resolver resolves purely and never re-loops — malformation preserves the retained candidate with the typed `delivery_control_degraded` reason, which is this forced rail's own code, while the ordinary repair path records `invalid_delivery_control_after_repair`. Every degradation carries the cause it computed: `outcomes.derive_loop_outcome` falls back to `delivery_control_degraded` only for a degradation that reports no cause and publishes the `loop_outcome.degraded`/`degraded_reason` pair the benchmark ledgers read. A balanced trailing object remains a malformed protocol attempt after the transient latch clears, provided the retained lineage saw the host control episode; it preserves the candidate and never leaks JSON. A control object quoted mid-prose stays prose, and without a host control episode protocol-shaped JSON remains ordinary text. On the forced rail a truncated trailing fragment remains prose under the existing parser contract.
 
