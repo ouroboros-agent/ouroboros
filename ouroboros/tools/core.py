@@ -964,9 +964,10 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
 
     def _mask_user_files_matches(result_text: str) -> str:
         # Same egress seam as _read_file (#447 В23): a search over the owner's
-        # home surfaces file CONTENT in the match lines, so raw credential
-        # bytes must be masked here too — on BOTH the rg path and the Python
-        # fallback. Names/paths stay; values become ***.
+        # home surfaces file CONTENT in the match lines, so bytes in a
+        # recognized credential format or a PEM block are masked here too, on
+        # BOTH the rg path and the Python fallback; secrets in unrecognized
+        # formats are not detected. Names/paths stay; masked values become ***.
         if normalized != "user_files" and not subagent_readonly:
             return result_text
         if normalized == "user_files" and _raw_owner_secret_access_allowed(ctx):

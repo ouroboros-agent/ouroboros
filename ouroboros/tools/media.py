@@ -82,8 +82,9 @@ def _resolve_local_file(ctx: ToolContext, path: str, *, max_bytes: int) -> tuple
 
 
 def _mask_user_files_text(ctx: ToolContext, fp: pathlib.Path, text: str) -> str:
-    """Same egress seam as read_file/search (#447 В23): TEXT extracted from an
-    owner-home file must not carry raw credential bytes into model context."""
+    """Same egress seam as read_file/search (#447 В23): in TEXT extracted
+    from an owner-home file, bytes in a recognized credential format or a PEM
+    block leave as ``***``; secrets in unrecognized formats are not detected."""
     try:
         from ouroboros.tool_access import path_is_relative_to, resource_root_path
 

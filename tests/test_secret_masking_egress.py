@@ -1,7 +1,8 @@
 """Secret-byte egress masking (#447 X1/В23) and observability G11 contracts.
 
-Egress contract: root may read owner-home files in full; the masked form of a
-credential (``***``) may enter model context, the raw bytes never. G11
+Egress contract: root may read owner-home files in full; bytes in a recognized
+credential format or a PEM private-key block leave as ``***``, and secrets in
+unrecognized formats are not detected (owner answer 5=A). G11
 contract: key-name redaction preserves non-secret meta as a fingerprint
 (type/len/sha256_8) instead of destroying it, and credential-metadata keys
 (counts, budgets, ids) are structurally non-secret without a per-name allowlist.
