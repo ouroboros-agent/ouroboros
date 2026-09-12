@@ -109,10 +109,11 @@ rules have no automated surface — review-only.
   output on attachment ingest, on export or Deliverables, on a `user_files`
   mutation, or in the git lanes, with one surviving tail rule: dotenv
   spellings (`.env`, `.env.local`, `prod.env`) still refuse on ingest, on
-  export, in the git lanes and in the skill/review packs. Refusal authority
-  is otherwise the exact credential leaves, the enumerated physical stores
-  and, in the git lanes, content evidence (the bounded PEM head read,
-  `workspace_patch_capture.pem_private_key_reason`).
+  export, in the git lanes and in the skill/review packs. Path-selected
+  attachment ingest otherwise checks exact credential leaves and credential/control
+  directory components; enumerated physical owner stores are mutation-fence
+  authority, while the git lanes also check content evidence (the bounded PEM
+  head read, `workspace_patch_capture.pem_private_key_reason`).
   Restricted file readers mask complete private-key blocks before
   selecting a window, preserving character positions and line breaks. The
   owner credential fence covers the enumerated locations in
