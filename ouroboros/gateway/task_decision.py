@@ -135,6 +135,43 @@ def _refused(message: str, status: int, **extra: Any) -> Tuple[int, Dict[str, An
     return status, payload
 
 
+def _record_quiz_answer_history(
+    drive_root: pathlib.Path, task_id: str, task: Optional[Dict[str, Any]],
+    block: Dict[str, Any], *, duplicate: bool,
+) -> None:
+    """Keep the winning answer in canonical dialogue beyond quiz/mailbox GC.
+
+    A retry reads the existing generation owner before healing a missing row.
+    Concurrent retry duplicates retain one exact source identity; dialogue's
+    identity projection, not another transaction or durable flag, deduplicates them.
+    """
+    from ouroboros.memory import Memory
+    from supervisor.log_addressing import address_task_event
+    from supervisor.message_bus import log_chat
+
+    source_id = f"quiz_answer:{task_id}:{block['quiz_id']}"
+    if duplicate:
+        rows, _coverage = Memory(drive_root).read_chat_generations(predicate=lambda row: (
+            row.get("type") == "quiz_answer" and row.get("task_id") == task_id
+            and row.get("client_message_id") == source_id
+        ))
+        if rows:
+            return
+    if task is None:
+        from ouroboros.task_results import load_task_result
+
+        task = load_task_result(drive_root, task_id) or {}
+    address = address_task_event({task_id: {"task": task}}, drive_root, {"task_id": task_id})
+    index = block.get("answered_index")
+    log_chat(
+        "system", address.get("chat_id"), 0,
+        _quiz_answer_frame(block, index if isinstance(index, int) else None, str(block.get("comment") or "")),
+        ts=str(block["answered_at"]), source="owner_quiz_answer", task_id=task_id,
+        client_message_id=source_id, record_type="quiz_answer", quiz=dict(block),
+        message_meta=address, drive_root=drive_root, require_write=True,
+    )
+
+
 async def answer_decision(
     drive_root: pathlib.Path, body: Any, *, get_background_model_wait: Any = None,
 ) -> Tuple[int, Dict[str, Any]]:
@@ -276,6 +313,17 @@ async def answer_decision(
                 status = 400
             return status, payload
         block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
+        try:
+            _record_quiz_answer_history(
+                drive_root, task_id, task, block, duplicate=bool(outcome.get("duplicate")),
+            )
+        except Exception:
+            log.warning("Quiz answer history write failed for %s", quiz_id, exc_info=True)
+            return _refused(
+                "the answer was recorded but its dialogue history could not be written "
+                "— retry to preserve and deliver it to the task",
+                503, task_id=task_id, reason_code="quiz_history_write_failed",
+            )
         if task is not None:
             from supervisor.queue import _task_drive_for_task
 

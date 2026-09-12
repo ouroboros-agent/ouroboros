@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 from starlette.requests import Request
 from starlette.responses import Response
 
-from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
+from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway._helpers import (
     _TAIL_WINDOW_START_BYTES,
     coerce_int,
@@ -665,67 +665,18 @@ def _make_thread_filter(
 
     Returns the one thread predicate shared by both durable stream readers."""
 
-    def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
-        # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
-        # classify into its root's project thread (only the root is bound).
-        # Same semantics as projects_registry.project_chat_for_task_tree, served
-        # from the ONE bindings map preloaded per request (no per-row file reads).
-        for candidate in (task_id, parent_task_id, root_task_id):
-            tid = str(candidate or "").strip()
-            if tid and bindings_by_task.get(tid):
-                return int(bindings_by_task[tid])
-        return 0
+    from ouroboros.project_dialogue import bound_room_chat, room_membership
+
+    belongs = room_membership(thread_id, project_chat_ids, project_source_refs, bindings_by_task)
 
     def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
-        # A post-hoc bound task keeps its original (main) chat_id on its rows
-        # but belongs to a project — classify by the durable LINEAGE binding too.
-        bound_chat = (
-            _bound_project_chat(
-                str(entry.get("task_id") or ""),
-                str(entry.get("parent_task_id") or ""),
-                str(entry.get("root_task_id") or ""),
-            ) if isinstance(entry, dict) else 0
-        )
-        is_project_lifecycle_row = bool(
-            isinstance(entry, dict)
-            and str(entry.get("type") or "")
-            in {"project_started", "project_completion_summary"}
-        )
-        is_cognitive_projection = bool(
-            isinstance(entry, dict)
-            and str(entry.get("summary_kind") or "")
-            in {"terminal_result_projection", "terminal_root_projection"}
-        )
-        if thread_id in project_chat_ids:
-            # The compact host-stamped lifecycle rows (started + terminal
-            # completion) belong only to Main; the Project thread already owns
-            # the complete task timeline/result.
-            if is_project_lifecycle_row:
-                return False
-            if bound_chat == thread_id:
-                return True
-            if isinstance(entry, dict) and _matches_project_source(entry, project_source_refs):
-                return True
-            return entry_chat == thread_id
-        # The hidden partition (Skill Review, and every headless run admitted
-        # without a registered project). Main is 1; explicit partition rows never
-        # become ordinary conversation history. Keep this after the Project
-        # branch so durable task binding stays unchanged.
         if _question_project_chat(entry):
             return True
-        if entry_chat == HIDDEN_CHAT_ID:
+        if (thread_id not in project_chat_ids and isinstance(entry, dict)
+                and entry.get("summary_kind") in {"terminal_result_projection", "terminal_root_projection"}
+                and entry.get("type") not in {"project_started", "project_completion_summary"}):
             return False
-        # Main / non-project view: exactly the two host-stamped Project-root
-        # lifecycle rows (started + terminal completion) are admitted from the
-        # canonical Main chat. Project progress, logs, child traffic, ordinary
-        # summaries and raw dialogue stay in Project.
-        if is_project_lifecycle_row:
-            return entry_chat not in project_chat_ids
-        if is_cognitive_projection:
-            return False
-        if entry_chat in project_chat_ids or bound_chat > 0:
-            return False
-        return entry_chat not in project_chat_ids
+        return belongs(entry_chat, entry)
 
     def _question_project_chat(entry):
         if thread_id != 1 or not isinstance(entry, dict) or entry.get("type") != "quiz":
@@ -733,7 +684,7 @@ def _make_thread_filter(
         quiz = entry.get("quiz")
         if not isinstance(quiz, dict) or quiz.get("wait_for_answer") is not True:
             return 0
-        chat = _bound_project_chat(str(entry.get("task_id") or "")) or _stored_chat_id(entry.get("chat_id"), 1)
+        chat = bound_room_chat(bindings_by_task, {"task_id": entry.get("task_id")}) or _stored_chat_id(entry.get("chat_id"), 1)
         return chat if chat in project_chat_ids else 0
 
     _row_matches_thread.question_project_chat = _question_project_chat
@@ -791,7 +742,14 @@ def _collect_chat_rows(
         chat_quota_rows = sum(
             1 for entry in _chat_entries if _chat_counts_toward_quota(entry)
         )
+        # These facts are durable evidence, not another visible message. Reuse
+        # the already-read window to recover old cards after lifecycle GC.
+        answered = {(str(row.get("task_id") or ""), str(row["quiz"].get("quiz_id") or "")): row["quiz"]
+                    for row in _chat_entries if row.get("type") == "quiz_answer"
+                    and isinstance(row.get("quiz"), dict)}
         for entry in _chat_entries:
+            if entry.get("type") == "quiz_answer":
+                continue
             # Preserve only the typed terminal fact from this already-bounded
             # pass, before the synthetic cognitive row is hidden. Only ids in
             # the final visible window are annotated with it below.
@@ -816,7 +774,7 @@ def _collect_chat_rows(
                     question_projects = {row["chat_id"]: row for row in list_reserved_projects(chat_path.parent.parent)}
                 tid, qid = str(entry.get("task_id") or ""), str(entry["quiz"].get("quiz_id") or "")
                 source = _quiz_source(tid)
-                pointer = project_question_pointer(entry, source["quizzes"].get(qid),
+                pointer = project_question_pointer(entry, source["quizzes"].get(qid) or answered.get((tid, qid)),
                                                    question_projects.get(pointer_chat), source["wait"])
                 if pointer and (tid, qid) not in question_keys:
                     question_keys.add((tid, qid))
@@ -894,7 +852,8 @@ def _collect_chat_rows(
                 quiz = dict(entry["quiz"])
                 _qtid = str(entry.get("task_id") or "")
                 if _qtid:
-                    _live = _quiz_source(_qtid)["quizzes"].get(str(quiz.get("quiz_id") or ""))
+                    _qid = str(quiz.get("quiz_id") or "")
+                    _live = _quiz_source(_qtid)["quizzes"].get(_qid) or answered.get((_qtid, _qid))
                     if isinstance(_live, dict):
                         quiz["state"] = str(_live.get("state") or quiz.get("state") or "open")
                         for key in ("answered_index", "comment"):  # the recorded answer itself

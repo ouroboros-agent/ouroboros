@@ -166,6 +166,42 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
     return rows
 
 
+def bound_room_chat(bindings: Dict[str, int], row: Dict[str, Any]) -> int:
+    """Resolve a row's immutable task binding in delivery lineage order."""
+    for field in ("task_id", "parent_task_id", "root_task_id"):
+        chat = bindings.get(str(row.get(field) or "").strip())
+        if chat:
+            return int(chat)
+    return 0
+
+
+def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
+                    bindings: Dict[str, int]):
+    """Canonical room membership shared by history and evidence readers.
+
+    Presentation-only hiding and cross-room question pointers belong to the UI
+    caller. A room source retains the actual cognitive result as well.
+    """
+    from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
+
+    def matches(entry_chat: int, entry: Optional[dict] = None) -> bool:
+        row = entry if isinstance(entry, dict) else {}
+        if is_a2a_chat_id(entry_chat):
+            return False
+        bound = bound_room_chat(bindings, row)
+        lifecycle = row.get("type") in {"project_started", "project_completion_summary"}
+        if chat_id in project_chat_ids:
+            return not lifecycle and (bound == chat_id or entry_chat == chat_id
+                                      or entry_matches_source_ref(row, source_refs))
+        if entry_chat == HIDDEN_CHAT_ID:
+            return False
+        if lifecycle:
+            return entry_chat not in project_chat_ids
+        return entry_chat not in project_chat_ids and not bound
+
+    return matches
+
+
 def project_recent_dialogue(
     memory: Any, project_chat_id: int, max_entries: int,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
@@ -177,14 +213,10 @@ def project_recent_dialogue(
     except Exception:
         bound = {}
     refs = source_refs_for_project(memory.drive_root, project_chat_id)
-    ref_keys = {key for ref in refs if (key := _source_ref_identity(ref)) is not None}
+    matches = room_membership(project_chat_id, {project_chat_id}, refs, bound)
     entries, coverage = memory.read_unconsolidated_chat(
         memory.load_dialogue_meta(), max_entries,
-        predicate=lambda row: (
-            _row_chat_id(row) == project_chat_id
-            or bound.get(str(row.get("task_id") or "")) == project_chat_id
-            or bool(_entry_source_identities(row) & ref_keys)
-        ),
+        predicate=lambda row: matches(_row_chat_id(row), row),
     )
     present_ref_keys = set()
     for entry in entries:
