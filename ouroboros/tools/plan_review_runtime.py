@@ -536,9 +536,12 @@ def synthesize_plan_review_wave(
     fingerprint: str, previous: Optional[dict], manifest: dict, manifest_hash: str,
     constitutional: bool, constitutional_note: str, cycle_index: int, retry_key: str,
     enforcement: str, cap: Any, quorum: int, configured_slots: list,
-    health_evidence: Any, reviewer_effort: str = "",
+    health_evidence: Any, reviewer_effort: str = "", dispositions: Optional[list] = None,
 ) -> tuple[dict, set[str], dict]:
-    """Validate raw actor rows and build one durable plan-review wave."""
+    """Validate raw actor rows and build one durable plan-review wave. ``dispositions``
+    are the ones already recorded on the wave being collected (an author's answers
+    given while slots were still in flight); they ride the collected wave and its
+    closure instead of being wiped by the re-synthesis."""
     from ouroboros.tools import plan_spec
 
     ids = plan_spec.spec_ids(spec)
@@ -588,8 +591,8 @@ def synthesize_plan_review_wave(
         "constitutional_note": constitutional_note, "findings": list(agg["findings"]),
         "aggregate": aggregate, "reasons": list(agg["reasons"]), "counts": dict(agg["counts"]),
         "closed": plan_spec.closure_after_disposition(
-            aggregate, agg["findings"], [], enforcement,
-        )["closed"], "dispositions": [], "actors": slot_records,
+            aggregate, agg["findings"], list(dispositions or []), enforcement,
+        )["closed"], "dispositions": list(dispositions or []), "actors": slot_records,
         "custody_pending": False,
         "actors_degraded": [str(r["slot_id"]) for r in slot_records if not r["ok"]],
         "enforcement": enforcement, "cycle_cap": cap,

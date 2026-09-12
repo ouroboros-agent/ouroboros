@@ -712,6 +712,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         cycle_index=cycle_index, retry_key=retry_key, enforcement=enforcement, cap=cap,
         quorum=quorum, configured_slots=configured_slots,
         health_evidence=health_evidence, reviewer_effort=request.reviewer_effort,
+        dispositions=list((existing or {}).get("dispositions") or []) if resume_in_flight else None,
     )
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
@@ -911,7 +912,7 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
         )
     if wave.get("custody_pending"):  # collection = the $0 custody reconcile of the addressed wave (window 0)
         text, state, wave = _collect.collect_wave_sync(ctx, state_root=root, task_id=task_id, wave=wave)
-        if not disposition.get("items") or wave.get("custody_pending"):
+        if not disposition.get("items"):  # a pure $0 peek; items are applied even while slots run
             return text
         cycles_paid = int(state.get("cycles_paid") or 0)
     if wave.get("closed") and not plan_review_notes_are_annotatable(wave):

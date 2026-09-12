@@ -543,10 +543,10 @@ def test_collection_never_waits_for_a_live_slot_and_stays_free(harness, monkeypa
     assert calls[-1]["drain"] is not None  # window 0: a peek, never a wait
     # Two settled physical rows prove dispatch: the cycle is paid now, once.
     assert _state(harness)["cycles_paid"] == 1
-    # A disposition with items on a still-open wave is refused nothing: the peek
-    # text is returned and the items wait for the wave to settle.
+    # Items on a still-open wave are applied after the collection, never dropped: an
+    # unknown finding id is the typed refusal every other disposition path gives.
     again = _collect(ctx, fingerprint, items=[{"finding_id": "x", "decision": "accept", "rationale": "r"}])
-    assert _control(again) == {"outcome": "DEGRADED", "closed": False}
+    assert again.startswith("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: unknown finding ids x")
     assert _state(harness)["cycles_paid"] == 1
 
 
@@ -646,3 +646,33 @@ def test_collection_rebuilds_the_roster_the_wave_was_dispatched_with(harness, mo
     collected = _collect(ctx, wave["request_fingerprint"])
     assert _control(collected) == {"outcome": "GREEN", "closed": True}
     assert calls[1]["retry_key"] == calls[0]["retry_key"]
+
+
+def test_disposition_items_are_recorded_on_a_wave_that_stays_custody_pending(harness, monkeypatch):
+    """Fix cycle 1, F2 (P1-3a's letter): collect, THEN apply the items. An author's answer
+    to a reviewer's question is recorded even while a sibling slot is still in flight,
+    with the closure note the base behaviour carried; nothing is dropped silently."""
+    calls = []
+    question = json.dumps([_finding("q1", "need_evidence", breaks="claim_1", summary="Why five?")])
+    _install_barrier_substrate(monkeypatch, calls, texts={"s1": question}, still_pending={"s3"})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    fingerprint = _state(harness)["waves"][-1]["request_fingerprint"]
+    peek = _collect(ctx, fingerprint)
+    assert _control(peek) == {"outcome": "DEGRADED", "closed": False}
+    answered = _collect(ctx, fingerprint, items=[
+        {"finding_id": "s1:q1", "decision": "accept", "rationale": "The board asked for five."}])
+    wave = _state(harness)["waves"][-1]
+    assert wave["custody_pending"] is True
+    assert [(d["finding_id"], d["decision"]) for d in wave["dispositions"]] == [("s1:q1", "accept")]
+    assert "The board asked for five." in answered and "degraded_not_closable_by_disposition" in answered
+    assert _state(harness)["cycles_paid"] == 1 and len(calls) == 3  # one dispatch, two $0 reconciles
+    # The last slot settles: the collection re-synthesizes the wave WITH the recorded
+    # answer, and the answered question closes the wave instead of being wiped.
+    _install_barrier_substrate(monkeypatch, calls, texts={"s1": question})
+    final = _collect(ctx, fingerprint)
+    wave = _state(harness)["waves"][-1]
+    assert wave["custody_pending"] is False and wave["aggregate"] == "REVIEW_REQUIRED"
+    assert [(d["finding_id"], d["decision"]) for d in wave["dispositions"]] == [("s1:q1", "accept")]
+    assert _control(final) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _state(harness)["cycles_paid"] == 1
