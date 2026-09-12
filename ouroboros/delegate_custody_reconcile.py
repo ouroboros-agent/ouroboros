@@ -194,7 +194,9 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
                 deliberate_terminal=deliberate_terminal,
             ))
         for record in pending or []:
-            outcomes.append(_recover_pending_invocation(drive_root, gateway, record))
+            outcomes.append(_recover_pending_invocation(
+                drive_root, gateway, record, deliberate_terminal=deliberate_terminal,
+            ))
         # Recomputed inside: a run settled this very pass may have made its
         # project eligible - the pre-pass gate is not the last word.
         if registrations or runs:
@@ -208,7 +210,8 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
 
 
 def _recover_pending_invocation(drive_root: Any, gateway: Any,
-                                record: Dict[str, Any]) -> Dict[str, Any]:
+                                record: Dict[str, Any], *,
+                                deliberate_terminal: str = "") -> Dict[str, Any]:
     """Recover the run (if any) behind an orphaned pending invocation, idempotently.
 
     The stored canonical body is re-POSTed under the invocation's own wire key:
@@ -299,7 +302,9 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         "delegated": bool(execution.get("delegated")), "root": str(scope.get("root") or ""),
         "recovered_from_pending_invocation": True,
     })
-    return _custody()._reconcile_one(drive_root, gateway, custody)
+    return _custody()._reconcile_one(
+        drive_root, gateway, custody, deliberate_terminal=deliberate_terminal,
+    )
 
 
 def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool:

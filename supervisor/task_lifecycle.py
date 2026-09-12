@@ -1141,21 +1141,6 @@ def _finish_captured_running(
 
     _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
 
-    # The verdict this function is about to write, stated to the audit that runs
-    # before the write (A4 ordering): an owner cancellation is a DELIBERATE
-    # terminal, so its live delegated runs are cancelled here instead of
-    # surviving until the next periodic sweep. ONLY when this path really writes
-    # it: for a task that had already settled, completion wins on the write and
-    # the stored terminal stays whatever the task decided, so claiming a
-    # cancellation here would cancel a healthy run behind an infrastructure
-    # failure, exactly the class B1-A spares. Then the audit reads the durable
-    # result instead, which by definition exists.
-    custody_audit = _audit_delegated_runs_on_kill(
-        q, task_id,
-        **({} if settled_status else {"deliberate_terminal": STATUS_CANCELLED}),
-    )
-    unreconciled = list(custody_audit.get("unreconciled") or [])
-
     # A terminal checkpoint can precede split-drive adoption and artifact capture.
     # Keep fully published CURRENT byte-identical; complete only work still owed.
     try:
@@ -1170,6 +1155,14 @@ def _finish_captured_running(
             ready = terminal_task_files_ready(q.DRIVE_ROOT, task, stored)
             if not ready and (settled_status or prepared.get("terminal_source_present") is not False):
                 raise RuntimeError("terminal file publication is unresolved")
+        # Decide from adopted terminal truth, not the pre-kill checkpoint. A
+        # ready result keeps its own verdict; only our future cancelled write
+        # authorizes an immediate request. Unknown file custody returns below
+        # without claiming or requesting cancellation; its intent stays open.
+        custody_audit = _audit_delegated_runs_on_kill(
+            q, task_id, **({} if ready else {"deliberate_terminal": STATUS_CANCELLED}),
+        )
+        unreconciled = list(custody_audit.get("unreconciled") or [])
         if ready:
             stored_cost = carry_cost_meta(stored) or {
                 "cost_accounting_status": "unavailable", "cost_final": False,
