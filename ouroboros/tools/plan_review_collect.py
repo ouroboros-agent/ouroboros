@@ -155,21 +155,23 @@ async def collect_before_supersede(
 
 
 def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
-    """The typed refusal for a REVISED envelope while a wave is still custody-pending
+    """The typed refusal for a REVISED envelope while ANOTHER wave is still custody-pending
     and the cap has no room for another committed panel, or ``''`` when the envelope
-    may proceed. A panel dispatched at the barrier is committed money, but whether it
-    SPENDS a cycle is proven only by its collection (a wave of typed $0 refusals leaves
-    the cap untouched), so nothing is written here: no superseding reference, no
-    cycles_exhausted. The pending wave stays the current, collectible wave and the
+    may proceed. Every in-flight wave occupies one cap slot: a wave that already proved
+    a dispatch counts through ``cycles_paid`` (never again as pending), an unproven one
+    counts as committed money whose spend only its collection proves (a wave of typed $0
+    refusals leaves the cap untouched). Nothing is written here: no superseding reference,
+    no cycles_exhausted. The pending wave stays the current, collectible wave and the
     text names its $0 collection. The identical envelope is never held (it resumes)."""
     if cap is None:
         return ""
     pending = [
         w for w in state.get("waves") or []
-        if isinstance(w, dict) and w.get("custody_pending") and not w.get("paid")
+        if isinstance(w, dict) and w.get("custody_pending")
         and str(w.get("request_fingerprint") or "") != str(fingerprint or "")
     ]
-    if not pending or int(state.get("cycles_paid") or 0) + len(pending) < int(cap):
+    unproven = sum(1 for w in pending if not w.get("paid"))
+    if not pending or int(state.get("cycles_paid") or 0) + unproven < int(cap):
         return ""
     wave = pending[-1]
     fp = str(wave.get("request_fingerprint") or "")

@@ -750,3 +750,54 @@ def test_a_revised_envelope_is_exhausted_only_after_the_collection_proves_the_di
     assert exhausted.startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED: 1 of 1 paid plan-review cycles are spent")
     assert plan_review_gate_projection(_state(harness), "blocking")["status"] == "cycles_exhausted"
     assert [c["reconcile_only"] for c in calls] == [False, True, True]  # no new panel was sent
+
+
+def _answered_mixed_wave(harness, monkeypatch, calls):
+    """The state after test_disposition_items_are_recorded_on_a_wave_that_stays_custody_pending:
+    s1 asked, the author answered at $0, s2 settled, s3 still pending_dispatch; the
+    wave is PAID (two proven sends) and still custody-pending; cycles_paid == 1."""
+    question = json.dumps([_finding("q1", "need_evidence", breaks="claim_1", summary="Why five?")])
+    _install_barrier_substrate(monkeypatch, calls, texts={"s1": question}, still_pending={"s3"})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    fingerprint = _state(harness)["waves"][-1]["request_fingerprint"]
+    _collect(ctx, fingerprint, items=[{"finding_id": "s1:q1", "decision": "accept", "rationale": "The board asked for five."}])
+    wave = _state(harness)["waves"][-1]
+    assert wave["paid"] is True and wave["custody_pending"] is True and _state(harness)["cycles_paid"] == 1
+    return ctx, fingerprint
+
+
+def test_a_paid_wave_still_in_flight_holds_a_revised_envelope_at_the_cap_and_counts_once(harness, monkeypatch):
+    """Fix cycle 3, 3a: a wave that already proved a dispatch (paid) but still has a
+    slot in flight occupies its cap slot ONCE (through cycles_paid, not again as
+    pending). At cap 1 a revised envelope is held, not exhausted: the pending wave
+    stays current and collectible and the gate is not released while a slot runs.
+    At the default cap 2 the same revised envelope dispatches a second panel."""
+    from ouroboros.task_results import plan_review_gate_projection
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    calls = []
+    ctx, fingerprint = _answered_mixed_wave(harness, monkeypatch, calls)
+    revised = {**DECK_SPEC, "in_scope": ["a 6-slide deck"]}
+    held = _call(ctx, spec=revised)
+    assert held.startswith("ERROR: PLAN_REVIEW_IN_FLIGHT:") and fingerprint in held
+    state = _state(harness)
+    assert state["current_attempt"]["fingerprint"] == fingerprint
+    assert state["current_attempt"].get("status") != "cycles_exhausted"
+    assert not any(w.get("cycles_exhausted") for w in state["waves"]) and state["cycles_paid"] == 1
+    gate = plan_review_gate_projection(state, "blocking")
+    assert gate["status"] != "cycles_exhausted" and gate["allow"] is False and gate["custody_pending"] is True
+    assert [c["reconcile_only"] for c in calls] == [False, True, True]  # nothing new was sent
+    # The author's answer is still dispositionable on the (still current) wave.
+    assert [d["decision"] for d in state["waves"][-1]["dispositions"]] == ["accept"]
+
+
+def test_a_paid_wave_still_in_flight_leaves_room_for_a_second_panel_under_the_default_cap(harness, monkeypatch):
+    calls = []
+    ctx, fingerprint = _answered_mixed_wave(harness, monkeypatch, calls)  # the harness cap is 2
+    dispatched = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})
+    assert _control(dispatched) == {"outcome": "DEGRADED", "closed": False}
+    state = _state(harness)
+    assert state["current_attempt"]["fingerprint"] != fingerprint
+    assert calls[-1]["reconcile_only"] is False and calls[-1]["drain"] is not None  # a real second panel
+    assert state["cycles_paid"] == 1  # the new barrier wave is unproven until its collection
