@@ -620,7 +620,9 @@ def validate_findings(
 
     Host checks membership/shape only (P5): ``blocking`` needs ``breaks`` ∈
     ``spec_ids`` else DEMOTED to ``note`` (``blocking_without_valid_breaks``);
-    ``need_evidence`` needs a non-empty ``locator`` else demoted; a missing
+    ``need_evidence`` needs a non-empty ``locator`` (a document the host attaches)
+    OR a ``breaks`` ∈ ``spec_ids`` (a question to the author) else demoted; an
+    over-long locator on such a question drops only the locator; a missing
     ``summary`` is filled with ``(missing summary)`` + disclosure (a finding is
     never dropped — an ok slot must not launder its blocking finding away); a
     ``need_evidence`` locator already in ``seen_locators`` — the PER-TASK
