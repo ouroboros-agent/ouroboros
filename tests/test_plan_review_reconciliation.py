@@ -866,3 +866,39 @@ def test_the_hold_names_only_the_identical_envelope_route_for_a_wave_that_is_not
     resumed = _call(ctx)  # E1's identical envelope collects W1
     assert _control(resumed) == {"outcome": "GREEN", "closed": True} and _state(harness)["cycles_paid"] == 2
     assert _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]}).startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED")
+
+
+def test_a_hold_after_collecting_a_wave_that_is_not_current_keeps_the_closed_authority(harness, monkeypatch):
+    """Fix cycle 4, J1 (cap 2): E1 dispatches W1 on a slow slot, a revised E2 dispatches
+    W2, and W2's $0 collection closes it GREEN. A third revised envelope arrives while W1
+    still runs: it collects W1 at $0 first (the engine's resume path over W1's own inputs)
+    and is then HELD at the cap. The hold writes nothing, so W2's closed authority must
+    still be the current wave: the collection may not leave the pointer on W1, or the gate
+    reopens, W2's acceptance claims unbind and the hold offers a disposition route that
+    would make E1's superseded spec the closed authority."""
+    from ouroboros.contracts.task_contract import effective_acceptance_claims
+    from ouroboros.task_results import closed_plan_review_wave, plan_review_gate_projection
+
+    calls = []
+    ctx, w1, w2 = _two_waves_in_flight(harness, monkeypatch, calls)
+    _install_barrier_substrate(monkeypatch, calls, pending_waves={w1})  # only W2's reviewers settled
+    assert _control(_collect(ctx, w2)) == {"outcome": "GREEN", "closed": True}
+    state = _state(harness)
+    assert state["current_attempt"]["fingerprint"] == w2 and state["cycles_paid"] == 1
+    assert plan_review_gate_projection(state, "blocking")["allow"] is True
+
+    held = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]})
+    assert held.startswith("ERROR: PLAN_REVIEW_IN_FLIGHT:") and w1 in held
+    state = _state(harness)
+    assert state["current_attempt"]["fingerprint"] == w2  # the collection left the pointer alone
+    gate = plan_review_gate_projection(state, "blocking")
+    assert gate["allow"] is True and gate["status"] == "closed" and gate["custody_pending"] is False
+    closed = closed_plan_review_wave(state)
+    assert closed is not None and closed["request_fingerprint"] == w2
+    claims, source = effective_acceptance_claims({}, closed)
+    assert source == "plan_review" and [c["claim"] for c in claims] == DECK_SPEC["acceptance_claims"]
+    by_fp = {w["request_fingerprint"]: w for w in state["waves"]}
+    assert by_fp[w1]["custody_pending"] is True and state["cycles_paid"] == 1
+    # W1 is not the current wave, so the hold offers only the identical-envelope route.
+    assert "plan_task(review_disposition=" not in held
+    assert "a review_disposition cannot address it" in held and "resubmit its identical envelope" in held

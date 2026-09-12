@@ -141,21 +141,37 @@ async def collect_before_supersede(
     only the current one: a wave superseded earlier under cap room is still money in
     flight, and only its collection can prove or clear its cycle. The caller then
     writes its own superseding reference. Returns the (re)loaded state; an unreadable
-    wave is logged and left as it was."""
-    from ouroboros.task_results import load_plan_review_state
+    wave is logged and left as it was.
+
+    The collection leaves the CURRENT pointer where the caller found it: each wave is
+    resumed over its own recorded inputs and records its own reference, so collecting a
+    wave that is not the current one moves ``current_attempt`` onto it. The caller alone
+    supersedes, and a caller that then refuses (the in-flight hold) must not have moved
+    the pointer off the closed authority. A pointer that stayed on the same wave is left
+    untouched: a collection may legitimately restate its status and reason."""
+    from ouroboros.task_results import load_plan_review_state, record_plan_review_attempt
 
     pending = [
         w for w in state.get("waves") or []
         if isinstance(w, dict) and w.get("custody_pending")
         and str(w.get("request_fingerprint") or "") != str(fingerprint or "")
     ]
+    if not pending:
+        return state
+    current = dict(state.get("current_attempt") or {})
     for wave in pending:
         try:
             await collect_open_wave(ctx, state_root=state_root, task_id=task_id, wave=wave)
         except (OSError, ValueError) as exc:
             log.warning("in-flight plan wave %s could not be collected before supersede: %s",
                         str(wave.get("request_fingerprint") or "")[:8], exc)
-    return load_plan_review_state(state_root, task_id) if pending else state
+    state = load_plan_review_state(state_root, task_id)
+    kept = str(current.get("fingerprint") or "")
+    if kept and str((state.get("current_attempt") or {}).get("fingerprint") or "") != kept:
+        state = record_plan_review_attempt(  # pointer only: no attempt row, no reference, no cycle
+            state_root, task_id, fingerprint=kept,
+            status=str(current.get("status") or "open"), reason=str(current.get("reason") or ""))
+    return state
 
 
 def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
