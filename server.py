@@ -1372,8 +1372,19 @@ async def lifespan(app):
         # write and every wait below it is best effort (ARCHITECTURE, Shutdown).
         try:
             restart_requested = _restart_requested.is_set()
-            # Record an explicit shutdown cause so a task interrupted by the
-            # shutdown is never later read as a worker crash storm.
+            from supervisor.workers import kill_workers
+            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
+            kill_workers(
+                force=True,
+                terminal_status=cleanup_status,
+                result_reason=cleanup_reason,
+                **_restart_cleanup_kwargs(),
+                **_managed_update_pending_kwargs(),
+            )
+            # Record an explicit shutdown cause so a task interrupted by the shutdown is
+            # never later read as a worker crash storm. Diagnostic, so it runs AFTER the
+            # custody write: append_jsonl waits up to two seconds for the log lock, and
+            # that wait must never spend the force-exit budget on unterminalized workers.
             try:
                 from ouroboros.utils import append_jsonl, utc_now_iso
                 append_jsonl(
@@ -1387,15 +1398,6 @@ async def lifespan(app):
                 )
             except Exception:
                 log.debug("Failed to record server_shutdown event", exc_info=True)
-            from supervisor.workers import kill_workers
-            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
-            kill_workers(
-                force=True,
-                terminal_status=cleanup_status,
-                result_reason=cleanup_reason,
-                **_restart_cleanup_kwargs(),
-                **_managed_update_pending_kwargs(),
-            )
         except Exception:
             pass
         if extension_reconcile_task is not None:
