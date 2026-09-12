@@ -13,7 +13,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 20 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 28 | 0 |
-| D06 | Review stack | 63 | 0 |
+| D06 | Review stack | 64 | 0 |
 | D07 | Delegation, subagents & Claudexor | 48 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 44 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 12 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 9 | 0 |
-| **total** | | **529** | **0** |
+| **total** | | **530** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -356,6 +356,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/tools/plan_render.py`
 - `ouroboros/tools/plan_review.py`
 - `ouroboros/tools/plan_review_artifacts.py`
+- `ouroboros/tools/plan_review_collect.py`
 - `ouroboros/tools/plan_review_references.py`
 - `ouroboros/tools/plan_review_runtime.py`
 - `ouroboros/tools/plan_spec.py`
