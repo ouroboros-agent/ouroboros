@@ -218,6 +218,8 @@ def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> t
         for item in list_task_results(env.drive_root):
             if not isinstance(item, dict):
                 continue
+            if str(item.get("task_id") or item.get("id") or "") == task_id:
+                continue  # the persisted root names its own subtree too
             if str(item.get("parent_task_id") or "") != task_id and str(item.get("root_task_id") or "") != task_id:
                 continue
             # ABI-3: resolve the stored pair (legacy read tolerance, deprecated

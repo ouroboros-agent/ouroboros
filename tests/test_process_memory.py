@@ -801,6 +801,38 @@ def test_only_a_genuinely_failed_child_admits_the_register(tmp_path):
         ) is True, failure
 
 
+def test_a_persisted_failed_root_is_not_its_own_child_evidence(tmp_path, monkeypatch):
+    """Production stores the root result before dispatching post-task synthesis.
+
+    Its root_task_id names the subtree, not a child relationship. A failed root
+    with no children must not invent a child failure or admit learning on one.
+    The existing own-tool-error trigger is unchanged.
+    """
+    from types import SimpleNamespace
+    from ouroboros import llm_observability, post_task_synthesis
+    from ouroboros.task_results import write_task_result
+
+    task = {"id": "root-only", "type": "task", "root_task_id": "root-only",
+            "parent_task_id": "", "delegation_role": "root"}
+    write_task_result(
+        tmp_path, task["id"], "failed", result="No child was started",
+        root_task_id=task["id"], parent_task_id="", delegation_role="root",
+        outcome_axes={"execution": {"status": "failed"}},
+    )
+    env = SimpleNamespace(drive_root=tmp_path)
+    evidence, rows = post_task_synthesis._child_task_evidence(env, task)
+    assert rows == [] and evidence == ""
+    assert post_task_synthesis._child_failure_classes(rows) == []
+    calls = []
+    monkeypatch.setattr(llm_observability, "chat_observed", lambda *_a, **kw: calls.append(kw))
+    trace = {"tool_calls": [{"tool": "read_file", "result": "ok", "status": "ok"}],
+             "reasoning_notes": []}
+    assert post_task_synthesis._run_reflection(
+        env, None, task, {"rounds": 2, "cost": 0.01}, trace, {},
+    ) is None
+    assert calls == []
+
+
 def test_a_failed_child_alone_triggers_the_roots_reflection(tmp_path, monkeypatch):
     """P5.3's own case, end to end: "a root whose only failures are children
     admits".
@@ -833,6 +865,11 @@ def test_a_failed_child_alone_triggers_the_roots_reflection(tmp_path, monkeypatc
     def _run(root_id, child_status, child_axes, *, rounds=2):
         calls.clear()
         prompts.clear()
+        # The root is already durable when production dispatches synthesis.
+        write_task_result(
+            tmp_path, root_id, "completed", result="Delegated step finished",
+            root_task_id=root_id, parent_task_id="", delegation_role="root",
+        )
         write_task_result(
             tmp_path, f"{root_id}-kid", child_status, result="child output",
             parent_task_id=root_id, root_task_id=root_id, delegation_role="subagent",
@@ -841,10 +878,13 @@ def test_a_failed_child_alone_triggers_the_roots_reflection(tmp_path, monkeypatc
         # Short, cheap and clean: every other trigger says no.
         task = {"id": root_id, "type": "task", "text": "Delegate one step",
                 "drive_root": str(tmp_path), "budget_drive_root": str(tmp_path)}
+        env = SimpleNamespace(drive_root=tmp_path)
+        _, children = post_task_synthesis._child_task_evidence(env, task)
+        assert [row["task_id"] for row in children] == [f"{root_id}-kid"]
         trace = {"tool_calls": [{"tool": "read_file", "result": "ok", "is_error": False,
                                  "status": "ok"}], "reasoning_notes": []}
         return post_task_synthesis._run_reflection(
-            SimpleNamespace(drive_root=tmp_path), None, task,
+            env, None, task,
             {"rounds": rounds, "cost": 0.01}, trace, {},
         )
 
