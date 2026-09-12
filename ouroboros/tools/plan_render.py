@@ -142,10 +142,17 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             )
         return "Closed: proceed with the reviewed spec."
     if bool(wave.get("custody_pending")):
+        # Facts about the route that exists (B2), not an instruction to take it: the
+        # settlement frame is a mailbox message, so the ordinary in-task wait returns
+        # on it. A followup would mint a NEW root task, which cannot collect this wave.
         return (
             "Open: one or more paid reviewer operations are still in flight. "
             "The responses received so far are not final authority; wait for "
-            "custody reconciliation before treating this wave as closed."
+            "custody reconciliation before treating this wave as closed. The host writes ONE "
+            "message into this task's mailbox when every released slot settles: wait_task on "
+            "this task's own id (wait_tasks while children run) returns on it, and the $0 "
+            f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}}) then "
+            "collects this wave without a second panel."
         )
     if aggregate == "DEGRADED":
         # B2: facts, not a retry coach (BIBLE P5 — the host never dictates the next tool

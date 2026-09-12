@@ -443,3 +443,29 @@ def test_a_collection_records_the_dispatched_packet_not_one_rebuilt_from_the_liv
     assert cause == "" and history
     assert late not in json.dumps(history["s1"][:-2]), "the late directive entered the prior history"
     assert history["s1"][:-2] == before_messages
+
+
+def test_the_open_wave_text_names_the_route_that_waits_for_the_settlement_frame(harness, monkeypatch):
+    """Owner-forwarded audit, finding 5: the barrier return says paid operations are still
+    in flight but never says how to wait for them. The auditor verified the working route
+    (``wait_task`` on the task's OWN id returns on the settlement frame, then the $0
+    collection) and that ``schedule_followup`` is the wrong one here: it mints a NEW root
+    task whose collection of the old wave is refused as PLAN_REVIEW_DISPOSITION_UNBINDABLE."""
+    from ouroboros.tools.plan_render import _next_step
+
+    executor = _install_real_substrate(monkeypatch)
+    ctx = harness.make_ctx()
+    try:
+        first = _call(ctx)
+        assert _wait_until(lambda: executor.execute_calls == 3)
+    finally:
+        executor.release.set()
+    wave = _state(harness)["waves"][-1]
+    fp = wave["request_fingerprint"]
+    for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
+        assert "one or more paid reviewer operations are still in flight" in text
+        assert ("The host writes ONE message into this task's mailbox when every released slot "
+                "settles: wait_task on this task's own id (wait_tasks while children run) "
+                "returns on it") in text
+        assert f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}})" in text
+        assert "schedule_followup" not in text  # a new root task cannot collect this wave
