@@ -188,35 +188,42 @@ test('a real debt beside a real execution cause is one card line', () => {
     }), 'Reason: provider_unavailable (delegated_custody_unreconciled)');
 });
 
-// A LIVE task_done event carries no debt list at all (composed in
-// ouroboros/agent_task_pipeline.py), while the overlay stamps this code only
-// while the stored list is non-empty. So a missing key is not a healed debt: it
-// is the write side's own proof that the debt was open when the row was
-// written, and only an explicit empty list is the healed row.
+// A LIVE task_done event carries the row's own debt list too
+// (agent_task_pipeline._custody_debt_event_fields), so the card reads the SAME
+// list the durable row holds and the stamped code is never a second source. A
+// record that carries no readable list therefore states nothing about the debt,
+// exactly as project_dialogue._custody_debt_reason reads the same record.
 
-test('a live event without the debt list keeps the stamped custody code', () => {
+test('a live event carrying an open debt list names the debt through the list', () => {
     assert.equal(taskReasonDetail({
         status: 'completed',
         reason_code: 'delegated_custody_unreconciled',
-        outcome_axes: { execution: { status: 'ok' } },
-    }), 'Reason: delegated_custody_unreconciled');
+        delegated_runs_unreconciled: ['run-a1'],
+        outcome_axes: { execution: { status: 'ok', reason_code: 'tool_failure' } },
+    }), 'Reason: tool_failure (delegated_custody_unreconciled)');
 });
 
-test('a live event without the debt list still names its execution cause beside the code', () => {
+test('a record carrying no debt list states nothing about the debt', () => {
     assert.equal(taskReasonDetail({
         status: 'failed',
         reason_code: 'delegated_custody_unreconciled',
         outcome_axes: { execution: { status: 'failed', reason_code: 'provider_unavailable' } },
-    }), 'Reason: provider_unavailable (delegated_custody_unreconciled)');
+    }), 'Reason: provider_unavailable');
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        outcome_axes: { execution: { status: 'ok' } },
+    }), '');
 });
 
-test('a debt list of an unreadable shape is not read as healed', () => {
+test('a debt list of an unreadable shape carries no readable debt', () => {
+    // The host reads the same value the same way: only a list is a debt list.
     assert.equal(taskReasonDetail({
         status: 'completed',
         reason_code: 'delegated_custody_unreconciled',
         delegated_runs_unreconciled: 'run-a1',
         outcome_axes: { execution: { status: 'ok' } },
-    }), 'Reason: delegated_custody_unreconciled');
+    }), '');
 });
 
 test('a healed debt with no execution cause states nothing on the card', () => {

@@ -403,11 +403,13 @@ export function taskReasonPhrase(code) {
 // The custody overlay stamps this code as the row's reason_code while a
 // delegated run is still unreconciled, and the debt then heals from the WRITE
 // side while the stored code may not be rewritten. So the code outlives the
-// fact, and a debt list the record actually CARRIES is the only fresh truth.
-// A record without that key states nothing about the debt: the live task_done
-// event never carries it, and the overlay stamps the code only while the stored
-// list is non-empty, so the stamp itself is the write side's proof that the debt
-// was open. Only an explicit empty list is a healed row. The browser twin of
+// fact, and the debt list the record CARRIES is the only fresh truth. ONE rule
+// from ONE source on every surface: a non-empty list names the debt beside the
+// execution reason, while an empty list or none at all leaves the execution
+// reason standing alone. Nothing is inferred from absence, because the live
+// task_done event carries the stored list too (agent_task_pipeline
+// ._custody_debt_event_fields), so a record without one is a record that states
+// nothing about the debt. The browser twin of
 // project_dialogue._custody_debt_reason: the debt is a warning BESIDE the rail
 // cause, never a replacement, and any other code passes through untouched.
 const CUSTODY_DEBT_REASON = 'delegated_custody_unreconciled';
@@ -416,10 +418,9 @@ function custodyDebtReason(record) {
     const raw = String(record?.reason_code || '');
     if (raw !== CUSTODY_DEBT_REASON) return [raw, ''];
     const debt = record?.delegated_runs_unreconciled;
-    const healed = Array.isArray(debt) && debt.length === 0;
     return [
         String(record?.outcome_axes?.execution?.reason_code || ''),
-        healed ? '' : CUSTODY_DEBT_REASON,
+        Array.isArray(debt) && debt.length ? CUSTODY_DEBT_REASON : '',
     ];
 }
 

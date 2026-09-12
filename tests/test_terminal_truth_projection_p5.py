@@ -116,3 +116,31 @@ def test_a_healed_debt_is_never_resurrected_by_its_own_frozen_warning() -> None:
         {"execution": {"status": "failed", "reason_code": "provider_unavailable"}}),
         delegated_runs_unreconciled=[])
     assert _completion_verdict(railed, {}) == "Reason: provider_unavailable."
+
+
+def test_the_event_and_the_row_render_one_reason_line_over_the_shared_fixture() -> None:
+    """S1: one debt rule on every surface, from one source.
+
+    ``web/tests/fixtures/outcome_phase_parity.json`` is the twin fixture the
+    browser reads in ``web/tests/reason_detail.test.js``: every case that
+    declares a Reason line is asserted there against ``taskReasonDetail`` and
+    here against ``_completion_verdict``, so a rule that lives on only one
+    surface fails on both sides of the boundary. The same record is asserted in
+    both lifecycle positions, because a live ``task_done`` event and the durable
+    row reach this renderer through different arguments and must never disagree:
+    the custody warning is named while the record's own debt list is non-empty,
+    the current execution cause stands once it is empty, and a record carrying
+    no list states nothing about the debt at all.
+    """
+    import json
+    import pathlib
+
+    fixture = (pathlib.Path(__file__).resolve().parents[1]
+               / "web" / "tests" / "fixtures" / "outcome_phase_parity.json")
+    cases = json.loads(fixture.read_text(encoding="utf-8"))["cases"]
+    asserted = [case for case in cases if case.get("acceptance_clause")]
+    assert len(asserted) >= 5, "the fixture lost its Reason-line cases"
+    for case in asserted:
+        record, clause = case["record"], case["acceptance_clause"]
+        assert _completion_verdict(record, {}) == clause, case["name"]
+        assert _completion_verdict({}, record) == clause, case["name"]
