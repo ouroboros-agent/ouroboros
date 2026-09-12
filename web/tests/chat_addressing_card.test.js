@@ -212,6 +212,7 @@ test('cold client distinguishes late addressing metrics without prior tool-start
         f.log({ type: 'task_metrics_event', tool_calls: 2, tool_errors: 0,
             tool_call_counts: { promote_chat_to_task: 1, read_file: 1 } });
         assert.ok(f.card());
+        assert.equal(f.card().dataset.finished, '0', 'live metrics alone do not conclude a turn');
     } finally { f.close(); }
 });
 
@@ -239,3 +240,77 @@ test('a retired addressing turn still reveals an actual error in late metrics', 
         assert.ok(f.card());
     } finally { f.close(); }
 });
+
+for (const [status, phase] of [['completed', 'done'], ['failed', 'error']]) {
+    test(`late complete work evidence restores a retired ${status} turn`, (t) => {
+        t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+        const f = fixture();
+        try {
+            f.log({ type: 'tool_call_started', tool: 'promote_chat_to_task' });
+            f.emit('chat', final);
+            t.mock.timers.tick(30001);
+            f.log({ type: 'task_metrics_event',
+                outcome_axes: { lifecycle: { status }, execution: { status: status === 'failed' ? 'failed' : 'ok' } },
+                tool_calls: 2, tool_errors: 0,
+                tool_call_counts: { promote_chat_to_task: 1, read_file: 1 },
+                accounted_upper_bound_usd: 0.75, cost_final: true, cost_accounting_status: 'available' });
+            assert.ok(f.card(), 'late proven work must remain visible');
+            assert.equal(f.card().dataset.finished, '1');
+            assert.equal(f.card().querySelector('[data-live-phase]').dataset.phase, phase);
+            assert.match(f.card().querySelector('[data-live-meta]').innerHTML, /\$0\.75/);
+        } finally { f.close(); }
+    });
+}
+
+test('late delayed read start and complete metrics keep the known retired outcome', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+    const f = fixture();
+    try {
+        f.log({ type: 'tool_call_started', tool: 'promote_chat_to_task' });
+        f.emit('chat', final);
+        t.mock.timers.tick(30001);
+        f.log({ type: 'tool_call_started', tool: 'read_file' });
+        f.log({ type: 'task_metrics_event', tool_calls: 2, tool_errors: 0,
+            tool_call_counts: { promote_chat_to_task: 1, read_file: 1 },
+            outcome_axes: { lifecycle: { status: 'completed' }, execution: { status: 'ok' } },
+            accounted_upper_bound_usd: 0.75, cost_final: true, cost_accounting_status: 'available' });
+        assert.equal(f.card().dataset.finished, '1');
+        assert.equal(f.card().querySelector('[data-live-phase]').dataset.phase, 'done');
+        assert.match(f.card().querySelector('[data-live-meta]').innerHTML, /\$0\.75/);
+    } finally { f.close(); }
+});
+
+test('late start and metrics preserve an existing retired failure', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+    const f = fixture();
+    try {
+        f.log({ type: 'tool_call_started', tool: 'read_file' });
+        const failed = { ...final, task_terminal_status: 'failed',
+            outcome_axes: { execution: { status: 'failed' } } };
+        f.emit('chat', failed);
+        f.log({ ...failed, type: 'task_done', status: 'failed' });
+        t.mock.timers.tick(120001);
+        for (const event of [{ type: 'tool_call_started', tool: 'read_file' },
+            { type: 'task_metrics_event', tool_calls: 2, tool_errors: 0,
+                tool_call_counts: { read_file: 2 } }]) {
+            f.log(event);
+            assert.equal(f.card().querySelector('[data-live-phase]').dataset.phase, 'error');
+            assert.equal(f.card().dataset.finished, '1');
+            assert.match(f.card().querySelector('[data-live-meta]').innerHTML, /\$0\.75/);
+        }
+    } finally { f.close(); }
+});
+
+for (const counts of [undefined, { promote_chat_to_task: 1 }, { promote_chat_to_task: 2 }]) {
+    test(`retired unknown or addressing-only metrics stay hidden: ${JSON.stringify(counts)}`, (t) => {
+        t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+        const f = fixture();
+        try {
+            f.log({ type: 'tool_call_started', tool: 'promote_chat_to_task' });
+            f.emit('chat', final);
+            t.mock.timers.tick(30001);
+            f.log({ type: 'task_metrics_event', tool_calls: 2, tool_errors: 0, tool_call_counts: counts });
+            assert.equal(Boolean(f.card()), false);
+        } finally { f.close(); }
+    });
+}

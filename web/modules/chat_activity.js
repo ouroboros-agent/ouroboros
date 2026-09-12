@@ -171,6 +171,18 @@ export function shouldAlwaysShowTaskCard(taskId = '') {
     return isBackgroundTaskId(taskId);
 }
 
+export const ADDRESSING_ONLY_TOOLS = new Set(['promote_chat_to_task', 'route_to_project', 'steer_task']);
+
+export function addressingToolCallCount(count, metrics) {
+    const counts = metrics.tool_call_counts;
+    const entries = counts && typeof counts === 'object' && !Array.isArray(counts) ? Object.entries(counts) : [];
+    if (!Number.isInteger(count) || count <= 0 || !Number.isInteger(metrics.tool_errors)
+            || metrics.tool_errors < 0 || !entries.length
+            || !entries.every(([, n]) => Number.isInteger(n) && n > 0)
+            || entries.reduce((sum, [, n]) => sum + n, 0) !== count) return null;
+    return entries.reduce((sum, [name, n]) => sum + (ADDRESSING_ONLY_TOOLS.has(name) ? n : 0), 0);
+}
+
 export function isForegroundLiveCard(record) {
     return Boolean(
         record?.root?.isConnected && !record.finished && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed

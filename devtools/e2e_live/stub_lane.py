@@ -3,9 +3,9 @@
 Reuses the system-E2E harness (``tests/system_e2e/harness.py``: the loopback model server, the
 review-organ classification with its canned parse-clean verdicts, ``keyless_settings``) instead
 of a second stub; the runner imports it lazily and only in stub mode. The one thing added here
-is ROUTING: a swarm scenario interleaves
-router, parent, child and admission-probe calls on one wire, so the script is a map of
-per-role queues rather than one ordered list (``scenarios.<id>_stub_script``).
+is per-role sequencing: a swarm scenario interleaves managed-root, child and admission-probe
+calls on one wire, so the script is a map of per-role queues rather than one ordered list
+(``scenarios.<id>_stub_script``).
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import json
 STUB_MODEL_SLUG = "openai-compatible::mock-model"   # == harness.MOCK_SLUG (asserted in stub_settings)
 STUB_CHILD_SLUG = "openai-compatible::mock-child"
 STUB_MODEL_SLOTS = {"OUROBOROS_MODEL": STUB_MODEL_SLUG, "OUROBOROS_MODEL_LIGHT": STUB_MODEL_SLUG}
-ROUTER_PROMPT_KEY = '"promoted_task_toolset"'  # only the Swarm router turn's runtime context carries it
 
 
 def routed_stub_model(script: dict):
@@ -35,8 +34,6 @@ def routed_stub_model(script: dict):
                 return "probe"
             if "mock-child" in str(body.get("model") or ""):
                 return "child"
-            if ROUTER_PROMPT_KEY in harness.body_text(body):
-                return "router"
             return "agent"
 
         def _answer(self, body: dict, seq: int) -> tuple[str, dict]:

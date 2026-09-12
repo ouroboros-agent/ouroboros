@@ -80,6 +80,8 @@ import {
     syncLiveCardToggle,
 } from './chat_render_batch.js';
 import {
+    ADDRESSING_ONLY_TOOLS,
+    addressingToolCallCount,
     COLLAPSED_ACTIVITY_MAX,
     boundActivityPreview,
     buildTimelineItemHtml,
@@ -522,7 +524,6 @@ export function createChatInstance({
     // A task_named frame can arrive before the card's record exists; buffer it.
     const pendingSuggestedNames = new Map();
     const taskUiStates = new Map();
-    const ADDRESSING_ONLY_TOOLS = new Set(['promote_chat_to_task', 'route_to_project', 'steer_task']);
     // Server-confirmed in-flight direct/managed activities.
     const activeDirectActivities = new Map();
     // Local user submissions awaiting server confirmation (clientMessageId
@@ -925,18 +926,15 @@ export function createChatInstance({
     function markTaskToolCall(taskId, count = 1, {
         minimumOnly = false, tool = '', metrics = {}, history = false, rawTs = '', suppressDomInsert = false,
     } = {}) {
-        if (minimumOnly && !(metrics.tool_errors > 0) && retiredTaskIds.has(taskId) && !liveCardRecords.has(taskId)) return false;
+        const safeCount = Math.max(0, Number(count) || 0);
+        const addressing = addressingToolCallCount(count, metrics);
+        const complete = addressing !== null;
+        const retired = retiredTaskIds.has(taskId);
+        if (minimumOnly && retired && !liveCardRecords.has(taskId)
+                && !(metrics.tool_errors > 0 || complete && safeCount > addressing)) return false;
         const taskState = getTaskUiState(taskId, true);
         if (!taskState) return false;
-        const safeCount = Math.max(0, Number(count) || 0);
-        const counts = metrics.tool_call_counts;
-        const entries = counts && typeof counts === 'object' && !Array.isArray(counts) ? Object.entries(counts) : [];
-        const complete = Number.isInteger(count) && count > 0 && Number.isInteger(metrics.tool_errors)
-            && metrics.tool_errors >= 0 && entries.length > 0
-            && entries.every(([, n]) => Number.isInteger(n) && n > 0)
-            && entries.reduce((sum, [, n]) => sum + n, 0) === count;
-        if (complete) taskState.addressingToolCalls = entries.reduce((sum, [name, n]) =>
-            sum + (ADDRESSING_ONLY_TOOLS.has(name) ? n : 0), 0);
+        if (complete) taskState.addressingToolCalls = addressing;
         if (metrics.tool_errors > 0 || (history && !complete && (safeCount > 0 || metrics.rounds > 1))) {
             taskState.forceCard = true;
         }
@@ -944,10 +942,14 @@ export function createChatInstance({
             taskState.addressingToolCalls += safeCount;
             return false;
         }
-        // Counts on the event retain their full cost/outcome meaning.
         taskState.toolCalls = minimumOnly
             ? Math.max(taskState.toolCalls, safeCount - taskState.addressingToolCalls)
             : taskState.toolCalls + safeCount;
+        if (retired && (complete || !minimumOnly || metrics.tool_errors > 0)
+                && (!liveCardRecords.has(taskId) || taskDoneIsTerminal({ status: metrics.outcome_axes?.lifecycle?.status, ...metrics }))) {
+            const summary = withTaskCostMeta(taskTerminalSummary({ ...metrics, task_id: taskId, outcome_final: true }), metrics, { rawTs });
+            return queueTaskLiveUpdate(summary, taskId, normalizeLogTs(rawTs), summary.dedupeKey, rawTs);
+        }
         return revealBufferedCardIfNeeded(taskState, { rawTs, suppressDomInsert });
     }
 

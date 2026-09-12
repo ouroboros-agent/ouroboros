@@ -117,7 +117,7 @@ def test_scenario_table_shape():
     assert {sid: row.expects_absorb for sid, row in scenarios.SCENARIOS.items()} == {"SM1": True, "SW1": False, "SK1": False}
     # Stub scripts are role-keyed queues; SW1 needs every role the swarm wire interleaves.
     sw1 = scenarios.SCENARIOS["SW1"].stub_script(REPO_ROOT)
-    assert set(sw1) == {"router", "agent", "child", "probe"}
+    assert set(sw1) == {"agent", "child", "probe"}
     assert [s["tool"] for s in sw1["agent"] if isinstance(s, dict) and "tool" in s] == [
         "plan_task", "schedule_subagent", "schedule_subagent"]
     assert sum(1 for s in sw1["agent"] if callable(s)) == 3  # wait_tasks + two child dispositions
