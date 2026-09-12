@@ -133,15 +133,15 @@ def test_facade_scan_matches_the_generated_facade_inventory(reexports):
     assert set(reexports) == pinned
 
 
-def test_facade_module_query_lists_its_import_consumers():
-    rows = facade_consumers(REPO, "ouroboros/llm.py")
+def test_facade_module_query_lists_its_import_consumers(reexports):
+    rows = facade_consumers(REPO, "ouroboros/llm.py", reexports=reexports)
     consumers = {r.consumer for r in rows}
     assert "ouroboros/agent.py" in consumers  # from ouroboros.llm import LLMClient
     assert all(r.facade == "ouroboros/llm.py" and r.line > 0 for r in rows)
 
 
 def test_facade_symbol_query_narrows_to_the_reexported_name(reexports):
-    rows = facade_consumers(REPO, "add_usage")
+    rows = facade_consumers(REPO, "add_usage", reexports=reexports)
     assert rows, "add_usage is a re-exported facade binding with real consumers"
     for row in rows:
         assert row.name == "add_usage"
@@ -149,11 +149,18 @@ def test_facade_symbol_query_narrows_to_the_reexported_name(reexports):
     assert "ouroboros/loop_llm_call.py" in {r.consumer for r in rows}
 
 
-def test_facade_query_on_a_non_facade_is_a_teaching_refusal():
+def test_injected_reexports_answer_exactly_as_the_self_built_map(reexports):
+    """The kwarg is reuse, never a different question: an injected map answers with
+    exactly the rows the query builds for itself. The two teaching refusals are pinned
+    on the injected path by the test below."""
+    assert facade_consumers(REPO, "add_usage", reexports=reexports) == facade_consumers(REPO, "add_usage")
+
+
+def test_facade_query_on_a_non_facade_is_a_teaching_refusal(reexports):
     with pytest.raises(ValueError, match="not a facade module"):
-        facade_consumers(REPO, "ouroboros/runtime_mode_policy.py")
+        facade_consumers(REPO, "ouroboros/runtime_mode_policy.py", reexports=reexports)
     with pytest.raises(ValueError, match="no facade re-exports"):
-        facade_consumers(REPO, "definitely_not_an_exported_name")
+        facade_consumers(REPO, "definitely_not_an_exported_name", reexports=reexports)
 
 
 # ---------------------------------------------------------------------------

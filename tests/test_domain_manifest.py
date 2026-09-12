@@ -32,6 +32,7 @@ check_domains = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(check_domains)
 
 from scripts.domain_graph import (  # noqa: E402
+    DUPLICATE_MIN_LINES,
     LAZY,
     STRICT,
     Manifest,
@@ -232,6 +233,27 @@ def test_small_bodies_are_below_the_literal_copy_floor(tmp_path):
     m = _mini_manifest(tmp_path, {
         "pkg/__init__.py": "DA", "pkg/a.py": "DA", "pkg/b.py": "DB"})
     assert duplicate_bodies(m, tmp_path) == []
+
+
+def test_the_literal_copy_floor_is_exact_at_its_boundary(tmp_path):
+    """``duplicate_bodies`` skips re-slicing a body whose raw span cannot reach the
+    floor. That filter must move nothing: a cross-domain copy of exactly
+    ``DUPLICATE_MIN_LINES`` lines is still detected, one line shorter still is not."""
+    def sized(name: str, lines: int) -> str:  # raw span == normalized lines == `lines`
+        assigns = (f"    v{i} = {i}\n" for i in range(lines - 2))
+        return "".join([f"def {name}():\n", *assigns, "    return 0\n"])
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    copies = sized("at_floor", DUPLICATE_MIN_LINES) + "\n\n" + sized("below_floor", DUPLICATE_MIN_LINES - 1)
+    (tmp_path / "pkg" / "a.py").write_text(copies, encoding="utf-8")
+    (tmp_path / "pkg" / "b.py").write_text(copies, encoding="utf-8")
+    m = _mini_manifest(tmp_path, {
+        "pkg/__init__.py": "DA", "pkg/a.py": "DA", "pkg/b.py": "DB"})
+    rows = duplicate_bodies(m, tmp_path)
+    assert len(rows) == 1, rows
+    assert "pkg/a.py::at_floor" in rows[0] and "pkg/b.py::at_floor" in rows[0]
+    assert "below_floor" not in rows[0]
 
 
 def test_generated_block_replacement_is_idempotent():

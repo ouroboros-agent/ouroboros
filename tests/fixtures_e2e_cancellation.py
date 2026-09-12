@@ -120,15 +120,33 @@ class StubModelServer:
                 outer.calls.append(body)
                 if outer.latency_sec:
                     time.sleep(outer.latency_sec)
-                return self._send(outer._completion(body, len(outer.calls)))
+                return self._send(outer._completion(body, len(outer.calls)), stream=bool(body.get("stream")))
 
-            def _send(self, payload):
-                data = json.dumps(payload).encode("utf-8")
+            def _send(self, payload, *, stream=False):
+                content_type = "application/json"
+                if stream:
+                    content_type = "text/event-stream"
+                    choices = []
+                    for choice in payload["choices"]:
+                        delta = dict(choice["message"])
+                        if delta.get("tool_calls"):
+                            delta["tool_calls"] = [
+                                dict(call, index=index) for index, call in enumerate(delta["tool_calls"])
+                            ]
+                        choices.append({"index": choice["index"], "delta": delta,
+                                        "finish_reason": choice["finish_reason"]})
+                    common = {"id": payload["id"], "model": payload["model"], "object": "chat.completion.chunk"}
+                    frames = [{**common, "choices": choices}, {**common, "choices": [], "usage": payload["usage"]}]
+                    data = ("".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
+                            + "data: [DONE]\n\n").encode("utf-8")
+                else:
+                    data = json.dumps(payload).encode("utf-8")
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                self.wfile.flush()
 
             def log_message(self, *_args):
                 return

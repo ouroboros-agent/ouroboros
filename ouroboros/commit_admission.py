@@ -256,12 +256,19 @@ def _executable_identity(executable: str) -> tuple:
     return str(invocation), str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
-def log_preflight_test_proof(ctx, proof: PreflightTestProof, *, reused: bool, phase: str) -> None:
-    """Disclose the runner's actual proof on the existing event log, never read it as authority."""
+def log_preflight_test_proof(ctx, proof: PreflightTestProof, *, reused: bool, phase: str,
+                             passes: list[tuple[str, float]] | None = None) -> None:
+    """Disclose the runner's actual proof on the existing event log, never read it as authority.
+
+    ``passes`` are the executed passes' own `(label, seconds)`. A green run renders
+    no pytest output at all, so this row is the only durable record of what the gate
+    cost against `budget_sec`; a reused proof executed nothing and reports none.
+    """
     event = {
         "ts": utc_now_iso(), "type": "preflight_test_proof",
         "action": "reused" if reused else "created", "phase": phase,
         "task_id": str(getattr(ctx, "task_id", "") or ""),
+        "pass_seconds": dict(passes or ()), "budget_sec": proof.workload[1],
         "head": proof.head, "tree": proof.tree, "index_tree": proof.index_tree,
         "workload_fingerprint": hashlib.sha256(json.dumps(
             proof.workload, sort_keys=True, separators=(",", ":"),

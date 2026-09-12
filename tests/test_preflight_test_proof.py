@@ -205,6 +205,26 @@ def test_proof_logging_failure_does_not_change_runner_authority(candidate, monke
     assert all(row["task_id"] == "" and row["head"] == proof.head for row in events)
 
 
+def test_green_proof_row_discloses_the_passes_it_ran_and_its_budget(candidate, monkeypatch):
+    """A GREEN gate renders no pytest output at all — stdout is piped and printed
+    only on timeout, containment loss or failure — so this disclosure row is the
+    only durable record of what a healthy run cost against the budget that would
+    have killed it. A reused proof executed nothing, so it reports no passes while
+    still naming the budget it was taken under."""
+    monkeypatch.setenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", "1234")
+    monkeypatch.setattr(pr, "_execute_pytest_pass", lambda *a: (0, "green fixture", ""))
+    monkeypatch.setattr(pr, "_observed_worker_ids", lambda *a: {"gw0", "gw1"})
+    assert pr.run_hermetic_pytest(candidate.repo_dir, ctx=candidate) is None
+    assert pr.run_hermetic_pytest(candidate.repo_dir, ctx=candidate) is None
+    created, reused = _proof_events(candidate.drive_root)
+    assert (created["action"], reused["action"]) == ("created", "reused")
+    assert list(created["pass_seconds"]) == [spec.label for spec in pr._preflight_pass_specs()]
+    assert all(isinstance(seconds, float) and seconds >= 0.0
+               for seconds in created["pass_seconds"].values())
+    assert created["budget_sec"] == reused["budget_sec"] == 1234
+    assert reused["pass_seconds"] == {}
+
+
 def test_interpreter_identity_preserves_real_venv_invocation_path(candidate, tmp_path, monkeypatch):
     from ouroboros.commit_admission import _executable_identity
 
