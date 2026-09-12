@@ -7,8 +7,9 @@ git history instead of an uncommitted pile a later crash/cleanup could lose.
 Boundaries (BIBLE "Leaking secrets: nowhere" + owner-folder ownership):
 - ONLY trees under the subagent-projects root (host-minted); an owner-attached folder
   is NEVER auto-committed.
-- Credential-shaped files (the same `_sensitive_untracked_reason` patterns the
-  workspace patch excludes) are unstaged before the commit, disclosed in the receipt.
+- Credential files (the exact leaves of `_sensitive_untracked_reason` plus the
+  content evidence of `pem_private_key_reason`, the same two checks the workspace
+  patch applies) are unstaged before the commit, disclosed in the receipt.
 - Skipped while the tree still has live tasks; fail-soft per root; never raises.
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ import pathlib
 import subprocess
 from typing import Any, Dict, List, Sequence
 
-from ouroboros.headless import _sensitive_untracked_reason
+from ouroboros.headless import _sensitive_untracked_reason, pem_private_key_reason
 
 def _run_git(cmd: Sequence[str], cwd: pathlib.Path) -> "subprocess.CompletedProcess[str]":
     """Bounded git call returning the full CompletedProcess (checkpoint-commit path).
@@ -155,7 +156,7 @@ def checkpoint_commit_coop_roots(
                 rel = rel.strip()
                 if not rel:
                     continue
-                reason = _sensitive_untracked_reason(rel)
+                reason = _sensitive_untracked_reason(rel) or pem_private_key_reason(root, rel)
                 if reason:
                     _run_git(["git", "reset", "-q", "HEAD", "--", rel], root)
                     receipt["skipped_sensitive"].append({"path": rel, "reason": reason})

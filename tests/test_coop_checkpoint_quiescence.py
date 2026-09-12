@@ -503,3 +503,34 @@ def test_a_clean_state_dirty_root_still_commits(tmp_path, monkeypatch):
     assert all(r["committed"] for r in receipts)
     assert "ouroboros: checkpoint after task root1" in _subjects(tree)
     assert _porcelain(tree) == ""
+
+
+@pytest.mark.serial
+def test_checkpoint_keeps_a_key_named_deck_and_unstages_key_material_by_content(
+    tmp_path, monkeypatch,
+):
+    """The checkpoint decides by content, not by spelling: the owner's deck.key
+    is committed with the rest of the paid work, while notes.txt carrying a PEM
+    private-key header is unstaged and disclosed in the receipt (owner answer
+    3=A)."""
+    from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
+
+    data, tree = _dirty_coop_tree(tmp_path, monkeypatch)
+    (tree / "deck.key").write_text("Keynote deck, ordinary bytes\n", encoding="utf-8")
+    (tree / "notes.txt").write_text(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA\n-----END OPENSSH PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+
+    receipts = checkpoint_commit_coop_roots(data, "root1", title="Sunken city")
+    assert [r.get("skipped", "") for r in receipts] == [""], receipts
+    assert all(r["committed"] for r in receipts)
+    assert receipts[0]["skipped_sensitive"] == [
+        {"path": "notes.txt", "reason": "private key material (PEM private-key header)"}
+    ]
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"], cwd=str(tree),
+        capture_output=True, text=True,
+    ).stdout.split()
+    assert "deck.key" in committed and "paid-work.txt" in committed
+    assert "notes.txt" not in committed

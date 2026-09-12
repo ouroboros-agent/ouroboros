@@ -56,6 +56,7 @@ from ouroboros.workspace_patch_capture import (  # noqa: F401
     _workspace_patch_base,
     _write_patch_separator,
     build_workspace_patch,
+    pem_private_key_reason,
     untracked_capture_veto_reason,
     write_workspace_patch_artifacts,
 )
