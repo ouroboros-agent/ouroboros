@@ -575,6 +575,20 @@ def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: froze
         task_id = str(row.get("task_id") or row.get("id") or "")
         if not task_id or task_id in exclude_task_ids:
             continue
+        # An ACTIVE cancel intent means cancellation custody already owns this
+        # row and will settle it with its own outcome and text; at boot that
+        # custody is still inside the watchdog's minimum age, so healing here
+        # would win the race and publish infra_failed for a task the owner was
+        # told is being cancelled. An UNREADABLE intent store is the same
+        # refusal: this sweep never settles over an unknown cancel authority.
+        try:
+            from ouroboros.cancel_intents import has_active_intent
+
+            if has_active_intent(root, task_id, strict=True):
+                continue
+        except Exception:
+            log.debug("Orphan reconcile skipped %s: cancel authority unreadable", task_id, exc_info=True)
+            continue
         try:
             effective = load_effective_task_result(root, task_id)
         except Exception:

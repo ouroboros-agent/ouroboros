@@ -391,3 +391,71 @@ def test_orphan_reconcile_closes_the_open_quiz_and_its_paired_wait(roots, monkey
 
     reconcile_terminal_task_projections(root, "ghost-root")
     assert owner_quiz.quiz_states(root, "ghost-root")["ghost-root-q"]["state"] == "expired_terminal"
+
+
+SERVER_STOPPED_CANCEL = "Task cancelled: the server stopped while this task was still running."
+
+
+def _interrupted_running_row(root, task_id, *, chat_id=1, age_sec=120.0, **fields):
+    """A row the previous generation left RUNNING, written the way a boot finds it.
+
+    The snapshot the shutdown left still names it (restore reads that list), the
+    heartbeat is older than the healer's grace window, and a worker_boot row
+    after it is the healer's positive death evidence.
+    """
+    import datetime as dt
+
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    stamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_sec))
+    write_task_result(root, task_id, "running", chat_id=chat_id,
+                      ts=stamp.isoformat().replace("+00:00", "Z"), **fields)
+    append_jsonl(root / "logs" / "events.jsonl",
+                 {"ts": utc_now_iso(), "type": "worker_boot", "worker_id": 1})
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    (root / "state" / "queue_snapshot.json").write_text(json.dumps({
+        "ts": utc_now_iso(), "pending": [], "acceptance_fences": [], "budget_root_fences": [],
+        "running": [{"id": task_id, "task": {"id": task_id, "chat_id": chat_id}}],
+    }), encoding="utf-8")
+
+
+def test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody(roots, monkeypatch):
+    """The real boot order: restore mints the fence, the startup re-persist empties
+    the snapshot, and startup recovery runs inside the watchdog's ten-second
+    minimum age. Healing there would settle the row as infra_failed and the later
+    sweep would answer already_settled, leaving a Failed card under a boot line
+    that promised a cancellation (owner Q11=A)."""
+    import time
+
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    from supervisor import queue as queue_module, task_lifecycle
+    root, _ = roots
+
+    _interrupted_running_row(root, "ghost-fenced")
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == ["ghost-fenced"]
+    queue_module.persist_queue_snapshot(reason="startup")
+
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "ghost-fenced")["status"] == "running"
+
+    assert task_lifecycle.sweep_cancel_intents(now=time.time() + 60)["ghost-fenced"] == "cancelled"
+    stored = load_task_result(root, "ghost-fenced")
+    assert stored["status"] == "cancelled" and stored["result"] == SERVER_STOPPED_CANCEL
+
+
+def test_the_boot_healer_still_settles_a_running_row_nothing_owns(roots):
+    """The skip is the intent, not the shape: an orphan with no cancel intent is
+    reconciled exactly as before."""
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "ghost-unowned")
+    queue_module.persist_queue_snapshot(reason="startup")
+
+    assert reconcile_orphaned_running_tasks(root) == 1
+    stored = load_task_result(root, "ghost-unowned")
+    assert stored["status"] == "failed"
+    assert stored["reason_code"] == "orphaned_running_after_worker_restart"
