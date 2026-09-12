@@ -195,9 +195,9 @@ def _settled_spend_fact(ctx: Any, root_task_id: str) -> dict[str, Any]:
     known-zero. The fact writes nothing of its own; it inherits the reader's bounded maintenance —
     today: the torn-tail quarantine after a SINGLE crash mid-append (a crash inside that repair, a
     torn quarantine sink, is a known residual, issue #586), the empty
-    ``state/`` lock directory on a never-initialized root, and removal of a stale
-    ``usage_attempts.lock`` past the 90 s window (``usage_ledger._locked`` →
-    ``platform_layer.acquire_exclusive_file_lock``, stale-age unlink) — each pinned by a regression."""
+    ``state/`` lock directory on a never-initialized root, and owner-aware
+    ``usage_attempts.lock`` recovery (ARCHITECTURE §1 Platform substrate) —
+    each pinned by a regression."""
     try:
         from ouroboros.usage_accounting import usage_breakdown
 
@@ -315,9 +315,9 @@ def coordination_live_context(ctx: Any) -> dict[str, Any]:
     maintenance — today: the torn-tail quarantine after a SINGLE crash mid-append
     (``usage_ledger._read_records_locked``, identical for every reader; a crash inside that repair
     is a known residual, issue #586), the empty ``state/`` lock directory
-    on a never-initialized root, and removal of a stale ``usage_attempts.lock`` past the 90 s window
-    (``usage_ledger._locked`` → ``platform_layer.acquire_exclusive_file_lock``, stale-age unlink) —
-    each pinned by a regression; the settled-spend fact reads the ledger through that reader.
+    on a never-initialized root, and owner-aware ``usage_attempts.lock`` recovery
+    (ARCHITECTURE §1 Platform substrate) — each pinned by a regression;
+    the settled-spend fact reads the ledger through that reader.
     """
 
     root_task_id = _coordination_root_id(ctx)

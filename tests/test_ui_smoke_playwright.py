@@ -286,12 +286,14 @@ def direct_server_with_data(tmp_path):
                 try:
                     # Parent exit never proves the entire incarnation is gone.
                     error = container.reap()
-                    if error:
-                        raise RuntimeError(f"UI fixture process cleanup failed: {error}")
                 finally:
                     container.close()
+                if error:
                     if proc is not None:
-                        proc.wait(timeout=5)
+                        proc.poll()  # Collect an exited parent without masking the reap failure.
+                    raise RuntimeError(f"UI fixture process cleanup failed: {error}")
+                if proc is not None:
+                    proc.wait(timeout=5)
 
         def start_server() -> None:
             nonlocal active_proc, active_container

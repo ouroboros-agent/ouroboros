@@ -25,6 +25,7 @@ pytestmark = pytest.mark.serial
 
 _TREE_SCRIPT = r"""
 import json, os, pathlib, subprocess, sys, time
+from ouroboros.platform_layer import subprocess_new_group_kwargs
 receipt, entered, ready = map(pathlib.Path, sys.argv[1:4])
 entered.write_text("entered", encoding="utf-8")
 child = subprocess.Popen(
@@ -32,7 +33,7 @@ child = subprocess.Popen(
      "import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready', encoding='utf-8'); time.sleep(90)",
      str(ready)],
     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    start_new_session=os.name != "nt",
+    **subprocess_new_group_kwargs(),
 )
 pending = receipt.with_suffix(".pending")
 pending.write_text(json.dumps({"parent": os.getpid(), "child": child.pid}), encoding="utf-8")
@@ -310,3 +311,47 @@ def test_ui_fixture_native_windows_assigns_suspended_root_then_reaps_orphan(fixt
     assert run.proc.poll() == 0 and not _gone(run.child)
     gen.close()
     _assert_stopped(probe, run)
+
+
+@pytest.mark.parametrize("reap_result", ["returned-error", "raised-error", "clean"])
+def test_ui_fixture_preserves_reap_diagnostic_when_parent_survives(tmp_path, monkeypatch, reap_result):
+    waits, closed = [], []
+
+    class UnstoppedProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired(["fixture-root"], timeout)
+
+    class FailedContainer:
+        def spawn(self, *args, **kwargs):
+            return UnstoppedProcess()
+
+        def reap(self):
+            if reap_result == "raised-error":
+                raise RuntimeError("owned root could not be proven gone")
+            return "owned root could not be proven gone" if reap_result == "returned-error" else ""
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setenv("OUROBOROS_RUN_UI_SMOKE", "1")
+    monkeypatch.setattr(pc, "ProcessContainer", FailedContainer)
+    monkeypatch.setattr(ui, "MockLLMServer", lambda: nullcontext(SimpleNamespace(base_url="http://127.0.0.1:9")))
+    monkeypatch.setattr(ui, "_free_port", lambda: 27991)
+    monkeypatch.setattr(ui, "_wait_health", lambda _: None)
+    monkeypatch.setattr(ui, "_wait_supervisor_ready", lambda _: None)
+    gen = ui.direct_server_with_data.__wrapped__(tmp_path)
+    next(gen)
+    expected = subprocess.TimeoutExpired if reap_result == "clean" else RuntimeError
+    with pytest.raises(expected) as failure:
+        gen.close()
+    assert closed == [True]
+    assert waits == ([10, 5] if reap_result == "clean" else [10])
+    if reap_result != "clean":
+        assert "owned root could not be proven gone" in str(failure.value)
