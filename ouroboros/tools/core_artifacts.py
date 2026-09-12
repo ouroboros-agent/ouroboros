@@ -345,6 +345,10 @@ def validate_quiz_payload(
         if item.get("recommended") is True:  # the asker's recommendation rides with its option
             option["recommended"] = True
         cleaned.append(option)
+    if sum(1 for option in cleaned if option.get("recommended")) > 1:
+        # One recommendation: the durable record keeps one index, so every surface
+        # (live card, replay, Telegram, parent frame) must be able to show the same one.
+        raise QuizValidationError("QUIZ_RECOMMENDED_INVALID", "mark at most one option as recommended.")
     assumption_text = str(assumption or "").strip()
     if not isinstance(wait_for_answer, bool):
         raise QuizValidationError("QUIZ_WAIT_INVALID", "wait_for_answer must be a boolean.")

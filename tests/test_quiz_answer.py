@@ -917,3 +917,26 @@ def test_escalate_refusals_are_typed_per_branch_and_a_headless_root_still_asks(t
     required = _escalate(headless, question="?", options=["a", "b"], assumption="", wait_for_answer=True)
     assert required == ("⚠️ ESCALATE_UNAVAILABLE: required owner waiting needs a root task with a live "
                         "continuation owner.")
+
+
+def test_two_recommended_options_are_refused_and_one_survives_live_and_replay_alike(tmp_path):
+    """Fix cycle 2, 2d: a two-recommendation payload is a typed refusal before any card
+    or projection exists; a single recommendation is the same option on the live card
+    (event) and in the durable block the replay reads (recommended_index)."""
+    from ouroboros.owner_quiz import quiz_states
+
+    ctx = _tool_ctx(tmp_path)
+    out = _escalate(ctx, question="Which db?",
+                    options=[{"label": "sqlite", "recommended": True}, {"label": "postgres", "recommended": True}],
+                    assumption="sqlite meanwhile")
+    assert out == "⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended."
+    assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    assert quiz_states(tmp_path, "root-1") == {}
+    out = _escalate(ctx, question="Which db?",
+                    options=[{"label": "sqlite"}, {"label": "postgres", "recommended": True}],
+                    assumption="sqlite meanwhile")
+    assert out.startswith("OK: quiz ")
+    [event] = [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    live = [index for index, option in enumerate(event["options"]) if option.get("recommended")]
+    [block] = quiz_states(tmp_path, "root-1").values()
+    assert live == [1] and block["recommended_index"] == 1  # live and replay agree on the one option
