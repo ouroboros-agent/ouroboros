@@ -817,8 +817,10 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     so no read can outrun it as the 60s default could. The internal supervision
     observer instead makes one read under the ordinary transport bound narrowed by
     the real task deadline; its three-second beat is not a network deadline. A transport
-    failure that delivered no daemon answer there (typed ``daemon_unreachable``, a read
-    timeout included) retains unknown observation and the same run, without model wake.
+    failure that delivered no daemon answer there (typed per class:
+    ``observation_read_timeout`` for our own bound expiring, ``daemon_unreachable`` for a
+    socket that carried nothing) retains unknown observation and the same run, without
+    model wake.
     Legacy caller-sized waits preserve their last-poll expiry contract.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
