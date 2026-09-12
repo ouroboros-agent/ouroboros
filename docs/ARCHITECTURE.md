@@ -1096,7 +1096,10 @@ is one paragraph per chat; a row written anywhere else has not seen that
 receipt and keeps the bytes, and no writer trades its only pointer for the
 label. One event is disclosed once, at the layer that owns it, so the forced
 orphan note names the finished children as finished rather than as completed
-and skips a child whose own terminal row already reached this chat. A rail
+and leaves a child to its own terminal row only where that row reached the
+reader this note addresses: every settled task has a receipt, so the
+receipt's recorded chat is what decides, and a claimed disposition that no
+longer binds is kept regardless, because no terminal row carries it. A rail
 that ended a routing turn is always named by that turn's own row: a stamped
 execution reason is not evidence that another layer states it, because every
 rail stamps one.

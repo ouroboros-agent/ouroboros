@@ -525,6 +525,22 @@ def canonical_task_summary_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
     return dict(receipt)
 
 
+def canonical_task_summary_reached_chat(result: Dict[str, Any], chat_id: Any) -> bool:
+    """Did this task's own terminal row already reach THAT chat?
+
+    Every settled task gets a receipt, so "a receipt exists" answers nothing: it
+    is true of every completed, failed and cancelled child alike. The question a
+    second writer actually has is whether the reader it is about to address has
+    already been told, and only the row's own chat answers that. A receipt
+    written before the chat was recorded says nothing either, so it never
+    silences anybody.
+    """
+    row_chat = canonical_task_summary_receipt(result).get("chat_id")
+    if row_chat is None or chat_id is None:
+        return False
+    return str(row_chat) == str(chat_id)
+
+
 def append_authored_task_summary(
     canonical_root: Any, result_root: Any, row: Dict[str, Any], *, status: str = "",
 ) -> bool:
@@ -813,7 +829,7 @@ def _append_terminal_task_projection(
             "status": str(current.get("status") or status),
             "canonical_terminal_projection": {
                 "summary_id": summary_id, "summary_kind": summary_kind,
-                "written_at": row["ts"],
+                "written_at": row["ts"], "chat_id": row_chat_id,
             },
             "canonical_terminal_projection_ready": None,
         }

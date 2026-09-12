@@ -188,24 +188,37 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
     both reported. On a NORMAL no-tool finalization
     (``include_terminal=False``) the agent saw every change, so only
     STILL-RUNNING undecided children — genuinely orphaned by finalizing
-    mid-flight — are reported. Never raises."""
+    mid-flight — are reported. A settled child whose own terminal row already
+    reached THIS reader's chat is left to that row rather than repeated here; a
+    child whose disposition was claimed but did not bind is kept whatever its
+    row said, because the terminal row does not carry that fact. Never
+    raises."""
     try:
-        from ouroboros.project_dialogue import canonical_task_summary_receipt
+        from ouroboros.project_dialogue import canonical_task_summary_reached_chat
         from ouroboros.task_status import FINAL_STATUSES
 
         children = _loop()._direct_child_results(ctx)
         claimed = _loop()._claimed_child_dispositions(ctx)
+        # The chat this note is about to be read in. Every settled task has a
+        # receipt, so only the receipt's own chat can say whether THIS reader
+        # already saw the child's terminal row; without it the note stays whole.
+        tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+        note_chat_id = getattr(tools_ctx, "current_chat_id", None)
 
         def _undecided(c: Dict[str, Any]) -> bool:
             if _loop()._child_disposition_state(c) in {
                 "integrated", "irrelevant", "deferred", "discarded", "cancelled",
             }:
                 return False  # explicitly handled
-            if canonical_task_summary_receipt(c):
-                # The child's own terminal row already reached this chat, so it
-                # was not orphaned SILENTLY: naming it here is a second telling of
-                # one event. The receipt is the child's durable fact, never a scan
-                # of chat text.
+            if (
+                canonical_task_summary_reached_chat(c, note_chat_id)
+                and str(c.get("task_id") or c.get("id") or "") not in claimed
+            ):
+                # This reader already has the child's own terminal row, so it was
+                # not orphaned SILENTLY and naming it here tells one event twice.
+                # A durable fact of the child's, never a scan of chat text. The
+                # claimed-but-unbound case stays: that row says the child
+                # finished, never that the parent's disposition failed to bind.
                 return False
             # completed children were already surfaced via the reminder
             return include_terminal or str(c.get("status") or "").strip().lower() not in FINAL_STATUSES

@@ -2734,40 +2734,63 @@ def test_web_forbidding_contract_keeps_the_forced_call_web_free(tmp_path, monkey
     assert seen["allow_server_web_search"] is False
 
 
-def test_orphan_note_names_failed_children_and_skips_already_delivered_ones(monkeypatch):
-    """Owner item spam G: the note described children it could not describe.
+def test_orphan_note_names_failed_children_and_skips_rows_this_chat_already_has(tmp_path, monkeypatch):
+    """Owner item spam G, corrected: the note described children it could not
+    describe, and then silenced far more than it meant to.
 
     The two-way clause said running children may be incomplete and completed
     ones may be unread, so a FAILED or CANCELLED child was told about as
-    something it is not. And a child whose own terminal row had already reached
-    this chat was listed again, which is one event told twice: that child was
-    not orphaned SILENTLY, so the parent's note has nothing to add.
+    something it is not. The first skip then asked only whether a canonical
+    receipt EXISTS, which is true of every settled task, so every completed,
+    failed and cancelled child vanished from the note and the forced contract
+    ("the parent may not have seen completions") was void. The receipt now
+    records the chat its row went to, and only that reader is spared the repeat.
+
+    Driven through the real writers, because a fixture that omits the receipt
+    production always writes cannot show either half.
     """
     import ouroboros.loop as loop
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.task_results import write_task_result
+    from ouroboros.task_status import find_child_tasks
 
-    children = [
-        {"task_id": "failed1", "status": "failed"},
-        {"task_id": "rowdone1", "status": "completed",
-         "canonical_terminal_projection": {
-             "summary_id": "task-terminal:rowdone1",
-             "summary_kind": "terminal_result_projection",
-             "written_at": "2026-09-11T00:00:00Z",
-         }},
-        {"task_id": "undelivered1", "status": "completed"},
-    ]
-    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: [dict(c) for c in children])
+    for tid, status in (("kid-done", "completed"), ("kid-failed", "failed")):
+        child = {"id": tid, "chat_id": 7, "parent_task_id": "parent",
+                 "root_task_id": "parent", "delegation_role": "subagent"}
+        stored = write_task_result(tmp_path, tid, status, result=f"{tid} output", **{
+            key: value for key, value in child.items() if key != "id"
+        })
+        assert append_terminal_task_projection(
+            tmp_path, tid, child, stored, {"status": status, "chat_id": 7},
+        )
+    rows = find_child_tasks(tmp_path, parent_task_id="parent", root_task_id="parent",
+                            exclude_task_id="parent", scope="direct")
+    assert len(rows) == 2 and all(r.get("canonical_terminal_projection") for r in rows)
+    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: [dict(r) for r in rows])
     monkeypatch.setattr(loop, "_child_disposition_state", lambda _child: "")
     monkeypatch.setattr(loop, "_claimed_child_dispositions", lambda _ctx: {})
 
-    note = loop._forced_orphan_note(SimpleNamespace())
+    def _ctx(chat_id):
+        return SimpleNamespace(tools=SimpleNamespace(
+            _ctx=SimpleNamespace(current_chat_id=chat_id)))
 
-    assert "finished ones (completed, failed or cancelled) may be UNREAD" in note
-    assert "failed1 [failed]" in note
-    assert "undelivered1 [completed]" in note
-    assert "rowdone1" not in note
-    assert "2 child task(s) not explicitly absorbed" in note
-    # A receipt that does not belong to the child it sits on proves nothing.
-    mismatched = [dict(children[1], canonical_terminal_projection={
-        "summary_id": "task-terminal:someone-else"})]
-    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: mismatched)
-    assert "rowdone1 [completed]" in loop._forced_orphan_note(SimpleNamespace())
+    # The reader that already has both terminal rows is not told twice.
+    assert loop._forced_orphan_note(_ctx(7)) == ""
+    # Every other reader, and an unknown one, gets the whole note.
+    for elsewhere in (_ctx(1), _ctx(None), SimpleNamespace()):
+        note = loop._forced_orphan_note(elsewhere)
+        assert "finished ones (completed, failed or cancelled) may be UNREAD" in note
+        assert "kid-done [completed]" in note and "kid-failed [failed]" in note
+        assert "2 child task(s) not explicitly absorbed" in note
+
+    # A claimed disposition that no longer binds is a DIFFERENT fact: the child's
+    # terminal row never carried it, so that hint survives in its own chat too.
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    monkeypatch.setattr(loop, "_claimed_child_dispositions",
+                        lambda _ctx: {"kid-done": ("integrated", "0" * 64)})
+    same_chat = loop._forced_orphan_note(_ctx(7))
+    assert "kid-done [completed;" in same_chat
+    assert "integrated recorded for an EARLIER result hash" in same_chat
+    assert "kid-failed" not in same_chat
+    assert _child_result_sha256(rows[0]) != "0" * 64
