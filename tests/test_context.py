@@ -111,16 +111,32 @@ class TestCacheHitRateInvariant:
         assert _compute_cache_hit_rate(env) == 0.0
         assert "LOW CACHE HIT RATE" in build_health_invariants(env)
 
-    def test_a_window_with_some_reporting_rounds_still_reports(self, tmp_path):
-        """One reporter is a measurement, so the window is not unknown. The
-        denominator stays the whole measured window, as it always has."""
+    def test_a_window_with_fewer_than_five_reporting_rounds_stays_unknown(self, tmp_path):
+        """The five-round threshold counts MEASUREMENTS, not rounds. Three
+        reporters beside three silent rounds are still too thin a sample to
+        publish a share, so the invariant says nothing rather than a number the
+        window cannot support."""
         from ouroboros.context_health import _compute_cache_hit_rate
 
         env = self._make_env(tmp_path, [])
         self._emit_producer_rounds(tmp_path, None, count=3)
         self._emit_producer_rounds(tmp_path, 600, count=3)
-        rate = _compute_cache_hit_rate(env)
-        assert rate is not None and 0.0 < rate < 1.0
+        assert _compute_cache_hit_rate(env) is None
+
+    def test_silent_rounds_stay_out_of_the_reporters_denominator(self, tmp_path):
+        """A mixed install reads the reporters' own ratio.
+
+        Charging a silent round's prompt tokens to the denominator turned a
+        provider that never measured a cache into measured misses: the share
+        collapsed and "LOW CACHE HIT RATE" fired for a regression no round had
+        measured. Five reporters at 600 cached of 1000 prompt are 60%, whatever
+        the silent rounds beside them spent."""
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        env = self._make_env(tmp_path, [])
+        self._emit_producer_rounds(tmp_path, None, count=3)
+        self._emit_producer_rounds(tmp_path, 600, count=5)
+        assert _compute_cache_hit_rate(env) == 0.6
 
 
 def test_health_invariants_reports_remote_context_overflow(tmp_path):

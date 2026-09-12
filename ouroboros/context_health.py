@@ -491,27 +491,29 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
 
 
 def _compute_cache_hit_rate(env: Any) -> Optional[float]:
-    total_prompt = total_cached = count = reported = 0
+    total_prompt = total_cached = reported = 0
     try:
         for ev in _iter_recent_jsonl(env.drive_path("logs/events.jsonl")):
             if ev.get("type") != "llm_round":
                 continue
             usage = ev.get("usage", ev)
             pt = int(usage.get("prompt_tokens", 0))
-            if pt > 0:
-                # An absent key and an explicit null both mean the provider
-                # reported no cache for that round; only a number is a report.
-                cached = usage.get("cached_tokens")
+            # An absent key and an explicit null both mean the round measured
+            # nothing, so it joins NEITHER side of the ratio; only a number is
+            # a report, and an explicit 0 is a real measured miss.
+            cached = usage.get("cached_tokens")
+            if pt > 0 and cached is not None:
                 total_prompt += pt
                 total_cached += int(cached or 0)
-                count += 1
-                reported += 1 if cached is not None else 0
+                reported += 1
     except Exception:
         return None
     # Nobody reporting a cache is not a cache that missed: without the key the
     # share is UNKNOWN, and the arithmetic zero below would render that absence
     # as an honest 0% and send the owner hunting a caching regression no round
-    # ever measured. An explicitly reported 0 stays the real 0.0.
-    if count < 5 or total_prompt == 0 or reported == 0:
+    # ever measured. The window is the REPORTING rounds for the same reason: on
+    # an install whose providers are mixed, charging a silent round's prompt to
+    # the denominator understates the share the measuring rounds actually saw.
+    if reported < 5 or total_prompt == 0:
         return None
     return total_cached / total_prompt
