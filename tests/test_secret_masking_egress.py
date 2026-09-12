@@ -32,10 +32,9 @@ PEM_BLOCK = (
 _FINGERPRINT_RE = re.compile(r"^\*\*\*REDACTED\[\w+:len=\d+:sha256_8=[0-9a-f]{8}\]\*\*\*$")
 
 
-@pytest.mark.parametrize("mask_opaque", [True, False])
-def test_mask_secret_bytes_masks_entropy_formats(mask_opaque):
+def test_mask_secret_bytes_masks_entropy_formats():
     text = f"config a\nkey={OPENROUTER_KEY}\nAuthorization: Bearer {GITHUB_TOKEN}\nplain tail"
-    masked, count = mask_secret_bytes(text, mask_opaque=mask_opaque)
+    masked, count = mask_secret_bytes(text)
     assert OPENROUTER_KEY not in masked
     assert GITHUB_TOKEN not in masked
     assert count >= 2
@@ -44,21 +43,19 @@ def test_mask_secret_bytes_masks_entropy_formats(mask_opaque):
     assert "config a" in masked and "plain tail" in masked
 
 
-@pytest.mark.parametrize("mask_opaque", [True, False])
-def test_mask_secret_bytes_masks_pem_block(mask_opaque):
-    masked, count = mask_secret_bytes(f"prefix\n{PEM_BLOCK}\nsuffix", mask_opaque=mask_opaque)
+def test_mask_secret_bytes_masks_pem_block():
+    masked, count = mask_secret_bytes(f"prefix\n{PEM_BLOCK}\nsuffix")
     assert "PRIVATE KEY" not in masked
     assert "b3BlbnNzaC1rZXktdjE" not in masked
     assert count == 1
     assert masked.startswith("prefix\n") and masked.endswith("\nsuffix")
 
 
-@pytest.mark.parametrize("mask_opaque", [True, False])
-def test_mask_secret_bytes_masks_unterminated_pem_to_end(mask_opaque):
+def test_mask_secret_bytes_masks_unterminated_pem_to_end():
     # A read slice can cut the file before the END marker; the tail is still
     # key material and must not survive.
     head, _, _ = PEM_BLOCK.partition("-----END")
-    masked, count = mask_secret_bytes(f"prefix\n{head}", mask_opaque=mask_opaque)
+    masked, count = mask_secret_bytes(f"prefix\n{head}")
     assert count == 1
     assert "b3BlbnNzaC1rZXktdjE" not in masked
     assert masked == "prefix\n***"
@@ -69,7 +66,7 @@ def test_mask_before_file_window_preserves_source_positions(separator):
     prefix = 'public line' + separator
     tail = separator + 'next source line' + separator
     text = prefix + PEM_BLOCK.replace('\n', separator) + tail
-    masked, count = mask_secret_bytes(text, mask_opaque=False, preserve_layout=True)
+    masked, count = mask_secret_bytes(text, preserve_layout=True)
     assert count == 1 and len(masked) == len(text)
     assert [i for i, char in enumerate(masked) if char == '\n'] == [i for i, char in enumerate(text) if char == '\n']
     assert len(masked.splitlines()) == len(text.splitlines())
@@ -85,26 +82,29 @@ def test_mask_secret_bytes_leaves_plain_text_untouched():
     assert count == 0
 
 
-def test_mask_secret_bytes_masks_long_opaque_runs():
-    """s2r2 F1: line-oriented egresses surface key MATERIAL without block
-    markers (a PEM body line, an AWS secret key). Any unbroken 40+ char opaque
-    run is masked; a long hash is the documented accepted false positive."""
+def test_key_material_without_a_known_format_now_reaches_the_reader():
+    """Owner answer 5=A removed the 40-character opaque-run rule. What that rule
+    alone used to cover is now delivered raw, on search and on read alike: a PEM
+    body line without its markers, and an AWS secret access key (which no
+    SECRET_TOKEN_PATTERN matches — the aws pattern is the AKIA key ID). This is
+    a stated relaxation, pinned so it cannot happen again unnoticed."""
     body_line = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw" + "x" * 10
-    masked, count = mask_secret_bytes(f"match: {body_line}\n")
-    assert body_line not in masked and count == 1
+    assert mask_secret_bytes(f"match: {body_line}\n") == (f"match: {body_line}\n", 0)
     aws_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-    masked2, count2 = mask_secret_bytes(f"aws_secret_access_key = {aws_secret}\n")
-    assert aws_secret not in masked2 and count2 == 1
-    # accepted FP, disclosed by design: a bare sha256 is an opaque run too
-    masked3, count3 = mask_secret_bytes("sha256: " + "a" * 64 + "\n")
-    assert "a" * 64 not in masked3 and count3 == 1
+    assert mask_secret_bytes(f"aws_secret_access_key = {aws_secret}\n") == (
+        f"aws_secret_access_key = {aws_secret}\n", 0
+    )
+    # The former accepted false positive is gone with it: hashes, data URIs and
+    # minified bodies in the owner's own files arrive intact.
+    assert mask_secret_bytes("sha256: " + "a" * 64 + "\n") == ("sha256: " + "a" * 64 + "\n", 0)
 
 
-def test_repo_precision_masking_preserves_long_source_and_hashes():
+def test_search_and_read_deliver_the_same_bytes_for_long_source():
+    """One masker, one answer: long source, hashes and identifiers survive in
+    every scope, and only known formats and PEM blocks are replaced."""
     source = "x" * 4000 + "\nsha256: " + "ab12cd34" * 8 + "\n"
-    assert mask_secret_bytes(source, mask_opaque=False) == (source, 0)
-    masked, count = mask_secret_bytes(source)
-    assert count == 2 and "x" * 4000 not in masked
+    assert mask_secret_bytes(source) == (source, 0)
+    assert mask_secret_bytes(f"{source}key={OPENROUTER_KEY}\n")[1] == 1
 
 
 @pytest.mark.parametrize("profile", ["local_readonly_subagent", "acting_subagent"])

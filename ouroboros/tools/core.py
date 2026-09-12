@@ -971,9 +971,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             return result_text
         if normalized == "user_files" and _raw_owner_secret_access_allowed(ctx):
             return result_text
-        masked_text, masked = mask_secret_bytes(
-            result_text, mask_opaque=normalized not in {"active_workspace", "system_repo"},
-        )
+        masked_text, masked = mask_secret_bytes(result_text)
         if masked:
             masked_text += (
                 f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) in these "

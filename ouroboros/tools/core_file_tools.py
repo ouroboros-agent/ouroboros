@@ -118,7 +118,7 @@ def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_lin
     if mask_secrets:
         from ouroboros.secret_masking import mask_secret_bytes
 
-        content, masked = mask_secret_bytes(content, mask_opaque=False, preserve_layout=True)
+        content, masked = mask_secret_bytes(content, preserve_layout=True)
     start_raw, max_raw = _coerce_line_window(start_line, max_lines)
     max_raw = max(1, max_raw)
     lines = content.splitlines(keepends=True)
@@ -412,7 +412,7 @@ def _data_read(
                 if is_restricted_subagent_profile(ctx):
                     from ouroboros.secret_masking import mask_secret_bytes
 
-                    content, masked = mask_secret_bytes(content, mask_opaque=False, preserve_layout=True)
+                    content, masked = mask_secret_bytes(content, preserve_layout=True)
                     if masked:
                         content += f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) replaced with *."
                 return content

@@ -480,9 +480,7 @@ def _query_code(
             return text
         from ouroboros.secret_masking import mask_secret_bytes
 
-        masked, count = mask_secret_bytes(
-            text, mask_opaque=normalized_root not in {"active_workspace", "system_repo"},
-        )
+        masked, count = mask_secret_bytes(text)
         if count:
             masked += (
                 f"\n⚠️ SECRET_BYTES_MASKED: {count} secret-shaped span(s) were "
