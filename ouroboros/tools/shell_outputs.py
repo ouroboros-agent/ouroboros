@@ -494,18 +494,6 @@ def _register_process_outputs(
     return "\n\n" + prefix + ":\n" + "\n".join(f"- {note}" for note in notes), failed, registered
 
 
-_SENSITIVE_OUTPUT_NAMES = frozenset({".env", ".env.local", "credentials.json", "secrets.json", "token.json"})
-
-
-_SENSITIVE_OUTPUT_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
-
-
-_SENSITIVE_OUTPUT_MARKERS = ("api_key", "apikey", "access_token", "bearer_token", "credential", "password", "refresh_token", "secret")
-
-
-_SENSITIVE_OUTPUT_COMPONENT_NAMES = _SENSITIVE_OUTPUT_NAMES | frozenset({"secret", "secrets", "credential", "credentials", "token", "tokens"})
-
-
 def _sensitive_output_component_reason(parts: tuple[str, ...]) -> str:
     """Credential-shape check for every relative path component of an export.
 
