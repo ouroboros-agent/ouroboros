@@ -468,10 +468,11 @@ def test_missing_substrate_actor_stays_paid_and_custody_lost(harness, monkeypatc
 # ------------------------------------------------------------- collection (P1-3)
 
 
-def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=()):
+def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=(), refused=()):
     """A substrate that honours the event route: a fresh dispatch released at its
     drain deadline returns ``pending_dispatch`` rows; a reconcile returns the settled
-    rows (except ``still_pending`` slots, which are still running)."""
+    rows (except ``still_pending`` slots, which are still running, and ``refused``
+    slots, which settled as typed $0 not_dispatched refusals: nothing was sent)."""
     import ouroboros.review_custody as review_custody
     import ouroboros.review_substrate as review_substrate
 
@@ -484,14 +485,17 @@ def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=
         actors = []
         for slot in slots:
             pending = fresh or slot.slot_id in still_pending
+            refuse = not pending and slot.slot_id in refused
             actors.append({
                 "slot_id": slot.slot_id, "model": slot.model,
-                "status": "error" if pending else "ok",
-                "raw_text": "" if pending else texts.get(slot.slot_id, CLEAN),
-                "error": "Pending dispatch; the physical review operation is in flight" if pending else "",
-                "usage": {"resolved_model": slot.model, **({} if pending else {"physical_attempt_state": "settled"})},
+                "status": "not_dispatched" if refuse else ("error" if pending else "ok"),
+                "raw_text": "" if (pending or refuse) else texts.get(slot.slot_id, CLEAN),
+                "error": ("Pending dispatch; the physical review operation is in flight" if pending
+                          else "daemon unreachable before physical review dispatch" if refuse else ""),
+                "usage": {"resolved_model": slot.model,
+                          **({} if (pending or refuse) else {"physical_attempt_state": "settled"})},
                 "prompt_ref": {}, "response_ref": {}, "operation_id": f"op-{slot.slot_id}",
-                "operation_state": "pending_dispatch" if pending else "settled",
+                "operation_state": "pending_dispatch" if pending else ("not_dispatched" if refuse else "settled"),
                 "late_result_pending": pending,
             })
         return SimpleNamespace(actors=actors)
@@ -676,3 +680,73 @@ def test_disposition_items_are_recorded_on_a_wave_that_stays_custody_pending(har
     assert [(d["finding_id"], d["decision"]) for d in wave["dispositions"]] == [("s1:q1", "accept")]
     assert _control(final) == {"outcome": "REVIEW_REQUIRED", "closed": True}
     assert _state(harness)["cycles_paid"] == 1
+
+
+# ------------------------------------------------------------- the cap and an in-flight wave (fix cycle 2, 2a)
+
+
+def _hold_text(text):
+    return text.startswith("ERROR: PLAN_REVIEW_IN_FLIGHT:")
+
+
+def test_a_revised_envelope_at_the_cap_is_held_until_the_in_flight_wave_is_collected_and_a_zero_wave_frees_it(harness, monkeypatch):
+    """Under blocking with cap 1: envelope 1 dispatches at the barrier; a revised
+    envelope while that wave is still in flight is HELD with a typed refusal that names
+    the $0 collection, recorded before any superseding reference (the pending wave
+    stays current and collectible); no cycles_exhausted is written for an unproven
+    panel, so the gate does not release. When the collection proves no physical
+    dispatch (all typed $0 refusals) the cap is untouched and the revised envelope
+    dispatches, exactly as the base."""
+    from ouroboros.task_results import plan_review_gate_projection
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls, still_pending={"s1", "s2", "s3"})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    first = _state(harness)["waves"][-1]
+    assert first["custody_pending"] is True and first["paid"] is False
+    revised = {**DECK_SPEC, "in_scope": ["a 6-slide deck"]}
+    held = _call(ctx, spec=revised)
+    assert _hold_text(held) and first["request_fingerprint"] in held and "review_disposition" in held
+    state = _state(harness)
+    assert state["current_attempt"]["fingerprint"] == first["request_fingerprint"]  # not superseded
+    assert state["current_attempt"].get("status") != "cycles_exhausted"
+    assert not any(w.get("cycles_exhausted") for w in state["waves"])
+    gate = plan_review_gate_projection(state, "blocking")
+    assert gate["allow"] is False and gate["custody_pending"] is True  # no release without a dispatch
+    assert [c["reconcile_only"] for c in calls] == [False, True]  # the hold collected at $0, sent nothing
+    # Every slot settles as a typed $0 refusal: the collection proves NO dispatch.
+    _install_barrier_substrate(monkeypatch, calls, refused={"s1", "s2", "s3"})
+    _collect(ctx, first["request_fingerprint"])
+    state = _state(harness)
+    wave = state["waves"][-1]
+    assert wave["custody_pending"] is False and wave["paid"] is False and state["cycles_paid"] == 0
+    assert plan_review_gate_projection(state, "blocking")["allow"] is False
+    dispatched = _call(ctx, spec=revised)
+    assert _control(dispatched) == {"outcome": "DEGRADED", "closed": False}
+    state = _state(harness)
+    assert state["current_attempt"]["fingerprint"] != first["request_fingerprint"]
+    assert calls[-1]["reconcile_only"] is False and calls[-1]["drain"] is not None  # a real new panel
+    assert state["cycles_paid"] == 0 and len(calls) == 4
+
+
+def test_a_revised_envelope_is_exhausted_only_after_the_collection_proves_the_dispatch(harness, monkeypatch):
+    from ouroboros.task_results import plan_review_gate_projection
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls, still_pending={"s1", "s2", "s3"})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    first = _state(harness)["waves"][-1]["request_fingerprint"]
+    revised = {**DECK_SPEC, "in_scope": ["a 6-slide deck"]}
+    assert _hold_text(_call(ctx, spec=revised))
+    assert _state(harness)["current_attempt"]["fingerprint"] == first
+    _install_barrier_substrate(monkeypatch, calls)  # the reviewers settle: the panel WAS sent
+    assert _control(_collect(ctx, first)) == {"outcome": "GREEN", "closed": True}
+    assert _state(harness)["cycles_paid"] == 1
+    exhausted = _call(ctx, spec=revised)
+    assert exhausted.startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED: 1 of 1 paid plan-review cycles are spent")
+    assert plan_review_gate_projection(_state(harness), "blocking")["status"] == "cycles_exhausted"
+    assert [c["reconcile_only"] for c in calls] == [False, True, True]  # no new panel was sent

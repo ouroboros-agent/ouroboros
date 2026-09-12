@@ -529,6 +529,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     enforcement = get_review_enforcement()
     cap = review_max_cycles()
     cycles_paid = int(state.get("cycles_paid") or 0)
+    # A revised envelope over an in-flight wave at the cap is held BEFORE any superseding
+    # reference: the pending wave stays current and collectible, nothing is written as spent.
+    if collect is None and (hold := _collect.in_flight_hold(state, fingerprint=fingerprint, cap=cap)):
+        return _typed_refusal(ctx, "TOOL_ERROR", hold)
     # C-01: every envelope supersedes prior authority BEFORE any cap/rail exit.
     try:
         _record_plan_review_attempt_with_reference(ctx, state_root, task_id, fingerprint=fingerprint)
@@ -592,9 +596,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         except (OSError, TimeoutError, ValueError) as exc:
             return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}")
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
-    # A panel dispatched at the barrier is committed money: the cap counts it before its collection.
-    if cap is not None and _collect.committed_cycles(state) >= cap and not resume_in_flight:
-        return _cycles_exhausted(ctx, state, state_root, task_id, cap=cap, cycles_paid=_collect.committed_cycles(state),
+    if cap is not None and cycles_paid >= cap and not resume_in_flight:  # PAID (proven) cycles only
+        return _cycles_exhausted(ctx, state, state_root, task_id, cap=cap, cycles_paid=cycles_paid,
                                  enforcement=enforcement, reminder=reminder,
                                  request_fingerprint=fingerprint)
     # #116: a malformed structured reviewer-slot config must refuse loudly here

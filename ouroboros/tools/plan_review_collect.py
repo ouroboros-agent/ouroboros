@@ -150,17 +150,35 @@ async def collect_before_supersede(
     return load_plan_review_state(state_root, task_id)
 
 
-def committed_cycles(state: Dict[str, Any]) -> int:
-    """``cycles_paid`` plus every open wave whose panel is dispatched but not yet
-    collected (``custody_pending`` and unpaid). The money is committed at the
-    dispatch barrier, so the shared cap counts such a wave BEFORE the collection
-    proves its sends; otherwise a revised envelope submitted while reviewers are
-    still running would buy another full panel under a spent cap."""
-    pending = sum(
-        1 for w in state.get("waves") or []
+def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
+    """The typed refusal for a REVISED envelope while a wave is still custody-pending
+    and the cap has no room for another committed panel, or ``''`` when the envelope
+    may proceed. A panel dispatched at the barrier is committed money, but whether it
+    SPENDS a cycle is proven only by its collection (a wave of typed $0 refusals leaves
+    the cap untouched), so nothing is written here: no superseding reference, no
+    cycles_exhausted. The pending wave stays the current, collectible wave and the
+    text names its $0 collection. The identical envelope is never held (it resumes)."""
+    if cap is None:
+        return ""
+    pending = [
+        w for w in state.get("waves") or []
         if isinstance(w, dict) and w.get("custody_pending") and not w.get("paid")
+        and str(w.get("request_fingerprint") or "") != str(fingerprint or "")
+    ]
+    if not pending or int(state.get("cycles_paid") or 0) + len(pending) < int(cap):
+        return ""
+    wave = pending[-1]
+    fp = str(wave.get("request_fingerprint") or "")
+    running = sum(1 for a in wave.get("actors") or []
+                  if isinstance(a, dict) and a.get("operation_state") in {"pending_dispatch", "in_flight"})
+    return (
+        f"ERROR: PLAN_REVIEW_IN_FLIGHT: plan-review wave {fp[:8]} still has {running} reviewer slot(s) "
+        f"in flight and the cycle cap ({cap}) has no room for another panel until that wave is collected. "
+        f"Collect it at $0 with plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}}) "
+        "(a wave that proves no physical dispatch leaves the cap untouched; a paid one spends it), or "
+        "resubmit the identical envelope to wait for it. No plan attempt was recorded; the in-flight wave "
+        "stays the current wave."
     )
-    return int(state.get("cycles_paid") or 0) + pending
 
 
 def collect_before_gate(ctx: Any, state: Dict[str, Any]) -> Dict[str, Any]:

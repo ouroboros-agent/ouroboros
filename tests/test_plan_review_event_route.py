@@ -304,14 +304,16 @@ def test_in_flight_panels_count_toward_the_cycle_cap_at_dispatch(harness, monkey
         first = _call(ctx)
         assert _control(first) == {"outcome": "DEGRADED", "closed": False}
         assert _wait_until(lambda: executor.execute_calls == 3)
+        first_fp = _state(harness)["waves"][-1]["request_fingerprint"]
         second = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})
-        assert second.startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED: 1 of 1 paid plan-review cycles are spent")
-        assert "REVIEW CUSTODY PENDING" in second  # the committed in-flight wave is the live obligation
+        assert second.startswith("ERROR: PLAN_REVIEW_IN_FLIGHT:") and first_fp in second
         third = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]})
         assert executor.execute_calls == 3, "no panel beyond the cap was dispatched"
-        assert third.startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED")
-        assert _state(harness)["cycles_paid"] == 0  # committed, not yet proven paid
-        assert any(line.startswith("📐 plan_task: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
+        assert third.startswith("ERROR: PLAN_REVIEW_IN_FLIGHT:")
+        state = _state(harness)
+        assert state["cycles_paid"] == 0  # committed, not yet proven paid: nothing is written as spent
+        assert state["current_attempt"]["fingerprint"] == first_fp  # the in-flight wave stays current
+        assert not any(line.startswith("📐 plan_task: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
     finally:
         executor.release.set()
     assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
