@@ -79,6 +79,29 @@ def test_subscription_prepared_candidate_admits_the_actual_forced_send(acting):
     assert len(acting.gateway.creates) == 1
 
 
+def test_subscription_prospective_and_send_share_the_execution_cache_key(acting, monkeypatch):
+    """The admitted candidate declares the same cache affinity as the real send."""
+    from ouroboros import llm_claudexor
+
+    acting.ctx.messages = [{"role": "user", "content": "Please finish"}]
+    built = []
+    build = llm_claudexor._request
+
+    def record(target, messages, tools, parameters):
+        payload = build(target, messages, tools, parameters)
+        built.append(deepcopy(payload["options"]))
+        return payload
+
+    monkeypatch.setattr(llm_claudexor, "_request", record)
+    request, prepared = task_pacing.prepared_wrapup_candidate(
+        acting.ctx, deepcopy(acting.ctx.messages), allow_server_web_search=False)
+    assert forced._call_forced_model_once(acting.ctx, initial_messages=prepared,
+                                          admitted_request=request) == "Ответ 🐍"
+    execution_id = acting.ctx.accumulated_usage["execution_id"]
+    assert len(built) == 2 and built[0] == built[1] == {"reasoningEffort": "high", "cacheKey": execution_id}
+    assert acting.gateway.uploads[0][0]["options"] == built[1]
+
+
 @pytest.mark.parametrize("shape", ["mid_round_image", "late_system_notice"])
 def test_subscription_prospective_and_send_share_transcript_normalization(acting, shape):
     if shape == "mid_round_image":
