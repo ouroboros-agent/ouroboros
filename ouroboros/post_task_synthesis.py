@@ -495,14 +495,20 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
             should_generate_reflection, generate_reflection, append_reflection_routed,
         )
         synthesis_cost = _synthesis_cost_usd(usage)
+        # The one walk happens BEFORE the decision, because a root whose only
+        # failures are its children cannot be recognized without it: children do
+        # not reflect, so their classes have to reach this gate to be learned
+        # from at all. Still one walk, and its rows serve the prompt below.
+        child_evidence, child_rows = _child_task_evidence(env, task)
+        child_classes = _child_failure_classes(child_rows)
         if should_generate_reflection(
             llm_trace,
             task=task,
             rounds=int(usage.get("rounds", 0)),
             cost_usd=synthesis_cost,
+            child_failure_classes=child_classes,
         ):
             trace_summary = build_trace_summary(llm_trace)
-            child_evidence, child_rows = _child_task_evidence(env, task)
             try:
                 reflection_usage = dict(usage)
                 # Reflection's legacy durable cost_usd field now records this
@@ -515,7 +521,7 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
                     child_evidence=child_evidence,
                     usage_snapshot_text=_synthesis_usage_snapshot_text(usage),
                     sealed_final_text=sealed_final_prompt_section(sealed_final),
-                    child_failure_classes=_child_failure_classes(child_rows),
+                    child_failure_classes=child_classes,
                 )
                 entry = {**entry, **presence_provenance_fields(task)}
                 append_reflection_routed(env, task, entry)

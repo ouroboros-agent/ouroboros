@@ -185,9 +185,19 @@ def should_generate_reflection(
     task: Optional[Dict[str, Any]] = None,
     rounds: int = 0,
     cost_usd: Optional[float] = None,
+    child_failure_classes: Optional[List[str]] = None,
 ) -> bool:
-    """Return True for tool errors/blocking markers or costly many-round tasks."""
+    """Return True for tool errors/blocking markers or costly many-round tasks.
+
+    ``child_failure_classes`` are the typed failure classes of this root's own
+    children, from the caller's single evidence walk. Children do not reflect,
+    so a short clean root that delegated the work and got a FAILED child back is
+    the only place that failure can be learned from: without this the register's
+    own admission rule could never fire for the shape it was written for.
+    """
     task = task or {}
+    if child_failure_classes:
+        return True
     if str(task.get("type") or "") in {"evolution", "deep_self_review"}:
         return True
     if str(task.get("workspace_root") or "").strip() or str(task.get("workspace_mode") or "").strip():

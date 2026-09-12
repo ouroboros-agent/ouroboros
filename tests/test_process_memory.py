@@ -335,7 +335,8 @@ class TestHelperFunctions:
         high_cost_usage = {"rounds": 20, "cost": 6.0}
 
         with mock.patch("ouroboros.reflection.should_generate_reflection",
-                        wraps=lambda trace, *, task=None, rounds=0, cost_usd=0.0: True) as mock_sgr, \
+                        wraps=lambda trace, *, task=None, rounds=0, cost_usd=0.0,
+                        child_failure_classes=None: True) as mock_sgr, \
              mock.patch("ouroboros.reflection.generate_reflection",
                         return_value={"reflection": "ok", "backlog_candidates": []}) as mock_gen, \
              mock.patch("ouroboros.reflection.append_reflection") as mock_append:
@@ -369,7 +370,7 @@ class TestHelperFunctions:
 
         captured = {}
 
-        def should_run(trace, *, task=None, rounds=0, cost_usd=None):
+        def should_run(trace, *, task=None, rounds=0, cost_usd=None, child_failure_classes=None):
             captured["cost_usd"] = cost_usd
             return False
 
@@ -798,3 +799,58 @@ def test_only_a_genuinely_failed_child_admits_the_register(tmp_path):
         assert classes and _admits_pattern_register(
             {"error_count": 0, "key_markers": [], "child_failure_classes": classes},
         ) is True, failure
+
+
+def test_a_failed_child_alone_triggers_the_roots_reflection(tmp_path, monkeypatch):
+    """P5.3's own case, end to end: "a root whose only failures are children
+    admits".
+
+    Reflection eligibility was decided before the child runs were walked, so a
+    short, cheap, otherwise clean root with one failed child returned false: no
+    reflection, no child execution class collected, no Pattern Register update.
+    The admission rule the register gained could therefore never fire for the
+    very shape it was written for, and 15 of the 16 failed tasks of the incident
+    day were children.
+
+    The single existing evidence walk now feeds the trigger, so no second walk
+    and no new collector appear. A cancelled child still triggers nothing.
+    """
+    from ouroboros import llm_observability, post_task_synthesis
+    from ouroboros.task_results import write_task_result
+    from types import SimpleNamespace
+
+    calls = []
+
+    def _chat_observed(*_args, **kwargs):
+        calls.append(str(kwargs.get("call_type") or ""))
+        return {"content": "Reflection over the child failure."}, {}
+
+    monkeypatch.setattr(llm_observability, "chat_observed", _chat_observed)
+
+    def _run(root_id, child_status, child_axes):
+        calls.clear()
+        write_task_result(
+            tmp_path, f"{root_id}-kid", child_status, result="child output",
+            parent_task_id=root_id, root_task_id=root_id, delegation_role="subagent",
+            outcome_axes=child_axes,
+        )
+        # Short, cheap and clean: every other trigger says no.
+        task = {"id": root_id, "type": "task", "text": "Delegate one step",
+                "drive_root": str(tmp_path), "budget_drive_root": str(tmp_path)}
+        trace = {"tool_calls": [{"tool": "read_file", "result": "ok", "is_error": False,
+                                 "status": "ok"}], "reasoning_notes": []}
+        return post_task_synthesis._run_reflection(
+            SimpleNamespace(drive_root=tmp_path), None, task,
+            {"rounds": 2, "cost": 0.01}, trace, {},
+        )
+
+    entry = _run("root-failed-kid", "failed", {"execution": {"status": "failed"}})
+    assert entry is not None, "a failed child is the root's own error evidence"
+    assert entry["child_failure_classes"] == ["failed"]
+    assert "reflection" in calls[0]
+    # The register was admitted on that child class, on the canonical drive.
+    assert "pattern_register_update" in calls, "the register was admitted on the child class"
+
+    # A cancelled child is not a failure: nothing runs, nothing is paid.
+    assert _run("root-cancelled-kid", "cancelled", {"execution": {"status": "cancelled"}}) is None
+    assert calls == []
