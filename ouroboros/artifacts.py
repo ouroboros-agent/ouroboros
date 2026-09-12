@@ -199,14 +199,14 @@ def stage_task_attachments(
 
     def _secret_source_reason(src: pathlib.Path) -> str:
         """Rule-named reason the source must not be staged, or ``""``."""
+        from ouroboros.workspace_patch_rules import _sensitive_untracked_reason
+
         if _uploads_root is not None:
             try:
                 src.relative_to(_uploads_root)
             except ValueError:
                 pass
             else:
-                from ouroboros.workspace_patch_rules import _sensitive_untracked_reason
-
                 original = _upload_name_re.sub("", src.name)
                 reason = _sensitive_untracked_reason(original)
                 return f"uploaded file name {original!r}: {reason}" if reason else ""
@@ -218,7 +218,8 @@ def stage_task_attachments(
         name_lower = name.lower()
         if name_lower in CREDENTIAL_FILE_NAMES:
             return f"credential-shaped file name {name!r}"
-        return ""
+        reason = _sensitive_untracked_reason(name)
+        return f"file name {name!r}: {reason}" if reason else ""
 
     try:
         artifact_root = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)

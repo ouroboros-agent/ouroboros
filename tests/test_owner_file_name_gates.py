@@ -99,6 +99,72 @@ def test_a_real_credential_directory_is_still_refused_and_names_its_rule(tmp_pat
     assert manifest[0]["rule"] == "credential/control directory component '.ssh'"
 
 
+@pytest.mark.serial
+@pytest.mark.parametrize("mode", ["light", "advanced", "pro", "cyber_pro"])
+@pytest.mark.parametrize("relative, below_cyber_status", [
+    ("x/prod.env", "rejected"),
+    ("x/.env.local", "rejected"),
+    ("Desktop/deck.key", "staged"),
+    (".codex/report.md", "staged"),
+    ("x/.env.example", "staged"),
+])
+def test_owner_file_ingest_routes_preserve_dotenv_policy_and_ordinary_files(
+    tmp_path, monkeypatch, mode, relative, below_cyber_status,
+):
+    """Path selection and the real multipart/WS ingest share the retained rule.
+
+    Cyber Pro keeps the owner's explicit sensitive-input capability. Elsewhere
+    dotenv refusals name their rule, while a real ZIP deck, a dotted-directory
+    report and a dotenv example remain physically readable staged inputs.
+    """
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros import config
+    from ouroboros.artifacts import stage_task_attachments
+    from ouroboros.gateway import files, ws
+    from ouroboros.gateway.tasks import _render_attachment_lines
+
+    drive = tmp_path / "data"
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(drive))
+    monkeypatch.setattr(config, "DATA_DIR", drive)
+    monkeypatch.setattr(config, "get_runtime_mode", lambda: mode)
+    monkeypatch.setattr(ws, "DATA_DIR", drive)
+    source = tmp_path / "home" / relative
+    source.parent.mkdir(parents=True)
+    payload = _keynote_shaped_bytes() if source.suffix == ".key" else b"VALUE=fixture\n"
+    source.write_bytes(payload)
+    app = Starlette(routes=[Route("/api/chat/upload", files.api_chat_upload, methods=["POST"])])
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat/upload", files={"file": (source.name, payload, "application/octet-stream")},
+        )
+    assert response.status_code == 200, response.text
+    upload = response.json()
+    assert upload["ok"] is True and upload["filename"].endswith("_" + source.name)
+    assert pathlib.Path(upload["path"]).read_bytes() == payload
+    routes = {"path": [str(source)], "upload": ws._chat_attachment_uploads([upload])}
+    manifests = {
+        route: stage_task_attachments(drive, f"owner-ingest-{route}", attachments)
+        for route, attachments in routes.items()
+    }
+    expected = "staged" if mode == "cyber_pro" else below_cyber_status
+    for route, manifest in manifests.items():
+        assert len(manifest) == 1, (route, manifest)
+        row = manifest[0]
+        assert row["status"] == expected, (mode, route, manifests)
+        rendered = _render_attachment_lines(manifest)
+        if expected == "rejected":
+            assert row["reason"] == "secret_source"
+            assert "dotenv secret" in row["rule"] and source.name in row["rule"]
+            assert f"rule: {row['rule']}" in rendered
+        else:
+            assert row["reason"] == "" and row["mime"] and row["abs_path"]
+            assert pathlib.Path(row["abs_path"]).read_bytes() == payload
+            assert "script/process path:" in rendered
+
+
 # --- (b) export: the same deck declared as a process output ------------------
 
 
@@ -119,6 +185,7 @@ def test_owner_declares_a_key_deck_as_a_process_output(tmp_path):
     )
 
 
+@pytest.mark.serial
 def test_a_declared_key_deck_output_is_actually_registered(tmp_path):
     """The predicate saying "no reason to refuse" is not the capability.
 
@@ -126,10 +193,11 @@ def test_a_declared_key_deck_output_is_actually_registered(tmp_path):
     so the acceptance covers what the owner sees: a canonical artifact record for
     the deck in the task artifact store, no ``ARTIFACT_OUTPUT_ERROR`` in the
     rendered result, and a published tool result that still classifies as ``OK``,
-    which is what keeps the task from being degraded by the export. The `.env`
-    negative stays beside it: a declared credential leaf is still refused, and
+    which is what keeps the task from being degraded by the export. The dotenv
+    negative stays beside it: a declared dotenv tail is still refused, and
     that refusal IS an artifact-output error.
     """
+    from ouroboros.artifacts import registered_task_artifact
     from ouroboros.tools.registry import ToolContext
     from ouroboros.tools.shell import _run_shell
     from ouroboros.tools.tool_result import (
@@ -166,25 +234,29 @@ def test_a_declared_key_deck_output_is_actually_registered(tmp_path):
     assert isinstance(published, ToolResult)
     assert (published.code, published.status) == ("OK", "ok")
     assert published.meta.get("artifact_registered") is True
-    assert any(path.name == "deck.key" for path in drive.rglob("deck.key"))
+    record = registered_task_artifact(drive, ctx.task_id, "deck.key")
+    assert record and record["kind"] == "process_output"
+    assert record["name"] == "deck.key" and record["size"] > 0 and record["sha256"]
+    assert zipfile.is_zipfile(record["path"])
 
     # The negative control on the SAME path, so the assertions above are not
     # vacuous: a declared credential leaf still refuses, and that refusal is
     # exactly the artifact-output error the deck must not produce.
-    build_dotenv = "open('.env', 'w').write('TOKEN=x\\n')\n"
+    build_dotenv = "open('prod.env', 'w').write('TOKEN=x\\n')\n"
     token = _install_tool_result_sidecar(ctx, sentinel)
     try:
         refused = _run_shell(
-            ctx, [sys.executable, "-c", build_dotenv], cwd="task_drive", outputs=[".env"],
+            ctx, [sys.executable, "-c", build_dotenv], cwd="task_drive", outputs=["prod.env"],
         )
         refused_result = _published_tool_result(ctx, sentinel)
     finally:
         _restore_tool_result_sidecar(token)
 
     assert "ARTIFACT_OUTPUT_ERROR" in refused
-    assert "credential-like output .env" in refused
+    assert "credential-like output prod.env" in refused and "dotenv secret" in refused
     assert isinstance(refused_result, ToolResult)
     assert refused_result.code == "ARTIFACT_OUTPUT_ERROR"
+    assert registered_task_artifact(drive, ctx.task_id, "prod.env") is None
 
 
 # --- (c) delegated snapshot: transport rules stay, name authority is gone ----
