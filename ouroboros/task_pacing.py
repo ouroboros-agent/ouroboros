@@ -670,7 +670,7 @@ def prospective_wrapup_attempt_request(
         candidate = _request(target, messages, tools, {"reasoning_effort": reasoning_effort,
             "model_role": model_role, "model_account_override": model_account_override,
             "model_turn_state": model_turn_state,
-            "cache_affinity": cache_affinity})
+            "cache_affinity": cache_affinity, "prospective": True})
         return _merge_scope(replace(_attempt_request(target, candidate),
             force_unknown_reservation=True, max_completion_tokens=MAIN_LOOP_MAX_TOKENS))[0]
     with request_wire_call_scope():

@@ -294,8 +294,11 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
     failed_key = (parameters.get("cache_affinity"), target["source"], target["resolved_model"])
     same_route = len(failed) == 4 and failed[:3] == failed_key
     failed_profile = failed[3] if same_route else ""
-    if same_route:
-        _FAILED_PROFILE.set(())  # the next matching-route request only; Pin still consumes it
+    if same_route and not parameters.get("prospective"):
+        # The next matching-route DISPATCH only; Pin still consumes it. A
+        # prospective build reads the same preference without spending the
+        # fact, so the priced candidate and the send it admits stay identical.
+        _FAILED_PROFILE.set(())
     if not pin:
         # Carry the conversation's last account as a preference, not admission.
         # The engine is still the only actor choosing an eligible account.
