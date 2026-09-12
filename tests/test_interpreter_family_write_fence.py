@@ -450,6 +450,31 @@ def test_run_script_keeps_the_same_fence(tmp_path, monkeypatch):
     assert target.read_text() == "original\n"
 
 
+@pytest.mark.serial
+@pytest.mark.parametrize("cwd", ["", "task_drive"])
+def test_readonly_python_refusal_explains_the_script_check(tmp_path, monkeypatch, cwd):
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    reg = _light_registry(tmp_path)
+    target = pathlib.Path(reg._ctx.repo_dir) / "probe.txt"
+    target.write_text("probe text\n")
+    script = f"text = open({target.as_posix()!r}).read(); print(text.replace('probe', 'read'))"
+    # The script only reads, but the existing parser cannot prove the receiver
+    # of replace() is a string. An outside cwd does not remove its repo target.
+    import subprocess
+
+    direct = subprocess.run([sys.executable, "-B", "-c", script], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=10)
+    assert direct.returncode == 0 and direct.stdout == "read text\n\n"
+    result = reg.execute("run_script", {"script": script, "cwd": cwd})
+    assert "LIGHT_MODE_BLOCKED" in result
+    assert target.read_text() == "probe text\n"
+    read = reg.execute("read_file", {"path": "probe.txt", "root": "system_repo"})
+    assert "probe text" in read and "LIGHT_MODE_BLOCKED" not in read
+    assert "cannot rule out" in result and "script form" in result
+    assert "changing cwd alone may not help" in result
+    assert "read_file or list_files" in result
+
+
 def test_legitimate_deliverable_writes_stay_allowed(tmp_path):
     """Reaching every surface must not turn the fence into a blanket refusal.
 

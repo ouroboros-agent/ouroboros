@@ -678,12 +678,12 @@ def _run_shell_safety_check(
                 status="blocked",
                 code="LIGHT_MODE_BLOCKED",
                 text=(
-                    "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses "
-                    "shell commands that mutate the Ouroboros repository. "
-                    "For external deliverables, run with cwd under user_files "
-                    "(for example /Users/<you>/Desktop), root=artifact_store, "
-                    "or root=task_drive. Switch to advanced/pro only for "
-                    "reviewed Ouroboros self-modification."
+                    "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light cannot rule out "
+                    "a repository write from this command's targets or script form. "
+                    "This can also block read-only scripts; changing cwd alone may not help. "
+                    "For inspection, use read_file or list_files with a root that "
+                    "contains the target. Repository writes require a runtime mode "
+                    "that permits them."
                 ),
             )
         runtime_data_executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
