@@ -1089,13 +1089,15 @@ A host-salvaged terminal is labelled rather than hidden: the durable row
 carries `Preserved intermediate output (not a final answer):` plus the same
 bounded excerpt every terminal row uses, while the untruncated copy stays
 with `get_task_result` and the stop receipt, so a card over applied work is
-never a bare headline and a reason code. When a peer receipt already
-published those bytes in this chat, its typed `cancel_receipt` on the task
-result reduces the row to that label beside its pointer: one salvage, one
-paragraph per chat. One event is disclosed once, at the layer that owns it, so the forced orphan
-note names the finished children as finished rather than as completed and
-skips a child whose own terminal row already reached this chat. A rail that
-ended a routing turn is always named by that turn's own row: a stamped
+never a bare headline and a reason code. A row written to the chat the stop
+receipt itself reached (the task's own lineage chat, proven by its typed
+`cancel_receipt`) reduces to that label beside its pointer, so one salvage
+is one paragraph per chat; a row written anywhere else has not seen that
+receipt and keeps the bytes, and no writer trades its only pointer for the
+label. One event is disclosed once, at the layer that owns it, so the forced
+orphan note names the finished children as finished rather than as completed
+and skips a child whose own terminal row already reached this chat. A rail
+that ended a routing turn is always named by that turn's own row: a stamped
 execution reason is not evidence that another layer states it, because every
 rail stamps one.
 

@@ -225,8 +225,9 @@ words while the record keeps the machine code; a cause with no sentence yet stay
 raw rather than borrowing a wrong one. A terminal whose preserved output was
 never reviewed shows that output labelled rather than hidden: a short labelled
 excerpt beside the pointer to the full copy, so a `Failed` card over applied work
-is never a bare headline. Where a stop receipt already carries the same text in
-that chat, the card keeps the label and the pointer alone.
+is never a bare headline. Where a stop receipt already carries the same text
+in the very chat the card is written to, the card keeps the label and the
+pointer alone; a card in another chat keeps the excerpt.
 
 | Role | Foreground | Background | Border |
 | --- | --- | --- | --- |

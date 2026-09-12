@@ -432,8 +432,9 @@ def test_a_notice_speaks_for_itself_while_a_salvage_is_labelled():
     SALVAGE is preserved intermediate output: dropping it left a bare headline
     and a reason code over work that had actually been applied, so the row now
     names what the bytes are beside the pointer both writers already append. A
-    peer stop receipt that already published the untruncated copy in this chat
-    (its durable ``cancel_receipt`` block) reduces the row to the label alone.
+    peer stop receipt reduces the row to the label alone only where that receipt
+    actually landed: it goes to the task's OWN lineage chat, so a row written to
+    any other chat has never seen it and keeps the bytes.
     """
     from ouroboros.project_dialogue import SALVAGE_EXCERPT_LABEL, _completion_excerpt
 
@@ -441,10 +442,14 @@ def test_a_notice_speaks_for_itself_while_a_salvage_is_labelled():
     assert _completion_excerpt(
         {"result": "x", "terminal_origin": "host_salvage"},
     ) == f"{SALVAGE_EXCERPT_LABEL}: x"
-    assert _completion_excerpt({
-        "result": "x", "terminal_origin": "host_salvage",
+    receipted = {
+        "result": "x", "terminal_origin": "host_salvage", "chat_id": 7,
         "cancel_receipt": {"delivery_id": "cancel:t:1"},
-    }) == f"{SALVAGE_EXCERPT_LABEL}."
+    }
+    assert _completion_excerpt(receipted, chat_id=7) == f"{SALVAGE_EXCERPT_LABEL}."
+    # Another chat, and an unknown destination, both keep the bytes.
+    assert _completion_excerpt(receipted, chat_id=1) == f"{SALVAGE_EXCERPT_LABEL}: x"
+    assert _completion_excerpt(receipted) == f"{SALVAGE_EXCERPT_LABEL}: x"
     # Nothing to preserve is still nothing to label.
     assert _completion_excerpt({"result": "", "terminal_origin": "host_salvage"}) == ""
 

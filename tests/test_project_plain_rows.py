@@ -619,3 +619,57 @@ def test_a_host_salvage_row_is_never_a_bare_headline_and_reason(tmp_path):
     assert row["text"].endswith('Details: get_task_result(task_id="salvaged-root")')
     for marker in ("#", "**", "`"):
         assert marker not in row["text"]
+
+
+def test_a_cancelled_salvage_keeps_bytes_or_a_pointer_in_the_main_row(tmp_path, monkeypatch):
+    """The stop receipt is not in Main, so Main may not be reduced to a label.
+
+    The receipt is delivered to the task's OWN lineage chat (a project root's is
+    the project room). Reducing every receipted row to a bare label therefore
+    stripped the Main summary of the bytes AND of its only pointer, which is
+    strictly less than the plain invitation it replaced. Main keeps the labelled
+    excerpt; where the receipt really did land in the row's chat, the label
+    keeps the invitation beside it.
+    """
+    from ouroboros.project_dialogue import (
+        SALVAGE_EXCERPT_LABEL, enqueue_project_completion_summary,
+    )
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+
+    project = create_project(tmp_path, "salvage", name="Salvage Project")
+    bind_task_to_project(
+        tmp_path, "salvage-root", project["id"], project["chat_id"],
+        origin={"absent": "system"},
+    )
+    queued = []
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.enqueue_terminal_delivery",
+        lambda _root, event, **_kwargs: queued.append(dict(event)) or True,
+    )
+    task = {"id": "salvage-root", "chat_id": project["chat_id"],
+            "project_id": project["id"], "title": "Stopped task"}
+    result = {
+        **task, "task_id": "salvage-root", "status": "cancelled",
+        "reason_code": "owner_requested_cancel", "result": "Rewrote the atlas builder. " * 20,
+        "terminal_origin": "host_salvage",
+        "cancel_receipt": {"delivery_id": "cancel:salvage-root:1"},
+    }
+    done = {"status": "cancelled", "reason_code": "owner_requested_cancel"}
+
+    assert enqueue_project_completion_summary(
+        tmp_path, {}, "salvage-root", task, result, done,
+    ) is True
+    text = queued[0]["text"]
+    assert f"{SALVAGE_EXCERPT_LABEL}: Rewrote the atlas builder." in text
+    assert text.endswith("…")
+
+    # A root whose own lineage chat IS Main: there the receipt is a real second
+    # copy, so the label stands, but never without the invitation.
+    queued.clear()
+    main_bound = {**task, "chat_id": 1}
+    assert enqueue_project_completion_summary(
+        tmp_path, {}, "salvage-root", main_bound, {**result, "chat_id": 1}, done,
+    ) is True
+    assert queued[0]["text"].endswith(
+        f"{SALVAGE_EXCERPT_LABEL}. Open the Project for details."
+    )

@@ -773,7 +773,8 @@ def _append_terminal_task_projection(
         reason = str(effective.get("reason_code") or event.get("reason_code") or "")
         phase = outcome_phase(effective, event)
         outcome = OUTCOME_PHASE_HEADLINE[phase]
-        excerpt = _completion_excerpt(effective)
+        row_chat_id = int(event.get("chat_id") or task.get("chat_id") or 0)
+        excerpt = _completion_excerpt(effective, chat_id=row_chat_id)
         details = f'Details: get_task_result(task_id="{tid}")'
         text = (
             f"{outcome}. role={role}; parent={parent_id or 'unknown'}; "
@@ -794,7 +795,7 @@ def _append_terminal_task_projection(
             "summary_id": summary_id, "task_id": tid,
             "parent_task_id": parent_id, "root_task_id": root_id,
             "project_id": project_id,
-            "chat_id": int(event.get("chat_id") or task.get("chat_id") or 0),
+            "chat_id": row_chat_id,
             "delegation_role": str(effective.get("delegation_role") or task.get("delegation_role") or ""),
             "role": role, "status": str(effective.get("status") or status),
             "outcome": outcome, "outcome_phase": phase, "outcome_final": True,
@@ -858,7 +859,23 @@ def append_terminal_task_projection(
 SALVAGE_EXCERPT_LABEL = "Preserved intermediate output (not a final answer)"
 
 
-def _completion_excerpt(result: Dict[str, Any]) -> str:
+def _stop_receipt_reached_chat(result: Dict[str, Any], chat_id: Any) -> bool:
+    """Did the stop receipt publish these bytes into the chat THIS row targets?
+
+    The receipt is delivered to the task's OWN lineage chat (project binding
+    first), so it is a second copy only for a row written to that same chat. The
+    Main project summary is written to chat 1, has never seen the receipt, and
+    reducing it to a label there left the owner with neither the bytes nor a way
+    to reach them. An unknown destination is not a match: the bytes stay.
+    """
+    receipt = result.get("cancel_receipt")
+    if not isinstance(receipt, dict) or not receipt or chat_id is None:
+        return False
+    lineage = result.get("chat_id")
+    return lineage is not None and str(lineage) == str(chat_id)
+
+
+def _completion_excerpt(result: Dict[str, Any], *, chat_id: Any = None) -> str:
     """One plain-text excerpt for BOTH lifecycle writers (event + task_summary).
 
     Markdown markers are stripped BEFORE whitespace flattening: the stripper's
@@ -869,10 +886,9 @@ def _completion_excerpt(result: Dict[str, Any]) -> str:
     Host-salvaged bytes are LABELLED, not hidden. They are real applied work, so
     a row that dropped them left a bare headline and a reason code over a task
     that had in fact produced something. The label says what the bytes are while
-    the caller's own pointer keeps owning the untruncated copy. When a peer
-    receipt already published that text in this chat (the stop receipt, whose
-    durable ``cancel_receipt`` block this row can see), the label stands alone so
-    one salvage is not quoted a third time.
+    the caller's own pointer keeps owning the untruncated copy. ``chat_id`` is
+    the row's destination: only there can the stop receipt already have
+    published the same text, and only there does the label stand alone.
     """
     body = ""
     for key in ("summary", "result", "error"):
@@ -884,8 +900,7 @@ def _completion_excerpt(result: Dict[str, Any]) -> str:
     excerpt = body if len(body) <= 240 else body[:239].rstrip() + "…"
     if str(result.get("terminal_origin") or "") != TERMINAL_ORIGIN_HOST_SALVAGE:
         return excerpt
-    receipt = result.get("cancel_receipt")
-    if isinstance(receipt, dict) and receipt:
+    if _stop_receipt_reached_chat(result, chat_id):
         return f"{SALVAGE_EXCERPT_LABEL}."
     return f"{SALVAGE_EXCERPT_LABEL}: {excerpt}"
 
@@ -1038,9 +1053,14 @@ def enqueue_project_completion_summary(
             # Offering "Open the Project" would reproduce the reported defect —
             # a Main row leading into an empty room.
             return False
-        excerpt = _completion_excerpt(result)
+        excerpt = _completion_excerpt(result, chat_id=1)
         verdict = _completion_verdict(result, task_done_event)
         lead = f"{verdict} " if verdict else ""
+        # This writer's only pointer is the invitation below, so a label must
+        # never replace it: a Main row saying bytes were preserved and offering
+        # no way to reach them is worse than the plain invitation it displaced.
+        if excerpt == f"{SALVAGE_EXCERPT_LABEL}.":
+            excerpt = f"{excerpt} Open the Project for details."
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
             "text": (f"{snapshot['target_label']} · "
