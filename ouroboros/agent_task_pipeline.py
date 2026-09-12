@@ -491,6 +491,20 @@ def _stamp_project_room_pointer(task: Dict[str, Any], env: Any) -> None:
     )
 
 
+def _custody_debt_event_fields(stored_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry the row's own custody debt list onto the live terminal event.
+
+    The stamped code outlives the fact, so the owner-facing Reason line names
+    the custody warning only while the record's own ``delegated_runs_unreconciled``
+    list is non-empty (docs/ARCHITECTURE.md, terminal composition). Both
+    renderers read that list off the record in front of them, and the card reads
+    this event rather than the durable row, so the event carries a copy of the
+    stored list. A row holding no list states nothing about the debt: absence
+    stays absence instead of becoming a second, guessed rule on one surface.
+    """
+    debt = stored_result.get("delegated_runs_unreconciled")
+    return {"delegated_runs_unreconciled": list(debt)} if isinstance(debt, list) else {}
+
 def emit_task_results(
     env: Any, memory: Any, llm: Any,
     pending_events: List[Dict[str, Any]],
@@ -667,8 +681,8 @@ def emit_task_results(
         # Carry the thread so the terminal card finalizes in its project panel
         # (per-thread fan-out), not just the main chat.
         "chat_id": int(task.get("chat_id") or 0),
-        "outcome_axes": outcome_axes,
-        "reason_code": reason_code,
+        "outcome_axes": outcome_axes, "reason_code": reason_code,
+        **_custody_debt_event_fields(stored_result),
         "artifact_status": artifact_bundle.get("status") or stored_result.get("artifact_status") or "",
         "artifact_bundle": artifact_bundle,
         "review_status": stored_result.get("review_status") if isinstance(stored_result.get("review_status"), dict) else {},

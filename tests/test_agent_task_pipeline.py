@@ -719,3 +719,49 @@ def test_terminal_event_reports_failed_bundle_over_older_capture_status(tmp_path
     terminal = next(item for item in pending if item["type"] == "task_done")
     assert terminal["artifact_status"] == artifact_status
     assert terminal["status"] == "completed"
+
+
+def test_task_done_carries_the_custody_debt_list_the_row_holds(tmp_path, monkeypatch):
+    """P5 S1: one debt rule on every surface, from one source.
+
+    The owner-facing Reason line names the custody warning only while the row's
+    own ``delegated_runs_unreconciled`` list is non-empty. The durable row
+    carries that list; the live ``task_done`` event did not, so the card had to
+    guess from the stamped code alone and the browser and the host rendered the
+    same record differently. The event now copies the stored list whenever the
+    row has one, and absent stays absent: a record with no list states nothing
+    about the debt, on either surface.
+    """
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: None)
+    from ouroboros.task_results import write_task_result
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+    write_task_result(tmp_path, "custody-open", "running", delegated_runs_unreconciled=["run-a1"])
+
+    owed_events = []
+    pipeline.emit_task_results(
+        env=env, memory=object(), llm=object(), pending_events=owed_events,
+        task={"id": "custody-open", "root_task_id": "custody-open", "type": "task",
+              "chat_id": 1, "text": "delegate"},
+        text="done", usage={"rounds": 1, "cost": 0.0},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0, drive_logs=drive_logs, ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+    owed = next(row for row in owed_events if row["type"] == "task_done")
+    stored = pipeline.load_task_result(tmp_path, "custody-open")
+    assert owed["delegated_runs_unreconciled"] == ["run-a1"] == stored["delegated_runs_unreconciled"]
+    assert owed["reason_code"] == "delegated_custody_unreconciled"
+
+    plain_events = []
+    pipeline.emit_task_results(
+        env=env, memory=object(), llm=object(), pending_events=plain_events,
+        task={"id": "custody-none", "root_task_id": "custody-none", "type": "task",
+              "chat_id": 1, "text": "no delegation"},
+        text="done", usage={"rounds": 1, "cost": 0.0},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0, drive_logs=drive_logs, ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+    plain = next(row for row in plain_events if row["type"] == "task_done")
+    assert "delegated_runs_unreconciled" not in plain
