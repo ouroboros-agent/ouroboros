@@ -554,7 +554,10 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         workspace_sentinel=str(evt.get("workspace") or ""),
     )
     if ws_error:
-        _fail_promoted_task_loudly(ctx, task, ws_error)
+        _fail_promoted_task_loudly(
+            ctx, task, ws_error,
+            explicit_workspace=str(evt.get("workspace_root") or "").strip(), project_id=pid,
+        )
         return {"status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid}
     if resolved_ws:
         task["workspace_root"] = resolved_ws
@@ -605,22 +608,65 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
     return None
 
 
-def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
+def _explicit_workspace_remedy(explicit: str, project_id: str) -> str:
+    """What to do about a folder the REQUEST named, not the project's own.
+
+    ``resolve_room_workspace`` already types the source, so the remedy follows
+    it instead of sending the owner to a Projects setting the failure never
+    touched. The project's folder is named only when the registry can be read,
+    and a path under the delegated-run worktree root gets the one clause that
+    explains why it is gone."""
+    import pathlib
+
+    folder = ""
+    try:
+        from ouroboros.projects_registry import get_project
+
+        folder = str((get_project(_pool().DRIVE_ROOT, project_id) or {}).get("working_dir") or "").strip()
+    except Exception:
+        log.debug("promote loud-fail: project working_dir unreadable for %s", project_id, exc_info=True)
+    retired = False
+    try:
+        from ouroboros.config import get_subagent_worktree_root
+        from ouroboros.tool_access_paths import path_is_relative_to
+
+        retired = path_is_relative_to(pathlib.Path(explicit), pathlib.Path(get_subagent_worktree_root()))
+    except Exception:
+        log.debug("promote loud-fail: worktree-root check failed for %r", explicit, exc_info=True)
+    return (
+        f"This task asked for {explicit} explicitly, so the project's working folder was never used."
+        + (" That path is inside a delegated-run worktree, which is removed when its run ends." if retired else "")
+        + " Re-promote it against"
+        + (f" the project folder ({folder})" if folder else " the project folder")
+        + " or with workspace='none' for a folder-less task."
+    )
+
+
+def _fail_promoted_task_loudly(
+    ctx: Any, task: dict, ws_error: str, *,
+    explicit_workspace: str = "", project_id: str = "",
+) -> None:
     """v6.58.0 loud-fail invariant: a room task whose workspace is SET-but-unusable
     is terminally FAILED at admission with a visible card + chat message — never
     silently admitted workspace-less (which would run the self_modification profile
-    over the system repo). Never raises."""
+    over the system repo). Never raises.
+
+    The remedy follows the SOURCE of the refused folder: a request that named its
+    own path is not fixed in Projects, and saying so is the difference between an
+    actionable message and one that points at a setting the failure never read."""
     tid = str(task.get("id") or "")
     chat_id = 0
     try:
         chat_id = int(task.get("chat_id") or 0)
     except (TypeError, ValueError):
         chat_id = 0
-    message = (
-        f"⚠️ WORKSPACE_UNUSABLE: task {tid} was NOT started — {ws_error} "
+    explicit = str(explicit_workspace or "").strip()
+    remedy = (
+        _explicit_workspace_remedy(explicit, str(project_id or "")) if explicit else
         "Fix the project's working folder (Projects → this project) or re-promote with "
         "workspace='none' for a folder-less task."
     )
+    message = f"⚠️ WORKSPACE_UNUSABLE: task {tid} was NOT started — {ws_error} {remedy}"
     try:
         from ouroboros.task_results import STATUS_FAILED, write_task_result
 

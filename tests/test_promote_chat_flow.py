@@ -2954,3 +2954,77 @@ def test_promote_emission_row_carries_the_owner_message_id(tmp_path, monkeypatch
     emitted = next(row for row in rows if row["type"] == "promote_chat_to_task_emitted")
     assert emitted["client_message_id"] == "cm-ingress"
     assert emitted["task_id"] == ctx.pending_events[0]["task_id"]
+
+
+def _loud_workspace_failure(tmp_path, monkeypatch, ws_error: str, **kwargs):
+    """Run the loud-fail writer directly and return (chat message, stored row)."""
+    import supervisor.workers as workers
+    from ouroboros.task_results import load_task_result
+    from supervisor import worker_promotion
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    sent: list = []
+    ctx = types.SimpleNamespace(send_with_budget=lambda chat_id, text: sent.append(text))
+    worker_promotion._fail_promoted_task_loudly(
+        ctx, {"id": "wsfail", "chat_id": 3}, ws_error, **kwargs,
+    )
+    assert len(sent) == 1
+    return sent[0], load_task_result(tmp_path, "wsfail")
+
+
+def test_loud_workspace_failure_remedy_follows_the_source_of_the_refused_folder(
+        tmp_path, monkeypatch):
+    """The request named its own folder, so the project's working folder was never
+    read: sending the owner to Projects points at a setting the failure never
+    touched. The project folder is named as the way back when it is readable."""
+    from ouroboros.projects_registry import create_project
+
+    create_project(tmp_path, "roomp", name="RoomP", working_dir=str(tmp_path / "room-tree"))
+    message, stored = _loud_workspace_failure(
+        tmp_path, monkeypatch,
+        "explicit workspace_root is unusable: not a git checkout.",
+        explicit_workspace=str(tmp_path / "asked-for"), project_id="roomp",
+    )
+
+    assert "asked for" in message and str(tmp_path / "asked-for") in message
+    assert "Projects → this project" not in message
+    assert str(tmp_path / "room-tree") in message
+    assert "workspace='none'" in message
+    assert stored["status"] == "failed" and stored["reason_code"] == "workspace_unusable"
+
+
+def test_loud_workspace_failure_keeps_the_projects_remedy_for_a_project_folder(
+        tmp_path, monkeypatch):
+    """A project working_dir failure — and an unreadable registry entry — is fixed
+    exactly where today's message says, so that text is unchanged."""
+    for ws_error in (
+        "project 'roomp' working_dir is unusable: not a git checkout.",
+        "project 'roomp' registry entry is unreadable (OSError: boom) — cannot determine "
+        "the task's workspace",
+    ):
+        message, stored = _loud_workspace_failure(tmp_path, monkeypatch, ws_error)
+        assert ws_error in message
+        assert message.endswith(
+            "Fix the project's working folder (Projects → this project) or re-promote with "
+            "workspace='none' for a folder-less task."
+        )
+        assert "asked for" not in message
+        assert stored["reason_code"] == "workspace_unusable"
+
+
+def test_loud_workspace_failure_names_a_retired_delegated_run_worktree(tmp_path, monkeypatch):
+    """The path the agent passed twice in one minute was a delegated-run worktree
+    its own run had already retired; nothing in the old message said so."""
+    from ouroboros import config
+
+    worktrees = tmp_path / "subagent_worktrees"
+    monkeypatch.setattr(config, "get_subagent_worktree_root", lambda: str(worktrees))
+    message, stored = _loud_workspace_failure(
+        tmp_path, monkeypatch,
+        "explicit workspace_root is unusable: path does not exist.",
+        explicit_workspace=str(worktrees / "dlg_060055d5_x"), project_id="",
+    )
+
+    assert "delegated-run worktree" in message and "removed when its run ends" in message
+    assert "Projects → this project" not in message
+    assert stored["reason_code"] == "workspace_unusable"
