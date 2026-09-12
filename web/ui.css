@@ -145,6 +145,11 @@
     /* Bounded scroll region for the Updates restore list (DESIGN section 5:
        a new visual dimension becomes a variable before a page-local literal). */
     --updates-list-max-height: 320px;
+    /* Bounded scroll window for the sidebar project list (v6.32.0 geometry): a
+       share of the visual viewport height below, so the navigation column keeps
+       its height whatever the project count. Distinct from the fixed Updates
+       window above: one is a page-local list, this one follows the viewport. */
+    --nav-projects-list-max-height: calc(var(--vvh) * 0.38);
     --vvh: 100dvh;
 }
 

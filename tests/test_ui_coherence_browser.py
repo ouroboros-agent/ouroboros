@@ -246,7 +246,7 @@ def test_settings_footer_controls_are_reachable_at_content_breakpoints(subscript
                     setup_browser.capture(page, f"shell-footer-{width}-{name}")
 
 
-def test_short_sidebar_has_one_scroll_and_cost_cards_keep_local_table_overflow(subscription_ui):
+def test_short_sidebar_bounds_projects_list_and_cost_cards_keep_local_table_overflow(subscription_ui):
     ui = subscription_ui
     page = ui["page"]
     projects = [{"id": f"project-{i}", "name": f"Project {i} with a descriptive title", "chat_id": 100+i,
@@ -267,7 +267,9 @@ def test_short_sidebar_has_one_scroll_and_cost_cards_keep_local_table_overflow(s
     sidebar = page.locator("#primary-sidebar")
     scrolling = sidebar.evaluate("""el => [...el.querySelectorAll('*')].filter(e =>
         ['auto','scroll'].includes(getComputedStyle(e).overflowY) && e.scrollHeight>e.clientHeight+1).map(e=>e.className)""")
-    assert scrolling == ["sidebar-scroll"], scrolling
+    # The projects list carries its own bounded window, so the column itself
+    # stays the same height whatever the project count.
+    assert set(scrolling) == {"sidebar-scroll", "nav-projects-list"}, scrolling
     nav = page.locator('[data-nav-page="settings"]')
     nav.scroll_into_view_if_needed()
     assert hit_box(nav)["reachable"]

@@ -5651,6 +5651,8 @@ textarea.chat-input {
     flex-shrink: 0;
 }
 
+/* The sidebar's one variable-length collection: a bounded window that scrolls
+   on its own, so expanding it never pushes the Utilities rows past the fold. */
 .nav-projects-list {
     display: flex;
     flex-direction: column;
@@ -5658,6 +5660,9 @@ textarea.chat-input {
     width: 100%;
     align-items: stretch;
     flex-shrink: 0;
+    max-height: var(--nav-projects-list-max-height);
+    min-height: 0;
+    overflow-y: auto;
 }
 
 .nav-projects-list[hidden] {
@@ -5713,12 +5718,6 @@ textarea.chat-input {
 
 .nav-project-row.active::before {
     display: none;
-}
-
-.nav-projects-more {
-    color: var(--text-muted);
-    font-size: 12px;
-    padding-left: calc(var(--space-3) + 18px + var(--space-3));
 }
 
 /* v6.59.0 — New Project "+" in the Projects header + per-row kebab actions. */
