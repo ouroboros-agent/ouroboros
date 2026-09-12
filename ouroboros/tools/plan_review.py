@@ -533,8 +533,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     # reference: the pending wave stays current and collectible, nothing is written as spent.
     if collect is None and (hold := _collect.in_flight_hold(state, fingerprint=fingerprint, cap=cap)):
         return _typed_refusal(ctx, "TOOL_ERROR", hold)
-    # C-01: the in-flight hold above is the ONE exit before the supersede; every other
-    # cap/rail exit comes after this reference, so a newer attempt never falls back to an older GREEN.
+    # C-01: the hold above is the ONE exit before the supersede; every other cap/rail exit follows it.
     try:
         _record_plan_review_attempt_with_reference(ctx, state_root, task_id, fingerprint=fingerprint)
     except (OSError, TimeoutError, ValueError) as exc:
