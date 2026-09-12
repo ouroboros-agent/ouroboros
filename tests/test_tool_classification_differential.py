@@ -32,6 +32,7 @@ from ouroboros.loop_tool_execution import _typed_execution_failure, _typed_resul
 from ouroboros.tools.tool_result import TOOL_CODE_SPECS, LegacyTextResultAdapter
 from tests.tool_classification_corpus import (
     GOLDEN_SOURCE_SHA,
+    _MARKER_RE,
     build_corpus,
     harvested_identifiers,
     harvested_native_codes,
@@ -352,6 +353,37 @@ def test_native_golden_answers_have_identical_retired_text_inputs() -> None:
         plain = corpus[f"ident:{key.split(':', 2)[2]}:plain"]
         assert (native.tool, native.text) == (plain.tool, plain.text)
         assert golden[key] == golden[plain.key]
+
+
+def test_shape_golden_answers_match_their_own_identifier_line() -> None:
+    """A hand-added shape answer is derived from the golden, never invented.
+
+    The retired pair is a pure text chain over the result's first marker line,
+    so a producer shape opening with `⚠️ IDENT` records the answer the plain
+    `ident:IDENT` case already holds, whatever tool published it and whatever
+    detail follows. Every shape row captured from the golden's source tree obeys
+    that, which is what lets a NEW shape row reuse the recorded identifier
+    answer instead of guessing at a tree this repository no longer holds. It is
+    the sibling of the native rule asserted above: same evidence, one axis over.
+
+    A shape whose identifier the harvest cannot see has no row to compare and is
+    skipped: the scratchpad upgrade keeps its marker and its name in two
+    different literals, so no `ident:` case exists for it.
+    """
+    golden = _golden()
+    checked = []
+    for case in build_corpus():
+        if not case.key.startswith("shape:"):
+            continue
+        marker = _MARKER_RE.match(case.text.strip())
+        if marker is None:
+            continue
+        plain = f"ident:{marker.group(1)}:plain"
+        if plain not in golden:
+            continue
+        assert golden[case.key] == golden[plain], case.key
+        checked.append(case.key)
+    assert len(checked) >= 20, "the marker-led shape rows collapsed; the rule lost its witnesses"
 
 
 def test_every_delta_without_a_producer_is_named_with_its_reason() -> None:

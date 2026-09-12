@@ -3131,6 +3131,10 @@
    "is_error": false,
    "status": "ok"
   },
+  "shape:list_files_not_found": {
+   "is_error": false,
+   "status": "ok"
+  },
   "shape:mcp_disabled": {
    "is_error": false,
    "status": "ok"
