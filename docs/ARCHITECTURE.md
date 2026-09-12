@@ -1090,9 +1090,13 @@ carries `Preserved intermediate output (not a final answer):` plus the same
 bounded excerpt every terminal row uses, while the untruncated copy stays
 with `get_task_result` and the stop receipt, so a card over applied work is
 never a bare headline and a reason code. A row written to the chat the stop
-receipt itself reached (the task's own lineage chat, proven by its typed
-`cancel_receipt`) reduces to that label beside its pointer, so one salvage
-is one paragraph per chat; a row written anywhere else has not seen that
+receipt itself reached, recorded as `cancel_receipt.delivered_chat_id` only
+after a successful send of that matching receipt, reduces to its label beside
+the pointer. An enqueued or legacy receipt without that fact keeps the excerpt;
+changing the receipt's delivery identity clears the old destination. Existing
+chat rows remain unchanged, and these two durable writes are not atomic.
+Thus later projections show one salvage paragraph per confirmed destination;
+a row written anywhere else has not seen that
 receipt and keeps the bytes, and no writer trades its only pointer for the
 label. One event is disclosed once, at the layer that owns it, so the forced
 orphan note names the finished children as finished rather than as completed

@@ -652,7 +652,9 @@ def test_a_cancelled_salvage_keeps_bytes_or_a_pointer_in_the_main_row(tmp_path, 
         **task, "task_id": "salvage-root", "status": "cancelled",
         "reason_code": "owner_requested_cancel", "result": "Rewrote the atlas builder. " * 20,
         "terminal_origin": "host_salvage",
-        "cancel_receipt": {"delivery_id": "cancel:salvage-root:1"},
+        "cancel_receipt": {
+            "delivery_id": "cancel:salvage-root:1", "delivered_chat_id": project["chat_id"],
+        },
     }
     done = {"status": "cancelled", "reason_code": "owner_requested_cancel"}
 
@@ -668,8 +670,12 @@ def test_a_cancelled_salvage_keeps_bytes_or_a_pointer_in_the_main_row(tmp_path, 
     # copy, so the label stands, but never without the invitation.
     queued.clear()
     main_bound = {**task, "chat_id": 1}
+    main_result = {
+        **result, "chat_id": 1,
+        "cancel_receipt": {"delivery_id": "cancel:salvage-root:1", "delivered_chat_id": 1},
+    }
     assert enqueue_project_completion_summary(
-        tmp_path, {}, "salvage-root", main_bound, {**result, "chat_id": 1}, done,
+        tmp_path, {}, "salvage-root", main_bound, main_result, done,
     ) is True
     assert queued[0]["text"].endswith(
         f"{SALVAGE_EXCERPT_LABEL}. Open the Project for details."

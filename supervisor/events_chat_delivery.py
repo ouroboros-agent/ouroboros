@@ -272,6 +272,10 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
             _register_delivered(ctx, delivery_id)
+            if system_type == "cancel_receipt":
+                from supervisor.terminal_delivery import record_cancel_receipt_delivery
+
+                record_cancel_receipt_delivery(ctx.DRIVE_ROOT, task_id, delivery_id, chat_id)
     except Exception as e:
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",

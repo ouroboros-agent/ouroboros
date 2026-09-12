@@ -9,6 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import types
+from collections import deque
+
+import pytest
 from ouroboros import cancel_intents as ci
 from ouroboros.task_results import (
     STATUS_COMPLETED,
@@ -397,7 +400,8 @@ def test_fast_settled_reentry_delivers_idempotently_and_settles_with_the_claim(
     )
 
 
-def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path):
+@pytest.mark.serial
+def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path, monkeypatch):
     """Owner item spam L: the stop receipt OWNS the preserved paragraph.
 
     A cancel used to put the same salvaged text in the chat three times: the
@@ -426,6 +430,17 @@ def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path):
     (receipt,) = queue.events
     assert salvage in receipt["text"]
 
+    from supervisor import events_chat_delivery as delivery
+    from ouroboros.utils import append_jsonl
+
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    sent = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
+        send_with_budget=lambda chat, text, **_kw: sent.append((chat, text)),
+    )
+    delivery._handle_send_message(receipt, ctx)
+    assert sent == [(7, receipt["text"])]
     stored = load_task_result(tmp_path, "stopped-one")
     assert stored["cancel_receipt"]["salvage"]["preserved"] is True
     assert append_terminal_task_projection(
@@ -440,3 +455,143 @@ def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path):
     assert f"{SALVAGE_EXCERPT_LABEL}." in row["text"]
     assert salvage not in row["text"]
     assert 'get_task_result(task_id="stopped-one")' in row["text"]
+
+
+@pytest.mark.serial
+def test_cascade_receipt_dedups_the_actual_destination_and_preserves_main(qenv, monkeypatch):
+    """A settled root borrows child lineage, then send-time binding wins.
+
+    The cascade does not re-emit a settled root's task_done or rewrite older
+    chat rows. A later terminal projection consumes the confirmed receipt.
+    """
+    from ouroboros.observability import preserve_salvaged_output
+    from ouroboros.project_dialogue import (
+        SALVAGE_EXCERPT_LABEL, _completion_excerpt, append_terminal_task_projection,
+        enqueue_project_completion_summary,
+    )
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+    from ouroboros.utils import append_jsonl
+    from supervisor import events_chat_delivery as delivery
+
+    queue = _CaptureQueue()
+    monkeypatch.setattr(qenv.workers, "get_event_q", lambda: queue)
+    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_k: None)
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    text = "Rewrote the atlas builder and reran the suite."
+    write_task_result(
+        qenv.drive, "settled-root", "failed", result=text,
+        terminal_origin="host_salvage", reason_code="budget_exhausted",
+    )
+    preserve_salvaged_output(qenv.drive, "settled-root", text)
+    qenv.q.PENDING[:] = [{
+        "id": "live-kid", "chat_id": 77,
+        "parent_task_id": "settled-root", "root_task_id": "settled-root",
+    }]
+    write_task_result(
+        qenv.drive, "live-kid", "scheduled",
+        parent_task_id="settled-root", root_task_id="settled-root",
+    )
+    assert qenv.tl.cancel_task_by_id("settled-root", cascade=True)
+    event = next(e for e in queue.events if e.get("system_type") == "cancel_receipt")
+    assert event["chat_id"] == 77 and text in event["text"]
+    before = load_task_result(qenv.drive, "settled-root")
+    assert "chat_id" not in before
+    assert text in _completion_excerpt(before, chat_id=77)
+
+    project = create_project(qenv.drive, "receipt-destination", name="Receipt destination")
+    bind_task_to_project(
+        qenv.drive, "settled-root", project["id"], project["chat_id"],
+        origin={"absent": "system"},
+    )
+    sent = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=qenv.drive, RUNNING={}, append_jsonl=append_jsonl,
+        send_with_budget=lambda chat, body, **_kw: sent.append((chat, body)),
+    )
+    delivery._handle_send_message(event, ctx)
+    assert sent == [(project["chat_id"], event["text"])]
+    stored = load_task_result(qenv.drive, "settled-root")
+    assert stored["cancel_receipt"]["delivered_chat_id"] == project["chat_id"]
+    assert _completion_excerpt(stored, chat_id=project["chat_id"]) == f"{SALVAGE_EXCERPT_LABEL}."
+    assert text in _completion_excerpt(stored, chat_id=77)
+    assert text in _completion_excerpt(stored, chat_id=1)
+    task = {"id": "settled-root", "project_id": project["id"], "chat_id": project["chat_id"]}
+    assert append_terminal_task_projection(
+        qenv.drive, "settled-root", task, stored,
+        {"status": "failed", "chat_id": project["chat_id"]},
+    )
+    terminal = next(
+        row for row in map(json.loads, (qenv.drive / "logs/chat.jsonl").read_text().splitlines())
+        if row.get("type") == "task_summary"
+    )
+    assert text not in terminal["text"] and SALVAGE_EXCERPT_LABEL in terminal["text"]
+    assert 'get_task_result(task_id="settled-root")' in terminal["text"]
+    queue.events.clear()
+    assert enqueue_project_completion_summary(
+        qenv.drive, {}, "settled-root", task, stored, {"status": "failed"},
+    )
+    summary = next(e for e in queue.events if e.get("system_type") == "project_completion_summary")
+    assert summary["chat_id"] == 1 and text in summary["text"]
+    assert summary["text"].endswith("Open the Project for details.")
+
+
+@pytest.mark.serial
+def test_unsent_receipts_and_new_stop_episodes_do_not_inherit_delivery(tmp_path, monkeypatch):
+    """An origin address, failed send and duplicate skip prove no new delivery."""
+    from ouroboros.project_dialogue import _completion_excerpt, SALVAGE_EXCERPT_LABEL
+    from ouroboros.utils import append_jsonl
+    from supervisor import terminal_delivery as td, events_chat_delivery as delivery
+
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    bound = {"chat": 9}
+    monkeypatch.setattr(delivery, "_bound_project_chat_id", lambda *_a: bound["chat"])
+    text = "Preserved applied output."
+    write_task_result(
+        tmp_path, "origin-seven", "cancelled", result=text,
+        chat_id=7, terminal_origin="host_salvage",
+    )
+
+    def build(did):
+        return td.build_unreviewed_salvage_event(
+            tmp_path, {"chat_id": 7}, "origin-seven", outcome="cancelled",
+            salvaged_text=text, delivery_id=did,
+        )
+
+    def stored():
+        return load_task_result(tmp_path, "origin-seven")
+
+    def fail(*_a, **_k):
+        raise RuntimeError("transport rejected")
+
+    event = build("cancel:origin-seven:one")
+    assert text in _completion_excerpt(stored(), chat_id=7)
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, send_with_budget=fail, append_jsonl=append_jsonl,
+    )
+    delivery._handle_send_message(event, ctx)
+    assert "delivered_chat_id" not in stored()["cancel_receipt"]
+    assert text in _completion_excerpt(stored(), chat_id=9)
+    sent = []
+    ctx.send_with_budget = lambda chat, body, **_k: sent.append((chat, body))
+    delivery._handle_send_message(event, ctx)
+    assert len(sent) == 1 and sent[0][0] == 9
+    assert _completion_excerpt(stored(), chat_id=9) == f"{SALVAGE_EXCERPT_LABEL}."
+    assert text in _completion_excerpt(stored(), chat_id=7)
+    bound["chat"] = 1
+    delivery._handle_send_message(event, ctx)
+    assert len(sent) == 1
+    assert stored()["cancel_receipt"]["delivered_chat_id"] == 9
+    assert text in _completion_excerpt(stored(), chat_id=1)
+    build("cancel:origin-seven:one")
+    assert stored()["cancel_receipt"]["delivered_chat_id"] == 9
+    new_event = build("cancel:origin-seven:two")
+    assert "delivered_chat_id" not in stored()["cancel_receipt"]
+    assert text in _completion_excerpt(stored(), chat_id=9)
+    # A late actual send for the older episode cannot attest the newer receipt.
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    monkeypatch.setattr(td, "already_delivered", lambda *_a: False)
+    delivery._handle_send_message(event, ctx)
+    assert "delivered_chat_id" not in stored()["cancel_receipt"]
+    delivery._handle_send_message(new_event, ctx)
+    assert stored()["cancel_receipt"]["delivered_chat_id"] == 1
+    assert _completion_excerpt(stored(), chat_id=1) == f"{SALVAGE_EXCERPT_LABEL}."

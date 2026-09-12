@@ -448,9 +448,11 @@ def test_a_notice_speaks_for_itself_while_a_salvage_is_labelled():
     ) == f"{SALVAGE_EXCERPT_LABEL}: x"
     receipted = {
         "result": "x", "terminal_origin": "host_salvage", "chat_id": 7,
-        "cancel_receipt": {"delivery_id": "cancel:t:1"},
+        "cancel_receipt": {"delivery_id": "cancel:t:1", "delivered_chat_id": 7},
     }
     assert _completion_excerpt(receipted, chat_id=7) == f"{SALVAGE_EXCERPT_LABEL}."
+    legacy = {**receipted, "cancel_receipt": {"delivery_id": "cancel:t:1"}}
+    assert _completion_excerpt(legacy, chat_id=7) == f"{SALVAGE_EXCERPT_LABEL}: x"
     # Another chat, and an unknown destination, both keep the bytes.
     assert _completion_excerpt(receipted, chat_id=1) == f"{SALVAGE_EXCERPT_LABEL}: x"
     assert _completion_excerpt(receipted) == f"{SALVAGE_EXCERPT_LABEL}: x"

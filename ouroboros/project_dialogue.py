@@ -878,16 +878,15 @@ SALVAGE_EXCERPT_LABEL = "Preserved intermediate output (not a final answer)"
 def _stop_receipt_reached_chat(result: Dict[str, Any], chat_id: Any) -> bool:
     """Did the stop receipt publish these bytes into the chat THIS row targets?
 
-    The receipt is delivered to the task's OWN lineage chat (project binding
-    first), so it is a second copy only for a row written to that same chat. The
-    Main project summary is written to chat 1, has never seen the receipt, and
-    reducing it to a label there left the owner with neither the bytes nor a way
-    to reach them. An unknown destination is not a match: the bytes stay.
+    Only the successful sender records the destination: a task's admission chat
+    or an enqueued receipt cannot prove delivery after lineage rebinding. Main
+    keeps its excerpt unless it received that receipt itself. A legacy receipt
+    without delivery evidence keeps the bytes too.
     """
     receipt = result.get("cancel_receipt")
     if not isinstance(receipt, dict) or not receipt or chat_id is None:
         return False
-    lineage = result.get("chat_id")
+    lineage = receipt.get("delivered_chat_id")
     return lineage is not None and str(lineage) == str(chat_id)
 
 
