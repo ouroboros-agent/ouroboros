@@ -285,3 +285,99 @@ def test_ui_conversion_of_a_scoped_but_unbound_task_moves_its_lane(tmp_path, mon
     assert pending[0]["project_id"] == "task-tpend"
     saved = json.loads(snap.read_text(encoding="utf-8"))
     assert saved["pending"][0]["task"]["project_id"] == "task-tpend"
+
+
+def test_ui_conversion_refuses_a_binding_that_lands_during_the_naming_await(tmp_path, monkeypatch):
+    """Scope review round 1: the durable binding was read BEFORE the naming step, and
+    that step can await a model call for seconds. A running task that scoped itself in
+    that window came back to a created project row, a moved lane and a durable bind
+    that then raised - binding B, lane A, orphan row A, the exact split state P4
+    removes. The authority is re-read at the side-effect boundary, so the conversion
+    answers the same 409 and touches nothing."""
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import (
+        bind_task_to_project,
+        create_project,
+        list_projects,
+        project_binding_for_task,
+    )
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setitem(workers.RUNNING, "trace", {"task": {"id": "trace", "project_id": ""}})
+
+    async def _namer_binds_meanwhile(*args, **kwargs):
+        create_project(tmp_path, "token-observatory", name="Token Observatory")
+        bind_task_to_project(tmp_path, "trace", "token-observatory", origin={"absent": "system"})
+        return "Coined by the model"
+
+    monkeypatch.setattr("ouroboros.project_naming.llm_project_name_async", _namer_binds_meanwhile)
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "trace", "id": "task-trace", "objective_hint": "build it"},
+    )))
+    body = json.loads(resp.body.decode("utf-8"))
+
+    assert resp.status_code == 409
+    assert "Token Observatory" in body["error"] and "token-observatory" in body["error"]
+    assert "open it there or start a new task" in body["error"]
+    assert [p["id"] for p in list_projects(tmp_path)] == ["token-observatory"]
+    assert workers.RUNNING["trace"]["task"]["project_id"] == ""
+    assert (project_binding_for_task(tmp_path, "trace") or {}).get("project_id") == "token-observatory"
+
+
+def test_ui_conversion_restores_the_lane_when_the_durable_bind_is_refused(tmp_path, monkeypatch):
+    """The window between that re-read and the immutable bind is microseconds, but its
+    consequence is the same split state, because the lane mark anticipates a bind that
+    is then refused. The mark goes back to the value it had, nothing is broadcast, and
+    the answer names the project the durable binding actually holds."""
+    import json
+
+    import ouroboros.projects_registry as registry
+    import supervisor.message_bus as message_bus
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+    from ouroboros.gateway.projects import api_project_from_task
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    snap = tmp_path / "state" / "queue_snapshot.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    running = {"tlate": {"task": {"id": "tlate", "project_id": ""}}}
+    for mod in (workers, queue):
+        monkeypatch.setattr(mod, "RUNNING", running)
+        monkeypatch.setattr(mod, "PENDING", [])
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snap)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
+
+    real_bind = registry.bind_task_to_project
+
+    def _bind_loses_the_race(drive_root, task_id, project_id, chat_id=None, *, origin):
+        registry.create_project(drive_root, "token-observatory", name="Token Observatory")
+        real_bind(drive_root, task_id, "token-observatory", origin={"absent": "system"})
+        raise ValueError(
+            f"task {task_id!r} is already bound to project 'token-observatory'; "
+            "project binding is immutable"
+        )
+
+    monkeypatch.setattr(registry, "bind_task_to_project", _bind_loses_the_race)
+    broadcasts = []
+    monkeypatch.setattr(
+        message_bus,
+        "get_bridge",
+        lambda: SimpleNamespace(broadcast=lambda payload: broadcasts.append(payload)),
+    )
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tlate", "id": "task-tlate", "name": "Late", "objective_hint": "x"},
+    )))
+    body = json.loads(resp.body.decode("utf-8"))
+
+    assert resp.status_code == 409
+    assert "Token Observatory" in body["error"] and "token-observatory" in body["error"]
+    assert running["tlate"]["task"]["project_id"] == ""
+    assert broadcasts == []
