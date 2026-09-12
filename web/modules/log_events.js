@@ -400,6 +400,24 @@ export function taskReasonPhrase(code) {
     return TASK_REASON_PHRASES[raw] || raw;
 }
 
+// The custody overlay stamps this code as the row's reason_code while a
+// delegated run is still unreconciled, and the debt then heals from the WRITE
+// side while the stored code may not be rewritten. So the code outlives the
+// fact, and the row's own debt list is the only fresh truth. The browser twin
+// of project_dialogue._custody_debt_reason: the debt is a warning BESIDE the
+// rail cause, never a replacement, and any other code passes through untouched.
+const CUSTODY_DEBT_REASON = 'delegated_custody_unreconciled';
+
+function custodyDebtReason(record) {
+    const raw = String(record?.reason_code || '');
+    if (raw !== CUSTODY_DEBT_REASON) return [raw, ''];
+    const debt = record?.delegated_runs_unreconciled;
+    return [
+        String(record?.outcome_axes?.execution?.reason_code || ''),
+        Array.isArray(debt) && debt.length ? CUSTODY_DEBT_REASON : '',
+    ];
+}
+
 export function taskReasonDetail(evt) {
     // An owner-requested stop is a success and carries its own marker instead.
     if (taskStoppedWithSummary(evt)) return '';
@@ -416,11 +434,17 @@ export function taskReasonDetail(evt) {
         return `Acceptance: ${decision.status}${rationale ? ` — ${rationale}` : ''}`;
     }
     if (!evt?.reason_code || evt.reason_code === 'final_message') return '';
+    // A healed debt is never restored: naming it again would state a debt the
+    // same record shows as empty. The current execution reason speaks when
+    // there is one, otherwise the row states no cause and leaves the headline
+    // to the frozen outcome axis that owns it.
+    const [reason, custody] = custodyDebtReason(record);
+    if (!reason) return custody ? `Reason: ${custody}` : '';
     const receiptVeto = record.outcome_axes?.objective?.receipt_veto;
-    if (receiptVeto?.reason === evt.reason_code && receiptVeto.detail) {
-        return `Reason: ${String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')}`;
-    }
-    return `Reason: ${taskReasonPhrase(evt.reason_code)}`;
+    const cause = receiptVeto?.reason === reason && receiptVeto.detail
+        ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
+        : taskReasonPhrase(reason);
+    return `Reason: ${cause}${custody ? ` (${custody})` : ''}`;
 }
 
 // S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the
