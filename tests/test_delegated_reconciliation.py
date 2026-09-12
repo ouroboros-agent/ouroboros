@@ -508,3 +508,89 @@ def test_the_supervisor_kill_path_carries_the_cancellation_verdict(tmp_path, mon
     _audit_delegated_runs_on_kill(q, "t1", trigger="reaper_deadline_exceeded")
 
     assert seen == ["cancelled", ""]
+
+
+def test_the_kill_path_claims_a_verdict_only_when_it_writes_one(tmp_path, monkeypatch):
+    """A settled task keeps its own durable verdict, so the kill path claims none.
+
+    For an UNSETTLED task this path writes the cancelled terminal, so stating it
+    to the audit that runs first is the truth. For a task that had ALREADY
+    settled when the cancel arrived, completion wins on the write and the stored
+    terminal stays whatever the task decided; claiming a cancellation there would
+    cancel a healthy paid run behind an infrastructure failure, which is exactly
+    the class owner answer B1-A spares.
+    """
+    import types
+
+    import supervisor.queue as q
+    from supervisor import task_lifecycle, workers
+    from ouroboros.task_results import STATUS_COMPLETED
+
+    monkeypatch.setattr(q, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(q, "RUNNING", {}, raising=False)
+    monkeypatch.setattr(workers, "WORKERS", {}, raising=False)
+
+    class _Stop(Exception):
+        """Ends the lifecycle right after the audit call under test."""
+
+    seen: list = []
+
+    def _audit(_q, _task_id, **kwargs):
+        seen.append(kwargs.get("deliberate_terminal", ""))
+        raise _Stop
+
+    monkeypatch.setattr(task_lifecycle, "_audit_delegated_runs_on_kill", _audit)
+    monkeypatch.setattr(task_lifecycle, "_reconcile_dead_review_owner",
+                        lambda *_a, **_kw: None)
+    monkeypatch.setattr(task_lifecycle, "_restore_custody", lambda *_a, **_kw: None)
+    worker = types.SimpleNamespace(proc=types.SimpleNamespace(
+        is_alive=lambda: False, pid=0,
+        join=lambda timeout=None: None, terminate=lambda: None,
+    ))
+
+    for settled in ("", STATUS_COMPLETED):
+        with pytest.raises(_Stop):
+            task_lifecycle._finish_captured_running(
+                "t-kill", worker, {}, intent=None, deliver=False,
+                settled_status=settled,
+            )
+
+    assert seen == ["cancelled", ""]
+
+
+@pytest.mark.parametrize("axes,expected,cancelled", [
+    ("infra", "left_live", []),
+    ("deliberate", "cancelled", [("run-settled-owner", "owner_task_gone")]),
+])
+def test_a_settled_owner_lets_its_durable_outcome_decide_the_live_run(
+    tmp_path, axes, expected, cancelled,
+):
+    """The audit with no claimed verdict falls through to the durable predicate.
+
+    This is what the kill path now does for an already-settled task: an
+    infrastructure death spares the live run, a deliberate completion cancels it.
+    """
+    import ouroboros.delegate_custody as dc
+    from ouroboros.outcomes import infra_failed_axes
+    from ouroboros.task_results import write_task_result
+
+    dc._CUSTODY.clear()
+    dc.record_started(tmp_path, dc.RunCustody(
+        run_id="run-settled-owner", task_id="t-settled", route_id="r", model="m",
+        project_id="p", project_owned=False, root_task_id="t-settled",
+        ledger_root=str(tmp_path)))
+    dc._CUSTODY.clear()
+    if axes == "infra":
+        write_task_result(tmp_path, "t-settled", "failed",
+                          reason_code="provider_unavailable",
+                          outcome_axes=infra_failed_axes("provider_unavailable"))
+    else:
+        write_task_result(tmp_path, "t-settled", "completed", result="verdict")
+
+    transport = _LiveRunStub(run_id="run-settled-owner")
+    outcomes = dc.reconcile_task_runs(
+        tmp_path, "t-settled", gateway_factory=lambda: transport)
+
+    assert [row["action"] for row in outcomes] == [expected]
+    assert transport.cancels == cancelled
+    dc._CUSTODY.clear()
