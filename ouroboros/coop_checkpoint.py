@@ -33,7 +33,6 @@ _INTERRUPTED_GIT_MARKERS = {
     "MERGE_HEAD": "merge_in_progress",
     "CHERRY_PICK_HEAD": "cherry_pick_in_progress",
     "REVERT_HEAD": "revert_in_progress",
-    "REBASE_HEAD": "rebase_in_progress",
     "rebase-merge": "rebase_in_progress",
     "rebase-apply": "rebase_in_progress",
 }
