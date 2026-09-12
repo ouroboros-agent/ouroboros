@@ -13,7 +13,7 @@ like the hurry projection):
     "owner_quiz": {
         "<quiz_id>": {
             "quiz_id", "question", "options": [label, ...], "stake",
-            "option_details"?: [detail, ...],
+            "option_details"?: [detail, ...], "recommended_index"?: int,
             "assumption", "state": open|answered|expired_terminal,
             "asked_at", "answered_at"?, "answered_index"?, "request_id"?,
             "comment"?, "reconciled_at"?,
@@ -111,6 +111,7 @@ def record_asked(
     stake: str = "", assumption: str = "",
     wait_for_answer: bool = False,
     option_details: Optional[List[str]] = None,
+    recommended_index: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Worker-side projection write at ask time.
 
@@ -127,6 +128,7 @@ def record_asked(
         "quiz_id": str(quiz_id), "question": str(question or ""),
         "options": [str(label) for label in options],
         **({"option_details": list(option_details)} if option_details is not None else {}),
+        **({"recommended_index": int(recommended_index)} if isinstance(recommended_index, int) else {}),
         "stake": str(stake or ""), "assumption": str(assumption or ""),
         "state": STATE_OPEN, "asked_at": stamp,
         **({"wait_for_answer": True} if wait_for_answer else {}),

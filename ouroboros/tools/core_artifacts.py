@@ -325,7 +325,7 @@ def validate_quiz_payload(
             "QUIZ_OPTIONS_INVALID",
             f"provide 2..{_MAX_QUIZ_OPTIONS} options.",
         )
-    cleaned: List[Dict[str, str]] = []
+    cleaned: List[Dict[str, Any]] = []
     for item in options:
         if isinstance(item, str):
             item = {"label": item}
@@ -339,9 +339,11 @@ def validate_quiz_payload(
             raise QuizValidationError(
                 "QUIZ_OPTIONS_INVALID", "each option needs a non-empty label."
             )
-        option: Dict[str, str] = {"label": label[:120]}
+        option: Dict[str, Any] = {"label": label[:120]}
         if detail:
             option["detail"] = detail[:500]
+        if item.get("recommended") is True:  # the asker's recommendation rides with its option
+            option["recommended"] = True
         cleaned.append(option)
     assumption_text = str(assumption or "").strip()
     if not isinstance(wait_for_answer, bool):
@@ -492,6 +494,7 @@ def _escalate(
         lines = [f"ESCALATION (decision requested): {payload['question']}", "Options:"]
         lines += [
             f"{i + 1}. {row['label']}" + (f" — {row['detail']}" if row.get("detail") else "")
+            + (" [recommended]" if row.get("recommended") else "")
             for i, row in enumerate(payload["options"])
         ]
         if payload["stake"]:
@@ -524,6 +527,7 @@ def _escalate(
         quiz_id=quiz_id, question=payload["question"],
         options=[row["label"] for row in payload["options"]],
         option_details=[row.get("detail", "") for row in payload["options"]],
+        recommended_index=next((i for i, row in enumerate(payload["options"]) if row.get("recommended")), None),
         stake=payload["stake"], assumption=payload["assumption"],
         wait_for_answer=wait_for_answer,
     )

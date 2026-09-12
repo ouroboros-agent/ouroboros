@@ -1444,6 +1444,8 @@ def get_tools() -> List[ToolEntry]:
             "name": "escalate",
             "description": (
                 "Escalate a decision up the responsibility chain instead of guessing. "
+                "List 2-6 real options, mark your recommendation with recommended=true on that option, "
+                "and let each option's detail name what it gains and what it costs. "
                 "A root task asks the OWNER (a typed quiz card with option buttons); "
                 "a subagent asks its PARENT task (a typed mailbox frame the parent "
                 "answers with forward_to_worker or escalates higher, verbatim). "
@@ -1458,6 +1460,7 @@ def get_tools() -> List[ToolEntry]:
                 "options": {"type": "array", "items": {"type": "object", "properties": {
                     "label": {"type": "string", "description": "Short option label (button text, max 120)"},
                     "detail": {"type": "string", "description": "Optional one-line consequence of this option (max 500)"},
+                    "recommended": {"type": "boolean", "description": "True on the ONE option you recommend"},
                 }, "required": ["label"]}, "description": "2-6 mutually exclusive options"},
                 "stake": {"type": "string", "description": "What depends on this decision (optional, max 500)"},
                 "assumption": {"type": "string", "description": "For optional clarification, the assumption you continue under (max 500); may be empty for required waiting."},

@@ -861,3 +861,39 @@ def test_quiz_state_frame_carries_the_comment_only_when_recorded():
         (False, None), (True, "neither — use duckdb"), (False, None),
     ]
     assert frames[0]["answered_index"] == 1 and "answered_index" not in frames[1]
+
+
+def test_recommended_option_rides_the_card_the_projection_and_the_parent_frame(tmp_path, monkeypatch):
+    """Owner batch 1 Q7=B / В8=A: the asker marks ONE option as its recommendation. The
+    shared validator carries the flag only when it is literally true, the owner card and
+    the durable projection keep it (the web badge and the Telegram star read them), and a
+    subagent's frame to its parent names it."""
+    from ouroboros.owner_quiz import quiz_states
+    from ouroboros.tools.core_artifacts import validate_quiz_payload
+
+    payload = validate_quiz_payload("Which db?", [
+        {"label": "sqlite", "detail": "cheap, single file", "recommended": True},
+        {"label": "postgres", "recommended": "yes"}, "mysql",
+    ], "", "sqlite meanwhile")
+    assert payload["options"] == [
+        {"label": "sqlite", "detail": "cheap, single file", "recommended": True}, {"label": "postgres"}, {"label": "mysql"},
+    ]
+    ctx = _tool_ctx(tmp_path)
+    out = _escalate(ctx, question="Which db?", options=payload["options"], assumption="sqlite meanwhile")
+    assert out.startswith("OK: quiz ")
+    [event] = [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    assert event["options"][0]["recommended"] is True and "recommended" not in event["options"][1]
+    [block] = quiz_states(tmp_path, "root-1").values()
+    assert block["recommended_index"] == 0 and block["options"] == ["sqlite", "postgres", "mysql"]
+    plain = _escalate(_tool_ctx(tmp_path, task_id="root-2"), question="?", options=["a", "b"], assumption="a")
+    assert plain.startswith("OK: quiz ")
+    assert "recommended_index" not in list(quiz_states(tmp_path, "root-2").values())[0]
+    # The subagent hop: the parent's frame names the recommended option.
+    import ouroboros.task_status as ts
+    from ouroboros.owner_mailbox import drain_owner_entries
+
+    monkeypatch.setattr(ts, "load_effective_task_result", lambda root, tid: {"status": "running"})
+    child = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
+    _escalate(child, question="Which db?", options=payload["options"], assumption="sqlite meanwhile")
+    [frame] = drain_owner_entries(tmp_path, "root-1", set())
+    assert "1. sqlite — cheap, single file [recommended]\n2. postgres\n3. mysql" in frame["text"]

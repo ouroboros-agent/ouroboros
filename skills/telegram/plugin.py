@@ -1284,7 +1284,7 @@ def _make_quiz(api):
                 if isinstance(option, dict):
                     label = str(option.get("label") or "").strip()
                     if label:
-                        labels.append(label)
+                        labels.append(f"★ {label}" if option.get("recommended") is True else label)
             # Shared quiz contract cap: ouroboros.tools.core._MAX_QUIZ_OPTIONS.
             labels = labels[:6]
             if not question or len(labels) < 2:

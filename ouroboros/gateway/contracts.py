@@ -364,6 +364,7 @@ class QuizOption(TypedDict):
 
     label: str
     detail: NotRequired[str]
+    recommended: NotRequired[bool]
 
 
 class QuizOutbound(TypedDict):

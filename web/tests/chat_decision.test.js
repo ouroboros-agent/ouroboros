@@ -736,3 +736,29 @@ test('a 409 loser adopts the winning comment over its local draft', async () => 
         assert.equal(card.dataset.ownerComment, 'winning note');
     } finally { fx.restore(); }
 });
+
+test('the recommended option carries a badge on the live card and on the targeted-detail replay', async () => {
+    const fx = fixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1', owner_quiz: {
+        'qz-2': { ...WS_MSG, quiz_id: 'qz-2', options: ['Yes', 'No'], option_details: ['', 'wait for CI'],
+            recommended_index: 1, asked_at: WS_MSG.ts },
+    } }) });
+    const badges = (card) => card.querySelectorAll('.chat-quiz-option')
+        .map((button) => button.querySelectorAll('.chat-quiz-option-recommended').length);
+    try {
+        const live = fx.decision.buildQuizCard({ ...WS_MSG, options: [{ label: 'Yes', recommended: true }, { label: 'No' }] });
+        assert.deepEqual(badges(live), [1, 0]);
+        assert.equal(live.querySelector('.chat-quiz-option-recommended').textContent, 'recommended');
+        // A history row that lost the option details carries no badge; the targeted detail
+        // (durable recommended_index) adds it in place, exactly like the option details.
+        const stale = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-2', options: ['Yes', 'No'] });
+        assert.deepEqual(badges(stale), [0, 0]);
+        const question = await fx.decision.readQuestion('t-1', 'qz-2', 'p1');
+        assert.equal(fx.decision.buildQuizCard(question), null);
+        assert.deepEqual(badges(stale), [0, 1]);
+        assert.equal(fx.decision.buildQuizCard(question), null);
+        assert.deepEqual(badges(stale), [0, 1], 'the badge is added once');
+        // A fresh card built straight from the projection carries the same badge; a plain card none.
+        assert.deepEqual(badges(fx.decision.buildQuizCard({ ...question, quiz_id: 'qz-5' })), [0, 1]);
+        assert.deepEqual(badges(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-3' })), [0, 0]);
+    } finally { fx.restore(); }
+});
