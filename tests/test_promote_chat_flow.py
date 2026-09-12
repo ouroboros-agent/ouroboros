@@ -2956,6 +2956,68 @@ def test_promote_emission_row_carries_the_owner_message_id(tmp_path, monkeypatch
     assert emitted["task_id"] == ctx.pending_events[0]["task_id"]
 
 
+def _steer_refusal(tmp_path, monkeypatch, *, running: dict, chat_id: int = 1):
+    """Drive one refused steer and return (receipt kwargs, owner messages)."""
+    import supervisor.events as events_mod
+    from supervisor.steering import _handle_steer_task
+
+    receipts: list = []
+    sent: list = []
+    monkeypatch.setattr(events_mod, "_emit_routing_receipt",
+                        lambda ctx, evt, **kwargs: receipts.append(kwargs) or {})
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[],
+        get_chat_agent=lambda: None,
+        send_with_budget=lambda _chat_id, text: sent.append(text),
+    )
+    _handle_steer_task(
+        {"target_task_id": "target-1", "message": "hurry up", "chat_id": chat_id}, ctx,
+    )
+    return receipts[-1], sent
+
+
+def test_steer_refusal_names_the_room_when_the_task_belongs_to_another_chat(tmp_path, monkeypatch):
+    """Four refusals folded into one boolean told the owner the task "may have
+    finished" while it ran in its own project room for another half hour, and the
+    receipt said only `target_not_steerable`. The room is what the owner needs."""
+    from ouroboros.projects_registry import create_project
+
+    create_project(tmp_path, "roomp", name="RoomP")
+    receipt, sent = _steer_refusal(tmp_path, monkeypatch, running={
+        "target-1": {"task": {"id": "target-1", "chat_id": 777, "project_id": "roomp",
+                              "title": "Deploy the docs"}},
+    })
+
+    assert receipt["status"] == "needs_manual_target" and receipt["reason"] == "chat_mismatch"
+    assert sent and "RoomP › Deploy the docs" in sent[0]
+    assert "may have finished" not in sent[0]
+    assert "belongs to another chat" in sent[0]
+
+
+@pytest.mark.parametrize("running, reason, phrase", [
+    ({}, "target_unknown", "may have finished"),
+    ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "delegation_role": "subagent",
+                            "title": "Review"}}}, "subagent_target", "delegated helper"),
+])
+def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
+        tmp_path, monkeypatch, running, reason, phrase):
+    receipt, sent = _steer_refusal(tmp_path, monkeypatch, running=running)
+
+    assert receipt["reason"] == reason and receipt["status"] == "needs_manual_target"
+    assert sent and phrase in sent[0]
+
+
+def test_steer_receipt_keeps_the_renderable_fallback_reason():
+    """`control_routing` renders `reason or 'target_not_steerable'`, and the tool
+    corpus holds that literal: the typed reasons are added beside it, never in
+    place of the default a missing reason still resolves to."""
+    import inspect
+
+    from supervisor import steering
+
+    assert 'reason=refusal or "target_not_steerable"' in inspect.getsource(steering._handle_steer_task)
+
+
 def _loud_workspace_failure(tmp_path, monkeypatch, ws_error: str, **kwargs):
     """Run the loud-fail writer directly and return (chat message, stored row)."""
     import supervisor.workers as workers
