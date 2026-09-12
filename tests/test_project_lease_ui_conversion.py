@@ -305,11 +305,18 @@ def test_ui_conversion_refuses_a_binding_that_lands_during_the_naming_await(tmp_
         list_projects,
         project_binding_for_task,
     )
+    import supervisor.message_bus as message_bus
     import supervisor.workers as workers
 
     (tmp_path / "logs").mkdir()
     (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
     monkeypatch.setitem(workers.RUNNING, "trace", {"task": {"id": "trace", "project_id": ""}})
+    broadcasts = []
+    monkeypatch.setattr(
+        message_bus,
+        "get_bridge",
+        lambda: SimpleNamespace(broadcast=lambda payload: broadcasts.append(payload)),
+    )
 
     async def _namer_binds_meanwhile(*args, **kwargs):
         create_project(tmp_path, "token-observatory", name="Token Observatory")
@@ -326,7 +333,10 @@ def test_ui_conversion_refuses_a_binding_that_lands_during_the_naming_await(tmp_
     assert resp.status_code == 409
     assert "Token Observatory" in body["error"] and "token-observatory" in body["error"]
     assert "open it there or start a new task" in body["error"]
+    # The refusal lands before create_project, so the requested row never exists and
+    # nothing was published about it: only the project the task actually belongs to.
     assert [p["id"] for p in list_projects(tmp_path)] == ["token-observatory"]
+    assert broadcasts == []
     assert workers.RUNNING["trace"]["task"]["project_id"] == ""
     assert (project_binding_for_task(tmp_path, "trace") or {}).get("project_id") == "token-observatory"
 
@@ -335,7 +345,13 @@ def test_ui_conversion_restores_the_lane_when_the_durable_bind_is_refused(tmp_pa
     """The window between that re-read and the immutable bind is microseconds, but its
     consequence is the same split state, because the lane mark anticipates a bind that
     is then refused. The mark goes back to the value it had, nothing is broadcast, and
-    the answer names the project the durable binding actually holds."""
+    the answer names the project the durable binding actually holds.
+
+    The empty project row created just before that bind is a DISCLOSED residual, not an
+    oversight: the registry has no primitive that removes a row. Its delete lifecycle
+    tombstones the row and reserves the id permanently, so a later create with that id
+    raises forever, and the in-task path derives that id from the display name the owner
+    asked for. An inert row the owner can delete is the smaller harm."""
     import json
 
     import ouroboros.projects_registry as registry
@@ -383,3 +399,13 @@ def test_ui_conversion_restores_the_lane_when_the_durable_bind_is_refused(tmp_pa
     assert "Token Observatory" in body["error"] and "token-observatory" in body["error"]
     assert running["tlate"]["task"]["project_id"] == ""
     assert broadcasts == []
+    # The residual: the requested row survives, holding no task and no binding, while
+    # the task itself belongs to the project the answer names.
+    assert sorted(p["id"] for p in registry.list_projects(tmp_path)) == [
+        "task-tlate", "token-observatory",
+    ]
+    assert (registry.project_binding_for_task(tmp_path, "tlate") or {}).get(
+        "project_id") == "token-observatory"
+    assert "task-tlate" not in {
+        str(row.get("project_id") or "") for row in registry.project_task_bindings(tmp_path).values()
+    }
