@@ -796,7 +796,7 @@ rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec 
 | 2 | load-bearing decisions | Are the decisions that are expensive to reverse explicit, with their rejected alternatives and why? |
 | 3 | constraints and invariants | Are the real constraints named — budget, deadline, safety, irreversibility, commitments to others? |
 | 4 | deferrals | Is anything deferred that will be expensive to change once the work has started? |
-| 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator) instead of inventing a gap. |
+| 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator or a spec item id) instead of inventing a gap. |
 | 6 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
 
 ### Height rule — what may block
