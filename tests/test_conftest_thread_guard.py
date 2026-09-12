@@ -61,10 +61,14 @@ def test_a_baseline_thread_is_held_by_object_not_by_ident(monkeypatch):
     old = threading.Thread(target=exit_old.wait, name="probe-old", daemon=True)
     old.start()
     item = SimpleNamespace(nodeid="tests/x.py::recycled", stash=pytest.Stash())
+    protocol = conftest.pytest_runtest_protocol(item, None)
+    next(protocol)
     snapshot = conftest.pytest_runtest_call(item)   # the call-phase hookwrapper: snapshot, then yield
     next(snapshot)
     with pytest.raises(StopIteration):
         next(snapshot)
+    with pytest.raises(StopIteration):
+        next(protocol)
     baseline = item.stash[conftest._THREADS_BEFORE_ITEM]
     assert old in baseline and old.ident is not None
     exit_old.set()

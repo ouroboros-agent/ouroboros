@@ -216,7 +216,8 @@ def test_null_reported_model_recovers_without_rewriting_unknown_custody(tmp_path
     def catalog(source, profile, **kwargs):
         assert (source, profile, kwargs["requested_model"]) == ("codex", "profile-a", "test")
         return {"source": source, "credentialProfileId": profile, "accountFingerprint": "account-a",
-                "provenance": "provider_http", "observedAt": datetime.now(timezone.utc).isoformat(),
+                "provenance": "provider_http",
+                "observedAt": datetime.fromtimestamp(episode.started_at + 1, timezone.utc).isoformat(),
                 "models": [{"id": "test"}]}
     monkeypatch.setattr(llm_claudexor, "model_catalog", catalog)
     monkeypatch.setattr("ouroboros.model_slots.task_model_binding", lambda *a, **kw: ("main", "profile-a"))
