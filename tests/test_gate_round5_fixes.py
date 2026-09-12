@@ -88,12 +88,14 @@ def _patch_open_delegated_run(monkeypatch, task_id: str, run_id: str = "run-open
         "ouroboros.delegate_custody.reconcile_task_runs",
         lambda root, tid, **kw: calls.append(str(tid)) or [],
     )
+    # `state` is part of these projections' contract: the terminal audit shares
+    # one custody replay across them, so a double must accept the keyword.
     monkeypatch.setattr(
         "ouroboros.delegate_custody.open_runs",
-        lambda root: [types.SimpleNamespace(task_id=task_id, run_id=run_id)],
+        lambda root, state=None: [types.SimpleNamespace(task_id=task_id, run_id=run_id)],
     )
     monkeypatch.setattr(
-        "ouroboros.delegate_custody.pending_invocations", lambda root: [],
+        "ouroboros.delegate_custody.pending_invocations", lambda root, rows=None: [],
     )
     return calls
 

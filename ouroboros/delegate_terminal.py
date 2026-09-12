@@ -77,9 +77,11 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
             log.debug("Custody audit snapshot unavailable for %s", mine, exc_info=True)
     state = snapshot.get("state") if snapshot is not None else None
     pending = snapshot.get("pending") if snapshot is not None else None
-    # The keyword rides only when a snapshot is really shared, so the
-    # no-snapshot call shape stays byte-identical for every existing caller
-    # and test seam over these projections.
+    # Since the audit builds its own snapshot above, the keyword rides on EVERY
+    # call, not only on a shared batch: `state` is the documented contract of
+    # these projections, and a seam over them must accept it. It is dropped only
+    # when the snapshot read itself failed, so each projection then replays for
+    # itself and the fail-closed arms below stay reachable.
     state_kw: Dict[str, Any] = {} if state is None else {"state": state}
     audit_failure = ""
     if custody.custody_log_unreadable(drive_root):
