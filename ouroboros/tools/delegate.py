@@ -857,9 +857,13 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
 
     def read_failure(exc: ClaudexorUnavailable) -> str:
         if observation_only and exc.observation_timeout:
+            # The gateway's per-class reason, not the generic transport code: a
+            # read bound that expired against a live daemon is a quiet hole and
+            # nothing more, while a socket that carried no answer is the outage
+            # the owner is told about once per episode.
             return json.dumps({
                 "status": "observation_pending", "run_id": rid,
-                "reason": exc.code, "detail": str(exc),
+                "reason": exc.observation_reason or exc.code, "detail": str(exc),
                 "waited_sec": time.monotonic() - started,
             })
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)

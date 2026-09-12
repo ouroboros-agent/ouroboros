@@ -131,17 +131,26 @@ def test_existing_control_returns_without_starting_another_observation(tmp_path,
     assert calls == []
 
 
-@pytest.mark.parametrize("failure", [
-    httpx.ConnectError("connection refused"), httpx.ConnectTimeout("connect timed out"),
-    httpx.PoolTimeout("pool exhausted"), httpx.ReadError("connection reset"),
-    httpx.WriteError("broken pipe"), httpx.RemoteProtocolError("server disconnected"),
+@pytest.mark.parametrize("failure,reason", [
+    (httpx.ReadTimeout("read timed out"), "observation_read_timeout"),
+    (httpx.ConnectError("connection refused"), "daemon_unreachable"),
+    (httpx.ConnectTimeout("connect timed out"), "daemon_unreachable"),
+    (httpx.PoolTimeout("pool exhausted"), "daemon_unreachable"),
+    (httpx.ReadError("connection reset"), "daemon_unreachable"),
+    (httpx.WriteError("broken pipe"), "daemon_unreachable"),
+    (httpx.RemoteProtocolError("server disconnected"), "daemon_unreachable"),
 ])
-def test_read_only_retryable_transport_failures_are_typed_observation_holes(failure):
+def test_read_only_retryable_transport_failures_are_typed_observation_holes(failure, reason):
     """A socket that delivered no daemon answer is the same unresolved read as a read
-    timeout: typed ``daemon_unreachable`` with ``observation_timeout`` set, so the
-    supervising wait renews quietly instead of waking the model on every 3 s beat
-    (I1: 359 refusals on 2026-09-10, two of them ReadError). Classified by the
-    exception TYPE, never by prose; a received status still wins (test above)."""
+    timeout: ``observation_timeout`` set, so the supervising wait renews quietly
+    instead of waking the model on every 3 s beat (I1: 359 refusals on 2026-09-10,
+    two of them ReadError). Classified by the exception TYPE, never by prose; a
+    received status still wins (test above).
+
+    The OBSERVATION reason separates the two halves of that class: our own read
+    bound expiring says nothing about the daemon, while a socket that could not be
+    opened or that broke mid-exchange did not carry an answer. The transport
+    ``code`` stays ``daemon_unreachable`` for every other reader of it."""
 
     def _raise(_request):
         raise failure
@@ -154,17 +163,36 @@ def test_read_only_retryable_transport_failures_are_typed_observation_holes(fail
             gateway.get_run("run-existing")
         assert caught.value.code == "daemon_unreachable"
         assert caught.value.observation_timeout is True
+        assert caught.value.observation_reason == reason
         assert caught.value.status_code == 0
         assert caught.value.__cause__ is failure
     finally:
         gateway.close()
 
 
+def test_a_received_refusal_carries_no_observation_reason():
+    """A 4xx the daemon actually sent is not an observation hole at all."""
+
+    def _refuse(_request):
+        return httpx.Response(401, json={"code": "http_401", "message": "unauthorized"})
+
+    gateway = gateway_module.ClaudexorGateway(gateway_module.DaemonEndpoint("127.0.0.1", 1, "fixture"))
+    gateway._client.close()
+    gateway._client = httpx.Client(base_url="http://127.0.0.1:1", transport=httpx.MockTransport(_refuse))
+    try:
+        with pytest.raises(gateway_module.ClaudexorUnavailable) as caught:
+            gateway.get_run("run-existing")
+        assert caught.value.observation_timeout is False
+        assert caught.value.observation_reason == ""
+    finally:
+        gateway.close()
+
+
 def test_observation_read_failure_carries_the_gateway_typed_code(tmp_path, monkeypatch):
-    """The observing wait relays the transport's own typed code as the quiet reason
+    """The observing wait relays the transport's own per-class observation reason
     (no hardcoded ``observation_read_timeout``), so the supervision loop can tell an
-    unreachable daemon apart from any other typed reason; a received refusal keeps
-    its refusal shape."""
+    unreachable daemon apart from a daemon that was merely slow; a received refusal
+    keeps its refusal shape."""
     ctx = _delegating_ctx(tmp_path, acting=False)
     entry = delegate._RunCustody(task_id=ctx.task_id, route_id="fixture", model="fixture",
                                 project_id="fixture", project_owned=False, access="readonly")
@@ -180,10 +208,19 @@ def test_observation_read_failure_carries_the_gateway_typed_code(tmp_path, monke
 
     monkeypatch.setattr(gateway_module, "ClaudexorGateway", lambda: _Dead())
     refusals.append(gateway_module.ClaudexorUnavailable(
-        "daemon_unreachable", "ConnectError: [Errno 61]", observation_timeout=True))
+        "daemon_unreachable", "ConnectError: [Errno 61]", observation_timeout=True,
+        observation_reason="daemon_unreachable"))
     quiet = json.loads(delegate._delegate_wait(ctx, "run-dead", observation_only=True))
     assert quiet["status"] == "observation_pending" and quiet["run_id"] == "run-dead"
     assert quiet["reason"] == "daemon_unreachable"
+    # A slow but LIVE daemon is the same quiet hole with a different typed reason,
+    # so the supervision loop does not raise the outage line for it.
+    refusals.append(gateway_module.ClaudexorUnavailable(
+        "daemon_unreachable", "ReadTimeout", observation_timeout=True,
+        observation_reason="observation_read_timeout"))
+    slow = json.loads(delegate._delegate_wait(ctx, "run-dead", observation_only=True))
+    assert slow["status"] == "observation_pending"
+    assert slow["reason"] == "observation_read_timeout"
     refusals.append(gateway_module.ClaudexorUnavailable("http_401", "unauthorized", status_code=401))
     refused = json.loads(delegate._delegate_wait(ctx, "run-dead", observation_only=True))
     assert refused["status"] == "refused" and refused["reason"] == "http_401"
@@ -244,6 +281,14 @@ def test_unreachable_daemon_episode_is_one_owner_line_each_way(tmp_path, monkeyp
 
 
 def test_other_typed_observation_reasons_say_nothing_to_the_owner(tmp_path, monkeypatch):
+    """A daemon that was merely SLOW stays silent to the owner.
+
+    ``observation_read_timeout`` is what the gateway mints for an httpx
+    ReadTimeout and what the observing wait relays (both pinned above), so this
+    is the production value of a live daemon that answered after our own read
+    bound, not a hand-fed string: the run settles from that same daemon and the
+    owner is never told it was unreachable.
+    """
     ctx = _delegating_ctx(tmp_path, acting=False)
     notes = []
     ctx.emit_progress_fn = lambda text, *, incident=None: notes.append((text, incident))
