@@ -1720,7 +1720,7 @@ def test_context_mode_self_lowering_indicators_block_attack_patterns(blocked_cmd
     [
         "echo \"$OUROBOROS_CONTEXT_MODE\"",
         "rg OUROBOROS_CONTEXT_MODE ouroboros/",
-        "curl http://127.0.0.1:8765/api/state",
+        "curl --max-time 1 http://127.0.0.1:9/api/state",
     ],
 )
 def test_context_mode_guard_does_not_block_readonly_diagnostics(diagnostic_cmd, tmp_path, monkeypatch):
