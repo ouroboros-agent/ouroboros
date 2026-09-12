@@ -315,3 +315,27 @@ def test_in_flight_panels_count_toward_the_cycle_cap_at_dispatch(harness, monkey
     finally:
         executor.release.set()
     assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
+
+
+def test_the_barrier_records_no_failed_last_execution_for_running_slots(harness, monkeypatch, tmp_path):
+    """Fix cycle 1, F3: a slot released at the dispatch barrier is running, not failed.
+    The last-execution projection (Settings and the capabilities digest) is written when
+    the slot settles, never at the barrier with an error status."""
+    from ouroboros import reviewer_slot_config
+
+    monkeypatch.setattr(reviewer_slot_config, "_last_execution_path", lambda: tmp_path / "last.json")
+    executor = _install_real_substrate(monkeypatch)
+    ctx = harness.make_ctx()
+    try:
+        _call(ctx)
+        assert {a["operation_state"] for a in _state(harness)["waves"][-1]["actors"]} == {"pending_dispatch"}
+        last = reviewer_slot_config.reviewer_slot_last_executions()
+        assert not [sid for sid, row in last.items() if row.get("status") == "error"], last
+        assert _wait_until(lambda: executor.execute_calls == 3)
+        executor.release.set()
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
+    finally:
+        executor.release.set()
+    assert _control(_call(ctx)) == {"outcome": "GREEN", "closed": True}  # the collection
+    last = reviewer_slot_config.reviewer_slot_last_executions()
+    assert {sid: row["status"] for sid, row in last.items()} == {"s1": "ok", "s2": "ok", "s3": "ok"}

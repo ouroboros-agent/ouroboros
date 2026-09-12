@@ -1079,6 +1079,8 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
             slot = slots_by_id.get(getattr(actor, "slot_id", ""))
             if slot is None:
                 continue
+            if str(getattr(actor, "operation_state", "") or "") == "pending_dispatch":
+                continue  # released at the dispatch barrier: still running, recorded when it settles
             usage = dict(getattr(actor, "usage", {}) or {})
             route_kind = str(getattr(getattr(slot, "route", None), "value", "") or "api_chat")
             delegated_route = str(usage.get("delegated_route") or "")
