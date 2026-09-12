@@ -24,8 +24,14 @@ def test_room_growth_reuses_snapshot_until_author_changes_plan(harness):
     source = read_actor_source_bytes(harness.drive, ctx.task_id, first["dialogue_source_ref"])
     append_jsonl(chat, {"direction": "out", "chat_id": 1, "text": "Panel complete, collecting"})
     append_jsonl(chat, {"direction": "in", "chat_id": 1, "text": "Actually keep B as well"})
-    _call(ctx)
+    replay_text = _call(ctx)
     replay = _state(harness)["waves"][-1]
+    from ouroboros.tools.plan_review_artifacts import read_wave
+    own = read_wave(harness.drive, ctx.task_id, first["wave_artifact"])["evidence_manifest_full"]["own_dialogue"]
+    assert first["dialogue_source_ref"]["sha256"] in replay_text
+    assert first["dialogue_source_ref"]["path"] in replay_text and own["captured_at"] in replay_text
+    assert "Later messages are not claimed reviewed" in replay_text
+    assert "Snapshot coverage" in replay_text
     assert replay["request_fingerprint"] == first["request_fingerprint"]
     assert _state(harness)["cycles_paid"] == 1 and len(substrate.calls) == 1
     exact = plan_chat_reader(harness.drive, ctx.task_id)(f"1@{first['dialogue_source_ref']['sha256']}")
@@ -146,3 +152,48 @@ def test_dialogue_source_survives_real_child_promotion_and_cleanup(harness):
     exact = read_wave(parent, "source", wave["wave_artifact"])
     assert exact["supersedes_wave_artifact"]["sha256"] == predecessor["sha256"]
     assert read_wave(parent, "source", exact["supersedes_wave_artifact"])["plan_prose"]
+
+
+def test_same_root_sibling_rooms_are_pointers_and_unrelated_rooms_stay_private(harness):
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+    from ouroboros.task_results import write_task_result
+    from ouroboros.tools.plan_dialogue import related_rooms
+
+    projects = {name: create_project(harness.drive, name, name=name) for name in ('own', 'sibling', 'unrelated')}
+    for tid, name, root in [('child-a', 'own', 'parent'), ('child-b', 'sibling', 'parent'), ('private', 'unrelated', 'different-root')]:
+        bind_task_to_project(harness.drive, tid, projects[name]['id'], origin={'absent': 'system'})
+        write_task_result(harness.drive, tid, 'running', parent_task_id=root, root_task_id=root)
+    ctx = harness.make_ctx(task_id='child-a')
+    ctx.task_metadata = {'parent_task_id': 'parent', 'root_task_id': 'parent'}
+    pointers = related_rooms(ctx, harness.drive, projects['own']['chat_id'])
+    assert {p['locator'] for p in pointers} == {'chat:1', f"chat:{projects['sibling']['chat_id']}"}
+    assert all(p['delivery'] == 'pointer_only' and 'text' not in p for p in pointers)
+
+
+def test_budget_prices_the_actual_window_fitted_inputs(harness, monkeypatch):
+    from ouroboros.tools import plan_review as pr, review_synthesis
+    from ouroboros import usage_accounting as ua
+    from tests.test_plan_review_engine import _user_text
+    from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS
+
+    ctx = harness.make_ctx()
+    ctx.current_chat_id = 1
+    append_jsonl(harness.drive / 'logs/chat.jsonl', {'ts': '2026-09-01T00:00:00Z',
+        'direction': 'out', 'chat_id': 1, 'text': 'Prior substantive discussion. ' * 20000})
+    monkeypatch.setattr(review_synthesis, 'per_slot_input_token_limits',
+                        lambda models, **kw: {slot.slot_id: 10000 for slot in kw['slots']})
+    substrate = harness.install({'s1': CLEAN, 's2': CLEAN, 's3': CLEAN})
+    captured = []
+    monkeypatch.setattr(pr, 'review_wave_budget_gate', lambda *a, **kw: captured.append(kw))
+    _call(ctx)
+    request = substrate.calls[0]['request']
+    slots = substrate.calls[0]['slots']
+    actual = [sum(len(_user_text(message['content'])) for message in request.slot_messages[slot.slot_id]) for slot in slots]
+    assert captured[0]['prompt_chars'] == actual
+    assert captured[0]['max_completion_tokens'] == PLAN_REVIEW_MAX_TOKENS
+    # Illustrative price replaces only vendor lookup, not the admission math.
+    monkeypatch.setattr(ua, 'estimate_cost_optional', lambda model, prompt, completion, **kw: prompt / 100000)
+    admission = ua.review_wave_admission(root_task_id='budget-probe', models=[slot.model for slot in slots],
+        prompt_chars=captured[0]['prompt_chars'], max_completion_tokens=PLAN_REVIEW_MAX_TOKENS, remaining_usd_override=1.0)
+    assert admission['fits'] is True and admission['estimated_wave_usd'] == 0.3
+    assert len(substrate.calls) == 1

@@ -660,7 +660,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     health_evidence = fanout["health_evidence"]
     admission = None if resume_in_flight else review_wave_budget_gate(
         ctx, surface="plan_review", models=[str(s.model) for s in callable_slots],
-        prompt_chars=len(system_prompt) + len(user_content), max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
+        prompt_chars=[delivery["slot_prompt_chars"][str(s.slot_id)] for s in callable_slots],
+        max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
     )
     if admission is not None:
         fence, remedy = review_wave_binding_fence(admission)
@@ -711,6 +712,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
         system_prompt=system_prompt, user_content=user_content, dispatched=existing if resume_in_flight else None,
         session_task=session_task, slot_messages=slot_messages, slot_session_tasks=delivery["slot_session_tasks"],
+        dialogue_delivery=delivery["dialogue_delivery"],
     )
     try:
         stored = _record_exact_wave(

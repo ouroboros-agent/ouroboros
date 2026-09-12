@@ -525,7 +525,7 @@ def exact_wave(
     wave: dict, *, plan_prose: str, manifest: dict, slots: List[Any], rows: List[dict],
     system_prompt: str, user_content: str, session_task: str,
     slot_messages: Dict[str, List[Dict[str, Any]]], dispatched: Optional[dict] = None,
-    slot_session_tasks: Optional[dict] = None,
+    slot_session_tasks: Optional[dict] = None, dialogue_delivery: Optional[dict] = None,
 ) -> dict:
     """``dispatched`` = the exact wave a reconciliation is resuming over.
 
@@ -573,5 +573,6 @@ def exact_wave(
         })
     return {
         **wave, "plan_prose": plan_prose, "evidence_manifest_full": manifest,
+        "dialogue_delivery": dispatched.get("dialogue_delivery", {}) if dispatched is not None else dialogue_delivery or {},
         "slots": [slot_row(slot) for slot in slots], "reviewer_outputs": outputs,
     }

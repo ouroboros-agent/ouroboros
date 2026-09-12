@@ -24,6 +24,12 @@ def related_rooms(ctx: Any, root: pathlib.Path, own_chat: int | None) -> list[di
             chat = bindings.get(tid) or source.get("chat_id")
             if chat is not None:
                 chats.add(int(chat))
+    from ouroboros.task_results import resolve_task_lineage
+    lineage_root = resolve_task_lineage(task_id, metadata=task)["root_task_id"]
+    for bound_id, chat in bindings.items():
+        related = task_room_record(root, bound_id)
+        if related and resolve_task_lineage(bound_id, metadata=related)["root_task_id"] == lineage_root:
+            chats.add(int(chat))
     projects = {int(p["chat_id"]): p for p in list_reserved_projects(root)}
     pointers = []
     for chat in sorted(chats - {own_chat}):
@@ -121,18 +127,20 @@ def render_dialogue(manifest: Any) -> str:
     )
 
 
-def fit_dialogue_text(packet: str, own: dict, capacity_chars: int) -> str:
+def fit_dialogue_text(packet: str, own: dict, capacity_chars: int) -> tuple[str, dict]:
     """Keep the newest available characters with exact immutable byte ranges.
 
     Only automatic dialogue yields room to the route's existing reserves.
     Required governance, plan/spec and author-declared evidence stay intact.
     """
     source = str(own.get("text") or "")
+    raw = source.encode("utf-8")
+    coverage = {"source_sha256": own.get("sha256"), "source_bytes": len(raw),
+                "inline_bytes": [0, len(raw) - 1] if raw else None, "omitted_prefix": None}
     if not source or len(packet) <= capacity_chars or source not in packet:
-        return packet
+        return packet, coverage
     base = len(packet) - len(source)
     take = max(0, min(len(source), capacity_chars - base))
-    raw = source.encode("utf-8")
     for _ in range(3):
         tail = source[-take:] if take else ""
         start = len(raw) - len(tail.encode("utf-8"))
@@ -147,7 +155,9 @@ def fit_dialogue_text(packet: str, own: dict, capacity_chars: int) -> str:
               if tail else "Dialogue coverage: no inline source bytes fit; ")
     notice += f"exact omitted prefix: {own['locator']}::bytes=0-{start - 1}. "
     notice += "The complete redacted snapshot remains at the recorded source handle.\n"
-    return packet.replace(source, notice + tail, 1)
+    coverage.update(inline_bytes=[start, len(raw) - 1] if tail else None,
+                    omitted_prefix=f"{own['locator']}::bytes=0-{start - 1}")
+    return packet.replace(source, notice + tail, 1), coverage
 
 
 def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
@@ -159,9 +169,10 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
     from ouroboros.tools.plan_packet import plan_user_stable_len
     from ouroboros.review_native_episode import review_native_transcript_bound, native_landing_at
     from ouroboros.reviewer_window import reviewer_window_binding
+    from ouroboros.review_execution import _messages_char_count
 
     own = manifest.get("own_dialogue") or {}
-    messages, tasks, lengths = dict(slot_messages), {}, {}
+    messages, tasks, lengths, coverage = dict(slot_messages), {}, {}, {}
     api = [slot for slot in slots if not slot_retrieves(slot)]
     limits = per_slot_input_token_limits([s.model for s in api], output_reserve=PLAN_REVIEW_MAX_TOKENS,
                                        tokenizer_margin=155_000, slots=api)
@@ -173,20 +184,20 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
             if existing:
                 # Continuation history is already exact; only this turn's new
                 # automatic source can shrink, never its prior paid inputs.
-                total = sum(len(json.dumps(m, ensure_ascii=False)) for m in existing)
-                view = fit_dialogue_text(user_content, own, capacity - total + len(user_content))
+                total = _messages_char_count(existing)
+                view, coverage[sid] = fit_dialogue_text(user_content, own, capacity - total + len(user_content))
                 messages[sid] = [{**m, "content": view} if i == len(existing) - 1 and m.get("role") == "user" else dict(m)
                                  for i, m in enumerate(existing)]
             else:
-                view = fit_dialogue_text(user_content, own, capacity - len(system_prompt))
+                view, coverage[sid] = fit_dialogue_text(user_content, own, capacity - len(system_prompt))
                 messages[sid] = build_plan_review_messages(system_prompt, view, plan_user_stable_len(view))
-            lengths[sid] = len(system_prompt) + len(view) if not existing else total - len(user_content) + len(view)
+            lengths[sid] = _messages_char_count(messages[sid])
         elif not slot_is_session(slot):
             bound = review_native_transcript_bound(slot.model, output_reserve=PLAN_REVIEW_MAX_TOKENS,
                                                    mandatory_read_chars=native_mandatory_chars,
                                                    **reviewer_window_binding(slot))
             governance_read = max(0, native_mandatory_chars - len(session_task))
-            tasks[sid] = fit_dialogue_text(session_task, own, native_landing_at(bound) - governance_read)
+            tasks[sid], coverage[sid] = fit_dialogue_text(session_task, own, native_landing_at(bound) - governance_read)
         elif own.get("file") and own.get("text"):
             instruction = (
                 f"MANDATORY FULL READ: {own['file']} (redacted immutable room dialogue; "
@@ -198,5 +209,13 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                 "File access is available; full-read coverage remains reviewer-declared, not host-attested.\n"
             )
             tasks[sid] = session_task.replace(str(own["text"]), instruction, 1)
+            coverage[sid] = {"source_sha256": own["sha256"], "source_bytes": own["bytes"],
+                             "inline_bytes": None, "full_file": own["file"], "read_coverage": "unobserved"}
+        if slot_retrieves(slot):
+            lengths[sid] = len(tasks.get(sid, session_task))
+        if sid in coverage:
+            coverage[sid]["delivery"] = ("delegated_file" if slot_is_session(slot) else
+                                         "native_retrieving" if slot_retrieves(slot) else "packet")
     return {"slot_messages": messages, "slot_session_tasks": tasks, "slot_prompt_chars": lengths,
+            "dialogue_delivery": coverage,
             "native_mandatory_read_chars": native_mandatory_chars}

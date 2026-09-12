@@ -243,6 +243,31 @@ def _closure_note_view(note: str) -> str:
     return f"{prefix}: {meaning}" if meaning else str(note)
 
 
+def _dialogue_source_view(wave: dict, *, cached: bool) -> list[str]:
+    """Expose recorded context, without re-reading or judging later messages."""
+    own = (wave.get("evidence_manifest_full") or {}).get("own_dialogue") or {}
+    source = wave.get("dialogue_source_ref") or own.get("source_ref") or {}
+    if not own and not source:
+        return []
+    if own.get("gap"):
+        return [f"**Own-room dialogue:** unavailable ({own['gap']})."]
+    coverage = {key: {field: len(value) if field == "generations" else value
+                      for field, value in section.items()} if isinstance(section, dict) else section
+                for key, section in (own.get("coverage") or {}).items()}
+    rows = [f"**Dialogue snapshot:** `{source.get('sha256') or own.get('sha256') or 'unavailable'}` "
+            f"captured {own.get('captured_at') or 'time unavailable'}; {own.get('bytes', source.get('size', '?'))} bytes.",
+            f"Source: read_file(root='artifact_store', path='{source.get('path') or ''}').",
+            "Snapshot coverage: " + json.dumps(coverage, ensure_ascii=False, default=str)]
+    for sid, facts in (wave.get("dialogue_delivery") or {}).items():
+        rows.append(f"- {sid} prepared dialogue coverage (physical/read status below): " + json.dumps(facts, ensure_ascii=False, default=str))
+    if not wave.get("dialogue_delivery"):
+        rows.append("Per-slot dialogue coverage was not recorded in this historical wave.")
+    if cached:
+        rows.append("Cached review covers this recorded snapshot only. Later messages are not claimed reviewed; "
+                    "their implications remain your judgment. A changed plan/evidence request captures current discussion.")
+    return rows
+
+
 def _render_wave(
     wave: dict, *, cap: Optional[int], cycles_paid: int, enforcement: str,
     cached: bool = False, notes: Optional[List[str]] = None, reminder: str = "",
@@ -258,9 +283,10 @@ def _render_wave(
         f"**Plan fingerprint:** `{wave.get('request_fingerprint') or ''}`"
         + ("  (cached exact review — no reviewer was called)" if cached else ""),
         f"**Constitutional:** {'yes' if wave.get('constitutional') else 'no'} — {wave.get('constitutional_note') or ''}",
-        f"**Evidence:** {len(manifest.get('attached') or [])} attached; omissions: "
+        f"**Declared/requested evidence:** {len(manifest.get('attached') or [])} attached; omissions: "
         + (", ".join(f"{o.get('locator')}: {o.get('reason')}" for o in manifest.get("omissions") or []) or "none"),
     ]
+    lines.extend(_dialogue_source_view(wave, cached=cached))
     if wave.get("compact"):
         ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
         artifact_path = str(ref.get("path") or "")
