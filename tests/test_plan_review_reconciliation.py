@@ -468,7 +468,7 @@ def test_missing_substrate_actor_stays_paid_and_custody_lost(harness, monkeypatc
 # ------------------------------------------------------------- collection (P1-3)
 
 
-def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=(), refused=()):
+def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=(), refused=(), pending_waves=()):
     """A substrate that honours the event route: a fresh dispatch released at its
     drain deadline returns ``pending_dispatch`` rows; a reconcile returns the settled
     rows (except ``still_pending`` slots, which are still running, and ``refused``
@@ -482,9 +482,10 @@ def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=
         calls.append({"retry_key": request.retry_key, "slots": [s.slot_id for s in slots],
                       "reconcile_only": request.reconcile_only, "drain": request.drain_deadline})
         fresh = request.drain_deadline is not None and not request.reconcile_only
+        wave_fp = str((request.reconciliation_identity or {}).get("subject_hash") or "")
         actors = []
         for slot in slots:
-            pending = fresh or slot.slot_id in still_pending
+            pending = fresh or slot.slot_id in still_pending or wave_fp in pending_waves
             refuse = not pending and slot.slot_id in refused
             actors.append({
                 "slot_id": slot.slot_id, "model": slot.model,
@@ -801,3 +802,67 @@ def test_a_paid_wave_still_in_flight_leaves_room_for_a_second_panel_under_the_de
     assert state["current_attempt"]["fingerprint"] != fingerprint
     assert calls[-1]["reconcile_only"] is False and calls[-1]["drain"] is not None  # a real second panel
     assert state["cycles_paid"] == 1  # the new barrier wave is unproven until its collection
+
+
+# ------------------------------------------------------------- two waves in flight (fix cycle 3, 3c)
+
+
+def _two_waves_in_flight(harness, monkeypatch, calls):
+    """Cap 2: E1 dispatches W1; while W1 runs, a revised E2 dispatches W2 (room in the cap)."""
+    _install_barrier_substrate(monkeypatch, calls, still_pending={"s1", "s2", "s3"})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    w1 = _state(harness)["waves"][-1]["request_fingerprint"]
+    _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})
+    state = _state(harness)
+    w2 = state["current_attempt"]["fingerprint"]
+    assert w1 != w2 and {w["request_fingerprint"]: w["custody_pending"] for w in state["waves"]} == {w1: True, w2: True}
+    return ctx, w1, w2
+
+
+def test_a_third_envelope_collects_every_in_flight_wave_and_meets_the_cap_when_both_proved_a_dispatch(harness, monkeypatch):
+    """Fix cycle 3, 3c (cap 2): E3 collects W1 AND W2 at $0 (not only the current W2);
+    both prove a dispatch, so E3 meets the cap as CYCLES_EXHAUSTED instead of looping
+    between a hold that names W1 and a STALE disposition on W1."""
+    calls = []
+    ctx, w1, w2 = _two_waves_in_flight(harness, monkeypatch, calls)
+    _install_barrier_substrate(monkeypatch, calls)  # every reviewer of both waves has settled
+    third = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]})
+    assert third.startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED: 2 of 2 paid plan-review cycles are spent")
+    state = _state(harness)
+    by_fp = {w["request_fingerprint"]: w for w in state["waves"]}
+    assert by_fp[w1]["closed"] and by_fp[w1]["paid"] and by_fp[w2]["closed"] and by_fp[w2]["paid"]
+    assert state["cycles_paid"] == 2 and not any(w["custody_pending"] for w in state["waves"])
+    assert calls[-1]["reconcile_only"] is True  # nothing new was sent
+
+
+def test_a_third_envelope_dispatches_when_the_collected_waves_proved_no_dispatch(harness, monkeypatch):
+    calls = []
+    ctx, w1, w2 = _two_waves_in_flight(harness, monkeypatch, calls)
+    _install_barrier_substrate(monkeypatch, calls, refused={"s1", "s2", "s3"})  # both waves: typed $0 refusals
+    third = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]})
+    assert _control(third) == {"outcome": "DEGRADED", "closed": False}
+    state = _state(harness)
+    assert state["cycles_paid"] == 0 and state["current_attempt"]["fingerprint"] not in {w1, w2}
+    assert calls[-1]["reconcile_only"] is False and calls[-1]["drain"] is not None  # a real third panel
+
+
+def test_the_hold_names_only_the_identical_envelope_route_for_a_wave_that_is_not_current(harness, monkeypatch):
+    """W1 keeps running while W2 settles: E3 collects both (W2 closes and pays, W1 stays
+    pending), the cap is full, and the hold names W1, which is not the current wave, so it
+    offers only the identical-envelope route; that route collects W1 once it settles."""
+    calls = []
+    ctx, w1, w2 = _two_waves_in_flight(harness, monkeypatch, calls)
+    _install_barrier_substrate(monkeypatch, calls, pending_waves={w1})
+    held = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]})
+    assert held.startswith("ERROR: PLAN_REVIEW_IN_FLIGHT:") and w1 in held
+    assert "plan_task(review_disposition=" not in held  # no route the model cannot take
+    assert "a review_disposition cannot address it" in held and "resubmit its identical envelope" in held
+    state = _state(harness)
+    by_fp = {w["request_fingerprint"]: w for w in state["waves"]}
+    assert by_fp[w2]["closed"] and by_fp[w2]["paid"] and by_fp[w1]["custody_pending"] is True
+    assert state["cycles_paid"] == 1 and not any(w.get("cycles_exhausted") for w in state["waves"])
+    _install_barrier_substrate(monkeypatch, calls)  # W1's reviewers settle
+    resumed = _call(ctx)  # E1's identical envelope collects W1
+    assert _control(resumed) == {"outcome": "GREEN", "closed": True} and _state(harness)["cycles_paid"] == 2
+    assert _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 7-slide deck"]}).startswith("⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED")

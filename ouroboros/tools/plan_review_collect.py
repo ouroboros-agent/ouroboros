@@ -136,22 +136,26 @@ def collect_wave_sync(ctx: Any, *, state_root: Any, task_id: str, wave: Dict[str
 async def collect_before_supersede(
     ctx: Any, *, state_root: Any, task_id: str, state: Dict[str, Any], fingerprint: str,
 ) -> Dict[str, Any]:
-    """Reconcile-before-supersede (I3): a NEW envelope arriving over an in-flight
-    wave first collects what has settled of that wave at $0 (window 0), then the
-    caller writes its superseding reference. Returns the (re)loaded state; an
-    unreadable old wave is logged and superseded as before."""
-    from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
+    """Reconcile-before-supersede (I3): a NEW envelope first collects what has
+    settled of EVERY custody-pending wave that is not its own at $0 (window 0), not
+    only the current one: a wave superseded earlier under cap room is still money in
+    flight, and only its collection can prove or clear its cycle. The caller then
+    writes its own superseding reference. Returns the (re)loaded state; an unreadable
+    wave is logged and left as it was."""
+    from ouroboros.task_results import load_plan_review_state
 
-    current = current_plan_review_wave(state)
-    if not current or not current.get("custody_pending") or str(current.get("request_fingerprint") or "") == fingerprint:
-        return state
-    try:
-        await collect_open_wave(ctx, state_root=state_root, task_id=task_id, wave=current)
-    except (OSError, ValueError) as exc:
-        log.warning("in-flight plan wave %s could not be collected before supersede: %s",
-                    str(current.get("request_fingerprint") or "")[:8], exc)
-        return state
-    return load_plan_review_state(state_root, task_id)
+    pending = [
+        w for w in state.get("waves") or []
+        if isinstance(w, dict) and w.get("custody_pending")
+        and str(w.get("request_fingerprint") or "") != str(fingerprint or "")
+    ]
+    for wave in pending:
+        try:
+            await collect_open_wave(ctx, state_root=state_root, task_id=task_id, wave=wave)
+        except (OSError, ValueError) as exc:
+            log.warning("in-flight plan wave %s could not be collected before supersede: %s",
+                        str(wave.get("request_fingerprint") or "")[:8], exc)
+    return load_plan_review_state(state_root, task_id) if pending else state
 
 
 def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
@@ -173,17 +177,23 @@ def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
     unproven = sum(1 for w in pending if not w.get("paid"))
     if not pending or int(state.get("cycles_paid") or 0) + unproven < int(cap):
         return ""
-    wave = pending[-1]
+    current_fp = str((state.get("current_attempt") or {}).get("fingerprint") or "")
+    wave = next((w for w in pending if str(w.get("request_fingerprint") or "") == current_fp), pending[-1])
     fp = str(wave.get("request_fingerprint") or "")
     running = sum(1 for a in wave.get("actors") or []
                   if isinstance(a, dict) and a.get("operation_state") in {"pending_dispatch", "in_flight"})
+    outcome = "(a wave that proves no physical dispatch leaves the cap untouched; a paid one spends it)"
+    route = (
+        f"Collect it at $0 with plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}}) "
+        f"{outcome}, or resubmit the identical envelope to wait for it."
+        if fp == current_fp else
+        "It is no longer the current wave, so a review_disposition cannot address it: resubmit its "
+        f"identical envelope (review_fingerprint {fp}) to collect it {outcome}."
+    )
     return (
         f"ERROR: PLAN_REVIEW_IN_FLIGHT: plan-review wave {fp[:8]} still has {running} reviewer slot(s) "
         f"in flight and the cycle cap ({cap}) has no room for another panel until that wave is collected. "
-        f"Collect it at $0 with plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}}) "
-        "(a wave that proves no physical dispatch leaves the cap untouched; a paid one spends it), or "
-        "resubmit the identical envelope to wait for it. No plan attempt was recorded; the in-flight wave "
-        "stays the current wave."
+        f"{route} No plan attempt was recorded; the current wave is unchanged."
     )
 
 
