@@ -9,6 +9,11 @@ import pytest
 from ouroboros import headless, observability, server_maintenance as maintenance
 from ouroboros.task_results import load_task_result, write_task_result
 
+from tests._cancel_intents_shared import _LiveProc
+from tests._cancel_intents_shared import (  # noqa: F401  (autouse fixture applies on import)
+    _reap_spawned_live_procs,
+)
+
 
 @pytest.fixture
 def roots(tmp_path, monkeypatch):
@@ -569,3 +574,78 @@ def test_the_boot_healer_still_settles_a_running_row_nothing_owns(roots):
     stored = load_task_result(root, "ghost-unowned")
     assert stored["status"] == "failed"
     assert stored["reason_code"] == "orphaned_running_after_worker_restart"
+
+
+LIVE_WORKER_CANCEL = "Running task cancelled and worker terminated."
+
+
+def _surviving_worker(root, task_id, *, chat_id=1):
+    """A REAL child process behind the worker surface, recorded the way the pool
+    records the owner of a running task.
+
+    A worker is a session leader, so SIGTERM to the server does not end it: the
+    process outlives the shutdown and is still alive while the next generation
+    restores the queue. That is the state this stands in for.
+    """
+    from supervisor import queue as queue_module, workers
+
+    proc = _LiveProc()
+    workers.WORKERS[0] = SimpleNamespace(wid=0, proc=proc, busy_task_id=task_id, reaping=False)
+    queue_module.RUNNING[task_id] = {"task": {"id": task_id, "chat_id": chat_id}, "worker_id": 0}
+    return proc
+
+
+@pytest.mark.serial
+def test_a_worker_that_survived_the_shutdown_is_killed_before_the_terminal_is_written(
+    roots, monkeypatch,
+):
+    """Custody claims and kills first, and only a confirmed-dead worker gets a
+    terminal row: that is why the boot order (restore, then the reap) is not a
+    correctness condition and why the fence never races a second writer."""
+    import time
+
+    from ouroboros import cancel_intents, task_results
+    from supervisor import queue as queue_module, task_lifecycle, workers
+    root, _ = roots
+
+    task_id = "shutdown-survivor"
+    _interrupted_running_row(root, task_id)
+    proc = _surviving_worker(root, task_id)
+    # Slot hygiene AFTER the durable boundary: a real respawn would start a
+    # second worker process, which this test neither observes nor owns.
+    monkeypatch.setattr(workers, "respawn_worker", lambda wid: None, raising=False)
+
+    writes: list = []
+    real_write = task_results.write_task_result
+
+    def observe(drive_root, written_id, status, **fields):
+        if str(written_id) == task_id:
+            writes.append({"status": str(status), "worker_alive": proc.is_alive(),
+                           "result": str(fields.get("result") or "")})
+        return real_write(drive_root, written_id, status, **fields)
+
+    monkeypatch.setattr(task_results, "write_task_result", observe)
+
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == [task_id]
+    assert proc.is_alive(), "restore mints an intent; it never kills or writes"
+    assert writes == []
+    assert cancel_intents.active_intent(root, task_id)["reason"] == "server_shutdown"
+
+    assert task_lifecycle.sweep_cancel_intents(now=time.time() + 60)[task_id] == "cancelled"
+
+    assert not proc.is_alive(), "custody must confirm the death it reports"
+    terminal = [row for row in writes if row["status"] == "cancelled"]
+    assert len(terminal) == 1, f"exactly one terminal writer, saw {writes}"
+    assert terminal[0]["worker_alive"] is False, "the kill precedes the terminal write"
+    stored = load_task_result(root, task_id)
+    assert stored["status"] == "cancelled"
+    assert cancel_intents.active_intent(root, task_id) is None
+    # The sentence belongs to the lane that ran. A live worker is settled by the
+    # kill path, which states the kill; the server-stopped sentence F1 added is
+    # the MISS lane's (supervisor/cancel_publication.py::_miss_lane_cancel_text),
+    # and that is the lane every real boot fence reaches, because restore runs
+    # before spawn_workers over an empty pool (server.py:658-660). See
+    # test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody.
+    assert stored["result"] == terminal[0]["result"] == LIVE_WORKER_CANCEL
