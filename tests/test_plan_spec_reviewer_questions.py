@@ -57,3 +57,26 @@ def test_a_question_only_wave_is_review_required_and_never_earns_a_paid_delta_cy
     # question wave and a paid panel bought by rejecting the question; pinned here.
     assert plan_spec.blocking_fully_rejected(
         agg["findings"], [{"finding_id": "s1:q1", "decision": "reject", "rationale": "not needed"}]) is False
+
+
+def test_the_output_contract_states_both_need_evidence_forms():
+    """Owner-forwarded audit, finding 3: the rubric invites a question to the author with
+    the spec id in ``breaks`` and no locator, and the validator accepts exactly that, while
+    the Output contract inserted into the same prompt still demanded a locator for every
+    ``need_evidence``. The contract must state the two forms instead of making the reviewer
+    guess between its own halves or invent a file."""
+    from ouroboros.tools.plan_packet import build_plan_review_system_prompt
+
+    prompt = build_plan_review_system_prompt(
+        checklist_section="", constitutional=False, bible_text=None,
+        cycle_index=1, enforcement="blocking")
+    assert "no locator needed" in prompt  # the rubric's question-to-the-author form
+    assert "REQUIRED for need_evidence" not in prompt
+    assert "for a need_evidence DOCUMENT request" in plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT
+    assert ("a need_evidence that asks the AUTHOR a question names the spec id in `breaks` "
+            "and needs no locator") in plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT
+    assert plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT in prompt
+    # The validator already accepts the question form; the contract now says so.
+    normalized, disclosures, _seen = _validate(
+        [{"id": "q1", "class": "need_evidence", "breaks": "goal", "summary": "Which goal matters more?"}])
+    assert normalized[0]["class"] == "need_evidence" and not disclosures
