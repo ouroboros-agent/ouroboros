@@ -430,3 +430,155 @@ def test_an_opted_in_exchange_still_adopts_and_then_clears_the_turn(setup, turn_
     send()
     # The engine answered without an envelope: the turn is stateless, not stale.
     assert gateway.uploads[-1][0]["nativeContinuation"] == TURN and slot.envelope is None
+
+
+# Main execution affinity follows the actual route after a live role override.
+CACHE_REPREPARE_API = "openrouter::openai/fixture-model"
+CACHE_REPREPARE_EXECUTION = "execution-reprepare-proof"
+
+
+@pytest.mark.parametrize(
+    "destination,use_local",
+    [(CACHE_REPREPARE_API, False), ("local-fixture", True), (MODEL, True), (MODEL, False)],
+    ids=["claudexor-to-openrouter", "claudexor-to-local", "claudexor-slug-to-local", "same-claudexor-control"],
+)
+def test_live_owner_wait_reprojects_affinity(main_call, monkeypatch, destination, use_local):
+    ctx, gateway, controller, events, decide, _ = main_call
+    ctx.accumulated_usage["execution_id"] = CACHE_REPREPARE_EXECUTION
+    gateway.results = [_failed("subscription_window_exhausted"), result(route=ROUTE_B)]
+    gateway.dispatch = ["not_started", "response_received"]
+    # The selected API fixture uses an explicit synthetic tariff, never a live pricing lookup.
+    monkeypatch.setattr(ua, "estimate_cost_optional", lambda *a, **kw: 0.0)
+    decisions = []
+    wire = []
+    prepared = []
+    from ouroboros import loop_model_call
+
+    reprepare = loop_model_call._reprepare_waiting_main
+
+    def observed_reprepare(call, values):
+        answer = reprepare(call, values)
+        prepared.append(
+            {
+                "model": answer.kwargs["model"],
+                "use_local": answer.kwargs.get("use_local"),
+                "cache_affinity": answer.kwargs.get("cache_affinity"),
+            }
+        )
+        return answer
+
+    monkeypatch.setattr(loop_model_call, "_reprepare_waiting_main", observed_reprepare)
+
+    def catalog(*args, **kwargs):
+        wait = next(x for x in reversed(list(events.queue)) if x.get("type") == "task_model_wait")
+        response = decide(
+            {
+                "request_id": "switch-once",
+                "decision_id": f"model_wait:task-one:{wait['wait_id']}",
+                "revision": wait["revision"],
+                "action": "switch",
+                "model": destination,
+                "credential_profile_id": "",
+                "use_local": use_local,
+                "persist_role": False,
+            }
+        )
+        assert response.status_code == 202
+        decisions.append(json.loads(response.body))
+        return {}
+
+    monkeypatch.setattr(ctx.llm, "claudexor_model_catalog", catalog)
+    remote = ctx.llm._chat_remote
+
+    def direct(messages, model, tools):
+        target = {"provider": "local" if use_local else "openrouter", "usage_model": model}
+        payload = {"messages": deepcopy(messages), "tools": tools or [], "model": model}
+        request = _attempt_request(target, payload)
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cost": 0,
+            "provider": target["provider"],
+            "resolved_model": model,
+            "cost_final": True,
+        }
+        return ua.execute_physical_attempt(
+            request,
+            lambda: ({"role": "assistant", "content": "switched"}, usage),
+            extractor=lambda value: (value[1], 0, True),
+            before_dispatch=_candidate_before_dispatch(payload, request),
+        )
+
+    def remote_call(target, messages, tools, *args, **kwargs):
+        wire.append(
+            {
+                "provider": target["provider"],
+                "model": target.get("resolved_model"),
+                "cache_affinity": kwargs.get("cache_affinity"),
+            }
+        )
+        if target["provider"] == "claudexor":
+            return remote(target, messages, tools, *args, **kwargs)
+        return direct(messages, destination, tools)
+
+    monkeypatch.setattr(ctx.llm, "_chat_remote", remote_call)
+    monkeypatch.setattr(
+        ctx.llm, "_chat_local", lambda messages, tools, *args, **kwargs: direct(messages, destination, tools)
+    )
+    answer, _, _ = _dispatch(ctx)
+    assert answer and len(decisions) == 1 and prepared
+    facts = {
+        "route": destination,
+        "use_local": use_local,
+        "prepared": prepared,
+        "remote_boundaries": wire,
+        "execution_id": ctx.accumulated_usage["execution_id"],
+        "owner_switch_saved": decisions[0]["saved"],
+        "completed_tool_texts": [x["content"] for x in ctx.messages if x.get("role") == "tool"],
+        "gateway_operations": len(gateway.operations),
+    }
+    assert facts["completed_tool_texts"] == ["verified read A", "completed review B"]
+    assert ctx.accumulated_usage["execution_id"] == CACHE_REPREPARE_EXECUTION
+    assert prepared[-1]["cache_affinity"] == ("" if use_local or destination != MODEL else CACHE_REPREPARE_EXECUTION), (
+        facts
+    )
+    if not use_local:
+        assert wire[-1]["cache_affinity"] == prepared[-1]["cache_affinity"]
+
+
+@pytest.mark.parametrize(
+    "initial_model,initial_local",
+    [(CACHE_REPREPARE_API, False), ("local-fixture", True)],
+    ids=["openrouter-to-claudexor", "local-to-claudexor"],
+)
+def test_recorded_wait_override_reprojects_affinity_before_send(main_call, initial_model, initial_local):
+    ctx, gateway, controller, events, decide, _ = main_call
+    ctx.accumulated_usage["execution_id"] = CACHE_REPREPARE_EXECUTION
+    ctx.active_model = ctx.tools._ctx.active_model = initial_model
+    ctx.active_use_local = initial_local
+    ctx.context_fit_plan = replace(
+        ctx.context_fit_plan,
+        model=initial_model,
+        provider="local" if initial_local else "openrouter",
+        model_route={},
+        route_fp="prior-api-local",
+    )
+    ctx.tools._ctx.context_fit_plan = ctx.context_fit_plan
+    # Existing task-local override is the ordinary model_wait.prepare branch;
+    # API/local have no subscription quota wait of their own.
+    controller.overrides["main"] = {"model": MODEL, "use_local": False, "model_account_override": ""}
+    answer, _, _ = _dispatch(ctx)
+    assert answer and len(gateway.operations) == 1
+    payload = gateway.uploads[0][0]
+    facts = {
+        "initial_model": initial_model,
+        "initial_local": initial_local,
+        "active_model": ctx.active_model,
+        "cache_key": payload["options"].get("cacheKey"),
+        "execution_id": ctx.accumulated_usage["execution_id"],
+        "gateway_operations": len(gateway.operations),
+        "completed_tool_texts": [x["content"] for x in ctx.messages if x.get("role") == "tool"],
+    }
+    assert facts["completed_tool_texts"] == ["verified read A", "completed review B"]
+    assert ctx.accumulated_usage["execution_id"] == CACHE_REPREPARE_EXECUTION
+    assert payload["options"].get("cacheKey") == CACHE_REPREPARE_EXECUTION, facts
