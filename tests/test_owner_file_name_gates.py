@@ -241,11 +241,21 @@ def test_a_comparison_sign_no_longer_makes_an_inspection_a_write(argv):
 @pytest.mark.parametrize("argv", [
     ["tee", "f"],
     ["grep", "-n", "x", "f", ">", "out.txt"],
+    # `>&` is a stdout+stderr redirect, never a comparison: a standalone token
+    # of it stays a write channel in both lanes.
+    ["ls", ">&", "out.txt"],
+    ["ls", ">&1"],
 ])
 def test_a_real_write_channel_is_still_write_shaped(argv):
     from ouroboros.tools.write_shape import non_interpreter_write_shape
 
     assert non_interpreter_write_shape(argv, argv, argv[0]) is True
+
+
+def test_a_standalone_stdout_stderr_redirect_token_is_write_shaped_as_a_string():
+    from ouroboros.tools.write_shape import shell_has_write_indicator
+
+    assert shell_has_write_indicator("cmd >& out.txt") is True
 
 
 @pytest.mark.parametrize("argv", [
@@ -255,7 +265,7 @@ def test_a_real_write_channel_is_still_write_shaped(argv):
 def test_disclosed_residual_a_quoted_operand_with_a_redirect_shape_stays_write_shaped(argv):
     """shlex strips the quotes before any guard sees the line, so the redirect
     grammar still matches inside the operand. Only the comparison forms (>=,
-    ->, =>, >&) were closed. Asserted as EXPECTED behaviour so the remaining
+    -> and =>) were closed. Asserted as EXPECTED behaviour so the remaining
     gap is visible rather than assumed fixed."""
     from ouroboros.tools.write_shape import non_interpreter_write_shape
 
