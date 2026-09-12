@@ -191,17 +191,16 @@ def test_applied_options_without_mismatch_emit_no_owner_line(honored):
     assert progress == []
 
 
-def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path, monkeypatch):
-    progress = []
-    applied_values = iter(("medium", "low"))
+def _mismatch_round_context(tmp_path, monkeypatch, *, emit_progress, applied_values):
+    """A Main round whose subscription answer reports a lowered effort."""
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.emit_progress_fn = lambda text, *, incident=None: progress.append((text, incident))
-    ctx = SimpleNamespace(
+    ctx = loop._RoundModelCallContext(
         llm=None, messages=[], tools=registry, context_fit_plan=None,
         active_model="claudexor::codex=model", tool_schemas=[], active_effort="high",
         max_retries=1, drive_logs=tmp_path / "logs", task_id="task-7", round_idx=1,
         event_queue=None, accumulated_usage={}, task_type="task", active_use_local=False,
-        active_context_mode="max", model_role="main",
+        active_context_mode="max", drive_root=tmp_path, model_role="main",
+        emit_progress=emit_progress,
     )
 
     def call(_llm, _messages, _model, _tools, _effort, _retries, _logs, _tid,
@@ -216,6 +215,15 @@ def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path,
 
     monkeypatch.setattr(loop, "call_llm_with_retry", call)
     monkeypatch.setattr(loop, "_server_web_allowed_by_task", lambda _ctx: False)
+    return ctx
+
+
+def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path, monkeypatch):
+    progress = []
+    ctx = _mismatch_round_context(
+        tmp_path, monkeypatch, applied_values=iter(("medium", "low")),
+        emit_progress=lambda text, *, incident=None: progress.append((text, incident)),
+    )
     loop._dispatch_round_model(ctx, None, attempt_cap=None)
     loop._dispatch_round_model(ctx, None, attempt_cap=None)
 
@@ -227,6 +235,18 @@ def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path,
         "task_incident": "model_effort_mismatch",
         "toast_once": "task-7:model_effort_mismatch:codex=model",
     }
+
+
+def test_mismatch_round_never_calls_the_one_argument_tool_context_emitter(tmp_path, monkeypatch):
+    """The frozen ToolContext seam takes one argument and stays out of this notice."""
+    seen = []
+    ctx = _mismatch_round_context(tmp_path, monkeypatch, emit_progress=None,
+                                  applied_values=iter(("medium",)))
+    ctx.tools._ctx.emit_progress_fn = seen.append  # rejects incident=, exactly like the ABI default
+
+    loop._dispatch_round_model(ctx, None, attempt_cap=None)
+
+    assert seen == [] and ctx.accumulated_usage["_options"]["options_honored"] == "mismatch"
 
 
 def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, monkeypatch):

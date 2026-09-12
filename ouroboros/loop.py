@@ -544,7 +544,7 @@ def run_llm_loop(
                         task_type=task_type,
                         active_use_local=active_use_local,
                         active_context_mode=active_context_mode,
-                        drive_root=drive_root,
+                        drive_root=drive_root, emit_progress=emit_progress,
                     )
                 try:
                     msg, cost, active_context_mode = _call_round_model(model_call)

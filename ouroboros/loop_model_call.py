@@ -180,6 +180,7 @@ def _run_cross_model_fallback_chain(
                 drive_root=pathlib.Path(drive_logs).parent,
                 attempt_cap=attempt_cap,
                 model_role=fallback_role,
+                emit_progress=emit_progress,
             )
         msg, _cost, candidate_mode = _loop()._call_round_model(candidate_call)
         if msg is not None:
@@ -354,6 +355,10 @@ class _RoundModelCallContext:
     drive_root: Optional[pathlib.Path]
     attempt_cap: Optional[int] = None
     model_role: str = ""
+    # The loop-level owner notifier (run_llm_loop's own parameter), the one
+    # callable documented to accept incident=; the ToolContext ABI's
+    # emit_progress_fn takes a single argument and must not carry the pair.
+    emit_progress: Optional[Callable[..., None]] = None
 
 
 def _context_fit_round_id(ctx: _RoundModelCallContext) -> str:
@@ -486,8 +491,7 @@ def _dispatch_round_model(
             use_local=ctx.active_use_local, preferred_mode=ctx.active_context_mode,
             tool_schemas=ctx.tool_schemas, model_role=role, model_route=observed,
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
-    emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id,
-                               emit_progress=getattr(getattr(ctx.tools, "_ctx", None), "emit_progress_fn", None))
+    emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id, emit_progress=ctx.emit_progress)
     call = ctx.accumulated_usage.get("_last_llm_call_meta")
     execution_id = ctx.accumulated_usage.get("execution_id")
     if (result[0] is not None and isinstance(call, dict) and call is not previous_call

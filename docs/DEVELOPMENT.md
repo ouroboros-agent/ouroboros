@@ -2426,7 +2426,9 @@ by "Provider Independence" above. Call-site imperatives:
   (`lambda text, *, incident=None: ...`). A cross-model lane switch is the
   second owner note carrying this pair; it names both models, the selected
   account when that route has accounts, and the typed failure reason when the
-  round record has one.
+  round record has one. The applied-option mismatch line is the third, and it
+  rides the same loop-level callable: the frozen `ToolContext.emit_progress_fn`
+  takes one argument and never carries the pair.
 - Timeout contract classes differ; keep the axes separate. A transport
   timeout only bounds a dead socket
   (`OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC`) — it is not a reasoning cutoff
