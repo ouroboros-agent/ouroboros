@@ -661,7 +661,8 @@ def test_a_cancelled_salvage_keeps_bytes_or_a_pointer_in_the_main_row(tmp_path, 
     ) is True
     text = queued[0]["text"]
     assert f"{SALVAGE_EXCERPT_LABEL}: Rewrote the atlas builder." in text
-    assert text.endswith("…")
+    # Bytes AND the pointer: this writer has no other way back to the full copy.
+    assert text.endswith("… Open the Project for details.")
 
     # A root whose own lineage chat IS Main: there the receipt is a real second
     # copy, so the label stands, but never without the invitation.

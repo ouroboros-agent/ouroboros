@@ -1078,10 +1078,11 @@ def enqueue_project_completion_summary(
         excerpt = _completion_excerpt(result, chat_id=1)
         verdict = _completion_verdict(result, task_done_event)
         lead = f"{verdict} " if verdict else ""
-        # This writer's only pointer is the invitation below, so a label must
-        # never replace it: a Main row saying bytes were preserved and offering
-        # no way to reach them is worse than the plain invitation it displaced.
-        if excerpt == f"{SALVAGE_EXCERPT_LABEL}.":
+        # This writer's only pointer is the invitation below, so a salvage may
+        # never displace it: preserved bytes named with no way to reach them are
+        # worse than the plain invitation. Both salvage forms keep it, the
+        # labelled excerpt and the label that stands alone.
+        if excerpt.startswith(SALVAGE_EXCERPT_LABEL):
             excerpt = f"{excerpt} Open the Project for details."
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,

@@ -194,12 +194,14 @@ def test_task_result_persists_origin_and_full_host_salvage(tmp_path):
     assert stored["terminal_salvage_path"] == str(path)
 
 
-def test_project_completion_host_salvage_labels_its_bytes(tmp_path, monkeypatch):
+def test_project_completion_host_salvage_labels_its_bytes_and_points(tmp_path, monkeypatch):
     """The Main row over a salvaged task says what survived, in bounded form.
 
     It used to fall back to the neutral pointer copy, which read as "nothing
     here" over work that had actually been applied. The untruncated bytes still
-    never enter the row: they stay with ``get_task_result``.
+    never enter the row: they stay with ``get_task_result``, and the pointer to
+    them rides beside the excerpt rather than being displaced by it, which is
+    the owner's answer (labelled excerpt PLUS pointer) in both forms.
     """
     from ouroboros.projects_registry import bind_task_to_project, create_project
     from ouroboros.project_dialogue import (
@@ -233,9 +235,11 @@ def test_project_completion_host_salvage_labels_its_bytes(tmp_path, monkeypatch)
     assert len(queued) == 1
     text = queued[0]["text"]
     assert raw not in text
-    assert "Open the Project for details." not in text
     assert f"Reason: provider_unavailable. {SALVAGE_EXCERPT_LABEL}: RAW PATCH" in text
+    # The excerpt form keeps the pointer too: this writer has no other one.
+    assert text.endswith(" Open the Project for details.")
     labelled = text.split(f"{SALVAGE_EXCERPT_LABEL}: ", 1)[1]
+    labelled = labelled[: -len(" Open the Project for details.")]
     assert len(labelled) <= 240 and labelled.endswith("…")
 
 
