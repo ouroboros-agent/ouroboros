@@ -665,22 +665,30 @@ def validate_findings(
             disclosures.append(f"blocking_without_valid_breaks:{fid}")
             klass = "note"
         if klass == "need_evidence":
-            if not locator:
+            # A question to the AUTHOR names the spec id it is about in `breaks` and needs
+            # no locator (the author answers in the disposition); a request for a document
+            # names a locator the host attaches. Neither: optional advice, disclosed.
+            asks_author = breaks in ids
+            if not locator and not asks_author:
                 disclosures.append(f"need_evidence_without_locator:{fid}")
                 klass = "note"
             elif len(locator) > MAX_ITEM_CHARS:
                 # W3 host attachment is bounded like the agent's own evidence items: an over-long
-                # locator is never remembered (state) nor attached — demoted, disclosed.
+                # locator is never remembered (state) nor attached — demoted, disclosed; a
+                # question to the author keeps its class and drops only the locator.
                 disclosures.append(f"need_evidence_locator_too_long:{fid}")
-                klass = "note"
-            elif locator not in seen and len(seen) >= MAX_NEED_EVIDENCE_MEMORY:
+                if asks_author:
+                    locator = ""
+                else:
+                    klass = "note"
+            elif locator and locator not in seen and len(seen) >= MAX_NEED_EVIDENCE_MEMORY:
                 disclosures.append(f"need_evidence_memory_full:{fid}")
-            elif locator in seen:
+            elif locator and locator in seen:
                 # I-03: request deduplication is not a reviewer withdrawing its
                 # need. Keep the typed request for a free disposition; leaving
                 # seen unchanged preserves the attachment and paid-cycle bounds.
                 disclosures.append(f"need_evidence_repeat:{locator}")
-            else:
+            elif locator:
                 seen.add(locator)
         normalized.append({
             "id": fid, "class": klass, "breaks": breaks,

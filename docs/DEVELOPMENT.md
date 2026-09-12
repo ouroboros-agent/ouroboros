@@ -843,7 +843,12 @@ non-goals, the load-bearing decisions with their rejected alternatives, and
 what is consciously deferred. Plan review publishes exactly `GREEN`,
 `REVIEW_REQUIRED`, `REVISE_PLAN`, or the honest `DEGRADED` (no quorum,
 or a paid actor still in flight);
-findings are inputs the main agent may accept, reject, or defer. Optional
+findings are inputs the main agent may accept, reject, or defer. A
+`need_evidence` finding names a locator the host attaches on the next cycle
+or, as a question to the author, the spec id it is about in `breaks`; the
+author answers it in the disposition (accept), rejects it, or defers it
+openly, and its answer reaches the reviewers only on the next paid cycle.
+Optional
 `note` findings, including useful premise criticism and simpler alternatives,
 remain readable but need no adoption or disposition; a note-only wave closes
 immediately under both enforcement modes. The same `review_disposition` call may

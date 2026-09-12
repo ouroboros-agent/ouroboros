@@ -44,7 +44,10 @@ _RUBRIC = (
     "4. Deferrals — is an expensive-to-reverse decision hiding inside `deferred`?",
     "5. Evidence sufficiency — is the attached evidence enough to judge 1–4? If not, ask for "
     "exactly what is missing with a `need_evidence` finding naming its locator (the host attaches "
-    "what its evidence policy allows on the next cycle and names every absence); do not invent a gap.",
+    "what its evidence policy allows on the next cycle and names every absence). When what is "
+    "missing is the AUTHOR's judgment rather than a document, ask the author: a `need_evidence` "
+    "finding whose `breaks` names the spec id the question is about, no locator needed; Ouroboros "
+    "answers it in its disposition or escalates it. Do not invent a gap.",
 )
 
 _BLOCKING_RULE = (
@@ -108,7 +111,11 @@ def build_plan_review_system_prompt(
         "and suggest a simpler or more general alternative when useful. Express this advice as "
         "optional `note` findings; Ouroboros decides whether to adopt it, without a required "
         "disposition. A preference, premise challenge, or repeated suggestion alone is never "
-        "a blocker. Independently demonstrated failures still follow the blocking rule below.\n\n"
+        "a blocker. Independently demonstrated failures still follow the blocking rule below. "
+        "A question the plan leaves open is returned to its author, not filed as advice: "
+        "`need_evidence` with the spec id in `breaks` asks Ouroboros, who authors the plan and is "
+        "the addressee of everything this review produces, to answer, escalate, or defer it openly "
+        "in its disposition.\n\n"
         "## Rubric (domain-free)\n\n" + "\n".join(_RUBRIC) + "\n",
     ]
     if constitutional:
@@ -216,7 +223,7 @@ def _render_prior_cycles(prior_cycles: list[dict], dispositions: list[dict], spe
         cycle = cycle if isinstance(cycle, Mapping) else {}
         lines.append(
             f"### Cycle {cycle.get('cycle_index', '?')} — aggregate {cycle.get('aggregate', '?')}: "
-            "findings (blocking first; summaries bounded)\n\n"
+            f"findings (blocking first; summaries bounded to {PACKET_PRIOR_FINDING_SUMMARY_CHARS} chars)\n\n"
             + _json_block(_prior_findings_projection(cycle), PACKET_PRIOR_CYCLES_CHARS) + "\n"
         )
     lines.append("### Agent dispositions\n\n" + _json_block(dispositions or [], PACKET_PRIOR_CYCLES_CHARS) + "\n")

@@ -863,3 +863,42 @@ def test_task_objective_carries_the_contract_context_redacted(harness):
     text = _task_objective(ctx)
     assert text == "Deliver the thing\n\nContract context: Owner said: token ***REDACTED***; audience is the board"
     assert "## TASK OBJECTIVE\n\n" + text + "\n" in _dry_run_packet(ctx)["user_content"]
+
+
+# ------------------------------------------------------------- the reviewer's question to the author (P1-7)
+
+
+def test_reviewer_question_holds_the_wave_until_a_free_disposition_and_its_answer_rides_the_next_cycle(harness):
+    """Owner batch 2, Q4=A: a reviewer returns an open question to the author as
+    `need_evidence` with the spec id in `breaks` (no locator); the wave holds until the
+    author's $0 disposition (accept = answered, reject, defer = deferred openly); the
+    answer reaches the reviewers only on the next PAID cycle, disclosed in the next step."""
+    question = json.dumps([_finding("q1", "need_evidence", breaks="claim_1", summary="Why exactly 5 slides?")])
+    sub = harness.install({"s1": question, "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    assert _control(first) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    wave = _state(harness)["waves"][-1]
+    [finding] = wave["findings"]
+    assert finding["class"] == "need_evidence" and finding["breaks"] == "claim_1" and finding["locator"] == ""
+    assert _state(harness).get("need_evidence_seen", []) == []  # a question is not a locator the host attaches
+    assert "a question addressed to you by spec id" in first and "defer = deferred openly" in first
+    answered = pr._handle_plan_task(ctx, review_disposition={
+        "review_fingerprint": wave["request_fingerprint"],
+        "items": [{"finding_id": "s1:q1", "decision": "accept", "rationale": "The board asked for five."}]})
+    assert _control(answered) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert len(sub.calls) == 1 and _state(harness)["cycles_paid"] == 1  # $0: no reviewer call, no cycle
+    _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})  # the next PAID cycle carries the answer
+    assert len(sub.calls) == 2
+    user2 = _user_text(sub.calls[1]["request"].messages[1]["content"])
+    assert "The board asked for five." in user2 and "s1:q1" in user2
+    assert "summaries bounded to 400 chars" in user2  # the carry-forward cut is named where it applies
+
+
+def test_escalate_is_available_wherever_planning_runs():
+    from ouroboros.tool_capabilities import (
+        ACTING_SUBAGENT_TOOL_NAMES, CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
+    )
+
+    assert all("escalate" in names for names in
+               (CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES, ACTING_SUBAGENT_TOOL_NAMES))

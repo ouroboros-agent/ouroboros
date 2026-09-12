@@ -773,8 +773,8 @@ Such advice is an optional `note`; Ouroboros decides whether to adopt it without
 disposition. A premise challenge, preference or repetition alone does not earn blocking
 authority. Independently demonstrated failures still follow the height rule below. No
 compulsory competing plan or finding quota: those create endless rewrite/review cycles.
-The agent authors the plan (P0); reviewers contribute criticism; the host aggregates and
-enforces the actual blocking contract.
+Ouroboros authors the plan and is the addressee of everything this review produces (P0);
+reviewers contribute criticism; the host aggregates and enforces the actual blocking contract.
 
 ### The spec you are reviewing
 
@@ -809,7 +809,9 @@ structurally unverifiable, that is blocking against the claim, not a `need_evide
 - `blocking` — requires `breaks: <spec id>`. Without a valid id the host demotes it to a note and
   discloses the demotion.
 - `note` — optional advice retained in the review; no disposition is required to proceed.
-- `need_evidence` — a typed request `{locator, why}`. It never blocks by itself and the same
+- `need_evidence` — a typed request `{locator, why}` for a document the host can attach, or
+  `{breaks: <spec id>, why}` for a question only the author can answer (Ouroboros answers it in
+  its disposition, escalates it, or defers it openly). It never blocks by itself and the same
   locator is remembered only once per task; repeating a valid request or filling the bounded
   request memory does not turn it into optional advice. It retains its free disposition,
   without another remembered locator or paid call. The host attaches a remembered locator on the next cycle
