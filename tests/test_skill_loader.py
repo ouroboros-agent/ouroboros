@@ -821,7 +821,9 @@ def test_sensitive_files_fail_closed_on_load(tmp_path):
     that the reviewer never saw. The loader fails closed via
     ``SkillPayloadUnreadable``; the user must rename / relocate the
     file out of the skill directory. The message names only what still
-    blocks: a certificate loads since PS-6, so it must not appear there."""
+    blocks: a certificate loads since PS-6, so it must not appear there, and
+    it names both blocking rules, since `prod.env` blocks on the `.env` tail
+    rather than on the exact-name list."""
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
     repo_root = tmp_path / "skills"
@@ -841,8 +843,25 @@ def test_sensitive_files_fail_closed_on_load(tmp_path):
     assert loaded.load_error
     assert "credential filename" in loaded.load_error.lower()
     assert "credentials.json" in loaded.load_error and "id_rsa" in loaded.load_error
+    assert ".env-tail filename" in loaded.load_error
+    assert "prod.env" in loaded.load_error
     assert ".pem" not in loaded.load_error
     assert loaded.available_for_execution is False
+
+    # `prod.env` is not in the exact-name list: it blocks through the `.env`
+    # tail, so a message that calls the rule an exact filename is wrong for it.
+    tail_dir = _write_skill(
+        repo_root,
+        "tailenv",
+        manifest=_valid_script_manifest("tailenv"),
+        scripts={"main.py": "print('ok')\n"},
+    )
+    (tail_dir / "prod.env").write_text("SECRET_KEY=leak\n", encoding="utf-8")
+    tail_loaded = load_skill(tail_dir, drive_root)
+    assert tail_loaded is not None
+    assert "prod.env" in tail_loaded.load_error
+    assert ".env-tail filename" in tail_loaded.load_error
+    assert tail_loaded.available_for_execution is False
 
 
 def test_certificate_and_key_suffixed_payload_loads_and_is_reviewable(tmp_path):
