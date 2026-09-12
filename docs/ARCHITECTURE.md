@@ -1129,7 +1129,7 @@ host target must still lie inside `active_workspace`. Other roots and unmapped
 absolute paths retain their confinement. Query scope and read/search labels use
 the physical binding. Restricted repository views mask known token formats and
 PEM private keys while preserving ordinary long identifiers, hashes and source
-bodies; the opaque-run fallback remains enabled for owner-home output. Runtime
+bodies; owner-home output no longer masks opaque runs either. Runtime
 secret/control entries keep their runtime-data predicate when that physical
 data root lies inside the project, across read, list, search and code queries.
 
