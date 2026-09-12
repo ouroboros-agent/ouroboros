@@ -314,7 +314,8 @@ def test_real_supervisor_orders_custody_recovery_before_prune(roots, monkeypatch
     order = []
     monkeypatch.setattr(server, "_migrate_startup_cancel_latches", lambda root: order.append("migrate"))
     monkeypatch.setattr(server, "_startup_worker_pids", lambda root: order.append("capture-pids") or {777})
-    monkeypatch.setattr(queue, "restore_pending_from_snapshot", lambda: order.append("restore") or 0)
+    monkeypatch.setattr(queue, "restore_pending_from_snapshot",
+                        lambda **_kw: order.append("restore") or 0)
     monkeypatch.setattr(workers, "kill_workers", lambda **k: order.append("kill"))
     monkeypatch.setattr(workers, "spawn_workers", lambda n: order.append("spawn"))
     monkeypatch.setattr(server, "_startup_custody_sweep", lambda: order.append("custody"))

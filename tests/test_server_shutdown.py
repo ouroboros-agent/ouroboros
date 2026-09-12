@@ -296,7 +296,7 @@ def test_supervisor_startup_restores_queue_before_worker_reset():
     import server
 
     source = inspect.getsource(server._run_supervisor)
-    restore = source.index("restored_pending = restore_pending_from_snapshot()")
+    restore = source.index("restored_pending = restore_pending_from_snapshot(")
     reset = source.index("kill_workers(preserve_pending=True)")
     spawn = source.index("spawn_workers(max_workers)")
     assert restore < reset < spawn
@@ -580,6 +580,16 @@ class _Recorder:
         self.stop = _FakeStopEvent()
         self.restart = None
         self.ready = None
+        # Snapshot restore reports revived PENDING rows in its return value and
+        # the RUNNING rows it fenced for cancellation custody through the
+        # keyword-only out-parameter; a test can script either.
+        self.restored_pending = 0
+        self.fenced_running: list = []
+
+    def restore(self, *_args, terminalized=None, **_kwargs):
+        if terminalized is not None:
+            terminalized.extend(self.fenced_running)
+        return self.restored_pending
 
 
 def _supervisor_harness(monkeypatch, tmp_path, steps):
@@ -669,7 +679,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
                  "persist_queue_snapshot", "cancel_task_by_id", "queue_deep_self_review_task",
                  "sort_pending", "check_scheduled_tasks"):
         monkeypatch.setattr(queue_pkg, name, noop)
-    monkeypatch.setattr(queue_pkg, "restore_pending_from_snapshot", lambda: 0)
+    monkeypatch.setattr(queue_pkg, "restore_pending_from_snapshot", rec.restore)
     for name in ("init", "spawn_workers", "kill_workers", "assign_tasks", "ensure_workers_healthy",
                  "auto_resume_after_restart"):
         monkeypatch.setattr(workers_mod, name, noop)
@@ -685,6 +695,28 @@ def _run(rec, server):
     server._run_supervisor({})
     assert rec.ready.is_set() or server._supervisor_error  # init reached the loop
     return rec
+
+
+@pytest.mark.parametrize("restored, fenced, expected", [
+    (0, ["a"], "♻️ Cancelling 1 task that was still running when the server stopped."),
+    (2, ["a", "b"],
+     "♻️ Restored pending queue from snapshot: 2 tasks. "
+     "Cancelling 2 tasks that were still running when the server stopped."),
+])
+def test_boot_notice_states_the_restart_cancellations_as_an_intent(
+        monkeypatch, tmp_path, restored, fenced, expected):
+    """A window closed on live work: the boot line names how many tasks the
+    restart interrupted and says they are BEING cancelled. It cannot claim they
+    ENDED: restore only minted the durable intent, and cancellation custody
+    writes each terminal result a watchdog window later."""
+    import server
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["stop"])
+    rec.restored_pending = restored
+    rec.fenced_running = list(fenced)
+    _run(rec, server)
+
+    assert [text for _chat, text in rec.alerts if text.startswith("♻️")] == [expected]
 
 
 def test_exception_while_stopping_exits_quietly_without_counting_a_crash(monkeypatch, tmp_path, caplog):

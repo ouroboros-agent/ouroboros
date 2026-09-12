@@ -648,7 +648,8 @@ def _run_supervisor(settings: dict) -> None:
 
         _migrate_startup_cancel_latches(DATA_DIR)
         prior_worker_pids = _startup_worker_pids(DATA_DIR)
-        restored_pending = restore_pending_from_snapshot()
+        interrupted_running: list = []
+        restored_pending = restore_pending_from_snapshot(terminalized=interrupted_running)
         kill_workers(preserve_pending=True)
         spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
@@ -670,11 +671,23 @@ def _run_supervisor(settings: dict) -> None:
 
         _prune_delegated_snapshots()
 
-        if restored_pending > 0:
+        if restored_pending > 0 or interrupted_running:
             st_boot = load_state()
             if st_boot.get("owner_chat_id"):
-                send_with_budget(int(st_boot["owner_chat_id"]),
-                    f"♻️ Restored pending queue from snapshot: {restored_pending} tasks.")
+                # The second clause states an INTENT, not an outcome: restore only
+                # fences an interrupted task with a durable cancel intent, and
+                # cancellation custody writes its terminal result a watchdog
+                # window later (task_lifecycle._INTENT_WATCHDOG_MIN_AGE_SEC).
+                notice = ["♻️"]
+                if restored_pending > 0:
+                    notice.append(f"Restored pending queue from snapshot: {restored_pending} tasks.")
+                if interrupted_running:
+                    count = len(interrupted_running)
+                    notice.append(
+                        f"Cancelling {count} task{'' if count == 1 else 's'} that "
+                        f"{'was' if count == 1 else 'were'} still running when the server stopped."
+                    )
+                send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice))
         _startup_retired_settings_notice(settings)
 
         auto_resume_after_restart()

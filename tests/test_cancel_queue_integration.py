@@ -829,3 +829,135 @@ def test_steer_refusal_removes_the_just_staged_attachments(tmp_path, monkeypatch
     from ouroboros.owner_mailbox import drain_owner_messages
 
     assert drain_owner_messages(tmp_path, "steer-stage") == []
+
+
+def _restart_snapshot(qenv, monkeypatch, *, running: list, pending: list = (), ts: str = ""):
+    """Write a queue snapshot the way a shutdown left it and point restore at it."""
+    from ouroboros.utils import utc_now_iso
+
+    state_dir = qenv.drive / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "queue_snapshot.json"
+    path.write_text(json.dumps({
+        "ts": ts or utc_now_iso(),
+        "pending": [{"task": task} for task in pending],
+        "running": running,
+        "acceptance_fences": [],
+        "budget_root_fences": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(qenv.q, "QUEUE_SNAPSHOT_PATH", path, raising=False)
+    return path
+
+
+def test_snapshot_restore_fences_a_surviving_running_row_for_custody(qenv, monkeypatch):
+    """Q11=A: work the window killed ends as Cancelled — through the ONE settle
+    owner. Restore only mints the durable intent; the terminal write, the kill and
+    the reconcile stay with cancellation custody a watchdog window later."""
+    import time
+
+    from supervisor import task_lifecycle
+
+    write_task_result(qenv.drive, "interrupted-root", STATUS_RUNNING, chat_id=1)
+    _restart_snapshot(qenv, monkeypatch, running=[
+        {"id": "interrupted-root", "task": {"id": "interrupted-root", "chat_id": 1}},
+    ])
+
+    fenced: list = []
+    assert qenv.q.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == ["interrupted-root"]
+
+    # Restore is NOT a terminal writer: the row is untouched, the intent is durable.
+    assert load_task_result(qenv.drive, "interrupted-root")["status"] == STATUS_RUNNING
+    intent = ci.active_intent(qenv.drive, "interrupted-root")
+    assert intent and intent["reason"] == "server_shutdown"
+    assert intent["source"] == "snapshot_restore"
+    rows = [json.loads(line) for line in
+            (qenv.drive / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()]
+    restore_rows = [row for row in rows if row["type"] == "queue_restored_from_snapshot"]
+    assert restore_rows[-1]["terminalized_running"] == ["interrupted-root"]
+    assert restore_rows[-1]["restored_pending"] == 0
+
+    # A second boot before custody ran re-reads the same row and mints nothing new.
+    second: list = []
+    assert qenv.q.restore_pending_from_snapshot(terminalized=second) == 0
+    assert second == []
+    assert ci.active_intent(qenv.drive, "interrupted-root")["request_id"] == intent["request_id"]
+
+    # The existing watchdog half terminalizes it; the text is custody's own.
+    outcomes = task_lifecycle.sweep_cancel_intents(now=time.time() + 60)
+    assert outcomes["interrupted-root"] == "cancelled"
+    settled = load_task_result(qenv.drive, "interrupted-root")
+    assert settled["status"] == STATUS_CANCELLED
+    assert settled["result"].startswith("Task cancelled")
+    assert ci.active_intent(qenv.drive, "interrupted-root") is None
+
+
+def test_snapshot_restore_leaves_owned_and_terminal_running_rows_alone(qenv, monkeypatch):
+    """The fence is for rows nothing else owns: an active intent belongs to
+    cancellation custody, and a task that finished stays finished."""
+    write_task_result(qenv.drive, "already-owned", STATUS_RUNNING, chat_id=1)
+    owned = ci.request_cancel(qenv.drive, "already-owned", reason="owner pressed Stop")
+    write_task_result(qenv.drive, "finished", STATUS_COMPLETED, chat_id=1, result="done")
+    write_task_result(qenv.drive, "revived", "scheduled", chat_id=1)
+    _restart_snapshot(
+        qenv, monkeypatch,
+        running=[
+            {"id": "already-owned", "task": {"id": "already-owned", "chat_id": 1}},
+            {"id": "finished", "task": {"id": "finished", "chat_id": 1}},
+            {"id": "", "task": {}},
+        ],
+        pending=[{"id": "revived", "chat_id": 1, "type": "chat"}],
+    )
+
+    fenced: list = []
+    assert qenv.q.restore_pending_from_snapshot(terminalized=fenced) == 1
+    assert fenced == []
+    assert [task["id"] for task in qenv.q.PENDING] == ["revived"]
+    assert ci.active_intent(qenv.drive, "already-owned")["request_id"] == owned["request_id"]
+    assert ci.active_intent(qenv.drive, "already-owned")["reason"] == "owner pressed Stop"
+    assert ci.active_intent(qenv.drive, "finished") is None
+    assert load_task_result(qenv.drive, "finished")["status"] == STATUS_COMPLETED
+
+
+def test_snapshot_restore_fence_expires_the_open_quiz_and_closes_the_owner_wait(qenv, monkeypatch):
+    """A restart that kills a task with an open question reuses the EXISTING
+    expiry state: no new 'lost to a restart' quiz state is invented."""
+    import time
+
+    from ouroboros import owner_quiz
+    from supervisor import queue_transitions, task_lifecycle, workers
+
+    events: list = []
+    monkeypatch.setattr(workers, "get_event_q",
+                        lambda: types.SimpleNamespace(put=events.append), raising=False)
+    task_id = "asked-and-interrupted"
+    write_task_result(qenv.drive, task_id, STATUS_RUNNING, chat_id=1)
+    owner_quiz.record_asked(
+        qenv.drive, task_id, quiz_id="q1", question="Which folder?",
+        options=["A", "B"], wait_for_answer=True,
+    )
+    write_task_result(
+        qenv.drive, task_id, STATUS_RUNNING,
+        owner_wait={"state": "waiting", "quiz_id": "q1"},
+    )
+    _restart_snapshot(qenv, monkeypatch, running=[
+        {"id": task_id, "owner_wait": {"state": "waiting"}, "task": {"id": task_id, "chat_id": 1}},
+    ])
+
+    fenced: list = []
+    assert qenv.q.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == [task_id]
+    assert owner_quiz.quiz_states(qenv.drive, task_id)["q1"]["state"] == "open"
+
+    assert task_lifecycle.sweep_cancel_intents(now=time.time() + 60)[task_id] == "cancelled"
+
+    assert load_task_result(qenv.drive, task_id)["status"] == STATUS_CANCELLED
+    # Custody publishes the terminal event; the supervisor's task-done seam
+    # (events_task_done -> reconcile_terminal_task_projections) is what closes
+    # the per-task owner-control projections, exactly as for any other terminal.
+    done = [event for event in events if event["type"] == "task_done"]
+    assert len(done) == 1 and done[0]["status"] == STATUS_CANCELLED
+    queue_transitions.reconcile_terminal_task_projections(qenv.drive, task_id)
+
+    assert owner_quiz.quiz_states(qenv.drive, task_id)["q1"]["state"] == "expired_terminal"
+    assert load_task_result(qenv.drive, task_id)["owner_wait"]["state"] == "expired_terminal"
