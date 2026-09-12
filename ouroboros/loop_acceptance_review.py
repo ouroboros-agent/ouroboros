@@ -712,17 +712,17 @@ def _apply_task_acceptance_result(
             if isinstance(run, dict) and run.get("authority") == "host_root":
                 run["feedback_delivered"] = True
                 break
-        # The aggregate word is not an explanation on its own: printing DEGRADED
-        # alone read as "no valid quorum" while a capsule was in fact fed back
-        # for one more bounded pass. Name the pass being started and the recorded
-        # causes; where the wave recorded none, the verdict is still the most the
-        # row can honestly say, and dropping it too left the row saying nothing.
+        # The aggregate word is not an explanation: printing DEGRADED alone read
+        # as "no valid quorum" while a capsule was in fact fed back for one more
+        # bounded pass. Name the pass being started and the recorded causes; a
+        # wave that recorded none says THAT, so the verdict is a label beside a
+        # stated absence rather than standing in for the reason.
         causes = _slot_cause_clause(result)
         verdict = str(result.aggregate_signal or "").strip()
         ctx.emit_progress(
             f"Task acceptance review: improvement note fed back for pass "
             f"{ctx.passes_done + 1}"
-            + (f" ({verdict})." if verdict and not causes else ".")
+            + (f" (verdict {verdict}; no causes recorded)." if verdict and not causes else ".")
             + causes
         )
         return True

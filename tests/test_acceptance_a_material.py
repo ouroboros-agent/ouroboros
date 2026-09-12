@@ -586,14 +586,15 @@ def test_the_degraded_terminal_keeps_its_wording_and_its_causes(monkeypatch, tmp
     )
 
 
-def test_a_revision_with_no_recorded_causes_still_names_the_verdict(monkeypatch, tmp_path):
-    """A row that names neither cause nor verdict says less than before.
+def test_a_revision_with_no_recorded_causes_says_so_beside_the_verdict(monkeypatch, tmp_path):
+    """Absence of causes is stated, not implied by a bare verdict word.
 
     `degraded_reasons` is empty for the ordinary case: a FAIL verdict that built
-    an improvement capsule and reached the revision branch. Removing the
-    aggregate word there left "improvement note fed back for pass N." and
-    nothing else, which is strictly less than the line it replaced. The verdict
-    returns when, and only when, the wave recorded no causes of its own.
+    an improvement capsule and reached the revision branch. Dropping the
+    aggregate word left "improvement note fed back for pass N." and nothing
+    else, which is less than the line it replaced; putting the bare word back
+    would make it the explanation again, which is what this rule removed. The
+    row names the verdict AND says that no causes were recorded.
     """
     _no_fence(monkeypatch)
     emitted: list = []
@@ -605,4 +606,7 @@ def test_a_revision_with_no_recorded_causes_still_names_the_verdict(monkeypatch,
 
     assert trace["acceptance_decision"]["status"] == ACCEPTANCE_REVISION_REQUESTED
     (line,) = emitted
-    assert line == "Task acceptance review: improvement note fed back for pass 2 (FAIL)."
+    assert line == (
+        "Task acceptance review: improvement note fed back for pass 2 "
+        "(verdict FAIL; no causes recorded)."
+    )
