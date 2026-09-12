@@ -693,9 +693,13 @@ def _finalize_cancel_intent_on_miss(
         # GR5-3: neither queued nor running — the worker is gone, but its
         # delegated runs may still be live; audit custody like the kill path
         # and thread the disclosure into every miss-lane delivery below.
-        audit = _audit_delegated_runs_on_kill(q, task_id)
-        unreconciled = list(audit.get("unreconciled") or [])
+        # Read after child copyback: only an unsettled task will receive our
+        # cancelled write. An existing terminal keeps its own custody verdict.
         settled = _settled_status(q.DRIVE_ROOT, task_id)
+        audit = _audit_delegated_runs_on_kill(
+            q, task_id, **({} if settled else {"deliberate_terminal": STATUS_CANCELLED}),
+        )
+        unreconciled = list(audit.get("unreconciled") or [])
         if settled:
             _recover_stranded_reaping_slot(q, task_id, active)
             # D1b (R4): this branch performs no terminal write of its own, so
