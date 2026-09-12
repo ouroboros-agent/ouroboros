@@ -276,10 +276,17 @@ def _render_directives(rows: Optional[list]) -> str:
     rows = [r for r in (rows or []) if isinstance(r, Mapping) and str(r.get("content") or "").strip()]
     if not rows:
         return "(none recorded by the host)\n"
-    rendered = [
-        f"[{r.get('source') or 'owner'}{' · ' + str(r['msg_id']) if r.get('msg_id') else ''}]\n{r.get('content')}"
-        for r in rows
-    ]
+
+    def label(row: Mapping) -> str:
+        """The row's own typed source. A parent's own message keeps its plain label; a
+        sibling's words the parent relayed name both ends, as the dialogue renderer does,
+        so a reviewer never reads a peer's proposal as the principal's directive."""
+        relayed = str(row.get("relayed_from_task_id") or "")
+        relay = f" · from task {relayed} relayed by {row.get('source_task_id') or 'ancestor'}" if relayed else ""
+        return (f"[{row.get('source') or 'owner'}{relay}"
+                f"{' · ' + str(row['msg_id']) if row.get('msg_id') else ''}]")
+
+    rendered = [f"{label(r)}\n{r.get('content')}" for r in rows]
     kept: list[str] = []
     used = 0
     for row in reversed(rendered):  # newest first; the newest row always survives

@@ -159,12 +159,18 @@ def _record_owner_directive(
     source: str,
     content: Any,
     msg_id: str = "",
+    origin: Optional[Dict[str, str]] = None,
 ) -> None:
     """Retain the task-local owner corpus across transcript compaction.
 
     This is deliberately a provenance-preserving list, not a semantic decision
     parser: reviewers interpret the owner's verbatim words.  Structural control
     messages never call this helper.
+
+    ``origin`` carries the typed ids the caller already holds (a task message's
+    ``source_task_id``, and ``relayed_from_task_id`` when a parent relayed a
+    sibling's words): the row keeps them so every reader of this one corpus can
+    tell a directive from a relayed proposal without inferring it from the text.
     """
     if ctx is None:
         return
@@ -189,6 +195,7 @@ def _record_owner_directive(
     row = {"source": str(source or "owner"), "content": frozen_content}
     if stable_id:
         row["msg_id"] = stable_id
+    row.update({key: str(value) for key, value in (origin or {}).items() if value})
     directives.append(row)
 
 

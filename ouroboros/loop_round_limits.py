@@ -117,11 +117,18 @@ def _drain_incoming_messages(
             if kind == KIND_TASK_MESSAGE:
                 # A principal's words to this task are premises every review reads
                 # (plan and acceptance share one corpus); a host system frame and a
-                # descendant's escalation are not the principal's directives.
-                if str(entry.get("provenance") or "ancestor_task") not in {"system", "descendant_task"}:
+                # descendant's escalation are not the principal's directives. A sibling's
+                # words the parent RELAYED are context with a real source, not the
+                # principal's own directive: the typed provenance and the relay ids ride
+                # the row, exactly as the dialogue renderer already distinguishes them.
+                provenance = str(entry.get("provenance") or "ancestor_task")
+                if provenance not in {"system", "descendant_task"}:
                     _loop()._record_owner_directive(
-                        owner_ctx, source="principal_task_message", content=dmsg,
-                        msg_id=str(entry.get("msg_id") or ""),
+                        owner_ctx, content=dmsg, msg_id=str(entry.get("msg_id") or ""),
+                        source=("relayed_peer_message" if provenance == "peer_via_ancestor"
+                                else "principal_task_message"),
+                        origin={"source_task_id": str(entry.get("source_task_id") or ""),
+                                "relayed_from_task_id": str(entry.get("relayed_from_task_id") or "")},
                     )
                 deliver_task_message(entry, task_id, event_queue, lambda text: _loop()._append_or_merge_user_message(messages, text))
                 acknowledge_transcript_entry(drive_root, task_id, entry)

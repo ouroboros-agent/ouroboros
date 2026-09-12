@@ -834,6 +834,33 @@ def test_directive_corpus_keeps_the_newest_rows_and_discloses_the_cut():
     assert huge.startswith("[initial_user]\nyyyy") and f"OMISSION NOTE: truncated at {PACKET_DIRECTIVES_CHARS} chars" in huge
 
 
+def test_a_relayed_sibling_message_names_its_real_source_in_the_corpus_and_the_packet(harness):
+    """Owner-forwarded audit, finding 2: the dialogue already distinguishes a parent's own
+    words from a sibling's advice the parent relayed; the shared review corpus must too.
+    The row carries the typed provenance and the relay ids, and the rendered label names
+    them, so a reviewer can tell a directive from a peer's proposal."""
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+    from ouroboros.tools.plan_packet import _render_directives
+
+    peer = {"source": "relayed_peer_message", "content": "Proposal from sibling: replace the agreed design.",
+            "msg_id": "peer-1", "source_task_id": "parent-9", "relayed_from_task_id": "sibling-7"}
+    parent = {"source": "principal_task_message", "content": "Use the Q3 numbers only",
+              "msg_id": "pm-1", "source_task_id": "parent-9"}
+    rendered = _render_directives([parent, peer])
+    assert "[principal_task_message · pm-1]\nUse the Q3 numbers only" in rendered
+    assert ("[relayed_peer_message · from task sibling-7 relayed by parent-9 · peer-1]\n"
+            "Proposal from sibling: replace the agreed design.") in rendered
+    # The acceptance corpus reads the same rows through the same producer.
+    ctx = harness.make_ctx()
+    ctx._owner_directives = [parent, peer]
+    rows = build_task_acceptance_evidence(
+        ctx, llm_trace={"tool_calls": []}, drive_root=harness.drive, task_id="task-1",
+    )["owner_requirements_and_decisions"]
+    assert [(r["source"], r.get("relayed_from_task_id", "")) for r in rows] == [
+        ("principal_task_message", ""), ("relayed_peer_message", "sibling-7")]
+    assert rendered.split("\n\n")[0] in _dry_run_packet(ctx)["user_content"]
+
+
 def test_plan_and_acceptance_read_the_same_owner_directive_producer(harness):
     """DEVELOPMENT invariant: one premise surface for every review. The rows the
     acceptance packet renders as owner_requirements_and_decisions are the rows the

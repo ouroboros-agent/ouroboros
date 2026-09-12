@@ -959,7 +959,7 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
     rows: List[Dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(source: str, content: Any, msg_id: str = "") -> None:
+    def add(source: str, content: Any, msg_id: str = "", origin: Any = None) -> None:
         text = _owner_content_projection(content)
         if not text.strip():
             return
@@ -970,6 +970,10 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
         row = {"source": source, "content": text}
         if msg_id:
             row["msg_id"] = str(msg_id)
+        # The typed origin the recorder already resolved (a task message's source task,
+        # and the sibling it was relayed from) travels with the row: every reader of this
+        # one corpus sees a relayed proposal as such, without inferring it from the text.
+        row.update({key: str(value) for key, value in (origin or {}).items() if value})
         rows.append(row)
 
     recorded = getattr(ctx, "_owner_directives", None)
@@ -980,6 +984,7 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
                     str(item.get("source") or "task_local"),
                     item.get("content"),
                     str(item.get("msg_id") or ""),
+                    {key: item.get(key) for key in ("source_task_id", "relayed_from_task_id")},
                 )
 
     messages = getattr(ctx, "messages", None)
