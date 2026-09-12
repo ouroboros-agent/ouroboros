@@ -9,7 +9,6 @@ from collections.abc import Callable, Sequence
 from ouroboros.shell_parse import directory_destination_child_name
 from ouroboros.tools.shell_guards import directory_destination_pairs
 from ouroboros.credential_shapes import (
-    BENIGN_DOT_NAMES,
     CREDENTIAL_COMPONENT_NAMES,
     CREDENTIAL_FILE_NAMES,
 )
@@ -45,7 +44,7 @@ def _short_option_present(argv: Sequence[str], wanted: str) -> bool:
 
 
 def lexical_user_files_block_reason(candidate: pathlib.Path) -> str:
-    """Retain hidden/credential semantics before a target symlink is resolved."""
+    """Retain credential semantics before a target symlink is resolved."""
     try:
         parts = pathlib.Path(candidate).expanduser().parts
     except (OSError, TypeError, ValueError):
@@ -56,8 +55,6 @@ def lexical_user_files_block_reason(candidate: pathlib.Path) -> str:
             continue
         if lower in CREDENTIAL_COMPONENT_NAMES:
             return "path is hidden or credential-like (secret/credential directory)"
-        if part.startswith(".") and lower not in BENIGN_DOT_NAMES:
-            return "path is hidden or credential-like (non-allowlisted hidden component)"
     name = pathlib.PurePath(str(candidate)).name.lower()
     if name in CREDENTIAL_FILE_NAMES:
         return "path name is credential-like"

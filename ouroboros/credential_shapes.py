@@ -20,17 +20,14 @@ import pathlib
 CREDENTIAL_COMPONENT_NAMES = frozenset({
     ".aws",
     ".azure",
-    ".config",
     ".docker",
     ".git",   # v6.52.0: VCS internals hold config + stored credentials
     ".gnupg",
     ".hg",
     ".kube",
-    ".local",
     ".netrc",
     ".ssh",
     ".svn",
-    "library",
 })
 
 # Credential / shell-init / history file names (lowercase).
@@ -58,25 +55,6 @@ CREDENTIAL_FILE_NAMES = frozenset({
     "settings.json",
     "token.json",
     "tokens.json",
-})
-
-# v6.52.0 (P1): a SMALL allowlist of benign hidden (dot) project components used
-# by the DEFAULT-DENY dotted-component rule on mutation/output surfaces: a
-# credential blocklist can never be exhaustive (~/.terraform.d, ~/.cargo,
-# ~/.pip, ...), so a dotted component is refused UNLESS it is a known-safe
-# project-config dir/file.
-BENIGN_DOT_NAMES = frozenset({
-    ".github",
-    ".gitlab",
-    ".circleci",
-    ".devcontainer",
-    ".vscode",
-    ".idea",
-    ".gitignore",
-    ".gitattributes",
-    ".gitmodules",
-    ".dockerignore",
-    ".editorconfig",
 })
 
 # Names denied to restricted (read-only / acting) subagents on the repo/data

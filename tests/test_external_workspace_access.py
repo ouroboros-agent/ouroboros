@@ -418,8 +418,9 @@ def test_nested_deliverables_keeps_target_policy_before_workspace_root(
         {"cmd": ["touch", str(deliverables / "ordinary.txt")], "cwd": str(workspace)},
         "advanced",
     ) is None
+    # A dotted component is no longer a refusal of its own: only a real
+    # credential/control directory (.ssh, .aws, .gnupg, VCS) still blocks.
     for target in (
-        deliverables / ".hidden" / "file",
         deliverables / ".ssh" / "key",
     ):
         blocked = _shell_guard_text(reg,
@@ -598,13 +599,22 @@ def test_nested_deliverables_keeps_target_policy_before_workspace_root(
 
     from ouroboros.tools.shell import _resolve_declared_output, _run_shell
 
+    # A dotted directory is ordinary owner output now: only real credential and
+    # control directories, and the escape checks below, refuse a declared output.
     declared_hidden, hidden_reason = _resolve_declared_output(
         ctx,
         str(deliverables / ".hidden" / "file"),
         workspace,
         cwd_root="active_workspace",
     )
-    assert declared_hidden is None and "hidden" in hidden_reason.lower()
+    assert declared_hidden is not None and hidden_reason == ""
+    declared_ssh, ssh_reason = _resolve_declared_output(
+        ctx,
+        str(deliverables / ".ssh" / "key"),
+        workspace,
+        cwd_root="active_workspace",
+    )
+    assert declared_ssh is None and "credential" in ssh_reason.lower()
     declared_link, link_reason = _resolve_declared_output(
         ctx,
         str(link / "declared.txt"),

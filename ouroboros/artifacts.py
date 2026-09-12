@@ -179,7 +179,6 @@ def stage_task_attachments(
     # SSOT secret detection: reuse the shared credential-shape vocabulary so a
     # credential SOURCE (e.g. ~/.ssh/id_rsa, credentials.json) is never copied in.
     from ouroboros.credential_shapes import (
-        BENIGN_DOT_NAMES,
         CREDENTIAL_COMPONENT_NAMES,
         CREDENTIAL_FILE_NAMES,
     )
@@ -215,12 +214,6 @@ def stage_task_attachments(
             part_lower = part.lower()
             if part_lower in CREDENTIAL_COMPONENT_NAMES:
                 return f"credential/control directory component {part!r}"
-            # DEFAULT-DENY dotted components: a non-allowlisted dotted SOURCE component is
-            # potentially credential-bearing, so an enumerated-blocklist gap (e.g.
-            # ~/.terraform.d/credentials.tfrc.json) can't auto-stage a secret. Owner-
-            # supplied attachments only — defense-in-depth, not a live agent-exfil path.
-            if part.startswith(".") and part_lower not in BENIGN_DOT_NAMES:
-                return f"non-allowlisted hidden path component {part!r}"
         name = src.name
         name_lower = name.lower()
         if name_lower in CREDENTIAL_FILE_NAMES:
