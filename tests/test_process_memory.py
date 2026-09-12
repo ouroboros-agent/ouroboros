@@ -820,15 +820,19 @@ def test_a_failed_child_alone_triggers_the_roots_reflection(tmp_path, monkeypatc
     from types import SimpleNamespace
 
     calls = []
+    prompts = []
 
     def _chat_observed(*_args, **kwargs):
         calls.append(str(kwargs.get("call_type") or ""))
+        if kwargs.get("call_type") == "task_reflection":
+            prompts.append(kwargs["messages"][0]["content"])
         return {"content": "Reflection over the child failure."}, {}
 
     monkeypatch.setattr(llm_observability, "chat_observed", _chat_observed)
 
-    def _run(root_id, child_status, child_axes):
+    def _run(root_id, child_status, child_axes, *, rounds=2):
         calls.clear()
+        prompts.clear()
         write_task_result(
             tmp_path, f"{root_id}-kid", child_status, result="child output",
             parent_task_id=root_id, root_task_id=root_id, delegation_role="subagent",
@@ -841,16 +845,24 @@ def test_a_failed_child_alone_triggers_the_roots_reflection(tmp_path, monkeypatc
                                  "status": "ok"}], "reasoning_notes": []}
         return post_task_synthesis._run_reflection(
             SimpleNamespace(drive_root=tmp_path), None, task,
-            {"rounds": 2, "cost": 0.01}, trace, {},
+            {"rounds": rounds, "cost": 0.01}, trace, {},
         )
 
     entry = _run("root-failed-kid", "failed", {"execution": {"status": "failed"}})
     assert entry is not None, "a failed child is the root's own error evidence"
     assert entry["child_failure_classes"] == ["failed"]
     assert "reflection" in calls[0]
+    assert "The task had errors or blocking events." in prompts[0]
+    assert "Child failure classes: failed" in prompts[0]
+    assert "completed without hard errors" not in prompts[0]
     # The register was admitted on that child class, on the canonical drive.
     assert "pattern_register_update" in calls, "the register was admitted on the child class"
 
     # A cancelled child is not a failure: nothing runs, nothing is paid.
     assert _run("root-cancelled-kid", "cancelled", {"execution": {"status": "cancelled"}}) is None
     assert calls == []
+
+    entry = _run("root-long-cancel", "cancelled", {"execution": {"status": "cancelled"}}, rounds=20)
+    assert entry is not None and entry["child_failure_classes"] == []
+    assert "completed without hard errors" in prompts[0]
+    assert "pattern_register_update" not in calls

@@ -406,7 +406,9 @@ def generate_reflection(
     except Exception:
         review_evidence_text = "(review evidence unavailable)"
 
-    if error_count or markers:
+    if child_failure_classes and not (error_count or markers):
+        error_details = "Child failure classes: " + ", ".join(child_failure_classes)
+    if error_count or markers or child_failure_classes:
         prompt_template = _REFLECTION_PROMPT_ERROR_FULL
     else:
         prompt_template = _REFLECTION_PROMPT_NONTRIVIAL_FULL
