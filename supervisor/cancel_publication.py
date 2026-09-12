@@ -130,15 +130,16 @@ def _cancel_result_fields(
     return payload
 
 
-def _miss_lane_cancel_text(intent: Dict[str, Any]) -> str:
-    """The owner sentence for a cancel settled with nothing queued or running.
+def shutdown_cancel_text(intent: Dict[str, Any]) -> str:
+    """The owner sentence for a fence the snapshot restore minted, else "".
 
-    That is the ordinary shape of this lane and its default says so. A fence the
-    snapshot restore minted is the one case where the same emptiness has a KNOWN
-    cause: the queue is empty because this process just started, and the task was
-    running when the previous one stopped. Saying "was neither queued nor running"
-    there would contradict the boot line and strand the lost quiz without the
-    cause its expiry carries.
+    ONE producer for every lane that settles such a fence. The cause is a
+    property of the INTENT, not of the lane that happened to reach it: the task
+    was running when the previous server stopped. At an ordinary boot the pool is
+    empty when restore runs, so the fence settles through the miss lane below; a
+    worker that outlived SIGTERM is claimed and killed instead, and the owner has
+    to read the same cause either way. Every other intent returns the empty
+    string, so each lane keeps its own default sentence.
     """
     row = intent if isinstance(intent, dict) else {}
     if (
@@ -146,7 +147,20 @@ def _miss_lane_cancel_text(intent: Dict[str, Any]) -> str:
         and str(row.get("source") or "") == "snapshot_restore"
     ):
         return "Task cancelled: the server stopped while this task was still running."
-    return "Task cancelled (was neither queued nor running at supervisor teardown)."
+    return ""
+
+
+def _miss_lane_cancel_text(intent: Dict[str, Any]) -> str:
+    """The owner sentence for a cancel settled with nothing queued or running.
+
+    That is the ordinary shape of this lane and its default says so. A restore
+    fence is the one case where the same emptiness has a KNOWN cause, and saying
+    "was neither queued nor running" there would contradict the boot line and
+    strand the lost quiz without the cause its expiry carries.
+    """
+    return shutdown_cancel_text(intent) or (
+        "Task cancelled (was neither queued nor running at supervisor teardown)."
+    )
 
 
 def _intent_outcome_fields(intent: Dict[str, Any]) -> Dict[str, Any]:

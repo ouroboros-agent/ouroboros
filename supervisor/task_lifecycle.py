@@ -44,6 +44,7 @@ from supervisor.cancel_publication import (  # noqa: F401 -- intentional public 
     _register_owed_terminal_delivery,
     _salvage_cancelled_output,
     _settle_or_reopen_intent,
+    shutdown_cancel_text,
 )
 
 log = logging.getLogger(__name__)
@@ -1274,7 +1275,14 @@ def _finish_captured_running(
                 # this same merge-write; the audit envelope rides the same
                 # single write (R2) so list and envelope stay coherent.
                 **_custody_disclosure_fields(custody_audit),
-                result="Running task cancelled and worker terminated." + salvage_note,
+                # The cause belongs to the INTENT, not to the lane: a fence the
+                # snapshot restore minted says the server stopped whether the
+                # miss lane or this kill path settles it (ONE producer). Any
+                # other cancel has no such cause and states the kill.
+                result=(
+                    shutdown_cancel_text(intent or {})
+                    or "Running task cancelled and worker terminated."
+                ) + salvage_note,
             ),
         )
     except Exception:

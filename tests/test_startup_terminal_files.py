@@ -613,7 +613,14 @@ def test_a_worker_that_survived_the_shutdown_is_killed_before_the_terminal_is_wr
 ):
     """Custody claims and kills first, and only a confirmed-dead worker gets a
     terminal row: that is why the boot order (restore, then the reap) is not a
-    correctness condition and why the fence never races a second writer."""
+    correctness condition and why the fence never races a second writer.
+
+    The cause is one producer for both lanes. In a real boot the pool is empty
+    when restore runs (spawn_workers comes after kill_workers, server.py
+    :658-660), so a fence ordinarily settles through the miss lane, which is
+    what test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody pins.
+    A worker that outlived SIGTERM and is still claimable settles here instead,
+    and the owner must read the SAME sentence either way."""
     import time
 
     from ouroboros import cancel_intents, task_results
@@ -654,13 +661,33 @@ def test_a_worker_that_survived_the_shutdown_is_killed_before_the_terminal_is_wr
     stored = load_task_result(root, task_id)
     assert stored["status"] == "cancelled"
     assert cancel_intents.active_intent(root, task_id) is None
-    # The sentence belongs to the lane that ran. A live worker is settled by the
-    # kill path, which states the kill; the server-stopped sentence F1 added is
-    # the MISS lane's (supervisor/cancel_publication.py::_miss_lane_cancel_text),
-    # and that is the lane every real boot fence reaches, because restore runs
-    # before spawn_workers over an empty pool (server.py:658-660). See
-    # test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody.
-    assert stored["result"] == terminal[0]["result"] == LIVE_WORKER_CANCEL
+    assert stored["result"] == terminal[0]["result"] == SERVER_STOPPED_CANCEL
+
+
+@pytest.mark.serial
+def test_an_ordinary_cancel_of_a_live_worker_keeps_stating_the_kill(roots, monkeypatch):
+    """The shared producer speaks for a shutdown fence and for nothing else.
+
+    An owner (or parent) cancel of a running task has no shutdown cause to state,
+    so the kill path keeps the only sentence it has ever written there."""
+    from ouroboros import cancel_intents
+    from supervisor import task_lifecycle, workers
+    root, _ = roots
+
+    task_id = "owner-cancelled-live"
+    _interrupted_running_row(root, task_id)
+    proc = _surviving_worker(root, task_id)
+    monkeypatch.setattr(workers, "respawn_worker", lambda wid: None, raising=False)
+
+    cancel_intents.request_cancel(root, task_id, reason="no longer needed",
+                                  requested_by="owner")
+
+    assert task_lifecycle.cancel_task_custody(task_id) == task_lifecycle.CANCEL_CANCELLED
+
+    assert not proc.is_alive()
+    stored = load_task_result(root, task_id)
+    assert stored["status"] == "cancelled"
+    assert stored["result"] == LIVE_WORKER_CANCEL
 
 
 @pytest.mark.serial
