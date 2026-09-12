@@ -43,9 +43,12 @@ def _owner_line(ctx: Any, text: str, key: str, tone: str) -> None:
         pass
 
 
-# A tick that returned no observation (a refusal, or a read the daemon never answered)
-# drops the loop's transport, so the next tick re-reads the descriptor and re-handshakes.
-_DROP_TRANSPORT_STATUSES = frozenset({"observation_pending", "refused"})
+# A tick that returned NO DAEMON ANSWER: either a read the daemon never answered,
+# or a refusal raised before any byte left the host (a missing descriptor, an
+# unreadable token, an engine below the floor). It drops the loop's transport, so
+# the next tick re-reads the descriptor and re-handshakes, and it cannot close an
+# open outage episode either: silence of a different shape is not contact.
+_NO_DAEMON_ANSWER_STATUSES = frozenset({"observation_pending", "refused"})
 
 
 def _loop_gateway() -> Any:
@@ -897,14 +900,18 @@ def supervised_wait(
                 raw = wait_once(ctx, run_id, _TICK_SEC, int(state.get("journal_cursor") or 0),
                                 **({"gateway": gateway} if gateway is not None else {}))
             payload = _payload(raw)
-            if str(payload.get("status") or "") in _DROP_TRANSPORT_STATUSES:
+            answered = str(payload.get("status") or "") not in _NO_DAEMON_ANSWER_STATUSES
+            if not answered:
                 gateway = _drop_gateway(gateway)
             unreachable = (
                 payload.get("status") == "observation_pending"
                 and payload.get("reason") == _DAEMON_UNREACHABLE
             )
-            if observed and outage_since and not unreachable:
-                # The first read the daemon answered again closes the episode.
+            if observed and outage_since and answered:
+                # The first read the daemon ANSWERED closes the episode. A refusal
+                # that never reached it (descriptor gone, token unreadable, engine
+                # too old) used to satisfy this and told the owner the daemon was
+                # reachable again at the moment it became less reachable.
                 _owner_line(
                     ctx,
                     "Delegation daemon reachable again; the outage that began at "

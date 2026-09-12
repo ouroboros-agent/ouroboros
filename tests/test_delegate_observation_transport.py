@@ -300,6 +300,30 @@ def test_other_typed_observation_reasons_say_nothing_to_the_owner(tmp_path, monk
     assert notes == []
 
 
+def test_a_refusal_that_never_reached_the_daemon_closes_no_outage(tmp_path, monkeypatch):
+    """Recovery is contact, not merely "something other than the outage".
+
+    A refusal raised before any byte left the host (a missing descriptor, an
+    unreadable token, an engine below the floor) used to satisfy the recovery
+    gate: the owner was told the daemon was reachable again at the moment it
+    became less reachable, and the constant recovery key was burned for the rest
+    of the session. Only a payload the daemon itself produced closes the episode.
+    """
+    ctx = _delegating_ctx(tmp_path, acting=False)
+    notes = []
+    ctx.emit_progress_fn = lambda text, *, incident=None: notes.append((text, incident))
+    monkeypatch.setattr(delegate_supervision.time, "sleep", lambda _sec: None)
+    unreachable = ("observation_pending", "daemon_unreachable")
+    result = json.loads(delegate_supervision.supervised_wait(
+        ctx, "run-existing", wait_once=_scripted_wait_once([
+            unreachable, unreachable, ("refused", "daemon_not_discovered"),
+        ])))
+
+    assert result["status"] == "refused" and result["reason"] == "daemon_not_discovered"
+    assert [text.startswith("Delegation daemon unreachable") for text, _ in notes] == [True]
+    assert not any("reachable again" in text for text, _ in notes)
+
+
 @pytest.mark.parametrize("control", ["deadline", "cancellation_intent"])
 def test_outer_controls_still_cut_a_long_unobserved_stretch(tmp_path, monkeypatch, control):
     """Quiet renewal on a dead socket never outlives the outer bounds: the deadline and a
