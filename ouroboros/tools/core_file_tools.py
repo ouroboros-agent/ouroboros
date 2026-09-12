@@ -188,12 +188,13 @@ def _is_skill_owner_state_target(target: pathlib.Path, data_root: pathlib.Path) 
 
 
 class _ListingFailure(Exception):
-    """A failed list_files state that must surface as a FIRST-CLASS tool error.
+    """A CONFINEMENT refusal: the resolved target escapes its root.
 
-    v6.54.3 (review round 4): path-escape / not-found / not-a-directory used to
-    return warning strings INSIDE an ok-shaped JSON list — the exact
-    error-inside-success shape the TB2.1 post-mortem showed silently poisoning
-    reasoning. _list_files renders this as a leading ⚠️ LIST_FILES_ERROR."""
+    v6.54.3 (review round 4): a refusal to list used to return a warning string
+    INSIDE an ok-shaped JSON list — the exact error-inside-success shape the
+    TB2.1 post-mortem showed silently poisoning reasoning. _list_files renders
+    this as a leading ⚠️ LIST_FILES_ERROR, a first-class tool error. Discovery
+    misses are the ``_ListingMiss`` subclass below and are NOT errors."""
 
 
 class _ListingMiss(_ListingFailure):
