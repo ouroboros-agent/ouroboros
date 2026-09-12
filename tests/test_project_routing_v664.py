@@ -720,6 +720,34 @@ def test_main_manifest_offers_owner_roots_not_swarm_children(tmp_path):
     assert manifest["omissions"]["final_results"] == 0
 
 
+def test_omissions_count_children_ordered_after_the_cap(tmp_path):
+    """The child count must not be a by-product of the capped loop: children older
+    than the 16th root were skipped but counted nowhere, and the cap number silently
+    absorbed them (A26 requires the two omissions to stay separate)."""
+    import os
+
+    import server
+    from ouroboros.task_results import task_result_path, write_task_result
+
+    for index in range(17):
+        tid = f"root{index:02d}"
+        write_task_result(tmp_path, tid, "completed", objective=f"owner work {index}",
+                          ts=f"2026-08-20T00:00:{index:02d}Z")
+        os.utime(task_result_path(tmp_path, tid, create=False), (900 + index, 900 + index))
+    for index in range(2):
+        tid = f"child{index}"
+        write_task_result(tmp_path, tid, "completed", objective="helper work",
+                          parent_task_id="root16", root_task_id="root16",
+                          delegation_role="subagent", ts=f"2026-08-01T00:00:{index:02d}Z")
+        os.utime(task_result_path(tmp_path, tid, create=False), (100 + index, 100 + index))
+
+    manifest = server._main_routing_manifest(_ctx(tmp_path))
+
+    assert len(manifest["final_results"]) == 16
+    assert manifest["omissions"]["children"] == 2      # counted even though they sort last
+    assert manifest["omissions"]["final_results"] == 1  # exactly the root cut by the cap
+
+
 def test_project_room_direct_chat_root_is_admitted_as_a_predecessor(tmp_path):
     """The second half of the traced refusal (I29): a project room's direct-chat
     root left the per-project pointer empty, so the room's own decision turn had no

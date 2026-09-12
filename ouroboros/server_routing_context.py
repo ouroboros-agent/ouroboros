@@ -284,18 +284,21 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         facts, unreadable = {}, ["result_directory_unreadable"]
         results_error = f"result_directory_unreadable: {exc}"
     ordered = sorted(facts, key=lambda name: facts[name]["ts"] or facts[name]["updated_at"], reverse=True)
+    # Only the owner's ROOT results are addressable predecessors (owner decision batch
+    # 3, answer 6b=A): a swarm wave's children are the newest results of ANY kind, so
+    # they evicted the owner's own roots from this window - which is how a root the
+    # same actor had just read stopped being offerable. The facts are already
+    # memoized, so both the filter and this count cost no extra read. The count runs
+    # over the WHOLE candidate list, not inside the capped loop: children older than
+    # the 16th root are skipped just the same, and counting them only until the cap
+    # reported zero while folding them into the cap's own number.
+    def _is_child(name: str) -> bool:
+        return bool(facts[name]["parent_task_id"]) or facts[name]["delegation_role"] == "subagent"
+
+    children = sum(1 for name in ordered if not facts[name]["schema_refusal"] and _is_child(name))
     finals = []
-    children = 0
     for name in ordered:
-        if facts[name]["schema_refusal"]:
-            continue
-        # Only the owner's ROOT results are addressable predecessors (owner decision
-        # batch 3, answer 6b=A): a swarm wave's children are the newest results of
-        # ANY kind, so they evicted the owner's own roots from this window - which is
-        # how a root the same actor had just read stopped being offerable. The facts
-        # are already memoized, so the filter costs no extra read.
-        if facts[name]["parent_task_id"] or facts[name]["delegation_role"] == "subagent":
-            children += 1
+        if facts[name]["schema_refusal"] or _is_child(name):
             continue
         row = load_task_result(ctx.DRIVE_ROOT, pathlib.Path(name).stem)
         if row is not None:
