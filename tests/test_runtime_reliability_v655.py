@@ -671,6 +671,13 @@ def test_plan_task_skips_under_tight_deadline(tmp_path):
 
 
 def test_plan_task_no_deadline_does_not_skip(tmp_path, monkeypatch):
+    # P1-2 moved the coroutine seam out of plan_review into
+    # plan_review_collect.run_plan_coroutine, which imports asyncio locally, so
+    # there is no plan_review.asyncio attribute to reach through any more. The
+    # same stdlib module object is patched directly; what is pinned is unchanged:
+    # with no deadline plan_task does not skip, it runs the review coroutine.
+    import asyncio
+
     from ouroboros.tools import plan_review as pr
 
     sentinel = {"called": False}
@@ -681,7 +688,7 @@ def test_plan_task_no_deadline_does_not_skip(tmp_path, monkeypatch):
             coro.close()
         return "ok"
 
-    monkeypatch.setattr(pr.asyncio, "run", _fake_run)
+    monkeypatch.setattr(asyncio, "run", _fake_run)
     ctx = _ctx(tmp_path)
     out = pr._handle_plan_task(ctx, plan="p", goal="g")
     assert sentinel["called"] is True and out == "ok"
