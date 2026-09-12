@@ -117,22 +117,30 @@ def test_review_reference_addresses_the_bound_project_chat(tmp_path):
     assert _reference_rows(events)[0]["chat_id"] == 7373
 
 
-def test_review_reference_still_emits_when_the_bindings_read_fails(tmp_path, monkeypatch):
-    """A broken bindings store must not cost the invalidation: the row is still
-    emitted, addressed to the hidden partition instead of guessing Main."""
-    import supervisor.log_addressing as log_addressing
+def test_review_reference_addresses_a_corrupt_bindings_store_like_no_binding(tmp_path):
+    """The REAL read failure, not a synthetic raise: resolve_project_chat swallows
+    every error and answers 0, so a corrupt store behaves exactly like "no binding"
+    (D6-6 fail-open). A run with no room of its own lands in the hidden partition;
+    a caller that named a chat keeps it, as it did before this seam existed."""
+    from supervisor.log_addressing import resolve_project_chat
 
-    def fail_resolve(*_args, **_kwargs):
-        raise TypeError("bindings unreadable")
-
-    monkeypatch.setattr(log_addressing, "resolve_project_chat", fail_resolve)
-    events: queue.Queue = queue.Queue()
-    ctx = SimpleNamespace(event_queue=events, current_chat_id=23, drive_root=tmp_path)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
     state = {"current_attempt": {"fingerprint": "review-fingerprint"}, "waves": []}
+    assert resolve_project_chat(tmp_path, "task-1", "", "") == 0  # never raises
 
-    plan_review_references._emit_plan_review_reference(ctx, "task-1", state)
+    roomless: queue.Queue = queue.Queue()
+    plan_review_references._emit_plan_review_reference(
+        SimpleNamespace(event_queue=roomless, drive_root=tmp_path), "task-1", state,
+    )
+    assert _reference_rows(roomless)[0]["chat_id"] == plan_review_references.HIDDEN_CHAT_ID
 
-    assert _reference_rows(events)[0]["chat_id"] == plan_review_references.HIDDEN_CHAT_ID
+    addressed: queue.Queue = queue.Queue()
+    plan_review_references._emit_plan_review_reference(
+        SimpleNamespace(event_queue=addressed, current_chat_id=23, drive_root=tmp_path),
+        "task-1", state,
+    )
+    assert _reference_rows(addressed)[0]["chat_id"] == 23
 
 
 def test_attempt_helper_publishes_immediately_after_the_canonical_write(monkeypatch):
