@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 
 from ouroboros.context import build_health_invariants, build_runtime_section
 
@@ -137,6 +138,59 @@ class TestCacheHitRateInvariant:
         self._emit_producer_rounds(tmp_path, None, count=3)
         self._emit_producer_rounds(tmp_path, 600, count=5)
         assert _compute_cache_hit_rate(env) == 0.6
+
+    @pytest.mark.parametrize("reports, expected_rate", [
+        ([None] * 6, None),
+        ([0] * 6, 0.0),
+        ([600] * 6, 0.6),
+        ([None] * 10 + [600] * 5, 0.6),
+    ], ids=["unknown", "measured_zero", "measured_hit", "mixed"])
+    def test_nullable_adapter_cache_reaches_durable_and_live_rounds(
+        self, tmp_path, reports, expected_rate,
+    ):
+        """The real adapter uses a present null key for an unreported cache.
+
+        Omitted-key fixtures alone missed the producer turning that null into
+        zero. Both round events must preserve the measurement before health
+        computes its share over the reporting rounds.
+        """
+        from queue import Queue
+        from ouroboros.context_health import _compute_cache_hit_rate
+        from ouroboros.llm_claudexor import _usage
+        from ouroboros.loop_llm_call import call_llm_with_retry
+
+        env = self._make_env(tmp_path, [])
+        events = Queue()
+        accumulated = {}
+
+        class LLM:
+            def chat(self, **_kwargs):
+                counters = {"input_tokens": 1000, "output_tokens": 10}
+                if reported is not None:
+                    counters["cached_input_tokens"] = reported
+                usage, cost, final = _usage({"usage": counters})
+                usage.update(provider="claudexor", resolved_model="claudexor/probe",
+                             cost=cost, cost_final=final)
+                return {"content": "Completed synthetic round."}, usage
+
+        for index, reported in enumerate(reports, 1):
+            message, _cost = call_llm_with_retry(
+                LLM(), [{"role": "user", "content": "Check the report."}],
+                "claudexor/probe", None, "medium", 1, tmp_path / "logs",
+                "nullable-cache", index, events, accumulated,
+            )
+            assert message["content"] == "Completed synthetic round."
+        rows = [json.loads(line) for line in (tmp_path / "logs/events.jsonl").read_text().splitlines()
+                if line.strip()]
+        durable = [row["cached_tokens"] for row in rows if row.get("type") == "llm_round"]
+        live = []
+        while not events.empty():
+            event = events.get_nowait()
+            if event.get("type") == "log_event" and event["data"].get("type") == "llm_round_finished":
+                live.append(event["data"]["cached_tokens"])
+        assert durable == reports
+        assert live == reports
+        assert _compute_cache_hit_rate(env) == expected_rate
 
 
 def test_health_invariants_reports_remote_context_overflow(tmp_path):
