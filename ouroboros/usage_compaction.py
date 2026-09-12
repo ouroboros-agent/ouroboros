@@ -7,8 +7,9 @@ the raw pre-compaction bytes move verbatim into an append-only
 ``archive/usage_ledger/`` segment referenced (and hash-pinned) by the header.
 Nothing is deleted, in-flight rows never fold, idempotency-bearing kinds
 (subscription/external/legacy) never fold, and the pass commits ONLY after
-proving, on the candidate bytes, that the production aggregation renders
-byte-equal results — otherwise it aborts and the ledger stays byte-identical.
+proving, on the candidate bytes, that the production aggregation renders an
+identical NON-MONEY view and that the money itself is decimal-identical —
+otherwise it aborts and the ledger stays byte-identical.
 
 Monetary exactness rule (fixed by the design note): group sums are computed as
 exact ``Decimal``s of the literals stored in the file and carried on group
@@ -149,6 +150,33 @@ NAME_TIER_REFUSAL = (
     "compaction refused; appends continue under the name protocol, the ledger stays uncompacted"
 )
 _NAME_TIER_REFUSED: set = set()  # data roots whose refusal event this process already wrote
+
+# A policy abort leaves the ledger byte-identical and the pass simply runs
+# again later, so the REASON is the only thing that outlives it — and it lived
+# in an INFO log line alone. The health tripwire above the ledger's warn size
+# then names a symptom (the file is large) and predicts this case without
+# being able to say which one it is: broken compaction, an unfoldable residue,
+# or the name tier. So every abort records the same typed row the name-tier
+# refusal does: ONE ``usage_ledger_compaction_skipped`` per process per (data
+# root, reason) — keyed by the reason so a new cause is never hidden behind an
+# old one, and never one row per pass.
+_SKIPPED_REASONS: set = set()  # (data root, reason) pairs this process already wrote
+
+
+def _record_skip(root: pathlib.Path, reason: str) -> None:
+    """Log a policy abort and durably record its typed reason, once per cause."""
+    log.info("usage-ledger compaction skipped: %s", reason)
+    told = (str(root.resolve(strict=False)), reason)  # one data root, however it is spelled
+    if told in _SKIPPED_REASONS:
+        return
+    try:  # only a row that LANDED is "already told": append_jsonl reports its
+        if append_jsonl(root / "logs" / "events.jsonl", {  # exhausted retries as
+            "type": "usage_ledger_compaction_skipped", "ts": utc_now_iso(),  # False
+            "reason": reason,
+        }):
+            _SKIPPED_REASONS.add(told)
+    except Exception:
+        log.exception("Failed to emit usage_ledger_compaction_skipped event")
 
 
 def _fsync_dir(path: pathlib.Path) -> None:
@@ -474,6 +502,30 @@ class _Group:
             )
 
 
+# The money keys every ``_summary`` carries — and therefore every
+# ``_breakdown_bucket``, which STARTS as one (``_usage_rows.py``). They are
+# projected out of the comparison below because ``_summary`` accumulates
+# dollars in BINARY floats and rounds at six places: the same history summed
+# as N per-row floats and as one exact per-group Decimal can round to either
+# side of the last digit. On the owner's live ledger that put 13 roots (51
+# buckets, 153 values) exactly 1e-6 apart and aborted a CORRECT fold every
+# time, holding the file at 77.8 MB against an 8 MB trigger. The answer is
+# not a tolerance: money is compared EXACTLY, one guard below, as decimals of
+# the literals actually stored.
+_FINGERPRINT_MONEY_KEYS = frozenset({
+    "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
+    "unresolved_upper_bound_usd", "accounted_usd",
+})
+
+
+def _without_money(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    """One summary/bucket as the NON-MONEY view its readers also consume."""
+    return {
+        key: value for key, value in bucket.items()
+        if key not in _FINGERPRINT_MONEY_KEYS
+    }
+
+
 def _render_fingerprint(finals: list) -> Dict[str, Any]:
     """The production-aggregation surfaces budget/display actually consume.
 
@@ -481,8 +533,14 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
     summaries + min known ``root_limit_usd``) and ``usage_breakdown`` (global
     bucket, per-axis buckets with the legacy/empty-key unattributed rule),
     built from the SAME ``_summary``/``_breakdown_bucket`` production
-    functions. Compared before/after on the candidate bytes; any inequality
-    aborts the compaction.
+    functions — minus the money keys (see above): the readers' NON-MONEY view
+    must be identical, and money is exact by Decimal in ``decimal_totals``.
+    What still has to match is everything a fold could actually lose: state
+    counts and their folded weights, physical calls, token sums, cache TTLs,
+    ``non_final_rows``/``cost_final``/``unknown_unmetered``, subscription
+    sessions and windows, the per-root minimum ``root_limit_usd``, and the
+    shape of every axis. Compared before/after on the candidate bytes; any
+    inequality aborts the compaction.
     """
     per_root: Dict[str, Any] = {}
     grouped_roots: Dict[str, list] = {}
@@ -497,7 +555,7 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             for value in (_number(row.get("root_limit_usd")) for row in rows)
             if value is not None
         ]
-        per_root[rid] = (_summary(rows), min(known) if known else None)
+        per_root[rid] = (_without_money(_summary(rows)), min(known) if known else None)
 
     def grouped(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         groups: Dict[str, list] = {}
@@ -509,14 +567,14 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             else:
                 groups.setdefault(key, []).append(row)
         return (
-            {key: _breakdown_bucket(groups[key]) for key in sorted(groups)},
-            _breakdown_bucket(unattributed),
+            {key: _without_money(_breakdown_bucket(groups[key])) for key in sorted(groups)},
+            _without_money(_breakdown_bucket(unattributed)),
         )
 
     return {
-        "summary": _summary(finals),
+        "summary": _without_money(_summary(finals)),
         "by_root": per_root,
-        "breakdown": _breakdown_bucket(finals),
+        "breakdown": _without_money(_breakdown_bucket(finals)),
         "axes": {
             field: grouped(field)
             for field in ("model", "provider", "category", "task_id", "root_task_id")
@@ -797,7 +855,7 @@ def compact_usage_ledger_locked(
                 raise _Abort("decimal money totals mismatch")
         _beat(heartbeat)
     except _Abort as abort:
-        log.info("usage-ledger compaction skipped: %s", abort.reason)
+        _record_skip(root, abort.reason)
         return None
     except (UsageLedgerCorrupt, DecimalException, ValueError, TypeError, KeyError) as exc:
         # Never let a compaction defect become a monetary failure: abort clean.
@@ -834,7 +892,7 @@ def compact_usage_ledger_locked(
             return None
         _swap_ledger_fsync(ledger_path, candidate, raw, beat)
     except _Abort as abort:
-        log.info("usage-ledger compaction skipped: %s", abort.reason)
+        _record_skip(root, abort.reason)
         return None
     try:
         append_jsonl(
@@ -859,10 +917,19 @@ def maybe_compact_usage_ledger_locked(
 ) -> bool:
     """Opportunistic trigger on the monetary write path (under the held lock).
 
-    ``os.stat`` fast-path below ``config.USAGE_LEDGER_COMPACT_BYTES``; a
-    per-process growth guard throttles re-attempts after an unprofitable or
-    aborted pass. Every failure is contained: this never raises into the
-    caller's reservation (a corrupt ledger still fails in the normal read)."""
+    ``os.stat`` fast-path below ``config.USAGE_LEDGER_COMPACT_BYTES``; above
+    it, a per-process growth guard throttles re-attempts after ANY pass, not
+    only an unprofitable one. A success used to clear the memo, which left the
+    threshold as the only brake: the unfoldable residue (group rows, retained
+    idempotent and review-attributed rows) never shrinks, so once it reaches
+    the trigger every reservation ran a full rewrite of the authority under
+    the held lock and copied the whole live file into a new archive segment
+    for a gain of a few kilobytes. Remembering the COMPACTED size instead
+    makes the memo mean "the ledger size when this process last ran a pass",
+    so the next one waits for ``USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES`` of
+    real growth whatever the last outcome was. Every failure is contained:
+    this never raises into the caller's reservation (a corrupt ledger still
+    fails in the normal read)."""
     try:
         root = pathlib.Path(_drive_root(root))
     except Exception:
@@ -889,8 +956,18 @@ def maybe_compact_usage_ledger_locked(
     except Exception:
         log.exception("usage-ledger compaction pass raised; the reservation continues on the ledger as it stands")
     if receipt is not None:
+        # The swap replaced the file, so the memo has to name the NEW inode
+        # and the size the pass left behind: keyed on the pre-compaction
+        # identity it would never match again and would throttle nothing.
+        try:
+            swapped = os.stat(ledger_path)
+        except OSError:
+            swapped = None
         with _COMPACT_ATTEMPTS_LOCK:
-            _COMPACT_ATTEMPTS.pop(key, None)
+            if swapped is None:
+                _COMPACT_ATTEMPTS.pop(key, None)
+            else:
+                _COMPACT_ATTEMPTS[key] = (swapped.st_ino, swapped.st_dev, swapped.st_size)
         return True
     with _COMPACT_ATTEMPTS_LOCK:
         _COMPACT_ATTEMPTS[key] = (stat.st_ino, stat.st_dev, stat.st_size)

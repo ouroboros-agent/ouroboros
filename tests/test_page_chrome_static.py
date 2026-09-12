@@ -171,6 +171,13 @@ def test_skills_and_widgets_use_inner_scroll_regions():
     assert ".widgets-scroll" in css and "overflow-y: auto" in css
 
 
+def test_sidebar_projects_list_is_a_bounded_scroll_region():
+    """The sidebar's one variable-length collection owns a bounded window with
+    its own scroll, so the navigation column cannot grow with the project count."""
+    rule = _read("web/style.css").split(".nav-projects-list {", 1)[1].split("}", 1)[0]
+    assert "max-height: var(--nav-projects-list-max-height)" in rule and "overflow-y: auto" in rule, rule
+
+
 # ---------------------------------------------------------------------------
 # Evolution / consciousness UI wiring
 # ---------------------------------------------------------------------------
