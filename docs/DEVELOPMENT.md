@@ -3050,8 +3050,12 @@ SPA, not a relocatable-page or multi-instance panel framework.
   `.app-tab-strip`/`.app-tab` and the `--pill-*` tokens). The binder owns
   selected state, ARIA, roving focus and strip-only reveal; callbacks own
   loading/panels, and programmatic `select()` never calls them. Dispose the
-  binder and its resize observer with the owning page. Scroll bodies share
-  `.scroll-fade-y`; `scroll_fade.js::bindScrollFade` enables an edge only when
+  binder and its resize observer with the owning page. The navigation column's
+  height must not grow with the number of items in a collection inside it; a
+  variable-length collection owns a bounded window with its own scroll
+  (`--nav-projects-list-max-height`). Scroll bodies share `.scroll-fade-y`,
+  except a dense list of rows shorter than its 32px edge, where the fade would
+  cover a whole row; `scroll_fade.js::bindScrollFade` enables an edge only when
   content is actually hidden there and returns its observer/listener disposer;
   masonry packing uses `web/modules/masonry.js::applyMasonry` (CSS Grid row
   packing leaves row gaps under shorter cards): it packs in the page's key
