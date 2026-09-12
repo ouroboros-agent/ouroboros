@@ -1089,7 +1089,7 @@ def record_settled_unread(drive_root: Any, custody: RunCustody) -> bool:
     return True
 
 
-def settled_unread_outputs(drive_root: Any) -> List[RunCustody]:
+def settled_unread_outputs(drive_root: Any, state: Optional[Dict[str, RunCustody]] = None) -> List[RunCustody]:
     """Settled runs whose verified FULL output was never read to EOF.
 
     The counterpart of ``open_containment_faults`` for the D7 class, and self-clearing
@@ -1099,7 +1099,7 @@ def settled_unread_outputs(drive_root: Any) -> List[RunCustody]:
     and a run that staged nothing (inline result, cancelled, failed with no output) owes
     nothing and must never appear here.
     """
-    return [custody for custody in replay(drive_root).values()
+    return [custody for custody in (state if state is not None else replay(drive_root)).values()
             if settled_output_unread(custody)]
 
 

@@ -2926,3 +2926,177 @@ def test_swarm_intent_survives_admission_to_the_finalization_read(tmp_path, monk
         "observed_started": 0,
         "status": "no_fanout_observed",
     }
+
+
+def test_promote_emission_row_carries_the_owner_message_id(tmp_path, monkeypatch):
+    """I7: the durable ingress row named the task and the routing token but not the
+    owner MESSAGE, so the same message becoming several roots could not be seen in
+    the record at all."""
+    import json
+
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    ctx = types.SimpleNamespace(
+        pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
+        task_metadata={"client_message_id": "cm-ingress"},
+    )
+
+    assert _promote_chat_to_task(
+        ctx, "Build the racer prototype", project_id="racer", predecessor_task_id="",
+    ).startswith("OK: task")
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    emitted = next(row for row in rows if row["type"] == "promote_chat_to_task_emitted")
+    assert emitted["client_message_id"] == "cm-ingress"
+    assert emitted["task_id"] == ctx.pending_events[0]["task_id"]
+
+
+def _steer_refusal(tmp_path, monkeypatch, *, running: dict, chat_id: int = 1):
+    """Drive one refused steer and return (receipt kwargs, owner messages)."""
+    import supervisor.events as events_mod
+    from supervisor.steering import _handle_steer_task
+
+    receipts: list = []
+    sent: list = []
+    monkeypatch.setattr(events_mod, "_emit_routing_receipt",
+                        lambda ctx, evt, **kwargs: receipts.append(kwargs) or {})
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[],
+        get_chat_agent=lambda: None,
+        send_with_budget=lambda _chat_id, text: sent.append(text),
+    )
+    _handle_steer_task(
+        {"target_task_id": "target-1", "message": "hurry up", "chat_id": chat_id}, ctx,
+    )
+    return receipts[-1], sent
+
+
+def test_steer_refusal_names_the_room_when_the_task_belongs_to_another_chat(tmp_path, monkeypatch):
+    """Four refusals folded into one boolean told the owner the task "may have
+    finished" while it ran in its own project room for another half hour, and the
+    receipt said only `target_not_steerable`. The room is what the owner needs."""
+    from ouroboros.projects_registry import create_project
+
+    create_project(tmp_path, "roomp", name="RoomP")
+    receipt, sent = _steer_refusal(tmp_path, monkeypatch, running={
+        "target-1": {"task": {"id": "target-1", "chat_id": 777, "project_id": "roomp",
+                              "title": "Deploy the docs"}},
+    })
+
+    assert receipt["status"] == "needs_manual_target" and receipt["reason"] == "chat_mismatch"
+    assert sent and "RoomP › Deploy the docs" in sent[0]
+    assert "may have finished" not in sent[0]
+    assert "belongs to another chat" in sent[0]
+
+
+@pytest.mark.parametrize("running, reason, phrase", [
+    ({}, "target_unknown", "may have finished"),
+    ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "delegation_role": "subagent",
+                            "title": "Review"}}}, "subagent_target", "delegated helper"),
+    ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
+                            "title": "Chat"}}}, "direct_chat_turn", "conversation turn has already"),
+])
+def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
+        tmp_path, monkeypatch, running, reason, phrase):
+    receipt, sent = _steer_refusal(tmp_path, monkeypatch, running=running)
+
+    assert receipt["reason"] == reason and receipt["status"] == "needs_manual_target"
+    assert sent and phrase in sent[0]
+
+
+def test_the_steer_tool_renders_the_typed_reason_and_still_defaults_without_one(monkeypatch):
+    """The fallback belongs to the RENDERER, not to the emitter: every refusal the
+    handler emits now carries its own typed reason, and a receipt that carries
+    none (another producer, an older row) still renders the documented default."""
+    from ouroboros.tools import control_routing
+
+    answers = iter([
+        ("live", {"status": "needs_manual_target", "reason": "chat_mismatch"}),
+        ("live", {"status": "needs_manual_target"}),
+    ])
+    monkeypatch.setattr(control_routing, "_emit_and_wait_for_routing",
+                        lambda _ctx, _evt: next(answers))
+    ctx = types.SimpleNamespace(pending_events=[], event_queue=None, current_chat_id=1,
+                                task_metadata={})
+
+    assert "(chat_mismatch)" in control_routing._steer_task(ctx, "t1", "go")
+    assert "(target_not_steerable)" in control_routing._steer_task(ctx, "t1", "go")
+
+
+def _loud_workspace_failure(tmp_path, monkeypatch, ws_error: str, **kwargs):
+    """Run the loud-fail writer directly and return (chat message, stored row)."""
+    import supervisor.workers as workers
+    from ouroboros.task_results import load_task_result
+    from supervisor import worker_promotion
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    sent: list = []
+    ctx = types.SimpleNamespace(send_with_budget=lambda chat_id, text: sent.append(text))
+    worker_promotion._fail_promoted_task_loudly(
+        ctx, {"id": "wsfail", "chat_id": 3}, ws_error, **kwargs,
+    )
+    assert len(sent) == 1
+    return sent[0], load_task_result(tmp_path, "wsfail")
+
+
+def test_loud_workspace_failure_remedy_follows_the_source_of_the_refused_folder(
+        tmp_path, monkeypatch):
+    """The request named its own folder, so the project's working folder was never
+    read: sending the owner to Projects points at a setting the failure never
+    touched. The project folder is named as the way back when it is readable."""
+    from ouroboros.projects_registry import create_project
+
+    create_project(tmp_path, "roomp", name="RoomP", working_dir=str(tmp_path / "room-tree"))
+    message, stored = _loud_workspace_failure(
+        tmp_path, monkeypatch,
+        "explicit workspace_root is unusable: not a git checkout.",
+        explicit_workspace=str(tmp_path / "asked-for"), project_id="roomp",
+    )
+
+    assert "asked for" in message and str(tmp_path / "asked-for") in message
+    assert "Projects → this project" not in message
+    assert str(tmp_path / "room-tree") in message
+    assert "workspace='none'" in message
+    assert stored["status"] == "failed" and stored["reason_code"] == "workspace_unusable"
+
+
+def test_loud_workspace_failure_keeps_the_projects_remedy_for_a_project_folder(
+        tmp_path, monkeypatch):
+    """A project working_dir failure — and an unreadable registry entry — is fixed
+    exactly where today's message says, so that text is unchanged."""
+    for ws_error in (
+        "project 'roomp' working_dir is unusable: not a git checkout.",
+        "project 'roomp' registry entry is unreadable (OSError: boom) — cannot determine "
+        "the task's workspace",
+    ):
+        message, stored = _loud_workspace_failure(tmp_path, monkeypatch, ws_error)
+        assert ws_error in message
+        assert message.endswith(
+            "Fix the project's working folder (Projects → this project) or re-promote with "
+            "workspace='none' for a folder-less task."
+        )
+        assert "asked for" not in message
+        assert stored["reason_code"] == "workspace_unusable"
+
+
+def test_loud_workspace_failure_names_a_retired_delegated_run_worktree(tmp_path, monkeypatch):
+    """The path the agent passed twice in one minute was a delegated-run worktree
+    its own run had already retired; nothing in the old message said so."""
+    from ouroboros import config
+
+    worktrees = tmp_path / "subagent_worktrees"
+    monkeypatch.setattr(config, "get_subagent_worktree_root", lambda: str(worktrees))
+    message, stored = _loud_workspace_failure(
+        tmp_path, monkeypatch,
+        "explicit workspace_root is unusable: path does not exist.",
+        explicit_workspace=str(worktrees / "dlg_060055d5_x"), project_id="",
+    )
+
+    assert "delegated-run worktree" in message and "removed when its run ends" in message
+    assert "Projects → this project" not in message
+    assert stored["reason_code"] == "workspace_unusable"

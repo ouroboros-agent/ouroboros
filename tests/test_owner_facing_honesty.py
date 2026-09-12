@@ -666,3 +666,11 @@ def test_affordance_map_carries_label_path_pairs(tmp_path):
     # The read-only orchestrator root is resolvable when visible to the profile.
     if "subagent_projects" in result.get("readonly_roots", []):
         assert paths.get("subagent_projects")
+
+
+def test_provider_terminal_notice_never_claims_unsupported_reroute():
+    import inspect
+    from ouroboros.loop_transport import provider_terminal_fallback_text
+
+    source = inspect.getsource(provider_terminal_fallback_text)
+    assert "same-model reroute" not in source

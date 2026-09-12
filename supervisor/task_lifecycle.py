@@ -44,6 +44,7 @@ from supervisor.cancel_publication import (  # noqa: F401 -- intentional public 
     _register_owed_terminal_delivery,
     _salvage_cancelled_output,
     _settle_or_reopen_intent,
+    shutdown_cancel_text,
 )
 
 log = logging.getLogger(__name__)
@@ -1140,9 +1141,6 @@ def _finish_captured_running(
 
     _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
 
-    custody_audit = _audit_delegated_runs_on_kill(q, task_id)
-    unreconciled = list(custody_audit.get("unreconciled") or [])
-
     # A terminal checkpoint can precede split-drive adoption and artifact capture.
     # Keep fully published CURRENT byte-identical; complete only work still owed.
     try:
@@ -1157,6 +1155,14 @@ def _finish_captured_running(
             ready = terminal_task_files_ready(q.DRIVE_ROOT, task, stored)
             if not ready and (settled_status or prepared.get("terminal_source_present") is not False):
                 raise RuntimeError("terminal file publication is unresolved")
+        # Decide from adopted terminal truth, not the pre-kill checkpoint. A
+        # ready result keeps its own verdict; only our future cancelled write
+        # authorizes an immediate request. Unknown file custody returns below
+        # without claiming or requesting cancellation; its intent stays open.
+        custody_audit = _audit_delegated_runs_on_kill(
+            q, task_id, **({} if ready else {"deliberate_terminal": STATUS_CANCELLED}),
+        )
+        unreconciled = list(custody_audit.get("unreconciled") or [])
         if ready:
             stored_cost = carry_cost_meta(stored) or {
                 "cost_accounting_status": "unavailable", "cost_final": False,
@@ -1262,7 +1268,14 @@ def _finish_captured_running(
                 # this same merge-write; the audit envelope rides the same
                 # single write (R2) so list and envelope stay coherent.
                 **_custody_disclosure_fields(custody_audit),
-                result="Running task cancelled and worker terminated." + salvage_note,
+                # The cause belongs to the INTENT, not to the lane: a fence the
+                # snapshot restore minted says the server stopped whether the
+                # miss lane or this kill path settles it (ONE producer). Any
+                # other cancel has no such cause and states the kill.
+                result=(
+                    shutdown_cancel_text(intent or {})
+                    or "Running task cancelled and worker terminated."
+                ) + salvage_note,
             ),
         )
     except Exception:

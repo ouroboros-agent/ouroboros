@@ -1038,6 +1038,12 @@ def delegated_capture_read_target(
     the capture prefix (the owning task's own capture dir, never a broader
     surface) re-anchor here. Returns None when the path is not a capture path
     or the base already IS canonical (ordinary single-drive tasks).
+
+    This anchor is deliberately OWNER-ONLY: it rebinds the caller's own
+    ``<task_id>`` prefix. A capture the ORPHAN disposition rule authorizes
+    lives under ANOTHER task's prefix and is resolved by the sibling
+    ``delegate_shared.orphan_capture_read_target``, which asks
+    ``orphan_disposition_status`` before returning a path.
     """
     prefix = DELEGATED_CAPTURE_PREFIX
     if rel_text != prefix and not rel_text.startswith(prefix + "/"):

@@ -129,7 +129,8 @@ def _delegated_disposition_refusal(status: str, entry: Any, rid: str,
             f"⚠️ INTEGRATE_DELEGATED_NOT_OWNED: run {rid!r} is {status} to this task. "
             "Only the task that started a delegated run may integrate its patch while that task "
             "is LIVE; once the owner is terminal, a live TOP-LEVEL task whose active root (Git lane) "
-            "or fresh payload binding (payload lane) is the run's recorded target may dispose the orphan."
+            "or fresh payload binding (payload lane) is the run's recorded target — or contains it as "
+            "a host-minted project tree — may dispose the orphan."
         )
     if not entry.execution_root:
         return (
@@ -378,7 +379,7 @@ def _integrate_delegated_patch(
     flow, whose own guards re-verify the tree. A no-op when nothing is pending.
     """
     from ouroboros import delegate_custody as custody, delegate_source_coverage
-    from ouroboros.delegate_shared import orphan_disposition_status
+    from ouroboros.delegate_shared import orphan_apply_target_ok, orphan_disposition_status
 
     rid = str(run_id or "").strip()
     if not rid:
@@ -485,11 +486,15 @@ def _integrate_delegated_patch(
     except Exception as exc:
         return f"⚠️ INTEGRATE_TARGET_ERROR: could not resolve active repo: {type(exc).__name__}: {exc}."
     target = pathlib.Path(str(entry.target_root or "")).resolve(strict=False)
-    if not str(entry.target_root or "").strip() or target != active_root:
+    # Owner decision B7=A: an ORPHAN may also apply into a target NESTED inside the
+    # caller's active root under the projects root; an OWN run keeps exact equality.
+    target_ok = orphan_apply_target_ok(target, active_root) if orphan_of else target == active_root
+    if not str(entry.target_root or "").strip() or not target_ok:
         return (
             "⚠️ INTEGRATE_DELEGATED_TARGET_MISMATCH: the run's recorded authority target "
             f"({entry.target_root or '(none)'}) is not this task's active root ({active_root}). "
-            "Refusing to apply across trees."
+            "Refusing to apply across trees. A terminal owner's orphan may also target a host-minted "
+            "project tree NESTED inside that root (both under the subagent-projects root); this one is not."
         )
     if not (target / ".git").exists():
         return f"⚠️ INTEGRATE_TARGET_NOT_GIT: target {target} is not a git working tree."

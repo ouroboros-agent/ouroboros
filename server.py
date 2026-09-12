@@ -397,9 +397,15 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             # Everything reversible is behind us (checkout landed, no-resume
             # intent durable): from here the restart always follows, and every
             # unconfirmed stop is a critical diagnostic, never a deferral.
-            _stop_owned_work(ctx)
+            stopped_task_ids = _stop_owned_work(ctx)
             try:
-                reply("Stopping active task. New settings apply to the next message.", "")
+                # Say only what happened: with nothing owned the stop sentence
+                # named a task that was never running.
+                reply(
+                    "Stopping active task. New settings apply to the next message."
+                    if stopped_task_ids else "New settings apply to the next message.",
+                    "",
+                )
             except Exception:
                 log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
             _request_restart_exit(owner=True)
@@ -648,7 +654,8 @@ def _run_supervisor(settings: dict) -> None:
 
         _migrate_startup_cancel_latches(DATA_DIR)
         prior_worker_pids = _startup_worker_pids(DATA_DIR)
-        restored_pending = restore_pending_from_snapshot()
+        interrupted_running: list = []
+        restored_pending = restore_pending_from_snapshot(terminalized=interrupted_running)
         kill_workers(preserve_pending=True)
         spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
@@ -670,11 +677,23 @@ def _run_supervisor(settings: dict) -> None:
 
         _prune_delegated_snapshots()
 
-        if restored_pending > 0:
+        if restored_pending > 0 or interrupted_running:
             st_boot = load_state()
             if st_boot.get("owner_chat_id"):
-                send_with_budget(int(st_boot["owner_chat_id"]),
-                    f"♻️ Restored pending queue from snapshot: {restored_pending} tasks.")
+                # The second clause states an INTENT, not an outcome: restore only
+                # fences an interrupted task with a durable cancel intent, and
+                # cancellation custody writes its terminal result a watchdog
+                # window later (task_lifecycle._INTENT_WATCHDOG_MIN_AGE_SEC).
+                notice = ["♻️"]
+                if restored_pending > 0:
+                    notice.append(f"Restored pending queue from snapshot: {restored_pending} tasks.")
+                if interrupted_running:
+                    count = len(interrupted_running)
+                    notice.append(
+                        f"Cancelling {count} task{'' if count == 1 else 's'} that "
+                        f"{'was' if count == 1 else 'were'} still running when the server stopped."
+                    )
+                send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice))
         _startup_retired_settings_notice(settings)
 
         auto_resume_after_restart()
@@ -1340,6 +1359,47 @@ async def lifespan(app):
         yield
     finally:
         _supervisor_stop.set()  # first: the loop must know a teardown owns what follows
+        log.info("Server shutting down...")
+        # Let the loop leave its current tick BEFORE workers are killed and the
+        # bridge/Manager go down: a tick still running would otherwise respawn
+        # a killed worker or meet BrokenPipe/EOF. Bounded well inside the
+        # launcher's force-exit budget; the stop flag already suppresses the
+        # crash counter if the join times out.
+        supervisor_thread = _supervisor_thread
+        if supervisor_thread is not None and supervisor_thread.is_alive():
+            supervisor_thread.join(timeout=2)
+        # Terminal custody FIRST: this is the teardown's one irreversible durable
+        # write and every wait below it is best effort (ARCHITECTURE, Shutdown).
+        try:
+            restart_requested = _restart_requested.is_set()
+            from supervisor.workers import kill_workers
+            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
+            kill_workers(
+                force=True,
+                terminal_status=cleanup_status,
+                result_reason=cleanup_reason,
+                **_restart_cleanup_kwargs(),
+                **_managed_update_pending_kwargs(),
+            )
+            # Record an explicit shutdown cause so a task interrupted by the shutdown is
+            # never later read as a worker crash storm. Diagnostic, so it runs AFTER the
+            # custody write: append_jsonl waits up to two seconds for the log lock, and
+            # that wait must never spend the force-exit budget on unterminalized workers.
+            try:
+                from ouroboros.utils import append_jsonl, utc_now_iso
+                append_jsonl(
+                    lifespan_drive_root / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "server_shutdown",
+                        "cause": "restart_requested" if restart_requested else "external_signal",
+                        "restart_exit": restart_requested,
+                    },
+                )
+            except Exception:
+                log.debug("Failed to record server_shutdown event", exc_info=True)
+        except Exception:
+            pass
         if extension_reconcile_task is not None:
             extension_reconcile_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
@@ -1361,15 +1421,6 @@ async def lifespan(app):
         with suppress(asyncio.CancelledError):
             await ws_heartbeat_task
 
-        log.info("Server shutting down...")
-        # Let the loop leave its current tick BEFORE workers are killed and the
-        # bridge/Manager go down: a tick still running would otherwise respawn
-        # a killed worker or meet BrokenPipe/EOF. Bounded well inside the
-        # launcher's force-exit budget; the stop flag already suppresses the
-        # crash counter if the join times out.
-        supervisor_thread = _supervisor_thread
-        if supervisor_thread is not None and supervisor_thread.is_alive():
-            supervisor_thread.join(timeout=2)
         try:
             from ouroboros.local_model import get_manager
             get_manager().stop_server()
@@ -1395,34 +1446,6 @@ async def lifespan(app):
             supervisor = get_global_supervisor()
             if supervisor is not None:
                 supervisor.stop_all()
-        except Exception:
-            pass
-        try:
-            restart_requested = _restart_requested.is_set()
-            # Record an explicit shutdown cause so a task interrupted by the
-            # shutdown is never later read as a worker crash storm.
-            try:
-                from ouroboros.utils import append_jsonl, utc_now_iso
-                append_jsonl(
-                    lifespan_drive_root / "logs" / "supervisor.jsonl",
-                    {
-                        "ts": utc_now_iso(),
-                        "type": "server_shutdown",
-                        "cause": "restart_requested" if restart_requested else "external_signal",
-                        "restart_exit": restart_requested,
-                    },
-                )
-            except Exception:
-                log.debug("Failed to record server_shutdown event", exc_info=True)
-            from supervisor.workers import kill_workers
-            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
-            kill_workers(
-                force=True,
-                terminal_status=cleanup_status,
-                result_reason=cleanup_reason,
-                **_restart_cleanup_kwargs(),
-                **_managed_update_pending_kwargs(),
-            )
         except Exception:
             pass
         if _restart_requested.is_set():

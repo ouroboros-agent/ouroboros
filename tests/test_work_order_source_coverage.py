@@ -100,7 +100,7 @@ def _source_response(request, text, start, end):
 def test_actor_first_coordination_appendix_preserves_complete_text():
     import ouroboros.tools.delegate as delegate
 
-    authority = SimpleNamespace(delegated=False)
+    authority = SimpleNamespace(delegated=False, access="readonly")
     context = " \n" + "яё𐍈🚀\n" * 55_000 + "DECISIVE_TAIL\n "
     instructions = delegate._build_start_instructions(authority, coordination_context=context)
     assert instructions.endswith(context)

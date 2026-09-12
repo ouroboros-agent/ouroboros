@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+import pathlib
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
 from ouroboros.delegate_custody import RunCustody as _RunCustody
@@ -99,4 +100,95 @@ def orphan_disposition_status(
     return status, entry, ""
 
 
-__all__ = ["_emit", "_fail", "_owned_run", "orphan_disposition_status"]
+def orphan_apply_target_ok(target: Any, active_root: Any) -> bool:
+    """May a disposition APPLY a run recorded against ``target`` from ``active_root``?
+
+    The nanny's own run still needs exact equality. An ORPHAN of a terminal
+    owner may additionally apply into a target NESTED inside the caller's
+    active root, provided BOTH live under ``get_subagent_projects_root()`` —
+    the host-minted project area. That is the aggregator shape the host itself
+    creates: a swarm fans into ``<project>/contributions/<track>`` clones of
+    the very tree the parent works in, and the host already checkpoint-commits
+    exactly those descendants (``coop_checkpoint._task_tree_coop_roots``), so
+    the widened set adds no tree the host was not already writing to. An
+    owner-attached folder never lives there, so this can never reach one.
+
+    ONE predicate for the apply gate, the health invariant, and the tool
+    description: a rule stated three ways drifts into three rules.
+    """
+    from ouroboros.config import get_subagent_projects_root
+    from ouroboros.tool_access import path_is_relative_to
+
+    try:
+        target_path = pathlib.Path(str(target or "")).expanduser().resolve(strict=False)
+        root_path = pathlib.Path(str(active_root or "")).expanduser().resolve(strict=False)
+    except (OSError, ValueError):
+        return False
+    if not str(target or "").strip() or not str(active_root or "").strip():
+        return False
+    if target_path == root_path:
+        return True
+    projects_root = pathlib.Path(get_subagent_projects_root()).expanduser().resolve(strict=False)
+    return (path_is_relative_to(target_path, root_path)
+            and path_is_relative_to(target_path, projects_root)
+            and path_is_relative_to(root_path, projects_root))
+
+
+def orphan_capture_read_target(
+    ctx: ToolContext, candidate: Any, *,
+    snapshot: Optional[Mapping[str, Any]] = None,
+) -> Optional[pathlib.Path]:
+    """READ anchor for the capture of a TERMINAL OWNER's orphan, or None.
+
+    ``artifacts.delegated_capture_read_target`` rebinds ``artifact_store``
+    reads for the caller's OWN ``delegated_runs/`` prefix only, so the task the
+    orphan rule already authorizes to APPLY a foreign capture could not READ
+    it: the sanctioned recovery root got ``outside selected root=artifact_store``
+    twice on the very patch it was told to dispose. Authority is not widened
+    here -- ``orphan_disposition_status`` remains the single decision, and this
+    only lets the actor that MAY apply also read.
+
+    Resolution is by PATH SHAPE first: a candidate must sit under
+    ``<canonical data root>/task_results/artifacts/<owner_tid>/delegated_runs/
+    <capture>/``. Everything else returns before custody is touched, so a plain
+    refusal never pays for an event-log replay. The custody row is read from a
+    SHARED ``delegate_terminal.custody_audit_snapshot`` when the caller has one,
+    and only without one does this replay -- exactly once.
+    """
+    from ouroboros.artifacts import DELEGATED_CAPTURE_PREFIX
+    from ouroboros.headless import ARTIFACTS_DIR
+    from ouroboros.tool_access import canonical_data_root, path_is_relative_to
+
+    try:
+        resolved = pathlib.Path(candidate).expanduser().resolve(strict=False)
+        artifacts_root = (pathlib.Path(canonical_data_root(ctx)) / ARTIFACTS_DIR).resolve(strict=False)
+        parts = resolved.relative_to(artifacts_root).parts
+    except (OSError, TypeError, ValueError):
+        return None
+    if len(parts) < 3 or parts[1] != DELEGATED_CAPTURE_PREFIX:
+        return None
+    owner_tid, capture_name = parts[0], parts[2]
+    if not owner_tid or owner_tid == str(getattr(ctx, "task_id", "") or ""):
+        return None  # the caller's OWN prefix is delegated_capture_read_target's job
+    drive = custody.custody_root(ctx)
+    state = (snapshot or {}).get("state")
+    rows = (custody.undisposed_patches(drive, state=state) if state is not None
+            else custody.undisposed_patches(drive))
+    for row in rows:
+        if str(row.task_id or "") != owner_tid:
+            continue
+        cap_dir = custody.delegated_capture_dir(drive, row.task_id, row.snapshot_id or row.run_id)
+        if cap_dir.name != capture_name or not path_is_relative_to(resolved, cap_dir):
+            continue
+        # The rows we just read ARE the durable authority; seeding the memo the
+        # ownership lookup consults keeps this read at the traversal budget
+        # above instead of replaying the same log a second time.
+        custody._CUSTODY.setdefault(str(row.run_id), row)
+        status, _entry, orphan_of = orphan_disposition_status(ctx, drive, str(row.run_id))
+        if status == custody.OWNED and orphan_of:
+            return resolved
+    return None
+
+
+__all__ = ["_emit", "_fail", "_owned_run", "orphan_apply_target_ok",
+           "orphan_capture_read_target", "orphan_disposition_status"]

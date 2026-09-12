@@ -40,17 +40,27 @@ def test_real_dispatch_preserves_last_solve_through_empty_and_forced_calls(tmp_p
         "used_model": "fallback", "reported_model": "Provider display alias",
         "used_local": False, "provider": "openrouter",
         "llm_call_id": ctx.accumulated_usage["llm_call_refs"][-1]["llm_call_id"],
+        "last_llm_error_kind": None,
         "source": "usable_solve_response",
     }
     ctx.round_idx += 1
     failed = dispatch(ctx, "empty", message={"role": "assistant", "content": "", "tool_calls": []})
     assert failed[0] is None
-    assert model_execution_projection(ctx.accumulated_usage) == observed
+    after_empty = model_execution_projection(ctx.accumulated_usage)
+    # The solve half is preserved. The host's OWN last typed failure is a
+    # separate fact on the same projection and does move (I9): a nanny that
+    # died on its own lane must be readable without guessing at the leaf.
+    assert {k: v for k, v in after_empty.items() if k != "last_llm_error_kind"} == {
+        k: v for k, v in observed.items() if k != "last_llm_error_kind"}
+    assert after_empty["last_llm_error_kind"] == "provider_incomplete_response"
+    assert observed["last_llm_error_kind"] is None
     assert not ctx.accumulated_usage["llm_call_refs"][-1].get("usable_solve_response")
     # Forced/post-task calls use the same call recorder but not ordinary dispatch.
     call_llm_with_retry(Model({"role": "assistant", "content": "wrap up"}, {}),
                        ctx.messages, "forced", [], "high", 1, ctx.drive_logs,
                        ctx.task_id, 3, None, ctx.accumulated_usage, attempt_cap=1)
+    # ...and a successful send clears the stale typed error, so the projection
+    # returns to the solve half alone.
     assert model_execution_projection(ctx.accumulated_usage) == observed
     refs = collect_trace_refs(ctx.accumulated_usage, {})["llm_call_refs"]
     assert len(refs) == 3
@@ -194,3 +204,28 @@ def test_owner_wait_source_retains_initial_route_and_marked_calls(tmp_path, monk
     resume_native_loop(registry, saved, [], {}, restored, set())
     assert model_execution_projection(restored) == expected
     assert ctx.active_model == "fallback" and ctx.owner_wait_resume is None
+
+
+def test_dead_host_lane_renders_its_own_half_without_inventing_the_leaf():
+    """I9: the host's typed failure and the leaf's identity are SEPARATE facts.
+
+    A nanny that died on its own Codex lane used to be reported by the reviewer
+    role it played, so the owner asked why the leaf's model was broken while
+    that leaf was alive. The host half now rides model_execution beside the
+    model it was running; when the delegated reconciliation was never persisted
+    (it was null on the live row) the custody notice stays silent rather than
+    guessing at the leaf.
+    """
+    from ouroboros.task_finalization import terminal_host_notice_text
+
+    usage = {
+        "initial_model_request": {"model": "primary", "use_local": False},
+        "llm_call_refs": [{"model": "host-lane-model", "llm_call_id": "call-1",
+                           "provider": "claudexor", "usable_solve_response": True}],
+        "_last_llm_error_kind": "provider_outcome_unknown",
+    }
+    projected = model_execution_projection(usage)
+    assert projected["used_model"] == "host-lane-model"
+    assert projected["provider"] == "claudexor"
+    assert projected["last_llm_error_kind"] == "provider_outcome_unknown"
+    assert terminal_host_notice_text({"model_execution": projected}) == ""

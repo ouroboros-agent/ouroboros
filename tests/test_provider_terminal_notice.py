@@ -160,6 +160,164 @@ def test_deadline_text_does_not_hide_an_existing_unknown_attempt():
     assert "no retry or paid fallback was sent" in text
 
 
+def test_provider_terminal_text_claims_only_recorded_recovery_facts():
+    ordinary = loop_transport.provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_transient", "_last_llm_error": "HTTP 503"},
+        is_context_overflow=False, is_transport_wait=False, waited_sec=0.0,
+        interactive=False, is_deadline_exhausted=False,
+    )
+    assert "provider returned no usable response" in ordinary
+    assert "same-model reroute" not in ordinary
+
+    unknown = loop_transport.provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_outcome_unknown"},
+        is_context_overflow=False, is_transport_wait=False, waited_sec=0.0,
+        interactive=False, is_deadline_exhausted=False,
+    )
+    assert unknown.count("dispatched request has no terminal provider outcome") == 1
+    assert "same-model reroute" not in unknown
+
+
+@pytest.mark.parametrize("honored", ["confirmed", "unknown"])
+def test_applied_options_without_mismatch_emit_no_owner_line(honored):
+    progress = []
+    usage = {"_options": {"options_honored": honored}}
+
+    loop_transport.emit_model_effort_mismatch(
+        usage, task_id="task-7",
+        emit_progress=lambda text, *, incident=None: progress.append((text, incident)),
+    )
+
+    assert progress == []
+
+
+def test_owner_line_speaks_only_for_a_changed_reasoning_effort():
+    """A mismatch on another submitted option is durable, never an effort claim."""
+    progress = []
+    route = {"credentialProfileId": "acct-a", "model": "codex=model"}
+    usage = {"_model_route": dict(route), "_options": {
+        "options_honored": "mismatch", "route": dict(route),
+        "requested_options": {"reasoningEffort": "high", "cacheKey": "execution-a"},
+        "applied_options": {"reasoningEffort": "high", "cacheKey": "engine-b"}}}
+
+    def emit(text, *, incident=None):
+        progress.append(text)
+
+    loop_transport.emit_model_effort_mismatch(usage, task_id="task-7", emit_progress=emit)
+    assert progress == [] and usage["_options"]["options_honored"] == "mismatch"
+
+    # The silent round spent no dedupe slot: a real effort change still speaks.
+    usage["_options"]["applied_options"] = {"reasoningEffort": "low", "cacheKey": "engine-b"}
+    loop_transport.emit_model_effort_mismatch(usage, task_id="task-7", emit_progress=emit)
+    assert progress == ["⚠️ Claudexor served at low effort while high was requested"
+                        " (Claudexor account acct-a)."]
+
+
+def _mismatch_round_context(tmp_path, monkeypatch, *, emit_progress, applied_values):
+    """A Main round whose subscription answer reports a lowered effort."""
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx = loop._RoundModelCallContext(
+        llm=None, messages=[], tools=registry, context_fit_plan=None,
+        active_model="claudexor::codex=model", tool_schemas=[], active_effort="high",
+        max_retries=1, drive_logs=tmp_path / "logs", task_id="task-7", round_idx=1,
+        event_queue=None, accumulated_usage={}, task_type="task", active_use_local=False,
+        active_context_mode="max", drive_root=tmp_path, model_role="main",
+        emit_progress=emit_progress,
+    )
+
+    route = {"credentialProfileId": "account-a", "model": "codex=model"}
+
+    def call(_llm, _messages, _model, _tools, _effort, _retries, _logs, _tid,
+             _round, _queue, usage, *_args, **_kwargs):
+        usage["_options"] = {
+            "requested_options": {"reasoningEffort": "high"},
+            "applied_options": {"reasoningEffort": next(applied_values)},
+            "options_honored": "mismatch",
+            "route": dict(route),
+        }
+        usage["_model_route"] = dict(route)
+        return {"role": "assistant", "content": "done"}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", call)
+    monkeypatch.setattr(loop, "_server_web_allowed_by_task", lambda _ctx: False)
+    return ctx
+
+
+def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path, monkeypatch):
+    progress = []
+    ctx = _mismatch_round_context(
+        tmp_path, monkeypatch, applied_values=iter(("medium", "low")),
+        emit_progress=lambda text, *, incident=None: progress.append((text, incident)),
+    )
+    loop._dispatch_round_model(ctx, None, attempt_cap=None)
+    loop._dispatch_round_model(ctx, None, attempt_cap=None)
+
+    assert len(progress) == 1
+    text, incident = progress[0]
+    assert "served at medium effort while high was requested" in text
+    assert "Claudexor account account-a" in text
+    assert incident == {
+        "task_incident": "model_effort_mismatch",
+        "toast_once": "task-7:model_effort_mismatch:codex=model",
+    }
+
+
+def test_failed_round_route_never_borrows_the_previous_applied_options(tmp_path, monkeypatch):
+    """Only the route that reported applied options can be named in its line."""
+    from ouroboros.llm_claudexor import ClaudexorModelError
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    usage, progress = {}, []
+    route_a = {"model": "MODEL-A", "credentialProfileId": "acct-a", "source": "codex"}
+    route_b = {"model": "MODEL-B", "credentialProfileId": "acct-b", "source": "claude"}
+
+    def served(route, requested, applied):
+        return {"role": "assistant", "content": "done"}, {"claudexor": {
+            "route": dict(route), "options_honored": "mismatch",
+            "requested_options": {"reasoningEffort": requested},
+            "applied_options": {"reasoningEffort": applied}}}
+
+    def failed(route):
+        raise ClaudexorModelError({"code": "model_operation_failed", "message": "engine down",
+                                   "context": {"httpStatus": 503}}, route=route)
+
+    rounds = [lambda: served(route_a, "xhigh", "low"), lambda: failed(route_b),
+              lambda: served(route_b, "high", "medium")]
+    lines_after = []
+
+    for index, step in enumerate(rounds):
+        monkeypatch.setattr(loop_llm_call, "_send_main_candidate",
+                            lambda *_args, _step=step, **_kwargs: _step())
+        loop_llm_call.call_llm_with_retry(
+            SimpleNamespace(), [], "MODEL", [], "xhigh", 1, logs, "task-1", index, None, usage,
+            "task", attempt_cap=1, initial_messages=[])
+        loop_transport.emit_model_effort_mismatch(
+            usage, task_id="task-1",
+            emit_progress=lambda text, *, incident=None: progress.append((text, incident)))
+        lines_after.append(len(progress))
+        if index == 1:  # the failed round names its own route and carries no applied options
+            assert usage["_model_route"] == route_b and usage["_options"]["route"] == route_a
+
+    assert lines_after == [1, 1, 2]  # the failed round adds nothing; MODEL-B speaks for itself
+    assert [incident["toast_once"] for _text, incident in progress] == [
+        "task-1:model_effort_mismatch:MODEL-A", "task-1:model_effort_mismatch:MODEL-B"]
+    assert progress[1][0] == ("⚠️ Claudexor served at medium effort while high was requested"
+                              " (Claudexor account acct-b).")
+
+
+def test_mismatch_round_never_calls_the_one_argument_tool_context_emitter(tmp_path, monkeypatch):
+    """The frozen ToolContext seam takes one argument and stays out of this notice."""
+    seen = []
+    ctx = _mismatch_round_context(tmp_path, monkeypatch, emit_progress=None,
+                                  applied_values=iter(("medium",)))
+    ctx.tools._ctx.emit_progress_fn = seen.append  # rejects incident=, exactly like the ABI default
+
+    loop._dispatch_round_model(ctx, None, attempt_cap=None)
+
+    assert seen == [] and ctx.accumulated_usage["_options"]["options_honored"] == "mismatch"
+
+
 def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, monkeypatch):
     from ouroboros.utils import sanitize_tool_result_for_log
     from tests.test_transport_death_retry import _ScriptedLLM, _death, _primary_call

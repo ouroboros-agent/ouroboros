@@ -130,9 +130,143 @@ def test_fallback_dispatch_lane_stays_the_global_flag(tmp_path, monkeypatch, cap
             messages=[], active_model="primary", active_use_local=False, tool_schemas=[],
             active_effort="high", max_retries=1, drive_logs=tmp_path / "logs", task_id="t",
             round_idx=1, event_queue=None, accumulated_usage={}, task_type="task",
-            emit_progress=lambda _: None, context_fit_plan=None, active_context_mode="max",
+            emit_progress=lambda _text, *, incident=None: None,
+            context_fit_plan=None, active_context_mode="max",
         )
     assert dispatched == [("remote-model", captured_local), ("other (local)", captured_local)]
+
+
+def test_fallback_notice_carries_lane_switch_incident_reason_and_pin(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+
+    fallback = "claudexor::codex=fallback"
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", fallback)
+    monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", '{"fallback":["account-a"]}')
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    monkeypatch.setattr(loop, "_call_round_model", lambda _ctx: ({"role": "assistant"}, 0, "max"))
+    progress = []
+    ctx = SimpleNamespace(active_model="primary", active_use_local=False)
+    tools = SimpleNamespace(_ctx=SimpleNamespace())
+
+    loop_model_call._run_cross_model_fallback_chain(
+        llm=None, ctx=ctx, tools=tools, messages=[], active_model="primary",
+        active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+        drive_logs=tmp_path / "logs", task_id="task-7", round_idx=3, event_queue=None,
+        accumulated_usage={"_last_llm_error_kind": "provider_transient"}, task_type="task",
+        emit_progress=lambda text, *, incident=None: progress.append((text, incident)),
+        context_fit_plan=None, active_context_mode="max",
+    )
+
+    assert len(progress) == 1
+    text, incident = progress[0]
+    assert "account: account-a" in text and "reason: provider_transient" in text
+    assert "pinned account: siblings were not tried" in text
+    assert incident == {
+        "task_incident": "model_lane_switch",
+        "toast_once": f"task-7:model_lane_switch:3:{fallback}",
+    }
+
+
+def test_second_lane_switch_names_the_candidate_that_just_failed(tmp_path, monkeypatch):
+    """Each notice names the model actually tried, beside that model's own reason."""
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "alt-a,alt-b")
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(fallback_cooldown, "mark_cooldown", lambda *_a, **_k: None)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    usage = {"_last_llm_error_kind": "primary_kind"}
+    progress = []
+
+    def call(ctx):
+        # Each candidate fails and stamps its own typed kind on the record.
+        usage["_last_llm_error_kind"] = f"{ctx.active_model}_kind"
+        return None, 0.0, "max"
+
+    monkeypatch.setattr(loop, "_call_round_model", call)
+    loop_model_call._run_cross_model_fallback_chain(
+        llm=None, ctx=SimpleNamespace(active_model="primary", active_use_local=False),
+        tools=SimpleNamespace(_ctx=SimpleNamespace()), messages=[], active_model="primary",
+        active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+        drive_logs=tmp_path / "logs", task_id="task-7", round_idx=3, event_queue=None,
+        accumulated_usage=usage, task_type="task",
+        emit_progress=lambda text, *, incident=None: progress.append(text),
+        context_fit_plan=None, active_context_mode="max",
+    )
+
+    assert progress == [
+        "⚡ Fallback: primary → alt-a; reason: primary_kind",
+        "⚡ Fallback: alt-a → alt-b; reason: alt-a_kind",
+    ]
+
+
+@pytest.mark.parametrize("override,expected_account,pinned", [
+    ("", "Auto", False), ("account-b", "account-b", True),
+])
+def test_fallback_notice_names_the_account_the_task_override_binds(
+    tmp_path, monkeypatch, override, expected_account, pinned,
+):
+    """A task-local wait override, not the configured value, is what the send uses."""
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+    from ouroboros.model_wait import task_model_wait_scope
+
+    fallback = "claudexor::codex=fallback"
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", fallback)
+    monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", '{"fallback":["account-a"]}')
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    monkeypatch.setattr(loop, "_call_round_model", lambda _ctx: ({"role": "assistant"}, 0, "max"))
+    progress = []
+
+    with task_model_wait_scope(task={"id": "task-7", "_attempt": 1}, drive_root=tmp_path,
+                               event_queue=None, worker_slot_held=True) as wait:
+        wait.overrides["fallback:0"] = {"model": fallback, "use_local": False,
+                                        "model_account_override": override}
+        loop_model_call._run_cross_model_fallback_chain(
+            llm=None, ctx=SimpleNamespace(active_model="primary", active_use_local=False),
+            tools=SimpleNamespace(_ctx=SimpleNamespace()), messages=[], active_model="primary",
+            active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+            drive_logs=tmp_path / "logs", task_id="task-7", round_idx=3, event_queue=None,
+            accumulated_usage={}, task_type="task",
+            emit_progress=lambda text, *, incident=None: progress.append(text),
+            context_fit_plan=None, active_context_mode="max",
+        )
+
+    assert len(progress) == 1 and f"account: {expected_account}" in progress[0]
+    assert "account-a" not in progress[0]
+    assert ("pinned account: siblings were not tried" in progress[0]) is pinned
+
+
+def test_api_fallback_notice_omits_inapplicable_account_clause(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import fallback_cooldown, loop, loop_model_call
+
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai::alternate")
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_: False)
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda _: None)
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    monkeypatch.setattr(loop, "_call_round_model", lambda _ctx: ({"role": "assistant"}, 0, "max"))
+    progress = []
+
+    loop_model_call._run_cross_model_fallback_chain(
+        llm=None, ctx=SimpleNamespace(active_model="primary", active_use_local=False),
+        tools=SimpleNamespace(_ctx=SimpleNamespace()), messages=[], active_model="primary",
+        active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+        drive_logs=tmp_path / "logs", task_id="task-7", round_idx=3, event_queue=None,
+        accumulated_usage={}, task_type="task",
+        emit_progress=lambda text, *, incident=None: progress.append(text),
+        context_fit_plan=None, active_context_mode="max",
+    )
+
+    assert len(progress) == 1
+    assert "account:" not in progress[0]
 
 
 # ---------------------------------------------------------------------------

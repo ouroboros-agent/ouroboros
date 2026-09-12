@@ -77,7 +77,8 @@ def release_task_runs(drive_root: Any, task_id: str, *,
 
 
 def reconcile_task_runs(drive_root: Any, task_id: str, *,
-                        gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
+                        gateway_factory: Optional[Callable[[], Any]] = None,
+                        deliberate_terminal: str = "") -> List[Dict[str, Any]]:
     """Settle or cancel ONE task's open runs from the DURABLE rows (kill path).
 
     The supervisor-side twin of ``release_task_runs`` for a task whose worker was
@@ -85,6 +86,15 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     its memo died with the process, so the durable rows are the only complete
     view. Covers pending invocations like the orphan sweep; cheap when the task
     delegated nothing.
+
+    ``deliberate_terminal`` is the terminal status the KILLING caller is about to
+    write, when that terminal is the task's own deliberate end (an owner
+    cancellation). The kill boundary audits custody before its terminal write, so
+    the durable result the inverted floor otherwise reads does not exist yet; the
+    caller already knows the verdict and states it here rather than having the
+    host guess or re-read a file that is not there. Empty means "no verdict from
+    me", which is what every host bound (deadline, reap) and every read-only
+    sweep passes.
     """
     mine = str(task_id or "")
     if not mine:
@@ -103,7 +113,8 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
             and r.settled and r.project_id not in live]
     if not held and not stray and not owed:
         return []
-    return _reconcile_each(drive_root, held, gateway_factory, pending=stray)
+    return _reconcile_each(drive_root, held, gateway_factory, pending=stray,
+                           deliberate_terminal=deliberate_terminal)
 
 
 def reconcile_orphaned_runs(
@@ -137,7 +148,8 @@ def reconcile_orphaned_runs(
 
 def _reconcile_each(drive_root: Any, runs: List[RunCustody],
                     gateway_factory: Optional[Callable[[], Any]],
-                    pending: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+                    pending: Optional[List[Dict[str, Any]]] = None,
+                    deliberate_terminal: str = "") -> List[Dict[str, Any]]:
     """One transport, one settle-or-cancel pass. Shared by both release surfaces.
 
     ``pending`` is the durable sweep's extra duty: START_REQUESTED-only invocations
@@ -177,9 +189,14 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     outcomes: List[Dict[str, Any]] = []
     try:
         for custody in runs:
-            outcomes.append(_custody()._reconcile_one(drive_root, gateway, custody))
+            outcomes.append(_custody()._reconcile_one(
+                drive_root, gateway, custody,
+                deliberate_terminal=deliberate_terminal,
+            ))
         for record in pending or []:
-            outcomes.append(_recover_pending_invocation(drive_root, gateway, record))
+            outcomes.append(_recover_pending_invocation(
+                drive_root, gateway, record, deliberate_terminal=deliberate_terminal,
+            ))
         # Recomputed inside: a run settled this very pass may have made its
         # project eligible - the pre-pass gate is not the last word.
         if registrations or runs:
@@ -193,7 +210,8 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
 
 
 def _recover_pending_invocation(drive_root: Any, gateway: Any,
-                                record: Dict[str, Any]) -> Dict[str, Any]:
+                                record: Dict[str, Any], *,
+                                deliberate_terminal: str = "") -> Dict[str, Any]:
     """Recover the run (if any) behind an orphaned pending invocation, idempotently.
 
     The stored canonical body is re-POSTed under the invocation's own wire key:
@@ -284,7 +302,9 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         "delegated": bool(execution.get("delegated")), "root": str(scope.get("root") or ""),
         "recovered_from_pending_invocation": True,
     })
-    return _custody()._reconcile_one(drive_root, gateway, custody)
+    return _custody()._reconcile_one(
+        drive_root, gateway, custody, deliberate_terminal=deliberate_terminal,
+    )
 
 
 def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool:
@@ -302,7 +322,39 @@ def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool
         return False
 
 
-def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[str, Any]:
+def _owner_terminal_is_deliberate(drive_root: Any, task_id: str) -> bool:
+    """Whether the run's owning task ended ON PURPOSE (owner answer B1-A, the floor
+    INVERTED: cancel only behind a verdict).
+
+    True only when the owner's durable result is readable, truly terminal, and its
+    execution axis says the task finished by its own decision: a completed, degraded
+    or best-effort answer, a failure the agent itself declared, or a cancellation.
+    A provider or transport death, a worker crash (``infra_failed``), an interrupted
+    row, a missing, unreadable or still-running result all answer False and SPARE
+    the run: an undignified nanny death must not kill a healthy paid run, and
+    "unknown" is exactly the case the answer is about. No reason-code table and no
+    special crash branch: the axis the finalizers already write is the class. The
+    spared run's own ``maxSeconds`` stays its damage limit (ARCHITECTURE, custody).
+    """
+    from ouroboros.outcomes import (
+        EXECUTION_BEST_EFFORT, EXECUTION_CANCELLED, EXECUTION_DEGRADED, EXECUTION_FAILED,
+        EXECUTION_OK, normalize_outcome_axes,
+    )
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+    try:
+        result = load_task_result(drive_root, str(task_id or ""))
+    except Exception:
+        return False
+    if not isinstance(result, dict) or str(result.get("status") or "") not in _TRULY_TERMINAL_STATUSES:
+        return False
+    execution = str((normalize_outcome_axes(result).get("execution") or {}).get("status") or "")
+    return execution in {EXECUTION_OK, EXECUTION_DEGRADED, EXECUTION_BEST_EFFORT,
+                         EXECUTION_FAILED, EXECUTION_CANCELLED}
+
+
+def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody, *,
+                   deliberate_terminal: str = "") -> Dict[str, Any]:
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.tools.delegate_integration import capture_stranded_patch
 
@@ -339,6 +391,19 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         # The C1 half: a TERMINAL DETAIL proves the run is over, so the sweep — its
         # last terminal observer — captures the diff eagerly here.
         result.update(capture_stranded_patch(drive_root, custody))
+    elif not (deliberate_terminal
+              or _owner_terminal_is_deliberate(drive_root, custody.task_id)):
+        # The inverted floor (B1-A): a live run outlives every owner terminal that
+        # was not a verdict. Two ways to know the verdict, and the caller's is
+        # first because a kill boundary audits custody BEFORE it writes its own
+        # terminal (the A4 ordering): `deliberate_terminal` is the status that
+        # caller is about to write. Everyone else, including the periodic sweep,
+        # reads the durable result. Without either, the run stays live: it settles
+        # itself through the terminal arm above when it ends, and its snapshot
+        # work becomes an undisposed_patches obligation like any other.
+        result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "left_live",
+                  "state": str(_custody().summary_of(detail).get("state") or ""),
+                  **_custody().output_disposition(custody)}
     else:
         cancelled = _custody().cancel_and_verify(drive_root, gateway, custody, "owner_task_gone")
         result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "cancelled",

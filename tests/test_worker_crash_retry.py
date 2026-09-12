@@ -664,6 +664,52 @@ def test_signal_crash_is_terminal_no_retry(tmp_path):
     }
 
 
+def test_crash_toast_for_a_bound_task_goes_to_its_project_chat(tmp_path):
+    """The crash toast is a DIRECT send, so the durable project binding has to
+    win over the chat the task was born in: a task converted into a project
+    mid-run would otherwise be told about its crash in Main."""
+    import supervisor.workers as W
+    import queue as _queue
+
+    from ouroboros.projects_registry import bind_task_to_project
+
+    bind_task_to_project(tmp_path, "sig02", "crash-proj", 5151, origin={"absent": "system"})
+    task = _make_task(task_id="sig02", attempt=1, chat_id=1)  # born in Main
+    worker = _make_worker(busy_task_id="sig02", exitcode=-11)
+
+    W.DRIVE_ROOT = tmp_path
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    W.QUEUE_MAX_RETRIES = 1
+    W.WORKERS = {0: worker}
+    W.RUNNING = {
+        "sig02": {
+            "task": task,
+            "started_at": time.time() - 5,
+            "last_heartbeat_at": time.time() - 5,
+            "attempt": 1,
+        }
+    }
+    W._LAST_SPAWN_TIME = 0
+    W.CRASH_TS = []
+
+    import supervisor.queue as sq
+
+    incident_notice = MagicMock()
+    with patch.object(sq, "enqueue_task", side_effect=lambda t, front=False: None), \
+         patch.object(sq, "persist_queue_snapshot", MagicMock()), \
+         patch("supervisor.workers.respawn_worker"), \
+         patch("supervisor.workers.load_state", return_value={}), \
+         patch("ouroboros.task_results.load_task_result", return_value=None), \
+         patch("ouroboros.task_results.write_task_result", side_effect=lambda *a, **k: None), \
+         patch("supervisor.workers.get_event_q", return_value=_queue.Queue()), \
+         patch("supervisor.workers.send_with_budget", incident_notice), \
+         patch("supervisor.message_bus.get_bridge", return_value=None):
+        _run_health_and_reap()
+
+    incident_notice.assert_called_once()
+    assert incident_notice.call_args[0][0] == 5151
+
+
 def test_deep_self_review_crash_emits_task_done_event(tmp_path):
     """deep_self_review crash must emit task_done so the UI live card closes."""
     import supervisor.workers as W

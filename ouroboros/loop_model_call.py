@@ -99,8 +99,10 @@ def _run_cross_model_fallback_chain(
     """Try fallbacks; unknown dispatch stops the chain."""
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.config import fallback_candidate_targets
-    from ouroboros.model_slots import parse_fallback_chain
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, parse_fallback_chain, task_model_binding
+    from ouroboros.model_wait import current_model_wait
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
+    from ouroboros.provider_models import provider_for_model
 
     def _cooled(model: str, use_local: bool) -> None:
         if str(accumulated_usage.get("_last_llm_error_kind") or "") in _cooldown_kinds:
@@ -110,7 +112,12 @@ def _run_cross_model_fallback_chain(
     primary_context_usage = _snapshot_context_fit_usage(accumulated_usage)
     fallback_use_local = runtime_setting("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
     attempt_cap = _fcd.attempts_per_model()
+    waiter = current_model_wait()
     configured_chain = parse_fallback_chain()
+    # The notice names the model that was actually just tried. `active_model`
+    # stays the primary until a candidate succeeds, so a second switch would
+    # otherwise read "primary -> B" beside B's predecessor's failure reason.
+    previous_model, previous_tag = active_model, " (local)" if active_use_local else ""
     msg = None
     # ABI-4: the candidate ladder arrives as typed ResolvedModelTarget values;
     # `.model_id` is read once here and crosses to strings only at the LLM
@@ -128,9 +135,22 @@ def _run_cross_model_fallback_chain(
         deadline = _loop()._task_deadline_epoch(tools)
         if deadline and time.time() >= deadline:
             break
-        ptag = " (local)" if active_use_local else ""
         ftag = " (local)" if fallback_use_local else ""
-        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}")
+        # Name the account the dispatch will actually use: a task-local wait
+        # override replaces the configured one for this role, or selects Auto,
+        # so the same binding must speak here as at the send.
+        _bound_role, bound_account = task_model_binding(
+            {"model_role": fallback_role, "task_metadata": getattr(tools._ctx, "task_metadata", {})},
+            overrides=waiter.overrides if waiter else None)
+        fallback_account = (bound_account.strip() if bound_account is not None
+                            else str(model_role_option(MODEL_ACCOUNTS_KEY, fallback_role) or ""))
+        account_route = provider_for_model(fallback_model) == "claudexor"
+        account_note = f"; account: {fallback_account or 'Auto'}" if account_route else ""
+        reason = str(accumulated_usage.get("_last_llm_error_kind") or "")
+        emit_progress(f"⚡ Fallback: {previous_model}{previous_tag} → {fallback_model}{ftag}"
+                      f"{account_note}"
+                      f"{f'; reason: {reason}' if reason else ''}{'; pinned account: siblings were not tried' if account_route and fallback_account else ''}",
+                      incident={"task_incident": "model_lane_switch", "toast_once": f"{task_id}:model_lane_switch:{round_idx}:{fallback_model}"})
         # Cross-FAMILY fallback must not replay the primary's
         # provider-private reasoning to a different family (the GLM->Claude
         # 400 "Invalid signature" death); the SSOT sanitizer no-ops same-family.
@@ -172,6 +192,7 @@ def _run_cross_model_fallback_chain(
                 drive_root=pathlib.Path(drive_logs).parent,
                 attempt_cap=attempt_cap,
                 model_role=fallback_role,
+                emit_progress=emit_progress,
             )
         msg, _cost, candidate_mode = _loop()._call_round_model(candidate_call)
         if msg is not None:
@@ -200,6 +221,7 @@ def _run_cross_model_fallback_chain(
         if str(accumulated_usage.get("_last_llm_error_kind") or "") in ("provider_outcome_unknown", "deadline_exhausted", "transport_unavailable"):
             break
         _cooled(fallback_model, fallback_use_local)
+        previous_model, previous_tag = fallback_model, ftag
     return (
         msg,
         active_model,
@@ -346,6 +368,10 @@ class _RoundModelCallContext:
     drive_root: Optional[pathlib.Path]
     attempt_cap: Optional[int] = None
     model_role: str = ""
+    # The loop-level owner notifier (run_llm_loop's own parameter), the one
+    # callable documented to accept incident=; the ToolContext ABI's
+    # emit_progress_fn takes a single argument and must not carry the pair.
+    emit_progress: Optional[Callable[..., None]] = None
 
 
 def _context_fit_round_id(ctx: _RoundModelCallContext) -> str:
@@ -433,7 +459,7 @@ def _dispatch_round_model(
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
 ) -> Tuple[Any, float]:
     from ouroboros.model_wait import current_model_wait
-    from ouroboros.loop_transport import managed_transport_continuation, transport_repeat_stop_requested
+    from ouroboros.loop_transport import emit_model_effort_mismatch, managed_transport_continuation, transport_repeat_stop_requested
     from ouroboros.owner_mailbox import OwnerMailboxPeek
 
     mailbox_peek = OwnerMailboxPeek()
@@ -478,6 +504,8 @@ def _dispatch_round_model(
             use_local=ctx.active_use_local, preferred_mode=ctx.active_context_mode,
             tool_schemas=ctx.tool_schemas, model_role=role, model_route=observed,
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
+    emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id,
+                               emit_progress=getattr(ctx, "emit_progress", None))
     call = ctx.accumulated_usage.get("_last_llm_call_meta")
     execution_id = ctx.accumulated_usage.get("execution_id")
     if (result[0] is not None and isinstance(call, dict) and call is not previous_call

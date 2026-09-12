@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import loop_forced_finalization as forced, task_pacing
+from ouroboros import llm_claudexor, loop_forced_finalization as forced, task_pacing
 from ouroboros.contracts.task_contract import normalize_budget_profile
 from ouroboros.loop_model_call import _RoundModelCallContext, _adopt_fallback_route, _call_round_model
 from ouroboros.llm import LLMClient
@@ -17,7 +17,7 @@ from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, task_model_binding
 from ouroboros.model_wait import task_model_wait_scope
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.usage_accounting import PhysicalAttemptPreconditionFailed
-from tests.test_llm_claudexor import MODEL, ROUTE, setup as setup
+from tests.test_llm_claudexor import MODEL, ROUTE, result, setup as setup
 
 
 @pytest.fixture
@@ -77,6 +77,53 @@ def test_subscription_prepared_candidate_admits_the_actual_forced_send(acting):
     text = forced._call_forced_model_once(acting.ctx, initial_messages=prepared, admitted_request=request)
     assert text == "Ответ 🐍", acting.ctx.accumulated_usage
     assert len(acting.gateway.creates) == 1
+
+
+def test_subscription_prospective_and_send_share_the_execution_cache_key(acting, monkeypatch):
+    """The admitted candidate declares the same cache affinity as the real send."""
+    from ouroboros import llm_claudexor
+
+    acting.ctx.messages = [{"role": "user", "content": "Please finish"}]
+    built = []
+    build = llm_claudexor._request
+
+    def record(target, messages, tools, parameters):
+        payload = build(target, messages, tools, parameters)
+        built.append(deepcopy(payload["options"]))
+        return payload
+
+    monkeypatch.setattr(llm_claudexor, "_request", record)
+    request, prepared = task_pacing.prepared_wrapup_candidate(
+        acting.ctx, deepcopy(acting.ctx.messages), allow_server_web_search=False)
+    assert forced._call_forced_model_once(acting.ctx, initial_messages=prepared,
+                                          admitted_request=request) == "Ответ 🐍"
+    execution_id = acting.ctx.accumulated_usage["execution_id"]
+    assert len(built) == 2 and built[0] == built[1] == {"reasoningEffort": "high", "cacheKey": execution_id}
+    assert acting.gateway.uploads[0][0]["options"] == built[1]
+
+
+def test_prospective_build_reads_the_failed_profile_without_spending_it(acting):
+    """Only the dispatch consumes the one-shot fact, so its candidate still admits it."""
+    acting.ctx.accumulated_usage["execution_id"] = "execution-refusal"
+    acting.ctx.messages = [result()["message"], {"role": "user", "content": "Please finish"}]
+    token = llm_claudexor._FAILED_PROFILE.set(
+        ("execution-refusal", "codex", "exact-model", "account-a"))
+    try:
+        with task_model_wait_scope(task={"id": "task-one", "_attempt": 1}, drive_root=acting.root,
+                                   event_queue=None, worker_slot_held=True) as wait:
+            wait.overrides["subagent:visual-actor"] = {
+                "model": MODEL, "use_local": False, "model_account_override": ""}
+            request, prepared = task_pacing.prepared_wrapup_candidate(
+                acting.ctx, deepcopy(acting.ctx.messages), allow_server_web_search=False)
+            assert llm_claudexor._FAILED_PROFILE.get()[3] == "account-a"  # observed, not spent
+            assert forced._call_forced_model_once(acting.ctx, initial_messages=prepared,
+                                                  admitted_request=request) == "Ответ 🐍"
+        assert llm_claudexor._FAILED_PROFILE.get() == ()  # the dispatch spent it, exactly once
+    finally:
+        llm_claudexor._FAILED_PROFILE.reset(token)
+    payload = acting.gateway.uploads[0][0]
+    assert payload["account"] == {"mode": "auto"}  # the refused account is not preferred back
+    assert payload["options"] == {"reasoningEffort": "high", "cacheKey": "execution-refusal"}
 
 
 @pytest.mark.parametrize("shape", ["mid_round_image", "late_system_notice"])

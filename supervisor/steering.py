@@ -64,6 +64,33 @@ def _refuse_steering_while_cancelling(
     return True
 
 
+def _steer_refusal_notice(refusal: str, target_label: str) -> str:
+    """The owner sentence for one typed steering refusal.
+
+    The cause is the whole point: a task running in its own project room is not a
+    task that "may have finished", and the room it runs in is the way to reach it.
+    """
+    label = target_label or "(no longer available)"
+    return {
+        "direct_chat_turn": (
+            f"⚠️ Couldn't steer task {label} — its direct conversation turn has already "
+            "ended. I'll answer here or start a new task instead."
+        ),
+        "subagent_target": (
+            f"⚠️ Couldn't steer task {label} — it is a delegated helper, which takes "
+            "direction from the task that started it. I'll answer here or start a new "
+            "task instead."
+        ),
+        "chat_mismatch": (
+            f"⚠️ Couldn't steer task {label} — it belongs to another chat, not this one. "
+            f"Open {label} and send it there, or start a new task here."
+        ),
+    }.get(refusal, (
+        f"⚠️ Couldn't steer task {label} — it isn't running in this chat anymore "
+        "(it may have finished). I'll answer here or start a new task instead."
+    ))
+
+
 def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     """Deliver an agent-chosen steering message to an addressable owner root.
 
@@ -146,32 +173,36 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         except Exception:
             return False
 
-    steerable = (
-        isinstance(task, dict)
-        and (direct_active or not task.get("_is_direct_chat"))
-        and str(task.get("delegation_role") or "") != "subagent"
-        and _matches_chat(task)
-    )
-    if not steerable:
-        # Fail visibly: the chosen task is no longer a steerable running task in
-        # this chat. Tell the owner so the agent/owner can answer or spawn instead.
+    # Four different refusals in the same order the boolean used to fold them
+    # into one. Which one fired is what the owner needs: a task running in its
+    # own project room for another half hour is not a task that "may have
+    # finished", and a receipt that says only `target_not_steerable` cannot tell
+    # the two apart afterwards either.
+    if not isinstance(task, dict):
+        refusal = "target_unknown"
+    elif not (direct_active or not task.get("_is_direct_chat")):
+        refusal = "direct_chat_turn"
+    elif str(task.get("delegation_role") or "") == "subagent":
+        refusal = "subagent_target"
+    elif not _matches_chat(task):
+        refusal = "chat_mismatch"
+    else:
+        refusal = ""
+    if refusal:
+        # Fail visibly: the chosen task is not a steerable running task here.
+        # Tell the owner so the agent/owner can answer or spawn instead.
         client_message_id = str(evt.get("client_message_id") or "").strip()
         _emit_routing_receipt(
             ctx, evt, action="steer_task", target=target, target_label=target_label,
             status="needs_manual_target",
-            reason="target_not_steerable",
+            reason=refusal,
         )
         if not client_message_id and chat_id:
             try:
-                ctx.send_with_budget(
-                    chat_id,
-                    f"⚠️ Couldn't steer task {target_label or '(no longer available)'} — it isn't running "
-                    "in this chat anymore "
-                    "(it may have finished). I'll answer here or start a new task instead.",
-                )
+                ctx.send_with_budget(chat_id, _steer_refusal_notice(refusal, target_label))
             except Exception:
-                log.debug("steer_task stale-target notice failed", exc_info=True)
-        log.info("steer_task: stale/invalid target %s for chat %s", target, chat_id)
+                log.debug("steer_task refusal notice failed", exc_info=True)
+        log.info("steer_task: %s target %s for chat %s", refusal, target, chat_id)
         return
     # Idempotent delivery: a stable msg_id from client_message_id+target dedups
     # retries; without a client id use a unique id (avoid false dedup/collision).

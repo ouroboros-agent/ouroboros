@@ -609,6 +609,8 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             PROJECT_NAME_MAX,
             bind_task_to_project,
             create_project,
+            get_project,
+            project_id_for_task,
             touch_project,
         )
 
@@ -625,6 +627,40 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                 status_code=400,
             )
         drive_root = request_drive_root(request)
+
+        def _conflicting_binding(*, disclose: bool) -> Any:
+            """The 409 answer when the task is READABLY bound to another project, None
+            otherwise. Read at EVERY side-effect boundary (owner decision B4=A): naming
+            can call a model, create_project mints a registry row and the lease mark
+            hands it a lane - all of which used to happen before the immutable bind
+            refused a task that already belonged somewhere else, and a single read taken
+            before the naming await cannot see a task that bound itself during it. The
+            refusal NAMES that project, so no surface has to invent an explanation
+            (there is no reload affordance in the desktop shell, the Telegram mini app
+            or the mobile layout). An UNREADABLE store is disclosed once and read as "no
+            binding", exactly as the hot path reads it, so the conversion proceeds as it
+            would for an unbound task."""
+            try:
+                bound = str(project_id_for_task(drive_root, task_id, strict=True) or "")
+            except Exception:
+                if disclose:
+                    log.warning(
+                        "project_binding_unreadable: convert of task %s continues as unbound",
+                        task_id, exc_info=True,
+                    )
+                return None
+            if not bound or bound == sanitize_project_id(raw_id):
+                return None
+            bound_name = str((get_project(drive_root, bound) or {}).get("name") or "").strip() or bound
+            return JSONResponse(
+                {"error": f"This task already belongs to {bound_name} (id={bound}); "
+                          "open it there or start a new task."},
+                status_code=409,
+            )
+
+        refusal = _conflicting_binding(disclose=True)
+        if refusal is not None:
+            return refusal
         # Auto-name from the task's own title/objective when the caller sends none
         # (the one-click convert path), so no human input and no extra LLM call
         # are needed (owner P1). An explicit name still wins. Order: explicit name ->
@@ -690,6 +726,15 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                     reason = "hint_or_fallback"
             project_name = _cap_name(project_name)
             _emit_naming_reason(drive_root, task_id, project_name, reason)
+        # Re-validate the authority now that the name is settled and BEFORE the first
+        # side effect. The naming step above can await a model call for seconds, and a
+        # running task that scopes itself in that window binds durably to ANOTHER
+        # project; without this second read the conversion created its own project row,
+        # moved the lane onto it and only then met the immutable bind, leaving the
+        # binding on one project and the lane on another.
+        refusal = _conflicting_binding(disclose=False)
+        if refusal is not None:
+            return refusal
         project = create_project(
             drive_root,
             sanitize_project_id(raw_id),
@@ -711,13 +756,21 @@ async def api_project_from_task(request: Request) -> JSONResponse:
         # SSOT helper shared with the in-task ensure_project_scope path. No-op if the task
         # is neither running nor pending (the durable bind alone is then correct — there
         # is no live lane to occupy).
-        try:
-            from ouroboros.project_lease import mark_task_project
+        def _mark_lane(pid: str) -> str:
+            """Point the live queue/lease copy of this task at ``pid`` under the queue
+            lock and persist the snapshot; returns the value the lane held BEFORE the
+            call, so a refused durable bind can put it back."""
+            from ouroboros.project_lease import mark_task_project, task_lane_project_id
             from supervisor.queue import _queue_lock, persist_queue_snapshot
             from supervisor.workers import PENDING, RUNNING
 
             with _queue_lock:
-                marked = mark_task_project(RUNNING, PENDING, task_id, str(project["id"]))
+                previous = task_lane_project_id(RUNNING, PENDING, task_id)
+                # This conversion OWNS the binding it is about to write (a task bound
+                # elsewhere was already refused above), so the in-memory copy follows
+                # it even when the row carries a derived project id from a
+                # bare-workspace promote; fill-only alone left that lane behind.
+                marked = mark_task_project(RUNNING, PENDING, task_id, pid, authority="binding")
             # Persist the snapshot so a still-PENDING converted task survives a restart
             # STILL scoped: restore_pending_from_snapshot rebuilds PENDING from
             # state/queue_snapshot.json (assignment reads task['project_id'] from there,
@@ -726,15 +779,36 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             # the task unscoped. Mirrors api_task_create persisting after enqueue.
             if marked:
                 persist_queue_snapshot(reason="project_from_task")
+            return previous
+
+        try:
+            previous_lane = _mark_lane(str(project["id"]))
         except Exception:
+            previous_lane = ""
             log.debug("api_project_from_task: in-memory project_id update failed for %s", task_id, exc_info=True)
-        binding = bind_task_to_project(
-            drive_root,
-            task_id,
-            str(project["id"]),
-            project.get("chat_id"),
-            origin=_owner_task_origin(drive_root, task_id),
-        )
+        try:
+            binding = bind_task_to_project(
+                drive_root,
+                task_id,
+                str(project["id"]),
+                project.get("chat_id"),
+                origin=_owner_task_origin(drive_root, task_id),
+            )
+        except Exception:
+            # The window between the re-read above and this bind is microseconds, but a
+            # bind that loses it is refused by the immutable store while the lane mark
+            # already anticipated it. Put the lane back where it was (its previous
+            # project, or none) before answering, so the durable binding stays the one
+            # truth and no lane points at a project that binds nothing. A bind that
+            # failed for any other reason keeps its old answer.
+            try:
+                _mark_lane(previous_lane)
+            except Exception:
+                log.debug("api_project_from_task: lane restore failed for %s", task_id, exc_info=True)
+            refusal = _conflicting_binding(disclose=False)
+            if refusal is None:
+                raise
+            return refusal
         touch_project(drive_root, str(project["id"]))
         # Broadcast so every open tab + the live WS fan-out learns the new project
         # immediately, instead of waiting for the periodic /api/state poll (mirrors

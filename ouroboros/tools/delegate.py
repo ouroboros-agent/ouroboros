@@ -50,6 +50,7 @@ from ouroboros.delegate_supervision import delegate_wait_entry as _delegate_wait
 from ouroboros.delegate_start_instructions import (
     HOST_INSTRUCTIONS as _HOST_INSTRUCTIONS,
     UNPROVEN_BOUNDARY_INSTRUCTION as _UNPROVEN_BOUNDARY_INSTRUCTION,
+    access_instruction,
     append_coordination_context,
 )
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
@@ -164,6 +165,7 @@ def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
         text = payload_host_instructions(text, payload_skill)
     if authority.delegated:
         text += _UNPROVEN_BOUNDARY_INSTRUCTION
+    text += access_instruction(authority.access)  # the typed profile outranks prose
     if assignment:
         text += "\n\n" + assignment
     return text
@@ -787,8 +789,14 @@ _emit_external_wait_lease = progress.emit_external_wait_lease
 
 
 def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None,
-                   since_seq: Optional[int] = None, *, observation_only: bool = False) -> str:
+                   since_seq: Optional[int] = None, *, observation_only: bool = False,
+                   gateway: Any = None) -> str:
     """Time-bounded, progress-aware wait (docs/DEVELOPMENT.md "Timeout & Wait Control").
+
+    ``gateway`` is a transport BORROWED from the supervision loop: it replaces the
+    per-call ``ClaudexorGateway()``, is handshaken here only when it has not been yet
+    (``engine_version`` is the handshake receipt), and is never closed here; the
+    owner closes it. Absent, the call builds, handshakes and closes its own.
 
     HOLDS the window it was given. It returns early only on a terminal state or a
     containment fault; a journal-cursor advance past ``since_seq`` is RECORDED and
@@ -810,8 +818,11 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     the connection, and every call is BOUNDED by what it has left (``progress.poll_bound``)
     so no read can outrun it as the 60s default could. The internal supervision
     observer instead makes one read under the ordinary transport bound narrowed by
-    the real task deadline; its three-second beat is not a network deadline. A read
-    timeout there retains unknown observation and the same run, without model wake.
+    the real task deadline; its three-second beat is not a network deadline. A transport
+    failure that delivered no daemon answer there (typed per class:
+    ``observation_read_timeout`` for our own bound expiring, ``daemon_unreachable`` for a
+    socket that carried nothing) retains unknown observation and the same run, without
+    model wake.
     Legacy caller-sized waits preserve their last-poll expiry contract.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
@@ -850,14 +861,18 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
 
     def read_failure(exc: ClaudexorUnavailable) -> str:
         if observation_only and exc.observation_timeout:
+            # The gateway's per-class reason, not the generic transport code: a
+            # read bound that expired against a live daemon is a quiet hole and
+            # nothing more, while a socket that carried no answer is the outage
+            # the owner is told about once per episode.
             return json.dumps({
                 "status": "observation_pending", "run_id": rid,
-                "reason": "observation_read_timeout", "detail": str(exc),
+                "reason": exc.observation_reason or exc.code, "detail": str(exc),
                 "waited_sec": time.monotonic() - started,
             })
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
 
-    gateway = None
+    borrowed = gateway is not None
 
     # The GRANTED shape replays from the durable custody row (R1 item 2): the run
     # was admitted under host-derived authority recorded on its STARTED row, and a
@@ -891,8 +906,10 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
             ctx, max(window, read_window()) if observation_only else window, _started_at, _run_max_seconds),
         lease_id=_lease_id)
     try:
-        gateway = ClaudexorGateway()
-        gateway.handshake(timeout_sec=progress.poll_bound(read_window()))
+        if gateway is None:
+            gateway = ClaudexorGateway()
+        if not getattr(gateway, "engine_version", ""):
+            gateway.handshake(timeout_sec=progress.poll_bound(read_window()))
         if observation_only:
             _emit_external_wait_lease(
                 ctx, rid, _external_wait_lease_until(ctx, read_window(), _started_at, _run_max_seconds),
@@ -1024,7 +1041,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
         return read_failure(exc)
     finally:
         _emit_external_wait_lease(ctx, rid, 0.0, lease_id=_lease_id)
-        if gateway is not None:
+        if gateway is not None and not borrowed:
             gateway.close()
 
 
@@ -1171,7 +1188,11 @@ def get_tools() -> List[ToolEntry]:
             "description": (
                 "Sleep on a delegated run until a meaningful event. Quiet transport windows "
                 "are renewed by the host with zero model calls; journal progress still streams "
-                "to the human but does not wake you. Terminal settlement, a new interaction, "
+                "to the human but does not wake you. A daemon that cannot be reached is the "
+                "same quiet renewal (typed reason daemon_unreachable, told to the owner once per "
+                "outage); while such a read hangs, a finalize_now/hurry control is noticed only "
+                "when it returns, up to ~60 s later rather than on the 3 s beat. "
+                "Terminal settlement, a new interaction, "
                 "fault, addressed owner/task message, a direct-child attention/terminal event, "
                 "cancel/deadline control, recovery judgment, or an explicit one-shot checkpoint "
                 "wakes exactly once. A run that asks its "

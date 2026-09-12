@@ -1379,7 +1379,7 @@ def call_llm_with_retry(
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
                 "stream": True, "caller_deadline_ts": (None if deadline_ts is None
                     else float(deadline_ts) - float(transport_reserve_sec or 0.0)),
-                "use_local": use_local,
+                "use_local": use_local, "cache_affinity": execution_id if provider_for_model(model) == "claudexor" else "",
                 # These are optional host hints, not required tools. This
                 # transport has neither provider-owned web tools nor a bypass
                 # knob; ordinary Ouroboros web tools stay in the schema.
@@ -1431,7 +1431,7 @@ def call_llm_with_retry(
             )
             host_route = usage.get("model_role_route") or {}
             model, use_local = host_route.get("model", model), host_route.get("use_local", use_local)
-            accumulated_usage["_model_route"] = dict((usage.get("claudexor") or {}).get("route") or {})
+            accumulated_usage["_model_route"], accumulated_usage["_options"] = dict((usage.get("claudexor") or {}).get("route") or {}), ({key: (usage.get("claudexor") or {}).get(key) for key in ("requested_options", "applied_options", "options_honored", "route")} if usage.get("claudexor") else {})
             context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
             _take_custom_receipts(usage, msg, accumulated_usage)
             for stale in ("_last_llm_error", "_last_llm_error_kind", "_last_llm_retry_same_request",

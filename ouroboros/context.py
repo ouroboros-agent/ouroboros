@@ -1330,9 +1330,9 @@ def _capture_context_core(
 
     semi_stable_text = "\n\n".join(semi_stable_parts)
 
-    health_section = build_health_invariants(
-        context_env, task_id=str(task.get("id") or "")
-    )
+    from ouroboros.tools.tool_resolution import active_repo_dir_for
+    active_root = str(active_repo_dir_for(ctx)) if ctx is not None else ""
+    health_section = build_health_invariants(context_env, task_id=str(task.get("id") or ""), active_root=active_root)
     dynamic_parts = []
     if health_section:
         dynamic_parts.append(health_section)

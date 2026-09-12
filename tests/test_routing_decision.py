@@ -470,3 +470,61 @@ def test_compare_and_append_refuses_under_the_lock(tmp_path):
         tmp_path, "cm-1", action="route_decision", status="needs_manual_target",
         routing_token="tok-1",
     )
+
+
+# --- the deciding turn is SHOWN an existing receipt (disclosure, never a gate) ---
+
+def _decision_ctx(tmp_path):
+    import types
+
+    return types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        PENDING=[],
+        RUNNING={},
+        load_state=lambda: {"owner_id": 1, "owner_chat_id": 1},
+        update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
+    )
+
+
+def test_decision_turn_is_shown_the_existing_receipt_for_the_same_message(tmp_path):
+    """I7 (owner decision B5=A): one owner message became task c405c824 and was then
+    steered into three more live roots, each paying a review wave, because the
+    deciding turn was never told a receipt already existed. It is a FACT on the
+    contract the turn already receives; the choice stays with the model."""
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    append_chat_annotation(
+        tmp_path, "cm-dup", action="promote_chat_to_task", target="c405c824",
+        target_label="MLConf deck", status="dispatched", routing_token="tok-dup",
+    )
+
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-dup", {})
+    receipt = metadata["routing_contract"]["message_routing_receipt"]
+
+    assert receipt["action"] == "promote_chat_to_task"
+    assert receipt["target"] == "c405c824"
+    assert receipt["target_label"] == "MLConf deck"
+    assert receipt["status"] == "dispatched"
+    assert receipt["ts"]
+    # Disclosure only: the model keeps every action it had.
+    assert "promote_chat_to_task" in metadata["routing_contract"]["valid_actions"]
+
+
+def test_decision_turn_without_a_receipt_carries_no_such_key(tmp_path):
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-fresh", {})
+
+    assert "message_routing_receipt" not in metadata["routing_contract"]
+
+
+def test_unreadable_annotations_do_not_break_the_decision_turn(tmp_path):
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs" / "chat_annotations.jsonl").write_text("{ torn", encoding="utf-8")
+
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-dup", {})
+
+    assert "message_routing_receipt" not in metadata["routing_contract"]
+    assert metadata["routing_contract"]["llm_first"] is True

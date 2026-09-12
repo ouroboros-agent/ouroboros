@@ -643,6 +643,7 @@ def prospective_wrapup_attempt_request(
     allow_server_web_search: bool = False, prompt_tokens: int = 0,
     model_role: str = "main", model_account_override: Optional[str] = None,
     model_turn_state: Any = None,
+    cache_affinity: str = "",
 ) -> Any:
     """Build the conservative request facts from the prospective wire payload.
 
@@ -668,7 +669,8 @@ def prospective_wrapup_attempt_request(
 
         candidate = _request(target, messages, tools, {"reasoning_effort": reasoning_effort,
             "model_role": model_role, "model_account_override": model_account_override,
-            "model_turn_state": model_turn_state})
+            "model_turn_state": model_turn_state,
+            "cache_affinity": cache_affinity, "prospective": True})
         return _merge_scope(replace(_attempt_request(target, candidate),
             force_unknown_reservation=True, max_completion_tokens=MAIN_LOOP_MAX_TOKENS))[0]
     with request_wire_call_scope():
@@ -695,6 +697,7 @@ def prepared_wrapup_candidate(
     from ouroboros.loop_llm_call import _prepare_main_messages
     from ouroboros.model_slots import task_model_binding
     from ouroboros.model_wait import current_model_wait
+    from ouroboros.observability import new_execution_id
 
     owner_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     waiter = current_model_wait()
@@ -722,6 +725,10 @@ def prepared_wrapup_candidate(
         model_role=role,
         model_account_override=account,
         model_turn_state=getattr(owner_ctx, "model_turn_state", None),
+        # The admitted candidate must be the payload the send will produce: the
+        # main loop declares the same execution-scoped cache affinity, so this
+        # prepared copy binds the execution id exactly as that dispatch does.
+        cache_affinity=str(ctx.accumulated_usage.setdefault("execution_id", new_execution_id())),
     )
     return request, send_messages
 

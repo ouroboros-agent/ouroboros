@@ -284,9 +284,21 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         facts, unreadable = {}, ["result_directory_unreadable"]
         results_error = f"result_directory_unreadable: {exc}"
     ordered = sorted(facts, key=lambda name: facts[name]["ts"] or facts[name]["updated_at"], reverse=True)
+    # Only the owner's ROOT results are addressable predecessors (owner decision batch
+    # 3, answer 6b=A): a swarm wave's children are the newest results of ANY kind, so
+    # they evicted the owner's own roots from this window - which is how a root the
+    # same actor had just read stopped being offerable. The facts are already
+    # memoized, so both the filter and this count cost no extra read. The count runs
+    # over the WHOLE candidate list, not inside the capped loop: children older than
+    # the 16th root are skipped just the same, and counting them only until the cap
+    # reported zero while folding them into the cap's own number.
+    def _is_child(name: str) -> bool:
+        return bool(facts[name]["parent_task_id"]) or facts[name]["delegation_role"] == "subagent"
+
+    children = sum(1 for name in ordered if not facts[name]["schema_refusal"] and _is_child(name))
     finals = []
     for name in ordered:
-        if facts[name]["schema_refusal"]:
+        if facts[name]["schema_refusal"] or _is_child(name):
             continue
         row = load_task_result(ctx.DRIVE_ROOT, pathlib.Path(name).stem)
         if row is not None:
@@ -321,8 +333,11 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         "omissions": {
             "projects": max(0, len(projects) - 40),
             "root_tasks": max(0, len(roots) - 40),
-            "final_results": None if unreadable else max(0, len(facts) - len(finals)),
+            # Kept meaning: results cut by the 16 cap. The children skipped above are
+            # a DIFFERENT omission and are counted as such, never folded in here.
+            "final_results": None if unreadable else max(0, len(facts) - children - len(finals)),
             "final_results_error": results_error,
+            "children": None if unreadable else children,
             # A bounded read cannot count bytes/rows it deliberately did not
             # visit. The exact historical messages remain available by id.
             "dialogue_rows": None,
@@ -428,8 +443,44 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     }
     if not swarm_intent:
         routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
+    receipt = _message_routing_receipt(ctx, client_message_id)
+    if receipt:
+        # DISCLOSURE, not a gate (owner decision B5=A): one owner message became a
+        # task and was then steered into three more live roots, each paying its own
+        # review wave, because the deciding turn was never told a receipt already
+        # existed. The choice stays with the model - no host ban on a second root.
+        routing_contract["message_routing_receipt"] = receipt
     md["routing_contract"] = routing_contract
     return md
+
+
+def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]:
+    """The existing routing receipt for THIS owner message, or {} when there is none.
+
+    Read from the annotation the routing rail already writes, so no new store and no
+    new reader: the decision turn simply sees what was already decided for the same
+    message. Fail-soft - a missing or torn annotations file leaves the turn exactly
+    as it was.
+    """
+    if not client_message_id:
+        return {}
+    try:
+        from ouroboros.project_dialogue import latest_chat_annotations
+
+        row = latest_chat_annotations(ctx.DRIVE_ROOT).get(str(client_message_id)) or {}
+    except Exception:
+        log.debug("message routing receipt lookup failed", exc_info=True)
+        return {}
+    if not row:
+        return {}
+    return {
+        "action": str(row.get("action") or ""),
+        "target": str(row.get("target") or ""),
+        "target_label": str(row.get("target_label") or ""),
+        "status": str(row.get("status") or ""),
+        "ts": str(row.get("ts") or ""),
+        "project_id": str(row.get("project_id") or ""),
+    }
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:

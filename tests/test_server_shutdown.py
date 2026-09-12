@@ -296,7 +296,7 @@ def test_supervisor_startup_restores_queue_before_worker_reset():
     import server
 
     source = inspect.getsource(server._run_supervisor)
-    restore = source.index("restored_pending = restore_pending_from_snapshot()")
+    restore = source.index("restored_pending = restore_pending_from_snapshot(")
     reset = source.index("kill_workers(preserve_pending=True)")
     spawn = source.index("spawn_workers(max_workers)")
     assert restore < reset < spawn
@@ -580,6 +580,16 @@ class _Recorder:
         self.stop = _FakeStopEvent()
         self.restart = None
         self.ready = None
+        # Snapshot restore reports revived PENDING rows in its return value and
+        # the RUNNING rows it fenced for cancellation custody through the
+        # keyword-only out-parameter; a test can script either.
+        self.restored_pending = 0
+        self.fenced_running: list = []
+
+    def restore(self, *_args, terminalized=None, **_kwargs):
+        if terminalized is not None:
+            terminalized.extend(self.fenced_running)
+        return self.restored_pending
 
 
 def _supervisor_harness(monkeypatch, tmp_path, steps):
@@ -669,7 +679,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
                  "persist_queue_snapshot", "cancel_task_by_id", "queue_deep_self_review_task",
                  "sort_pending", "check_scheduled_tasks"):
         monkeypatch.setattr(queue_pkg, name, noop)
-    monkeypatch.setattr(queue_pkg, "restore_pending_from_snapshot", lambda: 0)
+    monkeypatch.setattr(queue_pkg, "restore_pending_from_snapshot", rec.restore)
     for name in ("init", "spawn_workers", "kill_workers", "assign_tasks", "ensure_workers_healthy",
                  "auto_resume_after_restart"):
         monkeypatch.setattr(workers_mod, name, noop)
@@ -685,6 +695,28 @@ def _run(rec, server):
     server._run_supervisor({})
     assert rec.ready.is_set() or server._supervisor_error  # init reached the loop
     return rec
+
+
+@pytest.mark.parametrize("restored, fenced, expected", [
+    (0, ["a"], "♻️ Cancelling 1 task that was still running when the server stopped."),
+    (2, ["a", "b"],
+     "♻️ Restored pending queue from snapshot: 2 tasks. "
+     "Cancelling 2 tasks that were still running when the server stopped."),
+])
+def test_boot_notice_states_the_restart_cancellations_as_an_intent(
+        monkeypatch, tmp_path, restored, fenced, expected):
+    """A window closed on live work: the boot line names how many tasks the
+    restart interrupted and says they are BEING cancelled. It cannot claim they
+    ENDED: restore only minted the durable intent, and cancellation custody
+    writes each terminal result a watchdog window later."""
+    import server
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["stop"])
+    rec.restored_pending = restored
+    rec.fenced_running = list(fenced)
+    _run(rec, server)
+
+    assert [text for _chat, text in rec.alerts if text.startswith("♻️")] == [expected]
 
 
 def test_exception_while_stopping_exits_quietly_without_counting_a_crash(monkeypatch, tmp_path, caplog):
@@ -773,6 +805,35 @@ def test_lifespan_teardown_stops_and_joins_the_loop_before_the_bus_goes_down():
     assert finally_idx < stop_idx < join_idx < kill_idx < bridge_idx < bus_idx
     # Nothing between `finally:` and the stop flag but whitespace.
     assert source[finally_idx + len("    finally:\n"):stop_idx].strip() == ""
+
+
+def test_terminal_custody_precedes_every_best_effort_wait_in_the_teardown():
+    """The one IRREVERSIBLE durable write of the teardown goes first.
+
+    An external SIGKILL arrives about ten seconds after SIGTERM, while the
+    extension-reconcile and host-service waits ahead of kill_workers were worth
+    roughly thirty-nine seconds: an interrupted task was simply never
+    terminalized. Order is now stop flag, bounded join, terminal custody, then
+    the optional waits and the kill-all sweeps.
+
+    The diagnostic `server_shutdown` row is one of those best-effort steps and
+    goes AFTER the custody write too: `append_jsonl` waits up to two seconds for
+    the log lock and then does file I/O, so on slow storage or a held lock it can
+    eat the launcher's force-exit budget before a single worker is terminalized.
+    Nothing between the join and `kill_workers` may do I/O."""
+    import inspect
+    import server
+
+    teardown = inspect.getsource(server.lifespan).split("\n    finally:\n", 1)[1]
+    stop_idx = teardown.index("_supervisor_stop.set()")
+    join_idx = teardown.index("supervisor_thread.join(timeout=2)")
+    kill_idx = teardown.index("kill_workers(")
+    append_idx = teardown.index('"server_shutdown"')
+    extension_idx = teardown.index("extension_reconcile_task.cancel()")
+    host_idx = teardown.index("host_service_listener.close()")
+    sweeps_idx = teardown.index("kill_all_tracked_subprocesses()")
+    assert stop_idx < join_idx < kill_idx < extension_idx < host_idx < sweeps_idx
+    assert kill_idx < append_idx < extension_idx
 
 
 def test_supervisor_revival_clears_a_stale_stop_flag(monkeypatch):

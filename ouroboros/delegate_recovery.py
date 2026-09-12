@@ -209,10 +209,20 @@ def _selected_session(task: Mapping[str, Any]) -> dict[str, Any]:
     return snapshot if str(route.get("kind") or "") == "agent_session" else {}
 
 
+def _review_substrate_run(source: Any) -> bool:
+    """True for every durable `review_substrate*` custody source spelling."""
+
+    return str(source or "").startswith("review_substrate")
+
+
 def unsettled_start_ids(
     drive_root: Any, task_id: str, *, rows: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, list[str]]:
-    """Durable run/start blockers from one consistent custody-log snapshot."""
+    """Durable run/start blockers from one consistent custody-log snapshot.
+
+    A review run is the review substrate's obligation, not the actor's
+    delegation slot, so it never blocks the actor's own start.
+    """
 
     mine = str(task_id or "")
     snapshot = list(rows) if rows is not None else list(
@@ -223,16 +233,19 @@ def unsettled_start_ids(
         "open_run_ids": [
             row.run_id for row in runs.values()
             if row.task_id == mine and not row.settled
+            and not _review_substrate_run(row.source)
         ],
         "pending_invocation_ids": [
             str(row.get("invocation_id") or "")
             for row in custody.pending_invocations(drive_root, rows=snapshot)
             if str(row.get("task_id") or "") == mine
+            and not _review_substrate_run(row.get("source"))
         ],
         "undisposed_patch_run_ids": [
             row.run_id for row in runs.values()
             if row.task_id == mine and row.snapshot_id and row.settled
             and not row.patch_disposed
+            and not _review_substrate_run(row.source)
         ],
     }
 

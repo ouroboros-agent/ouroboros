@@ -22,6 +22,10 @@ import re
 from typing import Any, Dict
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_.-]")
+# A character a slug cannot carry: whitespace maps to "-" deterministically, so it
+# is not loss; anything else disappears and two different names can collapse onto
+# one id (see project_id_from_display_name).
+_LOSSY = re.compile(r"[^a-zA-Z0-9_.\-\s]")
 # Windows reserved device names (case-insensitive, incl. extension variants like
 # "con.md"): never allow these as a project dir component.
 _RESERVED_NAMES = frozenset(
@@ -49,14 +53,27 @@ def project_id_from_display_name(value: Any) -> str:
     emoji-only name like 'динозавры' still creates a project instead of failing —
     the Russian-speaking owner's common case). The real display name is stored
     separately on the registry, so the user always sees their own name, never the
-    id. Returns "" only for a truly empty name."""
-    slug = sanitize_project_id(value)
-    if slug:
-        return slug
+    id. Returns "" only for a truly empty name.
+
+    Two rules keep a LOSSY name from producing a misleading or COLLIDING id: runs
+    of ``-`` collapse (a Cyrillic word between two Latin ones minted
+    ``mlconf--------------------ouroboros``), and when the name held any character
+    the slug could not carry, a short digest of the whole raw name is appended — two
+    different Cyrillic titles otherwise normalized onto the same id and silently
+    shared one project. Only NEWLY minted ids are affected: ``sanitize_project_id``
+    is untouched, so every existing id, lookup and derived project chat stays
+    exactly as it is."""
     raw = str(value or "").strip()
     if not raw:
         return ""
-    return "proj_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    slug = re.sub(r"-{2,}", "-", sanitize_project_id(raw)).strip("-.")
+    if not slug:
+        return "proj_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    if _LOSSY.search(raw):
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        # The slug never starts with "-" or ".", so the truncated head stays usable.
+        slug = f"{slug[:63 - len(digest)].strip('-.')}-{digest}"
+    return slug
 
 
 def explicit_project_id_ok(raw: Any) -> bool:
@@ -98,13 +115,37 @@ def _registered_project_for_workspace(canon_workspace: str) -> str:
     return ""
 
 
+def _bound_project_id(task_id: str) -> str:
+    """Project a task is DURABLY bound to, read at the canonical DATA_DIR, else "".
+
+    Fail-OPEN, exactly like ``_registered_project_for_workspace``: this runs on
+    the hot resolution path of every context build, and an unreadable bindings
+    store must not stop the work. The one caller that AUTHORIZES creating a
+    project (``ensure_project_scope``) reads the same binding strictly instead.
+    """
+    if not task_id:
+        return ""
+    try:
+        from ouroboros.config import DATA_DIR
+        from ouroboros.projects_registry import project_id_for_task
+
+        return sanitize_project_id(project_id_for_task(DATA_DIR, task_id))
+    except Exception:
+        return ""
+
+
 def resolve_project_id(task: Dict[str, Any]) -> str:
-    """Resolve a task's project id (S7): explicit ``project_id`` wins; else, for a
-    workspace task, a REGISTERED project bound to that folder (v6.58.0 registry-first)
-    or a stable hash of the workspace path; else ``""`` (not project-scoped — canonical
-    memory, unchanged behavior)."""
+    """Resolve a task's project id (S7): the DURABLE binding wins (owner decision
+    B4=A - a "turn into project" conversion never reaches a running worker, so the
+    task dict can still say nothing while the task belongs to a project); else an
+    explicit ``project_id``; else, for a workspace task, a REGISTERED project bound
+    to that folder (v6.58.0 registry-first) or a stable hash of the workspace path;
+    else ``""`` (not project-scoped — canonical memory, unchanged behavior)."""
     if not isinstance(task, dict):
         return ""
+    bound = _bound_project_id(str(task.get("id") or task.get("task_id") or "").strip())
+    if bound:
+        return bound
     pid = sanitize_project_id(task.get("project_id"))
     if pid:
         return pid

@@ -9,6 +9,11 @@ import pytest
 from ouroboros import headless, observability, server_maintenance as maintenance
 from ouroboros.task_results import load_task_result, write_task_result
 
+from tests._cancel_intents_shared import _LiveProc
+from tests._cancel_intents_shared import (  # noqa: F401  (autouse fixture applies on import)
+    _reap_spawned_live_procs,
+)
+
 
 @pytest.fixture
 def roots(tmp_path, monkeypatch):
@@ -61,7 +66,7 @@ def test_saved_body_and_sources_precede_orphan_reader_and_actual_prune(roots, mo
     root, repo = roots
     child = _terminal(root, family=family)
     seen = []
-    def orphan_reader(_root, *, exclude_task_ids):
+    def orphan_reader(_root, *, exclude_task_ids, expired_quizzes=None):
         row = load_task_result(root, "saved", strict=True)
         assert row["result"] == "full retained answer"
         manifest = observability.read_call_manifest_ref(root, row["trace_refs"]["response"], task_id="saved")
@@ -314,7 +319,8 @@ def test_real_supervisor_orders_custody_recovery_before_prune(roots, monkeypatch
     order = []
     monkeypatch.setattr(server, "_migrate_startup_cancel_latches", lambda root: order.append("migrate"))
     monkeypatch.setattr(server, "_startup_worker_pids", lambda root: order.append("capture-pids") or {777})
-    monkeypatch.setattr(queue, "restore_pending_from_snapshot", lambda: order.append("restore") or 0)
+    monkeypatch.setattr(queue, "restore_pending_from_snapshot",
+                        lambda **_kw: order.append("restore") or 0)
     monkeypatch.setattr(workers, "kill_workers", lambda **k: order.append("kill"))
     monkeypatch.setattr(workers, "spawn_workers", lambda n: order.append("spawn"))
     monkeypatch.setattr(server, "_startup_custody_sweep", lambda: order.append("custody"))
@@ -357,3 +363,402 @@ def test_lifespan_does_not_race_recovery_against_provider_supervisor():
                 and isinstance(node.func, ast.Name) and node.func.id == "_run_startup_task_recovery"]
     assert len(recovery) == 1 and recovery[0] in list(ast.walk(branches[0]))
     assert "skip_live_data=pytest_default_real_data_dir" in ast.unparse(recovery[0])
+
+
+def test_orphan_reconcile_closes_the_open_quiz_and_its_paired_wait(roots, monkeypatch):
+    """The healer writes a terminal OFF the task-done seam, so it owes that seam's
+    domain reconciliation itself: a task whose record says 'ended' while its card
+    still shows an open question, and whose wait never releases, is the class."""
+    from ouroboros import owner_quiz
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    root, _ = roots
+
+    for tid in ("ghost-root", "ghost-child"):
+        write_task_result(root, tid, "running", result="original")
+        owner_quiz.record_asked(root, tid, quiz_id=f"{tid}-q", question="Which folder?",
+                                options=["A", "B"], wait_for_answer=True)
+        write_task_result(root, tid, "running", owner_wait={"state": "waiting", "quiz_id": f"{tid}-q"})
+    monkeypatch.setattr(
+        "ouroboros.task_status.load_effective_task_result",
+        lambda _root, tid: {"task_id": tid, "status": "failed", "result": "proven orphan"},
+    )
+
+    assert reconcile_orphaned_running_tasks(root) == 2
+
+    for tid in ("ghost-root", "ghost-child"):
+        stored = load_task_result(root, tid)
+        assert stored["status"] == "failed"
+        assert owner_quiz.quiz_states(root, tid)[f"{tid}-q"]["state"] == "expired_terminal"
+        assert stored["owner_wait"]["state"] == "expired_terminal"
+
+    # Idempotent against the task-done seam running the same legs afterwards.
+    from supervisor.queue_transitions import reconcile_terminal_task_projections
+
+    reconcile_terminal_task_projections(root, "ghost-root")
+    assert owner_quiz.quiz_states(root, "ghost-root")["ghost-root-q"]["state"] == "expired_terminal"
+
+
+SERVER_STOPPED_CANCEL = "Task cancelled: the server stopped while this task was still running."
+
+
+def _interrupted_running_row(root, task_id, *, chat_id=1, age_sec=120.0, **fields):
+    """A row the previous generation left RUNNING, written the way a boot finds it.
+
+    The snapshot the shutdown left still names it (restore reads that list), the
+    heartbeat is older than the healer's grace window, and a worker_boot row
+    after it is the healer's positive death evidence.
+    """
+    import datetime as dt
+
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    stamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_sec))
+    write_task_result(root, task_id, "running", chat_id=chat_id,
+                      ts=stamp.isoformat().replace("+00:00", "Z"), **fields)
+    append_jsonl(root / "logs" / "events.jsonl",
+                 {"ts": utc_now_iso(), "type": "worker_boot", "worker_id": 1})
+    _snapshot_naming_running(root, task_id, chat_id=chat_id)
+
+
+def _snapshot_naming_running(root, task_id, *, chat_id=1):
+    """The snapshot a shutdown left behind, naming one row as still running."""
+    from ouroboros.utils import utc_now_iso
+
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    (root / "state" / "queue_snapshot.json").write_text(json.dumps({
+        "ts": utc_now_iso(), "pending": [], "acceptance_fences": [], "budget_root_fences": [],
+        "running": [{"id": task_id, "task": {"id": task_id, "chat_id": chat_id}}],
+    }), encoding="utf-8")
+
+
+def test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody(roots, monkeypatch):
+    """The real boot order: restore mints the fence, the startup re-persist empties
+    the snapshot, and startup recovery runs inside the watchdog's ten-second
+    minimum age. Healing there would settle the row as infra_failed and the later
+    sweep would answer already_settled, leaving a Failed card under a boot line
+    that promised a cancellation (owner Q11=A)."""
+    import time
+
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    from supervisor import queue as queue_module, task_lifecycle
+    root, _ = roots
+
+    _interrupted_running_row(root, "ghost-fenced")
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == ["ghost-fenced"]
+    queue_module.persist_queue_snapshot(reason="startup")
+
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "ghost-fenced")["status"] == "running"
+
+    assert task_lifecycle.sweep_cancel_intents(now=time.time() + 60)["ghost-fenced"] == "cancelled"
+    stored = load_task_result(root, "ghost-fenced")
+    assert stored["status"] == "cancelled" and stored["result"] == SERVER_STOPPED_CANCEL
+
+
+def test_the_healer_tells_rendered_cards_their_question_expired(roots, monkeypatch):
+    """The durable projection is only half of it: the seam that normally expires a
+    quiz also sends the live frame, and the surfaces Ouroboros runs on have no
+    reload affordance. A healed terminal owes the same frame."""
+    from ouroboros import owner_quiz
+    from supervisor import message_bus, queue as queue_module
+    root, repo = roots
+
+    write_task_result(root, "ghost-asked", "running", chat_id=1)
+    owner_quiz.record_asked(root, "ghost-asked", quiz_id="q9", question="Which folder?",
+                            options=["A", "B"], wait_for_answer=True)
+    _interrupted_running_row(root, "ghost-asked")
+    queue_module.persist_queue_snapshot(reason="startup")
+    frames: list = []
+    monkeypatch.setattr(message_bus, "get_bridge",
+                        lambda: SimpleNamespace(send_quiz_state=lambda *args: frames.append(args)))
+
+    _recovery(root, repo)
+
+    assert load_task_result(root, "ghost-asked")["status"] == "failed"
+    assert owner_quiz.quiz_states(root, "ghost-asked")["q9"]["state"] == "expired_terminal"
+    assert frames == [("q9", "ghost-asked", "expired_terminal")]
+
+
+def _restore_rows(root, row_type):
+    path = root / "logs" / "supervisor.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line).get("type") == row_type]
+
+
+def test_a_running_row_with_no_durable_result_is_never_fenced(roots):
+    """Custody settles an intent for an id with no durable row as not_found and
+    writes nothing, so fencing that row would put a cancellation in the boot line
+    that never happens.
+
+    A failed RUNNING mirror is not this branch: admission writes the durable
+    scheduled row, so that row stays readable and is fenced like any other. This
+    branch is a missing or deleted admission record, logged and never fenced.
+    """
+    from ouroboros import cancel_intents
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "has-a-row")
+    snapshot = json.loads((root / "state" / "queue_snapshot.json").read_text(encoding="utf-8"))
+    snapshot["running"].append({"id": "never-recorded", "task": {"id": "never-recorded", "chat_id": 1}})
+    (root / "state" / "queue_snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == ["has-a-row"]
+    assert cancel_intents.active_intent(root, "never-recorded") is None
+    unrecorded = _restore_rows(root, "queue_restore_running_row_without_result")
+    assert unrecorded and unrecorded[-1]["task_ids"] == ["never-recorded"]
+
+
+def test_a_fail_closed_restore_still_records_the_rows_it_fenced(roots):
+    """The two fail-closed exits return before the restore ledger row, so the
+    boot line named fenced ids that no durable row recorded. The fence happens
+    either way, so its record must too."""
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "ghost-in-a-broken-snapshot")
+    snapshot = json.loads((root / "state" / "queue_snapshot.json").read_text(encoding="utf-8"))
+    snapshot["acceptance_fences"] = ["not-a-fence-object"]
+    (root / "state" / "queue_snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == ["ghost-in-a-broken-snapshot"]
+    assert _restore_rows(root, "queue_restore_invalid_acceptance_fences")
+    recorded = _restore_rows(root, "queue_restored_from_snapshot")
+    assert recorded and recorded[-1]["terminalized_running"] == ["ghost-in-a-broken-snapshot"]
+
+
+def test_the_healer_gates_a_root_on_its_real_liveness_evidence(roots):
+    """Assignment now mirrors RUNNING for roots, so this sweep decides their fate
+    too and its REAL gates have to be exercised, not a monkeypatched projection:
+    live queue ownership, an unusable snapshot and the grace window each keep the
+    row, and only the boot shape (fresh snapshot without it, stale heartbeat, a
+    worker booted after it) settles it."""
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "root-ghost", root_task_id="root-ghost",
+                             result="Assigned to a worker.")
+
+    # The snapshot the shutdown left still names it: that is live ownership.
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "root-ghost")["status"] == "running"
+
+    # No snapshot at all cannot prove a dead owner either (the work order's
+    # "with no snapshot" case is a refusal, not the reconciling one).
+    (root / "state" / "queue_snapshot.json").unlink()
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "root-ghost")["status"] == "running"
+
+    # The boot re-persist leaves a fresh snapshot without the row.
+    queue_module.persist_queue_snapshot(reason="startup")
+    assert reconcile_orphaned_running_tasks(root) == 1
+    healed = load_task_result(root, "root-ghost")
+    assert healed["status"] == "failed"
+    assert healed["reason_code"] == "orphaned_running_after_worker_restart"
+
+    # A root assigned seconds ago is never reconciled: the grace window holds
+    # even once the snapshot no longer names it.
+    _interrupted_running_row(root, "root-just-assigned", age_sec=1.0,
+                             result="Assigned to a worker.")
+    queue_module.persist_queue_snapshot(reason="startup")
+    assert reconcile_orphaned_running_tasks(root) == 0
+    assert load_task_result(root, "root-just-assigned")["status"] == "running"
+
+
+def test_the_boot_healer_still_settles_a_running_row_nothing_owns(roots):
+    """The skip is the intent, not the shape: an orphan with no cancel intent is
+    reconciled exactly as before."""
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    from supervisor import queue as queue_module
+    root, _ = roots
+
+    _interrupted_running_row(root, "ghost-unowned")
+    queue_module.persist_queue_snapshot(reason="startup")
+
+    assert reconcile_orphaned_running_tasks(root) == 1
+    stored = load_task_result(root, "ghost-unowned")
+    assert stored["status"] == "failed"
+    assert stored["reason_code"] == "orphaned_running_after_worker_restart"
+
+
+LIVE_WORKER_CANCEL = "Running task cancelled and worker terminated."
+
+
+def _surviving_worker(root, task_id, *, chat_id=1):
+    """A REAL child process behind the worker surface, recorded the way the pool
+    records the owner of a running task.
+
+    A worker is a session leader, so SIGTERM to the server does not end it: the
+    process outlives the shutdown and is still alive while the next generation
+    restores the queue. That is the state this stands in for.
+    """
+    from supervisor import queue as queue_module, workers
+
+    proc = _LiveProc()
+    workers.WORKERS[0] = SimpleNamespace(wid=0, proc=proc, busy_task_id=task_id, reaping=False)
+    queue_module.RUNNING[task_id] = {"task": {"id": task_id, "chat_id": chat_id}, "worker_id": 0}
+    return proc
+
+
+@pytest.mark.serial
+def test_a_worker_that_survived_the_shutdown_is_killed_before_the_terminal_is_written(
+    roots, monkeypatch,
+):
+    """Custody claims and kills first, and only a confirmed-dead worker gets a
+    terminal row: that is why the boot order (restore, then the reap) is not a
+    correctness condition and why the fence never races a second writer.
+
+    The cause is one producer for both lanes. In a real boot the pool is empty
+    when restore runs (spawn_workers comes after kill_workers, server.py
+    :658-660), so a fence ordinarily settles through the miss lane, which is
+    what test_the_boot_healer_leaves_a_fenced_row_to_cancellation_custody pins.
+    A worker that outlived SIGTERM and is still claimable settles here instead,
+    and the owner must read the SAME sentence either way."""
+    import time
+
+    from ouroboros import cancel_intents, task_results
+    from supervisor import queue as queue_module, task_lifecycle, workers
+    root, _ = roots
+
+    task_id = "shutdown-survivor"
+    _interrupted_running_row(root, task_id)
+    proc = _surviving_worker(root, task_id)
+    # Slot hygiene AFTER the durable boundary: a real respawn would start a
+    # second worker process, which this test neither observes nor owns.
+    monkeypatch.setattr(workers, "respawn_worker", lambda wid: None, raising=False)
+
+    writes: list = []
+    real_write = task_results.write_task_result
+
+    def observe(drive_root, written_id, status, **fields):
+        if str(written_id) == task_id:
+            writes.append({"status": str(status), "worker_alive": proc.is_alive(),
+                           "result": str(fields.get("result") or "")})
+        return real_write(drive_root, written_id, status, **fields)
+
+    monkeypatch.setattr(task_results, "write_task_result", observe)
+
+    fenced: list = []
+    assert queue_module.restore_pending_from_snapshot(terminalized=fenced) == 0
+    assert fenced == [task_id]
+    assert proc.is_alive(), "restore mints an intent; it never kills or writes"
+    assert writes == []
+    assert cancel_intents.active_intent(root, task_id)["reason"] == "server_shutdown"
+
+    assert task_lifecycle.sweep_cancel_intents(now=time.time() + 60)[task_id] == "cancelled"
+
+    assert not proc.is_alive(), "custody must confirm the death it reports"
+    terminal = [row for row in writes if row["status"] == "cancelled"]
+    assert len(terminal) == 1, f"exactly one terminal writer, saw {writes}"
+    assert terminal[0]["worker_alive"] is False, "the kill precedes the terminal write"
+    stored = load_task_result(root, task_id)
+    assert stored["status"] == "cancelled"
+    assert cancel_intents.active_intent(root, task_id) is None
+    assert stored["result"] == terminal[0]["result"] == SERVER_STOPPED_CANCEL
+
+
+@pytest.mark.serial
+def test_an_ordinary_cancel_of_a_live_worker_keeps_stating_the_kill(roots, monkeypatch):
+    """The shared producer speaks for a shutdown fence and for nothing else.
+
+    An owner (or parent) cancel of a running task has no shutdown cause to state,
+    so the kill path keeps the only sentence it has ever written there."""
+    from ouroboros import cancel_intents
+    from supervisor import task_lifecycle, workers
+    root, _ = roots
+
+    task_id = "owner-cancelled-live"
+    _interrupted_running_row(root, task_id)
+    proc = _surviving_worker(root, task_id)
+    monkeypatch.setattr(workers, "respawn_worker", lambda wid: None, raising=False)
+
+    cancel_intents.request_cancel(root, task_id, reason="no longer needed",
+                                  requested_by="owner")
+
+    assert task_lifecycle.cancel_task_custody(task_id) == task_lifecycle.CANCEL_CANCELLED
+
+    assert not proc.is_alive()
+    stored = load_task_result(root, task_id)
+    assert stored["status"] == "cancelled"
+    assert stored["result"] == LIVE_WORKER_CANCEL
+
+
+@pytest.mark.serial
+def test_the_fence_is_the_same_on_either_side_of_the_reap(roots):
+    """Restore never consults process liveness, so whether the previous
+    generation's worker died before or after the fence was minted must not change
+    anything the owner sees.
+
+    This is the real boot shape: the pool is empty when restore runs (workers_init
+    creates no process and spawn_workers comes after kill_workers, server.py
+    :658-660), so the worker that outlived SIGTERM is an orphan of the previous
+    generation, not a slot this process owns. The live order (restore, then
+    kill_workers) stays exactly as it is, pinned by
+    tests/test_server_shutdown.py::test_supervisor_startup_restores_queue_before_worker_reset.
+    """
+    import time
+
+    from ouroboros import cancel_intents
+    from supervisor import queue as queue_module, task_lifecycle, workers
+    root, _ = roots
+
+    def reap(proc):
+        proc.terminate()
+        proc.join(timeout=5)
+        assert not proc.is_alive()
+
+    def boot(task_id, *, reap_first):
+        survivor = _LiveProc()
+        _interrupted_running_row(root, task_id)
+        if reap_first:
+            reap(survivor)
+        notice: list = []
+        restored = queue_module.restore_pending_from_snapshot(terminalized=notice)
+        alive_at_mint = survivor.is_alive()
+        workers.kill_workers(preserve_pending=True)
+        if not reap_first:
+            reap(survivor)
+        minted = cancel_intents.active_intent(root, task_id) or {}
+        outcome = task_lifecycle.sweep_cancel_intents(now=time.time() + 60).get(task_id)
+        settled = load_task_result(root, task_id)
+        # A later boot re-reading the same pre-restart snapshot must not fence a
+        # row custody already settled, and must not touch its terminal text.
+        _snapshot_naming_running(root, task_id)
+        replay: list = []
+        queue_module.restore_pending_from_snapshot(terminalized=replay)
+        return alive_at_mint, {
+            "restored_pending": restored,
+            "boot_notice": len(notice),
+            "fence_reason": (minted.get("reason"), minted.get("source")),
+            "outcome": outcome,
+            "status": settled.get("status"),
+            "result": settled.get("result"),
+            "replay_notice": replay,
+            "replay_intent": cancel_intents.active_intent(root, task_id),
+            "replay_result": (load_task_result(root, task_id) or {}).get("result"),
+        }
+
+    alive_at_mint, after_the_fence = boot("reaped-after-restore", reap_first=False)
+    dead_at_mint, before_the_fence = boot("reaped-before-restore", reap_first=True)
+
+    # The two compositions really are the two sides of the reap.
+    assert (alive_at_mint, dead_at_mint) == (True, False)
+    assert after_the_fence == before_the_fence
+    assert after_the_fence == {
+        "restored_pending": 0,
+        "boot_notice": 1,
+        "fence_reason": ("server_shutdown", "snapshot_restore"),
+        "outcome": "cancelled",
+        "status": "cancelled",
+        "result": SERVER_STOPPED_CANCEL,
+        "replay_notice": [],
+        "replay_intent": None,
+        "replay_result": SERVER_STOPPED_CANCEL,
+    }

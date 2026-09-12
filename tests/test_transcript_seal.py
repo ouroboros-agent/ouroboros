@@ -218,6 +218,40 @@ def test_anthropic_messages_pass_through_list_content_for_tool_result():
     assert tool_result_block["content"] == sealed_content
 
 
+def test_claudexor_send_copy_is_stable_when_rolling_seal_moves():
+    """The subscription projection normalizes both sides of a seal move."""
+    from ouroboros.llm_claudexor import _request
+
+    target = {"source": "codex", "resolved_model": "model"}
+    parameters = {"model_account_override": ""}
+    messages = _make_messages(n_tool_rounds=7, prefix_per_tool=3000)
+    seal_task_transcript(messages, keep_active=5, min_prefix_tokens=100)
+    first = _request(target, messages, None, parameters)["messages"]
+
+    messages.append(_assistant_msg("new round"))
+    messages.append(_tool_msg("new_result" * 500, call_id="tc_new"))
+    seal_task_transcript(messages, keep_active=5, min_prefix_tokens=100)
+    second = _request(target, messages, None, parameters)["messages"]
+
+    assert second[:len(first)] == first
+
+
+def test_claudexor_send_copy_preserves_nontext_tool_blocks():
+    from ouroboros.llm_claudexor import _request
+
+    content = [
+        {"type": "text", "text": "caption"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]
+    payload = _request(
+        {"source": "codex", "resolved_model": "model"},
+        [{"role": "tool", "tool_call_id": "tc-image", "content": content}],
+        None,
+        {"model_account_override": ""},
+    )
+    assert payload["messages"][0]["content"] == content
+
+
 def test_compaction_receives_plain_strings():
     """After seal + revert cycle, all tool messages are plain strings (safe for compaction)."""
     msgs = _make_messages(n_tool_rounds=8, prefix_per_tool=3000)

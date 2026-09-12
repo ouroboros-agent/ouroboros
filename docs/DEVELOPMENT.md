@@ -321,10 +321,16 @@ two normalizers instead of a third: `message_bus.notification_chat_route`
 answers "where does this notice go" (first DELIVERABLE candidate, `None` when
 none is) and `message_bus.coerce_chat_identity` answers "what is this row's
 address" (explicit value kept, absence defaulted). Address a task once at admission (`log_addressing.ingress_chat_id`) and pass
-the value downstream. Explicit browser-source Main addressing is distinct from
+the value downstream; a producer that sends to the owner DIRECTLY (nothing
+re-addresses it later) resolves the task's durable project binding AT EMISSION
+through `log_addressing.resolve_project_chat` and puts it ahead of the row's
+chat, because a task bound to a project after admission still carries the chat
+it was born in. Explicit browser-source Main addressing is distinct from
 the ordinary hidden API default; task type is never source provenance. Enforcement: `tests/test_chat_id_truthiness_guard.py` is the
-source lint that keeps the class closed; its allowlist is where a deliberate
-exception states its reason.
+source lint that keeps the class closed; it also sees the id read straight off a
+mapping inside a condition (`if row.get("chat_id") and ...`), the form where no
+local exists for the other alternatives to match; its allowlist is where a
+deliberate exception states its reason.
 
 ### Mutable external-fact inventory
 
@@ -530,7 +536,12 @@ filtered down to the answer.
 - **House precedents — reuse these shapes:** chat log rotation with
   archive-aware readers (`supervisor/state.py::rotate_chat_log_if_needed`);
   the compact `containment_faults.jsonl` projection maintained beside an
-  unbounded event log (`ouroboros/delegate_custody.py`); the fingerprint-keyed
+  unbounded event log (`ouroboros/delegate_custody.py`); one shared custody replay
+  per context build and per terminal audit (`delegate_terminal.custody_audit_snapshot`,
+  consumed by `context_health.build_health_invariants` and `_audit_task_custody`): several
+  projections of the same growing store share ONE traversal instead of replaying per reader,
+  which bounds the multiplier, not the scan: the read stays O(history) until a compact
+  projection replaces it; the fingerprint-keyed
   render cache in `ouroboros/_usage_rows_memo.py` — a projection cached while
   its input is unchanged, invalidated only by advance/refold, never by TTL.
   Interactive result discovery reuses `gateway/task_list_scan.py`'s compact
@@ -563,7 +574,10 @@ the hot-store growth health invariant
 that introduces a new append-only store read on an interactive path must
 enroll that store in the `ouroboros/context_budget.py` threshold table (with a
 justified constant) in the same commit — an unenrolled hot store is invisible
-to the tripwire.
+to the tripwire. Retained execution drives under both `state/headless_tasks`
+and `task_drives` are enrolled by direct-child count at
+`context_budget.RETAINED_EXECUTION_DRIVES_WARN_COUNT`; startup never recursively
+sizes those trees.
 
 ### Invariant: Source-complete decision pipeline
 
@@ -946,6 +960,8 @@ what the owner reads:
   to a durable full copy (e.g. an observability `response_ref`). Reviewer
   rationale is a cognitive artifact (BIBLE P1): projecting it truncated while
   the full copy sits unreferenced in private blobs is partial memory loss.
+  Terminal text asserts only recovery facts carried by the round record, never
+  a route mechanism that the selected transport cannot perform.
 - **Model-bound projections** (review packs, context sections, tool-result
   transport) keep their disclosed-truncation budgets — those are real context
   economics.
@@ -1793,6 +1809,11 @@ both critical. The imperatives:
   in existing task source handles and only their references in the bounded
   review-state index; restore them for acceptance and plan comparisons.
   Redacted review evidence never substitutes for the original requirement text.
+  Access is stated ONCE, by the host, from the typed run shape: `_host_instructions`
+  renders `delegate_start_instructions.access_instruction(shape.access)` as one
+  sentence that names the profile and says it governs. Assignment prose about
+  access is CONTEXT, never authority, and is never parsed: a parent's prose ban
+  that contradicted the derived profile once cost a run and a review cycle.
   `subagents.route_health`
   is the ONE route reader for every consumer; quota readers project one
   `ClaudexorGateway.quota_state()` envelope
@@ -1859,6 +1880,18 @@ both critical. The imperatives:
   generic data-tool behavior while fixing subagent isolation
   (`forward_to_worker` writes only to validated running tasks in the
   current task/root lineage).
+- The DELEGATED lane is the other half of that rule: a delegated run edits a
+  private execution snapshot and reaches a tree only through
+  `integrate_delegated_patch`, whose apply normally requires the caller's
+  active root to EQUAL the run's recorded target. A terminal owner's orphan
+  relaxes that to containment: a swarm fanning into
+  `<project>/contributions/<track>` may dispose its dead children's captures
+  from the parent root, provided target and root both live under the
+  host-minted subagent-projects root. One predicate
+  (`delegate_shared.orphan_apply_target_ok`) serves the apply gate, the health
+  invariant and the tool description; every other guard (owner terminality,
+  top-level principal, proven drift, protected paths, staged-never-committed)
+  is unchanged (`tests/test_delegated_run_isolation_orphans.py`).
 - Outcome honesty: a delegating parent must not produce a clean no-tool
   final answer while direct children run undecided — one bounded absorption
   reminder, then best-effort (`children_unabsorbed`); while that gate is
@@ -2006,6 +2039,14 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
   saved-but-undiscovered choices stay visible and editable; a compound effort
   slug plus a conflicting separate effort is a validation error, never two
   applied efforts.
+  On the Auto lane, the host may prefer the last successful same-route account.
+  After a status-null or typed per-subject refusal, only the next matching-route dispatch in the
+  same execution omits that preference and lets the engine choose, and a prospective pricing copy
+  of that request reads the fact without spending it; without an
+  engine refusal fact, selecting a sibling is possible, not guaranteed. Pin
+  remains exact and never rotates. `OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL=1`
+  and `OUROBOROS_FALLBACK_COOLDOWN_SEC=120` keep their existing escalation
+  budget and do not turn preference suppression into a retry or cooldown.
 - Saved intent, generated drafts, and live status are different axes: a
   status/catalog failure annotates a loaded row and never erases it; GET may
   return an unsaved candidate but only explicit Save or onboarding completion
@@ -2100,9 +2141,9 @@ owner, owed terminal delivery, cascade postconditions — lives in ARCHITECTURE
 - Stream consumption completes inside physical accounting. Preserve indexed tools, native signatures, complete final framing and cumulative usage snapshots. An EOF/error/cancellation retains private wire evidence and cannot produce a usable partial answer. Only a structural parameter rejection uses the existing wire recovery; never infer a retry from missing stream text or ping cadence. Compatible async tool calls now use the same normalizer/validation path; local, GigaChat and Claudexor retain their separate wire contracts.
 - Late reviewer reuse resolves the exact operation's complete producer receipt from existing CAS, with original task/root/attempt, slot/route, subject, contract, roster/epoch and delegated invocation where present. The current surface remains the sole wave writer and reducer. No source file existence, preview or matching prompt prose alone grants authority; missing/partial/error/mismatched custody never buys another same-operation dispatch.
 - Managed unknown-outcome recovery uses the existing network-wait owner, with non-generating upstream observations and an explicit new-attempt notice after connectivity returns. Keep old outcome/cost unknown and apply current budget/Stop/deadline before dispatch. Subscription catalogs prove reachability only with generic `provenance="provider_http"` plus `observedAt` after wait entry and exact source/model/effective account; legacy/static catalogs remain unknown. A control-channel outage first rejoins the same accepted operation. Non-generating HEAD uses the existing connection allowance for every socket phase, narrowed by the owner remainder, rather than inheriting a cognitive read window without its lease. No scheduler, provider/model table, paid readiness probe or automatic manual-restart recovery is introduced.
-- `delegate_wait` supervision's three-second observation beat is separate from its HTTP read allowance. A typed read timeout is a quiet observation hole, with actual elapsed time; received auth/protocol failures and owner controls remain meaningful. After terminal cleanup, use the current custody host notice alongside the original answer/narrative. Genuine builtin refusals publish typed non-success at their producer; successful warnings and existing review/Git warning buckets keep their semantics. Acceptance JSON validity and completion cleanliness remain separate decisions.
+- `delegate_wait` supervision's three-second observation beat is separate from its HTTP read allowance. A typed read-only-retryable transport failure (read timeout, connect error or timeout, pool timeout, read/write error, protocol error) is a quiet observation hole carrying its typed reason and the actual elapsed time; the beat does not slow and no durable counter or outage latch is kept. The reason is per class, because our own read bound expiring against a live daemon is not the same fact as a socket that carried no answer: only the second is disclosed to the owner, once per episode with one recovery line, each stamped with that episode. Received auth/protocol failures and owner controls remain meaningful. After terminal cleanup, use the current custody host notice alongside the original answer/narrative. Genuine builtin refusals publish typed non-success at their producer; successful warnings and existing review/Git warning buckets keep their semantics. Acceptance JSON validity and completion cleanliness remain separate decisions.
 
-Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_lineage.py`, `test_terminal_custody_notice.py`, `test_delegate_observation_transport.py`, `test_transport_b_stream_deadlines.py`, `test_transport_unknown_continuation.py`, `test_builtin_refusal_results.py` and `test_v671_acceptance_convergence.py`. Use the ordinary isolated preflight runner; full provider/renderer smoke remains separate from local fake-provider evidence.
+Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_lineage.py`, `test_terminal_custody_notice.py`, `test_delegate_observation_transport.py`, `test_delegate_hold.py`, `test_configured_session_wake_rail.py`, `test_health_invariants_ownership.py`, `test_transport_b_stream_deadlines.py`, `test_transport_unknown_continuation.py`, `test_builtin_refusal_results.py` and `test_v671_acceptance_convergence.py`. Use the ordinary isolated preflight runner; full provider/renderer smoke remains separate from local fake-provider evidence.
 
 ### LLM call rules
 
@@ -2113,7 +2154,12 @@ Focused regressions: `test_review_late_cas_recovery.py`, `test_delivery_control_
   the same operation ID; record unknown outcomes as unknown. ACK only after the
   existing private CAS owns the exact result. Optional host hints must be chosen
   by their caller according to transport capability; explicit unsupported options
-  refuse, rather than being silently removed and retried.
+  refuse, rather than being silently removed and retried. Record submitted model
+  options beside the engine's applied options on the usage row; an absent report
+  stays unknown. That recorded state covers every submitted option, while the owner line
+  speaks only for the thinking horizon: the first changed reasoning effort of each model in a
+  task emits one typed owner line (keyed by task and model, never per round) naming only the
+  route that reported those applied options. A mismatch is disclosure, never a dispatch gate.
 - The engine's active-turn token is one of those transport facts, so the CALLER
   owns its slot (`llm_claudexor.ModelTurnState` on the loop context, a wake-scoped
   one in Background Consciousness) and the engine boundary is its only writer.
@@ -2240,7 +2286,9 @@ by "Provider Independence" above. Call-site imperatives:
   qualifies, migrated in the same call -- preserved on the
   direct-Anthropic lane by `_anthropic_blocks_from_content` and on
   OpenRouter by `supports_message_cache_control`, and pinned by
-  `tests/test_review_prompt_caching.py`;
+  `tests/test_review_prompt_caching.py`. The main loop declares an
+  execution-scoped cache affinity only for subscription transport; API-compatible
+  lanes retain their prefix-derived session identity;
   `review_substrate.assert_cache_breakpoint_cap` covers only the review
   builders. Review gate: CHECKLISTS item 22 (`cache_friendliness`).
 - Provider fallback is disabled only when the transcript carries a SEALED
@@ -2367,7 +2415,8 @@ by "Provider Independence" above. Call-site imperatives:
   waiting tunes the passive wait only.
 - Preserve raw terminal model/salvage bytes separately from the host-authored
   `terminal_provider_notice`. Existing receipts and secondary notices consume
-  those same facts; a retained answer must not hide wait or unknown-attempt
+  those same facts: attempted repeats, the last provider error, and an unknown
+  dispatched outcome. A retained answer must not hide wait or unknown-attempt
   evidence or invite a blind rerun. Ephemeral and message/deferred Presence
   responses render one host-labelled status section; cached Presence output
   is already rendered. Preserve silent/tool-delivered authority and never
@@ -2383,7 +2432,13 @@ by "Provider Independence" above. Call-site imperatives:
   reads the tone through `normalizeTone` and keeps the alarm tone for a
   frame without one — never parse `toast_once` or the text for it; `OuroborosAgent._emit_progress` is the
   production implementation and a test fake mirrors it
-  (`lambda text, *, incident=None: ...`).
+  (`lambda text, *, incident=None: ...`). A cross-model lane switch is the
+  second owner note carrying this pair; it names both models, the account the
+  send's own binding selects when that route has accounts (a task-local wait
+  override included, never the configured value alone), and the typed failure
+  reason when the round record has one. The applied-option mismatch line is the third, and it
+  rides the same loop-level callable: the frozen `ToolContext.emit_progress_fn`
+  takes one argument and never carries the pair.
 - Timeout contract classes differ; keep the axes separate. A transport
   timeout only bounds a dead socket
   (`OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC`) — it is not a reasoning cutoff
@@ -2428,7 +2483,9 @@ by "Provider Independence" above. Call-site imperatives:
   before it clears the row. A logical timeout with a live paid worker is
   custody/reconciliation-pending, never permission for a blind paid retry;
   late results settle the original attempt and stay bound to its retry
-  identity.
+  identity. Symmetrically, an owner terminal that is not a deliberate
+  verdict is not permission to cancel the live paid run that owner held: the
+  sweep spares it, discloses it, and lets its own bound limit the damage.
 - Once the owner deadline minus finalization reserve is spent, an unstarted
   review row is a typed `$0 not_dispatched` actor — no worker, paid stamp, or
   active lease; an already-paid in-flight wave stays eligible for exact

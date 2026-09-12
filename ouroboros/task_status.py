@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,8 @@ from ouroboros.task_results import (
     validate_task_id,
 )
 from ouroboros.utils import iter_jsonl_objects, read_json_dict
+
+log = logging.getLogger(__name__)
 
 
 # Terminal task statuses. Since the cancel redesign (Poltergeist sprint phase A)
@@ -541,7 +544,10 @@ def load_effective_task_result(
     )
 
 
-def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset()) -> int:
+def reconcile_orphaned_running_tasks(
+    drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset(),
+    expired_quizzes: Optional[List[Any]] = None,
+) -> int:
     """Durably finalize on-disk RUNNING task results the effective-status
     projection already considers terminal.
 
@@ -559,6 +565,10 @@ def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: froze
     reconciled. The monotonic guard in ``write_task_result`` additionally protects
     a genuinely newer terminal/cancel write. Idempotent; safe at boot and on a
     periodic supervisor tick.
+
+    ``expired_quizzes`` collects ``(task_id, quiz_id)`` for every question this
+    sweep expired, so the supervisor-side caller can send the same live frame the
+    task-done seam sends. This module stays free of a supervisor import.
     """
     from ouroboros.task_results import list_task_results, write_task_result
 
@@ -571,6 +581,20 @@ def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: froze
     for row in running:
         task_id = str(row.get("task_id") or row.get("id") or "")
         if not task_id or task_id in exclude_task_ids:
+            continue
+        # An ACTIVE cancel intent means cancellation custody already owns this
+        # row and will settle it with its own outcome and text; at boot that
+        # custody is still inside the watchdog's minimum age, so healing here
+        # would win the race and publish infra_failed for a task the owner was
+        # told is being cancelled. An UNREADABLE intent store is the same
+        # refusal: this sweep never settles over an unknown cancel authority.
+        try:
+            from ouroboros.cancel_intents import has_active_intent
+
+            if has_active_intent(root, task_id, strict=True):
+                continue
+        except Exception:
+            log.debug("Orphan reconcile skipped %s: cancel authority unreadable", task_id, exc_info=True)
             continue
         try:
             effective = load_effective_task_result(root, task_id)
@@ -596,6 +620,25 @@ def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: froze
             healed += 1
         except Exception:
             continue
+        # This sweep is a terminal writer that never passes the task-done seam, so
+        # it closes the same per-task owner-control projections that seam closes:
+        # otherwise the record says "ended" while the card still shows an open
+        # question and the paired wait never releases. Both legs are idempotent
+        # and fail-soft, exactly as in the seam's own coordinator.
+        try:
+            from ouroboros.owner_hurry import reconcile_terminal as reconcile_hurry
+
+            reconcile_hurry(root, task_id)
+        except Exception:
+            log.debug("owner_hurry reconcile failed for healed %s", task_id, exc_info=True)
+        try:
+            from ouroboros.owner_quiz import reconcile_terminal as reconcile_quiz
+
+            expired = reconcile_quiz(root, task_id)
+            if expired_quizzes is not None:
+                expired_quizzes.extend((task_id, quiz_id) for quiz_id in expired)
+        except Exception:
+            log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
     return healed
 
 

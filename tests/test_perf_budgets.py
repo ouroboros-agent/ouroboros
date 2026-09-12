@@ -20,12 +20,65 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import types
 
 from starlette.requests import Request
 
 from ouroboros import usage_accounting as ua
 from ouroboros import usage_ledger
+
+
+def test_retained_execution_drive_tripwire_counts_both_roots(tmp_path, monkeypatch):
+    from ouroboros import context_budget
+    from ouroboros.agent_startup_checks import hot_store_growth_notes
+    from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
+    from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
+
+    monkeypatch.setattr(context_budget, "RETAINED_EXECUTION_DRIVES_WARN_COUNT", 2)
+    env = types.SimpleNamespace(
+        drive_root=tmp_path,
+        drive_path=lambda rel: tmp_path / rel,
+    )
+    headless = tmp_path / HEADLESS_TASKS_DIR
+    task_drives = tmp_path / TASK_DRIVES_DIR
+    (headless / "headless-1").mkdir(parents=True)
+    (task_drives / "drive-1").mkdir(parents=True)
+
+    assert hot_store_growth_notes(env) == []
+
+    (task_drives / "drive-2").mkdir()
+    notes = hot_store_growth_notes(env)
+    assert len(notes) == 1
+    assert "retained execution drives" in notes[0]
+    assert "total 3 (threshold 2)" in notes[0]
+
+    (tmp_path / ISOLATED_BENCHMARK_SENTINEL).write_text("isolated\n", encoding="utf-8")
+    assert hot_store_growth_notes(env) == []
+
+
+def test_observability_write_failure_warns_once_and_stays_nonfatal(tmp_path, caplog):
+    from ouroboros.llm_observability import persist_observed_call
+
+    def fail_write(*args, **kwargs):
+        raise OSError("test write failure")
+
+    with caplog.at_level(logging.WARNING, logger="ouroboros.llm_observability"):
+        result = persist_observed_call(
+            tmp_path,
+            payload={"model": "claudexor/test"},
+            writer=fail_write,
+            task_id="task-1",
+        )
+
+    assert result == {}
+    records = [
+        record for record in caplog.records
+        if record.name == "ouroboros.llm_observability"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].getMessage() == "Failed to persist LLM observability payload"
 
 
 def _seeded_accounting_root(tmp_path, monkeypatch):

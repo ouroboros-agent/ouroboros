@@ -83,7 +83,8 @@ def _spawn_coop_checkpoint(
                 ctx.DRIVE_ROOT, root_tid, title=title, has_live_tree_tasks=live,
             )
             for receipt in receipts:
-                if receipt.get("committed") or receipt.get("error") or receipt.get("skipped_sensitive"):
+                if (receipt.get("committed") or receipt.get("error")
+                        or receipt.get("skipped_sensitive") or receipt.get("skipped")):
                     append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
                         "ts": utc_now_iso(), "type": "coop_checkpoint_commit",
                         "task_id": root_tid, "trigger": trigger, **receipt,

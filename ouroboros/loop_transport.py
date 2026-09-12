@@ -762,7 +762,7 @@ def provider_terminal_fallback_text(
             text += provider_recovery_hint(accumulated_usage)
         return text
     return (
-        "⚠️ The model provider returned no usable response after retries and same-model reroute."
+        "⚠️ The model provider returned no usable response."
         f"{provider_failure_hint(accumulated_usage)}{provider_recovery_hint(accumulated_usage)} "
         "Any files written so far are preserved in the workspace."
     )
@@ -775,6 +775,42 @@ def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
     if not detail:
         return ""
     return f" Last provider error: {detail}"
+
+
+def emit_model_effort_mismatch(
+    accumulated_usage: Dict[str, Any], *, task_id: str, emit_progress: Optional[Callable[..., None]],
+) -> None:
+    """Disclose an engine-applied reasoning-effort change once per task and model.
+
+    One line per (task, model), never per round: a second mismatch on the same
+    model in the same task stays in the durable usage rows only. The options
+    must belong to the route the record now names: an error round rewrites
+    `_model_route` from its own failure, and that model must never inherit an
+    earlier route's applied options. The durable state stays generic over every
+    submitted option; this line speaks only for the thinking horizon, so an
+    engine that echoes another option differently never reaches the owner as an
+    effort claim.
+    """
+    options = accumulated_usage.get("_options")
+    route = accumulated_usage.get("_model_route") or {}
+    model = str(route.get("model") or "")
+    notified = accumulated_usage.setdefault("_options_mismatch_notified", [])
+    if (emit_progress is None or not isinstance(options, dict)
+            or options.get("options_honored") != "mismatch" or model in notified
+            or (options.get("route") or {}) != route):
+        return
+    requested_effort = (options.get("requested_options") or {}).get("reasoningEffort")
+    applied_effort = (options.get("applied_options") or {}).get("reasoningEffort")
+    if requested_effort is None or applied_effort is None or requested_effort == applied_effort:
+        return
+    account = str(route.get("credentialProfileId") or "")
+    notified.append(model)
+    emit_progress(
+        f"⚠️ Claudexor served at {applied_effort} effort while {requested_effort} was requested"
+        f"{f' (Claudexor account {account})' if account else ''}.",
+        incident={"task_incident": "model_effort_mismatch",
+                  "toast_once": ":".join(part for part in (task_id, "model_effort_mismatch", model) if part)},
+    )
 
 
 def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:

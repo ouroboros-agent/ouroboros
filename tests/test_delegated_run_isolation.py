@@ -15,6 +15,7 @@ import subprocess
 import pytest
 
 from ouroboros import delegate_custody as custody
+from ouroboros.task_results import write_task_result
 from ouroboros.subagent_worktrees import (
     find_execution_snapshot,
     provision_execution_snapshot,
@@ -685,9 +686,10 @@ class TestOrphanReconciliation:
     def test_a_still_live_run_is_not_captured_and_stays_open(self, tmp_path):
         # A cancel that is merely REQUESTED leaves the run live and its snapshot
         # still being written: capturing there would ship a torn diff. Nothing is
-        # captured, nothing disposed, and the snapshot stays custody-open.
+        # captured, nothing disposed, snapshot custody-open. The deliberate owner terminal reaches the cancel arm (inverted floor, B1-A).
         target, data, handle = self._stranded(
             tmp_path, snapshot_id="inv-live", task_id="t-dead3")
+        write_task_result(data, "t-dead3", "completed", result="verdict")
         outcomes = custody.reconcile_orphaned_runs(
             data, set(),
             gateway_factory=lambda: _TerminalSweepGateway("run-inv-live", state="running"))
@@ -946,9 +948,10 @@ class TestLazyCaptureAtDisposition:
         # (d) regression pin: where a TERMINAL RECEIPT proves the run is over —
         # here a cancel verified terminal by the read-back — the sweep still
         # captures eagerly, exactly as before. (The is_terminal branch is pinned
-        # by test_reconcile_captures_the_stranded_patch_and_never_applies_it.)
+        # by test_reconcile_captures_the_stranded_patch_and_never_applies_it.) The deliberate owner terminal reaches the cancel arm (inverted floor, B1-A).
         target, data, handle = self._stranded_absent(
             tmp_path, snapshot_id="inv-can", task_id="t-can")
+        write_task_result(data, "t-can", "completed", result="verdict")
 
         class _CancelTerminalGateway(_TerminalSweepGateway):
             def __init__(self):

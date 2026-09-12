@@ -6,6 +6,12 @@ import pytest
 import yaml
 
 from ouroboros.gateways.claudexor import final_attempt_facts
+from ouroboros.llm_claudexor import (
+    ClaudexorModelError,
+    _ModelInvocation,
+    _remember_failed_profile,
+    _request,
+)
 
 
 def _write_telemetry(tmp_path, attempts, *, final_id="a02", run_id="run-fixture"):
@@ -108,3 +114,118 @@ def test_missing_engine_run_directory_never_reads_the_working_directory(detail, 
 
     monkeypatch.setattr(Path, "read_text", unexpected_read)
     assert final_attempt_facts(detail, "run-fixture") == {}
+
+
+@pytest.mark.parametrize("applied,expected", [
+    ({"reasoningEffort": "xhigh"}, "confirmed"),
+    ({"reasoningEffort": "medium"}, "mismatch"),
+    (None, "unknown"),
+])
+def test_model_invocation_records_requested_and_applied_options(applied, expected):
+    requested = {"reasoningEffort": "xhigh"}
+    invocation = _ModelInvocation(
+        {"usage_model": "claudexor::codex=model"}, {"options": requested}, {}
+    )
+    result = {
+        "outcome": "completed",
+        "message": {"role": "assistant", "content": "done"},
+    }
+    if applied is not None:
+        result["appliedOptions"] = applied
+
+    _message, usage = invocation.finish(result)
+    observed = usage["claudexor"]
+    assert observed["requested_options"] == requested
+    assert observed["applied_options"] == applied
+    assert observed["options_honored"] == expected
+
+
+def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
+    """The recorded state covers every submitted option, not the thinking horizon alone."""
+    requested = {"reasoningEffort": "xhigh", "cacheKey": "execution-a"}
+    invocation = _ModelInvocation(
+        {"usage_model": "claudexor::codex=model"}, {"options": requested}, {}
+    )
+
+    _message, usage = invocation.finish({
+        "outcome": "completed", "message": {"role": "assistant", "content": "done"},
+        "appliedOptions": {"reasoningEffort": "xhigh", "cacheKey": "engine-b"},
+    })
+
+    assert usage["claudexor"]["options_honored"] == "mismatch"
+
+
+def _continuation(profile="profile-a", source="codex", model="gpt-6"):
+    return [{
+        "role": "assistant",
+        "content": "prior answer",
+        "nativeContinuation": {"route": {
+            "source": source, "model": model, "credentialProfileId": profile,
+        }},
+    }]
+
+
+def test_successful_profile_remains_an_auto_lane_preference():
+    target = {"source": "codex", "resolved_model": "gpt-6"}
+
+    payload = _request(target, _continuation(), None, {"cache_affinity": "execution-success"})
+
+    assert payload["account"] == {"mode": "auto", "preferredProfileId": "profile-a"}
+
+
+def test_status_null_failure_suppresses_only_the_next_same_route_preference():
+    target = {"source": "codex", "resolved_model": "gpt-6"}
+    parameters = {"cache_affinity": "execution-failed"}
+    error = ClaudexorModelError(
+        {"code": "server_error", "message": "stream ended"},
+        route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
+        unknown=True,
+    )
+    _remember_failed_profile(target, parameters, error)
+
+    assert _request(target, _continuation(), None, parameters)["account"] == {"mode": "auto"}
+    assert _request(target, _continuation(), None, parameters)["account"] == {
+        "mode": "auto", "preferredProfileId": "profile-a",
+    }
+
+
+def test_failure_fact_survives_an_interleaved_request_on_another_route():
+    target = {"source": "codex", "resolved_model": "gpt-6"}
+    other = {"source": "claude", "resolved_model": "sonnet"}
+    parameters = {"cache_affinity": "execution-interleaved"}
+    error = ClaudexorModelError(
+        {"code": "server_error", "message": "stream ended"},
+        route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
+        unknown=True,
+    )
+    _remember_failed_profile(target, parameters, error)
+
+    # A request on another route neither consumes the fact nor loses its own preference.
+    assert _request(other, _continuation("profile-b", "claude", "sonnet"), None, parameters)["account"] == {
+        "mode": "auto", "preferredProfileId": "profile-b",
+    }
+    assert _request(target, _continuation(), None, parameters)["account"] == {"mode": "auto"}
+    assert _request(target, _continuation(), None, parameters)["account"] == {
+        "mode": "auto", "preferredProfileId": "profile-a",
+    }
+
+
+def test_failure_fact_does_not_change_pin_or_single_account_auto_mode():
+    target = {"source": "codex", "resolved_model": "gpt-6"}
+    parameters = {"cache_affinity": "execution-pin"}
+    error = ClaudexorModelError(
+        {"code": "subscription_window_exhausted", "message": "window spent",
+         "context": {"httpStatus": 429}},
+        route={"source": "codex", "model": "gpt-6", "credentialProfileId": "only-profile"},
+    )
+    _remember_failed_profile(target, parameters, error)
+
+    pinned = _request(target, _continuation("only-profile"), None, {
+        **parameters, "model_account_override": "only-profile",
+    })
+    assert pinned["account"] == {"mode": "pin", "profileId": "only-profile"}
+
+    _remember_failed_profile(target, parameters, error)
+    assert _request(target, _continuation("only-profile"), None, parameters)["account"] == {
+        "mode": "auto",
+    }

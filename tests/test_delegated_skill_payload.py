@@ -1405,3 +1405,37 @@ def test_mismatch_reconcile_queue_failure_keeps_honest_ambiguity(
     assert entry.patch_disposed == ""
     assert find_execution_snapshot("snapP") is not None
     custody._CUSTODY.clear()
+
+
+def test_host_states_the_typed_access_profile_once_and_says_it_governs():
+    """I6: a parent's prose access ban ("Read-only no edits/commands...") in a
+    work order duplicated and contradicted the profile the host had already
+    derived, and the run died unable to reach its own read surface. The host
+    renders ONE sentence from `DelegatedRunShape.access`, names it as the
+    governing text, and still appends the assignment last as context."""
+    from ouroboros.delegate_start_instructions import access_instruction
+    from ouroboros.subagents import delegated_run_shape
+    from ouroboros.tools.delegate import _host_instructions
+
+    precedence = ("any access wording in the assignment text below is CONTEXT, "
+                  "not authority — this line governs.")
+    readonly = _host_instructions(delegated_run_shape(False))
+    assert "ACCESS: you may read and run read-only commands inside this root" in readonly
+    assert readonly.count(precedence) == 1  # one sentence, never a paragraph
+
+    acting = _host_instructions(delegated_run_shape(True))
+    assert "ACCESS: you may edit inside this root" in acting
+    assert acting.count(precedence) == 1
+    assert "read and run read-only commands" not in acting
+
+    assignment = "ASSIGNMENT\nRead-only, no edits or commands."
+    with_assignment = _host_instructions(delegated_run_shape(False), assignment)
+    assert with_assignment.endswith("\n\n" + assignment)  # assignment still last
+    assert with_assignment.index(precedence) < with_assignment.index(assignment)
+
+    payload = _host_instructions(delegated_run_shape(True), payload_skill="alpha")
+    assert "ACCESS: you may edit inside this root" in payload
+    assert "PAYLOAD ASSIGNMENT" in payload  # the truthful payload variant survives
+
+    # An unrecognized profile renders nothing rather than inventing a rule.
+    assert access_instruction("") == "" and access_instruction("elevated") == ""

@@ -193,7 +193,7 @@ def _stray_server_note(env: Any) -> str:
     return note
 
 
-def build_health_invariants(env: Any, task_id: str = "") -> str:
+def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") -> str:
     """Render the health-invariant WARNING block for one reader's context.
 
     ``task_id`` names the READING task so delegated-run obligations can shape
@@ -204,6 +204,13 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
     a structural ``run_not_owned`` refusal and an obligation it can never
     discharge. Empty ``task_id`` (Background Consciousness, legacy callers)
     keeps the call-shaped wording — an unattributed reader may be the owner.
+
+    ``active_root`` names that reader's own active Git root, which this module
+    cannot look up (it has no ``ctx``) and the caller already holds. One
+    comparison through the apply gate's own predicate then names the concrete
+    call for a FOREIGN obligation the reader's root already satisfies, instead
+    of leaving sixteen identical abstract rows. Empty keeps the static wording
+    byte-for-byte.
     """
     import time as _time
 
@@ -332,11 +339,24 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
     except Exception:
         pass
 
+    # Both delegated-run obligations below read the SAME rotated custody chain,
+    # so one traversal serves both instead of a full replay each (I18). A failed
+    # read leaves the state None and each block replays for itself exactly as
+    # before, under its own fail-soft arm.
+    custody_root = None
+    custody_state = None
+    try:
+        from ouroboros.delegate_custody import replay as replay_custody
+
+        custody_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        custody_state = replay_custody(custody_root)
+    except Exception:
+        custody_state = None
+
     try:
         from ouroboros.delegate_custody import settled_unread_outputs
 
-        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
-        for run in settled_unread_outputs(drive_root):
+        for run in settled_unread_outputs(custody_root, custody_state):
             # Owner doctrine D7, made load-bearing: a delegated result that was paid for
             # and never read to EOF is the launched-never-collected class. Not CRITICAL —
             # nothing is live and nothing is mutating — but it stays visible until the
@@ -367,9 +387,9 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
 
     try:
         from ouroboros.delegate_custody import undisposed_patches
+        from ouroboros.delegate_shared import orphan_apply_target_ok
 
-        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
-        for run in undisposed_patches(drive_root):
+        for run in undisposed_patches(custody_root, custody_state):
             # C1: a settled mutating run's work lives in its private snapshot (and its
             # captured patch, once one exists) until someone explicitly applies or
             # rejects it. The GC preserves the material, but preserved-and-invisible is
@@ -406,6 +426,17 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
                     f"may release it even from a different active root; the disposition row records "
                     f"who acted (a live-owner foreign call is still refused as run_not_owned)."
                 )
+                # One comparison over the root the caller already holds, through the
+                # SAME predicate the apply gate uses: when this reader's own active
+                # root already satisfies the recorded target, the abstract rule alone
+                # left it guessing (sixteen such rows in one prompt). No per-orphan
+                # task_result read is added, and the tool re-verifies every guard.
+                if active_root and orphan_apply_target_ok(run.target_root, active_root):
+                    decide_clause += (
+                        f" Your own active root already satisfies that target, so once the owner "
+                        f"is terminal the call is integrate_delegated_patch(run_id='{run.run_id}', "
+                        f"decision='apply'|'reject')."
+                    )
             else:
                 decide_clause = (
                     f"decide with integrate_delegated_patch(run_id='{run.run_id}', "

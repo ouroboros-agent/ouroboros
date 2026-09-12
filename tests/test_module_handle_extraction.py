@@ -241,7 +241,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "cancel_and_verify", "close_absent_run", "daemon_says_absent", "emit",
         "is_terminal", "open_runs", "output_disposition", "pending_invocations",
         "record_containment_fault", "record_settled_unread", "record_started",
-        "replay", "retire_settled_registrations", "settle_run",
+        "replay", "retire_settled_registrations", "settle_run", "summary_of",
     })),
     "ouroboros/tools/delegate_payload_patch.py": ("ouroboros/tools/delegate_integration.py", "_di", frozenset({
         "_rebind_payload_reference", "_resolved", "payload_content_hash",

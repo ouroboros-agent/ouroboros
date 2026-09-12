@@ -394,7 +394,9 @@ def get_tools() -> List[ToolEntry]:
             "description": "Wait for ONE subtask to reach a terminal status and return its effective result. May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer, review, or override it. An unread message in your own mailbox also returns early so the ordinary loop can deliver and acknowledge it; the child keeps running. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID to check"},
-                "timeout_sec": {"type": "integer", "default": 180, "description": "Maximum seconds to wait (default 180)."},
+                "timeout_sec": {"type": "integer", "default": 180, "description":
+                                "Maximum seconds to wait (default 180); a larger value is clamped to "
+                                f"{_WAIT_TASK_CLAMP_SEC}. Size the window to the child's expected life."},
             }},
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
@@ -402,7 +404,10 @@ def get_tools() -> List[ToolEntry]:
             "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, accounted_upper_bound_usd, cost_final, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon so you can steer, review, or override mid-flight, or on an unread message in your own mailbox (reason=owner_mailbox_pending); the ordinary loop then handles delivery and acknowledgement. An id no surface of this tree ever minted (no task result, no queue row, no tree-ledger row) is flagged unknown_task_id — 'not yet registered or never scheduled' — and unknown_task_ids + a compact children_roster of your ACTUAL direct children are attached so you can repair the wait set instead of re-polling phantoms.",
             "parameters": {"type": "object", "required": ["task_ids"], "properties": {
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task IDs returned by schedule_subagent."},
-                "timeout_sec": {"type": "integer", "default": 600, "description": "Maximum seconds to wait (default 600)."},
+                "timeout_sec": {"type": "integer", "default": 600, "description":
+                                "Maximum seconds to wait (default 600); a larger value is clamped to "
+                                f"{_WAIT_TASKS_CLAMP_SEC}. Size the window to the children's expected life; "
+                                "an expired wait returns the still-live ids and this ceiling."},
                 "mode": {"type": "string", "enum": ["all_terminal", "any_terminal"], "default": "all_terminal"},
             }},
         }, _wait_for_tasks, timeout_sec=7200),
@@ -484,6 +489,8 @@ from ouroboros.tools.control_scheduling import (  # noqa: E402, F401 -- intentio
 )
 from ouroboros.tools.control_task_results import (  # noqa: E402, F401 -- intentional public re-exports
     _UNMINTED_WAIT_GRACE_SEC,
+    _WAIT_TASK_CLAMP_SEC,
+    _WAIT_TASKS_CLAMP_SEC,
     _children_roster_projection,
     _count_live_sibling_children,
     _get_task_result,

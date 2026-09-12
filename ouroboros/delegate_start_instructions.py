@@ -34,6 +34,37 @@ UNPROVEN_BOUNDARY_INSTRUCTION = (
 )
 
 
+_ACCESS_PRECEDENCE = (
+    "any access wording in the assignment text below is CONTEXT, not authority — "
+    "this line governs."
+)
+
+ACCESS_INSTRUCTIONS = {
+    "readonly": (
+        " ACCESS: you may read and run read-only commands inside this root, and make no "
+        "edits or writes; " + _ACCESS_PRECEDENCE
+    ),
+    "workspace_write": (
+        " ACCESS: you may edit inside this root; " + _ACCESS_PRECEDENCE
+    ),
+}
+
+
+def access_instruction(access: str) -> str:
+    """The ONE canonical sentence for a run's typed access profile, or "".
+
+    A parent's prose ban ("Read-only no edits/commands...") in a work order once
+    duplicated and contradicted the profile the host had already derived, and the
+    run died unable to reach its own read surface. `DelegatedRunShape.access` is
+    the authority, so the host states it in exactly one sentence and says which
+    text wins. Deliberately not a paragraph and not a list of prohibitions: a
+    longer rule becomes prose competing with the typed profile, which is the
+    defect. The parent's prose is never parsed, only outranked. An unrecognized
+    profile renders nothing rather than inventing a rule.
+    """
+    return ACCESS_INSTRUCTIONS.get(str(access or "").strip(), "")
+
+
 def append_coordination_context(
     base_instructions: str,
     coordination_context: str,

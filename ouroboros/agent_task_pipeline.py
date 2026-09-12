@@ -472,6 +472,25 @@ def _apply_terminal_custody_outcome(
         overlaid["reason_code"] = rail
     return overlaid
 
+
+def _stamp_project_room_pointer(task: Dict[str, Any], env: Any) -> None:
+    """The project's last-result POINTER for a room's direct-chat root.
+
+    A project ROOM's direct-chat turn writes a durable result carrying
+    ``project_id`` but no letters home, so the pointer stayed empty and the
+    room's own results were never offered as predecessors. Only the pointer is
+    written here: no milestone, work-location row, digest or blocking
+    post-processing - that exclusion is deliberate and stands.
+    """
+    from ouroboros.project_facts import resolve_project_id
+    from ouroboros.tools.project_journal import record_project_last_result
+
+    record_project_last_result(
+        resolve_project_id(task), str(task.get("id") or ""),
+        pathlib.Path(str(task.get("budget_drive_root") or env.drive_root)),
+    )
+
+
 def emit_task_results(
     env: Any, memory: Any, llm: Any,
     pending_events: List[Dict[str, Any]],
@@ -714,9 +733,7 @@ def emit_task_results(
             # the journal milestone and the consciousness digest (BIBLE P1: no
             # silent/lossy clip of cognitive text). Objectives are concise by
             # nature; the task and task_results remain the durable record.
-            _objective = str(
-                task.get("objective") or task.get("description") or task.get("text") or ""
-            )
+            _objective = str(task.get("objective") or task.get("description") or task.get("text") or "")
             _exec_status = str((outcome_axes.get("execution") or {}).get("status") or "unknown")
             try:
                 # One fail-soft seam (project_journal.record_task_finalization) for
@@ -751,6 +768,8 @@ def emit_task_results(
                 })
             except Exception:
                 log.debug("project digest emission failed", exc_info=True)
+        elif _project_scoped and not _ephemeral:
+            _stamp_project_room_pointer(task, env)
         budget_drive_root = str(task.get("budget_drive_root") or "").strip()
         split_drive = bool(
             budget_drive_root

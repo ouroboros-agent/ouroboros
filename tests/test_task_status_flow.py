@@ -1441,6 +1441,9 @@ def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, mon
     assert short["reason"] == "all_task_ids_unminted"
     assert short["requested_timeout_sec"] == 600.0
     assert sorted(payload["unknown_task_ids"]) == ["phantomid7", "phantomid8"]
+    # An id this tree never minted is disclosed as unknown, never counted as a
+    # live child of an expired window.
+    assert "wait_expired_with_live_children" not in payload
 
 
 def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypatch):
@@ -3515,3 +3518,95 @@ def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
     assert ctx.pending_events == []
     assert ctx.pending_restart_reason == "reload runtime"
     assert written
+
+
+def test_expired_batch_wait_discloses_live_children_as_facts(tmp_path):
+    """I10: an expired batch wait names the still-live children and the ceiling.
+
+    Facts only. How wide a window to ask for next is the mind's call, so the
+    block carries no advisory note and the host imposes no floor; the long-term
+    orientation lives in the schema description read BEFORE the window is
+    chosen.
+    """
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _WAIT_TASKS_CLAMP_SEC, _wait_for_tasks
+
+    write_task_result(tmp_path, "donechild", STATUS_COMPLETED, result="done")
+    write_task_result(tmp_path, "livechild", STATUS_SCHEDULED, result="")
+    ctx = SimpleNamespace(drive_root=tmp_path)
+
+    payload = json.loads(_wait_for_tasks(ctx, ["donechild", "livechild"], timeout_sec=0))
+
+    assert payload["timed_out"] is True and payload["all_terminal"] is False
+    assert payload["wait_expired_with_live_children"] == {
+        "reason": "timeout_expired_before_terminal",
+        "requested_timeout_sec": 0.0,
+        "max_timeout_sec": float(_WAIT_TASKS_CLAMP_SEC),
+        "live_task_ids": ["livechild"],
+    }
+
+    write_task_result(tmp_path, "livechild", STATUS_COMPLETED, result="done too")
+    settled = json.loads(_wait_for_tasks(ctx, ["donechild", "livechild"], timeout_sec=0))
+    assert settled["all_terminal"] is True
+    assert "wait_expired_with_live_children" not in settled
+
+
+def test_expired_batch_wait_reports_the_asked_for_window_not_the_clamp(tmp_path, monkeypatch):
+    """A request above the ceiling is disclosed as asked, beside the ceiling.
+
+    Reporting the clamp as requested_timeout_sec would hide the fact the model
+    most needs from the expiry: that the window it asked for was cut down.
+    """
+    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _WAIT_TASKS_CLAMP_SEC, _wait_for_tasks
+    from ouroboros.tools import control_task_results
+
+    write_task_result(tmp_path, "livechild", STATUS_SCHEDULED, result="")
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    # The clamp itself is unchanged; the wait returns at once on a spent window.
+    monkeypatch.setattr(
+        control_task_results, "wait_for_effective_tasks",
+        lambda root, ids, **kw: {
+            "mode": kw.get("mode"), "timeout_sec": float(kw.get("timeout_sec") or 0),
+            "elapsed_sec": 0.0, "timed_out": True, "all_terminal": False,
+            "tasks": {tid: {"task_id": tid, "status": STATUS_SCHEDULED} for tid in ids},
+        },
+    )
+
+    payload = json.loads(_wait_for_tasks(ctx, ["livechild"], timeout_sec=10000))
+
+    block = payload["wait_expired_with_live_children"]
+    assert block["requested_timeout_sec"] == 10000.0
+    assert block["max_timeout_sec"] == float(_WAIT_TASKS_CLAMP_SEC) == 7200.0
+    assert payload["timeout_sec"] == 7200.0, "the clamp still bounds the real wait"
+
+
+def test_wait_clamp_constants_match_the_scraped_literals():
+    """The schema text's number and the clamp arithmetic are one fact (A10)."""
+    import inspect
+    import re
+
+    from ouroboros.tools import control_task_results as mod
+
+    def _scraped(fn):
+        return int(re.findall(r"min\(int\(timeout_sec\),\s*(\d+)\)", inspect.getsource(fn))[0])
+
+    assert _scraped(mod._wait_for_task) == mod._WAIT_TASK_CLAMP_SEC
+    assert _scraped(mod._wait_for_tasks) == mod._WAIT_TASKS_CLAMP_SEC
+
+
+def test_wait_schemas_name_the_real_clamp(tmp_path):
+    """The model reads the real ceiling before it picks a window, not after."""
+    import pathlib
+
+    from ouroboros.tools.control import _WAIT_TASK_CLAMP_SEC, _WAIT_TASKS_CLAMP_SEC
+    from ouroboros.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(
+        repo_dir=pathlib.Path(__file__).resolve().parents[1], drive_root=tmp_path,
+    )
+    by_name = {t["function"]["name"]: t["function"] for t in registry.schemas()}
+    one = by_name["wait_task"]["parameters"]["properties"]["timeout_sec"]["description"]
+    many = by_name["wait_tasks"]["parameters"]["properties"]["timeout_sec"]["description"]
+    assert str(_WAIT_TASK_CLAMP_SEC) in one and "expected life" in one
+    assert str(_WAIT_TASKS_CLAMP_SEC) in many and "expected life" in many

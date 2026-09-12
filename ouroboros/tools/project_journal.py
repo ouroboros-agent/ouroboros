@@ -191,6 +191,25 @@ def _record_work_location(project_id: str, task: dict) -> None:
     )
 
 
+def record_project_last_result(project_id: str, task_id: str, drive_root: Any) -> None:
+    """Stamp the project's durable last-result pointer (read first by
+    ``_latest_project_task_result``). THE one writer of that pointer, shared by the
+    pooled-task finalization below and the project room's direct-chat root - which
+    writes a durable result carrying ``project_id`` but no letters home, so without
+    this the per-project fallback for "continue from this result" stayed empty.
+
+    A split-drive task's canonical copy-back may land moments later; the reader
+    validates the pointed file and falls back to the scan. Fail-soft."""
+    if drive_root is None or not str(task_id or "").strip() or not str(project_id or "").strip():
+        return
+    try:
+        from ouroboros.projects_registry import update_project
+
+        update_project(drive_root, project_id, last_task_result_id=str(task_id))
+    except Exception:
+        log.debug("project last-task-result pointer update failed", exc_info=True)
+
+
 def record_task_finalization(
     project_id: str, task: dict, *, objective: str, kind: str, exec_status: str,
     drive_root: Any = None,
@@ -207,16 +226,7 @@ def record_task_finalization(
         )
     except Exception:
         log.debug("project journal task-done entry failed", exc_info=True)
-    if drive_root is not None and tid:
-        # Durable last-result pointer (read first by _latest_project_task_result).
-        # A split-drive task's canonical copy-back may land moments later; the
-        # reader validates the pointed file and falls back to the scan.
-        try:
-            from ouroboros.projects_registry import update_project
-
-            update_project(drive_root, project_id, last_task_result_id=tid)
-        except Exception:
-            log.debug("project last-task-result pointer update failed", exc_info=True)
+    record_project_last_result(project_id, tid, drive_root)
     try:
         _record_work_location(project_id, task)
     except Exception:

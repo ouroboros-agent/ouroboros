@@ -11,6 +11,7 @@ cycle.
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import threading
 import uuid
@@ -26,6 +27,8 @@ from ouroboros.config import MAX_SUBAGENT_DEPTH_HARD_CAP
 from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import utc_now_iso
+
+log = logging.getLogger(__name__)
 
 # FR2: ONE shared from-scratch git tree per task-tree for cooperative acting-subagent
 # builds, keyed by root_task_id. Process-local cache so multiple fan-out waves of the
@@ -884,20 +887,39 @@ def _ensure_project_scope(ctx: ToolContext, project_name: str = "", project_id: 
     if not pid:
         return "⚠️ TOOL_ARG_ERROR (ensure_project_scope): could not derive a project id from the given name."
 
-    current = sanitize_project_id(getattr(ctx, "project_id", "") or "")
-    if current:
-        if current == pid:
-            return f"OK: this task is already scoped to project '{pid}' (no change)."
-        return (
-            f"⚠️ TOOL_ERROR (ensure_project_scope): this task is already scoped to project "
-            f"'{current}'; it cannot be re-scoped to '{pid}'."
-        )
-
     tid = str(getattr(ctx, "task_id", "") or "")
+    # The DURABLE binding is the one truth about this task's project (owner decision
+    # B4=A): ctx.project_id is an in-memory copy a mid-run conversion never reaches,
+    # and reading it alone is how a task already bound to one project minted a second,
+    # empty one. An unreadable store is DISCLOSED, not fatal - the work continues as
+    # it did before this seam existed; what is refused is the measured incident, a
+    # readable binding whose project the caller wants to replace with a new one.
+    from ouroboros.config import DATA_DIR
+    from ouroboros.projects_registry import project_id_for_task
+    try:
+        bound = sanitize_project_id(project_id_for_task(DATA_DIR, tid, strict=True))
+    except Exception:
+        bound = ""
+        log.warning("project_binding_unreadable: ensure_project_scope for task %s continues "
+                    "as unbound", tid, exc_info=True)
+    current = bound or sanitize_project_id(getattr(ctx, "project_id", "") or "")
+    if current == pid:
+        ctx.project_id = pid
+        return f"OK: this task is already scoped to project '{pid}' (no change)."
+    if current and not bound:
+        # Project-SCOPED but not project-BOUND (headless/CLI): there is no durable
+        # project to rename, so the old refusal stands.
+        return (f"⚠️ TOOL_ERROR (ensure_project_scope): this task is already scoped to project "
+                f"'{current}'; it cannot be re-scoped to '{pid}'.")
+    # Bound elsewhere: the request becomes a RENAME of the project this task already
+    # belongs to (B4=A), never a second project. The event keeps the REQUESTED id,
+    # because the supervisor handler reads the same binding and owns that turn:
+    # rewriting the id here made its rename branch unreachable and the rename
+    # silently disappeared while this text claimed it had happened.
     # Scope the REST of this task immediately so journal_write and per-project
     # knowledge target the project now; the emitted event makes the supervisor
     # create the registry project, bind THIS task durably, and broadcast.
-    ctx.project_id = pid
+    ctx.project_id = bound or pid
     evt = {
         "type": "ensure_project_scope",
         "task_id": tid,
@@ -916,6 +938,18 @@ def _ensure_project_scope(ctx: ToolContext, project_name: str = "", project_id: 
     _attach_origin_from_metadata(ctx, evt)
 
     mode = _emit_control_event(ctx, evt)
+    if bound:
+        from ouroboros.projects_registry import get_project
+
+        # Say only what is true: a rename is claimed exactly when one was requested
+        # AND the bound project does not already carry that name.
+        bound_name = str((get_project(DATA_DIR, bound) or {}).get("name") or "")
+        renaming = bool(display_name) and display_name != bound_name
+        named = (f"; the requested name '{display_name}' was sent to that project as a rename"
+                 if renaming else "")
+        return (f"OK: this task is durably bound to project '{bound}'"
+                f"{f' ({bound_name})' if bound_name else ''}, so it stays there and no second "
+                f"project was created{named} ({mode}).")
     return (
         f"OK: created/attached project '{display_name or pid}' (id={pid}) and scoped this "
         f"task into it ({mode}). journal_write and project knowledge now target this "

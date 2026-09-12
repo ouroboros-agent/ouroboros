@@ -60,6 +60,29 @@ _READ_TIMEOUT_SEC = 60.0
 # their total wall-clock bound outside this phase-local adapter.
 # Passed per request via ``_request(timeout_sec=...)``; it never changes the default.
 SHORT_POLL_TIMEOUT_SEC = 5.0
+# The httpx failures a READ-ONLY observer may retry as the same unresolved read: the
+# socket delivered no daemon answer, so nothing is known about the run and nothing
+# was claimed. Classified by exception TYPE plus received status, never by prose; a
+# received 4xx/5xx still wins (see ``_request``).
+_OBSERVATION_RETRYABLE_ERRORS = (
+    httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+    httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError,
+)
+# ...and WHICH hole it was, for the observer that has to tell the owner apart a
+# daemon that is merely slow from one that is not there. Our own read bound
+# expiring says nothing about the daemon; a socket that could not be opened or
+# that broke mid-exchange says it did not answer. Classified by exception TYPE,
+# never by prose, and carried beside ``code`` rather than replacing it: the
+# model-control retry loop, the daemon liveness probe and the definite-unrun set
+# all key on ``daemon_unreachable`` for reasons that have nothing to do with an
+# observation.
+_OBSERVATION_READ_TIMEOUT = "observation_read_timeout"
+
+
+def _observation_reason(exc: BaseException) -> str:
+    """The typed reason for a read-only observation hole."""
+    return (_OBSERVATION_READ_TIMEOUT if isinstance(exc, httpx.ReadTimeout)
+            else "daemon_unreachable")
 _ATTEMPTS_REL = "attempts"
 _ATTEMPT_RECORD = "attempt.yaml"
 
@@ -78,7 +101,8 @@ class ClaudexorUnavailable(RuntimeError):
     """
 
     def __init__(self, code: str, message: str, *, status_code: int = 0,
-                 required_actions: tuple[str, ...] = (), observation_timeout: bool = False) -> None:
+                 required_actions: tuple[str, ...] = (), observation_timeout: bool = False,
+                 observation_reason: str = "") -> None:
         super().__init__(message)
         self.code = str(code or "claudexor_unavailable")
         self.status_code = int(status_code or 0)
@@ -86,6 +110,11 @@ class ClaudexorUnavailable(RuntimeError):
         # Read-only observers may retry this exact HTTP read without claiming
         # anything about the worker. A received HTTP refusal still wins.
         self.observation_timeout = bool(observation_timeout)
+        # Which hole it was, for the observer only (``_observation_reason``):
+        # a read bound that expired against a live daemon is not the same fact
+        # as a socket that never carried an answer, and only the second is
+        # worth an owner-facing outage line.
+        self.observation_reason = str(observation_reason or "")
 
 
 # Cross-repo contract (B1): the engine's window-exhausted RunFailure codes. A
@@ -333,12 +362,14 @@ class ClaudexorGateway:
                                      headers=headers or None, **bound) as response:
                 response.read()
         except httpx.HTTPError as exc:
+            retryable = (isinstance(exc, _OBSERVATION_RETRYABLE_ERRORS)
+                         and (response is None or response.status_code < 400))
             raise ClaudexorUnavailable(
                 "daemon_unreachable",
                 f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
                 status_code=response.status_code if response is not None else 0,
-                observation_timeout=isinstance(exc, httpx.ReadTimeout)
-                and (response is None or response.status_code < 400),
+                observation_timeout=retryable,
+                observation_reason=_observation_reason(exc) if retryable else "",
             ) from exc
         if response.status_code >= 400:
             raise self._problem(response)

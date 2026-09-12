@@ -30,10 +30,16 @@ POISONED_RECORD = re.compile(r'(?:"chat_id":|\bchat_id=)\s*[^,\n]*\bor\s+None')
 # hidden partition, and `if chat_id:` guards a send the same wrong way.
 # ``owner_chat_id`` is deliberately exempt — a 0/absent OWNER chat means "no
 # owner chat is configured", never the panel, so testing it for truth is honest.
+# The third alternative is the same habit written WITHOUT a local: the id read
+# straight off a mapping inside the condition (`... and task.get("chat_id"):`),
+# which is how a cascade silently skipped a descendant homed in the partition.
+# A comparison that merely reads the value (`int(t.get("chat_id") or 0) == x`)
+# decides no route and stays out.
 _CHAT_NAME = r"(?!owner_chat_id\b)(?:[A-Za-z_]*_)?chat_id"
 TRUTHY_ROUTE = re.compile(
     rf"^\s*if (?:not {_CHAT_NAME}\b|(?:[^:\n]*\band )?{_CHAT_NAME}\s*:)"
     rf"|^\s*if not [^:\n]*\bor not {_CHAT_NAME}\b"
+    rf"|^\s*if [^:\n]*\.get\(\s*[\"']chat_id[\"']\s*\)\s*(?::|and\b)"
 )
 
 # (repo-relative path, exact stripped line) -> (occurrences, why it stays)
@@ -118,6 +124,28 @@ def test_no_new_truthiness_route_for_a_chat_id():
             f"allowlisted site count changed for {key}: expected {expected}, saw "
             f"{hits.get(key)} — re-read the reason and update it deliberately."
         )
+
+
+def test_the_lint_sees_the_mapping_read_form():
+    """The widened alternative, pinned by the two lines that motivated it.
+
+    Both defects read the id straight off a mapping inside the condition, so no
+    local named ``chat_id`` existed for the first two alternatives to see.
+    """
+    caught = (
+        '        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):',
+        '        if project and project.get("chat_id") and project.get("lifecycle") not in {"deleting"}:',
+        '    if not task.get("chat_id"):',
+    )
+    ignored = (
+        '        if isinstance(task, dict) and task.get("chat_id") is not None:',
+        '        if project and project.get("chat_id") is not None and project.get("id"):',
+        '            if int(t.get("chat_id") or 0) == chat_id:',
+    )
+    for line in caught:
+        assert TRUTHY_ROUTE.search(line), line
+    for line in ignored:
+        assert not TRUTHY_ROUTE.search(line), line
 
 
 def test_no_record_stores_the_hidden_partition_as_absent():

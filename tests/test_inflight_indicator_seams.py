@@ -244,6 +244,22 @@ def test_typing_start_leaves_kind_empty_for_untracked_managed_task():
     assert call["client_message_id"] == ""
 
 
+def test_typing_start_without_drive_root_or_running_still_sends():
+    """Binding resolution is fail-soft: a ctx that carries neither DRIVE_ROOT
+    nor a RUNNING table still delivers the indicator to the chat the event
+    names — and 0 is the panel, a destination, not an absence."""
+    from supervisor.events import _handle_typing_start
+
+    ctx = _CtxProbe()
+    _handle_typing_start(
+        {"type": "typing_start", "chat_id": 0, "task_id": "act-rootless", "phase": "thinking"},
+        ctx,
+    )
+
+    assert len(ctx.bridge.calls) == 1
+    assert ctx.bridge.calls[0]["chat_id"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Seam 3: send_chat_action broadcast frame
 # ---------------------------------------------------------------------------

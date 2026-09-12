@@ -86,6 +86,7 @@ def _tree_read(
 def get_tools() -> List[ToolEntry]:
     from ouroboros.task_tree_ledger import (
         CHILD_RESULT_DISPOSITIONS, DELEGATION_CONSTRAINT_DIRECTIVES, LEDGER_KINDS,
+        _MAX_TEXT_CHARS,
     )
 
     # The schema is where the model learns WHEN to choose each value, so the
@@ -122,7 +123,10 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "required": ["kind", "text"], "properties": {
                 "kind": {"type": "string", "enum": list(LEDGER_KINDS)},
-                "text": {"type": "string", "description": "Short coordination text (<=4000 chars)."},
+                # The bound is enforced by the validator; sourcing maxLength from ITS
+                # constant keeps the schema from becoming a false promise on drift.
+                "text": {"type": "string", "maxLength": _MAX_TEXT_CHARS,
+                         "description": f"Short coordination text (<={_MAX_TEXT_CHARS} chars)."},
                 "needs_parent_attention": {"type": "boolean", "default": False, "description": "Force a parent early-wait return (implied by blocker/question/interface_contract/review_requested)."},
                 "payload": {
                     "type": "object",
@@ -134,7 +138,8 @@ def get_tools() -> List[ToolEntry]:
                         "delegation_constraint. For a parent "
                         "decision about a direct child result, set type=child_result_disposition, "
                         "child_task_id, disposition, and the exact SHA-256 shown by child evidence; "
-                        "tree_note text is the rationale. To disposition MANY children in one call, "
+                        "tree_note text is the rationale (<=500 chars for a "
+                        "child_result_disposition). To disposition MANY children in one call, "
                         "set type=child_result_disposition and a children array of "
                         "{child_task_id, disposition, child_result_sha256} entries (one shared "
                         "rationale; each entry is validated exactly like the single form)."

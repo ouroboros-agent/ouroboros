@@ -21,7 +21,7 @@ def persist_observed_call(root: Any, *, payload: Any, writer: Any = None, **iden
     try:
         return (writer or persist_call)(root, payload=public_custody_projection(payload), **identity)
     except Exception:
-        logging.getLogger(__name__).debug("Failed to persist LLM observability payload", exc_info=True)
+        logging.getLogger(__name__).warning("Failed to persist LLM observability payload", exc_info=True)
         return {}
 
 

@@ -157,3 +157,255 @@ def test_ui_conversion_persists_pending_scope_across_restart(tmp_path, monkeypat
     pending_list.clear()
     assert queue.restore_pending_from_snapshot() == 1
     assert pending_list[0]["project_id"] == pid
+
+
+def test_mark_task_project_is_fill_only_over_a_different_project():
+    """B4=A: the durable binding is the one truth about a task's project, so by default
+    this in-memory copy may FILL an empty value or repeat the same one, and an ordinary
+    caller never moves a task from one project to another (that is how a second, empty
+    project got a lane). The single exception is a conversion that already holds the
+    binding it is about to write, which moves the lane onto that binding."""
+    from ouroboros.project_lease import mark_task_project
+
+    running = {"t1": {"task": {"id": "t1", "project_id": "token-atlas"}}}
+    pending = [{"id": "t2", "project_id": "token-atlas"}]
+
+    assert mark_task_project(running, pending, "t1", "token-observatory") is False
+    assert running["t1"]["task"]["project_id"] == "token-atlas"
+    assert mark_task_project(running, pending, "t2", "token-observatory") is False
+    assert pending[0]["project_id"] == "token-atlas"
+    # Same value stays the idempotent commit point both convert paths rely on.
+    assert mark_task_project(running, pending, "t1", "token-atlas") is True
+    # The ONE exception: a conversion that owns the durable binding for that project
+    # moves the in-memory copy onto it, because the copy follows the truth.
+    assert mark_task_project(running, pending, "t1", "token-observatory", authority="binding") is True
+    assert running["t1"]["task"]["project_id"] == "token-observatory"
+
+
+def test_ui_conversion_of_a_bound_task_refuses_before_any_side_effect(tmp_path, monkeypatch):
+    """B4=A + R14: converting a task that already belongs to a project creates no
+    second project, marks no lane and broadcasts nothing, and the refusal NAMES the
+    project (id + display name) in one human sentence - the only text the toast has
+    on the desktop shell, the Telegram mini app and the mobile layout."""
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import bind_task_to_project, create_project, list_projects
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    create_project(tmp_path, "token-atlas", name="Token Atlas")
+    bind_task_to_project(tmp_path, "tbound", "token-atlas", origin={"absent": "system"})
+    monkeypatch.setitem(workers.RUNNING, "tbound", {"task": {"id": "tbound", "project_id": "token-atlas"}})
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tbound", "id": "task-tbound", "objective_hint": "build it"},
+    )))
+    body = json.loads(resp.body.decode("utf-8"))
+
+    assert resp.status_code == 409
+    assert "Token Atlas" in body["error"] and "token-atlas" in body["error"]
+    assert "open it there or start a new task" in body["error"]
+    assert [p["id"] for p in list_projects(tmp_path)] == ["token-atlas"]
+    assert workers.RUNNING["tbound"]["task"]["project_id"] == "token-atlas"
+
+
+def test_ui_conversion_with_an_unreadable_bindings_store_proceeds_and_discloses(
+    tmp_path, monkeypatch, caplog,
+):
+    """Proportionality (D6-6): an unreadable store is not a measured incident. The
+    conversion runs as it would for an unbound task and says once that it could not
+    read the bindings; only a READABLE binding elsewhere refuses."""
+    import json
+    import logging
+
+    from ouroboros.gateway.projects import api_project_from_task
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
+    monkeypatch.setitem(workers.RUNNING, "tbroken", {"task": {"id": "tbroken", "project_id": ""}})
+
+    with caplog.at_level(logging.WARNING):
+        resp = asyncio.run(api_project_from_task(_request(
+            tmp_path, {"task_id": "tbroken", "id": "task-tbroken", "objective_hint": "build it"},
+        )))
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body.decode("utf-8"))["project"]["id"] == "task-tbroken"
+    assert "project_binding_unreadable" in caplog.text
+
+
+def test_ui_conversion_of_a_scoped_but_unbound_task_moves_its_lane(tmp_path, monkeypatch):
+    """A bare-workspace promote stamps a DERIVED proj_<hash> on the row without a
+    durable binding and keeps the originating chat, so the Main card still offers
+    "Turn into project". Fill-only alone left that conversion half-done: the durable
+    bind landed while RUNNING/PENDING kept the derived id and the snapshot was
+    skipped, so the new project's one-writer lane stayed free."""
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.project_lease import candidate_is_leasable, running_project_ids
+    from ouroboros.projects_registry import project_binding_for_task
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    snap = tmp_path / "state" / "queue_snapshot.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    derived = "proj_deadbeef1234"
+    running = {"tws": {"task": {"id": "tws", "project_id": derived}}}
+    pending = [{"id": "tpend", "project_id": derived, "type": "task", "chat_id": 5}]
+    for mod in (workers, queue):
+        monkeypatch.setattr(mod, "RUNNING", running)
+        monkeypatch.setattr(mod, "PENDING", pending)
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snap)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tws", "id": "task-tws", "objective_hint": "workspace work"},
+    )))
+    pid = json.loads(resp.body.decode("utf-8"))["project"]["id"]
+
+    assert resp.status_code == 200
+    assert (project_binding_for_task(tmp_path, "tws") or {}).get("project_id") == pid
+    assert running["tws"]["task"]["project_id"] == pid       # the lane followed the binding
+    leased = running_project_ids(running.values())
+    assert leased == {pid}
+    assert candidate_is_leasable({"id": "other", "project_id": pid}, leased) is False
+    assert snap.exists()                                      # the mark reached the snapshot
+
+    resp_pending = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tpend", "id": "task-tpend", "objective_hint": "queued work"},
+    )))
+    assert resp_pending.status_code == 200
+    assert pending[0]["project_id"] == "task-tpend"
+    saved = json.loads(snap.read_text(encoding="utf-8"))
+    assert saved["pending"][0]["task"]["project_id"] == "task-tpend"
+
+
+def test_ui_conversion_refuses_a_binding_that_lands_during_the_naming_await(tmp_path, monkeypatch):
+    """Scope review round 1: the durable binding was read BEFORE the naming step, and
+    that step can await a model call for seconds. A running task that scoped itself in
+    that window came back to a created project row, a moved lane and a durable bind
+    that then raised - binding B, lane A, orphan row A, the exact split state P4
+    removes. The authority is re-read at the side-effect boundary, so the conversion
+    answers the same 409 and touches nothing."""
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import (
+        bind_task_to_project,
+        create_project,
+        list_projects,
+        project_binding_for_task,
+    )
+    import supervisor.message_bus as message_bus
+    import supervisor.workers as workers
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setitem(workers.RUNNING, "trace", {"task": {"id": "trace", "project_id": ""}})
+    broadcasts = []
+    monkeypatch.setattr(
+        message_bus,
+        "get_bridge",
+        lambda: SimpleNamespace(broadcast=lambda payload: broadcasts.append(payload)),
+    )
+
+    async def _namer_binds_meanwhile(*args, **kwargs):
+        create_project(tmp_path, "token-observatory", name="Token Observatory")
+        bind_task_to_project(tmp_path, "trace", "token-observatory", origin={"absent": "system"})
+        return "Coined by the model"
+
+    monkeypatch.setattr("ouroboros.project_naming.llm_project_name_async", _namer_binds_meanwhile)
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "trace", "id": "task-trace", "objective_hint": "build it"},
+    )))
+    body = json.loads(resp.body.decode("utf-8"))
+
+    assert resp.status_code == 409
+    assert "Token Observatory" in body["error"] and "token-observatory" in body["error"]
+    assert "open it there or start a new task" in body["error"]
+    # The refusal lands before create_project, so the requested row never exists and
+    # nothing was published about it: only the project the task actually belongs to.
+    assert [p["id"] for p in list_projects(tmp_path)] == ["token-observatory"]
+    assert broadcasts == []
+    assert workers.RUNNING["trace"]["task"]["project_id"] == ""
+    assert (project_binding_for_task(tmp_path, "trace") or {}).get("project_id") == "token-observatory"
+
+
+def test_ui_conversion_restores_the_lane_when_the_durable_bind_is_refused(tmp_path, monkeypatch):
+    """The window between that re-read and the immutable bind is microseconds, but its
+    consequence is the same split state, because the lane mark anticipates a bind that
+    is then refused. The mark goes back to the value it had, nothing is broadcast, and
+    the answer names the project the durable binding actually holds.
+
+    The empty project row created just before that bind is a DISCLOSED residual, not an
+    oversight: the registry has no primitive that removes a row. Its delete lifecycle
+    tombstones the row and reserves the id permanently, so a later create with that id
+    raises forever, and the in-task path derives that id from the display name the owner
+    asked for. An inert row the owner can delete is the smaller harm."""
+    import json
+
+    import ouroboros.projects_registry as registry
+    import supervisor.message_bus as message_bus
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+    from ouroboros.gateway.projects import api_project_from_task
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    snap = tmp_path / "state" / "queue_snapshot.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    running = {"tlate": {"task": {"id": "tlate", "project_id": ""}}}
+    for mod in (workers, queue):
+        monkeypatch.setattr(mod, "RUNNING", running)
+        monkeypatch.setattr(mod, "PENDING", [])
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snap)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
+
+    real_bind = registry.bind_task_to_project
+
+    def _bind_loses_the_race(drive_root, task_id, project_id, chat_id=None, *, origin):
+        registry.create_project(drive_root, "token-observatory", name="Token Observatory")
+        real_bind(drive_root, task_id, "token-observatory", origin={"absent": "system"})
+        raise ValueError(
+            f"task {task_id!r} is already bound to project 'token-observatory'; "
+            "project binding is immutable"
+        )
+
+    monkeypatch.setattr(registry, "bind_task_to_project", _bind_loses_the_race)
+    broadcasts = []
+    monkeypatch.setattr(
+        message_bus,
+        "get_bridge",
+        lambda: SimpleNamespace(broadcast=lambda payload: broadcasts.append(payload)),
+    )
+
+    resp = asyncio.run(api_project_from_task(_request(
+        tmp_path, {"task_id": "tlate", "id": "task-tlate", "name": "Late", "objective_hint": "x"},
+    )))
+    body = json.loads(resp.body.decode("utf-8"))
+
+    assert resp.status_code == 409
+    assert "Token Observatory" in body["error"] and "token-observatory" in body["error"]
+    assert running["tlate"]["task"]["project_id"] == ""
+    assert broadcasts == []
+    # The residual: the requested row survives, holding no task and no binding, while
+    # the task itself belongs to the project the answer names.
+    assert sorted(p["id"] for p in registry.list_projects(tmp_path)) == [
+        "task-tlate", "token-observatory",
+    ]
+    assert (registry.project_binding_for_task(tmp_path, "tlate") or {}).get(
+        "project_id") == "token-observatory"
+    assert "task-tlate" not in {
+        str(row.get("project_id") or "") for row in registry.project_task_bindings(tmp_path).values()
+    }

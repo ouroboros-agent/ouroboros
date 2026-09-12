@@ -798,9 +798,9 @@ def hot_store_growth_notes(env: Any) -> list:
 
     Reused live by context.py::build_health_invariants (the
     check_stray_server_processes pattern). Deliberately NOT TTL-cached
-    (contrast context._STRAY_PROBE_CACHE): nine os.stat calls per task turn
-    are orders of magnitude cheaper than the pgrep probe that cache exists
-    for, and a stale reading would delay the regression signal."""
+    (contrast context._STRAY_PROBE_CACHE): nine os.stat calls plus two shallow
+    iterdir passes per task turn are orders of magnitude cheaper than the pgrep
+    probe that cache exists for, and a stale reading would delay the signal."""
     from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
 
     drive_root = pathlib.Path(getattr(env, "drive_root", None) or env.drive_path("state").parent)
@@ -859,6 +859,24 @@ def hot_store_growth_notes(env: Any) -> list:
             f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Custody "
             "replay scans this chain on ownership questions. Investigate chain "
             "indexing/compaction; archives are durable history and are never deleted."
+        )
+    from ouroboros.context_budget import RETAINED_EXECUTION_DRIVES_WARN_COUNT
+    from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
+    retained_drive_count = 0
+    for retained_root in (
+        drive_root / HEADLESS_TASKS_DIR,
+        drive_root / TASK_DRIVES_DIR,
+    ):
+        try:
+            retained_drive_count += sum(path.is_dir() for path in retained_root.iterdir())
+        except OSError:
+            pass
+    if retained_drive_count > RETAINED_EXECUTION_DRIVES_WARN_COUNT:
+        notes.append(
+            "WARNING: HOT STORE GROWTH — retained execution drives under "
+            f"state/headless_tasks and task_drives total {retained_drive_count} "
+            f"(threshold {RETAINED_EXECUTION_DRIVES_WARN_COUNT}). Terminal-task retention "
+            "or pruning is lagging; inspect lifecycle GC without recursively sizing drives."
         )
     return notes
 

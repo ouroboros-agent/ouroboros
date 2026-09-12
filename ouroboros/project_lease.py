@@ -62,7 +62,30 @@ def candidate_is_leasable(candidate: Dict[str, Any], running_ids: Set[str]) -> b
     return _task_project_id(candidate) not in running_ids
 
 
-def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any) -> bool:
+def task_lane_project_id(running: Any, pending: Any, tid: Any) -> str:
+    """The project id the live queue copy of ``tid`` carries right now, "" when the
+    task holds no lane or is neither running nor pending.
+
+    Walks the same RUNNING map and PENDING list as ``mark_task_project``, so the two
+    can never disagree about where a task's in-memory project id lives. The UI
+    conversion reads it under the queue lock right before it marks, so a durable bind
+    that is then refused can put the lane back instead of leaving it on a project the
+    binding does not name. The caller MUST hold the queue lock."""
+    key = str(tid or "")
+    if not key:
+        return ""
+    meta = running.get(key) if hasattr(running, "get") else None
+    rtask = _as_task(meta) if isinstance(meta, dict) else None
+    if isinstance(rtask, dict):
+        return _task_project_id(rtask)
+    for item in (pending or ()):
+        ptask = _as_task(item)
+        if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
+            return _task_project_id(ptask)
+    return ""
+
+
+def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authority: str = "") -> bool:
     """Set a task's ``project_id`` wherever it currently lives in the supervisor queue
     state — the live RUNNING map (``{tid: {"task": {...}}}``) AND the PENDING list (bare
     task dicts) — so a POST-HOC project conversion/scope makes it a one-writer lane
@@ -74,23 +97,50 @@ def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any) -> bool:
     in-task ``ensure_project_scope`` and the UI ``api_project_from_task`` — so they cannot
     drift apart again. The caller MUST hold the queue lock. Returns True if any in-memory
     task dict was updated; a no-op (False) when the task is neither running nor pending
-    (then the durable bind alone is correct — there is no live lane to occupy)."""
+    (then the durable bind alone is correct — there is no live lane to occupy).
+
+    FILL-ONLY by default: a task already carrying a DIFFERENT project keeps it and
+    False comes back. The durable binding is the one truth about a task's project
+    (owner decision B4=A); this in-memory copy must never be what moves a task
+    between projects, which is how a second, empty project acquired a live lane.
+
+    ``authority="binding"`` is the ONE exception, for a conversion that owns the
+    durable binding for ``pid`` itself: there the in-memory copy FOLLOWS the truth
+    instead of contradicting it. Without it a project-SCOPED but unbound task (a
+    bare-workspace promote carries a derived ``proj_<hash>``) converted durably
+    while its lane stayed on the old id, so the new project's one-writer lane was
+    left free and a concurrent task in it became assignable. That authority also
+    carries the rollback: an EMPTY ``pid`` clears the lane, so a conversion whose
+    durable bind was refused after the mark can restore the value the lane held
+    (including none) instead of leaving it on a project no binding names. Without
+    the authority an empty ``pid`` stays the no-op it has always been."""
     key = str(tid or "")
     project = str(pid or "").strip()
-    if not key or not project:
+    if not key or (not project and authority != "binding"):
         return False
-    updated = False
+    rows = []
     meta = running.get(key) if hasattr(running, "get") else None
     rtask = _as_task(meta) if isinstance(meta, dict) else None
     if isinstance(rtask, dict):
-        rtask["project_id"] = project
-        updated = True
+        rows.append(rtask)
     for item in (pending or ()):
         ptask = _as_task(item)
         if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
-            ptask["project_id"] = project
-            updated = True
+            rows.append(ptask)
+    if authority != "binding" and any(
+        str(row.get("project_id") or "").strip() not in ("", project) for row in rows
+    ):
+        return False
+    updated = False
+    for row in rows:
+        row["project_id"] = project
+        updated = True
     return updated
 
 
-__all__ = ["candidate_is_leasable", "mark_task_project", "running_project_ids"]
+__all__ = [
+    "candidate_is_leasable",
+    "mark_task_project",
+    "running_project_ids",
+    "task_lane_project_id",
+]

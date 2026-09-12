@@ -457,3 +457,62 @@ def test_delegate_wait_entry_never_acks_an_undelivered_pending_wake(tmp_path, mo
     )
 
     assert delegate_wait_entry(ctx, "run-1") == first
+
+
+def test_supervision_loop_holds_one_handshaken_gateway_and_drops_it_on_a_failed_tick(
+    tmp_path, monkeypatch,
+):
+    """N quiet ticks = ONE handshake: the loop owns one transport and lends it to every
+    observing wait, which handshakes it once (``engine_version`` is the receipt). A tick
+    that returned no observation (an unresolved read here) drops and closes it, so the
+    next tick re-reads the descriptor and re-handshakes; the loop's ``finally`` closes
+    whatever it still holds. Drives the REAL observing wait over a fake gateway."""
+    import ouroboros.delegate_custody as custody
+    import ouroboros.delegate_supervision as supervision
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.gateways import claudexor as gateway_module
+    from tests._delegated_transport_shared import _delegating_ctx
+
+    ctx = _delegating_ctx(tmp_path, acting=False)
+    entry = delegate._RunCustody(task_id=ctx.task_id, route_id="fixture", model="fixture",
+                                project_id="fixture", project_owned=False, access="readonly")
+    monkeypatch.setitem(custody._CUSTODY, "run-loop", entry)
+    monkeypatch.setattr(supervision.time, "sleep", lambda _sec: None)
+    ticks, gateways = [], []
+
+    class _Gateway:
+        def __init__(self):
+            self.handshakes, self.reads, self.closed = 0, 0, False
+            self._engine_version = ""
+            gateways.append(self)
+
+        @property
+        def engine_version(self):
+            return self._engine_version
+
+        def handshake(self, **_kw):
+            self.handshakes += 1
+            self._engine_version = "3.10.2"
+            return {}
+
+        def get_run(self, rid, *, timeout_sec=None):
+            assert rid == "run-loop" and timeout_sec is not None
+            self.reads += 1
+            ticks.append(len(gateways))
+            if len(ticks) == 4:
+                raise gateway_module.ClaudexorUnavailable(
+                    "daemon_unreachable", "ConnectError: [Errno 61]", observation_timeout=True)
+            return {"lastSeq": 0, "summary": {"state": "running", "effectiveAccess": "readonly"}}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(gateway_module, "ClaudexorGateway", _Gateway)
+    monkeypatch.setattr(supervision, "_control_wakes",
+                        lambda _ctx: [{"type": "deadline"}] if len(ticks) >= 6 else [])
+    wake = json.loads(supervision.supervised_wait(ctx, "run-loop"))
+    assert wake["wake_events"] == [{"type": "deadline"}]
+    assert ticks == [1, 1, 1, 1, 2, 2], ticks
+    first, second = gateways
+    assert (first.handshakes, first.reads, first.closed) == (1, 4, True)
+    assert (second.handshakes, second.reads, second.closed) == (1, 2, True)

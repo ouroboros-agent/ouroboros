@@ -603,7 +603,10 @@ def _periodic_zombie_reconcile() -> None:
         log.debug("Periodic skill review-job reconcile failed", exc_info=True)
     try:
         from ouroboros.task_status import reconcile_orphaned_running_tasks
-        reconcile_orphaned_running_tasks(DATA_DIR)
+
+        expired_quizzes: list = []
+        reconcile_orphaned_running_tasks(DATA_DIR, expired_quizzes=expired_quizzes)
+        _publish_expired_quiz_frames(expired_quizzes)
     except Exception:
         log.debug("Periodic orphaned running-task reconcile failed", exc_info=True)
     try:
@@ -637,6 +640,27 @@ def _migrate_startup_cancel_latches(drive_root: pathlib.Path) -> None:
                      len(migrated), migrated)
     except Exception:
         log.debug("Legacy cancel-latch migration failed", exc_info=True)
+
+
+def _publish_expired_quiz_frames(expired: list) -> None:
+    """Tell already-rendered cards that a healed terminal expired their question.
+
+    The same frame the task-done seam sends, from the one caller that is on the
+    supervisor side: the healer writes terminals off that seam, and the surfaces
+    Ouroboros runs on (packaged shell, mini app, phone) have no reload
+    affordance, so a card would keep a clickable question until navigation.
+    Fail-soft: the durable projection is already correct without the frame.
+    """
+    if not expired:
+        return
+    try:
+        from supervisor.message_bus import get_bridge
+
+        bridge = get_bridge()
+        for task_id, quiz_id in expired:
+            bridge.send_quiz_state(str(quiz_id), str(task_id), "expired_terminal")
+    except Exception:
+        log.debug("Expired-quiz frames after orphan reconcile were not sent", exc_info=True)
 
 
 def _startup_live_task_ids(drive_root: pathlib.Path, *, include_pending: bool = False) -> set[str]:
@@ -790,7 +814,11 @@ def _run_startup_task_recovery(
     try:
         from ouroboros.task_status import reconcile_orphaned_running_tasks
 
-        reconcile_orphaned_running_tasks(drive_root, exclude_task_ids=excluded)
+        expired_quizzes: list = []
+        reconcile_orphaned_running_tasks(
+            drive_root, exclude_task_ids=excluded, expired_quizzes=expired_quizzes,
+        )
+        _publish_expired_quiz_frames(expired_quizzes)
     except Exception:
         log.warning("Orphaned running-task reconciliation at startup failed", exc_info=True)
     try:
