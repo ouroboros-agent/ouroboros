@@ -209,12 +209,21 @@ def read_room_source(drive_root: Any, chat_id: int, *, task_id: str = "",
     if any(not row.get("ts") for row in unique):
         source_coverage["ordering_gap"] = "rows_without_timestamps_keep_source_order"
     label = str(projects.get(chat_id, {}).get("name") or ("Main" if chat_id == 1 else f"Chat {chat_id}"))
-    header = {"chat_id": chat_id, "label": label, "rows": len(unique), "coverage": source_coverage}
+    # Physical log growth/rotation and capture retries do not change this room.
+    # Keep their audit facts outside the source bytes used by paid identity;
+    # semantic gaps and stability still travel with every immutable snapshot.
+    source_header_coverage = {
+        name: {key: value for key, value in section.items()
+               if key not in {"generations", "capture_attempts", "matched_rows"}}
+        if isinstance(section, dict) else section
+        for name, section in source_coverage.items()
+    }
+    header = {"chat_id": chat_id, "label": label, "rows": len(unique), "coverage": source_header_coverage}
     text = "\n".join(json.dumps(row, ensure_ascii=False, default=str) for row in [header, *unique]) + "\n"
     from ouroboros.tools.review_helpers import redact_prompt_secrets
 
     text, redacted = redact_prompt_secrets(text)
-    return {**header, "captured_at": utc_now_iso(), "rows": [json.loads(line) for line in text.split("\n")[1:-1]], "text": text, "secrets_redacted": redacted,
+    return {**header, "coverage": source_coverage, "captured_at": utc_now_iso(), "rows": [json.loads(line) for line in text.split("\n")[1:-1]], "text": text, "secrets_redacted": redacted,
             "sha256": sha256(text.encode()).hexdigest(), "bytes": len(text.encode())}
 
 

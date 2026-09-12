@@ -235,3 +235,78 @@ def test_missing_recorded_policy_does_not_infer_current_paid_contract():
     from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs, PlanReviewSourceUnavailable
     with pytest.raises(PlanReviewSourceUnavailable, match='original request policy/fit was not recorded'):
         frozen_delivery_inputs({'reviewer_outputs': []}, [])
+
+
+def test_requested_related_room_replay_keeps_one_physical_panel_per_cycle(harness, monkeypatch):
+    from ouroboros.review_execution import ReviewAttemptResult
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+    from tests.test_plan_review_engine import _finding, _slots
+    from tests.test_plan_review_event_route import _HeldExecutor, _wait_until, _mailbox_entries
+    from ouroboros.tools import review_synthesis
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "3")
+    project = create_project(harness.drive, "own", name="Own room")
+    ctx = harness.make_ctx()
+    bind_task_to_project(harness.drive, ctx.task_id, project["id"], origin={"absent": "system"})
+    append_jsonl(harness.drive / "logs/chat.jsonl", {"chat_id": 1, "text": "Main premise"})
+    harness.state["slots"] = _slots(("s1", "m/a"))
+    monkeypatch.setattr(review_synthesis, "per_slot_input_token_limits",
+                        lambda models, *, slots, **kw: {slot.slot_id: 800000 for slot in slots})
+
+    class Executor(_HeldExecutor):
+        def execute(self):
+            self.execute_calls += 1
+            answer = (json.dumps([_finding("main", "need_evidence", locator="chat:1")])
+                      if self.execute_calls == 1 else CLEAN)
+            return ReviewAttemptResult(message={"content": answer}, raw_text=answer,
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "physical_attempt_state": "settled"})
+
+    executor = Executor()
+    monkeypatch.setattr("ouroboros.review_substrate._review_route_executor", lambda *a, **k: executor)
+    for cycle in (1, 2):
+        _call(ctx)
+        wave = _state(harness)["waves"][-1]
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) >= cycle)
+        _collect(ctx, wave["request_fingerprint"])
+    second = _state(harness)["waves"][-1]
+    replay = _call(ctx)
+    current = _state(harness)["waves"][-1]
+    if current["request_fingerprint"] != second["request_fingerprint"]:
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) >= 3)
+        _collect(ctx, current["request_fingerprint"])
+    assert "cached exact review" in replay
+    assert current["request_fingerprint"] == second["request_fingerprint"]
+    assert executor.execute_calls == 2 and _state(harness)["cycles_paid"] == 2
+    # A real update to requested evidence still earns the existing W3 refresh.
+    append_jsonl(harness.drive / "logs/chat.jsonl", {"chat_id": 1, "text": "Main premise changed"})
+    _call(ctx)
+    changed = _state(harness)["waves"][-1]
+    assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) >= 3)
+    _collect(ctx, changed["request_fingerprint"])
+    assert changed["request_fingerprint"] != second["request_fingerprint"]
+    assert executor.execute_calls == 3 and _state(harness)["cycles_paid"] == 3
+
+
+def test_snapshot_qualified_room_keeps_original_gap_disclosure(harness):
+    from ouroboros.tools.plan_evidence import resolve_evidence
+
+    ctx = harness.make_ctx()
+    ctx.current_chat_id = 1
+    harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
+    chat = harness.drive / "logs/chat.jsonl"
+    append_jsonl(chat, {"chat_id": 1, "text": "Retained explanation"})
+    with chat.open("a") as stream:
+        stream.write("{unreadable history row\n")
+    _call(ctx)
+    wave = _state(harness)["waves"][-1]
+    ref = wave["dialogue_source_ref"]
+    original = read_actor_source_bytes(harness.drive, ctx.task_id, ref)
+    append_jsonl(chat, {"chat_id": 1, "text": "Later room growth"})
+    reader = plan_chat_reader(harness.drive, ctx.task_id)
+    exact = reader(f"1@{ref['sha256']}")
+    assert exact["text"].encode() == original
+    assert exact["coverage"]["chat"]["gaps"] and exact["coverage"]["chat"]["snapshot_stable"]
+    manifest = resolve_evidence([f"chat:1@{ref['sha256']}::lines=2-2"],
+        active_root=harness.workspace, allowed_roots=[], resolve_chat=reader)
+    assert json.loads(manifest["attached"][0]["text"])["text"] == "Retained explanation"
+    assert any(row["reason"].startswith("chat_history_gap:") for row in manifest["omissions"])
