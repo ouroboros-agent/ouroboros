@@ -466,9 +466,15 @@ exactly the per-row branch taken `weight` times with the sums pre-added.
 - `reserve_attempt` calls `maybe_compact_usage_ledger_locked(root)` at the top
   of its locked section: an `os.stat` fast-path (~µs) below the threshold;
   above it, one compaction pass on exactly the path whose lock-hold the file
-  size degrades. Every failure inside compaction is contained (logged +
-  event), never fails the reservation; a structurally corrupt ledger still
-  fails in the normal read path with the normal error.
+  size degrades. Every failure inside compaction is contained and never fails
+  the reservation: a policy abort (`_Abort`) is logged AND records the typed
+  `usage_ledger_compaction_skipped` event naming its reason, once per process
+  per cause. Disclosed: the two snapshot-integrity abandons (a row that landed
+  under the lock between the proven snapshot and the archive write, or between
+  that write and the swap) log a warning and return without the typed event,
+  because they report a lost race the next pass simply repeats rather than a
+  cause an operator has to diagnose. A structurally corrupt ledger still fails
+  in the normal read path with the normal error.
 - Thrash guard: a per-process memo of the last attempted (inode, size); after
   ANY pass — unprofitable (nothing foldable / no shrink / verify-abort) or
   committed — the next pass runs only once the file grows by
@@ -655,11 +661,22 @@ the archive reader, invariants 5 and 8; shared fixtures in
 tests/fixtures_usage_compaction.py)
 
 1. **Byte-exact money**: decimal sums of `cost_usd` /
-   `reservation_upper_bound_usd` over finals are identical before/after; the
-   full `usage_projection` (global + per-root incl. limits) and
-   `usage_breakdown` (all axes) renders are equal dicts. A sum needing more
-   than the ambient 28 digits (10²⁸ + 1) keeps its last digit — pinned by an
-   oracle summing in its own, wider context.
+   `reservation_upper_bound_usd` over finals are identical before/after, and
+   the NON-money projection of `usage_projection` (global + per-root incl.
+   limits) and of `usage_breakdown` (all axes) renders equal dicts: state
+   counts and folded weights, physical calls, token sums, finality,
+   subscription sessions, per-root limits, every axis shape. The float dollars
+   those renders carry are deliberately NOT part of that equality (R2-37).
+   Readers round money at six places, so one history summed per row and summed
+   per group can land on either side of that boundary, and a displayed value
+   may move by up to 1e-6, a ten-thousandth of a cent, across a fold (pinned
+   in `tests/test_usage_compaction_fingerprint.py`, where `settled_usd`
+   2.467588 becomes 2.467589 while the exact decimal sum is unchanged).
+   Comparing the float view as well would abort correct folds forever instead
+   of protecting a cent; the money itself stays exact by the decimal check
+   that runs beside it. A sum needing more than the ambient 28 digits
+   (10²⁸ + 1) keeps its last digit — pinned by an oracle summing in its own,
+   wider context.
 2. **Unsettled never fold**: reserved/dispatched chains survive verbatim
    (modulo seq) and settle correctly after compaction.
 3. **Crash-safety**: a failure injected at the ledger rename ITSELF leaves a
