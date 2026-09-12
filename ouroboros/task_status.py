@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,8 @@ from ouroboros.task_results import (
     validate_task_id,
 )
 from ouroboros.utils import iter_jsonl_objects, read_json_dict
+
+log = logging.getLogger(__name__)
 
 
 # Terminal task statuses. Since the cancel redesign (Poltergeist sprint phase A)
@@ -596,6 +599,23 @@ def reconcile_orphaned_running_tasks(drive_root: Any, *, exclude_task_ids: froze
             healed += 1
         except Exception:
             continue
+        # This sweep is a terminal writer that never passes the task-done seam, so
+        # it closes the same per-task owner-control projections that seam closes:
+        # otherwise the record says "ended" while the card still shows an open
+        # question and the paired wait never releases. Both legs are idempotent
+        # and fail-soft, exactly as in the seam's own coordinator.
+        try:
+            from ouroboros.owner_hurry import reconcile_terminal as reconcile_hurry
+
+            reconcile_hurry(root, task_id)
+        except Exception:
+            log.debug("owner_hurry reconcile failed for healed %s", task_id, exc_info=True)
+        try:
+            from ouroboros.owner_quiz import reconcile_terminal as reconcile_quiz
+
+            reconcile_quiz(root, task_id)
+        except Exception:
+            log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
     return healed
 
 

@@ -358,3 +358,36 @@ def test_lifespan_does_not_race_recovery_against_provider_supervisor():
                 and isinstance(node.func, ast.Name) and node.func.id == "_run_startup_task_recovery"]
     assert len(recovery) == 1 and recovery[0] in list(ast.walk(branches[0]))
     assert "skip_live_data=pytest_default_real_data_dir" in ast.unparse(recovery[0])
+
+
+def test_orphan_reconcile_closes_the_open_quiz_and_its_paired_wait(roots, monkeypatch):
+    """The healer writes a terminal OFF the task-done seam, so it owes that seam's
+    domain reconciliation itself: a task whose record says 'ended' while its card
+    still shows an open question, and whose wait never releases, is the class."""
+    from ouroboros import owner_quiz
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    root, _ = roots
+
+    for tid in ("ghost-root", "ghost-child"):
+        write_task_result(root, tid, "running", result="original")
+        owner_quiz.record_asked(root, tid, quiz_id=f"{tid}-q", question="Which folder?",
+                                options=["A", "B"], wait_for_answer=True)
+        write_task_result(root, tid, "running", owner_wait={"state": "waiting", "quiz_id": f"{tid}-q"})
+    monkeypatch.setattr(
+        "ouroboros.task_status.load_effective_task_result",
+        lambda _root, tid: {"task_id": tid, "status": "failed", "result": "proven orphan"},
+    )
+
+    assert reconcile_orphaned_running_tasks(root) == 2
+
+    for tid in ("ghost-root", "ghost-child"):
+        stored = load_task_result(root, tid)
+        assert stored["status"] == "failed"
+        assert owner_quiz.quiz_states(root, tid)[f"{tid}-q"]["state"] == "expired_terminal"
+        assert stored["owner_wait"]["state"] == "expired_terminal"
+
+    # Idempotent against the task-done seam running the same legs afterwards.
+    from supervisor.queue_transitions import reconcile_terminal_task_projections
+
+    reconcile_terminal_task_projections(root, "ghost-root")
+    assert owner_quiz.quiz_states(root, "ghost-root")["ghost-root-q"]["state"] == "expired_terminal"
