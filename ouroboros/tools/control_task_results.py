@@ -633,9 +633,13 @@ def _wait_for_tasks(
         if tid not in normalized_ids:
             normalized_ids.append(tid)
     try:
+        # The normalized RAW request, kept before the clamp: an expiry that
+        # reports the ceiling as the asked-for window hides the very fact the
+        # model needs, that its request was cut down.
+        requested_timeout = float(max(0, int(timeout_sec)))
         timeout = max(0, min(int(timeout_sec), 7200))
     except (TypeError, ValueError):
-        timeout = 600
+        requested_timeout, timeout = 600.0, 600
     normalized_mode = str(mode or "all_terminal").strip().lower()
     if normalized_mode not in {"all_terminal", "any_terminal"}:
         return _publish_tool_result(ctx, ToolResult(
@@ -828,7 +832,7 @@ def _wait_for_tasks(
         if live_ids:
             waited["wait_expired_with_live_children"] = {
                 "reason": "timeout_expired_before_terminal",
-                "requested_timeout_sec": float(timeout),
+                "requested_timeout_sec": requested_timeout,
                 "max_timeout_sec": float(_WAIT_TASKS_CLAMP_SEC),
                 "live_task_ids": live_ids,
             }

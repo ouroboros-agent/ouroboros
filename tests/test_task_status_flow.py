@@ -3551,6 +3551,36 @@ def test_expired_batch_wait_discloses_live_children_as_facts(tmp_path):
     assert "wait_expired_with_live_children" not in settled
 
 
+def test_expired_batch_wait_reports_the_asked_for_window_not_the_clamp(tmp_path, monkeypatch):
+    """A request above the ceiling is disclosed as asked, beside the ceiling.
+
+    Reporting the clamp as requested_timeout_sec would hide the fact the model
+    most needs from the expiry: that the window it asked for was cut down.
+    """
+    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _WAIT_TASKS_CLAMP_SEC, _wait_for_tasks
+    from ouroboros.tools import control_task_results
+
+    write_task_result(tmp_path, "livechild", STATUS_SCHEDULED, result="")
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    # The clamp itself is unchanged; the wait returns at once on a spent window.
+    monkeypatch.setattr(
+        control_task_results, "wait_for_effective_tasks",
+        lambda root, ids, **kw: {
+            "mode": kw.get("mode"), "timeout_sec": float(kw.get("timeout_sec") or 0),
+            "elapsed_sec": 0.0, "timed_out": True, "all_terminal": False,
+            "tasks": {tid: {"task_id": tid, "status": STATUS_SCHEDULED} for tid in ids},
+        },
+    )
+
+    payload = json.loads(_wait_for_tasks(ctx, ["livechild"], timeout_sec=10000))
+
+    block = payload["wait_expired_with_live_children"]
+    assert block["requested_timeout_sec"] == 10000.0
+    assert block["max_timeout_sec"] == float(_WAIT_TASKS_CLAMP_SEC) == 7200.0
+    assert payload["timeout_sec"] == 7200.0, "the clamp still bounds the real wait"
+
+
 def test_wait_clamp_constants_match_the_scraped_literals():
     """The schema text's number and the clamp arithmetic are one fact (A10)."""
     import inspect
