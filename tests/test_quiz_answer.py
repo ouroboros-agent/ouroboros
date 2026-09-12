@@ -897,3 +897,23 @@ def test_recommended_option_rides_the_card_the_projection_and_the_parent_frame(t
     _escalate(child, question="Which db?", options=payload["options"], assumption="sqlite meanwhile")
     [frame] = drain_owner_entries(tmp_path, "root-1", set())
     assert "1. sqlite — cheap, single file [recommended]\n2. postgres\n3. mysql" in frame["text"]
+
+
+def test_escalate_refusals_are_typed_per_branch_and_a_headless_root_still_asks(tmp_path):
+    """Verification only: the three real refusal branches as the predicate is written.
+    Background consciousness is refused; a live direct conversation (ephemeral, or with
+    no continuation owner) is refused; REQUIRED waiting without a live continuation owner
+    is refused. A headless root without owner_wait_callback is NOT refused for an optional
+    question: it mints the ordinary card and continues under its assumption."""
+    background = _tool_ctx(tmp_path, task_id="bg", role="background")
+    out = _escalate(background, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("⚠️ ESCALATE_UNAVAILABLE: background consciousness cannot escalate")
+    direct = _tool_ctx(tmp_path)
+    direct.is_direct_chat = True
+    out = _escalate(direct, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("⚠️ ESCALATE_UNAVAILABLE: this is a live owner conversation")
+    headless = _tool_ctx(tmp_path)  # a queued root: not a direct chat, no owner_wait_callback
+    assert _escalate(headless, question="?", options=["a", "b"], assumption="a").startswith("OK: quiz ")
+    required = _escalate(headless, question="?", options=["a", "b"], assumption="", wait_for_answer=True)
+    assert required == ("⚠️ ESCALATE_UNAVAILABLE: required owner waiting needs a root task with a live "
+                        "continuation owner.")
