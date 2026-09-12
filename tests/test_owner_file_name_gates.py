@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pathlib
 import subprocess
+import sys
 import zipfile
 from io import BytesIO
 from types import SimpleNamespace
@@ -116,6 +117,74 @@ def test_owner_declares_a_key_deck_as_a_process_output(tmp_path):
     assert "credential-like output .env" in _protected_output_source_reason(
         ctx, dotenv, "task_drive", set(),
     )
+
+
+def test_a_declared_key_deck_output_is_actually_registered(tmp_path):
+    """The predicate saying "no reason to refuse" is not the capability.
+
+    This drives the registration path a real `run_command(outputs=[...])` runs,
+    so the acceptance covers what the owner sees: a canonical artifact record for
+    the deck in the task artifact store, no ``ARTIFACT_OUTPUT_ERROR`` in the
+    rendered result, and a published tool result that still classifies as ``OK``,
+    which is what keeps the task from being degraded by the export. The `.env`
+    negative stays beside it: a declared credential leaf is still refused, and
+    that refusal IS an artifact-output error.
+    """
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools.shell import _run_shell
+    from ouroboros.tools.tool_result import (
+        ToolResult,
+        _install_tool_result_sidecar,
+        _published_tool_result,
+        _restore_tool_result_sidecar,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    drive = tmp_path / "data"
+    drive.mkdir()
+    ctx = ToolContext(repo_dir=repo, drive_root=drive, task_id="t-owner-deck")
+    build_deck = (
+        "import zipfile\n"
+        "with zipfile.ZipFile('deck.key', 'w') as archive:\n"
+        "    archive.writestr('Index/Document.iwa', b'\\x00\\x01\\x02\\x03' * 512)\n"
+    )
+
+    sentinel = object()
+    token = _install_tool_result_sidecar(ctx, sentinel)
+    try:
+        rendered = _run_shell(
+            ctx, [sys.executable, "-c", build_deck], cwd="task_drive", outputs=["deck.key"],
+        )
+        published = _published_tool_result(ctx, sentinel)
+    finally:
+        _restore_tool_result_sidecar(token)
+
+    assert "ARTIFACT_OUTPUT_ERROR" not in rendered, rendered
+    assert "ARTIFACT_OUTPUTS" in rendered, rendered
+    assert "registered output" in rendered and "artifact_store:" in rendered
+    assert isinstance(published, ToolResult)
+    assert (published.code, published.status) == ("OK", "ok")
+    assert published.meta.get("artifact_registered") is True
+    assert any(path.name == "deck.key" for path in drive.rglob("deck.key"))
+
+    # The negative control on the SAME path, so the assertions above are not
+    # vacuous: a declared credential leaf still refuses, and that refusal is
+    # exactly the artifact-output error the deck must not produce.
+    build_dotenv = "open('.env', 'w').write('TOKEN=x\\n')\n"
+    token = _install_tool_result_sidecar(ctx, sentinel)
+    try:
+        refused = _run_shell(
+            ctx, [sys.executable, "-c", build_dotenv], cwd="task_drive", outputs=[".env"],
+        )
+        refused_result = _published_tool_result(ctx, sentinel)
+    finally:
+        _restore_tool_result_sidecar(token)
+
+    assert "ARTIFACT_OUTPUT_ERROR" in refused
+    assert "credential-like output .env" in refused
+    assert isinstance(refused_result, ToolResult)
+    assert refused_result.code == "ARTIFACT_OUTPUT_ERROR"
 
 
 # --- (c) delegated snapshot: transport rules stay, name authority is gone ----
