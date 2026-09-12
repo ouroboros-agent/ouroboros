@@ -214,3 +214,96 @@ def test_fingerprint_carries_no_money_but_keeps_limits_and_counts(data_root):
     assert fingerprint["by_root"]["root"][1] == 40.0  # min known root limit
     assert fingerprint["summary"]["attempt_counts"] == {"settled": 2}
     assert fingerprint["breakdown"]["physical_calls"] == 2
+
+
+# --- The growth guard after a COMMITTED pass ---------------------------------
+#
+# The trigger is a size threshold and the residue that cannot fold (group rows,
+# retained idempotent and review-attributed rows) only ever grows, so a
+# compacted ledger settles just under the threshold and stays there. While a
+# success cleared the memo, that left nothing between the threshold and the
+# pass: every reservation rewrote the whole monetary authority under the held
+# lock and copied the entire live file into a new, never-collected archive
+# segment to save a few kilobytes. Measured on the owner's live-ledger copy
+# before this fix: 200 production chains on the folded 7.87 MB ledger ran 7
+# full passes and grew the archive from 77.8 MB to 125.8 MB while the live
+# file gained 114 KB — a ninth of the 1 MB the guard asks for.
+
+
+def _trigger(data_root):
+    with ua._locked(data_root) as heartbeat:
+        return uc.maybe_compact_usage_ledger_locked(data_root, heartbeat=heartbeat)
+
+
+def _folds(data_root):
+    return sum(1 for row in _ledger_rows(data_root) if row.get("kind") == "usage_baseline")
+
+
+def test_a_committed_fold_arms_the_same_growth_guard_as_an_abort(data_root, monkeypatch):
+    """A pass that COMMITTED must throttle the next one exactly like a pass that
+    aborted: the memo means "the size this process last ran a pass on", not
+    "the size the last unprofitable pass saw"."""
+    _fixtures._seed_mixed_ledger(data_root)
+    monkeypatch.setattr("ouroboros.config.USAGE_LEDGER_COMPACT_BYTES", 1)
+    monkeypatch.setattr("ouroboros.config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES", 1_000_000)
+    uc._COMPACT_ATTEMPTS.clear()
+    entered = []
+    original = uc.compact_usage_ledger_locked
+    monkeypatch.setattr(uc, "compact_usage_ledger_locked",
+                        lambda root, **kwargs: (entered.append(1), original(root, **kwargs))[1])
+
+    assert _trigger(data_root) is True  # first pass: above threshold, no memo yet
+    assert _folds(data_root) == 1
+    compacted_bytes = (data_root / ua.LEDGER_REL).read_bytes()
+
+    # Still far above the threshold and freshly foldable rows keep arriving, so
+    # the threshold alone would re-enter the pass on every settle.
+    for index in range(3):
+        _settle(data_root, cost=0.25, cost_final=True, task_id="after-%d" % index)
+        assert _trigger(data_root) is False
+    assert len(entered) == 1, "the pass ran again below the growth threshold"
+    # Declined, not aborted: the pass was never entered, so it recorded no
+    # typed skip reason and the fold it already committed still stands.
+    assert _skip_events(data_root) == []
+    assert (data_root / ua.LEDGER_REL).read_bytes().startswith(compacted_bytes)
+
+    # Real growth past the threshold releases it, and the new pass folds again.
+    monkeypatch.setattr("ouroboros.config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES", 1)
+    assert _trigger(data_root) is True
+    assert len(entered) == 2
+    assert _folds(data_root) == 1  # the header is replaced, never accumulated
+    assert int(_ledger_rows(data_root)[0]["compaction_epoch"]) == 2
+
+
+def test_repeated_chains_cost_at_most_one_pass_per_growth_window(data_root, monkeypatch):
+    """The refuters' driver, in miniature: chains that keep the ledger above the
+    trigger may not buy one full rewrite each. The bound is the guard's own
+    arithmetic — a pass, then one more per RETRY_GROWTH_BYTES of real growth —
+    not a magic number."""
+    _fixtures._seed_mixed_ledger(data_root)
+    growth = 4_096
+    monkeypatch.setattr("ouroboros.config.USAGE_LEDGER_COMPACT_BYTES", 1)
+    monkeypatch.setattr("ouroboros.config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES", growth)
+    uc._COMPACT_ATTEMPTS.clear()
+    passes = []
+    original = uc.compact_usage_ledger_locked
+
+    def counting(root, **kwargs):
+        receipt = original(root, **kwargs)
+        passes.append(receipt is not None)
+        return receipt
+
+    monkeypatch.setattr(uc, "compact_usage_ledger_locked", counting)
+
+    path = data_root / ua.LEDGER_REL
+    added = 0
+    for index in range(30):
+        before = path.stat().st_size
+        _settle(data_root, cost=0.5, cost_final=True, task_id="chain-%d" % index)
+        added += max(0, path.stat().st_size - before)  # a pass shrinks it: count appends only
+        assert _trigger(data_root) is not None
+    assert added > 0
+    assert len(passes) <= 1 + added // growth, (
+        "%d passes for %d appended bytes at a %d-byte guard" % (len(passes), added, growth)
+    )
+    assert all(passes), "a pass that aborts would prove nothing about the guard"

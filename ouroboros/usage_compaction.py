@@ -917,10 +917,19 @@ def maybe_compact_usage_ledger_locked(
 ) -> bool:
     """Opportunistic trigger on the monetary write path (under the held lock).
 
-    ``os.stat`` fast-path below ``config.USAGE_LEDGER_COMPACT_BYTES``; a
-    per-process growth guard throttles re-attempts after an unprofitable or
-    aborted pass. Every failure is contained: this never raises into the
-    caller's reservation (a corrupt ledger still fails in the normal read)."""
+    ``os.stat`` fast-path below ``config.USAGE_LEDGER_COMPACT_BYTES``; above
+    it, a per-process growth guard throttles re-attempts after ANY pass, not
+    only an unprofitable one. A success used to clear the memo, which left the
+    threshold as the only brake: the unfoldable residue (group rows, retained
+    idempotent and review-attributed rows) never shrinks, so once it reaches
+    the trigger every reservation ran a full rewrite of the authority under
+    the held lock and copied the whole live file into a new archive segment
+    for a gain of a few kilobytes. Remembering the COMPACTED size instead
+    makes the memo mean "the ledger size when this process last ran a pass",
+    so the next one waits for ``USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES`` of
+    real growth whatever the last outcome was. Every failure is contained:
+    this never raises into the caller's reservation (a corrupt ledger still
+    fails in the normal read)."""
     try:
         root = pathlib.Path(_drive_root(root))
     except Exception:
@@ -947,8 +956,18 @@ def maybe_compact_usage_ledger_locked(
     except Exception:
         log.exception("usage-ledger compaction pass raised; the reservation continues on the ledger as it stands")
     if receipt is not None:
+        # The swap replaced the file, so the memo has to name the NEW inode
+        # and the size the pass left behind: keyed on the pre-compaction
+        # identity it would never match again and would throttle nothing.
+        try:
+            swapped = os.stat(ledger_path)
+        except OSError:
+            swapped = None
         with _COMPACT_ATTEMPTS_LOCK:
-            _COMPACT_ATTEMPTS.pop(key, None)
+            if swapped is None:
+                _COMPACT_ATTEMPTS.pop(key, None)
+            else:
+                _COMPACT_ATTEMPTS[key] = (swapped.st_ino, swapped.st_dev, swapped.st_size)
         return True
     with _COMPACT_ATTEMPTS_LOCK:
         _COMPACT_ATTEMPTS[key] = (stat.st_ino, stat.st_dev, stat.st_size)

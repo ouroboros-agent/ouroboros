@@ -470,8 +470,17 @@ exactly the per-row branch taken `weight` times with the sums pre-added.
   event), never fails the reservation; a structurally corrupt ledger still
   fails in the normal read path with the normal error.
 - Thrash guard: a per-process memo of the last attempted (inode, size); after
-  an unprofitable pass (nothing foldable / no shrink / verify-abort) the next
-  pass runs only once the file grows by `…_RETRY_GROWTH_BYTES` or is replaced.
+  ANY pass — unprofitable (nothing foldable / no shrink / verify-abort) or
+  committed — the next pass runs only once the file grows by
+  `…_RETRY_GROWTH_BYTES` beyond the size that pass left, or the file is
+  replaced by someone else. A success arms the memo with the COMPACTED size
+  and the new inode, because the threshold alone is no brake: the unfoldable
+  residue (group rows, retained idempotent and review-attributed rows) only
+  grows, so once it reaches the trigger every reservation would run a full
+  rewrite of the authority under the held lock and copy the whole live file
+  into a new archive segment for a gain of a few kilobytes. Profitability is
+  not the question the guard asks; a pass is worth its cost only after real
+  growth.
 - `USAGE_LEDGER_WARN_BYTES` (20 MB) stays as the regression tripwire above the
   mechanism, exactly like the rotation-bounded log warns: it now fires only if
   compaction is broken or the unfoldable residue itself reaches 20 MB.
