@@ -879,7 +879,11 @@ def supervised_wait(
         "checkpoint_scheduled": bool(checkpoint_after_sec is not None),
     })
 
-    unobserved = False  # an unreachable-daemon episode is open (one owner line each way)
+    # The OPEN unreachable-daemon episode: its UTC start (empty when none) plus the
+    # millisecond stamp that keeps two episodes of one wait distinct on both client
+    # dedup surfaces (the loop_transport.incident precedent).
+    outage_since = ""
+    outage_stamp = ""
     gateway = None  # the loop's own transport, only when it built the observing wait
     try:
         while True:
@@ -899,11 +903,14 @@ def supervised_wait(
                 payload.get("status") == "observation_pending"
                 and payload.get("reason") == _DAEMON_UNREACHABLE
             )
-            if observed and unobserved and not unreachable:
+            if observed and outage_since and not unreachable:
                 # The first read the daemon answered again closes the episode.
-                unobserved = False
-                _owner_line(ctx, "Delegation daemon reachable again; delegated runs are "
-                            "being observed again.", "delegation_daemon_recovered", "ok")
+                _owner_line(
+                    ctx,
+                    "Delegation daemon reachable again; the outage that began at "
+                    f"{outage_since} is over and delegated runs are being observed again.",
+                    f"delegation_daemon_recovered:{outage_stamp}", "ok")
+                outage_since, outage_stamp = "", ""
             cursor = payload.get("last_seq")
             if isinstance(cursor, int):
                 state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), cursor)
@@ -974,16 +981,21 @@ def supervised_wait(
                     "run_id": str(run_id), "reason": payload.get("reason"),
                     "waited_sec": payload.get("waited_sec"),
                 })
-                if unreachable and not unobserved:
+                if unreachable and not outage_since:
                     # The class the model can do nothing about: a dead socket is a quiet
                     # renewal on the same 3 s beat (no backoff, no durable counter), and
                     # the owner hears about it exactly once per episode. Deadline, ceiling,
                     # budget and cancel stay the outer bounds that cut a long unobserved
-                    # stretch.
-                    unobserved = True
-                    _owner_line(ctx, "Delegation daemon unreachable; delegated runs are not "
-                                "being observed, the runs themselves keep going.",
-                                "delegation_daemon_unreachable", "warn")
+                    # stretch. The episode stamps its own key and names its start in the
+                    # text, so a SECOND outage in the same wait is a new line on both
+                    # client surfaces instead of a duplicate the toast set already holds.
+                    opened = time.time()
+                    outage_since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(opened))
+                    outage_stamp = str(int(opened * 1000))
+                    _owner_line(ctx, f"Delegation daemon unreachable since {outage_since}; "
+                                "delegated runs are not being observed, the runs themselves "
+                                "keep going.",
+                                f"delegation_daemon_unreachable:{outage_stamp}", "warn")
                 # A failed read is not a completed quiet window; retain the cursor
                 # and avoid a busy loop if a transport fails before its read bound.
                 time.sleep(_TICK_SEC)

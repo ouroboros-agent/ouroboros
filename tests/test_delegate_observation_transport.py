@@ -224,13 +224,22 @@ def test_unreachable_daemon_episode_is_one_owner_line_each_way(tmp_path, monkeyp
     assert [text.startswith("Delegation daemon unreachable") for text, _ in notes] == [
         True, False, True, False]
     outage, recovered = notes[0][1], notes[1][1]
-    assert outage == {"task_incident": "delegation_daemon_unreachable",
-                      "toast_once": f"{ctx.task_id}:delegation_daemon_unreachable",
-                      "toast_tone": "warn"}
-    assert recovered == {"task_incident": "delegation_daemon_unreachable",
-                         "toast_once": f"{ctx.task_id}:delegation_daemon_recovered",
-                         "toast_tone": "ok"}
-    assert notes[2][1] == outage and notes[3][1] == recovered
+    assert outage["task_incident"] == recovered["task_incident"] == "delegation_daemon_unreachable"
+    assert outage["toast_tone"] == "warn" and recovered["toast_tone"] == "ok"
+    assert outage["toast_once"].startswith(f"{ctx.task_id}:delegation_daemon_unreachable:")
+    assert recovered["toast_once"].startswith(f"{ctx.task_id}:delegation_daemon_recovered:")
+    # The SECOND episode is a second line on both client surfaces: the toast set
+    # dedupes on the key and the timeline on the rendered text, so an episode
+    # discriminator has to reach both or outages 2..N are dropped, not repeated.
+    keys = [incident["toast_once"] for _text, incident in notes]
+    assert len(set(keys)) == 4, keys
+    # The text names the episode it belongs to, so the timeline's text-keyed
+    # dedup sees a second episode too (two episodes inside one second would
+    # still collapse there; the toast key above never does).
+    assert all(text.count(":") >= 2 for text, _ in notes), notes
+    # One episode's own pair shares its stamp: the recovery names the outage it closes.
+    assert outage["toast_once"].rsplit(":", 1)[1] == recovered["toast_once"].rsplit(":", 1)[1]
+    assert notes[2][1]["toast_once"].rsplit(":", 1)[1] == notes[3][1]["toast_once"].rsplit(":", 1)[1]
     assert sleeps == [delegate_supervision._TICK_SEC] * 4
 
 
