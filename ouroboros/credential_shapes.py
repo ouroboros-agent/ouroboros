@@ -75,6 +75,7 @@ SUBAGENT_CREDENTIAL_FILE_NAMES = frozenset({
     "tokens.json",
 })
 
+
 def owner_credential_locations(home: pathlib.Path) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
     """The existing host credential locations, independent of project names.
 
