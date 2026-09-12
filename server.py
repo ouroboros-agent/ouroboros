@@ -397,9 +397,15 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             # Everything reversible is behind us (checkout landed, no-resume
             # intent durable): from here the restart always follows, and every
             # unconfirmed stop is a critical diagnostic, never a deferral.
-            _stop_owned_work(ctx)
+            stopped_task_ids = _stop_owned_work(ctx)
             try:
-                reply("Stopping active task. New settings apply to the next message.", "")
+                # Say only what happened: with nothing owned the stop sentence
+                # named a task that was never running.
+                reply(
+                    "Stopping active task. New settings apply to the next message."
+                    if stopped_task_ids else "New settings apply to the next message.",
+                    "",
+                )
             except Exception:
                 log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
             _request_restart_exit(owner=True)

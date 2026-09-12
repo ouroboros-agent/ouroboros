@@ -397,7 +397,9 @@ def test_auto_resume_skips_owner_restart_no_resume_flag(tmp_path, monkeypatch):
 
 def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch):
     """A worker shutdown that raises is a diagnostic, not a veto: the no-resume
-    intent stays, the owner is told the work is stopped, and the process exits."""
+    intent stays, the owner is told what the restart changes, and the process
+    exits. Nothing is owned here, so the notice claims no stopped task: the
+    owned-work branch is pinned in tests/test_manual_restart_execution.py."""
     import server
     import supervisor.message_bus as message_bus
     from ouroboros import config, server_restart
@@ -452,7 +454,8 @@ def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch
 
     assert (tmp_path / "state" / "owner_restart_no_resume.flag").exists()
     assert (tmp_path / "state" / "panic_stop.flag").exists()
-    assert "Stopping active task. New settings apply to the next message." in messages
+    assert "New settings apply to the next message." in messages
+    assert not any("Stopping active task" in text for text in messages)
     assert not any("cancelled" in text or "deferred" in text for text in messages)
     assert exits == [True]
 

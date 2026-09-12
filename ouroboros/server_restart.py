@@ -36,7 +36,7 @@ def _owned_live_task_ids(ctx: Any) -> list:
     return [tid for tid in dict.fromkeys(task_ids) if tid]
 
 
-def _stop_owned_work(ctx: Any) -> None:
+def _stop_owned_work(ctx: Any) -> list:
     """The owner's manual Restart: stop what this generation owns, then let it re-exec.
 
     Runs AFTER the checkout gate and the durable no-resume flags, so nothing
@@ -49,12 +49,17 @@ def _stop_owned_work(ctx: Any) -> None:
     attested owned-daemon stop exactly as Panic makes it. Between the cancel
     intents and that stop nothing may call ``ensure_owned_gateway`` — it would
     start a dead daemon — which is what the two flags above guarantee.
+
+    Returns the owned live task ids it addressed — captured ONCE, before the
+    stop makes them unreadable — so the caller can tell the owner what was
+    stopped instead of claiming a task was stopped when nothing was running.
     """
     from ouroboros.cancel_intents import request_cancel
     from ouroboros.claudexor_daemon import read_owned_gateway
     from ouroboros.delegate_custody import reconcile_orphaned_runs
 
-    for task_id in _owned_live_task_ids(ctx):
+    stopped = _owned_live_task_ids(ctx)
+    for task_id in stopped:
         try:
             request_cancel(DATA_DIR, task_id, reason="Owner restart", source="owner_restart",
                            requested_by="owner", requested_stop_policy="immediate",
@@ -80,6 +85,7 @@ def _stop_owned_work(ctx: Any) -> None:
         log.warning("Owner restart: delegated-run cancellation did not complete; custody retained",
                     exc_info=True)
     _stop_owned_daemon("Owner restart")
+    return stopped
 
 
 def _stop_owned_daemon(label: str) -> None:
