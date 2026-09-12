@@ -527,13 +527,13 @@ def test_the_kill_path_claims_a_verdict_only_when_it_writes_one(tmp_path, monkey
 
     import supervisor.queue as q
     from supervisor import task_lifecycle, workers
-    from ouroboros.task_results import STATUS_COMPLETED
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 
     monkeypatch.setattr(q, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(q, "RUNNING", {}, raising=False)
     monkeypatch.setattr(workers, "WORKERS", {}, raising=False)
 
-    class _Stop(Exception):
+    class _Stop(BaseException):
         """Ends the lifecycle right after the audit call under test."""
 
     seen: list = []
@@ -552,9 +552,11 @@ def test_the_kill_path_claims_a_verdict_only_when_it_writes_one(tmp_path, monkey
     ))
 
     for settled in ("", STATUS_COMPLETED):
+        if settled:
+            write_task_result(tmp_path, "t-kill", settled, result="Completed before Stop")
         with pytest.raises(_Stop):
             task_lifecycle._finish_captured_running(
-                "t-kill", worker, {}, intent=None, deliver=False,
+                "t-kill", worker, {"task": {"id": "t-kill"}}, intent=None, deliver=False,
                 settled_status=settled,
             )
 
@@ -599,8 +601,13 @@ def test_a_settled_owner_lets_its_durable_outcome_decide_the_live_run(
     dc._CUSTODY.clear()
 
 
-@pytest.mark.parametrize("case", ["owner_stop", "snapshot_restore", "prior_infra", "child_infra"])
-def test_miss_lane_cancels_live_delegation_only_for_its_own_terminal(qenv, monkeypatch, case):
+@pytest.mark.serial
+@pytest.mark.parametrize("pending", [False, True], ids=["bound", "pending"])
+@pytest.mark.parametrize("captured,case", [
+    (captured, case) for captured in (False, True)
+    for case in ("owner_stop", "snapshot_restore", "prior_infra", "child_infra")
+] + [(True, "child_unreadable")])
+def test_cancellation_uses_adopted_terminal_for_live_delegation(qenv, monkeypatch, captured, case, pending):
     """A fresh Stop requests cancellation before publication, including after restore.
 
     A prior provider failure, even one only found by child-result copyback, keeps
@@ -614,8 +621,13 @@ def test_miss_lane_cancels_live_delegation_only_for_its_own_terminal(qenv, monke
 
     root, task_id, run_id = qenv.drive, "owner", "run-owned"
     status_at_cancel = []
+    recovered_keys = []
 
     class Gateway(_LiveRunStub):
+        def start_run(self, request, *, idempotency_key=""):
+            recovered_keys.append(idempotency_key)
+            return {"runId": run_id}
+
         def cancel_run(self, rid, reason=""):
             status_at_cancel.append(load_task_result(root, task_id)["status"])
             return super().cancel_run(rid, reason)
@@ -627,18 +639,27 @@ def test_miss_lane_cancels_live_delegation_only_for_its_own_terminal(qenv, monke
     monkeypatch.setattr(qenv.tl, "_deliver_on_miss", lambda *a, **kw: True)
     monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
     monkeypatch.setattr(dc, "_CUSTODY", {})
-    dc.record_started(root, dc.RunCustody(
-        run_id=run_id, task_id=task_id, route_id="r", model="m", project_id="p",
-        project_owned=False, root_task_id=task_id, ledger_root=str(root),
-    ))
+    if pending:
+        assert dc.record_start_requested(
+            root, task_id=task_id, invocation_id="inv-owned", idempotency_key="inv-owned",
+            route="r", project_id="p", project_owned=False, root_task_id=task_id,
+            request={"prompt": "stored request", "primaryHarness": "r", "model": "m"},
+        )
+    else:
+        dc.record_started(root, dc.RunCustody(
+            run_id=run_id, task_id=task_id, route_id="r", model="m", project_id="p",
+            project_owned=False, root_task_id=task_id, ledger_root=str(root),
+        ))
     dc._CUSTODY.clear()  # Recover the actual durable custody, as after restart.
 
     fields = {"root_task_id": task_id, "result": "working"}
     failure = {"result": "provider died", "outcome_axes": infra_failed_axes("provider_unavailable")}
-    if case == "child_infra":
+    if case in {"child_infra", "child_unreadable"}:
         child = root / "state" / "headless_tasks" / task_id / "data"
         write_task_result(child, task_id, "failed", root_task_id=task_id, **failure)
         fields.update(child_drive_root=str(child), delegation_role="subagent")
+        if case == "child_unreadable":
+            (child / "task_results" / f"{task_id}.json").write_text("{unreadable")
     if case == "prior_infra":
         fields.update(failure)
     write_task_result(root, task_id, "failed" if case == "prior_infra" else "running", **fields)
@@ -648,9 +669,40 @@ def test_miss_lane_cancels_live_delegation_only_for_its_own_terminal(qenv, monke
         reason="server_shutdown" if restoring else "Stop",
         allow_settled_target=case == "prior_infra",
     )
+    if captured:
+        class WorkerProcess:
+            pid = 0  # No OS process or signal: exercise real custody around this facade.
+            alive = True
+
+            def is_alive(self): return self.alive
+            def join(self, timeout=None): pass
+            def terminate(self): self.alive = False
+
+        task = {"id": task_id, "chat_id": 0, "root_task_id": task_id, "drive_root": str(root)}
+        if "child_drive_root" in fields:
+            task.update(child_drive_root=str(child), drive_root=str(child), delegation_role="subagent")
+        worker = SimpleNamespace(wid=0, busy_task_id=task_id, reaping=False, proc=WorkerProcess())
+        qenv.workers.WORKERS[0] = worker
+        qenv.q.RUNNING[task_id] = {"task": task, "worker_id": 0}
+        monkeypatch.setattr(qenv.tl, "_reconcile_dead_review_owner", lambda *a, **kw: None)
 
     outcome = qenv.tl.cancel_task_custody(task_id, deliver=False)
     stored = load_task_result(root, task_id)
+    if case == "child_unreadable":
+        assert outcome == qenv.tl.CANCEL_FAILED and stored["status"] == "running"
+        assert transport.cancels == [] and recovered_keys == []
+        assert task_id in qenv.q.RUNNING and not worker.proc.is_alive()
+        assert cancel_intents.cancel_pending(root, task_id) and child.is_dir()
+        # The same open intent can finish after file access recovers; no new
+        # scheduler, flag or cancellation claim is needed.
+        write_task_result(child, task_id, "failed", root_task_id=task_id, **failure)
+        assert qenv.tl.cancel_task_custody(task_id, deliver=False) == qenv.tl.CANCEL_ALREADY_SETTLED
+        assert load_task_result(root, task_id)["status"] == "failed"
+        assert transport.cancels == []
+        assert recovered_keys == (["inv-owned"] if pending else [])
+        assert not cancel_intents.cancel_pending(root, task_id) and task_id not in qenv.q.RUNNING
+        return
+    assert recovered_keys == (["inv-owned"] if pending else [])
     if case in {"owner_stop", "snapshot_restore"}:
         assert outcome == qenv.tl.CANCEL_CANCELLED
         assert stored["status"] == "cancelled"
@@ -663,3 +715,25 @@ def test_miss_lane_cancels_live_delegation_only_for_its_own_terminal(qenv, monke
         assert stored["status"] == "failed" and stored["result"] == "provider died"
         assert stored["outcome_axes"] == failure["outcome_axes"]
         assert transport.cancels == [] and status_at_cancel == []
+
+
+def test_pending_recovery_without_owner_verdict_leaves_live_run(tmp_path, monkeypatch):
+    """The periodic recovery default still spares an owner with no known outcome."""
+    from ouroboros import delegate_custody as dc
+
+    monkeypatch.setattr(dc, "_CUSTODY", {})
+    assert dc.record_start_requested(
+        tmp_path, task_id="owner", invocation_id="inv-unknown", route="r",
+        project_id="p", project_owned=False, request={"prompt": "original work", "model": "m"},
+    )
+    recovered = []
+
+    class Gateway(_LiveRunStub):
+        def start_run(self, request, *, idempotency_key=""):
+            recovered.append((request, idempotency_key))
+            return {"runId": "run-unknown"}
+
+    gateway = Gateway(run_id="run-unknown")
+    outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
+    assert recovered == [({"prompt": "original work", "model": "m"}, "inv-unknown")]
+    assert [row["action"] for row in outcomes] == ["left_live"] and gateway.cancels == []
