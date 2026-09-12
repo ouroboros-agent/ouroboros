@@ -302,7 +302,9 @@ def facade_reexports(
     return facades
 
 
-def facade_consumers(repo_root: pathlib.Path, sym: str) -> Tuple[FacadeConsumer, ...]:
+def facade_consumers(
+    repo_root: pathlib.Path, sym: str, *, reexports: Dict[str, Dict[str, str]] | None = None,
+) -> Tuple[FacadeConsumer, ...]:
     """Who imports through a facade — for a facade module, or one re-exported name.
 
     ``sym`` may be a facade module (path or dotted) — every import of that
@@ -311,10 +313,14 @@ def facade_consumers(repo_root: pathlib.Path, sym: str) -> Tuple[FacadeConsumer,
     facades that re-export it. Attribute access on a plain module import
     (``import ouroboros.llm`` then ``llm.chat``) is deliberately out of scope:
     only import statements are counted.
+
+    ``reexports`` accepts an already-built facade map of this same root instead
+    of walking the population for it again — the optional-reuse seam ``owner_of``
+    and ``facade_reexports`` already carry for their own inputs.
     """
     root = pathlib.Path(repo_root)
     manifest = load_domain_manifest(root)
-    reexports = facade_reexports(root, manifest)
+    reexports = facade_reexports(root, manifest) if reexports is None else reexports
     text = str(sym or "").strip().replace("\\", "/")
     if not text:
         raise ValueError("facade_consumers requires a facade module or a re-exported name")

@@ -403,7 +403,10 @@ def duplicate_bodies(manifest: Manifest, root: pathlib.Path = REPO_ROOT,
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     qual = f"{prefix}{child.name}"
-                    segment = ast.get_source_segment(source, child)
+                    # For ordinary source line endings, normalization cannot grow
+                    # the raw span. Embedded splitlines-only separators are not counted.
+                    span = (getattr(child, "end_lineno", None) or child.lineno) - child.lineno + 1
+                    segment = ast.get_source_segment(source, child) if span >= min_lines else None
                     if segment is not None:
                         norm = _normalize_body(segment)
                         if norm.count("\n") + 1 >= min_lines:

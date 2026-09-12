@@ -602,11 +602,11 @@ class TestPrePushGate:
     def test_pre_push_tests_timeout_is_sufficient(self):
         """The pre-push/post-commit pytest budget must be >= 180s.
 
-        Since v6.88.0 this is the TOTAL budget across BOTH preflight passes
-        (parallel ``not serial``, then ``serial``, which gets the remainder).
-        The full suite measures ~180s two-pass against ~470-510s for the old
-        single serial pass, so a shorter cap produces false TESTS_FAILED on
-        every successful commit. The budget is owned by ``run_hermetic_pytest``
+        Since v6.88.0 this is the TOTAL budget across the node test lane AND
+        both preflight passes (parallel ``not serial``, then ``serial``, which
+        gets the remainder) — not a per-pass one. A full suite takes MINUTES,
+        and one loaded-host run measured 1077s, so a cap sized for an idle host
+        reports a healthy suite as a timeout. The budget is owned by ``run_hermetic_pytest``
         (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` env) so callers do not
         re-pin a stale literal — this guard anchors on that single source of truth.
         """
@@ -616,9 +616,9 @@ class TestPrePushGate:
         )
 
         assert _DEFAULT_PREFLIGHT_TIMEOUT_SEC >= 180, (
-            f"preflight default timeout is {_DEFAULT_PREFLIGHT_TIMEOUT_SEC}s — must be "
-            ">= 180s; the full suite takes ~2 minutes and a shorter cap reports "
-            "spurious TESTS_FAILED on successful commits."
+            f"preflight default timeout is {_DEFAULT_PREFLIGHT_TIMEOUT_SEC}s — 180s is a "
+            "FLOOR against a caller re-pinning a tiny literal, never a claim about how "
+            "long the suite takes; the real budget must cover a whole loaded-host run."
         )
         # The env override is honoured so operators can raise it on slow hosts.
         import os as _os

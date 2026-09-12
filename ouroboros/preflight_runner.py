@@ -480,11 +480,11 @@ def _copy_untracked(repo_dir: pathlib.Path, worktree: pathlib.Path) -> None:
 # inherited — `_preflight_env` scrubs the whole PYTEST_* namespace and re-injects
 # the count resolved here, which is clamped so it can never fall below two.
 _MIN_PREFLIGHT_WORKERS = 2
-# Private test-only seam. Read from the OPERATOR environment and never forwarded
-# to the candidate (the scrub removes every OUROBOROS_* key first): the nested
-# fixture repos in tests/test_preflight_runner.py hold 1-3 probe tests, so a full
-# `-n auto` fan-out would spend minutes on worker startup for nothing. It can
-# only lower the count TO the floor, never below it.
+# Operator lever for the parallel pass's xdist worker count, floored at two and
+# sized per concurrent build lane by the rule in docs/DEVELOPMENT.md. It also
+# keeps the nested fixture repos in tests/test_preflight_runner.py (1-3 probe
+# tests each) from spending minutes on a full `-n auto` fan-out. Read from the
+# OPERATOR environment, never forwarded to the candidate: the scrub drops it.
 _PREFLIGHT_WORKERS_ENV = "OUROBOROS_PREFLIGHT_TEST_WORKERS"
 
 
@@ -753,7 +753,7 @@ def _plugin_missing_remediation(agent_python: str, rejected: str = "") -> str:
     )
 
 
-_DEFAULT_PREFLIGHT_TIMEOUT_SEC = 900
+_DEFAULT_PREFLIGHT_TIMEOUT_SEC = 1800
 
 
 def _resolve_preflight_timeout(timeout: int) -> int:
@@ -1377,6 +1377,7 @@ def run_hermetic_pytest(
         if node_error := (node_result or {}).get("error"):
             return node_error
         empty_passes = 0
+        timings: list[tuple[str, float]] = []
         for spec in passes:
             # Keep the exact float remainder; rounding up would exceed the
             # shared total budget (including the preceding node lane).
@@ -1394,6 +1395,7 @@ def run_hermetic_pytest(
                 agent_python, worktree, temp_root, spec.args, remaining
             )
             elapsed = time.monotonic() - pass_started
+            timings.append((spec.label, round(elapsed, 1)))
             # Sweep between passes so a pass-1 escapee cannot touch pass 2.
             kill_processes_referencing(str(temp_root))
             if reap_error:
@@ -1471,7 +1473,7 @@ def run_hermetic_pytest(
                     and preflight_test_workload_unchanged(subject, worktree, timeout=timeout, pytest_args=pytest_args)
                     and (not subject.workload[4] or (node_result or {}).get("returncode") == 0)):
                 ctx._preflight_test_proof = subject
-                log_preflight_test_proof(ctx, subject, reused=False, phase=phase)
+                log_preflight_test_proof(ctx, subject, reused=False, phase=phase, passes=timings)
         return None
     except subprocess.TimeoutExpired:
         return f"⚠️ PRE_PUSH_TEST_ERROR: pytest timed out after {timeout} seconds"

@@ -3504,6 +3504,10 @@ independent second opinion — CI-only, never part of the gate.
 against both CI jobs; the candidate is captured as one hardened
 worktree-vs-`HEAD` binary diff, and a capture or apply failure is the typed
 `PREFLIGHT_CANDIDATE_ASSEMBLY` hard block, never a test failure.
+The `pyproject.toml` `addopts` line is the single home of the per-test timing
+report (`--durations=25 --durations-min=1.0`): it is prepended to every argv, so
+the same slowest-test evidence appears in a plain local run, in both CI jobs and
+in both gate passes without any surface pinning its own copy.
 Contributor rules:
 
 - The candidate cannot weaken the pass: `PYTEST_*`/`NODE_OPTIONS` are
