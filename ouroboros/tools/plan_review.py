@@ -532,7 +532,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     # A revised envelope over an in-flight wave at the cap is held BEFORE any superseding
     # reference: the pending wave stays current and collectible, nothing is written as spent.
     if collect is None and (hold := _collect.in_flight_hold(state, fingerprint=fingerprint, cap=cap)):
-        return _typed_refusal(ctx, "TOOL_ERROR", hold)
+        return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_IN_FLIGHT: {hold}")
     # C-01: the hold above is the ONE exit before the supersede; every other cap/rail exit follows it.
     try:
         _record_plan_review_attempt_with_reference(ctx, state_root, task_id, fingerprint=fingerprint)

@@ -175,7 +175,7 @@ async def collect_before_supersede(
 
 
 def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
-    """The typed refusal for a REVISED envelope while ANOTHER wave is still custody-pending
+    """The refusal body for a REVISED envelope while ANOTHER wave is still custody-pending
     and the cap has no room for another committed panel, or ``''`` when the envelope
     may proceed. Every in-flight wave occupies one cap slot: a wave that already proved
     a dispatch counts through ``cycles_paid`` (never again as pending), an unproven one
@@ -207,7 +207,7 @@ def in_flight_hold(state: Dict[str, Any], *, fingerprint: str, cap: Any) -> str:
         f"identical envelope (review_fingerprint {fp}) to collect it {outcome}."
     )
     return (
-        f"ERROR: PLAN_REVIEW_IN_FLIGHT: plan-review wave {fp[:8]} still has {running} reviewer slot(s) "
+        f"plan-review wave {fp[:8]} still has {running} reviewer slot(s) "
         f"in flight and the cycle cap ({cap}) has no room for another panel until that wave is collected. "
         f"{route} No plan attempt was recorded; the current wave is unchanged."
     )
