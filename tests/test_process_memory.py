@@ -66,6 +66,63 @@ class TestReflectionTrigger:
         ]}
         assert should_generate_reflection(quoted) is False
 
+    def test_a_preserved_commit_with_failing_post_commit_tests_still_reflects(self):
+        """The ordinary self-modification commit reports failing post-commit
+        tests as a WARNING appended to a success: the commit is preserved, the
+        call is ok, and no consumer of that distinction may be told otherwise.
+        The failing tests are still the class the register exists for, so the
+        producer states them as a typed fact beside the unchanged text and the
+        triggers read that, never the word in the body.
+
+        Driven through the real producer seam (tools/git.py) and the real trace
+        projection, because a hand-written row cannot prove either of them.
+        """
+        import types
+
+        from ouroboros.loop_tool_execution import _typed_execution_failure, _typed_result_metadata
+        from ouroboros.reflection import (
+            POST_COMMIT_TESTS_FAILED, _admits_pattern_register, _detect_markers,
+            _trace_call_errored, should_generate_reflection,
+        )
+        from ouroboros.tools import git as git_tools
+        from ouroboros.tools.tool_result import (
+            _install_tool_result_sidecar, _published_tool_result, _restore_tool_result_sidecar,
+        )
+
+        def _row(test_warning: str) -> dict:
+            ctx = types.SimpleNamespace()
+            sentinel = object()
+            token = _install_tool_result_sidecar(ctx, sentinel)
+            try:
+                text = git_tools._publish_post_commit_test_fact(
+                    ctx, "OK: committed to dev: fix parser[pushed: abc1234]" + test_warning,
+                    test_warning,
+                )
+                published = _published_tool_result(ctx, sentinel)
+            finally:
+                _restore_tool_result_sidecar(token)
+            is_error = _typed_execution_failure(True, published) if published else False
+            return {"tool": "commit_reviewed", "result": text, "is_error": is_error,
+                    **_typed_result_metadata("commit_reviewed", text, is_error, published)}
+
+        failed = _row("\n\n⚠️ TESTS_FAILED (commit preserved, consecutive failures: 2):\n"
+                      "⚠️ TESTS_FAILED: Post-commit verification failed.")
+        # The commit succeeded and stays a success on every axis that reads it.
+        assert failed["is_error"] is False and failed["status"] == "ok"
+        assert _trace_call_errored(failed) is False
+        trace = {"tool_calls": [failed]}
+        assert should_generate_reflection(trace, rounds=3, cost_usd=0.5) is True
+        assert _detect_markers(trace) == [POST_COMMIT_TESTS_FAILED]
+        assert _admits_pattern_register(
+            {"error_count": 0, "key_markers": _detect_markers(trace),
+             "child_failure_classes": []},
+        ) is True
+
+        clean = _row("")
+        assert "post_commit_tests" not in clean
+        assert should_generate_reflection({"tool_calls": [clean]}) is False
+        assert _detect_markers({"tool_calls": [clean]}) == []
+
     def test_empty_trace_no_reflection(self):
         from ouroboros.reflection import should_generate_reflection
         assert should_generate_reflection({"tool_calls": []}) is False

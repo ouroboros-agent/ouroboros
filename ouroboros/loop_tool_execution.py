@@ -499,6 +499,11 @@ def _typed_result_metadata(
         ):
             meta["plan_review_outcome"] = plan_outcome
             meta["plan_review_closed"] = plan_closed
+    if isinstance(tool_result, ToolResult) and tool_result.meta.get("post_commit_tests") == "failed":
+        # A preserved commit whose post-commit tests failed is a SUCCESS that
+        # still holds a failure the reflection triggers must see. The producer
+        # states it; nothing here reads the result body for the word.
+        meta["post_commit_tests"] = "failed"
     if fn_name in _PROCESS_RESULT_TOOLS and isinstance(tool_result, ToolResult):
         exit_code = tool_result.meta.get("exit_code")
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):

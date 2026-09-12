@@ -52,6 +52,25 @@ def _trace_call_errored(tc: Dict[str, Any]) -> bool:
     )
 
 
+# The typed code for a success that still carries a failure: the ordinary
+# self-modification commit PRESERVES a revision whose post-commit tests failed
+# and reports it as an ok result with a warning appended (tools/git.py publishes
+# the fact in the result meta, loop_tool_execution stamps it on the trace row).
+POST_COMMIT_TESTS_FAILED = "POST_COMMIT_TESTS_FAILED"
+
+
+def _trace_call_reported_failure(tc: Dict[str, Any]) -> bool:
+    """Did this call report something that went wrong, errored or not?
+
+    The commit above must NOT become an error - it succeeded, and every consumer
+    of that distinction is right about it - but the failing tests are exactly the
+    class the Pattern Register exists for, so the reflection triggers read the
+    producer's typed fact beside the ok status instead of hunting for a word in
+    the body.
+    """
+    return _trace_call_errored(tc) or str(tc.get("post_commit_tests") or "") == "failed"
+
+
 _REFLECTION_PROMPT_ERROR = """\
 You are performing a post-task experience review for Ouroboros, a self-modifying AI agent.
 The task had errors or blocking events. Write a concise 150-250 word reflection covering:
@@ -179,7 +198,7 @@ def should_generate_reflection(
         return True
 
     for tc in (llm_trace.get("tool_calls") or []):
-        if isinstance(tc, dict) and _trace_call_errored(tc):
+        if isinstance(tc, dict) and _trace_call_reported_failure(tc):
             return True
 
     return False
@@ -270,7 +289,13 @@ def _detect_markers(llm_trace: Dict[str, Any]) -> List[str]:
     verbatim rather than dressed up as a code it never had."""
     found: set = set()
     for tc in (llm_trace.get("tool_calls") or []):
-        if not isinstance(tc, dict) or not _trace_call_errored(tc):
+        if not isinstance(tc, dict):
+            continue
+        if str(tc.get("post_commit_tests") or "") == "failed":
+            # An ok commit that preserved a revision with failing tests: its own
+            # code says OK and is right, so the failure needs its own name.
+            found.add(POST_COMMIT_TESTS_FAILED)
+        if not _trace_call_errored(tc):
             continue
         code = str(tc.get("tool_result_code") or "").strip() or str(tc.get("status") or "").strip()
         if code:
