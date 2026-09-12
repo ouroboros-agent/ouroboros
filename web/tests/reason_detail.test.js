@@ -188,6 +188,37 @@ test('a real debt beside a real execution cause is one card line', () => {
     }), 'Reason: provider_unavailable (delegated_custody_unreconciled)');
 });
 
+// A LIVE task_done event carries no debt list at all (composed in
+// ouroboros/agent_task_pipeline.py), while the overlay stamps this code only
+// while the stored list is non-empty. So a missing key is not a healed debt: it
+// is the write side's own proof that the debt was open when the row was
+// written, and only an explicit empty list is the healed row.
+
+test('a live event without the debt list keeps the stamped custody code', () => {
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        outcome_axes: { execution: { status: 'ok' } },
+    }), 'Reason: delegated_custody_unreconciled');
+});
+
+test('a live event without the debt list still names its execution cause beside the code', () => {
+    assert.equal(taskReasonDetail({
+        status: 'failed',
+        reason_code: 'delegated_custody_unreconciled',
+        outcome_axes: { execution: { status: 'failed', reason_code: 'provider_unavailable' } },
+    }), 'Reason: provider_unavailable (delegated_custody_unreconciled)');
+});
+
+test('a debt list of an unreadable shape is not read as healed', () => {
+    assert.equal(taskReasonDetail({
+        status: 'completed',
+        reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: 'run-a1',
+        outcome_axes: { execution: { status: 'ok' } },
+    }), 'Reason: delegated_custody_unreconciled');
+});
+
 test('a healed debt with no execution cause states nothing on the card', () => {
     // The warn headline still comes from the frozen objective warning; inventing
     // a Reason line here is exactly the false statement this rule removes.
