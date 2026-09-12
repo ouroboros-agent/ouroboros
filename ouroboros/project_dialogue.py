@@ -954,8 +954,15 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
             if isinstance(holder, dict) and isinstance(holder.get("acceptance_decision"), dict):
                 decision = holder["acceptance_decision"]
     status = str(decision.get("status") or "").strip()
-    reason = str(result.get("reason_code") or event.get("reason_code") or "")
-    reason, custody = _custody_debt_reason(reason, result, event)
+    stored_reason = str(result.get("reason_code") or event.get("reason_code") or "")
+    reason, custody = _custody_debt_reason(stored_reason, result, event)
+    if not reason and not custody and stored_reason and outcome_phase(result, event) != "done":
+        # The debt healed, but the objective warning it stamped is still what
+        # makes this row a warning: a warn headline with no cause at all is less
+        # honest than the code the record still holds. A row whose axes healed
+        # too reads as clean and says nothing, which is the false line this
+        # whole rule exists to remove.
+        reason = stored_reason
     if (reason != REASON_OWNER_REQUESTED_FINALIZATION and status != ACCEPTANCE_ACCEPTED
             and status and outcome_phase(result, event) in {"done", "warn"}):
         clause = f"Acceptance: {status}"

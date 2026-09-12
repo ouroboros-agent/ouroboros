@@ -76,3 +76,39 @@ def test_every_other_reason_code_passes_through_untouched() -> None:
     plain = {"status": "failed", "reason_code": "provider_unavailable"}
     assert _completion_verdict(plain, {}) == "Reason: provider_unavailable."
     assert _completion_verdict({"status": "completed"}, {}) == ""
+
+
+def test_a_healed_debt_never_leaves_a_warning_headline_without_a_cause() -> None:
+    """Headline and Reason describe the same record.
+
+    The overlay stamps BOTH the top-level reason code and an objective warning,
+    and the refresh may not rewrite either. Suppressing the code once the debt
+    heals therefore produced a row headed "Done with warnings" that stated no
+    cause at all, which is a worse lie than the stale code it removed: the
+    warning is still what the record holds. Built through the real overlay, not
+    a hand-written axes dict.
+    """
+    from ouroboros.outcomes import custody_debt_axes
+    from ouroboros.project_dialogue import OUTCOME_PHASE_HEADLINE, outcome_phase
+
+    axes = custody_debt_axes({"lifecycle": {"status": "completed"},
+                              "execution": {"status": "ok", "reason_code": ""}})
+    for debt in ([], ["run-a1"]):
+        row = _row(outcome_axes=axes, delegated_runs_unreconciled=debt)
+        assert OUTCOME_PHASE_HEADLINE[outcome_phase(row, {})] == "Done with warnings"
+        assert _completion_verdict(row, {}) == (
+            f"Reason: {WARN_DELEGATED_CUSTODY_UNRECONCILED}."
+        )
+
+    # A row whose axes healed too reads as clean, so it states nothing: that is
+    # the false Reason line this rule removes, and it stays removed.
+    clean = _row(outcome_axes={"execution": {"status": "ok"}},
+                 delegated_runs_unreconciled=[])
+    assert OUTCOME_PHASE_HEADLINE[outcome_phase(clean, {})] == "Done"
+    assert _completion_verdict(clean, {}) == ""
+
+    # An execution cause still wins over the healed debt.
+    railed = _row(outcome_axes=custody_debt_axes(
+        {"execution": {"status": "failed", "reason_code": "provider_unavailable"}}),
+        delegated_runs_unreconciled=[])
+    assert _completion_verdict(railed, {}) == "Reason: provider_unavailable."
