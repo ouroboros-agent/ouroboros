@@ -160,9 +160,11 @@ def test_ui_conversion_persists_pending_scope_across_restart(tmp_path, monkeypat
 
 
 def test_mark_task_project_is_fill_only_over_a_different_project():
-    """B4=A: the durable binding is the one truth about a task's project, so this
-    in-memory copy may FILL an empty value or repeat the same one, never move a task
-    from one project to another (that is how a second, empty project got a lane)."""
+    """B4=A: the durable binding is the one truth about a task's project, so by default
+    this in-memory copy may FILL an empty value or repeat the same one, and an ordinary
+    caller never moves a task from one project to another (that is how a second, empty
+    project got a lane). The single exception is a conversion that already holds the
+    binding it is about to write, which moves the lane onto that binding."""
     from ouroboros.project_lease import mark_task_project
 
     running = {"t1": {"task": {"id": "t1", "project_id": "token-atlas"}}}
