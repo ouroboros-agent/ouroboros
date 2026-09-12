@@ -114,9 +114,11 @@ def checkpoint_commit_coop_roots(
       owner-attached folder is NEVER auto-committed (the owner owns its history).
     - Skipped entirely while the tree still has live tasks (a racing child could be
       mid-write); children are terminal by root finalization in the normal flow.
-    - Credential-shaped files (the SAME `_sensitive_untracked_reason` patterns the
-      workspace patch excludes) are NOT staged — BIBLE "Leaking secrets: nowhere":
-      this is a refusal to bake secrets into git history, disclosed in the receipt.
+    - A file is NOT staged when its name is a dotenv spelling or an exact
+      credential leaf, or when its head bytes carry a PEM private-key header
+      (`pem_private_key_reason`, name OR content, the same predicate the
+      workspace patch applies) — BIBLE "Leaking secrets: nowhere": this is a
+      refusal to bake secrets into git history, disclosed in the receipt.
     - Skipped for a root whose owner is mid merge/rebase/cherry-pick/revert; the
       receipt names the operation (`skipped`) instead of committing their state.
     - Fail-soft per root (index.lock, git errors → logged skip; never raises).

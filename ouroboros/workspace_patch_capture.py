@@ -656,9 +656,11 @@ def untracked_capture_veto_reason(root: pathlib.Path, rel: str) -> str:
     The delegated-run baseline snapshot
     (``subagent_worktrees.provision_execution_snapshot``) asks the SAME three
     checks, in the SAME order, that ``write_workspace_patch_artifacts`` applies
-    to untracked files: sensitive/credential-shaped names first, then the
-    static junk rules, then the binary/size veto. One combined predicate here so
-    the snapshot and the patch cannot drift apart about eligibility.
+    to untracked files: the dotenv spellings and exact credential leaves first,
+    then the static junk rules, then the blob veto, which reads the head bytes
+    for a PEM private-key header before the size cap and the binary check. One
+    combined predicate here so the snapshot and the patch cannot drift apart
+    about eligibility.
     Returns the human-readable reason, or "" when the file is eligible.
     """
     reason = _sensitive_untracked_reason(rel)
