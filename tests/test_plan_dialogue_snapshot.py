@@ -86,7 +86,7 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
     own = manifest["own_dialogue"]
     packet = render_dialogue(manifest)
     def slot(name, native=False, session=False):
-        return SimpleNamespace(slot_id=name, model="same/model", use_local=False, session_profile=name,
+        return SimpleNamespace(slot_id=name, model="same/model", role_hint="plan reviewer", use_local=False, session_profile=name,
                                route=ReviewRouteKind.AGENT_SESSION if session else ReviewRouteKind.API_CHAT,
                                retrieves=native or session, native_retrieval=native)
     slots = [slot("small"), slot("large"), slot("native", native=True), slot("delegated", session=True)]
@@ -94,10 +94,10 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
     declarations = []
     def bound(*a, **kwargs):
         declarations.append(kwargs)
-        return 24000
+        return 100000
     monkeypatch.setattr(review_native_episode, "review_native_transcript_bound", bound)
     delivery = dialogue_slot_inputs(slots, system_prompt="governance", user_content=packet,
-                                   session_task=packet, manifest=manifest, slot_messages={}, native_mandatory_chars=len(packet))
+                                   session_task=packet, manifest=manifest, slot_messages={}, native_mandatory_chars=len(packet), session_root=str(harness.workspace), task_id=ctx.task_id)
     small = json.dumps(delivery["slot_messages"]["small"], ensure_ascii=False)
     large = json.dumps(delivery["slot_messages"]["large"], ensure_ascii=False)
     assert "LATEST CHOICE" in small and "exact omitted prefix" in small

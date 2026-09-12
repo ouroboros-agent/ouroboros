@@ -142,6 +142,10 @@ def read_room_source(drive_root: Any, chat_id: int, *, task_id: str = "",
     progress, progress_coverage = _progress_source(root, matches)
     source_rows.extend(_row_projection(row, "progress", i, root) for i, row in enumerate(progress, 1))
     mailbox_coverage = {"included": bool(task_id), "complete": True}
+    # steering.py constructs this exact delivery id from the canonical client
+    # id and target. Link delivery provenance, never deduplicate by meaning.
+    owner_deliveries = {f"{row['client_message_id']}:{task_id}": row for row in source_rows
+                        if row.get("direction") == "in" and row.get("client_message_id")}
     if task_id:
         from ouroboros.owner_mailbox import (
             KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE,
@@ -161,7 +165,14 @@ def read_room_source(drive_root: Any, chat_id: int, *, task_id: str = "",
                 rendered = []
                 deliver_task_message(entry, task_id, None, rendered.append)
                 row["text"] = "\n".join(rendered)
-            source_rows.append(_row_projection(row, "mailbox", i, mailbox_root or root))
+            projected = _row_projection(row, "mailbox", i, mailbox_root or root)
+            original = owner_deliveries.get(str(entry.get("msg_id") or "")) if entry.get("kind") == KIND_OWNER_TEXT else None
+            if original is not None:
+                if projected["text"] == original["text"]:
+                    projected.pop("text")  # Same proven source id and exact bytes.
+                original.setdefault("mailbox_deliveries", []).append(projected)
+            else:
+                source_rows.append(projected)
     seen, unique = set(), []
     for row in source_rows:
         identity = str(row.get("client_message_id") or row.get("msg_id") or "")
@@ -192,7 +203,7 @@ def read_room_source(drive_root: Any, chat_id: int, *, task_id: str = "",
     from ouroboros.tools.review_helpers import redact_prompt_secrets
 
     text, redacted = redact_prompt_secrets(text)
-    return {**header, "captured_at": utc_now_iso(), "rows": [json.loads(line) for line in text.splitlines()[1:]], "text": text, "secrets_redacted": redacted,
+    return {**header, "captured_at": utc_now_iso(), "rows": [json.loads(line) for line in text.split("\n")[1:-1]], "text": text, "secrets_redacted": redacted,
             "sha256": sha256(text.encode()).hexdigest(), "bytes": len(text.encode())}
 
 

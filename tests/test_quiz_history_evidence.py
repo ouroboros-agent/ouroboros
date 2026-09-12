@@ -208,3 +208,43 @@ def test_recent_room_and_history_share_parent_root_and_origin_membership(runtime
     project_filter = _make_thread_filter(project["chat_id"], {project["chat_id"]}, [], {"parent": project["chat_id"]})
     main_filter = _make_thread_filter(1, {project["chat_id"]}, [], {"parent": project["chat_id"]})
     assert all(project_filter(row["chat_id"], row) and not main_filter(row["chat_id"], row) for row in rows)
+
+
+def test_new_request_heals_committed_answer_before_projection_eviction(runtime):
+    from ouroboros.owner_quiz import record_answered
+
+    _ask(runtime, 'crash')
+    # Exact crash boundary: projection committed, canonical history not written.
+    assert record_answered(runtime.root, runtime.task['id'], quiz_id='crash', option_index=0,
+                           request_id='winner', comment='Original owner answer')['ok']
+    status, reply = _answer(runtime, 'crash', request_id='new-browser-request', index=1, comment='Losing payload')
+    assert status == 409 and reply['answered_index'] == 0
+    for i in range(16):
+        _ask(runtime, f'following-{i}')
+        assert _answer(runtime, f'following-{i}', request_id=f'following-{i}')[0] == 200
+    cleanup_task_mailbox(runtime.root, runtime.task['id'])
+    state.rotate_jsonl_log_if_needed(runtime.root, 'chat.jsonl', 'chat', max_bytes=1)
+    assert 'crash' not in quiz_states(runtime.root, runtime.task['id'])
+    [fact] = [row for row in _facts(runtime) if row['quiz']['quiz_id'] == 'crash']
+    assert fact['quiz']['comment'] == 'Original owner answer'
+
+
+def test_competing_request_history_failure_is_retryable_without_changing_winner(runtime, monkeypatch):
+    from ouroboros.owner_quiz import record_answered
+
+    _ask(runtime, 'recover-new-id')
+    record_answered(runtime.root, runtime.task['id'], quiz_id='recover-new-id', option_index=0,
+                    request_id='winner', comment='Winning choice')
+    real = message_bus.log_chat
+    def fail(*args, **kwargs):
+        if kwargs.get('record_type') == 'quiz_answer':
+            raise OSError('unavailable history')
+        return real(*args, **kwargs)
+    monkeypatch.setattr(message_bus, 'log_chat', fail)
+    status, response = _answer(runtime, 'recover-new-id', request_id='loser', index=1)
+    assert status == 503 and response['reason_code'] == 'quiz_history_write_failed'
+    monkeypatch.setattr(message_bus, 'log_chat', real)
+    status, response = _answer(runtime, 'recover-new-id', request_id='another-retry', index=1)
+    assert status == 409 and response['answered_index'] == 0
+    [fact] = _facts(runtime)
+    assert fact['quiz']['comment'] == 'Winning choice'

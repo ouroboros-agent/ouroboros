@@ -909,20 +909,25 @@ documents — only actual provider overflow may use a task-local Low projection,
 followed by at most one same-route strictly-smaller call, and this never
 changes owner mode or P3 commit/scope review.
 
-### Invariant: One premise surface for every review
+### Invariant: Exact premises with explicit source ownership
 
-Every review of a task's work reads the principal's words from ONE producer:
-plan review (the intention) and task acceptance (the result) both render
-`review_evidence._accept_owner_directives`, the task-local `_owner_directives`
-corpus that `loop_round_limits` fills as frames arrive (the initial turn, owner
-follow-ups, owner quiz answers, a parent's task messages to a child; host
-`system` frames and a descendant's escalations are not directives). Each
-consumer redacts at its own boundary and bounds its display with the cut
-disclosed; none summarizes or paraphrases. A second collector, a paraphrase in
-place of the rows, or a new review surface that receives none of them is a
-regression. Enforcement: `tests/test_plan_review_w3.py`
-(`test_plan_and_acceptance_read_the_same_owner_directive_producer`) and
-`tests/test_loop_misc.py` (capture of both frame kinds).
+Planning reads the complete retained room through `dialogue_evidence` and
+`Memory.read_chat_generations`, with the shared Project membership predicate,
+progress and addressed mailbox provenance. Both speakers, options and answers
+remain exact. JSONL records and chat line selectors use physical LF boundaries;
+valid Unicode inside a message is never a record delimiter. Task acceptance
+keeps `review_evidence._accept_owner_directives` over the task-local ledger;
+planning does not recreate its retired bounded directive section.
+
+Each consumer redacts at its boundary and discloses missing source or ranges.
+A replay or an already-earned paid retry of the same author request keeps its
+recorded snapshot and discloses that later messages were not reviewed. A changed
+plan or explicit evidence request captures current discussion. Native sizing
+measures the complete first request, including its schemas and instruction
+wrapper; existing task-local model choices apply before fresh source fitting.
+Enforcement: `test_packet_uses_full_dialogue_and_keeps_acceptance_directives`,
+`tests/test_plan_dialogue_review_regressions.py`, and the acceptance ledger tests
+in `tests/test_loop_misc.py`.
 
 ### Invariant: Compaction must earn its rewrite
 

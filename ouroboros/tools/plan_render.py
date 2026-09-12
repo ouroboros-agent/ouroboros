@@ -262,9 +262,9 @@ def _dialogue_source_view(wave: dict, *, cached: bool) -> list[str]:
         rows.append(f"- {sid} prepared dialogue coverage (physical/read status below): " + json.dumps(facts, ensure_ascii=False, default=str))
     if not wave.get("dialogue_delivery"):
         rows.append("Per-slot dialogue coverage was not recorded in this historical wave.")
-    if cached:
-        rows.append("Cached review covers this recorded snapshot only. Later messages are not claimed reviewed; "
-                    "their implications remain your judgment. A changed plan/evidence request captures current discussion.")
+    rows.append(("Cached review" if cached else "This review") + " covers this recorded snapshot only. "
+                "Later messages are not claimed reviewed; their implications remain your judgment. "
+                "A changed plan/evidence request captures current discussion.")
     return rows
 
 

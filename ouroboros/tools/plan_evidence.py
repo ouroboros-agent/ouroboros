@@ -70,7 +70,7 @@ def _split_selector(locator: str) -> tuple[str, Optional[dict], Optional[str]]:
     return locator, None, None
 
 
-def _selected_payload(raw: bytes, selector: dict, path: Optional[pathlib.Path] = None) -> tuple[Optional[dict], Optional[str]]:
+def _selected_payload(raw: bytes, selector: dict, path: Optional[pathlib.Path] = None, *, physical_lf: bool = False) -> tuple[Optional[dict], Optional[str]]:
     digest = sha256(raw).hexdigest()
     kind = selector["kind"]
     selected: bytes
@@ -88,6 +88,9 @@ def _selected_payload(raw: bytes, selector: dict, path: Optional[pathlib.Path] =
         except UnicodeDecodeError:
             return None, "binary"
         lines = text.splitlines(keepends=True)
+        if physical_lf:
+            parts = text.split("\n")
+            lines = [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
         if kind == "line_range":
             start, end = int(selector["start"]), int(selector["end"])
             if start > len(lines) or end > len(lines):
@@ -325,7 +328,7 @@ def resolve_evidence(
             if text is None:
                 payload, reason = None, f"{kind}_not_found"
             elif selector:
-                payload, reason = _selected_payload(str(text).encode("utf-8"), selector)
+                payload, reason = _selected_payload(str(text).encode("utf-8"), selector, physical_lf=kind == "chat")
             else:
                 payload, reason = _payload_from_text(str(text), per_item)
             if payload is None:

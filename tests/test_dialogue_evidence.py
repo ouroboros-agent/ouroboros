@@ -73,3 +73,38 @@ def test_explicit_hidden_room_keeps_its_address_and_never_becomes_main(tmp_path)
     assert "Headless discussion" in read_room_source(tmp_path, 0)["text"]
     assert "Main conversation" not in read_room_source(tmp_path, 0)["text"]
     assert "Headless discussion" not in read_room_source(tmp_path, 1)["text"]
+
+
+def test_unicode_separators_remain_inside_one_physical_jsonl_record(tmp_path):
+    import json
+    from ouroboros.dialogue_evidence import read_room_source, chat_evidence_reader
+    from ouroboros.tools.plan_evidence import resolve_evidence
+
+    original = 'A is cheaper\u2028B is flexible\u2029Keep both\u0085Owner explanation\nOrdinary newline'
+    append_jsonl(tmp_path / 'logs/chat.jsonl', {'direction': 'in', 'chat_id': 1, 'text': original})
+    source = read_room_source(tmp_path, 1)
+    assert source['rows'][0]['text'] == original and source['text'].count('\n') == 2
+    manifest = resolve_evidence(['chat:1::lines=2-2'], active_root=tmp_path, allowed_roots=[],
+                                resolve_chat=chat_evidence_reader(tmp_path))
+    assert json.loads(manifest['attached'][0]['text'])['text'] == original
+
+
+def test_steered_delivery_joins_exact_source_id_and_keeps_changed_text(tmp_path):
+    from ouroboros.dialogue_evidence import read_room_source
+    from ouroboros.owner_mailbox import write_owner_message
+
+    append_jsonl(tmp_path / 'logs/chat.jsonl', {'direction': 'in', 'chat_id': 1,
+                 'text': 'Use B', 'client_message_id': 'cm1'})
+    assert write_owner_message(tmp_path, 'Use B', 'root', msg_id='cm1:root')
+    source = read_room_source(tmp_path, 1, task_id='root')
+    assert source['text'].count('Use B') == 1
+    delivery = source['rows'][0]['mailbox_deliveries'][0]
+    assert delivery['task_id'] == 'root' and delivery['msg_id'] == 'cm1:root' and delivery['ts']
+    # A transformed delivery of the same source remains exact, not deduplicated
+    # by an interpretation of equivalent meaning.
+    assert write_owner_message(tmp_path, 'Use B with the additional context', 'other', msg_id='cm1:other')
+    changed = read_room_source(tmp_path, 1, task_id='other')
+    assert changed['rows'][0]['mailbox_deliveries'][0]['text'] == 'Use B with the additional context'
+    assert write_owner_message(tmp_path, 'Use B', 'root', msg_id='unrelated-id')
+    distinct = read_room_source(tmp_path, 1, task_id='root')
+    assert distinct['text'].count('Use B') == 2

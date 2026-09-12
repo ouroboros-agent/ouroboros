@@ -1213,6 +1213,15 @@ def plan_quorum_unreachable_facts(slot_records: List[dict], *, quorum: int) -> D
     }
 
 
+def effective_plan_slots(slots: list) -> list:
+    """Resolve existing task-local owner model choices before sizing or sending."""
+    from ouroboros.review_records import apply_review_model_override
+    from ouroboros.model_wait import current_model_wait
+
+    waiter = current_model_wait()
+    return [apply_review_model_override(slot, waiter.overrides) for slot in slots] if waiter else list(slots)
+
+
 def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int, slot_prompt_chars: Optional[dict] = None) -> tuple[list, list[dict], str]:
     """``(callable_slots, oversize_rows, error)`` for ONE shared packet fanned across
     mixed-window slots — the review organ's calibrated per-slot input caps
@@ -1221,11 +1230,7 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int, slot_prompt_ch
     (ok=False, $0) so it is REPORTED as not participating; fewer callable slots than the
     review quorum is a loud typed refusal, never a silent absence of review."""
     from ouroboros.tools.review_synthesis import per_slot_input_token_limits
-    from ouroboros.review_records import apply_review_model_override
-    from ouroboros.model_wait import current_model_wait
-
-    waiter = current_model_wait()
-    slots = [apply_review_model_override(slot, waiter.overrides) for slot in slots] if waiter else slots
+    slots = effective_plan_slots(slots)
 
     # Only api_chat rows are sized: a RETRIEVING (agent_session) row's model id is an opaque
     # harness target, not a provider route (`reviewer_window.reviewer_route(session=True)`), and
@@ -1285,10 +1290,7 @@ def plan_fanout_inputs(
             "oversize_rows": [], "health_evidence": resume.get("health_evidence") or {},
             "error": "",
         }
-    from ouroboros.review_records import apply_review_model_override
-    from ouroboros.model_wait import current_model_wait
-    waiter = current_model_wait()
-    slots = [apply_review_model_override(slot, waiter.overrides) for slot in slots] if waiter else slots
+    slots = effective_plan_slots(slots)
     health_evidence = (
         plan_panel_health_snapshot(slots)
         if replay_snapshot is PLAN_NO_SNAPSHOT else replay_snapshot

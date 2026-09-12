@@ -288,6 +288,20 @@ async def answer_decision(
             quiz_id=quiz_id, option_index=raw_index,
             request_id=request_id, comment=comment,
         )
+        block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
+        try:
+            if block.get("state") == "answered":
+                _record_quiz_answer_history(
+                    drive_root, task_id, task, block,
+                    duplicate=bool(outcome.get("duplicate") or not outcome.get("ok")),
+                )
+        except Exception:
+            log.warning("Quiz answer history write failed for %s", quiz_id, exc_info=True)
+            return _refused(
+                "the answer was recorded but its dialogue history could not be written "
+                "— retry to preserve and deliver it to the task",
+                503, task_id=task_id, reason_code="quiz_history_write_failed",
+            )
         if not outcome.get("ok"):
             error = str(outcome.get("error") or "quiz_answer_refused")
             state = str(outcome.get("state") or "")
@@ -312,18 +326,6 @@ async def answer_decision(
             if error in {"option_out_of_range", "answer_empty"}:
                 status = 400
             return status, payload
-        block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
-        try:
-            _record_quiz_answer_history(
-                drive_root, task_id, task, block, duplicate=bool(outcome.get("duplicate")),
-            )
-        except Exception:
-            log.warning("Quiz answer history write failed for %s", quiz_id, exc_info=True)
-            return _refused(
-                "the answer was recorded but its dialogue history could not be written "
-                "— retry to preserve and deliver it to the task",
-                503, task_id=task_id, reason_code="quiz_history_write_failed",
-            )
         if task is not None:
             from supervisor.queue import _task_drive_for_task
 

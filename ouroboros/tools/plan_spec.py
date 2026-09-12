@@ -879,3 +879,11 @@ def closure_after_disposition(
             "blocking_enforcement: the wave must close before the work starts"
         )
     return {"closed": closed, "open_ids": open_ids, "notes": notes}
+
+
+def plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
+    """Identity of one review request (F4): goal, prose, canonical spec, evidence identity,
+    the constitutional fact — never the exploration log (it changes no obligation)."""
+    payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
+               "constitutional": bool(constitutional)}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()

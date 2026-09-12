@@ -28,7 +28,6 @@ host's loud disclosure. Domain-neutral: a spec with zero paths is first-class.
 
 from __future__ import annotations
 
-from hashlib import sha256
 import json
 import logging
 import pathlib
@@ -68,14 +67,17 @@ from ouroboros.tools.plan_review_runtime import (
     plan_wave_has_in_flight as _plan_wave_has_in_flight,
     plan_no_dispatch_line as _plan_no_dispatch_line,
     plan_wave_progress_line as _plan_wave_progress_line,
+    effective_plan_slots as _effective_plan_slots,
     root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
     run_plan_review_slots as _run_plan_review_slots,
     synthesize_plan_review_wave as _synthesize_plan_review_wave,
     build_plan_review_packet as _build_packet,
 )
+from ouroboros.tools.plan_spec import plan_fingerprint as _plan_fingerprint
 from ouroboros.tools.plan_evidence import task_evidence_reader as _task_evidence_reader
 from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs
 from ouroboros.tools.plan_review_artifacts import (
+    PlanReviewSourceUnavailable,
     attach_continuation_restart_delta as _attach_continuation_restart_delta,
     authority_wave as _authority_wave,
     continuation_state as _continuation_state,
@@ -375,13 +377,6 @@ def _evidence_deny_paths(ctx: ToolContext) -> list[str]:
         pass
     return out
 
-def _plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
-    """Identity of one review request (F4): goal, prose, canonical spec, evidence identity,
-    the constitutional fact — never the exploration log (it changes no obligation)."""
-    payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
-               "constitutional": bool(constitutional)}
-    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-
 # W3 host attachment is bounded like the agent's own evidence list (MAX_LIST_ITEMS honoured
 # locators per task); what the cap drops is a NAMED `reviewer_request_cap` omission, never silent.
 _REVIEWER_REQUEST_CAP = plan_spec.MAX_LIST_ITEMS
@@ -622,6 +617,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             )
     cycle_index = int(resume.get("cycle_index") or cycles_paid + 1)
     retry_key = str(resume.get("retry_key") or f"plan_review:{fingerprint}:{cycle_index}")
+    slots = _effective_plan_slots(slots)
     system_prompt, user_content, session_task = _build_packet(
         ctx, spec=spec, request=request, manifest=manifest, constitutional=constitutional,
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
@@ -633,7 +629,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     delivery = dialogue_slot_inputs(slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, manifest=manifest, slot_messages=slot_messages,
         native_mandatory_chars=len(system_prompt) + len(user_content), data_root=state_root,
-        frozen=existing if resume_in_flight else None)
+        frozen=existing if resume_in_flight else None, session_root=str(active_root), task_id=task_id)
     slot_messages = delivery["slot_messages"]
     quorum = adaptive_quorum(len(slots))
     fanout = _plan_fanout_inputs(
@@ -907,7 +903,10 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             "No plan attempt was recorded.",
         )
     if wave.get("custody_pending"):  # collection = the $0 custody reconcile of the addressed wave (window 0)
-        text, state, wave = _collect.collect_wave_sync(ctx, state_root=root, task_id=task_id, wave=wave)
+        try:
+            text, state, wave = _collect.collect_wave_sync(ctx, state_root=root, task_id=task_id, wave=wave)
+        except PlanReviewSourceUnavailable as exc:
+            return _plan_unavailable(ctx, str(exc), "plan_review_exact_artifact_unavailable")
         if not disposition.get("items"):  # a pure $0 peek; items are applied even while slots run
             return text
         cycles_paid = int(state.get("cycles_paid") or 0)

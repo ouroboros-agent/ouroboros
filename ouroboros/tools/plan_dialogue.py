@@ -45,7 +45,7 @@ def related_rooms(ctx: Any, root: pathlib.Path, own_chat: int | None) -> list[di
 def _source_view(root: pathlib.Path, task_id: str, source: dict, ref: dict | None) -> dict:
     view = {key: source[key] for key in ("chat_id", "label", "captured_at", "coverage", "sha256", "bytes", "text", "secrets_redacted") if key in source}
     view["locator"] = f"chat:{source['chat_id']}@{source['sha256']}"
-    view["lines"] = len(source["text"].splitlines())
+    view["lines"] = source["text"].count("\n")
     if ref:
         view["source_ref"] = ref
         view["file"] = str(task_artifact_dir_path(root, task_id, create=False) / ref["path"])
@@ -108,7 +108,7 @@ def plan_chat_reader(root: pathlib.Path, task_id: str):
             ref = wave.get("dialogue_source_ref") or {}
             if ref.get("sha256") == digest and wave.get("dialogue_chat_id") == chat_id:
                 raw = read_actor_source_bytes(root, task_id, ref)
-                return {"text": raw.decode("utf-8"), "coverage": json.loads(raw.splitlines()[0]).get("coverage", {})}
+                return {"text": raw.decode("utf-8"), "coverage": json.loads(raw.split(b"\n", 1)[0]).get("coverage", {})}
         return None
     return read
 
@@ -127,43 +127,44 @@ def render_dialogue(manifest: Any) -> str:
     )
 
 
-def fit_dialogue_text(packet: str, own: dict, capacity_chars: int) -> tuple[str, dict]:
-    """Keep the newest available characters with exact immutable byte ranges.
+def fit_dialogue_text(packet: str, own: dict, capacity_chars: int, *, measure=len) -> tuple[str, dict]:
+    """Keep the largest newest suffix fitting this delivery's actual measure.
 
-    Only automatic dialogue yields room to the route's existing reserves.
-    Required governance, plan/spec and author-declared evidence stay intact.
+    Only automatic dialogue yields room; required governance and operative
+    inputs stay intact. Ranges describe the immutable UTF-8 source exactly.
     """
     source = str(own.get("text") or "")
     raw = source.encode("utf-8")
     coverage = {"source_sha256": own.get("sha256"), "source_bytes": len(raw),
                 "inline_bytes": [0, len(raw) - 1] if raw else None, "omitted_prefix": None}
-    if not source or len(packet) <= capacity_chars or source not in packet:
+    if not source or measure(packet) <= capacity_chars or source not in packet:
         return packet, coverage
-    base = len(packet) - len(source)
-    take = max(0, min(len(source), capacity_chars - base))
-    for _ in range(3):
+
+    def selected(take):
         tail = source[-take:] if take else ""
         start = len(raw) - len(tail.encode("utf-8"))
         notice = (f"Dialogue coverage: newest bytes {start}-{len(raw) - 1} attached; "
                   if tail else "Dialogue coverage: no inline source bytes fit; ")
-        notice += f"exact omitted prefix: {own['locator']}::bytes=0-{start - 1}. "
-        notice += "The complete redacted snapshot remains at the recorded source handle.\n"
-        take = max(0, min(take, capacity_chars - base - len(notice)))
-    tail = source[-take:] if take else ""
-    start = len(raw) - len(tail.encode("utf-8"))
-    notice = (f"Dialogue coverage: newest bytes {start}-{len(raw) - 1} attached; "
-              if tail else "Dialogue coverage: no inline source bytes fit; ")
-    notice += f"exact omitted prefix: {own['locator']}::bytes=0-{start - 1}. "
-    notice += "The complete redacted snapshot remains at the recorded source handle.\n"
-    coverage.update(inline_bytes=[start, len(raw) - 1] if tail else None,
-                    omitted_prefix=f"{own['locator']}::bytes=0-{start - 1}")
-    return packet.replace(source, notice + tail, 1), coverage
+        omitted = f"{own['locator']}::bytes=0-{start - 1}"
+        notice += f"exact omitted prefix: {omitted}. The complete redacted snapshot remains at the recorded source handle.\n"
+        return packet.replace(source, notice + tail, 1), start, omitted
+
+    low, high = 0, len(source) - 1
+    while low < high:
+        count = (low + high + 1) // 2
+        if measure(selected(count)[0]) <= capacity_chars:
+            low = count
+        else:
+            high = count - 1
+    fitted, start, omitted = selected(low)
+    coverage.update(inline_bytes=[start, len(raw) - 1] if low else None, omitted_prefix=omitted)
+    return fitted, coverage
 
 
 def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                          session_task: str, manifest: dict, slot_messages: dict,
                          native_mandatory_chars: int, data_root: Any = "",
-                         frozen: dict | None = None) -> dict:
+                         frozen: dict | None = None, session_root: str = "", task_id: str = "") -> dict:
     """Project a fresh request, or reuse the recorded delivery at collection."""
     if frozen is not None:
         from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs
@@ -172,7 +173,7 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
     from ouroboros.tools.review_synthesis import build_plan_review_messages, per_slot_input_token_limits
     from ouroboros.tools.plan_packet import plan_user_stable_len
     from ouroboros.tools.plan_spec import PLAN_FINDINGS_ARRAY_CONTRACT
-    from ouroboros.review_native_episode import review_native_transcript_bound, native_landing_at
+    from ouroboros.review_native_episode import review_native_transcript_bound, native_landing_at, native_first_send_chars
     from ouroboros.reviewer_window import reviewer_window_binding
     from ouroboros.review_execution import _messages_char_count
 
@@ -202,7 +203,11 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                                                    mandatory_read_chars=native_mandatory_chars,
                                                    **reviewer_window_binding(slot))
             governance_read = max(0, native_mandatory_chars - len(session_task))
-            tasks[sid], coverage[sid] = fit_dialogue_text(session_task, own, native_landing_at(bound) - governance_read)
+            def first_send(task):
+                return native_first_send_chars(session_root, surface="plan_review", role_hint=slot.role_hint,
+                    slot_id=sid, session_task=task, output_contract=PLAN_FINDINGS_ARRAY_CONTRACT, task_id=task_id)
+            tasks[sid], coverage[sid] = fit_dialogue_text(session_task, own,
+                native_landing_at(bound) - governance_read - 1, measure=first_send)
         elif own.get("file") and own.get("text"):
             instruction = (
                 f"MANDATORY FULL READ: {own['file']} (redacted immutable room dialogue; "
@@ -217,7 +222,8 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
             coverage[sid] = {"source_sha256": own["sha256"], "source_bytes": own["bytes"],
                              "inline_bytes": None, "full_file": own["file"], "read_coverage": "unobserved"}
         if slot_retrieves(slot):
-            lengths[sid] = len(tasks.get(sid, session_task))
+            lengths[sid] = (first_send(tasks.get(sid, session_task)) if not slot_is_session(slot)
+                            else len(tasks.get(sid, session_task)))
         if sid in coverage:
             coverage[sid]["delivery"] = ("delegated_file" if slot_is_session(slot) else
                                          "native_retrieving" if slot_retrieves(slot) else "packet")
