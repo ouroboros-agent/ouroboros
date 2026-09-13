@@ -58,7 +58,7 @@ class Bridge:
 
 
 def rows(path):
-    return [json.loads(line) for line in path.read_text().splitlines() if line] if path.exists() else []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line] if path.exists() else []
 
 
 @pytest.fixture
