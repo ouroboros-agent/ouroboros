@@ -180,7 +180,7 @@ def capture(host, case, **extra):
     return {
         "annotations": rows(host.root / "logs/chat_annotations.jsonl"),
         "scheduled_result": load_task_result(host.root, case.task_id),
-        "queue_snapshot": (json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+        "queue_snapshot": (json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
                            if queue.QUEUE_SNAPSHOT_PATH.exists() else None),
         **extra,
     }
