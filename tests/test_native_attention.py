@@ -8,7 +8,7 @@ def test_macos_attention_uses_system_sound(monkeypatch):
 
     calls = []
     monkeypatch.setattr(platform_layer, "IS_MACOS", True)
-    monkeypatch.setattr(platform_layer.pathlib.Path, "is_file", lambda self: str(self) == "/System/Library/Sounds/Glass.aiff")
+    monkeypatch.setattr(platform_layer.pathlib.Path, "is_file", lambda self: self.as_posix() == "/System/Library/Sounds/Glass.aiff")  # as_posix: str() is backslashed on Windows
     monkeypatch.setattr(platform_layer.subprocess, "run", lambda *args, **kwargs: (calls.append((args, kwargs)) or type("Result", (), {"returncode": 0})()))
     shown = []
     result = platform_layer.request_native_attention(lambda: shown.append(True))

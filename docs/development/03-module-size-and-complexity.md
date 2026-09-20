@@ -255,40 +255,38 @@ keep their existing recovery behavior. Enforcement:
 
 ### Invariant: notifications ring for live events only
 
-Owner-facing notification POLICY is `docs/DESIGN.md` §9 — one canonical
-section, never re-derived here. The engineering rules are:
+Owner-facing notification POLICY lives only in `docs/DESIGN.md` §9. The
+engineering rules:
 
-The subscription is CLIENT-level and must never move into a chat instance. An
-instance dies with its room — closing a Project panel disposes its `ws.on`
-handlers — so a notifier wired inside one is silent in exactly the case
-notifications exist for: the owner left and the room is closed.
-`notifications.js::attach()` takes one subscription on the shared socket in
-`app.js`, and `chat.js` holds no notification code.
+The subscription is CLIENT-level and never moves into a chat instance. An
+instance dies with its room (closing a Project panel disposes its `ws.on`
+handlers), so a notifier inside one is silent exactly when notifications
+matter: the owner left and the room is closed. `notifications.js::attach()`
+takes the one subscription on the shared socket in `app.js`; `chat.js` has none.
 
-Only live frames reach it; history and reconnect backfill run through the
-instances' own readers, which never call it. That boundary — not a persisted
-ledger — is what makes replay safe, so no notification state survives a reload.
-The room gate is the client's owner-visible chat set: the hidden partition, A2A
+Only live frames reach it: history and reconnect backfill use the instances'
+own readers, which never call it. That boundary, not a persisted ledger, makes
+replay safe; no notification state survives a reload.
+The room gate is the client's owner-visible chat set; the hidden partition, A2A
 ids and unknown chats are refused.
 
 One ending is one key per task: the `task_done` log frame, the authored summary
-and the turn's ordinary reply all collapse together, and a direct turn's ending
-is the ordinary-reply category rather than a finished task. Lineage comes from
-the delegation facts frames carry, because the terminal frame has none — a child
-must not reach the owner's banner.
+and the turn's ordinary reply collapse together, and a direct turn's ending is
+an ordinary reply, not a finished task. Lineage comes from the delegation facts
+frames carry (the terminal frame has none): a child never reaches the owner's
+banner.
 
-Classification and the delivery gate stay pure over one frame plus the stored
-preferences, so the rules are testable without a DOM or a socket. Preferences
-are client-local, carry no `s-` field and are excluded from the settings-dirty
+Classification and the delivery gate are pure over one frame plus the stored
+preferences, testable without a DOM or a socket. Preferences
+are client-local, carry no `s-` field and stay out of the settings-dirty
 tracker, so they neither reach `/api/settings` nor offer to discard unsaved
 settings (`tests/test_notifications_static.py` asserts those causes, not only
 their effects). Delivery degrades rather than disappearing, and the status line
-says which surface this client has. The optional desktop bridge is invoked at
-delivery time, feature-detected per call, and returns a capability fact rather
-than a banner/delivery claim; it may raise the existing window and request one
-system sound, but it must not add a scheduler, persistence or background
-process. Importance must not acquire a new host field, a text heuristic or a
-second model call.
+names this client's surface. The optional desktop bridge runs at delivery time,
+is feature-detected per call and returns a capability fact, never a delivery
+claim: it may raise the window and request one system sound, with no
+scheduler, persistence or background job. Importance gains no host field, text
+heuristic or second model call.
 
 ### Invariant: UI resources carry a disposer
 
