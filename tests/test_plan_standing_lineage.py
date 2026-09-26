@@ -6,6 +6,7 @@ owes its answer to the wave before (``plan_review_artifacts.standing_findings_li
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from tests.test_plan_review_engine import CLEAN, _call, _control, _finding, _patch_health, _state
 from tests.test_plan_review_engine import harness as _engine_harness
 from tests.test_plan_review_epoch import _effort_aware_builder
+from ouroboros import task_results
 from tests.test_plan_review_reconciliation import _collect, _install_barrier_substrate
 
 harness = _engine_harness  # noqa: F811 - pytest fixture re-export
@@ -188,3 +190,49 @@ def test_a_compacted_last_paid_wave_still_owes_its_objection(harness, monkeypatc
     assert last["previous_fingerprint"] == a_fp and last["previous_wave_artifact"]
     assert _control(_collect(ctx, last["request_fingerprint"])) == {"outcome": "REVIEW_REQUIRED", "closed": False}
     assert _carried(harness) == ["s1:n1"]
+
+
+def _artifact_file(harness, ref):
+    hits = [p for p in pathlib.Path(harness.drive).rglob(pathlib.Path(str(ref["path"])).name)]
+    assert len(hits) == 1, hits
+    return hits[0]
+
+
+def test_unreadable_deep_history_refuses_the_dispatch_before_anything_is_paid(harness, monkeypatch):
+    """History that cannot be read is a typed refusal BEFORE the third envelope pays anything:
+    A's exact artifact vanishes while B (pending s1) still points at it; the envelope that
+    would need A's obligation is refused, nothing is dispatched, no cycle is charged, the
+    attempt is marked unavailable and the blocking gate stays shut; a same-spec retry is
+    refused again, a changed spec ends every obligation and dispatches."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "6")
+    _patch_health(monkeypatch, lambda slots: {})
+    _effort_aware_builder(harness, monkeypatch)
+    harness.install({"s1": _objection("n1", "Friday is impossible"), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    a = _state(harness)["waves"][-1]
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls, still_pending={"s1"})
+    assert _control(_call(ctx, plan="Draft each slide first, outline after.")) == {"outcome": "DEGRADED", "closed": False}
+    b_fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    assert _control(_collect(ctx, b_fp)) == {"outcome": "DEGRADED", "closed": False}
+    before = _state(harness)
+    assert before["cycles_paid"] == 2
+    os.remove(_artifact_file(harness, a["wave_artifact"]))     # fault injection: A's exact vanishes; B's pointer names it
+    n_calls = len(calls)
+    _install_barrier_substrate(monkeypatch, calls, refused={"s1"})
+    out = _call(ctx, plan="Rehearse, then draft, then outline.")
+    assert "PLAN_REVIEW_SOURCE_UNAVAILABLE" in out and "predecessor artifact" in out
+    after = _state(harness)
+    assert len(calls) == n_calls                                  # nothing was dispatched for the third envelope
+    assert after["cycles_paid"] == before["cycles_paid"]
+    assert [w["request_fingerprint"] for w in after["waves"]] == [w["request_fingerprint"] for w in before["waves"]]
+    assert after["current_attempt"]["status"] == "unavailable"
+    assert after["current_attempt"]["reason"] == "plan_review_exact_artifact_unavailable"
+    assert task_results.plan_review_gate_projection(after, "blocking")["allow"] is False
+    # a same-spec retry is refused again (fail closed); a changed spec ends the obligations and dispatches
+    assert "PLAN_REVIEW_SOURCE_UNAVAILABLE" in _call(ctx, plan="Rehearse, then draft, then outline.")
+    assert len(calls) == n_calls
+    _install_barrier_substrate(monkeypatch, calls)
+    changed = _call(ctx, plan="Rehearse, then draft, then outline.", spec={**DECK_SPEC, "in_scope": ["a six-slide deck"]})
+    assert _control(changed) == {"outcome": "DEGRADED", "closed": False} and len(calls) == n_calls + 1
