@@ -233,7 +233,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 320500 -> 321400 (merge of the moved target into the plan-review branch, measured 321261): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
     # 321400 -> 321600 (measured 321394): the closure sentence names the CONFIGURED enforcement against the hurry-projected advisory.
-    "docs/architecture/06-agent-core.md": 321600,
+    # 321600 -> 321800 (measured 321594): the unanswered-slot floor names the terminal-absence rule and the lineage walk.
+    "docs/architecture/06-agent-core.md": 321800,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route

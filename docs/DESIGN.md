@@ -609,7 +609,8 @@ not child-task cards and never prove execution by themselves.
   the setting (`Reviewers ordered weaker than your setting: s1 low (setting
   xhigh)`), at desktop and phone width alike; the verdict token is never
   recoloured for it. A seat that did not answer a same-spec cycle adds `· did
-  not answer; its earlier finding is still listed` to its unavailable row.
+  not answer; its earlier finding is still listed` to its unavailable row (a
+  never-sent seat: `· not sent; its earlier finding is still listed`).
 - An awaited or unresolved reviewer row adds `· since HH:MM` in the viewer's
   local 24-hour clock, prefixed with the short date when the wait began on an
   earlier day, only where the host recorded the moment it sent that reviewer's

@@ -287,6 +287,8 @@ def in_flight_resume_inputs(
         from ouroboros.task_results import plan_review_wave
 
         previous = plan_review_wave(state, previous_fingerprint)
+        if previous is not None and previous.get("cycle_index") == existing.get("cycle_index"):
+            previous = None  # the hot index already holds THIS wave under that fingerprint: never its own predecessor
         if previous is not None:
             try:
                 previous = authority_wave(state_root, task_id, previous)
@@ -748,3 +750,46 @@ def current_author_plan(drive_root: Any, task_id: str, state: dict) -> Optional[
         return {**value, "author_disposition": author, "review_fingerprint": subject["review_fingerprint"]}
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise PlanReviewSourceUnavailable(f"PLAN_AUTHOR_SOURCE_UNAVAILABLE: {exc}") from exc
+
+
+def row_pending(row: Dict[str, Any]) -> bool:
+    """A reviewer row whose answer has not arrived (awaiting, in flight, late-pending): never a terminal absence."""
+    return not row.get("ok") and (bool(row.get("late_result_pending")) or str(row.get("operation_state") or "settled") in (
+        "pending_dispatch", "in_flight", "custody_lost"))
+
+
+def standing_findings_lineage(state_root: Any, task_id: str, state: Dict[str, Any], previous: Optional[dict],
+                              spec: dict, enforcement: str, *, depth: int = 8) -> Dict[str, list]:
+    """Per-seat standing findings across the same-spec lineage. A seat still pending when its
+    wave was superseded gave no terminal answer there, so its obligation comes from the wave
+    before (exact predecessor by pointer, else the hot index, never the wave itself), until a
+    real answer, a closed predecessor or a changed spec ends it."""
+    from ouroboros.tools import plan_spec
+
+    standing = plan_spec.plan_standing_findings(previous, spec, enforcement)
+    wave, steps = previous, 0
+    while isinstance(wave, dict) and steps < depth and not wave.get("closed"):
+        pending = {str(r.get("slot_id") or "") for r in wave.get("actors") or [] if isinstance(r, dict) and row_pending(r)}
+        pending -= set(standing)
+        if not pending:
+            break
+        ref = wave.get("previous_wave_artifact") if isinstance(wave.get("previous_wave_artifact"), dict) else {}
+        earlier = None
+        if ref:
+            try:
+                earlier = read_wave(state_root, task_id, ref)
+            except (OSError, ValueError, json.JSONDecodeError):
+                break
+        elif wave.get("previous_fingerprint"):
+            from ouroboros.task_results import plan_review_wave
+
+            earlier = plan_review_wave(state, str(wave["previous_fingerprint"]))
+            if earlier is not None and earlier.get("cycle_index") == wave.get("cycle_index"):
+                earlier = None
+        if not isinstance(earlier, dict) or not isinstance(earlier.get("spec"), dict) or str(
+                earlier.get("spec_hash") or plan_spec.spec_hash(earlier["spec"])) != plan_spec.spec_hash(spec):
+            break
+        step = plan_spec.plan_standing_findings(earlier, spec, enforcement)
+        standing.update({sid: step[sid] for sid in pending if sid in step})
+        wave, steps = earlier, steps + 1
+    return standing

@@ -84,6 +84,7 @@ from ouroboros.tools.plan_spec import plan_fingerprint as _plan_fingerprint
 from ouroboros.tools.plan_evidence import task_evidence_reader as _task_evidence_reader
 from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs
 from ouroboros.tools.plan_review_artifacts import (
+    standing_findings_lineage as _standing_findings_lineage,
     PlanReviewSourceUnavailable,
     attach_continuation_restart_delta as _attach_continuation_restart_delta,
     authority_wave as _authority_wave,
@@ -829,8 +830,13 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         quorum=quorum, configured_slots=configured_slots,
         health_evidence=health_evidence, reviewer_effort=request.reviewer_effort,
         dispositions=list((existing or {}).get("dispositions") or []) if resume_in_flight else None,
-        owner_efforts=owner_efforts, standing=plan_spec.plan_standing_findings(previous, spec, enforcement),
+        owner_efforts=owner_efforts,
+        standing=_standing_findings_lineage(state_root, task_id, state, previous, spec, enforcement),
     )
+    # The predecessor this dispatch judged against stays reachable by its exact artifact even
+    # after a same-fingerprint re-dispatch replaces it in the hot index (kept on resume).
+    wave["previous_wave_artifact"] = dict((existing or {}).get("previous_wave_artifact") or {}) if resume_in_flight else dict(
+        (previous or {}).get("wave_artifact") or (plan_review_wave(state, str((previous or {}).get("request_fingerprint") or "")) or {}).get("wave_artifact") or {})
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,

@@ -885,9 +885,9 @@ def test_a_reject_closed_predecessor_carries_nothing_on_a_later_same_spec_wave(h
     fp = _state(harness)["waves"][-1]["request_fingerprint"]
     closed = _collect(ctx, fp, items=[{"finding_id": "s1:n1", "decision": "reject", "rationale": "Friday is a hard date"}])
     assert _control(closed) == {"outcome": "GREEN", "closed": True}
-    sub.answers = {"s1": "", "s2": CLEAN, "s3": CLEAN}
-    later = _call(ctx, reviewer_effort="max")
-    assert _control(later) == {"outcome": "GREEN", "closed": True}
+    sub.answers = {"s1": "", "s2": CLEAN, "s3": CLEAN}  # a prose revision: a new fingerprint on the same spec
+    later = _call(ctx, plan="Outline first, then draft each slide, then rehearse.", reviewer_effort="max")
+    assert _control(later) == {"outcome": "GREEN", "closed": True} and len(sub.calls) == 2
     assert not any(f.get("carried_absent_answer") for f in _state(harness)["waves"][-1]["findings"])
 
 
