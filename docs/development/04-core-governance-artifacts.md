@@ -132,13 +132,19 @@ in `tests/test_loop_misc.py`.
 
 ### Invariant: Compaction must earn its rewrite
 
-Helper compaction is deficit-driven: checkpoint the exact actor-visible source
-before summarizing, then publish only completely covered, bound units with
-provenance and a strictly smaller ContextFit size (same image proxy/density).
-Only typed summarizer overflow may split sources; capsules retain the original
-provenance union. No-positive-reclaim and route+round rules belong to ARCHITECTURE
-§6 "Context fitting, retry, and compaction"; the materializer adds no threshold,
-timer, route or retry policy.
+Helper compaction is deficit-triggered and low-water-sized: a positive deficit
+against the binding boundary (the smaller known of owner target and route
+capacity) requests at most one pass per route+round, sized deficit plus
+ceil(boundary / `context_budget.RECLAIM_LOW_WATER_DIVISOR`) — a structural
+constant pinned by `tests/test_context_budget_ssot.py`, not a setting — so the pass lands
+below the boundary rather than at it; requested margin and achieved headroom are
+separate checkpoint facts, never conflated. The materializer then checkpoints the
+exact actor-visible source before summarizing and publishes only completely
+covered, bound units with provenance and a strictly smaller ContextFit size (same
+image proxy/density). Only typed summarizer overflow may split sources; capsules
+retain the original provenance union. Trigger, sizing and route+round rules
+belong to ARCHITECTURE §6 "Context fitting, retry, and compaction"; the
+materializer adds no threshold, timer, route or retry policy.
 
 Authored views reuse that custody but follow the actor's note/source selection,
 so need not shrink. Preserve complete units, owner/new tail and schema residency;

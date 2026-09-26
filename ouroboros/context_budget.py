@@ -36,6 +36,24 @@ OWNER_LOW_TARGET_TOKENS = 200_000
 OWNER_NANO_TARGET_TOKENS = 81_920
 NANO_MIN_HEADROOM_TOKENS = 8_192
 
+# Low-water sizing of the automatic context-reclaim pass. The TRIGGER is
+# unchanged: a positive deficit against the binding boundary (the smaller known
+# of the owner target T and the route capacity W), one pass per route+round.
+# Only the SIZE of the requested pass changes: goal = deficit +
+# ceil(boundary / RECLAIM_LOW_WATER_DIVISOR), and 0 without a deficit. A pass
+# sized to the deficit alone lands exactly AT the boundary, so the next round's
+# ordinary growth re-arms it (a summarizer pass nearly every round). Sized this
+# way it lands about an eighth of the boundary below (~125K tokens on a 1M
+# route, ~25K under the 200K Low target), so the next pass needs that much real
+# growth. Structural constant, not a setting: 8 (12.5 % of the boundary) is a
+# disclosed design choice, not a measured optimum; change it here and only here
+# (tests/test_context_budget_ssot.py pins it). Cost: older history is condensed
+# sooner and each summarizer pass is larger. The materializer, its receipts and
+# the route+round latch are unchanged; the checkpoint event records requested
+# margin versus achieved headroom (context_fit.measure_main_fit,
+# loop_model_call._run_main_reclaim).
+RECLAIM_LOW_WATER_DIVISOR = 8
+
 # One overflow vocabulary for every seam that must recognize a CONTEXT-WINDOW
 # overflow (Main provider-code precedence, the local transport, and the
 # summarizer split path). A provider code or message shape added here reaches

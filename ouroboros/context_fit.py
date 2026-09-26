@@ -200,6 +200,9 @@ class MainFitMeasurement:
     target_deficit_tokens: Optional[int]
     capacity_deficit_tokens: Optional[int]
     reclaim_goal_tokens: int
+    # Low-water margin the goal carries ABOVE the deficit (0 without a deficit):
+    # the pass is deficit-triggered but sized to land below the boundary.
+    low_water_margin_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -559,6 +562,22 @@ def _route_calibration_ratio(
         return 1.0
 
 
+def reclaim_low_water_margin(
+    target_total_tokens: Optional[int], capacity_total_tokens: Optional[int],
+) -> int:
+    """Tokens a reclaim pass lands BELOW the binding boundary: ceil(boundary / divisor).
+
+    The boundary is the smaller known positive one of owner target T and route
+    capacity W; 0 when neither is known. The divisor is read at call time so
+    the SSOT constant stays the one place to change it.
+    """
+    from ouroboros.context_budget import RECLAIM_LOW_WATER_DIVISOR
+
+    known = [int(value) for value in (target_total_tokens, capacity_total_tokens)
+             if value is not None and int(value) > 0]
+    return int(math.ceil(min(known) / RECLAIM_LOW_WATER_DIVISOR)) if known else 0
+
+
 def measure_main_fit(
     plan: ContextFitPlan,
     messages: List[Dict[str, Any]],
@@ -575,6 +594,9 @@ def measure_main_fit(
 
     ``drive_root=None`` reads density from the canonical host evidence root
     (one observation store) — a child task's own drive must not be consulted.
+    A positive deficit triggers at most one reclaim pass per route+round; the
+    requested goal is deficit + ``reclaim_low_water_margin`` so the pass lands
+    below the boundary instead of exactly at it (``RECLAIM_LOW_WATER_DIVISOR``).
     """
     from ouroboros.capability_evidence import (
         canonical_evidence_root, is_known, resolve_main_token_density,
@@ -598,10 +620,12 @@ def measure_main_fit(
     capacity = int(plan.window_tokens or 0) if is_known(plan, require_fresh=True) else None
     target_deficit = max(0, total - target) if target is not None else None
     capacity_deficit = max(0, total - capacity) if capacity is not None else None
-    goal = max(
+    deficit = max(
         [value for value in (target_deficit, capacity_deficit) if value is not None]
         or [0]
     )
+    margin = reclaim_low_water_margin(target, capacity) if deficit > 0 else 0
+    goal = deficit + margin
     measurement = MainFitMeasurement(
         route_fp=str(plan.route_fp or ""),
         round_id=str(round_id or ""),
@@ -616,6 +640,7 @@ def measure_main_fit(
         target_deficit_tokens=target_deficit,
         capacity_deficit_tokens=capacity_deficit,
         reclaim_goal_tokens=goal,
+        low_water_margin_tokens=margin,
     )
     if goal > 0 and not automatic_pass_used:
         action: Literal["send", "reclaim_once", "send_target_miss"] = "reclaim_once"

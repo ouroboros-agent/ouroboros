@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 from ouroboros.outcomes import normalize_outcome_axes
+from ouroboros.runtime_limits import NESTED_SETTLEMENT_MARGIN_SEC
 from ouroboros.task_results import (
     STATUS_COMPLETED,
     STATUS_REJECTED_DUPLICATE,
@@ -505,18 +506,15 @@ def cache_horizon_note(ctx: Any, elapsed_sec: Any) -> str:
     (batch waits, longer single windows), while "~X tokens will re-write" is a
     counterfactual — the next send may reroute, compact, or still hit a live cache.
 
-    REACHABILITY, honestly (each wait tool clamps its own window, so "all three
-    wait tools carry the line" is a capability, not a per-configuration promise):
-    at the shipped default TTL ``1h`` (3600s horizon) only ``wait_tasks`` (7200s
-    clamp) can genuinely emit it; ``wait_task`` clamps at exactly 3600s and can
-    only cross by a poll overshoot of a couple of seconds, and ``delegate_wait``
-    clamps its WINDOW at ``config.DELEGATE_WAIT_WINDOW_MAX_SEC`` (1800s; the
-    2100s ToolEntry ceiling above it is the kill timeout, not the window — F5)
-    and cannot cross at all.
-    At ``5m`` all three emit it. Pinned by
-    tests/test_cache_optimization.py::test_cache_horizon_reachability_matches_the_wait_clamps —
-    the call sites stay on all three because the tier is an owner setting, not a
-    constant, and a wait tool that silently could not disclose would be worse.
+    REACHABILITY, honestly: the root waits (``wait_task``, ``wait_tasks``) feed
+    their own elapsed window, a LOWER bound on cache age, so at the shipped ``1h``
+    tier only ``wait_tasks`` (7200s ceiling) can cross inside the window and
+    ``wait_task`` sits on the 3600s horizon; at ``5m`` both cross. ``delegate_wait``
+    feeds the time since the task's last recorded model response, once per wake, so
+    its line is reachable at ANY tier and no longer depends on the 3 s tick. Pinned by
+    tests/test_cache_optimization.py::test_cache_horizon_reachability_matches_the_wait_clamps
+    and the supervising-wake tests; the tier is an owner setting, not a constant, and
+    a wait tool that silently could not disclose would be worse.
     """
     try:
         elapsed = float(elapsed_sec)
@@ -532,8 +530,8 @@ def cache_horizon_note(ctx: Any, elapsed_sec: Any) -> str:
     if horizon is None or elapsed <= horizon:
         return ""
     return (
-        f"⚠️ configured prompt-cache horizon ({applied_ttl}, {horizon}s) elapsed during "
-        f"this wait ({elapsed:.0f}s); the next model send may be cold."
+        f"⚠️ configured prompt-cache horizon ({applied_ttl}, {horizon}s) elapsed since the "
+        f"last model response ({elapsed:.0f}s ago); the next model send may be cold."
     )
 
 
@@ -557,9 +555,11 @@ def _wait_for_task(
             text=f"⚠️ TOOL_ARG_ERROR (wait_task): {exc}",
         ))
     try:
-        timeout = max(0, min(int(timeout_sec), 3600))
+        requested = int(timeout_sec)
     except (TypeError, ValueError):
-        timeout = 180
+        requested = 180
+    timeout, bound = _wait_window(ctx, requested, clamp=_WAIT_TASK_CLAMP_SEC, minimum=0,
+                                  margin=NESTED_SETTLEMENT_MARGIN_SEC)
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     waited = wait_for_effective_tasks(
@@ -588,9 +588,107 @@ def _wait_for_task(
     horizon_note = cache_horizon_note(ctx, waited.get("elapsed_sec"))
     if horizon_note:
         extra += f"\n\n{horizon_note}"
-    result = (_get_task_result(ctx, tid, known_result_sha256=known_result_sha256)
-              if known_result_sha256 else _get_task_result(ctx, tid))
+    if bound != "requested":
+        window = {"requested_sec": requested, "window_sec": timeout, "window_bound": bound}
+        extra += f"\n\n[WAIT_WINDOW] {json.dumps(window)}"
+    tasks = waited.get("tasks") if isinstance(waited.get("tasks"), dict) else {}
+    result = _unsettled_wait_body(status_drive_root, tid, tasks.get(tid), known_result_sha256)
+    if not result:
+        result = (_get_task_result(ctx, tid, known_result_sha256=known_result_sha256)
+                  if known_result_sha256 else _get_task_result(ctx, tid))
     return f"{header} after {waited.get('elapsed_sec', 0):.1f}s.{extra}\n\n{result}"
+
+
+def _unsettled_wait_body(drive_root: Path, tid: str, data: Any, known_result_sha256: str) -> str:
+    """The compact body of a wait_task that returned BEFORE the child settled
+    (timeout, mailbox interrupt, attention beacon), or ``""`` when the full
+    single-child handoff is due: a settled child, an unknown or admission-pending
+    id, or a caller whose ``known_result_sha256`` no longer matches (the result
+    changed, so it gets the full body). The ``Task <id> [<status>]`` header of
+    the full read is kept; the full envelope stays one get_task_result away."""
+    from ouroboros.routing_wait import is_emitted_admission_stub
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    if not isinstance(data, dict) or not data or is_emitted_admission_stub(data):
+        return ""
+    status = data.get("status", "unknown")
+    if str(status or "").strip().lower() in SETTLED_STATUSES:
+        return ""
+    sha = _child_result_sha256(data)
+    if known_result_sha256 and known_result_sha256 != sha:
+        return ""
+    projection = _compact_child_projection(tid, data, known_result_sha256 or None)
+    projection["delegated_runs"] = _delegated_run_facts(drive_root, projection["task_id"])
+    return (
+        f"Task {tid} [{status}]\nchild_result_sha256={sha}\n\n[CHILD_PROJECTION]\n"
+        f"{json.dumps(projection, ensure_ascii=False, indent=2, default=str)}\n[/CHILD_PROJECTION]\n"
+        f"Compact projection of an unsettled child; get_task_result({tid}) returns the full envelope."
+    )
+
+
+def _age_sec(stamp: Any, now: float) -> Any:
+    from datetime import datetime
+
+    try:
+        return round(now - datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp(), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _delegated_run_facts(drive_root: Path, child_id: str) -> Any:
+    """The child's own open delegated runs, as DATED facts read once per result.
+
+    Rows come from delegate custody (``open_runs`` + ``run_timing``; review-owned
+    runs belong to their panel, as in ``prepare_handoff``). The child's supervision
+    record (``state/delegate_supervision/<child>.json``) is read ONCE, after the
+    wait, with no handle kept and no retry loop: a missing, unreadable or racing
+    file (Windows ``os.replace``) is the fact ``unknown``. Its facts attach only to
+    the run it names. Ages are facts; there is no threshold and no liveness verdict.
+    """
+    from ouroboros import delegate_custody as custody
+
+    try:
+        runs = [run for run in custody.open_runs(drive_root)
+                if run.task_id == child_id and not run.review_owned]
+    except Exception:
+        return {"state": "unknown", "reason": "custody_unreadable"}
+    if not runs:
+        return []
+    record: Any = None
+    try:
+        path = Path(drive_root) / "state" / "delegate_supervision" / f"{child_id}.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        reason = "" if isinstance(record, dict) else "unreadable"
+    except FileNotFoundError:
+        reason = "no_supervision_record"
+    except (OSError, ValueError):
+        reason = "unreadable"
+    now = time.time()
+    rows: List[Dict[str, Any]] = []
+    for run in runs:
+        started_at, max_seconds = custody.run_timing(drive_root, run.run_id)
+        row: Dict[str, Any] = {"run_id": run.run_id, "started_at": started_at or "unknown",
+                               "age_sec": _age_sec(started_at, now), "max_seconds": max_seconds or None}
+        if reason:
+            row["supervision"] = {"state": "unknown", "reason": reason}
+        elif str(record.get("run_id") or "") != run.run_id:
+            row["supervision"] = {"state": "unknown", "reason": "record_names_another_run"}
+        else:
+            observation = record.get("observation") if isinstance(record.get("observation"), dict) else None
+            entry = record.get("sleep_entry") if isinstance(record.get("sleep_entry"), dict) else {}
+            last = str(record.get("last_answered_observation_at") or "")
+            row["supervision"] = {
+                "hold_entered_at": str(entry.get("entered_at") or "unknown"),
+                "last_answered_observation_at": last or "unknown",
+                "observation_age_sec": _age_sec(last, now) if last else None,
+                "observed_run_state": str((observation or {}).get("run_state") or "unknown"),
+                "observation_failure": (
+                    "unknown" if observation is None else "" if observation.get("answered")
+                    else str(observation.get("reason") or observation.get("status") or "unanswered")),
+                "journal_cursor": record.get("journal_cursor"),
+            }
+        rows.append(row)
+    return rows
 
 
 _AWAIT_MESSAGES_POLL_SEC = 2.0
@@ -600,29 +698,34 @@ _AWAIT_MESSAGES_NOTE = (
 )
 
 
-def _await_messages_window(ctx: ToolContext, requested: int) -> tuple[int, str]:
-    """The wait window in seconds and the bound that set it.
+def _wait_window(
+    ctx: Any, requested: int, *, clamp: int, minimum: int, margin: int,
+) -> tuple[int, str]:
+    """The wait window in seconds and the bound that set it — ONE ladder for
+    ``wait_task``, ``wait_tasks`` and ``await_messages``.
 
-    ``requested`` is clamped to [1, per-call timeout ceiling]. Under a task deadline
-    the window also stops one second short of the emit window (remaining minus the
-    finalization reserve) that ``_deadline_clamped_timeout`` gives the executor's
-    kill timer, so the tool returns cleanly instead of being timed out mid-sleep;
-    a spent emit window is a zero-second window (one peek, then return).
+    ``requested`` is clamped to [``minimum``, ``clamp``]. Under a task deadline the
+    window also stops ``margin`` seconds short of the emit window (remaining minus
+    the finalization reserve, subtracted ONCE) that ``_deadline_clamped_timeout``
+    gives the executor's kill timer, so the tool returns and builds its result
+    instead of being timed out mid-sleep; a spent emit window is a zero-second
+    window (one peek, then return). Without a deadline the kill timer is at least
+    the tool's entry timeout, which each caller keeps at ``clamp + margin`` or
+    more. Inside the finalization reserve the executor's 1 s floor stays the
+    bounded exit.
     """
-    from ouroboros.config import get_per_call_timeout_ceiling_sec
     from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
     from ouroboros.task_pacing import effective_finalization_reserve_sec
 
-    ceiling = int(get_per_call_timeout_ceiling_sec())
-    if requested < 1:
-        window, bound = 1, "minimum"
-    elif requested > ceiling:
-        window, bound = ceiling, "ceiling"
+    if requested < minimum:
+        window, bound = minimum, "minimum"
+    elif requested > clamp:
+        window, bound = clamp, "ceiling"
     else:
         window, bound = requested, "requested"
     if has_deadline(ctx):
         emit_window = deadline_remaining_sec(ctx) - effective_finalization_reserve_sec(ctx)
-        deadline_window = max(0, int(emit_window) - 1)
+        deadline_window = max(0, int(emit_window) - margin)
         if deadline_window < window:
             window, bound = deadline_window, "deadline"
     return window, bound
@@ -633,7 +736,7 @@ def _await_messages(ctx: ToolContext, timeout_sec: int) -> str:
     window elapses. Delivers nothing: the round-top drain owns delivery and
     acknowledgement, exactly as after a wait_task early return. An owner Stop
     is a mailbox control, so it ends the wait like any message; a cancel kills
-    the worker process; the window is bounded by ``_await_messages_window``.
+    the worker process; the window is bounded by ``_wait_window``.
 
     Idle rail, honestly: the supervisor stamps ``last_progress_at`` on completed
     model rounds, on narration and, when a tool's typed lease closes, on the
@@ -660,7 +763,10 @@ def _await_messages(ctx: ToolContext, timeout_sec: int) -> str:
             status="error", code="TOOL_ARG_ERROR",
             text="⚠️ TOOL_ARG_ERROR (await_messages): timeout_sec must be an integer number of seconds.",
         ))
-    window, bound = _await_messages_window(ctx, requested)
+    from ouroboros.config import get_per_call_timeout_ceiling_sec
+
+    window, bound = _wait_window(ctx, requested, clamp=int(get_per_call_timeout_ceiling_sec()),
+                                 minimum=1, margin=1)
     peek = OwnerMailboxPeek()
     drive_root = getattr(ctx, "drive_root", None)
     task_id = str(getattr(ctx, "task_id", "") or "")
@@ -714,7 +820,7 @@ def await_messages_entry() -> ToolEntry:
             "off you and its completion counts as progress, so your next round starts inside a "
             "full idle window — call again to keep waiting. It delivers nothing itself: the message "
             "reaches you at the next round top, exactly as after a wait_task early return. The "
-            "result says when the applied prompt-cache horizon elapsed during the wait."
+            "result says when the applied prompt-cache horizon elapsed since the last model response."
         ),
         "parameters": {"type": "object", "required": ["timeout_sec"], "properties": {
             "timeout_sec": {"type": "integer", "description":
@@ -750,11 +856,9 @@ def _count_live_sibling_children(ctx: ToolContext, status_drive_root: Path, *, e
 
 
 _UNMINTED_WAIT_GRACE_SEC = 30.0
-# The wait ceilings as READABLE facts, for the tool schemas and the expiry
-# disclosure. The literals stay inside ``min(int(timeout_sec), N)`` below —
-# test_cache_optimization scrapes the clamp out of the function source and a
-# named constant there would leave it nothing to find; the test beside it
-# asserts the two spellings agree.
+# The wait ceilings, read by the tool schemas, the expiry disclosure and the one
+# ``_wait_window`` ladder. Each ToolEntry kill timeout stays at least ceiling +
+# NESTED_SETTLEMENT_MARGIN_SEC, so a full window ends inside its executor bound.
 _WAIT_TASK_CLAMP_SEC = 3600
 _WAIT_TASKS_CLAMP_SEC = 7200
 
@@ -849,6 +953,93 @@ def _children_roster_projection(
     )
 
 
+def _compact_child_projection(tid: str, data: Dict[str, Any], known_hash: Any) -> Dict[str, Any]:
+    """ONE compact per-child field list, shared by the batch wait and an unsettled
+    single wait: the semantic handoff, never the forensics of the full envelope."""
+    from ouroboros.cost_projection import cost_projection
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    # SSOT cost projection (C2/ABI-3): honest null (never a
+    # confirmed-looking $0), the honest name only, and finality
+    # only when the child's own record claims it.
+    _cost = cost_projection(data)
+    projected: Dict[str, Any] = {
+        "task_id": str(data.get("task_id") or data.get("id") or tid),
+        "status": data.get("status"),
+        "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
+        "cost_final": _cost["cost_final"],
+        "child_result_sha256": _child_result_sha256(data),
+        "outcome_axes": normalize_outcome_axes(data),
+        "result": data.get("result"),
+        "trace_summary": data.get("trace_summary"),
+    }
+    # The result hash binds this limitation too; keep its host authorship
+    # separate from the unchanged model answer, including an empty answer.
+    from ouroboros.task_finalization import terminal_host_notice_text
+
+    notice = terminal_host_notice_text(data)
+    if notice:
+        projected["terminal_host_notice"] = notice
+    if data.get("duplicate_of"):
+        projected["duplicate_of"] = str(data.get("duplicate_of"))
+    # A capability reduction is a SEMANTIC handoff fact, not forensics: it is
+    # what decides how far to trust this answer, and this is the surface a
+    # fan-out parent absorbs its children through. Same predicate as the
+    # single-child read, so the batch and the singleton cannot disagree.
+    _delta = disclosable_capability_delta(data)
+    if _delta:
+        projected["capability_delta"] = _delta
+    # Delegation honesty (Q1A, 2026-08-10 amendments): whether a
+    # harness-dispatched child ACTUALLY delegated is a handoff fact the
+    # fan-out parent absorbs here — the e9108a09 incident hid nine
+    # native-only "harness" children behind this very projection.
+    # Compact counts only; the full evidence stays in the envelope.
+    _envelope = data.get("subagent_envelope") if isinstance(data.get("subagent_envelope"), dict) else {}
+    _evidence = _envelope.get("execution_evidence") if isinstance(_envelope.get("execution_evidence"), dict) else {}
+    if _evidence or str(data.get("effective_executor") or "") == "harness":
+        _ee: Dict[str, Any] = {
+            "dispatch_executor": str(data.get("effective_executor") or ""),
+        }
+        if _evidence.get("evidence_read_failed"):
+            # Unreadable custody log (v6.94.0 landing-gate scope fix):
+            # the counts are UNKNOWN — emitting them as 0 beside the
+            # marker fabricated a "no runs" receipt for a log that was
+            # never read. The compact projection carries ONLY the typed
+            # marker; counts AND the substrate claim are omitted, the
+            # same omission rule subagents.envelope_from_task applies.
+            _ee["evidence_read_failed"] = True
+        else:
+            if _evidence:
+                # Counts only when the envelope actually attested them:
+                # a result with no evidence recorded (pre-6.94) gets NO
+                # zero counts — absence means "no evidence yet", not
+                # "no runs".
+                _ee["delegated_runs_started"] = int(_evidence.get("delegated_runs_started") or 0)
+                _ee["delegated_runs_settled"] = int(_evidence.get("delegated_runs_settled") or 0)
+                _ee["delegated_runs_succeeded"] = int(_evidence.get("delegated_runs_succeeded") or 0)
+                _ee["delegated_runs_failed"] = int(_evidence.get("delegated_runs_failed") or 0)
+                _ee["delegated_runs_source_unresolved"] = int(
+                    _evidence.get("delegated_runs_source_unresolved") or 0
+                )
+            # The substrate claim rides only when the envelope made one.
+            _substrate = str(data.get("actual_substrate") or _envelope.get("actual_substrate") or "")
+            if _substrate:
+                _ee["actual_substrate"] = _substrate
+                # C3: counters are delegated-run facts; the native
+                # (metered) contribution beside them is unknown.
+                _ee["native_contribution"] = "unknown"
+        projected["execution_evidence"] = _ee
+    unchanged = (_unchanged_result_reference(str(tid), projected["child_result_sha256"], known_hash)
+                 if data else {})
+    if isinstance(data.get("cancel_origin"), dict):
+        projected["cancel_origin"] = data["cancel_origin"]
+    if unchanged:
+        projected.pop("result", None)
+        projected.pop("trace_summary", None)
+        projected.update(unchanged)
+    return projected
+
+
 def _wait_for_tasks(
     ctx: ToolContext,
     task_ids: List[str],
@@ -868,7 +1059,6 @@ def _wait_for_tasks(
             text="⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids must be a non-empty list.",
         ))
     from ouroboros.config import MAX_ACTIVE_SUBAGENTS_HARD_CAP
-    from ouroboros.cost_projection import cost_projection
 
     if len(task_ids) > MAX_ACTIVE_SUBAGENTS_HARD_CAP:
         return _publish_tool_result(ctx, ToolResult(
@@ -894,9 +1084,10 @@ def _wait_for_tasks(
         # reports the ceiling as the asked-for window hides the very fact the
         # model needs, that its request was cut down.
         requested_timeout = float(max(0, int(timeout_sec)))
-        timeout = max(0, min(int(timeout_sec), 7200))
     except (TypeError, ValueError):
-        requested_timeout, timeout = 600.0, 600
+        requested_timeout = 600.0
+    timeout, bound = _wait_window(ctx, int(requested_timeout), clamp=_WAIT_TASKS_CLAMP_SEC, minimum=0,
+                                  margin=NESTED_SETTLEMENT_MARGIN_SEC)
     normalized_mode = str(mode or "all_terminal").strip().lower()
     if normalized_mode not in {"all_terminal", "any_terminal"}:
         return _publish_tool_result(ctx, ToolResult(
@@ -951,8 +1142,6 @@ def _wait_for_tasks(
             }
     tasks = waited.get("tasks")
     if isinstance(tasks, dict):
-        from ouroboros.tools.join_ledger import _child_result_sha256
-
         # Re-probe the entry-time unknowns once: an id minted mid-wait (queue
         # row or result appeared) is a real child, not a phantom.
         unknown_ids = [tid for tid in entry_unknown_ids if not tasks.get(tid)]
@@ -966,7 +1155,8 @@ def _wait_for_tasks(
         # stays on disk in task_results/<id>.json, addressable by
         # child_result_sha256 (the join-ledger SSOT hash), and is fetched with
         # get_task_result — a DISCLOSED omission (BIBLE P1), not silent
-        # truncation. Single-task wait_task/get_task_result stay full.
+        # truncation. get_task_result and a SETTLED wait_task stay full; an
+        # unsettled wait_task returns this same projection.
         public_tasks: Dict[str, Any] = {}
         for tid, data in tasks.items():
             if str(tid) in unknown_ids:
@@ -986,85 +1176,9 @@ def _wait_for_tasks(
             if not isinstance(data, dict):
                 public_tasks[str(tid)] = data
                 continue
-            # SSOT cost projection (C2/ABI-3): honest null (never a
-            # confirmed-looking $0), the honest name only, and finality
-            # only when the child's own record claims it.
-            _cost = cost_projection(data)
-            projected: Dict[str, Any] = {
-                "task_id": str(data.get("task_id") or data.get("id") or tid),
-                "status": data.get("status"),
-                "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
-                "cost_final": _cost["cost_final"],
-                "child_result_sha256": _child_result_sha256(data),
-                "outcome_axes": normalize_outcome_axes(data),
-                "result": data.get("result"),
-                "trace_summary": data.get("trace_summary"),
-            }
-            # The result hash binds this limitation too; keep its host authorship
-            # separate from the unchanged model answer, including an empty answer.
-            from ouroboros.task_finalization import terminal_host_notice_text
-
-            notice = terminal_host_notice_text(data)
-            if notice:
-                projected["terminal_host_notice"] = notice
-            if data.get("duplicate_of"):
-                projected["duplicate_of"] = str(data.get("duplicate_of"))
-            # A capability reduction is a SEMANTIC handoff fact, not forensics: it is
-            # what decides how far to trust this answer, and this is the surface a
-            # fan-out parent absorbs its children through. Same predicate as the
-            # single-child read, so the batch and the singleton cannot disagree.
-            _delta = disclosable_capability_delta(data)
-            if _delta:
-                projected["capability_delta"] = _delta
-            # Delegation honesty (Q1A, 2026-08-10 amendments): whether a
-            # harness-dispatched child ACTUALLY delegated is a handoff fact the
-            # fan-out parent absorbs here — the e9108a09 incident hid nine
-            # native-only "harness" children behind this very projection.
-            # Compact counts only; the full evidence stays in the envelope.
-            _envelope = data.get("subagent_envelope") if isinstance(data.get("subagent_envelope"), dict) else {}
-            _evidence = _envelope.get("execution_evidence") if isinstance(_envelope.get("execution_evidence"), dict) else {}
-            if _evidence or str(data.get("effective_executor") or "") == "harness":
-                _ee: Dict[str, Any] = {
-                    "dispatch_executor": str(data.get("effective_executor") or ""),
-                }
-                if _evidence.get("evidence_read_failed"):
-                    # Unreadable custody log (v6.94.0 landing-gate scope fix):
-                    # the counts are UNKNOWN — emitting them as 0 beside the
-                    # marker fabricated a "no runs" receipt for a log that was
-                    # never read. The compact projection carries ONLY the typed
-                    # marker; counts AND the substrate claim are omitted, the
-                    # same omission rule subagents.envelope_from_task applies.
-                    _ee["evidence_read_failed"] = True
-                else:
-                    if _evidence:
-                        # Counts only when the envelope actually attested them:
-                        # a result with no evidence recorded (pre-6.94) gets NO
-                        # zero counts — absence means "no evidence yet", not
-                        # "no runs".
-                        _ee["delegated_runs_started"] = int(_evidence.get("delegated_runs_started") or 0)
-                        _ee["delegated_runs_settled"] = int(_evidence.get("delegated_runs_settled") or 0)
-                        _ee["delegated_runs_succeeded"] = int(_evidence.get("delegated_runs_succeeded") or 0)
-                        _ee["delegated_runs_failed"] = int(_evidence.get("delegated_runs_failed") or 0)
-                        _ee["delegated_runs_source_unresolved"] = int(
-                            _evidence.get("delegated_runs_source_unresolved") or 0
-                        )
-                    # The substrate claim rides only when the envelope made one.
-                    _substrate = str(data.get("actual_substrate") or _envelope.get("actual_substrate") or "")
-                    if _substrate:
-                        _ee["actual_substrate"] = _substrate
-                        # C3: counters are delegated-run facts; the native
-                        # (metered) contribution beside them is unknown.
-                        _ee["native_contribution"] = "unknown"
-                projected["execution_evidence"] = _ee
             known = (known_result_sha256_by_task.get(str(tid))
                      if isinstance(known_result_sha256_by_task, dict) else None)
-            unchanged = (_unchanged_result_reference(str(tid), projected["child_result_sha256"], known)
-                         if data else {})
-            if unchanged:
-                projected.pop("result", None)
-                projected.pop("trace_summary", None)
-                projected.update(unchanged)
-            public_tasks[str(tid)] = projected
+            public_tasks[str(tid)] = _compact_child_projection(str(tid), data, known)
         waited["tasks"] = public_tasks
         waited["tasks_note"] = (
             "Compact per-child projection. The full result envelope (trace_refs, "
@@ -1101,6 +1215,8 @@ def _wait_for_tasks(
                 "max_timeout_sec": float(_WAIT_TASKS_CLAMP_SEC),
                 "live_task_ids": live_ids,
             }
+    if bound != "requested":
+        waited["window_sec"], waited["window_bound"] = float(timeout), bound
     if note := _wait_early_return_note(waited.get("early_return")):
         waited["early_return_note"] = note
     horizon_note = cache_horizon_note(ctx, waited.get("elapsed_sec"))

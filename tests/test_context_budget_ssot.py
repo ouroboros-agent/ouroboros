@@ -24,6 +24,25 @@ def test_agent_context_budget_values_pinned():
     assert cb.MAX_RECENT_CHAT_TAIL == 1000
     assert cb.CHAT_ARCHIVE_SCAN_WARN_BYTES == 100_000_000
     assert not hasattr(cb, "CONTEXT_SOFT_CAP_TOKENS")
+    # Structural low-water divisor of the automatic reclaim pass (12.5 % of the
+    # binding boundary): a disclosed design choice, not a setting.
+    assert cb.RECLAIM_LOW_WATER_DIVISOR == 8
+
+
+def test_reclaim_low_water_divisor_is_one_constant_read_at_call_time(monkeypatch):
+    """CHECKLISTS item 20: the fit consumes the SSOT name (no bare literal), reads it
+    at call time so changing the one constant changes every pass, and the margin
+    is the LAST measurement field (appended; older readers stay positional-safe)."""
+    from ouroboros import context_fit
+
+    assert "RECLAIM_LOW_WATER_DIVISOR" in _src("ouroboros/context_fit.py")
+    assert "/ 8" not in inspect.getsource(context_fit.measure_main_fit)
+    assert dataclasses.fields(context_fit.MainFitMeasurement)[-1].name == "low_water_margin_tokens"
+    assert context_fit.reclaim_low_water_margin(200_000, 500_000) == 25_000  # target binds
+    assert context_fit.reclaim_low_water_margin(None, 70_000) == 8_750  # capacity alone
+    assert context_fit.reclaim_low_water_margin(None, None) == 0  # nothing known
+    monkeypatch.setattr(cb, "RECLAIM_LOW_WATER_DIVISOR", 4)
+    assert context_fit.reclaim_low_water_margin(200_000, 500_000) == 50_000
 
 
 def test_reclaim_request_and_receipt_are_exact_frozen_records():

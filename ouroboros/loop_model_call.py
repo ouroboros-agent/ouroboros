@@ -867,6 +867,29 @@ def _run_main_reclaim(
         ctx.tools._ctx.messages = ctx.messages
         _loop().seal_task_transcript(ctx.messages)
         prune_reclaim_trace_refs(ctx.tools._ctx, ctx.messages)
+    # Low-water facts: the pass is deficit-triggered but sized to land below the
+    # boundary, so the landing is re-measured on the SAME fit basis as the trigger
+    # and "reached the boundary" stays distinct from "achieved the margin"
+    # (reclaimed == deficit is AT the boundary, not below it).
+    deficit = max(int(measurement.target_deficit_tokens or 0),
+                  int(measurement.capacity_deficit_tokens or 0))
+    requested_margin = int(request.reclaim_goal_tokens) - deficit
+    landed = measurement
+    if receipt.status == "applied":
+        try:
+            remeasured = _loop()._measure_round_main_fit(ctx, automatic_pass_used=True)
+        except Exception:  # telemetry only: an unmeasurable landing must not fail the pass
+            log.debug("Post-reclaim fit measurement unavailable", exc_info=True)
+            remeasured = None
+        landed = remeasured.measurement if remeasured is not None else None
+    boundary = [value for value in (
+        landed.target_total_tokens, landed.capacity_total_tokens) if value is not None] if landed else []
+    # None = the landing could not be measured (unknown), never "not reached".
+    headroom = (min(boundary) - (landed.estimated_input_tokens + landed.response_reserve_tokens)
+                if boundary else None)
+    tool_ctx = ctx.tools._ctx
+    previous_round = getattr(tool_ctx, "_context_reclaim_last_pass_round", None)
+    tool_ctx._context_reclaim_last_pass_round = int(ctx.round_idx)
     _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "type": "context_reclaim",
         "checkpoint_kind": "context_reclaim_automatic",
@@ -878,6 +901,13 @@ def _run_main_reclaim(
         "reclaimed_tokens": receipt.reclaimed_tokens,
         "goal_reached": receipt.goal_reached,
         "checkpoint_ref": receipt.checkpoint_ref,
+        "deficit_tokens": deficit,
+        "requested_margin_tokens": requested_margin,
+        "achieved_headroom_tokens": headroom,
+        "boundary_reached": None if headroom is None else headroom >= 0,
+        "below_boundary": None if headroom is None else headroom >= max(1, requested_margin),
+        "rounds_since_previous_pass": (
+            int(ctx.round_idx) - int(previous_round) if previous_round is not None else None),
     })
     return receipt
 
@@ -997,7 +1027,15 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         return msg, cost, ctx.active_context_mode
     key = _fit_key(overflow_fit)
     if key not in _loop()._context_reclaim_passes(ctx.tools._ctx):
-        _loop()._run_main_reclaim(ctx, overflow_fit, minimum_goal_tokens=1)
+        # The provider proved the prediction short by an unknown amount: request a
+        # low-water-sized pass, never a token-sized one, so the single strict-shrink
+        # retry has real headroom (the goal already carries the margin when the
+        # measurement itself found a deficit).
+        from ouroboros.context_fit import reclaim_low_water_margin
+
+        landed = overflow_fit.measurement
+        _loop()._run_main_reclaim(ctx, overflow_fit, minimum_goal_tokens=max(
+            1, reclaim_low_water_margin(landed.target_total_tokens, landed.capacity_total_tokens)))
         overflow_fit = _measure_after_reclaim(ctx)
         if overflow_fit is None:
             return msg, cost, ctx.active_context_mode

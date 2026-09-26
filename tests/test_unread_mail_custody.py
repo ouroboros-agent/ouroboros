@@ -129,6 +129,40 @@ def test_forward_to_a_queued_task_is_read_when_it_starts_and_kept_if_it_never_do
     assert "start with the logs" in json.dumps(messages) and owner_mailbox.mail_read_state(drive, TASK, msg_id) is True
 
 
+def test_forward_to_a_queued_task_cancelled_before_start_is_held_unread_as_its_exact_row(tmp_path):
+    """TZ-2 B5 acceptance: the real ``_forward_to_worker`` writes to a queued task and says
+    only that (queued; nothing has read it); the supervisor's pending drop then cancels the
+    task before it ever starts; the result reader shows the message as unread mail and the
+    authority carries the exact mailbox row. Nothing acknowledged it and nothing says "read"."""
+    from ouroboros.tools.control_task_results import _get_task_result
+    from ouroboros.tools.core import _forward_to_worker
+
+    data = tmp_path / "data"
+    drive = headless.prepare_task_drive(data, TASK, "forked")
+    write_task_result(data, TASK, "scheduled", child_drive_root=str(drive), parent_task_id="parent1",
+                      root_task_id="parent1", delegation_role="subagent")
+    ctx = SimpleNamespace(drive_root=data, task_id="parent1", task_metadata={})
+
+    receipt = _forward_to_worker(ctx, TASK, "start with the logs — then the config")
+
+    assert f"({owner_mailbox.MAIL_QUEUED})" in receipt and "has not started, so nothing has read it" in receipt
+    assert "delivered" not in receipt and "next checkpoint" not in receipt
+    raw = owner_mailbox._mailbox_path(drive, TASK).read_text(encoding="utf-8")
+    assert raw.count("\n") == 1 and raw.endswith("\n")
+    row = raw[:-1]
+    msg_id = json.loads(row)["msg_id"]
+
+    stored = write_task_result(data, TASK, "cancelled", strict_existing_dict=True, result="Cancelled before start.")
+
+    assert stored["unread_mailbox"]["rows"] == [row] and stored["unread_mailbox"]["read_complete"] is True
+    text = _get_task_result(ctx, TASK)
+    assert "[UNREAD_MAILBOX] 1 message(s)" in text and "start with the logs — then the config" in text
+    authority = json.loads(_get_task_result(ctx, TASK, include_authority=True))["authority"]
+    assert authority["status"] == "cancelled" and authority["unread_mailbox"]["rows"] == [row]
+    assert owner_mailbox.mail_read_state(drive, TASK, msg_id) is False
+    assert owner_mailbox.acknowledged_task_message_ids(drive, TASK) == set()
+
+
 def test_mail_write_receipt_vocabulary():
     assert owner_mailbox.mail_write_receipt("scheduled")["receipt"] == owner_mailbox.MAIL_QUEUED
     assert owner_mailbox.mail_write_receipt("running")["receipt"] == owner_mailbox.MAIL_DELIVERED

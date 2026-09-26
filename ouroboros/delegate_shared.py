@@ -10,9 +10,9 @@ so every existing reference and monkeypatch target keeps the same objects.
 
 This module also owns the external-executor family's RESULT ENVELOPE. Inside the
 family (``delegate_start``/``delegate_wait``/``delegate_cancel``/
-``delegate_answer``, their producers and their host consumers) a result is a
-native ``ToolResult``; only the four registered entries project it back to the
-``str`` handler ABI. The envelope is two additive JSON keys — ``ok`` and
+``delegate_answer``/``delegate_message``, their producers and their host
+consumers) a result is a native ``ToolResult``; only the five registered entries
+project it back to the ``str`` handler ABI. The envelope is two additive JSON keys — ``ok`` and
 ``host_code`` — written beside the domain payload, never instead of it: the
 domain ``reason`` keeps its own name and its own vocabulary, and nothing here
 renames it into ``ToolResult.code``.
@@ -64,6 +64,10 @@ _AGENT_FAULT_REASONS = frozenset({
     "configured_actor_resource_mismatch",
     "configured_actor_route_mismatch",
     "empty_prompt",
+    # The engine's typed rejection of a live message whose message_id was
+    # replayed with DIFFERENT text: the caller reused an invocation identity.
+    "idempotency_conflict",
+    "message_text_required",
     "missing_interaction_id",
     "missing_run_id",
     "payload_binding_mismatch",

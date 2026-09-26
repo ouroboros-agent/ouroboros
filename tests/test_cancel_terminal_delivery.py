@@ -645,10 +645,12 @@ def test_receipt_names_the_stop_cause_before_and_after_the_settle(tmp_path):
 
 def test_salvage_receipt_states_files_rescued_even_without_salvageable_text(tmp_path):
     """TZ-2 C2: "(no salvageable agent output ...)" must not read as "no files". The
-    receipt states the stat-only artifact-store count — positive, zero or unknown — and
-    that no hashes were computed; the typed fact rides ``cancel_receipt``. The count is a
-    mutable disclosure, never part of the content-derived delivery identity."""
+    receipt states the artifact-store count from the shared unmeasured listing — positive,
+    zero or unknown — and that no hashes were computed; the typed fact rides
+    ``cancel_receipt``. The count is a mutable disclosure, never part of the
+    content-derived delivery identity, and staged inputs or receipts never raise it."""
     from ouroboros.headless import task_artifacts_dir
+    from ouroboros.outcome_receipt_store import verification_receipts_path
     from supervisor import terminal_delivery as td
 
     def build(tid, task=None):
@@ -668,6 +670,11 @@ def test_salvage_receipt_states_files_rescued_even_without_salvageable_text(tmp_
     rebuilt = build("files-1")
     assert rebuilt["delivery_id"] == event["delivery_id"] and "Files rescued: 2 " in rebuilt["text"]
     assert load_task_result(tmp_path, "files-1")["cancel_receipt"]["files_rescued"]["count"] == 2
+    (store / "attachments").mkdir()
+    (store / "attachments" / "brief.pdf").write_bytes(b"input")
+    verification_receipts_path(tmp_path, "files-1").write_text('{"check": "x"}\n', encoding="utf-8")
+    inputs_only = build("files-1")
+    assert inputs_only["delivery_id"] == event["delivery_id"] and "Files rescued: 2 " in inputs_only["text"]
 
     write_task_result(tmp_path, "files-0", STATUS_RUNNING, result="working")
     task_artifacts_dir(tmp_path, "files-0")

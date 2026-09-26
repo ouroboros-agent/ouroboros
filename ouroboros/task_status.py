@@ -1062,7 +1062,7 @@ def wait_for_effective_tasks(
         if time.monotonic() >= deadline:
             timed_out = True
             break
-        time.sleep(max(0.05, min(2.0, float(poll_interval_sec or 0.5))))
+        time.sleep(max(0.05, min(2.0, float(poll_interval_sec or 0.5), deadline - time.monotonic())))
     # The single full read, on EVERY exit path (terminal, timeout, early
     # beacon): the returned rows re-enter the sha/artifact economy.
     results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}

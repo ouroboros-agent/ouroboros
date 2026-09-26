@@ -358,6 +358,31 @@ def model_failure_evidence_supported(operations: list[dict]) -> bool:
                                      name="captureFailureEvidence", value="true")
 
 
+# The engine's typed live-message outcomes (``LiveMessageOutcome``): the two
+# positive boundaries plus the four typed non-deliveries. Mirrored 1:1 by
+# ``delegate_message``; the host adds only its own ``not_found`` vocabulary.
+LIVE_MESSAGE_OUTCOMES = frozenset({
+    "delivered", "accepted", "rejected", "not_active", "unsupported", "delivery_unknown",
+})
+# The catalog spelling of the live-message route (Express-style template, the
+# same shape as ``/v2/runs/:id/control`` and the interaction-answer row).
+RUN_MESSAGE_OPERATION = ("POST", "/v2/runs/:id/messages")
+
+
+def run_message_supported(operations: list[dict]) -> bool:
+    """Does this engine's own route catalog list ``POST /v2/runs/:id/messages``?
+
+    Presence is negotiated structurally, like every other route here: an engine
+    older than the live-message release answers a route 404, which the verb must
+    never reach (a 404 is otherwise the daemon's "no such run").
+    """
+    method, path = RUN_MESSAGE_OPERATION
+    return any(
+        operation.get("method") == method and operation.get("path") == path
+        for operation in operations if isinstance(operation, dict)
+    )
+
+
 class ClaudexorGateway:
     """Thin typed client over the Claudexor ``/v2`` control API."""
 
@@ -529,8 +554,9 @@ class ClaudexorGateway:
         self._engine_build_sha = str(engine.get("sha") or "")
         return body
 
-    def agent_capabilities(self) -> Dict[str, Any]:
-        body = self._request("GET", "/v2/agent-capabilities")
+    def agent_capabilities(self, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        body = self._request("GET", "/v2/agent-capabilities",
+                             **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
         return body if isinstance(body, dict) else {}
 
     # Model operations use the same private control transport, not Agent runs
@@ -1000,6 +1026,63 @@ class ClaudexorGateway:
             f"interaction answer returned no typed status (HTTP {response.status_code})",
         )
 
+    def send_run_message(self, run_id: str, text: str, *, idempotency_key: str,
+                         expected_attempt_id: str = "",
+                         timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        """POST /v2/runs/:id/messages — one live message into a running run.
+
+        ``idempotency_key`` is REQUIRED and is the caller's message identity: the
+        engine serves the route through its idempotent-delivery store, so a replay
+        under the same key returns the stored receipt instead of delivering twice
+        (``delegate_message`` mints it as ``message_id`` and hands it back).
+        ``expected_attempt_id`` pins the live attempt when a caller holds one.
+
+        Like ``answer_interaction`` this is transport, not translation, and it never
+        goes through ``_request`` (which raises on every status >= 400): any body
+        carrying a typed ``outcome`` (``LIVE_MESSAGE_OUTCOMES``) is returned as the
+        ANSWER it is, whatever the HTTP status. What raises ``ClaudexorUnavailable``:
+        transport failures (``daemon_unreachable``), and every refusal without a
+        typed outcome — the daemon's 404 ``no such run``, the 409 idempotency
+        problems (``idempotency_conflict`` / ``delivery_in_progress`` /
+        ``delivery_interrupted``), 400 (malformed, secret, too long), 501 (no
+        service), 5xx — each typed through ``_problem`` with its status code, so the
+        verb classifies by code AND status. A 2xx without a typed outcome is
+        ``malformed_response``.
+        """
+        from urllib.parse import quote
+
+        path = f"/v2/runs/{quote(str(run_id), safe='')}/messages"
+        payload: Dict[str, Any] = {"text": str(text)}
+        if expected_attempt_id:
+            payload["expectedAttemptId"] = str(expected_attempt_id)
+        bound: Dict[str, Any] = {}
+        if timeout_sec is not None:
+            bounded = max(0.000001, float(timeout_sec))
+            bound = {"timeout": httpx.Timeout(bounded, connect=min(_CONNECT_TIMEOUT_SEC, bounded))}
+        try:
+            response = self._client.request(
+                "POST", path, json=payload,
+                headers={"Idempotency-Key": str(idempotency_key)}, **bound)
+        except httpx.HTTPError as exc:
+            raise ClaudexorUnavailable(
+                "daemon_unreachable",
+                f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
+            ) from exc
+        body: Any = None
+        if response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+        if isinstance(body, dict) and str(body.get("outcome") or "") in LIVE_MESSAGE_OUTCOMES:
+            return body
+        if response.status_code >= 400:
+            raise self._problem(response)
+        raise ClaudexorUnavailable(
+            "malformed_response",
+            f"run message returned no typed outcome (HTTP {response.status_code})",
+        )
+
     def cancel_run(self, run_id: str, *, reason: str = "") -> Dict[str, Any]:
         control: Dict[str, Any] = {"kind": "cancel"}
         if reason:
@@ -1133,7 +1216,7 @@ class ClaudexorGateway:
             raise ValueError(f"unknown setup job op: {op!r}")
         return body if isinstance(body, dict) else {}
 
-    def operations(self) -> List[Dict[str, Any]]:
+    def operations(self, *, timeout_sec: Optional[float] = None) -> List[Dict[str, Any]]:
         """GET /v2/operations — the engine's own implemented-route catalog.
 
         The handshake advertises this path (``operationsPath``); the catalog is
@@ -1141,7 +1224,7 @@ class ClaudexorGateway:
         on version folklore (verified live: ``{protocolMajor, operations:[{id,
         method, path, ...}]}``).
         """
-        body = self._request("GET", "/v2/operations")
+        body = self._request("GET", "/v2/operations", timeout_sec=timeout_sec)
         ops = body.get("operations") if isinstance(body, dict) else None
         return [row for row in (ops or []) if isinstance(row, dict)]
 

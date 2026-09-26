@@ -904,3 +904,47 @@ def test_burn_phrase_never_claims_zero_rounds_with_real_dollars():
     assert "0 of your own metered LLM rounds" not in _nanny_burn_phrase(0, 2.45)
     assert "$2.45" in _nanny_burn_phrase(0, 2.45)
     assert "3 of your own metered LLM rounds" in _nanny_burn_phrase(3, 2.45)
+
+
+# -- the money sentence follows the round's own cost evidence ------------------
+
+
+def _fire_reminder(cost_per_round, meta, monkeypatch, fallbacks=""):
+    from ouroboros.loop import _maybe_inject_nanny_economics_reminder, _note_nanny_delegate_activity
+
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", fallbacks)
+    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACK", raising=False)
+    ctx = _nanny_ctx(_accumulated_usage={"_last_llm_call_meta": meta})
+    tools = SimpleNamespace(_ctx=ctx)
+    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
+    round_idx, msgs = 1, []
+    while not msgs:
+        round_idx += 1
+        _note_nanny_delegate_activity(ctx, round_idx, {"cost": cost_per_round * round_idx}, [])
+        _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None)
+    return "\n".join(m.get("content", "") for m in msgs)
+
+
+def test_an_unpriced_round_is_an_unknown_cash_cost_never_metered_or_zero(monkeypatch):
+    text = _fire_reminder(0.0, {"provider": "claudexor", "model": "codex=gpt"}, monkeypatch)
+    assert "metered API money" not in text and "metered LLM rounds" not in text
+    assert "cash cost unknown, not zero" in text          # burn phrase, cost class 'unpriced'
+    assert "claudexor / codex=gpt" in text                 # the route, named as context only
+    assert "only when its settled spend reports $0" in text  # the pinned conditional stays
+    assert "fallback" not in text                          # no chain configured, no claim
+
+
+def test_a_priced_round_stays_metered_and_names_a_configured_fallback(monkeypatch):
+    text = _fire_reminder(0.05, {"provider": "openrouter", "model": "anthropic/claude"},
+                          monkeypatch, fallbacks="openai/gpt-x, google/gem")
+    assert "metered LLM rounds" in text and "that spend is metered money" in text
+    assert "cash cost unknown" not in text
+    assert "configured fallback (openai/gpt-x, google/gem)" in text
+
+
+def test_the_unpriced_burn_phrase_never_calls_rounds_metered():
+    from ouroboros.loop import _nanny_burn_phrase
+
+    assert _nanny_burn_phrase(4, 0.0) == (
+        "4 of your own LLM rounds (no provider price reported: cash cost unknown, not zero)")
+    assert "4 of your own metered LLM rounds" in _nanny_burn_phrase(4, 0.5)

@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from types import SimpleNamespace
+
+import pytest
+
+from ouroboros.context_budget import RECLAIM_LOW_WATER_DIVISOR
+from ouroboros.context_fit import reclaim_low_water_margin
 
 
 def _fit(
@@ -15,6 +21,8 @@ def _fit(
     target_deficit=None,
     capacity_deficit=None,
     used=False,
+    estimated_input=120_000,
+    low_water_margin=0,
 ):
     from ouroboros.context_fit import MainFitDisposition, MainFitMeasurement
 
@@ -23,7 +31,7 @@ def _fit(
         round_id="exec:round:1",
         profile=profile,
         rendered_mode=mode,
-        estimated_input_tokens=120_000,
+        estimated_input_tokens=estimated_input,
         response_reserve_tokens=65_536,
         target_total_tokens=200_000 if profile == "owner_low" else None,
         capacity_total_tokens=500_000,
@@ -32,6 +40,7 @@ def _fit(
         target_deficit_tokens=target_deficit,
         capacity_deficit_tokens=capacity_deficit,
         reclaim_goal_tokens=goal,
+        low_water_margin_tokens=low_water_margin,
     )
     return MainFitDisposition(
         measurement=measurement,
@@ -220,6 +229,175 @@ def test_checkpoint_proves_automatic_materializer_attempt_even_on_binding_mismat
     assert ("route-a", "exec:round:1") in context.tools._ctx._context_reclaim_materializations
 
 
+def _applied_receipt(*, reclaimed: int, goal_reached: bool):
+    from ouroboros.context_budget import ContextReclaimReceipt
+
+    return ContextReclaimReceipt(
+        status="applied",
+        before_transcript_sha256="a" * 64,
+        after_transcript_sha256="b" * 64,
+        selection_fingerprint="f" * 64,
+        selected_unit_ids=("unit",),
+        reclaimed_tokens=reclaimed,
+        goal_reached=goal_reached,
+        checkpoint_ref={"path": "checkpoint", "sha256": "c" * 64},
+        capsule_refs=(),
+    )
+
+
+# Owner Low: the 200,000 target binds (capacity 500,000); its input boundary is
+# 200,000 - 65,536 = 134,464 estimated tokens; margin = ceil(200,000 / 8) = 25,000.
+_LOW_BOUNDARY_INPUT = 200_000 - 65_536
+
+
+@pytest.mark.parametrize("landed_input,headroom,reached,below", [
+    (_LOW_BOUNDARY_INPUT, 0, True, False),  # reclaimed == deficit: AT the boundary, not below
+    (_LOW_BOUNDARY_INPUT - 25_000, 25_000, True, True),  # the full margin achieved
+    (_LOW_BOUNDARY_INPUT - 12_000, 12_000, True, False),  # under-landed: reached, margin missed
+    (_LOW_BOUNDARY_INPUT + 2_000, -2_000, False, False),  # still above the boundary
+])
+def test_reclaim_checkpoint_separates_boundary_from_low_water(
+    tmp_path, monkeypatch, landed_input, headroom, reached, below,
+):
+    from ouroboros import loop
+
+    context = _ctx(tmp_path, preferred="low", mode="low")
+    disposition = _fit(
+        action="reclaim_once", profile="owner_low", mode="low", goal=10_000 + 25_000,
+        target_deficit=10_000, capacity_deficit=0, estimated_input=_LOW_BOUNDARY_INPUT + 10_000,
+        low_water_margin=25_000,
+    )
+    landed = _fit(
+        action="send", profile="owner_low", mode="low", used=True, estimated_input=landed_input,
+    )
+    measured, events = [], []
+    monkeypatch.setattr(
+        loop, "compact_tool_history_llm",
+        lambda *_a, **_kw: (context.messages, _applied_receipt(reclaimed=1, goal_reached=False), None),
+    )
+    monkeypatch.setattr(
+        loop, "_measure_round_main_fit", lambda _ctx, **kwargs: measured.append(kwargs) or landed,
+    )
+    monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda _q, _t, _d, data: events.append(data))
+
+    loop._run_main_reclaim(context, disposition)
+
+    # The landing is re-measured on the SAME basis as the trigger, once, as a used pass.
+    assert measured == [{"automatic_pass_used": True}]
+    event = events[-1]
+    assert event["checkpoint_kind"] == "context_reclaim_automatic"
+    assert event["deficit_tokens"] == 10_000
+    assert event["requested_margin_tokens"] == 25_000
+    assert event["reclaim_goal_tokens"] == 35_000
+    assert event["achieved_headroom_tokens"] == headroom
+    assert event["boundary_reached"] is reached
+    assert event["below_boundary"] is below
+    assert event["rounds_since_previous_pass"] is None
+    assert context.tools._ctx._context_reclaim_last_pass_round == 1
+
+
+def test_reclaim_checkpoint_counts_rounds_since_the_previous_pass_without_remeasuring_a_no_op(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import loop
+
+    context = replace(_ctx(tmp_path, preferred="low", mode="low"), round_idx=9)
+    context.tools._ctx._context_reclaim_last_pass_round = 3
+    disposition = _fit(
+        action="reclaim_once", profile="owner_low", mode="low", goal=10_000 + 25_000,
+        target_deficit=10_000, capacity_deficit=0, estimated_input=_LOW_BOUNDARY_INPUT + 10_000,
+        low_water_margin=25_000,
+    )
+    disposition = replace(
+        disposition, measurement=replace(disposition.measurement, round_id="exec:round:9"),
+    )
+    events = []
+    monkeypatch.setattr(
+        loop, "compact_tool_history_llm",
+        lambda *_a, **_kw: (context.messages, replace(
+            _applied_receipt(reclaimed=0, goal_reached=False), status="no_eligible",
+        ), None),
+    )
+    monkeypatch.setattr(
+        loop, "_measure_round_main_fit",
+        lambda *_a, **_kw: pytest.fail("a pass that changed nothing has no new landing to measure"),
+    )
+    monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda _q, _t, _d, data: events.append(data))
+
+    loop._run_main_reclaim(context, disposition)
+
+    event = events[-1]
+    assert event["status"] == "no_eligible"
+    assert event["rounds_since_previous_pass"] == 6
+    # Unchanged transcript: the pre-pass fit IS the landing, 10,000 above the boundary.
+    assert event["achieved_headroom_tokens"] == -10_000
+    assert event["boundary_reached"] is False
+    assert event["below_boundary"] is False
+    assert event["requested_margin_tokens"] == 25_000
+    assert context.tools._ctx._context_reclaim_last_pass_round == 9
+
+
+def test_reclaim_checkpoint_reports_an_unmeasurable_landing_as_unknown(tmp_path, monkeypatch):
+    """A route/plan rebind can leave the post-pass fit unmeasurable (the fit seam
+    returns None by contract): the pass still applies and the event says UNKNOWN,
+    never "boundary not reached"."""
+    from ouroboros import loop
+
+    context = _ctx(tmp_path, preferred="low", mode="low")
+    disposition = _fit(
+        action="reclaim_once", profile="owner_low", mode="low", goal=10_000 + 25_000,
+        target_deficit=10_000, capacity_deficit=0, estimated_input=_LOW_BOUNDARY_INPUT + 10_000,
+        low_water_margin=25_000,
+    )
+    events = []
+    monkeypatch.setattr(
+        loop, "compact_tool_history_llm",
+        lambda *_a, **_kw: (context.messages, _applied_receipt(reclaimed=30_000, goal_reached=False), None),
+    )
+    monkeypatch.setattr(loop, "_measure_round_main_fit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda _q, _t, _d, data: events.append(data))
+
+    receipt = loop._run_main_reclaim(context, disposition)
+
+    assert receipt.status == "applied"
+    assert events[-1]["reclaimed_tokens"] == 30_000
+    assert events[-1]["achieved_headroom_tokens"] is None
+    assert events[-1]["boundary_reached"] is None
+    assert events[-1]["below_boundary"] is None
+    assert events[-1]["requested_margin_tokens"] == 25_000
+
+
+def test_overflow_minimum_goal_is_low_water_sized_even_without_a_predicted_deficit(
+    tmp_path, monkeypatch,
+):
+    """Both directions: the measurement found no deficit (goal 0), the provider still
+    overflowed; the pass requests the low-water minimum, and its telemetry reports
+    that minimum as the requested margin over a zero deficit."""
+    from ouroboros import loop
+
+    context = _ctx(tmp_path, preferred="low", mode="low")
+    disposition = _fit(action="send", profile="owner_low", mode="low", goal=0, target_deficit=0,
+                       capacity_deficit=0, estimated_input=_LOW_BOUNDARY_INPUT - 500)
+    requests, events = [], []
+
+    def compact(messages, *, request, **_kwargs):
+        requests.append(request.reclaim_goal_tokens)
+        return messages, replace(_applied_receipt(reclaimed=0, goal_reached=False),
+                                 status="no_eligible"), None
+
+    monkeypatch.setattr(loop, "compact_tool_history_llm", compact)
+    monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda _q, _t, _d, data: events.append(data))
+    minimum = max(1, reclaim_low_water_margin(200_000, 500_000))  # what the overflow path passes
+    loop._run_main_reclaim(context, disposition, minimum_goal_tokens=minimum)
+
+    assert requests == [25_000]
+    assert events[-1]["deficit_tokens"] == 0
+    assert events[-1]["requested_margin_tokens"] == 25_000
+    assert events[-1]["achieved_headroom_tokens"] == 500
+    assert events[-1]["boundary_reached"] is True
+    assert events[-1]["below_boundary"] is False
+
+
 def test_predicted_reclaim_runs_once_then_sends_target_miss(tmp_path, monkeypatch):
     from ouroboros import loop
 
@@ -276,7 +454,9 @@ def test_actual_max_overflow_reprojects_and_retries_only_smaller_context(tmp_pat
         return disposition
 
     def reclaim(ctx, _disposition, **kwargs):
-        assert kwargs["minimum_goal_tokens"] == 1
+        # An actual overflow asks for a low-water-sized pass (an eighth of the 500K
+        # route), never a token-sized one, before its single strict-shrink retry.
+        assert kwargs["minimum_goal_tokens"] == math.ceil(500_000 / RECLAIM_LOW_WATER_DIVISOR)
         ctx.tools._ctx._context_reclaim_passes.add(("route-a", "exec:round:1"))
 
     sends = []

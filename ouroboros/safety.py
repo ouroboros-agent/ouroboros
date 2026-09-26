@@ -125,6 +125,7 @@ TOOL_POLICY: Dict[str, str] = {
     # Answering a run's question is custody-gated to the task that started it and
     # carries no authority the task lacks (same reasoning as the verbs above).
     "delegate_answer": POLICY_SKIP,
+    "delegate_message": POLICY_SKIP,
     "cancel_task": POLICY_SKIP,
     # The other half of the same nanny authority (#1196, owner Q9): selecting ONE
     # of this task's OWN budget-paused descendants to continue under its same id.

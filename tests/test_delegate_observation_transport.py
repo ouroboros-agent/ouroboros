@@ -42,6 +42,9 @@ def test_public_wait_reads_response_slower_than_five_seconds(tmp_path, monkeypat
 
         def do_GET(self):
             requests.append((self.command, self.path))
+            if self.path == "/v2/agent-capabilities":
+                self.answer({"harnesses": [{"id": "fixture", "liveInput": "mid_turn"}]})
+                return
             assert self.path == "/v2/runs/run-slow"
             # Deliberate network-latency reproduction: the previous five-second
             # HTTP timeout fails before this real socket sends its headers.
@@ -71,9 +74,12 @@ def test_public_wait_reads_response_slower_than_five_seconds(tmp_path, monkeypat
         assert time.monotonic() - started >= 5.0
         assert result["status"] == "terminal", result
         assert result["state"] == "succeeded"
-        # One handshake per supervision loop, one GET per tick (S2): the loop holds the
-        # transport across quiet ticks instead of rebuilding it every 3 s.
-        assert requests == [("POST", "/v2/handshake")] + [("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1)
+        # The route's live-input capability is read ONCE at entry on the same transport
+        # and stamped on the wake; then one handshake per supervision loop, one GET per
+        # tick (S2): the loop holds the transport across quiet ticks.
+        assert result["leaf_live_input"] == "mid_turn"
+        assert requests == [("GET", "/v2/agent-capabilities"), ("POST", "/v2/handshake")] + [
+            ("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1)
     finally:
         server.shutdown()
         server.server_close()

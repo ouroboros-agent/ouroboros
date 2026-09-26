@@ -68,7 +68,9 @@ def _bounded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in rows[-_TIMELINE_TAIL:]:
         item = {"type": _label(row.get("type")), "title": _label(row.get("title")),
                 "severity": _label(row.get("severity"))}
-        for key in ("attemptId", "harnessId"):
+        # ``messageId``/``outcome`` ride the engine's ``message.*`` rows: the
+        # receipts a recovered nanny reconciles a delegate_message against (A26).
+        for key in ("attemptId", "harnessId", "messageId", "outcome"):
             if isinstance(row.get(key), str) and row[key]:
                 item[key] = _label(row[key])
         if row.get("textKind") in _TEXT_KINDS and isinstance(row.get("detail"), str):
@@ -622,6 +624,19 @@ def emit(ctx: Any, run_id: str, advance: _Advance, *,
         log.debug("delegated progress emit failed", exc_info=True)
 
 
+def paused_note(pending_interactions: Optional[List[Dict[str, Any]]]) -> str:
+    """The note of a run PAUSED on its own question(s): never "stuck" (owner 7=A /
+    F13). Shared by the per-window payload and the supervising wake, which keeps it
+    when it drops the per-tick keep-watching/cancel note."""
+    return ("The run is alive and PAUSED on the question(s) it already asked "
+            "(waiting_on_user; see pending_interactions). Decide: answer with "
+            "delegate_answer, escalate an above-authority question with the "
+            "escalate verb (parent-first; the reply reaches your mailbox on a "
+            "later round), or "
+            f"keep waiting (call again) — {waiting_expiry_clause(pending_interactions)}. "
+            "Do not cancel a run merely because it asked a question.")
+
+
 def window_payload(
     *,
     run_id: str,
@@ -671,14 +686,7 @@ def window_payload(
         # generic delegate_cancel hint invited cancelling a run that is simply
         # waiting to be answered. The waiting state gets its own note.
         payload["note"] = (
-            ("The run is alive and PAUSED on the question(s) it already asked "
-             "(waiting_on_user; see pending_interactions). Decide: answer with "
-             "delegate_answer, escalate an above-authority question with the "
-             "escalate verb (parent-first; the reply reaches your mailbox on a "
-             "later round), or "
-             f"keep waiting (call again) — {waiting_expiry_clause(pending_interactions)}. "
-             "Do not cancel a run merely because it asked a question.")
-            if waiting_on_user else
+            paused_note(pending_interactions) if waiting_on_user else
             ("The run is alive but silent. Decide: keep waiting (call again), "
              "or delegate_cancel if it is stuck."))
         _fitted_pending(payload, list(pending_interactions or []), budget)

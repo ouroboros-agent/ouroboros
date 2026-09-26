@@ -407,6 +407,10 @@ def _restore_wait_checkpoint(drive_root: Any, row: Mapping[str, Any]) -> None:
             state["last_wake"] = dict(payload)
     if isinstance(row.get("checkpoint"), dict):
         state["checkpoint"] = dict(row["checkpoint"])
+    # A run-id mismatch discarded the state above; the acked child cursor is
+    # task-scoped, so the successor must not re-announce delivered child events.
+    if isinstance(row.get("coordination_cursor"), dict) and not isinstance(state.get("coordination_cursor"), dict):
+        state["coordination_cursor"] = dict(row["coordination_cursor"])
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, state)
     interaction_ids = frozenset(
@@ -572,6 +576,9 @@ def prepare_handoff(
             supervision.get("interaction_acknowledged_ids") or []
         ),
         "pending_wake": dict(pending_wake),
+        # The task-scoped COMMITTED child-delivery cursor (acked events only).
+        "coordination_cursor": dict(supervision["coordination_cursor"])
+        if isinstance(supervision.get("coordination_cursor"), dict) else {},
         "checkpoint": supervision.get("checkpoint") if isinstance(supervision.get("checkpoint"), dict) else {},
         "no_resume_veto_causes": list(NO_RESUME_CAUSES),
         "created_at": utc_now_iso(),

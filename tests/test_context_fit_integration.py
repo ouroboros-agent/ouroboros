@@ -123,6 +123,138 @@ def test_owner_low_deficit_reclaim_remeasures_on_one_basis(monkeypatch, tmp_path
     assert after.measurement.reclaim_goal_tokens == 0
 
 
+def _growth_unit(tag: str, chars: int):
+    return [{
+        "role": "assistant",
+        "content": "investigating",
+        "tool_calls": [{
+            "id": f"call-{tag}",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "x" * chars},
+        }],
+    }, {"role": "tool", "tool_call_id": f"call-{tag}", "content": "y" * chars}]
+
+
+def _install_full_budget_materializer(monkeypatch):
+    """A13 worst case: every summary comes back at the FULL summary budget of its
+    source (never a tiny summary), the private checkpoint is stubbed, density 1.0."""
+    from ouroboros import capability_evidence, context_compaction as cc
+
+    monkeypatch.setattr(
+        capability_evidence, "resolve_main_token_density",
+        lambda *_a, **_kw: (1.0, "fresh_route_usage"),
+    )
+    monkeypatch.setattr(cc, "_summarizer_spec", lambda: {
+        "model": "summary-model", "resolved_model": "summary-model", "provider": "test",
+        "route_fp": "summary-route", "effort": "low", "output_budget": 32_768, "use_local": False,
+    })
+    monkeypatch.setattr(
+        cc, "_persist_reclaim_checkpoint",
+        lambda *_a, **_kw: {"path": "checkpoint", "sha256": "c" * 64},
+    )
+    monkeypatch.setattr(cc, "_call_summarizer", lambda parts, *, summary_budgets, **_kw: {
+        part.source_id: "s" * (4 * int(summary_budgets[part.root_id])) for part in parts
+    })
+
+
+def _simulate_growing_transcript(tmp_path, *, window: int, rounds: int, growth_chars: int):
+    """Owner Max on a known ``window``: fill to just under the capacity boundary, then
+    grow one completed tool unit per round, running the REAL fit and the REAL
+    materializer the way the loop does (at most one automatic pass per route+round,
+    the landing re-measured on the same basis). Returns (unit tokens, per-pass rows
+    of (round, requested margin, achieved headroom, receipt))."""
+    from ouroboros import context_compaction as cc
+    from ouroboros.context_budget import ContextReclaimRequest
+    from ouroboros.context_fit import estimate_context_prompt_tokens, measure_main_fit
+
+    plan = _plan(preferred="max", window=window)
+    messages = plan.messages_for("max")
+    unit_tokens = estimate_context_prompt_tokens(_growth_unit("probe", growth_chars))
+    boundary_input = window - plan.output_reserve_tokens
+    filler = (boundary_input - estimate_context_prompt_tokens(messages) - unit_tokens // 2) // unit_tokens
+    for index in range(filler):
+        messages = messages + _growth_unit(f"f{index}", growth_chars)
+
+    def fit(current, round_idx, *, used):
+        return measure_main_fit(
+            plan, current, [], drive_root=tmp_path, profile="owner_max", rendered_mode="max",
+            round_id=f"exec:round:{round_idx}", automatic_pass_used=used,
+        )
+
+    memo: set = set()
+    rows = []
+    for round_idx in range(1, rounds + 1):
+        messages = messages + _growth_unit(f"g{round_idx}", growth_chars)
+        before = fit(messages, round_idx, used=False)
+        if before.action != "reclaim_once":
+            assert before.action == "send"
+            continue
+        measurement = before.measurement
+        request = ContextReclaimRequest(
+            route_fp=measurement.route_fp, round_id=measurement.round_id,
+            transcript_sha256=cc.context_reclaim_transcript_sha256(messages),
+            measurement_basis=measurement.measurement_basis,
+            measurement_density=measurement.measurement_density,
+            reclaim_goal_tokens=measurement.reclaim_goal_tokens,
+        )
+        messages, receipt, _usage = cc.compact_tool_history_llm(
+            messages, request=request, drive_root=tmp_path, negative_memo=memo,
+        )
+        after = fit(messages, round_idx, used=True).measurement
+        rows.append((
+            round_idx, measurement.low_water_margin_tokens,
+            window - (after.estimated_input_tokens + after.response_reserve_tokens), receipt,
+        ))
+    return unit_tokens, rows
+
+
+def test_low_water_margin_bounds_automatic_passes_under_a_full_budget_summarizer(monkeypatch, tmp_path):
+    """Anti-thrash class. A pass sized to the deficit alone lands AT the boundary, so the
+    next round's ordinary growth re-arms it: one summarizer pass nearly every round.
+    Sized deficit + boundary/RECLAIM_LOW_WATER_DIVISOR it lands below the boundary and
+    the next pass needs real growth. Under the A13 worst-case stub every selected unit
+    halves, so a pass lands about HALF the requested margin below (the receipt says
+    goal_reached=False): the bound proven with that stub is ceil(N*g / (margin/2)) + 1;
+    the ideal-summarizer bound ceil(N*g / margin) + 1 holds for the ACHIEVED headroom and
+    is asserted in that form (requested margin is not achieved headroom). With the
+    margin removed the same assertions fail."""
+    import math
+
+    from ouroboros import context_budget as cb
+
+    _install_full_budget_materializer(monkeypatch)
+    window, rounds, chars = 400_000, 40, 4_000
+    margin = math.ceil(window / cb.RECLAIM_LOW_WATER_DIVISOR)
+
+    unit_tokens, passes = _simulate_growing_transcript(
+        tmp_path, window=window, rounds=rounds, growth_chars=chars,
+    )
+    growth = rounds * unit_tokens
+    bound = math.ceil(growth / (margin // 2)) + 1
+    assert 2 <= len(passes) <= bound
+    assert [row[1] for row in passes] == [margin] * len(passes)
+    assert all(row[3].status == "applied" for row in passes)
+    # Every pass reached the boundary; none achieved the full margin (partial shrink
+    # under full-budget summaries), and the receipt discloses that underlanding.
+    assert all(0 <= row[2] < margin for row in passes)
+    assert not any(row[3].goal_reached for row in passes)
+    achieved = min(row[2] for row in passes)
+    assert len(passes) <= math.ceil(growth / achieved) + 1
+    gaps = [later[0] - earlier[0] for earlier, later in zip(passes, passes[1:])]
+    assert min(gaps) > achieved // unit_tokens
+
+    monkeypatch.setattr(cb, "RECLAIM_LOW_WATER_DIVISOR", 10 ** 9)  # margin 1: deficit-sized passes
+    _unit, thrash = _simulate_growing_transcript(
+        tmp_path, window=window, rounds=rounds, growth_chars=chars,
+    )
+    assert len(thrash) >= rounds - 2
+    assert len(thrash) > bound
+    assert [row[1] for row in thrash] == [1] * len(thrash)
+    # A deficit-sized pass lands at (here: still above) the boundary, which is exactly
+    # what re-arms it on the next round.
+    assert sum(1 for row in thrash if row[2] < 0) >= len(thrash) - 2
+
+
 def test_target_miss_is_non_terminal_fit_evidence(monkeypatch, tmp_path):
     from ouroboros import capability_evidence, loop
     from ouroboros.context_fit import measure_main_fit

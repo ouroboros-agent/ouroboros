@@ -41,6 +41,7 @@ DEFAULT_DISABLED_TOOLS = (
     "delegate_wait",
     "delegate_cancel",
     "delegate_answer",
+    "delegate_message",
     "claude_code_edit",
     "analyze_screenshot",
     "vlm_query",
@@ -198,7 +199,7 @@ def derive_disabled_tools(extra: Iterable[str] = ()) -> tuple[str, ...]:
         "analyze_screenshot", "vlm_query", "view_image", "ocr_pdf",
         "extract_video_frames", "send_photo", "send_video", "switch_model",
         "schedule_subagent", "delegate_start", "delegate_wait", "delegate_cancel",
-        "delegate_answer", "claude_code_edit", "wait_task", "wait_tasks",
+        "delegate_answer", "delegate_message", "claude_code_edit", "wait_task", "wait_tasks",
         "get_task_result", "peek_task", "cancel_task", "discard_child_result",
         "task_acceptance_review", "request_deep_self_review",
     }

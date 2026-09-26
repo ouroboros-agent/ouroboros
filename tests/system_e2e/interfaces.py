@@ -9,7 +9,10 @@ digest → 409 ``idempotency_conflict``), run detail with the ``summary`` facts 
 custody settler consumes, the cancel control verb, and the interactive
 question surface — ``pendingInteractions`` on the detail plus the
 ``POST /v2/runs/:id/interactions/:iid/answer`` verb ``delegate_answer`` speaks,
-with its typed delivered/already_resolved/rejected statuses. Behavior is scripted
+with its typed delivered/already_resolved/rejected statuses — and the live-message
+surface ``delegate_message`` negotiates: the ``/v2/operations`` catalog row for
+``POST /v2/runs/:id/messages``, ``liveInput`` on the harness row, and the route
+itself (Idempotency-Key replay, typed outcomes at HTTP 200). Behavior is scripted
 PER RUN by markers in the POSTed prompt (success / hang / typed refusal / ask)
 plus the pinned-profile refusal, and the applied facts a
 WRITING run produces: the edits themselves, made inside the private execution
@@ -158,8 +161,12 @@ class FakeClaudexorDaemon:
                  applied_profile: str = "fake-profile-1",
                  ghost_profile: str = "ghost-profile",
                  workspace_edits: Optional[Dict[str, str]] = None,
-                 runs_dir: Optional[pathlib.Path] = None) -> None:
+                 runs_dir: Optional[pathlib.Path] = None,
+                 live_input: str = "mid_turn") -> None:
         self.harness_id = str(harness_id)
+        # The harness row's declared live-input capability (``liveInput``); a
+        # scenario passes "none" to script a route with no mid-run channel.
+        self.live_input = str(live_input)
         pin_version, pin_sha = _tree_engine_identity()
         self.engine_version = str(engine_version or pin_version)
         self.engine_build_sha = str(engine_build_sha or pin_sha)
@@ -295,6 +302,15 @@ class FakeClaudexorDaemon:
                                     "sha": self.engine_build_sha}}
         if method == "GET" and clean == "/v2/agent-capabilities":
             return 200, {"harnesses": [self._harness_row()]}
+        if method == "GET" and clean == "/v2/operations":
+            # The engine's own route catalog (Express-style templates, the shape
+            # ``run_message_supported`` negotiates against).
+            return 200, {"protocolMajor": 3, "operations": [
+                {"id": "run.message", "method": "POST", "path": "/v2/runs/:id/messages",
+                 "mutability": "mutating", "idempotency": "key_required"},
+                {"id": "run.control", "method": "POST", "path": "/v2/runs/:id/control",
+                 "mutability": "mutating", "idempotency": "natural"},
+            ]}
         if method == "GET" and clean == "/v2/harnesses":
             return 200, {"harnesses": [self._harness_row()]}
         if method == "GET" and clean == "/v2/quota":
@@ -354,6 +370,8 @@ class FakeClaudexorDaemon:
                     run["turn"] += 1
                     run["pending"] = [_fake_turn_interaction(run["id"], self.harness_id, run["turn"])]
                 return 200, {"accepted": True, "status": "delivered"}
+            if method == "POST" and len(parts) == 4 and parts[3] == "messages":
+                return self._run_message(run, record)
             if method == "POST" and len(parts) == 4 and parts[3] == "control":
                 control = body.get("control") if isinstance(body.get("control"), dict) else {}
                 if str(control.get("kind") or "") == "cancel":
@@ -367,7 +385,50 @@ class FakeClaudexorDaemon:
     def _harness_row(self) -> Dict[str, Any]:
         return {"id": self.harness_id, "enabled": True,
                 "accessProfilesSupported": ["readonly", "workspace_write",
-                                            "external_sandbox_full"]}
+                                            "external_sandbox_full"],
+                "liveInput": self.live_input}
+
+    def _run_message(self, run: Dict[str, Any], record: Dict[str, Any]) -> tuple:
+        """``POST /v2/runs/:id/messages``: the live-message route, every typed
+        outcome at HTTP 200 (the deliberate difference from the answer route),
+        served through the same Idempotency-Key replay as run creation — a
+        replayed key with the same digest returns the STORED receipt (never a
+        second delivery), a different digest is 409 ``idempotency_conflict``."""
+        body = record["body"]
+        key = record["idempotency_key"]
+        if not key:
+            return 400, {"code": "missing_idempotency_key",
+                         "message": "run message requires Idempotency-Key"}
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+        replayed = self._replay.get(key)
+        if replayed is not None:
+            if replayed["digest"] != digest:
+                return 409, {"code": "idempotency_conflict",
+                             "message": "Idempotency-Key replayed with a different request digest"}
+            return replayed["status"], json.loads(json.dumps(replayed["payload"]))
+
+        def _remember(status: int, payload: Dict[str, Any]) -> tuple:
+            self._replay[key] = {"digest": digest, "status": status, "payload": payload}
+            return status, payload
+
+        text = body.get("text")
+        if not isinstance(text, str) or not text:
+            return _remember(400, {"code": "invalid_request", "message": "text is required"})
+        receipt: Dict[str, Any] = {"runId": run["id"], "messageId": key,
+                                   "harnessId": self.harness_id, "liveInput": self.live_input}
+        if run["state"] in ("succeeded", "cancelled", "failed"):
+            return _remember(200, {**receipt, "accepted": False, "outcome": "not_active",
+                                   "reason": "run_terminal"})
+        if run["pending"]:
+            # INV-048: a steer beside an open question is never written to the harness.
+            return _remember(200, {**receipt, "accepted": False, "outcome": "not_active",
+                                   "reason": "interaction_pending", "attemptId": "a01"})
+        if self.live_input == "none":
+            return _remember(200, {**receipt, "accepted": False, "outcome": "unsupported",
+                                   "reason": "no_live_session", "attemptId": "a01"})
+        run.setdefault("messages", []).append({"message_id": key, "text": text})
+        return _remember(200, {**receipt, "accepted": True, "outcome": "accepted",
+                               "attemptId": "a01"})
 
     def _start_run(self, record: Dict[str, Any]) -> tuple:
         body = record["body"]

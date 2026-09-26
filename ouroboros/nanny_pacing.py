@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 DELEGATE_ACTIVITY_TOOLS = frozenset({
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+    "delegate_message",
 })
 
 # Only genuine ACTS of delegation reset the burn baseline: starting a physical
@@ -131,7 +132,7 @@ def nanny_burn_phrase(rounds: int, cost: float) -> str:
         return f"~${cost:.2f} of your own metered spend"
     if cost > 0:
         return f"{rounds} of your own metered LLM rounds (~${cost:.2f})"
-    return f"{rounds} of your own metered LLM rounds"
+    return f"{rounds} of your own LLM rounds (no provider price reported: cash cost unknown, not zero)"
 
 
 # Compatibility spellings retained on ``ouroboros.loop`` through imports.

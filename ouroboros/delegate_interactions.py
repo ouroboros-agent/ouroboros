@@ -1,4 +1,5 @@
-"""A delegated run's interactive questions, and the nanny's answer to them.
+"""Nanny input into a delegated run's LIVE session: the answer to its question,
+and a live message into its running turn.
 
 Extracted from ``ouroboros/tools/delegate.py`` when that module crossed its size
 gate — the same split as ``delegate_output`` / ``delegate_progress`` /
@@ -7,6 +8,9 @@ AskUserQuestion-style interaction (full question text/options on the run detail;
 a row carrying ``timeout_at`` benign-declines at the engine timeout, a null one
 waits until answered), and the nanny — the task that owns the
 run — is the party that answers (owner decision 7=A, poltergeist phase B).
+``_delegate_message`` is the same concern one step earlier: a message placed
+into the run's live turn through the engine's capability-declared channel
+(``liveInput`` on the route's catalog row), typed end to end and never guessed.
 ``tools.delegate`` re-exports these names, so every existing reference (and the
 tests) still finds them there, and ``_REPORTED_INTERACTIONS`` stays one object.
 """
@@ -17,10 +21,19 @@ import hashlib
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import uuid
+from typing import Callable, Any, Dict, List, Optional, Tuple
 
 from ouroboros.delegate_output import _PAYLOAD_ENVELOPE_HEADROOM, _stage_full_output
-from ouroboros.delegate_shared import AGENT_FAULT_CODE, SUBSTRATE_REFUSAL_CODE, _emit, _fail, _owned_run, delegate_result
+from ouroboros.delegate_shared import (
+    AGENT_FAULT_CODE,
+    SUBSTRATE_REFUSAL_CODE,
+    _emit,
+    _fail,
+    _owned_run,
+    delegate_result,
+    refusal_host_code,
+)
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.tool_result import ToolResult
@@ -635,5 +648,257 @@ def _delegate_answer(
         # retry blindly.
         log.warning("delegate_answer failed untyped for %s/%s", rid, iid, exc_info=True)
         return _answer_delivery_unknown(gateway, rid, iid, exc, seconds_left=_left())
+    finally:
+        gateway.close()
+
+
+# -- delegate_message: a live message into the run's running turn ----------------
+#
+# What each typed live-message outcome MEANS for the nanny, relayed verbatim like
+# ``_ANSWER_NOTES``. Custody of ``message_id`` (the wire Idempotency-Key, minted
+# here, returned in EVERY result): the engine REPLAYS a succeeded command's stored
+# receipt under the same key, so every FINAL verdict (delivered / accepted /
+# rejected / not_active / unsupported) is that invocation's answer forever — the
+# SAME message_id is re-sent ONLY after ``delivery_unknown``; a new message after
+# any final verdict needs a NEW id (omit message_id). Never a content-stable key.
+_MESSAGE_NOTES = {
+    "delivered": "The harness CONSUMED this message inside the live turn (a correlated "
+                 "native echo); obedience is unproved. Keep watching with delegate_wait "
+                 "(timeline rows carrying this messageId — message.* receipts and the harness "
+                 "status row — carry messageId and outcome). This "
+                 "message_id is spent: a further message needs a NEW one (omit message_id).",
+    "accepted": "The harness's acceptance boundary was observed; CONSUMPTION is unproved "
+                "until a timeline row with this message_id reads outcome=delivered (Codex "
+                "answers accepted first; the consumption echo lands as a later status row). Keep watching with "
+                "delegate_wait. This message_id is spent: a further message needs a NEW one.",
+    "rejected": "An explicit refusal of THIS submission (see reason/detail): the vendor "
+                "refused the steer on a still-active turn, the call itself was in error, "
+                "or the daemon could not persist admission. The message did NOT land. A "
+                "retry needs a NEW message_id — a replay of this one returns this verdict.",
+    "not_active": "No eligible live target existed before dispatch (no live attempt, a "
+                  "terminal or settled run, a turn gap, an attempt mismatch, or a PENDING "
+                  "question — answer that with delegate_answer). Nothing was written to the "
+                  "harness. A later message needs a NEW message_id.",
+    "unsupported": "This route/run has no live-input channel (engine without the operation, "
+                   "harness liveInput none, or a thread-bound run). Nothing was written. "
+                   "Steer by cancel + a new delegate_start, or wait for the terminal.",
+    "delivery_unknown": "The message MAY have landed (transport loss, timeout, malformed "
+                        "reply, receipt-save failure). Do NOT send a different message. "
+                        "Re-check the timeline with delegate_wait (rows carrying this messageId "
+                        "carry its outcome); to retry, call delegate_message again "
+                        "with the SAME message_id and the SAME text — the engine replays "
+                        "the stored receipt instead of delivering twice.",
+    "not_found": "The daemon answered 404 for this run after advertising the operation "
+                 "and the route's live-input capability: the run is unknown to it. "
+                 "Custody is untouched; re-read the run with delegate_wait first.",
+}
+
+# A reason that overrides the outcome note: a FAILED capability read is not a
+# missing channel, so the note must not prescribe cancel + restart.
+_MESSAGE_REASON_NOTES = {
+    "capability_read_failed": "The route's live-input capability could not be READ (daemon "
+                              "or catalog error), so nothing was sent and the channel is "
+                              "unknown, not absent. Keep the run; re-check with delegate_wait "
+                              "and send again later with a NEW message_id.",
+}
+
+# The 4xx problem bodies that are a PAYLOAD verdict about these message bytes
+# (malformed, secret-bearing, too long): ``rejected`` as the agent fault it is.
+# 409 is deliberately absent — on this route it is the idempotency store
+# speaking (``idempotency_conflict`` = the same message_id with different text,
+# a rejection; ``delivery_in_progress`` / ``delivery_interrupted`` = a delivery
+# whose fate is unknown), read from the typed ``code`` FIRST.
+_MESSAGE_PAYLOAD_VERDICT_CODES = frozenset({400, 413, 422})
+# The internal wall-clock budget for ONE delegate_message call, strictly below
+# its ToolEntry timeout (120s): handshake, the two capability reads and the
+# POST are budgeted against what remains (the codex steer itself is bounded at
+# 30s inside the engine), and exhaustion returns a typed outcome instead of an
+# executor thread-kill mid-wire.
+_MESSAGE_DEADLINE_SEC = 100.0
+
+
+def _live_input_unsupported(gateway: Any, route_id: str,
+                            left: Callable[[], float]) -> Tuple[str, str, str]:
+    """``(reason, detail, live_input)`` — reason empty when the route CAN take a
+    live message. Discovery is structural (A18): the engine's own route catalog
+    must list the operation AND the route's catalog row must declare a
+    ``liveInput`` other than ``none``; a read that fails is ``unsupported`` too
+    (no POST on a guess), never a refusal that spends a model round."""
+    from ouroboros.delegate_progress import poll_bound
+    from ouroboros.gateways.claudexor import RUN_MESSAGE_OPERATION, run_message_supported
+
+    try:
+        if left() <= 0:
+            return ("deadline_exhausted", "budget spent before the operations read", "unknown")
+        if not run_message_supported(gateway.operations(timeout_sec=poll_bound(left()))):
+            return ("engine_lacks_operation",
+                    f"the engine's /v2/operations catalog does not list "
+                    f"{' '.join(RUN_MESSAGE_OPERATION)}", "")
+        if left() <= 0:
+            return ("deadline_exhausted", "budget spent before the capability read", "unknown")
+        catalog = gateway.agent_capabilities(timeout_sec=poll_bound(left()))
+        row = next((item for item in (catalog.get("harnesses") or [])
+                    if isinstance(item, dict) and str(item.get("id") or "") == route_id), None)
+    except Exception as exc:  # noqa: BLE001 — a failed read is "unknown", answered typed
+        return ("capability_read_failed", f"{type(exc).__name__}: {exc}", "unknown")
+    if row is None:
+        return ("route_not_in_capability_catalog",
+                f"route {route_id!r} has no row in /v2/agent-capabilities", "")
+    live_input = str(row.get("liveInput") or "none")
+    if live_input == "none":
+        return ("route_live_input_none",
+                f"route {route_id!r} declares liveInput={live_input!r}", live_input)
+    return ("", "", live_input)
+
+
+def _message_problem_outcome(exc: Exception) -> Tuple[str, str, Optional[str]]:
+    """``(outcome, reason, host_code)`` for an untyped refusal of the message POST.
+
+    The typed ``code`` is read FIRST (A16): a 409 ``idempotency_conflict`` is a
+    definite rejection of this submission (same message_id, different text); the
+    other 409s, every 5xx, status 0 (transport death) and every non-verdict 4xx
+    (auth, rate, timeout) say nothing about delivery and are ``delivery_unknown``;
+    ANY 404 — every daemon 404 has a body — is the host's own ``not_found``
+    (custody untouched: ``daemon_says_absent`` is never consulted here).
+    """
+    status = int(getattr(exc, "status_code", 0) or 0)
+    code = str(getattr(exc, "code", "") or "") or f"http_{status}"
+    if status == 409 and code == "idempotency_conflict":
+        return "rejected", code, refusal_host_code(code)
+    if status == 409:
+        return "delivery_unknown", code, None
+    if status == 404:
+        return "not_found", code, SUBSTRATE_REFUSAL_CODE
+    if status in _MESSAGE_PAYLOAD_VERDICT_CODES:
+        return "rejected", code, AGENT_FAULT_CODE
+    return "delivery_unknown", code, None
+
+
+def _message_result(ctx: ToolContext, facts: Dict[str, Any], *, outcome: str,
+                    reason: str = "", http_status: int = 0, detail: str = "",
+                    host_code: Optional[str] = None, **engine: Any) -> ToolResult:
+    """Record the receipt (``delegate_message_outcome``, digest and size, never
+    the text) and render the typed result. ``host_code`` marks a refusal;
+    ``delivery_unknown`` and the two positive outcomes are OK observations."""
+    _emit(ctx, "delegate_message_outcome", {
+        **facts, "outcome": outcome, "reason": reason, "http_status": int(http_status),
+        "attempt_id": str(engine.get("attempt_id") or ""),
+        "harness_id": str(engine.get("harness_id") or ""),
+    })
+    payload: Dict[str, Any] = {
+        "status": outcome, "run_id": facts["run_id"], "message_id": facts["message_id"],
+        "accepted": outcome in ("delivered", "accepted"), "reason": reason or None,
+        "attempt_id": str(engine.get("attempt_id") or "") or None,
+        "harness_id": str(engine.get("harness_id") or "") or None,
+        "live_input": str(engine.get("live_input") or "") or None,
+        "native_turn_id": str(engine.get("native_turn_id") or "") or None,
+        "detail": detail,
+        "note": _MESSAGE_REASON_NOTES.get(reason) or _MESSAGE_NOTES.get(outcome, ""),
+    }
+    if host_code:
+        payload.update({"ok": False, "host_code": host_code})
+    return delegate_result(payload)
+
+
+def _delegate_message(ctx: ToolContext, run_id: str, text: Any,
+                      message_id: str = "") -> ToolResult:
+    """Place one live message into a delegated run's running turn.
+
+    Custody-gated like answer/cancel: only the task that started the run may
+    speak into it. The outcome is TYPED end to end and mirrors the engine's
+    ``LiveMessageOutcome`` 1:1 (``delivered`` / ``accepted`` / ``rejected`` /
+    ``not_active`` / ``unsupported`` / ``delivery_unknown``) plus the host's own
+    ``not_found``; the engine's ``reason`` rides verbatim. Two host short-circuits
+    never POST a FRESH message: a settled run (``not_active``) and a route with
+    no live-input channel (``unsupported``, discovered structurally from the
+    operation catalog and the route row's ``liveInput`` — no harness-name
+    branch). The host mints ``message_id`` (= the wire Idempotency-Key) and
+    returns it; a call carrying a previously returned id SKIPS both
+    short-circuits and POSTs so the engine replays the stored receipt (A27) —
+    the recovery for ``delivery_unknown``, and ONLY for it. No retry loop, no
+    stall detector: the whole call runs under one internal deadline strictly
+    below its ToolEntry timeout, and no failure reaches the model as a
+    traceback.
+    """
+    from ouroboros.delegate_progress import poll_bound
+    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+
+    rid = str(run_id or "").strip()
+    if not rid:
+        return _fail("delegate_message", "missing_run_id", "run_id is required")
+    body_text = text if isinstance(text, str) else ""
+    if not body_text.strip():
+        return _fail("delegate_message", "message_text_required",
+                     "text is required: the message to place into the run's live "
+                     "session, a non-empty string (nothing is coerced).", run_id=rid)
+    not_mine, entry = _owned_run(ctx, "delegate_message", rid)
+    if not_mine or entry is None:
+        return not_mine or _fail("delegate_message", "run_ownership_unknown",
+                                 "custody unresolved", run_id=rid)
+    mid = str(message_id or "").strip()
+    replay = bool(mid)
+    if not replay:
+        mid = uuid.uuid4().hex
+    facts = {"run_id": rid, "message_id": mid, "text_chars": len(body_text),
+             "text_sha256": hashlib.sha256(body_text.encode("utf-8", "replace")).hexdigest()}
+    if not replay and entry.settled:
+        return _message_result(
+            ctx, facts, outcome="not_active", reason="run_settled",
+            host_code=SUBSTRATE_REFUSAL_CODE,
+            detail="custody records this run as settled; there is no live turn to steer")
+    deadline = time.monotonic() + _MESSAGE_DEADLINE_SEC
+
+    def _left() -> float:
+        return deadline - time.monotonic()
+
+    gateway = ClaudexorGateway()
+    try:
+        gateway.handshake(timeout_sec=poll_bound(min(_left(), _ANSWER_HANDSHAKE_MAX_SEC)))
+    except ClaudexorUnavailable as exc:
+        gateway.close()
+        return _fail("delegate_message", exc.code, str(exc), run_id=rid, message_id=mid)
+    try:
+        live_input = ""
+        if not replay:
+            reason, detail, live_input = _live_input_unsupported(
+                gateway, str(entry.route_id or ""), _left)
+            if reason and reason != "deadline_exhausted":
+                return _message_result(ctx, facts, outcome="unsupported", reason=reason,
+                                       host_code=SUBSTRATE_REFUSAL_CODE, detail=detail,
+                                       live_input=live_input)
+        if _left() <= 0:
+            # Spent before the POST: nothing was sent, and the same-id retry the
+            # delivery_unknown note prescribes is exactly right (the key is unused).
+            return _message_result(
+                ctx, facts, outcome="delivery_unknown", reason="deadline_exhausted",
+                detail=(f"local time budget ({_MESSAGE_DEADLINE_SEC:.0f}s) spent before "
+                        "the message POST was sent; nothing was sent"), live_input=live_input)
+        try:
+            body = gateway.send_run_message(rid, body_text, idempotency_key=mid,
+                                            timeout_sec=poll_bound(_left()))
+        except ClaudexorUnavailable as exc:
+            outcome, reason, host_code = _message_problem_outcome(exc)
+            return _message_result(
+                ctx, facts, outcome=outcome, reason=reason, host_code=host_code,
+                http_status=int(getattr(exc, "status_code", 0) or 0), detail=str(exc),
+                live_input=live_input)
+        outcome = str(body.get("outcome") or "")
+        reason = str(body.get("reason") or "")
+        host_code = None
+        if outcome == "rejected":
+            host_code = refusal_host_code(reason)
+        elif outcome in ("not_active", "unsupported"):
+            host_code = SUBSTRATE_REFUSAL_CODE
+        return _message_result(
+            ctx, facts, outcome=outcome, reason=reason, http_status=200,
+            host_code=host_code, detail=str(body.get("message") or ""),
+            attempt_id=body.get("attemptId"), harness_id=body.get("harnessId"),
+            live_input=body.get("liveInput") or live_input,
+            native_turn_id=body.get("nativeTurnId"))
+    except Exception as exc:  # noqa: BLE001 — F7: never a raw traceback to the model
+        log.warning("delegate_message failed untyped for %s/%s", rid, mid, exc_info=True)
+        return _message_result(
+            ctx, facts, outcome="delivery_unknown", reason="host_exception",
+            detail=f"{type(exc).__name__}: {exc}")
     finally:
         gateway.close()

@@ -248,12 +248,13 @@ def test_build_trace_summary_shows_structured_failure_facts():
     assert "OMISSION NOTE" in pipeline.build_trace_summary(long_trace)
 
 
-def test_facts_row_states_files_rescued_from_a_stat_only_walk(tmp_path, no_model_calls):
+def test_facts_row_states_files_rescued_from_the_shared_unmeasured_listing(tmp_path, no_model_calls):
     """TZ-2 C2: at terminal the free facts row says how many files reached the task's
-    artifact store — a positive count, a confirmed zero, or unknown — from a stat-only
-    walk that discloses it computed no hashes. Store bookkeeping is not a rescued file,
-    an empty readable manifest alone never proves zero (the walk does), an unreadable
-    store is unknown (never zero), and a split root walks the child-drive store too."""
+    artifact store — a positive count, a confirmed zero, or unknown — from the shared
+    unmeasured listing, disclosing that no hash was computed. Store bookkeeping is not a
+    rescued file, an empty readable manifest alone never proves zero (the listing does),
+    something other than a store directory is unknown (never zero), and a split root lists
+    the child-drive store too."""
     from ouroboros.headless import task_artifacts_dir
 
     drive_logs = tmp_path / "logs"
@@ -295,10 +296,149 @@ def test_facts_row_states_files_rescued_from_a_stat_only_walk(tmp_path, no_model
                    {"store": str(task_artifacts_dir(child, "split-1", create=False)), "count": 1, "readable": True}]}
 
 
-def test_rescued_files_walk_excludes_exactly_the_store_bookkeeping_names():
-    """The bookkeeping names the walk skips are the SSOT literals, pinned so they cannot drift."""
+def test_rescued_files_count_listed_deliverables_never_store_metadata_inputs_or_receipts(tmp_path):
+    """The count is the shared listing's: registration metadata, the scratch manifest, the
+    receipt stream, staged inputs, chat media and source handles are not rescued files; an
+    unregistered output is one; a registration whose file is gone is not a file."""
     from ouroboros.artifacts import _ARTIFACT_MANIFEST
-    from ouroboros.task_finalization import RESCUED_FILES_BOOKKEEPING
-    from ouroboros.workspace_patch_capture import SCRATCH_MANIFEST_NAME
+    from ouroboros.headless import SCRATCH_MANIFEST_NAME, task_artifacts_dir
+    from ouroboros.outcome_receipt_store import verification_receipts_path
+    from ouroboros.task_finalization import rescued_files_fact
 
-    assert RESCUED_FILES_BOOKKEEPING == frozenset({_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME})
+    store = task_artifacts_dir(tmp_path, "mix-1")
+    (store / _ARTIFACT_MANIFEST).write_text(json.dumps({"schema_version": 1, "artifacts": {
+        "report.md": {"kind": "task_artifact", "name": "report.md", "path": str(store / "report.md")},
+        "gone.md": {"kind": "task_artifact", "name": "gone.md", "path": str(store / "gone.md")}}}), encoding="utf-8")
+    (store / (_ARTIFACT_MANIFEST + ".lock")).write_text("", encoding="utf-8")
+    (store / SCRATCH_MANIFEST_NAME).write_text("{}", encoding="utf-8")
+    verification_receipts_path(tmp_path, "mix-1").write_text('{"check": "x"}\n', encoding="utf-8")
+    for rel in ("attachments/brief.pdf", "chat_media/photo.png", "source_handles/tool_results/r.txt"):
+        (store / rel).parent.mkdir(parents=True, exist_ok=True)
+        (store / rel).write_text("input", encoding="utf-8")
+    (store / "report.md").write_text("registered", encoding="utf-8")
+    (store / "unregistered.csv").write_text("1,2", encoding="utf-8")
+    (store / "nested").mkdir()
+    (store / "nested" / "notes.txt").write_text("n", encoding="utf-8")
+
+    assert rescued_files_fact("mix-1", [store]) == {
+        "count": 3, "state": "positive", "hash_computed": False,
+        "stores": [{"store": str(store), "count": 3, "readable": True}]}
+
+    only_inputs = task_artifacts_dir(tmp_path, "inputs-1")
+    (only_inputs / "attachments").mkdir()
+    (only_inputs / "attachments" / "brief.pdf").write_text("input", encoding="utf-8")
+    (only_inputs / _ARTIFACT_MANIFEST).write_text(json.dumps({"schema_version": 1, "artifacts": {
+        "gone.md": {"kind": "task_artifact", "name": "gone.md"}}}), encoding="utf-8")
+    assert rescued_files_fact("inputs-1", [only_inputs])["state"] == "zero"
+
+
+def test_rescued_files_are_unknown_never_zero_when_the_listing_cannot_vouch(tmp_path, monkeypatch):
+    """A corrupt registration, a failed tree read, a link where the store should be and a
+    path that is not the task's store are each unknown with the readable stores' floor —
+    never a confirmed zero; a store never created is zero."""
+    import os
+
+    from ouroboros import artifacts
+    from ouroboros.headless import task_artifacts_dir
+    from ouroboros.task_finalization import rescued_files_fact, rescued_files_sentence
+
+    good = task_artifacts_dir(tmp_path, "unk-2")
+    (good / "kept.txt").write_text("k", encoding="utf-8")
+    corrupt_drive = tmp_path / "corrupt-drive"
+    corrupt = task_artifacts_dir(corrupt_drive, "unk-2")
+    (corrupt / "out.txt").write_text("o", encoding="utf-8")
+    (corrupt / artifacts._ARTIFACT_MANIFEST).write_text('{"artifacts": {', encoding="utf-8")
+    fact = rescued_files_fact("unk-2", [good, corrupt])
+    assert fact == {"count": 1, "state": "unknown", "hash_computed": False,
+                    "stores": [{"store": str(good), "count": 1, "readable": True},
+                               {"store": str(corrupt), "count": 0, "readable": False}]}
+    assert rescued_files_sentence(fact) == ("Files rescued: unknown — a task artifact store could not be "
+                                            "listed; 1 listed before the failure (hashes not computed).")
+
+    def unreadable_tree(_root):
+        raise PermissionError("tree read denied")
+        yield  # pragma: no cover - a generator that fails on first read
+
+    monkeypatch.setattr(artifacts, "iter_artifact_tree", unreadable_tree)
+    assert rescued_files_fact("unk-2", [good])["state"] == "unknown"
+    monkeypatch.undo()
+
+    assert rescued_files_fact("unk-2", [good.parent / "someone-else"])["state"] == "unknown"
+    assert rescued_files_fact("unk-2", [tmp_path / "shallow"])["state"] == "unknown"
+    never = task_artifacts_dir(tmp_path, "never-2", create=False)
+    assert rescued_files_fact("never-2", [never]) == {
+        "count": 0, "state": "zero", "hash_computed": False,
+        "stores": [{"store": str(never), "count": 0, "readable": True}]}
+
+    linked = task_artifacts_dir(tmp_path, "link-2", create=False)
+    try:
+        os.symlink(good, linked, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable on this platform")
+    assert rescued_files_fact("link-2", [linked])["state"] == "unknown"
+
+
+def test_rescued_files_count_physical_files_per_distinct_store_without_deduplicating(tmp_path):
+    """The canonical store and a custom actor drive's store are both listed; the same
+    relative path in each is two listed files (nothing proves one copy), and one store
+    named twice is listed once by ``artifact_store_roots``."""
+    from ouroboros.headless import task_artifacts_dir
+    from ouroboros.task_finalization import artifact_store_roots, rescued_files_fact, rescued_files_sentence
+
+    actor = tmp_path / "custom" / "actor-drive"
+    for drive in (tmp_path, actor):
+        (task_artifacts_dir(drive, "dup-1") / "out.txt").write_text("o", encoding="utf-8")
+    stores = artifact_store_roots(tmp_path, "dup-1", task={"child_drive_root": str(actor)})
+    assert stores == [task_artifacts_dir(tmp_path, "dup-1", create=False),
+                      task_artifacts_dir(actor, "dup-1", create=False)]
+    fact = rescued_files_fact("dup-1", stores)
+    assert (fact["count"], fact["state"], [row["count"] for row in fact["stores"]]) == (2, "positive", [1, 1])
+    assert rescued_files_sentence(fact) == "Files rescued: 2 listed in the task's artifact stores (hashes not computed)."
+    assert artifact_store_roots(tmp_path, "dup-1", child_root=tmp_path) == [task_artifacts_dir(tmp_path, "dup-1", create=False)]
+
+
+def test_rescued_files_fact_hashes_copies_registers_and_opens_nothing_but_the_registration(tmp_path, monkeypatch):
+    """Pure: no hash, no copy, no registration write, and the only file whose content is
+    read is the store's shared registration metadata."""
+    import hashlib
+    import io
+
+    from ouroboros import artifacts
+    from ouroboros.headless import task_artifacts_dir
+    from ouroboros.task_finalization import rescued_files_fact
+
+    store = task_artifacts_dir(tmp_path, "pure-1")
+    (store / artifacts._ARTIFACT_MANIFEST).write_text(json.dumps({"schema_version": 1, "artifacts": {
+        "a.bin": {"kind": "task_artifact", "name": "a.bin", "immutable": True, "size": 2, "sha256": "0" * 64}}}),
+        encoding="utf-8")
+    (store / "a.bin").write_bytes(b"ab")
+    (store / "deep").mkdir()
+    (store / "deep" / "b.bin").write_bytes(b"cd")
+
+    def snapshot():
+        return sorted((str(p), p.stat().st_mtime_ns, p.read_bytes() if p.is_file() else b"")
+                      for p in tmp_path.rglob("*"))
+
+    before = snapshot()
+    opened = []
+    real_open = io.open
+
+    def spying_open(file, *args, **kwargs):
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("the rescued-files fact hashes, measures, copies or registers nothing")
+
+    monkeypatch.setattr(io, "open", spying_open)
+    monkeypatch.setattr(artifacts, "sha256", forbidden)
+    monkeypatch.setattr(hashlib, "sha256", forbidden)
+    for name in ("artifact_record", "stream_artifact_file", "_register_task_artifact_records",
+                 "copy_file_to_task_artifacts", "update_json_locked"):
+        monkeypatch.setattr(artifacts, name, forbidden)
+    fact = rescued_files_fact("pure-1", [store])
+    monkeypatch.undo()
+
+    assert (fact["count"], fact["state"], fact["hash_computed"]) == (2, "positive", False)
+    assert set(opened) <= {str(store / artifacts._ARTIFACT_MANIFEST)}, opened
+    assert snapshot() == before

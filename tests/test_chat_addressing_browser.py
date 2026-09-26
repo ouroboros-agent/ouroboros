@@ -36,6 +36,26 @@ _OBSERVE_CARDS = """() => {
 }"""
 
 
+def _work_order(text):
+    """The objective an actor was handed, read past the drafted-objective frame.
+
+    A promoted follow-up's first user row opens with the host's
+    ``[OBJECTIVE_AUTHOR]`` notice (a task, not the owner, drafted it); the
+    fixture routes actors by the work order that follows, never by the frame.
+    """
+    frame, closed, rest = text.partition("[/OBJECTIVE_AUTHOR]\n\n")
+    return rest if closed and frame.startswith("[OBJECTIVE_AUTHOR]") else text
+
+
+def test_work_order_reads_the_objective_under_the_drafted_objective_frame():
+    from ouroboros.context import build_user_content
+
+    rendered = build_user_content({"text": "MANAGED_FOLLOWUP_x", "metadata": {
+        "objective_author": {"kind": "task", "task_id": "addressing-1"}}})
+    assert rendered.startswith("[OBJECTIVE_AUTHOR]") and _work_order(rendered) == "MANAGED_FOLLOWUP_x"
+    assert _work_order("NATIVE_ADDRESSING_x") == "NATIVE_ADDRESSING_x"
+
+
 class ToolCallOnlyModel(ScriptedStubModel):
     """Use the harness's full-message seam for genuine tool-only turns.
 
@@ -75,7 +95,7 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
 
     def response(body):
         user_messages = [message_text(m) for m in body.get("messages", []) if m.get("role") == "user"]
-        if any(text.startswith(child_marker) for text in user_messages):
+        if any(_work_order(text).startswith(child_marker) for text in user_messages):
             child_calls.append(body)
             return ({"tool": "read_file", "arguments": {"root": "system_repo", "path": "VERSION"}}
                     if len(child_calls) == 1 else {"final": "The admitted follow-up is complete."})
@@ -135,6 +155,10 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                         child_metrics = [row for row in oracle.supervisor_rows("task_metrics_event") if row.get("task_id") == child_id]
                         assert child_metrics and child_metrics[-1]["tool_calls"] == 1
                         assert len(child_calls) >= 2
+                        # The follow-up is told the addressing turn drafted its objective.
+                        drafted = next(message_text(m) for m in child_calls[0]["messages"] if m.get("role") == "user"
+                                       and _work_order(message_text(m)).startswith(child_marker))
+                        assert drafted.startswith("[OBJECTIVE_AUTHOR]") and f"drafted by task {task_id}," in drafted, drafted
                         page.locator('.msg-routing-annotation[data-annotation-status="scheduled"]').wait_for(timeout=30000)
                         page.locator(f'.chat-live-card[data-task-id="{child_id}"]').wait_for(state="attached", timeout=30000)
                         assert page.locator(f'.chat-live-card[data-task-id="{child_id}"]').count() == 1

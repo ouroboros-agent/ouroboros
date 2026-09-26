@@ -466,46 +466,78 @@ def test_wait_for_task_appends_cache_horizon_note(tmp_path, monkeypatch):
     )
 
 
-def test_cache_horizon_reachability_matches_the_wait_clamps():
-    """Honest reachability of the wait disclosure, derived from the REAL clamps.
+def test_cache_horizon_reachability_matches_the_wait_clamps(tmp_path, monkeypatch):
+    """Honest reachability of the wait disclosure, measured on BEHAVIOR.
 
-    Each wait tool caps its own window, so the line's availability is per-tool and
-    per-TTL: at the shipped '1h' default only wait_tasks (7200s) can genuinely emit
-    it, wait_task sits exactly on the 3600s horizon and delegate_wait (1800s window
-    max — the wait's REAL clamp since F5a, not the 2100s ToolEntry kill timeout)
-    cannot reach it at all; at '5m' all three do. The stream report advertised it as
-    a live capability of all three at the default — this pin makes the truth loud and
-    fails if a clamp, the ceiling, or the tier scale moves without revisiting it."""
-    import inspect
-    import re
+    The root waits measure their own elapsed window, so their line's availability is
+    per-tool and per-TTL and follows the window each one actually hands the poller: at
+    the shipped '1h' default only wait_tasks (7200s) can genuinely emit it and
+    wait_task sits exactly on the 3600s horizon; at '5m' both do. delegate_wait no
+    longer measures its 3 s tick: its wake measures the time since the task's last
+    model response, so it can emit at ANY tier (pinned in the supervising-wake test
+    below). Fails if a clamp, the ceiling or the tier scale moves without revisiting
+    the disclosure."""
     from types import SimpleNamespace
 
-    from ouroboros.config import DELEGATE_WAIT_WINDOW_MAX_SEC
     from ouroboros.llm import cache_ttl_seconds
     from ouroboros.tools import control_task_results as control_mod
     from ouroboros.tools.control import cache_horizon_note
 
-    def _clamp(fn):
-        found = re.findall(r"min\(int\(timeout_sec\),\s*(\d+)\)", inspect.getsource(fn))
-        assert len(found) == 1, f"{fn.__name__}: expected one timeout clamp, found {found}"
-        return int(found[0])
+    def _clamp(ceiling):
+        # The one window ladder both task waits use, probed without a deadline.
+        window = control_mod._wait_window(SimpleNamespace(), 10**9, clamp=ceiling, minimum=0, margin=30)
+        assert window == (ceiling, "ceiling")
+        return window[0]
 
     ceilings = {
-        "wait_task": _clamp(control_mod._wait_for_task),
-        "wait_tasks": _clamp(control_mod._wait_for_tasks),
-        "delegate_wait": DELEGATE_WAIT_WINDOW_MAX_SEC,
+        "wait_task": _clamp(control_mod._WAIT_TASK_CLAMP_SEC),
+        "wait_tasks": _clamp(control_mod._WAIT_TASKS_CLAMP_SEC),
     }
-    assert ceilings == {"wait_task": 3600, "wait_tasks": 7200, "delegate_wait": 1800}
+    assert ceilings == {"wait_task": 3600, "wait_tasks": 7200}
 
     def _emits(tier, ceiling):
         ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": tier})
         return bool(cache_horizon_note(ctx, float(ceiling)))
 
     assert cache_ttl_seconds("1h") == 3600 and cache_ttl_seconds("5m") == 300
-    at_1h = {name: _emits("1h", sec) for name, sec in ceilings.items()}
-    assert at_1h == {"wait_task": False, "wait_tasks": True, "delegate_wait": False}
-    at_5m = {name: _emits("5m", sec) for name, sec in ceilings.items()}
-    assert at_5m == {"wait_task": True, "wait_tasks": True, "delegate_wait": True}
+    assert {name: _emits("1h", sec) for name, sec in ceilings.items()} == {
+        "wait_task": False, "wait_tasks": True}
+    assert {name: _emits("5m", sec) for name, sec in ceilings.items()} == {
+        "wait_task": True, "wait_tasks": True}
 
     doc = cache_horizon_note.__doc__ or ""
     assert "REACHABILITY" in doc  # the limitation is stated where the note is built
+
+
+def _response_meta(seconds_ago):
+    import datetime as _dt
+
+    stamp = _dt.datetime.now(tz=_dt.timezone.utc) - _dt.timedelta(seconds=seconds_ago)
+    return {"ts": stamp.isoformat(), "provider": "anthropic", "model": "m"}
+
+
+def test_supervising_wake_horizon_fires_only_past_the_applied_ttl(tmp_path):
+    """delegate_wait's note is computed ONCE per wake from the task's last model
+    response (a lower bound on cache age): it fires past the APPLIED horizon, stays
+    silent below it and on an unknown tier, and a replay repeats the recorded wake."""
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.delegate_supervision import supervised_wait
+
+    def _wake(ttl, seconds_ago):
+        ctx = SimpleNamespace(
+            task_id=f"t-{ttl or 'none'}-{seconds_ago}", task_attempt=1, drive_root=tmp_path,
+            _accumulated_usage={"_last_prompt_cache_ttl": ttl,
+                                "_last_llm_call_meta": _response_meta(seconds_ago)})
+        raw = supervised_wait(ctx, "run-h", wait_once=lambda *_a: json.dumps(
+            {"status": "completed", "run_id": "run-h", "last_seq": 1})).text
+        return ctx, json.loads(raw)
+
+    _ctx, past = _wake("1h", 3700)
+    assert "1h" in past["cache_horizon_note"] and "may be cold" in past["cache_horizon_note"]
+    assert "cache_horizon_note" not in _wake("1h", 3500)[1]
+    assert "cache_horizon_note" not in _wake("", 10_000)[1]
+    replay = json.loads(supervised_wait(_ctx, "run-h", wait_once=lambda *_a: (_ for _ in ()).throw(
+        AssertionError("an unacknowledged wake replays before any new observation"))).text)
+    assert replay == past

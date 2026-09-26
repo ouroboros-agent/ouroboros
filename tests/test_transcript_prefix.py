@@ -315,8 +315,17 @@ def test_automatic_reclaim_inside_the_model_call_is_a_sanctioned_break_on_its_ro
         if ctx.round_idx != 3 or fired or automatic_pass_used:
             return None
         fired.append(True)
-        measurement = SimpleNamespace(route_fp="fp", round_id="r3", measurement_basis="cold_estimate",
-                                      measurement_density=1.0, reclaim_goal_tokens=100)
+        from ouroboros.context_fit import MainFitMeasurement
+
+        # A real measurement: only a positive deficit decides "reclaim_once", and the
+        # reclaim's low-water telemetry reads the deficit and boundary fields.
+        measurement = MainFitMeasurement(
+            route_fp="fp", round_id="r3", profile="owner_low", rendered_mode="low",
+            estimated_input_tokens=200_000 - 65_536 + 100, response_reserve_tokens=65_536,
+            target_total_tokens=200_000, capacity_total_tokens=None,
+            measurement_basis="cold_estimate", measurement_density=1.0,
+            target_deficit_tokens=100, capacity_deficit_tokens=None, reclaim_goal_tokens=100,
+        )
         return SimpleNamespace(action="reclaim_once", measurement=measurement, automatic_pass_used=False)
 
     monkeypatch.setattr(loop, "_measure_round_main_fit", measure)

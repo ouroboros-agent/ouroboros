@@ -27,7 +27,8 @@ from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture 
 )
 
 
-NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer"}
+NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+               "delegate_message"}
 
 
 def test_subagent_harness_key_stays_out_of_the_model_key_sweep():
