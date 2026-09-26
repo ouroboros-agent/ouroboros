@@ -164,6 +164,32 @@ def test_a_predecessor_without_an_operative_spec_is_unresolved_history_not_a_cha
     assert _walk([], None) == {}  # no predecessor at all is a first wave
 
 
+def test_the_last_paid_wave_survives_hot_index_eviction(harness, monkeypatch):
+    """The hot index keeps at most 64 waves; eviction drops the oldest entries but never the
+    newest PAID wave, so after 64 unpaid revisions the next revision still judges against A
+    and a refused objector carries A's finding (the 63/64 boundary)."""
+    from ouroboros.task_results import _PLAN_REVIEW_MAX_WAVES
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "20")
+    _patch_health(monkeypatch, lambda slots: {})
+    _effort_aware_builder(harness, monkeypatch)
+    harness.install({"s1": _objection("n1", "Friday is impossible"), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    a_fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    for n in range(_PLAN_REVIEW_MAX_WAVES):
+        _install_barrier_substrate(monkeypatch, [], refused={"s1", "s2", "s3"})
+        _call(ctx, plan=f"Revision {n}: outline, then draft.")
+        _collect(ctx, _state(harness)["waves"][-1]["request_fingerprint"])
+    state = _state(harness)
+    assert state["waves_omitted"] >= 1 and len(state["waves"]) == _PLAN_REVIEW_MAX_WAVES
+    assert any(w["request_fingerprint"] == a_fp and w.get("paid") for w in state["waves"])
+    _install_barrier_substrate(monkeypatch, [], refused={"s1"})
+    _call(ctx, plan="The final revision: draft, then outline.")
+    assert _control(_collect(ctx, _state(harness)["waves"][-1]["request_fingerprint"])) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    assert _carried(harness) == ["s1:n1"]
+
+
 def test_a_compacted_last_paid_wave_still_owes_its_objection(harness, monkeypatch):
     """The hot index keeps eight full waves and compacts older ones. After A (paid, s1
     objecting) and eight unpaid revisions (every seat refused at $0), A is compact; the

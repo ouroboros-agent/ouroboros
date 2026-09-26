@@ -1502,9 +1502,11 @@ def record_plan_review_wave(
             for idx, w in enumerate(waves)
         ]
         overflow = max(0, len(waves) - _PLAN_REVIEW_MAX_WAVES)
-        if overflow:
-            state["waves_omitted"] = int(state.get("waves_omitted") or 0) + overflow
-            waves = waves[overflow:]
+        if overflow:  # the newest PAID wave stays reachable: the next dispatch judges against it
+            keep = next((i for i in range(len(waves) - 1, -1, -1) if waves[i].get("paid")), None)
+            dropped = set([i for i in range(len(waves)) if i != keep][:overflow])
+            state["waves_omitted"] = int(state.get("waves_omitted") or 0) + len(dropped)
+            waves = [w for i, w in enumerate(waves) if i not in dropped]
         # I-02: size-fitting (older-wave compaction, then the last-resort text cut) runs for
         # EVERY writer in `_update_plan_review_state` → `_fit_plan_review_state`.
         state["waves"] = waves
