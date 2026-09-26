@@ -912,8 +912,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder)
 
 def _last_paid_wave(state: dict) -> Optional[dict]:
+    """The latest PAID wave, compact or not: a compact entry is materialized (or refused as
+    unreadable) by the authority read that follows, never skipped as if no panel had run."""
     for wave in reversed(state.get("waves") or []):
-        if wave.get("paid") and not wave.get("compact"):
+        if wave.get("paid"):
             return wave
     return None
 

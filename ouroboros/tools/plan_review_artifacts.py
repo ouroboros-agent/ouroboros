@@ -807,10 +807,11 @@ def standing_findings_lineage(state_root: Any, task_id: str, state: Dict[str, An
     target = plan_spec.spec_hash(spec)
 
     def same_spec(wave: Any) -> bool:
-        return (isinstance(wave, dict) and isinstance(wave.get("spec"), dict)
-                and str(wave.get("spec_hash") or plan_spec.spec_hash(wave["spec"])) == target)
+        if not isinstance(wave.get("spec"), dict):  # unresolved spec authority is not a verified mismatch
+            raise PlanReviewSourceUnavailable("PLAN_REVIEW_SOURCE_UNAVAILABLE: a plan-review wave carries no operative spec")
+        return str(wave.get("spec_hash") or plan_spec.spec_hash(wave["spec"])) == target
 
-    if not same_spec(previous) or previous.get("closed"):
+    if not isinstance(previous, dict) or not same_spec(previous) or previous.get("closed"):
         return {}
     standing = plan_spec.plan_standing_findings(previous, spec, enforcement)
     pending = _pending_seats(previous) - set(standing)

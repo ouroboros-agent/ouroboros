@@ -151,3 +151,40 @@ def test_history_that_cannot_be_read_is_never_an_empty_obligation():
     # Quiet side: a seat that was pending in the very first wave owes nothing (nobody objected).
     first = _hot("a" * 64, 1, actors=[_pend("s1")])
     assert _walk([first], first) == {}
+
+
+def test_a_predecessor_without_an_operative_spec_is_unresolved_history_not_a_changed_spec():
+    a = _hot("a" * 64, 1, actors=[_ok("s1")], findings=[OBJECTION])
+    b = _hot("b" * 64, 2, actors=[_pend("s1")], previous=a["request_fingerprint"])
+    del a["spec"]
+    with pytest.raises(PlanReviewSourceUnavailable):
+        _walk([a, b], b)
+    assert _walk([], None) == {}  # no predecessor at all is a first wave
+
+
+def test_a_compacted_last_paid_wave_still_owes_its_objection(harness, monkeypatch):
+    """The hot index keeps eight full waves and compacts older ones. After A (paid, s1
+    objecting) and eight unpaid revisions (every seat refused at $0), A is compact; the
+    next revision must still judge against A (materialized from its exact artifact), so a
+    refused s1 carries A's objection instead of the panel closing GREEN on nobody's word."""
+    from ouroboros.task_results import _PLAN_REVIEW_FULL_WAVES
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "20")
+    _patch_health(monkeypatch, lambda slots: {})
+    _effort_aware_builder(harness, monkeypatch)
+    harness.install({"s1": _objection("n1", "Friday is impossible"), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    a_fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    for n in range(_PLAN_REVIEW_FULL_WAVES):
+        _install_barrier_substrate(monkeypatch, [], refused={"s1", "s2", "s3"})
+        assert _control(_call(ctx, plan=f"Revision {n}: outline, then draft.")) == {"outcome": "DEGRADED", "closed": False}
+        _collect(ctx, _state(harness)["waves"][-1]["request_fingerprint"])
+    a = next(w for w in _state(harness)["waves"] if w["request_fingerprint"] == a_fp)
+    assert a.get("compact") is True and a.get("paid") is True
+    _install_barrier_substrate(monkeypatch, [], refused={"s1"})
+    assert _control(_call(ctx, plan="The final revision: draft, then outline.")) == {"outcome": "DEGRADED", "closed": False}
+    last = _state(harness)["waves"][-1]
+    assert last["previous_fingerprint"] == a_fp and last["previous_wave_artifact"]
+    assert _control(_collect(ctx, last["request_fingerprint"])) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    assert _carried(harness) == ["s1:n1"]
