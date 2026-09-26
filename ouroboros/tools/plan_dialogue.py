@@ -189,6 +189,9 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                                        tokenizer_margin=155_000, slots=api)
     for slot in slots:
         sid = str(slot.slot_id)
+        # A shared packet cannot say "your": each slot's send ends with its own seat, after the
+        # cache-stable prefix, so a cycle-2 reviewer knows which earlier findings are its own.
+        seat = f"\n## YOUR PANEL SEAT\n\n`{sid}`\n"
         if not slot_retrieves(slot):
             capacity = int(limits[sid]) * 4
             existing = messages.get(sid)
@@ -196,12 +199,12 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                 # Continuation history is already exact; only this turn's new
                 # automatic source can shrink, never its prior paid inputs.
                 total = _messages_char_count(existing)
-                view, coverage[sid] = fit_dialogue_text(user_content, own, capacity - total + len(user_content))
-                messages[sid] = [{**m, "content": view} if i == len(existing) - 1 and m.get("role") == "user" else dict(m)
+                view, coverage[sid] = fit_dialogue_text(user_content, own, capacity - total + len(user_content) - len(seat))
+                messages[sid] = [{**m, "content": view + seat} if i == len(existing) - 1 and m.get("role") == "user" else dict(m)
                                  for i, m in enumerate(existing)]
             else:
-                view, coverage[sid] = fit_dialogue_text(user_content, own, capacity - len(system_prompt))
-                messages[sid] = build_plan_review_messages(system_prompt, view, plan_user_stable_len(view))
+                view, coverage[sid] = fit_dialogue_text(user_content, own, capacity - len(system_prompt) - len(seat))
+                messages[sid] = build_plan_review_messages(system_prompt, view + seat, plan_user_stable_len(view))
             lengths[sid] = _messages_char_count(messages[sid])
         elif not slot_is_session(slot):
             bound = review_native_transcript_bound(slot.model, output_reserve=PLAN_REVIEW_MAX_TOKENS,
@@ -211,7 +214,7 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
             def first_send(task):
                 return native_first_send_chars(session_root, surface="plan_review", role_hint=slot.role_hint,
                     slot_id=sid, session_task=task, output_contract=PLAN_FINDINGS_ARRAY_CONTRACT, task_id=task_id)
-            tasks[sid], coverage[sid] = fit_dialogue_text(session_task, own,
+            tasks[sid], coverage[sid] = fit_dialogue_text(session_task + seat, own,
                 native_landing_at(bound) - governance_read - 1, measure=first_send)
         elif own.get("file") and own.get("text"):
             instruction = (
@@ -223,9 +226,11 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                 f"using {own['locator']}::lines or ::bytes. Do not claim unread messages reviewed. "
                 "File access is available; full-read coverage remains reviewer-declared, not host-attested.\n"
             )
-            tasks[sid] = session_task.replace(str(own["text"]), instruction, 1)
+            tasks[sid] = session_task.replace(str(own["text"]), instruction, 1) + seat
             coverage[sid] = {"source_sha256": own["sha256"], "source_bytes": own["bytes"],
                              "inline_bytes": None, "full_file": own["file"], "read_coverage": "unobserved"}
+        else:
+            tasks[sid] = session_task + seat
         if slot_retrieves(slot):
             lengths[sid] = (first_send(tasks.get(sid, session_task)) if not slot_is_session(slot)
                             else len(tasks.get(sid, session_task)))

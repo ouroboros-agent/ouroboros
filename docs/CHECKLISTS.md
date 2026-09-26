@@ -823,7 +823,7 @@ Every element has a host-minted id (`goal`, `claim_N`, `invariant_N`, `decision_
 Those ids are the only valid `breaks` targets. Ids may shift between cycles when the agent
 rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec delta.
 
-### The rubric (five domain-free questions + one for self-modification)
+### The rubric (six domain-free questions + one for self-modification)
 
 | # | item | what to check |
 |---|------|---------------|
@@ -832,14 +832,15 @@ rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec 
 | 3 | constraints and invariants | Are the real constraints named — budget, deadline, safety, irreversibility, commitments to others? |
 | 4 | deferrals | Is anything deferred that will be expensive to change once the work has started? |
 | 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator or a spec item id) instead of inventing a gap. |
-| 6 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
+| 6 | subtraction | What could the spec drop (a claim, decision, invariant, deferral, path or guard) without losing the goal? Say it as a `note` naming the element id; removing is advice as legitimate as adding. |
+| 7 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
 
 ### Height rule — what may block
 
 A finding is **blocking** only if being wrong about it AFTER the work starts would invalidate work
 already done, violate a declared commitment, or make an acceptance claim unverifiable — and it
-MUST name the spec id it breaks. Everything else is a **note**. If missing evidence makes a claim
-structurally unverifiable, that is blocking against the claim, not a `need_evidence` request.
+MUST name the spec id it breaks. Everything else is a **note**. A claim you cannot check as written
+is a question to the author (`need_evidence` with the claim id in `breaks`) or a `note`, not a blocker.
 
 - `blocking` — requires `breaks: <spec id>`. Without a valid id the host demotes it to a note and
   discloses the demotion.
@@ -871,15 +872,18 @@ authority, and prose outside the array is not parsed.
 
 ### Cycles and closure
 
-- **GREEN** — no findings. Proceed.
-- **REVIEW_REQUIRED** — notes / `need_evidence`, or a blocking finding BELOW quorum. A
-  note-only wave closes immediately in either enforcement mode. The agent closes outstanding
-  `need_evidence` with a disposition (accept / reject with rationale / defer) — no new panel,
-  no cost; notes do not need entries. Voluntary dispositions on current closed note-only
-  waves remain available through the same call, without reopening or a paid cycle.
-  A below-quorum blocking
-  finding stays OPEN whatever the disposition says: it closes only through a changed spec
-  (a new fingerprint, the next paid cycle) or a reject the next paid delta cycle judges.
+- **GREEN** — no blocking finding and no `need_evidence` without a disposition; notes never
+  change the verdict, so a note-only wave is GREEN in either enforcement mode. Proceed.
+- **REVIEW_REQUIRED** — `need_evidence` without a disposition, or a blocking finding BELOW
+  quorum. The agent closes outstanding `need_evidence` with a disposition (accept / reject with
+  rationale / defer) — no new panel, no cost; notes do not need entries. Voluntary dispositions
+  on closed note-only waves remain available through the same call, without reopening or a
+  paid cycle. Under advisory enforcement a reject with its rationale also closes a below-quorum
+  blocking finding (per finding; accept or defer keeps it open until a changed spec is
+  reviewed). Under blocking enforcement a below-quorum blocking finding stays OPEN whatever the
+  disposition says: it closes only through a changed spec (a new fingerprint, the next paid
+  cycle) or the slot that raised it no longer raising it in a later paid cycle. A
+  REVIEW_REQUIRED wave whose open set empties is recorded GREEN.
 - **REVISE_PLAN** — blocking findings at quorum. A disposition can never close it: the agent
   either changes the spec (a new fingerprint, the next paid cycle) or rejects a blocking finding
   with a rationale that rides into that next cycle, where reviewers mark it resolved or still open.
@@ -902,9 +906,13 @@ Paid cycles per task are bounded by the owner's `OUROBOROS_REVIEW_MAX_CYCLES` (d
 `unlimited` available). Replaying an identical envelope is free — identical including the
 evidence the host attaches for reviewers' `need_evidence` requests, so a request received in the
 last cycle makes the next envelope a new one. On cycle 2+ every reviewer sees
-all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta:
-a reformulation of an earlier finding is not a new finding, and a new blocking finding must say
-why it was invisible before. When the cap is spent under blocking enforcement the host holds
+all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta, and
+its first duty is to adjudicate its OWN earlier findings (the rows whose finding_id starts with its
+panel seat): RESOLVED (the delta or the rationale answers it) and SUPERSEDED (the element it targeted
+was removed or replaced) are not repeated; STILL OPEN is re-emitted naming the residual the answer
+does not cover, and only while the goal is unchanged (the packet states `Goal changed since cycle n`;
+a changed goal is judged afresh). Then: a reformulation of an earlier finding is not a new finding,
+and a new blocking finding must say why it was invisible before. When the cap is spent under blocking enforcement the host holds
 implementation and escalates with the typed `review_cycles_exhausted` reason; under advisory the
 agent may proceed with the wave open under a loud host disclosure. Explicit
 `review_disposition.author_action` plus author disposition may retain/select a full

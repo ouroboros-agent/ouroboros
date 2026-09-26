@@ -178,6 +178,35 @@ def test_spec_delta_reports_renumbered_ids_and_convergence_rule_says_retarget():
     assert "re-target `breaks` against the CURRENT spec ids" in user and "renumbered" in user
 
 
+def test_cycle_two_packet_carries_the_adjudication_duty_and_the_goal_fact():
+    """Cycle ≥2: the reviewer's first duty is to adjudicate its OWN earlier findings
+    (RESOLVED / SUPERSEDED / STILL OPEN with the residual), and the host states whether the
+    goal changed since the previous cycle; a cycle-1 packet carries neither."""
+    from ouroboros.tools.plan_packet import build_plan_review_user_content
+
+    prev, _ = plan_spec.normalize_spec({"goal": "ship the deck", "affected_paths": []})
+    same, _ = plan_spec.normalize_spec({"goal": "ship the deck", "affected_paths": [], "in_scope": ["five slides"]})
+    moved, _ = plan_spec.normalize_spec({"goal": "ship a memo instead", "affected_paths": []})
+
+    def packet(spec, delta, cycle):
+        return build_plan_review_user_content(
+            objective="o", goal=spec["goal"], plan_prose="p", spec=spec,
+            manifest={"declared": [], "attached": [], "omissions": []},
+            prior_cycles=[{"cycle_index": cycle - 1, "aggregate": "REVIEW_REQUIRED", "findings": []}] if cycle > 1 else [],
+            dispositions=[], spec_delta=delta, root_exploration_log=None, cycle_index=cycle)
+
+    unchanged = packet(same, plan_spec.spec_delta(prev, same), 2)
+    for word in ("adjudicate your OWN earlier findings first", "RESOLVED", "SUPERSEDED", "STILL OPEN",
+                 "still breaks a CURRENT element", "Goal changed since cycle 1: no"):
+        assert word in unchanged, word
+    assert unchanged.index("## ROOT EXPLORATION LOG") < unchanged.index("Goal changed since cycle 1")
+    assert "Goal changed since cycle 1: yes" in packet(moved, plan_spec.spec_delta(prev, moved), 2)
+    truncated = packet(same, {"unavailable": "previous frozen spec body truncated"}, 2)
+    assert "Goal changed since cycle 1: unknown" in truncated
+    first = packet(same, None, 1)
+    assert "Goal changed since" not in first and "adjudicate your OWN" not in first and "STILL OPEN" not in first
+
+
 # ------------------------------------------------------------ B2 constitutional
 
 
@@ -745,6 +774,10 @@ def test_system_prompt_stance_and_bible_gating():
     assert "OMISSION NOTE: ARCHITECTURE navigation map not supplied" in plain
     assert checklist in plain
     assert "Convergence rule" not in plain
+    # The height rule sends an unverifiable claim back as a question or a note, never a blocker.
+    assert "STRUCTURALLY" not in plain and "structurally unverifiable" not in lowered
+    assert "A claim you cannot check as written is a question to the author" in plain
+    assert "6. Subtraction" in plain and "7. Governance" not in plain
     assert "blocking" in lowered and "`breaks`" in plain
     assert "need_evidence" in plain
     assert "important brainstorming opportunity" in plain
@@ -758,6 +791,7 @@ def test_system_prompt_stance_and_bible_gating():
         cycle_index=2, enforcement="advisory", architecture_text="ARCH BODY",
     )
     assert "BIBLE BODY" in constitutional and "Governance" in constitutional
+    assert "6. Subtraction" in constitutional and "7. Governance" in constitutional and "6. Governance" not in constitutional
     # W3: ARCHITECTURE.md rides inline, in full, in the self-modification pack
     assert "## ARCHITECTURE.md" in constitutional and "ARCH BODY" in constitutional
     # the convergence rule is cycle-dependent and now lives in the USER prior-cycles section

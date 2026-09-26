@@ -200,7 +200,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # count), the per-finding advisory closure of a below-quorum blocking finding, the closed
     # REVIEW_REQUIRED written GREEN, and the author path's labelled critic pair REPLACE the
     # closure/aggregate/disclosed-gap sentences in place; the base sat 69 bytes under.
-    "docs/architecture/06-agent-core.md": 318000,
+    # 318000 -> 318700: the reviewer stance sentence names the cycle-2 adjudication duty, the
+    # goal-changed fact, the subtraction voice and the per-slot seat line (REPLACED in place).
+    "docs/architecture/06-agent-core.md": 318700,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route

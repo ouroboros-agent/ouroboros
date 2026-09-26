@@ -690,7 +690,7 @@ def test_constitutional_from_affected_paths_and_reminder_on_system_binding(harne
     # W3: a self-modification plan carries ARCHITECTURE.md inline, in full — not a map, not a pointer
     assert "## ARCHITECTURE.md" in system_prompt and "slots and quorum." in system_prompt
     assert "ARCHITECTURE navigation map" not in system_prompt
-    assert "6. Governance" in system_prompt
+    assert "7. Governance" in system_prompt  # the rubric gained a subtraction voice at 6
     assert "REMINDER" not in out
     # (b) system binding, nothing declared: NOT constitutional (D29) + a reminder, BIBLE as pointer
     ctx = harness.make_ctx(active_workspace=False, task_id="task-2")
@@ -919,6 +919,11 @@ def test_packet_uses_the_REAL_checklist_section_and_its_findings_only_contract()
         assert retired not in lowered, retired
     assert "only a json array" in lowered and "NO_FINDINGS" in prompt
     assert "breaks" in lowered and "need_evidence" in lowered
+    # The shipped checklist agrees with the packet: no height clause that turns an unverifiable
+    # claim into a blocker, GREEN is the empty open set, and the rubric has a subtraction voice.
+    assert "structurally unverifiable" not in section.lower() and "GREEN** — no findings" not in section
+    assert "| 6 | subtraction |" in section and "| 7 | governance" in section
+    assert "adjudicate its OWN earlier findings" in section and "Goal changed since cycle n" in section
 
 
 def test_diff_size_cap_is_route_aware():

@@ -106,6 +106,13 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
     assert "LATEST CHOICE" in native and "exact omitted prefix" in native
     assert declarations[0]["mandatory_read_chars"] == len(packet)
     delegated = delivery["slot_session_tasks"]["delegated"]
+    # Every slot's send ends with ITS OWN panel seat: a shared packet cannot say "your".
+    from tests.test_plan_review_engine import _user_text
+    last_user = {sid: _user_text(delivery["slot_messages"][sid][-1]["content"]) for sid in ("small", "large")}
+    seat = {sid: f"\n## YOUR PANEL SEAT\n\n`{sid}`\n" for sid in last_user}
+    assert all(last_user[sid].endswith(seat[sid]) for sid in last_user)
+    assert last_user["large"].removesuffix(seat["large"]) == packet  # the seat is the only addition
+    assert native.endswith("\n## YOUR PANEL SEAT\n\n`native`\n") and delegated.endswith("\n## YOUR PANEL SEAT\n\n`delegated`\n")
     assert "MANDATORY FULL READ" in delegated and own["file"] in delegated
     assert "no numerical window evidence" in delegated and "1M" not in delegated
     assert "discussion discussion discussion" not in delegated
@@ -310,3 +317,35 @@ def test_snapshot_qualified_room_keeps_original_gap_disclosure(harness):
         active_root=harness.workspace, allowed_roots=[], resolve_chat=reader)
     assert json.loads(manifest["attached"][0]["text"])["text"] == "Retained explanation"
     assert any(row["reason"].startswith("chat_history_gap:") for row in manifest["omissions"])
+
+
+def test_the_seat_line_follows_the_cache_stable_prefix_on_every_api_slot(harness, monkeypatch):
+    """The per-slot seat is appended AFTER `## ROOT EXPLORATION LOG` (the cache-stable prefix
+    stays byte-identical across api slots) and each slot gets its own id; reverted, no seat."""
+    from types import SimpleNamespace
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.tools import plan_spec, review_synthesis
+    from ouroboros.tools.plan_dialogue import dialogue_slot_inputs
+    from ouroboros.tools.plan_packet import build_plan_review_user_content, plan_user_stable_len
+    from tests.test_plan_review_engine import DECK_SPEC, _user_text
+
+    spec, _ = plan_spec.normalize_spec({**DECK_SPEC, "goal": "Ship the deck"})
+    packet = build_plan_review_user_content(
+        objective="o", goal=spec["goal"], plan_prose="p", spec=spec,
+        manifest={"declared": [], "attached": [], "omissions": []},
+        prior_cycles=[], dispositions=[], spec_delta=None, root_exploration_log="ran: ls")
+    def slot(name):
+        return SimpleNamespace(slot_id=name, model="same/model", role_hint="plan reviewer", use_local=False,
+                               session_profile=name, route=ReviewRouteKind.API_CHAT, retrieves=False, native_retrieval=False)
+    monkeypatch.setattr(review_synthesis, "per_slot_input_token_limits", lambda *a, **k: {"a": 200000, "b": 200000})
+    delivery = dialogue_slot_inputs([slot("a"), slot("b")], system_prompt="governance", user_content=packet,
+                                    session_task=packet, manifest={}, slot_messages={}, native_mandatory_chars=len(packet),
+                                    session_root=str(harness.workspace), task_id="task-1")
+    sent = {sid: _user_text(delivery["slot_messages"][sid][-1]["content"]) for sid in ("a", "b")}
+    boundary = plan_user_stable_len(packet)
+    assert boundary > 0 and sent["a"][:boundary] == sent["b"][:boundary] == packet[:boundary]
+    assert sent["a"].endswith("\n## YOUR PANEL SEAT\n\n`a`\n") and sent["b"].endswith("\n## YOUR PANEL SEAT\n\n`b`\n")
+    assert sent["a"].index("## YOUR PANEL SEAT") > sent["a"].index("## ROOT EXPLORATION LOG")
+    # The recorded cache split is the same boundary: stable block, then the dynamic tail with the seat.
+    blocks = delivery["slot_messages"]["a"][-1]["content"]
+    assert isinstance(blocks, list) and blocks[0]["text"] == packet[:boundary] and blocks[-1]["text"].endswith("`a`\n")

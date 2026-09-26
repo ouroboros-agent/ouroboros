@@ -120,7 +120,7 @@ def test_a_declared_new_source_file_is_constitutional_before_it_exists(harness):
     assert wave["constitutional"] is True
     assert "affected_paths" in wave["constitutional_note"] and str(target) in wave["constitutional_note"]
     system_prompt = _system_prompt(substrate)
-    assert "## BIBLE.md (constitution" in system_prompt and "6. Governance" in system_prompt
+    assert "## BIBLE.md (constitution" in system_prompt and "7. Governance" in system_prompt
     assert "## ARCHITECTURE.md (architecture and data flow" in system_prompt
     assert "on-demand pointer" not in system_prompt
     assert "REMINDER" not in out
