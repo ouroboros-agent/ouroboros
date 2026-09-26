@@ -25,6 +25,7 @@ import re
 from typing import Any, Iterable, Mapping, Optional
 
 from ouroboros.config import adaptive_quorum
+from ouroboros.settings_scales import effort_rank
 from ouroboros.contracts.task_contract import normalize_acceptance_claims
 from ouroboros.tool_access import path_is_relative_to
 from ouroboros.triad_review import empty_array_is_verified_clean, extract_json_array
@@ -727,7 +728,11 @@ def aggregate(slot_results: Iterable[Mapping[str, Any]], *, quorum: Optional[int
     """Host-computed wave aggregate — no reviewer-authored verdict.
 
     ``slot_results`` = EVERY configured slot as ``{slot, model, ok, findings,
-    error?}`` (``ok`` = parseable; ``findings`` = ``validate_findings`` output).
+    error?, carried?}`` (``ok`` = parseable; ``findings`` = ``validate_findings``
+    output; ``carried`` = a seat's still-open findings from the same-spec
+    predecessor when the seat did not answer THIS wave — they join the open set
+    stamped ``carried_absent_answer`` but the row stays unparseable and casts no
+    quorum or blocking-slot vote: silence never manufactures GREEN).
     ``quorum`` defaults to ``config.adaptive_quorum(len(slot_results))``.
     parseable slots < quorum → ``DEGRADED``; slots with ≥1 ``blocking`` ≥ quorum
     → ``REVISE_PLAN``; a non-empty OPEN SET — any ``blocking`` finding below
@@ -756,6 +761,13 @@ def aggregate(slot_results: Iterable[Mapping[str, Any]], *, quorum: Optional[int
         labels.add(slot)
         if not row.get("ok"):
             reasons.append(f"slot_unparseable:{slot}:{str(row.get('error') or 'no parseable findings')}")
+            carried = [dict(f) for f in (row.get("carried") or []) if isinstance(f, Mapping)]
+            for finding in carried:
+                finding.update({"slot": slot, "carried_absent_answer": True})
+                finding.setdefault("finding_id", f"{slot}:{finding.get('id', '')}")
+                flat.append(finding)
+            if carried:
+                reasons.append(f"findings_carried_absent_answer:{slot}:{len(carried)}")
             continue
         parseable += 1
         slot_findings = [dict(f) for f in (row.get("findings") or []) if isinstance(f, Mapping)]
@@ -924,6 +936,44 @@ def closure_after_disposition(
     if recorded != verdict:
         notes.append("closed_by_disposition: REVIEW_REQUIRED → GREEN (open set emptied)")
     return {"closed": closed, "aggregate": recorded, "open_ids": open_ids, "notes": notes}
+
+
+def plan_ordered_weaker(configured_slots: list, owner_efforts: Optional[dict]) -> dict[str, dict[str, str]]:
+    """``{slot_id: {effort, owner_effort}}`` for every seat whose EFFECTIVE effort ranks
+    below the effort the owner's settings would have run (both ranks known on
+    ``EFFORT_SCALE``); ``{}`` when nothing was ordered weaker. Computed from the
+    request at dispatch and carried through collection, never recomputed from the
+    live owner setting."""
+    weaker: dict[str, dict[str, str]] = {}
+    for slot in configured_slots or []:
+        sid = str(getattr(slot, "slot_id", "") or "")
+        effort = str(getattr(slot, "effort", "") or "")
+        owner = str((owner_efforts or {}).get(sid) or "")
+        if 0 <= effort_rank(effort) < effort_rank(owner):
+            weaker[sid] = {"effort": effort, "owner_effort": owner}
+    return weaker
+
+
+def plan_standing_findings(previous: Optional[dict], spec: dict, enforcement: str) -> dict[str, list[dict]]:
+    """``{slot_id: [findings]}`` still open on ``previous`` when it reviewed the SAME spec
+    (equal ``spec_hash``): keyed by seat, independent of the roster fingerprint, effort or
+    order, so a seat that fails to answer a same-spec cycle keeps its objection listed
+    (``plan_review_runtime.synthesize_plan_review_wave``). A changed spec, a closed predecessor or no
+    predecessor carries nothing."""
+    if not isinstance(previous, dict) or not isinstance(previous.get("spec"), dict):
+        return {}
+    if str(previous.get("spec_hash") or spec_hash(previous["spec"])) != spec_hash(spec):
+        return {}
+    findings = [f for f in previous.get("findings") or [] if isinstance(f, Mapping)]
+    open_ids = set(closure_after_disposition(
+        str(previous.get("aggregate") or ""), findings, list(previous.get("dispositions") or []), enforcement,
+    )["open_ids"])
+    standing: dict[str, list[dict]] = {}
+    for finding in findings:
+        if str(finding.get("finding_id") or "") in open_ids and finding.get("class") in ("blocking", "need_evidence"):
+            standing.setdefault(str(finding.get("slot") or ""), []).append(dict(finding))
+    return standing
+
 
 
 def plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:

@@ -892,7 +892,8 @@ authority, and prose outside the array is not parsed.
   the control line reports DEGRADED honestly, and the recorded result replays for free ONLY
   under all three conditions — an identical envelope, a NON-EMPTY recorded structural
   lane-health epoch that a fresh snapshot still matches, and an unchanged reviewer roster
-  (slot ids, targets, routes, pinned profiles and EFFORTS). An empty-epoch DEGRADED wave
+  (slot ids, targets, routes, pinned profiles and the effective per-seat EFFORTS, an
+  envelope's `reviewer_effort` included). An empty-epoch DEGRADED wave
   (slots died at dispatch time, no structural snapshot evidence) re-dispatches a PAID panel
   on the identical envelope; so does a healed or newly dead lane or a changed roster. Only a
   wave in which no reviewer slot was physically dispatched (typed $0 skip rows only —
@@ -912,7 +913,9 @@ panel seat): RESOLVED (the delta or the rationale answers it) and SUPERSEDED (th
 was removed or replaced) are not repeated; STILL OPEN is re-emitted naming the residual the answer
 does not cover, and only while the goal is unchanged (the packet states `Goal changed since cycle n`;
 a changed goal is judged afresh). Then: a reformulation of an earlier finding is not a new finding,
-and a new blocking finding must say why it was invisible before. When the cap is spent under blocking enforcement the host holds
+and a new blocking finding must say why it was invisible before. A seat that does not answer a
+same-spec cycle is recorded as not having answered; its earlier still-open findings stay listed on
+the wave (never as re-emitted), so silence never reads as GREEN. When the cap is spent under blocking enforcement the host holds
 implementation and escalates with the typed `review_cycles_exhausted` reason; under advisory the
 agent may proceed with the wave open under a loud host disclosure. Explicit
 `review_disposition.author_action` plus author disposition may retain/select a full

@@ -37,7 +37,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # extra-CA bundle; the base sat 174 bytes under the previous budget.
     # 165900 -> 166100: the plan_spec.py and plan_review.py rows name the open-set aggregate, the
     # one closure table and the author path's labelled critic pair; the base sat 110 bytes under.
-    "docs/architecture/01-high-level-architecture.md": 166100,
+    # 166100 -> 166300: the reviewer_slot_config.py and plan_review_runtime.py rows name the plan
+    # order precedence and the wave effort/standing facts (descriptions replaced in place).
+    "docs/architecture/01-high-level-architecture.md": 166300,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -75,7 +77,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # vocabulary (#931/#1061); the touched descriptions were REPLACED and
     # compressed (net chapter growth is under the added owner's paragraph size),
     # and the merged #1236 base already sat 5 bytes under the previous budget.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 107000,
+    # 107000 -> 107300: the Reviews projection names the per-seat effort, weaker-order and
+    # earlier-plan facts as read-side projections (one clause); the base sat 22 bytes under.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 107300,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -202,14 +206,19 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # closure/aggregate/disclosed-gap sentences in place; the base sat 69 bytes under.
     # 318000 -> 318700: the reviewer stance sentence names the cycle-2 adjudication duty, the
     # goal-changed fact, the subtraction voice and the per-slot seat line (REPLACED in place).
-    "docs/architecture/06-agent-core.md": 318700,
+    # 318700 -> 319500: the reviewer-effort paragraph REPLACES the default-rung ladder with the
+    # order-outranks-pins ladder, the recorded per-seat/owner/ordered_weaker facts, and the
+    # unanswered-slot floor gains the same-spec standing-findings clause.
+    "docs/architecture/06-agent-core.md": 319500,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
     # paragraph (plan-selected endpoint, low/high/max projection, 1113 billing) plus two
     # settings rows; the base sat 95 bytes under the previous budget, no older text to displace.
     # 38400 -> 38700 (PR #1300): one settings row for the extra-CA trust bundle; the base sat 33 bytes under.
-    "docs/architecture/07-configuration.md": 38700,
+    # 38700 -> 39000: OUROBOROS_EFFORT_REVIEW and the reviewer-slot row description name the plan
+    # order that outranks a pinned row effort (compound slugs keep theirs); the base sat 139 under.
+    "docs/architecture/07-configuration.md": 39000,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
     # ONE reusable browser lane and the two triggers that share it (the unfiltered
@@ -321,7 +330,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the union displaces nothing.
     # 96800 -> 97700: one Loop / State-Machine bullet for the plan-review open-set verdict, the
     # one closure table and the labelled critic pair of an author-selected plan; the base sat 48 under.
-    "docs/development/06-rules-by-change-class.md": 97700,
+    # 97700 -> 98300: the plan-review bullet gains the effort-order precedence, the recorded
+    # effort facts and the same-spec standing-findings clause (extended in place).
+    "docs/development/06-rules-by-change-class.md": 98300,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

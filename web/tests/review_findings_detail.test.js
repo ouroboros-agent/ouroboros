@@ -138,6 +138,37 @@ test('a revised plan selected after a critic wave is labelled as the earlier pla
     assert.doesNotMatch(own.authorDecisionText, /no verdict of its own/);
 });
 
+test('a plan wave ordered weaker than the owner setting names each seat, and a silent seat keeps its earlier finding listed', () => {
+    const fingerprint = 'w'.repeat(64);
+    const detail = (extra) => planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            schema_version: 2,
+            current_attempt: { fingerprint, status: 'open' },
+            waves: [{
+                request_fingerprint: fingerprint, cycle_index: 2, aggregate: 'REVIEW_REQUIRED', closed: false, paid: true,
+                counts: { blocking: 1, note: 0, need_evidence: 0 },
+                findings: [{ finding_id: 'slot_1:f1', id: 'f1', class: 'blocking', summary: 'Friday is impossible', breaks: 'invariant_1', slot: 'slot_1', model: 'm/a', carried_absent_answer: true }],
+                actors: [
+                    { slot_id: 'slot_1', model: 'm/a', ok: false, error: 'transport died', effort: 'low', declared_effort: 'low', carried_findings: 1 },
+                    { slot_id: 'slot_2', model: 'm/b', ok: true, effort: 'low', declared_effort: 'low' },
+                    { slot_id: 'slot_3', model: 'cursor-grok-4.6-xhigh', ok: true, effort: 'xhigh', declared_effort: '' },
+                ],
+                ...extra,
+            }],
+            waves_omitted: 0,
+        },
+    }).attempts[0].detailText;
+    const weaker = detail({ ordered_weaker: { slot_1: { effort: 'low', owner_effort: 'xhigh' }, slot_2: { effort: 'low', owner_effort: 'high' } } });
+    assert.match(weaker, /^Reviewers ordered weaker than your setting: slot_1 low \(setting xhigh\), slot_2 low \(setting high\)$/m);
+    assert.match(weaker, /^m\/a · unavailable · did not answer; its earlier finding is still listed$/m);
+    assert.match(weaker, /\[blocking\] Friday is impossible — breaks invariant_1 — slot_1 · m\/a/);
+    assert.doesNotMatch(weaker, /Verdict: GREEN/);
+    // Quiet side: a wave with no weaker order (or an empty fact) draws no such line.
+    assert.doesNotMatch(detail({}), /ordered weaker/);
+    assert.doesNotMatch(detail({ ordered_weaker: {} }), /ordered weaker/);
+});
+
 test('the hydrator announces first load, failure and retry without narrating background refreshes', async () => {
     const events = [];
     let mode = 'ok';

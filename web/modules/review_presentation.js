@@ -544,7 +544,7 @@ function planActorAvailabilityLines(wave) {
         if (actorAwaiting(actor)) lines.push(`${model} · awaiting${sinceLocalTime(actor.awaiting_since)}`);
         else if (actorUnresolved(actor)) lines.push(`${model} · no answer${cause ? ` — "${cause}"` : ''}${sinceLocalTime(actor.awaiting_since)}`);
         else if (text(actor.operation_state) === 'not_dispatched') lines.push(`${model} · not sent`);
-        else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}`);
+        else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}${finiteCount(actor.carried_findings) ? ' · did not answer; its earlier finding is still listed' : ''}`);
     }
     return lines;
 }
@@ -580,6 +580,14 @@ function planWaveDetail(wave) {
         .filter((key) => finiteCount(counts[key]) != null)
         .map((key) => `${finiteCount(counts[key])} ${key}`);
     if (countParts.length) lines.push(`Findings: ${countParts.join(' · ')}`);
+    // A panel the mind ordered weaker than the owner's effort setting says so, seat by
+    // seat, from the wave's typed fact; the verdict token is never recoloured for it.
+    const weaker = wave.ordered_weaker && typeof wave.ordered_weaker === 'object'
+        ? Object.entries(wave.ordered_weaker).filter(([, row]) => row && typeof row === 'object') : [];
+    if (weaker.length) {
+        lines.push(`Reviewers ordered weaker than your setting: ${weaker
+            .map(([sid, row]) => `${sid} ${text(row.effort) || '?'} (setting ${text(row.owner_effort) || '?'})`).join(', ')}`);
+    }
     lines.push(...planFindingLines(wave));
     lines.push(...planActorAvailabilityLines(wave));
     const findingsShown = (Array.isArray(wave.findings) ? wave.findings : []).length;

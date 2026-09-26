@@ -409,8 +409,10 @@ def _render_wave(
         lines += ["", "⚠️ DEGRADED: no parseable reviewer quorum — recorded as an OPEN wave; "
                   + _degraded_replay_note(wave, paid_available=cap is None or cycles_paid < cap) + "."]
     actor_lines = [
-        f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')} · host_file_read: "
-        f"{a.get('host_file_read_attestation')} · {_actor_outcome(a, slot_class.get(id(a), ''))}"
+        f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')}"
+        + (f" · effort {a['effort']}{' (ordered)' if a.get('declared_effort') else ''}" if a.get("effort") else "")
+        + f" · host_file_read: {a.get('host_file_read_attestation')} · {_actor_outcome(a, slot_class.get(id(a), ''))}"
+        + (" · did not answer; its earlier finding is still listed" if a.get("carried_findings") else "")
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []
     ] or ["(no actor records)"]
@@ -418,9 +420,11 @@ def _render_wave(
     findings_total = int(wave.get("findings_total") or len(findings))
     finding_page = findings[:MAX_FINDINGS_PER_SLOT]
     if wave.get("reviewer_effort"):
-        actor_lines.append(
-            f"- declared reviewer effort: {wave['reviewer_effort']} (this envelope's order; an explicit "
-            "per-row effort or a compound route slug outranks it)")
+        actor_lines.append(f"- reviewer effort ordered for this envelope: {wave['reviewer_effort']}")
+    if isinstance(wave.get("ordered_weaker"), dict) and wave["ordered_weaker"]:
+        actor_lines.append("- ORDERED WEAKER THAN THE OWNER SETTING on " + ", ".join(
+            f"{sid} ({row.get('effort')} < {row.get('owner_effort')})"
+            for sid, row in wave["ordered_weaker"].items() if isinstance(row, dict)))
     lines += [
         "", "### Reviewer slots" + (" (original recorded state)" if historical_feedback is not None else ""), "", *actor_lines,
         "", "### Findings (per slot; finding_id = slot:id)", "", "```json",

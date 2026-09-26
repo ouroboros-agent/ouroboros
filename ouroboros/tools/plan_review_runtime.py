@@ -18,7 +18,7 @@ import json
 import logging
 import pathlib
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
@@ -41,20 +41,22 @@ from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compat
     read_wave as read_plan_review_wave_artifact,
 )
 # The one caller-facing strength axis of a review panel: the plan envelope may
-# declare the panel's effort for THIS order as the default rung of each row's
-# ladder (explicit per-row effort and compound route slugs still outrank it; the
-# owner's review-effort setting applies when nothing is declared). Owner
-# decision 2026-09-11 (batch 1/Q6, batch 2/Q3=A): the setting is the default,
-# Ouroboros may order stronger or weaker; a different strength is a different
-# envelope and re-dispatches a paid panel within OUROBOROS_REVIEW_MAX_CYCLES.
+# order the panel's effort for THIS plan, and the order outranks each row's own
+# pinned effort (a compound Cursor/Agy route slug keeps its encoded effort: it is
+# the route's identity); the owner's review-effort setting and pins apply when
+# nothing is ordered. The setting is the default, Ouroboros may order stronger or
+# weaker, and every wave records the effective per-seat effort and names a panel
+# ordered weaker than the owner's setting; a different strength on an OPEN
+# review re-dispatches a paid panel within OUROBOROS_REVIEW_MAX_CYCLES.
 REVIEWER_EFFORT_SCHEMA = {
     "type": "string", "enum": list(EFFORT_SCALE),
     "description": (
-        "Optional reviewer-panel strength for THIS order (the default rung of each "
-        "reviewer row's effort ladder; an explicit per-row effort or a compound route "
-        "slug still wins; omitted = the owner's review-effort setting). A different "
-        "strength is a different envelope: it re-dispatches a paid panel within "
-        "OUROBOROS_REVIEW_MAX_CYCLES, while the same strength replays free."
+        "Optional reviewer-panel strength for THIS plan: it outranks each reviewer row's own "
+        "effort setting (a Cursor/Agy compound route slug keeps its encoded effort); omitted = "
+        "the owner's settings. The verdict names a panel ordered weaker than the owner's "
+        "setting. On an OPEN review a different strength re-dispatches a paid panel within "
+        "OUROBOROS_REVIEW_MAX_CYCLES; the same strength replays free; a CLOSED review stands "
+        "for its envelope."
     ),
 }
 # ``None`` means no plan-local cognition cutoff.  The substrate settles against
@@ -351,11 +353,13 @@ def plan_review_slots(default_effort: str = "") -> list:
     the shared ``triad_delivery_slots`` builder (one reader of the triad rows
     for plan, skill and acceptance review) with plan review's own slot
     properties — timeout, output budget, temperature — and the envelope's
-    declared ``reviewer_effort`` as the rows' default rung (``''`` = the owner's
-    review-effort setting, exactly like the commit triad). The declaration is an
-    ARGUMENT of this builder only, never a contextvar: the commit gate, scope,
-    acceptance and skill review keep reading the untouched rows. Both delivery
-    kinds ride; slot ids are the rows' own.
+    ``reviewer_effort`` as the ORDER for this plan: it outranks each row's own
+    pinned effort, a compound route slug keeps its encoded effort, and ``''``
+    leaves every row at its own effort or the owner's review-effort setting,
+    exactly like the commit triad. The order is an ARGUMENT of this builder
+    only, never a contextvar: the commit gate, scope, acceptance and skill
+    review keep reading the untouched rows. Both delivery kinds ride; slot ids
+    are the rows' own.
     """
     from ouroboros.reviewer_slot_config import triad_delivery_slots
 
@@ -510,6 +514,10 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "slot_id": str(actor.get("slot_id") or getattr(slot, "slot_id", "") or ""),
         "model": str(usage.get("resolved_model") or actor.get("model") or getattr(slot, "model", "") or ""),
         "request_model": str(getattr(slot, "model", "") or actor.get("model") or ""),
+        # The RESOLVED requested effort of this seat (never a provider-observed applied
+        # effort: no telemetry carries one), and whether an envelope's order set it.
+        "effort": str(getattr(slot, "effort", "") or ""),
+        "declared_effort": str(getattr(slot, "declared_effort", "") or ""),
         "route": "agent_session" if session else "api_chat",
         # Delivery-truthful provenance: a native tool-round actor discloses its
         # HOST-OBSERVED reads through its usage; session stays unobserved and a
@@ -597,21 +605,36 @@ def synthesize_plan_review_wave(
     constitutional: bool, constitutional_note: str, cycle_index: int, retry_key: str,
     enforcement: str, cap: Any, quorum: int, configured_slots: list,
     health_evidence: Any, reviewer_effort: str = "", dispositions: Optional[list] = None,
+    owner_efforts: Optional[dict] = None, standing: Optional[dict] = None,
 ) -> tuple[dict, set[str], dict]:
     """Validate raw actor rows and build one durable plan-review wave. ``dispositions``
     are the ones already recorded on the wave being collected (an author's answers
     given while slots were still in flight); they ride the collected wave and its
-    closure instead of being wiped by the re-synthesis."""
+    closure instead of being wiped by the re-synthesis. ``owner_efforts`` is the
+    per-seat effort the owner's settings would have run (recorded at dispatch when
+    the envelope ordered one, reused on resume) and yields the wave's typed
+    ``ordered_weaker``; ``standing`` (``plan_spec.plan_standing_findings``) is each seat's
+    still-open findings from a same-spec predecessor: a seat that does not answer
+    keeps them listed on this wave (``findings_carried_absent_answer``) — silence
+    never manufactures GREEN and never counts as parseable."""
     from ouroboros.tools import plan_spec
 
     ids = plan_spec.spec_ids(spec)
     seen_before = {str(s) for s in state.get("need_evidence_seen") or []}
     seen_after = set(seen_before)
+    slots_by_id = {str(getattr(s, "slot_id", "") or ""): s for s in configured_slots or []}
     slot_results, slot_records = [], []
     for row in rows:
         findings, disclosures = [], plan_row_disclosures(row)
         error = str(row.get("error") or "")
         ok = not error
+        sid = str(row.get("slot_id") or "")
+        slot = slots_by_id.get(sid)
+        if reviewer_effort and slot is not None and not str(getattr(slot, "declared_effort", "") or ""):
+            disclosures.append("reviewer_effort_not_applied")  # a compound route slug kept its encoded effort
+        carried = [] if ok else [dict(f) for f in (standing or {}).get(sid) or [] if isinstance(f, Mapping)]
+        if carried:
+            disclosures.append(f"findings_carried_absent_answer:{len(carried)}")
         if ok:
             parsed, parse_error = plan_spec.parse_findings(str(row.get("text") or ""))
             if parse_error:
@@ -624,10 +647,12 @@ def synthesize_plan_review_wave(
                 disclosures += finding_disclosures
                 seen_after |= set(slot_seen)
         slot_results.append({"slot": row.get("slot_id"), "model": row.get("model"),
-                             "ok": ok, "findings": findings, "error": error or None})
+                             "ok": ok, "findings": findings, "error": error or None,
+                             **({"carried": carried} if carried else {})})
         slot_records.append(plan_wave_actor_record(
             row, ok=ok, error=error, disclosures=disclosures,
             raw_text_preview_chars=PLAN_RAW_TEXT_PREVIEW_CHARS,
+            **({"carried_findings": len(carried)} if carried else {}),
         ))
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
     # ONE closure table for every write path: a REVIEW_REQUIRED whose open set is
@@ -664,6 +689,8 @@ def synthesize_plan_review_wave(
         "health_epoch": plan_health_epoch(health_evidence),
         "reviewer_config_fingerprint": plan_reviewer_config_fingerprint(configured_slots),
         "reviewer_effort": str(reviewer_effort or ""),  # the envelope's declared panel strength ('' = setting)
+        **({"owner_efforts": dict(owner_efforts)} if owner_efforts is not None else {}),
+        **({"ordered_weaker": weaker} if (weaker := plan_spec.plan_ordered_weaker(configured_slots, owner_efforts)) else {}),
         **plan_quorum_unreachable_facts(slot_records, quorum=quorum), "reviewed_at": utc_now_iso(),
     }
     # A partially-settled paid cycle is not yet allowed to mutate the next
@@ -687,13 +714,15 @@ def synthesize_plan_review_wave(
 
 def plan_wave_actor_record(
     row: Dict[str, Any], *, ok: bool, error: str,
-    disclosures: List[str], raw_text_preview_chars: int,
+    disclosures: List[str], raw_text_preview_chars: int, carried_findings: int = 0,
 ) -> Dict[str, Any]:
     """Build the durable Plan actor projection outside the orchestration loop."""
     from ouroboros.utils import truncate_review_artifact
 
     return {
         "slot_id": row.get("slot_id"), "model": row.get("model"),
+        "effort": str(row.get("effort") or ""), "declared_effort": str(row.get("declared_effort") or ""),
+        **({"carried_findings": int(carried_findings)} if carried_findings else {}),
         "route": row.get("route"), "executions": list(row.get("executions") or []),
         "host_file_read_attestation": row.get("host_file_read_attestation"),
         "ok": ok, "error": error or None, "disclosures": disclosures,

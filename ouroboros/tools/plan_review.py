@@ -275,7 +275,7 @@ def get_tools():
                     "when another paid cycle is available. Cycles are bounded by the owner's Max review cycles; an unchanged "
                     "envelope replays the recorded result for free (a locator a reviewer asked for "
                     "with need_evidence is attached by the host next time and makes the envelope "
-                    "new; a new review-mode call with a different reviewer_effort re-dispatches a paid panel). Under blocking enforcement an "
+                    "new; on an OPEN review a different reviewer_effort re-dispatches the panel, a CLOSED review stands for its envelope). Under blocking enforcement an "
                     "open review holds implementation. An explicit review_disposition.author_action=stop "
                     "permits unfinished finalization only. Advisory author_action=finish may select a corrected "
                     "goal+plan+spec in the same call without another panel, citing the earlier review_fingerprint "
@@ -816,6 +816,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     # excluded slots stay configured rows: they count in the quorum denominator
     rows = list(rows) + oversize_rows + health_skip_rows
     _attach_continuation_restart_delta(rows, continuation_restarted)
+    # The owner baseline for `ordered_weaker`: the same builder with no order, recorded at
+    # dispatch and reused on resume (never recomputed from the live setting at collection).
+    owner_efforts = None if not request.reviewer_effort else (
+        (existing or {}).get("owner_efforts") if resume_in_flight else
+        {str(s.slot_id): str(s.effort or "") for s in _plan_review_slots()})
     wave, seen_after, agg = _synthesize_plan_review_wave(
         rows, state=state, spec=spec, request_plan=request.plan, fingerprint=fingerprint,
         previous=previous, manifest=manifest, manifest_hash=manifest_hash,
@@ -824,6 +829,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         quorum=quorum, configured_slots=configured_slots,
         health_evidence=health_evidence, reviewer_effort=request.reviewer_effort,
         dispositions=list((existing or {}).get("dispositions") or []) if resume_in_flight else None,
+        owner_efforts=owner_efforts, standing=plan_spec.plan_standing_findings(previous, spec, enforcement),
     )
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
