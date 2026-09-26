@@ -713,20 +713,15 @@ def _actor(slot_id, *, ok=False, failure_code="", error=""):
     return {"slot_id": slot_id, "model": "m", "ok": ok, "failure_code": failure_code, "error": error}
 
 
-def test_slot_reasons_dedup_typed_reasons_and_the_owner_line_names_the_late_result():
-    from ouroboros.tools.plan_review_runtime import plan_slot_reasons, plan_wave_progress_line
+def test_the_owner_line_names_the_late_result_and_carries_no_slot_reason():
+    from ouroboros.tools.plan_review_runtime import plan_wave_progress_line
 
     counts = {"parseable": 0, "configured": 6, "blocking": 0, "note": 0, "need_evidence": 0}
     same = [_actor(f"s{i}", failure_code="subscription_window_exhausted") for i in range(3)]
     distinct = [_actor("d1", failure_code="credential_pool_exhausted"), _actor("d2", error="transport died"),
                 _actor("d3", error="x" * 400), _actor("d4", failure_code="deadline_exhausted")]
     wave = {"actors": same + distinct, "custody_pending": True}
-    reasons = plan_slot_reasons(wave)  # the MODEL-facing helper keeps the typed reasons, deduplicated and bounded
-    assert reasons.count("subscription_window_exhausted") == 1  # three identical reasons -> one
-    assert "credential_pool_exhausted; transport died" in reasons
-    assert "(+1 more in the task result)" in reasons and "deadline_exhausted" not in reasons  # first four shown
-    assert "OMISSION NOTE" in reasons and "\n" not in reasons  # bounded, one line
-    # The OWNER line carries none of them: who answered, and that a result is still owed.
+    # The OWNER line carries no typed reason: who answered, and that a result is still owed.
     line = plan_wave_progress_line("DEGRADED", counts, cycles_paid=1, cap=2, wave=wave)
     assert line == "📐 Plan review: none of the 7 reviewers answered; a reviewer's answer is still on its way."
     # A clean wave reads the same with or without its roster.

@@ -725,36 +725,6 @@ def plan_row_disclosures(row: Dict[str, Any]) -> List[str]:
     return [f"profile_continuity: cannot_verify ({reason})"]
 
 
-_PROGRESS_REASON_CHARS = 160
-_PROGRESS_REASONS_SHOWN = 4
-
-
-def plan_slot_reasons(wave: Optional[Dict[str, Any]], *, failed_only: bool = False) -> str:
-    """The failed slots' typed reasons, deduplicated in order, the first four
-    shown and the rest counted (``failure_code`` when the row carries one, else
-    its error text, each bounded by ``truncate_review_artifact``). A slot with no
-    answer yet (awaiting, unresolved, uncollected) has no reason to name: it is
-    read through ``plan_wave_slot_census``, never listed here. ``failed_only``
-    also leaves out the typed $0 ``not_dispatched`` rows."""
-    from ouroboros.utils import truncate_review_artifact
-
-    census = plan_wave_slot_census(wave)
-    unanswered = {id(row) for name in ("awaiting", "unresolved", "uncollected", *(("skipped",) if failed_only else ()))
-                  for row in census[name]}
-    reasons: List[str] = []
-    for actor in (wave or {}).get("actors") or []:
-        if not isinstance(actor, dict) or actor.get("ok") or id(actor) in unanswered:
-            continue
-        reason = str(actor.get("failure_code") or actor.get("error") or "unknown")
-        reason = truncate_review_artifact(reason, limit=_PROGRESS_REASON_CHARS).replace("\n", " ")
-        if reason not in reasons:
-            reasons.append(reason)
-    shown = "; ".join(reasons[:_PROGRESS_REASONS_SHOWN])
-    if len(reasons) > _PROGRESS_REASONS_SHOWN:
-        shown += f" (+{len(reasons) - _PROGRESS_REASONS_SHOWN} more in the task result)"
-    return shown
-
-
 def _findings_phrase(counts: Dict[str, Any]) -> str:
     """``2 blocking findings, 1 ask for evidence, 3 notes``; findings with none blocking
     end ``nothing blocking``; none at all read ``no findings``."""
