@@ -20,7 +20,7 @@ from ouroboros.task_results import (
     write_task_result,
 )
 
-from tests._cancel_intents_shared import _CaptureQueue, _LiveProc, _live_split_drive_task, _seed_llm_response
+from tests._cancel_intents_shared import _CaptureQueue, _LiveProc, _live_split_drive_task, _seed_llm_response, settled_off_loop
 from tests._cancel_intents_shared import (  # noqa: F401  (autouse fixture applies on import)
     _reap_spawned_live_procs,
 )
@@ -77,7 +77,7 @@ def test_e2e_tool_cancel_kills_live_worker_and_settles_with_cost(qenv, monkeypat
     assert stored["parent_decision"] == "cancelled"          # stamped at OUTCOME
     assert stored.get("cost_accounting_status") == "available"  # reconstructed
     assert ci.active_intent(qenv.drive, task_id) is None
-    assert not child_drive.exists(), "cancelled subagent drive is cleaned up"
+    assert settled_off_loop(qenv.drive, task_id, child_drive), "the off-loop settlement removes the cancelled subagent's drive"
     # task_done carries the reconstructed accounting — never a fabricated final $0
     # (an empty ledger reconstructs to a CONFIRMED zero, which is fine).
     (done,) = done_events

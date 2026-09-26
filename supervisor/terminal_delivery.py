@@ -68,16 +68,16 @@ _HOST_SALVAGE_RECEIPT = (
 
 
 def cleanup_settled_owner_mailbox(
-    drive_root: Any, task_id: str, task: Optional[Dict[str, Any]] = None,
+    drive_root: Any, task_id: str, task: Optional[Dict[str, Any]] = None, *, carry_inputs: bool = True, stop: Any = None,
 ) -> None:
-    """Release the execution mailbox only after its canonical obligations settle."""
+    """Release the execution mailbox once its canonical obligations settle and the canonical row holds its unread rows with their input closure; ``carry_inputs=False`` (the loop thread) leaves inputs to an off-loop owner, whose generation ``stop()`` fences the cleanup."""
     from ouroboros.owner_mailbox import cleanup_task_mailbox, settled_mailbox_cleanup_allowed
     from ouroboros.task_results import load_task_result
     from supervisor.queue import _task_drive_for_task
 
     durable = load_task_result(pathlib.Path(drive_root), str(task_id)) or {}
     if settled_mailbox_cleanup_allowed(durable):
-        cleanup_task_mailbox(_task_drive_for_task(task or durable, str(task_id)), str(task_id))
+        cleanup_task_mailbox(_task_drive_for_task(task or durable, str(task_id)), str(task_id), canonical_root=drive_root, carry_inputs=carry_inputs, stop=stop)
 
 
 def _registry_path(drive_root: Any) -> pathlib.Path:

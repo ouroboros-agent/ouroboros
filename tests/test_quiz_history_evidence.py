@@ -83,7 +83,13 @@ def test_answers_survive_eighteen_quizzes_mailbox_gc_and_rotation(runtime):
             state.rotate_jsonl_log_if_needed(runtime.root, "chat.jsonl", "chat", max_bytes=1)
     assert len(quiz_states(runtime.root, runtime.task["id"])) == 16
     assert "q00" not in quiz_states(runtime.root, runtime.task["id"])
-    cleanup_task_mailbox(runtime.root, runtime.task["id"])
+    # TZ-1 V10: an unread answer leaves the mailbox only into the settled row that holds it.
+    assert not cleanup_task_mailbox(runtime.root, runtime.task["id"])
+    from ouroboros.task_results import write_task_result
+
+    held = write_task_result(runtime.root, runtime.task["id"], "completed", result="done")["unread_mailbox"]
+    assert held["total"] == 18 and held["read_complete"] is True
+    assert cleanup_task_mailbox(runtime.root, runtime.task["id"])
     state.rotate_jsonl_log_if_needed(runtime.root, "chat.jsonl", "chat", max_bytes=1)
     assert not drain_owner_entries(runtime.root, runtime.task["id"], include_acknowledged=True)
     facts = _facts(runtime)

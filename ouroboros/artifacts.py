@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 from ouroboros.utils import atomic_write_json, read_json_dict, update_json_locked, write_bytes_atomic
 from ouroboros.headless import ARTIFACT_STATUS_FAILED, ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
 from ouroboros.outcome_receipt_store import is_verification_receipts_path
+from ouroboros.task_custody import fence_publication
 from ouroboros.task_results import validate_task_id
 
 log = logging.getLogger(__name__)
@@ -707,6 +708,7 @@ def store_actor_source_bytes(
     except OSError:
         already_stored = False
     if not already_stored:
+        fence_publication()  # a closed publication generation writes no new source
         write_bytes_atomic(target, bytes(data))
     return {
         "kind": "task_source",
@@ -1226,11 +1228,13 @@ def stream_artifact_file(path: Any, sink: Any = None, *, expected: Any = None) -
 
 
 def copy_artifact_file(source: Any, destination: pathlib.Path, *, expected: Any = None) -> Dict[str, Any]:
-    """Publish a verified file copy atomically; preserve any prior bytes on failure."""
+    """Publish a verified file copy atomically; preserve any prior bytes on failure. Inside a
+    ``task_custody.publication_fence`` a closed generation starts no copy."""
     source_path = pathlib.Path(source) if isinstance(source, (str, os.PathLike)) else None
     destination = pathlib.Path(destination)
     if source_path is not None and not destination.is_symlink() and source_path.resolve(strict=False) == destination.resolve(strict=False):
         return stream_artifact_file(source, expected=expected)
+    fence_publication()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{uuid.uuid4().hex}.tmp")
     try:
@@ -1340,6 +1344,7 @@ def _archive_previous_artifact_version(drive_root: pathlib.Path, task_id: str, d
     copy_artifact_file(dest, version_path, expected=previous)
     versions = sorted((p for p in version_dir.iterdir() if p.is_file()), key=lambda p: p.name)
     for stale in versions[:-_ARTIFACT_VERSION_RETENTION]:
+        fence_publication()  # a closed generation deletes no retained version, even after its backup landed
         try:
             stale.unlink()
         except OSError:
@@ -1502,9 +1507,12 @@ def copy_directory_to_task_artifacts(
     return records
 
 
-def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id: str) -> List[Dict[str, Any]]:
-    """Collect deliverables while excluding internal task metadata and source handles."""
-
+def collect_task_artifact_records(
+    drive_root: Union[pathlib.Path, str], task_id: str, *, measure: bool = True, strict: bool = False,
+) -> List[Dict[str, Any]]:
+    """List one store's deliverables (nested ones carry ``relpath``), never its metadata or
+    inputs. ``measure=False`` is the pure view: size from lstat, ``measured: False``, only a
+    registration's recorded identity. ``strict`` raises on unreadable material instead."""
     try:
         artifact_dir = task_artifact_dir_path(pathlib.Path(drive_root), validate_task_id(task_id), create=False)
     except ValueError:
@@ -1512,41 +1520,44 @@ def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id:
     records: List[Dict[str, Any]] = []
     if not artifact_dir.exists():
         return records
-    data = read_json_dict(artifact_dir / _ARTIFACT_MANIFEST) or {}
-    raw_manifest = data.get("artifacts") if isinstance(data.get("artifacts"), dict) else {}
+    manifest_path = artifact_dir / _ARTIFACT_MANIFEST
+    data = read_json_dict(manifest_path)
+    if data is None and strict and (manifest_path.exists() or manifest_path.is_symlink()):
+        raise OSError(f"artifact registration is unreadable: {manifest_path}")
+    raw_manifest = (data or {}).get("artifacts") if isinstance((data or {}).get("artifacts"), dict) else {}
     manifest = {str(key): dict(value) for key, value in raw_manifest.items() if isinstance(value, dict)}
     artifact_root = artifact_dir.resolve(strict=False)
-    for path in sorted(p for p in artifact_dir.rglob("*") if p.is_file() and not p.is_symlink()):
-        # Internal task-metadata files (the artifact manifest and the v6.52.2 scratch manifest)
-        # are NOT deliverables — never record them as produced artifacts.
-        if path.name in (_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME):
-            continue
-        if path == artifact_dir / (_ARTIFACT_MANIFEST + ".lock"):
-            continue  # an in-flight registration lock is not a deliverable
-        # Verification receipts live beside artifacts for durable custody, but
-        # they are an append-only authority stream, not a deliverable.  Letting
-        # generic materialization register/copy this file can replace a newer
-        # canonical-only lifecycle row with a stale child replica.
-        if is_verification_receipts_path(drive_root, task_id, path):
+    members = iter_artifact_tree(artifact_dir) if strict else artifact_dir.rglob("*")
+    for path in sorted(p for p in members if p.is_file() and not p.is_symlink()):
+        # Metadata (manifests, the registration lock) and the receipt stream (its own
+        # union writer) are not deliverables.
+        if (path.name in (_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME) or path == artifact_dir / (_ARTIFACT_MANIFEST + ".lock")
+                or is_verification_receipts_path(drive_root, task_id, path)):
             continue
         try:
             rel_parts = path.resolve(strict=False).relative_to(artifact_root).parts
         except (OSError, ValueError):
-            continue
-        # v6.52.0 (P1): staged INPUT attachments live under attachments/ and are NOT
-        # task deliverables — never record them as produced artifacts.
-        if rel_parts and rel_parts[0] in {
-            _ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR, _SOURCE_HANDLES_SUBDIR,
-        }:
+            continue  # reached through a link: not this store's material
+        # Staged inputs, chat media and source handles are not deliverables.
+        if rel_parts and rel_parts[0] in {_ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR, _SOURCE_HANDLES_SUBDIR}:
             continue
         manifest_record = manifest.get(path.name) if path.parent == artifact_dir else None
+        nested = {"relpath": "/".join(rel_parts)} if len(rel_parts) > 1 else {}
         try:
-            record = artifact_record(path)
+            if not measure:  # an immutable registration keeps its recorded identity; nothing else is claimed
+                registered = manifest_record or {}
+                records.append({"kind": str(registered.get("kind") or "task_artifact"), "name": path.name,
+                                "path": str(path), **nested, "size": path.lstat().st_size, "measured": False,
+                                **({key: registered.get(key) for key in ("immutable", "size", "sha256")}
+                                   if registered.get("immutable") else {})})
+                continue
+            record = artifact_record(path) | nested
             if manifest_record:
                 record = merge_artifact_records([{**manifest_record, "path": str(path)}], [record])[0]
             records.append(record)
         except OSError:
-            continue
+            if strict:
+                raise
     return records
 
 

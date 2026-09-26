@@ -70,8 +70,27 @@ def _mailbox_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
     return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.jsonl"
 
 
+def mailbox_lines(content: str) -> List[str]:
+    """The non-blank rows of a mailbox or ack file, for EVERY reader of them: ``append_jsonl``
+    ends each row with "\n" and escapes "\r", so only "\n" separates rows. ``str.splitlines``
+    would also cut at a literal U+2028/U+2029 inside owner text, and lose that row."""
+    return [line for line in content.split("\n") if line.strip()]
+
+
 def _ack_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
     return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.acks.jsonl"
+
+
+def _append_mail(drive_root: pathlib.Path, task_id: str, path: pathlib.Path, entry: Dict[str, Any]) -> bool:
+    """Append one mailbox row under the task's mail lock (``task_custody.task_mail_lock``,
+    on the canonical side), so a row can never land between a settlement's custody read and
+    the unlink or drive move it permits (a sender after that recreates the mailbox, which
+    the next settlement holds). Never held across a copy: a publisher's custody lock is a
+    different lock, so a long copy-back never blocks a sender."""
+    from ouroboros.task_custody import task_mail_lock
+
+    with task_mail_lock(drive_root, task_id) as locked:
+        return bool(locked and append_jsonl(path, entry))
 
 
 def acknowledged_task_message_ids(
@@ -104,7 +123,7 @@ def acknowledged_task_message_ids(
         try:
             content = _mailbox_path(drive_root, task_id).read_text(encoding="utf-8")
             complete = not content or content.endswith("\n")
-            for line in content.splitlines():
+            for line in mailbox_lines(content):
                 try:
                     entry = json.loads(line)
                 except (TypeError, ValueError):
@@ -128,7 +147,7 @@ def acknowledged_task_message_ids(
     try:
         content = path.read_text(encoding="utf-8")
         complete = complete and (not content or content.endswith("\n"))
-        for line in content.splitlines():
+        for line in mailbox_lines(content):
             try:
                 row = json.loads(line)
             except (TypeError, ValueError):
@@ -159,23 +178,29 @@ def acknowledge_task_messages(
     wake_id: str,
     attempt_key: Any = None,
 ) -> bool:
-    """Acknowledge messages only after their full content entered a transcript."""
+    """Acknowledge messages only after their full content entered a transcript; the rows
+    land under the task's mail lock, so a custody read under it sees the mailbox and its
+    acknowledgements as one state."""
+    from ouroboros.task_custody import task_mail_lock
 
     path = _ack_path(drive_root, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = acknowledged_task_message_ids(
-        drive_root, task_id, attempt_key=attempt_key,
-    )
-    for msg_id in [str(item) for item in msg_ids if str(item) and str(item) not in existing]:
-        row = {
-            "ts": utc_now_iso(), "type": "task_message_acknowledged",
-            "task_id": str(task_id), "msg_id": msg_id, "wake_id": str(wake_id or ""),
-        }
-        if attempt_key is not None:
-            row["attempt_key"] = str(attempt_key)
-            row["settled"] = False
-        if not append_jsonl(path, row):
+    with task_mail_lock(drive_root, task_id) as locked:
+        if not locked:
             return False
+        existing = acknowledged_task_message_ids(
+            drive_root, task_id, attempt_key=attempt_key,
+        )
+        for msg_id in [str(item) for item in msg_ids if str(item) and str(item) not in existing]:
+            row = {
+                "ts": utc_now_iso(), "type": "task_message_acknowledged",
+                "task_id": str(task_id), "msg_id": msg_id, "wake_id": str(wake_id or ""),
+            }
+            if attempt_key is not None:
+                row["attempt_key"] = str(attempt_key)
+                row["settled"] = False
+            if not append_jsonl(path, row):
+                return False
     return True
 
 
@@ -243,7 +268,7 @@ def write_owner_message(
         if isinstance(attachment_manifest, list):
             from ouroboros.artifacts import attachment_manifest_projection
             entry.update(attachment_manifest_projection(drive_root, task_id, attachment_manifest))
-        if not append_jsonl(path, entry):
+        if not _append_mail(drive_root, task_id, path, entry):
             log.warning("Failed to durably append owner message for task %s", task_id)
             return False
         return True
@@ -294,7 +319,7 @@ def write_task_message(
     if provenance == "system" and isinstance(review_feedback, dict):
         entry["review_feedback"] = dict(review_feedback)
     try:
-        return bool(append_jsonl(path, entry))
+        return _append_mail(drive_root, task_id, path, entry)
     except Exception:
         log.warning("Failed to write task message for task %s", task_id, exc_info=True)
         return False
@@ -303,7 +328,9 @@ def write_task_message(
 def owner_attachment_manifest(
     drive_root: pathlib.Path, task_id: str, *, _source_refs: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Read all owner input history, including ACKed rows, with optional exact refs."""
+    """Read all owner input history, including ACKed rows, with optional exact refs. A row
+    that is not JSON (torn or unreadable, so possibly owner text with inputs) fails the
+    read closed with ``OSError``, as an unreadable file does."""
 
     path = _mailbox_path(drive_root, task_id)
     if not path.exists():
@@ -311,11 +338,11 @@ def owner_attachment_manifest(
     manifests: List[Dict[str, Any]] = []
     seen_ids: set[str] = set()
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in mailbox_lines(path.read_text(encoding="utf-8")):
             try:
                 entry = json.loads(line)
-            except (TypeError, ValueError):
-                continue
+            except ValueError as exc:
+                raise OSError(f"owner mailbox of {task_id} holds an unreadable row") from exc
             if not isinstance(entry, dict) or str(entry.get("kind") or KIND_OWNER_TEXT) != KIND_OWNER_TEXT:
                 continue
             msg_id = str(entry.get("msg_id") or "")
@@ -479,7 +506,7 @@ def reset_attempt_controls_for_retry(
     try:
         rows: List[dict] = []
         revoked: set[str] = set()
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in mailbox_lines(path.read_text(encoding="utf-8")):
             try:
                 row = json.loads(line)
             except (TypeError, ValueError):
@@ -531,17 +558,9 @@ def copy_owner_mailbox_for_retry(
         if not source.exists():
             continue
         try:
-            source_rows = [
-                json.loads(line)
-                for line in source.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            source_rows = [json.loads(line) for line in mailbox_lines(source.read_text(encoding="utf-8"))]
             target_rows = (
-                [
-                    json.loads(line)
-                    for line in target.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                ]
+                [json.loads(line) for line in mailbox_lines(target.read_text(encoding="utf-8"))]
                 if target.exists() else []
             )
         except (OSError, TypeError, ValueError):
@@ -588,7 +607,7 @@ def copy_owner_mailbox_for_retry(
             )
             if fingerprint in fingerprints:
                 continue
-            if not append_jsonl(target, row):
+            if not _append_mail(drive_root, retry_task_id, target, row):
                 return False
             fingerprints.add(fingerprint)
     return True
@@ -637,17 +656,13 @@ def drain_owner_entries(
     try:
         content = path.read_text(encoding="utf-8")
         complete = ack_status.get("complete", False) and (not content or content.endswith("\n"))
-        content = content.strip()
-        if not content:
+        if not content.strip():
             if _read_status is not None:
                 _read_status["complete"] = complete
             return []
         parsed: List[dict] = []
         revoked: set = set()
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        for line in mailbox_lines(content):
             try:
                 entry = json.loads(line)
             except Exception:
@@ -775,14 +790,30 @@ def drain_owner_messages(
     ]
 
 
-def cleanup_task_mailbox(drive_root: pathlib.Path, task_id: str) -> None:
-    """Remove a task's mailbox file after task completes."""
-    for path in (_mailbox_path(drive_root, task_id), _ack_path(drive_root, task_id)):
-        try:
-            if path.exists():
-                path.unlink()
-        except Exception:
-            log.debug("Failed to cleanup mailbox for task %s", task_id, exc_info=True)
+def cleanup_task_mailbox(drive_root: pathlib.Path, task_id: str, *, canonical_root: Any = None,
+                         carry_inputs: bool = True, stop: Any = None) -> bool:
+    """Remove a settled task's mailbox and acks once post-work and input copy are closed
+    (``settled_mailbox_cleanup_allowed``) and its canonical result holds every unread row with
+    a verified canonical closure of its inputs (``task_custody.settle_task_mailbox``); returns
+    whether they are gone. ``canonical_root`` is the result root, by default the drive's
+    host-layout owner. ``carry_inputs=False`` copies and hashes nothing (the loop thread): a
+    mailbox with inputs to carry or verify is kept for an off-loop owner, whose generation
+    ``stop()`` fences every copy, write and unlink."""
+    from ouroboros.task_custody import custody_anchor, settle_task_mailbox
+
+    return settle_task_mailbox(canonical_root or custody_anchor(drive_root, task_id), task_id, drive_root,
+                               carry_inputs=carry_inputs, stop=stop)
+
+
+def discard_mailbox_copy(drive_root: pathlib.Path, task_id: str) -> None:
+    """Drop a by-value mailbox copy made for a retry id that will never run: the original
+    id keeps every row, so no custody is owed; appends still serialize with the unlink."""
+    from ouroboros.task_custody import task_mail_lock
+
+    with task_mail_lock(drive_root, task_id) as locked:
+        if locked:
+            for path in (_mailbox_path(drive_root, task_id), _ack_path(drive_root, task_id)):
+                path.unlink(missing_ok=True)
 
 
 def mailbox_drain_ended(task_drive: pathlib.Path, task_id: str) -> bool:
@@ -792,15 +823,40 @@ def mailbox_drain_ended(task_drive: pathlib.Path, task_id: str) -> bool:
     (TZ-2 D15). Its mailbox is then only cleaned up, never read again, so owner
     mail and quiz answers must not be labelled delivered into it — the routing
     guard and the quiz ingress both ask this one fact. The actor's drive is read,
-    not the canonical row: split-root copyback can lag the settlement. A receipt for
-    mail that queued after the drain ended (TZ-2 B5) is not built yet: it waits for
-    the artifact/forwarding API TZ-1 lands in ``origin/ouroboros`` and is not to be
-    copied from provisional code.
+    not the canonical row: split-root copyback can lag the settlement. Mail that
+    lands after the drain ended is ``MAIL_RETAINED_UNREAD`` (``mail_write_receipt``):
+    the task's result keeps it as unread mail.
     """
     from ouroboros.task_results import load_task_result
     from ouroboros.task_status import SETTLED_STATUSES
 
     return str((load_task_result(task_drive, task_id) or {}).get("status") or "") in SETTLED_STATUSES
+
+
+# Receipt vocabulary for a message written into a task's mailbox. A write proves only
+# that the row is durable; "read" is proven later by the recipient loop's acknowledgement
+# (``mail_read_state``), never claimed at write time.
+MAIL_QUEUED = "queued"  # the recipient has not started; it reads the row when it starts
+MAIL_DELIVERED = "delivered"  # a live drain reads it at its next checkpoint
+MAIL_RETAINED_UNREAD = "retained_unread"  # its drain ended: the result keeps it unread
+
+
+def mail_write_receipt(recipient_status: str, *, drain_ended: bool = False) -> Dict[str, Any]:
+    """The typed receipt for one durable mailbox write to a recipient in ``recipient_status``."""
+    state = (MAIL_RETAINED_UNREAD if drain_ended
+             else MAIL_QUEUED if str(recipient_status or "") in {"requested", "scheduled"} else MAIL_DELIVERED)
+    return {"receipt": state, "read": False,
+            "read_evidence": "the recipient's task_message_acknowledged row (mail_read_state)"}
+
+
+def mail_read_state(drive_root: pathlib.Path, task_id: str, msg_id: str) -> Optional[bool]:
+    """True once the recipient acknowledged MSG_ID (its words entered a transcript), False
+    while unread, None when the acknowledgement ledger could not be read completely."""
+    status: Dict[str, bool] = {}
+    acknowledged = acknowledged_task_message_ids(drive_root, task_id, _read_status=status)
+    if str(msg_id) in acknowledged:
+        return True
+    return False if status.get("complete") else None
 
 
 def settled_mailbox_cleanup_allowed(result: Dict[str, Any]) -> bool:
@@ -823,14 +879,15 @@ def settled_mailbox_cleanup_allowed(result: Dict[str, Any]) -> bool:
     )
 
 
-def sweep_settled_owner_mailboxes(drive_root: pathlib.Path) -> Dict[str, Any]:
-    """Startup sweep of mailboxes whose task died off the terminal paths (CPL4-C18).
-
-    The only regular unlink is the task_done dispatch; a task that never
-    reached it (crash, lost event, hard kill) leaked its mailbox forever.
-    A mailbox goes only after terminal file recovery, with a settled result,
-    settled post-task work and no pending input copy. No result keeps it.
-    Lock sidecars are untouched (self-healing by staleness).
+def sweep_settled_owner_mailboxes(drive_root: pathlib.Path, *, stop: Any = None) -> Dict[str, Any]:
+    """Off-loop sweep of canonical mailboxes whose task settled without a cleanup (CPL4-C18:
+    a task that never reached the task_done dispatch - crash, lost event, hard kill - leaked
+    its mailbox forever) or whose cleanup the loop thread declined because unread rows carry
+    inputs to verify or copy (carried here). Startup and the drive-custody pass call it. A
+    mailbox goes only with a settled result, settled post-task work, no pending input copy and
+    every unread row in verified canonical custody. No result keeps it. ``stop()`` (the
+    maintenance generation) is asked before each mailbox and fences its cleanup's copies,
+    row write and unlinks. Lock sidecars are untouched (self-healing by staleness).
     """
     report: Dict[str, Any] = {"removed": [], "kept": 0}
     mailbox_dir = pathlib.Path(drive_root) / _MAILBOX_DIR
@@ -853,10 +910,10 @@ def sweep_settled_owner_mailboxes(drive_root: pathlib.Path) -> Dict[str, Any]:
             settled = settled_mailbox_cleanup_allowed(result)
         except Exception:
             settled = False
-        if not settled:
+        if not settled or (stop is not None and stop()):
             report["kept"] += 1
             continue
-        cleanup_task_mailbox(pathlib.Path(drive_root), task_id)
+        cleanup_task_mailbox(pathlib.Path(drive_root), task_id, stop=stop)
         if path.exists():
             report["kept"] += 1  # unlink refused: still owned by the mailbox
         else:

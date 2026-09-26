@@ -66,7 +66,7 @@ def test_saved_body_and_sources_precede_orphan_reader_and_actual_prune(roots, mo
     root, repo = roots
     child = _terminal(root, family=family)
     seen = []
-    def orphan_reader(_root, *, exclude_task_ids, expired_quizzes=None):
+    def orphan_reader(_root, *, exclude_task_ids, expired_quizzes=None, write_guard=None):
         row = load_task_result(root, "saved", strict=True)
         assert row["result"] == "full retained answer"
         manifest = observability.read_call_manifest_ref(root, row["trace_refs"]["response"], task_id="saved")
@@ -83,7 +83,11 @@ def test_saved_body_and_sources_precede_orphan_reader_and_actual_prune(roots, mo
         assert _recovery(root, repo)["recovered"] == []
     row = load_task_result(root, "saved")
     monkeypatch.setattr("ouroboros.retention.age_cutoff", lambda *a, **k: 4_000_000_000)
+    # The supervisor probe proves no owner of this dead task (unknown would keep the drive).
+    monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
     maintenance._startup_prune_sweeps()
+    assert child.exists(), "startup copies and hashes no child store: settlement is the off-loop pass's"
+    maintenance._run_drive_custody_pass()
     assert not child.exists()
     manifest = observability.read_call_manifest_ref(root, row["trace_refs"]["response"], task_id="saved")
     assert observability.read_blob_ref(root, manifest["full_payload_ref"])["answer"] == "full retained answer"
@@ -126,7 +130,7 @@ def test_orphan_exclusion_filters_before_effective_materialization(roots, monkey
         return {"task_id": tid, "status": "failed", "result": "proven orphan"}
     monkeypatch.setattr("ouroboros.task_status.load_effective_task_result", effective)
     assert reconcile_orphaned_running_tasks(root, exclude_task_ids={"live"}) == 1
-    assert read == [("dead", False), ("dead", True)]  # decide on a projection, then heal with custody
+    assert read == [("dead", False)]  # decide and persist on the status-only projection: no file work
     assert load_task_result(root, "live")["status"] == "running"
     assert load_task_result(root, "dead")["status"] == "failed"
 
@@ -180,8 +184,8 @@ def test_host_terminal_without_child_terminal_does_not_disable_retention(
     assert report["unresolved"] == report["errors"] == report["protected"] == []
     assert result_path.read_bytes() == settled_bytes
     monkeypatch.setattr("ouroboros.retention.age_cutoff", lambda *a, **k: 4_000_000_000)
-    maintenance._startup_prune_sweeps(preserve_task_sources=bool(
-        report["unresolved"] or report["protected"] or report["errors"]))
+    monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
+    maintenance._run_drive_custody_pass()
     assert not child.exists()
     assert result_path.read_bytes() == settled_bytes
 
@@ -382,38 +386,72 @@ def test_late_split_root_start_cannot_replace_canonical_terminal(roots):
 
 @pytest.mark.parametrize("failure", [False, True])
 def test_periodic_bulk_work_does_not_block_drain_or_duplicate_sweep(roots, monkeypatch, failure):
+    """The child-ref promotion walk is history-sized (every child drive, a result load
+    each). It rides the 300 s reconcile block, never the 20 s cancel sweep: while the
+    walk is held the tick returns, the cancel sweep keeps its OWN cadence (a second one
+    starts and finishes 25 s later), and no second walk starts. Whether the walk ends or
+    raises, its latch opens and its marker is stamped at the END (issue #1230)."""
     root, _ = roots
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
-    lock = threading.Lock()
-    clock = [100.0]
-    calls = []
-    monkeypatch.setattr(maintenance, "_CANCEL_INTENT_SWEEP_LOCK", lock)
+    cancel_lock, reconcile_lock = threading.Lock(), threading.Lock()
+    clock = [1000.0]
+    calls, threads = [], []
+    monkeypatch.setattr(maintenance, "_CANCEL_INTENT_SWEEP_LOCK", cancel_lock)
+    monkeypatch.setattr(maintenance, "_RECONCILE_SWEEP_LOCK", reconcile_lock)
     monkeypatch.setattr(maintenance, "_LAST_CANCEL_INTENT_SWEEP", [0.0])
     monkeypatch.setattr(maintenance, "time", SimpleNamespace(time=lambda: clock[0]))
+
+    def tracked(**kwargs):
+        thread = threading.Thread(**kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(maintenance, "threading", SimpleNamespace(Thread=tracked))
     monkeypatch.setattr("supervisor.task_lifecycle.sweep_cancel_intents", lambda: calls.append("cancel"))
     monkeypatch.setattr("supervisor.terminal_delivery.replay_pending_deliveries", lambda root: calls.append("delivery"))
-    def bulk(root):
+    monkeypatch.setattr(maintenance, "_reconcile_abandoned_usage", lambda root: calls.append("usage"))
+    monkeypatch.setattr(maintenance, "_periodic_zombie_reconcile", lambda **kw: calls.append("heal"))
+
+    def bulk(root, **_kwargs):
         calls.append("refs")
         entered.set()
         assert release.wait(3)
         done.set()
         if failure:
             raise OSError("copy failed")
+
     monkeypatch.setattr(observability, "retry_pending_child_ref_promotions", bulk)
-    maintenance._periodic_supervisor_maintenance([100.0], [100.0])
+    marker = [0.0]
+
+    def cancel_sweeps():
+        return [thread for thread in threads if thread.name == "terminal-maintenance"]
+
+    maintenance._periodic_supervisor_maintenance([clock[0]], marker)  # both cadences due
     assert entered.wait(2)
     try:
-        clock[0] = 125
-        maintenance._periodic_supervisor_maintenance([125.0], [125.0])
-        assert calls == ["cancel", "delivery", "refs"]  # drain returned while I/O is still held
+        for thread in cancel_sweeps():
+            thread.join(3)
+        assert calls.count("cancel") == calls.count("delivery") == calls.count("usage") == 1
+        assert calls.index("heal") < calls.index("refs"), "heal first, then promote"
+        assert not cancel_lock.locked(), "the cancel sweep finished while the walk is still held"
+        clock[0] = 1025.0
+        maintenance._periodic_supervisor_maintenance([clock[0]], marker)
+        for thread in cancel_sweeps():
+            thread.join(3)
+        assert [t.name for t in threads] == ["terminal-maintenance", "reconcile-maintenance", "terminal-maintenance"]
+        assert calls.count("cancel") == 2 and calls.count("refs") == 1, "cancel cadence held; no duplicate walk"
+        assert marker[0] == 0.0 and reconcile_lock.locked(), "stamped only when the walk ENDS"
     finally:
         release.set()
-    assert done.wait(2) and lock.acquire(timeout=2)
-    lock.release()
-    maintenance._periodic_supervisor_maintenance([125.0], [125.0])
-    assert lock.acquire(timeout=2)
-    lock.release()
-    assert calls == ["cancel", "delivery", "refs"] * 2
+        for thread in threads:
+            thread.join(3)
+    assert done.wait(2) and all(not thread.is_alive() for thread in threads)
+    assert marker[0] == 1025.0 and not reconcile_lock.locked() and not cancel_lock.locked()
+    clock[0] = 1050.0
+    maintenance._periodic_supervisor_maintenance([clock[0]], marker)  # 25 s after the END
+    for thread in threads:
+        thread.join(3)
+    assert calls.count("cancel") == 3 and calls.count("refs") == 1, "the walk waits its 300 s, the cancel sweep does not"
 
 
 def test_thread_start_failure_releases_maintenance_latch(roots, monkeypatch):

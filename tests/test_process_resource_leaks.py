@@ -27,20 +27,29 @@ def test_remove_subagent_task_drive(tmp_path):
         remove_subagent_task_drive,
     )
 
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+
     tid = "abcd1234"
     headless_dir = tmp_path / HEADLESS_TASKS_DIR / tid / "data"
     drive_dir = tmp_path / TASK_DRIVES_DIR / tid
     headless_dir.mkdir(parents=True)
     drive_dir.mkdir(parents=True)
+    # No settled row, no probe, or a live owner: custody is not proven, nothing goes.
+    assert remove_subagent_task_drive(tmp_path, tid, live=lambda _task: False) is False
+    write_task_result(tmp_path, tid, STATUS_CANCELLED, delegation_role="subagent")
+    assert remove_subagent_task_drive(tmp_path, tid) is False
+    assert remove_subagent_task_drive(tmp_path, tid, live=lambda _task: True) is False
+    assert remove_subagent_task_drive(tmp_path, tid, live=lambda _task: None) is False
+    assert headless_dir.is_dir() and drive_dir.is_dir()
 
-    assert remove_subagent_task_drive(tmp_path, tid) is True
+    assert remove_subagent_task_drive(tmp_path, tid, live=lambda _task: False) is True
     assert not (tmp_path / HEADLESS_TASKS_DIR / tid).exists()
     assert not (tmp_path / TASK_DRIVES_DIR / tid).exists()
 
     # idempotent / no error when nothing to remove
-    assert remove_subagent_task_drive(tmp_path, tid) is False
+    assert remove_subagent_task_drive(tmp_path, tid, live=lambda _task: False) is False
     # invalid task id is rejected, not raised
-    assert remove_subagent_task_drive(tmp_path, "../escape") is False
+    assert remove_subagent_task_drive(tmp_path, "../escape", live=lambda _task: False) is False
 
 
 def test_remove_task_scratch_never_promotes_forged_terminal_result(tmp_path):
@@ -67,7 +76,7 @@ def test_remove_task_scratch_never_promotes_forged_terminal_result(tmp_path):
         artifacts=[],
     )
 
-    assert remove_subagent_task_drive(tmp_path, tid) is True
+    assert remove_subagent_task_drive(tmp_path, tid, live=lambda _task: False) is True
     stored = load_task_result(tmp_path, tid) or {}
     assert "terminal_child_result_snapshot" not in stored
     assert not child_drive.exists()
@@ -100,7 +109,7 @@ def test_remove_subagent_drive_does_not_promote_custom_late_result(tmp_path):
     scratch = tmp_path / TASK_DRIVES_DIR / tid
     scratch.mkdir(parents=True)
 
-    assert remove_subagent_task_drive(tmp_path, tid) is True
+    assert remove_subagent_task_drive(tmp_path, tid, live=lambda _task: False) is True
     stored = load_task_result(tmp_path, tid) or {}
     assert stored["status"] == STATUS_CANCELLED
     assert "terminal_child_result_snapshot" not in stored
@@ -108,25 +117,31 @@ def test_remove_subagent_drive_does_not_promote_custom_late_result(tmp_path):
     assert not scratch.exists()
 
 
-def test_cancel_running_subagent_removes_drive_source():
+def test_cancel_running_subagent_leaves_its_drive_to_the_off_loop_settlement(tmp_path):
     # The cancellation custody family lives in task_lifecycle; its settlement
-    # PUBLICATION half (where the drive cleanup runs) was split into
-    # supervisor/cancel_publication.py at the module-size boundary.
+    # PUBLICATION half was split into supervisor/cancel_publication.py at the
+    # module-size boundary. Neither half deletes the subagent's drive any more:
+    # settlement copies and hashes the child store, which the cancel path must not
+    # carry, so the off-loop drive-custody pass settles a cancelled subagent's drive
+    # WITHOUT waiting out retention (the promptness the cancel path used to give).
+    from ouroboros import headless
+    from ouroboros.task_results import write_task_result
+
     custody_src = _read("supervisor/task_lifecycle.py")
     publish_src = _read("supervisor/cancel_publication.py")
-    assert "remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))" in publish_src
-    assert "delegation_role" in publish_src  # gated on subagent role
-    # ORDER matters: the drive may only be reclaimed after the process is confirmed
-    # dead, or a still-running worker loses its scratch out from under it. The
-    # death confirmation lives in custody, which only then calls the publish
-    # step; inside the publish step the cleanup follows the terminal emit.
+    assert "remove_subagent_task_drive" not in publish_src and "remove_subagent_task_drive" not in custody_src
+    assert "settle_child_drive" not in publish_src and "shutil.rmtree" not in publish_src
     assert "survived kill escalation" in custody_src
-    assert custody_src.index("survived kill escalation") < custody_src.index(
-        "_publish_cancelled_task(\n"
-    )
-    assert publish_src.index("_emit_cancel_task_done") < publish_src.index(
-        "remove_subagent_task_drive"
-    )
+    assert custody_src.index("survived kill escalation") < custody_src.index("_publish_cancelled_task(\n")
+
+    data = tmp_path / "data"
+    fresh = headless.prepare_task_drive(data, "young1", "empty")
+    write_task_result(data, "young1", "cancelled", result="killed", delegation_role="subagent", child_drive_root=str(fresh))
+    kept = headless.prepare_task_drive(data, "young2", "empty")
+    write_task_result(data, "young2", "completed", result="done", delegation_role="subagent", child_drive_root=str(kept))
+    report = headless.prune_headless_task_drives(data, retention_days=7, live=lambda _task: False)
+    assert [row["task_id"] for row in report["pruned"]] == ["young1"] and not fresh.exists()
+    assert kept.is_dir() and report["skipped"] == [{"task_id": "young2", "reason": "younger_than_retention"}]
 
 
 # ───────────────────────── #9: orphan worker reaping ────────────────────────

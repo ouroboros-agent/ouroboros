@@ -9,6 +9,8 @@ both outside the loop it watches.
 from __future__ import annotations
 
 import queue
+import re
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -27,6 +29,10 @@ from ouroboros.utils import utc_now_iso
 # lock, calls the daemon or touches disk — a watchdog that waits on the thread it
 # watches reports nothing. Older/foreign callers may pass the stamp alone.
 _STAMP, _FACTS, _CPU, _LAG = 0, 1, 2, 3
+
+# A stall row carries the loop thread's stack at onset: at most this many
+# innermost frames, each one line, so the journal row stays bounded.
+_STALL_STACK_FRAMES = 12
 
 
 def _supervisor_loop_stalled(last_tick: float, now: float, deadline_sec: int) -> bool:
@@ -65,9 +71,14 @@ def loop_phase_facts(liveness: list, phase: str, *, new_tick: bool = False) -> d
     ``maintenance`` | ``assign``, one stamp per phase and never per sub-step — so a
     stall names where the thread went silent instead of only how long it was.
     ``loop_thread_cpu_sec`` is the ``time.thread_time()`` delta over the interval
-    that ENDS with this stamp, sampled on the loop thread itself: read beside the
-    wall gap it separates a thread that BURNED that gap from one blocked on a lock
-    or starved of the GIL. ``max_event_lag_sec`` is the worst worker-stamped lag of
+    that ENDS with this stamp, sampled on the loop thread itself, and
+    ``cpu_interval_sec`` is that interval's wall (monotonic) length — the number
+    is honest only beside the interval it covers, and at stall onset that
+    interval is the last HEALTHY phase, not the stall. ``loop_thread_cpu_total_sec``
+    is the thread's cumulative CPU at this stamp, so the watchdog can charge a
+    whole stall (onset stamp to recovery stamp) without seeing every stamp in
+    between. Read beside the wall gap they separate a thread that BURNED it from
+    one blocked on a lock or starved of the GIL. ``max_event_lag_sec`` is the worst worker-stamped lag of
     the most recently completed drain, absent when no drained event carried a
     worker stamp. ``new_tick`` opens a fresh drain maximum (the events phase opens
     the tick), so a lag can never outlive the tick that observed it. No
@@ -79,6 +90,8 @@ def loop_phase_facts(liveness: list, phase: str, *, new_tick: bool = False) -> d
     facts = {
         "phase": phase,
         "loop_thread_cpu_sec": round(cpu - liveness[_CPU], 3),
+        "cpu_interval_sec": round(max(0.0, time.monotonic() - liveness[_STAMP]), 3),
+        "loop_thread_cpu_total_sec": round(cpu, 6),
         "daemon_pin_matched": _daemon_pin_matched(),
     }
     if liveness[_LAG] is not None:
@@ -165,6 +178,80 @@ def _published_loop_facts(liveness: list) -> dict:
     return dict(facts) if isinstance(facts, dict) else {}
 
 
+def _loop_thread_stack(ident: Optional[int], *, limit: int = _STALL_STACK_FRAMES,
+                       facts: Optional[dict] = None) -> list[str]:
+    """The loop thread's CURRENT stack, outermost first, at most ``limit`` innermost
+    ``path:line in func`` frames (repository files relative, others absolute). Walk code
+    objects instead of traceback.extract_stack: linecache could read a stalled filesystem on
+    this watchdog thread; no locals, no message bodies. A cut walk sets
+    ``facts["loop_stack_truncated"]`` when ``facts`` is given, so a bounded stack is never
+    mistaken for the whole one. No lock, disk or cooperation from the loop; [] if its
+    stack is unavailable."""
+    if not ident or limit <= 0:
+        return []
+    try:
+        frame = sys._current_frames().get(ident)
+        summaries = []
+        while frame is not None and len(summaries) < limit:
+            code = frame.f_code
+            summaries.append((code.co_filename, frame.f_lineno, code.co_name))
+            frame = frame.f_back
+        if frame is not None and facts is not None:
+            facts["loop_stack_truncated"] = True
+    except Exception:
+        log.debug("loop-thread stack capture failed", exc_info=True)
+        return []
+    finally:
+        frame = None  # never keep a foreign frame alive past this call
+    try:
+        from ouroboros.config import REPO_DIR
+
+        root = str(REPO_DIR).rstrip("/\\") + "/"
+    except Exception:
+        root = ""
+    rows = []
+    for filename, lineno, name in reversed(summaries):
+        path = filename.replace("\\", "/")
+        if root and path.startswith(root.replace("\\", "/")):
+            path = path[len(root):]
+        rows.append(f"{path[:200]}:{lineno} in {name[:100]}")
+    return rows
+
+
+_ABSOLUTE_PATH = re.compile(r"^([A-Za-z]:)?[/\\]")
+# One ``_loop_thread_stack`` row: ``path:line in func``. The path is everything before the LAST
+# ``:<line> in `` (a Windows drive ``C:`` or a colon inside the path is part of the path).
+_STACK_ROW = re.compile(r"^(?P<path>.*):(?P<line>\d+) in (?P<func>.*)$")
+
+
+def _innermost_repo_frame(stack: list[str]) -> str:
+    """``path:function`` of the innermost frame inside the repository - a relative path, else
+    the innermost frame outside the Python runtime ('' when none) - without the line number,
+    so the samples of one stalled function fold into one row."""
+    runtime = tuple(prefix.replace("\\", "/") for prefix in {sys.prefix, sys.base_prefix} if prefix)
+    outside = ""
+    for row in reversed(stack):
+        parsed = _STACK_ROW.match(row)
+        path, func = (parsed.group("path"), parsed.group("func")) if parsed else ("", "")
+        key = f"{path}:{func}"
+        if path and not _ABSOLUTE_PATH.match(path):
+            return key
+        if path and not outside and not path.startswith(runtime):
+            outside = key
+    return outside
+
+
+def _stall_cpu_over(onset_facts: dict, latest_facts: dict) -> Optional[float]:
+    """The loop thread's CPU from the stamp it went silent on to its latest stamp
+    — the whole stall, however many stamps the recovery published before the
+    watchdog looked — from the cumulative totals; the latest stamp's own delta
+    when a foreign/older stamp published no total (never invented)."""
+    onset_total, latest_total = onset_facts.get("loop_thread_cpu_total_sec"), latest_facts.get("loop_thread_cpu_total_sec")
+    if isinstance(onset_total, (int, float)) and isinstance(latest_total, (int, float)):
+        return round(max(0.0, latest_total - onset_total), 3)
+    return latest_facts.get("loop_thread_cpu_sec")
+
+
 def _chat_turn_wedged(busy: bool, last_activity_ts, now: float, deadline_sec: int) -> bool:
     """True when an IN-PROCESS direct-chat turn is busy but its liveness tick has been
     silent past the deadline (WS3). ``last_activity_ts is None`` => the turn has not
@@ -207,19 +294,29 @@ def _alert_chat_turn_wedge(task_id, gap: float) -> None:
         log.debug("chat-turn wedge owner alert failed", exc_info=True)
 
 
-def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None:
+def _start_supervisor_liveness_watchdog(
+    liveness: list, stop_event=None, *, loop_thread_ident: Optional[int] = None,
+) -> None:
     """Dedicated daemon thread (NOT inside the supervisor loop, so it fires even when
     that loop stalls). It observes two silent-wedge classes and reports them
     DIFFERENTLY (owner decision 4C). A heartbeat-silent in-process direct-chat turn
     ALERTS the owner, because /restart is a recovery they can perform. A supervisor
     loop stall (new-message intake starvation) is JOURNAL ONLY: the ``log.error``
     and one durable ``supervisor_loop_stall`` row with the phase facts the loop
-    published with its last stamp, closed once the loop ticks again by one
-    ``supervisor_loop_stall_end`` — onset without an end is a generation that never
-    recovered. Nothing reaches the owner's chat from that half: a stall they cannot
-    act on is an alarm, not information, and the rows carry the diagnosis anyway.
-    It deliberately does NOT kill a hung thread; independent native actors keep
-    the chat responsive meanwhile. ``stop_event`` is
+    published with its last stamp plus the loop thread's stack at onset
+    (``stack``, bounded; ``loop_stack_truncated`` when cut), then one bounded stack
+    sample per watchdog interval while the stall is open, closed once the loop ticks
+    again by one ``supervisor_loop_stall_end`` charging the thread's CPU over the
+    whole stall and carrying ``samples``, up to five ``top_frames`` (innermost
+    repository frame -> samples) and the ``last_stack`` — where it spent the stall,
+    not only where it began. Onset without an end is a generation that never
+    recovered. Nothing reaches the
+    owner's chat from that half: a stall they cannot act on is an alarm, not
+    information, and the rows carry the diagnosis anyway. It deliberately does NOT
+    kill a hung thread; independent native actors keep the chat responsive
+    meanwhile. ``loop_thread_ident`` is the thread whose stack a stall row carries;
+    it defaults to the CALLER, because the loop thread starts its own watchdog
+    (startup phase included). ``stop_event`` is
     a PER-GENERATION token: when the supervisor loop that owns ``liveness`` exits (incl.
     the crash-storm death path, which never sets the global restart flag), it is set so
     this watchdog stops watching a now-stale liveness list (no false post-revival alert)."""
@@ -228,13 +325,23 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
     deadline = get_supervisor_liveness_deadline_sec()
     if deadline <= 0:
         return
+    watched_ident = loop_thread_ident if loop_thread_ident is not None else threading.get_ident()
 
     def _watch() -> None:
         from supervisor.state import append_jsonl
         interval = min(15, max(1, deadline // 3))
         loop_alerted = False
-        stall_onset: tuple = ()  # (stalled stamp, phase) of the OPEN alerted stall
+        stall_onset: tuple = ()  # (stalled stamp, phase, onset facts) of the OPEN alerted stall
+        samples: dict = {}  # innermost repository frame -> stack samples while the stall is open
+        last_stack: list = []
         wedged_tasks: set[str] = set()
+
+        def sample(stack: list) -> None:
+            nonlocal last_stack
+            if stack:
+                last_stack = stack
+            key = _innermost_repo_frame(stack) or "(outside the repository)"
+            samples[key] = samples.get(key, 0) + 1
         while not _restart_requested.is_set() and not (stop_event is not None and stop_event.is_set()):
             time.sleep(interval)
             # ONE clock: both halves measure an ELAPSED GAP against stamps taken on
@@ -248,22 +355,33 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                 if not loop_alerted:
                     gap = now - liveness[_STAMP]
                     facts = _published_loop_facts(liveness)
-                    log.error(
-                        "Supervisor loop STALLED ~%.0fs — new-message intake starved (native "
-                        "chat still answers); investigate a blocking step.", gap,
-                    )
+                    flags: dict = {}
+                    stack = _loop_thread_stack(watched_ident, facts=flags)
+                    # A startup stall is a generation that has not finished initializing: no
+                    # native chat answers for it, so the line says only what is true.
+                    starved = ("startup has not finished" if facts.get("phase") == "startup"
+                               else "new-message intake starved (native chat still answers)")
+                    log.error("Supervisor loop STALLED ~%.0fs in phase %s — %s; loop thread is at: %s",
+                              gap, facts.get("phase"), starved, stack[-1] if stack else "(stack unavailable)")
                     try:
                         # The facts the loop published with the stamp it went silent
-                        # on: where it was, what its own thread burned, how far
-                        # behind the drained worker events already were.
+                        # on: where it was, what its own thread burned over the
+                        # interval BEFORE the stall (cpu_interval_sec says how long
+                        # that was), how far behind the drained worker events
+                        # already were — and where its thread stands right now.
                         append_jsonl(DATA_DIR / "logs" / "supervisor.jsonl", {
                             "ts": utc_now_iso(), "type": "supervisor_loop_stall",
-                            "stalled_sec": round(gap, 1), **facts,
+                            "stalled_sec": round(gap, 1), **facts, **flags,
+                            **({"stack": stack} if stack else {}),
                         })
                     except Exception:
                         log.debug("loop-stall log failed", exc_info=True)
                     loop_alerted = True
-                    stall_onset = (liveness[_STAMP], facts.get("phase"))
+                    stall_onset = (liveness[_STAMP], facts.get("phase"), facts)
+                    samples, last_stack = {}, []
+                    sample(stack)
+                else:
+                    sample(_loop_thread_stack(watched_ident))  # one bounded sample per interval
             else:
                 if loop_alerted:
                     # The loop ticked again: close the episode ONCE, and only one
@@ -272,14 +390,26 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                     # jump; it rounds up by at most one watchdog interval, the
                     # resolution at which recovery is observed at all.
                     try:
+                        latest = _published_loop_facts(liveness)
+                        stalled = round(liveness[_STAMP] - stall_onset[0], 1)
                         append_jsonl(DATA_DIR / "logs" / "supervisor.jsonl", {
                             "ts": utc_now_iso(), "type": "supervisor_loop_stall_end",
-                            "stalled_sec": round(liveness[_STAMP] - stall_onset[0], 1),
+                            "stalled_sec": stalled,
                             "phase": stall_onset[1],
-                            # The recovery stamp's CPU delta covers the stalled interval itself:
-                            # beside the wall gap it tells a thread that burned it from one that
+                            # The thread's CPU from the stamp it went silent on to its
+                            # latest stamp — the stalled interval itself, whole, however
+                            # many phases the recovery published before this look —
+                            # beside the wall interval it covers (the same seconds as
+                            # stalled_sec): a thread that burned them versus one that
                             # waited on a lock, IO or the GIL.
-                            "loop_thread_cpu_sec": _published_loop_facts(liveness).get("loop_thread_cpu_sec"),
+                            "loop_thread_cpu_sec": _stall_cpu_over(stall_onset[2], latest),
+                            "cpu_interval_sec": stalled,
+                            # Where the thread SPENT the stall: one stack sample per watchdog
+                            # interval, folded by innermost repository frame, plus the last one.
+                            "samples": sum(samples.values()),
+                            "top_frames": [{"frame": frame, "samples": count} for frame, count in
+                                           sorted(samples.items(), key=lambda item: (-item[1], item[0]))[:5]],
+                            "last_stack": last_stack,
                         })
                     except Exception:
                         log.debug("loop-stall-end log failed", exc_info=True)

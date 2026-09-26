@@ -1159,6 +1159,12 @@
  * intent is the SOFT stop ("finalize_then_cancel") — the UI shows
  * "Finalizing…" and offers the hard escalation; absent on immediate intents.
  * @typedef {Object} TaskDetailResponse
+ * @property {Array<{name:string, path?:string, relpath?:string, size?:number, measured?:boolean, status?:string, errors?:string[]}>=} artifacts
+ *   Recorded result rows; a nested file keeps its store-relative `relpath`, and `measured: false`
+ *   marks a stat-only listing, not a verified capture.
+ * @property {Object.<string, {name:string, files:number, size:number, excluded:number, available:boolean}>=} artifact_archives
+ *   Per top-level result directory, what `?archive=<dir>` would stream now (members from one
+ *   confined stat each, rows left out counted); a folder offers its `.zip` only when `available`.
  * @property {Object.<string,Object>=} model_waits
  * @property {TaskCostBreakdown=} cost_breakdown
  * @property {string=} cancel_state

@@ -54,7 +54,7 @@ def test_clean_source_in_model_request_survives_child_copyback_and_pruning(tmp_p
     promoted = read_blob_ref(parent, manifest["full_payload_ref"])["messages"][0]["content"]
     assert warning in promoted
     assert _marker_ref(promoted, "PRODUCER_RESULT_SOURCE_JSON=") == source
-    prune_headless_task_drives(parent, retention_days=0, now=4_000_000_000.0)
+    prune_headless_task_drives(parent, retention_days=0, now=4_000_000_000.0, live=lambda _task: False)
     assert not child.exists()
     assert read_actor_source_bytes(parent, task_id, source) == payload.encode("utf-8")
     canonical_ctx = ToolContext(repo_dir=repo, drive_root=parent, task_id=task_id)

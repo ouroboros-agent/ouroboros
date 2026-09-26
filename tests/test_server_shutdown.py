@@ -705,7 +705,6 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
         monkeypatch.setattr(workers_mod, name, noop)
     monkeypatch.setattr(workers_mod, "get_event_q", lambda: queue_mod.Queue())
     monkeypatch.setattr("ouroboros.delegate_recovery.pre_adopt_planned_handoffs", noop)
-    monkeypatch.setattr("ouroboros.observability.prune_observability_blobs", lambda _root: {})
     monkeypatch.setattr("ouroboros.tools.services.prune_service_logs", lambda _root: {})
     monkeypatch.setattr("ouroboros.consciousness.BackgroundConsciousness", _Consciousness)
     return rec

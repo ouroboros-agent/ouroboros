@@ -18,7 +18,8 @@ def _managed_worker_pool_available(monkeypatch):
     """HTTP task tests model a ready server unless a case overrides the pool."""
     import supervisor.workers as workers
 
-    monkeypatch.setattr(workers, "WORKERS", {0: SimpleNamespace()})
+    # An idle slot: the liveness readers (settlement probe, live ownership) read these facts.
+    monkeypatch.setattr(workers, "WORKERS", {0: SimpleNamespace(busy_task_id=None, reaping=False)})
     monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
 
 

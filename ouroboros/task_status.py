@@ -7,7 +7,7 @@ import pathlib
 from functools import partial
 import time
 from datetime import datetime, timezone
-from types import SimpleNamespace
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ouroboros.headless import (
@@ -406,16 +406,20 @@ class _EventsTailIndex:
         return self._worker_boot
 
 
-def _still_orphan_at_write(task_id: str, applied: List[bool], existing: Dict[str, Any],
+def _still_orphan_at_write(task_id: str, observed: tuple, applied: List[bool], existing: Dict[str, Any],
                            fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Projector for the reconciler's terminal write (bound with ``partial``): the decision was taken
-    outside the row lock, so a presence retry that went live meanwhile, or a row that already moved on
-    (requeued, settled by another writer), cancels the write. ``applied`` gets True only on a real write."""
+    outside the row lock, so a presence retry that went live meanwhile, or a row that moved on (requeued,
+    restarted as a new attempt even under the same status, settled by another writer), cancels the write:
+    ``observed`` is the row's attempt basis plus ``updated_at`` at decision time. ``applied`` gets True
+    only on a real write."""
     from ouroboros.presence_runner import presence_turn_is_live
+    from ouroboros.task_custody import attempt_basis
 
     if presence_turn_is_live(task_id):
         return None
-    if str(existing.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}:
+    if (attempt_basis(existing), existing.get("updated_at")) != observed \
+            or str(existing.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}:
         return None
     applied.append(True)
     return fields
@@ -614,6 +618,7 @@ def load_effective_task_result(
 def reconcile_orphaned_running_tasks(
     drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset(),
     expired_quizzes: Optional[List[Any]] = None,
+    write_guard: Optional[Callable[[str], Any]] = None,
 ) -> int:
     """Durably finalize on-disk RUNNING task results the effective-status
     projection already considers terminal.
@@ -624,22 +629,23 @@ def reconcile_orphaned_running_tasks(
     terminal status, but never persists it, so a headless/no-UI run that never
     re-reads the result keeps the stale ``running`` on disk.
 
-    This sweep reuses ``load_effective_task_result`` so the persisted file matches
-    the read projection exactly and inherits ALL of its liveness gates: the grace
-    window, the worker-boot-after-task evidence, and the refusal to reconcile when
-    the queue snapshot is missing. A task that is still pending/running in the
-    queue, or whose worker has not booted after the task's last event, is never
-    reconciled. Two reads per candidate: the decision is a status-only
-    (``materialize_artifacts=False``) projection, and only a row it is about to
-    settle is read again with artifact materialization, so a live child's
-    scratch tree is never copied by this sweep. The monotonic guard in
-    ``write_task_result`` additionally protects a genuinely newer terminal/cancel
-    write. Idempotent; safe at boot and on a periodic supervisor tick.
+    This sweep persists that projection and inherits ALL of its liveness gates:
+    the grace window, the worker-boot-after-task evidence, and the refusal to
+    reconcile when the queue snapshot is missing. It decides and persists on the
+    status-only (``materialize_artifacts=False``) projection, so no child file is
+    listed or copied here: the child store stays served read-only from its drive
+    and reaches the canonical store through ``task_custody.settle_child_drive``
+    before that drive can go. The write is fenced by the row's attempt basis and
+    ``updated_at`` at decision time, and, given ``write_guard`` (the supervisor's
+    queue-ownership fence, queue -> row lock order), by live queue ownership; the
+    monotonic guard in ``write_task_result`` protects a newer terminal/cancel write.
+    Idempotent; safe at boot and on a periodic tick.
 
     ``expired_quizzes`` collects ``(task_id, quiz_id)`` for every question this
     sweep expired, so the supervisor-side caller can send the same live frame the
     task-done seam sends. This module stays free of a supervisor import.
     """
+    from ouroboros.task_custody import attempt_basis
     from ouroboros.task_results import list_task_results, write_task_result
 
     root = pathlib.Path(drive_root)
@@ -666,15 +672,8 @@ def reconcile_orphaned_running_tasks(
         except Exception:
             log.debug("Orphan reconcile skipped %s: cancel authority unreadable", task_id, exc_info=True)
             continue
-        # Decide on the status-only projection: a live row costs one projection and
-        # zero artifact transfers. Only a row this sweep is about to settle pays the
-        # materializing read, so the persisted terminal row keeps full custody
-        # (artifact rebase, verification receipts, artifact_bundle) (issue #1230).
         try:
-            projected = load_effective_task_result(root, task_id, materialize_artifacts=False)
-            if str(projected.get("status") or "").strip().lower() not in SETTLED_STATUSES:
-                continue
-            effective = load_effective_task_result(root, task_id)
+            effective = load_effective_task_result(root, task_id, materialize_artifacts=False)
         except Exception:
             continue
         eff_status = str(effective.get("status") or "").strip().lower()
@@ -694,32 +693,36 @@ def reconcile_orphaned_running_tasks(
         }
         try:
             applied: List[bool] = []
-            write_task_result(root, task_id, status=eff_status,
-                              _field_projector=partial(_still_orphan_at_write, task_id, applied), **persist_fields)
-            if not applied:
-                continue  # the row moved on between the effective read and this write: nothing was settled here
-            healed += 1
+            observed = (attempt_basis(row), row.get("updated_at"))
+            with (write_guard(task_id) if write_guard else nullcontext(True)) as allowed:
+                if not allowed:
+                    continue
+                write_task_result(root, task_id, status=eff_status,
+                                  _field_projector=partial(_still_orphan_at_write, task_id, observed, applied),
+                                  **persist_fields)
+                if not applied:
+                    continue  # the row moved on between the effective read and this write: nothing was settled here
+                healed += 1
+                # This sweep is a terminal writer that never passes the task-done seam, so it closes the
+                # same per-task owner-control projections that seam closes (otherwise the record says
+                # "ended" while the card keeps an open question), before any next attempt can open new
+                # ones. Both legs are idempotent and fail-soft, as in the seam's own coordinator.
+                try:
+                    from ouroboros.owner_hurry import reconcile_terminal as reconcile_hurry
+
+                    reconcile_hurry(root, task_id)
+                except Exception:
+                    log.debug("owner_hurry reconcile failed for healed %s", task_id, exc_info=True)
+                try:
+                    from ouroboros.owner_quiz import reconcile_terminal as reconcile_quiz
+
+                    expired = reconcile_quiz(root, task_id)
+                    if expired_quizzes is not None:
+                        expired_quizzes.extend((task_id, quiz_id) for quiz_id in expired)
+                except Exception:
+                    log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
         except Exception:
             continue
-        # This sweep is a terminal writer that never passes the task-done seam, so
-        # it closes the same per-task owner-control projections that seam closes:
-        # otherwise the record says "ended" while the card still shows an open
-        # question and the paired wait never releases. Both legs are idempotent
-        # and fail-soft, exactly as in the seam's own coordinator.
-        try:
-            from ouroboros.owner_hurry import reconcile_terminal as reconcile_hurry
-
-            reconcile_hurry(root, task_id)
-        except Exception:
-            log.debug("owner_hurry reconcile failed for healed %s", task_id, exc_info=True)
-        try:
-            from ouroboros.owner_quiz import reconcile_terminal as reconcile_quiz
-
-            expired = reconcile_quiz(root, task_id)
-            if expired_quizzes is not None:
-                expired_quizzes.extend((task_id, quiz_id) for quiz_id in expired)
-        except Exception:
-            log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
     return healed
 
 
@@ -768,19 +771,19 @@ def effective_task_result(
 ) -> Dict[str, Any]:
     """Merge parent result, child-drive result, and active queue state.
 
-    ``materialize_artifacts=False`` yields a "status/cost projection only" read
-    (v6.90.x P2): the entire artifact block — including the mutating child-artifact
-    rebase (``copy_file_to_task_artifacts``), ``collect_task_artifact_records``
-    scans, and the task-tree ``_project_child_result_disposition`` hash lookup — is
-    skipped, and the projection never carries sha-bearing/disposition claims.
-    ``artifacts`` on a False row are the raw admission-time recorded entries,
-    not the merged/rebased set a materializing read would produce.
-    Read-only display surfaces (chat history annotation, ``api_tasks_list``, the
-    SSE follow loop, ``api_logs_tail`` discovery) pass ``False``; every consumer
-    that participates in the child-result sha economy or artifact durability
-    (join_ledger, wait_*/get_task_result, api_task_get/artifact, prune) keeps the
-    ``True`` default. The orphan reconciler decides on a ``False`` read and
-    materializes only the row it heals.
+    Every read is pure (TZ-1 A): no file copy, hash, registration or manifest
+    write. Child files reach the canonical store only through copy-back and
+    ``task_custody.settle_child_drive``. The default read adds the artifact VIEW
+    (``task_custody.store_artifact_view``: recorded canonical rows, the task's
+    OWN child stores' recorded rows and stat-only ``measured: False`` listings)
+    plus the task-tree disposition lookup. ``materialize_artifacts=False`` (the
+    historical name) is the "status/cost projection only" read: no view, no
+    disposition lookup and no sha-bearing/disposition claims; its ``artifacts``
+    are the raw recorded rows. Read-only display surfaces (chat history
+    annotation, ``api_tasks_list``, the SSE follow loop, ``api_logs_tail``
+    discovery) pass ``False``; child-result consumers (join_ledger,
+    wait_*/get_task_result, api_task_get/artifact, prune) keep the ``True``
+    default. The orphan reconciler decides and persists on a ``False`` read.
     ``_events_index`` optionally shares ONE parsed events-tail across a batch of
     rows (the task-list request), so N stale-running rows cost one tail read
     instead of N; ``None`` keeps the per-call read for single-row callers.
@@ -966,10 +969,9 @@ def effective_task_result(
     _apply_cancel_state_projection(pathlib.Path(drive_root), task_id, merged)
 
     if not materialize_artifacts:
-        # Status/cost projection only: skip the whole artifact block (incl. the
-        # mutating child-artifact rebase and collect_task_artifact_records file
-        # scans) AND the disposition hash lookup. Strip the legacy mirrored
-        # fields so a False row never carries sha-bearing/disposition claims.
+        # Status/cost projection only: no artifact view (no store listing) and no
+        # disposition lookup. Strip the legacy mirrored fields so a False row
+        # never carries sha-bearing/disposition claims.
         projected = dict(merged)
         for field in _CHILD_DISPOSITION_FIELDS:
             projected.pop(field, None)
@@ -977,84 +979,24 @@ def effective_task_result(
             projected["artifact_status"] = normalize_outcome_axes(projected)["artifacts"]["status"]
         return projected
     try:
-        from ouroboros.artifacts import (
-            collect_task_artifact_records,
-            copy_file_to_task_artifacts,
-            merge_artifact_records,
-        )
         from ouroboros.outcomes import artifact_bundle_from_result
+        from ouroboros.task_custody import own_child_drives, store_artifact_view
 
-        if child_result:
-            parent_artifacts = [item for item in (result.get("artifacts") or []) if isinstance(item, dict)]
-            child_artifacts_for_merge = [item for item in (child_result.get("artifacts") or []) if isinstance(item, dict)]
-            if parent_artifacts or child_artifacts_for_merge:
-                merged["artifacts"] = merge_artifact_records(parent_artifacts, child_artifacts_for_merge)
-
-        rebased_child_artifacts: List[Dict[str, Any]] = []
-        if child_text:
-            parent_artifact_ctx = SimpleNamespace(drive_root=pathlib.Path(drive_root), task_id=task_id)
-            child_artifacts = merge_artifact_records(
-                [item for item in (child_result.get("artifacts") or []) if isinstance(item, dict)],
-                collect_task_artifact_records(pathlib.Path(child_text), task_id),
-            )
-            from ouroboros.outcome_receipt_store import (
-                is_verification_receipts_path,
-                publish_verification_receipt_union,
-            )
-
-            for child_artifact in child_artifacts:
-                source_text = str(child_artifact.get("path") or "").strip()
-                if not source_text:
-                    continue
-                source = pathlib.Path(source_text).expanduser().resolve(strict=False)
-                if is_verification_receipts_path(child_text, task_id, source):
-                    # Historical child results may already list the receipt
-                    # stream as a generic artifact.  Reconcile it through its
-                    # one locked owner and never feed it to shutil.copy2.
-                    publish_verification_receipt_union(
-                        pathlib.Path(drive_root), task_id, pathlib.Path(child_text),
-                    )
-                    continue
-                try:
-                    copied = copy_file_to_task_artifacts(
-                        parent_artifact_ctx, source,
-                        kind=str(child_artifact.get("kind") or "child_artifact"),
-                        **({"immutable": True, "expected": child_artifact} if child_artifact.get("immutable") else {}),
-                    )
-                    if copied is None:
-                        raise OSError("child artifact file is missing")
-                except (OSError, ValueError) as exc:
-                    copied = {**child_artifact, "status": ARTIFACT_STATUS_FAILED,
-                              "copy_status": "failed", "copy_error": f"{type(exc).__name__}: {exc}"}
-                    promotion = merged.get("child_ref_promotion")
-                    promotion = dict(promotion) if isinstance(promotion, dict) else {}
-                    merged["child_ref_promotion"] = {
-                        **promotion, "schema_version": 1, "status": "incomplete",
-                        "pending_refs": [*(promotion.get("pending_refs") or []),
-                                         {"path": str(source), "kind": "task_artifact", "reason": copied["copy_error"]}],
-                    }
-                rebased_child_artifacts.append(copied)
-
-        collected_artifacts = collect_task_artifact_records(drive_root, task_id)
-        if collected_artifacts or rebased_child_artifacts:
-            existing_artifacts = [item for item in (merged.get("artifacts") or []) if isinstance(item, dict)]
-            rebased_names = {
-                str(item.get("name") or pathlib.Path(str(item.get("path") or "")).name)
-                for item in rebased_child_artifacts
-                if isinstance(item, dict)
-            }
-            if rebased_names:
-                existing_artifacts = [
-                    item
-                    for item in existing_artifacts
-                    if str(item.get("name") or pathlib.Path(str(item.get("path") or "")).name) not in rebased_names
-                ]
-                collected_artifacts = collect_task_artifact_records(drive_root, task_id)
-            merged["artifacts"] = merge_artifact_records(existing_artifacts, rebased_child_artifacts, collected_artifacts)
+        # A pure view (TZ-1 A): recorded rows, the task's OWN child stores' recorded rows
+        # (their identity survives a suppressed cancelled child result) and stat-only
+        # listings; nothing is copied, hashed or registered here.
+        child_rows = {}
+        for drive in own_child_drives(drive_root, task_id):
+            rows = (load_task_result(drive, task_id) or {}).get("artifacts")
+            child_rows[drive / "task_results" / "artifacts" / task_id] = rows if isinstance(rows, list) else []
+        recorded = [item for item in (merged.get("artifacts") or []) if isinstance(item, dict)]
+        listed = store_artifact_view(drive_root, task_id, recorded, child_rows)
+        if listed:
+            merged["artifacts"] = listed
             merged["artifact_bundle"] = artifact_bundle_from_result(merged)
             merged["artifact_status"] = merged["artifact_bundle"].get("status")
     except Exception:
-        pass
+        log.debug("Artifact view unavailable for %s", task_id, exc_info=True)
     return _project_child_result_disposition(pathlib.Path(drive_root), merged)
 
 
@@ -1091,12 +1033,10 @@ def wait_for_effective_tasks(
     timed_out = False
     early: Any = None
     while True:
-        # Poll reads are status/cancel_state projections only: the
-        # materializing default performed real cross-tree writes (artifact
-        # copy2 + manifest rewrites) every 2s tick — a 600s wait over 5
-        # children was ~1500 spurious materializations. The one materializing
-        # read happens after the loop, on every exit path, so wait/get
-        # consumers keep their place in the child-result sha economy.
+        # Poll reads are status/cancel_state projections only (no store listing
+        # or disposition lookup per 2s tick). The one full read happens after the
+        # loop, on every exit path, so wait/get consumers keep their place in the
+        # child-result sha economy.
         results = {
             tid: load_effective_task_result(
                 pathlib.Path(drive_root), tid, materialize_artifacts=False
@@ -1123,8 +1063,8 @@ def wait_for_effective_tasks(
             timed_out = True
             break
         time.sleep(max(0.05, min(2.0, float(poll_interval_sec or 0.5))))
-    # The single materializing read, on EVERY exit path (terminal, timeout,
-    # early beacon): the returned rows re-enter the sha/artifact economy.
+    # The single full read, on EVERY exit path (terminal, timeout, early
+    # beacon): the returned rows re-enter the sha/artifact economy.
     results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}
     out: Dict[str, Any] = {
         "mode": mode,
@@ -1190,11 +1130,9 @@ def find_child_tasks(
 
     def _raw_row_may_match(item: Dict[str, Any]) -> bool:
         # Prefilter on the RAW disk row before paying for the effective
-        # projection: with the materializing default that projection is not a
-        # read — it copies files, rewrites artifact manifests and re-hashes
-        # every artifact of UNRELATED tasks (one finalization ran it 4-5x over
-        # the whole store). The lineage fields the filter needs are already on
-        # the raw row. Two classes must still materialize despite not matching
+        # projection (child-drive result, queue, store listing and disposition
+        # reads) for UNRELATED tasks. The lineage fields the filter needs are
+        # already on the raw row. Two classes must still be projected despite not matching
         # raw: a row with a retry pointer (the retry chain projects the
         # RETRY's lineage, which may match where the raw row does not), and a
         # lineage-less row is safe to skip — a LIVE one is re-discovered by

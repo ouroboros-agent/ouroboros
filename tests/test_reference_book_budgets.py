@@ -35,11 +35,16 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 7 bytes on the official line); re-based here, no text of this chapter was touched.
     # 165550 -> 165900 (PR #1300): the net_transport row and the data-layout row for the merged
     # extra-CA bundle; the base sat 174 bytes under the previous budget.
+    # 165900 -> 166450 (TZ-1 PR-2 custody, measured 166432): module-map rows for the two new
+    # owners (task_custody.py, gateway/task_archive.py) and the data-layout row for the
+    # settlement's staging/trash; the artifact-route sentence was replaced, not appended to.
     # 165900 -> 166100: the plan_spec.py and plan_review.py rows name the open-set aggregate, the
     # one closure table and the author path's labelled critic pair; the base sat 110 bytes under.
     # 166100 -> 166300: the reviewer_slot_config.py and plan_review_runtime.py rows name the plan
     # order precedence and the wave effort/standing facts (descriptions replaced in place).
-    "docs/architecture/01-high-level-architecture.md": 166300,
+    # 166450 -> 167000 (merge of the moved target into the plan-review branch, measured 166885): both
+    # sides' replaced paragraphs land together; no text was appended by the merge itself.
+    "docs/architecture/01-high-level-architecture.md": 167000,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -77,9 +82,13 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # vocabulary (#931/#1061); the touched descriptions were REPLACED and
     # compressed (net chapter growth is under the added owner's paragraph size),
     # and the merged #1236 base already sat 5 bytes under the previous budget.
+    # 107000 -> 107200 (TZ-1 PR-2, measured 107174): one module row for result_files.js, the
+    # card's Files row; no older text described task result files on the card.
     # 107000 -> 107300: the Reviews projection names the per-seat effort, weaker-order and
     # earlier-plan facts as read-side projections (one clause); the base sat 22 bytes under.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 107300,
+    # 107300 -> 107500 (merge of the moved target into the plan-review branch, measured 107392): both
+    # sides' replaced paragraphs land together; no text was appended by the merge itself.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 107500,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -116,7 +125,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # typed timeout-cause sentence join TZ-1's bridge-intake paragraph; TZ-2 had compressed the
     # owner-wait and heartbeat paragraphs it touched in place (+103 bytes alone), TZ-1's
     # paragraph is new, so the union displaces nothing.
-    "docs/architecture/05-supervisor-loop.md": 33700,
+    # 33700 -> 34100 (TZ-1 PR-2, measured 34059): the reconcile pass moved off the loop thread
+    # (own latch, the attempt-basis fence, the drive-custody pass: child-ref retry then bounded
+    # drive settlements under the queue interlock, generation re-asked per item and commit) and
+    # the watchdog watches startup with the stall stack; the sentences they change were replaced.
+    "docs/architecture/05-supervisor-loop.md": 34100,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -200,6 +213,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # free host_task_facts, stat-only files_rescued and post-work settlement clauses
     # replace their prior paragraphs (+242 bytes) independently of the memory writer;
     # both contracts survive the merge, with no duplicated prose to displace.
+    # 316800 -> 317750 (TZ-1 PR-2 custody, measured 317713): the startup-prune sentence is
+    # replaced by the one deletion owner (settle_child_drive): its obligations (recorded rows
+    # first, unrecorded files, the input closure, exact unread lines), the shared custody lock,
+    # the queue interlock the move needs and the identity-ranked view; the forward_to_worker
+    # clause gains the queued receipt and the terminal unread-mail custody.
     # 316800 -> 318000: the plan-review open-set verdict (GREEN = empty open set, notes never
     # count), the per-finding advisory closure of a below-quorum blocking finding, the closed
     # REVIEW_REQUIRED written GREEN, and the author path's labelled critic pair REPLACE the
@@ -212,7 +230,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 319500 -> 320500: the dialogue-delivery paragraph REPLACES the byte-suffix/mandatory-full-read
     # contract with the numbered conversation view, the per-route fit, the session pointer and the
     # observed-source read facts; the capture paragraph gains the snapshot-vs-inline clause.
-    "docs/architecture/06-agent-core.md": 320500,
+    # 320500 -> 321400 (merge of the moved target into the plan-review branch, measured 321261): both
+    # sides' replaced paragraphs land together; no text was appended by the merge itself.
+    "docs/architecture/06-agent-core.md": 321400,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route

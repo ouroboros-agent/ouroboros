@@ -579,7 +579,9 @@ def _finish_task_done_dispatch(
         try:
             from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
 
-            cleanup_settled_owner_mailbox(ctx.DRIVE_ROOT, str(task_id), task)
+            # The loop thread copies and hashes nothing: a mailbox with unread inputs to carry
+            # waits for the off-loop mailbox sweep or the drive settlement.
+            cleanup_settled_owner_mailbox(ctx.DRIVE_ROOT, str(task_id), task, carry_inputs=False)
         except Exception:
             log.warning("Failed to cleanup terminal owner mailbox for %s", task_id, exc_info=True)
 

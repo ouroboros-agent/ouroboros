@@ -209,14 +209,14 @@ successor-parity and artifact-transport rules are review-only.
   that reason).
 - Durable artifacts are NOT age-pruned: genesis projects
   (`OUROBOROS_SUBAGENT_PROJECTS_ROOT`) and forensic observability blobs (kept
-  compressed indefinitely by contract; startup runs a census, never a
-  deletion).
+  compressed indefinitely by contract; blobs are never deleted or
+  counted).
 - Review continuations are recovery state, not disposable GC: archive a record
   (collision-safe move, never delete) only when its owner task is settled, it
   stayed un-resumed past the seven-day threshold and no recorded obligation
   remains open; any uncertainty or move error leaves the live record intact.
 
-Enforcement: `tests/test_phase3c_observability_gc.py` (the unified knob and the cutoff math) and `tests/test_observability_retention.py` (the census and preserve-indefinitely contract); the review-continuation archive rule has no automated surface — review-only.
+Enforcement: `tests/test_phase3c_observability_gc.py` (the unified knob and the cutoff math) and `tests/test_observability_retention.py` (the preserve-indefinitely contract); the review-continuation archive rule has no automated surface — review-only.
 
 ### Live subagents
 
@@ -309,7 +309,7 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   stale-replica regression at BOTH seams
   (`tests/test_available_subagents_runtime_review_fixes.py`). Do not broaden
   generic data-tool behavior while fixing isolation (`forward_to_worker`
-  writes only to validated running tasks in the current task/root lineage).
+  writes only to validated running or queued tasks in the current lineage).
 - A custody row carries its owner's kind; every sweep, audit and counter over
   custody rows states which kinds it covers. A review-owned run
   (`RunCustody.review_owned`) belongs to its panel — never the task's open

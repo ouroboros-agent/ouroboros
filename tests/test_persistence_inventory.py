@@ -581,7 +581,10 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # 297 -> 296 (TZ-3 PR-1): the ``knowledge_journal.jsonl`` size-telemetry writer is
 # removed (its only reader was this inventory); ``knowledge_history.jsonl`` keeps the
 # complete captures, now host-stamped.
-EXPECTED_SCAN_PATHS = 296
+# 296 -> 300 (TZ-1 child-drive custody): ``task_results/<id>.custody.lock`` (the per-task
+# custody lock) and the settlement's ``state/custody_staging`` / ``state/custody_trash``
+# entries; one PERSISTENCE.md row covers all three.
+EXPECTED_SCAN_PATHS = 300
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts

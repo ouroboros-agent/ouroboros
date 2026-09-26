@@ -2,6 +2,7 @@
 // live-card presentation projections (moved verbatim from chat.js) plus the
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
 import { executorIdentityMarkup, joinMetaParts } from './harness_presentation.js';
+import { resultFilesItemHtml } from './result_files.js';
 import { compactModel, formatLogDuration, modelExecutionLabel } from './log_events.js';
 import { createSystemMessageActions } from './ui_helpers.js';
 import { projectReference } from './project_reference.js';
@@ -71,6 +72,7 @@ export function isLiveLineExpandable(item) {
 }
 
 export function buildTimelineItemHtml(item, record) {
+    if (item.resultArtifacts) return resultFilesItemHtml(item);
     const expandable = isLiveLineExpandable(item);
     const expanded = expandable && record.expandedLineKeys.has(item.lineKey);
     const displayHeadline = expanded && item.fullHeadline ? item.fullHeadline : item.headline;

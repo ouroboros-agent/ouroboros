@@ -90,8 +90,9 @@ def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, *
             if retain_inputs is not None:
                 retain_inputs()
         ref = build_owner_message_ref(chat_id=chat_id, client_message_id=message_id, ts=ts, text=logged)
-        # The row rides the item as its in-process witness (``record_inbound_message``).
-        bridge.enqueue_local_message(text, **message, accepted_source_ref=ref, accepted_source_row=row)
+        # The row rides the item as its in-process witness (``record_inbound_message``); its
+        # acceptance time is this message's receipt stamp.
+        bridge.enqueue_local_message(text, **message, accepted_source_ref=ref, accepted_source_row=row, received_at=ts)
         return row, False
 
 
@@ -357,7 +358,7 @@ class LocalChatBridge:
         for key in (
             "sender_label", "sender_session_id", "client_message_id", "transport",
             "image_base64", "image_mime", "image_caption", "suppress_chat_log",
-            "task_constraint", "task_metadata", "accepted_source_ref", "accepted_source_row",
+            "task_constraint", "task_metadata", "accepted_source_ref", "accepted_source_row", "received_at",
         ):
             value = msg.get(key)
             if value not in (None, "", 0):
@@ -508,7 +509,13 @@ class LocalChatBridge:
         task_metadata: Optional[Dict[str, Any]] = None,
         accepted_source_ref: Optional[Dict[str, Any]] = None,
         accepted_source_row: Optional[Dict[str, Any]] = None,
+        received_at: str = "",
     ) -> None:
+        """The ONE ingress every transport enqueues through, so it stamps the host receipt time
+        ``received_at`` for all of them: an earlier host stamp of this message (its accepted row's
+        time, the WS acceptance's ``client_surface.received_at``) is kept, else now. The update
+        carries it; a surface fact without one (a host channel stamp) gets it too, so every
+        record that copies the fact carries it. Nothing else: a dict put, no lock, no I/O."""
         clean_text = str(text or "").strip()
         caption_text = str(image_caption or "").strip()
         image_b64 = str(image_base64 or "").strip()
@@ -516,6 +523,11 @@ class LocalChatBridge:
             clean_text = caption_text
         if not clean_text and not image_b64 and not (task_metadata or {}).get("chat_attachment_uploads"):
             return  # nothing to say and nothing attached (a file-only message carries uploads)
+        surface = (task_metadata or {}).get("client_surface")
+        surface = surface if isinstance(surface, dict) and surface else None
+        received_at = str(received_at or (surface or {}).get("received_at") or "") or utc_now_iso()
+        if surface is not None and not surface.get("received_at"):
+            task_metadata = {**(task_metadata or {}), "client_surface": {**surface, "received_at": received_at}}
         # Invariant: the default chat/user id is the web owner (1). External
         # transports (source != "web") MUST pass explicit ids — the Host Service
         # injects 0 for unidentified senders so they can never bind/own the web
@@ -537,6 +549,7 @@ class LocalChatBridge:
             "task_metadata": dict(task_metadata or {}),
             "accepted_source_ref": dict(accepted_source_ref or {}),
             "accepted_source_row": dict(accepted_source_row or {}),
+            "received_at": received_at,
         })
 
     def send_message(

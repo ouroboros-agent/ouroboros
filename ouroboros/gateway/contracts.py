@@ -1131,15 +1131,17 @@ class TaskDetailResponse(TypedDict, total=False):
     """``GET /api/tasks/{task_id}`` — the public task-result envelope (open shape;
     stored task-result keys pass through) plus additive typed projections."""
 
+    artifacts: List[Dict[str, Any]]  # Open result rows; a nested file carries additive ``relpath``.
+    # Per top-level result dir: {name, files, size, excluded, available} of its on-demand ``?archive=`` ZIP.
+    artifact_archives: Dict[str, Dict[str, Any]]
     cost_breakdown: TaskCostBreakdown
     model_waits: Dict[str, Any]
     # Cancel projection (additive-optional): ``"pending"`` while a durable cancel intent is open and the
     # supervisor teardown has not settled — the status itself honestly stays running/scheduled; absent on
     # settled results and on tasks nobody asked to cancel. The UI's interim "Cancelling…" reads this, never a status.
     cancel_state: str
-    # Rides beside ``cancel_state`` when the intent carries a reason (GR2-11):
-    # the WHY of the pending cancellation (owner text, "subtree cancellation of
-    # <root>", "evolution stopped", …). Absent when no reason was recorded.
+    # Beside ``cancel_state`` when the intent carries a reason (GR2-11): the WHY of the pending
+    # cancellation (owner text, "subtree cancellation of <root>", …); absent when none was recorded.
     cancel_reason: str
     # S3 (Q1, additive-optional): rides beside a pending ``cancel_state`` when
     # the open intent is the SOFT stop ("finalize_then_cancel") — the UI shows

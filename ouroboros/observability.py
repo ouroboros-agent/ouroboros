@@ -73,6 +73,9 @@ def _memo_publish(key: tuple, payload: Any, writer: Callable[[], dict], *, ref_r
                 return dict(cached[1])
         except OSError:
             pass
+    from ouroboros.task_custody import fence_publication
+
+    fence_publication()  # every promotion write goes through here: a closed generation starts none
     ref = writer()
     if memo is not None:
         memo[key] = (copy.deepcopy(payload), dict(ref), _file_identity(ref_root / ref["path"]))
@@ -1041,38 +1044,34 @@ def _has_pending_ref_promotion(promotion: Any) -> bool:
     )
 
 
-def _retry_pending_child_ref_promotion(
-    parent: pathlib.Path,
-    child: pathlib.Path,
-    task_id: str,
-    loaded_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Retry CURRENT refs through the headless publication owner, then cleanup."""
+def _retry_pending_child_ref_promotion(parent: pathlib.Path, child: pathlib.Path, task_id: str,
+                                       loaded_result: Dict[str, Any], *, stop: Any = None) -> Dict[str, Any]:
+    """Retry CURRENT refs through the publication owner, then the off-loop mailbox cleanup
+    (it may carry inputs); a closed generation declined the publication and cleans nothing."""
     from ouroboros.headless import retry_child_task_refs
-    settled = retry_child_task_refs(parent, child, task_id)
+    settled = retry_child_task_refs(parent, child, task_id, stop=stop)
+    if stop is not None and stop():
+        return settled
     from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
 
-    cleanup_settled_owner_mailbox(parent, task_id, {"drive_root": str(child)})
+    cleanup_settled_owner_mailbox(parent, task_id, {"drive_root": str(child)}, carry_inputs=True, stop=stop)
     return settled
 
 
 def retry_pending_child_ref_promotions(
     parent_drive_root: pathlib.Path,
+    *, stop: Any = None,
 ) -> Dict[str, Any]:
-    """Retry only newly ledgered pending refs, never the stale child result."""
+    """Retry only newly ledgered pending refs, never the stale child result. ``stop()`` is
+    the maintenance generation's close, asked before every item and again at each
+    publication's commit: a closed generation leaves the rest ``deferred``."""
 
     from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
     from ouroboros.task_status import SETTLED_STATUSES
     from ouroboros.task_results import load_task_result, validate_task_id
 
     parent = pathlib.Path(parent_drive_root)
-    report: Dict[str, Any] = {
-        "scanned": 0,
-        "retried": [],
-        "completed": [],
-        "pending": [],
-        "errors": [],
-    }
+    report: Dict[str, Any] = {"scanned": 0, "retried": [], "completed": [], "pending": [], "errors": [], "deferred": []}
     directories = [(path, path / suffix) for base, suffix in
                    ((parent / HEADLESS_TASKS_DIR, "data"), (parent / TASK_DRIVES_DIR, ""))
                    if base.is_dir() for path in sorted(base.iterdir()) if path.is_dir()]
@@ -1086,8 +1085,11 @@ def retry_pending_child_ref_promotions(
                 continue
             if not _has_pending_ref_promotion(result.get("child_ref_promotion")):
                 continue
+            if stop is not None and stop():
+                report["deferred"].append(task_id)
+                continue
             settled = _retry_pending_child_ref_promotion(
-                parent, child_root, task_id, result
+                parent, child_root, task_id, result, stop=stop,
             )
             report["retried"].append(task_id)
             promotion = settled.get("child_ref_promotion") or {}
@@ -1467,7 +1469,7 @@ def preserve_salvaged_output(preserve_root: pathlib.Path, task_id: str, text: st
     """Write the FULL salvaged text durably under ``preserve_root``; return its path.
 
     The observability root is the drive's durable forensic area
-    (``prune_observability_blobs`` deliberately never deletes it), so a copy
+    (nothing deletes it), so a copy
     landed here survives the child-drive removal that follows a cancel/timeout
     publication. Returns "" when nothing could be written.
     """
@@ -1543,42 +1545,6 @@ def salvaged_output_note(
             return (f"\n\n{label}; "
                     f"full copy preserved at {full_path}):\n" + preview)
     return f"\n\n{label}):\n" + salvaged
-
-
-def prune_observability_blobs(drive_root: pathlib.Path) -> Dict[str, Any]:
-    """Startup observability census — counts only, never deletion.
-    Forensic call manifests and CAS blobs are durable replay evidence,
-    preserved indefinitely BY CONTRACT. The retirable half of this surface —
-    ``OUROBOROS_OBSERVABILITY_RETENTION_DAYS``, a knob that was parsed,
-    clamped and reported while deleting nothing — is GONE (CPL4-C22, owner
-    7A): a documented no-op was a misleading operator surface. The key sits
-    in ``RETIRED_SETTING_KEYS`` so stored ghosts drop on settings load.
-    """
-    root = pathlib.Path(drive_root) / OBSERVABILITY_DIR
-    calls_root = root / "calls"
-    blobs_root = root / "blobs"
-    report: Dict[str, Any] = {
-        "preserved_indefinitely": True,
-        "manifest_count": 0,
-        "blob_count": 0,
-        "errors": [],
-    }
-    if not root.exists():
-        return report
-    for manifest_path in list(calls_root.glob("*/*.json")) if calls_root.exists() else []:
-        try:
-            manifest_path.stat()
-            report["manifest_count"] += 1
-        except Exception as exc:
-            report["errors"].append(f"{manifest_path}: {type(exc).__name__}: {exc}")
-    if blobs_root.exists():
-        for blob_path in list(blobs_root.glob("*.gz")):
-            try:
-                blob_path.stat()
-                report["blob_count"] += 1
-            except Exception as exc:
-                report["errors"].append(f"{blob_path}: {type(exc).__name__}: {exc}")
-    return report
 
 
 class SecretRedactingLogFilter(logging.Filter):

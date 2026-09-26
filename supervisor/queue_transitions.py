@@ -24,6 +24,7 @@ nothing from ``task_lifecycle``, which re-exports these names so
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import pathlib
 import threading
@@ -897,6 +898,44 @@ def task_has_live_ownership(task_id: str) -> bool:
                 )
             )
         )
+
+
+def task_settlement_liveness(task_id: str) -> Optional[bool]:
+    """The probe a destructive custody settlement asks (``task_custody.settle_child_drive``):
+    True while ``task_has_live_ownership`` holds or the id waits in PENDING, None while a
+    reap of this task (its slot or a queued/deferred reap job) makes absence inconclusive
+    or the queue cannot be read, False only for proven absence. Callers without the
+    supervisor's live maps have no such probe, so they never delete."""
+    q = _queue_module()
+    from supervisor import task_reaper, workers
+
+    task_id = str(task_id or "").strip()
+    if not getattr(q, "INITIALIZED", False):
+        return None  # empty maps outside the supervisor process prove no absence
+    try:
+        with q._queue_lock:
+            if task_has_live_ownership(task_id) or any(str(row.get("id") or "") == task_id for row in q.PENDING):
+                return True
+            with q._reap_queue.mutex:
+                jobs = [*q._reap_queue.queue, *task_reaper._deferred_reap_jobs]
+            if any(worker.reaping and worker.busy_task_id == task_id for worker in workers.WORKERS.values()) \
+                    or any(isinstance(job, dict) and str(job.get("task_id") or "") == task_id for job in jobs):
+                return None  # a reap of this task is queued or holds its slot: its process may live
+        return False
+    except Exception:
+        log.warning("Settlement liveness of %s is unknown", task_id, exc_info=True)
+        return None
+
+
+@contextlib.contextmanager
+def task_settlement_interlock(stop: Any = None):
+    """The ownership interlock a drive settlement moves under (``task_custody.settle_child_drive``
+    ``guard``): the queue lock admission and assignment hold, so no occupant can be admitted,
+    assigned or retried between the settlement's last probe and the drive's move. Yields
+    whether the caller's generation is still open (``stop()`` False)."""
+    q = _queue_module()
+    with q._queue_lock:
+        yield not (callable(stop) and stop())
 
 
 def run_project_deletion(

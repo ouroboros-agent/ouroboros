@@ -260,7 +260,7 @@ def test_dialogue_source_survives_real_child_promotion_and_cleanup(harness):
     write_task_result(child, "source", "completed")
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
     assert copied["child_ref_promotion"]["status"] == "complete"
-    assert remove_subagent_task_drive(parent, "source") is True
+    assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert not child.exists()
     wave = load_plan_review_state(parent, "source")["waves"][-1]
     assert read_actor_source_bytes(parent, "source", wave["dialogue_source_ref"]) == raw

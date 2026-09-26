@@ -377,6 +377,10 @@ def _get_task_result(
         )
     if isinstance(data.get("cancel_origin"), dict):
         output += f"\n\n[CANCELLED_BY] {json.dumps(data['cancel_origin'], ensure_ascii=False)}"
+    from ouroboros.task_custody import unread_mail_notice
+
+    if unread := unread_mail_notice(data.get("unread_mailbox")):
+        output += f"\n\n{unread}"  # TZ-1 V10: mail written to this task that its model never read
     if trace and not unchanged:
         output += f"\n\n[SUBTASK_TRACE]\n{trace}\n[/SUBTASK_TRACE]"
     from ouroboros.task_finalization import provider_terminal_body, terminal_host_notice_text

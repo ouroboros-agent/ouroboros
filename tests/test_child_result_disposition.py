@@ -156,7 +156,10 @@ def test_changed_child_result_reopens_and_old_hash_is_stale(tmp_path):
 
 
 def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
-    from ouroboros.artifacts import task_artifact_dir_path
+    """Reads hash no files (TZ-1 A): the recorded artifact identity is what the
+    exact-hash disposition covers, so a published byte change reopens it while an
+    unrecorded file mutation leaves the pure read unchanged."""
+    from ouroboros.artifacts import artifact_record, task_artifact_dir_path
     from ouroboros.task_results import write_task_result
     from ouroboros.task_status import load_effective_task_result
     from ouroboros.tools.join_ledger import (
@@ -166,6 +169,10 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
     from ouroboros.tools.task_tree import _tree_note
 
     child_id = "artifact-child"
+    artifact_dir = task_artifact_dir_path(tmp_path, child_id)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "report.md"
+    artifact_path.write_text("version one\n", encoding="utf-8")
     write_task_result(
         tmp_path,
         child_id,
@@ -174,11 +181,8 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
         root_task_id="parent1",
         delegation_role="subagent",
         result="artifact-backed result",
+        artifacts=[artifact_record(artifact_path)],
     )
-    artifact_dir = task_artifact_dir_path(tmp_path, child_id)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / "report.md"
-    artifact_path.write_text("version one\n", encoding="utf-8")
     shown_hash = _child_result_sha256(load_effective_task_result(tmp_path, child_id))
     assert _tree_note(
         _parent_ctx(tmp_path),
@@ -191,6 +195,8 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
     ) == "integrated"
 
     artifact_path.write_text("version two\n", encoding="utf-8")
+    assert _child_result_sha256(load_effective_task_result(tmp_path, child_id)) == shown_hash
+    write_task_result(tmp_path, child_id, "completed", artifacts=[artifact_record(artifact_path)])
     changed = load_effective_task_result(tmp_path, child_id)
     assert _child_result_sha256(changed) != shown_hash
     assert _current_child_result_disposition(changed) == ""
@@ -651,7 +657,7 @@ def test_cancellation_wins_and_late_scratch_result_is_deleted(tmp_path):
         trace_summary="late trace",
     )
 
-    assert remove_subagent_task_drive(tmp_path, child_id) is True
+    assert remove_subagent_task_drive(tmp_path, child_id, live=lambda _task: False) is True
     assert not scratch.parent.exists()
     raw = load_task_result(tmp_path, child_id) or {}
     assert raw["status"] == STATUS_CANCELLED

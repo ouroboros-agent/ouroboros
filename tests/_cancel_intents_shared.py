@@ -19,6 +19,16 @@ from ouroboros.task_results import (
 )
 
 
+def settled_off_loop(drive, task_id: str, child) -> bool:
+    """TZ-1 A: the cancel path deletes no execution drive. It stays for the off-loop settlement
+    (``task_custody.settle_child_drive``, a cancelled subagent's at once), which removes it only
+    with its custody proven; True when the drive was kept and that settlement then removed it."""
+    from ouroboros.task_custody import settle_child_drive
+
+    return child.is_dir() and settle_child_drive(drive, task_id, child, live=lambda _task: False)["status"] == "removed" \
+        and not child.exists()
+
+
 def _write_root_retry_pair(tmp_path, old_id: str, new_id: str, *, new_status="scheduled"):
     write_task_result(
         tmp_path,

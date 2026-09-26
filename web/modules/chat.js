@@ -10,6 +10,7 @@ import { createChatDecision } from './chat_decision.js';
 import { bindProjectWorkPointer } from './project_work_pointer.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
 import { clientSurfaceField } from './client_surface.js';
+import { syncResultFilesItem } from './result_files.js';
 import { createChatHistoryPager } from './chat_history.js';
 import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
@@ -1167,16 +1168,22 @@ export function createChatInstance({
         return withStableViewport(() => {
             const id = taskKey(taskId);
             modelWaits.observe(id, detail);
+            const filed = noteResultFiles(liveCardRecords.get(id), detail);
             const groups = reviewGroupsFromTaskDetail(detail, id);
-            if (!id || groups.length === 0) return false;
+            if (!id || groups.length === 0) return filed;
             const fresh = !liveCardRecords.has(id);
             const record = getLiveCardRecord(id);
             if (fresh) reanchorTaskCard(record, detail?.ts || detail?.timestamp || '');
             const changed = record.reviewController.updateMany(groups);
             ensureLiveCardVisible(record);
             const reconciled = reconcileCancelCardFromDetail(record, id, detail);
-            return Boolean(changed || reconciled);
+            return Boolean(changed || reconciled || filed);
         });
+    }
+
+    // V12: a settled detail keeps the card's one Files row current.
+    function noteResultFiles(record, detail) {
+        return Boolean(syncResultFilesItem(record, detail) && (updateLiveCardCount(record), renderLiveCardTimeline(record), true));
     }
 
     function hydrateCardReviews(taskId, revision = null) {

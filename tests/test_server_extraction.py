@@ -198,7 +198,11 @@ def test_server_extraction_size_bounds_have_meaningful_headroom():
         for module in _LEAVES
     }
     counts["server"] = len((REPO / "server.py").read_text(encoding="utf-8").splitlines())
-    assert all(count <= 1000 for name, count in counts.items() if name != "server")
+    # server_maintenance.py entered the size band with TZ-1 A (its rationale in
+    # size_ratchet_manifest.BAND_PATHS): the bounded off-loop drive-custody pass joined the
+    # reconcile block it runs in; it stays under the band's ceiling, shrink-only from here.
+    assert all(count <= 1000 for name, count in counts.items() if name not in {"server", "ouroboros.server_maintenance"})
+    assert counts["ouroboros.server_maintenance"] <= 1150
     # server.py keeps the lifespan, the supervisor loop, the owner-command
     # dispatch, the process state those three need, AND (on this tree) the
     # deferred restart transaction plus post-cutoff upstream drift, so the

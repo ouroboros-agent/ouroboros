@@ -861,6 +861,11 @@ def write_task_result(
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
+    from ouroboros.task_custody import capture_unread_mail, merge_unread_mail
+
+    # TZ-1 V10: the mailbox bytes are read BEFORE the row lock (a bounded union happens
+    # under it); a terminal write that the projector turns terminal captures under it.
+    captured = capture_unread_mail(results_drive_root, task_id) if status in _TRULY_TERMINAL_STATUSES else None
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if strict_existing_dict and existing and (
@@ -901,6 +906,16 @@ def write_task_result(
             if resolve_task_lineage(task_id, metadata=merged.get("metadata"),
                                     **{key: merged.get(key) for key in lineage_keys})["is_root_task"]:
                 projected_fields["canonical_terminal_projection_origin"] = "terminal_transition"
+            # TZ-1 V10: this accepted transition keeps the mail no attempt read (no ACK written);
+            # later late mail joins through settlement, never through a rejected write.
+            projected_fields["unread_mailbox"] = merge_unread_mail(
+                projected_fields.get("unread_mailbox"),
+                captured if status in _TRULY_TERMINAL_STATUSES else capture_unread_mail(results_drive_root, task_id))
+        # Unread-mail custody only grows: no replica or partial write can shrink it.
+        projected_fields["unread_mailbox"] = merge_unread_mail(
+            existing.get("unread_mailbox"), projected_fields.get("unread_mailbox"))
+        if projected_fields["unread_mailbox"] is None:
+            projected_fields.pop("unread_mailbox")
         now = utc_now_iso()
         # ABI-3 write seam: the merge BASE is normalized onto honest cost names first, so a stored alias
         # neither survives nor outranks this write's fresh value; a legacy spelling IN this write still

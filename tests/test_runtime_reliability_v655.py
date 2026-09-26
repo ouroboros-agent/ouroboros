@@ -788,3 +788,20 @@ def test_owner_safety_mode_response_in_frozen_contract():
 
     assert "OwnerSafetyModeResponse" in contracts.__all__
     assert set(contracts.OwnerSafetyModeResponse.__annotations__) == {"ok", "safety_mode"}
+
+
+def test_safety_mode_skip_keeps_its_durable_row_without_a_log_line(tmp_path, caplog):
+    """Owner decision В6 (TZ-1): the waved-through check leaves ONLY its durable audit row
+    (and the counter/Logs it feeds), never a process-log WARNING beside it."""
+    import json as _json
+    import logging
+
+    ctx = ToolContext(repo_dir=tmp_path / "system", drive_root=tmp_path / "data", task_id="t-quiet", task_metadata={})
+    (tmp_path / "data" / "logs").mkdir(parents=True, exist_ok=True)
+    with caplog.at_level(logging.DEBUG, logger=safety_mod.log.name):
+        safety_mod._emit_safety_mode_skip(ctx, "run_command", "light", "check_conditional")
+    assert not [r for r in caplog.records if "waved through" in r.getMessage()]
+    rows = [_json.loads(line) for line in (tmp_path / "data" / "logs" / "events.jsonl").read_text().splitlines()]
+    assert [r for r in rows if r.get("type") == "safety_mode_skip"] == [
+        {**row, "ts": row["ts"]} for row in rows if row.get("type") == "safety_mode_skip"]
+    assert rows[-1]["tool"] == "run_command" and rows[-1]["policy"] == "check_conditional"

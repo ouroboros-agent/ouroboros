@@ -289,6 +289,13 @@ def test_reaper_terminal_cleans_split_drive_not_canonical_mailbox(
         task_done_event={"type": "task_done", "task_id": task_id, "status": "failed"},
     )
 
+    # The loop-thread seam copies nothing: a split drive's mailbox (its acknowledged history
+    # may carry inputs to promote) waits for the off-loop owner, which releases it; the
+    # canonical mailbox is never the split task's to clean.
+    assert _mailbox_path(child_drive, task_id).exists()
+    from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+
+    cleanup_settled_owner_mailbox(tmp_path, task_id, {}, carry_inputs=True)
     assert not _mailbox_path(child_drive, task_id).exists()
     assert not _ack_path(child_drive, task_id).exists()
     assert _mailbox_path(tmp_path, task_id).exists()

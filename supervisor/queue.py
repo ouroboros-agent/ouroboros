@@ -73,9 +73,15 @@ SCHEDULED_TASKS_FILE = pathlib.Path("state") / "scheduled_tasks.json"
 OBJECTIVE_REPEAT_CAP: int = 3
 
 
+# Whether THIS process owns the supervisor's live maps (``init`` ran): a process that merely
+# imports the module sees empty maps, which prove nothing (``task_settlement_liveness``).
+INITIALIZED = False
+
+
 def init(drive_root: pathlib.Path) -> None:
-    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, QUEUE_SNAPSHOT_PATH
+    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, INITIALIZED, QUEUE_SNAPSHOT_PATH
     DRIVE_ROOT = drive_root
+    INITIALIZED = True
     QUEUE_SNAPSHOT_PATH = drive_root / "state" / "queue_snapshot.json"
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()
@@ -455,6 +461,8 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
     evolution_stop_report,
     stop_evolution_tasks,
     sweep_orphaned_budget_fences,
+    task_settlement_interlock,
+    task_settlement_liveness,
 )
 
 

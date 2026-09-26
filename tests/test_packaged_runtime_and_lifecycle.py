@@ -858,9 +858,10 @@ def test_salvage_without_a_durable_copy_keeps_everything_in_the_note(tmp_path):
 def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
     monkeypatch, tmp_path,
 ):
-    """End to end through the REAL cancel path: publication deletes the child
-    drive, so the full blob must already have a copy on the canonical drive and
-    the terminal result must point at it (XG-7B.1, BIBLE P1)."""
+    """End to end through the REAL cancel path: the child drive goes later, through the
+    off-loop settlement (``task_custody.settle_child_drive``), so the full blob must already
+    have a copy on the canonical drive and the terminal result must point at it (XG-7B.1,
+    BIBLE P1)."""
     from ouroboros import observability
     from ouroboros.headless import HEADLESS_TASKS_DIR
     from ouroboros.task_results import load_task_result
@@ -905,7 +906,9 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
 
     assert q.cancel_task_custody(task_id) == q.CANCEL_CANCELLED
 
-    assert not child_drive.exists(), "publication no longer deletes the child drive?"
+    from tests._cancel_intents_shared import settled_off_loop
+
+    assert settled_off_loop(tmp_path, task_id, child_drive), "the settlement no longer removes the child drive?"
     result = load_task_result(tmp_path, task_id)
     assert result["status"] == "cancelled"
     assert "full copy preserved at " in result["result"]

@@ -124,7 +124,9 @@ _pytest_default_real_data_dir = (
     and not os.environ.get("OUROBOROS_DATA_DIR")
     and DATA_DIR == pathlib.Path.home() / "Ouroboros" / "data"
 )
-if _pytest_default_real_data_dir:
+if _pytest_default_real_data_dir or __name__ == "__mp_main__":
+    # A spawn/forkserver worker re-imports this module as ``__mp_main__``: it gets a stream
+    # handler only, so two processes never rotate ``server.log`` against each other.
     logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, handlers=[logging.StreamHandler()])
 else:
     _log_dir = DATA_DIR / "logs"
@@ -559,7 +561,7 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
                     "task_metadata": task_metadata,
                     "log_text": log_text,
                     "origin_message_ref": origin_message_ref,
-                    "source": source,
+                    "source": source, "received_at": str(msg.get("received_at") or ""),
                 },
             )
     return offset
@@ -650,7 +652,13 @@ def _run_supervisor(settings: dict) -> None:
             log.debug("Failed to stop previous consciousness instance", exc_info=True)
         _consciousness = None
     prior_worker_pids: set[int] | None = None
+    _watchdog_stop = threading.Event()  # per-generation: set on EVERY exit of this generation
     try:
+        # Watch startup stalls; even a failed watchdog start publishes an init outcome.
+        from ouroboros.server_liveness import loop_phase_facts
+        _loop_liveness = [time.monotonic(), {}, time.thread_time(), None]  # slots: server_liveness.py
+        _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "startup", new_tick=True), time.monotonic()
+        _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
 
         from supervisor.message_bus import LocalChatBridge, init as bus_init
@@ -807,6 +815,7 @@ def _run_supervisor(settings: dict) -> None:
         _supervisor_ready.clear()  # never reached its loop: the API must not paint Online over the error
         _supervisor_init_done.set()
         _supervisor_thread = None
+        _watchdog_stop.set()  # a generation that died in init has no loop to watch
         return
 
     _supervisor_ready.set()
@@ -818,15 +827,8 @@ def _run_supervisor(settings: dict) -> None:
     crash_count = 0
     _last_custody_reap = [time.time()]
     _last_review_job_reconcile = [time.time()]
-    # WS3: a dedicated watchdog thread (outside this loop, so it fires even if the
-    # loop stalls) surfaces a wedge as an observable signal + owner alert instead
-    # of silent hours; the loop publishes a liveness tick at each tick PHASE. The
-    # tick is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock
-    # jump must not turn a healthy loop into a phantom stall (nor hide a real one).
-    from ouroboros.server_liveness import loop_phase_facts
-    _loop_liveness = [time.monotonic(), {}, time.thread_time(), None]  # slots: server_liveness.py
-    _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
-    _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
+    # The watchdog was started before startup recovery; never start another here.
+
     while not _restart_requested.is_set() and not _supervisor_stop.is_set() and not _exit_signalled.is_set():
         try:
             _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "events", new_tick=True), time.monotonic()

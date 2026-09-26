@@ -6,7 +6,7 @@ import pytest
 
 from ouroboros import cancel_intents, headless
 from ouroboros.task_results import load_task_result, write_task_result
-from tests._cancel_intents_shared import qenv  # noqa: F401
+from tests._cancel_intents_shared import qenv, settled_off_loop  # noqa: F401
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def test_cancel_prepares_early_terminal_before_cleanup_and_real_dispatch(split, 
     monkeypatch.setattr(headless, "finalize_task_artifacts", finalize)
     cancel_intents.request_cancel(s.drive, s.task["id"], reason="owner", allow_settled_target=True)
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert finalized == [s.task["id"]] and not s.child.exists()
+    assert finalized == [s.task["id"]] and settled_off_loop(s.drive, s.task["id"], s.child)
     for event in s.frames:
         dispatch_event(event, s.ctx)
     assert [e["status"] for e in s.pushed if e.get("type") == "task_done"] == ["completed"]
@@ -83,7 +83,7 @@ def test_cancel_file_outage_retains_intent_and_retries_dead_worker(split, monkey
     assert s.child.is_dir() and s.frames == [] and s.task["id"] in s.q.RUNNING
     assert cancel_intents.cancel_pending(s.drive, s.task["id"])
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert s.state["kills"] == 1 and not s.child.exists()
+    assert s.state["kills"] == 1 and settled_off_loop(s.drive, s.task["id"], s.child)
     assert load_task_result(s.drive, s.task["id"])["result"] == "Retained child answer"
 
 
@@ -98,7 +98,7 @@ def test_genuinely_ready_current_survives_cancel_byte_identical(split, monkeypat
     cancel_intents.request_cancel(s.drive, s.task["id"], reason="owner", allow_settled_target=True)
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
     assert (s.drive / "task_results" / f'{s.task["id"]}.json').read_bytes() == before
-    assert json.loads(before)["result"] == "Accepted answer" and not s.child.exists()
+    assert json.loads(before)["result"] == "Accepted answer" and settled_off_loop(s.drive, s.task["id"], s.child)
 
 
 def test_reconciled_terminal_without_checkpoint_still_needs_real_file_adoption(split):

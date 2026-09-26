@@ -235,6 +235,9 @@ def publish_verification_receipt_union(
         content = "".join(
             json.dumps(row, ensure_ascii=False) + "\n" for row in merged
         )
+        from ouroboros.task_custody import fence_publication
+
+        fence_publication()  # after the lock wait: a closed publication generation replaces nothing
         write_text_atomic(dest, content)
         return True
     finally:

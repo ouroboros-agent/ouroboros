@@ -193,32 +193,64 @@ def _effective_task_result(parent: pathlib.Path, task_id: str) -> Dict[str, Any]
         return load_task_result(parent, task_id) or {}
 
 
-def _live_unpromoted_child_refs(
-    promotion: Any, expected_child: pathlib.Path,
-) -> List[Dict[str, Any]]:
-    if not isinstance(promotion, dict):
-        return []
-    try:
-        version = int(promotion.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        return []
-    if version < 1:
-        return []
-    if str(promotion.get("status") or "") == "complete":
-        return []
-    child_root = expected_child.resolve(strict=False)
-    live: List[Dict[str, Any]] = []
-    for row in promotion.get("pending_refs") or []:
-        if not isinstance(row, dict) or not row.get("path"):
-            continue
+# How many drive settlements one off-loop pass attempts before yielding (each may copy and
+# hash a whole child store); the caller carries the cursor so later passes continue.
+DRIVE_SETTLEMENTS_PER_PASS = 16
+
+
+def _prompt_settlement(result: Dict[str, Any]) -> bool:
+    """A cancelled subagent's drive settles without waiting out retention: the cancel path
+    used to delete it at once and now leaves that work to the off-loop pass."""
+    return (str(result.get("status") or "").lower() == "cancelled"
+            and str(result.get("delegation_role") or "") == "subagent")
+
+
+def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, not_terminal: str,
+                  retention_days: Optional[int], now: Optional[float], live: Any, guard: Any, stop: Any,
+                  budget: Optional[int], after: str, extra_checks: Any) -> Dict[str, Any]:
+    """The prune both drive layouts share: candidates from the DURABLE canonical row (a projection is not
+    custody), settled through ``task_custody.settle_child_drive`` in name order after ``after`` (wrapping), at
+    most ``budget`` attempts per call; ``cursor`` is the last attempted drive, ``deferred`` the unreached rest."""
+    from ouroboros.retention import age_cutoff
+    from ouroboros.task_custody import settle_child_drive
+
+    days = _resolve_retention_days(retention_days)
+    cutoff = age_cutoff(days, now)
+    report: Dict[str, Any] = {"retention_days": days, "scanned": 0, "pruned": [], "skipped": [], "errors": [],
+                              "deferred": [], "cursor": after}
+    if not base.is_dir():
+        return report
+    names = sorted(entry.name for entry in base.iterdir() if entry.is_dir())
+    names = [name for name in names if name > after] + [name for name in names if name <= after]
+    attempts = 0
+    for task_id in names:
+        task_dir = base / task_id
+        report["scanned"] += 1
         try:
-            path = pathlib.Path(str(row["path"])).resolve(strict=False)
-            path.relative_to(child_root)
-        except (OSError, ValueError):
-            continue
-        if path.is_file():
-            live.append(dict(row))
-    return live
+            validate_task_id(task_id)
+            result = load_task_result(parent, task_id, strict=True) or {}
+            status = str(result.get("status") or "").lower()
+            if status not in _FINAL_STATUSES:
+                report["skipped"].append({"task_id": task_id, "reason": not_terminal, "status": status})
+                continue
+            if not _prompt_settlement(result) and _timestamp_from_result(result, task_dir.stat().st_mtime) > cutoff:
+                report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
+                continue
+            skip = extra_checks(task_dir, result)
+            if skip is not None:
+                report["skipped"].append({"task_id": task_id, **skip})
+                continue
+            if (budget is not None and attempts >= budget) or (stop is not None and stop()):
+                report["deferred"].append(task_id)
+                continue
+            attempts += 1
+            report["cursor"] = task_id
+            if settle_child_drive(parent, task_id, drive_of(task_dir), live=live, guard=guard, stop=stop,
+                                  report=report)["status"] == "removed":
+                report["pruned"].append({"task_id": task_id, "path": str(task_dir)})
+        except Exception as exc:
+            report["errors"].append({"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"})
+    return report
 
 
 def prune_headless_task_drives(
@@ -226,74 +258,30 @@ def prune_headless_task_drives(
     *,
     retention_days: Optional[int] = None,
     now: Optional[float] = None,
+    live: Any = None,
+    guard: Any = None,
+    stop: Any = None,
+    budget: Optional[int] = None,
+    after: str = "",
 ) -> Dict[str, Any]:
-    """Best-effort startup prune for copied-back terminal child drives."""
-
-    from ouroboros.retention import age_cutoff
-
+    """Prune terminal child drives past retention (a cancelled subagent's at once). Removal is
+    ``task_custody.settle_child_drive``'s decision alone: ``live`` is the supervisor's probe (without it nothing
+    is removed), ``guard`` its interlock, ``stop`` the generation's close, ``budget``/``after`` the pass bound/cursor."""
     parent = pathlib.Path(parent_drive_root)
-    base = parent / HEADLESS_TASKS_DIR
-    days = _resolve_retention_days(retention_days)
-    cutoff = age_cutoff(days, now)
-    report: Dict[str, Any] = {
-        "retention_days": days,
-        "scanned": 0,
-        "pruned": [],
-        "skipped": [],
-        "errors": [],
-        "promotion_retry": {},
-    }
-    if not base.is_dir():
-        return report
-    from ouroboros.observability import retry_pending_child_ref_promotions
 
-    report["promotion_retry"] = retry_pending_child_ref_promotions(parent)
-    for task_dir in sorted(base.iterdir()):
-        if not task_dir.is_dir():
-            continue
-        task_id = task_dir.name
-        report["scanned"] += 1
-        try:
-            validate_task_id(task_id)
-            dir_mtime = task_dir.stat().st_mtime
-            result = _effective_task_result(parent, task_id)
-            status = str(result.get("status") or "").lower()
-            if status not in _FINAL_STATUSES:
-                report["skipped"].append({"task_id": task_id, "reason": "parent_not_terminal", "status": status})
-                continue
-            artifact_status = str(result.get("artifact_status") or "").lower()
-            if artifact_status and artifact_status not in ARTIFACT_TERMINAL_STATUSES:
-                report["skipped"].append({"task_id": task_id, "reason": "artifacts_not_terminal", "artifact_status": artifact_status})
-                continue
-            retention_ts = _timestamp_from_result(result, dir_mtime)
-            if retention_ts > cutoff:
-                report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
-                continue
-            expected_child = str((task_dir / "data").resolve(strict=False))
-            known_child = str(
-                result.get("child_drive_root")
-                or result.get("headless_child_drive_root")
-                or result.get("drive_root")
-                or ""
-            ).strip()
-            if known_child and str(pathlib.Path(known_child).resolve(strict=False)) != expected_child:
-                report["skipped"].append({"task_id": task_id, "reason": "child_drive_mismatch"})
-                continue
-            live_unpromoted = _live_unpromoted_child_refs(
-                result.get("child_ref_promotion"), pathlib.Path(expected_child),
-            )
-            if live_unpromoted:
-                report["skipped"].append({
-                    "task_id": task_id,
-                    "reason": "child_refs_unpromoted",
-                    "pending_ref_count": len(live_unpromoted),
-                })
-                continue
-            shutil.rmtree(task_dir)
-            report["pruned"].append({"task_id": task_id, "path": str(task_dir)})
-        except Exception as exc:
-            report["errors"].append({"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"})
-    return report
+    def checks(task_dir: pathlib.Path, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        artifact_status = str(result.get("artifact_status") or "").lower()
+        if artifact_status and artifact_status not in ARTIFACT_TERMINAL_STATUSES:
+            return {"reason": "artifacts_not_terminal", "artifact_status": artifact_status}
+        known_child = str(result.get("child_drive_root") or result.get("headless_child_drive_root")
+                          or result.get("drive_root") or "").strip()
+        if known_child and pathlib.Path(known_child).resolve(strict=False) != (task_dir / "data").resolve(strict=False):
+            return {"reason": "child_drive_mismatch"}
+        return None
+
+    return _prune_drives(parent / HEADLESS_TASKS_DIR, parent, drive_of=lambda task_dir: task_dir / "data",
+                         not_terminal="parent_not_terminal", retention_days=retention_days, now=now, live=live,
+                         guard=guard, stop=stop, budget=budget, after=after, extra_checks=checks)
 
 
 def prune_task_drives(
@@ -301,44 +289,18 @@ def prune_task_drives(
     *,
     retention_days: Optional[int] = None,
     now: Optional[float] = None,
+    live: Any = None,
+    guard: Any = None,
+    stop: Any = None,
+    budget: Optional[int] = None,
+    after: str = "",
 ) -> Dict[str, Any]:
-    """Best-effort startup prune for direct-task scratch drives."""
-
-    from ouroboros.retention import age_cutoff
-
+    """Prune direct-task scratch drives past retention (``settle_child_drive`` decides;
+    same knobs as ``prune_headless_task_drives``)."""
     parent = pathlib.Path(parent_drive_root)
-    base = parent / TASK_DRIVES_DIR
-    days = _resolve_retention_days(retention_days)
-    cutoff = age_cutoff(days, now)
-    report: Dict[str, Any] = {"retention_days": days, "scanned": 0, "pruned": [], "skipped": [], "errors": []}
-    if not base.is_dir():
-        return report
-    from ouroboros.observability import retry_pending_child_ref_promotions
-    retry_pending_child_ref_promotions(parent)
-    for task_dir in sorted(base.iterdir()):
-        if not task_dir.is_dir():
-            continue
-        task_id = task_dir.name
-        report["scanned"] += 1
-        try:
-            validate_task_id(task_id)
-            dir_mtime = task_dir.stat().st_mtime
-            result = _effective_task_result(parent, task_id)
-            status = str(result.get("status") or "").lower()
-            if status not in _FINAL_STATUSES:
-                report["skipped"].append({"task_id": task_id, "reason": "task_not_terminal", "status": status})
-                continue
-            if _live_unpromoted_child_refs(result.get("child_ref_promotion"), task_dir):
-                report["skipped"].append({"task_id": task_id, "reason": "unpromoted_child_refs"})
-                continue
-            if _timestamp_from_result(result, dir_mtime) > cutoff:
-                report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
-                continue
-            shutil.rmtree(task_dir)
-            report["pruned"].append({"task_id": task_id, "path": str(task_dir)})
-        except Exception as exc:
-            report["errors"].append({"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"})
-    return report
+    return _prune_drives(parent / TASK_DRIVES_DIR, parent, drive_of=lambda task_dir: task_dir,
+                         not_terminal="task_not_terminal", retention_days=retention_days, now=now, live=live,
+                         guard=guard, stop=stop, budget=budget, after=after, extra_checks=lambda *_a: None)
 
 
 def prune_task_trees(
@@ -381,44 +343,32 @@ def prune_task_trees(
     return report
 
 
-def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) -> bool:
-    """Remove scratch after settled copyback/salvage, preserving completion wins.
-    Pending live refs retain their source. Returns whether any drive was removed.
-    """
-    parent = pathlib.Path(parent_drive_root)
+def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str, *, live: Any = None,
+                               guard: Any = None, admission_rollback: bool = False) -> bool:
+    """Remove TASK's own drives through ``task_custody.settle_child_drive`` (the one deletion owner):
+    ``live`` is the supervisor's probe, ``guard`` its interlock, ``admission_rollback`` frees a never-started drive."""
+    from ouroboros.task_custody import own_child_drives, settle_child_drive
+
     try:
-        validate_task_id(task_id)
+        drives = own_child_drives(parent_drive_root, validate_task_id(task_id))
     except Exception:
         return False
-    headless_base = parent / HEADLESS_TASKS_DIR / task_id
-    task_drive_base = parent / TASK_DRIVES_DIR / task_id
-    try:
-        result = load_task_result(parent, task_id) or {}
-        promotion = result.get("child_ref_promotion")
-        if (
-            _live_unpromoted_child_refs(promotion, headless_base / "data")
-            or _live_unpromoted_child_refs(promotion, task_drive_base)
-        ):
-            return False
-    except Exception:
-        # Legacy/no-metadata cleanup behavior remains fail-soft. Newly produced
-        # valid metadata is parsed by the helper without raising.
-        pass
-    bases = (headless_base, task_drive_base)
-    removed = False
-    for base in bases:
-        try:
-            if base.is_dir():
-                shutil.rmtree(base)
-                removed = True
-        except Exception:
-            log.debug("Failed to remove subagent task drive %s", base, exc_info=True)
-    return removed
+    return any([settle_child_drive(parent_drive_root, task_id, drive, live=live, guard=guard,
+                                   admission_rollback=admission_rollback)["status"] == "removed"
+                for drive in drives])
+
+
+# How long a publisher waits for the task's custody lock before answering ``CustodyBusy``.
+PUBLICATION_LOCK_SEC = 30.0
 
 
 def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Copy a child-drive task result back to the parent data root."""
+    """Copy a child-drive task result back to the parent data root under the task's custody lock
+    (``task_custody.task_custody_lock``) from the child read to the row write, so a settlement never moves
+    the drive under a copy in flight; a settled (gone) drive publishes nothing; a busy lock is ``CustodyBusy``."""
     from ouroboros.observability import child_ref_promotion_scope
+    from ouroboros.task_custody import CustodyBusy, task_custody_lock
+
     with child_ref_promotion_scope():
         task_id = str(task.get("id") or "")
         if not task_id:
@@ -430,52 +380,76 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         child_drive = _child_drive_from_task(task)
         if child_drive is None:
             return None
-        child_result = load_task_result(child_drive, task_id)
-        if not isinstance(child_result, dict):
-            return None
-        # Bulk refs precede publication/GC; review refs first select CURRENT below.
-        from ouroboros.observability import promote_child_task_refs
+        with task_custody_lock(parent_drive_root, task_id, timeout_sec=PUBLICATION_LOCK_SEC) as locked:
+            if not locked:
+                raise CustodyBusy(f"custody lock of {task_id} is held by another publisher")
+            canonical_existing = load_task_result(parent_drive_root, task_id) or {}
+            if cancellation_blocks_child_result(canonical_existing):
+                return canonical_existing  # cancelled while this publisher waited: the child's authority is declined
+            return _copy_child_task_result_locked(parent_drive_root, task, task_id, canonical_existing, child_drive)
 
-        review_fields = {key: value for key, value in child_result.items() if key == "review_projection"}
-        child_result, ref_promotion = promote_child_task_refs(
-            pathlib.Path(parent_drive_root), child_drive, task_id,
-            {key: value for key, value in child_result.items() if key != "review_projection"})
-        child_result.update(review_fields)
-        _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
-        child_status = str(child_result.pop("status", None) or "completed")
-        child_result.pop("task_id", None)
-        child_result["child_ref_promotion"] = ref_promotion
-        if isinstance(child_result.get("artifacts"), list):
-            try:
-                from ouroboros.outcomes import artifact_bundle_from_result
-                child_result["artifact_bundle"] = artifact_bundle_from_result(child_result)
-            except Exception:
-                child_result.pop("artifact_bundle", None)
-        child_result.setdefault("headless_child_drive_root", str(child_drive))
-        if (child_status in _FINAL_STATUSES and _workspace_root_from_task(task) is not None
-                and not task_is_readonly_subagent(task)):
-            artifact_status = str(canonical_existing.get("artifact_status") or "").strip().lower()
-            if artifact_status in ARTIFACT_TERMINAL_STATUSES | {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}:
-                child_result["artifacts"] = _merge_artifacts(
-                    list(canonical_existing.get("artifacts") or []), list(child_result.get("artifacts") or []))
-                child_result.update({key: canonical_existing[key] for key in _ARTIFACT_LIFECYCLE_FIELDS
-                                if key in canonical_existing})
-            else:
-                child_result["artifact_status"] = ARTIFACT_STATUS_FINALIZING
-            child_result["child_status"] = child_status
 
-        return retry_child_task_refs(parent_drive_root, child_drive, task_id,
-                                     replica={**child_result, "status": child_status})
+def _copy_child_task_result_locked(parent_drive_root: pathlib.Path, task: Dict[str, Any], task_id: str,
+                                   canonical_existing: Dict[str, Any], child_drive: pathlib.Path) -> Optional[Dict[str, Any]]:
+    child_result = load_task_result(child_drive, task_id)
+    if not isinstance(child_result, dict):
+        return None
+    # Bulk refs precede publication/GC; review refs first select CURRENT below.
+    from ouroboros.observability import promote_child_task_refs
+
+    review_fields = {key: value for key, value in child_result.items() if key == "review_projection"}
+    child_result, ref_promotion = promote_child_task_refs(
+        pathlib.Path(parent_drive_root), child_drive, task_id,
+        {key: value for key, value in child_result.items() if key != "review_projection"})
+    child_result.update(review_fields)
+    _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
+    child_status = str(child_result.pop("status", None) or "completed")
+    child_result.pop("task_id", None)
+    child_result["child_ref_promotion"] = ref_promotion
+    if isinstance(child_result.get("artifacts"), list):
+        try:
+            from ouroboros.outcomes import artifact_bundle_from_result
+            child_result["artifact_bundle"] = artifact_bundle_from_result(child_result)
+        except Exception:
+            child_result.pop("artifact_bundle", None)
+    child_result.setdefault("headless_child_drive_root", str(child_drive))
+    if (child_status in _FINAL_STATUSES and _workspace_root_from_task(task) is not None
+            and not task_is_readonly_subagent(task)):
+        artifact_status = str(canonical_existing.get("artifact_status") or "").strip().lower()
+        if artifact_status in ARTIFACT_TERMINAL_STATUSES | {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}:
+            child_result["artifacts"] = _merge_artifacts(
+                list(canonical_existing.get("artifacts") or []), list(child_result.get("artifacts") or []))
+            child_result.update({key: canonical_existing[key] for key in _ARTIFACT_LIFECYCLE_FIELDS
+                            if key in canonical_existing})
+        else:
+            child_result["artifact_status"] = ARTIFACT_STATUS_FINALIZING
+        child_result["child_status"] = child_status
+
+    return _retry_child_task_refs_locked(parent_drive_root, child_drive, task_id,
+                                         replica={**child_result, "status": child_status})
+
+
+class _GenerationClosed(Exception):
+    """The maintenance generation closed before this publication's commit."""
 
 
 def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: str,
-                          *, replica: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """One optimistic publisher for pending CURRENT refs and prepared copyback.
+                          *, replica: Optional[Dict[str, Any]] = None, stop: Any = None) -> Dict[str, Any]:
+    """One optimistic publisher for pending CURRENT refs and prepared copyback, under the task's custody
+    lock (``CustodyBusy`` when held). ``stop()`` fences every file it promotes (``publication_fence``) and is
+    re-asked at the commit: a closed generation starts no further write and returns CURRENT."""
+    from ouroboros.task_custody import CustodyBusy, publication_fence, task_custody_lock
 
-    Normal copyback supplies its already-copied replica; only its selected review
-    still needs I/O. Retry has no replica and never reads an old child body. A
-    changed CURRENT basis repeats preparation under the same file-I/O memo.
-    """
+    with task_custody_lock(parent, task_id, timeout_sec=PUBLICATION_LOCK_SEC) as locked, publication_fence(stop):
+        if not locked:
+            raise CustodyBusy(f"custody lock of {task_id} is held by another publisher")
+        return _retry_child_task_refs_locked(parent, child, task_id, replica=replica, stop=stop)
+
+
+def _retry_child_task_refs_locked(parent: pathlib.Path, child: pathlib.Path, task_id: str,
+                                  *, replica: Optional[Dict[str, Any]] = None, stop: Any = None) -> Dict[str, Any]:
+    """Normal copyback supplies its already-copied replica (only its selected review needs I/O); retry has
+    no replica and never reads an old child body; a changed CURRENT basis repeats preparation."""
     from ouroboros.observability import (
         _has_pending_ref_promotion, _rewrite_child_ref_tree,
         child_ref_promotion_scope, promote_child_task_ref_patch,
@@ -483,6 +457,8 @@ def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: st
     with child_ref_promotion_scope():
         while True:
             source = load_task_result(parent, task_id, strict=True) or {}
+            if stop is not None and stop():
+                return source  # a closed generation starts no file promotion, not only no commit
             if replica is None and not source:
                 raise ValueError("pending child-ref authority is missing")
             if replica is None:
@@ -502,10 +478,19 @@ def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: st
                     patch["review_projection"] = prepared
                 basis = {"review_projection": review}
 
-            def project(current: dict, _incoming: dict) -> dict:
+            def project(current: dict, _incoming: dict) -> Optional[dict]:
+                if stop is not None and stop():
+                    raise _GenerationClosed()  # re-asked at the commit, not only before the walk
+                if replica is not None and cancellation_blocks_child_result(current):
+                    return None  # cancelled under the row lock: the child enriches nothing, not even by replica
                 selected = {**current, **project_replica_task_result_fields(current, replica)} if replica is not None else current
                 if {key: selected.get(key) for key in basis} != basis:
                     raise _RefPublicationChanged()
+                if replica is not None and current.get("status") in _FINAL_STATUSES \
+                        and selected.get("status") != current["status"]:
+                    # A settled canonical row keeps its outcome; the child's is child_status.
+                    selected = {**selected, **{key: current[key] for key in ("status", "result", "error", "ts")
+                                               if key in current}, "child_status": replica.get("status")}
                 return {**(selected if replica is not None else {}), **patch, "status": selected["status"]}
 
             try:
@@ -514,6 +499,8 @@ def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: st
                                          **{key: value for key, value in (replica or {}).items() if key != "status"})
             except _RefPublicationChanged:
                 continue
+            except _GenerationClosed:
+                return source
 
 
 def _child_result_adopted(child: pathlib.Path, result: Dict[str, Any]) -> bool:
@@ -561,6 +548,8 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
     """
     task_id = str(task.get("id") or task.get("task_id") or "")
     report: Dict[str, Any] = {"task_id": task_id, "result": None, "error": "", "terminal_source_present": None}
+    from ouroboros.task_custody import CustodyBusy
+
     try:
         root = pathlib.Path(canonical_root)
         current = load_task_result(root, task_id, strict=True) or {}
@@ -582,6 +571,11 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
         if not task_is_readonly_subagent(task) and current.get("artifact_status") not in ARTIFACT_TERMINAL_STATUSES:
             finalize_task_artifacts(root, {**task, "id": task_id})
         report["result"] = load_task_result(root, task_id, strict=True)
+    except CustodyBusy as exc:
+        # Another publisher (a settlement or copy-back) holds the store: the next attempt
+        # completes the same work; nothing failed and no failure is stamped.
+        report["error"] = f"CustodyBusy: {exc}"
+        log.warning("Terminal file preparation for %s waits: %s", task_id, exc)
     except Exception as exc:
         from ouroboros.observability import redact_projection
         report["error"] = str(redact_projection(f"{type(exc).__name__}: {exc}").value)
@@ -630,11 +624,16 @@ def _copy_child_artifacts_to_parent(
     artifacts: List[Dict[str, Any]],
     *, promotion: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
-    """Verify/rebase files; failed copy-back shares the existing ref custody/GC."""
-    from ouroboros.artifacts import copy_artifact_file
+    """Copy-back's file publication: a child-store file keeps its store relpath (a nested
+    row gains ``relpath``); an immutable capture publishes only its recorded bytes and never
+    replaces different canonical bytes, a mutable one publishes its current bytes after the
+    differing prior copy is versioned; a failed copy keeps its row plus a pending ref."""
+    from ouroboros.artifacts import _archive_previous_artifact_version, copy_artifact_file, stream_artifact_file
     from ouroboros.outcome_receipt_store import is_verification_receipts_path
 
     parent_dir = task_artifacts_dir(parent_drive_root, task_id)
+    parent_base = parent_dir.resolve(strict=False)
+    child_base = task_artifacts_dir(child_drive, task_id, create=False).resolve(strict=False)
     rebased: List[Dict[str, Any]] = []
     for artifact in artifacts:
         item = dict(artifact)
@@ -643,27 +642,25 @@ def _copy_child_artifacts_to_parent(
             rebased.append(item)
             continue
         src = pathlib.Path(raw_path)
-        if not src.is_absolute():
-            src = (child_drive / raw_path).resolve(strict=False)
+        src = (src if src.is_absolute() else child_drive / raw_path).resolve(strict=False)
         if is_verification_receipts_path(child_drive, task_id, src):
             # Receipt union has its own locked writer; never replace its rows.
             continue
-        try:
-            src.resolve(strict=False).relative_to(parent_dir.resolve(strict=False))
-            dest = src.resolve(strict=False)
-        except ValueError:
-            dest = parent_dir / src.name
-            if dest.exists() and dest.resolve(strict=False) != src.resolve(strict=False):
-                from ouroboros.artifacts import stream_artifact_file
+        expected = item if item.get("immutable") else None
+        if src.is_relative_to(parent_base):
+            dest = src
+        else:
+            dest = parent_dir / (src.relative_to(child_base) if src.is_relative_to(child_base) else src.name)
+            if expected is not None and dest.exists() and dest.resolve(strict=False) != src:
                 try:
-                    if not item.get("sha256"):
-                        raise OSError("legacy artifact has no captured digest")
                     stream_artifact_file(dest, expected=item)
                     src = dest  # Exact canonical bytes already survive this copy-back.
                 except OSError:
-                    dest = parent_dir / f"{src.stem}_{sha256(str(src).encode('utf-8')).hexdigest()[:8]}{src.suffix}"
+                    dest = dest.with_name(f"{src.stem}_{sha256(str(src).encode('utf-8')).hexdigest()[:8]}{src.suffix}")
         try:
-            measured = copy_artifact_file(src, dest, expected=item)
+            if expected is None and dest != src and dest.is_file() and not dest.is_symlink():
+                _archive_previous_artifact_version(pathlib.Path(parent_drive_root), task_id, dest, src)
+            measured = copy_artifact_file(src, dest, expected=expected)
         except OSError as exc:
             item.update(copy_status="failed", copy_error=f"{type(exc).__name__}: {exc}")
             if promotion is not None:
@@ -674,6 +671,9 @@ def _copy_child_artifacts_to_parent(
         item.pop("copy_status", None)
         item.pop("copy_error", None)
         item.update(path=str(dest), name=str(item.get("name") or dest.name), **measured)
+        relpath = dest.resolve(strict=False).relative_to(parent_base).as_posix() \
+            if dest.resolve(strict=False).is_relative_to(parent_base) else ""
+        item.update({"relpath": relpath} if "/" in relpath else {})
         rebased.append(item)
     return rebased
 
@@ -735,13 +735,22 @@ def _file_artifact(kind: str, path: pathlib.Path, **facts: Any) -> Dict[str, Any
 
 
 def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Write patch/memory-export artifacts for a completed headless task."""
+    """Write patch/memory-export artifacts for a completed headless task under the task's custody lock, the
+    one lock every canonical-store publisher takes (copy-back, ref retry, settlement, mailbox cleanup), so no
+    two publishers place or list one task's files at once; a held lock is ``CustodyBusy`` (nothing failed)."""
+    from ouroboros.task_custody import CustodyBusy, task_custody_lock
 
-    artifacts: List[Dict[str, Any]] = []
     task_id = str(task.get("id") or "")
     if not task_id:
-        return artifacts
+        return []
+    with task_custody_lock(parent_drive_root, task_id, timeout_sec=PUBLICATION_LOCK_SEC) as locked:
+        if not locked:
+            raise CustodyBusy(f"custody lock of {task_id} is held by another publisher")
+        return _finalize_task_artifacts_locked(parent_drive_root, task, task_id)
 
+
+def _finalize_task_artifacts_locked(parent_drive_root: pathlib.Path, task: Dict[str, Any], task_id: str) -> List[Dict[str, Any]]:
+    artifacts: List[Dict[str, Any]] = []
     existing = load_task_result(parent_drive_root, task_id) or {}
     # A cancellation latch wins before artifact creation or surviving-root reads.
     if cancellation_blocks_child_result(existing):

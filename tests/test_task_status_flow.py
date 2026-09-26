@@ -780,13 +780,14 @@ def test_materializing_child_read_cannot_overwrite_canonical_zero_run_receipt(tm
         "ts": "2026-01-01T00:00:02+00:00",
     })
 
-    # Repeated polling must preserve the canonical-only row.  Final copy-back
-    # then unions the ordinary child check into that same authority file.
+    # Repeated polling must preserve the canonical-only row, and a read writes no
+    # receipt (TZ-1 A: reads are pure). Final copy-back then unions the ordinary
+    # child check into that same authority file.
     effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
     assert [
         row.get("contract_kind")
         for row in read_verification_receipts(tmp_path, tid)
-    ] == [None, "delegation_zero_run"]
+    ] == ["delegation_zero_run"]
 
     copied = copy_child_task_result(
         tmp_path, {"id": tid, "drive_root": str(child_drive)},

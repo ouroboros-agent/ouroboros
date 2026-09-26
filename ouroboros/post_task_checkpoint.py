@@ -121,6 +121,12 @@ def project_replica_task_result_fields(
     # The receiving drive's first accepted terminal transition owns provenance,
     # including its absence on historical rows; replicas cannot originate it.
     overlay.pop("canonical_terminal_projection_origin", None)
+    # Unread-mail custody is a union: a stale replica never drops a canonical row.
+    from ouroboros.task_custody import merge_unread_mail
+
+    custody = merge_unread_mail(canonical_fields.get("unread_mailbox"), overlay.get("unread_mailbox"))
+    if custody is not None:
+        overlay["unread_mailbox"] = custody
     canonical_cost = canonical_fields.get("cost_presentation")
     replica_cost = overlay.get("cost_presentation")
     if (isinstance(canonical_cost, dict) and canonical_cost.get("scope") == COST_SCOPE_ROOT_TREE

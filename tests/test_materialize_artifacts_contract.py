@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 from types import SimpleNamespace
 
 from ouroboros.task_results import write_task_result
@@ -28,7 +29,7 @@ def _seed_child_drive_scenario(tmp_path):
     from ouroboros.artifacts import collect_task_artifact_records, copy_file_to_task_artifacts
 
     data = tmp_path / "data"
-    child = tmp_path / "child"
+    child = data / "state" / "headless_tasks" / "childart" / "data"  # the task's OWN drive
     source_dir = tmp_path / "Desktop"
     source_dir.mkdir()
     source = source_dir / "report.html"
@@ -114,19 +115,24 @@ def test_child_result_sha_stable_across_false_path_reads(tmp_path):
     assert sha_before == sha_after
 
 
-def test_true_default_still_materializes_child_artifacts(tmp_path):
-    """The default path keeps the read-repair durability: child artifacts are
-    rebased onto the parent drive (api_task_artifact depends on it)."""
+def test_true_default_lists_child_artifacts_without_copying_them(tmp_path):
+    """The default read shows the child's recorded rows at their child-drive
+    paths and copies nothing; copy-back alone rebases them onto the parent."""
+    from ouroboros.headless import copy_child_task_result
+
     data, child = _seed_child_drive_scenario(tmp_path)
+    rebased = data / "task_results" / "artifacts" / "childart" / "report.html"
 
     row = load_effective_task_result(data, "childart")
 
-    rebased = data / "task_results" / "artifacts" / "childart" / "report.html"
-    assert rebased.exists()
+    listed = next(item for item in row["artifacts"] if item.get("name") == "report.html")
+    assert listed["path"] == str(child / "task_results" / "artifacts" / "childart" / "report.html")
+    assert not rebased.exists() and not rebased.parent.exists()
+
+    copied = copy_child_task_result(data, {"id": "childart", "drive_root": str(child)})
     assert rebased.read_text(encoding="utf-8") == "<h1>child</h1>"
-    assert any(
-        (item.get("name") or "") == "report.html" for item in row.get("artifacts") or []
-    )
+    assert [item["path"] for item in copied["artifacts"]] == [str(rebased)]
+    assert [item["path"] for item in load_effective_task_result(data, "childart")["artifacts"]] == [str(rebased)]
 
 
 def test_generic_receipt_named_output_never_owns_receipt_authority(tmp_path):
@@ -307,20 +313,25 @@ def test_reconcile_skips_a_live_running_child_without_materializing(tmp_path, mo
     assert json.loads((data / "task_results" / f"{tid}.json").read_text(encoding="utf-8"))["status"] == "running"
 
 
-def test_reconcile_heals_a_genuine_orphan_with_full_artifact_custody(tmp_path, monkeypatch):
-    """The positive path: a parent row stuck at ``running`` over a finished child
-    drive is settled from the materializing read, so the persisted row carries
-    the promoted artifact, its bundle and the terminal quiz settlement."""
+def test_reconcile_heals_a_genuine_orphan_and_settlement_publishes_its_files(tmp_path, monkeypatch):
+    """The positive path: a parent row stuck at ``running`` over a finished child drive
+    is settled from the status-only read — the sweep lists, copies and hashes no file —
+    with its terminal quiz settlement. The child's file stays served from its OWN drive
+    until copy-back adopts the child and ``settle_child_drive`` publishes it before the
+    drive goes (TZ-1 A: publication is explicit, never a read side effect)."""
     import time
 
     from ouroboros import owner_quiz
     from ouroboros.artifacts import collect_task_artifact_records, copy_file_to_task_artifacts
+    from ouroboros.headless import prepare_terminal_task_files
+    from ouroboros.task_custody import settle_child_drive
     from ouroboros.task_status import SETTLED_STATUSES, reconcile_orphaned_running_tasks
     from ouroboros.utils import append_jsonl
 
     now = 1_800_000_000.0
     monkeypatch.setattr(time, "time", lambda: now)
-    data, child, tid = tmp_path / "data", tmp_path / "child", "orphanchild"
+    data, tid = tmp_path / "data", "orphanchild"
+    child = data / "state" / "headless_tasks" / tid / "data"  # the task's OWN drive (host layout)
     source = tmp_path / "report.html"
     source.write_text("<h1>child</h1>", encoding="utf-8")
     copy_file_to_task_artifacts(SimpleNamespace(drive_root=child, task_id=tid), source, kind="user_file")
@@ -341,18 +352,19 @@ def test_reconcile_heals_a_genuine_orphan_with_full_artifact_custody(tmp_path, m
 
     assert reconcile_orphaned_running_tasks(data, expired_quizzes=expired) == 1
 
-    assert flags == [False, True]
-    assert copies["copy"] >= 1
-    # The persisted bytes and the promoted file are checked BEFORE any materializing
-    # loader runs again, so the oracle cannot repair what the sweep left undone.
+    assert flags == [False]
+    assert copies == {"copy": 0}
     on_disk = json.loads((data / "task_results" / f"{tid}.json").read_text(encoding="utf-8"))
     assert on_disk["status"] in SETTLED_STATUSES
-    assert on_disk["artifact_status"] and isinstance(on_disk.get("artifact_bundle"), dict)
     promoted = data / "task_results" / "artifacts" / tid / "report.html"
-    assert promoted.read_text(encoding="utf-8") == "<h1>child</h1>"
+    assert not promoted.exists()
     assert expired == [(tid, "q1")]
     assert owner_quiz.quiz_states(data, tid)["q1"]["state"] == "expired_terminal"
-    direct = load_effective_task_result(data, tid)
-    for key in ("status", "artifact_status", "artifact_bundle"):
-        assert on_disk[key] == direct[key], key
-    assert on_disk.get("status_reconciled_from") == direct.get("status_reconciled_from")
+    listed = next(row for row in load_effective_task_result(data, tid)["artifacts"] if row["name"] == "report.html")
+    assert pathlib.Path(listed["path"]).is_relative_to(child.resolve())  # served from where it lies
+    assert not prepare_terminal_task_files(data, {"id": tid, "drive_root": str(child)})["error"]
+    assert settle_child_drive(data, tid, child, live=lambda _task: False)["status"] == "removed"
+    assert promoted.read_text(encoding="utf-8") == "<h1>child</h1>"
+    assert not child.exists()
+    published = next(row for row in load_effective_task_result(data, tid)["artifacts"] if row["name"] == "report.html")
+    assert published["path"] == str(promoted.resolve()) and published["sha256"]

@@ -120,11 +120,17 @@ class TestOwnerInjectPerTask(unittest.TestCase):
 
     def test_cleanup_removes_file(self):
         from ouroboros.owner_mailbox import write_owner_message, cleanup_task_mailbox, _mailbox_path
+        from ouroboros.task_results import load_task_result, write_task_result
         write_owner_message(self.drive_root, "hello", task_id="t1", msg_id="m1")
         path = _mailbox_path(self.drive_root, "t1")
         self.assertTrue(path.exists())
 
-        cleanup_task_mailbox(self.drive_root, "t1")
+        # TZ-1 V10: an unread row leaves only into a canonical row that holds it.
+        self.assertFalse(cleanup_task_mailbox(self.drive_root, "t1"))
+        self.assertTrue(path.exists())
+        write_task_result(self.drive_root, "t1", "cancelled", result="Cancelled before start.")
+        self.assertIn('"msg_id": "m1"', load_task_result(self.drive_root, "t1")["unread_mailbox"]["rows"][0])
+        self.assertTrue(cleanup_task_mailbox(self.drive_root, "t1"))
         self.assertFalse(path.exists())
 
     def test_drain_nonexistent_task_returns_empty(self):
@@ -226,17 +232,25 @@ class TestForwardToWorkerTool(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             parent_drive = pathlib.Path(tmp) / "parent"
             child_drive = pathlib.Path(tmp) / "child"
+            queued_drive = pathlib.Path(tmp) / "queued-child"
             child_drive.mkdir(parents=True)
             write_task_result(parent_drive, "child1", STATUS_RUNNING, child_drive_root=str(child_drive), parent_task_id="parent1", root_task_id="parent1", result="running")
-            write_task_result(parent_drive, "queued1", STATUS_SCHEDULED, result="queued")
+            write_task_result(parent_drive, "queued1", STATUS_SCHEDULED, child_drive_root=str(queued_drive), parent_task_id="parent1", root_task_id="parent1", result="queued")
+            write_task_result(parent_drive, "asked1", "requested", parent_task_id="parent1", root_task_id="parent1", result="requested")
             write_task_result(parent_drive, "otherchild", STATUS_RUNNING, parent_task_id="otherparent", root_task_id="otherroot", result="running")
             ctx = SimpleNamespace(drive_root=parent_drive, task_id="parent1")
 
             output = _forward_to_worker(ctx, "child1", "continue")
-            blocked = _forward_to_worker(ctx, "queued1", "too soon")
+            queued = _forward_to_worker(ctx, "queued1", "read this when you start")
+            blocked = _forward_to_worker(ctx, "asked1", "not admitted yet")
             forbidden = _forward_to_worker(ctx, "otherchild", "wrong root")
 
             self.assertIn("Message forwarded", output)
+            # TZ-1 V10: a queued task's mailbox takes the message; the receipt says nothing read it.
+            self.assertIn("(queued)", queued)
+            self.assertIn("has not started, so nothing has read it", queued)
+            queued_mailbox = queued_drive / "memory" / "owner_mailbox" / "queued1.jsonl"
+            self.assertIn("read this when you start", queued_mailbox.read_text(encoding="utf-8"))
             self.assertIn("TASK_NOT_ACTIVE", blocked)
             self.assertIn("TASK_FORBIDDEN", forbidden)
             self.assertFalse((parent_drive / "memory" / "owner_mailbox" / "child1.jsonl").exists())

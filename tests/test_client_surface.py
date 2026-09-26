@@ -421,6 +421,15 @@ def test_route_owner_message_stamps_channel_for_non_web_ingress(monkeypatch):
         "machine-to-machine traffic must never wear an owner_client fact"
     )
 
+    # The common ingress receipt stamp rides the channel fact of a surface-less transport.
+    server._route_owner_message(SimpleNamespace(), make_ctx(), {
+        "chat_id": 1, "text": "со штампом", "client_message_id": "m5",
+        "task_metadata": None, "log_text": "со штампом",
+        "origin_message_ref": {"chat_id": 1, "client_message_id": "m5"},
+        "source": "skill:telegram", "received_at": "2026-09-26T00:00:00+00:00",
+    })
+    assert captured[-1]["client_surface"] == {"channel": "skill:telegram", "received_at": "2026-09-26T00:00:00+00:00"}
+
 
 def test_steering_and_project_mailbox_writers_pass_client_surface():
     # Tripwire complement to the behavioral tests above (the mailbox writers are
@@ -527,3 +536,63 @@ def test_frontend_sends_raw_observables_without_device_taxonomy():
                 f"device taxonomy label {label!r} crept into {src_name} — raw "
                 "observables only, the model classifies"
             )
+
+
+def test_the_common_enqueue_stamps_one_host_receipt_for_every_transport(tmp_path, monkeypatch):
+    """TZ-1 F: ``enqueue_local_message`` is the one ingress of every transport, so it stamps the
+    host receipt time once: an earlier host stamp (the WS acceptance's, an accepted row's time) is
+    kept, a host channel fact without one gets it (so a row written at dequeue measures intake lag
+    as ``ts - client_surface.received_at``), and a surface-less message gets no phantom fact."""
+    from datetime import datetime
+
+    from supervisor import message_bus
+    from supervisor.message_bus import LocalChatBridge
+
+    bridge = LocalChatBridge()
+    socket_fact = {"pywebview": True, "received_at": "2026-09-26T00:00:01+00:00"}
+    bridge.enqueue_local_message("from the socket", source="web", task_metadata={"client_surface": socket_fact})
+    bridge.enqueue_local_message("via /api/command", task_metadata={"client_surface": {"channel": "api_command"}})
+    bridge.enqueue_local_message("unnamed skill", chat_id=5, user_id=5, source="skill:bridge")
+    bridge.enqueue_local_message("accepted", chat_id=5, user_id=5, source="skill:x", received_at="2026-09-26T00:00:02+00:00")
+    socket, command, skill, accepted = [update["message"] for update in bridge.get_updates(offset=0, timeout=1)]
+
+    assert socket["received_at"] == socket_fact["received_at"] and socket["task_metadata"]["client_surface"] == socket_fact
+    assert command["task_metadata"]["client_surface"] == {"channel": "api_command", "received_at": command["received_at"]}
+    assert datetime.fromisoformat(command["received_at"]) and datetime.fromisoformat(skill["received_at"])
+    assert "client_surface" not in (skill.get("task_metadata") or {}), "no phantom surface fact"
+    assert accepted["received_at"] == "2026-09-26T00:00:02+00:00"
+
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {})
+    message_bus.record_inbound_message(bridge, command, chat_id=1, user_id=1, client_message_id="c1",
+                                       text="via /api/command", ts="2026-09-26T09:00:00+00:00")
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8"))
+    assert row["client_surface"]["received_at"] == command["received_at"] and "logged_at" not in row
+
+
+def test_a_named_acceptance_queues_its_row_time_as_the_receipt(tmp_path, monkeypatch):
+    from supervisor import message_bus
+    from supervisor.message_bus import LocalChatBridge
+
+    bridge = LocalChatBridge()
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {})
+    row, _rejoined = message_bus.accept_local_message(
+        bridge, tmp_path, "named delivery", chat_id=7, user_id=7, source="skill:telegram", client_message_id="n1",
+    )
+    [update] = bridge.get_updates(offset=0, timeout=1)
+    assert update["message"]["received_at"] == row["ts"]
+
+
+def test_supervisor_intake_hands_the_receipt_stamp_to_routing(monkeypatch):
+    import server
+    import supervisor.message_bus as message_bus
+    from tests.test_transport_commands import Ctx
+
+    routed = []
+    monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_route_owner_message", lambda bridge, ctx, incoming: routed.append(incoming))
+    bridge = message_bus.LocalChatBridge({})
+    bridge.enqueue_local_message("hello", chat_id=42, user_id=7, source="skill:telegram", received_at="2026-09-26T01:00:00+00:00")
+    server._process_bridge_updates(bridge, 0, Ctx({"owner_id": 7, "owner_chat_id": 42}))
+    assert [incoming["received_at"] for incoming in routed] == ["2026-09-26T01:00:00+00:00"]

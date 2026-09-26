@@ -540,6 +540,15 @@ def test_task_result_row_publishes_the_runtime_reason_alongside_the_adapter_stag
 # enforces — a new runtime code with no row here fails the suite, which is the only thing
 # that stops the vocabulary from being hand-copied beside the check again.
 _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
+    "artifact_archive_empty": (False, "gateway/task_archive.py: no eligible recorded directory member; HTTP refusal, not a task terminal"),
+    "artifact_archive_invalid": (False, "gateway/task_archive.py: invalid selector; HTTP refusal, not a task terminal"),
+    "artifact_archive_unavailable": (False, "gateway/task_archive.py: confined read or spool unavailable; HTTP refusal, not a task terminal"),
+    "artifact_archive_unverified": (False, "gateway/task_archive.py: member drift or capture verification failure; HTTP refusal, not a task terminal"),
+    "artifact_identity_changed": (False, "gateway/task_archive.py: a mutable file's bytes no longer match its recorded identity; HTTP 409, not a task terminal"),
+    "artifact_name_ambiguous": (False, "gateway/tasks.py: ambiguous nested basename; HTTP refusal, not a task terminal"),
+    "artifact_relpath_invalid": (False, "gateway/tasks.py: invalid exact artifact selector; HTTP refusal, not a task terminal"),
+    "artifact_unavailable": (False, "gateway/task_archive.py: confined single-file read unavailable; HTTP refusal, not a task terminal"),
+    "artifact_unverified": (False, "gateway/task_archive.py: single-file drift or capture verification failure; HTTP refusal, not a task terminal"),
     "history_source_unavailable": (False, "gateway/history_paging.py: readable recent projection with explicit source gap; no task attempt was truncated"),
     "late_answer_not_delivered": (False, "gateway/task_decision.py: a late quiz answer was recorded but its chat delivery failed (503, retry); no task attempt was truncated"),
     "budget_pausing_no_extraction": (False, "review_verdict_extraction.py: Light verdict extraction refused while the task's exact budget pause is closing dispatch (#1196); the review row stays undispatched and the attempt is paused, not truncated"),

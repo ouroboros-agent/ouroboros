@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import JSONResponse, Response
 
 from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, run_sync_to_completion, stage_initial_task_attachments
 from ouroboros.gateway.cost_breakdown import _task_cost_breakdown_view  # noqa: F401
@@ -36,6 +36,11 @@ from ouroboros.gateway.task_events import (  # noqa: F401
 # wiring and tests address gateway.tasks.api_task_hurry.
 from ouroboros.gateway.task_hurry import api_task_hurry  # noqa: F401
 from ouroboros.gateway.task_decision import api_decision_answer  # noqa: F401
+from ouroboros.gateway.task_archive import (
+    chat_media_identity, directory_archives, plain_segments, serve_directory_archive, serve_task_file,
+    task_artifact_location, recorded_identity,
+)
+from ouroboros.task_custody import task_artifact_stores
 from ouroboros.headless import (
     ARTIFACTS_DIR,
     ARTIFACT_STATUS_FAILED,
@@ -125,8 +130,9 @@ def _cleanup_api_admission_attempt(
     if child_drive is not None:
         try:
             from ouroboros.headless import remove_subagent_task_drive
-
-            remove_subagent_task_drive(drive_root, task_id)
+            from supervisor.queue import task_settlement_interlock, task_settlement_liveness
+            remove_subagent_task_drive(drive_root, task_id, live=task_settlement_liveness,
+                                       guard=task_settlement_interlock, admission_rollback=True)
         except Exception:
             log.warning("Failed to clean child drive for rejected task %s", task_id, exc_info=True)
     try:
@@ -241,8 +247,9 @@ def _admission_rejection_response(
     )
     if child_drive is not None:
         from ouroboros.headless import remove_subagent_task_drive
-
-        removed = remove_subagent_task_drive(drive_root, task_id)
+        from supervisor.queue import task_settlement_interlock, task_settlement_liveness
+        removed = remove_subagent_task_drive(drive_root, task_id, live=task_settlement_liveness,
+                                             guard=task_settlement_interlock, admission_rollback=True)
         write_task_result(
             drive_root,
             task_id,
@@ -902,7 +909,7 @@ async def api_task_get(request: Request) -> JSONResponse:
 
 
 def _task_get_response(request: Request) -> JSONResponse:
-    """Materialize the complete detail and ledger projection off the HTTP loop."""
+    """Project the complete detail and ledger view off the HTTP loop (a pure read)."""
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
@@ -918,6 +925,9 @@ def _task_get_response(request: Request) -> JSONResponse:
             pass
         return json_error("task result is unavailable", 503)
     payload = public_task_result(data)
+    if isinstance(payload.get("artifacts"), list):  # what ``?archive=<dir>`` would stream now, per top-level dir
+        payload["artifact_archives"] = directory_archives(task_artifact_stores(drive_root, task_id),
+                                                          payload["artifacts"], anchor=drive_root)
     breakdown_view = _task_cost_breakdown_view(drive_root, data)
     if breakdown_view is not None:
         payload["cost_breakdown"] = breakdown_view
@@ -925,6 +935,10 @@ def _task_get_response(request: Request) -> JSONResponse:
 
 
 def api_task_artifact(request: Request):
+    """Serve one task file read-only from its canonical or OWN child store (``task_archive``): a bare
+    name selects only a top-level file (several nested matches: 409 ``artifact_name_ambiguous`` naming
+    their ``relpaths``), ``?relpath=a/b/{name}`` is exact, ``?archive=<dir>`` with ``{name}`` =
+    ``<basename>.zip`` streams a recorded directory; bytes leave only through ``serve_task_file``."""
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
@@ -932,45 +946,50 @@ def api_task_artifact(request: Request):
     name = str(request.path_params.get("name") or "").strip()
     if not name or "/" in name or "\\" in name or name in {".", ".."} or ".." in pathlib.PurePosixPath(name).parts:
         return json_error("artifact name must be a simple filename", 400)
+    source, relpath = request.query_params.get("source"), request.query_params.get("relpath")
+    if relpath is not None and (source or plain_segments(relpath)[-1:] != [name]):
+        return json_error("relpath must be store-relative plain segments ending in the name, without source",
+                          400, reason_code="artifact_relpath_invalid", task_id=task_id, artifact=name)
     drive_root = request_drive_root(request)
-    path = artifact_store.resolve_chat_media_path(drive_root, task_id, name)
-    if path is None:
-        registered = artifact_store.registered_task_artifact(drive_root, task_id, name)
-        source = request.query_params.get("source")
-        # Registered immutable bytes need one identity check below, not a
-        # materialization/hash of the whole result before that same check.
-        result = (load_effective_task_result(drive_root, task_id) or {}
-                  if source or not registered or not registered.get("immutable") else {})
-        if not result and not registered:
-            return json_error("task not found", 404)
-        if source:
-            try:
-                return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source), media_type="application/json")
-            except (OSError, ValueError, RuntimeError):
-                return json_error("task source is unavailable or does not match its recorded identity", 404)
-        artifact = registered if registered and registered.get("immutable") else next(
-            (row for row in result.get("artifacts") or []
-             if isinstance(row, dict)
-             and str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name),
-            None) or registered
-        if artifact is None:
-            return json_error("artifact not found", 404, task_id=task_id, artifact=name)
-        base = task_artifacts_dir(drive_root, task_id).resolve(strict=False)
-        path = pathlib.Path(str(artifact.get("path") or "")).resolve(strict=False)
-        if path.name != name:
-            return json_error("artifact metadata path does not match requested name", 500)
+    if (archive := request.query_params.get("archive")) is not None:
+        return serve_directory_archive(drive_root, task_id, name, archive,
+                                       other_selectors=source is not None or relpath is not None)
+    stores = task_artifact_stores(drive_root, task_id)
+    path = None if relpath is not None else artifact_store.resolve_chat_media_path(drive_root, task_id, name)
+    if path is not None:  # content-addressed chat media: the canonical store, bytes that hash to the name
+        media = task_artifact_location(stores[:1], path)
+        return (serve_task_file(drive_root, stores[0], media[2], name, chat_media_identity(name), task_id=task_id)
+                if media else json_error("artifact not found", 404, task_id=task_id, artifact=name))
+    registered = artifact_store.registered_task_artifact(drive_root, task_id, name) if relpath in (None, name) else None
+    # A registered immutable top-level file needs one identity check, not a result projection.
+    fast = bool(not source and registered and registered.get("immutable")
+                and (at := task_artifact_location(stores, registered.get("path"))) and at[2] == name)
+    result = {} if fast else (load_effective_task_result(drive_root, task_id) or {})
+    if not result and not registered:
+        return json_error("task not found", 404)
+    if source:
         try:
-            path.relative_to(base)
-        except ValueError:
+            return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source), media_type="application/json")
+        except (OSError, ValueError, RuntimeError):
+            return json_error("task source is unavailable or does not match its recorded identity", 404)
+    rows = [] if fast else [row for row in result.get("artifacts") or [] if isinstance(row, dict) and (
+        relpath is not None or str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name)]
+    located = [(at, order, row) for order, row in enumerate(rows + ([registered] if registered else []))
+               if (at := task_artifact_location(stores, row.get("path")))]
+    matches = [item for item in located if item[0][2] == (relpath or name)]
+    nested = sorted({item[0][2] for item in located if "/" in item[0][2]})
+    if relpath is None and not matches and len(nested) > 1:
+        return json_error("artifact name matches several nested files; select one with ?relpath=", 409,
+                          reason_code="artifact_name_ambiguous", task_id=task_id, artifact=name, relpaths=nested)
+    if not matches:
+        if relpath is None and any(at[2].rsplit("/", 1)[-1] != name for at, _order, _row in located):
+            return json_error("artifact metadata path does not match requested name", 500)
+        if (rows or registered) and not located and relpath is None:
             return json_error("artifact path is outside task artifact directory", 500)
-        if not path.is_file():
-            return json_error("artifact file is missing", 404, task_id=task_id, artifact=name)
-        if artifact.get("immutable"):
-            try:
-                artifact_store.stream_artifact_file(path, expected=artifact)
-            except OSError:
-                return json_error("captured artifact failed byte verification", 404)
-    return FileResponse(path)
+        return json_error("artifact not found", 404, task_id=task_id, artifact=name)
+    (index, _path, relative), _order, artifact = min(matches, key=lambda item: (item[0][0], item[1]))
+    return serve_task_file(drive_root, stores[index], relative, name, recorded_identity(artifact), task_id=task_id,
+                           mutable=not artifact.get("immutable"))
 
 
 def _record_cascade_incident(task_id: str, kind: str, detail: str = "") -> None:

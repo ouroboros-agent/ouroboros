@@ -212,6 +212,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── context_health.py    ← Health invariants for the reading task (`build_health_invariants`, ONCE per task attempt — a task-start snapshot); delegated-run obligations stay globally visible — a preserved-and-invisible result is how work rots on disk — while the instruction is ownership-aware (`delegate_shared.orphan_apply_target_ok`) (§6 Context fitting, retry, and compaction; Delegated subagents)
       ├── context_runtime_facts.py ← The runtime section's FACT builders: what the host can honestly say it knows about this turn
       ├── headless.py          ← Child-drive isolation, workspace patch artifacts, memory export helpers; typed `sensitive_blocked` exclusions (§6 Headless finalization and workspace patch capture)
+      ├── task_custody.py      ← The one child-drive deletion owner (`settle_child_drive`), the per-task custody lock, unread-mail capture and the pure store view (§6 Headless finalization)
       ├── headless_status.py ← Artifact and task lifecycle vocabulary shared by the headless owners
       ├── workspace_patch_rules.py ← Pure patch-exclusion rules (env/cache sets, junk regex, lockfiles, credential-shaped names); the I/O checks + `untracked_capture_veto_reason` stay in headless
       ├── workspace_patch_capture.py ← Workspace patch capture: the patch artifact, its manifest, and its git plumbing
@@ -378,6 +379,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── ws.py            ← WS manager, extension WS dispatch (a synchronous in-process handler runs in a worker thread like the HTTP dispatcher, so one skill's blocking callback never stalls the ASGI loop), broadcast (§4 WebSocket protocol)
       │   ├── state.py         ← /api/health + /api/state
       │   ├── tasks.py         ← Headless task create/list/get/cancel/events; cancel accepts `stop_policy` (empty = immediate; `finalize_then_cancel` → 202 + open intent → supervisor/owner_stop.py; unknown → 400)
+      │   ├── task_archive.py  ← Confined single-file and directory-ZIP reads of a task's own stores; a typed 503 without directory-relative opens
       │   ├── task_events.py   ← Task-event SSE endpoint: legacy GET ranks plus read-only POST v2 physical-chain cursors (§3 History reads and the SSE v2 transport)
       │   ├── task_hurry.py    ← POST hurry ingress: exact one-field `{request_id}` body — extra fields refused, because hurry carries no text by design and a smuggled field must not become a side channel; queue-owned admission initializes only an absent pooled lifecycle (`write_task_result(create_only=True)`), direct turns excluded (semantics: owner_hurry.py)
       │   ├── task_decision.py ← ONE `POST /api/decisions` ingress with family-parsed ids (`quiz:` here, `routing:` → routing_decision.py, `interaction:` reserved); writes `KIND_QUIZ_ANSWER`, broadcasts `quiz_state` (lifecycle: owner_quiz.py; ABI: §11.1)
@@ -522,7 +524,7 @@ Frontend calls go through `web/modules/api_client.js` with the JSDoc mirror `web
 
 `ouroboros.cli` is a client of the same gateway/queue — no second task engine. Its parser is the command-surface SSOT (server, run, tasks, chat, logs, evolve, schedule, settings, skills, marketplace, local-model, MCP); streaming commands reserve stdout for the final answer/patch/result/JSONL and send progress to stderr.
 
-`POST /api/tasks` creates an ordinary managed root; `GET /api/tasks` is a non-materializing list; `GET /api/tasks/<id>` returns the effective durable result; `/events` is the archive-aware SSE stream (§3 History reads and the SSE v2 transport); `/artifacts/<name>` serves simple filenames confined to `data/task_results/artifacts/<task_id>/` — a stored arbitrary path is not a download capability. The CLI refuses any `delegation_role` other than `root`, the gateway rejects caller lineage/subagent labels, and only `schedule_subagent` creates children; reserved service metadata is written after caller metadata. Admission reserves the task id plus a worker-pool slot under one queue lock, and a failure rolls back only the token-owned row with a loud typed refusal; blocking admission and materialization run off the HTTP event loop (`gateway._helpers.run_sync_to_completion`), so a cancelled HTTP waiter never cancels the admitted task. Attachments are copied into the effective task drive before enqueue; artifact-store references are not host-path authority.
+`POST /api/tasks` creates an ordinary managed root; `GET /api/tasks` is a non-materializing list; `GET /api/tasks/<id>` returns the effective durable result; `/events` is the archive-aware SSE stream (§3 History reads and the SSE v2 transport); `/artifacts/<name>` serves one recorded file of the task's own stores through one confined descriptor (`?relpath=` a nested file, `?archive=` a directory ZIP) — a stored arbitrary path is not a download capability. The CLI refuses any `delegation_role` other than `root`, the gateway rejects caller lineage/subagent labels, and only `schedule_subagent` creates children; reserved service metadata is written after caller metadata. Admission reserves the task id plus a worker-pool slot under one queue lock, and a failure rolls back only the token-owned row with a loud typed refusal; blocking admission and materialization run off the HTTP event loop (`gateway._helpers.run_sync_to_completion`), so a cancelled HTTP waiter never cancels the admitted task. Attachments are copied into the effective task drive before enqueue; artifact-store references are not host-path authority.
 
 Workspace tasks default `memory_mode=forked`; `shared` is rejected for an external workspace and materialized on a forked child drive for project scope — the stored `memory_mode` reports what was requested while `drive_root` reports where the task executes, so isolation does not depend on relabelling the request. The mode isolates the execution drive and the knowledge seed; identity and scratchpad writes still land on the canonical root the next context reads.
 
@@ -616,7 +618,7 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   ├── settings.json              ← user settings (API keys, models, budget; §7)
 │   ├── task_results/              ← durable task results (task_results/<id>.json, every write stamped `_schema_version: 1`; an inadmissible row is QUARANTINED and keeps its id occupied — `task_result_schema.py`); artifacts/<task_id>/ holds .artifact_manifest.json (private metadata) + artifact files; .scratch_manifest.json declares ephemeral scratch {abs_path: sha256} excluded from patch capture only while content matches
 │   │   └── artifact_versions/<task_id>/ ← artifact recovery history, last 5 versions per name (`artifacts.py`)
-│   ├── task_drives/<task_id>/     ← task-scoped scratch, including live per-call manifests; startup prunes terminal tasks after the headless retention window
+│   ├── task_drives/<task_id>/     ← task-scoped scratch, including live per-call manifests; the off-loop drive-custody pass settles terminal tasks after the retention window
 │   ├── task_trees/<root>/blackboard.jsonl ← append-only swarm blackboard + beacons; tree-scoped and ephemeral (task_tree_ledger.py), pruned on root terminal
 │   ├── state/
 │   │   ├── state.json             ← runtime state + compatibility cost projection; never the monetary authority
@@ -654,6 +656,8 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   │   ├── review_continuations/  ← durable blocked-review continuations (+ corrupt/ quarantine; archived/ holds settled un-resumed rows ≥7 days, never deleted)
 │   │   ├── workspace_executor_processes/ ← durable local/docker executor cleanup records
 │   │   ├── headless_tasks/<task_id>/data ← forked/empty child execution drives whose live per-call manifests are promoted at terminal; until then the canonical reader cannot resolve their refs (issue #805) (CLI / Headless Boundary above)
+│   │   ├── custody_staging/       ← unserved copies a drive settlement prepares (`task_custody.py`)
+│   │   ├── custody_trash/         ← a fully custodied drive awaiting deletion (`task_custody.py`)
 │   │   ├── pycache/               ← embedded-interpreter bytecode (packaged builds; CLI / Headless Boundary above)
 │   │   ├── python-userbase/       ← embedded-interpreter user installs (packaged builds)
 │   │   ├── betterleaks/           ← versioned scanner runtime + archive cache, created only by the explicit source-checkout installer

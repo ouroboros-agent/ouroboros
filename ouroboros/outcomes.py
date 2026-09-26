@@ -1357,7 +1357,7 @@ def artifact_bundle_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "errors": (list(item.get("errors") or []) if isinstance(item.get("errors"), list) else [])
                       + ([str(item["copy_error"])] if item.get("copy_error") else []),
         }
-        records.append(record)
+        records.append(record | ({"relpath": str(item["relpath"])} if item.get("relpath") else {}))
     if old_status == ARTIFACT_STATUS_FAILED or any(item["status"] == ARTIFACT_STATUS_FAILED for item in records):
         status = ARTIFACT_STATUS_FAILED
     elif status != ARTIFACT_STATUS_FAILED and any(item["status"] == "missing" for item in records):

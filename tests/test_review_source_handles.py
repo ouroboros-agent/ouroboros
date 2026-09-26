@@ -31,7 +31,7 @@ def test_child_source_closure_survives_real_cleanup(tmp_path, source):
     write_task_result(child, "source", "completed", **_field(ref, source))
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
     assert copied["child_ref_promotion"]["promoted_source_handle_count"] == 1
-    assert remove_subagent_task_drive(parent, "source") is True
+    assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert not child.exists()
     assert artifacts.read_actor_source_bytes(parent, "source", ref) == raw
     assert artifacts.collect_task_artifact_records(parent, "source") == []
@@ -48,11 +48,11 @@ def test_failed_completion_promotion_retains_child_until_retry(tmp_path, monkeyp
         patch.setattr(artifacts, "store_actor_source_bytes", lambda *_a, **_k: (_ for _ in ()).throw(OSError("copy failed")))
         copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
         assert copied["child_ref_promotion"]["status"] == "incomplete"
-        assert remove_subagent_task_drive(parent, "source") is False
+        assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is False
         assert child.exists()
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
     assert copied["child_ref_promotion"]["status"] == "complete"
-    assert remove_subagent_task_drive(parent, "source") is True
+    assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert artifacts.read_actor_source_bytes(parent, "source", ref) == raw
 
 
@@ -136,7 +136,7 @@ def test_nested_acceptance_sources_survive_copy_back_and_cleanup(tmp_path, outer
         assert copied["child_ref_promotion"]["status"] == "complete"
         assert copied["child_ref_promotion"]["promoted_source_handle_count"] == 3
         assert copied["review_projection"]["panels"][0]["applied_source_ref"] == refs[0]
-    assert remove_subagent_task_drive(parent, "source") is True
+    assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert not child.exists()
     assert [artifacts.read_actor_source_bytes(parent, "source", ref) for ref in refs] == before
     assert artifacts.collect_task_artifact_records(parent, "source") == []
@@ -166,11 +166,11 @@ def test_nested_copy_failure_holds_child_and_rechecks_existing_checkpoint(tmp_pa
             artifacts.task_artifact_dir_path(child, "source") / result["path"])
         assert artifacts.read_actor_source_bytes(parent, "source", checkpoint)
         assert artifacts.read_actor_source_bytes(parent, "source", trajectory)
-        assert remove_subagent_task_drive(parent, "source") is False
+        assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is False
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert copied["child_ref_promotion"]["pending_refs"] == []
-    assert remove_subagent_task_drive(parent, "source") is True
+    assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert artifacts.read_actor_source_bytes(parent, "source", result) == b"complete output beyond the preview"
 
 
@@ -227,7 +227,7 @@ def test_nested_trajectory_promotes_existing_call_blobs_without_crawling_prose(t
             copied = copy_child_task_result(parent, task)
             assert copied["child_ref_promotion"]["status"] == "incomplete"
             assert copied["child_ref_promotion"]["pending_refs"]
-            assert remove_subagent_task_drive(parent, "source") is False
+            assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is False
         assert retry_pending_child_ref_promotions(parent)["completed"] == ["source"]
     first_ref = None
     for _ in range(2):
@@ -238,7 +238,7 @@ def test_nested_trajectory_promotes_existing_call_blobs_without_crawling_prose(t
         assert ref == first_ref
         assert "corpus_sha256" not in ref  # Checkpoints keep their own byte identity.
     assert artifacts.read_actor_source_bytes(checkpoint_root, "source", checkpoint) == original_checkpoint
-    assert remove_subagent_task_drive(parent, "source") is True
+    assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert not child.exists()
     # Rebase the already promoted source again, then repeat after the child is
     # gone. Neither a second physical digest nor idempotent copying renames rows.
@@ -339,5 +339,5 @@ def test_copyback_prepares_bulk_artifacts_and_selected_review_refs_outside_lock(
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert observed[0] == "bulk" and "review" in observed
-    assert remove_subagent_task_drive(parent, "source") is True
+    assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert (artifacts.task_artifact_dir_path(parent, "source") / "report.txt").read_bytes() == b"actual deliverable"

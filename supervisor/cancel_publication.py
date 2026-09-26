@@ -447,12 +447,9 @@ def _publish_cancelled_task(
     # the lock so the crash detector can recover the slot on a later tick.
     from supervisor.task_reaper import _respawn_after_reap
     _respawn_after_reap(q, workers, worker.wid, expected_worker=worker)
-    if str(task.get("delegation_role") or "") == "subagent":
-        try:
-            from ouroboros.headless import remove_subagent_task_drive
-            remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))
-        except Exception:
-            log.debug("Failed to remove cancelled subagent drive for %s", task_id, exc_info=True)
+    # A cancelled subagent's drive is NOT settled here: settlement copies and hashes the
+    # child store, which the cancel path must not carry. The off-loop reconcile pass
+    # settles it without waiting out retention (``headless.prune_headless_task_drives``).
     try:
         q.persist_queue_snapshot(reason="cancel_running")
     except Exception:

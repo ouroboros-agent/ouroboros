@@ -60,6 +60,15 @@ def subscription_ui():
                 self.end_headers()
                 self.wfile.write(body.encode())
                 return
+            if self.path.startswith("/api/tasks/") and backend.get("task_gateway"):
+                response = backend["task_gateway"].get(self.path)
+                self.send_response(response.status_code)
+                for key in ("content-type", "content-disposition", "content-length"):
+                    if key in response.headers:
+                        self.send_header(key, response.headers[key])
+                self.end_headers()
+                self.wfile.write(response.content)
+                return
             self.path = self.path.removeprefix("/static")
             super().do_GET()
 

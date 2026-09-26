@@ -677,14 +677,15 @@ def _run_retry_admission_transaction(
 
 
 def _discard_retry_inputs(q: Any, task: Dict[str, Any], task_id: str, retry_task_id: str) -> None:
-    """Drop the inputs copied onto a retry id that will never run."""
+    """Drop the inputs copied onto a retry id that will never run: by-value copies whose original id keeps
+    every row and input, never admitted data, so no custody settlement (``settle_child_drive``) is owed."""
     if not retry_task_id or retry_task_id == task_id:
         return
     from ouroboros.artifacts import task_artifact_dir_path
-    from ouroboros.owner_mailbox import cleanup_task_mailbox
+    from ouroboros.owner_mailbox import discard_mailbox_copy
 
     drive = q._task_drive_for_task(task, task_id)
-    cleanup_task_mailbox(drive, retry_task_id)
+    discard_mailbox_copy(drive, retry_task_id)
     shutil.rmtree(task_artifact_dir_path(drive, retry_task_id), ignore_errors=True)
 
 
