@@ -65,7 +65,7 @@ def test_closed_notes_allow_voluntary_disposition_without_new_authority(harness,
     notes = json.dumps([_finding("n1", "note"), _finding("n2", "note")])
     sub = harness.install({"s1": notes, "s2": CLEAN, "s3": CLEAN})
     ctx = harness.make_ctx()
-    assert _control(_call(ctx)) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(_call(ctx)) == {"outcome": "GREEN", "closed": True}
     before = _state(harness)
     wave = before["waves"][-1]
     fingerprint = wave["request_fingerprint"]
@@ -75,7 +75,7 @@ def test_closed_notes_allow_voluntary_disposition_without_new_authority(harness,
 
     out = pr._handle_plan_task(ctx, review_disposition={"review_fingerprint": fingerprint, "items": items})
 
-    assert _control(out) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(out) == {"outcome": "GREEN", "closed": True}
     assert "Notes are optional" in out and "neither reopens" in out
     after = _state(harness)
     annotated = after["waves"][-1]
@@ -88,7 +88,7 @@ def test_closed_notes_allow_voluntary_disposition_without_new_authority(harness,
     assert exact["supersedes_wave_artifact"] == prior_ref
     assert exact["dispositions"] == items
     assert pr._read_plan_review_wave_artifact(harness.drive, "task-1", prior_ref) == exact_before
-    assert _control(_call(ctx)) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(_call(ctx)) == {"outcome": "GREEN", "closed": True}
     assert len(sub.calls) == 1
 
 
@@ -548,7 +548,7 @@ def test_disposition_inputs_are_bounded_at_entry(harness):
     huge = "r" * (plan_spec.MAX_FINDING_TEXT_CHARS * 20)
     out = pr._handle_plan_task(ctx, review_disposition={"review_fingerprint": fp, "items": [
         {"finding_id": "s1:n1", "decision": "accept", "rationale": huge}]})
-    assert _control(out) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(out) == {"outcome": "GREEN", "closed": True}
     stored = _state(harness)["waves"][-1]["dispositions"][0]
     assert len(stored["rationale"]) < plan_spec.MAX_FINDING_TEXT_CHARS + 200 and "truncat" in stored["rationale"].lower()
     # R10-1: `decision` is enum-like and bounded at entry — identity keys are never wide carriers
@@ -676,7 +676,7 @@ def test_missing_requested_evidence_reask_keeps_free_disposition_without_new_att
         "items": [{"finding_id": repeat[0]["finding_id"], "decision": "defer",
                    "rationale": "The source is unavailable; it is not needed to begin this work."}],
     })
-    assert _control(disposed) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(disposed) == {"outcome": "GREEN", "closed": True}
     assert len(sub.calls) == 1 and _state(harness)["cycles_paid"] == 2
 
 
@@ -857,7 +857,7 @@ def test_reviewer_question_holds_the_wave_until_a_free_disposition_and_its_answe
     answered = pr._handle_plan_task(ctx, review_disposition={
         "review_fingerprint": wave["request_fingerprint"],
         "items": [{"finding_id": "s1:q1", "decision": "accept", "rationale": "The board asked for five."}]})
-    assert _control(answered) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(answered) == {"outcome": "GREEN", "closed": True}
     assert len(sub.calls) == 1 and _state(harness)["cycles_paid"] == 1  # $0: no reviewer call, no cycle
     _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})  # the next PAID cycle carries the answer
     assert len(sub.calls) == 2

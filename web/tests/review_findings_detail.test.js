@@ -106,6 +106,38 @@ test('a compact Plan wave names its recorded counts and the immutable artifact r
     assert.doesNotMatch(detail, /w\.json/);
 });
 
+test('a revised plan selected after a critic wave is labelled as the earlier plan\'s review', () => {
+    const critic = 'c'.repeat(64);
+    const revised = 'r'.repeat(64);
+    const authorSubject = {
+        review_fingerprint: critic,
+        source_ref: { root: 'artifact_store', path: 'plan-author.json', sha256: 'f'.repeat(64) },
+        author_disposition: { action: 'finish', disposition: 'partial', rationale: 'Considered.', subject_hash: revised },
+    };
+    const detail = (fingerprint) => ({
+        task_id: 'root',
+        plan_review_state: {
+            schema_version: 2,
+            current_attempt: { fingerprint, status: 'open', reason: 'author_current_plan', author_subject: { ...authorSubject, author_disposition: { ...authorSubject.author_disposition, subject_hash: fingerprint } } },
+            waves: [{ request_fingerprint: critic, cycle_index: 1, aggregate: 'GREEN', closed: true, paid: true, findings: [], counts: { blocking: 0, note: 0, need_evidence: 0 } }],
+            waves_omitted: 0,
+        },
+    });
+    const historical = planReviewGroupFromTaskDetail(detail(revised));
+    assert.equal(historical.label, 'Plan review · earlier plan');
+    assert.equal(historical.historicalCritic, true);
+    assert.equal(historical.verdict, 'GREEN');  // the critic's real verdict, never a synthesized one
+    assert.match(historical.authorDecisionText, /The verdict shown is the earlier plan's review; the selected plan r{64} has no verdict of its own/);
+    const html = renderReviewsSection([historical], { sectionExpanded: true, expandedGroups: new Set(['plan:root']) });
+    assert.match(html, /Plan review · earlier plan/);
+    assert.match(html, /has no verdict of its own/);
+    // Quiet side: the author selecting the reviewed plan itself keeps the plain group.
+    const own = planReviewGroupFromTaskDetail(detail(critic));
+    assert.equal(own.label, 'Plan review');
+    assert.equal(own.historicalCritic, false);
+    assert.doesNotMatch(own.authorDecisionText, /no verdict of its own/);
+});
+
 test('the hydrator announces first load, failure and retry without narrating background refreshes', async () => {
     const events = [];
     let mode = 'ok';

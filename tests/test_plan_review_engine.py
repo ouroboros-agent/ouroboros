@@ -476,7 +476,7 @@ def test_need_evidence_closes_by_disposition_at_zero_cost_with_optional_notes(ha
             {"finding_id": "s1:e1", "decision": "defer", "rationale": "not needed"},
         ],
     })
-    assert _control(full) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(full) == {"outcome": "GREEN", "closed": True}
     assert len(sub.calls) == 1
     state = _state(harness)
     assert state["waves"][-1]["closed"] is True and state["cycles_paid"] == 1
@@ -518,7 +518,7 @@ def test_v2_wave_without_exact_artifact_can_close_by_disposition(harness):
         "items": [{"finding_id": "s1:n1", "decision": "accept", "rationale": "will do"}],
     })
 
-    assert _control(closed) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(closed) == {"outcome": "GREEN", "closed": True}
     assert "exact_artifact_absent" in closed
     wave = _state(harness)["waves"][-1]
     assert any(note.startswith("exact_artifact_absent:") for note in wave["closure_notes"])
@@ -563,7 +563,7 @@ def test_blocking_without_valid_breaks_is_demoted_to_note(harness):
     bad = json.dumps([_finding("b1", "blocking", breaks="claim_99")])
     harness.install({"s1": bad, "s2": bad, "s3": CLEAN})
     out = _call(harness.make_ctx())
-    assert _control(out) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(out) == {"outcome": "GREEN", "closed": True}
     wave = _state(harness)["waves"][-1]
     assert {f["class"] for f in wave["findings"]} == {"note"}
     assert any("blocking_without_valid_breaks" in d for a in wave["actors"] for d in a["disclosures"])
@@ -962,7 +962,7 @@ def test_disposition_cannot_close_a_superseded_wave(harness, monkeypatch):
     ctx = harness.make_ctx()
     harness.install({"s1": note, "s2": note, "s3": CLEAN})
     first = _call(ctx)
-    assert _control(first) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(first) == {"outcome": "GREEN", "closed": True}
     fp_a = _state(harness)["waves"][-1]["request_fingerprint"]
     harness.install({"s1": blocking, "s2": blocking, "s3": CLEAN})
     second = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 9-slide deck"]})

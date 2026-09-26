@@ -274,12 +274,18 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
         )
         if blocking:
             ids = ", ".join(str(f.get("finding_id") or f.get("id")) for f in blocking[:4])
-            text += (
-                f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}) stay OPEN whatever "
-                "you disposition. "
-                + ("A changed spec or a justified rejection may be judged in another paid cycle. "
-                   if not at_cap else "The cycle cap is reached; no further paid panel is available. ")
-            )
+            if enforcement == "advisory":  # the closure table's per-finding rule, stated as a fact
+                text += (
+                    f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}): a reject with its "
+                    "rationale closes each one; accept or defer keeps it open until a changed spec is reviewed. "
+                )
+            else:
+                text += (
+                    f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}) stay OPEN whatever "
+                    "you disposition: a changed spec, or a justified rejection judged in another paid "
+                    "cycle, closes them. "
+                    + ("" if not at_cap else "The cycle cap is reached; no further paid panel is available. ")
+                )
     else:
         text = author_note + (
             "Blocking findings: accept ⇒ change the spec and re-call plan_task (new fingerprint, "
@@ -317,6 +323,7 @@ def _closure_note_view(note: str) -> str:
     """Legacy host notes describe state; the current renderer owns available steps."""
     prefix = str(note).partition(":")[0]
     meaning = {
+        "closed_by_disposition": "the open set emptied; the wave is recorded GREEN",
         "blocking_finding_below_quorum_stays_open": "blocking findings remain open after disposition",
         "revise_plan_not_closable_by_disposition": "disposition does not close blocking findings",
         "degraded_not_closable_by_disposition": "no parseable reviewer quorum; disposition does not close the wave",

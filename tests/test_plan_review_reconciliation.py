@@ -678,9 +678,9 @@ def test_disposition_items_are_recorded_on_a_wave_that_stays_custody_pending(har
     _install_barrier_substrate(monkeypatch, calls, texts={"s1": question})
     final = _collect(ctx, fingerprint)
     wave = _state(harness)["waves"][-1]
-    assert wave["custody_pending"] is False and wave["aggregate"] == "REVIEW_REQUIRED"
+    assert wave["custody_pending"] is False and wave["aggregate"] == "GREEN"  # the answered question emptied the open set
     assert [(d["finding_id"], d["decision"]) for d in wave["dispositions"]] == [("s1:q1", "accept")]
-    assert _control(final) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(final) == {"outcome": "GREEN", "closed": True}
     assert _state(harness)["cycles_paid"] == 1
 
 

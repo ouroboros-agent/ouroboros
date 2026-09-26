@@ -35,7 +35,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 7 bytes on the official line); re-based here, no text of this chapter was touched.
     # 165550 -> 165900 (PR #1300): the net_transport row and the data-layout row for the merged
     # extra-CA bundle; the base sat 174 bytes under the previous budget.
-    "docs/architecture/01-high-level-architecture.md": 165900,
+    # 165900 -> 166100: the plan_spec.py and plan_review.py rows name the open-set aggregate, the
+    # one closure table and the author path's labelled critic pair; the base sat 110 bytes under.
+    "docs/architecture/01-high-level-architecture.md": 166100,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -194,7 +196,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # free host_task_facts, stat-only files_rescued and post-work settlement clauses
     # replace their prior paragraphs (+242 bytes) independently of the memory writer;
     # both contracts survive the merge, with no duplicated prose to displace.
-    "docs/architecture/06-agent-core.md": 316800,
+    # 316800 -> 318000: the plan-review open-set verdict (GREEN = empty open set, notes never
+    # count), the per-finding advisory closure of a below-quorum blocking finding, the closed
+    # REVIEW_REQUIRED written GREEN, and the author path's labelled critic pair REPLACE the
+    # closure/aggregate/disclosed-gap sentences in place; the base sat 69 bytes under.
+    "docs/architecture/06-agent-core.md": 318000,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
@@ -284,7 +290,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 23400 -> 23500: the long-work continuity merge landed the chapter at 23471 on the
     # official line; re-based here, no text of this chapter was touched.
     "docs/development/03-module-size-and-complexity.md": 23500,
-    "docs/development/04-core-governance-artifacts.md": 16431,
+    # 16431 -> 16600: the disposition paragraph names the advisory reasoned-reject closure of a
+    # below-quorum blocking finding (one clause); the base sat 2 bytes under.
+    "docs/development/04-core-governance-artifacts.md": 16600,
     "docs/development/05-review-and-commit-protocol.md": 12956,
     # 94197 -> 94520: the usage-ledger lock rule gains its reader contract (a display read
     # on the supervisor loop or a gateway thread rides the last validated snapshot; money
@@ -309,7 +317,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # each side fit alone (TZ-2 96666, TZ-1 96682); TZ-2's reflection-custody and stop-freshness
     # clauses and TZ-1's off-loop ingress-lock clause rewrite different bullets in place, so
     # the union displaces nothing.
-    "docs/development/06-rules-by-change-class.md": 96800,
+    # 96800 -> 97700: one Loop / State-Machine bullet for the plan-review open-set verdict, the
+    # one closure table and the labelled critic pair of an author-selected plan; the base sat 48 under.
+    "docs/development/06-rules-by-change-class.md": 97700,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

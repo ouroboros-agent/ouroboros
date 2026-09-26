@@ -270,11 +270,11 @@ def test_a_wave_stored_before_affected_paths_still_closes_at_zero_cost(harness):
         {"finding_id": "s1:f1", "decision": "accept", "rationale": "the owner signs it off"},
     ]})
 
-    assert _control(out) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(out) == {"outcome": "GREEN", "closed": True}
     assert substrate.calls == []
     state = _state(harness)
     assert int(state.get("cycles_paid") or 0) == paid_before
     closed = state["waves"][-1]
     assert closed["request_fingerprint"] == fingerprint and closed["closed"] is True
-    assert closed["spec_hash"] == stored_hash and closed["aggregate"] == "REVIEW_REQUIRED"
+    assert closed["spec_hash"] == stored_hash and closed["aggregate"] == "GREEN"
     assert "affected_paths" not in closed["spec"]

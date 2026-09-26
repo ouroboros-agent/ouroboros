@@ -80,7 +80,8 @@ self-modification, never attachable evidence (`denied_path`).
 Specs, findings and closure: ARCHITECTURE §6 "Plan construction and review".
 Accept, reject or defer findings. Disposition-only
 `plan_task(review_disposition={review_fingerprint, items:[{finding_id, decision, rationale}]})`
-closes `need_evidence` at $0, one item per required finding.
+closes `need_evidence` at $0, one item per required finding; under advisory a
+reasoned reject also closes a below-quorum blocking finding.
 Duplicate, conflicting, unknown, stale, incomplete, mixed or vacuous calls
 return typed argument errors before recording; `plan_review._handle_plan_task` ignores
 default-empty optional fields. Do not replay plans for dispositions.

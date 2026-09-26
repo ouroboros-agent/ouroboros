@@ -613,6 +613,17 @@ def test_aggregate_need_evidence_only_wave_and_degraded():
     assert [f["finding_id"] for f in dup["findings"]] == ["rev:b", "rev_2:b"]
 
 
+def test_notes_never_change_the_aggregate():
+    """GREEN = a quorum parsed and the open set is empty; notes are optional advice."""
+    notes = plan_spec.aggregate([_slot("1", [NOTE]), _slot("2", [dict(NOTE, id="n2")]), _slot("3", [])])
+    assert notes["aggregate"] == "GREEN" and notes["reasons"] == [] and notes["counts"]["note"] == 2
+    assert [f["finding_id"] for f in notes["findings"]] == ["1:n", "2:n2"]  # advice is kept, never counted
+    held = plan_spec.aggregate([_slot("1", [BLOCK]), _slot("2", [NOTE]), _slot("3", [])])
+    assert held["aggregate"] == "REVIEW_REQUIRED" and "blocking_below_quorum:1/2" in held["reasons"]
+    asked = plan_spec.aggregate([_slot("1", [NEED]), _slot("2", [NOTE]), _slot("3", [])])
+    assert asked["aggregate"] == "REVIEW_REQUIRED" and "need_evidence_only" in asked["reasons"]
+
+
 def _control(outcome: str, closed: bool):
     return _parse_plan_review_control(PLAN_REVIEW_CONTROL_PREFIX + json.dumps({"outcome": outcome, "closed": closed}))
 
@@ -633,6 +644,10 @@ def test_closure_table_and_control_line_invariants():
     assert no_rationale["closed"] is False and "invalid_disposition:2:e" in no_rationale["notes"]
     done = plan_spec.closure_after_disposition("REVIEW_REQUIRED", findings, full, "blocking")
     assert done["closed"] is True and done["open_ids"] == []
+    # The table also says what to RECORD: an emptied open set is written GREEN, with its note.
+    assert done["aggregate"] == "GREEN" and partial["aggregate"] == "REVIEW_REQUIRED"
+    assert "closed_by_disposition: REVIEW_REQUIRED → GREEN (open set emptied)" in done["notes"]
+    assert green["aggregate"] == "GREEN"
     deferred = plan_spec.closure_after_disposition(
         "REVIEW_REQUIRED", findings, [dict(full[0], decision="defer"), full[1]], "blocking",
     )
@@ -641,12 +656,12 @@ def test_closure_table_and_control_line_invariants():
         "REVISE_PLAN", [dict(BLOCK, finding_id="1:b")] + findings,
         [{"finding_id": "1:b", "decision": "reject", "rationale": "disagree"}] + full, "blocking",
     )
-    assert revise["closed"] is False and revise["open_ids"] == ["1:b"]
+    assert revise["closed"] is False and revise["open_ids"] == ["1:b"] and revise["aggregate"] == "REVISE_PLAN"
     assert any(n.startswith("revise_plan_not_closable_by_disposition") for n in revise["notes"])
     advisory = plan_spec.closure_after_disposition("REVISE_PLAN", [dict(BLOCK, finding_id="1:b")], [], "advisory")
     assert advisory["closed"] is False and any(n.startswith("advisory_enforcement") for n in advisory["notes"])
     degraded = plan_spec.closure_after_disposition("DEGRADED", [], [], "blocking")
-    assert degraded["closed"] is False
+    assert degraded["closed"] is False and degraded["aggregate"] == "DEGRADED"
     unknown = plan_spec.closure_after_disposition("REVIEW_REQUIRED", findings, full + [{"finding_id": "9:z", "decision": "accept", "rationale": "r"}], "blocking")
     assert unknown["closed"] is True and "unknown_finding_id:9:z" in unknown["notes"]
     vacuous = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [], [], "blocking")
@@ -663,7 +678,6 @@ def test_closure_table_and_control_line_invariants():
 def test_optional_notes_do_not_require_disposition(enforcement):
     note = dict(NOTE, finding_id="1:n")
     need = dict(NEED, finding_id="2:e")
-    blocker = dict(BLOCK, finding_id="3:b")
     closure = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [note], [], enforcement)
     assert closure["closed"] and closure["open_ids"] == []
     mixed = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [note, need], [], enforcement)
@@ -672,12 +686,39 @@ def test_optional_notes_do_not_require_disposition(enforcement):
     assert plan_spec.closure_after_disposition(
         "REVIEW_REQUIRED", [note, need], disposed, enforcement,
     )["closed"]
-    rejected = [{"finding_id": "3:b", "decision": "reject", "rationale": "disagree"}]
-    below_quorum = plan_spec.closure_after_disposition(
-        "REVIEW_REQUIRED", [note, blocker], rejected, enforcement,
-    )
-    assert not below_quorum["closed"] and below_quorum["open_ids"] == ["3:b"]
     assert not plan_spec.closure_after_disposition("DEGRADED", [note], [], enforcement)["closed"]
+
+
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_reasoned_reject_closes_below_quorum_blocking_only_under_advisory(enforcement):
+    """The open set: under advisory a reject WITH its rationale closes a below-quorum
+    blocking finding, per finding; accept and defer keep it open; under blocking the
+    same reject leaves it open (a changed spec or the reviewer retiring it closes it)."""
+    note = dict(NOTE, finding_id="1:n")
+    blocker = dict(BLOCK, finding_id="3:b")
+    advisory = enforcement == "advisory"
+    rejected = [{"finding_id": "3:b", "decision": "reject", "rationale": "disagree"}]
+    closure = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [note, blocker], rejected, enforcement)
+    assert closure["closed"] is advisory and closure["open_ids"] == ([] if advisory else ["3:b"])
+    assert closure["aggregate"] == ("GREEN" if advisory else "REVIEW_REQUIRED")
+    assert ("closed_by_disposition: REVIEW_REQUIRED → GREEN (open set emptied)" in closure["notes"]) is advisory
+    assert any(n.startswith("blocking_finding_below_quorum_stays_open") for n in closure["notes"]) is not advisory
+    for decision in ("accept", "defer"):
+        kept = plan_spec.closure_after_disposition(
+            "REVIEW_REQUIRED", [note, blocker], [dict(rejected[0], decision=decision)], enforcement)
+        assert not kept["closed"] and kept["open_ids"] == ["3:b"] and kept["aggregate"] == "REVIEW_REQUIRED"
+    unreasoned = plan_spec.closure_after_disposition(
+        "REVIEW_REQUIRED", [blocker], [dict(rejected[0], rationale="")], enforcement)
+    assert not unreasoned["closed"] and "invalid_disposition:3:b" in unreasoned["notes"]
+    # Per finding: one rejected of two blocking findings still holds the wave.
+    second = dict(BLOCK, finding_id="4:b")
+    partial = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [blocker, second], rejected, enforcement)
+    assert not partial["closed"] and partial["open_ids"] == ([] if advisory else ["3:b"]) + ["4:b"]
+    # REVISE_PLAN and DEGRADED stay unclosable whatever is rejected.
+    revise = plan_spec.closure_after_disposition(
+        "REVISE_PLAN", [blocker, second], rejected + [dict(rejected[0], finding_id="4:b")], enforcement)
+    assert not revise["closed"] and revise["open_ids"] == ["3:b", "4:b"] and revise["aggregate"] == "REVISE_PLAN"
+    assert not plan_spec.closure_after_disposition("DEGRADED", [blocker], rejected, enforcement)["closed"]
 
 
 # ------------------------------------------------------------------- B5 packet

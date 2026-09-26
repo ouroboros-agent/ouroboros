@@ -669,8 +669,13 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     const authorSubject = current.author_subject;
     const author = authorDispositionText(authorSubject?.author_disposition);
     const reviewFingerprint = author ? text(authorSubject.review_fingerprint) : currentFingerprint;
+    // The critic reviewed the EARLIER plan when the author selected a revised one: the group
+    // is labelled as that plan's review and the selected plan is named unreviewed — the same
+    // `historical_critic` fact the gate projection carries, never a synthesized verdict.
+    const historicalCritic = Boolean(author) && Boolean(reviewFingerprint) && reviewFingerprint !== currentFingerprint;
     const authorDecisionText = author ? [author,
         `Critic plan: ${reviewFingerprint}`,
+        historicalCritic ? `The verdict shown is the earlier plan's review; the selected plan ${currentFingerprint} has no verdict of its own` : '',
         authorSubject.source_ref?.path ? `Current plan source: ${text(authorSubject.source_ref.root)}:${text(authorSubject.source_ref.path)}` : '',
         authorSubject.source_ref?.sha256 ? `Source sha256=${text(authorSubject.source_ref.sha256)}` : '',
     ].filter(Boolean).join('\n') : '';
@@ -738,7 +743,8 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     return {
         id: `plan:${owner}`,
         surface: 'plan',
-        label: 'Plan review',
+        label: historicalCritic ? 'Plan review · earlier plan' : 'Plan review',
+        historicalCritic,
         subject: '',
         presentationOwnerTaskId: owner,
         subjectTaskId: owner,

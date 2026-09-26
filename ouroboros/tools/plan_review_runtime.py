@@ -219,6 +219,8 @@ def publish_plan_review_projection(
             meta={
                 "plan_review_outcome": aggregate,
                 "plan_review_closed": closed,
+                # Whose verdict: the earlier plan's (an author-selected revised plan has none of its own).
+                **({"plan_review_historical_critic": True} if review.get("historical_critic") else {}),
             },
         ),
     )
@@ -628,7 +630,12 @@ def synthesize_plan_review_wave(
             raw_text_preview_chars=PLAN_RAW_TEXT_PREVIEW_CHARS,
         ))
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
-    aggregate = str(agg["aggregate"])
+    # ONE closure table for every write path: a REVIEW_REQUIRED whose open set is
+    # already empty (answers recorded while slots were in flight) is written GREEN.
+    closure = plan_spec.closure_after_disposition(
+        str(agg["aggregate"]), agg["findings"], list(dispositions or []), enforcement,
+    )
+    aggregate = str(closure["aggregate"])
     wave = {
         "schema_version": 2, "cycle_index": cycle_index, "retry_key": retry_key,
         "request_fingerprint": fingerprint,
@@ -648,9 +655,8 @@ def synthesize_plan_review_wave(
         "evidence_manifest_hash": manifest_hash, "constitutional": bool(constitutional),
         "constitutional_note": constitutional_note, "findings": list(agg["findings"]),
         "aggregate": aggregate, "reasons": list(agg["reasons"]), "counts": dict(agg["counts"]),
-        "closed": plan_spec.closure_after_disposition(
-            aggregate, agg["findings"], list(dispositions or []), enforcement,
-        )["closed"], "dispositions": list(dispositions or []), "actors": slot_records,
+        "closed": bool(closure["closed"]), "dispositions": list(dispositions or []), "actors": slot_records,
+        **({"closure_notes": list(closure["notes"])} if aggregate != str(agg["aggregate"]) else {}),
         "custody_pending": False,
         "actors_degraded": [str(r["slot_id"]) for r in slot_records if not r["ok"]],
         "enforcement": enforcement, "cycle_cap": cap,
