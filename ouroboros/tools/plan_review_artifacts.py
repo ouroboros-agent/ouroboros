@@ -277,7 +277,13 @@ def in_flight_resume_inputs(
         )}
     previous = None
     previous_fingerprint = str(existing.get("previous_fingerprint") or "")
-    if previous_fingerprint:
+    replaced = existing.get("previous_wave_artifact") if isinstance(existing.get("previous_wave_artifact"), dict) else {}
+    if replaced:  # a same-fingerprint re-dispatch replaced its predecessor in the hot index: read the exact copy
+        try:
+            previous = read_wave(state_root, task_id, replaced)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {"error": "Prior exact plan-review authority is unreadable; in-flight reconciliation is refused."}
+    elif previous_fingerprint:
         from ouroboros.task_results import plan_review_wave
 
         previous = plan_review_wave(state, previous_fingerprint)
@@ -663,7 +669,7 @@ def compact_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),
         "wave_artifact": copy.deepcopy(wave.get("wave_artifact") or {}),
-        **{key: copy.deepcopy(wave[key]) for key in ("historical_supplements", "retry_key", "custody_pending", "ordered_weaker") if key in wave},
+        **{key: copy.deepcopy(wave[key]) for key in ("historical_supplements", "retry_key", "custody_pending", "ordered_weaker", "previous_wave_artifact") if key in wave},
         **({"author_disposition": copy.deepcopy(wave["author_disposition"])}
            if isinstance(wave.get("author_disposition"), dict) else {}),
         **({"spec_source_ref": copy.deepcopy(wave["spec_source_ref"])} if wave.get("spec_source_ref") else {}),

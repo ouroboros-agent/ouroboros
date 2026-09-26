@@ -232,7 +232,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # observed-source read facts; the capture paragraph gains the snapshot-vs-inline clause.
     # 320500 -> 321400 (merge of the moved target into the plan-review branch, measured 321261): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
-    "docs/architecture/06-agent-core.md": 321400,
+    # 321400 -> 321600 (measured 321394): the closure sentence names the CONFIGURED enforcement against the hurry-projected advisory.
+    "docs/architecture/06-agent-core.md": 321600,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
@@ -241,7 +242,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 38400 -> 38700 (PR #1300): one settings row for the extra-CA trust bundle; the base sat 33 bytes under.
     # 38700 -> 39000: OUROBOROS_EFFORT_REVIEW and the reviewer-slot row description name the plan
     # order that outranks a pinned row effort (compound slugs keep theirs); the base sat 139 under.
-    "docs/architecture/07-configuration.md": 39000,
+    # 39000 -> 39100 (measured 38988): the review-enforcement row names what plan-review closure reads.
+    "docs/architecture/07-configuration.md": 39100,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
     # ONE reusable browser lane and the two triggers that share it (the unfiltered

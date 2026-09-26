@@ -1478,6 +1478,12 @@ def record_plan_review_wave(
             return state
         waves = [w for w in state.get("waves") or [] if str(w.get("request_fingerprint") or "") != fingerprint]
         recorded = copy.deepcopy(wave)
+        # A paid re-dispatch that REPLACES its same-fingerprint predecessor keeps that
+        # predecessor's exact artifact reachable (standing findings, prior cycles, facts).
+        for prior in previous:
+            ref = prior.get("wave_artifact") if prior.get("cycle_index") != wave.get("cycle_index") else prior.get("previous_wave_artifact")
+            if isinstance(ref, dict) and ref and not recorded.get("previous_wave_artifact"):
+                recorded["previous_wave_artifact"] = copy.deepcopy(ref)
         history = [item for prior in previous for item in prior.get("historical_supplements") or []]
         if history:
             recorded["historical_supplements"] = copy.deepcopy(history)

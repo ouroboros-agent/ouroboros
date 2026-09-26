@@ -156,7 +156,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults canonical in `settings_
 | OUROBOROS_OBSERVABILITY_RETENTION_DAYS | (retired) | Retired (`RETIRED_SETTING_KEYS`): rows are kept indefinitely and the reader never deletes, so the knob had no reader; stored value stripped at load, env inert |
 | OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC | (unset) | Env-only: logical review timeout (absent = route-owned; late in-flight results stay in custody) |
 | OUROBOROS_REVIEW_MAX_TOKENS | 65536 | Env-only: reviewer output budget, clamped to the 8192 floor |
-| OUROBOROS_REVIEW_ENFORCEMENT | advisory | Review enforcement: advisory/blocking (closed enum; anything else coerces to the default) |
+| OUROBOROS_REVIEW_ENFORCEMENT | advisory | Review enforcement: advisory/blocking (closed enum; anything else coerces to the default); plan-review closure of a below-quorum blocking finding by a reasoned reject reads this configured value, never the hurry-projected advisory the finalization gate uses |
 | OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 1800 | Env-only: TOTAL wall-clock budget for the hermetic test preflight (node lane + both passes); Android entry defaults to 3600, explicit override wins; teardown/containment remain in `preflight_runner.py`/`process_containment.py` |
 | OUROBOROS_PREFLIGHT_SERIAL | unset | Env-only: `1` selects one serial pytest pass; scrubbed from the candidate environment |
 | OUROBOROS_PREFLIGHT_TEST_WORKERS | (unset) | Env-only: xdist workers for the hermetic parallel pass (floor 2, else `os.cpu_count()`); read from the OPERATOR environment, scrubbed from the candidate |

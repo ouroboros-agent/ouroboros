@@ -960,7 +960,7 @@ def plan_standing_findings(previous: Optional[dict], spec: dict, enforcement: st
     order, so a seat that fails to answer a same-spec cycle keeps its objection listed
     (``plan_review_runtime.synthesize_plan_review_wave``). A changed spec, a closed predecessor or no
     predecessor carries nothing."""
-    if not isinstance(previous, dict) or not isinstance(previous.get("spec"), dict):
+    if not isinstance(previous, dict) or not isinstance(previous.get("spec"), dict) or previous.get("closed"):
         return {}
     if str(previous.get("spec_hash") or spec_hash(previous["spec"])) != spec_hash(spec):
         return {}

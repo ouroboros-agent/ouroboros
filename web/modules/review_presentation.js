@@ -533,18 +533,18 @@ function planFindingLines(wave) {
 
 function planActorAvailabilityLines(wave) {
     // The bug report's own bar: a result that was never received must say so
-    // explicitly instead of contributing silently-zero findings. A row names the
-    // model and quotes the engine's reported sentence; the failure code and the
-    // slot id stay in the task detail and Logs (an unresolved slot keeps its raw state).
+    // explicitly instead of contributing silently-zero findings. A row names the model and
+    // quotes the engine's sentence; failure code and slot id stay in the task detail and Logs.
     const lines = [];
     for (const actor of (Array.isArray(wave.actors) ? wave.actors : [])) {
         if (!actor || typeof actor !== 'object' || actor.ok !== false) continue;
         const model = text(actor.model) || 'reviewer';
         const cause = text(actor.reported_cause).split(/\s+/).join(' ');
+        const carried = finiteCount(actor.carried_findings) ? '; its earlier finding is still listed' : '';
         if (actorAwaiting(actor)) lines.push(`${model} · awaiting${sinceLocalTime(actor.awaiting_since)}`);
         else if (actorUnresolved(actor)) lines.push(`${model} · no answer${cause ? ` — "${cause}"` : ''}${sinceLocalTime(actor.awaiting_since)}`);
-        else if (text(actor.operation_state) === 'not_dispatched') lines.push(`${model} · not sent`);
-        else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}${finiteCount(actor.carried_findings) ? ' · did not answer; its earlier finding is still listed' : ''}`);
+        else if (text(actor.operation_state) === 'not_dispatched') lines.push(`${model} · not sent${carried}`);
+        else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}${carried ? ` · did not answer${carried}` : ''}`);
     }
     return lines;
 }
@@ -561,6 +561,14 @@ function planWaveDetail(wave) {
         wave.reason ? `Reason: ${text(wave.reason)}` : '',
     ];
     const counts = wave.counts && typeof wave.counts === 'object' ? wave.counts : {};
+    // A panel ordered weaker than the owner's setting says so seat by seat (typed fact; the
+    // verdict token is never recoloured), on compact waves too since compaction keeps the fact.
+    const weaker = wave.ordered_weaker && typeof wave.ordered_weaker === 'object'
+        ? Object.entries(wave.ordered_weaker).filter(([, row]) => row && typeof row === 'object') : [];
+    if (weaker.length) {
+        lines.push(`Reviewers ordered weaker than your setting: ${weaker
+            .map(([sid, row]) => `${sid} ${text(row.effort) || '?'} (setting ${text(row.owner_effort) || '?'})`).join(', ')}`);
+    }
     if (wave.compact) {
         // A compacted wave keeps counts while its finding bodies moved to the
         // immutable wave artifact; name that remainder instead of rendering a
@@ -580,14 +588,6 @@ function planWaveDetail(wave) {
         .filter((key) => finiteCount(counts[key]) != null)
         .map((key) => `${finiteCount(counts[key])} ${key}`);
     if (countParts.length) lines.push(`Findings: ${countParts.join(' · ')}`);
-    // A panel the mind ordered weaker than the owner's effort setting says so, seat by
-    // seat, from the wave's typed fact; the verdict token is never recoloured for it.
-    const weaker = wave.ordered_weaker && typeof wave.ordered_weaker === 'object'
-        ? Object.entries(wave.ordered_weaker).filter(([, row]) => row && typeof row === 'object') : [];
-    if (weaker.length) {
-        lines.push(`Reviewers ordered weaker than your setting: ${weaker
-            .map(([sid, row]) => `${sid} ${text(row.effort) || '?'} (setting ${text(row.owner_effort) || '?'})`).join(', ')}`);
-    }
     lines.push(...planFindingLines(wave));
     lines.push(...planActorAvailabilityLines(wave));
     const findingsShown = (Array.isArray(wave.findings) ? wave.findings : []).length;

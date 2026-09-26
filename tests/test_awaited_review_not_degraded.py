@@ -70,10 +70,10 @@ ONLY_AWAITED = {
         [_row("s1", ok=True), _awaiting("s2"), _awaiting("s3")], answered=1, findings=[_NOTE]),
     "a clean quorum held open by the last slot": _wave(
         [_row("s1", ok=True), _row("s2", ok=True), _awaiting("s3")], answered=2),
+    "a quorum whose only findings are notes: notes never move the verdict": _wave(
+        [_row("s1", ok=True), _row("s2", ok=True), _awaiting("s3")], answered=2, findings=[_NOTE]),
 }
 NOT_ONLY_AWAITED = {
-    "a quorum of answers raised findings: a critic verdict sits beneath the placeholder": _wave(
-        [_row("s1", ok=True), _row("s2", ok=True), _awaiting("s3")], answered=2, findings=[_NOTE]),
     "a wait beside a real failure": _wave(
         [_row("s1", failure_code="run_failed"), _awaiting("s2"), _awaiting("s3")]),
     "a wait beside a typed $0 refusal": _wave(

@@ -631,9 +631,6 @@ def synthesize_plan_review_wave(
         slot = slots_by_id.get(sid)
         if reviewer_effort and slot is not None and not str(getattr(slot, "declared_effort", "") or ""):
             disclosures.append("reviewer_effort_not_applied")  # a compound route slug kept its encoded effort
-        carried = [] if ok else [dict(f) for f in (standing or {}).get(sid) or [] if isinstance(f, Mapping)]
-        if carried:
-            disclosures.append(f"findings_carried_absent_answer:{len(carried)}")
         if ok:
             parsed, parse_error = plan_spec.parse_findings(str(row.get("text") or ""))
             if parse_error:
@@ -645,6 +642,14 @@ def synthesize_plan_review_wave(
                 )
                 disclosures += finding_disclosures
                 seen_after |= set(slot_seen)
+        # Standing findings ride only a TERMINAL absence, judged once ``ok`` is final: an
+        # unparseable reply is a non-answer, while a seat still awaiting the barrier, in
+        # flight or late-pending is a gap, never an answer (06 §Plan construction and review).
+        pending = bool(row.get("late_result_pending")) or str(row.get("operation_state") or "settled") in (
+            "pending_dispatch", "in_flight", "custody_lost")
+        carried = [] if ok or pending else [dict(f) for f in (standing or {}).get(sid) or [] if isinstance(f, Mapping)]
+        if carried:
+            disclosures.append(f"findings_carried_absent_answer:{len(carried)}")
         slot_results.append({"slot": row.get("slot_id"), "model": row.get("model"),
                              "ok": ok, "findings": findings, "error": error or None,
                              **({"carried": carried} if carried else {})})
@@ -1163,6 +1168,7 @@ def plan_health_skip_rows(slots: list, evidence: Optional[Dict[str, Dict[str, st
             "model": str(getattr(slot, "model", "") or ""),
             "request_model": str(getattr(slot, "model", "") or ""),
             "route": "agent_session", "host_file_read_attestation": None, "text": "",
+            "effort": str(getattr(slot, "effort", "") or ""), "declared_effort": str(getattr(slot, "declared_effort", "") or ""),
             "error": (
                 f"health_skip[{code}]: the pre-fan-out panel health snapshot shows this "
                 f"slot's delegated route window spent{f' (resets {reset})' if reset else ''}; "
@@ -1448,6 +1454,7 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int, slot_prompt_ch
             "request_model": str(getattr(slot, "model", "") or ""),
             "route": "agent_session" if slot_is_session(slot) else "api_chat",
             "host_file_read_attestation": None, "text": "",
+            "effort": str(getattr(slot, "effort", "") or ""), "declared_effort": str(getattr(slot, "declared_effort", "") or ""),
             "error": (f"preflight_oversize: assembled packet ~{estimated:,} estimated tokens exceeds "
                       f"this slot's calibrated input cap {cap:,}"),
             "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,

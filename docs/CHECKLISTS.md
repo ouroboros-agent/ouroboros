@@ -882,8 +882,8 @@ authority, and prose outside the array is not parsed.
   paid cycle. Under advisory enforcement a reject with its rationale also closes a below-quorum
   blocking finding (per finding; accept or defer keeps it open until a changed spec is
   reviewed). Under blocking enforcement a below-quorum blocking finding stays OPEN whatever the
-  disposition says: it closes only through a changed spec (a new fingerprint, the next paid
-  cycle) or the slot that raised it no longer raising it in a later paid cycle. A
+  disposition says: it closes only through a changed spec (a new spec hash reviewed in the next
+  paid cycle) or the slot that raised it no longer raising it in a later paid cycle. A
   REVIEW_REQUIRED wave whose open set empties is recorded GREEN.
 - **REVISE_PLAN** — blocking findings at quorum. A disposition can never close it: the agent
   either changes the spec (a new fingerprint, the next paid cycle) or rejects a blocking finding

@@ -278,6 +278,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
                 text += (
                     f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}): a reject with its "
                     "rationale closes each one; accept or defer keeps it open until a changed spec is reviewed. "
+                    + ("" if not at_cap else "The cycle cap is reached; no further paid panel is available. ")
                 )
             else:
                 text += (
@@ -415,7 +416,8 @@ def _render_wave(
         + (f" · room snapshot read {a['room_read_coverage'].get('covered_chars')}/{a['room_read_coverage'].get('complete_chars')} "
            f"chars ({a['room_read_coverage'].get('provenance')})" if isinstance(a.get("room_read_coverage"), dict) else "")
         + f" · {_actor_outcome(a, slot_class.get(id(a), ''))}"
-        + (" · did not answer; its earlier finding is still listed" if a.get("carried_findings") else "")
+        + ((" · not sent" if a.get("operation_state") == "not_dispatched" else " · did not answer")
+           + "; its earlier finding is still listed" if a.get("carried_findings") else "")
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []
     ] or ["(no actor records)"]

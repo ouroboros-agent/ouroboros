@@ -351,3 +351,48 @@ test('the hydrate status node swaps its message text across the loading→error 
     assert.match(current.children[0].innerHTML, /Loading review details/);
     assert.equal(current.children.length, 1);
 });
+
+test('a compact Plan wave still names reviewers ordered weaker than the setting', () => {
+    const fingerprint = 'c'.repeat(64);
+    const group = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            schema_version: 2,
+            current_attempt: {},
+            waves: [{
+                compact: true, request_fingerprint: fingerprint, cycle_index: 1, aggregate: 'GREEN', closed: true,
+                counts: { findings: 0, blocking: 0, dispositions: 0 },
+                wave_artifact: { root: 'artifact_store', path: 'w.json', sha256: 'abc123def4567890', bytes: 321 },
+                ordered_weaker: { slot_1: { effort: 'low', owner_effort: 'xhigh' } },
+            }],
+            waves_omitted: 0,
+        },
+    });
+    const detail = group.attempts[0].detailText;
+    assert.match(detail, /Reviewers ordered weaker than your setting: slot_1 low \(setting xhigh\)/);
+    assert.match(detail, /Finding bodies compacted/);
+});
+
+test('a carried finding is explained on a not-sent seat and on a failed seat alike', () => {
+    const fingerprint = 'e'.repeat(64);
+    const detail = (actor) => planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            schema_version: 2,
+            current_attempt: { fingerprint, status: 'open' },
+            waves: [{
+                request_fingerprint: fingerprint, cycle_index: 2, aggregate: 'REVIEW_REQUIRED', closed: false, paid: true,
+                counts: { blocking: 1, note: 0, need_evidence: 0, parseable: 2, quorum: 2 }, findings: [],
+                actors: [{ slot_id: 'slot_1', model: 'm/a', ...actor }],
+            }],
+            waves_omitted: 0,
+        },
+    }).attempts[0].detailText;
+    assert.match(detail({ ok: false, operation_state: 'not_dispatched', error: 'health_skip', carried_findings: 1 }),
+        /m\/a · not sent; its earlier finding is still listed/);
+    assert.match(detail({ ok: false, error: 'transport died', reported_cause: 'transport died', carried_findings: 1 }),
+        /m\/a · unavailable — "transport died" · did not answer; its earlier finding is still listed/);
+    assert.doesNotMatch(detail({ ok: false, operation_state: 'not_dispatched', error: 'health_skip' }), /earlier finding/);
+    assert.doesNotMatch(detail({ ok: false, error: 'transport died' }), /earlier finding/);
+});
+

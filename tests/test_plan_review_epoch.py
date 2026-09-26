@@ -868,6 +868,84 @@ def test_a_compound_route_slug_keeps_its_effort_and_discloses_the_unapplied_orde
     assert all(a["declared_effort"] == "" for a in _state(harness, "task-plain")["waves"][-1]["actors"])
 
 
+def test_a_reject_closed_predecessor_carries_nothing_on_a_later_same_spec_wave(harness, monkeypatch):
+    """A below-quorum blocking finding closed by a reasoned reject under advisory is earned
+    authority: a later same-spec re-dispatch with its objecting seat silent carries nothing
+    from that CLOSED predecessor (an OPEN one carries it: the tests below)."""
+    from tests.test_plan_review_reconciliation import _collect
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
+    harness.state["enforcement"] = "advisory"
+    _patch_health(monkeypatch, lambda slots: {})
+    _effort_aware_builder(harness, monkeypatch)
+    objection = json.dumps([_finding("n1", "blocking", breaks="claim_1", summary="Friday is impossible")])
+    sub = harness.install({"s1": objection, "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx, reviewer_effort="low")) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    closed = _collect(ctx, fp, items=[{"finding_id": "s1:n1", "decision": "reject", "rationale": "Friday is a hard date"}])
+    assert _control(closed) == {"outcome": "GREEN", "closed": True}
+    sub.answers = {"s1": "", "s2": CLEAN, "s3": CLEAN}
+    later = _call(ctx, reviewer_effort="max")
+    assert _control(later) == {"outcome": "GREEN", "closed": True}
+    assert not any(f.get("carried_absent_answer") for f in _state(harness)["waves"][-1]["findings"])
+
+
+def test_an_unparseable_objector_reply_still_carries_its_finding(harness, monkeypatch):
+    """Standing findings are judged once ``ok`` is final: an objecting seat that answers prose
+    (no findings array) on a same-spec re-dispatch is a non-answer, so its earlier blocking
+    finding stays listed and the wave stays REVIEW_REQUIRED; a clean answer retires it."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
+    _patch_health(monkeypatch, lambda slots: {})
+    _effort_aware_builder(harness, monkeypatch)
+    objection = json.dumps([_finding("n1", "blocking", breaks="claim_1", summary="Friday is impossible")])
+    sub = harness.install({"s1": objection, "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx, reviewer_effort="low")) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    sub.answers = {"s1": "I have nothing to add this round.", "s2": CLEAN, "s3": CLEAN}
+    prose = _call(ctx, reviewer_effort="max")
+    assert _control(prose) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    wave = _state(harness)["waves"][-1]
+    s1 = next(a for a in wave["actors"] if a["slot_id"] == "s1")
+    assert s1["ok"] is False and s1["carried_findings"] == 1
+    assert [f["finding_id"] for f in wave["findings"] if f.get("carried_absent_answer")] == ["s1:n1"]
+    assert wave["counts"]["parseable"] == 2 and "did not answer; its earlier finding is still listed" in prose
+    sub.answers = {"s1": CLEAN, "s2": CLEAN, "s3": CLEAN}
+    assert _control(_call(ctx, reviewer_effort="xhigh")) == {"outcome": "GREEN", "closed": True}
+
+
+def test_a_seat_awaiting_the_barrier_carries_nothing_until_its_absence_is_terminal(harness, monkeypatch):
+    """At the dispatch barrier every fresh row is ``pending_dispatch``: a gap, never a
+    non-answer, so no standing finding is carried and nothing says «did not answer»;
+    once collection settles the objecting seat as a $0 ``not_dispatched`` refusal, its
+    earlier finding is carried and the actor line says «not sent»."""
+    from tests.test_plan_review_reconciliation import _collect, _install_barrier_substrate
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
+    _patch_health(monkeypatch, lambda slots: {})
+    _effort_aware_builder(harness, monkeypatch)
+    objection = json.dumps([_finding("n1", "blocking", breaks="claim_1", summary="Friday is impossible")])
+    harness.install({"s1": objection, "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx, reviewer_effort="low")) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    calls = []
+    _install_barrier_substrate(monkeypatch, calls, refused={"s1"})
+    barrier = _call(ctx, reviewer_effort="max")
+    assert _control(barrier) == {"outcome": "DEGRADED", "closed": False}
+    wave = _state(harness)["waves"][-1]
+    assert wave["custody_pending"] is True
+    assert not any(f.get("carried_absent_answer") for f in wave["findings"])
+    assert all(not a.get("carried_findings") for a in wave["actors"])
+    assert "earlier finding is still listed" not in barrier
+    settled = _collect(ctx, wave["request_fingerprint"])
+    assert _control(settled) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    wave = _state(harness)["waves"][-1]
+    s1 = next(a for a in wave["actors"] if a["slot_id"] == "s1")
+    assert s1["operation_state"] == "not_dispatched" and s1["carried_findings"] == 1
+    assert [f["finding_id"] for f in wave["findings"] if f.get("carried_absent_answer")] == ["s1:n1"]
+    assert "not sent; its earlier finding is still listed" in settled
+
+
 def test_a_changed_order_never_retires_a_silent_objectors_finding(harness, monkeypatch):
     """Standing findings by same spec hash and same seat: after s1 raised a blocking
     finding at `low`, a `max` re-dispatch on the SAME spec where s1 fails to answer
@@ -899,10 +977,16 @@ def test_a_changed_order_never_retires_a_silent_objectors_finding(harness, monke
     sub.answers = {"s1": CLEAN, "s2": CLEAN, "s3": CLEAN}
     assert _control(_call(ctx, reviewer_effort="xhigh")) == {"outcome": "GREEN", "closed": True}
     assert not any(f.get("carried_absent_answer") for f in _state(harness)["waves"][-1]["findings"])
-    # A changed spec is a fresh judgement: s1's silence there carries nothing.
+    # A changed spec is a fresh judgement: on a second task whose wave is OPEN on s1's
+    # objection, the changed spec with s1 silent carries nothing (the guard is spec-hash
+    # equality), while the same silence on the unchanged spec carries it (above).
+    other = harness.make_ctx(task_id="task-2")
+    sub.answers = {"s1": objection, "s2": CLEAN, "s3": CLEAN}
+    assert _control(_call(other, reviewer_effort="low")) == {"outcome": "REVIEW_REQUIRED", "closed": False}
     sub.answers = {"s1": "", "s2": CLEAN, "s3": CLEAN}
-    changed = _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]}, reviewer_effort="low")
+    changed = _call(other, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]}, reviewer_effort="low")
     assert _control(changed) == {"outcome": "GREEN", "closed": True}
+    assert not any(f.get("carried_absent_answer") for f in _state(harness, "task-2")["waves"][-1]["findings"])
     assert "did not answer; its earlier finding is still listed" not in changed
 
 
