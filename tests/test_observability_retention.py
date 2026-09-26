@@ -9,6 +9,7 @@ nor touches the store.
 from __future__ import annotations
 
 import os
+import pathlib
 import time
 
 
@@ -40,10 +41,16 @@ def test_startup_neither_counts_nor_deletes_observability_blobs(tmp_path, monkey
             touched.append(str(path))
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", spy)
-    sm._startup_prune_sweeps()
-    assert all(path.exists() for path in paths)
+    # The spy watches startup only: from Python 3.11 pathlib stats through ``os.stat``, so the
+    # checks below would otherwise count themselves as startup touches. Python 3.10 pathlib
+    # bound ``os.stat`` at import in its accessor, which a pathlib census would stat through.
+    with monkeypatch.context() as startup:
+        startup.setattr(os, "stat", spy)
+        if hasattr(pathlib, "_NormalAccessor"):
+            startup.setattr(pathlib._NormalAccessor, "stat", staticmethod(spy))
+        sm._startup_prune_sweeps()
     assert touched == [], touched
+    assert all(path.read_bytes() == b"data" for path in paths)
     assert not hasattr(observability, "prune_observability_blobs")
 
 
