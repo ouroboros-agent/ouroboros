@@ -786,14 +786,15 @@ block repo commits and vice versa.
 
 Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
 work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
-SPEC, the task objective, the complete retained own-room discussion (both speakers, explanations,
-options, quiz recommendations and accepted answers, attachment names and addressed mailbox provenance),
-and declared evidence (attached bounded, with every absence named). Own dialogue uses an exact
-redacted snapshot outside those evidence bounds; when the route cannot hold it all, the newest part
-and exact accessible omitted ranges remain. Related rooms are pointers, not unsolicited content.
-Replay refers to the recorded snapshot and does not claim later messages reviewed. An agent reviewer
-can read the full artifact; its declared reading is not host-attested coverage. Missing generations
-and unavailable rooms remain gaps. For a self-modification plan, BIBLE.md and ARCHITECTURE.md are
+SPEC, the task objective, the own-room conversation inline as numbered readable lines (both
+speakers, explanations, options, quiz cards with the chosen answer, attachment names and addressed
+mailbox provenance; each line carries its snapshot line number), and declared evidence (attached
+bounded, with every absence named). Progress rows and host notices stay in the exact redacted
+snapshot outside those evidence bounds, addressed by the inline line numbers through a pointer every
+reviewer receives; a route that cannot hold the whole conversation keeps its newest rows and names
+the cut as an exact line range. Related rooms are pointers, not unsolicited content. Replay refers
+to the recorded snapshot and does not claim later messages reviewed. What a session reads of the
+snapshot is recorded as a fact, never a gate. Missing generations and unavailable rooms remain gaps. For a self-modification plan, BIBLE.md and ARCHITECTURE.md are
 required in full (inline for
 an api reviewer; a retrieving reviewer reads both in full with its own tools, the pack names them
 as mandatory reads); every other plan gets the heading-derived navigation maps of BIBLE.md and

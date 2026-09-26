@@ -209,7 +209,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 318700 -> 319500: the reviewer-effort paragraph REPLACES the default-rung ladder with the
     # order-outranks-pins ladder, the recorded per-seat/owner/ordered_weaker facts, and the
     # unanswered-slot floor gains the same-spec standing-findings clause.
-    "docs/architecture/06-agent-core.md": 319500,
+    # 319500 -> 320500: the dialogue-delivery paragraph REPLACES the byte-suffix/mandatory-full-read
+    # contract with the numbered conversation view, the per-route fit, the session pointer and the
+    # observed-source read facts; the capture paragraph gains the snapshot-vs-inline clause.
+    "docs/architecture/06-agent-core.md": 320500,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
@@ -303,7 +306,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/development/03-module-size-and-complexity.md": 23500,
     # 16431 -> 16600: the disposition paragraph names the advisory reasoned-reject closure of a
     # below-quorum blocking finding (one clause); the base sat 2 bytes under.
-    "docs/development/04-core-governance-artifacts.md": 16600,
+    # 16600 -> 16700: the snapshot sentence names the conversation-only inline view and its pointer.
+    "docs/development/04-core-governance-artifacts.md": 16700,
     "docs/development/05-review-and-commit-protocol.md": 12956,
     # 94197 -> 94520: the usage-ledger lock rule gains its reader contract (a display read
     # on the supervisor loop or a gateway thread rides the last validated snapshot; money
@@ -332,7 +336,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # one closure table and the labelled critic pair of an author-selected plan; the base sat 48 under.
     # 97700 -> 98300: the plan-review bullet gains the effort-order precedence, the recorded
     # effort facts and the same-spec standing-findings clause (extended in place).
-    "docs/development/06-rules-by-change-class.md": 98300,
+    # 98300 -> 98600: the plan-review bullet gains the numbered-conversation delivery and the
+    # observed-source read fact (extended in place) and two test pointers.
+    "docs/development/06-rules-by-change-class.md": 98600,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

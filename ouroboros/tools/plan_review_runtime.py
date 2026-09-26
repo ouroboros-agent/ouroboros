@@ -40,14 +40,10 @@ from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compat
     persist_wave as persist_plan_review_wave_artifact,
     read_wave as read_plan_review_wave_artifact,
 )
-# The one caller-facing strength axis of a review panel: the plan envelope may
-# order the panel's effort for THIS plan, and the order outranks each row's own
-# pinned effort (a compound Cursor/Agy route slug keeps its encoded effort: it is
-# the route's identity); the owner's review-effort setting and pins apply when
-# nothing is ordered. The setting is the default, Ouroboros may order stronger or
-# weaker, and every wave records the effective per-seat effort and names a panel
-# ordered weaker than the owner's setting; a different strength on an OPEN
-# review re-dispatches a paid panel within OUROBOROS_REVIEW_MAX_CYCLES.
+# The one caller-facing strength axis of a review panel: the envelope's order for THIS
+# plan outranks each row's pinned effort (a compound Cursor/Agy route slug keeps its
+# encoded effort: the route's identity); the owner's setting is the default, Ouroboros
+# may order stronger or weaker, and every wave records the effective per-seat effort.
 REVIEWER_EFFORT_SCHEMA = {
     "type": "string", "enum": list(EFFORT_SCALE),
     "description": (
@@ -63,14 +59,11 @@ REVIEWER_EFFORT_SCHEMA = {
 # the owner deadline or shared transport bound, keeping the historical 560s
 # number from being reused as an HTTP timeout.
 PLAN_REVIEW_SLOT_TIMEOUT_SEC = None
-# Per-slot provenance of what the reviewer read (BIBLE P3, retrieving reviewers):
-# an api_chat slot read exactly the host-assembled packet; an agent_session slot
-# retrieved with its own tools and the host did not observe what it opened; a
-# native tool-round slot retrieved with HOST tools, so its reads are observed —
-# a stronger disclosure that is still never a claim of full-surface coverage.
+# Per-slot provenance of what the reviewer read (BIBLE P3): an api_chat slot read exactly
+# the host-assembled packet; a retrieving slot's reads are observed (host or harness journal)
+# or unobserved — a disclosure, never a claim of full-surface coverage.
 HOST_FILE_READ_ASSEMBLED = "host_assembled_packet"
 HOST_FILE_READ_UNOBSERVED = "unobserved"
-HOST_FILE_READ_OBSERVED = "host_observed"
 
 log = logging.getLogger(__name__)
 
@@ -206,12 +199,8 @@ def publish_plan_review_projection(
         raise ValueError(f"invalid plan review aggregate signal: {aggregate!r}")
     if type(closed) is not bool:
         raise ValueError("plan review closed state must be boolean")
-    if (aggregate == "GREEN" and not closed) or (
-        aggregate in {"REVISE_PLAN", "DEGRADED"} and closed
-    ):
-        raise ValueError(
-            f"invalid plan review control state: outcome={aggregate}, closed={closed}"
-        )
+    if (aggregate == "GREEN" and not closed) or (aggregate in {"REVISE_PLAN", "DEGRADED"} and closed):
+        raise ValueError(f"invalid plan review control state: outcome={aggregate}, closed={closed}")
     return _publish_tool_result(
         ctx,
         ToolResult(
@@ -520,12 +509,14 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "declared_effort": str(getattr(slot, "declared_effort", "") or ""),
         "route": "agent_session" if session else "api_chat",
         # Delivery-truthful provenance: a native tool-round actor discloses its
-        # HOST-OBSERVED reads through its usage; session stays unobserved and a
+        # HOST-OBSERVED reads through its usage; a session whose journal was folded
+        # over the room snapshot reads `harness_observed`, else unobserved; a
         # packet row stays host-assembled.
         "host_file_read_attestation": (
-            str(usage.get("host_file_read_attestation") or "")
+            str(usage.get("host_file_read_attestation") or "") or str(usage.get("read_provenance") or "")
             or (HOST_FILE_READ_UNOBSERVED if session else HOST_FILE_READ_ASSEMBLED)
         ),
+        **({"room_read_coverage": coverage} if (coverage := _room_read_coverage(usage)) else {}),
         "text": text,
         "error": error or None,
         "prompt_ref": actor.get("prompt_ref") or {},
@@ -561,6 +552,14 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
             usage.get("delegated_run_id") or actor.get("delegated_run_id") or ""
         ),
     }
+
+
+def _room_read_coverage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """What this reviewer read of the own-room snapshot (observed-source fold): a fact beside the verdict."""
+    rows = (usage.get("native_read_coverage") or {}).get("sources") if isinstance(usage.get("native_read_coverage"), dict) else None
+    row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) and rows[0].get("root") == "artifact_store" else {}
+    return {"status": str(row.get("status") or ""), "covered_chars": int(row.get("covered_chars") or 0),
+            "complete_chars": int(row.get("complete_chars") or 0), "provenance": str(usage.get("read_provenance") or "")} if row else {}
 
 
 def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -723,6 +722,7 @@ def plan_wave_actor_record(
         "slot_id": row.get("slot_id"), "model": row.get("model"),
         "effort": str(row.get("effort") or ""), "declared_effort": str(row.get("declared_effort") or ""),
         **({"carried_findings": int(carried_findings)} if carried_findings else {}),
+        **({"room_read_coverage": dict(row["room_read_coverage"])} if isinstance(row.get("room_read_coverage"), dict) else {}),
         "route": row.get("route"), "executions": list(row.get("executions") or []),
         "host_file_read_attestation": row.get("host_file_read_attestation"),
         "ok": ok, "error": error or None, "disclosures": disclosures,
@@ -1428,7 +1428,9 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int, slot_prompt_ch
     # Only api_chat rows are sized: a RETRIEVING (agent_session) row's model id is an opaque
     # harness target, not a provider route (`reviewer_window.reviewer_route(session=True)`), and
     # the review organ's convention (triad: "session rows are not constrained by this pack")
-    # is that such a row is never fit-excluded — it retrieves with its own tools.
+    # is that such a row is never fit-excluded — it retrieves with its own tools. Its inline
+    # conversation is fitted only to an owner-asserted `reviewer:<slot>` window
+    # (`plan_dialogue.dialogue_slot_inputs`); without one the host invents no window.
     api_slots = [slot for slot in slots if not slot_retrieves(slot)]
     api_models = [str(getattr(slot, "model", "") or "") for slot in api_slots]
     limits = per_slot_input_token_limits(

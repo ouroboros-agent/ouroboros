@@ -411,7 +411,10 @@ def _render_wave(
     actor_lines = [
         f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')}"
         + (f" · effort {a['effort']}{' (ordered)' if a.get('declared_effort') else ''}" if a.get("effort") else "")
-        + f" · host_file_read: {a.get('host_file_read_attestation')} · {_actor_outcome(a, slot_class.get(id(a), ''))}"
+        + f" · host_file_read: {a.get('host_file_read_attestation')}"
+        + (f" · room snapshot read {a['room_read_coverage'].get('covered_chars')}/{a['room_read_coverage'].get('complete_chars')} "
+           f"chars ({a['room_read_coverage'].get('provenance')})" if isinstance(a.get("room_read_coverage"), dict) else "")
+        + f" · {_actor_outcome(a, slot_class.get(id(a), ''))}"
         + (" · did not answer; its earlier finding is still listed" if a.get("carried_findings") else "")
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []

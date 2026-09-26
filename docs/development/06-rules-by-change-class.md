@@ -948,9 +948,12 @@ and what enforces each.
   effort); every wave records its effective per-seat efforts, the owner baseline captured
   at dispatch and one typed `ordered_weaker`. On a same-spec cycle a seat that does not
   answer keeps its still-open findings listed (`carried_absent_answer`), never counted as
-  parseable. Tests: `tests/test_plan_spec.py`, `tests/test_plan_review_engine_quorum.py`,
+  parseable. The own-room conversation reaches every reviewer as numbered readable lines;
+  progress and host rows stay behind the exact snapshot; session reads of it are an
+  observed fact (`observed_sources`), never a gate. Tests: `tests/test_plan_spec.py`, `tests/test_plan_review_engine_quorum.py`,
   `tests/test_awaited_review_not_degraded.py`, `tests/test_plan_author_disclosure.py`,
-  `tests/test_plan_review_epoch.py`, `tests/test_reviewer_slot_route_contract.py`.
+  `tests/test_plan_review_epoch.py`, `tests/test_reviewer_slot_route_contract.py`,
+  `tests/test_plan_dialogue_snapshot.py`, `tests/test_review_session_reads.py`.
 - Keep delivered result, unresolved tool-call evidence and host acceptance separate.
   Error count alone does not degrade execution or establish objective acceptance;
   retain `execution.unresolved_tool_errors` and the cosmetic bucket, and expose the
