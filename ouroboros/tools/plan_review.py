@@ -591,6 +591,26 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
 
 # --------------------------------------------------------------------------- review
 
+def _standing_or_refusal(ctx: ToolContext, state_root, task_id: str, state: dict, previous: Optional[dict],
+                         spec: dict, enforcement: str):
+    """The seats' standing obligations across the same-spec lineage, resolved BEFORE anything
+    is paid; unreadable history is a typed refusal, never an empty obligation."""
+    try:
+        return _standing_findings_lineage(state_root, task_id, state, previous, spec, enforcement)
+    except PlanReviewSourceUnavailable as exc:
+        return _plan_unavailable(ctx, str(exc), "plan_review_exact_artifact_unavailable")
+
+
+def _predecessor_ref(existing: Optional[dict], previous: Optional[dict], state: dict, resume_in_flight: bool) -> dict:
+    """The exact artifact of the predecessor this dispatch judged against: kept on resume, else
+    the selected predecessor's own reference (its hot entry when the materialized copy lacks one),
+    so a same-fingerprint re-dispatch that replaces it in the hot index still reaches it."""
+    if resume_in_flight:
+        return dict((existing or {}).get("previous_wave_artifact") or {})
+    hot = plan_review_wave(state, str((previous or {}).get("request_fingerprint") or "")) or {}
+    return dict((previous or {}).get("wave_artifact") or hot.get("wave_artifact") or {})
+
+
 async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, collect: Optional[dict] = None) -> str:
     """``collect`` = the recorded inputs of an open wave being collected at $0 (window 0)."""
     try:
@@ -736,6 +756,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
                 "ERROR: Prior exact plan-review authority is unreadable; a delta review is refused.",
                 "plan_review_exact_artifact_unavailable",
             )
+    standing = _standing_or_refusal(ctx, state_root, task_id, state, previous, spec, enforcement)
+    if isinstance(standing, str):
+        return standing
+
     cycle_index = int(resume.get("cycle_index") or cycles_paid + 1)
     retry_key = str(resume.get("retry_key") or f"plan_review:{fingerprint}:{cycle_index}")
     slots = _effective_plan_slots(slots)
@@ -831,12 +855,9 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         health_evidence=health_evidence, reviewer_effort=request.reviewer_effort,
         dispositions=list((existing or {}).get("dispositions") or []) if resume_in_flight else None,
         owner_efforts=owner_efforts,
-        standing=_standing_findings_lineage(state_root, task_id, state, previous, spec, enforcement),
+        standing=standing,
     )
-    # The predecessor this dispatch judged against stays reachable by its exact artifact even
-    # after a same-fingerprint re-dispatch replaces it in the hot index (kept on resume).
-    wave["previous_wave_artifact"] = dict((existing or {}).get("previous_wave_artifact") or {}) if resume_in_flight else dict(
-        (previous or {}).get("wave_artifact") or (plan_review_wave(state, str((previous or {}).get("request_fingerprint") or "")) or {}).get("wave_artifact") or {})
+    wave["previous_wave_artifact"] = _predecessor_ref(existing, previous, state, resume_in_flight)
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
