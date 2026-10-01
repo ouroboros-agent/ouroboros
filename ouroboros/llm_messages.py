@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 from ouroboros.anthropic_native_custody import custody_private_key, scrub_native_custody
 from ouroboros.llm_attempt import _VALID_CACHE_TTLS
 from ouroboros.provider_models import normalize_model_identity
+from ouroboros.context_budget import HOST_CONTEXT_NOTICE_BEFORE_TASK, HOST_CONTEXT_NOTICE_AFTER_TASK
 
 # The Main context builder's declaration on its leading system message: how many leading
 # text blocks are byte-stable across conversations (governance). A provider whose prompt
@@ -28,16 +29,6 @@ STABLE_PREFIX_BLOCKS_KEY = "_stable_prefix_blocks"
 
 # Byte-stable provenance header of the projected host-context notice (no clocks, hashes
 # or ids: round N+1's send copy must remain a prefix extension of round N's).
-HOST_CONTEXT_NOTICE_BEFORE_TASK = (
-    "Host context for this turn: memory, knowledge index, runtime facts and recent "
-    "activity, rendered by the runtime as a continuation of the system prompt. Not "
-    "written by my human and not a message to answer; the message to act on follows next."
-)
-HOST_CONTEXT_NOTICE_AFTER_TASK = (
-    "Host context for this turn: memory, knowledge index, runtime facts and recent "
-    "activity, rendered by the runtime as a continuation of the system prompt. Not "
-    "written by my human and not a message to answer; the message to act on is the one above."
-)
 SYSTEM_PREFIX_SPLIT_PLACEMENTS = ("before_task", "after_task")
 
 

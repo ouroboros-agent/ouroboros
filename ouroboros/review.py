@@ -29,11 +29,10 @@ MAX_FUNCTION_LINES = 300
 # own single-caller inlines and an upstream base that grew ~42 functions in one
 # day; the remaining delta is decomposition, not duplication, so buying the gap
 # by merging load-bearing steps would read worse.
-# The approved aggregate budget is 11000: independent review found distinct
-# review-operation, state, schedule and tool-custody duties after simplification.
-# This adds headroom, not permission for duplicate machinery; module,
-# function-length, byte and debt-transition limits still hold independently.
-MAX_TOTAL_FUNCTIONS = 11000
+# Owner decision 2026-09-30: raise the aggregate high-water alarm to 15000
+# after memory-writer simplification. Independent module, function-length,
+# byte and debt-transition limits still hold; this is not paydown credit.
+MAX_TOTAL_FUNCTIONS = 15000
 
 SIZE_RATCHET_MANIFEST_PATH = "ouroboros/size_ratchet_manifest.py"
 
