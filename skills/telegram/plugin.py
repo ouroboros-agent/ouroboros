@@ -39,15 +39,24 @@ from .lib.miniapp_registration import _read_status, register as register_miniapp
 from .scripts.telegram_settings import (
     TelegramSettingsError,
     merge_settings,
-    request_may_change_owner,
+    make_settings_save as _make_settings_save,
+    telegram_proxy,
 )
 
 # Decided once in the server process: a proxy-routed install keeps its only egress, every
 # other install is isolated from ambient proxy and SSL_CERT env; the worker guard mirrors
 # the core's macOS fork-safety rule. Residual: a CA-only install (custom CA via
 # SSL_CERT_FILE/SSL_CERT_DIR, no proxy) loses Telegram egress until that CA is trusted
-# system-wide or a proxy is set; the menu client stays pinned either way.
+# system-wide or an ambient proxy is set. The explicit skill proxy is independent
+# of this legacy bridge behavior; companion Telegram calls do not trust the env.
 _HONOR_ENV_PROXIES = (not in_worker_process()) and env_proxies_configured()
+
+
+def _telegram_client(api) -> TelegramClient:
+    """Build each bridge client with the granted token and skill-local proxy."""
+    granted = api.get_settings(["TELEGRAM_BOT_TOKEN"])
+    return TelegramClient(granted.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES,
+                          proxy=telegram_proxy(pathlib.Path(api.get_state_dir())))
 
 _SLASH_COMMAND_RE = re.compile(r"^\s*/[A-Za-z]")
 
@@ -70,16 +79,6 @@ _VALID_COMMAND_MODES = frozenset({_COMMAND_MODE_STRICT, _COMMAND_MODE_SAFE, _COM
 
 # Which translation keys are available in safe mode (full_access forwards raw)
 _SAFE_TRANSLATION_KEYS = frozenset({"/status", "/bg status", "/bg"})
-
-# The exact keys the declarative Settings form owns: POST accepts only these and
-# the GET that hydrates the form returns only these. The bot token belongs to
-# Secrets and is deliberately absent from both directions.
-_SETTINGS_FORM_KEYS = (
-    "TELEGRAM_CHAT_ID", "TELEGRAM_MAX_UPDATES_PER_POLL", "TELEGRAM_MIRROR_MODE",
-    "TELEGRAM_COMMAND_MODE", "TELEGRAM_LANGUAGE", "TELEGRAM_SILENT_MODE",
-    "TELEGRAM_SUBAGENT_CARDS", "TELEGRAM_MIRROR_PROGRESS", "TELEGRAM_NOTIFY_TASKS",
-    "TELEGRAM_NOTIFY_BUDGET", "TELEGRAM_MINIAPP_ENABLED",
-)
 
 def _setting_int(settings: Dict[str, Any], key: str, default: int, *, minimum: int = 1, maximum: int = 100) -> int:
     try:
@@ -266,50 +265,6 @@ def _build_language_keyboard(lang: str = "en") -> tuple[str, list[list[dict]]]:
         [{"text": t["btn_back"], "callback_data": "nav:menu"}]
     ]
     return header, rows
-
-
-def _make_settings_save(api):
-    async def _settings_save(request):
-        if str(getattr(request, "method", "POST") or "POST").upper() == "GET":
-            # Hydration read for the Settings form: only the form's own keys
-            # that are actually stored, as strings, so the UI shows what is
-            # saved instead of the schema's first option.
-            try:
-                stored = _load_settings(api)
-            except TelegramSettingsError as exc:
-                return JSONResponse({"ok": False, "message": str(exc)}, status_code=409)
-            return JSONResponse(
-                {key: str(stored[key]) for key in _SETTINGS_FORM_KEYS if key in stored}
-            )
-        try:
-            data = await request.json()
-        except (TypeError, ValueError):
-            return JSONResponse(
-                {"ok": False, "message": "Invalid Telegram settings payload."},
-                status_code=400,
-            )
-        if not isinstance(data, dict):
-            return JSONResponse(
-                {"ok": False, "message": "Invalid Telegram settings payload."},
-                status_code=400,
-            )
-        payload = {key: data.get(key) for key in _SETTINGS_FORM_KEYS if key in data}
-        owner_ignored = False
-        if "TELEGRAM_CHAT_ID" in payload and not request_may_change_owner(request):
-            payload.pop("TELEGRAM_CHAT_ID", None)
-            owner_ignored = True
-        try:
-            merge_settings(pathlib.Path(api.get_state_dir()), payload)
-        except TelegramSettingsError as exc:
-            return JSONResponse(
-                {"ok": False, "message": str(exc)},
-                status_code=409,
-            )
-        message = "Telegram settings saved."
-        if owner_ignored:
-            message += " Owner binding was left unchanged."
-        return JSONResponse({"ok": True, "owner_ignored": owner_ignored, "message": message})
-    return _settings_save
 
 
 def _bridge_status(api) -> dict[str, Any]:
@@ -628,9 +583,8 @@ async def _validate_bot(api, client, command_mode: str, lang: str) -> None:
 
 async def _start_poller(api):
     try:
-        protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
         _settings, pinned_chat, max_updates, command_mode, lang = _poller_preferences(api)
-        client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+        client = _telegram_client(api)
         offset = _load_offset(api)
         try:
             await _validate_bot(api, client, command_mode, lang)
@@ -1019,9 +973,8 @@ def _make_poller(api):
 def _make_outbound(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if not chat_id:
                 return
@@ -1113,9 +1066,8 @@ def _make_outbound(api):
 def _make_typing(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if chat_id:
                 await client.send_chat_action(chat_id, "typing")
@@ -1127,9 +1079,8 @@ def _make_typing(api):
 def _make_photo(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             image_base64 = str(event.get("image_base64") or "").strip()
             if chat_id and image_base64:
@@ -1150,9 +1101,8 @@ def _make_photo(api):
 def _make_video(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             video_base64 = str(event.get("video_base64") or "").strip()
             if chat_id and video_base64:
@@ -1173,9 +1123,8 @@ def _make_document(api):
     async def handle(event: Dict[str, Any]) -> None:
         file_handle = None
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             file_base64 = str(event.get("file_base64") or "").strip()
             file_ref = event.get("file_ref") if isinstance(event.get("file_ref"), dict) else None
@@ -1261,9 +1210,8 @@ def _is_native_audio_document(filename: str, mime: str) -> bool:
 def _make_links(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if not chat_id:
                 return
@@ -1299,9 +1247,8 @@ def _make_links(api):
 def _make_quiz(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if not chat_id:
                 return
@@ -1371,9 +1318,7 @@ def _make_quiz_state(api):
         try:
             await telegram_quiz.follow_lifecycle(
                 api, event, _poller_preferences(api)[4],
-                client_factory=lambda: TelegramClient(
-                    api.get_settings(["TELEGRAM_BOT_TOKEN"]).get("TELEGRAM_BOT_TOKEN", ""),
-                    trust_env=_HONOR_ENV_PROXIES))
+                client_factory=lambda: _telegram_client(api))
         except Exception as exc:
             api.log("error", f"Telegram quiz state error: {exc}")
     return handle
@@ -1401,7 +1346,9 @@ def register(api):
                 {
                     "type": "markdown",
                     "text": (
-                        "Set TELEGRAM_BOT_TOKEN in Settings → Secrets, grant it to this skill, then configure the options below.\n\n"
+                        "Set TELEGRAM_BOT_TOKEN in Settings → Secrets, grant it to this skill, then configure the options below. "
+                        "If Telegram needs a proxy, configure Telegram proxy below. It applies to all Telegram API calls, "
+                        "including the menu button; the Mini App tunnel and web traffic keep their existing routes.\n\n"
                         "**Command mode**: controls which slash commands can be sent from Telegram. "
                         "Use `/menu` in Telegram to see available commands as inline buttons.\n\n"
                         "**Mirror mode**: *all* mirrors every chat message (including web UI) to Telegram — requires Chat ID. "
@@ -1415,6 +1362,14 @@ def register(api):
                     "route": "settings/save",
                     "method": "POST",
                     "fields": [
+                        {"name": "telegram_proxy_status", "label": "Saved Telegram proxy (at form load)",
+                         "type": "text", "disabled": True, "default": "Not configured"},
+                        {"name": "TELEGRAM_PROXY", "label": "Telegram proxy", "type": "password",
+                         "placeholder": "scheme://[user:password@]host:port",
+                         "help": "Optional HTTP, HTTPS, SOCKS5 or SOCKS5h proxy for Telegram only. "
+                                 "Leave empty to keep the saved proxy. Disable and re-enable the skill after changing it."},
+                        {"name": "clear_telegram_proxy", "label": "Clear saved Telegram proxy", "type": "checkbox",
+                         "help": "Remove the proxy instead of replacing it."},
                         {"name": "TELEGRAM_LANGUAGE", "label": "Language / Язык", "type": "select",
                          "options": [
                              {"value": "en", "label": "🇬🇧 English"},

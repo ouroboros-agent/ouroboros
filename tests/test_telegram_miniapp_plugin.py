@@ -77,6 +77,9 @@ class FakeAPI:
 
 def test_register_writes_nonsecret_runtime_config_and_companion(tmp_path: Path) -> None:
     api = FakeAPI(tmp_path, port=9012)
+    (api.state_dir / "settings.json").write_text(json.dumps({
+        "TELEGRAM_CHAT_ID": "12345", "TELEGRAM_PROXY": "socks5://owner:proxy-secret@127.0.0.1:1080",
+    }))
     plugin.register(api)
     config_path = api.state_dir / plugin._CONFIG_NAME
     config = json.loads(config_path.read_text(encoding="utf-8"))

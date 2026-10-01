@@ -259,7 +259,7 @@ def test_settings_route_returns_bounded_conflict_for_busy_store(tmp_path: Path, 
     def busy(_state_dir, _payload):
         raise plugin.TelegramSettingsError("Telegram settings are busy.")
 
-    monkeypatch.setattr(plugin, "merge_settings", busy)
+    monkeypatch.setattr(sys.modules[plugin._make_settings_save.__module__], "merge_settings", busy)
     response = asyncio.run(
         plugin._make_settings_save(_RouteApi(tmp_path))(
             _RouteRequest({"TELEGRAM_LANGUAGE": "ru"})
@@ -319,3 +319,29 @@ def test_combined_status_has_only_bounded_bridge_and_mini_app_sections(tmp_path:
         "platform", "reason_code", "updated_at_epoch", "last_ready_at_epoch",
         "attempt", "next_retry_at_epoch", "security",
     }
+
+
+@pytest.mark.parametrize("host,marker", [("127.0.0.1", ""), ("127.0.0.1", "1"), ("203.0.113.7", "")])
+def test_proxy_form_is_masked_preserves_empty_and_explicitly_clears(tmp_path, host, marker):
+    plugin = _load_plugin()
+    handler = plugin._make_settings_save(_RouteApi(tmp_path))
+    proxy = "socks5h://owner:proxy-secret@127.0.0.1:1080"
+    def request(payload=None, method="POST"):
+        return asyncio.run(handler(_RouteRequest(payload, host=host, marker=marker, method=method)))
+    assert request({"TELEGRAM_PROXY": proxy}).status_code == 200
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
+    hydrated = request(method="GET")
+    assert b"TELEGRAM_PROXY" not in hydrated.body and b"proxy-secret" not in hydrated.body
+    assert request({"TELEGRAM_PROXY": "", "TELEGRAM_LANGUAGE": "ru"}).status_code == 200
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
+    assert load_settings(tmp_path)["TELEGRAM_LANGUAGE"] == "ru"
+    refused = request({"TELEGRAM_PROXY": "socks5://owner:proxy-secret@bad-host"})
+    assert refused.status_code == 400
+    failure = json.loads(refused.body)
+    assert failure["error"] == failure["message"]
+    assert "TELEGRAM_PROXY must be" in failure["error"]
+    assert b"proxy-secret" not in refused.body and b"bad-host" not in refused.body
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
+    assert request({"clear_telegram_proxy": True, "TELEGRAM_PROXY": ""}).status_code == 200
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == ""
+    assert "clear_telegram_proxy" not in load_settings(tmp_path)

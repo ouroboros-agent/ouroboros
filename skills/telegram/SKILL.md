@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.8
+version: 1.2.9
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -63,6 +63,11 @@ counts as your message. The card only moves forward — nothing reopens an answe
 An open question (no options) is the same whole card without buttons; it asks for
 a reply in your own words.
 
+Version 1.2.9 routes every Telegram API call through the optional skill-local
+`TELEGRAM_PROXY` setting, including polling, sends, downloads, notifications,
+and the companion's menu button lifecycle. The Settings form masks the proxy
+and never reads its stored credentials back into the browser.
+
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled
 by default after owner binding and can be turned off independently without
@@ -81,6 +86,21 @@ and send the bot a private message to bind the owner. No legacy Telegram skill
 state is copied or changed. Installations that use `telegram-bridge` or
 `telegram-miniapp-poc` must disable or remove those skills before enabling this
 one.
+
+If Telegram requires a proxy, open this skill's Telegram settings and enter
+`TELEGRAM_PROXY` as `scheme://[user:password@]host[:port]` (`socks5`, `socks5h`,
+`http` or `https`; SOCKS needs an explicit port). Leave the masked field empty
+to keep a saved value, or use **Clear saved Telegram proxy** to remove it.
+Disable and re-enable the skill after changing the proxy so its poller and
+companion also pick up the change. No additional Secrets grant is needed.
+
+The Bot API stays `https://api.telegram.org` with TLS through the proxy and no
+redirects. Proxy credentials follow the selected protocol: HTTP and SOCKS do
+not encrypt the connection to the proxy; HTTPS does. Invalid proxy settings
+produce an error naming the key without its value. With no skill proxy, the
+bridge retains its existing direct/ambient-proxy behavior and the companion's
+Telegram calls stay direct. This setting does not change the application proxy,
+Cloudflare tunnel, Mini App web traffic, or local host requests.
 
 The Mini App supports macOS arm64/x86_64, Linux arm64/x86_64, and Windows
 x86_64. Only the explicit unsupported OS/architecture case degrades

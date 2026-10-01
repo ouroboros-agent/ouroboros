@@ -32,7 +32,7 @@ dependencies = [
     # Runtime self-update and install paths execute ``sys.executable -m pip``.
     # uv-created source/tool environments do not seed pip unless it is declared.
     "pip",
-    "httpx",
+    "httpx[socks]>=0.28",  # SOCKS transport plus socks5h URL support (HTTPX 0.28+).
     # Native process command/tree observations for shared-daemon custody on Windows.
     "psutil>=7.2; sys_platform == 'win32'",
     # Runtime custom-tool calls are validated against the exact projected schema.

@@ -418,7 +418,7 @@ def test_plugin_honours_env_proxies_only_in_a_proxy_routed_server_process(
     assert plugin._HONOR_ENV_PROXIES is expected
 
     # The decision is only worth making if it is wired: an outbound handler must
-    # hand it to every TelegramClient it builds.
+    # hand it to every TelegramClient it builds, beside the (here ungranted) proxy.
     built: list[dict] = []
 
     class _Recorder:
@@ -433,4 +433,4 @@ def test_plugin_honours_env_proxies_only_in_a_proxy_routed_server_process(
     quiz = plugin._make_quiz(_Api(tmp_path))
     asyncio.run(quiz({"question": "q?", "options": [{"label": "a"}, {"label": "b"}]}))
 
-    assert built == [{"trust_env": expected}]
+    assert built == [{"trust_env": expected, "proxy": None}]
