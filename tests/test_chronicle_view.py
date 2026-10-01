@@ -140,8 +140,10 @@ def test_other_room_growth_cannot_demote_a_fitting_focused_conversation():
 
 
 def test_shared_closed_history_is_identical_across_foci_and_tail_growth():
+    import copy
     from ouroboros.context_fit import ContextFitProjection
-    from ouroboros.llm_messages import STABLE_PREFIX_BLOCKS_KEY, split_leading_system_prefix
+    from ouroboros.llm_claudexor import _request
+    from ouroboros.llm_messages import STABLE_PREFIX_BLOCKS_KEY
 
     a = record("closed-a", "Owner rejected deployment until review.", kind="legacy")
     b = record("closed-b", "Another room kept its separate objective.", room="2", kind="legacy")
@@ -149,18 +151,31 @@ def test_shared_closed_history_is_identical_across_foci_and_tail_growth():
     template = [{"type": "text", "text": "governance"}, {"type": "text", "text": "identity"},
                 {"type": "text", "text": "Health first" + CHRONICLE_MARKER}]
     outputs = []
-    for focus in ("1", "2"):
+    for focus, changed in (("1", False), ("2", False), ("1", True)):
+        if changed:
+            a["text"] = "Owner rejected deployment; the later review remains open."
         snapshot = {"focus": focus, "rooms": rooms, "open_focus": [{"chat_id": int(focus), "text": "new " + focus}]}
         rendered = render_system_view(template, json.dumps(snapshot), mode="max", window_tokens=100000,
             calibration_ratio=1, output_reserve_tokens=1000, task={})
         projection = ContextFitProjection("max", json.dumps(rendered), 0, 0, 1, True)
         message = projection.system_message()
         assert message[STABLE_PREFIX_BLOCKS_KEY] == 2 and len(message["content"]) == 4
-        outputs.append(split_leading_system_prefix([message, {"role": "user", "content": "task " + focus}])[0])
-    assert outputs[0][0] == outputs[1][0]
-    assert outputs[0][1] != outputs[1][1]
-    assert "Owner rejected deployment" in str(outputs[0][0])
-    assert "new 1" in str(outputs[0][1]) and "new 2" in str(outputs[1][1])
+        messages = [message, {"role": "user", "content": "task " + focus}]
+        original = copy.deepcopy(messages)
+        wire = _request({"source": "codex", "resolved_model": "gpt-6-astra"}, messages, [],
+                        {"model_role": "main", "model_account_override": ""})["messages"]
+        assert messages == original
+        assert [item["role"] for item in wire[:2]] == ["system", "system"]
+        assert [item["content"][0]["text"] for item in wire[:2]] == [
+            block["text"] for block in message["content"][:2]]
+        outputs.append(wire)
+    assert outputs[0][:2] == outputs[1][:2], "focus must not change either shared system item"
+    assert outputs[0][2] != outputs[1][2]
+    assert outputs[0][0] == outputs[2][0], "changed memory leaves the whole governance item reusable"
+    assert outputs[0][1] != outputs[2][1]
+    assert "Owner rejected deployment" in str(outputs[0][1])
+    assert "later review remains open" in str(outputs[2][1])
+    assert "new 1" in str(outputs[0][2]) and "new 2" in str(outputs[1][2])
     empty = ContextFitProjection("max", json.dumps(template), 0, 0, 1, True).system_message()
     assert empty[STABLE_PREFIX_BLOCKS_KEY] == 1
 
