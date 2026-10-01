@@ -872,3 +872,84 @@ def test_fit_receipts_do_not_credit_uncaptured_append_or_budget_zero_stop(tmp_pa
     assert store.get("digest-fit:zero-stop")["target_fits"] is False
     assert [r["target_id"] for r in store.records(kinds=["maintenance"])
             if r["id"].startswith("digest-fulfilled:")] == [first["id"]]
+
+
+@pytest.mark.parametrize("ordinary", [False, True])
+def test_raw_room_publication_unit_preserves_interleaved_frontier_and_no_rebuy(tmp_path, monkeypatch, ordinary):
+    raw = [{"chat_id": room, "direction": "in", "ts": "2026-09-30T01:00:00Z", "text": text}
+           for room, text in [(2, "First A"), (3, "B"), (2, "Later A"), (4, "C")]]
+    store, ctx, chat, blocks, meta = setup(tmp_path, raw)
+    original = chat.read_bytes(), blocks.read_bytes(), meta.read_bytes()
+    helper = Helper()
+    monkeypatch.setattr(c, "_light_call", lambda *_a: helper)
+    demand = {"ordinary_maintenance": ordinary}
+    expected_rooms = ["2", "3", "4"]
+    for step, frontier in enumerate(([1, 3, 4] if ordinary else [4]), 1):
+        usage = consolidate_closed(chat, blocks, meta, None, knowledge_context=ctx,
+            compact_chronicle=True, pressure_fits=lambda: True, fitting_demand=demand)
+        count = step if ordinary else 3
+        assert [r["room_id"] for r in store.records(kinds=["episode"])] == expected_rooms[:count]
+        assert len(store.records(kinds=["revision"])) == count
+        assert store.scan_state()["last_consolidated_offset"] == frontier
+        assert usage["_blocks_written"] == (1 if ordinary else 3)
+        assert [call[1] for call in helper.calls] == ["Room episode", "Episode correction"] * count
+    first = store.records(kinds=["episode"])[0]
+    assert first["metadata"]["source_row_ids"] == [source_row_id(raw[0]), source_row_id(raw[2])]
+    assert (chat.read_bytes(), blocks.read_bytes(), meta.read_bytes()) == original
+    prior_calls = len(helper.calls)
+    consolidate_closed(chat, blocks, meta, None, knowledge_context=ctx,
+        compact_chronicle=True, pressure_fits=lambda: True, fitting_demand=demand)
+    assert len(helper.calls) == prior_calls
+
+
+def test_ordinary_raw_unit_keeps_own_correction_and_independent_pressure_progress(tmp_path, monkeypatch):
+    raw = [{"chat_id": n, "direction": "in", "ts": "2026-09-30T01:00:00Z", "text": f"Completed room {n}"}
+           for n in (2, 3)]
+    store, ctx, chat, blocks, meta = setup(tmp_path, raw)
+    # Immediate mind-authored checking is separate from importing old raw rooms.
+    ref = c.retain_memory_source(ctx, "own-source", json.dumps([{"text": "I learned this."}]).encode(), "json")
+    own = store.append_episode("own", "My interpretation.", [ref], {"kind": "mind"})
+    for n in (1, 2):
+        store.append_episode(f"old-{n}", "Older meaningful causal account. " * 1000, [], {"kind": "legacy"}, kind="legacy")
+    helper = Helper()
+    monkeypatch.setattr(c, "_light_call", lambda *_a: helper)
+    monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
+    demand = {"ordinary_maintenance": True, "purpose": "working_headroom"}
+    for step in (1, 2):
+        if step == 2:
+            with chat.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"chat_id": 4, "task_id": "memory-writer", "direction": "in",
+                                         "ts": "2026-09-30T02:00:00Z", "text": "New completed experience."}) + "\n")
+        before = len(helper.calls)
+        consolidate_closed(chat, blocks, meta, None, knowledge_context=ctx,
+            compact_chronicle=True, pressure_fits=lambda: False, fitting_demand=demand)
+        labels = [call[1] for call in helper.calls[before:]]
+        assert labels == (["Episode correction"] if step == 1 else []) + ["Room episode", "Episode correction", "Room digest"]
+        assert len(store.records(kinds=["digest"])) == step
+    assert store.room_records("own")[0]["correction"]["target_id"] == own["id"]
+    assert {r["room_id"] for r in store.records(kinds=["digest"])} == {"old-1", "old-2"}
+    assert {r["room_id"] for r in store.records(kinds=["episode"])} == {"own", "2", "3"}
+
+
+def test_ordinary_raw_correction_budget_failure_keeps_publication_without_rebuy(tmp_path, monkeypatch):
+    raw = [{"chat_id": n, "direction": "in", "ts": "2026-09-30T01:00:00Z", "text": f"Completed room {n}"}
+           for n in (2, 3)]
+    store, ctx, chat, blocks, meta = setup(tmp_path, raw)
+    helper = Helper()
+    helper.correction_error = "budget_exhausted"
+    monkeypatch.setattr(c, "_light_call", lambda *_a: helper)
+    demand = {"ordinary_maintenance": True}
+    result = consolidate_closed(chat, blocks, meta, None, knowledge_context=ctx,
+        compact_chronicle=True, pressure_fits=lambda: False, fitting_demand=demand)
+    first = store.records(kinds=["episode"])[0]
+    assert result["_consolidation_errors"][-1]["kind"] == "budget_exhausted"
+    assert store.scan_state()["last_consolidated_offset"] == 1
+    assert len(store.records(kinds=["episode"])) == 1 and not store.records(kinds=["revision"])
+    helper.correction_error = None
+    before = len(helper.calls)
+    consolidate_closed(chat, blocks, meta, None, knowledge_context=ctx,
+        compact_chronicle=True, pressure_fits=lambda: True, fitting_demand=demand)
+    assert [call[1] for call in helper.calls[before:]] == ["Episode correction", "Room episode", "Episode correction"]
+    assert store.records(kinds=["episode"])[0]["id"] == first["id"]
+    assert len(store.records(kinds=["episode"])) == len(store.records(kinds=["revision"])) == 2
+    assert store.scan_state()["last_consolidated_offset"] == 2

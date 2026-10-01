@@ -518,7 +518,11 @@ def consolidate_chronicle(store: Any, source_path: Any, llm: Any, identity_text:
                 coverage.update(status="accepted", output_chars=len(text.strip()), record_id=episode["id"])
                 usage = _correct_chronicle_episode(store, episode, exact.decode("utf-8"), call, context, identity_text)
                 usages.append(usage)
-                if any(e.get("kind") == "budget_exhausted" for e in usage.get("_consolidation_errors", [])):
+                # Yield this ordinary source-publication unit only after its
+                # correction attempt; advance the frontier and keep the separate
+                # pressure stage eligible so new raw work cannot starve it.
+                if ((fitting_demand or {}).get("ordinary_maintenance") or
+                        any(e.get("kind") == "budget_exhausted" for e in usage.get("_consolidation_errors", []))):
                     break
             position = offset
             for row in entries:
