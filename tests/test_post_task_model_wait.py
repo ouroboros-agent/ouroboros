@@ -920,13 +920,14 @@ def test_retained_source_recovery_is_not_an_unresolved_consolidation_failure(pha
     The retired fixed-block writer split the same source inside one call. The
     active writer retains the refusal bound and reads the complete source on its
     next maintenance pass. Through the real post-task adapter, that recovered
-    history is not an unresolved error; an independently lost room still degrades
-    the phase and budget exhaustion still stops every later paid stage.
+    history is not an unresolved error. Ordinary upkeep yields after that room;
+    a following completed task processes the next room, whose real failure still
+    degrades its phase or stops every later paid stage on budget exhaustion.
     """
     import json
     from ouroboros import consolidator, context_fit, llm_observability, post_task_synthesis, chronicle_view
     from ouroboros.capability_evidence import CapabilityEvidence
-    from ouroboros.chronicle_store import ChronicleStore
+    from ouroboros.chronicle_store import ChronicleStore, source_row_id
     from ouroboros.memory import Memory
     from ouroboros.tools.registry import ToolContext
     from ouroboros.usage_accounting import BudgetExceeded
@@ -974,20 +975,61 @@ def test_retained_source_recovery_is_not_an_unresolved_consolidation_failure(pha
     chronicle = ChronicleStore(f.root)
     assert not chronicle.records(kinds=["episode"])
     assert chronicle.records(kinds=["input_refusal"])
+    second_row = {"ts": "2026-01-01T00:03:00Z", "direction": "in", "task_id": f.task["id"],
+                  "text": "SECOND_ROOM_EVENT", "chat_id": 22}
     with chat.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({"ts": "2026-01-01T00:03:00Z", "direction": "in", "task_id": f.task["id"],
-                                "text": "SECOND_ROOM_EVENT", "chat_id": 22}) + "\n")
+        stream.write(json.dumps(second_row) + "\n")
+        # Both rooms belong to a truly completed task, so the second was
+        # eligible in the first pass and remains closed for the next task's pass.
+        stream.write(json.dumps({"ts": "2026-01-01T00:04:00Z", "direction": "system", "chat_id": 22,
+            "task_id": f.task["id"], "type": "task_summary", "summary_kind": "terminal_root_projection",
+            "outcome_authority": "canonical_task_result_after_finalization", "outcome_final": True,
+            "outcome_phase": "done", "status": "completed", "text": "Already answered"}) + "\n")
     recovering = True
     launch(f)
     assert f.done.wait(10)
     assert actor.received and json.dumps(first_rows, ensure_ascii=False, sort_keys=True) in actor.received[0]
+    until(lambda: not post_task_model_waits(f.root))
+    first_task_id = f.task["id"]
+    first_checkpoint = load_task_result(f.root, first_task_id)["root_phase_checkpoint"]
+    assert first_checkpoint["post_task_synthesis"] == "completed"
+    assert not first_checkpoint.get("post_task_stop_reason")
+    assert f.stages == ["facts", "scratch", "reflection", "backlog"]
+    [first_episode] = chronicle.records(kinds=["episode"])
+    assert first_episode["room_id"] == "1"
+    assert chronicle.scan_state()["last_consolidated_offset"] == 2
+    assert "last_consolidation_error" not in chronicle.scan_state()
+    first_events = [json.loads(line) for line in (f.root / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()]
+    [first_row] = [event for event in first_events if event.get("type") == "chat_block_consolidation"]
+    assert first_row["last_error_kind"] is None and first_row["blocks_written"] == 1
+
+    # A new completed owner supplies the next ordinary maintenance opportunity;
+    # do not replay a completed checkpoint or turn ordinary upkeep into a sweep.
+    f.task = {**f.task, "id": "post-owner-next", "root_task_id": "post-owner-next", "text": "Next answer"}
+    write_task_result(f.root, f.task["id"], "completed", result="Next answer",
+                      root_phase_checkpoint={"post_task_synthesis": "pending_once"})
+    f.done.clear()
+    f.stages.clear()
+    first_reads = len(actor.received)
+    launch(f)
+    assert f.done.wait(10)
+    until(lambda: not post_task_model_waits(f.root))
+    assert chronicle.records(kinds=["episode"])[0]["id"] == first_episode["id"]
+    assert all("FIRST_ROOM_EVENT" not in source for source in actor.received[first_reads:])
+    assert load_task_result(f.root, first_task_id)["root_phase_checkpoint"] == first_checkpoint
     checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
     meta = chronicle.scan_state()
     episodes = chronicle.records(kinds=["episode"])
     events = [json.loads(line) for line in (f.root / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()]
-    [row] = [event for event in events if event.get("type") == "chat_block_consolidation"]
-    assert len(episodes) == (2 if second_room == "recovered" else 1)
-    assert meta["last_consolidated_offset"] == (3 if second_room == "recovered" else 2)
+    [row] = [event for event in events if event.get("type") == "chat_block_consolidation"
+             and event.get("task_id") == f.task["id"]]
+    # The earlier completed post phase also wrote a separate host fact, which
+    # may be represented after an ordinary error. It cannot stand in for the
+    # failed room's source coverage or turn this checkpoint green.
+    assert len([episode for episode in episodes if episode["room_id"] == "22"]) == (1 if second_room == "recovered" else 0)
+    represented = {key for episode in episodes for key in episode["metadata"]["source_row_ids"]}
+    assert (source_row_id(second_row) in represented) == (second_room == "recovered")
+    assert meta["last_consolidated_offset"] == (4 if second_room == "recovered" else 2)
     assert chronicle.records(kinds=["input_refusal"]), "the old attempt receipt is not erased by recovery"
     # The stage classifier still understands explicitly resolved old attempts,
     # even though the new retained-source pass keeps them in its durable ledger.
