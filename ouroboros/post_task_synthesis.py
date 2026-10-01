@@ -635,13 +635,19 @@ def _run_chat_consolidation(env, memory, llm, task, drive_logs):
                 demand_facts.update(purpose="owner_mode", requirement_tokens=(
                     OWNER_NANO_TARGET_TOKENS if owner_mode == "nano" else OWNER_LOW_TARGET_TOKENS))
                 maintain_published = True
-            elif not demand_facts.get("legacy_transition"):
+            else:
                 demand_facts.update(purpose="working_headroom",
                                     requirement_tokens=demand_facts.get("window_tokens") or None)
                 maintain_published = True
-        # New closed sources and authored corrections remain ordinary post-work.
-        # An old biography missing a soft target is not a second paid sweep
-        # merely moved from before the answer to after it.
+        # Old and new representations share ordinary incremental maintenance.
+        # A useful publication returns with the remaining measured need; this
+        # is not an obligation to convert the whole biography in this task.
+        if demand_facts is not None:
+            demand_facts["ordinary_maintenance"] = True
+            from ouroboros.room_consolidation import record_maintenance_fit
+            if pressure_fits is not None:
+                pressure_fits()
+                record_maintenance_fit(store, demand_facts)
         if pending or (maintain_published and pressure_fits is not None and not pressure_fits()):
             _id, _ident, _llm, _logs = task.get("id"), memory.load_identity(), llm, drive_logs
             from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
@@ -675,7 +681,7 @@ def _run_chat_consolidation(env, memory, llm, task, drive_logs):
                                     "fitting_demand": demand_facts}
                                    if maintain_published and pressure_fits is not None else {}))
                 if pressure_fits is not None:
-                    pressure_fits()  # Refresh observations without commissioning old-memory work.
+                    pressure_fits()  # Retain the measured remaining need after this transaction.
             if u:
                 # A run that produced no block and a run that never happened look the
                 # same in this stream without a written count; last_error_kind names the

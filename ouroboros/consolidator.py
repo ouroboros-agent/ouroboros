@@ -167,7 +167,10 @@ def consolidate(
             log.info("Dialogue consolidation already running, skipping")
             _emit_event(chat_path.parent, "consolidation_skipped_locked", lock_path=str(lock_path),
                         task_id=str(getattr(knowledge_context, "task_id", "") or ""))
-            return None
+            return ({"_consolidation_errors": [{"kind": "temporarily_unavailable",
+                "reason": "consolidation_lock_held",
+                "message": "Source preparation is busy, not proved irreducible."}],
+                "_blocks_written": 0} if represented_only else None)
 
         from ouroboros.chronicle_store import ChronicleStore
         store = ChronicleStore(meta_path.parent.parent)

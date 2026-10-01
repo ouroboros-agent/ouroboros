@@ -42,16 +42,20 @@ def _memory_recovery_held(usage: dict) -> bool:
 class _DeferredMemoryRefusal:
     call: _RoundModelCallContext
     capture: Any
+    refused_digest_ids: tuple | None = None
+    refused_memory_bytes: int | None = None
 
 
-def _defer_memory_refusal(ctx: _RoundModelCallContext, capture: Any) -> None:
+def _defer_memory_refusal(ctx: _RoundModelCallContext, capture: Any, *,
+                          refused_digest_ids=None, refused_memory_bytes=None) -> None:
     """Keep the acting route's paid need while configured alternatives are tried."""
     if (getattr(ctx.tools._ctx, "_deferred_memory_refusal", None) is not None
-            or not _may_repair_main_memory(ctx) or _memory_recovery_held(ctx.accumulated_usage)
+            or not (_may_repair_main_memory(ctx) or ctx.active_context_mode == "max")
+            or _memory_recovery_held(ctx.accumulated_usage)
             or not _model_calls()._failed_capture_is_comparable(capture)):
         return
     ctx.tools._ctx._deferred_memory_refusal = _DeferredMemoryRefusal(
-        replace(ctx, messages=copy.deepcopy(ctx.messages)), capture)
+        replace(ctx, messages=copy.deepcopy(ctx.messages)), capture, refused_digest_ids, refused_memory_bytes)
 
 
 def _main_frame_bytes(ctx: _RoundModelCallContext) -> int:
@@ -75,7 +79,25 @@ def _may_repair_main_memory(ctx: _RoundModelCallContext) -> bool:
             and not json.loads(plan.chronicle_state_json).get("is_child"))
 
 
-def _repair_refused_main_memory(ctx: _RoundModelCallContext, failed: Any) -> bool:
+def _fit_existing_refused_memory(ctx: _RoundModelCallContext) -> None:
+    """Use ready meaningful alternatives without changing books or buying work."""
+    if not getattr(ctx.context_fit_plan, "chronicle_state_json", ""):
+        return
+    plan = replace(ctx.context_fit_plan, context_task={
+        **ctx.context_fit_plan.context_task, "memory_refusal_recovery": True,
+        "refused_memory_bytes": ctx.context_fit_plan.projection(ctx.active_context_mode).memory_facts.get(
+            "rendered_memory_bytes")})
+    prepared = ctx.prepared_main_frame if ctx.prepared_main_frame is not None else ctx.messages
+    plan = plan.fit_prepared_memory(prepared, ctx.tool_schemas, ctx.active_context_mode,
+                                   reasoning_effort=ctx.active_effort)
+    ctx.context_fit_plan = ctx.tools._ctx.context_fit_plan = plan
+    ctx.messages[:] = plan.reproject_transcript(ctx.messages, ctx.active_context_mode)
+    ctx.tools._ctx.messages = ctx.messages
+    invalidate_task_cache_splits(ctx.task_id)
+
+
+def _repair_refused_main_memory(ctx: _RoundModelCallContext, failed: Any, *,
+                                refused_digest_ids=None, refused_memory_bytes=None) -> bool:
     """Buy only a useful source-bound reduction after the allowed routes refused."""
     import hashlib
     from ouroboros import consolidator
@@ -89,10 +111,16 @@ def _repair_refused_main_memory(ctx: _RoundModelCallContext, failed: Any) -> boo
         return False
     root = canonical_data_root(ctx.tools._ctx)
     before = _main_frame_bytes(ctx)
+    if refused_memory_bytes is None:
+        refused_memory_bytes = ctx.context_fit_plan.projection(ctx.active_context_mode).memory_facts.get("rendered_memory_bytes")
     captured_plan = replace(ctx.context_fit_plan,
-        context_task={**ctx.context_fit_plan.context_task, "memory_refusal_recovery": True})
+        context_task={**ctx.context_fit_plan.context_task, "memory_refusal_recovery": True,
+                      "refused_memory_bytes": refused_memory_bytes})
     source = captured_plan.chronicle_state_json
+    refused_facts = ctx.context_fit_plan.projection(ctx.active_context_mode).memory_facts
     demand = {"purpose": "actual_context_refusal", "rendered_mode": ctx.active_context_mode,
+              "refused_digest_ids": sorted(refused_digest_ids if refused_digest_ids is not None
+                                           else refused_facts.get("selected_digest_ids") or []),
               "route_fingerprint": captured_plan.route_fp,
               "failed_candidate_sha256": failed.candidate_raw_sha256,
               "failed_candidate_context_bytes": failed.candidate_context_size_bytes}
@@ -152,13 +180,24 @@ def _recover_deferred_memory_refusal(tools: Any) -> tuple:
     if pending is None:
         return None, None, 0.0
     ctx, failed = pending.call, pending.capture
+    refused_digest_ids = pending.refused_digest_ids
+    refused_memory_bytes = pending.refused_memory_bytes
     total_cost = 0.0
     while not _memory_recovery_held(ctx.accumulated_usage) and calls._failed_capture_is_comparable(failed):
         # A released fallback failure does not replace this route's definite
         # refusal. New helper/dispatch outcomes below remain authoritative.
         ctx.accumulated_usage["_last_llm_error_kind"] = "context_overflow"
-        if not _repair_refused_main_memory(ctx, failed):
+        repaired = _may_repair_main_memory(ctx) and _repair_refused_main_memory(
+            ctx, failed, refused_digest_ids=refused_digest_ids, refused_memory_bytes=refused_memory_bytes)
+        if _memory_recovery_held(ctx.accumulated_usage):
             break
+        if not repaired:
+            if ctx.active_context_mode != "max":
+                if calls._strict_context_shrink_predicate(pending.capture)(failed):
+                    return ctx, None, total_cost  # A repaired owner-Low view may fit another route.
+                break
+            # Only exhausted meaningful Max recovery releases resident books.
+            calls._reproject_actual_overflow_low(ctx)
         disposition = calls._measure_after_reclaim(ctx)
         if disposition is None:
             break
@@ -179,6 +218,9 @@ def _recover_deferred_memory_refusal(tools: Any) -> tuple:
         # is the actual smaller frame plus another source-bound view, never a
         # retry counter, fictional round, advertised capacity or unchanged send.
         failed = current
+        refused_digest_ids = refused_memory_bytes = None  # This plan produced the newly refused frame.
+        if not repaired:
+            return ctx, None, total_cost  # Configured routes can use this final reduced view.
     return None, None, total_cost
 
 
@@ -220,3 +262,23 @@ def _prepare_first_main_memory(ctx: _RoundModelCallContext, prepared: list):
     calls._remember_main_fit(ctx, disposition)
     ctx.prepared_main_frame = copy.deepcopy([*prepared, *clock])
     return prepared, calls._physical_context_for_fit(disposition)
+
+
+def _reproject_actual_overflow_low(ctx: _RoundModelCallContext) -> None:
+    if ctx.active_context_mode != "max" or ctx.context_fit_plan is None:
+        return
+    ctx.context_fit_plan = replace(ctx.context_fit_plan, rendered_mode="low")
+    ctx.messages[:] = ctx.context_fit_plan.reproject_transcript(ctx.messages, "low")
+    invalidate_task_cache_splits(ctx.task_id)
+    ctx.active_context_mode = "low"
+    ctx.tools._ctx.messages = ctx.messages
+    ctx.tools._ctx.active_context_mode = "low"
+    ctx.tools._ctx.context_fit_plan = ctx.context_fit_plan
+    _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "checkpoint_kind": "context_fit_low_retry",
+        "round": ctx.round_idx,
+        "route_fp": str(getattr(ctx.context_fit_plan, "route_fp", "") or ""),
+        "preferred_mode": str(getattr(ctx.context_fit_plan, "preferred_mode", "") or ""),
+        "effective_mode": "low",
+        "owner_visible": True,
+    })

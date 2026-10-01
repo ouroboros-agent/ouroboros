@@ -543,23 +543,110 @@ def consolidate_chronicle(store: Any, source_path: Any, llm: Any, identity_text:
 
 
 def _digest_requirement(demand: Optional[dict]) -> dict:
-    """Semantic purpose/boundary, never leftover space or a physical-attempt nonce."""
-    return {key: demand[key] for key in ("purpose", "requirement_tokens", "rendered_mode")
+    """Stable fitting boundary; purpose/mode labels remain observations, not paid needs."""
+    return {key: demand[key] for key in ("requirement_tokens",)
             if demand and demand.get(key) is not None}
 
 
-def _digest_attempt_satisfies(prior: dict, requirement: dict, guidance_sha: str) -> bool:
-    """A completed attempt covers equal/looser needs; untagged old work stays usable."""
+def _digest_requirement_attempted(prior: dict, requirement: dict, guidance_sha: str) -> bool:
+    """Deduplicate a tried requirement; an attempt is not proof of successful fit."""
     if prior.get("guidance_sha256", guidance_sha) != guidance_sha:
         return False
     previous = prior.get("requirement", _digest_requirement(prior.get("fitting_demand")))
-    if requirement.get("purpose") and previous.get("purpose") != requirement["purpose"]:
-        return False
-    if (requirement.get("rendered_mode") and previous.get("rendered_mode")
-            and previous["rendered_mode"] != requirement["rendered_mode"]):
-        return False
+    for witness in ("refused_digest_ids", "unmet_digest_ids"):
+        if requirement.get(witness) and previous.get(witness) != requirement[witness]:
+            return False
     before, now = previous.get("requirement_tokens"), requirement.get("requirement_tokens")
     return now is None or (before is not None and now >= before)
+
+
+def _digest_fulfilled_id(record_id, requirement, guidance_sha):
+    import hashlib
+    return "digest-fulfilled:" + hashlib.sha256(json.dumps(
+        [record_id, _digest_requirement(requirement), guidance_sha], sort_keys=True).encode()).hexdigest()
+
+
+def record_maintenance_fit(store, demand):
+    """Accept only observed target satisfaction, naming the actual captured digest revisions."""
+    from ouroboros.memory_guidance import remembering_guidance
+    import hashlib
+    if (not demand or not demand.get("ordinary_maintenance") or demand.get("target_miss") is not False
+            or demand.get("maintenance_target_reachable") is False or demand.get("memory_budget_tokens") == 0):
+        return
+    guidance_sha = hashlib.sha256(remembering_guidance(store.data_root).encode("utf-8")).hexdigest()
+    requirement, records = _digest_requirement(demand), []
+    for record_id in dict.fromkeys(demand.get("selected_digest_ids") or []):
+        key = _digest_fulfilled_id(record_id, requirement, guidance_sha)
+        source = store.get(record_id)
+        if source and store.get(key) is None:
+            records.append({"id": key, "kind": "maintenance", "room_id": source["room_id"],
+                "target_id": record_id, "target_fits": True, "requirement": requirement,
+                "guidance_sha256": guidance_sha})
+    if records:
+        store.publish(records)  # One immutable transaction; no scan-state read/modify/write race.
+
+
+def _unfulfilled_digest(store, parent, requirement, guidance_sha):
+    record_id = (parent.get("correction") or parent)["id"]
+    if (not requirement or record_id != parent["id"]
+            or store.get(_digest_fulfilled_id(record_id, requirement, guidance_sha)) is not None):
+        return False
+    suffix = parent["id"].removeprefix("digest:")
+    attempt = store.get("digest-attempt:" + suffix) or {}
+    outcome = store.get("digest-fit:" + suffix) or {}
+    return (outcome.get("published_progress") is True and outcome.get("target_fits") is False
+            and attempt.get("guidance_sha256") == guidance_sha
+            and _digest_requirement(attempt.get("requirement")) == requirement)
+
+
+def _record_digest_fit(store, fingerprint, room_id, progress, observed, demand):
+    """Keep publication, measured fit and still-unknown provider acceptance separate."""
+    # Recovery's callback proves useful shrink, not a successful Main send.
+    facts = demand or {}
+    target_fits = not facts["target_miss"] if "target_miss" in facts else observed
+    if facts.get("memory_budget_tokens") == 0 or facts.get("maintenance_target_reachable") is False:
+        target_fits = False  # The callback may stop futile work without satisfying its target.
+    outcome = {"published_progress": progress,
+        "target_fits": target_fits if facts.get("purpose") != "actual_context_refusal" else None,
+        "remaining_demand": dict(facts)}
+    store.publish([{"id": "digest-fit:" + fingerprint, "kind": "maintenance", "room_id": room_id,
+                   "target_id": "digest-attempt:" + fingerprint, **outcome}])
+    if demand is not None:
+        demand.update(published_progress=progress, target_fits=outcome["target_fits"])
+    record_maintenance_fit(store, demand)
+
+
+def _digest_source_groups(store, records, requirement, guidance_sha, refused, ordinary=False):
+    """Whole stable peers and fixed children of an eligible existing interpretation."""
+    from itertools import groupby
+    from ouroboros.chronicle_view import _cuts
+
+    # Recover heights/order for older digests too. Parents were published
+    # after children; current revision ids alias the same immutable node.
+    topology = {}
+    for record in records:
+        children = (record.get("metadata") or {}).get("covers_record_ids", [])
+        child_nodes = [topology[cid] for cid in children if cid in topology]
+        node = (1 + max((n[0] for n in child_nodes), default=0),
+                min((n[1] for n in child_nodes), default=record["sequence"])) if record["kind"] == "digest" else (0, record["sequence"])
+        topology[record["id"]] = topology[(record.get("correction") or record)["id"]] = node
+    frontier = sorted(_cuts(records)[-1], key=lambda r: topology[r["id"]][1])
+    unmet = {r["id"] for r in frontier if ordinary and r["kind"] == "digest"
+             and _unfulfilled_digest(store, r, requirement, guidance_sha)}
+    groups = [list(group) for _height, group in groupby(frontier, key=lambda r: topology[r["id"]][0])]
+    groups = [group for group in groups if len(group) > 1 or group[0]["kind"] != "digest"]
+    groups.sort(key=lambda group: topology[group[0]["id"]][0])
+    # A changed requirement or guidance can need an alternative.
+    # Read fixed children, never the parent's own previous wording.
+    current = {(r.get("correction") or r)["id"]: r for r in records}
+    for parent in frontier:
+        children = (parent.get("metadata") or {}).get("covers_record_ids", [])
+        if parent["kind"] == "digest" and children and all(cid in current for cid in children):
+            published = store.get(parent["id"].replace("digest:", "digest-attempt:", 1)) or {}
+            if ((parent.get("correction") or parent)["id"] in refused | unmet
+                    or not _digest_requirement_attempted(published, requirement, guidance_sha)):
+                groups.append([current[cid] for cid in children])
+    return groups, unmet
 
 
 def compact_chronicle_rooms(store: Any, call: LightCall, context: Any,
@@ -574,9 +661,7 @@ def compact_chronicle_rooms(store: Any, call: LightCall, context: Any,
     Leftover memory allowance, account and request identity are observations.
     """
     import hashlib
-    from itertools import groupby
     from ouroboros import consolidator as c
-    from ouroboros.chronicle_view import _cuts
     from ouroboros.chronicle_store import source_time_span
     from ouroboros.memory_guidance import remembering_guidance
     from ouroboros.utils import estimate_tokens
@@ -587,50 +672,47 @@ def compact_chronicle_rooms(store: Any, call: LightCall, context: Any,
     usages = []  # Held custody is resident memory, not a new interruption.
     attempted = set()
     demand = dict(fitting_demand or {})
-    requirement = _digest_requirement(demand)
+    base_requirement = _digest_requirement(demand)
+    fits()  # Refresh the captured representation before recording any positive observation.
+    record_maintenance_fit(store, fitting_demand)
+    refused = set(demand.get("refused_digest_ids") or []) if demand.get("purpose") == "actual_context_refusal" else set()
     room_sizes = [(sum(len(r["current_text"]) for r in store.room_cover(room)), room)
                   for room in store.room_ids()]
     for _size, room_id in sorted(room_sizes, reverse=True):
         while not fits():
             guidance_sha = hashlib.sha256(remembering_guidance(store.data_root).encode("utf-8")).hexdigest()
             records = store.room_records(room_id)
-            # Recover heights/order for older digests too. Parents were published
-            # after children; current revision ids alias the same immutable node.
-            topology = {}
-            for record in records:
-                children = (record.get("metadata") or {}).get("covers_record_ids", [])
-                child_nodes = [topology[cid] for cid in children if cid in topology]
-                node = (1 + max((n[0] for n in child_nodes), default=0),
-                        min((n[1] for n in child_nodes), default=record["sequence"])) if record["kind"] == "digest" else (0, record["sequence"])
-                topology[record["id"]] = topology[(record.get("correction") or record)["id"]] = node
-            frontier = sorted(_cuts(records)[-1], key=lambda r: topology[r["id"]][1])
-            groups = [list(group) for _height, group in groupby(frontier, key=lambda r: topology[r["id"]][0])]
-            groups = [group for group in groups if len(group) > 1 or group[0]["kind"] != "digest"]
-            groups.sort(key=lambda group: topology[group[0]["id"]][0])
-            # A changed requirement or guidance can need an alternative.
-            # Read fixed children, never the parent's own previous wording.
-            current = {(r.get("correction") or r)["id"]: r for r in records}
-            for parent in frontier:
-                children = (parent.get("metadata") or {}).get("covers_record_ids", [])
-                if parent["kind"] == "digest" and children and all(cid in current for cid in children):
-                    published = store.get(parent["id"].replace("digest:", "digest-attempt:", 1)) or {}
-                    if not _digest_attempt_satisfies(published, requirement, guidance_sha):
-                        groups.append([current[cid] for cid in children])
+            groups, unmet = _digest_source_groups(store, records, base_requirement, guidance_sha, refused,
+                                                   ordinary=bool(demand.get("ordinary_maintenance")))
             sources = []
             attempts = store.records(room_id, kinds=["maintenance"])
-            for group in groups:
+            while groups:
+                group = groups.pop(0)
                 if len(group) == 1 and group[0]["kind"] == "digest":
                     continue
                 source_keys = [[r["id"], (r.get("correction") or {}).get("id", r["id"])] for r in group]
+                alternatives = [r for r in records if r["kind"] == "digest"
+                    and (r.get("metadata") or {}).get("source_revisions") == source_keys]
+                rejected = sorted((r.get("correction") or r)["id"] for r in alternatives
+                                  if (r.get("correction") or r)["id"] in refused)
+                unfinished = sorted(r["id"] for r in alternatives if r["id"] in unmet)
+                requirement = {**base_requirement, **({"refused_digest_ids": rejected} if rejected else {}),
+                               **({"unmet_digest_ids": unfinished} if unfinished else {})}
                 if any(tuple(key) in held for key in source_keys):
                     # Keep this unresolved operation and its sources visible;
                     # it cannot freeze unrelated rooms or buy overlapping work.
                     continue
                 fingerprint = hashlib.sha256(json.dumps([source_keys, guidance_sha, requirement],
                     sort_keys=True).encode()).hexdigest()
-                already_tried = any(prior.get("source_keys") == source_keys
-                    and _digest_attempt_satisfies(prior, requirement, guidance_sha) for prior in attempts)
-                if not already_tried and fingerprint not in attempted and store.get("digest-attempt:" + fingerprint) is None:
+                matching = [prior for prior in attempts if prior.get("source_keys") == source_keys
+                            and _digest_requirement_attempted(prior, requirement, guidance_sha)]
+                if len(group) > 1 and any(prior.get("status") == "output_truncated" for prior in matching):
+                    # A known terminal output failure justifies smaller existing
+                    # source units; unknown physical custody never enters here.
+                    middle = len(group) // 2
+                    groups[:0] = [group[:middle], group[middle:]]
+                    continue
+                if not matching and fingerprint not in attempted and store.get("digest-attempt:" + fingerprint) is None:
                     attempted.add(fingerprint)
                     sources = group
                     break
@@ -658,7 +740,10 @@ def compact_chronicle_rooms(store: Any, call: LightCall, context: Any,
                     if isinstance(ref, dict):
                         for key in locator_fields:
                             ref.pop(key, None)
-            observations = {**dict(fitting_demand or {}), "token_estimate_basis": "chars_div_4",
+            previous_chars = min([len(r["current_text"]) for r in alternatives]
+                                 + [sum(len(r["current_text"]) for r in sources)])
+            observations = {**dict(fitting_demand or {}), "previous_representation_chars": previous_chars,
+                "token_estimate_basis": "chars_div_4",
                 "source_text_chars": sum(len(row["text"]) for row in source_rows),
                 "source_text_estimated_tokens": estimate_tokens("".join(row["text"] for row in source_rows)),
                 "source_contribution_basis": "Complete source bodies only; excludes record and locator overhead."}
@@ -682,7 +767,10 @@ def compact_chronicle_rooms(store: Any, call: LightCall, context: Any,
                     "protocol of superseded steps into their outcome and lesson; exact intermediate identifiers and "
                     "test counters remain in the addressed children when unnecessary for this understanding. "
                     "Do not turn unsettled work into completion or replace its meaning with an address. "
-                    "The model chooses the level of detail; no per-room word quota or fixed compression ratio is imposed."
+                    "The model chooses the level of detail; no per-room word quota or fixed compression ratio is imposed. "
+                    "When a published account was actually refused, choose a materially coarser useful account from "
+                    "these original sources. An alternative must improve on the previous representation size, "
+                    "not merely on the larger original sources; do not paraphrase the prior account."
                     + "\nMeasured whole-memory fitting demand (shared with other rooms; estimates, not a word quota): " + json.dumps(observations)
                     + "\nAll source text and authors follow. Host index arrays in metadata " + json.dumps(index_fields)
                     + " are shown as retained item counts. Locator fields " + json.dumps(locator_fields)
@@ -694,12 +782,20 @@ def compact_chronicle_rooms(store: Any, call: LightCall, context: Any,
                 "Room digest", fixed_prompt=prompt(""), call_type="era_compression",
                 memory_operation={"kind": "digest", "room_id": room_id, "source_revisions": source_keys})
             usages.append(usage)
-            if usage.get("_consolidation_errors"):
-                return usages
             applied_guidance = usage.get("_remembering_guidance_sha256") or guidance_sha
             fingerprint = hashlib.sha256(json.dumps([source_keys, applied_guidance, requirement],
                 sort_keys=True).encode()).hexdigest()
-            shorter = bool(text.strip()) and len(text) < sum(len(r["current_text"]) for r in sources)
+            if errors := usage.get("_consolidation_errors"):
+                if all(error.get("kind") == "output_truncated" for error in errors):
+                    store.publish([{"id": "digest-attempt:" + fingerprint, "kind": "maintenance", "room_id": room_id,
+                        "status": "output_truncated", "source_keys": source_keys, "source_ref": source_ref,
+                        "requirement": requirement, "guidance_sha256": applied_guidance, "fitting_demand": demand}])
+                    if demand.get("purpose") == "actual_context_refusal" and len(sources) > 1:
+                        # Finish available source-part preparation before book fallback;
+                        # only the caller's complete-frame measurement proves progress.
+                        continue
+                return usages
+            shorter = bool(text.strip()) and len(text.strip()) < previous_chars
             coverage = {"unit": "era", "representation": "digest",
                 "status": "accepted" if shorter else "not_shorter", "blocks": len(sources),
                 "messages": sum(r.get("metadata", {}).get("message_count", 0) for r in sources),
@@ -729,4 +825,11 @@ def compact_chronicle_rooms(store: Any, call: LightCall, context: Any,
                         "source_revisions": source_keys}})
                 coverage["record_id"] = records[-1]["id"]
             store.publish(records)
+            _record_digest_fit(store, fingerprint, room_id, shorter, bool(fits()), fitting_demand)
+            if shorter and demand.get("ordinary_maintenance"):
+                # A complete source-cover publication is the incremental unit,
+                # even when its transport needed several physical source reads.
+                # Return the still-measured need to the ordinary rail, rather
+                # than making this task finish a whole-corpus conversion.
+                return usages
     return usages

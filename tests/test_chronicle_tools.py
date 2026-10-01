@@ -127,7 +127,8 @@ def test_readonly_registry_exposes_read_and_denies_actual_memory_writes(tmp_path
 
 
 @pytest.mark.parametrize("source_format", ["list", "chunks", "locators"])
-def test_retained_source_formats_page_exact_rows_and_credit_only_that_page(tmp_path, monkeypatch, source_format):
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_retained_source_formats_page_exact_rows_and_credit_only_that_page(tmp_path, monkeypatch, source_format, newline):
     from ouroboros.chronicle_sources import capture_room, retain_room_source
     from ouroboros.consolidator import retain_memory_source
     from ouroboros.memory import Memory
@@ -138,7 +139,8 @@ def test_retained_source_formats_page_exact_rows_and_credit_only_that_page(tmp_p
             {"chat_id": 7, "text": "second original words", "task_id": "second"}]
     chat = tmp_path / "logs/chat.jsonl"
     chat.parent.mkdir()
-    chat.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    source_lines = [(json.dumps(row) + newline).encode("utf-8") for row in rows]
+    chat.write_bytes(b"".join(source_lines))
     if source_format == "list":
         ref = retain_memory_source(SimpleNamespace(drive_root=tmp_path, task_id=ctx.task_id),
                                   "episode", json.dumps(rows).encode("utf-8"), "json")
@@ -168,7 +170,8 @@ def test_retained_source_formats_page_exact_rows_and_credit_only_that_page(tmp_p
     assert page["source_ref"] != ref
     assert "first original words" not in json.dumps(page) and "later uncaptured words" not in json.dumps(page)
     if source_format == "locators":
-        assert sum(read_sizes) == len((json.dumps(rows[1]) + "\n").encode("utf-8"))
+        # Locators address physical bytes, including the stored line ending.
+        assert sum(read_sizes) == len(source_lines[1])
     full = json.loads(_memory_read(ctx, source_ref=ref))
     assert full["rows"] == rows and full["page_complete"] and full["range_complete"]
     assert page["parent_source_ref"] == ref
@@ -213,3 +216,97 @@ def test_locator_source_gaps_do_not_claim_complete_or_unread_source_credit(tmp_p
     assert episode["metadata"]["source_coverage"]["complete"] is False
     reread = json.loads(_memory_read(ctx, source_ref=page["source_ref"]))
     assert reread["rows"] == page["rows"] and not reread["range_complete"]
+
+
+def test_mind_interim_covers_hundreds_of_unfinished_foreign_rooms_through_registry(tmp_path):
+    from ouroboros.chronicle_view import capture_chronicle, render_memory
+    from ouroboros.memory import Memory
+    from ouroboros.projects_registry import create_project
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    store = ChronicleStore(tmp_path)
+    store.import_legacy()
+    rooms = [create_project(tmp_path, f"unfinished-{n}", name=f"Unfinished project {n}") for n in range(200)]
+    rows = [{"chat_id": room["chat_id"], "task_id": f"unfinished-task-{n}", "direction": "in",
+             "status": "waiting_owner", "ts": "2000-01-01T00:00:00Z",
+             "text": f"Question {n} is still unanswered. " + "Original reasoning and alternatives. " * 100}
+            for n, room in enumerate(rooms)]
+    chat = tmp_path / "logs/chat.jsonl"
+    chat.parent.mkdir(exist_ok=True)
+    original = "".join(json.dumps(row) + "\n" for row in rows).encode("utf-8")
+    chat.write_bytes(original)
+    state = tmp_path / "state/queue_snapshot.json"
+    state.parent.mkdir(exist_ok=True)
+    statuses = json.dumps({row["task_id"]: "waiting_owner" for row in rows}).encode("utf-8")
+    state.write_bytes(statuses)
+    memory = Memory(tmp_path)
+    before = json.loads(capture_chronicle(memory, {"id": "before", "chat_id": 1}))
+    assert sum(len(room["rows"]) for room in before["other_open_rooms"]) == 200
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, current_chat_id=1, task_id="remember"))
+    assert registry.get_schema_by_name("chronicle_write") is not None
+    for n, room in enumerate(rooms):
+        page = json.loads(registry.execute("memory_read", {"room_id": str(room["chat_id"]), "raw_room": True}))
+        assert page["rows"] == [rows[n]]
+        episode = json.loads(registry.execute("chronicle_write", {
+            "room_id": str(room["chat_id"]), "source_ref": page["source_ref"],
+            "text": f"Project {n}: I compared alternatives; the owner has not chosen. Work remains unfinished."}))
+        assert episode["author"]["kind"] == "mind"
+        assert episode["metadata"]["source_row_ids"] == [source_row_id(rows[n])]
+    after = json.loads(capture_chronicle(memory, {"id": "after", "chat_id": 1}))
+    compact, _ = render_memory(after, 0, shared_out={})
+    assert after["other_open_rooms"] == []
+    for n in range(200):
+        assert f"Project {n}: I compared alternatives; the owner has not chosen." in compact
+        assert rows[n]["text"] not in compact
+    assert len(compact) < len(render_memory(before)[0]) / 4
+    assert chat.read_bytes() == original and state.read_bytes() == statuses
+    assert len(store.records(kinds=["episode"])) == 200
+    assert not store.records(kinds=["digest", "revision"])
+
+
+@pytest.mark.parametrize("finished", [False, True], ids=["still-open", "cancelled"])
+def test_interim_coverage_keeps_current_open_arc_raw_without_reopening_cancelled_task(tmp_path, finished):
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.chronicle_view import capture_chronicle, refresh_chronicle_snapshot, render_memory
+    from ouroboros.memory import Memory
+    from ouroboros.projects_registry import create_project
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    store = ChronicleStore(tmp_path)
+    store.import_legacy()
+    room = create_project(tmp_path, "interim", name="Interim project")
+    chat_id = room["chat_id"]
+    original = {"chat_id": chat_id, "task_id": "interim-task", "direction": "in",
+                "status": "waiting_owner", "text": "Owner's exact still-unanswered question. " * 100}
+    rows = [original]
+    if finished:
+        rows.append({"chat_id": chat_id, "task_id": "interim-task", "direction": "system",
+                     "type": "task_summary", "summary_kind": "terminal_root_projection",
+                     "outcome_authority": "canonical_task_result_after_finalization", "outcome_final": True,
+                     "outcome_phase": "done", "status": "cancelled", "text": "Task was cancelled; no approval granted."})
+    chat = tmp_path / "logs/chat.jsonl"
+    chat.parent.mkdir(exist_ok=True)
+    source_bytes = "".join(json.dumps(row) + "\n" for row in rows).encode("utf-8")
+    chat.write_bytes(source_bytes)
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, current_chat_id=1, task_id="remember"))
+    page = json.loads(registry.execute("memory_read", {"room_id": str(chat_id), "raw_room": True}))
+    meaning = "I retain the cancellation; no approval was granted." if finished else "I have not received the owner's choice; the question remains open."
+    registry.execute("chronicle_write", {"room_id": str(chat_id), "source_ref": page["source_ref"], "text": meaning})
+    memory = Memory(tmp_path)
+    for source_budget in (None, 1):
+        captured = capture_chronicle(memory, {"id": "return", "chat_id": chat_id}, rendered_chars_budget=source_budget)
+        for snapshot in (json.loads(captured), json.loads(refresh_chronicle_snapshot(captured, tmp_path))):
+            text, facts = render_memory(snapshot, 0, shared_out={})
+            assert (original["text"] in text) is not finished
+            assert meaning in text and facts["target_miss"]
+            assert bool(snapshot["open_focus"]) is not finished
+            if source_budget == 1:
+                assert snapshot["raw_focus"] == []
+                retained = json.loads(read_actor_source_bytes(tmp_path, "return", snapshot["source_ref"]))
+                assert "row_locators" in retained and "source_chunks" not in retained
+    returned = json.loads(capture_chronicle(memory, {"id": "roomy-return", "chat_id": chat_id}))
+    assert original["text"] in render_memory(returned, None)[0]
+    assert json.loads(registry.execute("memory_read", {"source_ref": page["source_ref"]}))["rows"] == rows
+    assert chat.read_bytes() == source_bytes

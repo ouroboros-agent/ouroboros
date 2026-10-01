@@ -14,6 +14,29 @@ from tests import test_consolidator_context_fit as fit_helpers
 fit = fit_helpers.fit
 
 
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("represented_only", [False, True])
+def test_busy_memory_preparation_reports_availability_without_claiming_irreducibility(
+    tmp_path, monkeypatch, locked, represented_only,
+):
+    _store, ctx, chat, blocks, meta = setup(tmp_path)
+    if locked:
+        def busy(_fd):
+            raise BlockingIOError("another publication owns the lock")
+        monkeypatch.setattr(c, "_lock_nb", busy)
+    result = c.consolidate(chat, blocks, meta, None, knowledge_context=ctx,
+        represented_only=represented_only, compact_chronicle=True, pressure_fits=lambda: True)
+    if locked and not represented_only:
+        assert result is None  # Existing ordinary maintenance skip is unchanged.
+    else:
+        errors = result.get("_consolidation_errors", [])
+        assert bool(errors) is locked
+        if locked:
+            assert errors[0]["reason"] == "consolidation_lock_held"
+            assert errors[0]["kind"] == "temporarily_unavailable"
+            assert result["_blocks_written"] == 0
+
+
 def consolidate_closed(*args, **kwargs):
     """These fixtures explicitly model a completed post-task producer."""
     return c.consolidate(*args, completed_task={"id": "memory-writer"}, **kwargs)
@@ -336,19 +359,20 @@ def test_account_change_does_not_rebuy_a_completed_digest(tmp_path, monkeypatch)
 
 
 
-@pytest.mark.parametrize("change", ["guidance", "explicit_revision"])
-def test_changed_remembering_purpose_can_revise_fixed_sources_once(tmp_path, monkeypatch, change):
+@pytest.mark.parametrize("change", ["guidance", "tighter_boundary"])
+def test_changed_guidance_or_tighter_boundary_can_revise_fixed_sources_once(tmp_path, monkeypatch, change):
     store, ctx, *_ = setup(tmp_path)
     original = store.append_episode("1", "The owner left this unresolved. " * 100, [], {"kind": "mind"})
     helper = Helper()
     monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
-    demand = {"purpose": "actual_context_refusal", "rendered_mode": "max", "memory_budget_tokens": 900}
+    demand = {"purpose": "owner_mode", "rendered_mode": "low", "memory_budget_tokens": 900,
+              "requirement_tokens": 250000}
     rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand)
     if change == "guidance":
         write_knowledge_note(resolve_knowledge_address(tmp_path, "remembering", "global"),
                              "Retain the unresolved owner's choice and distinguish my assumptions.")
     else:
-        demand["purpose"] = "explicit_revision"
+        demand.update(rendered_mode="nano", requirement_tokens=85000)
     rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand)
     assert len(helper.calls) == 2 and original["text"] in helper.calls[-1][0]
     assert all(d["metadata"]["covers_record_ids"] == [original["id"]] for d in store.records(kinds=["digest"]))
@@ -372,7 +396,7 @@ def test_old_soft_budget_digest_remains_usable_until_first_real_refusal(tmp_path
     assert rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand) == []
     assert helper.calls == []
     assert rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False) == []
-    demand.update(purpose="actual_context_refusal", requirement_tokens=None)
+    demand.update(purpose="actual_context_refusal", requirement_tokens=None, refused_digest_ids=["digest:old"])
     rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand)
     assert len(helper.calls) == 1 and original["text"] in helper.calls[0][0]
     demand.update(memory_budget_tokens=982, failed_candidate_sha256="next-refused-body")
@@ -549,7 +573,7 @@ def test_large_guidance_keeps_the_existing_complete_source_reading_path(tmp_path
 @pytest.mark.parametrize("owner,rendered,legacy", [
     ("max", "max", True), ("max", "low", True), ("max", "max", False),
     ("low", "low", True), ("nano", "nano", True)])
-def test_post_task_pressure_keeps_owner_modes_and_only_exempts_legacy_transition(
+def test_post_task_pressure_keeps_owner_modes_with_legacy_and_new_sources(
         tmp_path, monkeypatch, pressure, owner, rendered, legacy):
     from ouroboros import chronicle_view, post_task_synthesis
     from ouroboros.memory import Memory
@@ -570,13 +594,13 @@ def test_post_task_pressure_keeps_owner_modes_and_only_exempts_legacy_transition
     env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path, drive_path=lambda path: tmp_path / path)
     post_task_synthesis._run_chat_consolidation(env, Memory(tmp_path, tmp_path), None,
         {"id": "post-memory", "chat_id": 1}, chat.parent)
-    purchased = pressure and (owner in {"low", "nano"} or not legacy)
+    purchased = pressure
     assert len(helper.calls) == int(purchased)
     assert len(store.records(kinds=["digest"])) == int(purchased)
     if purchased:
         attempt = next(row for row in store.records(kinds=["maintenance"]) if row.get("source_keys"))
         expected = ("owner_mode", 85000 if owner == "nano" else 250000) if owner != "max" else ("working_headroom", 1000000)
-        assert (attempt["requirement"]["purpose"], attempt["requirement"]["requirement_tokens"]) == expected
+        assert (attempt["fitting_demand"]["purpose"], attempt["requirement"]["requirement_tokens"]) == expected
 
 
 @pytest.mark.parametrize("missing", [False, True])
@@ -639,3 +663,212 @@ def test_digest_keeps_bounded_source_span_and_unknowns_apart_from_publication(tm
     assert second["text"] in helper.calls[0][0]
     if corrected:
         assert '"revision_source_span"' in helper.calls[0][0] and span["start"] in helper.calls[0][0]
+
+
+@pytest.mark.parametrize("improves", [True, False])
+def test_real_refusal_refines_exposed_digest_from_fixed_children_once(tmp_path, monkeypatch, improves):
+    store, ctx, *_ = setup(tmp_path)
+    original = store.append_episode("1", "Owner obligation and why it remains open. " * 100, [], {"kind": "mind"})
+    monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
+    calls = []
+    outputs = iter(["First account: the owner's unresolved obligation remains. " * 5,
+                    "The obligation remains open." if improves else "Expanded account. " * 100,
+                    "Obligation open."])
+    def helper(prompt, *_args, **_kwargs):
+        calls.append(prompt)
+        return next(outputs), {}, None
+    demand = {"purpose": "actual_context_refusal", "rendered_mode": "max"}
+    rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand)
+    first = store.records(kinds=["digest"])[0]
+    # Another request or profile refusing the same unaltered representation
+    # is not a new semantic attempt; the representation itself is the need.
+    demand.update(refused_digest_ids=[first["id"]], failed_candidate_sha256="physical-rejection")
+    rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand)
+    assert len(calls) == 2 and original["text"] in calls[-1] and first["text"] not in calls[-1]
+    assert len(store.records(kinds=["digest"])) == (2 if improves else 1)
+    for jitter in ("another-account", "another-request"):
+        demand.update(route_fingerprint=jitter, failed_candidate_sha256=jitter, memory_budget_tokens=991)
+        assert rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand) == []
+    attempts = [r for r in store.records(kinds=["maintenance"]) if r["id"].startswith("digest-fit:")]
+    assert all(r["target_fits"] is None for r in attempts)
+    assert attempts[-1]["published_progress"] is improves
+    if improves:
+        second = store.records(kinds=["digest"])[-1]
+        demand["refused_digest_ids"] = [second["id"]]
+        rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand)
+        assert len(calls) == 3 and original["text"] in calls[-1] and second["text"] not in calls[-1]
+        assert store.records(kinds=["digest"])[-1]["text"] == "Obligation open."
+
+
+def test_ordinary_maintenance_advances_old_and_new_without_whole_corpus_sweep(tmp_path, monkeypatch):
+    store, ctx, *_ = setup(tmp_path)
+    store.publish([{"id": "legacy-history", "kind": "legacy", "room_id": "old",
+                    "text": "Original old room meaning. " * 1000, "author": {"kind": "legacy"}}])
+    store.append_episode("new", "Fresh completed source. " * 500, [], {"kind": "mind"})
+    monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
+    helper = Helper()
+    demand = {"purpose": "working_headroom", "requirement_tokens": 1000000,
+              "ordinary_maintenance": True, "legacy_transition": True}
+    def fits():
+        demand["rendered_memory_tokens"] = sum(len(r["current_text"]) for room in store.room_ids()
+                                               for r in store.room_cover(room)) // 4
+        return demand["rendered_memory_tokens"] < 100
+    rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand)
+    assert [r["room_id"] for r in store.records(kinds=["digest"])] == ["old"]
+    assert demand["published_progress"] and demand["target_fits"] is False
+    rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand)
+    assert [r["room_id"] for r in store.records(kinds=["digest"])] == ["old", "new"]
+    assert demand["target_fits"] is True and len(helper.calls) == 2
+    assert rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand) == []
+    assert store.get("legacy-history")["text"] == "Original old room meaning. " * 1000
+
+
+@pytest.mark.parametrize("saved_old_shape", [False, True])
+@pytest.mark.parametrize("next_tokens", [250000, 500000])
+def test_purpose_and_mode_labels_do_not_rebuy_fixed_sources(tmp_path, monkeypatch, saved_old_shape, next_tokens):
+    store, ctx, *_ = setup(tmp_path)
+    original = store.append_episode("1", "The owner left a decision unresolved. " * 100, [], {"kind": "mind"})
+    keys = [[original["id"], original["id"]]]
+    helper = Helper()
+    monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
+    demand = {"purpose": "working_headroom", "rendered_mode": "max", "requirement_tokens": 250000}
+    if saved_old_shape:
+        store.publish([
+            {"id": "digest-attempt:old-labels", "kind": "maintenance", "room_id": "1", "status": "compressed",
+             "source_keys": keys, "requirement": dict(demand)},
+            {"id": "digest:old-labels", "kind": "digest", "room_id": "1", "text": "Earlier whole account. " * 20,
+             "author": {"kind": "helper"}, "metadata": {"covers_record_ids": [original["id"]], "source_revisions": keys}}])
+    else:
+        rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand)
+    before_calls = len(helper.calls)
+    before_records = store.records()
+    demand.update(purpose="actual_context_refusal", rendered_mode="nano", requirement_tokens=next_tokens)
+    assert rooms.compact_chronicle_rooms(store, helper, ctx, "", lambda: False, fitting_demand=demand) == []
+    assert len(helper.calls) == before_calls
+    assert store.records() == before_records  # Old authoritative records are never rewritten.
+
+
+@pytest.mark.parametrize("failure,count", [("output_truncated", 4), ("output_truncated", 1), ("provider_outcome_unknown", 4)])
+def test_terminal_output_cut_uses_source_halves_without_rebuy_or_unknown_overlap(tmp_path, monkeypatch, failure, count):
+    store, ctx, chat, blocks, meta = setup(tmp_path)
+    original = [store.append_episode("1", f"Original source {n}. " * 200, [], {"kind": "mind"},
+                                    metadata={"source_row_ids": [str(n)]}) for n in range(count)]
+    calls = []
+    def helper(prompt, _label, **_kwargs):
+        rows = [json.loads(row) for row in prompt.split("## Source group: complete text, projected host metadata\n", 1)[1].split("\n\n")]
+        calls.append([row["record_id"] for row in rows])
+        if len(calls) == 1:
+            return "", {"ledger_attempt_ids": ["cut-or-unknown"], "_consolidation_errors": [{"kind": failure,
+                         "preflight_only": False}]}, None
+        return "The sources preserve an unresolved obligation.", {}, None
+    monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
+    monkeypatch.setattr(c, "_light_call", lambda *_args: helper)
+    demand = {"ordinary_maintenance": True, "requirement_tokens": 250000}
+    def fits():
+        return all(r["kind"] == "digest" for r in store.room_cover("1"))
+    def run():
+        return c.consolidate(chat, blocks, meta, None, knowledge_context=ctx, represented_only=True,
+                             compact_chronicle=True, pressure_fits=fits, fitting_demand=demand)
+    first = run()
+    assert first["_consolidation_errors"][0]["kind"] == failure
+    for _ in range(3):
+        run()
+    assert calls.count([r["id"] for r in original]) == 1
+    if failure == "output_truncated" and count > 1:
+        assert calls == [[r["id"] for r in original], [r["id"] for r in original[:2]], [r["id"] for r in original[2:]]]
+        assert fits() and {i for r in store.room_cover("1") for i in r["metadata"]["source_row_ids"]} == {str(n) for n in range(count)}
+    else:
+        assert len(calls) == 1 and not store.records(kinds=["digest"])
+    assert all(store.get(r["id"])["text"] == r["text"] for r in original)
+    failed = [r for r in store.records(kinds=["maintenance"]) if r.get("status") == "output_truncated"]
+    if failure == "output_truncated":
+        assert len(failed) == 1 and failed[0]["source_ref"]["read"]
+    else:
+        assert failed == [] and store.scan_state()["pending_consolidation_outcomes"]
+
+
+def test_same_unfulfilled_goal_refines_fixed_children_until_fit_then_ignores_jitter(tmp_path, monkeypatch):
+    store, ctx, *_ = setup(tmp_path)
+    original = store.append_episode("1", "Immutable original meaning. " * 1000, [], {"kind": "mind"})
+    monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
+    calls, answers = [], iter(["First useful account. " * 100, "Coarser account. " * 40, "Obligation open. " * 20])
+    def helper(prompt, *_args, **_kwargs):
+        calls.append(prompt)
+        return next(answers), {}, None
+    demand = {"ordinary_maintenance": True, "requirement_tokens": 500000, "memory_budget_tokens": 85}
+    def fits():
+        cover = store.room_cover("1")
+        demand.update(selected_digest_ids=[r["id"] for r in cover if r["kind"] == "digest"],
+                      rendered_memory_tokens=sum(len(r["current_text"]) for r in cover) // 4)
+        demand["target_miss"] = demand["rendered_memory_tokens"] > demand["memory_budget_tokens"]
+        return not demand["target_miss"]
+    for expected in (1, 2, 3):
+        rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand)
+        assert len(calls) == expected and original["text"] in calls[-1]
+    digests = store.records(kinds=["digest"])
+    assert len(digests) == 3 and demand["target_fits"] is True
+    assert all(d["text"] not in call for d, call in zip(digests, calls[1:]))
+    demand.update(memory_budget_tokens=76, route_fingerprint="another-account")
+    assert not fits()
+    assert rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand) == []
+    assert len(calls) == 3 and store.get(original["id"])["text"] == original["text"]
+
+
+@pytest.mark.parametrize("settle_without_publication", [False, True])
+def test_later_whole_view_success_settles_older_false_digest_need(tmp_path, monkeypatch, settle_without_publication):
+    from ouroboros import chronicle_view, post_task_synthesis
+    from ouroboros.memory import Memory
+    store, ctx, chat, *_ = setup(tmp_path)
+    store.append_episode("1", "Large old room. " * 1000, [], {"kind": "mind"})
+    if not settle_without_publication:
+        store.append_episode("2", "Second old room. " * 500, [], {"kind": "mind"})
+    calls = []
+    def helper(*_args, **_kwargs):
+        calls.append(1)
+        return ("A" * 1800 if len(calls) == 1 else "B" * 100), {}, None
+    monkeypatch.setattr(c, "_light_route", lambda: {"model": "fake"})
+    demand = {"ordinary_maintenance": True, "requirement_tokens": 500000, "memory_budget_tokens": 100}
+    def fits():
+        cover = [r for room in store.room_ids() for r in store.room_cover(room)]
+        demand.update(selected_digest_ids=[r["id"] for r in cover if r["kind"] == "digest"],
+                      rendered_memory_tokens=sum(len(r["current_text"]) for r in cover) // 4)
+        demand["target_miss"] = demand["rendered_memory_tokens"] > demand["memory_budget_tokens"]
+        return not demand["target_miss"]
+    rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand)
+    first = store.records(kinds=["digest"])[0]
+    assert demand["target_fits"] is False
+    demand["memory_budget_tokens"] = 455 if settle_without_publication else 480
+    if settle_without_publication:
+        demand.update(owner_context_mode="max", mode="max", window_tokens=500000)
+        monkeypatch.setattr(c, "should_consolidate", lambda *_args: False)
+        monkeypatch.setattr(chronicle_view, "maintenance_projection", lambda *_args: (fits, demand))
+        env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path, drive_path=lambda path: tmp_path / path)
+        post_task_synthesis._run_chat_consolidation(env, Memory(tmp_path, tmp_path), None, {"id": "already-fits"}, chat.parent)
+    else:
+        rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand)
+    assert fits()
+    assert any(r.get("target_id") == first["id"] and r.get("target_fits") is True
+               for r in store.records(kinds=["maintenance"]) if r["id"].startswith("digest-fulfilled:"))
+    before = len(calls)
+    demand["memory_budget_tokens"] -= 9
+    assert not fits()
+    assert rooms.compact_chronicle_rooms(store, helper, ctx, "", fits, fitting_demand=demand) == []
+    assert len(calls) == before
+
+
+def test_fit_receipts_do_not_credit_uncaptured_append_or_budget_zero_stop(tmp_path):
+    store, _, *_ = setup(tmp_path)
+    first = store.publish([{"id": "digest:first", "kind": "digest", "room_id": "1", "text": "Captured"}])[0]
+    observed = {"ordinary_maintenance": True, "requirement_tokens": 500000, "target_miss": False,
+                "selected_digest_ids": [first["id"]], "memory_budget_tokens": 100}
+    late = store.publish([{"id": "digest:later", "kind": "digest", "room_id": "2", "text": "Not in fit observation"}])[0]
+    rooms.record_maintenance_fit(store, observed)
+    receipts = store.records(kinds=["maintenance"])
+    assert [r["target_id"] for r in receipts] == [first["id"]]
+    rooms.record_maintenance_fit(store, observed)
+    assert store.records(kinds=["maintenance"]) == receipts
+    observed.update(selected_digest_ids=[late["id"]], target_miss=True, memory_budget_tokens=0)
+    rooms._record_digest_fit(store, "zero-stop", "2", False, True, observed)
+    assert store.get("digest-fit:zero-stop")["target_fits"] is False
+    assert [r["target_id"] for r in store.records(kinds=["maintenance"])
+            if r["id"].startswith("digest-fulfilled:")] == [first["id"]]

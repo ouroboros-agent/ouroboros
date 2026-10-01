@@ -358,3 +358,227 @@ def test_source_dates_are_distinct_from_publication_and_follow_explicit_revision
     row["metadata"] = {}
     text, _ = render_memory(snapshot)
     assert "Recorded: 2099-01-01T00:00:00+00:00; source period unknown" in text
+
+
+def test_other_rooms_expand_from_same_frozen_snapshot_and_keep_shared_prefix(tmp_path):
+    from ouroboros.utils import estimate_tokens
+
+    memory = Memory(tmp_path)
+    store = ChronicleStore(tmp_path)
+    store.import_legacy()
+    child = store.append_episode("2", "The old disagreement remains unresolved for its original reasons. " * 80,
+                                 [], {"kind": "mind"})
+    cover = store.append_episode("2", "The old disagreement remains unresolved.", [], {"kind": "helper"},
+                                 kind="digest", metadata={"covers_record_ids": [child["id"]]})
+    frozen = capture_chronicle(memory, {"id": "capture", "chat_id": 1})
+    snapshot = json.loads(frozen)
+    assert {r["id"] for room in snapshot["rooms"] for r in room["records"]} >= {child["id"], cover["id"]}
+    coarse_shared, full_shared = {}, {}
+    coarse, minimum = render_memory(snapshot, 0, shared_out=coarse_shared)
+    full, expanded = render_memory(snapshot, None, shared_out=full_shared)
+    assert coarse_shared == full_shared
+    assert child["text"] not in coarse and child["text"] in full
+    assert cover["text"] in coarse and cover["text"] in full_shared["text"]
+    assert minimum["levels"]["2"] == 1 and expanded["levels"]["2"] == 0
+    assert expanded["rendered_memory_tokens"] == estimate_tokens(full)
+    assert expanded["rendered_memory_tokens"] > minimum["rendered_memory_tokens"]
+    assert expanded["selected_digest_ids"] == [cover["id"]]
+    assert expanded["selection_sha256"] != minimum["selection_sha256"]
+    # A fitting projection measures the common cover AND its detailed tail.
+    budget = estimate_tokens(full) - 1
+    fitted, facts = render_memory(snapshot, budget, shared_out={})
+    assert child["text"] not in fitted and not facts["target_miss"]
+    assert facts["rendered_memory_tokens"] <= budget
+    assert json.dumps(snapshot, ensure_ascii=False, sort_keys=True) == json.dumps(json.loads(frozen), ensure_ascii=False, sort_keys=True)
+    # Ordinary rebind can restore detail; source aging does not close the arc.
+    assert render_memory(snapshot, None, shared_out={}) == (full, expanded)
+    refused, facts = render_memory(snapshot, None, shared_out={}, refusal_recovery=True)
+    assert child["text"] not in refused and cover["text"] in refused
+    assert facts["selected_digest_ids"] == [cover["id"]]
+
+
+def test_soft_target_exhaustion_keeps_minimum_instead_of_expanding_to_route():
+    from ouroboros.chronicle_view import _memory_allowance
+
+    child = record("detail", "A long account of the owner's still-open choice. " * 200)
+    cover = record("cover", "The owner has not decided; both options remain open.",
+                   kind="digest", children=["detail"])
+    snapshot = {"focus": "1", "rooms": [{"id": "1", "records": [child, cover]}]}
+    template = [{"text": CHRONICLE_MARKER}]
+    for mode in ("low", "nano"):
+        task = {"context_non_memory_tokens": 300000}
+        allowance = _memory_allowance(template, snapshot, mode, 1000000, 1, 65536, task)
+        assert allowance == 0
+        facts = {}
+        rendered = render_system_view(template, json.dumps(snapshot), mode=mode, window_tokens=1000000,
+            calibration_ratio=1, output_reserve_tokens=65536, task=task, facts_out=facts)
+        assert facts["requested_memory_tokens"] == 0 and facts["target_miss"]
+        assert child["text"] not in str(rendered) and cover["text"] in str(rendered)
+        # Crossing the soft boundary never grants the remainder of Max's window.
+        base = _memory_allowance(template, snapshot, mode, 1000000, 1, 65536, {"context_non_memory_tokens": 0})
+        before = _memory_allowance(template, snapshot, mode, 1000000, 1, 65536,
+                                   {"context_non_memory_tokens": base - 1})
+        after = _memory_allowance(template, snapshot, mode, 1000000, 1, 65536,
+                                  {"context_non_memory_tokens": base + 1})
+        assert before == 1 and after == 0
+
+
+def test_correction_invalidates_shared_cover_immediately_and_refusal_ids_are_current(tmp_path):
+    from ouroboros.chronicle_view import refresh_chronicle_snapshot
+
+    store = ChronicleStore(tmp_path)
+    original = store.append_episode("2", "Owner approved deployment. " * 100, [], {"kind": "mind"})
+    cover = store.append_episode("2", "Deployment was approved.", [], {"kind": "helper"}, kind="digest",
+        metadata={"covers_record_ids": [original["id"]]})
+    snapshot = capture_chronicle(Memory(tmp_path), {"id": "view", "chat_id": 1})
+    shared = {}
+    render_memory(json.loads(snapshot), 0, shared_out=shared)
+    assert cover["text"] in shared["text"]
+    store.revise(original["id"], "Owner revoked deployment approval.", {"kind": "mind"})
+    refreshed = refresh_chronicle_snapshot(snapshot, tmp_path)
+    shared = {}
+    text, facts = render_memory(json.loads(refreshed), 0, shared_out=shared)
+    assert "Owner revoked deployment approval." in text and cover["text"] not in text
+    assert cover["id"] not in facts["selected_digest_ids"]
+    # A revised digest is recoverable under its actual current revision identity.
+    current = store.append_episode("2", "The owner revoked approval; deployment remains blocked.", [],
+        {"kind": "helper"}, kind="digest", metadata={"covers_record_ids": [store.room_records("2")[0]["correction"]["id"]]})
+    revision = store.revise(current["id"], "Deployment is not approved.", {"kind": "mind"})
+    refreshed = refresh_chronicle_snapshot(snapshot, tmp_path)
+    _, facts = render_memory(json.loads(refreshed), 0, shared_out={})
+    assert facts["selected_digest_ids"] == [revision["id"]]
+
+
+def test_finer_room_views_measure_monotonic_shared_plus_tail_without_false_fit():
+    from ouroboros.utils import estimate_tokens
+
+    rooms = []
+    for rid, repeats in (("2", 80), ("3", 45), ("4", 30)):
+        child = record("child" + rid, f"Room {rid} still waits for its own answer. " * repeats, room=rid)
+        cover = record("cover" + rid, f"Room {rid} remains unresolved.", room=rid, kind="digest", children=[child["id"]])
+        rooms.append({"id": rid, "records": [child, cover]})
+    snapshot = {"focus": "1", "rooms": rooms}
+    totals, prefixes, levels = [], [], []
+    for budget in range(400, 2400, 50):
+        shared = {}
+        text, facts = render_memory(snapshot, budget, shared_out=shared)
+        assert not facts["target_miss"]
+        assert facts["rendered_memory_tokens"] == estimate_tokens(text) <= budget
+        totals.append(facts["rendered_memory_tokens"])
+        levels.append(facts["levels"])
+        prefixes.append(shared["text"])
+    assert totals == sorted(totals) and totals[0] < totals[-1]
+    assert all(prefix == prefixes[0] for prefix in prefixes)
+    assert any(level != levels[0] for level in levels)
+
+
+def test_snapshot_packing_removes_only_equal_projection_fields():
+    from ouroboros.chronicle_view import _record_text, _snapshot_record
+
+    original = record("own", "I kept the original interpretation.")
+    original.update(current_text=original["text"], current_author=original["author"], revisions=[])
+    packed = _snapshot_record(original)
+    assert "current_text" not in packed and "current_author" not in packed and "revisions" not in packed
+    assert _record_text(packed) == _record_text(original)
+    assert original["current_text"] == original["text"]
+    revised = {**original, "current_text": "The owner corrected my interpretation.",
+               "current_author": {"kind": "helper"}, "correction": {"id": "rev"},
+               "revisions": [{"id": "rev", "text": "The owner corrected my interpretation."}]}
+    assert _snapshot_record(revised) == revised
+
+
+def test_legacy_only_oversized_focus_does_not_reopen_or_reread_its_old_raw_corpus(tmp_path, monkeypatch):
+    from ouroboros import chronicle_sources
+
+    memory_dir, logs = tmp_path / "memory", tmp_path / "logs"
+    memory_dir.mkdir()
+    logs.mkdir()
+    old = {"chat_id": 1, "task_id": "old-without-terminal", "direction": "in",
+           "text": "Old source with an existing legacy account. " * 1000}
+    (logs / "chat.jsonl").write_text(json.dumps(old) + "\n", encoding="utf-8")
+    (memory_dir / "dialogue_blocks.json").write_text(json.dumps([
+        {"content": "The historical question and its uncertainty were preserved."}]), encoding="utf-8")
+    store = ChronicleStore(tmp_path)
+    store.import_legacy()
+    from ouroboros.consolidator import _chat_log_signature
+    store.publish([], scan_state={"last_consolidated_offset": 1,
+                                  "chat_log_signature": _chat_log_signature(logs / "chat.jsonl")})
+    memory = Memory(tmp_path)
+    capture_chronicle(memory, {"id": "prime", "chat_id": 1}, rendered_chars_budget=1)
+    reads = []
+    original = chronicle_sources.JsonlChainSnapshot._read
+    def counted(self, start, end):
+        reads.append(end - start)
+        return original(self, start, end)
+    monkeypatch.setattr(chronicle_sources.JsonlChainSnapshot, "_read", counted)
+    snapshot = json.loads(capture_chronicle(memory, {"id": "hot", "chat_id": 1}, rendered_chars_budget=1))
+    assert snapshot["raw_focus"] == [] and snapshot["open_focus"] == []
+    assert reads == []
+    assert "The historical question and its uncertainty were preserved." in render_memory(snapshot, 0)[0]
+
+
+def test_zero_maintenance_allowance_stops_futile_work_without_claiming_target_fit(tmp_path, monkeypatch):
+    from ouroboros import context
+    from ouroboros.chronicle_view import maintenance_projection
+
+    store = ChronicleStore(tmp_path)
+    store.append_episode("2", "The owner has not approved this work.", [], {"kind": "mind"})
+    snapshot = capture_chronicle(Memory(tmp_path), {"id": "view", "chat_id": 1})
+    plan = SimpleNamespace(chronicle_state_json=snapshot, preferred_mode="nano", window_tokens=1000000,
+        system_templates_json={"nano": json.dumps([{"text": CHRONICLE_MARKER}])},
+        context_task={"context_non_memory_tokens": 90000}, output_reserve_tokens=10000,
+        core_sha256="source", route_fp="route", projection=lambda _mode: SimpleNamespace(calibration_ratio=1))
+    monkeypatch.setattr(context, "build_context_fit_plan", lambda *_a, **_kw: plan)
+    fits, facts = maintenance_projection(SimpleNamespace(drive_root=tmp_path), Memory(tmp_path), {"id": "done"})
+    assert fits()  # no achievable zero-memory target to purchase summaries for
+    assert facts["memory_budget_tokens"] == 0 and facts["target_miss"]
+    assert facts["maintenance_target_reachable"] is False
+    assert facts["maintenance_target_reason"] == "non_memory_core_exhausts_target"
+    assert facts["rendered_memory_tokens"] > 0
+
+
+def test_refusal_drops_optional_other_detail_before_fitting_focus():
+    focus_child = record("focus-fine", "Focused decision with its essential reasons. " * 100, kind="legacy")
+    focus_cover = record("focus-cover", "Focused decision and reasons retained.", kind="digest", children=["focus-fine"])
+    other_child = record("other-fine", "Other room has detailed historical circumstances. " * 100, room="2", kind="legacy")
+    other_cover = record("other-cover", "Other room retains its historical outcome.", room="2", kind="digest", children=["other-fine"])
+    snapshot = {"focus": "1", "rooms": [{"id": "1", "records": [focus_child, focus_cover]},
+                                         {"id": "2", "records": [other_child, other_cover]}]}
+    original, _ = render_memory(snapshot, None, shared_out={})
+    reduced, _ = render_memory(snapshot, None, shared_out={}, refusal_recovery=True)
+    assert len(reduced.encode("utf-8")) < len(original.encode("utf-8"))
+    assert focus_child["text"] in reduced
+    assert other_child["text"] not in reduced and other_cover["text"] in reduced
+
+
+def test_each_refusal_uses_actual_view_bytes_and_only_one_needed_focus_cut():
+    child = record("fine", "A source-grounded detailed account. " * 200, kind="legacy")
+    middle = record("middle", "The same causal account with less detail. " * 70, kind="digest", children=["fine"])
+    coarse = record("coarse", "The decision remains unresolved for the original reasons.", kind="digest", children=["middle"])
+    snapshot = {"focus": "1", "rooms": [{"id": "1", "records": [child, middle, coarse]}]}
+    full, original = render_memory(snapshot, None, shared_out={})
+    first, first_facts = render_memory(snapshot, None, shared_out={}, refusal_recovery=True,
+        refused_memory_bytes=original["rendered_memory_bytes"])
+    assert middle["text"] in first and child["text"] not in first
+    assert first_facts["levels"]["1"] == 1
+    second, second_facts = render_memory(snapshot, None, shared_out={}, refusal_recovery=True,
+        refused_memory_bytes=first_facts["rendered_memory_bytes"])
+    assert middle["text"] not in second and coarse["text"] in second
+    assert second_facts["levels"]["1"] == 2
+    assert len(second.encode()) < len(first.encode()) < len(full.encode())
+    assert second_facts["requested_memory_tokens"] is None
+    assert second_facts["selection_sha256"] != first_facts["selection_sha256"]
+
+
+def test_refusal_keeps_raw_focused_arc_when_other_optional_detail_can_shrink():
+    raw = {"chat_id": 1, "text": "Owner's exact open question.", "direction": "in"}
+    fine = record("other-long", "Old detailed shared events. " * 200, room="2", kind="legacy")
+    cover = record("other-short", "The old shared events and outcome.", room="2", kind="digest", children=["other-long"])
+    snapshot = {"focus": "1", "raw_focus": [raw], "open_focus": [raw],
+                "rooms": [{"id": "2", "records": [fine, cover]}]}
+    original, before = render_memory(snapshot, 100000, shared_out={})
+    reduced, after = render_memory(snapshot, 100000, shared_out={}, refusal_recovery=True,
+        refused_memory_bytes=before["rendered_memory_bytes"])
+    assert after["full_focused_room"] and raw["text"] in reduced
+    assert fine["text"] not in reduced and len(reduced.encode()) < len(original.encode())
+    assert after["requested_memory_tokens"] == 100000

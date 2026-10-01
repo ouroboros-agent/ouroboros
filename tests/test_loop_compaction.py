@@ -429,7 +429,7 @@ def test_predicted_reclaim_runs_once_then_sends_target_miss(tmp_path, monkeypatc
     assert context.accumulated_usage["_context_target_miss"] is True
 
 
-def test_actual_max_overflow_reprojects_and_retries_only_smaller_context(tmp_path, monkeypatch):
+def test_actual_max_overflow_defers_low_until_recovery_owner(tmp_path, monkeypatch):
     from ouroboros import loop
 
     context = _ctx(tmp_path)
@@ -440,7 +440,7 @@ def test_actual_max_overflow_reprojects_and_retries_only_smaller_context(tmp_pat
     ])
 
     def measure(ctx, **_kwargs):
-        disposition = next(fits)
+        disposition = next(fits, _fit(profile="task_local_low", mode="low", used=True))
         loop._remember_main_fit(ctx, disposition)
         return disposition
 
@@ -467,11 +467,15 @@ def test_actual_max_overflow_reprojects_and_retries_only_smaller_context(tmp_pat
     monkeypatch.setattr(loop, "_dispatch_round_model", dispatch)
     monkeypatch.setattr(loop, "last_physical_attempt_capture", lambda: _failed_capture())
     msg, _cost, mode = loop._call_round_model(context)
+    assert msg is None and mode == "max"
+    from ouroboros.loop_memory import _recover_deferred_memory_refusal
+    recovered, msg, _cost = _recover_deferred_memory_refusal(context.tools)
+    mode = recovered.active_context_mode
     assert msg["content"] == "fits"
     assert sends == ["failed-main", "smaller-retry"]
     assert mode == "low"
-    assert context.messages[0]["content"] == "LOW_SYSTEM"
-    assert ("route-a", "exec:round:1") in context.tools._ctx._context_overflow_retries
+    assert recovered.messages[0]["content"] == "LOW_SYSTEM"
+    assert ("route-a", "exec:round:1") not in context.tools._ctx._context_overflow_retries
 
 
 def test_equal_context_releases_retry_before_provider_send(tmp_path, monkeypatch):
@@ -488,7 +492,7 @@ def test_equal_context_releases_retry_before_provider_send(tmp_path, monkeypatch
     provider_sends = 0
 
     def measure(ctx, **_kwargs):
-        disposition = next(fits)
+        disposition = next(fits, _fit(profile="task_local_low", mode="low", used=True))
         loop._remember_main_fit(ctx, disposition)
         return disposition
 
@@ -512,8 +516,9 @@ def test_equal_context_releases_retry_before_provider_send(tmp_path, monkeypatch
     monkeypatch.setattr(loop, "last_physical_attempt_capture", lambda: _failed_capture())
     monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda *_a, **kw: events.append(kw or _a[-1]))
     msg, _cost, mode = loop._call_round_model(context)
-    assert msg is None
-    assert mode == "low"
+    assert msg is None and mode == "max"
+    from ouroboros.loop_memory import _recover_deferred_memory_refusal
+    assert _recover_deferred_memory_refusal(context.tools)[1] is None
     assert provider_sends == 1
     assert any(event.get("reason") == "context_candidate_not_strictly_smaller" for event in events)
 
@@ -608,7 +613,7 @@ def test_failed_main_capture_is_snapshotted_before_reclaim_attempt(tmp_path, mon
     """A receipted summarizer must not replace the failed Main comparison candidate."""
     from ouroboros import loop
 
-    context = _ctx(tmp_path)
+    context = _ctx(tmp_path, preferred="low", mode="low")
     fits = iter([
         _fit(),
         _fit(profile="task_local_low", mode="low"),
@@ -918,3 +923,15 @@ def test_main_unexposed_new_raw_cannot_make_automatic_reclaim_reachable(real_mai
     assert not run.calls and not receipt.checkpoint_ref
     assert context.messages[2] == run.capsule
     assert context.messages[3]["tool_calls"][0]["id"] == "new"
+
+
+@pytest.mark.parametrize("physical", [0, 100, 1000000])
+def test_economic_target_cannot_veto_real_pressure_relief(real_main_reclaim, physical):
+    from ouroboros import loop
+    run = real_main_reclaim
+    fit = _fit(action="reclaim_once", profile="owner_low", mode="low",
+        goal=1000000, target_deficit=1000000, capacity_deficit=physical)
+    receipt = loop._run_main_reclaim(run.context, fit, minimum_goal_tokens=1000)
+    assert receipt.status == "applied" and receipt.reclaimed_tokens > 0
+    assert receipt.fit["required_reclaim_tokens"] == 0  # Actual refusal supplies no numeric deficit.
+    assert run.calls

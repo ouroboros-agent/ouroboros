@@ -176,7 +176,7 @@ def test_project_owner_source_reference_matches_without_copying_text_to_index(tm
     assert rows == [row] and coverage["complete"]
 
 
-def test_pending_index_uses_valid_non_a2a_cursor_and_reads_only_unrepresented_suffix(tmp_path, monkeypatch):
+def test_pending_index_reads_only_unrepresented_suffix_and_covered_open_focus(tmp_path, monkeypatch):
     from ouroboros import chronicle_sources, consolidator
     from ouroboros.chronicle_store import source_row_id
     from ouroboros.chronicle_view import capture_chronicle
@@ -206,8 +206,9 @@ def test_pending_index_uses_valid_non_a2a_cursor_and_reads_only_unrepresented_su
     monkeypatch.setattr(consolidator, "_capture_generation_window", no_full_replay)
     snap = json.loads(capture_chronicle(memory, {"id": "warm", "chat_id": 1}, rendered_chars_budget=1))
     visible = snap["open_focus"] + [row for room in snap["other_open_rooms"] for row in room["rows"]]
-    assert visible == pending
-    assert sum(calls) == sum(len(_line(row)) for row in pending)
+    # A source-bound account is not proof that the represented task finished.
+    assert visible == [represented, *pending]
+    assert sum(calls) == sum(len(_line(row)) for row in [represented, *pending])
     assert any("invalid_chat_row" in gap["kind"] for gap in snap["coverage"]["gaps"])
     assert store.scan_state()["last_consolidated_offset"] == len(closed)
 

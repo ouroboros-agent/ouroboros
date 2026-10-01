@@ -280,6 +280,26 @@ class ChronicleStore:
         with self._index() as db:
             return [{**json.loads(body), "sequence": seq} for seq, body in db.execute(query, args)]
 
+    def observation_snapshot(self, boundary=None):
+        """New immutable records plus their exact accepted position, under one read lock.
+
+        Without a previous position, establish a baseline using only the index;
+        the caller discloses that earlier changes were not inventoried.
+        """
+        with self._index() as db:
+            latest = db.execute("SELECT sequence,id FROM records ORDER BY sequence DESC LIMIT 1").fetchone()
+            current = {"sequence": latest[0] if latest else 0, "record_id": latest[1] if latest else None}
+            if boundary is None:
+                return [], current
+            sequence = boundary.get("sequence")
+            if type(sequence) is not int or sequence < 0:
+                raise ValueError("invalid accepted memory sequence")
+            anchor = db.execute("SELECT id FROM records WHERE sequence=?", (sequence,)).fetchone()
+            if sequence and (not anchor or anchor[0] != boundary.get("record_id")):
+                raise ValueError("accepted memory boundary no longer matches source")
+            rows = db.execute("SELECT sequence,body FROM records WHERE sequence>? ORDER BY sequence", (sequence,))
+            return [{**json.loads(body), "sequence": seq} for seq, body in rows], current
+
     def pending_episodes(self, *, limit=None):
         """Source-bound originals not yet given their automatic helper correction."""
         query = ("SELECT e.sequence,e.body FROM records e WHERE e.kind='episode' "

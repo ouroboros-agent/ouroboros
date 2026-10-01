@@ -19,6 +19,10 @@ from ouroboros.context_budget import MEMORY_BEGIN, MEMORY_END, MEMORY_FACTS_PREF
 
 
 CHRONICLE_MARKER = "\n[CHRONICLE_VIEW]\n"
+_TARGET_MISS_NOTICE = (
+    "\n\n[Memory does not fit the requested remaining space. Complete available meanings were retained; "
+    "the selected published views exceed this target. This is a target miss, not a demonstrated route refusal "
+    "or permission to discard a period. Exact sources and revision history remain readable.]")
 
 
 def _current_id(record: dict) -> str:
@@ -78,6 +82,22 @@ def _cuts(records: list[dict]) -> list[list[dict]]:
     return cuts
 
 
+
+def _snapshot_record(record: dict) -> dict:
+    """Omit exact duplicate projection fields, retaining their existing fallbacks.
+
+    This only packs a captured view; source records and revision history stay
+    untouched in the append-only store.
+    """
+    packed = dict(record)
+    for current, original in (("current_text", "text"), ("current_author", "author")):
+        if current in packed and packed[current] == packed.get(original):
+            packed.pop(current)
+    if packed.get("revisions") == []:
+        packed.pop("revisions")
+    return packed
+
+
 def _derived_rooms(store: ChronicleStore, focus: str, resolver: Any, bindings: dict):
     from ouroboros.project_dialogue import bound_room_chat
 
@@ -85,7 +105,9 @@ def _derived_rooms(store: ChronicleStore, focus: str, resolver: Any, bindings: d
     rooms: dict[str, dict] = {}
     covered = set()
     for room_id in room_ids:
-        for record in (store.room_records(room_id) if room_id == focus else store.room_cover(room_id)):
+        # Capture published alternatives, not only today's smallest cover. The
+        # immutable snapshot can then rebind upward without rereading sources.
+        for record in store.room_records(room_id):
             meta = record.get("metadata") or {}
             task_ids = meta.get("task_ids") or [(record.get("author") or {}).get("task_id")]
             projected = {bound_room_chat(bindings, {"task_id": tid}) for tid in task_ids if tid}
@@ -93,7 +115,7 @@ def _derived_rooms(store: ChronicleStore, focus: str, resolver: Any, bindings: d
             destination = str(next(iter(projected))) if len(projected) == 1 else room_id
             room = rooms.setdefault(destination, {"id": destination, "records": [], "label":
                 resolver.label({"chat_id": destination}) if destination.lstrip("-").isdigit() else destination})
-            room["records"].append(record)
+            room["records"].append(_snapshot_record(record))
             if destination == focus:
                 covered.update(meta.get("source_row_ids") or [])
     # A Project can adopt rows that were written in Main. The provenance index
@@ -102,7 +124,7 @@ def _derived_rooms(store: ChronicleStore, focus: str, resolver: Any, bindings: d
     for record in store.records_for_tasks([tid for tid, chat in bindings.items() if str(chat) == focus]):
         if record["id"] not in present:
             room = rooms.setdefault(focus, {"id": focus, "label": resolver.label({"chat_id": focus}), "records": []})
-            room["records"].append({**record, "focus_expansion": True})
+            room["records"].append({**_snapshot_record(record), "focus_expansion": True})
             present.add(record["id"])
             covered.update((record.get("metadata") or {}).get("source_row_ids") or [])
     return list(rooms.values()), covered
@@ -136,12 +158,24 @@ def capture_chronicle(memory: Any, task: dict, *, rendered_chars_budget: int | N
     predicate = lambda row: matches(_row_chat_id(row), row)
     from ouroboros.chronicle_sources import capture_room, capture_pending_rows, retain_room_source
 
+    rooms, covered = _derived_rooms(store, focus, resolver, bindings)
     raw, coverage = capture_room(memory, focus, rendered_chars_budget=rendered_chars_budget)
+    from ouroboros.room_consolidation import _closed_source_rows
+    from ouroboros.chronicle_sources import capture_covered_focus
+
+    # Summary coverage is not completion. An oversized focus reads only its
+    # covered sources and typed closure candidates from existing indexed rows.
+    focused_sources = raw
+    if covered and not coverage.get("full_room_in_view", True):
+        focused_sources, source_gaps = capture_covered_focus(memory, store, coverage.get("row_locators", []), covered)
+        coverage.setdefault("gaps", []).extend(source_gaps)
+        if source_gaps:
+            coverage.update(complete=False, snapshot_stable=False)
+    closed = _closed_source_rows(memory.drive_root, focused_sources, None)
     historical_gaps, gap_ids = memory._durable_dialogue_gaps()
     coverage.setdefault("gaps", []).extend(historical_gaps)
     coverage["durable_gap_ids"] = gap_ids
     scan = store.scan_state()
-    rooms, covered = _derived_rooms(store, focus, resolver, bindings)
     represented = {key for room in rooms for record in room["records"]
                    for key in (record.get("metadata") or {}).get("source_row_ids", [])}
     pending_all, pending_gaps = capture_pending_rows(memory, store, represented)
@@ -149,7 +183,14 @@ def capture_chronicle(memory: Any, task: dict, *, rendered_chars_budget: int | N
     # Preserve the existing explicit fallback when the scan boundary is unknown.
     pending = raw if pending_all is None else [row for row in pending_all if predicate(row)]
     pending_all = pending_all or []
-    pending = [row for row in pending if source_row_id(row) not in covered]
+    # An authored interim account can cover an unfinished OTHER room, while
+    # returning to that room restores its still-open source words. Unrepresented
+    # closed sources also stay until a meaningful account exists.
+    pending_by_id = {source_row_id(row): row for row in pending if source_row_id(row) not in covered}
+    pending_by_id.update((source_row_id(row), row) for row in focused_sources
+                         if source_row_id(row) in covered and source_row_id(row) not in closed)
+    source_order = {locator["source_row_id"]: index for index, locator in enumerate(coverage.get("row_locators", []))}
+    pending = sorted(pending_by_id.values(), key=lambda row: source_order.get(source_row_id(row), len(source_order)))
     other_open: dict[str, dict] = {}
     for row in pending_all:
         if predicate(row) or source_row_id(row) in represented:
@@ -184,13 +225,30 @@ def _raw_text(rows: list[dict], source_ref: dict | None) -> str:
 
 
 def render_memory(snapshot: dict, token_budget: int | None = None, *, shared_out: dict | None = None,
-                  refusal_recovery: bool = False) -> tuple[str, dict]:
+                  refusal_recovery: bool = False, refused_memory_bytes: int | None = None) -> tuple[str, dict]:
     """Choose complete published views, preserving meaning before lowering detail.
 
     A budget is an economic/physical fact, never an importance classifier. Other
     rooms start at their smallest already-authored cover; no source is dropped
     to make an arithmetic target appear satisfied.
     """
+    if refusal_recovery and refused_memory_bytes is None:
+        # Compatibility for callers without a captured view: compare with this
+        # same snapshot's ordinary projection, never infer a route capacity.
+        ordinary, _ = render_memory(snapshot, token_budget,
+                                    shared_out={} if shared_out is not None else None)
+        refused_memory_bytes = len(ordinary.encode("utf-8"))
+
+    def reduction_needed(value):
+        target_miss = token_budget is not None and estimate_tokens(value) > token_budget
+        physical_view = value + (_TARGET_MISS_NOTICE if target_miss else "")
+        return target_miss or (refusal_recovery and len(physical_view.encode("utf-8")) >= refused_memory_bytes)
+
+    def refusal_shrinks(value):
+        target_miss = token_budget is not None and estimate_tokens(value) > token_budget
+        physical_view = value + (_TARGET_MISS_NOTICE if target_miss else "")
+        return refusal_recovery and len(physical_view.encode("utf-8")) < refused_memory_bytes
+
     focus = str(snapshot.get("focus", "1"))
     rooms = snapshot.get("rooms") or []
     cuts = {room["id"]: _cuts(room.get("records") or []) for room in rooms}
@@ -198,7 +256,7 @@ def render_memory(snapshot: dict, token_budget: int | None = None, *, shared_out
     if focus in selected:
         selected[focus] = 0
     raw_full = bool(snapshot.get("raw_focus")) and (snapshot.get("coverage") or {}).get("full_room_in_view", True)
-    shared_ids, shared_parts, shared_focus = set(), [], ""
+    shared_ids, shared_digest_ids, shared_parts, shared_focus = set(), set(), [], ""
     if shared_out is not None:
         # Closed published interpretations have the same words for every focus.
         # New episodes/open work stay in the mutable tail; no timer reseals them.
@@ -210,6 +268,7 @@ def render_memory(snapshot: dict, token_budget: int | None = None, *, shared_out
                 if room["id"] == focus:
                     shared_focus = room_text
                 shared_ids.update(_current_id(row) for row in stable)
+                shared_digest_ids.update(_current_id(row) for row in stable if row.get("kind") == "digest")
         shared_out["text"] = ("## Dialogue History\n\nShared closed history; finer views below retain the same sources.\n\n"
                               + "\n\n".join(shared_parts)) if shared_parts else ""
 
@@ -261,11 +320,11 @@ def render_memory(snapshot: dict, token_budget: int | None = None, *, shared_out
             parts.append("[Memory maintenance fact; inspect sources and judge what needs repair]\n" + _encoded(snapshot["maintenance"]))
         return "\n\n".join([*([shared_out["text"]] if shared_out is not None and shared_out["text"] else []), *parts])
 
-    # Other rooms already use their smallest published covers. Reduce focus
+    # Other rooms initially use their smallest published covers. Reduce focus
     # detail last, measuring the whole frame including its common cover. A
     # shorter digest may otherwise add bytes beside the fine focused records.
     text = compose()
-    if refusal_recovery or (token_budget is not None and estimate_tokens(text) > token_budget):
+    if reduction_needed(text):
         focus_words = shared_focus + _raw_text(
             snapshot.get("raw_focus" if raw_full else "open_focus") or [], snapshot.get("source_ref") or {})
         focus_words += "\n\n".join(_record_text(row) for room in rooms if room["id"] == focus
@@ -275,29 +334,49 @@ def render_memory(snapshot: dict, token_budget: int | None = None, *, shared_out
         raw_full = False
         reduced = compose()
         if focus in cuts:
-            while selected[focus] < len(cuts[focus]) - 1 and (refusal_recovery or estimate_tokens(reduced) > token_budget):
+            while selected[focus] < len(cuts[focus]) - 1 and reduction_needed(reduced):
                 selected[focus] += 1
                 reduced = compose()
         # Do not lose independently fitting focus detail when reducing it
         # cannot resolve pressure from the rest of the biography.
-        if len(reduced) < len(text) and (refusal_recovery or not focus_fits or estimate_tokens(reduced) <= token_budget):
+        if len(reduced) < len(text) and (refusal_shrinks(reduced) or not focus_fits or
+                                      (token_budget is not None and estimate_tokens(reduced) <= token_budget)):
             text = reduced
         else:
             raw_full = full_before
             if focus in selected:
                 selected[focus] = 0
+    # Keep a stable meaningful common base, then use remaining space for
+    # available finer accounts. Traverse whole published alternatives in their
+    # existing presentation order; this is fitting, not an importance score.
+    for room in rooms:
+        rid = room["id"]
+        if rid == focus:
+            continue
+        while selected[rid] > 0:
+            previous = selected[rid]
+            selected[rid] -= 1
+            expanded = compose()
+            if reduction_needed(expanded):
+                selected[rid] = previous
+                break
+            text = expanded
+    visible = [row for room in rooms for row in visible_rows(room)]
+    selected_ids = shared_ids | {_current_id(row) for row in visible}
+    digest_ids = shared_digest_ids | {_current_id(row) for row in visible if row.get("kind") == "digest"}
     facts = {"requested_memory_tokens": token_budget, "rendered_memory_tokens": estimate_tokens(text),
+             "selected_record_count": len(selected_ids), "selected_digest_ids": sorted(digest_ids),
+             "shared_memory_tokens": estimate_tokens(shared_out["text"]) if shared_out and shared_out.get("text") else 0,
              "full_focused_room": raw_full,
              "legacy_transition": any(row.get("kind") == "legacy" and (row.get("author") or {}).get("kind") != "host"
                                       for options in cuts.values() for row in options[-1]),
              "verbatim_marks": all(mark.get("visibility", "full") == "full" for mark in snapshot.get("marks") or []),
              "levels": selected, "target_miss": token_budget is not None and estimate_tokens(text) > token_budget}
     if facts["target_miss"]:
-        text += ("\n\n[Memory does not fit the requested remaining space. Complete available meanings were retained; "
-                 "the selected published views exceed this target. This is a target miss, not a demonstrated route refusal "
-                 "or permission to discard a period. Exact sources and revision history remain readable.]")
+        text += _TARGET_MISS_NOTICE
     facts.update(rendered_memory_chars=len(text), rendered_memory_bytes=len(text.encode("utf-8")),
-                 rendered_memory_tokens=estimate_tokens(text))
+                 rendered_memory_tokens=estimate_tokens(text),
+                 selection_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
     if refusal_recovery:
         facts["reduction_requested_after_refusal"] = True
     return text, facts
@@ -325,11 +404,6 @@ def _memory_allowance(system_content, snapshot, mode, window_tokens, calibration
         if task.get("context_non_memory_tokens") is not None:
             other = max(0, int(task["context_non_memory_tokens"]))
         remaining = max(0, int((int(boundary) - reserve - margins * margin) / ratio) - other)
-        if remaining == 0 and window_tokens:
-            # A soft target below the non-memory core cannot be reached by
-            # rewriting memory. Preserve capability against the physical route
-            # and disclose the economic target miss through normal fit facts.
-            remaining = max(0, int((window_tokens - reserve) / ratio) - other)
     return remaining
 
 
@@ -344,7 +418,8 @@ def render_system_view(system_content: list[dict], snapshot_json: str, *, mode: 
                                  calibration_ratio, output_reserve_tokens, task)
     shared = {}
     text, facts = render_memory(snapshot, remaining, shared_out=shared,
-        refusal_recovery=bool(task.get("memory_refusal_recovery")))
+        refusal_recovery=bool(task.get("memory_refusal_recovery")),
+        refused_memory_bytes=task.get("refused_memory_bytes"))
     if facts_out is not None:
         facts_out.update(facts)
     rendered = copy.deepcopy(system_content)
@@ -369,7 +444,11 @@ def refresh_chronicle_snapshot(snapshot_json: str, data_root: Any) -> str:
     store = ChronicleStore(data_root)
     snapshot["rooms"], covered = _derived_rooms(store, snapshot["focus"],
         RoomLabelResolver(data_root), all_task_bindings(data_root))
-    snapshot["open_focus"] = [row for row in snapshot.get("open_focus", []) if source_row_id(row) not in covered]
+    from ouroboros.room_consolidation import _closed_source_rows
+
+    closed = _closed_source_rows(data_root, snapshot.get("raw_focus") or snapshot.get("open_focus", []), None)
+    snapshot["open_focus"] = [row for row in snapshot.get("open_focus", [])
+                              if source_row_id(row) not in covered or source_row_id(row) not in closed]
     represented = {key for room in snapshot["rooms"] for record in room["records"]
                    for key in (record.get("metadata") or {}).get("source_row_ids", [])}
     snapshot["other_open_rooms"] = [{**room, "rows": [row for row in room.get("rows", [])
@@ -407,7 +486,8 @@ def helper_memory_reference(ctx: Any, task: dict | None = None) -> dict:
     remaining = _memory_allowance(template, snapshot, mode, plan.window_tokens,
         plan.projection(mode).calibration_ratio, plan.output_reserve_tokens, task_facts)
     text, facts = render_memory(snapshot, remaining,
-        refusal_recovery=bool(task_facts.get("memory_refusal_recovery")))
+        refusal_recovery=bool(task_facts.get("memory_refusal_recovery")),
+        refused_memory_bytes=task_facts.get("refused_memory_bytes"))
     orientation = snapshot.get("shared_orientation", "")
     from ouroboros.tool_access import canonical_data_root
 
@@ -440,8 +520,11 @@ def maintenance_projection(env: Any, memory: Any, task: dict):
         plan.projection(mode).calibration_ratio, plan.output_reserve_tokens, plan.context_task)
     canonical_root = task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or memory.drive_root
     facts = {"evaluation": "post_task_main_view", "mode": mode, "memory_budget_tokens": budget,
+             "maintenance_target_reachable": budget != 0,
              "owner_context_mode": get_owner_context_mode(), "window_tokens": plan.window_tokens,
              "route_fp": plan.route_fp, "context_source_sha256": plan.core_sha256}
+    if budget == 0:
+        facts["maintenance_target_reason"] = "non_memory_core_exhausts_target"
 
     def fits():
         current = json.loads(refresh_chronicle_snapshot(plan.chronicle_state_json, canonical_root))
@@ -449,6 +532,7 @@ def maintenance_projection(env: Any, memory: Any, task: dict):
         facts.update(projection)
         # A zero allowance means the rest of the context alone exhausts the
         # bound. Buying another summary cannot reach it, and must not loop.
+        # True here stops futile work; target_miss still reports the real view.
         return budget == 0 or not projection["target_miss"]
 
     fits()

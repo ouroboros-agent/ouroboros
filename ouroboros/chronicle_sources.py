@@ -346,6 +346,24 @@ def capture_room(memory, room_id, byte_budget=None, *, rendered_chars_budget=Non
     return rows, coverage
 
 
+
+def capture_covered_focus(memory, store, locators, covered):
+    """Read represented focus sources plus typed closure facts, not old bodies.
+
+    The existing row index supplies type only for locating candidate facts;
+    canonical lifecycle logic interprets the actual returned rows. Ordering and
+    exact source identity are inherited from the captured focused locators.
+    """
+    selected = []
+    with store._index() as db:
+        for locator in locators:
+            row_type = db.execute("SELECT type FROM raw_rows WHERE generation=? AND start=?",
+                (locator["generation"], locator["start_byte"])).fetchone()
+            if locator["source_row_id"] in covered or (row_type and row_type[0]):
+                selected.append(locator)
+    return read_locator_rows(memory.drive_root, selected)
+
+
 def capture_pending_rows(memory, store, represented):
     """Read only unrepresented rows after the generation-aware legacy cursor.
 

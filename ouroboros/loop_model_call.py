@@ -28,6 +28,8 @@ from ouroboros.tools.registry import ToolRegistry
 from ouroboros.loop_memory import (
     _defer_memory_refusal, _main_frame_bytes, _may_repair_main_memory,
     _recover_deferred_memory_refusal, _prepare_first_main_memory, _memory_recovery_held,
+    _fit_existing_refused_memory,
+    _reproject_actual_overflow_low as _reproject_actual_overflow_low,
 )
 from ouroboros.transcript_prefix import sanction_rewrite
 from ouroboros.usage_accounting import PhysicalAttemptContext, PhysicalAttemptPreconditionFailed, invalidate_task_cache_splits
@@ -176,6 +178,17 @@ def _resume_memory_refusal(tools: Any, messages: list, route: tuple, usage: dict
         return None, *route
     previous_fit = _snapshot_context_fit_usage(usage)
     recovered, msg, _cost = _recover_deferred_memory_refusal(tools)
+    if recovered is not None and msg is None and usage.get("_last_llm_error_kind") == "context_overflow":
+        msg, recovered.active_model, recovered.active_use_local, recovered.context_fit_plan, recovered.active_context_mode = (
+            _loop()._run_cross_model_fallback_chain(
+                llm=recovered.llm, ctx=tools._ctx, tools=tools, messages=recovered.messages,
+                active_model=recovered.active_model, active_use_local=recovered.active_use_local,
+                tool_schemas=schemas, active_effort=recovered.active_effort, max_retries=recovered.max_retries,
+                drive_logs=recovered.drive_logs, task_id=recovered.task_id, round_idx=recovered.round_idx,
+                event_queue=recovered.event_queue, accumulated_usage=usage, task_type=recovered.task_type,
+                emit_progress=recovered.emit_progress or (lambda *_a, **_k: None),
+                context_fit_plan=recovered.context_fit_plan, active_context_mode=recovered.active_context_mode,
+                recovery_only=True))
     if recovered is not None and msg is not None:
         from ouroboros.model_wait import current_model_wait
         from ouroboros.model_slots import route_binding
@@ -281,7 +294,7 @@ def _run_cross_model_fallback_chain(
     *, llm, ctx, tools, messages, active_model, active_use_local, tool_schemas,
     active_effort, max_retries, drive_logs, task_id, round_idx, event_queue,
     accumulated_usage, task_type, emit_progress, context_fit_plan,
-    active_context_mode,
+    active_context_mode, recovery_only=False,
 ) -> tuple:
     """Try the configured routes other than the acting binding before any wait begins.
 
@@ -356,7 +369,7 @@ def _run_cross_model_fallback_chain(
         # Bind exact route evidence and choose its deterministic projection
         # BEFORE physical dispatch: the fallback's first request must not
         # inherit the failed primary route's Max projection/fingerprint. It
-        # then uses the ordinary single confirmed-overflow Low retry path.
+        # then uses the ordinary confirmed-overflow recovery owner.
         candidate_plan, candidate_mode = _loop()._rebind_context_fit_plan(
             context_fit_plan,
             tools,
@@ -364,7 +377,7 @@ def _run_cross_model_fallback_chain(
             model=fallback_model,
             use_local=fallback_use_local,
             preferred_mode=str(
-                getattr(context_fit_plan, "preferred_mode", "") or active_context_mode
+                active_context_mode if recovery_only else getattr(context_fit_plan, "preferred_mode", "") or active_context_mode
             ),
             tool_schemas=tool_schemas,
             model_role=fallback_role,
@@ -389,6 +402,7 @@ def _run_cross_model_fallback_chain(
                 active_context_mode=candidate_mode,
                 drive_root=pathlib.Path(drive_logs).parent,
                 attempt_cap=attempt_cap,
+                recovery_only=recovery_only,
                 model_role=fallback_role,
                 emit_progress=emit_progress,
                 defer_resource_wait=(task_type == "presence" or owner_question
@@ -790,6 +804,7 @@ class _RoundModelCallContext:
     # The first call's already prepared vision/executor additions, with its
     # sizing clock. Reprojection reuses this observation without another helper.
     prepared_main_frame: Optional[List[Dict[str, Any]]] = None
+    recovery_only: bool = False  # Reuse the final reduced view, without another preparation cycle.
 
 
 def _route_follows(candidates: List[Tuple[str, str, bool, bool]]) -> bool:
@@ -1175,8 +1190,10 @@ def _run_main_reclaim(
     passes = _loop()._context_reclaim_passes(ctx.tools._ctx)
     if key in passes:
         return None
-    deficit = max(int(measurement.target_deficit_tokens or 0),
-                  int(measurement.capacity_deficit_tokens or 0))
+    economic_deficit = int(measurement.target_deficit_tokens or 0)
+    physical_deficit = int(measurement.capacity_deficit_tokens or 0)
+    # A soft economic target cannot veto useful relief of physical pressure.
+    deficit = 0 if minimum_goal_tokens else physical_deficit or economic_deficit
     request = ContextReclaimRequest(
         route_fp=measurement.route_fp,
         round_id=measurement.round_id,
@@ -1284,25 +1301,6 @@ def _measure_after_reclaim(ctx: _RoundModelCallContext) -> Any:
         _remember_main_fit(ctx, disposition)
     return disposition
 
-
-def _reproject_actual_overflow_low(ctx: _RoundModelCallContext) -> None:
-    if ctx.active_context_mode != "max" or ctx.context_fit_plan is None:
-        return
-    ctx.context_fit_plan = replace(ctx.context_fit_plan, rendered_mode="low")
-    ctx.messages[:] = ctx.context_fit_plan.reproject_transcript(ctx.messages, "low")
-    invalidate_task_cache_splits(ctx.task_id)
-    ctx.active_context_mode = "low"
-    ctx.tools._ctx.messages = ctx.messages
-    ctx.tools._ctx.active_context_mode = "low"
-    ctx.tools._ctx.context_fit_plan = ctx.context_fit_plan
-    _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-        "checkpoint_kind": "context_fit_low_retry",
-        "round": ctx.round_idx,
-        "route_fp": str(getattr(ctx.context_fit_plan, "route_fp", "") or ""),
-        "preferred_mode": str(getattr(ctx.context_fit_plan, "preferred_mode", "") or ""),
-        "effective_mode": "low",
-        "owner_visible": True,
-    })
 
 
 def _failed_capture_is_comparable(capture: Any) -> bool:
@@ -1484,12 +1482,13 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         _loop()._append_or_merge_user_message(ctx.messages, facts)
     if ctx.defer_resource_wait is None:
         ctx.tools._ctx._deferred_memory_refusal = None
+        ctx.tools._ctx._context_refusal_captures = {}
     _append_routing_receipts(ctx)
     _project_wake_input(ctx)
     disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
     initial_memory = (disposition is not None and ctx.round_idx == 1 and not ctx.accumulated_usage.get("rounds")
                       and bool(getattr(ctx.context_fit_plan, "chronicle_state_json", "")))
-    if disposition is not None and not initial_memory:
+    if disposition is not None and not initial_memory and not getattr(ctx, "recovery_only", False):
         key = _fit_key(disposition)
         already_reclaimed = key in _loop()._context_reclaim_passes(ctx.tools._ctx)
         if disposition.action == "reclaim_once" and not already_reclaimed:
@@ -1498,18 +1497,29 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         if already_reclaimed:
             disposition = _measure_after_reclaim(ctx)
 
-    msg, cost = _loop()._dispatch_round_model(
-        ctx,
-        disposition,
-        attempt_cap=ctx.attempt_cap,
-    )
+    captures = getattr(ctx.tools._ctx, "_context_refusal_captures", {})
+    prior = captures.get(_fit_key(disposition)) if disposition is not None and getattr(ctx, "recovery_only", False) else None
+    try:
+        msg, cost = _loop()._dispatch_round_model(ctx, disposition, attempt_cap=ctx.attempt_cap,
+            **({"candidate_predicate": _strict_context_shrink_predicate(prior)} if prior is not None else {}))
+    except PhysicalAttemptPreconditionFailed:
+        _emit_overflow_retry_skipped(ctx, "context_candidate_not_strictly_smaller")
+        return None, 0.0, ctx.active_context_mode
+    if getattr(ctx, "recovery_only", False):
+        return msg, cost, ctx.active_context_mode
     if msg is not None or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") != "context_overflow":
         return msg, cost, ctx.active_context_mode
 
     # Snapshot immediately: a reclaim summarizer is itself physically receipted
     # and would otherwise replace the failed Main candidate in the ContextVar.
     failed_capture = _loop().last_physical_attempt_capture()
+    if disposition is not None and _failed_capture_is_comparable(failed_capture):
+        captures[_fit_key(disposition)] = failed_capture
+        ctx.tools._ctx._context_refusal_captures = captures
     refused_frame_bytes = _main_frame_bytes(ctx)
+    refused_facts = ctx.context_fit_plan.projection(ctx.active_context_mode).memory_facts if ctx.context_fit_plan else {}
+    refused_digest_ids = tuple(refused_facts.get("selected_digest_ids") or [])
+    refused_memory_bytes = refused_facts.get("rendered_memory_bytes")
     if disposition is None:
         return msg, cost, ctx.active_context_mode
 
@@ -1520,7 +1530,7 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
     if isinstance(ctx.accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict):
         return _skipped("round_holds_unresolved_attempt")
     _project_wake_input(ctx, overflowed=True)
-    _reproject_actual_overflow_low(ctx)
+    _fit_existing_refused_memory(ctx)
     reclaim_key = _fit_key(disposition)
     overflow_fit = (
         _measure_after_reclaim(ctx)
@@ -1530,6 +1540,9 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
     if overflow_fit is None:
         return msg, cost, ctx.active_context_mode
     key = _fit_key(overflow_fit)
+    if key not in _loop()._context_reclaim_materializations(ctx.tools._ctx):
+        # A skipped economic pass did not consume the physical recovery work.
+        _loop()._context_reclaim_passes(ctx.tools._ctx).discard(key)
     if key not in _loop()._context_reclaim_passes(ctx.tools._ctx):
         # The provider proved the prediction short by an unknown amount: request a
         # low-water-sized pass, never a token-sized one, so the single strict-shrink
@@ -1549,10 +1562,11 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         return _skipped("route_round_retry_already_used")
     if not _failed_capture_is_comparable(failed_capture):
         return _skipped("failed_candidate_not_comparable")
-    if _may_repair_main_memory(ctx) and _main_frame_bytes(ctx) >= refused_frame_bytes:
-        # New biography work waits for alternatives. An already shorter
-        # Low/history view keeps the acting route's immediate retry below.
-        _defer_memory_refusal(ctx, failed_capture)
+    if (ctx.active_context_mode == "max" or _may_repair_main_memory(ctx)) and _main_frame_bytes(ctx) >= refused_frame_bytes:
+        # New biography work and book navigation wait for configured routes.
+        # An already shorter Max/history view keeps its immediate retry below.
+        _defer_memory_refusal(ctx, failed_capture, refused_digest_ids=refused_digest_ids,
+                              refused_memory_bytes=refused_memory_bytes)
         return msg, cost, ctx.active_context_mode
     retries.add(key)
     try:
@@ -1565,7 +1579,8 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
             ),
         )
     except PhysicalAttemptPreconditionFailed:
-        _defer_memory_refusal(ctx, failed_capture)
+        _defer_memory_refusal(ctx, failed_capture, refused_digest_ids=refused_digest_ids,
+                              refused_memory_bytes=refused_memory_bytes)
         return _skipped("context_candidate_not_strictly_smaller")
     if retry_msg is None and ctx.accumulated_usage.get("_last_llm_error_kind") == "context_overflow":
         _defer_memory_refusal(ctx, _loop().last_physical_attempt_capture())

@@ -154,7 +154,7 @@ def test_pressure_reduces_whole_chronicle_and_one_huge_block_before_normal_send(
     scratch = {"ts": "2026-09-01", "source": "task", "content": "Active complete source. " * 15000 + "FINAL QUESTION."}
     memory.mutate_scratchpad_blocks(lambda _current: [scratch])
     def fits():
-        messages = [{"role": "system", "content": memory.identity_path().read_text(encoding="utf-8") + render_memory(json.loads(capture_chronicle(memory, {"id": "pressure-view", "chat_id": 1})))[0] + memory.scratchpad_path().read_text(encoding="utf-8")}]
+        messages = [{"role": "system", "content": memory.identity_path().read_text(encoding="utf-8") + render_memory(json.loads(capture_chronicle(memory, {"id": "pressure-view", "chat_id": 1})), token_budget=1500)[0] + memory.scratchpad_path().read_text(encoding="utf-8")}]
         return estimate_context_prompt_tokens(messages) < 2000
     assert not fits() and not c.should_consolidate_scratchpad(memory)
     actor = SourceReader(tmp_path, fit.window)
@@ -279,9 +279,9 @@ def test_scratchpad_pressure_cas_preserves_concurrent_sources(tmp_path, fit, cha
 
 @pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("mode,owner_mode,legacy,maintain", [
-    ("max", "max", True, False), ("max", "max", False, True),
+    ("max", "max", True, True), ("max", "max", False, True),
     ("low", "low", True, True), ("nano", "nano", True, True),
-    ("low", "max", True, False),
+    ("low", "max", True, True),
 ])
 def test_post_task_keeps_new_work_and_owner_targets_without_legacy_margin_chase(
         tmp_path, monkeypatch, pending, mode, owner_mode, legacy, maintain):

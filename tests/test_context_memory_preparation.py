@@ -176,7 +176,7 @@ def test_real_round_dispatch_sends_published_memory_without_paid_preparation(pre
 
 @pytest.mark.parametrize("fallback,recovery_failure", [
     ("none", ""), ("success", ""), ("quota_exhausted", ""), ("context_overflow", ""),
-    ("provider_outcome_unknown", ""), ("transport_unavailable", ""), ("free_low", ""),
+    ("provider_outcome_unknown", ""), ("transport_unavailable", ""),
     ("context_overflow", "context_overflow"), ("context_overflow", "provider_outcome_unknown"),
     ("context_overflow", "helper_unknown"),
 ])
@@ -191,14 +191,6 @@ def test_actual_refusal_tries_configured_route_before_source_bound_memory_repair
     ctx.active_context_mode = "low"
     ctx.context_fit_plan = replace(ctx.context_fit_plan, preferred_mode="low", rendered_mode="low")
     ctx.messages[:] = ctx.context_fit_plan.messages_for("low")
-    if fallback == "free_low":
-        templates = dict(ctx.context_fit_plan.system_templates_json)
-        content = json.loads(templates["max"])
-        content[0]["text"] += "Complete resident book text. " * 5000
-        templates["max"] = json.dumps(content)
-        ctx.active_context_mode = "max"
-        ctx.context_fit_plan = replace(ctx.context_fit_plan, preferred_mode="max", rendered_mode="max",
-                                       system_templates_json=templates)
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "" if fallback == "none" else backup)
     monkeypatch.setenv("USE_LOCAL_FALLBACK", "false")
     monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_a: False)
@@ -236,10 +228,7 @@ def test_actual_refusal_tries_configured_route_before_source_bound_memory_repair
                 candidate_raw_sha256="changed", candidate_context_size_bytes=size,
                 candidate_measurement_kind="canonical_json_v1", physical_context=physical)
             assert candidate_predicate(request), "the actual retry must be smaller with the same route and reserve"
-            if fallback == "free_low":
-                assert run.helper.calls == [] and all(r["text"] in str(prepared) for r in run.records)
-            else:
-                assert "Room history retains the open question and its cause." in str(prepared)
+            assert "Room history retains the open question and its cause." in str(prepared)
             if recovery_failure:
                 call.accumulated_usage["_last_llm_error_kind"] = recovery_failure
                 captures.append(replace(_failed_capture(mode="low", size=size), model=call.active_model,
@@ -249,7 +238,7 @@ def test_actual_refusal_tries_configured_route_before_source_bound_memory_repair
         if call.active_model == backup and fallback == "success":
             assert run.helper.calls == []
             return {"role": "assistant", "content": "fallback accepted old meanings"}, 0.0
-        kind = ("quota_exhausted" if fallback == "free_low" else fallback) if call.active_model == backup else "context_overflow"
+        kind = fallback if call.active_model == backup else "context_overflow"
         call.accumulated_usage["_last_llm_error_kind"] = kind
         if call.active_model == backup and fallback == "quota_exhausted":
             call.tools._ctx._deferred_resource_refusal = SimpleNamespace(
@@ -261,7 +250,7 @@ def test_actual_refusal_tries_configured_route_before_source_bound_memory_repair
     monkeypatch.setattr(loop, "_dispatch_round_model", dispatch)
     message, _, _ = loop_model_call._call_round_model(ctx)
     assert run.helper.calls == []
-    assert (message is not None) is (fallback == "free_low")
+    assert message is None
     primary_fit_usage = loop_model_call._snapshot_context_fit_usage(ctx.accumulated_usage)
     ctx.accumulated_usage["cost"] = 0.37
     result = loop_model_call._recover_failed_round(ctx, ctx.tools, message, None,
@@ -270,7 +259,7 @@ def test_actual_refusal_tries_configured_route_before_source_bound_memory_repair
     message = result[0]
     if recovery_failure:
         shared = ctx.tools._ctx
-        assert message is None and len(run.helper.calls) == 1
+        assert message is None and len(run.helper.calls) == (2 if recovery_failure == "context_overflow" else 1)
         assert result[1] == primary and shared.context_fit_plan is result[3]
         assert shared.context_fit_plan.model == primary and shared.context_fit_plan.route_fp == "route-a"
         assert shared.messages is ctx.messages and shared.active_context_mode == result[4]
@@ -280,17 +269,14 @@ def test_actual_refusal_tries_configured_route_before_source_bound_memory_repair
         expected_error = "provider_outcome_unknown" if recovery_failure == "helper_unknown" else recovery_failure
         assert ctx.accumulated_usage["_last_llm_error_kind"] == expected_error
         assert loop.last_physical_attempt_capture() is captures[-1]
-        assert len(sent) == (2 if recovery_failure == "helper_unknown" else 3)
+        assert len(sent) == (2 if recovery_failure == "helper_unknown" else
+                             4 if recovery_failure == "context_overflow" else 3)
         if recovery_failure == "helper_unknown":
             assert run.store.scan_state()["pending_consolidation_outcomes"][0]["physical_attempt_id"] == "held-helper"
         assert loop_model_call._recover_deferred_memory_refusal(ctx.tools) == (None, None, 0.0)
     elif fallback in {"success", "provider_outcome_unknown"}:
         assert run.helper.calls == [] and len(sent) == 2
         assert bool(message) is (fallback == "success")
-    elif fallback == "free_low":
-        assert message["content"] == "recovered" and run.helper.calls == []
-        assert [model for model, _calls, _retry in sent] == [primary, primary]
-        assert sent[-1][2] is True
     else:
         assert message["content"] == "recovered" and len(run.helper.calls) == 1
         assert sent[-1][0] == primary  # an alternative never replaces the acting route's paid need
@@ -327,7 +313,7 @@ def test_refused_memory_repair_preserves_paid_interruptions_and_originals(prepar
     (False, "", True), (False, "context_overflow", True), (False, "transport_unavailable", True),
     (True, "", True), (False, "transport_unavailable", False),
 ])
-def test_failed_free_low_retry_keeps_source_bound_recovery_reachable(
+def test_books_remain_max_until_source_bound_recovery_exhausted(
         prepared_memory, monkeypatch, extra_room, backup_failure, repairable):
     from ouroboros import fallback_cooldown
     from ouroboros.chronicle_view import refresh_chronicle_snapshot
@@ -361,9 +347,9 @@ def test_failed_free_low_retry_keeps_source_bound_recovery_reachable(
 
     def rebind(plan, tools, messages, *, model, **_kwargs):
         plan = replace(plan, model=model, route_fp="backup-route")
-        messages[:] = plan.reproject_transcript(messages, "low")
+        messages[:] = plan.reproject_transcript(messages, "max")
         tools._ctx.context_fit_plan = plan
-        return plan, "low"
+        return plan, "max"
 
     monkeypatch.setattr(loop, "_rebind_context_fit_plan", rebind)
 
@@ -384,13 +370,13 @@ def test_failed_free_low_retry_keeps_source_bound_recovery_reachable(
 
     monkeypatch.setattr(loop, "_dispatch_round_model", dispatch)
     message, _, _ = loop_model_call._call_round_model(ctx)
-    assert message is None and [row[:2] for row in sent] == [(primary, "max"), (primary, "low")]
+    assert message is None and [row[:2] for row in sent] == [(primary, "max")]
     assert run.helper.calls == []
     result = loop_model_call._recover_failed_round(ctx, ctx.tools, message, None,
         context_fit_plan=ctx.context_fit_plan, active_context_mode=ctx.active_context_mode,
         emit_progress=lambda text, **_kw: notes.append(text))
     assert result[5] is None and not any("Could not establish" in note for note in notes)
-    assert len(run.helper.calls) == (2 if extra_room else 1)
+    assert len(run.helper.calls) == ((4 if extra_room else 2) if repairable else 1)
     if not repairable:
         assert result[0] is None and ctx.accumulated_usage["_last_llm_error_kind"] == "context_overflow"
         assert not run.store.records(kinds=["digest"])
@@ -399,7 +385,7 @@ def test_failed_free_low_retry_keeps_source_bound_recovery_reachable(
     primary_sizes = [row[2] for row in sent if row[0] == primary]
     assert all(later < earlier for earlier, later in zip(primary_sizes, primary_sizes[1:]))
     if backup_failure:
-        assert sent[2][0] == backup and sent[2][3] == 0
+        assert sent[1][0] == backup and sent[1][1] == "max" and sent[1][3] == 0
     assert ctx.tools._ctx.context_fit_plan is result[3] and ctx.tools._ctx.messages is ctx.messages
 
 
@@ -530,7 +516,7 @@ def test_memory_sizes_follow_real_attempt_ledger_and_success_or_error_event(tran
 
 
 @pytest.mark.parametrize("path,backup_failure", [
-    ("free_retry", ""),                      # control: owner Max, free Low retry hits connect failure
+    ("max_repair", ""),                      # Max meaningful repair send hits connect failure
     ("repair_resend", ""),                   # owner Low, no fallback; repaired re-send hits connect failure
     ("repair_resend", "transport_unavailable"),
     ("repair_resend", "context_overflow"),   # owner Low, backup refuses; repaired re-send hits connect failure
@@ -541,7 +527,7 @@ def test_acting_route_connect_failure_after_memory_repair_keeps_real_outage(prep
 
     run, ctx, sent, captures, notes = prepared_memory, prepared_memory.context, [], [], []
     primary, backup = ctx.active_model, "openai/backup"
-    if path == "free_retry":
+    if path == "max_repair":
         templates = dict(ctx.context_fit_plan.system_templates_json)
         content = json.loads(templates["max"])
         content[0]["text"] += "Complete resident book text. " * 5000
@@ -565,9 +551,9 @@ def test_acting_route_connect_failure_after_memory_repair_keeps_real_outage(prep
 
     def rebind(plan, tools, messages, *, model, **_kwargs):
         plan = replace(plan, model=model, route_fp="backup-route")
-        messages[:] = plan.reproject_transcript(messages, "low")
+        messages[:] = plan.reproject_transcript(messages, "max")
         tools._ctx.context_fit_plan = plan
-        return plan, "low"
+        return plan, "max"
 
     monkeypatch.setattr(loop, "_rebind_context_fit_plan", rebind)
 
@@ -598,6 +584,131 @@ def test_acting_route_connect_failure_after_memory_repair_keeps_real_outage(prep
     assert result[5] is not None and result[5].wait_cause == "transport_unavailable"
     assert ctx.accumulated_usage["_last_llm_error_kind"] == "transport_unavailable"
     assert sent[-1][0] == primary and sent[-1][3] is True
-    assert len(run.helper.calls) == (0 if path == "free_retry" else 1)
+    assert len(run.helper.calls) == 1
     assert sum(row[0] == backup for row in sent) == bool(backup_failure)
     assert any("Could not establish" in note for note in notes)
+
+
+@pytest.mark.parametrize("outcome", ["max_progress", "truncated_group", "irreducible", "fallback_success", "helper_unknown", "helper_budget", "ready_view", "fallback_low_success", "owner_low_fallback"])
+def test_physical_recovery_keeps_books_and_options_until_useful_paths_exhausted(
+        prepared_memory, transport, monkeypatch, outcome):  # noqa: F811
+    """Actual dispatch/capture gate, source writer and configured fallback walk."""
+    from copy import deepcopy
+    from ouroboros import fallback_cooldown
+    run, ctx = prepared_memory, prepared_memory.context
+    _root, client, sent = transport
+    ctx.llm = client
+    primary, backup = "openai::test-model", "openai::backup"
+    ctx.active_model = primary
+    templates = dict(ctx.context_fit_plan.system_templates_json)
+    blocks = json.loads(templates["max"])
+    book = "COMPLETE_RESIDENT_BOOK " * 2000
+    blocks[0]["text"] += book
+    templates["max"] = json.dumps(blocks)
+    if outcome == "ready_view":
+        from ouroboros.chronicle_view import refresh_chronicle_snapshot
+        run.store.append_episode("2", "Ready meaningful history retains its cause.", [], {"kind": "helper"},
+            kind="digest", metadata={"covers_record_ids": [r["id"] for r in run.records]})
+        ctx.context_fit_plan = replace(ctx.context_fit_plan, chronicle_state_json=refresh_chronicle_snapshot(
+            ctx.context_fit_plan.chronicle_state_json, run.store.data_root))
+    ctx.context_fit_plan = replace(ctx.context_fit_plan, model=primary, window_tokens=1000000,
+                                   system_templates_json=templates)
+    if outcome == "owner_low_fallback":
+        ctx.active_context_mode = "low"
+        ctx.context_fit_plan = replace(ctx.context_fit_plan, preferred_mode="low", rendered_mode="low")
+    ctx.messages[:] = ctx.context_fit_plan.messages_for(ctx.active_context_mode)
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", backup)
+    monkeypatch.setenv("USE_LOCAL_FALLBACK", "false")
+    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_a: False)
+    monkeypatch.setattr(fallback_cooldown, "mark_cooldown", lambda *_a: None)
+    monkeypatch.setattr("ouroboros.loop_llm_call.main_loop_wire_options", lambda *_a, **_k: {"stream": False})
+    monkeypatch.setattr(loop, "_task_deadline_epoch", lambda *_a: None)
+    monkeypatch.setattr(loop, "_reconcile_transport_wait", lambda current, *_a, **_k: current)
+    def rebind(plan, tools, messages, *, model, preferred_mode, **_kwargs):
+        assert preferred_mode in {"max", "low"}
+        plan = replace(plan, model=model, route_fp="backup-route")
+        messages[:] = plan.reproject_transcript(messages, preferred_mode)
+        tools._ctx.context_fit_plan = plan
+        return plan, preferred_mode
+    monkeypatch.setattr(loop, "_rebind_context_fit_plan", rebind)
+    helper_calls = []
+    def helper(prompt, label, **options):
+        helper_calls.append(prompt)
+        if outcome == "truncated_group" and len(helper_calls) == 1:
+            return "", {"_consolidation_errors": [{"kind": "output_truncated"}], "cost": 0}, None
+        if outcome.startswith("helper_"):
+            kind = "provider_outcome_unknown" if outcome == "helper_unknown" else "budget_exhausted"
+            return "", {"_consolidation_errors": [{"kind": kind}]}, None
+        repeats = 80 if len(helper_calls) == 1 else (10 if outcome == "max_progress" else 80)
+        return "Meaningful causal account remains open. " * repeats, {"prompt_tokens": 1, "cost": 0}, None
+    monkeypatch.setattr(consolidator, "_light_call", lambda *_a: helper)
+    observations = []
+    class Overflow(Exception):
+        status_code = 400
+    class Response:
+        def model_dump(self):
+            return {"choices": [{"message": {"role": "assistant", "content": "Recovered"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 1, "cost": 0}}
+    def create(**candidate):
+        sent.append(deepcopy(candidate))
+        full = book in str(candidate["messages"])
+        observations.append((candidate["model"], full, len(helper_calls)))
+        is_backup = "backup" in candidate["model"]
+        if outcome == "ready_view" and len(sent) == 2:
+            return Response()
+        if is_backup and (outcome == "fallback_success" or (outcome == "fallback_low_success" and not full)
+                          or (outcome == "owner_low_fallback" and len(helper_calls) >= 2)):
+            return Response()
+        if not is_backup and ((outcome == "max_progress" and len(helper_calls) >= 2)
+                              or (outcome == "truncated_group" and len(helper_calls) >= 3)
+                              or (outcome == "irreducible" and not full)):
+            return Response()
+        raise Overflow("maximum context length exceeded")
+    monkeypatch.setattr(client, "_get_remote_client", lambda *_a: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+    ua.adopt_physical_attempt_capture(None)
+    message, _, mode = loop_model_call._call_round_model(ctx)
+    if outcome == "ready_view":
+        assert message["content"] == "Recovered" and mode == "max" and not helper_calls
+        assert len(sent) == 2 and all(row[:2] == ("test-model", True) for row in observations)
+        assert all(r["text"] in str(sent[0]["messages"]) for r in run.records)
+        assert all(r["text"] not in str(sent[1]["messages"]) for r in run.records)
+        return
+    assert message is None and mode == ("low" if outcome == "owner_low_fallback" else "max") and not helper_calls
+    result = loop_model_call._recover_failed_round(ctx, ctx.tools, message, None,
+        context_fit_plan=ctx.context_fit_plan, active_context_mode=mode, emit_progress=lambda *_a, **_k: None)
+    assert observations[0][1:] == (outcome != "owner_low_fallback", 0)
+    assert observations[1] == ("backup", outcome != "owner_low_fallback", 0)
+    if outcome == "fallback_success":
+        assert result[0]["content"] == "Recovered" and not helper_calls
+    elif outcome in {"fallback_low_success", "owner_low_fallback"}:
+        assert result[0]["content"] == "Recovered" and result[1] == backup
+        assert result[4] == "low" and len(helper_calls) == 2
+        assert observations[-2][0] == "test-model" and observations[-2][1] is False
+        assert observations[-1] == ("backup", False, 2)
+        backup_sends = [row for row in sent if row["model"] == "backup"]
+        assert len(backup_sends) == 2
+        assert len(json.dumps(backup_sends[1]["messages"])) < len(json.dumps(backup_sends[0]["messages"]))
+    elif outcome.startswith("helper_"):
+        assert result[0] is None and len(sent) == 2 and len(helper_calls) == 1
+        assert ctx.accumulated_usage["_last_llm_error_kind"] == (
+            "provider_outcome_unknown" if outcome == "helper_unknown" else "budget_exhausted")
+    else:
+        assert result[0]["content"] == "Recovered" and result[1] == primary
+        assert len(helper_calls) == (3 if outcome == "truncated_group" else 2)
+        if outcome == "truncated_group":
+            groups = [[json.loads(row)["record_id"] for row in prompt.split(
+                "## Source group: complete text, projected host metadata\n", 1)[1].split("\n\n")]
+                      for prompt in helper_calls]
+            ids = [record["id"] for record in run.records]
+            assert groups == [ids, ids[:1], ids[1:]]  # Failed whole, then its exact immutable halves.
+            assert all(full for _model, full, _count in observations)
+            assert not any(e.get("checkpoint_kind") == "context_fit_low_retry" for e in run.events)
+        assert all(full for _model, full, _count in observations[:-1])
+        assert observations[-1][1] is (outcome in {"max_progress", "truncated_group"})
+        primary_sends = [row for row in sent if row["model"] != "backup"]
+        sizes = [len(json.dumps(row["messages"])) for row in primary_sends]
+        assert all(b < a for a, b in zip(sizes, sizes[1:]))
+        options = [{key: value for key, value in row.items() if key not in {"messages", "prompt_cache_key"}} for row in primary_sends]
+        assert all(options[0] == option for option in options[1:]), options
+    assert all(run.store.get(record["id"])["text"] == record["text"] for record in run.records)

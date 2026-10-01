@@ -96,14 +96,13 @@ GREEN. Every submitted envelope reaching `plan_task` supersedes prior authority,
 so no newer attempt falls back to an older GREEN. Paid cycles are bounded by the
 shared `OUROBOROS_REVIEW_MAX_CYCLES` (`ouroboros/review_cycles.py`).
 
-**Context mode (Nano / Low / Max).** The Main task context row above is each
-mode's projection of the two books (ARCHITECTURE §6 "Context fitting, retry, and
-compaction"); Max binds `DEVELOPMENT.md` to the active repository — a path fact,
-never a guess from message text. Tier-0 identity and constitutional context
+**Context mode (Nano / Low / Max).** The Main row above defines book projections
+(ARCHITECTURE §6 "Context fitting, retry, and compaction"); Max binds
+`DEVELOPMENT.md` to the active repository by path, not message wording. Tier-0 identity and constitutional context
 stays full in every mode. Predicted Max pressure never swaps in Low documents:
-only actual provider overflow may use a task-local Low projection, then at most
-one same-route strictly-smaller call, and none of it changes owner mode or P3
-commit/scope review. Disclosed residual: an explicit per-task handbook override
+only actual provider overflow, after useful working-history and narrative-memory
+reduction, may use task-local Low book navigation. Recovery sends must be strictly
+smaller; none changes owner mode or P3 commit/scope review. Disclosed residual: an explicit per-task handbook override
 (`context_requires_self_body_docs`) wins in Max only: Low and Nano ignore it
 (issue #1019), as does a delegated subagent child in every mode (issue #1026); the
 sibling `context_requires_development` flag is ignored on the same paths.
