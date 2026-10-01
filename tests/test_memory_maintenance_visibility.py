@@ -60,7 +60,11 @@ def test_a_lock_skip_is_a_typed_event_and_a_free_run_is_not(tmp_path, fit):
     c._lock_nb(holder)
     try:
         ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="held")
-        assert c.consolidate(chat, blocks, meta, _LLM(), knowledge_context=ctx, represented_only=True) is None
+        llm = _LLM()
+        outcome = c.consolidate(chat, blocks, meta, llm, knowledge_context=ctx, represented_only=True)
+        assert outcome["_blocks_written"] == 0 and not llm.calls
+        assert [(row["kind"], row["reason"]) for row in outcome["_consolidation_errors"]] == [
+            ("temporarily_unavailable", "consolidation_lock_held")]
     finally:
         c._unlock(holder)
         os.close(holder)
@@ -103,6 +107,9 @@ def test_existing_digest_can_be_coarsened_without_changing_its_original_sources(
     _digest_run(tmp_path, llm, fitting_demand={"memory_budget_tokens": 100})
     assert not llm.calls  # a changed leftover allowance is not a new semantic request
     _digest_run(tmp_path, llm, fitting_demand={"purpose": "explicit_revision", "memory_budget_tokens": 100})
+    assert not llm.calls  # A new purpose label alone does not authorize a rebuy either.
+    _digest_run(tmp_path, llm, fitting_demand={"purpose": "owner_mode", "rendered_mode": "nano",
+                                             "requirement_tokens": 85000, "memory_budget_tokens": 100})
     latest = chronicle.records(kinds=["digest"])[-1]
     assert len(llm.calls) == 1 and latest["metadata"]["covers_record_ids"] == [original["id"]]
     request = str(llm.calls[0]["messages"])
@@ -110,6 +117,7 @@ def test_existing_digest_can_be_coarsened_without_changing_its_original_sources(
     assert chronicle.get(original["id"])["text"] == original["text"]
     assert chronicle.get(prior["id"])["text"] == prior["text"]
     assert latest["source_refs"] and latest["author"]["kind"] == "helper"
+    assert len(latest["text"]) < len(prior["text"])
 
 
 def test_fitting_projection_never_buys_an_automatic_digest(tmp_path, fit):
@@ -156,8 +164,12 @@ def test_each_room_keeps_its_own_refusal_when_another_room_changes_and_succeeds(
     chronicle, originals = _digest_store(tmp_path, ("a", "b"))
     first = _long_digest()
     _digest_run(tmp_path, first)
-    receipts = chronicle.records(kinds=["maintenance"])
-    assert len(receipts) == 2 and all(row["status"] == "not_shorter" for row in receipts)
+    maintenance = chronicle.records(kinds=["maintenance"])
+    receipts = [row for row in maintenance if row.get("status") == "not_shorter"]
+    assert len(receipts) == 2 and {row["room_id"] for row in receipts} == {"a", "b"}
+    measured = [row for row in maintenance if row["id"].startswith("digest-fit:")]
+    assert len(measured) == 2 and {row["target_id"] for row in measured} == {row["id"] for row in receipts}
+    assert all(row["published_progress"] is False and row["target_fits"] is False for row in measured)
     chronicle.revise(originals[0]["id"], originals[0]["text"] + "New cause.", {"kind": "mind"})
     next_model = _LLM()
     _digest_run(tmp_path, next_model)
@@ -227,7 +239,9 @@ def test_digest_retry_is_bound_to_the_request_after_model_wait_reprepare(tmp_pat
     first = _LLM(effect=rebound)
     usage = _digest_run(tmp_path, first)
     assert len(first.calls) == 1 and usage["_light_dispatch_binding"] == route_b
-    receipt = chronicle.records(kinds=["maintenance"])[-1]
+    (receipt,) = [row for row in chronicle.records(kinds=["maintenance"]) if row.get("status") == "not_shorter"]
+    fit_receipt = chronicle.get(receipt["id"].replace("digest-attempt:", "digest-fit:", 1))
+    assert fit_receipt["target_id"] == receipt["id"] and fit_receipt["target_fits"] is False
     assert receipt["source_keys"] == [[original["id"], original["id"]]]
     assert receipt["guidance_sha256"] == usage["_remembering_guidance_sha256"] == hashlib.sha256(
         remembering_guidance(tmp_path).encode("utf-8")).hexdigest()
@@ -238,7 +252,10 @@ def test_digest_retry_is_bound_to_the_request_after_model_wait_reprepare(tmp_pat
     on_a = _long_digest()
     _digest_run(tmp_path, on_a)
     assert on_a.calls == []  # the completed judgment is source-bound, even after returning to A
-    next_usage = _digest_run(tmp_path, on_a, fitting_demand={"purpose": "explicit_revision"})
+    _digest_run(tmp_path, on_a, fitting_demand={"purpose": "explicit_revision"})
+    assert on_a.calls == []  # Rewording the same demand does not undo the reprepare receipt.
+    next_usage = _digest_run(tmp_path, on_a, fitting_demand={"purpose": "owner_mode", "rendered_mode": "nano",
+                                                           "requirement_tokens": 85000})
     assert len(on_a.calls) == 1 and on_a.calls[0]["model"] == "test/model"
     assert next_usage["_light_dispatch_binding"]["model"] == "test/model"
     assert original["text"] in str(on_a.calls[0]["messages"])

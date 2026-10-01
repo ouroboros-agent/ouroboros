@@ -148,22 +148,41 @@ def test_unchanged_marks_preserve_prefix_and_do_not_refresh_raw_sources(marked_m
     assert [row["sanctioned_by"] for row in events if row.get("checkpoint_kind") == "prompt_prefix_break"] == ["memory_marks"]
 
 
-def test_mark_survives_narrow_reprojection_and_real_fallback(marked_main, monkeypatch):
+def test_mark_survives_real_fallback_that_can_fit_max(marked_main, monkeypatch):
     import httpx
-    from ouroboros import context
+    from ouroboros import context, usage_accounting
+    from ouroboros.observability import read_call_payload
+
     f = marked_main
+    primary = f.ctx.context_fit_plan.model
+    # Distinct physical book bytes prove the fallback kept Max, independently
+    # of the plan's optional rendered_mode override (empty means preferred).
+    resident_book = "Complete Max reference book stays resident."
+    templates = dict(f.ctx.context_fit_plan.system_templates_json)
+    max_blocks = json.loads(templates["max"])
+    max_blocks[0]["text"] += "\n" + resident_book
+    templates["max"] = json.dumps(max_blocks)
+    f.ctx.context_fit_plan = replace(f.ctx.context_fit_plan, system_templates_json=templates)
+    f.messages = f.ctx.context_fit_plan.messages_for("max")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai/alternate")
     monkeypatch.setattr(context, "_context_fit_route", lambda task, **kw: (
         {"model": task["model"], "provider": "openai"},
         SimpleNamespace(route_fp="fallback-route", status="confirmed", stale=False, window_tokens=900_000)))
     overflow = httpx.HTTPStatusError("context_length_exceeded", request=httpx.Request("POST", "https://fixture.invalid"),
         response=httpx.Response(400, json={"error": {"message": "context_length_exceeded"}}))
-    f.run([call("memory_mark", f.mark_args, "mark"), overflow, overflow, {"content": "done"}])
-    assert f.inputs[-1]["model"] == "openai/alternate"
-    for physical in f.inputs[1:]:
-        system = extract_plain_text_from_content(physical["messages"][0]["content"])
+    answer, _, _ = f.run([call("memory_mark", f.mark_args, "mark"), overflow, {"content": "done"}])
+    assert answer == "done"
+    assert [request["model"] for request in f.inputs] == [primary, primary, "openai/alternate"]
+    for request in f.inputs[1:]:
+        system = extract_plain_text_from_content(request["messages"][0]["content"])
         assert f.mark_args["text"] in system and f.mark_args["quote"] in system and f.source_record["id"] in system
-    assert f.ctx.context_fit_plan.preferred_mode == "max" and f.ctx.context_fit_plan.rendered_mode == "low"
+        assert resident_book in system
+    _, physical, _ = read_call_payload(f.ctx.drive_root, task_id="authored-main", call_id="authored-send-3")
+    system = extract_plain_text_from_content(physical["messages"][0]["content"])
+    assert resident_book in system
+    assert f.mark_args["text"] in system and f.mark_args["quote"] in system and f.source_record["id"] in system
+    assert f.ctx.context_fit_plan.preferred_mode == "max" and f.ctx.active_context_mode == "max"
+    assert usage_accounting.last_physical_attempt_capture().physical_context.rendered_mode == "max"
 
 
 def test_account_reprepare_refreshes_marks_before_its_physical_candidate(marked_main, monkeypatch):
