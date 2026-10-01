@@ -136,6 +136,8 @@ def _memory_read(ctx, node_id="", room_id="", after_seq=0, limit=None, raw_room=
                     json.dumps(payload, ensure_ascii=False).encode("utf-8"), "json")
             payload["source_ref"] = source_ref
         elif raw_room:
+            if limit is not None:
+                end = start + limit if end is None else min(end, start + limit)
             payload = _raw_room(ctx, _room(ctx, room_id), start, end)
         elif node_id:
             node = store.get(node_id)
@@ -209,7 +211,7 @@ def chronicle_tools():
          {"text": string, "room_id": string, "node_id": string, "source_ref": source,
           "revision_id": string, "decision": {"type": "string", "enum": ["accept", "reject"]}, "reason": string}),
         ("memory_read", _memory_read,
-         "Read originals, revisions and their sources, or page through a room. source_ref reads a retained snapshot, including its exact source chunks; start/end page its rows. room_id is the original numeric chat ID as text (for example 1), with the current addressed room as default. raw_room=true captures exact current room messages and returns a retained source_ref with row identities and explicit range/coverage. Use it to investigate lost detail, verify a correction or recall an old decision; choose the depth yourself.",
+         "Read originals, revisions and their sources, or page through a room. source_ref reads a retained snapshot, including its exact source chunks; start/end page its rows. room_id is the original numeric chat ID as text (for example 1), with the current addressed room as default. raw_room=true captures exact current room messages and returns a retained source_ref with row identities and explicit range/coverage. limit caps room records; with raw_room it caps rows from start without extending end. Omitting limit keeps the requested range unrestricted. Use it to investigate lost detail, verify a correction or recall an old decision; choose the depth yourself.",
          {"node_id": string, "room_id": string, "source_ref": source, "after_seq": {"type": "integer", "minimum": 0},
           "limit": {"type": "integer", "minimum": 1}, "raw_room": {"type": "boolean"},
           "start": {"type": "integer", "minimum": 0}, "end": {"type": "integer", "minimum": 0}}),

@@ -310,3 +310,66 @@ def test_interim_coverage_keeps_current_open_arc_raw_without_reopening_cancelled
     assert original["text"] in render_memory(returned, None)[0]
     assert json.loads(registry.execute("memory_read", {"source_ref": page["source_ref"]}))["rows"] == rows
     assert chat.read_bytes() == source_bytes
+
+
+@pytest.fixture
+def raw_room_registry(tmp_path):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    (data / "logs").mkdir(parents=True)
+    rows = [{"chat_id": 7, "direction": "in", "task_id": f"original-{index}",
+             "text": f"Original owner message {index}",
+             "ts": f"2026-10-01T12:{index // 60:02}:{index % 60:02}Z"} for index in range(75)]
+    foreign = {"chat_id": 99, "direction": "in", "text": "Another room"}
+    (data / "logs/chat.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in [foreign, *rows]), encoding="utf-8")
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    registry.set_context(ToolContext(repo_dir=repo, drive_root=data, current_chat_id=7,
+                                    task_id="raw-page-reader", task_metadata={"chat_id": 7}))
+    return registry, rows
+
+
+def test_raw_room_limit_pages_real_registry_and_binds_only_returned_sources(raw_room_registry):
+    registry, rows = raw_room_registry
+    seen, identifiers = [], []
+    for start in (0, 20, 40, 60):
+        result = registry.execute_result("memory_read", {"raw_room": True, "start": start, "limit": 20})
+        assert result.status == "ok"
+        page = json.loads(result.text)
+        end = min(start + 20, len(rows))
+        assert page["rows"] == rows[start:end]
+        assert page["range"] == {"start": start, "end": end, "total": 75, "unit": "matching_rows"}
+        assert page["page_complete"] is False
+        expected_ids = [source_row_id(row) for row in rows[start:end]]
+        assert page["source_row_ids"] == expected_ids
+        retained = json.loads(registry.execute("memory_read", {"source_ref": page["source_ref"]}))
+        assert retained["rows"] == page["rows"] and retained["source_row_ids"] == expected_ids
+        episode = json.loads(registry.execute("chronicle_write", {
+            "text": "I inspected only this page.", "source_ref": page["source_ref"]}))
+        assert episode["metadata"]["source_row_ids"] == expected_ids
+        assert episode["metadata"]["source_range"] == page["range"]
+        assert set(episode["metadata"]["task_ids"]) == (
+            {row["task_id"] for row in rows[start:end]} | {"raw-page-reader"})
+        seen.extend(page["rows"])
+        identifiers.extend(expected_ids)
+    assert seen == rows and len(set(identifiers)) == 75
+
+
+@pytest.mark.parametrize("arguments,start,end", [
+    ({"start": 10, "end": 35, "limit": 20}, 10, 30),
+    ({"start": 10, "end": 15, "limit": 20}, 10, 15),
+    ({"start": 10, "end": 35}, 10, 35),
+    ({"start": 70}, 70, 75),
+    ({}, 0, 75),
+    ({"limit": 100}, 0, 75),
+])
+def test_raw_room_limit_respects_end_and_keeps_unbounded_reads(raw_room_registry, arguments, start, end):
+    registry, rows = raw_room_registry
+    result = registry.execute_result("memory_read", {"raw_room": True, **arguments})
+    assert result.status == "ok"
+    page = json.loads(result.text)
+    assert page["rows"] == rows[start:end]
+    assert page["range"] == {"start": start, "end": end, "total": 75, "unit": "matching_rows"}
+    assert page["page_complete"] is (start == 0 and end == 75)
