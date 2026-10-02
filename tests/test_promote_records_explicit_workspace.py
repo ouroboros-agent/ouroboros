@@ -146,3 +146,37 @@ def test_update_project_only_if_empty_is_a_compare_and_set(tmp_path):
     assert second["working_dir"] == "/a"  # the loser reads the winner's value back
     plain = update_project(tmp_path, "cas-room", working_dir="/c")
     assert plain["working_dir"] == "/c"  # an ordinary update still overwrites
+
+
+@pytest.mark.parametrize("stage", ["create_project", "bind_task_to_project"])
+@pytest.mark.parametrize("choice", ["explicit", "none", "room_default"])
+@pytest.mark.serial
+def test_room_default_drift_respects_the_promoted_resource_choice(tmp_path, monkeypatch, stage, choice):
+    import supervisor.workers as workers
+    from ouroboros import projects_registry as registry
+
+    drive = _drive(tmp_path, monkeypatch)
+    registry.create_project(drive, "changing-room")
+    explicit, other = tmp_path / "explicit", tmp_path / "other"
+    explicit.mkdir()
+    other.mkdir()
+    original = getattr(registry, stage)
+
+    def changed(*args, **kwargs):
+        registry.update_project(drive, "changing-room", working_dir=str(other))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(registry, stage, changed)
+    enqueued = []
+    outcome = workers.promote_chat_to_task({
+        "task_id": "drift", "objective": "Use the selected resource", "project_id": "changing-room",
+        "workspace_root": str(explicit) if choice == "explicit" else "",
+        "workspace": "none" if choice == "none" else "", "chat_id": 1,
+    }, _promote_ctx(enqueued))
+    if choice == "room_default":
+        assert outcome["status"] == "needs_manual_target" and not enqueued
+    else:
+        assert outcome["status"] == "scheduled" and len(enqueued) == 1
+        assert enqueued[0].get("workspace_root", "") == (str(explicit.resolve()) if choice == "explicit" else "")
+        assert enqueued[0]["_project_admission"]["frozen"] is True
+    assert registry.get_project(drive, "changing-room")["working_dir"] == str(other)

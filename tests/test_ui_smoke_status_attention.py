@@ -26,6 +26,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
     from playwright.sync_api import sync_playwright
 
     from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
@@ -64,6 +65,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         )
 
     def emit_progress(page, chat_id, task_id, content):
+        # A later real census/detail refresh must find this synthetic task.
+        # Socket-only rows otherwise become correctly "Outcome unavailable".
+        write_task_result(data_dir, task_id, "running", chat_id=chat_id)
         emit(page, {
             "type": "chat",
             "role": "assistant",
@@ -78,6 +82,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         lifecycle = "cancelled" if status == "cancelled" else "completed"
         execution = "failed" if status == "failed" else "ok"
         objective = "fail" if status == "failed" else "pass"
+        write_task_result(data_dir, task_id, status, chat_id=chat_id, outcome_axes={
+            "lifecycle": {"status": lifecycle}, "execution": {"status": execution},
+            "objective": {"status": objective},
+        })
         emit(page, {
             "type": "log",
             "chat_id": chat_id,

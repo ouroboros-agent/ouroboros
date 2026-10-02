@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -94,6 +95,7 @@ def run_chat_viewport_smoke(
     """Live card growth follows bottom or preserves the visible descendant."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
     from tests.ci_evidence import output_dir
 
@@ -154,14 +156,25 @@ def run_chat_viewport_smoke(
         box = page.locator("#chat-messages").bounding_box()
         evidence.point = {"x": box["x"] + box["width"] / 2, "y": box["y"] + box["height"] / 2}
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        page.mouse.wheel(0, jump_state(page)["remaining"] + 200)
-        evidence.checkpoint("read_to_latest:wait_for_live_edge")
-        page.wait_for_function(
-            """() => {
-                const messages = document.querySelector('#chat-messages');
-                return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 1;
-            }"""
-        )
+        # A wheel delta need not become the same number of scroll pixels.
+        # Keep reading physically until arrival, within the original 30s limit.
+        # Even at the bottom, one gesture must renew the reader's follow intent.
+        deadline = time.monotonic() + 30
+        while True:
+            page.mouse.wheel(0, jump_state(page)["remaining"] + 200)
+            evidence.checkpoint("read_to_latest:wait_for_live_edge")
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const messages = document.querySelector('#chat-messages');
+                        return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 1;
+                    }""",
+                    timeout=max(1, min(1_000, (deadline - time.monotonic()) * 1_000)),
+                )
+                break
+            except PlaywrightTimeoutError:
+                if time.monotonic() >= deadline:
+                    raise
         page.evaluate(_SETTLE_TWO_FRAMES)
         evidence.checkpoint("read_to_latest:complete")
 

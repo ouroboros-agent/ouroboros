@@ -9,14 +9,13 @@ re-adopts an ``active`` row of the SAME task with token rebinding, never a
 worker treats only ``sealed`` as a seal.
 
 The pooled tests run the REAL worker seam, the REAL ack writer and the REAL
-queue transition behind an emulated (slow / lossy) supervisor loop.
+queue transition with controlled supervisor delivery, loss and suspension.
 """
 
 from __future__ import annotations
 
 import json
 import queue as stdqueue
-import threading
 import time
 from types import SimpleNamespace
 
@@ -41,61 +40,56 @@ def _pooled_agent(tmp_path, events, task_id="root-1"):
 
 
 class _Supervisor:
-    """The supervisor's fence handler behind a consumer thread.
+    """Deliver real fence events at controlled points, independent of scheduling.
 
     ``drop_events``: the first N events are never applied (a loop that never got
     to them). ``lose_acks``: the first N transitions ARE applied but their ack is
     lost. ``paused``: events queue up until ``resume()`` (a stalled loop).
     """
 
-    def __init__(self, events, drive_root, *, drop_events=0, lose_acks=0, delay=0.0, paused=False):
+    def __init__(self, events, drive_root, *, drop_events=0, lose_acks=0, paused=False):
         self.events, self.drive_root = events, drive_root
-        self.drop_events, self.lose_acks, self.delay = drop_events, lose_acks, delay
+        self.drop_events, self.lose_acks = drop_events, lose_acks
         self.seen: list = []
-        self._go = threading.Event()
+        self.paused = paused
+        self._put = events.put
+        events.put = self._deliver
         if not paused:
-            self._go.set()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+            self._drain()  # requests may predate this supervisor
 
     def resume(self):
-        self._go.set()
+        self.paused = False
+        self._drain()
 
-    def _run(self):
-        from supervisor import queue as queue_mod
+    def _deliver(self, evt):
+        self._put(evt)
+        if not self.paused:
+            self._drain()
+
+    def _drain(self):
         from supervisor.events_worker_reports import _handle_acceptance_fence
 
         while True:
-            evt = self.events.get()
-            if evt is None:
+            try:
+                evt = self.events.get_nowait()
+            except stdqueue.Empty:
                 return
-            self._go.wait(30)
             self.seen.append(dict(evt))
             if self.drop_events > 0:
                 self.drop_events -= 1
                 continue
-            time.sleep(self.delay)
+            _handle_acceptance_fence(evt, SimpleNamespace(DRIVE_ROOT=self.drive_root))
             if self.lose_acks > 0:
                 self.lose_acks -= 1
-                queue_mod.transition_acceptance_fence(**{
-                    key: evt[key] for key in ("action", "token", "root_task_id", "task_id", "outcome", "expected_generation")
-                    if key in evt
-                })
-                continue
-            _handle_acceptance_fence(evt, SimpleNamespace(DRIVE_ROOT=self.drive_root))
+                (self.drive_root / "state" / "acceptance_fence_acks" / f"{evt['token']}.{evt['req']}.json").unlink()
 
-    def drained(self, count, timeout=10.0):
-        deadline = time.monotonic() + timeout
-        while len(self.seen) < count and time.monotonic() < deadline:
-            time.sleep(0.01)
-        time.sleep(0.05)
+    def drained(self, count):
         return len(self.seen) >= count
 
     def stop(self):
-        self._go.set()
-        self.events.put(None)
-        self._thread.join(timeout=10)
-        assert not self._thread.is_alive()
+        if self.events.put == self._deliver:
+            self.resume()
+            self.events.put = self._put
 
 
 @pytest.fixture
@@ -262,11 +256,11 @@ def test_late_ack_of_a_previous_request_is_read_by_nobody(monkeypatch, tmp_path,
         token = agent._begin_acceptance_fence(root_task_id="root-1", task_id="root-1")["token"]
         supervisor.stop()
 
-        stalled = _Supervisor(events, tmp_path, paused=True)
+        supervisor = _Supervisor(events, tmp_path, paused=True)
         with pytest.raises(TimeoutError):
             agent._inspect_acceptance_fence(token=token)
-        stalled.resume()  # the loop catches up and answers the inspect LATE
-        assert stalled.drained(1)  # a read is sent once, never re-sent
+        supervisor.resume()  # the loop catches up and answers the inspect LATE
+        assert supervisor.drained(1)  # a read is sent once, never re-sent
         late = _ack_names(tmp_path)
         assert late and all(name.startswith(f"{token}.") for name in late)
 
@@ -274,9 +268,8 @@ def test_late_ack_of_a_previous_request_is_read_by_nobody(monkeypatch, tmp_path,
         assert ended["status"] == "sealed"  # the end's own answer, not the late ``active``
         assert queue_mod.ACCEPTANCE_FENCES["root-1"]["status"] == "sealed"
         assert _ack_names(tmp_path) == late  # the late acks were read by nobody
-        stalled.stop()
     finally:
-        events.put(None)
+        supervisor.stop()
 
 
 # --- pooled: one re-send, then a typed outcome ---------------------------------------------
@@ -347,12 +340,14 @@ def test_direct_turn_uses_no_event_and_no_ack_file(monkeypatch, tmp_path, short_
     events: stdqueue.Queue = stdqueue.Queue()
     direct = _pooled_agent(tmp_path, events, task_id="direct-1")
     direct.fence_transition = queue_mod.transition_acceptance_fence  # what ``_get_chat_agent`` injects
-    started = time.monotonic()
+    def forbidden_send(*_args, **_kwargs):
+        pytest.fail("a direct fence transition must not send or poll an ACK")
+
+    monkeypatch.setattr(direct, "_send_fence_event", forbidden_send)
     token = direct._begin_acceptance_fence(root_task_id="direct-1", task_id="direct-1")["token"]
     assert queue_mod.ACCEPTANCE_FENCES["direct-1"]["status"] == "active"
     assert direct._inspect_acceptance_fence(token=token)["status"] == "active"
     assert direct._end_acceptance_fence(token=token, outcome="terminal", expected_generation=0)["status"] == "sealed"
-    assert time.monotonic() - started < WAIT_SEC  # nobody was asked, nobody was waited for
     assert events.empty() and _ack_names(tmp_path) == []
 
     # The other direction: a pooled worker still travels by event + ack.

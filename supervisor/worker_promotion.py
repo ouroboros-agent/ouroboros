@@ -233,6 +233,12 @@ def _admit_project_scope(
     root in Main as a second convertible unit for one piece of work."""
     if not pid:
         return None
+    from ouroboros.workspace_admission import WORKSPACE_NONE
+
+    # Explicit folder/no-folder choices never depend on the room's default,
+    # including the create/bind window before workspace validation below.
+    frozen = (bool(str(evt.get("workspace_root") or "").strip())
+              or str(evt.get("workspace") or "").strip().lower() == WORKSPACE_NONE)
     # Deletion closes admission before cancellation/quiescence begins. Check
     # the durable lifecycle before creating projects or child drives;
     # enqueue_task repeats this check atomically under the queue lock.
@@ -240,7 +246,7 @@ def _admit_project_scope(
         from ouroboros.projects_registry import project_admission_view, validate_project_admission
 
         basis = (validate_project_admission(evt["_project_admission"]) if "_project_admission" in evt
-                 else project_admission_view(_pool().DRIVE_ROOT, pid, allow_unregistered=True))
+                 else project_admission_view(_pool().DRIVE_ROOT, pid, allow_unregistered=True, frozen=frozen))
         existing_project = basis["project"]
         existing_lifecycle = str((existing_project or {}).get("lifecycle") or "active")
         if existing_project is not None and existing_lifecycle != "active":
@@ -269,7 +275,7 @@ def _admit_project_scope(
             _pool().DRIVE_ROOT, pid, name=project_display_name, origin="promote_chat_to_task",
             admission_basis=basis,
         )
-        task["_project_admission"] = (basis if "_project_admission" in evt else project_admission_basis(pid, project))
+        task["_project_admission"] = (basis if "_project_admission" in evt else project_admission_basis(pid, project, frozen=frozen))
         touch_project(_pool().DRIVE_ROOT, pid)
         # Bind the task to its project (durable task->project map). Without this
         # the task is project-scoped only in its own metadata; the frontend (via

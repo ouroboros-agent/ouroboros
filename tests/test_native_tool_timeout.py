@@ -11,6 +11,7 @@ value the worker finally produces sources no receipt and no read coverage.
 """
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
@@ -184,21 +185,22 @@ def test_tool_bound_is_the_loop_policy_for_this_registry_and_call(repo, monkeypa
 
 
 def test_inherited_dispatch_deadline_narrows_the_tool_wait(repo, monkeypatch):
-    """An inherited execution bound narrows the wait below the tool's own
-    ceiling; without it the same call on the same tool finishes untouched."""
+    """The inherited deadline narrows the tool wait, even if preparation spent it."""
     release, _holder = _install_registry(monkeypatch, hold_sec=3.0)
     llm = _reading_script()
-    started = monotonic_now()
-    with execution_deadline_scope(monotonic_now() + 1.0):
-        result = NativeToolRoundReviewExecutor(_assignment(repo), llm=llm).execute()
-    elapsed = monotonic_now() - started
-
-    assert elapsed < 3.0  # the 600s tool ceiling did not decide this wait
-    receipt = result.usage["native_tool_receipts"][0]
-    assert receipt["outcome"] == "error" and receipt["source_gap"] == "native_tool_abandoned"
-    bound = float(_tool_messages(llm)[0]["content"].split("exceeded ")[1].split("s limit")[0])
-    assert 0 < bound <= 1.0 + 1e-9 + 1e-9
-    release.set()
+    # The test owns and joins the actual executor even when an assertion fails.
+    with ThreadPoolExecutor(max_workers=1) as worker, monkeypatch.context() as patch:
+        patch.setattr(loop_tool_execution, "ThreadPoolExecutor", lambda **_kwargs: worker)
+        try:
+            with execution_deadline_scope(monotonic_now() + 1.0):
+                result = NativeToolRoundReviewExecutor(_assignment(repo), llm=llm).execute()
+            receipt = result.usage["native_tool_receipts"][0]
+            assert receipt["outcome"] == "error" and receipt["source_gap"] == "native_tool_abandoned"
+            bound = float(_tool_messages(llm)[0]["content"].split("exceeded ")[1].split("s limit")[0])
+            # The episode prepares its registry after the inherited deadline starts.
+            assert 0 <= bound <= 1.0 + 1e-9
+        finally:
+            release.set()
 
     release_again, _holder_again = _install_registry(monkeypatch, hold_sec=3.0)
     release_again.set()

@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 _BOUND_API_PAID_STAMP: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "ouroboros_review_api_paid_stamp", default=None,
 )
+_ACCEPTANCE_COLLECTION_LOCK = threading.Lock()
 
 # Identity prefixes for the configured reviewer surfaces. A surface that fans
 # rows out registers its prefix here rather than spelling one inline, so
@@ -201,20 +202,37 @@ def reconcile_pending_acceptance_runs(
             continue
         if not isinstance(run.get("request"), dict) or not run.get("slot_roster"):
             continue
-        if not acceptance_run_pending(run):
-            continue
-        try:
-            result = collect_task_acceptance_run(
-                run, drive_root=drive_root, usage_ctx=usage_ctx,
-                **({"controller": controller} if controller is not None else {}),
-            )
-        except (OSError, TimeoutError, ValueError, KeyError) as exc:
-            log.warning("acceptance run %s could not be reconciled: %s",
-                        str(run.get("panel_id") or "")[:16], exc)
-            continue
-        # Keep the host panel identity and paid request; only producer facts advance.
-        run.update({key: value for key, value in vars(result).items() if key not in {"request", "panel_id"}})
-        advanced += not acceptance_run_pending(run)
+        while True:
+            with _ACCEPTANCE_COLLECTION_LOCK:
+                if not acceptance_run_pending(run):
+                    break
+                actors = run.get("actors")
+                snapshot = dict(run)
+            try:
+                # Collection may read a delegated run; never hold the lock over I/O.
+                result = collect_task_acceptance_run(
+                    snapshot, drive_root=drive_root, usage_ctx=usage_ctx,
+                    **({"controller": controller} if controller is not None else {}),
+                )
+            except (OSError, TimeoutError, ValueError, KeyError) as exc:
+                log.warning("acceptance run %s could not be reconciled: %s",
+                            str(run.get("panel_id") or "")[:16], exc)
+                break
+            with _ACCEPTANCE_COLLECTION_LOCK:
+                if not acceptance_run_pending(run):
+                    # This caller observed pending too and may own publication
+                    # of the transition, even when another collector applied it.
+                    advanced += 1
+                    break
+                # Collectors replace this list, never mutate its rows. A concurrent
+                # collection won: recollect its facts instead of erasing progress.
+                if run.get("actors") is not actors:
+                    continue
+                # Keep the host panel identity and paid request.
+                run.update({key: value for key, value in vars(result).items()
+                            if key not in {"request", "panel_id"}})
+                advanced += not acceptance_run_pending(run)
+                break
     return advanced
 
 

@@ -36,7 +36,6 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     FinalPocRefused,
     TaskSpec,
     _terminal_gateway_accounting,
-    build_submit_argv,
     classify_official_exit,
     final_poc_record,
     safe_task_path,
@@ -894,8 +893,10 @@ class _LifecycleMixin:
             container_id = str(self._task_containers.get(container_name) or "").strip()
         if not container_id or not _GATEWAY_TASK_ID.fullmatch(container_id):
             raise ExecutorFailure("final submit requires the immutable workspace container id")
+        # These paths belong to the Linux container, not the host filesystem.
         result = self.config.command_runner(
-            ["docker", "--host", self.host.value, "exec", "--workdir", "/workspace", container_id, *build_submit_argv(pathlib.Path("/workspace/submit.sh"), pathlib.Path("/workspace/final.poc"))[0:]],
+            ["docker", "--host", self.host.value, "exec", "--workdir", "/workspace", container_id,
+             "bash", "/workspace/submit.sh", DEFAULT_FINAL_POC_PATH],
             cwd=self.config.run_root, env=_minimal_child_env(self.host), timeout=300,
         )
         response = _parse_json_stdout(result.stdout)

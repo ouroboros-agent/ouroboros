@@ -292,7 +292,9 @@ def test_drain_and_last_slot_callback_settling_one_wave_queue_one_live_notice(la
     panel, = load_task_result(f.root, f.tid)['review_projection']['panels']
     assert len(notices) == 1 and notices[0]['chat_id'] == 7, notices
     assert notices[0]['delivery_id'] == owed['delivery_id'] and notices[0]['text'] == owed['text']
-    assert owed['text'] == panel['late_settlement']['note'] and len(late.calls) == 3
+    assert owed['text'] == panel['late_settlement']['note'] and len(late.calls) == 3, json.dumps([
+        {key: actor.get(key) for key in ('slot_id', 'transport_status', 'parse_status', 'operation_state', 'reason')}
+        for actor in panel['actors']])
     if order == 'drain_first':  # the callback's duty mark was consumed, not left to re-announce
         assert not settlement.late_publication_owed(f.tid, panel['late_settlement']['reviewed_subject']['retry_key'])
 

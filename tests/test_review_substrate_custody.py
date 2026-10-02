@@ -363,7 +363,8 @@ def test_explicit_retry_key_replays_normally_settled_actor_without_second_dispat
             return {"content": '{"verdict":"PASS","findings":[],"summary":"done"}'}, {}
 
     ctx = SimpleNamespace(task_id="settled-retry", event_queue=None, pending_events=[])
-    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=1)
+    # Replay identity is under test, not completion inside a one-second window.
+    slot = ReviewSlot(slot_id="slot_a", model="same/model")
     first = run_review_request(
         ReviewRequest(
             surface="plan_review", goal="review", task_id="settled-retry",
@@ -371,6 +372,7 @@ def test_explicit_retry_key_replays_normally_settled_actor_without_second_dispat
         ),
         slots=[slot], drive_root=tmp_path, llm=FastLLM(), usage_ctx=ctx,
     )
+    assert first.actors[0]["operation_state"] == "settled"
     second = run_review_request(
         ReviewRequest(
             surface="plan_review", goal="review", task_id="settled-retry",

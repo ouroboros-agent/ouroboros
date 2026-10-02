@@ -193,6 +193,16 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
     api = _Api(state, {"TELEGRAM_BOT_TOKEN": _TOKEN, "TELEGRAM_PROXY": "http://ignored.invalid"})
 
     async def scenario():
+        loop = asyncio.get_running_loop()
+        real_connect = loop.sock_connect
+        async def connect(sock, address):
+            if isinstance(address, tuple):
+                assert ipaddress.ip_address(address[0]).is_loopback, address
+                if address[1] == 443:
+                    # AnyIO retains the URL port; Proactor bypasses socket.connect.
+                    address = (address[0], bot.origin_port, *address[2:])
+            return await real_connect(sock, address)
+        monkeypatch.setattr(loop, "sock_connect", connect)
         origin = await asyncio.start_server(bot.accept(bot.origin), "127.0.0.1", 0, ssl=server_tls)
         bot.origin_port = origin.sockets[0].getsockname()[1]
         loop = asyncio.get_running_loop()
