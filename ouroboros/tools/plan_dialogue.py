@@ -258,10 +258,39 @@ def fit_dialogue_view(packet: str, own: dict, capacity_chars: int, *, measure=le
     return selected(low)
 
 
+def session_input_limits(slots: list) -> dict:
+    """Read engine ASK budgets once for fresh delivery, never for paid replay."""
+    from ouroboros.claudexor_daemon import ensure_owned_gateway
+    from ouroboros.review_execution import session_route_for_review_slot
+    from ouroboros.tools.plan_review_runtime import slot_is_session
+
+    routes = {}
+    for slot in slots:
+        if slot_is_session(slot):
+            try:
+                routes[str(slot.slot_id)] = session_route_for_review_slot(slot).route_id
+            except (ValueError, RuntimeError):
+                pass  # The executor still owns the original typed route refusal.
+    if not routes:
+        return {}
+    gateway = None
+    try:
+        gateway = ensure_owned_gateway()
+        limits = gateway.ask_input_limits()
+        return {sid: dict(limits[route]) for sid, route in routes.items() if route in limits}
+    except Exception:
+        # Discovery failure cannot invent a limit or remove a working route.
+        return {}
+    finally:
+        if gateway is not None:
+            gateway.close()
+
+
 def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                          session_task: str, manifest: dict, slot_messages: dict,
                          native_mandatory_chars: int, data_root: Any = "",
-                         frozen: dict | None = None, session_root: str = "", task_id: str = "") -> dict:
+                         frozen: dict | None = None, session_root: str = "", task_id: str = "",
+                         session_limits: dict | None = None) -> dict:
     """Project a fresh request, or reuse the recorded delivery at collection."""
     if frozen is not None:
         from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs
@@ -275,6 +304,8 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
     from ouroboros.review_native_episode import review_native_transcript_bound, native_landing_at, native_first_send_chars
     from ouroboros.reviewer_window import reviewer_window_binding
     from ouroboros.review_execution import _messages_char_count
+    from ouroboros.review_session_preparation import render_review_session_prompt
+    from types import SimpleNamespace
 
     own = manifest.get("own_dialogue") or {}
     messages, tasks, lengths, coverage, restarted = dict(slot_messages), {}, {}, {}, {}
@@ -324,21 +355,29 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
             tasks[sid], coverage[sid] = fit_dialogue_view(session_task + seat, own,
                 native_landing_at(bound) - governance_read - 1, measure=first_send)
         else:
-            # A delegated session receives the conversation inline like every other slot. The
-            # host owns no session window: an owner-asserted `reviewer:<slot>` window fits the
-            # conversation to it; without one nothing is invented — the whole conversation goes,
-            # the pointer names the exact snapshot, and the harness owns its own context.
+            # Native input capacity and an owner-selected context window are different facts.
+            # Only the inline projection yields: its complete source stays in task custody.
+            bound = (session_limits or {}).get(sid)
+            capacity = bound["prompt_budget"] if bound else None
             asserted = int(model_role_option(MODEL_CONTEXT_WINDOWS_KEY, reviewer_window_binding(slot)["model_role"]))
             if asserted > 0:
                 limit = per_slot_input_token_limits([slot.model], context_window=asserted, slots=[slot],
                                                     output_reserve=PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
-                tasks[sid], coverage[sid] = fit_dialogue_view(session_task + seat, own, int(limit[sid]) * 4)
+                capacity = min(capacity, int(limit[sid]) * 4) if capacity is not None else int(limit[sid]) * 4
+            request = SimpleNamespace(surface="plan_review", policy={"output_contract": PLAN_FINDINGS_ARRAY_CONTRACT})
+            def session_chars(task):
+                return len(render_review_session_prompt(request, slot, task.strip()))
+            if capacity is not None:
+                tasks[sid], coverage[sid] = fit_dialogue_view(session_task + seat, own, capacity, measure=session_chars)
             else:
                 tasks[sid], coverage[sid] = session_task + seat, dialogue_view(own)[1]
             coverage[sid].update(window="asserted" if asserted > 0 else "unasserted", file=own.get("file") or "")
+            if bound:
+                coverage[sid]["input_limit"] = {**bound, "prompt_chars": session_chars(tasks[sid]),
+                                                "fits": session_chars(tasks[sid]) <= bound["prompt_budget"]}
         if slot_retrieves(slot):
             lengths[sid] = (first_send(tasks.get(sid, session_task)) if not slot_is_session(slot)
-                            else len(tasks.get(sid, session_task)))
+                            else session_chars(tasks.get(sid, session_task)))
         if sid in coverage:
             coverage[sid]["delivery"] = ("delegated_session" if slot_is_session(slot) else
                                          "native_retrieving" if slot_retrieves(slot) else "packet")

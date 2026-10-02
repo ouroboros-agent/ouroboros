@@ -941,8 +941,10 @@ def _format_obligations_clause(open_obligations: List[Dict[str, Any]]) -> str:
         return ""
     lines = [
         "",
-        "OPEN OBLIGATIONS (blocking review policy). Either FIX the work so the next review "
-        "panel finds it clean, or record your disagreement via the task_acceptance_review "
+        "OPEN OBLIGATIONS (blocking review policy). FIX the requirement by repair or by a "
+        "means you are authorized to change, with evidence it still holds; owner- and "
+        "parent-fixed methods stay binding. Or record disagreement about a finding or its "
+        "current applicability via the task_acceptance_review "
         "tool's obligation_dispositions (addressed / rejected / deferred + reason) — "
         "dispositions are the ONLY channel the reviewer adjudicates:",
     ]

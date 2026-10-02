@@ -948,6 +948,7 @@ def _integrate_subagent_patch(
             mutation_root=target,
             changed_paths=touched,
             source_tool="integrate_subagent_patch",
+            mutating_task_id=str(getattr(ctx, "task_id", "") or ""),
         )
     except Exception:
         pass

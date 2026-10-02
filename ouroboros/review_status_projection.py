@@ -25,8 +25,13 @@ def build_review_projection(
     task_id: str = "",
     attempt: int | None = None,
     snapshot_hash_fn: Any = None,
+    reader_task_id: str = "",
 ) -> Dict[str, Any]:
-    """Build the semantic read-model shared by review_status-style renderers."""
+    """Build the semantic read-model shared by review_status-style renderers.
+
+    ``task_id`` is a record FILTER; ``reader_task_id`` is the calling task, the
+    only identity the stale-marker attribution may be relative to.
+    """
     from ouroboros.review_state import (
         advisory_commit_ready,
         compute_snapshot_hash,
@@ -108,6 +113,9 @@ def build_review_projection(
         "stale_reason": (
             state.last_stale_reason if stale_matches_repo else ""
         ) or ("Current snapshot hash no longer matches the latest advisory run." if hash_mismatch else None),
+        # Attribution of the marker only; stale_from_edit/freshness above never read it.
+        **{key: value if stale_matches_repo else "" for key, value in
+           state.stale_marker_provenance(reader_task_id).items()},
         "open_obligations": open_obligations,
         "open_debts": open_debts,
         "repo_commit_ready": advisory_commit_ready(
@@ -130,6 +138,7 @@ def build_review_status_payload(projection: Dict[str, Any], *, next_step: str, i
         "stale_from_edit": projection["stale_from_edit"],
         "stale_from_edit_ts": projection["stale_from_edit_ts"],
         "stale_reason": projection["stale_reason"],
+        **{key: projection.get(key, "") for key in ("stale_task_id", "stale_attribution", "stale_repo_key")},
         "filters": projection["filters"],
         "advisory_runs": [_review_status_run_to_dict(run) for run in reversed(projection.get("runs") or [])],
         "attempts": [_review_status_attempt_to_dict(item) for item in reversed(projection.get("attempts") or [])],

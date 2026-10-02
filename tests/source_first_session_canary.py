@@ -65,7 +65,7 @@ def main() -> int:
     os.environ.update(env)
     sys.path.insert(0, str(root))
     from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order, retain_review_source
-    from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment, ReviewRouteKind
+    from ouroboros.review_execution import ReviewRouteKind, session_route_for_review_slot
     from ouroboros.review_records import ReviewRequest, ReviewSlot
     from ouroboros.review_substrate import ReviewCoordinator
     from ouroboros.review_source_closure import retain_review_request_sources
@@ -146,7 +146,7 @@ def main() -> int:
     from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
     try:
         endpoint = discover_daemon_at(args.engine_config_dir)  # token stays only in the existing client, never saved
-        route = AgentSessionReviewExecutor(ReviewAssignment(request, slot))._session_route()
+        route = session_route_for_review_slot(slot)
         with ClaudexorGateway(endpoint=endpoint) as gateway:
             hello = gateway.handshake()
             catalog = gateway.agent_capabilities()

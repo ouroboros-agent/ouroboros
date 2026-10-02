@@ -1,4 +1,4 @@
-"""Opt-in failure evidence for two isolated, synthetic UI smoke scenarios.
+"""Opt-in failure evidence for isolated, synthetic UI smoke scenarios.
 
 This is deliberately not a pytest/browser lifetime plugin. Callers supply their
 existing page and browser; successful cases discard the trace and keep no rich

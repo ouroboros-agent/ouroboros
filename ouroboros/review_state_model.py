@@ -60,6 +60,8 @@ class AdvisoryReviewState:
     last_stale_from_edit_ts: str = ""
     last_stale_reason: str = ""
     last_stale_repo_key: str = ""
+    # The task whose mutation or review wrote the marker; "" = not recorded.
+    last_stale_task_id: str = ""
 
     def latest(self) -> Optional[AdvisoryRunRecord]:
         return self.advisory_runs[-1] if self.advisory_runs else None
@@ -202,6 +204,7 @@ class AdvisoryReviewState:
             self.last_stale_from_edit_ts = ""
             self.last_stale_reason = ""
             self.last_stale_repo_key = ""
+            self.last_stale_task_id = ""
         self._sync_commit_readiness_debts(repo_key=run.repo_key or None)
 
     def mark_stale(self, snapshot_hash: str) -> None:
@@ -224,6 +227,7 @@ class AdvisoryReviewState:
         reason_ts: str = "",
         reason: str = "",
         stale_repo_key: str = "",
+        stale_task_id: str = "",
     ) -> int:
         """Invalidate advisory runs for a repo, falling back conservatively."""
         invalidatable = [
@@ -247,8 +251,40 @@ class AdvisoryReviewState:
             self.last_stale_from_edit_ts = reason_ts or _rs()._utc_now()
             self.last_stale_reason = reason
             self.last_stale_repo_key = stale_repo_key or repo_key
+            self.last_stale_task_id = stale_task_id
             self._sync_commit_readiness_debts(repo_key=stale_repo_key or repo_key or None)
         return len(target_runs)
+
+    def stale_marker_provenance(self, task_id: str = "") -> Dict[str, str]:
+        """Whose mutation or review wrote the stale marker, and for which checkout.
+
+        Attribution, never scoping (#783, owner 6A): staleness is a fact about
+        the checkout, so every task on it keeps seeing the marker; this only
+        names the writer relative to the reading ``task_id``. An unrecorded
+        writer (legacy marker, or a writer without task identity) or a reader
+        without identity stays ``unknown`` — never re-attributed to either side.
+        An empty ``stale_repo_key`` is an ambiguous or unrecorded checkout scope,
+        which is why that marker applies to every checkout.
+        """
+        if not self.last_stale_from_edit_ts:
+            return {"stale_task_id": "", "stale_attribution": "", "stale_repo_key": ""}
+        writer, reader = str(self.last_stale_task_id or ""), str(task_id or "")
+        relation = ("this_task" if writer == reader else "other_task") if writer and reader else "unknown"
+        return {"stale_task_id": writer, "stale_attribution": relation,
+                "stale_repo_key": str(self.last_stale_repo_key or "")}
+
+    def stale_marker_attribution_note(self, task_id: str = "") -> str:
+        """Prose form of ``stale_marker_provenance`` for text surfaces ("invalidated by …")."""
+        provenance = self.stale_marker_provenance(task_id)
+        writer = provenance["stale_task_id"]
+        note = {
+            "this_task": f"this task ({writer})",
+            "other_task": f"another task ({writer}); the shared checkout stays stale for every task on it",
+        }.get(provenance["stale_attribution"]) or (
+            f"task {writer}" if writer else "an unrecorded writer (legacy or unattributed marker)")
+        if not provenance["stale_repo_key"]:
+            note += "; checkout scope ambiguous or unrecorded, so it applies to every checkout"
+        return note
 
     def add_blocking_attempt(self, attempt: CommitAttemptRecord) -> None:
         """Compatibility alias for existing callers/tests."""
@@ -792,6 +828,7 @@ class AdvisoryReviewState:
             self.last_stale_from_edit_ts = ""
             self.last_stale_reason = ""
             self.last_stale_repo_key = ""
+            self.last_stale_task_id = ""
             for debt in _rs()._commit_readiness_debts_view(self):
                 self._hydrate_commit_readiness_debt(debt)
                 if debt.status in _rs()._OPEN_COMMIT_READINESS_DEBT_STATUSES:
@@ -809,6 +846,7 @@ class AdvisoryReviewState:
             self.last_stale_from_edit_ts = ""
             self.last_stale_reason = ""
             self.last_stale_repo_key = ""
+            self.last_stale_task_id = ""
         self._sync_commit_readiness_debts(repo_key=repo_key)
 
     def expire_stale_attempts(

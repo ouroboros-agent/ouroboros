@@ -236,6 +236,7 @@ def _load_state_unlocked(
         last_stale_from_edit_ts=str(data.get("last_stale_from_edit_ts", "")),
         last_stale_reason=str(data.get("last_stale_reason", "")),
         last_stale_repo_key=str(data.get("last_stale_repo_key", "")),
+        last_stale_task_id=str(data.get("last_stale_task_id", "")),
     )
 
     state.attempts.sort(key=_attempt_order_key)
@@ -349,6 +350,7 @@ def _save_state_unlocked(drive_root: pathlib.Path, state: AdvisoryReviewState) -
         "last_stale_from_edit_ts": state.last_stale_from_edit_ts,
         "last_stale_reason": state.last_stale_reason,
         "last_stale_repo_key": state.last_stale_repo_key,
+        "last_stale_task_id": state.last_stale_task_id,
         "saved_at": _utc_now(),
     }
     atomic_write_json(path, data)
@@ -539,26 +541,24 @@ def invalidate_advisory_after_mutation(
     mutation_root: pathlib.Path | None = None,
     changed_paths: Optional[List[str]] = None,
     source_tool: str = "",
+    mutating_task_id: str = "",
 ) -> None:
-    """Invalidate advisory freshness after mutation; ambiguous repo scope stales all."""
+    """Invalidate advisory freshness after mutation; ambiguous repo scope stales all.
+
+    ``mutating_task_id`` attributes the marker to the task whose tool call
+    mutated the checkout; a caller without task identity records none (unknown).
+    """
     try:
         changed_paths = [str(p).strip() for p in (changed_paths or []) if str(p).strip()]
         resolved_repo_keys = _resolve_mutation_repo_keys(mutation_root, changed_paths)
         reason_ts = _utc_now()
         reason = _build_invalidation_reason(source_tool, mutation_root, changed_paths, resolved_repo_keys)
-
-        def _mutate(state: AdvisoryReviewState) -> None:
-            if not resolved_repo_keys or len(resolved_repo_keys) != 1:
-                state.mark_repo_stale(repo_key="", reason_ts=reason_ts, reason=reason, stale_repo_key="")
-                return
-            state.mark_repo_stale(
-                repo_key=resolved_repo_keys[0],
-                reason_ts=reason_ts,
-                reason=reason,
-                stale_repo_key=resolved_repo_keys[0],
-            )
-
-        update_state(drive_root, _mutate)
+        # Exactly one resolved checkout scopes the invalidation; none or several stale all.
+        repo_key = resolved_repo_keys[0] if len(resolved_repo_keys) == 1 else ""
+        update_state(drive_root, lambda state: state.mark_repo_stale(
+            repo_key=repo_key, reason_ts=reason_ts, reason=reason,
+            stale_repo_key=repo_key, stale_task_id=mutating_task_id,
+        ))
     except Exception as e:
         log.debug("invalidate_advisory_after_mutation failed (non-fatal): %s", e)
 
@@ -621,6 +621,7 @@ def format_status_section(state: AdvisoryReviewState, repo_dir: Optional[pathlib
         lines.append(f"\n⚠️ Advisory marked stale after worktree edit at {state.last_stale_from_edit_ts}.")  # full ts — no [:16]
         if state.last_stale_reason:
             lines.append(f"   Reason: {state.last_stale_reason}")
+        lines.append(f"   Invalidated by: {state.stale_marker_attribution_note()}")
         lines.append("   Run preflight_review again before commit_reviewed.")
 
     if open_debts:

@@ -457,15 +457,18 @@ def build_improvement_capsule(
     lines += dissent
     lines += [f"- {b}" for b in bullets]
     if coach:
-        lines.append(f"Highest-value next step: {coach}")
+        lines.append(f"Reviewer's next-step advice: {coach}")
     lines.append(
         # The three real moves (A1): the old "revise only if it genuinely
         # improves the result; otherwise produce your normal final answer" tail
         # was the measured cause of the do-nothing resubmit loop (SWE 1b311217:
         # 7 passes, zero tool calls). The anti-derailment guards stay verbatim.
-        "Four real moves are available: (1) FIX — change the work/answer so the next panel is "
-        "clean; (2) REBUT — file obligation_dispositions (rejected + your reason) via the "
-        "task_acceptance_review tool for findings you can show are wrong; the reviewer "
+        "Four real moves are available: (1) FIX — meet the requirement behind the finding, "
+        "by repair or by replacing a means that is yours to change with evidence the requirement "
+        "still holds; an owner- or parent-fixed method stays binding. (2) REBUT — file "
+        "obligation_dispositions (rejected + your reason) via the task_acceptance_review tool "
+        "for findings you can show are wrong or no longer applicable to the current work; "
+        "a true historical finding stays true, and the rebuttal is not criterion evidence. The reviewer "
         "adjudicates the argument; (3) DECLARE UNREACHABLE — dispose an obligation as "
         "unsatisfiable in this environment (rejected + the concrete gap), and the reviewer "
         "judges reachability. Resubmitting the same answer with none of these moves changes "

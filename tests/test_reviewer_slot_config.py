@@ -532,30 +532,24 @@ def test_scope_slots_from_structured_config(monkeypatch):
 
 def test_session_executor_prefers_the_slots_own_target(monkeypatch):
     from ouroboros.review_execution import (
-        AgentSessionReviewExecutor,
-        ReviewAssignment,
         ReviewRouteKind,
         ReviewRouteUnavailable,
+        session_route_for_review_slot,
     )
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.review_substrate import ReviewSlot
 
     monkeypatch.delenv("OUROBOROS_REVIEW_SESSION_ROUTE", raising=False)
     monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
-    request = ReviewRequest(surface="scope_review", goal="g")
     slot = ReviewSlot(slot_id="s_owner", model="codex=gpt-5.6-sol", effort="xhigh",
                       route=ReviewRouteKind.AGENT_SESSION,
                       session_target="codex=gpt-5.6-sol")
-    executor = AgentSessionReviewExecutor(
-        ReviewAssignment(request=request, slot=slot))
-    route = executor._session_route()
+    route = session_route_for_review_slot(slot)
     assert (route.route_id, route.model, route.effort) == ("codex", "gpt-5.6-sol", "xhigh")
 
     # Without a per-row target the shared-route absence stays a typed refusal.
-    bare = AgentSessionReviewExecutor(ReviewAssignment(
-        request=request,
-        slot=ReviewSlot(slot_id="s2", model="m", route=ReviewRouteKind.AGENT_SESSION)))
+    bare = ReviewSlot(slot_id="s2", model="m", route=ReviewRouteKind.AGENT_SESSION)
     with pytest.raises(ReviewRouteUnavailable):
-        bare._session_route()
+        session_route_for_review_slot(bare)
 
 
 # ---------------------------------------------------------------------------
@@ -726,26 +720,21 @@ def test_effort_field_is_the_single_source_over_an_embedded_target_effort(monkey
     _clear_legacy(monkeypatch)
     monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
     from ouroboros.review_execution import (
-        AgentSessionReviewExecutor,
-        ReviewAssignment,
         ReviewRouteKind,
+        session_route_for_review_slot,
     )
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
-
-    request = ReviewRequest(surface="scope_review", goal="g")
+    from ouroboros.review_substrate import ReviewSlot
     # Field says max; the target embeds :low. The field must win.
     slot = ReviewSlot(slot_id="s", model="codex=gpt-5.6-sol:low", effort="max",
                       route=ReviewRouteKind.AGENT_SESSION,
                       session_target="codex=gpt-5.6-sol:low")
-    route = AgentSessionReviewExecutor(
-        ReviewAssignment(request=request, slot=slot))._session_route()
+    route = session_route_for_review_slot(slot)
     assert (route.route_id, route.model, route.effort) == ("codex", "gpt-5.6-sol", "max")
     # Empty field → empty effort (embedded value is dropped, not resurrected).
     bare = ReviewSlot(slot_id="s2", model="x", effort="",
                       route=ReviewRouteKind.AGENT_SESSION,
                       session_target="codex=gpt-5.6-sol:low")
-    assert AgentSessionReviewExecutor(
-        ReviewAssignment(request=request, slot=bare))._session_route().effort == ""
+    assert session_route_for_review_slot(bare).effort == ""
 
 
 def test_all_delegated_triad_writes_no_fallback_record_and_reaches_acceptance(monkeypatch):

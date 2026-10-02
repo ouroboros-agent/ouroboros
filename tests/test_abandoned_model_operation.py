@@ -91,6 +91,25 @@ def test_legacy_response_rechecks_exact_dispatch_before_release(tmp_path):
     assert gateway.reads == ["op-one"] and not gateway.results
 
 
+@pytest.mark.parametrize("proven", [False, True])
+@pytest.mark.parametrize("ready", [False, True])
+def test_late_upload_proof_keeps_attempt_but_releases_only_definite_non_delivery(tmp_path, proven, ready):
+    request(tmp_path, operation_id="op-one")
+    gateway = Gateway(state="failed", dispatch="not_started" if proven else "unknown", ready=ready)
+    gateway.detail["dispatch"].update(startedAt="2026-09-30T00:00:00Z", route={"source": "codex"})
+    problem = {"code": "transport_not_delivered" if proven else "transport_unknown",
+               "message": "Upload ended", "context": {"bodyBytes": 3_000_000,
+               "handedToSocketBytes": 65_536 if proven else 3_000_000}}
+    gateway.detail["problem"] = problem
+    gateway.raw = json.dumps({"outcome": "failed" if proven else "unknown", "message": None,
+                              "problem": problem, "usage": {}, "cost": {"knowledge": "unknown"}}).encode()
+    got = transport.recover_model_attempt(tmp_path, ROW, gateway_factory=lambda: gateway)
+    assert got == ("released" if proven else "abandoned", {}, None, False)
+    assert gateway.reads == ["op-one"] and len(gateway.acks) == int(ready)
+    # Once retained, reconciliation uses the same receipt without another engine read.
+    assert transport.recover_model_attempt(tmp_path, ROW, gateway_factory=lambda: pytest.fail("new lookup")) == got
+
+
 @pytest.mark.parametrize("dispatch", ["started", "unknown", "response_received"])
 def test_terminal_operation_without_response_keeps_price_unknown(tmp_path, dispatch):
     request(tmp_path, operation_id="op-one")

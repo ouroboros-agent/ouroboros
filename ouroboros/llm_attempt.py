@@ -538,8 +538,10 @@ def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
     def _strip(value: Any) -> None:
         if isinstance(value, dict):
             value.pop("_context_capsule", None)
-            for child in value.values():
-                _strip(child)
+            for key, child in value.items():
+                # Continuation payloads belong to the provider, including nested keys.
+                if key not in {"reasoning_details", "reasoning_content"}:
+                    _strip(child)
         elif isinstance(value, list):
             for child in value:
                 _strip(child)

@@ -1290,6 +1290,7 @@ def build_review_context(env: Any) -> str:
                 f"- stale_marker={state.last_stale_from_edit_ts[:19]}: "
                 f"{_truncate_with_notice(state.last_stale_reason or 'worktree edit invalidated advisory freshness', 220)}"
             )
+            lines.append(f"  invalidated_by={state.stale_marker_attribution_note()}")
 
         if open_debts:
             lines.append("- retry_anchor=commit_readiness_debt")

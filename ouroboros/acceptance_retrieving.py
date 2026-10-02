@@ -127,11 +127,10 @@ def _first_send_fits(request: Any, slot: Any, text: str, *, session: bool) -> tu
 
     if session:
         from ouroboros.review_execution import (
-            AgentSessionReviewExecutor, ReviewAssignment, SessionInvocation,
-            review_session_output_schema,
+            SessionInvocation, review_session_output_schema, session_route_for_review_slot,
         )
         from ouroboros.review_session_preparation import prepare_review_session_request, render_review_session_prompt
-        route = AgentSessionReviewExecutor(ReviewAssignment(request, slot))._session_route()
+        route = session_route_for_review_slot(slot)
         invocation = SessionInvocation(task_id=request.task_id, surface=request.surface, slot_id=slot.slot_id,
                                        timeout_sec=604800, output_schema=review_session_output_schema(request.surface))
         wire = prepare_review_session_request(invocation, route,

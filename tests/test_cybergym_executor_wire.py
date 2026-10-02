@@ -505,6 +505,98 @@ def _stub_terminal_task_executor(tmp_path, monkeypatch, gateway_result):
     return config, executor
 
 
+@pytest.mark.parametrize("change", ["stable_a", "stable_b_before_submit", "changed_back_after_submit"])
+def test_delivery_binds_published_bytes_to_submitted_digest(tmp_path, monkeypatch, change):
+    gateway_result = {
+        "status": "completed", "observed_model": "deepseek/deepseek-v4-flash-0731",
+        "observed_provider": "synthetic-backend", "reasoning_effort": "high",
+        "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.1, "cost_final": True,
+        "cost_breakdown": {"accounted_upper_bound_usd": 0.1, "cost_final": True},
+        "outcome_axes": {"execution": {"status": "ok"}},
+    }
+    config, executor = _stub_terminal_task_executor(tmp_path, monkeypatch, gateway_result)
+    original, updated = b"synthetic-original-marker", b"synthetic-later-marker"
+    markers, submitted = [], []
+    calls = {"gateway": 0, "query": 0}
+
+    def generate(_task, workspace, _agent_id):
+        marker = workspace / "final.poc"
+        marker.write_bytes(original)
+        (workspace / "submit.sh").write_text('TASK_ID="opaque1234"\n', encoding="utf-8")
+        markers.append(marker)
+
+    def gateway(*_args, **_kwargs):
+        calls["gateway"] += 1
+        return dict(gateway_result)
+
+    def command(argv, **_kwargs):
+        assert argv[:1] == ["docker"] and "exec" in argv
+        assert "/workspace/final.poc" in argv
+        submitted.append(markers[0].read_bytes())
+        if change == "changed_back_after_submit":
+            markers[0].write_bytes(original)
+        return CommandResult(0, json.dumps({"task_id": "opaque1234", "poc_id": "poc-1", "exit_code": 1}), "")
+
+    def query(*_args, **_kwargs):
+        calls["query"] += 1
+        if calls["query"] == 1:
+            if change != "stable_a":
+                markers[0].write_bytes(updated)
+            return []
+        return [{"task_id": "arvo:1", "agent_id": "opaque1234", "poc_id": "poc-1",
+                 "poc_hash": hashlib.sha256(submitted[0]).hexdigest(),
+                 "vul_exit_code": 1, "fix_exit_code": 0}]
+
+    def external_operation(*_args, **_kwargs):
+        pytest.fail("No actual command, HTTP, provider or PoC may execute")
+
+    executor.config = dataclasses_replace(config, command_runner=command, http_runner=external_operation)
+    executor._task_containers["container-a"] = "workspace-123"
+    monkeypatch.setattr(executor, "_generate", generate)
+    monkeypatch.setattr(executor, "_gateway_wait", gateway)
+    monkeypatch.setattr(executor, "_private_query", query)
+    monkeypatch.setattr(executor, "_ensure_key", lambda: "synthetic-key")
+    monkeypatch.setattr(executor, "_server_http", external_operation)
+    [row] = run_campaign([TaskSpec("arvo:1", "arvo")], run_root=config.run_root,
+                         executor=executor.run_task, estimated_cost_usd=1, budget_cap_usd=10)
+    persisted = [json.loads(line) for line in (config.run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert persisted == [row]
+    assert calls["gateway"] == len(submitted) == 1
+    expected = original if change == "stable_a" else updated
+    assert submitted == [expected]
+    digest = hashlib.sha256(expected).hexdigest()
+    checkpoint = json.loads(pathlib.Path(row["artifact_refs"]["checkpoint"]).read_text(encoding="utf-8"))
+    delivery = checkpoint["delivery"]
+    assert delivery["final_poc_sha256"] == digest
+    assert delivery["submit"]["poc_id"] == "poc-1"
+    destination = pathlib.Path(row["artifact_refs"]["task_dir"]) / "final.poc"
+    assert not list(destination.parent.glob(".final-poc-*"))
+    if change == "changed_back_after_submit":
+        assert row["status"] == "infra_failed"
+        assert row["lifecycle"] == "post_gateway_evaluation_failed"
+        assert row["error"] == "final PoC changed before copy"
+        assert row["final_submission_status"] == "unknown"
+        assert row["final_submission_success"] is not True and row["official_success"] is not True
+        assert row["prediction_written"] is False and row["official_eval_status"] == "not_run"
+        assert row["trial_count"] == 0
+        assert not destination.exists()
+        assert delivery["phase"] == "submitted" and calls["query"] == 1
+    else:
+        assert row["status"] == "completed"
+        assert row["final_submission_success"] is True and row["official_success"] is True
+        assert row["prediction_written"] is True and row["official_eval_status"] == "completed"
+        assert row["final_poc_hash"] == digest
+        assert destination.read_bytes() == expected
+        assert delivery["phase"] == "classified" and calls["query"] > 1
+    assert row["cost_usd"] == pytest.approx(0.1) and row["cost_final"] is True
+    assert row["prompt_tokens"] == 10 and row["completion_tokens"] == 5
+    ledger = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=10)
+    assert ledger.projection().settled_usd == pytest.approx(0.1)
+    assert ledger.projection().unresolved_upper_bound_usd == 0
+    events = [json.loads(line)["event"] for line in ledger.path.read_text(encoding="utf-8").splitlines()]
+    assert events.count("claim") == events.count("settle") == 1
+
+
 def test_regrade_final_poc_uses_official_verifier_without_gateway(tmp_path, monkeypatch):
     config = _config(tmp_path, provider_probe=False)
     executor = CyberGymExecutor(config)

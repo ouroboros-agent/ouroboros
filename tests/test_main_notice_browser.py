@@ -15,12 +15,9 @@ before the notice exists, and inside its second round, after the notice tool
 returned and before the final answer, so "still running" is a fact, not a race.
 """
 
-import json
-import os
 import re
 import time
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -38,6 +35,8 @@ from tests.system_e2e.harness import (
 )
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
+from tests.ci_evidence import output_dir
+from tests.ui_failure_evidence import FailureEvidence
 
 wait_clone = clone_fixture
 pytestmark = [pytest.mark.serial, pytest.mark.ui_browser]
@@ -180,7 +179,7 @@ def _history(page, chat_id):
 @pytest.mark.parametrize("engine,width,theme", [("chromium", 1440, "dark"), ("webkit", 390, "light")],
                          ids=["chromium-desktop-dark", "webkit-mobile-light"])
 def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer(
-    wait_clone, tmp_path, monkeypatch, engine, width, theme,
+    wait_clone, tmp_path, monkeypatch, request, engine, width, theme,
 ):
     from playwright.sync_api import sync_playwright
 
@@ -223,9 +222,7 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
         **original_env(server), "HOME": str(home), "USERPROFILE": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
     })
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "evidence")
-    evidence = evidence / f"main-notice-{engine}-{theme}-{width}"
-    evidence.mkdir(parents=True, exist_ok=True)
+    evidence = output_dir(request.config)
     gates = lambda body: (before_notice(body), before_answer(body))  # noqa: E731
     # The stub narrates its tool round ("still working"): that durable progress row is
     # what a re-mounted Project panel rebuilds the running card from.
@@ -247,9 +244,8 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                 page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
                 page.add_init_script(f"localStorage.setItem('ouroboros.theme', '{theme}')")
                 main_feed = "#chat-messages"
-                shot = lambda name: page.screenshot(  # noqa: E731
-                    path=str(evidence / f"{name}.png"), full_page=True, animations="disabled")
-                try:
+                with FailureEvidence(page, browser, evidence, request.node.nodeid, engine) as capture:
+                    capture.details.update({"theme": theme, "width": width})
                     page.goto(server.base_url, wait_until="domcontentloaded")
                     page.wait_for_function("() => window.__testSockets?.[0]?.readyState === WebSocket.OPEN")
 
@@ -303,7 +299,7 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                     away_notice = page.evaluate(_NAV_FACTS, project["id"])
                     assert away_notice["main_badge"] == "1" and "Unread" not in away_notice["project_label"], away_notice
                     _open_drawer(page)
-                    shot("1-away-after-notice")
+                    capture.checkpoint("1-away-after-notice")
 
                     # ---- Main shows the notice as an assistant message ----
                     _nav(page, "chat")
@@ -316,7 +312,7 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                     assert bubble["type"] == "main_notice" and bubble["task"] == task_id, bubble
                     assert bubble["sender"] == "Ouroboros", bubble
                     assert main_live["cards"] == 0 and not main_live["answer_anywhere"], main_live
-                    shot("2-main-notice-live")
+                    capture.checkpoint("2-main-notice-live")
 
                     # ---- the Project still runs; the notice is not its answer ----
                     _open_project(page, project)
@@ -326,8 +322,9 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                     assert project_held["card_finished"] == "0", project_held
                     assert project_held["cards"] == 1, project_held
                     assert not project_held["notice_anywhere"] and not project_held["answer_anywhere"], project_held
-                    cover_held = _panel_cover(page)
-                    shot("3-project-held-running")
+                    capture.checkpoint("project_held:panel_cover")
+                    _panel_cover(page)
+                    capture.checkpoint("3-project-held-running")
 
                     # ---- the answer lands in the Project while the owner is away ----
                     _nav(page, "dashboard")
@@ -350,7 +347,7 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                     away_answer = page.evaluate(_NAV_FACTS, project["id"])
                     assert away_answer["main_badge"] == "", away_answer
                     _open_drawer(page)
-                    shot("4-away-after-answer")
+                    capture.checkpoint("4-away-after-answer")
 
                     _nav(page, "chat")
                     main_final = _feed(page, main_feed, task_id, notice_mark, answer_mark)
@@ -365,7 +362,7 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                     page.wait_for_function(
                         "() => (document.querySelector('#nav-projects-count')?.textContent.trim() || '') === ''",
                         timeout=45_000)
-                    shot("5-project-final")
+                    capture.checkpoint("5-project-final")
 
                     # ---- reload: durable history keeps both identities apart ----
                     page.reload(wait_until="domcontentloaded")
@@ -386,42 +383,18 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                     assert [row for row in project_history if answer_mark in str(row.get("text") or "")], project_history
                     nav_reloaded = page.evaluate(_NAV_FACTS, project["id"])
                     assert nav_reloaded["main_badge"] == "" and nav_reloaded["projects_count"] == "", nav_reloaded
-                    shot("6-reloaded-main")
+                    capture.checkpoint("6-reloaded-main")
                     _open_project(page, project)
                     page.locator(project_feed).get_by_text(answer_mark, exact=False).first.wait_for(timeout=30_000)
                     page.wait_for_selector(
                         f'{project_feed} .chat-live-card[data-task-id="{task_id}"][data-finished="1"]', timeout=30_000)
                     project_reloaded = _feed(page, project_feed, task_id, notice_mark, answer_mark)
                     assert not project_reloaded["notice_anywhere"], project_reloaded
-                    cover_reloaded = _panel_cover(page)
-                    shot("7-reloaded-project")
+                    capture.checkpoint("project_reloaded:panel_cover")
+                    _panel_cover(page)
+                    capture.checkpoint("7-reloaded-project")
                     assert not strangers, strangers
                     assert not errors, errors
-                    (evidence / "receipt.json").write_text(json.dumps({
-                        "engine": engine, "theme": theme, "width": width, "task": task, "project": project,
-                        "notice_rows": notice_rows, "answer_rows": answer_rows, "proactive_events": proactive,
-                        "tool_results": tool_results, "stored_status": stored["status"],
-                        "revisions": {"before_notice": revision_before, "after_notice": revision_after_notice,
-                                      "after_answer": revision_after_answer},
-                        "project_counts_during_notice_hold": counts_during_hold,
-                        "state_reads_after_notice": len(polled),
-                        "nav": {"away_before": away_before, "away_notice": away_notice,
-                                "away_answer": away_answer, "reloaded": nav_reloaded},
-                        "feeds": {"main_live": main_live, "project_held": project_held, "main_final": main_final,
-                                  "project_final": project_final, "main_reloaded": main_reloaded,
-                                  "project_reloaded": project_reloaded},
-                        "main_history": main_history, "project_history": project_history,
-                        "panel_cover": {"held": cover_held, "reloaded": cover_reloaded},
-                        "model_rounds": stub.kinds(), "errors": errors,
-                    }, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-                except Exception:
-                    shot("failure")
-                    (evidence / "failure-dom.html").write_text(page.content(), encoding="utf-8")
-                    raise
-                finally:
-                    before_notice.release.set()
-                    before_answer.release.set()
-                    browser.close()
         finally:
             before_notice.release.set()
             before_answer.release.set()

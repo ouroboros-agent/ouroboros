@@ -10,14 +10,18 @@ from __future__ import annotations
 import datetime
 import gzip
 import hashlib
+import io
 import json
 import math
+import os
 import pathlib
 import re
+import stat
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from typing import Any, Mapping, Sequence
 
 from devtools.benchmarks.cybergym.cybergym_cost_evidence import (
@@ -649,7 +653,12 @@ def _read_json_ref(
     if not compressed and not {"observability", "calls"}.issubset(parts):
         return None
     try:
-        raw = path.read_bytes()
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_TELEMETRY_REF_BYTES:
+                return None
+            raw = handle.read(_MAX_TELEMETRY_REF_BYTES + 1)
     except OSError:
         return None
     if len(raw) > _MAX_TELEMETRY_REF_BYTES:
@@ -662,7 +671,8 @@ def _read_json_ref(
             kind = str(ref.get("kind") or "")
             if kind != "json" or str(ref.get("encoding") or "") != "gzip":
                 return None
-            raw = gzip.decompress(raw)
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as handle:
+                raw = handle.read(_MAX_TELEMETRY_REF_BYTES + 1)
             try:
                 expected_size = int(ref.get("size"))
             except (TypeError, ValueError):
@@ -674,7 +684,7 @@ def _read_json_ref(
         elif hashlib.sha256(raw).hexdigest() != expected_sha:
             return None
         value = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, gzip.BadGzipFile, EOFError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, zlib.error, EOFError):
         return None
     return dict(value) if isinstance(value, Mapping) else None
 

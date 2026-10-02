@@ -662,7 +662,9 @@ def test_live_run_scripts_keep_git_clean_and_own_only_their_scratch(tmp_path, mo
                        workspace_mode="external", task_id=f"script-{i}") for i in range(2)]
     scripts = [
         "import pathlib, time, sys\n"
-        f"pathlib.Path({str(ready[i])!r}).write_text(sys.argv[0])\n"
+        # READY exists only after its complete script path has been published.
+        f"pathlib.Path({str(ready[i].with_suffix('.tmp'))!r}).write_text(sys.argv[0])\n"
+        f"pathlib.Path({str(ready[i].with_suffix('.tmp'))!r}).replace({str(ready[i])!r})\n"
         f"while not pathlib.Path({str(releases[i])!r}).exists(): time.sleep(0.01)\n"
         "print('finished', pathlib.Path.cwd(), sys.argv[1])\n"
         for i in range(2)

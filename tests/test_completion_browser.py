@@ -208,12 +208,14 @@ def _receipt_only_mounts(page, task_id):
 
 
 def _presentation(page, feed, task_id, answer, case, project, *, managed=False):
+    from playwright.sync_api import expect
+
     output = page.locator(feed).get_by_text(answer, exact=True)
     output.wait_for(timeout=30000)
     assert output.count() == 1
     card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
     if case == "finish_only":
-        assert card.count() == 0
+        expect(card).to_have_count(0, timeout=30000)
         _receipt_only_mounts(page, task_id)
     else:
         card.wait_for(timeout=30000)
@@ -322,6 +324,9 @@ def test_native_completion_receipt_keeps_work_and_errors_visible(
                     assert metrics[-1]["tool_calls"] == (2 if case == "read_then_finish" else 1)
                     assert metrics[-1]["tool_errors"] == (1 if case == "invalid_finish" else 0)
                     assert len(calls) == len(steps)
+                    # The answer and metrics precede task_done. Until that frame
+                    # settles the turn, its host-attested Stop remains legitimate.
+                    order = _wire_order(page, task_id)
                     capture.checkpoint("live_presentation", task_id=task_id)
                     try:
                         views = {"live": _presentation(page, feed, task_id, answer, case, project)}
@@ -330,7 +335,6 @@ def test_native_completion_receipt_keeps_work_and_errors_visible(
                             page.evaluate("() => ({frames: window.__completionFrames, mounts: window.__completionMounts})")))
                         raise
                     delivery = _delivery(oracle, task_id, result, answer, chat_id, stop=case == "unfinished_stop")
-                    order = _wire_order(page, task_id)
                     page.screenshot(path=str(evidence / "live.png"), full_page=True, animations="disabled")
                     capture.checkpoint("reconnect", task_id=task_id)
                     _reconnect(page, chat_id)

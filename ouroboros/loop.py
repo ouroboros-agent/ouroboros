@@ -92,7 +92,7 @@ def _handle_text_response(
     return safe_content, accumulated_usage, llm_trace
 
 
-def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_tools=False):
+def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_tools=False, assistant_message=None):
     """One completion request owner, with ordinary first/direct prose compatibility."""
     from ouroboros.loop_delivery import consume_completion_request, hold_completion_response
     ctx = tools._ctx
@@ -132,6 +132,13 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
             if not ctx._completion_pair_appended:
                 hold_completion_response(content, tools, limit_ctx, limit_ctx.llm_trace,
                                          response_start=response_start, selected=selected)
+        if assistant_message is not None and not selected:
+            # Enrich only this round's already-retained row, using the hold owner's
+            # complete row comparison. Earlier equal answers keep their own continuation.
+            for row in limit_ctx.messages[response_start:]:
+                if row == {"role": "assistant", "content": content}:
+                    row.update({key: assistant_message[key] for key in ("reasoning_details", "reasoning_content")
+                                if key in assistant_message})
         if can_park:
             wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
                                          limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
@@ -635,7 +642,7 @@ def run_llm_loop(
             # Every metered response counts as nanny progress.
             _note_nanny_delegate_activity(tools._ctx, round_idx, accumulated_usage, [])
             if not tool_calls:
-                final_result = _finalize_loop_candidate(content, limit_ctx, tools, emit_progress)
+                final_result = _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, assistant_message=msg)
                 if final_result is None:
                     # Unfinished: the loop continues and keeps spending, so it
                     # rejoins the SAME budget tail a tool round does. A ready

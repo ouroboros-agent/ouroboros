@@ -561,7 +561,7 @@ def test_acceptance_request_carries_the_route_owned_work_order(structured_env, t
         _review_route_executor,
         review_output_contract,
     )
-    from ouroboros.triad_review import ACCEPTANCE_SURFACE_RULES
+    from ouroboros.triad_review import ACCEPTANCE_SURFACE_RULES, TIER_CLASSIFICATION_RULES
 
     captured = _capture_panel(structured_env)
     governance, workspace = _roots(tmp_path)
@@ -593,6 +593,13 @@ def test_acceptance_request_carries_the_route_owned_work_order(structured_env, t
     # Both carry the task-stable contract the packet rows render; the FULL packet stays the authority.
     _stable, task_stable, _dynamic = _render_prompt_parts(request, api)
     assert task_stable.rstrip() in order["t_sess"] and task_stable.rstrip() in order["t_actor"]
+    # Exercise the real root checklist, not only the synthetic pre-seam goldens:
+    # each route carries one coaching owner without the old contradictory copy.
+    for delivered in (_stable + task_stable + _dynamic,
+                      contract + order["t_sess"], contract + order["t_actor"]):
+        assert delivered.count(TIER_CLASSIFICATION_RULES) == 1
+        assert "move it one tier up" not in delivered
+        assert "not a weaker surrogate self-test" in delivered
     assert request.evidence["tool_trajectory"][0]["result"] == "TRAJECTORY-RESULT-3-passed"
     # The executor labels the slot itself: a work order carries no `Slot:` line of its own.
     assert "Slot:" not in order["t_sess"] and "Slot:" not in order["t_actor"]

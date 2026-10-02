@@ -800,6 +800,7 @@ def _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orph
             mutation_root=target,
             changed_paths=touched,
             source_tool="integrate_delegated_patch",
+            mutating_task_id=str(getattr(ctx, "task_id", "") or ""),
         )
     except Exception:
         pass

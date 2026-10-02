@@ -68,12 +68,14 @@ def test_render_prompt_requires_outcome_tier_and_independence():
 # resolving, so the prompt must stop advertising them), and a FOURTH time when
 # receipt refs started enumerating the packet's verification_receipts exhibit
 # rows (only a green pass/observed receipt resolves, so the prompt says so).
+# Re-pinned for goal-directed coaching, independently grounded checks and current
+# applicability of historical RED; this pins delivery, not model judgment.
 # Only the acceptance surface moves: the four non-acceptance digests are unchanged.
 _PRE_SEAM_PROMPT_DIGESTS = [
     "0261c7c7fe477ad7f8901a28bee1ad23905d40c3c62825d2bc406ecd9ca37f82",
     "9cf4de6f66001c3b4cec7fdd3d8552ecf83fc886004a7020e98a4c28c022c4e3",
-    "bc49f3bf1d7273c6cfa3d882dc5738e379f3dcc7af37a15a3686a30f89b8b355",
-    "674971a10ccd95822cf790f5038eaf77824d38996f52c61a30a93f8666a324d3",
+    "c10f29dba99ae7d0d284916dad47f554368361a48ca17fdcf776e28d17be3f2d",
+    "f4125ec5a987ff9ea35f7dd497a57ab4eeb9c935d6eb2cb100d56c6475a70e37",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
 ]

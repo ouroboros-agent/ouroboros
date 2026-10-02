@@ -82,7 +82,7 @@ Provider/UI summaries report Actions producer outcomes separately from testcase 
 
 Provider failures retain every attempt, including earlier retries, with labelled logical, persisted request, received tool-field, partial-assembly and normalized views. Successes are compact. Omitted/redacted views are explicit; original nonstream bodies may be unavailable, and partial assembly cannot exonerate the assembler. Private native data and exception bodies are excluded.
 
-Only the synthetic viewport/inflight fixtures capture screenshot, trace and event/geometry facts before close on failure; capture/cleanup errors preserve the first exception. Dispatch `ui-browser-push.yml` with `viewport` or `inflight` for Linux PARTIAL DIAGNOSTIC checks without paid calls or browser-tool tests. `full` retains the collection guard and existing assertions/gestures/waits; partial success is never full proof. The accounting test checks causal loop progress under lock contention, not a wall-time tick rate.
+The synthetic viewport, inflight and Main-notice fixtures capture screenshot, trace and event/geometry facts before close on failure; capture/cleanup errors preserve the first exception. Dispatch `ui-browser-push.yml` with `viewport` or `inflight` for Linux PARTIAL DIAGNOSTIC checks without paid calls or browser-tool tests. `full` retains the collection guard and existing assertions/gestures/waits; partial success is never full proof. The accounting test checks causal loop progress under lock contention, not a wall-time tick rate.
 
 ### The commit gate mirrors the CI split
 

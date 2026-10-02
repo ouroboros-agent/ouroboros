@@ -124,28 +124,12 @@ class _OpenAICompatibleLaneMixin:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
         provider = str(target.get("provider") or "")
-        # Blind-model image placeholder applies to BOTH the direct (OpenAI/OpenAI-
-        # compatible/Cloud.ru) and OpenRouter lanes (C2.3): a model with no native
-        # vision gets an explicit "[image omitted]" placeholder instead of raw image
-        # blocks it would 404/ignore. Done BEFORE the provider-branch split so the
-        # direct branch (which returns early below) is covered too — mirrors the
-        # local/GigaChat lanes; the VLM tool lane already routes vision to a capable
-        # slot. supports_vision() is a no-op for vision-capable models.
-        # The lookup MUST use the qualified identity (usage_model): the stripped
-        # resolved_model has lost its "<provider>::" namespace, matched no
-        # normalized vision prefix, and blinded every direct-provider install —
-        # same identity contract as the browser-screenshot call site (E1).
+        # Blind models receive an explicit image placeholder on both branches,
+        # preserving canonical blocks. Check qualified and bare identities:
+        # direct names lose their provider prefix, while a compatible route's
+        # vendor-prefixed bare name may carry the only recognizable vision prefix.
+        # OpenRouter's two spellings coincide; vision-capable models pass unchanged.
         from ouroboros.provider_models import supports_vision
-        # Judge vision on EITHER identity: direct lanes strip the
-        # ``provider::`` prefix from ``resolved_model``, so the bare id never
-        # matched the slash-form vision prefixes and provider-namespaced direct
-        # routes (openai::/deepseek::/...) were treated blind regardless of
-        # real capability — ``usage_model`` carries their qualified spelling.
-        # The BARE id stays in the judgment too, because the openai-compatible
-        # lane's qualifier (``openai-compatible/<id>``) can never match while
-        # a vendor-form bare id (``qwen/qwen2.5-vl-…``) legitimately does —
-        # judging only the qualified name would flip that lane blind. On
-        # OpenRouter both spellings are the same string.
         if not (
             supports_vision(str(target.get("usage_model") or resolved_model))
             or supports_vision(resolved_model)
@@ -169,7 +153,8 @@ class _OpenAICompatibleLaneMixin:
                     # DeepSeek accepts content arrays only on user turns.
                     flatten_non_user_content_blocks=provider == "deepseek",
                 ),
-                keep_reasoning_content=bool(target.get("requires_reasoning_echo")),
+                keep_reasoning_content=provider == "minimax" or bool(target.get("requires_reasoning_echo")),
+                keep_reasoning_details=bool(target.get("reasoning_split")),
             )
             if target.get("requires_reasoning_echo"):
                 # A reasoning-echo route (DeepSeek) REQUIRES every assistant
@@ -187,6 +172,10 @@ class _OpenAICompatibleLaneMixin:
                 "messages": clean_messages,
                 token_limit_key: max_tokens,
             }
+            if target.get("reasoning_split"):
+                # Split thinking from final content at the provider boundary.
+                # The SDK forwards this extension through extra_body, not a keyword.
+                kwargs.setdefault("extra_body", {})["reasoning_split"] = True
             if stream:
                 kwargs.update(stream=True, stream_options={"include_usage": True})
             if provider == "openai":
@@ -265,9 +254,8 @@ class _OpenAICompatibleLaneMixin:
             return kwargs
 
         if any(isinstance(m, dict) and "reasoning_content" in m for m in messages):
-            # ``reasoning_content`` in canonical history is direct-DeepSeek
-            # custody (the inbound normalizer pops it from every other lane's
-            # responses, OpenRouter included). OR upstreams of other families
+            # ``reasoning_content`` is direct-provider custody (DeepSeek and
+            # MiniMax); OpenRouter responses drop it. OR upstreams of other families
             # reject the echoed field, and leaving it here would also trip the
             # replay-artifact pin below (allow_fallbacks=False), silently
             # killing same-model failover for a mixed transcript. Dropping it
@@ -509,9 +497,12 @@ class _OpenAICompatibleLaneMixin:
         # assistant message — the same-family-continuity treatment ``reasoning_details``
         # already gets. Cross-family sends strip it (sanitize_reasoning_on_model_switch
         # + the outbound scrubber), and the deepseek outbound build replays it.
-        if str(target.get("provider") or "") != "deepseek":
+        provider = str(target.get("provider") or "")
+        # MiniMax's two continuation carriers stay verbatim, including unknown
+        # shapes. Retention does not make an opaque value displayable or portable.
+        if provider not in {"deepseek", "minimax"}:
             msg.pop("reasoning_content", None)
-        elif not isinstance(msg.get("reasoning_content", ""), str):
+        elif provider == "deepseek" and not isinstance(msg.get("reasoning_content", ""), str):
             # The SDK surfaces server extras verbatim (same hazard the
             # refusal/annotations pops above guard): a null here would live on
             # the canonical assistant turn forever and the direct lane has no

@@ -404,6 +404,18 @@ def test_total_function_cap_checks_staged_and_live_projections(tmp_path: Path) -
     assert expected in errors
     assert not any(error.startswith("staged:") for error in errors)
 
+    # The approved capacity remains usable, including headroom above the old
+    # limit; the exact next function still trips the same live inventory gate.
+    remaining = MAX_TOTAL_FUNCTIONS
+    for rel in paths:
+        count = min(functions_per_path, remaining)
+        (repo / rel).write_text("".join(f"def f{i}(): pass\n" for i in range(count)), encoding="utf-8")
+        remaining -= count
+    assert not any("total function count exceeds" in error for error in validate_size_ratchet(repo))
+    with (repo / paths[-1]).open("a", encoding="utf-8") as stream:
+        stream.write("def extra(): pass\n")
+    assert f"total function count exceeds {MAX_TOTAL_FUNCTIONS}: {MAX_TOTAL_FUNCTIONS + 1}" in validate_size_ratchet(repo)
+
 
 def test_staged_manifest_cannot_self_authorize_staged_new_debt(tmp_path: Path) -> None:
     repo = tmp_path / "repo"

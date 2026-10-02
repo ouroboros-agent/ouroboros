@@ -116,6 +116,7 @@ def harness(tmp_path, monkeypatch):
     state = {"enforcement": "blocking", "slots": _slots(("s1", "m/a"), ("s2", "m/b"), ("s3", "m/c"))}
     monkeypatch.setattr(pr, "get_review_enforcement", lambda: state["enforcement"])
     monkeypatch.setattr(pr, "_plan_review_slots", lambda: state["slots"])
+    monkeypatch.setattr(pr, "session_input_limits", lambda _slots: {})
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
 
     def install(answers):

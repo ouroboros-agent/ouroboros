@@ -373,8 +373,9 @@ class ReviewSlotExecutor:
     def _observe_usage(self, usage: Optional[Dict[str, Any]]) -> None:
         observe_review_usage(self.usage_observer, usage)
 
-    def _observe_failed_send(self, exc: BaseException) -> None:
-        observe_failed_review_send(self.usage_observer, exc)
+    def _output_contract(self) -> str:
+        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
+        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
 
     def prompt_payload(self) -> Dict[str, Any]:
         """Route-owned projection of what will actually be sent (for the durable
@@ -481,7 +482,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 capture = getattr(exc, "physical_attempt_capture", None)
                 if str(getattr(capture, "state", "") or "") in POSITIVE_PHYSICAL_ATTEMPT_STATES:
                     invoke_review_paid_stamp(self.assignment.dispatch_stamp)
-                self._observe_failed_send(exc)
+                observe_failed_review_send(self.usage_observer, exc)
                 raise
         # Null/non-object provider messages follow the caller's empty-response rail.
         raw_text = str(msg.get("content") or "") if isinstance(msg, dict) else ""
@@ -1177,6 +1178,31 @@ def session_identity_deltas(slot: Any, facts: Dict[str, Any]) -> List[Dict[str, 
     return deltas
 
 
+def session_route_for_review_slot(slot: Any) -> Any:
+    """Resolve the same opaque route for preparation and physical dispatch."""
+    spec = str(getattr(slot, "session_target", "") or "")
+    if spec:
+        import dataclasses
+        from ouroboros.subagents import parse_subagent_harness
+
+        route = parse_subagent_harness(spec)
+        if route is None:
+            raise ReviewRouteUnavailable(
+                f"agent_session slot {slot.slot_id} has an unparsable session target {spec!r}",
+                code="session_target_unparsable")
+        # The slot owns effort; a target string cannot silently override it.
+        route = dataclasses.replace(route, effort=str(slot.effort or ""))
+        pin = str(getattr(slot, "session_profile", "") or "")
+        return dataclasses.replace(route, profile_id=pin) if pin else route
+    route = review_session_route()
+    if route is None:
+        raise ReviewRouteUnavailable(
+            "agent_session review slot has no configured session route "
+            f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
+            code="session_route_unconfigured")
+    return route
+
+
 class AgentSessionReviewExecutor(ReviewSlotExecutor):
     """One pinned Claudexor run per reviewer slot.
 
@@ -1200,10 +1226,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         self._settled_failure: Optional[BaseException] = None
 
     # -- prompt (route-owned; never the api pack) ------------------------------
-
-    def _output_contract(self) -> str:
-        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
-        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
 
     def prompt_payload(self) -> Dict[str, Any]:
         return {"session_prompt": self.session_prompt}
@@ -1277,35 +1299,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         # Captured by the physical worker before the logical caller may return.
         # Commit review uses it to patch the exact reserved slot before POST.
         self._pending_invocation_checkpoint = checkpoint
-    def _session_route(self) -> Any:
-        # 6.1: a structured row carries ITS OWN opaque target; the shared
-        # session-route key stays as the legacy fallback for rows without one.
-        spec = str(getattr(self.assignment.slot, "session_target", "") or "")
-        if spec:
-            import dataclasses
-            from ouroboros.subagents import parse_subagent_harness
-
-            route = parse_subagent_harness(spec)
-            if route is None:
-                raise ReviewRouteUnavailable(
-                    f"agent_session slot {self.assignment.slot.slot_id} has an "
-                    f"unparsable session target {spec!r}", code="session_target_unparsable")
-            # D1/6.3: effort has ONE source — the per-slot effort field. The
-            # target_id carries route identity only; any effort a caller
-            # embedded in the spec (`harness=model:effort`) is dropped so the
-            # field can never be silently overridden by the identity string.
-            route = dataclasses.replace(route, effort=str(self.assignment.slot.effort or ""))
-            pin = str(getattr(self.assignment.slot, "session_profile", "") or "")
-            if pin:
-                route = dataclasses.replace(route, profile_id=pin)
-            return route
-        route = review_session_route()
-        if route is None:
-            raise ReviewRouteUnavailable(
-                "agent_session review slot has no configured session route "
-                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
-                code="session_route_unconfigured")
-        return route
 
     def _custody_drive(self) -> Any:
         drive = self.assignment.custody_root
@@ -1345,7 +1338,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 timeout_sec=logical_timeout,
                 logical_key_extra=(self.assignment.call_id,),
                 output_schema=review_session_output_schema(request.surface),
-                session_route=self._session_route(),
+                session_route=session_route_for_review_slot(slot),
                 retry_state=self._retry_state,
                 reconcile_only=bool(getattr(request, "reconcile_only", False)),
                 use_thread=request.surface == "plan_review",

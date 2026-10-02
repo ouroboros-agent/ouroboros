@@ -384,6 +384,9 @@ class _ProviderRoutingMixin:
                 "api_key": configured("MINIMAX_API_KEY", ""),
                 "base_url": resolve_minimax_base_url(configured("MINIMAX_REGION", "")),
                 "default_headers": {},
+                # Request separate reasoning carriers and replay them unchanged
+                # on this direct lane so interleaved thinking survives tool calls.
+                "reasoning_split": True,
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
             }

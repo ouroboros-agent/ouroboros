@@ -175,10 +175,14 @@ the open obligations and commit-readiness debt shown by `review_status` and the
 Review Continuity context section — stays recorded until a later review or
 successful commit resolves it; the author's response rewrites neither it nor the
 selected enforcement. Before the next attempt the author owes an outcome, not a
-procedure: consider the open findings together against the evidence rather than
-patching one visible symptom, repair what the evidence supports, rebut with
-reasons what it does not (`review_rebuttal`), and keep anything unresolved
-visible. How to inspect, group, order and explain that work, and whether to seek
+procedure: consider the open findings together against the evidence and accepted
+goal rather than patching one visible symptom. Repair what the requirement still
+needs, or replace or remove a chosen means within the applicable task authority,
+with evidence that the requirement still holds. This does not make a true
+historical finding false or permit dropping an owner- or parent-fixed requirement
+or method. Rebut unsupported findings or their current applicability with reasons
+(`review_rebuttal`), preserving the original record and anything unresolved.
+How to inspect, group, order and explain that work, and whether to seek
 more feedback first, is the author's judgment for the case (BIBLE P13). Whether
 the next attempt is replayed or refused for free, rejoins unresolved review
 work, or dispatches a paid review is decided by the gate's recorded replay

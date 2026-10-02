@@ -564,7 +564,13 @@ def test_owned_process_churn_keeps_single_send_and_controls(root, cancel):
         with owner(root, control=control), ua.physical_attempt_limit(1):
             if cancel:
                 with pytest.raises(PhysicalDispatchInterrupted):
-                    ua.execute_physical_attempt(request(root), lambda: sends.append(1))
+                    try:
+                        ua.execute_physical_attempt(request(root), lambda: sends.append(1))
+                    except ledger.UsageLockUnavailable as exc:
+                        raise AssertionError(
+                            "Accounting acquisition failed before cancellation: "
+                            f"reason={exc.reason!r}, error_number={exc.error_number!r}"
+                        ) from exc
             else:
                 ua.execute_physical_attempt(request(root), lambda: sends.append(1) or {"usage": {}})
                 assert ua._PHYSICAL_LIMIT.get().used == 1

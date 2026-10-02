@@ -1415,6 +1415,7 @@ class ToolRegistry:
                 pathlib.Path(self._ctx.drive_root),
                 mutation_root=pathlib.Path(self._ctx.repo_dir),
                 source_tool=tool_name,
+                mutating_task_id=str(getattr(self._ctx, "task_id", "") or ""),
             )
         except Exception:
             logging.getLogger(__name__).debug(

@@ -498,7 +498,8 @@ def test_field_refusal_retains_then_acknowledges_once_with_display(setup, asynch
 
 
 @pytest.mark.parametrize("code,vendor", [("unsupported_parameter", ""),
-    ("provider_failed", "context_length_exceeded"), ("invalid_request", "context_length_exceeded")])
+    ("provider_failed", "context_length_exceeded"), ("invalid_request", "context_length_exceeded"),
+    ("transport_not_delivered", "")])
 def test_proven_not_started_releases_and_never_fabricates_provider_usage(setup, code, vendor):
     root, gateway, client = setup
     gateway.results = [result(outcome="failed", problem={"code": code, "message": "Controlled refusal",
@@ -512,6 +513,35 @@ def test_proven_not_started_releases_and_never_fabricates_provider_usage(setup, 
     assert gateway.uploads[0][0]["options"]["temperature"] == 0.2
     assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"]
     assert len(gateway.accepted_operations) == 1
+
+
+@pytest.mark.parametrize("proof", ["connection_not_written", "incomplete_upload"])
+@pytest.mark.parametrize("proven", [True, False])
+def test_upload_proof_refines_terminal_without_resending_or_inventing_usage(setup, proof, proven):
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    root, gateway, client = setup
+    problem = {"code": "transport_not_delivered" if proven else "transport_unknown",
+               "message": "Controlled transport outcome", "retryable": proven,
+               "context": {"proof": proof, "bodyBytes": 3_000_000,
+                           "handedToSocketBytes": 65_536 if proven else 3_000_000}}
+    value = result(outcome="failed" if proven else "unknown", problem=problem)
+    value.update(message=None, usage={"input_tokens": None, "output_tokens": None},
+                 cost={"knowledge": "unknown", "cashUsd": None, "valuationUsd": None})
+    gateway.results = [value]
+    gateway.dispatch = ["not_started" if proven else "unknown"]
+    original_detail = gateway.detail
+    gateway.detail = lambda index: {**original_detail(index), "dispatch": {
+        "state": gateway.dispatch[index], "startedAt": "2026-09-30T00:00:00Z", "route": dict(ROUTE)}}
+    with pytest.raises(transport.ClaudexorModelError) as raised:
+        client.chat([{"role": "user", "content": "hi"}], MODEL)
+    error = raised.value
+    assert isinstance(error, transport.ClaudexorModelNotDispatched) is proven
+    assert error.problem == problem
+    assert ledger(root)[-1]["state"] == ("released" if proven else "unresolved")
+    classified = classify_llm_exception(error)
+    assert classified.retry_same_request is proven
+    assert len(gateway.accepted_operations) == len(gateway.creates) == 1
 
 
 def test_typed_subject_refusal_suppresses_next_auto_preference(setup):

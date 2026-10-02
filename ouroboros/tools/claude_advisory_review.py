@@ -1400,6 +1400,7 @@ def _handle_review_status(
         task_id=task_id,
         attempt=attempt,
         snapshot_hash_fn=compute_snapshot_hash,
+        reader_task_id=str(getattr(ctx, "task_id", "") or ""),
     )
     next_step = _next_step_guidance(
         projection["guidance_run"],

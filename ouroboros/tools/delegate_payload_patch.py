@@ -80,7 +80,8 @@ def _finalize_payload_apply(
 
         invalidate_advisory_after_mutation(
             pathlib.Path(getattr(ctx, "drive_root", ".")), mutation_root=target,
-            changed_paths=ordered, source_tool="integrate_delegated_patch")
+            changed_paths=ordered, source_tool="integrate_delegated_patch",
+            mutating_task_id=str(getattr(ctx, "task_id", "") or ""))
     except Exception:
         pass
     reconcile_err = ""
@@ -718,7 +719,8 @@ def integrate_payload_patch(
             invalidate_advisory_after_mutation(
                 pathlib.Path(str(getattr(ctx, "drive_root", "") or ".")),
                 mutation_root=target, changed_paths=ordered,
-                source_tool="integrate_delegated_patch")
+                source_tool="integrate_delegated_patch",
+                mutating_task_id=str(getattr(ctx, "task_id", "") or ""))
         except Exception:
             pass
         reconcile_err = ""

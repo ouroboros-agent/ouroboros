@@ -378,12 +378,7 @@ def _mark_failed_bypass_advisory_stale(
 ) -> None:
     """Prevent a failed bypass preflight from satisfying later freshness checks."""
     try:
-        from ouroboros.review_state import (
-            compute_snapshot_hash,
-            make_repo_key,
-            update_state,
-            _utc_now,
-        )
+        from ouroboros.review_state import compute_snapshot_hash, make_repo_key, update_state, _utc_now
 
         snapshot_hash = compute_snapshot_hash(
             pathlib.Path(ctx.repo_dir),
@@ -397,6 +392,7 @@ def _mark_failed_bypass_advisory_stale(
             state.last_stale_from_edit_ts = _utc_now()
             state.last_stale_reason = "tests_preflight_blocked"
             state.last_stale_repo_key = repo_key
+            state.last_stale_task_id = str(getattr(ctx, "task_id", "") or "")
 
         update_state(pathlib.Path(ctx.drive_root), _mutate)
     except Exception:

@@ -241,9 +241,13 @@ def build_anti_thrashing_rules_section(
 # retrying after review findings"): the outcome is owed, the procedure is the
 # author's (BIBLE P13).
 REVIEW_REPAIR_JUDGMENT = (
-    "Consider the open findings together against the evidence: repair what it "
-    "supports, rebut with reasons what it does not, and keep anything unresolved "
-    "visible. How to inspect, group, order and explain that work, and whether to "
+    "Consider the open findings together against the evidence and the accepted goal. "
+    "Repair what the requirement still needs, or replace or remove a means that is "
+    "yours to change, with evidence that the requirement still holds. An owner- or "
+    "parent-fixed requirement or method stays binding. A changed means does not make "
+    "a true historical finding false. Rebut unsupported findings or their current "
+    "applicability with reasons, preserving the record and anything unresolved. "
+    "How to inspect, group, order and explain that work, and whether to "
     "seek more feedback first, is your judgment for this case."
 )
 

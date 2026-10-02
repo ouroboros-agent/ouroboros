@@ -574,6 +574,38 @@ class ClaudexorGateway:
                              **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
         return body if isinstance(body, dict) else {}
 
+    def ask_input_limits(self) -> Dict[str, Dict[str, Any]]:
+        """Declared native text limits with the engine's ordinary ASK framing.
+
+        This catalog projection covers initial attempts, including thread turns.
+        Missing/unknown units or framing remain unknown, never a model window.
+        """
+        limits: Dict[str, Dict[str, Any]] = {}
+        for row in self.agent_capabilities().get("harnesses") or []:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            for value in row.get("inputLimits") or []:
+                if not isinstance(value, dict):
+                    continue
+                framing = value.get("askPromptBudget")
+                if (value.get("scope") != "turn_text" or value.get("unit") != "unicode_scalars"
+                        or not isinstance(framing, dict)
+                        or framing.get("shape") != "ordinary_initial_attempt"):
+                    continue
+                bound, overhead = value.get("limit"), framing.get("engineOverheadMax")
+                if (type(bound) is not int or bound <= 0 or type(overhead) is not int or overhead < 0
+                        or not isinstance(value.get("source"), str) or not value["source"]
+                        or not isinstance(value.get("verified_against"), str) or not value["verified_against"]):
+                    continue
+                candidate = {**value, "askPromptBudget": dict(framing),
+                             "prompt_budget": max(0, bound - overhead),
+                             "engine_version": self.engine_version,
+                             "engine_build_sha": self.engine_build_sha}
+                route_id = str(row["id"])
+                if route_id not in limits or candidate["prompt_budget"] < limits[route_id]["prompt_budget"]:
+                    limits[route_id] = candidate
+        return limits
+
     # Model operations use the same private control transport, not Agent runs
     # or the redacted/size-capped artifact surface. Callers own all admission,
     # waiting, billing and explicit acknowledgement. The engine owns account
@@ -741,7 +773,8 @@ class ClaudexorGateway:
         The agent-capability catalog is a derived projection that deliberately
         drops the manifest's transport flags (``json_schema_output``,
         ``interactive``); this is the surface that still carries them, so
-        transport-capability questions are asked here, not of the catalog.
+        these transport questions are asked here. The catalog's explicit
+        ``inputLimits`` projection separately includes engine ASK framing.
         """
         body = self._request("GET", "/v2/harnesses")
         rows = body.get("harnesses") if isinstance(body, dict) else None

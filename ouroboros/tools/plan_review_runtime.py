@@ -1060,30 +1060,6 @@ def plan_payload_roots(ctx: ToolContext, locators: List[str]) -> list[pathlib.Pa
 # always dispatch. Cursor lanes without quota snapshots simply dispatch too.
 
 
-def _slot_session_route(slot: Any) -> Any:
-    """The route an agent_session slot would dispatch on (None when unresolvable —
-    the dispatch path owns that refusal; health has nothing to say about it).
-
-    Mirrors the dispatcher's own resolution (`review_execution` `_session_route`)
-    including the row's optional credential pin, so health judges the SAME account
-    the run would actually ride. Effort is deliberately NOT mirrored: health reads
-    route identity, model and profile only.
-    """
-    import dataclasses
-
-    from ouroboros.review_execution import review_session_route
-    from ouroboros.subagents import parse_subagent_harness
-
-    spec = str(getattr(slot, "session_target", "") or "")
-    if spec:
-        route = parse_subagent_harness(spec)
-        pin = str(getattr(slot, "session_profile", "") or "")
-        if route is not None and pin:
-            route = dataclasses.replace(route, profile_id=pin)
-        return route
-    return review_session_route()
-
-
 def _structural_skip_code(reason: str, reset_at: str) -> str:
     """POSITIVE structural evidence only: a dated window exhaustion whose reset is
     still ahead, or a typed dead-pool code. An UNDATED exhaustion, a stale reset and
@@ -1117,6 +1093,7 @@ def plan_panel_health_snapshot(slots: list) -> Optional[Dict[str, Dict[str, str]
     from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_daemon_provisioned
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.subagents import delegated_run_shape, route_health
+    from ouroboros.review_execution import ReviewRouteUnavailable, session_route_for_review_slot
 
     if not owned_daemon_provisioned():
         return None
@@ -1127,8 +1104,11 @@ def plan_panel_health_snapshot(slots: list) -> Optional[Dict[str, Dict[str, str]
     try:
         gateway = ensure_owned_gateway()
         for slot in session_slots:
-            route = _slot_session_route(slot)
-            if route is None:
+            try:
+                route = session_route_for_review_slot(slot)
+            except ReviewRouteUnavailable:
+                # Dispatch owns the typed refusal; unresolvable slots supply
+                # no health fact and cannot hide a sibling's actual evidence.
                 continue
             # The PIN is part of the subject, so it is part of the memo key: two
             # rows on the same harness+model but different accounts must never

@@ -83,7 +83,7 @@ from ouroboros.tools.plan_review_runtime import (
 )
 from ouroboros.tools.plan_spec import plan_fingerprint as _plan_fingerprint
 from ouroboros.tools.plan_evidence import task_evidence_reader as _task_evidence_reader
-from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs
+from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs, session_input_limits
 from ouroboros.tools.plan_review_artifacts import (
     addressed_notes as _addressed_notes,
     addressed_slots as _addressed_slots,
@@ -844,7 +844,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     delivery = dialogue_slot_inputs(dispatch_slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, manifest=manifest, slot_messages=slot_messages,
         native_mandatory_chars=len(system_prompt) + len(user_content), data_root=state_root,
-        frozen=existing if resume_in_flight else None, session_root=str(active_root), task_id=task_id)
+        frozen=existing if resume_in_flight else None, session_root=str(active_root), task_id=task_id,
+        session_limits={} if resume_in_flight else session_input_limits(dispatch_slots))
     slot_messages = delivery["slot_messages"]
     quorum = adaptive_quorum(len(slots))  # the wave's quorum spans the whole roster; the send fits its seats
     fanout = _plan_fanout_inputs(
