@@ -199,7 +199,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── room_consolidation.py ← Per-room helper episodes, attributed corrections/digests and nomination custody (§6)
       ├── consolidator.py      ← Generation capture, Light transport and scratchpad maintenance; activates the chronicle before dialogue writes (§6)
       ├── memory_nomination_receipts.py ← Source-addressed pending nominations; no cross-batch retirement (§6)
-      ├── chronicle_store.py, chronicle_import.py ← Append-only derived memory authority, rebuildable SQLite index and deterministic legacy activation (§6)
+      ├── chronicle_store.py, chronicle_import.py, chronicle_sources.py ← Append-only memory, deterministic import, rebuildable SQLite index and source reads (§6)
       ├── chronicle_view.py, memory_guidance.py ← Frozen adaptive biography views and the revisable remembering note (§6)
       ├── memory.py            ← Scratchpad, identity, chat history
       ├── knowledge.py         ← Global/project Markdown sources, revision-checked anchored writes and shelf indexes (§6)

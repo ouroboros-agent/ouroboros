@@ -16,7 +16,9 @@ def _root(ctx):
 
 def _room(ctx, room_id=""):
     metadata = getattr(ctx, "task_metadata", {}) or {}
-    value = room_id or metadata.get("chat_id") or getattr(ctx, "current_chat_id", None) or getattr(ctx, "chat_id", None)
+    value = next((address for address in (room_id, metadata.get("chat_id"),
+                  getattr(ctx, "current_chat_id", None), getattr(ctx, "chat_id", None))
+                  if address is not None and address != ""), None)
     if value is None or value == "":
         raise ValueError("room_id is required when this task has no room address")
     return str(value)

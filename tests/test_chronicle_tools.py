@@ -373,3 +373,41 @@ def test_raw_room_limit_respects_end_and_keeps_unbounded_reads(raw_room_registry
     assert page["rows"] == rows[start:end]
     assert page["range"] == {"start": start, "end": end, "total": 75, "unit": "matching_rows"}
     assert page["page_complete"] is (start == 0 and end == 75)
+
+
+@pytest.mark.parametrize("room", [0, 1, 42017], ids=["hidden", "main", "project"])
+def test_default_room_tools_preserve_hidden_main_and_project_addresses(tmp_path, room):
+    ctx = context(tmp_path)
+    ctx.task_metadata = {"chat_id": room}
+    ctx.current_chat_id = room
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    row = {"chat_id": room, "direction": "in", "text": "Exact source words"}
+    (logs / "chat.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    page = json.loads(_memory_read(ctx, raw_room=True, limit=1))
+    assert page["room_id"] == str(room) and page["rows"] == [row]
+    episode = json.loads(_chronicle_write(ctx, text="I understood the source", source_ref=page["source_ref"]))
+    assert episode["room_id"] == str(room)
+    readback = json.loads(_memory_read(ctx))
+    assert readback["room_id"] == str(room) and readback["records"][0]["id"] == episode["id"]
+    mark = json.loads(_memory_mark(ctx, text="Keep this source", source_ref=page["source_ref"], quote="Exact source words"))
+    assert mark["room_id"] == str(room) and mark["quote"] == row["text"]
+
+
+def test_default_room_uses_first_present_address_not_first_truthy_address(tmp_path):
+    from ouroboros.tools.chronicle import _room
+
+    ctx = context(tmp_path)
+    ctx.task_metadata = {"chat_id": 0}
+    ctx.current_chat_id = 7
+    ctx.chat_id = 9
+    assert _room(ctx) == "0"
+    assert _room(ctx, "12") == "12"
+    ctx.task_metadata = {"chat_id": None}
+    ctx.current_chat_id = 0
+    assert _room(ctx) == "0"
+    ctx.current_chat_id = None
+    assert _room(ctx) == "9"
+    ctx.chat_id = None
+    with pytest.raises(ValueError, match="room_id is required"):
+        _room(ctx)
