@@ -26,6 +26,80 @@ def test_authored_episode_has_host_actor_and_no_invented_coverage(tmp_path):
     assert not (ctx.drive_root / "memory" / "chronicle").exists()
 
 
+@pytest.mark.parametrize("source_backed", [False, True])
+def test_bound_writer_cannot_adopt_an_explicit_foreign_room(tmp_path, source_backed):
+    from ouroboros.chronicle_view import capture_chronicle
+    from ouroboros.memory import Memory
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+
+    ctx, store = context(tmp_path), ChronicleStore(tmp_path)
+    store.import_legacy()
+    own = create_project(tmp_path, "writer-room")
+    foreign = create_project(tmp_path, "source-room")
+    bind_task_to_project(tmp_path, ctx.task_id, own["id"], origin={"absent": "system"})
+    ctx.current_chat_id = ctx.task_metadata["chat_id"] = own["chat_id"]
+    row = {"chat_id": foreign["chat_id"], "direction": "in", "text": "Owner has not chosen."}
+    path = tmp_path / "logs/chat.jsonl"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    page = json.loads(_memory_read(ctx, room_id=str(foreign["chat_id"]), raw_room=True))
+    episode = json.loads(_chronicle_write(ctx, room_id=str(foreign["chat_id"]),
+        text="I remember the other room's open choice.",
+        **({"source_ref": page["source_ref"]} if source_backed else {})))
+    assert episode["author"]["task_id"] == ctx.task_id
+    assert episode["metadata"]["task_ids"] == []
+    assert episode["metadata"]["source_row_ids"] == ([source_row_id(row)] if source_backed else [])
+    mark = json.loads(_memory_mark(ctx, node_id=episode["id"], text="Still open"))
+    journal = store.log_path.read_bytes()
+    assert store.records_for_tasks([ctx.task_id]) == []
+    store.index_path.unlink()  # Rebuilding the index must not invent writer membership.
+    assert store.records_for_tasks([ctx.task_id]) == []
+    for focus in (own["chat_id"], foreign["chat_id"]):
+        snap = json.loads(capture_chronicle(Memory(tmp_path), {"id": "inspect", "chat_id": focus}))
+        destinations = [room["id"] for room in snap["rooms"]
+                        if any(record["id"] == episode["id"] for record in room["records"])]
+        assert destinations == [str(foreign["chat_id"])]
+        assert (mark["id"] in {m["id"] for m in snap["marks"]}) == (focus == foreign["chat_id"])
+    assert store.log_path.read_bytes() == journal
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("source_backed", [False, True])
+def test_own_main_episode_follows_its_source_task_promotion(tmp_path, explicit, source_backed):
+    from ouroboros.chronicle_view import capture_chronicle
+    from ouroboros.memory import Memory
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+
+    ctx, store = context(tmp_path), ChronicleStore(tmp_path)
+    store.import_legacy()
+    source_task = "source-task" if source_backed else ctx.task_id
+    kwargs = {"room_id": "1"} if explicit else {}
+    if source_backed:
+        path = tmp_path / "logs/chat.jsonl"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"chat_id": 1, "task_id": source_task, "text": "Our decision"}) + "\n",
+                        encoding="utf-8")
+        kwargs["source_ref"] = json.loads(_memory_read(ctx, raw_room=True))["source_ref"]
+    episode = json.loads(_chronicle_write(ctx, text="I remember our decision.", **kwargs))
+    assert episode["metadata"]["task_ids"] == [source_task]
+    assert episode["author"]["task_id"] == ctx.task_id
+    room = create_project(tmp_path, "promoted")
+    bind_task_to_project(tmp_path, source_task, room["id"], origin={"absent": "system"})
+    snap = json.loads(capture_chronicle(Memory(tmp_path), {"id": "inspect", "chat_id": room["chat_id"]}))
+    assert any(r["id"] == str(room["chat_id"]) and any(e["id"] == episode["id"] for e in r["records"])
+               for r in snap["rooms"])
+    assert store.get(episode["id"])["room_id"] == "1"  # Adoption never rewrites the original.
+
+
+def test_explicit_episode_destination_needs_no_current_address(tmp_path):
+    ctx = context(tmp_path)
+    ctx.task_metadata = {}
+    ctx.current_chat_id = None
+    episode = json.loads(_chronicle_write(ctx, room_id="7", text="An explicitly addressed memory"))
+    assert episode["room_id"] == "7" and episode["author"]["task_id"] == ctx.task_id
+    assert episode["metadata"]["task_ids"] == []
+
+
 def test_raw_room_read_retains_exact_page_and_write_binds_same_rows(tmp_path):
     ctx = context(tmp_path)
     logs = tmp_path / "logs"
@@ -350,8 +424,8 @@ def test_raw_room_limit_pages_real_registry_and_binds_only_returned_sources(raw_
             "text": "I inspected only this page.", "source_ref": page["source_ref"]}))
         assert episode["metadata"]["source_row_ids"] == expected_ids
         assert episode["metadata"]["source_range"] == page["range"]
-        assert set(episode["metadata"]["task_ids"]) == (
-            {row["task_id"] for row in rows[start:end]} | {"raw-page-reader"})
+        assert set(episode["metadata"]["task_ids"]) == {row["task_id"] for row in rows[start:end]}
+        assert episode["author"]["task_id"] == "raw-page-reader"
         seen.extend(page["rows"])
         identifiers.extend(expected_ids)
     assert seen == rows and len(set(identifiers)) == 75

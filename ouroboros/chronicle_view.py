@@ -109,7 +109,7 @@ def _derived_rooms(store: ChronicleStore, focus: str, resolver: Any, bindings: d
         # immutable snapshot can then rebind upward without rereading sources.
         for record in store.room_records(room_id):
             meta = record.get("metadata") or {}
-            task_ids = meta.get("task_ids") or [(record.get("author") or {}).get("task_id")]
+            task_ids = meta.get("task_ids", [(record.get("author") or {}).get("task_id")]) or []
             projected = {bound_room_chat(bindings, {"task_id": tid}) for tid in task_ids if tid}
             projected.discard(0)
             destination = str(next(iter(projected))) if len(projected) == 1 else room_id

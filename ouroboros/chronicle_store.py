@@ -375,14 +375,14 @@ class ChronicleStore:
         db.execute("INSERT OR REPLACE INTO memory_nodes VALUES (?,?,?,?,?,?,?)",
                    (row["id"], row["room_id"], row["sequence"], _current_id(row), row["kind"],
                     len(_record_text(row)), _json(metadata.get("covers_record_ids") or [])))
-        task_ids = metadata.get("task_ids") or [(row.get("author") or {}).get("task_id")]
+        task_ids = metadata.get("task_ids", [(row.get("author") or {}).get("task_id")]) or []
         db.execute("DELETE FROM node_tasks WHERE node_id=?", (row["id"],))
         db.executemany("INSERT OR IGNORE INTO node_tasks VALUES (?,?)",
                        [(str(task_id), row["id"]) for task_id in task_ids if task_id])
         self._set_state(db, "cover_dirty:" + row["room_id"], True)
 
     def records_for_tasks(self, task_ids):
-        """Resolve existing task provenance, independent of current room bindings."""
+        """Resolve source task membership, independent of current room bindings."""
         selected = set(str(task_id) for task_id in task_ids if task_id)
         if not selected:
             return []

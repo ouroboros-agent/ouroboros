@@ -359,6 +359,11 @@ PROGRESS_LOG_WARN_BYTES = 8_000_000
 SCHEDULED_TASKS_WARN_BYTES = 2_000_000
 # Compact root-task -> skill review index used by acceptance packet assembly.
 SKILL_REVIEW_ROOT_TASKS_WARN_BYTES = 20_000_000
+# Chronicle capture loads retained interpretations from its rebuildable index;
+# a cold rebuild also folds the immutable journal. Use the existing indexed
+# ledger warning scale to expose that growth, not as a retention or summary
+# trigger: original memory must survive any future projection optimization.
+CHRONICLE_JOURNAL_WARN_BYTES = 20_000_000
 # ``chat_history`` can deliberately replay the archive chain, while ordinary
 # context reads only the unconsolidated generation suffix.  Warn before an
 # explicit full-history read becomes seconds-scale; this is observability, not

@@ -74,7 +74,15 @@ def _chronicle_write(ctx, text="", room_id="", node_id="", revision_id="", decis
                 raise ValueError("text must contain your episode or revision")
             metadata = (_source_metadata(ctx, source_ref) if source_ref else
                         {"coverage": "authored_without_source_range", "source_row_ids": []})
-            metadata["task_ids"] = sorted(set(metadata.get("task_ids", [])) | ({author["task_id"]} if author["task_id"] else set()))
+            metadata.setdefault("task_ids", [])
+            if not source_ref:
+                try:
+                    current_room = _room(ctx)
+                except ValueError:
+                    current_room = None  # An explicit destination needs no current address.
+                if author["task_id"] and (room_id in ("", None) or str(room_id) == current_room):
+                    metadata["task_ids"] = [author["task_id"]]
+            # Source task membership drives adoption; the writer stays in author.task_id.
             if source_ref:
                 metadata["source_refs"] = [source_ref]
             if node_id:
