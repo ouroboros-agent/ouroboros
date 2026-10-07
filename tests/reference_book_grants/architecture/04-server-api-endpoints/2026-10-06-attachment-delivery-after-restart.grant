@@ -1,0 +1,2 @@
+251
+A kept attachment send after a host restart: only the accepting process (its ingress_process stamp) marks a row ingress_dispatched, the composer settles a saved row without it as "Saved; delivery not confirmed." with no replay, and an unreadable kept copy is shown.

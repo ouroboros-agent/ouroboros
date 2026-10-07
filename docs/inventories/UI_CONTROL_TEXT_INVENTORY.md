@@ -5,13 +5,13 @@ it: `docs/DESIGN.md` "References and actions". Rows are sorted by text so that t
 the same thing sit together: when your diff adds a row, read its neighbours.
 
 181 controls with fixed text in 172 rows, 131 distinct texts;
-61 more controls build their text at run time and are not listed.
+63 more controls build their text at run time and are not listed.
 
 ## Fixed control text
 
 | text | classes | file | n |
 |---|---|---|---|
-| × | `attach-remove` | modules/chat.js | 1 |
+| × | `attach-remove` | modules/chat_attachments.js | 1 |
 | × | `project-panel-close` | index.html | 1 |
 | ↑ | `btn btn-default` | modules/model_roles.js | 1 |
 | ↓ | `(no class)` | modules/chat_media.js | 1 |

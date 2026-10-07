@@ -1,0 +1,2 @@
+79
+A crash keeps the host session: the operation read also names the ended accepting process by the row's ingress_process stamp, so it reads lost instead of pending.

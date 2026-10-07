@@ -1,0 +1,2 @@
+322
+Clarify that path-addressed Files operations use the selected Files root while upload IDs use their separately confined stored-upload authority; required correction to the former blanket claim.

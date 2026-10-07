@@ -239,7 +239,8 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
     """Origin rows a Project lens can SYNTHESIZE when the canonical row is gone.
 
     Only bindings that carry ``source_text`` qualify (cross-thread origins — the
-    binding is the retention-proof copy of the message that started the project).
+    binding is the retention-proof copy of the message that started the project),
+    with the attachment refs, ``source`` and placeholder mark recorded from its row.
     Deduplicated by complete origin identity so several bindings created from one
     owner message yield one row."""
     from ouroboros.projects_registry import project_task_bindings
@@ -264,7 +265,11 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
         if identity in seen:
             continue
         seen.add(identity)
-        rows.append({"ref": dict(ref), "text": text, "origin_id": project_origin_identity(ref)})
+        media = row.get("source_attachments")
+        rows.append({"ref": dict(ref), "text": text, "origin_id": project_origin_identity(ref), **({
+            "attachments": media, "channel": str(row.get("source_channel") or ""),
+            "text_placeholder": row.get("source_text_placeholder") is True,
+        } if isinstance(media, list) and media else {})})
     return rows
 
 

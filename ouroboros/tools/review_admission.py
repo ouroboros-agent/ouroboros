@@ -645,7 +645,7 @@ def admit_commit_gate_wave(ctx, seats) -> str | None:
     """All-or-nothing money admission of one commit-gate wave (owner decision
     2026-09-05): every paid seat's reservation upper bound must fit TOGETHER,
     against every fence ``reserve_attempt`` enforces (the global TOTAL_BUDGET
-    remainder and the root fence), before ANY seat is dispatched. Returns the
+    remainder, root and original group fences), before ANY seat is dispatched. Returns the
     typed refusal text ($0, nothing dispatched) naming the binding axis, or
     None; fail-open on unknowns like the task-level surfaces that already ride
     ``review_wave_budget_gate``."""
@@ -685,8 +685,9 @@ def admit_commit_gate_wave(ctx, seats) -> str | None:
             f"{usd(limit)} alone would leave {usd(root_remaining)}"
         )
     else:
+        label = "whole-work billing-group budget fence" if admission.get("binding_axis") == "group" else "per-task budget fence"
         fence = (
-            f"the per-task budget fence {usd(limit)}: accounted={usd(accounted)} (of which "
+            f"the {label} {usd(limit)}: accounted={usd(accounted)} (of which "
             f"{usd(admission.get('reserved_usd'))} is reserved by other in-flight attempts), "
             f"remaining={usd(remaining)}, shortfall={usd(shortfall)}; the global budget "
             f"{usd(admission.get('global_limit_usd'))} alone would leave {usd(admission.get('global_remaining_usd'))}"

@@ -7,6 +7,7 @@ import { apiFetch, taskArtifactDownloadUrl } from './api_client.js';
 import { bindMenu } from './ui_interactions.js';
 import { stampHistoryNode } from './chat_history_replay.js';
 import { isFileDrag } from './chat_activity.js';
+import { buildAttachmentBlock } from './chat_attachments.js';
 import { createDocumentReader, documentReaderKind } from './document_reader.js';
 
 const MIME_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
@@ -182,6 +183,7 @@ export function createChatMedia({
     insertMessageNode,
     senderLabel,
     stampNodeTimestamp,
+    onDomWrite = (mutate) => mutate(),
 }) {
     const disposers = new Set();
     const resourceOwners = new Map();
@@ -194,15 +196,16 @@ export function createChatMedia({
     const fileGroups = new Map();
     let fileDialog = null;
     let dialogFile = null;
+    let dialogOwner = null;  // the card's item (buildGallery may move it to an earlier group): releasing it or its holder closes the dialog
     let destroyed = false;
+
+    // A disposer owned like a listener (a late answer's end too): its owner's release, reset or destroy runs it.
+    function own(dispose, owner) { disposers.add(dispose); resourceOwners.set(dispose, owner); return dispose; }
 
     function listen(target, type, handler, options, owner = target) {
         if (!target) return () => {};
         target.addEventListener(type, handler, options);
-        const dispose = () => target.removeEventListener(type, handler, options);
-        disposers.add(dispose);
-        resourceOwners.set(dispose, owner);
-        return dispose;
+        return own(() => target.removeEventListener(type, handler, options), owner);
     }
 
     function later(handler, delay, owner = null) {
@@ -389,13 +392,16 @@ export function createChatMedia({
 
     function closeFileDialog() {
         dialogFile = null;
-        if (typeof fileDialog?.close === 'function') fileDialog.close();
-        else fileDialog?.removeAttribute('open');
+        dialogOwner = null;
+        if (!fileDialog) return;
+        if (typeof fileDialog.close === 'function') fileDialog.close();
+        else fileDialog.removeAttribute('open');
     }
 
-    function openFileDialog(file) {
+    function openFileDialog(file, owner = null) {
         const dialog = ensureFileDialog();
         dialogFile = file;
+        dialogOwner = owner;
         dialog.querySelector('.chat-file-dialog-title').textContent = file.filename;
         const open = dialog.querySelector('[data-file-action="open"]');
         open.hidden = !file.source.durable;
@@ -672,7 +678,7 @@ export function createChatMedia({
             const file = { source, filename, mime, meta, kind: readable, reader: source.reader, size, canOpen: Boolean(source.durable) };
             if (card && source.src) listen(card, 'click', (event) => (readable
                 ? reader.open(file, { owner: item, returnFocus: card, pointer: event?.detail > 0 })
-                : openFileDialog(file)));
+                : openFileDialog(file, item)));
         }
         return bubble;
     }
@@ -760,6 +766,26 @@ export function createChatMedia({
         map.set(key, bubble);
         groupingWrappers.add(bubble);
         insertMessageNode(bubble);
+        return true;
+    }
+
+    // The owner's attachments sit above the caption inside the bubble addMessage is
+    // building (DESIGN "Chat attachments"), from these same atoms and disposers; an
+    // empty caption leaves no empty text row (the node stays, hidden, as the anchor
+    // other bubble decorations are placed against).
+    function mountAttachments(bubble, views, caption) {
+        const block = destroyed ? null : buildAttachmentBlock({
+            listen, own, photoActionsHtml, wirePhotoActions, playerHtml, wirePlayer, openFileDialog,
+            humanSize, fileExtension, release, onDomWrite,
+        }, views);
+        const message = block && bubble?.querySelector('.message');
+        if (!message) return false;
+        message.before(block);
+        message.hidden = !caption;
+        bubble.classList.add('has-attachments');
+        // Several photos or a player take the media width; one photo or a card shrinks to fit.
+        bubble.classList.toggle('has-wide-media', Boolean(block.querySelector('.is-multiple')
+            || block.querySelector('.chat-attachment-player')));
         return true;
     }
 
@@ -864,6 +890,7 @@ export function createChatMedia({
     function release(root) {
         reader.release(root);
         const owns = (node) => node === root || root?.contains?.(node);
+        if (dialogOwner && owns(dialogOwner)) closeFileDialog();  // no actions on a released message's file
         for (const [dispose, owner] of resourceOwners) if (owns(owner)) {
             try { dispose(); } catch {}
             resourceOwners.delete(dispose);
@@ -991,6 +1018,7 @@ export function createChatMedia({
         buildGallery,
         bubbleFrameNode,
         attachCopyControl,
+        mountAttachments,
         wireDeliveries,
         reset,
         release,

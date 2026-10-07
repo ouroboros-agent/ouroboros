@@ -7210,12 +7210,111 @@ textarea.chat-input {
     background: var(--ui-card-bg);
 }
 
+/* Whole images on both sides (owner choice): a tile letterboxes, never crops. */
 .chat-gallery-item .chat-photo {
     display: block;
     width: 100%;
     aspect-ratio: 4 / 3;
-    object-fit: cover;
+    object-fit: contain;
     border-radius: 0;
+}
+
+/* One photo alone keeps its own ratio up to the token height, whoever sent it:
+   an Ouroboros single-photo bubble or an owner bubble with one image. */
+.chat-bubble:not(.is-multiple) .chat-gallery-grid:not(.is-multiple) .chat-gallery-item {
+    justify-self: start;
+    width: fit-content;
+    max-width: 100%;
+}
+
+.chat-bubble:not(.is-multiple) .chat-gallery-grid:not(.is-multiple) .chat-photo {
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    max-height: var(--chat-photo-max-height);
+    /* A tiny, very narrow or very short photo still gets a box its always-present
+       actions fit in (the figure clips what overflows it); scale-down shows the
+       photo whole at its own size and ratio inside that box, never enlarged. */
+    min-width: var(--chat-photo-min-box);
+    min-height: var(--chat-photo-min-box);
+    aspect-ratio: auto;
+    object-fit: scale-down;
+}
+
+/* Owner attachments: one block above the caption inside the owner's bubble
+   (DESIGN "Chat attachments"); the photo grid, players and file cards are the
+   shared delivery atoms above, composed — not restyled. */
+.chat-bubble.has-attachments {
+    max-width: min(80%, var(--chat-media-bubble-max));
+}
+
+.chat-bubble.has-attachments.has-wide-media {
+    width: min(80%, var(--chat-media-bubble-max));
+}
+
+.chat-attachments {
+    display: grid;
+    /* One column the bubble's width: no child's min-content (a player's control
+       row, a long nowrap title) may widen it past the bubble's edge. */
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2);
+    min-width: 0;
+    white-space: normal;
+}
+
+.chat-attachments + .message { margin-top: var(--space-2); }
+
+.chat-attachments .chat-gallery-grid.is-multiple {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.chat-attachments .chat-file-card { min-width: 0; }
+
+/* A long name wraps to two lines instead of widening the bubble; the dialog a
+   tap opens shows it whole (touch has no hover title). */
+.chat-attachments .chat-file-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.chat-file-item.is-unavailable .chat-file-name { color: var(--text-meta); }
+.chat-file-card:disabled .chat-file-more { visibility: hidden; }
+
+.chat-attachment-player .chat-media-player { min-width: 0; }
+
+/* The shared player keeps its controls inside the bubble: they wrap, and a video's
+   progress bar takes its own row (the player's narrow layout below). */
+.chat-attachment-player .chat-media-controls { flex-wrap: wrap; }
+.chat-attachment-player .chat-media-player:not(.is-audio) .chat-media-progress { order: 2; flex-basis: 100%; }
+
+.attach-badge .attach-thumb {
+    flex: 0 0 auto;
+    width: var(--chat-attach-thumb-size);
+    height: var(--chat-attach-thumb-size);
+    border-radius: var(--radius-xs);
+    object-fit: cover;
+}
+
+/* Touch: actions are always visible (no hover), and big enough for a finger. */
+@media (pointer: coarse) {
+    .chat-photo-actions summary,
+    .attach-remove {
+        min-width: var(--touch-target-min);
+        min-height: var(--touch-target-min);
+    }
+}
+
+@container chatcol (max-width: 620px) {
+    .chat-bubble.has-attachments,
+    .chat-bubble.has-attachments.has-wide-media {
+        width: auto;
+        max-width: 100%;
+    }
+
+    .chat-attachments .chat-gallery-grid.is-multiple { grid-template-columns: minmax(0, 1fr); }
 }
 
 .chat-gallery-item figcaption,

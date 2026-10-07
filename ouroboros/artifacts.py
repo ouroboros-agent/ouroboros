@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import mimetypes
 import os
 import stat
 import pathlib
@@ -294,7 +293,8 @@ def stage_task_attachments(
                     manifest.append(_rejected(ordinal, label, "copy_failed"))
                     continue
             measured = stream_artifact_file(dest, expected=source_identity)
-            mime = mimetypes.guess_type(str(dest))[0] or "application/octet-stream"
+            from ouroboros.chat_uploads import file_media
+            mime, kind = file_media(dest)
             manifest.append({
                 **measured,
                 "ordinal": ordinal,
@@ -311,7 +311,7 @@ def stage_task_attachments(
                 # every runtime mode.
                 "abs_path": str(dest),
                 "mime": mime,
-                "is_image": mime.startswith("image/"),
+                "is_image": kind == "image",
             })
         except Exception:
             log.debug("stage_task_attachments: rejected a file on error", exc_info=True)

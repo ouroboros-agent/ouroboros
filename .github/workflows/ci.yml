@@ -299,6 +299,41 @@ jobs:
       - name: Guard extracted transport imports stay out of core
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
+      # The owner-attachment path on real Windows (confined handle reads behind
+      # `/api/files/download?upload=`): this one module's Chromium cases on the Windows
+      # leg of THIS matrix — no second matrix, and the complete UI lane stays in
+      # ui-browser.yml. Nothing skips: the smoke switch is set, an engine that cannot
+      # launch fails, and a run in which no case ran or any case skipped is refused.
+      # The browser fixture runs its candidate only from an interpreter that cannot import
+      # an INSTALLED ouroboros (tests/candidate_checkout.py), and this job's shared env has
+      # the checkout installed. So these two steps own a dependency-only env from the same
+      # reviewed lock and the shared env's own base interpreter (the setup action's test
+      # profile with --no-install-project, as the UI lane's); the shared env and every
+      # other step of this job stay as they are.
+      - name: Install the dependency-only env and Chromium for the Windows owner-attachment browser test
+        id: attachment_browser_install
+        timeout-minutes: 20
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.setup_python.outcome == 'success' && steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success' }}
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/attachment-browsers
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/attachment-env
+        run: |
+          base="$(python -c 'import sys; print(sys._base_executable, end="")')"
+          uv sync --locked --extra browser --group dev --no-install-project --python "$base"
+          "$UV_PROJECT_ENVIRONMENT/Scripts/python.exe" -m playwright install chromium
+      - name: Run the owner-attachment browser test on Windows (Chromium)
+        id: attachment_browser
+        timeout-minutes: 30
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.attachment_browser_install.outcome == 'success' }}
+        shell: bash
+        env:
+          OUROBOROS_RUN_UI_SMOKE: "1"
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/attachment-browsers
+          ATTACHMENT_PYTHON: ${{ runner.temp }}/attachment-env/Scripts/python.exe
+        run: |
+          "$ATTACHMENT_PYTHON" -I -S scripts/safe_test.py -- "$ATTACHMENT_PYTHON" -m pytest tests/test_chat_attachments_browser.py -m ui_browser -k chromium -q --tb=short -rs --junitxml="$RUNNER_TEMP/ci-private/attachment-browser.xml"
+          python -c "import sys, xml.etree.ElementTree as E; s = next(E.parse(sys.argv[1]).getroot().iter('testsuite')); n, k = int(s.get('tests')), int(s.get('skipped')); print(f'{n} ran, {k} skipped'); sys.exit(n == 0 or k > 0)" "$RUNNER_TEMP/ci-private/attachment-browser.xml"
       # Names the failed, crashed and in-flight tests in the job summary and as
       # annotations; a killed step still reports through its incremental journal.
       - name: Publish test evidence

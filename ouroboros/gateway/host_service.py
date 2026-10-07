@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import functools
 import hmac
 import json
@@ -27,7 +29,8 @@ from ouroboros.event_bus import get_global_event_bus
 from ouroboros.config import WS_RELAY_BURST, WS_RELAY_REFILL_PER_SEC
 from ouroboros.gateway._helpers import run_sync_to_completion
 from ouroboros.server_control import dispatch_accepted_restart
-from ouroboros.gateway.files import store_chat_upload
+from ouroboros import chat_uploads
+from ouroboros.chat_uploads import store_upload
 from ouroboros.presence_delivery import (
     DELIVERY_VERSION, PresenceDeliveryConflict, PresenceDeliveryRecorder,
     delivery_reporting_version,
@@ -503,10 +506,14 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
     subscription_id = ""
     pending_uploads = ExitStack()
     try:
+        from ouroboros.task_status import SETTLED_STATUSES
+
         text = str(payload.get("text") or "")
         image_caption = str(payload.get("image_caption") or "")
         client_message_id = str(payload.get("client_message_id") or "").strip()[:128]
         chat_id = int(payload.get("chat_id") or 0)
+        if _inline_image_too_large(payload):  # refused on its encoded length, before any decode or queue
+            return _json_error(f"image_base64: at most {_INLINE_IMAGE_MAX // (1024 * 1024)} MiB per image", 413)
         wait_for_response = bool(payload.get("wait_for_response", False))
         if wait_for_response and not is_a2a_chat_id(chat_id):
             # A response subscription resolves on the FIRST non-progress frame
@@ -525,16 +532,15 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
             rows = await asyncio.to_thread(_chat_rows, ctx, chat_id)
             inbound = _inbound_row(rows, client_message_id)
             if inbound is not None:
-                from ouroboros.project_dialogue import _text_sha256
-                from ouroboros.task_status import SETTLED_STATUSES
-
                 if str(inbound.get("source") or "") != f"skill:{skill_name}":
                     return _json_error("client_message_id is already bound to another source", 409)
-                logged = text.strip() or image_caption.strip() or (
-                    "(image attached)" if str(payload.get("image_base64") or "").strip()
-                    else "(file attached)" if payload.get("attachments") else ""
-                )
-                if _text_sha256(inbound.get("text")) != _text_sha256(logged):
+                try:  # the same message means the same words AND the same ordered attachment content
+                    incoming, inline_image = await run_sync_to_completion(_inject_identity, ctx, skill_name, payload)
+                except ValueError as exc:
+                    return _json_error(str(exc), 400)
+                logged = text.strip() or image_caption.strip() or (  # as accept_local_message logs it
+                    "(image attached)" if inline_image else "(file attached)" if incoming else "")
+                if not chat_uploads.same_message(inbound, logged, incoming):
                     return _json_error("client_message_id was already used for a different message", 409)
                 state = _operation_state(ctx, rows, inbound)
                 if state["status"] in SETTLED_STATUSES:
@@ -542,17 +548,22 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                         "ok": True, "response": str(state.get("text") or ""),
                         "status": state["status"], "rejoined": True, **correlated,
                     })
-                if not wait_for_response:
-                    return JSONResponse({"ok": True, "status": "accepted", "rejoined": True, **correlated}, status_code=202)
-                rejoined = True
-        uploads: list[dict[str, str]] = []
+                # Proven never dispatched by THIS process: the named ingress below hands it over, once.
+                rejoined = state.get("reason") != "acceptance_write_failed"
+        metadata: dict[str, Any] = {}
+        inline, image_mime = "", ""
         if not rejoined:
             try:
-                uploads = await run_sync_to_completion(
-                    _inject_attachment_uploads, ctx, skill_name, payload.get("attachments"), pending_uploads,
+                uploads, refs, image_mime = await run_sync_to_completion(
+                    _inject_attachment_uploads, ctx, skill_name, payload, pending_uploads,
                 )
             except ValueError as exc:
                 return _json_error(str(exc), 400)
+            # Vision gets only bytes proven to be an image, under the type they prove; any
+            # other inline bytes travel as the ordinary staged file stored above.
+            inline = str(payload.get("image_base64") or "") if image_mime else ""
+            metadata = {**({"chat_attachment_uploads": uploads} if uploads else {}),
+                        **({"chat_attachments": refs} if refs else {})}
         bridge = ctx.bridge_getter()
         response_event: asyncio.Event = asyncio.Event()
         response_holder: dict[str, str] = {}
@@ -570,11 +581,11 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 user_id=int(payload.get("user_id") or 0),
                 source=f"skill:{skill_name}",
                 sender_label=str(payload.get("sender_label") or skill_name),
-                image_base64=str(payload.get("image_base64") or ""),
-                image_mime=str(payload.get("image_mime") or ""),
+                image_base64=inline,
+                image_mime=image_mime,
                 image_caption=image_caption,
                 transport=payload.get("transport") if isinstance(payload.get("transport"), dict) else {},
-                **({"task_metadata": {"chat_attachment_uploads": uploads}} if uploads else {}),
+                **({"task_metadata": metadata} if metadata else {}),
                 **({"client_message_id": client_message_id} if client_message_id else {}),
             )
             if client_message_id:
@@ -589,8 +600,11 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 except ValueError as exc:
                     return _json_error(str(exc), 409)
             else:
-                dispatch_accepted_restart(bridge, text, **message)
+                # Custody passes BEFORE the handoff: dispatch may enqueue and then raise, so from
+                # here a failure is unknown. The copies stay (an orphan at worst), never deleted
+                # under queued work; the error still answers the skill, nothing is re-dispatched.
                 pending_uploads.pop_all()
+                dispatch_accepted_restart(bridge, text, **message)
         if not wait_for_response:
             if rejoined:
                 return JSONResponse({"ok": True, "status": "accepted", "rejoined": True, **correlated}, status_code=202)
@@ -598,8 +612,6 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         deadline = time.monotonic() + timeout
         while not response_event.is_set():
             if client_message_id:
-                from ouroboros.task_status import SETTLED_STATUSES
-
                 state = await asyncio.to_thread(_owned_operation_state, ctx, skill_name, chat_id, client_message_id)
                 if state and state["status"] in {*SETTLED_STATUSES, "lost"}:
                     return JSONResponse({"ok": True, "response": str(state.get("text") or ""),
@@ -641,44 +653,119 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
 _INJECT_ATTACHMENT_MAX = 25
 
 
-def _inject_attachment_uploads(
-    ctx: HostServiceContext, skill_name: str, value: Any, cleanup: ExitStack,
-) -> list[dict[str, str]]:
-    """Copy a skill's inbound files into the shared chat-upload store (#668).
+_INLINE_IMAGE_MAX = 50 * 1024 * 1024  # the routed-staging bound for a transport's inline photo
+_B64_BLANKS = " \t\r\n"  # MIME-style line wrapping; any other non-alphabet character is refused
+_B64_UNWRAP = str.maketrans("", "", _B64_BLANKS)
 
-    Each ``{path, name?, mime?}`` must be a regular file under the calling
-    skill's OWN state root (the ``staged_files`` confinement; a symlink that
-    resolves outside is refused). The host copies it through the SAME store the
-    browser paperclip uses — ``data/uploads``, unique name, verified bytes — so the
-    worker's ``stage_task_attachments`` and the secret-name rule see one upload
-    family. Returns ``chat_attachment_uploads`` specs (``{path, label, mime}``);
-    the skill removes its parked copy afterwards. Each new destination belongs
-    to the request cleanup stack until its message is accepted; partial batches
-    and cancelled copy waits therefore cannot orphan successful earlier copies.
-    """
+
+def _inline_image_too_large(payload: Dict[str, Any]) -> bool:
+    """Whether the inline photo's base64 decodes to more than the bound, judged before any
+    decode from its length: the exact decoded size of well-formed base64 (blanks aside,
+    ``=`` padding counted); malformed input is refused by the decode itself."""
+    encoded = str(payload.get("image_base64") or "")
+    tail = encoded.rstrip(_B64_BLANKS)
+    padding = 2 if tail.endswith("==") else 1 if tail.endswith("=") else 0
+    compact = len(encoded) - sum(encoded.count(blank) for blank in _B64_BLANKS)
+    return compact * 3 // 4 - padding > _INLINE_IMAGE_MAX
+
+
+def _inline_image_bytes(payload: Dict[str, Any]) -> tuple[bytes, bool]:
+    """The inline photo's bytes (size preflighted by the caller, re-checked on the decoded
+    bytes) and whether they prove an image; line-wrapped base64 is still base64, anything
+    else is refused rather than parked or forwarded half-read."""
+    raw = str(payload.get("image_base64") or "").translate(_B64_UNWRAP)
+    try:
+        data = base64.b64decode(raw, validate=True) if raw else b""
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("image_base64 is not valid base64") from exc
+    if len(data) > _INLINE_IMAGE_MAX:
+        raise ValueError(f"image_base64: at most {_INLINE_IMAGE_MAX // (1024 * 1024)} MiB per image")
+    return data, bool(data) and chat_uploads.detect_media(data, "")[1] == "image"
+
+
+def _skill_state_path(ctx: HostServiceContext, skill_name: str, raw: Any, field: str) -> pathlib.Path:
+    """``raw`` resolved, refused unless under the calling skill's OWN state root (a symlink
+    that resolves outside is refused)."""
+    path = pathlib.Path(str(raw or "")).expanduser().resolve(strict=False)
+    try:
+        path.relative_to((ctx.skills_state_dir / skill_name).resolve(strict=False))
+    except ValueError as exc:
+        raise ValueError(f"{field} is outside this skill's state") from exc
+    return path
+
+
+def _confined_inject_sources(
+    ctx: HostServiceContext, skill_name: str, value: Any,
+) -> list[tuple[pathlib.Path, str, str]]:
+    """``(source, name, mime)`` per ``{path, name?, mime?}``; each a regular file under the
+    calling skill's OWN state root (the ``staged_files`` confinement, ``_skill_state_path``)."""
     if value in (None, []):
         return []
     if not isinstance(value, list):
         raise ValueError("attachments must be a list of {path, name?, mime?}")
     if len(value) > _INJECT_ATTACHMENT_MAX:
         raise ValueError(f"attachments: at most {_INJECT_ATTACHMENT_MAX} files per message")
-    state_root = (ctx.skills_state_dir / skill_name).resolve(strict=False)
-    specs: list[dict[str, str]] = []
+    sources: list[tuple[pathlib.Path, str, str]] = []
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise ValueError(f"attachments[{index}] must be an object")
-        source = pathlib.Path(str(item.get("path") or "")).expanduser().resolve(strict=False)
-        try:
-            source.relative_to(state_root)
-        except ValueError as exc:
-            raise ValueError(f"attachments[{index}] is outside this skill's state") from exc
+        source = _skill_state_path(ctx, skill_name, item.get("path"), f"attachments[{index}]")
         if not source.is_file():
             raise ValueError(f"attachments[{index}] is not a regular file")
-        name = os.path.basename(str(item.get("name") or "").strip()) or source.name
-        stored = store_chat_upload(source, name, data_dir=ctx.data_dir)
+        sources.append((source, os.path.basename(str(item.get("name") or "").strip()) or source.name,
+                        str(item.get("mime") or "")))
+    return sources
+
+
+def _inject_identity(
+    ctx: HostServiceContext, skill_name: str, payload: Dict[str, Any],
+) -> tuple[list[dict[str, str]], bool]:
+    """The attachment identity this delivery will record (inline bytes first, then files),
+    measured from the sources, so a regenerated stored name never changes it; and whether
+    the inline bytes are a proven image (what the placeholder text says)."""
+    data, inline_image = _inline_image_bytes(payload)
+    entries = [chat_uploads.bytes_identity(data, chat_uploads.inline_image_name(data))] if data else []
+    entries += [chat_uploads.source_identity(source, name)
+                for source, name, _mime in _confined_inject_sources(ctx, skill_name, payload.get("attachments"))]
+    return [{"sha256": sha256, "name": name} for sha256, name in entries], inline_image
+
+
+def _inject_attachment_uploads(
+    ctx: HostServiceContext, skill_name: str, payload: Dict[str, Any], cleanup: ExitStack,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Copy a skill's inbound files (#668) and its inline photo into the shared upload store.
+
+    The host copies through the SAME store the browser paperclip uses —
+    ``data/uploads``, unique name, verified bytes — so the worker's
+    ``stage_task_attachments`` and the secret-name rule see one upload family.
+    Returns ``(chat_attachment_uploads specs, measured display refs, the inline photo's
+    byte-proven image mime or "")``. Inline bytes are parked ONCE, and the owner sees
+    one bubble. A proven image alone still feeds vision and routed staging unchanged;
+    beside files it is staged first with them, because every lane drops the inline
+    copy once uploads stage. Inline bytes that prove no image are no photo: they are
+    staged as an ordinary file and never reach vision under the transport's label.
+    Each spec carries its ref's measured identity, which staging verifies while copying.
+    Each new destination belongs to the request cleanup stack until its message is
+    accepted; partial batches and cancelled copy waits therefore cannot orphan earlier copies.
+    """
+    refs: list[dict[str, Any]] = []
+    specs: list[dict[str, Any]] = []
+    sources = _confined_inject_sources(ctx, skill_name, payload.get("attachments"))
+
+    def park(source: Any, name: str, mime: str = "", *, staged: bool = True) -> None:
+        stored, ref = store_upload(source, name, data_dir=ctx.data_dir)
         cleanup.callback(stored.unlink, missing_ok=True)
-        specs.append({"path": str(stored), "label": name, "mime": str(item.get("mime") or "")})
-    return specs
+        refs.append(ref)
+        if staged:
+            specs.append({"path": str(stored), "label": name, "mime": mime or ref["mime"],
+                          "size": ref["size"], "sha256": ref["sha256"]})
+
+    data, image = _inline_image_bytes(payload)
+    if data:  # parked first: a proven image's ref is refs[0]
+        park(data, chat_uploads.inline_image_name(data), staged=bool(sources) or not image)
+    for source, name, mime in sources:
+        park(source, name, mime)
+    return specs, refs, refs[0]["mime"] if image else ""
 
 
 def _presence_staged_files(
@@ -690,20 +777,11 @@ def _presence_staged_files(
         return ()
     if not isinstance(value, list):
         raise ValueError("staged_files must be a list of paths")
-    state_root = (ctx.skills_state_dir / skill_name).resolve(strict=False)
-    files = []
-    for index, raw in enumerate(value):
-        # Keep the host boundary responsible only for request shape and source
-        # confinement.  Missing/non-file inputs and the staging limit belong to
-        # the existing canonical staging owner, which emits the complete typed
-        # ordinal manifest before Presence can call the model.
-        path = pathlib.Path(str(raw or "")).expanduser().resolve(strict=False)
-        try:
-            path.relative_to(state_root)
-        except ValueError as exc:
-            raise ValueError(f"staged_files[{index}] is outside this skill's state") from exc
-        files.append(path)
-    return tuple(files)
+    # Keep the host boundary responsible only for request shape and source
+    # confinement.  Missing/non-file inputs and the staging limit belong to
+    # the existing canonical staging owner, which emits the complete typed
+    # ordinal manifest before Presence can call the model.
+    return tuple(_skill_state_path(ctx, skill_name, raw, f"staged_files[{index}]") for index, raw in enumerate(value))
 
 
 async def _api_presence_delivery(request: Request) -> JSONResponse:
@@ -1168,7 +1246,8 @@ def _operation_state(ctx: HostServiceContext, rows: list, inbound: Dict[str, Any
     Authority is the task/turn's complete ingress origin matched to the skill's
     canonical source, then that task's effective retry-aware status; otherwise
     ``pending`` — or ``lost``
-    when the host session that accepted the message is gone and nothing else
+    when the host process or session that accepted the message is gone, or this process
+    saw its acceptance write raise (the row landed, nothing was queued), and nothing else
     answers. ``cancel_supported`` is true only for work THIS message started
     that the cancellation owner can address: a promoted task or a live direct
     turn; a message steered into a pre-existing task is disclosed, not cancelled.
@@ -1255,9 +1334,16 @@ def _operation_state(ctx: HostServiceContext, rows: list, inbound: Dict[str, Any
         if row.get("direction") in {"out", "system"} and terminal in SETTLED_STATUSES and owns(row):
             state.update({"status": terminal, "text": str(row.get("text") or "")})
             return state
+    from supervisor.message_ingress import accepted_here, acceptance_undispatched
+
+    if acceptance_undispatched(chat_id, client_message_id):  # its write raised; nothing was queued
+        state.update({"status": "lost", "reason": "acceptance_write_failed"})
+        return state
     accepted_session = str(inbound.get("session_id") or "")
     live_session = str((read_json_dict(ctx.data_dir / "state" / "state.json") or {}).get("session_id") or "")
-    if accepted_session and live_session and accepted_session != live_session:
+    # A crash keeps the session: the row's process stamp names the ended process (and its queue).
+    ended = bool(inbound.get("ingress_process")) and not accepted_here(inbound)
+    if ended or (accepted_session and live_session and accepted_session != live_session):
         state.update({"status": "lost", "reason": "host_restarted_before_answer"})
     return state
 

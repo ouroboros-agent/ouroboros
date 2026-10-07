@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional
 from ouroboros.cost_projection import CostPresentation
 
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
+from ouroboros.gateway.attachment_contracts import (  # noqa: F401 -- public re-exports
+    AttachmentManifestEntry, ChatAttachmentInbound, ChatAttachmentView,
+)
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
 from ouroboros.gateway.schedule_contracts import (  # noqa: F401 -- public re-exports
@@ -21,33 +24,6 @@ try:  # Python 3.11+
     from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - CI supports Python 3.10.
     from typing_extensions import Literal, NotRequired, Required, TypedDict  # type: ignore[assignment]
-
-
-class ChatAttachmentInbound(TypedDict, total=False):
-    """Reference to a file stored by /api/chat/upload under data/uploads/.
-    ``filename`` is its stored basename. Images reach vision models as
-    native image blocks."""
-
-    filename: str
-    display_name: str
-    mime: str
-
-
-class AttachmentManifestEntry(TypedDict, total=False):
-    """One declared task attachment after staging admission."""
-
-    ordinal: int
-    status: Literal["staged", "rejected"]
-    reason: str
-    label: str
-    root: str
-    relpath: str
-    abs_path: str
-    mime: str
-    is_image: bool
-    size: int
-    sha256: str
-    rule: str
 
 
 class ChatInbound(TypedDict):
@@ -112,6 +88,11 @@ class ChatOutbound(TypedDict):
     content: str
     ts: str
     ingress_accepted: NotRequired[bool]  # Canonical inbound row saved; not processing/start proof.
+    ingress_dispatched: NotRequired[bool]  # This live host process accepted the row and entered its dispatch.
+    ingress_pending: NotRequired[bool]  # This live host process accepted the row and has entered or refused neither yet.
+    ingress_undispatched: NotRequired[bool]  # History only: this process proved the row's write raised before dispatch.
+    attachments: NotRequired[List[ChatAttachmentView]]  # owner message's attachments (same views as history)
+    text_placeholder: NotRequired[bool]  # owner row whose text the host wrote (no words were sent); shown as no caption
     markdown: NotRequired[bool]
     is_progress: NotRequired[bool]
     task_id: NotRequired[str]
@@ -941,7 +922,8 @@ class UploadResponse(TypedDict):
     path: str
     size: int
     sha256: NotRequired[str]
-    mime: str
+    mime: str  # the extension's type, as the model-input rail reads it
+    view: NotRequired[ChatAttachmentView]  # the sender's own bubble renders exactly this (kind proven from bytes)
 
 
 class ExtensionsIndexResponse(TypedDict, total=False):
@@ -1571,6 +1553,8 @@ __all__ = [
     "FileBrowserListResponse",
     "ChatHistoryResponse",
     "AttachmentManifestEntry",
+    "ChatAttachmentInbound",
+    "ChatAttachmentView",
     "ExecutorRef",
     "TaskCreateRequest",
     "TaskCreateResponse",

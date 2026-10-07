@@ -221,6 +221,33 @@ def test_an_acceptance_failure_still_answers_the_socket(bridge):
 
 
 
+def test_a_redelivered_frame_rejoins_and_a_reused_id_gets_the_failure_reply(bridge):
+    """The same frame twice on a socket (a redispatch) is one row, one queue item and the
+    same echo again; the id reused for other words is refused with the socket's only
+    failure reply, and nothing more is logged, queued or echoed."""
+    echoes = _witness_echoes(bridge)
+    socket = _OpenSocket([_chat_frame("dup-1", "hello"), _chat_frame("dup-1", "hello"),
+                          _chat_frame("dup-1", "changed")])
+
+    async def main():
+        task = asyncio.create_task(ws_endpoint(socket))
+        deadline = time.monotonic() + 5.0
+        while not socket.sent and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5)
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(main())
+    assert [(q, ids) for _payload, q, ids in echoes] == [(1, ["dup-1"]), (1, ["dup-1"])], echoes
+    assert echoes[1][0] == echoes[0][0], "the rejoin echo is the accepted row's echo"
+    assert [frame["system_type"] for frame in socket.sent] == ["initialization_notice"]
+    assert _row_ids(bridge.drive) == ["dup-1"]
+    assert len(bridge.get_updates(offset=0, timeout=1)) == 1
+
+
 def _record_handoffs(bridge, release: threading.Event | None = None):
     """Instrument the bridge callback the socket hands every frame to: record each
     chat acceptance entering it (held until ``release`` when given) and each command

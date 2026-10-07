@@ -606,6 +606,17 @@ def _reset_custody_memo_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _reset_accepted_ids_between_tests():
+    """The named-ingress index (``message_ingress._AcceptedIds``) is keyed by chat-log path:
+    no folded prefix outlives its test, whatever the next one writes at that path."""
+    from supervisor.message_ingress import reset_accepted_ids
+
+    reset_accepted_ids()
+    yield
+    reset_accepted_ids()
+
+
+@pytest.fixture(autouse=True)
 def _unlatch_supervisor_event_bus_between_tests():
     """A TestClient lifespan runs the server shutdown, whose ``workers.shutdown_event_q()``
     latches ``_EVENT_Q_SHUTDOWN`` for the rest of the xdist worker; the next test in that

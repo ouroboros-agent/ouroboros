@@ -7,6 +7,7 @@ import { tx } from './i18n.js';
 import { decorateProjectRow, syncSavedProjectContext } from './project_answer.js';
 import { createProjectHandoffs, receiptNotice } from './project_handoff.js';
 import { bindComposerFileTargets, cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
+import { attachmentCaption, attachmentViews, composerText, createComposerAttachments, createUnconfirmedSends } from './chat_attachments.js';
 import { createChatDecision } from './chat_decision.js';
 import { bindProjectWorkPointer } from './project_work_pointer.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
@@ -187,7 +188,6 @@ const CARD_ROW_PHASES = new Map([['timeline', 'warn'], ['reviews', 'result']]);
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
-const ATTACHMENT_PREVIEW_COUNT = 25;
 
 export function initChat(ctx) {
     // Back-compat main-chat entry: one full-page instance bound to chat 1.
@@ -305,8 +305,6 @@ export function createChatInstance({
     const attachmentPreview = byId('attachment-preview');
     const scrollBottomBtn = byId('scroll-bottom');
     const scrollActivityDot = scrollBottomBtn?.querySelector('.chat-scroll-activity-dot');
-    let pendingAttachments = [];
-    let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
     let _remoteActivityDepth = 0;
 
@@ -323,6 +321,7 @@ export function createChatInstance({
         insertMessageNode,
         senderLabel,
         stampNodeTimestamp,
+        onDomWrite: withStableViewport,
     });
     const chatDecision = createChatDecision({
         apiFetch,
@@ -351,58 +350,13 @@ export function createChatInstance({
         }
     }
 
-    function updateAttachmentPreview() {
-        if (!pendingAttachments.length) {
-            attachmentPreview.classList.remove('visible');
-            attachmentPreview.innerHTML = '';
-            requestAnimationFrame(() => updateMessagesPadding());
-            return;
-        }
-        attachmentPreview.classList.add('visible');
-        attachmentPreview.innerHTML = pendingAttachments.map((item) => `
-            <span class="attach-badge" data-attachment-id="${escapeHtmlAttr(item.id)}">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
-                <span class="attach-name" title="${escapeHtmlAttr(item.display_name)}">${escapeHtml(item.display_name)}</span>
-                <button class="attach-remove" type="button" title="Remove" aria-label="Remove attachment ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
-            </span>
-        `).join('');
-        requestAnimationFrame(() => updateMessagesPadding());
-        attachmentPreview.querySelectorAll('[data-attachment-remove]').forEach((button) => {
-            button.addEventListener('click', () => {
-                if (attachmentsUploading) return;
-                const removeId = button.getAttribute('data-attachment-remove') || '';
-                pendingAttachments = pendingAttachments.filter((item) => item.id !== removeId);
-                updateAttachmentPreview();
-            });
-        });
-    }
-
-    // Shared paperclip/paste stager; upload still happens only on Send.
-    function stagePendingFiles(files) {
-        const incoming = Array.from(files || []).filter(Boolean);
-        if (!incoming.length) return;
-        if (attachmentsUploading) {
-            showToast('Wait for the current upload to finish before changing attachments.', 'error');
-            return;
-        }
-        pendingAttachments = pendingAttachments.concat(incoming.map((file) => ({
-            id: (globalThis.crypto && typeof crypto.randomUUID === 'function')
-                ? crypto.randomUUID()
-                : `attachment-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-            file,
-            display_name: file.name || 'upload',
-        })));
-        updateAttachmentPreview();
-    }
-
-    function setAttachmentUploadState(uploading) {
-        attachmentsUploading = uploading;
-        attachBtn.disabled = uploading;
-        attachBtn.classList.toggle('uploading', uploading);
-        fileInput.disabled = uploading;
-        input.disabled = uploading;
-        updateAttachmentPreview();
-    }
+    // Staged files, their thumbnails and object URLs, and the upload on Send.
+    const composer = createComposerAttachments({ preview: attachmentPreview, attachBtn, fileInput, input, showToast,
+        onLayout: () => requestAnimationFrame(() => updateMessagesPadding()) });
+    // Sent attachment messages not yet confirmed saved: "Send again" with the same id, kept by this tab across a reload.
+    const unconfirmed = createUnconfirmedSends({ send: (frame, options) => ws.send(frame, options),
+        root: () => messagesDiv, onDomWrite: withStableViewport, showToast,
+        storage: sessionStorage, storageKey: storeKey('ouro_chat_unconfirmed') });
 
     attachBtn.addEventListener('click', () => fileInput.click());
 
@@ -410,10 +364,10 @@ export function createChatInstance({
     fileInput.addEventListener('change', () => {
         const files = Array.from(fileInput.files || []);
         fileInput.value = '';
-        stagePendingFiles(files);
+        composer.stage(files);
     });
 
-    bindComposerFileTargets({ page, inputArea, input, stagePendingFiles });
+    bindComposerFileTargets({ page, inputArea, input, stagePendingFiles: composer.stage });
 
     let _syncPass1Active = false;
     let _historyReplayActive = false;
@@ -2224,6 +2178,7 @@ export function createChatInstance({
         const taskId = opts.taskId || '';
         const projectId = opts.projectId || '';
         const projectName = opts.projectName || '';
+        const attachments = role === 'user' ? attachmentViews(opts.attachments) : [];
         const ts = timestamp || new Date().toISOString();
         const legacyKey = buildMessageKey(role, text, ts, {
             clientMessageId,
@@ -2285,6 +2240,8 @@ export function createChatInstance({
                 terminalTime: opts.terminalTime || null,
                 skillReview: opts.skillReview || null,
                 evidenceRef: opts.evidenceRef || null,
+                attachments: attachments.length ? attachments : null,
+                textPlaceholder: opts.textPlaceholder === true,
             });
             // Match the persisted-history cap.
             if (persistedHistory.length > 200) persistedHistory.splice(0, persistedHistory.length - 200);
@@ -2308,8 +2265,11 @@ export function createChatInstance({
         }, chatSessionId);
         if (role === 'system' && ['task_pause_notice', 'legacy_memory_notice'].includes(systemType)) text = tx(text);
         const richMarkdown = role !== 'user' && systemType !== 'skill_review' && (role !== 'system' || markdown === true);
+        // Only the web composer writes the file-name tail; a Telegram/skill caption is kept word for word.
+        const shown = attachments.length ? attachmentCaption(text, attachments,
+            { placeholder: opts.textPlaceholder === true, composed: source === 'web' }) : text;
         const rendered = role === 'user'
-            ? escapeHtml(text)
+            ? escapeHtml(shown)
             : role === 'system' && systemType === 'skill_review'
                 ? renderSkillReviewDisclosure(text, opts.skillReview || null)
                 : role === 'system' && systemType !== 'skill_review' && markdown !== true
@@ -2326,7 +2286,8 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
-        if (!isProgress && text) chatMedia.attachCopyControl(bubble, String(text));
+        if (attachments.length) chatMedia.mountAttachments(bubble, attachments, shown);
+        if (!isProgress && shown) chatMedia.attachCopyControl(bubble, String(shown));
         if (systemType === 'project_handoff' && handoffs) handoffs.mount(bubble, { taskId, projectId, projectName, title: text, handoffId: opts.handoffId, kind: 'receipt' });
         else if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName,
             terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary' });
@@ -2604,7 +2565,8 @@ export function createChatInstance({
                         pendingSubmissions.delete(String(msg.client_message_id));
                     }
                     addStoredRow(msg, taskId, {
-                        clientMessageId: msg.client_message_id || '',
+                        clientMessageId: msg.client_message_id || '', attachments: msg.attachments,
+                        textPlaceholder: msg.text_placeholder === true,
                         originProjected: msg.origin_projected === true,
                         originId: msg.origin_id || '',
                         chatAnnotation: msg.chat_annotation || null,
@@ -2612,7 +2574,7 @@ export function createChatInstance({
                             ? { skill: msg.skill, jobId: msg.job_id }
                             : null,
                     });
-                    if (msg.role === 'user') markIngressSaved(messagesDiv, msg);
+                    if (msg.role === 'user') { markIngressSaved(messagesDiv, msg); unconfirmed.settle(msg); }
                 }
                 _historyRow = null;
                 // Persisted terminals without task_summary (crash/timeout/cancel) also settle
@@ -2861,7 +2823,10 @@ export function createChatInstance({
         // below folds this trigger with the first socket open / refreshHistory.
         await waitForHydrationWindow();
         if (destroyed) return;
-        if (await awaitInitialHydration({ includeUser: true })) return;
+        // A message this tab kept across a reload that the first read (or its preview) did not show saved is in doubt.
+        const reconcileUnsaved = () => !destroyed && unconfirmed.reconcile(({ frame, views, ts }) => addMessage(frame.content,
+            'user', false, ts || null, false, { source: 'web', senderSessionId: chatSessionId, clientMessageId: frame.client_message_id, attachments: views }));
+        if (await awaitInitialHydration({ includeUser: true })) return reconcileUnsaved();
         try {
             const saved = JSON.parse(sessionStorage.getItem(storeKey(CHAT_STORAGE_KEY)) || '[]');
             // A snapshot row is the addMessage option bag persistedHistory wrote;
@@ -2873,6 +2838,7 @@ export function createChatInstance({
         historyLoaded = true;
         // The next successful source read reconciles this offline preview.
         if (!lastHistorySyncSucceeded) liveCardBound.arm();
+        reconcileUnsaved();
     })();
 
     function rememberInput(text) {
@@ -2912,73 +2878,42 @@ export function createChatInstance({
     async function sendMessage(planMode = false) {
         if (sendBtn.disabled) return;  // guard against Enter re-entry during async upload
         let text = input.value.trim();
-        const hasAttachments = pendingAttachments.length > 0;
+        const hasAttachments = composer.count > 0;
         let uploadedAttachments = [];
-        let attachmentMeta = [];
-        if (!text && !pendingAttachments.length) return;
-        if (pendingAttachments.length) {
+        if (!text && !hasAttachments) return;
+        if (hasAttachments) {
             // Upload immediately before send; offline queueing would orphan files.
             if (ws.ws?.readyState !== WebSocket.OPEN) {
                 showToast('Cannot attach file while offline. Reconnect and try again.', 'error');
                 return;
             }
-            const staged = [...pendingAttachments];
-            const uploaded = [];
-            setAttachmentUploadState(true);
-            setSendBusy(true, staged.length > 1 ? 'Uploading files' : 'Uploading');
+            setSendBusy(true, composer.count > 1 ? 'Uploading files' : 'Uploading');
             try {
-                for (const stagedItem of staged) {
-                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed during upload. Reconnect and try again.');
-                    const formData = new FormData();
-                    formData.append('file', stagedItem.file);
-                    const resp = await apiFetch('/api/chat/upload', { method: 'POST', body: formData });
-                    const data = await resp.json().catch(() => ({}));
-                    if (!resp.ok || !data.ok) {
-                        throw new Error(data.error || resp.statusText);
-                    }
-                    uploaded.push({
-                        filename: data.filename || '',
-                        path: data.path || '',
-                        display_name: data.display_name || stagedItem.display_name,
-                        mime: data.mime || stagedItem.file?.type || '',
-                    });
-                }
-                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed after upload. Reconnect and try again.');
-                uploadedAttachments = uploaded;
-                const attachmentLines = uploaded.slice(0, ATTACHMENT_PREVIEW_COUNT)
-                    .map((item) => `[Attached file: ${item.display_name}]`)
-                    .concat(uploaded.length > ATTACHMENT_PREVIEW_COUNT ? [`[${uploaded.length - ATTACHMENT_PREVIEW_COUNT} more attached files]`] : [])
-                    .join('\n');
-                text += (text ? '\n\n' : '') + attachmentLines;
-                // Structured attachment metadata rides the WS frame so the
-                // gateway can hand image uploads to the model as NATIVE image
-                // blocks (vision models) instead of only a path label.
-                attachmentMeta = uploaded.map((item) => ({
-                    filename: item.filename,
-                    display_name: item.display_name,
-                    mime: item.mime || '',
-                }));
+                uploadedAttachments = await composer.upload(() => ws.ws?.readyState === WebSocket.OPEN);
             } catch (e) {
-                await cleanupUploadedAttachments(uploaded);
+                await cleanupUploadedAttachments(e.uploaded || []);
                 showToast('Upload error: ' + e.message, 'error');
-                return;  // pending attachments and preview remain so the user can retry
+                return;  // staged files and their previews remain so the user can retry
             } finally {
-                setAttachmentUploadState(false);
                 setSendBusy(false);
             }
+            // The model reads these names (an exact /restart stays the command); the bubble shows the server views.
+            text = composerText(text, uploadedAttachments.map((item) => item.view?.name || item.display_name));
         }
         if (!text) return;
         const forcePlan = !!planMode && !text.startsWith('/');
-        const result = ws.send({
+        const frame = {
             type: 'chat',
             content: text,
             sender_session_id: chatSessionId,
             force_plan: forcePlan,
             ...(isMain ? {} : { chat_id: chatId }),
             ...(projectId ? { project_id: projectId } : {}),
-            ...(attachmentMeta.length ? { attachments: attachmentMeta } : {}),
+            // Structured metadata rides the frame: model staging and native image blocks.
+            ...(hasAttachments ? { attachments: uploadedAttachments.map(({ filename, display_name, mime }) => ({ filename, display_name, mime })) } : {}),
             ...clientSurfaceField(),
-        }, hasAttachments ? { queue: false } : undefined);
+        };
+        const result = ws.send(frame, hasAttachments ? { queue: false } : undefined);
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);
             showToast('Connection lost before send. Reconnect and try again.', 'error');
@@ -2986,10 +2921,7 @@ export function createChatInstance({
         }
         // One-shot: disarm Swarm now that the message is sent.
         if (planMode) setSwarm(false);
-        if (hasAttachments) {
-            pendingAttachments = [];
-            updateAttachmentPreview();
-        }
+        if (hasAttachments) composer.clear();
         rememberInput(text);
         input.value = '';
         clearInputDraft();
@@ -3001,7 +2933,11 @@ export function createChatInstance({
             senderSessionId: chatSessionId,
             clientMessageId: result?.clientMessageId || '',
             forceStick: true,
+            attachments: uploadedAttachments.map((item) => item.view),
         });
+        // The socket took it; only the host's saved echo proves acceptance (its frame stays for Send again).
+        if (hasAttachments) unconfirmed.track({ ...frame, client_message_id: result.clientMessageId },
+            { views: uploadedAttachments.map((item) => item.view), ts: sentTs });
         // ws.send always coins a client_message_id for chat frames; guard
         // only against a non-chat result shape.
         const pendingId = result?.clientMessageId || '';
@@ -3095,7 +3031,15 @@ export function createChatInstance({
 
     // Scroll events observe position; only positive navigation changes follow intent.
     messagesDiv?.addEventListener('scroll', () => { reading.scroll(); settleHistoryViewport(); readReceipt.note(); }, { passive: true });
-    messagesDiv?.addEventListener('load', reading.reflow, true);
+    // An image's load reflows in the next frame, after that frame's scroll events: a load
+    // landing between a move (a wheel step, a scrollIntoView) and the scroll event the move
+    // still owes would otherwise restore the anchor of the place just left.
+    let loadReflowQueued = false;
+    messagesDiv?.addEventListener('load', () => {
+        if (loadReflowQueued) return;
+        loadReflowQueued = true;
+        requestAnimationFrame(() => { loadReflowQueued = false; if (!destroyed) reading.reflow(); });
+    }, true);
 
     // Navigation plus one coalesced, non-live-region remote-activity bit.
     function updateScrollButton() {
@@ -3663,6 +3607,7 @@ export function createChatInstance({
     };
 
     onWs('chat', (msg) => {
+        if (msg.system_type === 'initialization_notice') unconfirmed.unsettle();  // a frame was refused
         if (!isMyThread(msg)) return;
         if (msg.system_type === 'project_question_pointer') { chatDecision.appendQuestionPointer(msg); return; }
         if (msg.role === 'user') {
@@ -3681,10 +3626,13 @@ export function createChatInstance({
                 senderSessionId,
                 clientMessageId,
                 taskId: msg.task_id || '',
+                attachments: msg.attachments,
+                textPlaceholder: msg.text_placeholder === true,
                 },
             ));
             if (added) incrementUnreadIfNeeded(msg);
             withStableViewport(() => markIngressSaved(messagesDiv, msg));
+            unconfirmed.settle(msg);
             syncChatStatus();
             return;
         }
@@ -3869,6 +3817,7 @@ export function createChatInstance({
     });
 
     onWs('close', () => {
+        unconfirmed.unsettle();
         handoffs?.setConnected(false);
         hostReady = false;
         hideTypingIndicatorOnly();
@@ -3895,8 +3844,9 @@ export function createChatInstance({
         // app.js uses it to decide whether a reopen needs a forced repaint.
         hasPaintedHistory: () => historyLoaded && lastHistorySyncSucceeded,
         // Unsendable client-side state (staged File objects / an in-flight
-        // upload). app.js must hide, not destroy, an instance holding it.
-        hasPendingWork: () => pendingAttachments.length > 0 || attachmentsUploading,
+        // upload / a sent attachment message not yet saved, whose Send again
+        // lives here). app.js must hide, not destroy, an instance holding it.
+        hasPendingWork: () => composer.count > 0 || composer.busy || unconfirmed.count > 0,
         // app.js, when this room leaves the screen without being destroyed: the
         // modal a file card opened (reader, file dialog) closes and its read
         // stops; staged attachments and uploads are untouched.
@@ -3908,6 +3858,8 @@ export function createChatInstance({
         destroy() {
             if (destroyed) return;
             destroyed = true;
+            composer.destroy();
+            unconfirmed.release();
             emptyWelcome?.dispose();
             readReceipt.cancel();
             for (const dispose of wsDisposers) {

@@ -12,18 +12,24 @@ import threading
 
 def shutdown_fixture_processes(root, generation):
     """Join this private interpreter's event bus and multiprocessing support."""
-    from multiprocessing import active_children, resource_tracker
+    from multiprocessing import active_children, forkserver, resource_tracker
     from supervisor.workers import shutdown_event_q
 
     children = [child.pid for child in active_children()]
     tracker = resource_tracker._resource_tracker
     tracker_pid = tracker._pid
+    server = forkserver._forkserver
+    server_pid = server._forkserver_pid
     # A stopped author can settle review during shutdown and enqueue a late
     # notice, lazily starting the real supervisor event-bus manager. This small
     # Host fixture has no server lifespan to close that bus for it.
     shutdown_event_q()
     remaining = [child.pid for child in active_children()]
     assert not remaining, f"fixture multiprocessing children remain: {remaining}"
+    # Linux's forkserver is not an active_children() member. Join the support
+    # process while this interpreter owns its pipe/PID, before parent exit can
+    # race the strict private-process-group assertion in the TCP consumer.
+    server._stop()
     # CPython normally lets the tracker exit on interpreter pipe EOF, AFTER the
     # parent is reaped. Join it here (as CPython's own test cleanup does), while
     # this fixture still owns it. Never kill/ignore arbitrary group members.
@@ -31,6 +37,7 @@ def shutdown_fixture_processes(root, generation):
     (root / f"process-cleanup-{generation}.json").write_text(json.dumps({
         "event_bus_children": children, "remaining_children": remaining,
         "resource_tracker_pid": tracker_pid, "resource_tracker_joined": tracker._pid is None,
+        "forkserver_pid": server_pid, "forkserver_joined": server._forkserver_pid is None,
     }))
 
 

@@ -235,9 +235,9 @@ def review_wave_budget_gate(
     ``max_completion_tokens`` take one value per slot, and ``categories`` /
     ``slot_ids`` name the usage scope each seat will SEND under, so its bound
     reads the seat's own observed cache split rather than the caller's), against
-    every fence ``reserve_attempt`` enforces — the global TOTAL_BUDGET remainder
-    (the scope's ``global_limit_usd``) and the task's root fence — the event naming
-    the binding axis with both remainders. A wave that fits at admission time is
+    every fence ``reserve_attempt`` enforces — global TOTAL_BUDGET, the task's
+    current root and its original billing group — with the binding axis and
+    remainders named in the event. A wave that fits at admission time is
     dispatched whole; one that does not is refused before any seat spends.
     Fail-open on any error/unknown."""
     try:
@@ -299,12 +299,14 @@ def review_wave_budget_gate(
 
 
 def review_wave_binding_fence(admission: dict) -> tuple[str, str]:
-    """(fence, remedy) of a refused wave: the binding axis (global TOTAL_BUDGET or
-    per-task root fence) and ITS knob — never a fence the wave would have fit."""
+    """Name the binding global/root/group fence and its actual remedy."""
     usd = lambda key: "unknown" if admission.get(key) is None else f"${float(admission[key]):.6f}"  # noqa: E731
     if admission.get("binding_axis") == "global":
         return (f"global budget TOTAL_BUDGET {usd('global_limit_usd')}, accounted {usd('global_accounted_usd')} "
                 "across every task", "raise TOTAL_BUDGET")
+    if admission.get("binding_axis") == "group":
+        return (f"whole-work billing-group budget fence {usd('limit_usd')}, accounted {usd('accounted_usd')}",
+                "amend the original billing-group owner's cap explicitly; changing the per-task setting does not amend it")
     return f"per-task budget fence {usd('limit_usd')}, accounted {usd('accounted_usd')}", (
         "raise the per-task budget (OUROBOROS_PER_TASK_COST_USD)")
 

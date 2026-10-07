@@ -13,6 +13,7 @@ import {
 import { renderChatMarkdown } from '../modules/chat_markdown.js';
 import { createChatMedia } from '../modules/chat_media.js';
 import { stampNodeTimestamp } from '../modules/chat_activity.js';
+import { uploadView } from './helpers/attachment_views.js';
 
 const encoder = new TextEncoder();
 const URL_SOURCE = { url: '/api/tasks/task-1/artifacts/report.md' };
@@ -562,6 +563,72 @@ test('closeTransient closes the reader and the file dialog and keeps the chat as
         fx.held.pending[1].answer('hello', { headers: { 'content-length': '5' } });
         await settle();
         assert.equal(fx.reader().querySelector('.document-reader-source').textContent, 'hello');
+    } finally {
+        fx.restore();
+    }
+});
+
+// The owner's attachments and Ouroboros's deliveries share one media controller: an uploaded
+// Markdown file keeps the file dialog (Read takes only a delivered copy), a delivered one reads,
+// and each modal ends with the message that holds its card, a grouped card's earlier bubble too.
+test("owner uploads keep the file dialog beside the delivered reader, and each modal ends with its own card", () => {
+    const fx = mediaFixture();
+    try {
+        const owner = (caption, views) => {
+            const bubble = fx.doc.createElement('div');
+            bubble.innerHTML = `<div class="sender">You</div><div class="message">${caption}</div>`;
+            fx.feed.append(bubble);
+            assert.equal(fx.media.mountAttachments(bubble, views, caption), true);
+            return bubble;
+        };
+        const earlier = owner('Earlier', [uploadView('sheet.pdf', 'file')]);
+        const own = owner('Files', [uploadView('notes.md', 'file', { mime: 'text/markdown' }), uploadView('plan.pdf', 'file')]);
+        // Two tasks each deliver two files; the second card of each joins its first bubble's grid.
+        const group = (taskId, messages) => {
+            const bubbles = messages.map((msg) => {
+                const bubble = fx.media.buildDocumentBubble({ ...fx.delivered(msg.filename, msg.second, taskId), ...msg });
+                assert.equal(fx.media.buildGallery('files', { ...fx.delivered(msg.filename, msg.second, taskId), ...msg }, bubble), true);
+                return bubble;
+            });
+            assert.equal(bubbles[1].isConnected, false, `${messages[1].filename} joined ${messages[0].filename}`);
+            return { wrapper: fx.feed.children.at(-1), dropped: bubbles[1] };
+        };
+        const report = group('task-r', [{ filename: 'report.pdf', second: 1, mime: 'application/pdf' }, { filename: 'report.md', second: 2 }]);
+        const brief = group('task-b', [{ filename: 'data.pdf', second: 3, mime: 'application/pdf' }, { filename: 'brief.md', second: 4 }]);
+        assert.equal(fx.feed.children.length, 4);
+        const card = (root, name) => root.querySelectorAll('.chat-file-card')
+            .find((node) => node.querySelector('.chat-file-name').textContent === name);
+        const dialog = () => fx.doc.body.querySelector('.chat-file-dialog');
+        const title = () => (dialog()?.open ? dialog().querySelector('.chat-file-dialog-title').textContent : null);
+        assert.deepEqual(['notes.md', 'plan.pdf'].map((name) => Boolean(card(own, name).querySelector('.is-read'))), [false, false]);
+        assert.deepEqual(['report.md', 'report.pdf'].map((name) => Boolean(card(report.wrapper, name).querySelector('.is-read'))), [true, false]);
+
+        card(own, 'notes.md').click();
+        assert.deepEqual([title(), fx.reader()], ['notes.md', null], "the owner's Markdown upload opens the file dialog");
+        fx.media.closeTransient();
+        card(report.wrapper, 'report.pdf').click();
+        assert.equal(title(), 'report.pdf');
+        fx.media.release(report.dropped);
+        assert.equal(title(), 'report.pdf', 'the emptied bubble that never reached the feed owns nothing');
+        fx.media.release(report.wrapper);
+        assert.equal(title(), null, 'releasing the group that holds report.pdf closes its file dialog');
+
+        card(brief.wrapper, 'brief.md').click();
+        assert.equal(fx.reader().querySelector('.document-reader-title').textContent, 'brief.md');
+        fx.media.release(earlier);
+        assert.ok(fx.reader(), "releasing an owner's message leaves the delivered reader open");
+        fx.media.release(brief.wrapper);
+        assert.equal(fx.reader(), null, 'releasing the group that holds brief.md closes its reader');
+        assert.equal(fx.held.pending[0].signal.aborted, true, 'and stops its read');
+
+        card(own, 'plan.pdf').click();
+        assert.equal(title(), 'plan.pdf');
+        fx.media.release(brief.wrapper);
+        assert.equal(title(), 'plan.pdf', "another message's release leaves the owner's file dialog open");
+        fx.media.release(own);
+        assert.equal(title(), null, "releasing the owner's message closes the dialog its card opened");
+        card(own, 'notes.md').click();
+        assert.deepEqual([title(), fx.reader()], [null, null], 'a released card opens nothing');
     } finally {
         fx.restore();
     }

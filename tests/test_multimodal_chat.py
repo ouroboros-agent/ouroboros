@@ -49,15 +49,32 @@ class TestWebAttachmentBlocks:
 
         uploads = tmp_path / "uploads"
         uploads.mkdir(parents=True)
-        (uploads / "abc_cat.png").write_bytes(b"\x89PNG fake")
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+        (uploads / ("a" * 32 + "_cat.png")).write_bytes(png)
         monkeypatch.setattr(ws_mod, "DATA_DIR", tmp_path)
 
         b64, mime, caption = ws_mod._first_image_attachment([
-            {"filename": "abc_cat.png", "mime": "image/png", "display_name": "cat.png"},
+            {"filename": "a" * 32 + "_cat.png", "mime": "image/png", "display_name": "cat.png"},
         ])
-        assert base64.b64decode(b64) == b"\x89PNG fake"
+        assert base64.b64decode(b64) == png
         assert mime == "image/png"
         assert "cat.png" in caption
+
+    def test_the_bytes_not_the_frame_decide_what_is_an_image(self, tmp_path, monkeypatch):
+        import ouroboros.gateway.ws as ws_mod
+
+        uploads = tmp_path / "uploads"
+        uploads.mkdir(parents=True)
+        (uploads / ("b" * 32 + "_page.png")).write_bytes(b"<html><script>x</script></html>")
+        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 28
+        (uploads / ("c" * 32 + "_clip.mp4")).write_bytes(jpeg)
+        monkeypatch.setattr(ws_mod, "DATA_DIR", tmp_path)
+
+        assert ws_mod._first_image_attachment(
+            [{"filename": "b" * 32 + "_page.png", "mime": "image/png"}]) == ("", "", ""), "HTML is no image"
+        b64, mime, _caption = ws_mod._first_image_attachment(
+            [{"filename": "c" * 32 + "_clip.mp4", "mime": "video/mp4"}])
+        assert base64.b64decode(b64) == jpeg and mime == "image/jpeg", "a JPEG is one, whatever its name"
 
     def test_traversal_and_non_image_rejected(self, tmp_path, monkeypatch):
         import ouroboros.gateway.ws as ws_mod

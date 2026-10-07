@@ -237,12 +237,12 @@ def test_racing_named_upload_rejoin_keeps_only_the_accepted_copy(tmp_path, monke
     source = tmp_path / "state/skills/a2a/input.pdf"
     source.write_bytes(b"complete attachment")
     barrier = threading.Barrier(2)
-    original = host_service.store_chat_upload
+    original = host_service.store_upload
     def copy(*args, **kwargs):
         result = original(*args, **kwargs)
         barrier.wait(timeout=5)
         return result
-    monkeypatch.setattr(host_service, "store_chat_upload", copy)
+    monkeypatch.setattr(host_service, "store_upload", copy)
     body = {"chat_id": CHAT, "client_message_id": MSG, "text": "one message",
             "attachments": [{"path": str(source)}]}
     with ThreadPoolExecutor(max_workers=2) as pool:

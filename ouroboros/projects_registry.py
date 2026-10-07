@@ -32,7 +32,8 @@ _BINDINGS_NAME = "project_task_bindings.json"
 # Additive schema: unstamped rows are version 0; reconstructed rows may lack
 # optional provenance fields, whose defaults must remain compatible.
 _REGISTRY_SCHEMA_VERSION = 2
-# v6.73.0: project_task_bindings.json gains source_text / origin_absent fields.
+# v6.73.0: project_task_bindings.json gains source_text / origin_absent fields; a copied origin with
+# attachments adds source_attachments / source_channel / source_text_placeholder (optional).
 _BINDINGS_SCHEMA_VERSION = 1
 _LOCK = threading.RLock()
 
@@ -226,6 +227,27 @@ def _validated_origin(origin: Any, resolved_chat: int) -> Dict[str, Any]:
     return {"source_ref": clean_ref, "source_text": text}
 
 
+def _origin_media(drive_root: Any, origin: Any) -> Dict[str, Any]:
+    """The attachment refs, ``source`` and placeholder mark the origin's canonical row recorded —
+    found by the ref's own ids and verified against the whole ref, never guessed from the text.
+    No row, another row or an unreadable chain records nothing; the text copy still stands."""
+    ref = origin.get("ref") if isinstance(origin, dict) else None
+    if not isinstance(ref, dict) or not isinstance(origin.get("text"), str):
+        return {}
+    from ouroboros.chat_uploads import stored_refs
+    from ouroboros.project_dialogue import entry_matches_source_ref
+    from supervisor.message_ingress import accepted_chat_message
+    try:
+        row = accepted_chat_message(drive_root, int(ref.get("chat_id") or 0), str(ref.get("client_message_id") or ""))
+    except (OSError, TypeError, ValueError):
+        log.debug("origin attachments unreadable for %r", ref, exc_info=True)
+        return {}
+    if not row or not row.get("attachments") or not entry_matches_source_ref(row, [ref]):
+        return {}
+    return {"source_attachments": stored_refs(row["attachments"]), "source_channel": str(row.get("source") or ""),
+            **({"source_text_placeholder": True} if row.get("text_placeholder") is True else {})}
+
+
 def bind_task_to_project(
     drive_root: Any,
     task_id: str,
@@ -255,6 +277,7 @@ def bind_task_to_project(
         raise ValueError(f"unusable project id: {project_id!r}")
     if admission_basis is None and get_reserved_project(drive_root, pid) is None:
         create_project(drive_root, pid)
+    media = _origin_media(drive_root, origin)  # a chat read: never under the registry's cross-process lock
     # Linearize admission with the lifecycle fence. Holding the registry lock
     # through the short bindings append means begin_project_deletion either lands
     # before this bind (which is refused) or after it (which cancellation sees).
@@ -272,6 +295,8 @@ def bind_task_to_project(
         except (TypeError, ValueError):
             resolved_chat = project_chat_id(pid)
         origin_fields = _validated_origin(origin, resolved_chat)
+        if "source_text" in origin_fields:  # only a cross-thread origin keeps a copy, and so its media
+            origin_fields.update(media)
         row = {
             "task_id": tid,
             "project_id": pid,

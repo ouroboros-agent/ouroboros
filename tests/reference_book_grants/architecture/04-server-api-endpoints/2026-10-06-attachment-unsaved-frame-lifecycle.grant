@@ -1,0 +1,2 @@
+408
+The unsaved attachment frame's lifecycle: no count bound, settled only by its saved echo or history row (not one marked ingress_undispatched), kept when its bubble leaves the feed and by the tab's sessionStorage across a reload, with manual Send again and Discard.

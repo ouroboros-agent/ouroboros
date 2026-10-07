@@ -40,6 +40,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   ├── supervisor/              ← Background thread inside server.py (§5)
   │   ├── active_activity.py   ← process-local owner of in-flight native chat actors (`DirectActivityRegistry`): private handles for controls and the writer drain, public snapshots for `/api/state` `active_direct_turns` and WS typing frames; no queue records (§3 Direct turns and the activity block)
   │   ├── message_bus.py       ← Queue-based local message bus (Web UI + reviewed transport skills)
+  │   ├── message_ingress.py   ← Named ingress it re-exports: one accepted row per message id before dispatch, found through its process-local index of the chat chain; this process's dispatch facts
   │   ├── workers.py           ← Multiprocessing worker pool (forkserver on Linux, spawn on macOS/Windows; never fork from the multi-threaded supervisor)
   │   ├── worker_assignment.py, worker_chat_lane.py, worker_health.py, worker_pool_lifecycle.py, worker_process.py, worker_promotion.py ← Pool leaves: assignment/refusals; direct chat/restart/update admission; crash and terminal-file recovery; lifecycle and `kill_worker_tree` (daemon roots spared), diagnostic `worker_sha_verify` ancestry (normal descendants only in Logs); worker child; chat/project promotion via `_persist_promote_rejection` (§5; §6 Owner routing verbs)
   │   ├── worker_owner_wait.py ← Queue-owned active-capacity transfer for a required owner wait: the task stays RUNNING and custodied while another worker takes the active slot (§5)
@@ -284,6 +285,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── subagent_history.py  ← Existing compact helper receipt: dated API attempts, session settlement/recovery and typed unrun starts; dynamic context and owner UI only, never admission (§6 Route health)
       ├── subagent_worktrees.py ← Registry state/subagent_worktrees.json, refs/ouroboros/delegated/ pins and payload snapshots; ops lock: metadata-only except prune_orphans/genesis filesystem work; explicit/custody-checked GC; genesis uses neither registry nor GC (§6 Delegated subagents)
       ├── artifacts.py         ← Attachment staging into `artifact_store/attachments/`; artifact records; scratch fingerprints (`.scratch_manifest.json`) that gate patch exclusion only while content matches; the undeclared-output guard; `delegated_capture_read_target`; partial tool evidence first reads its verified actor source, then a matching redacted observability projection; recovered text uses the existing exact-text source writer best-effort, and a later budget cut without a verified handle remains source-unavailable
+      ├── chat_uploads.py      ← The one owner-attachment store (`data/uploads`): server-measured refs, byte-proven media kind, pending guard, the one attachment view (DESIGN "Chat attachments")
+      ├── confined_files.py    ← Regular-file open confined to one directory (POSIX no-follow, Windows handle proof); the upload route's reader
       ├── retention.py         ← Unified GC retention SSOT: clamp/age-cutoff + legacy-key seed picker
       ├── workspace_preflight.py ← Read-only external-workspace git/manifest/toolchain snapshot used by gateway task creation
       ├── project_sources.py   ← Folder attach validation (realpath, not the home root, no repo/data overlap); opt-in `init_git`, NEVER auto-init; atomic server-side clone with `GIT_TERMINAL_PROMPT=0` and typed `auth_required`; attaching IS the trust grant (`trusted_at`)
@@ -465,6 +468,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── host_notify.py   ← POST /notify beside the Host Service: a granted skill's sentence → one signed `skill_notice` System row in the owner's chat (§12)
       │   ├── history.py       ← Shared Chat room/quiz/media/review/terminal projection + cost breakdown factories
       │   ├── history_contracts.py ← Descriptive paged Chat history response, re-exported by contracts.py
+      │   ├── attachment_contracts.py ← Typed owner-attachment shapes (frame ref, staging row, attachment view), re-exported by contracts.py
       │   ├── schedule_contracts.py ← Typed schedule list/upsert/lifecycle-action responses, re-exported by contracts.py
       │   ├── ui_i18n_contracts.py ← Typed interface-language envelopes (`/api/ui/i18n*`), their own twin pair beside contracts.py (which sits at its line cap); browser twin `web/modules/ui_i18n_types.js`
       │   ├── history_paging.py ← A room's own pages over retained chat/progress JSONL chains (counted in its rows, no archive-count bound), frozen room-bound page/continuation cursors, read gaps and a Project room's `latest_arrival`; no stored history copy
@@ -726,7 +730,7 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   │   ├── update_letter.json     ← update letter (base/target/channel/ref, state, text, `last_good`); kept after apply; panel uses startup source, context its checkout (update_letter.py)
 │   │   ├── projects.json          ← Project registry: immutable id/chat identity, working folder, lifecycle/routing fence, revision; tombstones are durable and never age-pruned
 │   │   ├── projects.json.committed ← registry commit witness: beside it a missing registry is unavailable, not empty
-│   │   ├── project_task_bindings.json ← schema v1 root↔Project bindings with REQUIRED typed origin; one-way enrichment; tombstoning never removes a binding
+│   │   ├── project_task_bindings.json ← schema v1 root↔Project bindings with REQUIRED typed origin (a cross-thread copy keeps its row's recorded attachment refs); one-way enrichment; tombstoning never removes a binding
 │   │   ├── ui_preferences.json    ← owner-local layout/`welcome` prefs + monotonic project_seen_revision ACKs
 │   │   ├── i18n/<tag>.json        ← one translation memory per interface language (schema 1: entries by code or rendered English, provenance owner > imported > generated, `refused` ledger; i18n_memory.py), beside `<tag>.pending.json`, the generator's bounded miss queue
 │   │   ├── cancel_intents.json    ← compact locked projection of ACTIVE cancel intents; the forensic trail is typed cancel_intent rows in logs/supervisor.jsonl, never read back (cancel_intents.py)

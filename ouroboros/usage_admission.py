@@ -356,11 +356,15 @@ def review_wave_admission(
                 remaining = round(max(0.0, limit - accounted), 6)
                 result.update(limit_usd=limit, accounted_usd=accounted, reserved_usd=holds(projection),
                               binding_axis="root")
-            bound_scope = ua.current_usage_scope() or ua.UsageScope()
-            resolved = effective_billing_fields(drive_root, bound_scope.root_task_id, {
-                key: getattr(bound_scope, key) for key in ("billing_group_id", "billing_group_limit_usd",
-                    "billing_group_limit_source", "billing_group_limit_revision")})
-            group, group_limit = scope_group(replace(bound_scope, **resolved))
+            # Resolve the same task-bound durable group and owner amendments
+            # as a seat reservation, without reserving money or pinning a binding.
+            # A raised in-memory root fence alone cannot raise the original group.
+            _, bound_scope = ua._merge_scope(ua.AttemptRequest(
+                model="", provider="", drive_root=drive_root,
+                task_id=task_id, root_task_id=root_task_id,
+                root_limit_usd=root_limit_usd,
+            ))
+            group, group_limit = scope_group(bound_scope)
             if group.startswith(UNAVAILABLE_GROUP_PREFIX):
                 return {**result, "fits": False, "binding_axis": "group", "reason": "billing_authority_unavailable"}
             if group and group_limit is not None:

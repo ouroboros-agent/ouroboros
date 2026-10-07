@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Optional
 from starlette.requests import Request
 from starlette.responses import Response
 
+from ouroboros.chat_uploads import attachment_views
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway._helpers import coerce_int, read_rotated_jsonl_entries
 from ouroboros.gateway.cost_breakdown import make_cost_breakdown_endpoint  # noqa: F401 — historical import path (router)
@@ -180,7 +181,8 @@ def _user_annotation(
 def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
     """Binding-backed context absent from this physical page, with disclosed cap.
 
-    The immutable source ref links it to canonical adoption, never ts alone.
+    The immutable source ref links it to canonical adoption, never ts alone; a
+    copy with recorded attachments renders as its row does (views, source, mark).
     """
     from ouroboros.project_dialogue import project_origin_rows
 
@@ -206,13 +208,15 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
             "is_progress": False,
             "system_type": "",
             "markdown": False,
-            "source": "",
+            "source": str(row.get("channel") or ""),
             "sender_label": "",
             "sender_session_id": "",
             "client_message_id": cmid,
             "task_id": "",
             "origin_projected": True,
             "origin_id": row["origin_id"],
+            **({"attachments": attachment_views(row["attachments"], data_dir)} if row.get("attachments") else {}),
+            **({"text_placeholder": True} if row.get("text_placeholder") is True else {}),
         })
         if len(synthesized) >= _ORIGIN_SYNTH_CAP:
             omitted = sum(
@@ -694,6 +698,8 @@ def _collect_chat_rows(
     replay_evidence: Optional[list] = None,
 ) -> tuple[list, int] | tuple[list, int, set[str]]:
     """Project selected chat entries (or the legacy recent read), with quota/gaps."""
+    from supervisor.message_ingress import delivery_facts
+
     # Quiz lifecycle merge (#Q-2b): the chat row froze the card at ask time
     # ("open"); the durable truth lives in the owner_quiz task-result
     # projection. One projection read per distinct asking task, cached for
@@ -807,6 +813,12 @@ def _collect_chat_rows(
             }
             if role == "user" and entry.get("ingress_accepted") is True:
                 rec["ingress_accepted"] = True
+                # Proven undispatched, entered, or this live process's and pending; an ended process's: nothing.
+                rec.update(delivery_facts(entry, entry_chat))
+            if role == "user" and entry.get("attachments"):  # the same views the live echo carried
+                rec["attachments"] = attachment_views(entry["attachments"], chat_path.parent.parent)
+            if role == "user" and entry.get("text_placeholder") is True:  # host-written text, not the owner's
+                rec["text_placeholder"] = True
             if rec["system_type"] in {"project_started", "project_handoff", "project_completion_summary"}:
                 # Read-side plain normalization for lifecycle rows persisted
                 # before the producer stripped markdown; a no-op on new rows.

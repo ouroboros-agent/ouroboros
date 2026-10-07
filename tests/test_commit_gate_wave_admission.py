@@ -3,9 +3,8 @@
 The scope reviewer — the only constitutionally blocking seat — reserves its
 budget FIRST, and the commit-gate wave (scope seats + triad seats) is admitted
 all-or-nothing against every fence the ledger enforces at reservation — the
-global TOTAL_BUDGET remainder and the task's root fence (the earlier wording
-"against the task's current root fence" omitted the global axis; rc.14 audit
-point 2) — BEFORE any paid seat is dispatched. A wave that does not fit is a
+global TOTAL_BUDGET remainder, the task's current root and its original billing
+group — BEFORE any paid seat is dispatched. A wave that does not fit is a
 typed $0 pre-dispatch refusal naming the binding axis and the shortfall, never
 a half-dispatched panel (the 4 September paid run: two triad seats held the
 money, the third seat and the scope seat were refused mid-wave, and the commit
@@ -603,10 +602,19 @@ def test_seats_reserve_against_exactly_the_fence_the_wave_was_admitted_with(gate
     bound fence, so the seats must reserve against THAT fence — not against a
     setting hot-reloaded mid-turn that the reviewer threads would re-read from
     the environment once the executor transitions dropped the usage scope.
-    Bound $50, environment $8, a $4 history row at $8: the $5 wave is admitted
-    against $50 AND every seat's own ``reserve_attempt`` binds $50 — dispatched
-    whole, never a partial paid wave."""
+    An explicit owner amendment raises root AND group from $8 to $50.
+    The environment stays $8; every seat retains the amended authority rather
+    than mistaking an in-memory root fence for a group-cap amendment."""
     _seed_settled(gate, fence=8.0, cost=4.0)
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(gate, ROOT, "running", root_task_id=ROOT,
+                      acceptance_root_cap_amendments=[{
+                          "accounting_root_task_id": ROOT, "new_cap_usd": 50.0,
+                          "source_identity": "fixture-owner-amendment",
+                          "source_ref": {"kind": "fixture_owner_decision"},
+                          "recorded_at": "2026-10-07T00:00:00+00:00",
+                      }])
     llm = LedgerLLM()
     ctx, (review_err, scope_result, _reason, _adv) = _run(
         gate, tmp_path, monkeypatch, llm, fence=50.0, env_fence=8.0)
@@ -617,9 +625,56 @@ def test_seats_reserve_against_exactly_the_fence_the_wave_was_admitted_with(gate
     seats = [row for row in _ledger(gate) if row["source"] != "main"]
     assert sorted(row["model"] for row in seats) == sorted([SCOPE_MODEL, *TRIAD_MODELS])
     assert {row["root_limit_usd"] for row in seats} == {50.0}
+    assert {row["billing_group_limit_usd"] for row in seats} == {50.0}
+    assert {row["billing_group_limit_source"] for row in seats} == {"owner_amendment"}
     assert not [e for e in ctx.pending_events if e.get("type") == "review_wave_budget_insufficient"]
     assert not [r for r in ctx._last_triad_raw_results if r.get("status") != "ok"] or all(
         "BudgetExceeded" not in str(r.get("error") or "") for r in ctx._last_triad_raw_results)
+
+
+def test_raised_root_without_group_amendment_refuses_the_whole_wave(gate, tmp_path, monkeypatch):
+    """#1599: durable group8 beats an in-memory root50, before any seat sends.
+
+    This fails on the old admission reader without relying on settlement order:
+    reservations recover group8, but the old wave precheck admitted against50.
+    """
+    _seed_settled(gate, fence=8.0, cost=4.0)
+    before = _ledger(gate)
+    llm = LedgerLLM()
+    ctx, (review_err, scope_result, reason, _adv) = _run(
+        gate, tmp_path, monkeypatch, llm, fence=50.0, env_fence=8.0)
+
+    assert llm.calls == [] and _ledger(gate) == before
+    assert reason == "review_wave_budget_insufficient" and scope_result.status == "not_dispatched"
+    assert review_err and "remaining=$4.000000, shortfall=$1.000000" in review_err
+    event = next(e for e in ctx.pending_events if e.get("type") == "review_wave_budget_insufficient")
+    assert event["binding_axis"] == "group" and event["limit_usd"] == 8.0
+    assert "whole-work billing-group budget fence" in review_err
+    assert "amend the original billing-group owner's cap explicitly" in review_err
+    assert "raise the per-task budget" not in review_err
+    assert [r["status"] for r in ctx._last_triad_raw_results] == ["not_dispatched"] * 2
+
+
+@pytest.mark.parametrize("group_limit", [0.0, 8.0, None])
+def test_wave_group_resolution_matches_reservation_without_pinning_authority(
+    gate, monkeypatch, group_limit,
+):
+    from ouroboros.task_results import write_task_result, load_task_result
+
+    binding = {"billing_group_id": "original-root", "billing_group_limit_usd": group_limit,
+               "billing_group_limit_source": "fixture-carried"}
+    write_task_result(gate, ROOT, "running", root_task_id=ROOT, billing_group=binding)
+    before = load_task_result(gate, ROOT)
+    with ua.usage_scope(ua.UsageScope(drive_root=gate, task_id=ROOT, root_task_id=ROOT,
+                                    root_limit_usd=50.0)):
+        _, resolved = ua._merge_scope(ua.AttemptRequest(model="triad/a", provider="test"))
+        admission = ua.review_wave_admission(
+            gate, root_task_id=ROOT, task_id=ROOT, root_limit_usd=50.0,
+            models=[SCOPE_MODEL, *TRIAD_MODELS], prompt_chars=10)
+    assert resolved.billing_group_id == "original-root"
+    assert resolved.billing_group_limit_usd == group_limit
+    assert admission["fits"] is (group_limit is None or group_limit >= 5.0)
+    assert load_task_result(gate, ROOT) == before and _ledger(gate) == []
 
 
 def test_bound_fence_that_does_not_fit_refuses_even_when_the_environment_is_roomier(gate, tmp_path, monkeypatch):
@@ -636,6 +691,41 @@ def test_bound_fence_that_does_not_fit_refuses_even_when_the_environment_is_room
     assert "remaining=$4.000000, shortfall=$1.000000" in review_err
     assert block_reason == "review_wave_budget_insufficient"
     assert scope_result.status == "not_dispatched"
+
+
+@pytest.mark.parametrize("non_task", [False, True])
+def test_wave_resolution_preserves_explicit_host_operation_scope(gate, monkeypatch, non_task):
+    """A declared host operation never borrows canonical task amendment authority."""
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(gate, ROOT, "running", root_task_id=ROOT, billing_group={
+        "billing_group_id": "original-root", "billing_group_limit_usd": 0.0,
+        "billing_group_limit_source": "fixture-carried"})
+    bound = ua.UsageScope(drive_root=gate, task_id=ROOT, root_task_id=ROOT,
+                          root_limit_usd=50.0, non_task_operation=non_task)
+    with ua.usage_scope(bound):
+        admission = ua.review_wave_admission(
+            gate, root_task_id=ROOT, task_id=ROOT, root_limit_usd=50.0,
+            models=[SCOPE_MODEL], prompt_chars=10)
+    assert admission["fits"] is non_task
+    assert _ledger(gate) == []
+
+
+def test_wave_resolution_does_not_borrow_a_foreign_roots_explicit_group(gate, monkeypatch):
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(gate, "target", "running", root_task_id="target", billing_group={
+        "billing_group_id": "target-origin", "billing_group_limit_usd": 0.0,
+        "billing_group_limit_source": "fixture-carried"})
+    caller = ua.UsageScope(drive_root=gate, task_id=ROOT, root_task_id=ROOT,
+                           root_limit_usd=50.0, billing_group_id="caller-origin",
+                           billing_group_limit_usd=50.0, billing_group_limit_source="fixture")
+    with ua.usage_scope(caller):
+        admission = ua.review_wave_admission(
+            gate, root_task_id="target", task_id="target", root_limit_usd=50.0,
+            models=[SCOPE_MODEL], prompt_chars=10)
+    assert admission["fits"] is False and admission["billing_group_id"] == "target-origin"
+    assert admission["binding_axis"] == "group" and _ledger(gate) == []
 
 
 def test_scope_first_hold_ignores_a_sibling_tasks_same_named_scope_slot(gate, tmp_path, monkeypatch):

@@ -1,0 +1,2 @@
+120
+Review repairs of the attachment candidate: the message_ingress row names its accepted-id index; the bindings row names the recorded attachment refs a cross-thread origin copy keeps.

@@ -361,7 +361,10 @@ def test_unknown_model_image_reaches_the_async_send_payload(cold, monkeypatch, m
 
     monkeypatch.setattr(LLMClient, "_normalize_payload_cache_ttl", capture)
     with pytest.raises(_Captured) as captured:
-        asyncio.run(LLMClient().chat_async(_image_messages(), model=model, max_tokens=128, no_proxy=True))
+        # conftest creates this loop before cold forbids network operations;
+        # constructing another Windows loop here would block its own self-pipe.
+        asyncio.get_event_loop().run_until_complete(
+            LLMClient().chat_async(_image_messages(), model=model, max_tokens=128, no_proxy=True))
     assert _payload_images(model, captured.value.payload) == [_expected_image(model)]
     assert cold.network == []
 

@@ -272,6 +272,12 @@ export const apiClient = {
     health: () => fetchJson('/api/health', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').StateResponse>} */
     state: () => fetchJson('/api/state', { cache: 'no-store' }),
+    /** One composer file into the upload store. @returns {Promise<import('./api_types.js').UploadResponse>} */
+    uploadChatAttachment: (file) => {
+        const body = new FormData();
+        body.append('file', file);
+        return fetchJson('/api/chat/upload', { method: 'POST', body }, { rejectOkFalse: true });
+    },
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
     /** @param {{key: string}|{mcp_server_id: string}} selector @returns {Promise<{value: string}>} */
     revealSettingsSecret: (selector) => jsonPost('/api/settings/secret', selector),

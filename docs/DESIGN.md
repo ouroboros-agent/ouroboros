@@ -1044,6 +1044,68 @@ Details and Logs name the recorded failure reasons, grouping repeated reasons wi
 counts. Logs Raw retains the complete source/failure facts; a missing recorded reason is
 stated explicitly. Existing task-detail hydration and replay refresh this projection.
 
+### Chat attachments
+
+The owner's photos and files are part of the owner's message, shown the way
+Ouroboros's own deliveries are: one message, one bubble, never one bubble per
+file (owner choice 1C/2A/3A/4A/5A/6A with mobile first-class).
+
+- **Order:** attachments sit above the caption inside the owner's bubble; a
+  message with no words shows its attachments alone, never an empty text row.
+- **Photos are whole on both sides.** One photo keeps its own ratio up to
+  `--chat-photo-max-height`, never enlarged; a tiny, very narrow or very short
+  one sits inside a `--chat-photo-min-box` box so its `•••` is never clipped
+  (either side); several share the existing two-column grid with
+  letterboxed (`contain`) tiles, one column in a narrow chat column. Ouroboros's
+  own photo tiles letterbox the same way — no side crops an image.
+- **Video and audio** play in the existing inline players; every other file is
+  the existing file card (no PDF viewer). A preview the engine cannot show (HEIC
+  in Chromium, an unsupported codec) becomes an ordinary card with Open/Download
+  and "Preview unavailable"; a file deleted since it was sent, or whose size or
+  mtime no longer matches the recorded stat witness (a replace or rewrite that
+  changed either), is the inert card "Unavailable". The witness is not a hash and
+  nothing rehashes per view: a same-size replacement that restores the mtime is
+  not detected and shows as the original.
+- **Actions never depend on hover:** the photo `•••` and file cards are always
+  visible and finger-sized under a coarse pointer; a long name wraps to two lines
+  and the card's dialog shows it whole. Open/Save succeed only when the desktop
+  bridge says so; a copied link is a fallback, never reported as opened.
+- **The same view everywhere:** the sender's bubble, another tab and the replay
+  after reload or restart render the one server view of each attachment. The
+  stored text still names the files for the model; only the exact tail the web
+  composer generated, on its own row (or text the row marks as host-written,
+  `text_placeholder`, such as "(image attached)" — the echo carries the same
+  mark), is hidden from the caption — the owner's words, even those same ones,
+  and a Telegram or skill caption are never rewritten. Every attachment renders, however many; only the text tail is
+  bounded. A Project's start message copied from Main shows the attachments its
+  row recorded when that row is outside the window. History without recorded
+  attachments stays as it was; nothing is guessed from a file name.
+- **Composer:** each staged image shows a small thumbnail beside its name; the
+  field stays focusable (read-only, not disabled) while files upload, so a phone
+  keeps its keyboard. `/restart` typed with staged files stays the Restart
+  command (the files ride its row); any other words are a message. A sent
+  attachment message is not yet saved: if the socket
+  closes, or the host refuses the frame, before its "Input saved" echo, the
+  bubble says "Not confirmed as saved" with "Send again", which resends the same
+  frame and id (the host rejoins it if it was saved after all — never a second
+  message), and "Discard", which forgets this tab's copy (never an upload).
+  Nothing resends by itself. The frame is kept, with no count bound, until that
+  id's saved echo or history row settles it (a row the running host has not
+  yet dispatched keeps it until the host says which): a bubble the feed released or
+  rebuilt keeps its frame, and a Project room holding one is hidden, not
+  destroyed. The tab's sessionStorage keeps its words, id, routing and upload
+  references (never file bytes) across a reload — the asset reload a reconnect
+  forces included — and a room's teardown; after a reload the first history
+  read settles it or shows the same doubt. A browser that refuses to keep it
+  says so, and Send again then lasts until a reload; a kept copy it cannot read
+  back is said too, never silently dropped. A saved row the host knows never
+  reached the agent (its write failed before dispatch, in the running host)
+  says "Saved, not delivered." and keeps Send again: the host hands that row
+  over once. A kept message whose saved row a host process before a restart
+  took says "Saved; delivery not confirmed." without Send
+  again: nothing is known, so nothing is replayed. Rows nobody kept stay plain
+  history ("Input saved").
+
 ### Conversation activity block
 
 A task's activity block is in the transcript exactly when the record already

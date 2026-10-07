@@ -448,7 +448,7 @@ def test_promoted_self_body_requirement_reaches_the_contract_and_context_without
     books_env, _memory = _make_env_and_memory(tmp_path / "books")
     env = Env(repo_dir=books_env.repo_dir, drive_root=host.root, budget_drive_root=host.root)
     development_body = "# DEVELOPMENT.md — Dev Guide\n\n## Review\n\nRead every source before committing.\n"
-    (env.repo_dir / "docs" / "DEVELOPMENT.md").write_text(development_body, encoding="utf-8")
+    (env.repo_dir / "docs" / "DEVELOPMENT.md").write_text(development_body, encoding="utf-8", newline="\n")
     memory = Memory(host.root, repo_dir=env.repo_dir)
     workspace = tmp_path / "working-copy"
     workspace.mkdir()
