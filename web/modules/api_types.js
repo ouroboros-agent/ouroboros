@@ -44,8 +44,7 @@
  * @property {ActiveChatActivity[]=} active_chat_activities  // combined snapshot: direct/ephemeral turns + root managed queue tasks
  */
 /**
- * Background Consciousness alarm-clock snapshot (server._describe_bg_consciousness_state over
- * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the direct-activity census, never a flag here.
+ * Background Consciousness alarm clock (server._describe_bg_consciousness_state over consciousness.status_snapshot). A wake-up is an ordinary Main turn; the direct-activity census owns its liveness.
  * @typedef {Object} BgConsciousnessState
  * @property {boolean} enabled
  * @property {string} status  // disabled | stopped | thinking | sleeping | waiting_for_first_conversation | allowance_exhausted | allowance_unknown | wake_rejected | wake_failed | wake_paused | wake_outcome_unknown
@@ -180,9 +179,8 @@
  */
 
 /**
- * POST /api/onboarding/subagents/preview accepts the same open provider/local
- * draft and subscription declarations as onboarding completion. It returns a
- * canonical editable actor list without persisting anything.
+ * POST /api/onboarding/subagents/preview accepts the same open provider/local draft and subscription
+ * declarations as onboarding completion. It returns a canonical editable actor list without persisting anything.
  * @typedef {OnboardingCompleteRequest} OnboardingSubagentsPreviewRequest
  */
 
@@ -638,6 +636,7 @@
  * @property {string=} reason
  * @property {string=} detail
  * @property {string=} cause  // the owner-facing sentence for a refused routing act (409 dispatch_rejected)
+ * @property {string=} reasoning_effort  // a New task picked from the card: the start its admitted row requests; never on a steer
  */
 
 /**
@@ -680,8 +679,7 @@
  */
 
 /**
- * Bubble-free presentation update for an existing owner message.
- * @typedef {Object} MessageAnnotationOutbound
+ * @typedef {Object} MessageAnnotationOutbound Bubble-free update for an existing owner message.
  * @property {"message_annotation"} type
  * @property {"routing_ack"} annotation_type
  * @property {number=} chat_id
@@ -696,6 +694,7 @@
  * @property {AttachmentManifestEntry[]=} attachment_manifest
  * @property {string=} routing_token
  * @property {string=} cause  // host-authored owner sentence for a REFUSED act; absent on scheduled/delivered/pending and on the picker frame
+ * @property {string=} reasoning_effort  // the explicit start a New task picked from this picker card requests
  * @property {boolean} suppress_bubble
  * @property {string=} ts
  */
@@ -1052,6 +1051,7 @@
  * @property {string=} expected_output
  * @property {string=} constraints
  * @property {boolean=} context_requires_self_body_docs
+ * @property {string=} reasoning_effort Optional explicit starting effort of this root (a server-validated effort tier); omitted = the Task default; metadata.reasoning_effort is refused.
  * @property {string=} actor_id Top-level task actor/provenance id; metadata.actor_id is reserved.
  * @property {string=} source Top-level task source/provenance label.
  * @property {Object=} metadata Arbitrary task metadata; executor_ref/workspace_executor keys are reserved.

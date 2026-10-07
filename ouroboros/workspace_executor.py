@@ -246,14 +246,17 @@ def execute(
     bootstrap_process_path()
     cwd_path = pathlib.Path(cwd).resolve(strict=False)
     backend_cwd = map_host_path(executor, cwd_path)
+    from ouroboros.body_candidate import executor_environment
+    candidate_env = executor_environment(ctx, cwd_path, executor=executor, map_path=map_host_path)
     if executor.kind == "local":
         return _execute_local(
             executor, cmd, cwd_path, timeout_sec,
-            drive_root=_drive_root_from_ctx(ctx),
+            drive_root=_drive_root_from_ctx(ctx), local_env=candidate_env,
             env_overlay=env_overlay, **({"target_env": target_env} if target_env else {}),
         )
     return _execute_docker(executor, cmd, backend_cwd, timeout_sec, drive_root=_drive_root_from_ctx(ctx),
-                           **({"target_env": target_env} if target_env else {}))
+                           **({"target_env": overlay_env(candidate_env or {}, target_env), "replace_env": True}
+                              if candidate_env is not None else {"target_env": target_env} if target_env else {}))
 
 
 def _system_repo_dir() -> str | None:
@@ -285,13 +288,6 @@ def overlay_env(base: "dict[str, str]", env_overlay: "dict[str, str] | None") ->
     return env
 
 
-def _env_with_overlay(env_overlay: "dict[str, str] | None") -> dict[str, str]:
-    """Task environment with the caller's overlay applied on top."""
-    from ouroboros.settings_integrity import runtime_environ
-
-    return overlay_env(runtime_environ(), env_overlay)
-
-
 def _execute_local(
     executor: ExecutorRef,
     cmd: list[str],
@@ -301,13 +297,16 @@ def _execute_local(
     drive_root: pathlib.Path | None,
     env_overlay: "dict[str, str] | None" = None,
     target_env: "dict[str, str] | None" = None,
+    local_env: "dict[str, str] | None" = None,
 ) -> ExecutorResult:
     if _panic_requested:
         raise RuntimeError("Emergency Stop has retired executor admission")
     started = time.monotonic()
     from ouroboros.owner_pause import operation_start
+    from ouroboros.settings_integrity import runtime_environ
 
-    process_env = overlay_env(overlay_env(scrub_repo_from_pythonpath(_env_with_overlay(None), _system_repo_dir()), target_env), env_overlay)
+    base_env = local_env if local_env is not None else scrub_repo_from_pythonpath(runtime_environ(), _system_repo_dir())
+    process_env = overlay_env(overlay_env(base_env, target_env), env_overlay)
     with operation_start():
         try:
             proc = subprocess.Popen(
@@ -367,6 +366,7 @@ def _execute_docker(
     *,
     drive_root: pathlib.Path | None,
     target_env: "dict[str, str] | None" = None,
+    replace_env: bool = False,
 ) -> ExecutorResult:
     if _panic_requested:
         raise RuntimeError("Emergency Stop has retired executor admission")
@@ -375,7 +375,7 @@ def _execute_docker(
     pidfile = f"/tmp/ouroboros-exec-{uuid.uuid4().hex}.pid"
     prefix = f"OUROBOROS_PROCESS_ENV_{uuid.uuid4().hex}_"
     aliases = {key: f"{prefix}{index}" for index, key in enumerate(target_env or {})}
-    command = _docker_env_command(shlex.join(str(part) for part in cmd), aliases)
+    command = _docker_env_command(shlex.join(str(part) for part in cmd), aliases, replace_env=replace_env)
     exec_payload = shlex.quote(f"exec {command}")
     quoted_pidfile = shlex.quote(pidfile)
     wrapper = (
@@ -959,6 +959,8 @@ def start_service(
         if stopped.get("stop_failed"):
             raise RuntimeError("previous service termination is not confirmed: " + str(stopped.get("stop_error") or "unknown"))
     backend_cwd = map_host_path(executor, host_cwd)
+    from ouroboros.body_candidate import executor_environment
+    candidate_env = executor_environment(ctx, host_cwd, executor=executor, map_path=map_host_path)
     record = _ExecutorService(
         service_id=key,
         task_id=str(getattr(ctx, "task_id", "") or "manual"),
@@ -980,10 +982,13 @@ def start_service(
         drive_root=_drive_root_from_ctx(ctx),
     )
     if executor.kind == "local":
+        from ouroboros.process_custody import spawn_supervised
+
+        # A service inside the bound body candidate runs isolated; a refusal precedes any log.
+        base_env = candidate_env if candidate_env is not None else _executor_service_env()
         log_path = pathlib.Path(getattr(ctx, "drive_root")) / "services" / record.task_id / f"{name}.executor.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = log_path.open("ab")
-        from ouroboros.process_custody import spawn_supervised
 
         def publish_process(proc):
             record.local_proc = proc
@@ -1000,7 +1005,7 @@ def start_service(
                 owner_task_id=record.task_id, on_spawn=publish_process, cwd=str(host_cwd),
                 stdout=log_fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 # Host interpreter overlay applies only to the local executor.
-                env=overlay_env(overlay_env(_executor_service_env(), env_overlay), env),
+                env=overlay_env(overlay_env(base_env, env_overlay), env),
             )
         finally:
             log_fh.close()
@@ -1009,14 +1014,15 @@ def start_service(
             _assert_docker_network_none(executor.container_name)
         log_path = f"/tmp/ouroboros-service-{record.task_id}-{name}.log"
         prefix = f"OUROBOROS_SERVICE_ENV_{uuid.uuid4().hex}_"
-        aliases = {key: f"{prefix}{index}" for index, key in enumerate(env)}
-        shell = _docker_service_start_shell(record, log_path, aliases)
+        target_env = overlay_env(candidate_env or {}, env)
+        aliases = {key: f"{prefix}{index}" for index, key in enumerate(target_env)}
+        shell = _docker_service_start_shell(record, log_path, aliases, replace_env=candidate_env is not None)
         proc = _submit_service_command(
             ["docker", "exec", *[part for alias in aliases.values() for part in ("--env", alias)],
              executor.container_name, "sh", "-lc", shell],
             # Target PATH/DOCKER_HOST/LD_PRELOAD must not reconfigure the host
             # CLI. Only inert aliases cross this hop; values stay out of argv.
-            **({"env": {**os.environ, **{aliases[key]: value for key, value in env.items()}}} if env else {}),
+            **({"env": {**os.environ, **{aliases[key]: value for key, value in target_env.items()}}} if target_env else {}),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1070,6 +1076,26 @@ def service_status(ctx: Any, name: str) -> dict[str, Any] | None:
     if record is None:
         return None
     return _service_payload(record)
+
+
+def service_execution_facts(service_id: str) -> dict[str, Any] | None:
+    """One executor service's start identity and execution state, without readiness work.
+
+    The local backend's Popen gives the real return code. Docker gives state only:
+    its ``kill -0`` probe's own exit status is not the service's, so ``returncode``
+    stays ``None`` and an inconclusive probe reads ``unknown``. ``None`` = no record.
+    """
+    with _STATE_LOCK:
+        record = _SERVICES.get(service_id)
+    if record is None:
+        return None
+    if record.executor.kind == "local" and record.local_proc is not None:
+        rc = record.local_proc.poll()
+        state = "running" if rc is None else "exited"
+    else:
+        rc, state = None, _safe_service_state(record)
+    return {"service_id": service_id, "started_at": record.started_at, "backend_pid": record.backend_pid,
+            "state": state, "returncode": rc}
 
 
 def service_logs(ctx: Any, name: str, tail: int) -> dict[str, Any] | None:
@@ -1293,17 +1319,20 @@ def _executor_service_env() -> dict[str, str]:
     return scrub_repo_from_pythonpath(service_env(), _system_repo_dir())
 
 
-def _docker_env_command(command: str, aliases: dict[str, str] | None) -> str:
+def _docker_env_command(command: str, aliases: dict[str, str] | None, *, replace_env: bool = False) -> str:
     """Expand selected values only in the target, never in host argv or shell code."""
     if not aliases:
         return command
-    unset = shlex.join([part for alias in aliases.values() for part in ("-u", alias)])
+    unset = "-i" if replace_env else shlex.join([part for alias in aliases.values() for part in ("-u", alias)])
     assignments = " ".join(f'{shlex.quote(key)}="${{{alias}}}"' for key, alias in aliases.items())
+    if replace_env:
+        assignments = 'PATH="$PATH" ' + assignments  # backend executable search, never the host PATH
     return f"env {unset} -- {assignments} {command}"
 
 
-def _docker_service_start_shell(record: _ExecutorService, log_path: str, aliases: dict[str, str] | None = None) -> str:
-    command = _docker_env_command(shlex.join(record.cmd), aliases)
+def _docker_service_start_shell(record: _ExecutorService, log_path: str, aliases: dict[str, str] | None = None,
+                                *, replace_env: bool = False) -> str:
+    command = _docker_env_command(shlex.join(record.cmd), aliases, replace_env=replace_env)
     exec_payload = shlex.quote(f"exec {command}")
     quoted_cwd = shlex.quote(record.backend_cwd)
     quoted_log = shlex.quote(log_path)

@@ -134,6 +134,26 @@ _PROMOTE_CHAT_DESCRIPTION = (
     "claimed as created, and UNCONFIRMED must not be retried automatically."
 )
 
+# route_to_project tool description, hoisted from get_tools for the same function gate.
+_ROUTE_TO_PROJECT_DESCRIPTION = (
+    "Route a main-chat message to an EXISTING project so the work continues in that "
+    "project's own context (memory/journal/thread), keeping the main chat free. Use "
+    "when a message clearly belongs to a known project (call list_projects first if "
+    "unsure of the id). If confidence is low or several projects/tasks could match, "
+    "CALL THIS TOOL with project_id='' and the owner's message: it emits the typed "
+    "needs_manual_target acknowledgement with host-validated task options and New task "
+    "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
+    "use promote_chat_to_task instead. When continuing one settled result (any project; "
+    "the host list is a hint), pass its internal `predecessor_task_id`; pass an empty "
+    "string for fresh work. Returns a visible routing receipt."
+)
+
+# The new root's starting effort: one optional choice shared by both verbs that mint a
+# root from a conversation. Child actors keep their configured profiles (schedule_subagent).
+_ROOT_EFFORT_PARAM = {"type": "string", "enum": list(EFFORT_SCALE), "description": (
+    "Optional: the reasoning effort the NEW task starts on, chosen for this work (it can still "
+    "switch_model later). Omit for the configured Task default. A request: the route may adapt it.")}
+
 
 _SCHEDULE_SUBAGENT_DESCRIPTION = (
     "Schedule a live subagent (a child of Ouroboros). Returns task_id for later retrieval. "
@@ -202,11 +222,7 @@ def get_tools() -> List[ToolEntry]:
                 "seconds": {"type": "integer", "description": "New timeout in seconds (>= 1)"},
             }, "required": ["seconds"]},
         }, _set_tool_timeout),
-        ToolEntry("request_restart", {
-            "name": "request_restart",
-            "description": "Ask supervisor to restart runtime after a reviewed local commit or a non-evolution clean no-op; evolution requires its exact active commit receipt.",
-            "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
-        }, _request_restart),
+        *self_change_tool_entries(),
         ToolEntry("promote_to_stable", {
             "name": "promote_to_stable",
             "description": "Promote ouroboros -> ouroboros-stable. Call when you consider the code stable.",
@@ -228,6 +244,7 @@ def get_tools() -> List[ToolEntry]:
                     "context_requires_self_body_docs": {"type": "boolean", "description": "Set true when this task works on Ouroboros's own code, including a copy in another folder. In Max, this task receives the full development handbook. This applies to this task only; Low/Nano and helpers keep their usual book maps.", "default": False},
                     "source": {"type": "string", "description": "Attach or clone the project's working folder in ONE move: a git URL (https://... or git@host:path — cloned server-side into the projects root; private repos fail typed auth_required) or an existing folder path (validated attach). The folder is registered on the project (provenance + trusted_at) and becomes this task's active workspace. Use for 'help me debug this GitHub repo / this folder' asks.", "default": ""},
                     "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a settled result (any settled status; any project, the host list is a hint; a helper's result is continued with its root named) to continue it. A live root or a pending promote is refused."},
+                    "reasoning_effort": _ROOT_EFFORT_PARAM,
                 },
                 "required": ["objective", "predecessor_task_id"],
             },
@@ -269,24 +286,14 @@ def get_tools() -> List[ToolEntry]:
         }, _list_projects),
         ToolEntry("route_to_project", {
             "name": "route_to_project",
-            "description": (
-                "Route a main-chat message to an EXISTING project so the work continues in that "
-                "project's own context (memory/journal/thread), keeping the main chat free. Use "
-                "when a message clearly belongs to a known project (call list_projects first if "
-                "unsure of the id). If confidence is low or several projects/tasks could match, "
-                "CALL THIS TOOL with project_id='' and the owner's message: it emits the typed "
-                "needs_manual_target acknowledgement with host-validated task options and New task "
-                "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
-                "use promote_chat_to_task instead. When continuing one settled result (any project; "
-                "the host list is a hint), pass its internal `predecessor_task_id`; pass an empty "
-                "string for fresh work. Returns a visible routing receipt."
-            ),
+            "description": _ROUTE_TO_PROJECT_DESCRIPTION,
             "parameters": {"type": "object", "properties": {
                 "project_id": {"type": "string", "default": "", "description": "Target project id (filesystem-clean; see list_projects), or empty to emit typed needs_manual_target."},
                 "message": {"type": "string", "description": "The owner message / work to route into the project."},
                 "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
                 "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a settled result (any settled status; any project, the host list is a hint; a helper's result is continued with its root named) to continue it. A live root or a pending promote is refused."},
                 "candidates": {"type": "array", "items": {"type": "string"}, "description": "Optional, ONLY with project_id='': the task/project ids you consider plausible, in preference order. The typed picker shows them first; ids not in the host-built option list are ignored."},
+                "reasoning_effort": _ROOT_EFFORT_PARAM,
             }, "required": ["message", "predecessor_task_id"]},
         }, _route_to_project),
         ToolEntry("steer_task", {
@@ -494,7 +501,9 @@ from ouroboros.tools.control_routing import (  # noqa: E402, F401 -- intentional
 from ouroboros.tools.control_runtime import (  # noqa: E402, F401 -- intentional public re-exports
     _chat_history,
     _evolution_restart_block_reason,
+    _prepare_self_change,
     _promote_to_stable,
+    self_change_tool_entries,
     _request_deep_self_review,
     _request_restart,
     _finish_task,

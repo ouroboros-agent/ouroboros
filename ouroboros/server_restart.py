@@ -222,12 +222,11 @@ def _stop_owned_daemon_for_new_pin() -> None:
     startup sweep and resumed parents close them as absent (no invented spend).
     """
     from ouroboros.claudexor_daemon import owned_daemon_provisioned, read_owned_gateway
-    from ouroboros.claudexor_runtime import load_runtime_pin
 
     if not owned_daemon_provisioned():
         return
     try:
-        pin = load_runtime_pin()
+        pin = _next_generation_pin()
         if pin is None:
             return
         with read_owned_gateway() as gateway:
@@ -243,6 +242,28 @@ def _stop_owned_daemon_for_new_pin() -> None:
                 "in flight end with this one", serving[0] or "unknown", serving[1][:12] or "unknown",
                 pin.version, pin.build_sha[:12])
     _stop_owned_daemon("Planned restart")
+
+
+def _next_generation_pin():
+    """The engine pin the NEXT generation selects.
+
+    Ordinarily the landed checkout's own tracked pin file. When this restart carries
+    a bound body adoption whose switch changes that file, the next generation boots
+    the candidate commit: its pin is read from that commit
+    (``body_adoption.bound_candidate_file``), through the same validating parser.
+    """
+    import tempfile
+
+    from ouroboros import body_adoption
+    from ouroboros.claudexor_runtime import _PIN_FILENAME, load_runtime_pin
+
+    raw = body_adoption.bound_candidate_file(DATA_DIR, "ouroboros/" + _PIN_FILENAME)
+    if raw is None:
+        return load_runtime_pin()
+    with tempfile.TemporaryDirectory(prefix="ouroboros-next-pin-") as scratch:
+        pin_file = pathlib.Path(scratch) / _PIN_FILENAME
+        pin_file.write_bytes(raw)
+        return load_runtime_pin(pin_file)
 
 
 def _live_running_task_ids(ctx: Any) -> list:

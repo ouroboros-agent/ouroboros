@@ -87,7 +87,8 @@ def _replay(q: Any, predecessor: str, nonce: str, successor: str) -> Optional[Di
                 write_task_result(q.DRIVE_ROOT, successor, stored.get("status") or "scheduled",
                                   continuation_admission=admission, metadata=(row or stored).get("metadata"),
                                   root_task_id=successor, chat_id=binding.get("chat_id"),
-                                  project_id=binding.get("project_id") or "")
+                                  project_id=binding.get("project_id") or "",
+                                  **{k: v for k, v in (row or {}).items() if k == "reasoning_effort" and v})
             if row is not None and row.get("_continuation_prepared"):
                 prepared = row.pop("_continuation_prepared")
                 if q.persist_queue_snapshot(reason="owner_continue_binding_recovered") is not True:
@@ -221,7 +222,14 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
     title = str(result.get("title") or result.get("suggested_name") or result.get("objective") or predecessor)[:80]
     original = sources.get("original") or {}
     origin_ref = original.get("origin_message_ref")
+    from ouroboros.settings_scales import EFFORT_SCALE
+
+    # The same work keeps the effort it was explicitly started on. A root's stored value is
+    # only that explicit choice (dispatch stamps children alone; a switch_model is not
+    # stored), read from the result row its admission wrote even if no worker ever ran.
+    effort = str(result.get("reasoning_effort") or "")
     task: Dict[str, Any] = {
+        **({"reasoning_effort": effort} if effort in EFFORT_SCALE else {}),
         "id": binding["successor_task_id"], "type": "task", "chat_id": binding.get("chat_id"),
         "project_id": str(binding.get("project_id") or ""), "text": text, "objective": text,
         "title": f"Continue: {title}", "suggested_name": f"Continue: {title}",
@@ -451,7 +459,7 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
                 q.DRIVE_ROOT, successor, STATUS_SCHEDULED, continuation_admission=admission,
             chat_id=task.get("chat_id"), project_id=task.get("project_id") or "", title=task["title"],
             suggested_name=task["suggested_name"], root_task_id=successor, metadata=task["metadata"],
-            **({"deadline_at": task["deadline_at"]} if task.get("deadline_at") else {}),
+            **{key: task[key] for key in ("deadline_at", "reasoning_effort") if task.get(key)},
             **({"reason_code": HOLD_CONTINUATION_WRITER,
                 "resource_limit": {"status": "budget_hold", "auto_resume": False, "exact_continuation": False,
                                    **task["_budget_pause_hold"]}} if blockers else {}),

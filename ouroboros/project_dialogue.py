@@ -475,6 +475,7 @@ def append_chat_annotation(
     attachment_manifest: Any = None,
     require_latest_status: Any = None,
     require_latest_token: Any = None,
+    reasoning_effort: str = "",
 ) -> bool:
     """Append one compact UI annotation.
 
@@ -489,6 +490,10 @@ def append_chat_annotation(
     a compare-and-append under the annotations lock: the row is written only
     while the message's CURRENT latest status is in the set — the first-wins
     claim seam of the routing picker (#198). Absent/None keeps plain append.
+
+    ``reasoning_effort`` rides a picker row whose producer chose the explicit
+    start of a New task picked from it (#1539), and a closing row naming the
+    start that root was admitted with; a steered task never wears one.
     """
     message_id = str(client_message_id or "").strip()
     if not message_id:
@@ -521,6 +526,8 @@ def append_chat_annotation(
         row["attachment_manifest"] = [
             dict(item) for item in attachment_manifest if isinstance(item, dict)
         ]
+    if str(reasoning_effort or ""):
+        row["reasoning_effort"] = str(reasoning_effort)[:16]
     path = pathlib.Path(drive_root) / "logs" / _ANNOTATIONS_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = jsonl_append_lock_path(path)

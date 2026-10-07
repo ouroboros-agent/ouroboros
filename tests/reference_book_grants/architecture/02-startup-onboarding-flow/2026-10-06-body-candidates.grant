@@ -1,0 +1,2 @@
+1341
+The pre-import package-init hook is a new node of every entry's startup (#1539): what an armed body adoption does before the first body import, how an interrupted switch resumes, when the boot stops instead of importing a mixed tree, and the managed boot that skips its reset after a switch. The chapter had no text on any of it.

@@ -27,6 +27,7 @@ from ouroboros.server_auth import (
 )
 from ouroboros.server_entrypoint import bound_service_socket, find_free_port, parse_server_args, write_port_file
 from ouroboros.launcher_bootstrap import automatic_launch_allowed
+from ouroboros import body_adoption
 from ouroboros.server_web import NoCacheStaticFiles, make_index_page, resolve_web_dir
 from ouroboros.process_logging import configure_process_logging
 from ouroboros.task_finalization import host_operation_reply_kwargs
@@ -197,6 +198,7 @@ from ouroboros.server_runtime import (
 _supervisor_ready = threading.Event()  # a live generation finished init: the API's `supervisor_ready`
 _supervisor_init_done = threading.Event()  # init reached an outcome (ready OR `_supervisor_error`): boot waiters
 _supervisor_error: Optional[str] = None
+_bootstrap_ok: Optional[bool] = None  # this generation's `_bootstrap_supervisor_repo` outcome; None until it ran
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 _supervisor_thread: Optional[threading.Thread] = None
 _consciousness: Any = None
@@ -254,7 +256,7 @@ def _describe_bg_consciousness_state(requested_enabled: bool | None) -> dict:
 
 def _start_supervisor_if_needed(settings: dict) -> bool:
     """Start the supervisor once when runtime providers become available."""
-    global _supervisor_thread, _supervisor_error
+    global _supervisor_thread, _supervisor_error, _bootstrap_ok
     if not has_startup_ready_provider(settings):
         return False
     if _supervisor_thread and _supervisor_thread.is_alive():
@@ -262,6 +264,7 @@ def _start_supervisor_if_needed(settings: dict) -> bool:
     if _exit_signalled.is_set():
         return False  # the process is exiting: no revival behind the teardown
     _supervisor_error = None
+    _bootstrap_ok = None
     _supervisor_stop.clear()  # in-process revival after a teardown-stopped generation
     _supervisor_ready.clear()  # readiness is THIS generation's: Starting, not a stale Online, until init succeeds
     _supervisor_init_done.clear()
@@ -549,7 +552,9 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     git_ops_module.ensure_repo_present()
     setup_remote_if_configured(settings, log)
 
-    if _launcher_managed_repo_matches():
+    # This tree is inside an adoption transition (landed, returned or still open): never reset it.
+    adoption_boot = body_adoption.holds_checkout(DATA_DIR, REPO_DIR)
+    if _launcher_managed_repo_matches() and not adoption_boot:
         # An in-flight managed-update assisted merge intentionally leaves MERGE_HEAD + the partly
         # resolved merge in the live worktree (over pre_update_sha). Use the NON-destructive
         # rescue_and_block policy so the bootstrap restart does not reset/clean that merge state
@@ -577,7 +582,7 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
                 log.debug("Failed to pause evolution after blocked bootstrap", exc_info=True)
         return ok, msg
 
-    if _LAUNCHER_MANAGED:
+    if _LAUNCHER_MANAGED and not adoption_boot:
         log.warning("Managed marker lacks matching repository identity; skipping destructive bootstrap for %s.", REPO_DIR)
 
     log.info("Local-dev server start detected — skipping bootstrap git reset.")
@@ -649,6 +654,8 @@ def _run_supervisor(settings: dict) -> None:
 
         from supervisor.git_ops import safe_restart
         ok, msg = _bootstrap_supervisor_repo(settings)
+        global _bootstrap_ok
+        _bootstrap_ok = bool(ok)
         if not ok:
             log.error("Supervisor bootstrap failed: %s", msg)
 
@@ -1006,26 +1013,17 @@ def _perform_supervisor_restart(
             return
         expected_sha = str(claim.get("commit_sha") or "")
         try:
-            head_proc = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(ctx.REPO_DIR),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            status_proc = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(ctx.REPO_DIR),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            head_proc, status_proc = (subprocess.run(
+                ["git", *args], cwd=str(ctx.REPO_DIR), check=False, capture_output=True, text=True,
+            ) for args in (("rev-parse", "HEAD"), ("status", "--porcelain")))
             head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
             clean = status_proc.returncode == 0 and not status_proc.stdout.strip()
         except Exception:
             head = ""
             clean = False
-        if not expected_sha or head != expected_sha or not clean:
+        # A candidate commit is claimed BEFORE its switch: the serving checkout is then at the adoption's base.
+        serving_sha = body_adoption.authorized_base(ctx.DRIVE_ROOT, expected_sha, restart_reason) or expected_sha
+        if not expected_sha or head != serving_sha or not clean:
             if st.get("owner_chat_id"):
                 ctx.send_with_budget(
                     int(st["owner_chat_id"]),
@@ -1034,7 +1032,7 @@ def _perform_supervisor_restart(
                     role="system", system_type="restart_notice")
             return
     ok, msg = _safe_restart_serialized(
-        ctx.safe_restart,
+        body_adoption.bind_restart(ctx.safe_restart, ctx.DRIVE_ROOT, restart_reason),
         reason="agent_restart_request",
         unsynced_policy="rescue_and_block",
     )
@@ -1098,9 +1096,12 @@ def _boot_managed_update_tasks() -> None:
         from supervisor.git_ops import compute_managed_update_status
         from supervisor.update_merge import active_update_tx, finalize_managed_update_on_boot
 
-        result = finalize_managed_update_on_boot(
-            supervisor_ready=_wait_for_supervisor_update_finalize()
-        )
+        ready = _wait_for_supervisor_update_finalize()
+        result = finalize_managed_update_on_boot(supervisor_ready=ready)
+        # A failed bootstrap (dependency sync or the import test of this tree) is not a
+        # ready generation even when the supervisor thread survived it: the adoption
+        # of a tree that does not import is returned, not finalized.
+        body_adoption.settle_on_boot(DATA_DIR, REPO_DIR, supervisor_ready=ready and _bootstrap_ok is True)
         stash_note = str(result.get("stash_note") or "")
         if stash_note:
             # Q1=C disclosure contract: a stash restore that conflicted keeps the
@@ -1580,8 +1581,9 @@ def _restart_cleanup_kwargs() -> dict:
 def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
     """Kill child processes, workers, companions, and runtime port holders."""
     begin_owned_stop(DATA_DIR)  # the grace starts here; pending stops are recorded before any wait
+    worker_exits = None  # the pool's own PID census; None until kill_workers ran to its end
     try:
-        from supervisor.workers import kill_workers
+        from supervisor.workers import kill_workers, last_worker_exit_census
         cleanup_kwargs = _restart_cleanup_kwargs()
         if _restart_requested.is_set():
             # A restart that hung past the uvicorn shutdown timeout still reaches
@@ -1595,6 +1597,7 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
             )
         kill_workers(force=True, archive_service_logs=False,
                      **cleanup_kwargs, **_managed_update_pending_kwargs())
+        worker_exits = last_worker_exit_census()
     except Exception:
         pass
     if _restart_requested.is_set():
@@ -1603,7 +1606,7 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
         except Exception:
             log.critical("Planned restart: engine pin check raised; the owned daemon is left serving",
                          exc_info=True)
-    stop_owned_work(DATA_DIR)  # the same one stop: joined until it completes or its deadline
+    owned_stop = stop_owned_work(DATA_DIR)  # the same one stop: joined until it completes or its deadline
     import multiprocessing
     from ouroboros.platform_layer import force_kill_pid, kill_process_on_port
     for child in multiprocessing.active_children():
@@ -1611,12 +1614,13 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
             force_kill_pid(child.pid)
         except (ProcessLookupError, PermissionError):
             pass
-        # Reap the Process object so it does not linger as a zombie / keep
-        # active_children non-empty if the main process exits before it dies.
-        try:
+        try:  # reap it: a zombie would keep active_children non-empty past this exit
             child.join(timeout=2)
         except Exception:
             pass
+    if _restart_requested.is_set():  # only the restart that carried an adoption can arm it; never a wait
+        body_adoption.arm(DATA_DIR, worker_exits=worker_exits, live_children=multiprocessing.active_children(),
+                          owned_stop=owned_stop, owner_restart=_owner_restart_requested.is_set())
     if port_sweep:
         # Sweep the ACTUALLY bound port (find_free_port may have moved off
         # DEFAULT_PORT); the old hardcoded 8765/8766 pair could kill an

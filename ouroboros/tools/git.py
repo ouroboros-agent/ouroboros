@@ -1086,6 +1086,8 @@ def _task_attributed_commit_paths(
     )
 
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    # A bound body candidate is attributed like the serving checkout: ``body_candidate.bind``
+    # appends it to the lineage's baseline, so its candidates resolve on ``ctx.repo_dir`` below.
     if not task_id:
         return paths, None, "", None
     metadata = getattr(ctx, "task_metadata", {})
@@ -1163,6 +1165,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                        scope: str = "", review_reference: Optional[dict] = None,
                        author_disposition: Optional[dict] = None) -> str:
     """Stage, review, and commit files with unified pre-commit review."""
+    from ouroboros import body_candidate  # lazy: the Git tools reach the candidate owner only when committing
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     _reset_commit_review_state(ctx)
     error = prepare_author_commit_request(ctx, review_reference, author_disposition, review_rebuttal)
@@ -1404,8 +1407,9 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             )
             if publication_error:
                 return publication_error
-            push_status = _auto_push(ctx.repo_dir)
+            push_status = _auto_push(ctx.repo_dir) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
         ctx.last_reviewed_commit_sha = commit_sha
+        body_candidate.record_reviewed_commit(ctx, commit_sha)
         if attribution_binding is not None:
             # The task's own commit moved HEAD: open the next attributed-staging
             # epoch so a follow-up commit does not read as ``baseline_stale``.
@@ -1443,7 +1447,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             test_warning_ref[0],
         )
     if not evolution_claim:
-        push_status = _auto_push(ctx.repo_dir)
+        push_status = _auto_push(ctx.repo_dir) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
     return _publish_reviewed_commit(
         ctx, commit_message, commit_sha, tag_info, test_warning_ref[0], paths, push_status,
     )

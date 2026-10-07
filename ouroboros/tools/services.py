@@ -46,6 +46,7 @@ from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import overlay_env, resolve_process_env, service_env, validate_process_env
 from ouroboros.workspace_executor import kill_all_services as executor_kill_all_services
 from ouroboros.workspace_executor import _read_local_service_marker
+from ouroboros.workspace_executor import service_execution_facts as executor_service_execution_facts
 from ouroboros.workspace_executor import service_logs as executor_service_logs
 from ouroboros.workspace_executor import service_status as executor_service_status
 from ouroboros.workspace_executor import start_service as executor_start_service
@@ -455,6 +456,8 @@ def _start_service(
         # Retire the exited host record before a new process can append to its
         # log with a different environment (or switch to an executor backend).
         _stop_service(ctx, name=service_name)
+    from ouroboros import body_candidate
+
     if _executor_can_run_cwd(ctx, workdir):
         try:
             payload = executor_start_service(
@@ -477,6 +480,8 @@ def _start_service(
             return json.dumps(payload, ensure_ascii=False, indent=2)
         except OwnerPauseRefused as exc:
             return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
+        except body_candidate.CandidateRefused:
+            raise
         except Exception as exc:
             text = redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
             if getattr(exc, "process_not_started", False) is True:
@@ -513,6 +518,11 @@ def _start_service(
         if _panic_requested:
             raise RuntimeError(f"Emergency Stop during service spawn: {request_process_tree_kill(proc)}")
 
+    # Inside the bound candidate a failure to isolate refuses the start on either backend
+    # (the registry types CandidateRefused); it never falls back to the serving environment.
+    candidate_env = body_candidate.process_environment(ctx, workdir)
+    service_base_env = candidate_env if candidate_env is not None else _service_env()
+
     log_fh = log_path.open("ab")
     try:
         bootstrap_process_path()
@@ -537,7 +547,7 @@ def _start_service(
             # The attested emergency bundled-node PATH prepend (post-gates
             # node resolver) applies on top of the allowlisted service env;
             # a healthy resolution leaves the env byte-identical.
-            env=overlay_env(apply_env_path_prepend(_service_env(), active_node_resolution(ctx)), env),
+            env=overlay_env(apply_env_path_prepend(service_base_env, active_node_resolution(ctx)), env),
         )
         log_fh.close()
     except OwnerPauseRefused as exc:
@@ -607,6 +617,24 @@ def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
         "log_path": str(record.log_path),
         "ts": utc_now_iso(),
     }
+
+
+def service_execution_facts(service_id: str) -> Dict[str, Any] | None:
+    """One task service's start identity and execution state, for a sleep selector.
+
+    Execution facts only: no readiness refresh, no log read. ``service_id`` is the
+    ``task_id:name`` lookup key a stop/start reuses, so ``started_at`` with the
+    process identity pins ONE start. ``returncode`` is the real exit status where
+    this process holds the child, else ``None``. ``None`` = no record in this
+    process: never started, stopped, or a registry a restart did not carry.
+    """
+    with _LOCK:
+        record = _SERVICES.get(service_id)
+    if record is None:
+        return executor_service_execution_facts(service_id)
+    rc = record.proc.poll()
+    return {"service_id": service_id, "started_at": record.started_at, "pid": record.proc.pid,
+            "pgid": record.pgid, "state": "running" if rc is None else "exited", "returncode": rc}
 
 
 def _service_status(ctx: ToolContext, name: str = "service") -> str:

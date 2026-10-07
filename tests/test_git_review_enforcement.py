@@ -531,9 +531,19 @@ class TestReviewEnforcementModes:
         assert "PREFLIGHT_BLOCKED" in result
         assert "ARCHITECTURE.md" in result
 
-    def test_rename_into_ouroboros_with_architecture_passes(self):
-        """Renaming a .py file into ouroboros/ + staging ARCHITECTURE.md passes check 4."""
+    def test_rename_into_ouroboros_with_architecture_passes(self, monkeypatch):
+        """Renaming a .py file into ouroboros/ + staging ARCHITECTURE.md passes check 4.
+
+        ARCHITECTURE.md is a version carrier: the version-neutral index lane reads
+        the staged carrier to compare its span with HEAD, so the lexical case
+        supplies an index and a HEAD of its own (an unreadable one is honest unavailable evidence).
+        """
+        from ouroboros import commit_admission
+
         review = _get_review_module()
+        show = lambda repo_dir, path: "# Ouroboros v3.24.0\n" if path == "docs/ARCHITECTURE.md" else None  # noqa: E731
+        monkeypatch.setattr(review, "_git_show_staged", show)
+        monkeypatch.setattr(commit_admission, "_head_text", show)  # HEAD's carrier equals the index's
         result = review._preflight_check(
             "move module into ouroboros",
             "D  docs/old_module.py\nA  ouroboros/new_module.py\nM  tests/test_new.py\nM  docs/ARCHITECTURE.md",
@@ -599,9 +609,14 @@ class TestReviewEnforcementModes:
         assert "PREFLIGHT_BLOCKED" in result
         assert "ARCHITECTURE.md" in result
 
-    def test_copied_module_with_architecture_passes(self):
+    def test_copied_module_with_architecture_passes(self, monkeypatch):
         """Copied .py file in ouroboros/ + ARCHITECTURE.md staged → passes."""
+        from ouroboros import commit_admission
+
         review = _get_review_module()
+        show = lambda repo_dir, path: "# Ouroboros v3.24.0\n" if path == "docs/ARCHITECTURE.md" else None  # noqa: E731
+        monkeypatch.setattr(review, "_git_show_staged", show)  # the staged carrier the neutral lane compares
+        monkeypatch.setattr(commit_admission, "_head_text", show)  # ... with HEAD's equal one
         result = review._preflight_check(
             "add copied module",
             "C  ouroboros/new_copy.py\nM  tests/test_new_copy.py\nM  docs/ARCHITECTURE.md",
@@ -632,9 +647,16 @@ class TestReviewEnforcementModes:
         )
         assert result is None
 
-    def test_deleted_architecture_does_not_satisfy_check4(self):
-        """Deleting ARCHITECTURE.md does not count as 'architecture doc staged'."""
+    def test_deleted_architecture_does_not_satisfy_check4(self, monkeypatch):
+        """Deleting ARCHITECTURE.md does not count as 'architecture doc staged'.
+
+        HEAD's file carries no version span here, so the release lane has no carrier
+        move to report and check 4 stays the subject.
+        """
+        from ouroboros import commit_admission
+
         review = _get_review_module()
+        monkeypatch.setattr(commit_admission, "_head_text", lambda repo_dir, path: "# Architecture\n")
         result = review._preflight_check(
             "add new module",
             "A  ouroboros/new_module.py\nM  tests/test_new.py\nD  docs/ARCHITECTURE.md",

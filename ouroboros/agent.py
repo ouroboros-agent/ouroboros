@@ -54,7 +54,7 @@ from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.consciousness_authority import apply_consciousness_authority
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
-from ouroboros import subagent_bootstrap, subagent_runtime
+from ouroboros import body_candidate, subagent_bootstrap, subagent_runtime
 from ouroboros.subagents import (
     CapabilityDelta,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
     SubagentExecutorResolution,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
@@ -598,9 +598,8 @@ class OuroborosAgent:
             if _inherited_deadline:
                 task_metadata["deadline_at"] = _inherited_deadline
         _tc_meta = task.get("task_constraint")
-        _surface_meta = str((_tc_meta.get("surface") if isinstance(_tc_meta, dict) else "") or "")
-        if _surface_meta:
-            task_metadata["write_surface"] = _surface_meta
+        if isinstance(_tc_meta, dict) and _tc_meta.get("surface"):
+            task_metadata["write_surface"] = str(_tc_meta["surface"])
         with self._owner_message_admission_lock:
             self._current_task_metadata = dict(task_metadata)
 
@@ -654,6 +653,7 @@ class OuroborosAgent:
             task_constraint=normalize_task_constraint(task.get("task_constraint")),
             task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
         )
+        body_candidate.restore(ctx)  # a retry, Resume or new worker authors the candidate this lineage owns
         # Existing ToolContext stays the loop's carrier; these process-local
         # references are not serialized state or a new routing authority.
         ctx.owner_message_admission_lock = self._owner_message_admission_lock

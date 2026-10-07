@@ -684,7 +684,8 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # historical_owner_request, plan-spec, task_input, terminal-delivery and view;
 # tool_results also gains acceptance_tool_trajectory. Existing section-7 rows
 # cover these immutable sources; no stale-row or unresolved-path exemption.
-EXPECTED_SCAN_PATHS = 337
+# Own-body candidates add two existing-owner state paths alongside the retained source store.
+EXPECTED_SCAN_PATHS = 339
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts

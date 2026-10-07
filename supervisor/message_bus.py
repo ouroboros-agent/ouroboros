@@ -575,14 +575,13 @@ class LocalChatBridge:
         options: Optional[List[Dict[str, Any]]] = None,
         attachment_manifest: Optional[List[Dict[str, Any]]] = None,
         routing_token: str = "",
-        cause: str = "",
+        cause: str = "", reasoning_effort: str = "",
     ) -> None:
         """Emit a typed routing receipt without creating an assistant bubble.
 
-        Web consumes the WS annotation; non-Web skills receive the same additive
-        typed envelope on their existing outbound subscription.  ``text`` stays
-        empty and ``suppress_bubble`` is explicit, so legacy transports do not
-        invent a human-visible mirror message.
+        Web consumes the WS annotation; non-Web skills receive the same additive typed envelope on
+        their existing outbound subscription.  ``text`` stays empty and ``suppress_bubble`` is
+        explicit, so legacy transports do not invent a human-visible mirror message.
         """
         payload = {
             "type": "message_annotation",
@@ -600,12 +599,13 @@ class LocalChatBridge:
         if project_id and int(project_chat_id) > 0:
             payload.update(project_id=str(project_id), project_chat_id=int(project_chat_id))
         if str(routing_token or ""):
-            # #198: the picker card's click identity; presentation-only frames
-            # without it stay text lines.
+            # #198: the picker card's click identity; presentation-only frames without it stay text lines.
             payload["routing_token"] = str(routing_token)
         if str(cause or ""):
             # Q3=A: the host-owned owner-facing sentence for a refused act.
             payload["cause"] = str(cause)
+        if str(reasoning_effort or ""):  # #1539: the start a New task picked from this card requests
+            payload["reasoning_effort"] = str(reasoning_effort)
         if options is not None:
             payload["options"] = [dict(row) for row in options if isinstance(row, dict)]
         if attachment_manifest is not None:

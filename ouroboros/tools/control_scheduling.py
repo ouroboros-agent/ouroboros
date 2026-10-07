@@ -654,6 +654,15 @@ def _child_workspace(ctx, metadata, params):
     """Bind the parent's observed source before selecting the child's start."""
     workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
     workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
+    from ouroboros import body_candidate
+    from ouroboros.workspace_copies import same_directory
+
+    own_body_copy = str(params.get("write_surface") or "").strip().lower() == "self_worktree"
+    if body_candidate.is_bound(ctx) and (not workspace_root or (own_body_copy and same_directory(
+            workspace_root, body_candidate.serving_repo_dir_for(ctx)))):
+        # The parent authors a body candidate: its child reads and copies THAT, and an
+        # acting child's patch therefore returns into it, never into the serving tree.
+        workspace_root, workspace_mode = str(body_candidate.descriptor(ctx)["path"]), "self_worktree"
     from ouroboros.tool_access_reads import admit_child_start_folder, capture_parent_workspace
     parent_workspace = capture_parent_workspace(ctx)
     workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
@@ -664,12 +673,32 @@ def _child_workspace(ctx, metadata, params):
             if not selected_path.is_absolute() and (not parent_workspace["root"]
                     or parent_workspace.get("availability") == "unavailable"):
                 raise ValueError("relative workspace_root needs an available parent folder; name an absolute readable folder")
-            workspace_root = admit_child_start_folder(ctx,
-                selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path, params)
+            selected_path = selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path
+            if (own_body_copy and body_candidate.is_bound(ctx)
+                    and same_directory(selected_path, body_candidate.serving_repo_dir_for(ctx))):
+                selected_path = Path(body_candidate.descriptor(ctx)["path"])
+            workspace_root = admit_child_start_folder(ctx, selected_path, params)
             workspace_mode = "read_only"
         except (OSError, ValueError, RuntimeError) as exc:
             return workspace_root, workspace_mode, parent_workspace, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}"
     return workspace_root, workspace_mode, parent_workspace, ""
+
+
+def child_copies_serving_body(ctx, params) -> bool:
+    """Whether a self_worktree child scheduled now copies the serving checkout: this
+    selection names it, or names nothing and the supervisor copies the system repository.
+    The body-candidate seam asks before scheduling, so such a child copies the candidate.
+    A named selection is pinned to the checkout it resolved to here: binding moves the
+    parent folder a relative spelling (``../repo``) is read from, not the selected source."""
+    from ouroboros.body_candidate import serving_repo_dir_for
+    from ouroboros.workspace_copies import same_directory
+
+    metadata = getattr(ctx, "task_metadata", None)
+    source, _mode, _parent, error = _child_workspace(ctx, metadata if isinstance(metadata, dict) else {}, params)
+    copies = not error and (not source or same_directory(source, serving_repo_dir_for(ctx)))
+    if copies and str(params.get("workspace_root") or "").strip():
+        params["workspace_root"] = source
+    return copies
 
 
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:

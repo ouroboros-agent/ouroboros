@@ -791,7 +791,8 @@ def _wait_window(
 
 
 def _await_messages(ctx: ToolContext, timeout_sec: int = 0, mode: str = "in_slot", senders: Any = None,
-                    tasks: Any = None, runs: Any = None, wake_at: Any = None, wake_after_sec: Any = None) -> str:
+                    tasks: Any = None, runs: Any = None, wake_at: Any = None, wake_after_sec: Any = None,
+                    services: Any = None) -> str:
     """Hold this task's worker slot until an unread mailbox entry exists or the
     window elapses. Delivers nothing: the round-top drain owns delivery and
     acknowledgement, exactly as after a wait_task early return. An owner Stop
@@ -816,8 +817,8 @@ def _await_messages(ctx: ToolContext, timeout_sec: int = 0, mode: str = "in_slot
     from ouroboros.loop_transport import _owner_signal_pending
     from ouroboros.owner_mailbox import OwnerMailboxPeek
 
-    if mode != "in_slot" or senders or tasks or runs or wake_at or wake_after_sec:
-        return _await_as_sleep(ctx, mode, senders=senders, tasks=tasks, runs=runs,
+    if mode != "in_slot" or senders or tasks or runs or services or wake_at or wake_after_sec:
+        return _await_as_sleep(ctx, mode, senders=senders, tasks=tasks, runs=runs, services=services,
                                wake_at=wake_at, wake_after_sec=wake_after_sec)
     try:
         requested = int(timeout_sec)
@@ -872,7 +873,7 @@ def _await_as_sleep(ctx: ToolContext, mode: str, **chosen: Any) -> str:
 
     try:
         if mode not in (model_sleep.MODE_WARM, model_sleep.MODE_COLD):
-            raise ValueError("senders/tasks/runs/wake_at/wake_after_sec select a sleep: give mode warm or cold")
+            raise ValueError("senders/tasks/runs/services/wake_at/wake_after_sec select a sleep: give mode warm or cold")
         if not callable(getattr(ctx, "owner_wait_callback", None)):
             raise ValueError("this task has no continuation owner to sleep under")
         outcome = model_sleep.request_sleep(ctx, model_sleep.selectors(ctx, **chosen), mode)
@@ -905,7 +906,9 @@ def await_messages_entry() -> ToolEntry:
             "result says when the applied prompt-cache horizon elapsed since the last model response. "
             "mode=warm or mode=cold instead SLEEPS without holding your model slot, until what you select: "
             "mail from `senders`, the terminal of `tasks` you can read, the terminal of delegated `runs` you "
-            "own, and/or `wake_at`/`wake_after_sec`; with nothing selected any addressed mail wakes you. The "
+            "own, the exit of your own `services` (warm only: the start each has now; a replaced, stopped "
+            "or lost one wakes you as unknown, never as success), and/or `wake_at`/`wake_after_sec`; with "
+            "nothing selected any addressed mail wakes you. The "
             "owner's messages and controls always wake you; unselected mail waits unread. Warm keeps your "
             "process and browser (a pooled slot is lent meanwhile); you choose which fits. A source that is "
             "already ready answers at once. Sleep does not count as execution time; an explicit deadline "
@@ -923,6 +926,8 @@ def await_messages_entry() -> ToolEntry:
                       "description": "Sleep: task ids whose terminal (any settled status) wakes you."},
             "runs": {"type": "array", "items": {"type": "string"},
                      "description": "Sleep: your delegated run ids whose terminal wakes you."},
+            "services": {"type": "array", "items": {"type": "string"},
+                         "description": "Warm sleep: names of your own running services whose exit wakes you."},
             "wake_at": {"type": "string", "description": "Sleep: an absolute ISO-8601 wake time (with timezone)."},
             "wake_after_sec": {"type": "integer", "description": "Sleep: wake after this many seconds."},
         }},

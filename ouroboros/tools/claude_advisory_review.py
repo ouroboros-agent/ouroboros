@@ -1003,8 +1003,12 @@ def _advisory_pre_sdk_gate(
             ),
         })
 
+    from ouroboros import body_candidate
+    # A commit prepared in a body candidate may take P9's version-neutral form; the serving checkout
+    # keeps the numbered release (the prepared index lane is the contribution path and allows it).
     release_preflight_err = (_release_metadata_preflight(repo_dir, commit_message, paths, source="index")
-                             if prepared else _release_metadata_preflight(repo_dir, commit_message, paths))
+                             if prepared else _release_metadata_preflight(
+                                 repo_dir, commit_message, paths, neutral_allowed=body_candidate.is_bound(ctx)))
     if release_preflight_err:
         from ouroboros.commit_admission import preflight_evidence_unavailable
         unavailable = preflight_evidence_unavailable(release_preflight_err)
@@ -1109,7 +1113,10 @@ def _handle_advisory_pre_review(
         if source not in ("worktree", "index"):
             return _json_response({"status": "error", "failure_code": "PREFLIGHT_SOURCE_REQUIRED",
                                    "message": "deterministic_only requires explicit source=worktree or source=index."})
-        return _json_response({**release_metadata_diagnostics(ctx.repo_dir, paths, source=source),
+        from ouroboros import body_candidate
+        return _json_response({**release_metadata_diagnostics(
+                                   ctx.repo_dir, paths, source=source,
+                                   neutral_allowed=True if source == "index" else body_candidate.is_bound(ctx)),
                                "deterministic_only": True, "review_freshness": False})
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     repo_dir = pathlib.Path(ctx.repo_dir)

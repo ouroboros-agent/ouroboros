@@ -15,6 +15,11 @@ from ouroboros.tools.git import _acquire_git_lock, _release_git_lock, _sanitize_
 log = logging.getLogger(__name__)
 
 _PR_BRANCH_PREFIX = "integrate/pr-"
+# The verbs that check out, commit or stage in the body's own worktree: an ordinary
+# author runs them in its body candidate (``body_candidate.authoring_seam``).
+BODY_WORKTREE_TOOLS = frozenset({
+    "create_integration_branch", "cherry_pick_pr_commits", "stage_adaptations", "stage_pr_merge",
+})
 
 
 def _g(args: List[str], cwd: pathlib.Path,
@@ -144,10 +149,12 @@ def _fetch_pr_ref(ctx: ToolContext, pr_number: int, remote: str = "origin") -> s
 def _create_integration_branch(
     ctx: ToolContext,
     pr_number: int,
-    base_branch: str = "ouroboros",
+    base_branch: str = "",
 ) -> str:
     if pr_number <= 0:
         return "⚠️ PR_BRANCH_ERROR: pr_number must be a positive integer."
+    # The body's working branch: ouroboros, or the bound candidate's branch.
+    base_branch = str(base_branch or getattr(ctx, "branch_dev", "") or "ouroboros").strip()
     err = _validate_git_ref_arg(base_branch, "base_branch")
     if err:
         return f"⚠️ PR_BRANCH_ERROR: {err}"
@@ -447,7 +454,7 @@ def _stage_adaptations(ctx: ToolContext) -> str:
         + "\n".join(f"  {f}" for f in files[:20])
         + (f"\n  ... and {len(files)-20} more" if len(files) > 20 else "")
         + f"\n\nNext: stage_pr_merge(branch='{current_branch}') — do NOT commit here;\n"
-          f"  adaptation changes land in the merge commit on ouroboros."
+          f"  adaptation changes land in the merge commit on {ctx.branch_dev}."
     )
 
 
@@ -624,14 +631,14 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("create_integration_branch", {
             "name": "create_integration_branch",
             "description": (
-                "Create a fresh integration branch (integrate/pr-N) from ouroboros. "
+                "Create a fresh integration branch (integrate/pr-N) from the body's working branch. "
                 "External cherry-picked commits and Ouroboros adaptation changes are "
                 "kept separate here before merging."
             ),
             "parameters": {"type": "object", "properties": {
                 "pr_number": {"type": "integer", "description": "GitHub PR number"},
-                "base_branch": {"type": "string", "default": "ouroboros",
-                                "description": "Branch to create from"},
+                "base_branch": {"type": "string", "description": (
+                    "Branch to create from (default: ouroboros, or this task's candidate branch)")},
             }, "required": ["pr_number"]},
         }, _create_integration_branch, is_code_tool=True, mutates_worktree=True),
 
@@ -694,10 +701,10 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("stage_pr_merge", {
             "name": "stage_pr_merge",
             "description": (
-                "Stage a no-fast-forward merge of an integration branch into ouroboros "
+                "Stage a no-fast-forward merge of an integration branch into the body's working branch "
                 "WITHOUT committing (git merge --no-ff --no-commit). Sets MERGE_HEAD so "
                 "commit_reviewed creates a proper merge commit with both parents. Target is "
-                "always ouroboros (commit_reviewed always checks out branch_dev before "
+                "branch_dev (the bound candidate branch during self-development; commit_reviewed checks it out before "
                 "committing — any other target would lose MERGE_HEAD). The "
                 "integration-branch history (with original author commits) is permanently "
                 "linked. Finalize via preflight_review + commit_reviewed."

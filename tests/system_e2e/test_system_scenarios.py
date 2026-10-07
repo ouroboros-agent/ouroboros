@@ -661,6 +661,8 @@ def test_s2_commit_reviewed_triad_and_scope_pass_on_doc_only_diff(e2e_clone, tmp
         )
         server = start_server(e2e_clone, root, settings)
         try:
+            serving_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(e2e_clone),
+                                          check=True, capture_output=True, text=True).stdout.strip()
             task_id = submit_running(
                 server,
                 "Write the smoke note and land it through commit_reviewed, then finish.",
@@ -677,18 +679,27 @@ def test_s2_commit_reviewed_triad_and_scope_pass_on_doc_only_diff(e2e_clone, tmp
             assert "triad_review" in kinds, kinds
             assert "scope_review" in kinds, kinds
 
-            # The commit LANDED in the isolated clone — under blocking enforcement this
-            # is only reachable through PASS verdicts from both organs.
+            # The commit LANDED on the root's body candidate (#1539: an ordinary author
+            # never commits the checkout the server imports) — under blocking enforcement
+            # only through PASS verdicts from both organs — and is recorded as reviewed
+            # there; the serving clone did not move.
+            rows = [row for path in sorted(server.data_root.rglob("state/subagent_worktrees.json"))
+                    for row in json.loads(path.read_text())["worktrees"] if row.get("kind") == "body_candidate"]
+            assert len(rows) == 1 and rows[0]["task_id"] == task_id, rows
             log_output = subprocess.run(
-                ["git", "log", "-n", "5", "--format=%s"],
+                ["git", "log", "-n", "5", "--format=%H %s", rows[0]["branch"]],
                 cwd=str(e2e_clone), check=True, capture_output=True, text=True,
             ).stdout
-            assert S2_COMMIT_MESSAGE in log_output, log_output
+            tip, subject = log_output.splitlines()[0].split(" ", 1)
+            assert subject == S2_COMMIT_MESSAGE and tip in rows[0]["reviewed_commits"], (log_output, rows)
             committed_doc = subprocess.run(
-                ["git", "show", f"HEAD:{S2_DOC_PATH}"],
+                ["git", "show", f"{tip}:{S2_DOC_PATH}"],
                 cwd=str(e2e_clone), check=False, capture_output=True, text=True,
             )
             assert committed_doc.returncode == 0, "smoke doc is not in the committed tree"
+            serving = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(e2e_clone),
+                                     check=True, capture_output=True, text=True).stdout.strip()
+            assert serving == serving_head and not (e2e_clone / S2_DOC_PATH).exists()
 
             # Durable review evidence lives in the task's FORKED drive root
             # (state/headless_tasks/<id>/data — headless-task isolation on this tree):

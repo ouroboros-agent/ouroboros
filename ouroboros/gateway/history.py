@@ -172,7 +172,7 @@ def _user_annotation(
         key: annotation.get(key)
         for key in (
             "action", "target", "target_label", "status", "detail", "cause", "options",
-            "attachment_manifest", "routing_token", "project_id", "project_chat_id",
+            "attachment_manifest", "routing_token", "project_id", "project_chat_id", "reasoning_effort",
         )
         if key in annotation
     }

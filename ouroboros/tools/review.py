@@ -620,7 +620,7 @@ def _preflight_check(commit_message: str, staged_files: str,
     from ouroboros.commit_admission import release_metadata_diagnostics, format_release_metadata_preflight
     release_error = format_release_metadata_preflight(release_metadata_diagnostics(
         repo_dir, sorted(active_staged), source="index",
-        read_text=lambda path: _git_show_staged(repo_dir, path),
+        read_text=lambda path: _git_show_staged(repo_dir, path), deleted=sorted(staged_set - active_staged),
     ))
     if release_error:
         return release_error

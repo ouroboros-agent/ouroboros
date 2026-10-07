@@ -753,7 +753,16 @@ trapping Ouroboros with broken code it cannot revert.
 External contribution commits proposed to the official repository are
 version-neutral: they leave every release carrier byte-identical, and
 the maintainer's integration commit performs the single version
-increment for the landed change. Forensic recovery snapshots — commits
+increment for the landed change. A reviewed contribution commit prepared
+in a body candidate may also be deliberately adopted by the local
+installation as it is: there it takes no version increment and no tag,
+the installation identifies itself by commit, and a numbered local
+release remains the explicit alternative. This is not a waiver of review
+(P3), and a constitutional change is not adopted this way outside Cyber
+Pro — it takes effect only through an explicit reviewed release
+(amendment proposed in the isolated self-development contribution;
+effective through the standard reviewed release that lands it).
+Forensic recovery snapshots — commits
 that exist only to preserve an interrupted work state on a dedicated
 recovery ref — are rescue artifacts, not releases: no version bump, no
 tag, never a published line (amendment proposed in the update-flow

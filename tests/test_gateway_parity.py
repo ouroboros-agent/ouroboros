@@ -47,6 +47,7 @@ from ouroboros.gateway.contracts import (
     SkillPublishPreflightResponse,
     StateResponse,
     TaskCostBreakdown,
+    TaskCreateRequest,
     TaskCreateResponse,
     TaskDetailResponse,
     TaskEvent,
@@ -253,7 +254,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound,
-                UploadResponse, TaskCreateResponse, AttachmentManifestEntry,
+                # #1539: the optional root starting effort joins the request mirror field by field.
+                UploadResponse, TaskCreateRequest, TaskCreateResponse, AttachmentManifestEntry,
                 DecisionRequest, DecisionResponse, LinkAction, LinksOutbound, QuizOption, QuizOutbound, QuizStateOutbound,
                 # widgets-lifecycle W1b: the owner's per-card start-mode override is checked field by field.
                 UiPreferencesResponse, DesktopAutostartResponse,
@@ -477,6 +479,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "project_chat_id",
         "routing_token",
         "cause",
+        "reasoning_effort",
         "status",
         "options",
         "attachment_manifest",

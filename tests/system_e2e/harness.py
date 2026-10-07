@@ -140,6 +140,10 @@ SCENARIOS = {
     # (the stub answers per seat by the wire model id).
     "S34": ("plan review addressed answer, BLOCKING at the shipped cap: t1 objects below quorum -> $0 reject -> the identical envelope with the answer re-asks t1 ALONE (t2/t3 kept at $0 as replayed rows) over the barrier route -> t1 retires -> GREEN closed, two paid cycles, the task completes under blocking", LANE_MOCK),
     "S35": ("plan review no-need path, BLOCKING: t1 asks the author (need_evidence), t2 leaves a note; a $0 accept closes the wave GREEN with no second panel (three reviewer calls, one paid cycle) and the task completes under blocking", LANE_MOCK),
+    # #1539 own-body candidates: the smallest real consumer of the authoring seam.
+    "S36": ("own-body candidate on a real server: the root's first body write in the installation's spelling binds a candidate, later repo/… and absolute serving spellings reach the same candidate files, the serving clone is byte-identical, a refused resume is the typed CANDIDATE_MISSING in the tool log, and a process in the candidate sees its isolated data root", LANE_MOCK),
+    "S37": ("restart-bound adoption on one real server: a reviewed candidate commit, request_restart(adopt_commit) arms on the stop evidence, the in-place re-exec switches the clean serving checkout before its imports, generation B settles it adopted and verifies the restart on the serving SHA", LANE_MOCK),
+    "S38": ("evolution crash between the candidate commit and its receipts: the supervisor's cycle commits in its candidate under blocking review, the tree is SIGKILLed and the post-commit receipts removed; a fresh boot recovers the exact commit and its reviewed provenance at worker boot and does not absorb it (the serving checkout never held it)", LANE_MOCK),
 }
 
 MOCK_SLUG = "openai-compatible::mock-model"
@@ -1227,6 +1231,8 @@ def write_settings_file(settings_path: pathlib.Path, settings: dict) -> None:
 
 def start_server(clone, root, settings: dict, *, ready_timeout: float = 300) -> KeylessIsolatedServer:
     assert_settings_keyless(settings)
+    # A body write prepares a candidate checkout under this root (#1539): keep it in the scenario.
+    settings = {"OUROBOROS_SUBAGENT_WORKTREE_ROOT": str(pathlib.Path(root) / "worktrees"), **settings}
     data_root = pathlib.Path(root) / "data"
     data_root.mkdir(parents=True, exist_ok=True)
     settings_path = data_root / "settings.json"

@@ -459,6 +459,7 @@ def ensure_control_task_result(task_id: str) -> Dict[str, Any]:
             "origin_message_text", "origin_message_ref", "objective", "title", "suggested_name",
             "original_task_id", "timeout_retry_from", "deadline_at", "root_cost_ceiling_usd",
             "billing_group", "task_constraint", "objective_author", "owner_corpus", "task_group_id", "task_group",
+            "reasoning_effort",
         ) if key in task}
         fields["root_task_id"] = resolve_task_lineage(task_id, **{
             key: task.get(key) for key in ("metadata", "root_task_id", "parent_task_id", "delegation_role",
@@ -744,7 +745,7 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         detail = "Evolution control is unknown: runtime state is unavailable or recovering from a backup."
     elif restart_blocked:
         status = "waiting_for_restart_verify"
-        detail = "Waiting for restart verification before the next absorbed evolution cycle."
+        detail = str(active_tx.get("restart_guidance") or "Waiting for restart verification before the next absorbed evolution cycle.")
     elif isinstance(running_task, dict):
         status = "running"
         detail = "Evolution task is running now."

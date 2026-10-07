@@ -156,6 +156,15 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "use an authority permitted by the task contract",
         ),
+        # ``body_candidate.CandidateRefused``: the task's own-body candidate could not be
+        # prepared, resumed or isolated; nothing was changed and no process started.
+        **{code: _code_spec("blocked", "blocked", "warning", "inspect or repair the retained body candidate")
+           for code in (
+            "CANDIDATE_UNAVAILABLE", "CANDIDATE_PATH_OCCUPIED", "CANDIDATE_MISSING",
+            "CANDIDATE_OWNER_LIVE", "CANDIDATE_OWNER_PROCESSES_LIVE", "CANDIDATE_OWNER_CHANGED",
+            "CANDIDATE_NOT_APPLICABLE", "CANDIDATE_ALREADY_OWNED", "CANDIDATE_OWNER_UNKNOWN",
+            "CANDIDATE_ENVIRONMENT_UNAVAILABLE",
+        )},
         "CORE_PROTECTION_BLOCKED": _code_spec(
             "blocked",
             "protected_blocked",

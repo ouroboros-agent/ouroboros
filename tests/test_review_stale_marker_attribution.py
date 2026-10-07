@@ -302,6 +302,11 @@ def test_registered_writer_persists_identity_without_changing_shared_freshness(t
     assert _check_advisory_freshness(reader, "commit") is None
     tools = ToolRegistry(repo_dir=shared, drive_root=drive)
     tools._ctx.task_id = "task-a"
+    # Exercise intentional shared-body edits via the supported Cyber override;
+    # ordinary self-authoring now isolates them in a task-owned candidate.
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+    assert "writes the serving checkout directly" in tools.execute(
+        "prepare_self_change", {"in_place": True})
     if writer != "builtin":
         # run_command is a registered mutates_worktree producer. write_file
         # owns its invalidation inside its handler, so replacing that handler
@@ -326,6 +331,9 @@ def test_registered_writer_persists_identity_without_changing_shared_freshness(t
             "cwd": "system_repo", "cmd": ["/usr/bin/printf", "x = 2\n"]}))
     assert (result.status == "ok") is (writer != "generic_error"), result.text
     assert target.read_text(encoding="utf-8") == "x = 2\n"
+    # Read the shared freshness evidence under ordinary blocking enforcement;
+    # the Cyber writer's exception does not erase that evidence.
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     state = load_state(drive)
     assert state.last_stale_task_id == "task-a"
     assert state.advisory_runs[0].status == "stale"

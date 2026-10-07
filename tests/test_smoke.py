@@ -99,7 +99,7 @@ def test_tool_set_matches(registry):
 EXPECTED_TOOLS = [
     "browse_page", "browser_action",
     "preflight_review", "review_status",
-    "compact_context", "set_tool_timeout", "request_restart",
+    "compact_context", "set_tool_timeout", "request_restart", "prepare_self_change",
     "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
     "configure_presence", "initiate_presence",
     "integrate_subagent_patch", "compare_subagent_patches",

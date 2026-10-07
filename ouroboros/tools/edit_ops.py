@@ -477,6 +477,7 @@ _PATCH_END = "*** End Patch"
 _UPDATE_HDR = "*** Update File:"
 _ADD_HDR = "*** Add File:"
 _DELETE_HDR = "*** Delete File:"
+_PATCH_HEADERS = {_UPDATE_HDR: "update", _ADD_HDR: "add", _DELETE_HDR: "delete"}
 
 
 @dataclass
@@ -516,16 +517,9 @@ def _parse_patch(patch: str) -> Tuple[List[_FileOp], str]:
         if directive == _strip_directive_tail(_PATCH_END) and raw.lstrip().startswith("***"):
             seen_end = True
             continue
-        if raw.startswith(_UPDATE_HDR):
-            current = _FileOp("update", _strip_directive_tail(raw[len(_UPDATE_HDR):]))
-            ops.append(current)
-            continue
-        if raw.startswith(_ADD_HDR):
-            current = _FileOp("add", _strip_directive_tail(raw[len(_ADD_HDR):]))
-            ops.append(current)
-            continue
-        if raw.startswith(_DELETE_HDR):
-            current = _FileOp("delete", _strip_directive_tail(raw[len(_DELETE_HDR):]))
+        header = next((h for h in _PATCH_HEADERS if raw.startswith(h)), None)
+        if header is not None:
+            current = _FileOp(_PATCH_HEADERS[header], _strip_directive_tail(raw[len(header):]))
             ops.append(current)
             continue
         if raw.startswith("***"):
@@ -592,6 +586,21 @@ def patch_target_paths(patch: str) -> List[str]:
     if err:
         return []
     return [op.path for op in ops if op.path]
+
+
+def normalize_patch_paths(patch: str, normalize) -> str:
+    """Rewrite valid file directives only; guards and handler consume the same payload."""
+    ops, error = _parse_patch(patch)
+    if error:
+        return patch
+    paths = iter(normalize(op.path) for op in ops)
+    lines = patch.splitlines(keepends=True)
+    for index, raw in enumerate(lines):
+        header = next((h for h in _PATCH_HEADERS if raw.startswith(h)), None)
+        if header is not None:
+            ending = "\r\n" if raw.endswith("\r\n") else "\n" if raw.endswith("\n") else ""
+            lines[index] = f"{header} {next(paths)}{ending}"
+    return "".join(lines)
 
 
 def _find_sequence(

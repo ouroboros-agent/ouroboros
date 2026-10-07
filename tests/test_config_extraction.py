@@ -35,6 +35,8 @@ _ADDED_OWNERS = {
     "USAGE_DISPLAY_LOCK_TIMEOUT_SEC": runtime_limits,
     "IMMEDIATE_SETTINGS": settings_scales,
     "RESTART_REQUIRED_SETTINGS": settings_scales,
+    # An explicit root starting effort is validated against the effort scale it names.
+    "requested_effort": settings_scales,
     "get_finalization_grace_sec": runtime_limits,
     "PROMOTE_CONFIRM_WAIT_SEC": runtime_limits,
     "get_promote_confirm_wait_sec": runtime_limits,

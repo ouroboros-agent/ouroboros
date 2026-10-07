@@ -617,6 +617,7 @@ def _git_protected_roots(self) -> list:
     git_protected_roots = [
         pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir),
         pathlib.Path(self._ctx.repo_dir),
+        pathlib.Path(getattr(self._ctx, "serving_repo_dir", None) or self._ctx.repo_dir),
         pathlib.Path(self._ctx.drive_root),
     ]
     _meta = getattr(self._ctx, "task_metadata", {})

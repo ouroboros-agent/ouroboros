@@ -68,7 +68,9 @@ def test_push_to_remote_push_tags_compatibility(monkeypatch):
     assert ok is True
     assert commands == [
         ["push", "-u", "origin", "feature"],
-        ["push", "origin", "--tags"],
+        # Only annotated tags reachable from the pushed branch: a release tag on an
+        # unadopted body candidate (shared tag namespace) must not leak (#1539).
+        ["push", "--follow-tags", "origin", "feature"],
     ]
 
 

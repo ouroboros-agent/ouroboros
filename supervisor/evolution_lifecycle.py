@@ -759,18 +759,18 @@ def adopt_evolution_commit_intent(
         return ""
     head = str(head_sha or "").strip() or "HEAD"
     try:
+        from ouroboros.body_candidate import intent_capture  # boot verifies its serving SHA; else the candidate
         from supervisor import git_ops
 
-        rc_tree, actual_tree, _ = git_ops.git_capture(["git", "rev-parse", f"{head}^{{tree}}"])
-        rc_parents, parent_line, _ = git_ops.git_capture(
-            ["git", "rev-list", "--parents", "-n", "1", head]
-        )
+        capture, recover = intent_capture("" if head_sha else str(tx.get("task_id") or ""), git_ops.git_capture)
+        rc_tree, actual_tree, _ = capture(["git", "rev-parse", f"{head}^{{tree}}"])
+        rc_parents, parent_line, _ = capture(["git", "rev-list", "--parents", "-n", "1", head])
     except Exception:
         return ""
     fields = parent_line.strip().split() if rc_parents == 0 else []
     if rc_tree != 0 or not fields or actual_tree.strip() != tree_sha or fields[1:] != parents:
         return ""
-    commit_sha, now = fields[0], utc_now_iso()
+    commit_sha, now = recover(fields[0]), utc_now_iso()
     tx.update({
         "commit_sha": commit_sha,
         "commit_receipt": _build_commit_receipt(
@@ -971,11 +971,9 @@ def update_evolution_transaction(task_id: str, **updates: Any) -> bool:
 
 
 def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
-    """Restore a no-op/abandoned admitted cycle's base, preserving dirty/ahead work
-    in recorded stash/local refs. Never reset a positively unadmitted cycle or
-    another live writer; unknown base, live tests and the cleanup kill-switch skip
-    cleanup with a reason. Never raises (OUROBOROS_EVOLUTION_CYCLE_CLEANUP=false).
-    """
+    """Restore an ended cycle's base, preserving dirty/ahead work in stash/local refs.
+    Unadmitted cycles, other writers, unknown base, live tests or disabled cleanup
+    retain their reason. Never raises (OUROBOROS_EVOLUTION_CYCLE_CLEANUP=false)."""
     if str(os.environ.get("OUROBOROS_EVOLUTION_CYCLE_CLEANUP", "true") or "true").lower() in {"0", "false", "no", "off"}:
         tx["cleanup_status"] = "disabled"
         return
@@ -986,6 +984,12 @@ def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
     if not base_head:
         tx["cleanup_status"] = "skipped_no_base"
         return
+    from ouroboros import body_adoption, body_candidate
+    candidate = body_candidate.find(str(task_id))
+    if candidate is not None:                         # its work is in the retained candidate;
+        tx["cleanup_status"] = "candidate_retained"    # serving dirt belongs to someone else
+        return body_adoption.abandon(_evolution_campaign_path().parents[1], "evolution_cycle_ended",
+                                     task_id=str(task_id), candidate_id=str(candidate["candidate_id"]))
     update_lock_fh = None
     release_update_lock = None
     try:
@@ -1010,9 +1014,7 @@ def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
         if os.environ.get("OUROBOROS_ALLOW_LIVE_REPO_TESTS") != "1":
             import sys as _sys
             try:
-                live_repo = git_ops.REPO_DIR.resolve(strict=False) == (
-                    pathlib.Path.home() / "Ouroboros" / "repo"
-                ).resolve(strict=False)
+                live_repo = git_ops.REPO_DIR.resolve(strict=False) == (pathlib.Path.home() / "Ouroboros" / "repo").resolve(strict=False)
             except OSError:
                 live_repo = False
             if live_repo and ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in _sys.modules):
@@ -1579,8 +1581,10 @@ def request_evolution_restart(drive_root: pathlib.Path, tx: Dict[str, Any], log:
             drive_root, expected_sha=commit_sha, expected_branch=str(tx.get("base_branch") or ""),
             reason=restart_reason, evolution_claim=claim,
         )
-        auto_restart = str(os.environ.get("OUROBOROS_EVOLUTION_AUTO_RESTART", "true") or "true").lower()
-        if auto_restart in {"0", "false", "no", "off"}:
+        from ouroboros import body_adoption
+        if not body_adoption.authorize_for_task(drive_root, claim["task_id"], commit_sha, restart_reason):
+            return  # a candidate commit with no authorized adoption cannot be restarted into
+        if str(os.environ.get("OUROBOROS_EVOLUTION_AUTO_RESTART", "true") or "true").lower() in {"0", "false", "no", "off"}:
             if log is not None:
                 log.info("Automatic evolution restart is off; the restart-verify marker for %s awaits "
                          "a manual restart", commit_sha[:12])

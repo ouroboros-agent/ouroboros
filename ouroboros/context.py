@@ -554,6 +554,11 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         log.debug("Failed to inject answer_protocol rule", exc_info=True)
     if not declared:
         runtime_data["official_update"] = official_update_projection(git_sha)
+        from ouroboros import body_candidate
+
+        # Absent when none exists, so an ordinary Runtime block stays byte-identical.
+        if candidates := body_candidate.context_fact(str(task.get("root_task_id") or task.get("id") or "")):
+            runtime_data["body_candidates"] = candidates
     out = "## Runtime context\n\n" + json.dumps(runtime_data, ensure_ascii=False, indent=2)
     if declared:
         return out

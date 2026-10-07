@@ -143,6 +143,9 @@ TOOL_POLICY: Dict[str, str] = {
     "discard_child_result": POLICY_SKIP,
     "override_delegation_constraint": POLICY_SKIP,
     "request_restart": POLICY_SKIP,
+    # Provisions (or rebinds) this task's own body candidate under the isolated worktree
+    # root: no serving-tree write, no external effect; the mode gates live in the handler.
+    "prepare_self_change": POLICY_SKIP,
     "request_deep_self_review": POLICY_SKIP,
     "set_tool_timeout": POLICY_SKIP,
     "toggle_evolution": POLICY_SKIP,

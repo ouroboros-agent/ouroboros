@@ -477,6 +477,9 @@ D20 = "Presence"
 "ouroboros/subagent_work_order.py" = "D07"
 "ouroboros/subagent_worktrees.py" = "D07"
 "ouroboros/workspace_copies.py" = "D07"
+"ouroboros/body_candidate.py" = "D07"  # own-body authoring candidate: one more kind of task-owned isolated copy
+"ouroboros/body_adoption.py" = "D10"  # restart-bound adoption of one exact candidate commit (authorize/arm/finalize)
+"ouroboros/body_switch.py" = "D10"  # the captured stdlib helper that moves an armed adoption into the checkout
 "ouroboros/delegate_directory.py" = "D07"
 "ouroboros/subagents.py" = "D07"
 "ouroboros/subagent_route_health.py" = "D07"
@@ -975,6 +978,7 @@ lazy_only = [
   "D09->D15",
   "D09->D17",
   "D10->D01",
+  "D10->D07",
   "D10->D09",
   "D10->D11",
   "D10->D14",

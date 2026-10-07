@@ -461,10 +461,9 @@ class ExtensionLifecycleOutbound(TypedDict):
 
 
 class ProjectsChangedOutbound(TypedDict):
-    """Outbound notice that the project registry changed server-side (e.g. the
-    agent's ``promote_chat_to_task`` created/bound a project). The client refreshes
-    its project nav + WS-fan-out ``projectChatIds`` on receipt; ``chat_id`` lets it
-    learn the new project thread immediately, before the /api/state round-trip."""
+    """Outbound notice that the project registry changed server-side (e.g. the agent's ``promote_chat_to_task``
+    created/bound a project). The client refreshes its project nav + WS-fan-out ``projectChatIds`` on receipt;
+    ``chat_id`` lets it learn the new project thread immediately, before the /api/state round-trip."""
 
     type: Literal["projects_changed"]
     project_id: NotRequired[str]
@@ -491,6 +490,7 @@ class MessageAnnotationOutbound(TypedDict):
     # (routing:{client_message_id}:{routing_token}) from it; a frame without it renders text, never a card.
     routing_token: NotRequired[str]
     cause: NotRequired[str]
+    reasoning_effort: NotRequired[str]  # #1539: the explicit start a New task picked from this card requests
     ts: NotRequired[str]
 
 
@@ -1044,9 +1044,8 @@ class TaskCreateRequest(_TaskCreateRequestRequired, total=False):
     memory_mode: str
     project_id: str
     attachments: list[Dict[str, Any]]
-    # Partial staging is the default (В25c, capinv-447): omitted/true stages
-    # the good attachments and discloses rejected rows; explicit false keeps
-    # the old atomic all-or-nothing admission.
+    # Partial staging is the default (В25c, capinv-447): omitted/true stages the good
+    # attachments and discloses rejected rows; explicit false keeps the old atomic admission.
     allow_partial_attachments: bool
     acceptance_claims: list[Dict[str, Any]]
     # v6.60.0: "" | "final_answer_line" — adapter-declared machine-extractable answer
@@ -1064,6 +1063,7 @@ class TaskCreateRequest(_TaskCreateRequestRequired, total=False):
     expected_output: str
     constraints: str
     context_requires_self_body_docs: bool
+    reasoning_effort: str  # optional explicit starting effort: an EFFORT_SCALE tier, checked by the handler
     actor_id: str
     source: str
     metadata: Dict[str, Any]

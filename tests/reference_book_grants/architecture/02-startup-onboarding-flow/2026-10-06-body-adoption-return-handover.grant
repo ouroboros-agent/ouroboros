@@ -1,0 +1,7 @@
+568
+The switch paragraph now states what a return to the old tree does when the process began on a
+half-switched tree (it hands the returned tree to a fresh process), that a directory at a switch path
+holding only other switch paths and bytecode caches is the other side's own rather than foreign
+content, that the managed boot skips its reset for a returned or still-open transition too
+(`holds_checkout`), that a failed bootstrap settles the adoption as unready, and when the launcher
+re-executes itself after exit 42 (#1539 countercheck findings 1, 2, 3, 4, 8).

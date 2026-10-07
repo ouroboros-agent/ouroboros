@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit
 
@@ -29,6 +30,21 @@ LATE_CHILD = "work-promoted-after-first-yield"
 MANUAL = "I checked the prior delivery. Continue the interrupted report as a new turn."
 pytestmark = [pytest.mark.serial, pytest.mark.skipif(
     os.name != "posix", reason="This fixture qualifies POSIX SIGKILL/process-group custody only")]
+
+
+@pytest.fixture
+def tmp_path(tmp_path):
+    """Keep private multiprocessing sockets short, independent of runner basetemp.
+
+    macOS limits AF_UNIX addresses to 104 bytes. The runner's nested pytest
+    root can consume that before multiprocessing appends its own socket name.
+    Retain this test's separate root and leave its address in pytest's tree,
+    just like the other isolated session trees; never discard failure evidence.
+    """
+    root = Path(tempfile.mkdtemp(prefix="ob-pres-", dir="/tmp"))
+    (tmp_path / "presence-root.txt").write_text(str(root), encoding="utf-8")
+    yield root
+    print(f"Presence fixture tree retained: {root}")
 
 
 def eventually(read, *, seconds=45):

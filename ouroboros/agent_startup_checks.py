@@ -30,6 +30,14 @@ from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
+
+def _candidate_restart_guidance(tx, commit_sha, *, held=True):
+    prefix = "Reviewed candidate awaits deliberate adoption." if held else "Candidate availability is unconfirmed; inspect the retained transaction."
+    return (f"{prefix} Nothing was adopted automatically. When adoption is authorized, "
+            f"select the ended owner's candidate with prepare_self_change(resume={str(tx.get('task_id') or '')!r}), "
+            f"then request_restart(adopt_commit={commit_sha!r}); an active owner resumes its own task.")
+
+
 _TASK_RESULT_PROCESS_EVIDENCE_FIELDS = frozenset({
     # These are raw reasoning/transport records, not terminal task authority.
     # Exact immutable refs and compact terminal facts remain top-level and are
@@ -1140,6 +1148,13 @@ def verify_restart(env: Any, git_sha: str) -> None:
             snapshot_reachable = bool(
                 snapshot_sha and _commit_reachable(snapshot_sha, observed_sha)
             )
+            # #1539: a commit its task's body candidate still holds awaits adoption; read like
+            # reachability, outside the lock (None: unreadable, which never proves it lost).
+            snapshot_task, snapshot_held = str(snapshot_tx.get("task_id") or ""), None
+            if snapshot_sha and not snapshot_reachable:
+                from ouroboros.body_candidate import holds_commit
+
+                snapshot_held = holds_commit(snapshot_task, snapshot_sha, drive_root)
             # Reconcile AT MOST ONCE per server generation. A genuine restart
             # begins a new custody generation (NW-10 session id, which workers
             # inherit from the server); a routine worker RESPAWN keeps the same
@@ -1193,6 +1208,15 @@ def verify_restart(env: Any, git_sha: str) -> None:
                     commit_sha = adopt_evolution_commit_intent(campaign, tx, observed_sha)
                     if commit_sha:
                         expected_sha, reachable = commit_sha, True
+                    elif (recovered := adopt_evolution_commit_intent(campaign, tx)):
+                        # ...or the task's body candidate holds it (#1539): its receipt and
+                        # reviewed provenance are restored, but only the serving SHA proves a
+                        # restart, so the unadopted commit stays open until adoption lands it.
+                        tx["restart_guidance"] = _candidate_restart_guidance(tx, recovered)
+                        if gen:
+                            campaign["last_boot_reconcile_gen"] = gen
+                        campaign["updated_at"] = utc_now_iso()
+                        return campaign
                 # Capture before the absorbed branch pops it via _close_post_task_backlog.
                 outcome_snapshot["backlog_id"] = str(campaign.get("post_task_backlog_id") or "")
                 if not commit_sha or bool(tx.get("restart_verified")):
@@ -1236,6 +1260,22 @@ def verify_restart(env: Any, git_sha: str) -> None:
                         "commit_sha": commit_sha,
                         "observed_sha": observed_sha,
                     })
+                    return campaign
+                held = snapshot_held if str(tx.get("task_id") or "") == snapshot_task else None
+                if not reachable and held is not False:
+                    # Before its restart-bound adoption the serving HEAD lacks the candidate's
+                    # commit: keep the exact transaction, receipt and backlog link; adopt nothing.
+                    tx.update({"restart_required": True, "restart_verified": False,
+                               "restart_observed_sha": observed_sha, "updated_at": now,
+                               "restart_guidance": _candidate_restart_guidance(tx, commit_sha, held=held)})
+                    campaign.update({"last_boot_reconcile_gen": gen, "active_transaction": tx, "updated_at": now})
+                    reason = "candidate_holds_commit" if held else "candidate_unreadable"
+                    campaign["progress_notes"] = (
+                        f"Restart reconciliation kept the evolution transaction open ({reason}): "
+                        f"reviewed commit {commit_sha[:12]} awaits its restart-bound adoption.")
+                    event.update({"ts": now, "type": "evolution_tx_awaiting_adoption", "ok": False,
+                                  "reason": reason, "task_id": str(tx.get("task_id") or ""),
+                                  "commit_sha": commit_sha, "observed_sha": observed_sha})
                     return campaign
                 campaign["last_boot_reconcile_gen"] = gen
                 tx["restart_verified_at"] = now

@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -468,6 +469,31 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
     return True, "ok"
 
 
+def _dependency_install_plan(repo_dir: pathlib.Path) -> Tuple[List[str], str, pathlib.Path]:
+    """``(command, source, lock path)`` of the one runtime-dependency install for ``repo_dir``."""
+    from ouroboros.platform_layer import pip_install_target_args
+
+    req_path = repo_dir / "requirements-runtime.lock"
+    if not req_path.exists():
+        # Preserve upgrades from managed repositories created before uv locks.
+        req_path = repo_dir / "requirements.txt"
+    # The sixth and last pip call site. On a packaged install `sys.executable` IS the
+    # bundled interpreter, so an unflagged install wrote into the signed bundle.
+    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q",
+                      *pip_install_target_args(sys.executable)]
+    if req_path.exists():
+        return cmd + ["-r", str(req_path)], f"requirements:{req_path}", req_path
+    return cmd + ["openai>=1.0.0", "requests"], "fallback:minimal", req_path
+
+
+def runtime_dependency_command(repo_dir: pathlib.Path) -> Optional[List[str]]:
+    """The same install command for a body switch that runs with no launcher; ``None`` where
+    this chokepoint installs nothing (a frozen bundle, an active test boundary)."""
+    if getattr(sys, 'frozen', False) or os.environ.get("OUROBOROS_PYTEST_ACTIVE") == "1":
+        return None
+    return _dependency_install_plan(pathlib.Path(repo_dir))[0]
+
+
 def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
     if getattr(sys, 'frozen', False):
         log.info("Skipping pip install in frozen (PyInstaller) mode — deps are bundled.")
@@ -485,23 +511,7 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
         log.info("Skipping dependency sync under an active test boundary (%s).", reason)
         return True, "pytest:suppressed"
 
-    from ouroboros.platform_layer import pip_install_target_args
-
-    req_path = _go().REPO_DIR / "requirements-runtime.lock"
-    if not req_path.exists():
-        # Preserve upgrades from managed repositories created before uv locks.
-        req_path = _go().REPO_DIR / "requirements.txt"
-    # The sixth and last pip call site. On a packaged install `sys.executable` IS the
-    # bundled interpreter, so an unflagged install wrote into the signed bundle.
-    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q",
-                      *pip_install_target_args(sys.executable)]
-    source = ""
-    if req_path.exists():
-        cmd += ["-r", str(req_path)]
-        source = f"requirements:{req_path}"
-    else:
-        cmd += ["openai>=1.0.0", "requests"]
-        source = "fallback:minimal"
+    cmd, source, req_path = _dependency_install_plan(_go().REPO_DIR)
     try:
         from ouroboros.startup_migrations import watermarks, stamp
         fingerprint = _dependency_fingerprint(req_path, cmd)
