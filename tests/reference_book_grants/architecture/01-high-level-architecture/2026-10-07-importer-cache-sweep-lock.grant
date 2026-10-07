@@ -1,5 +1,6 @@
-306
+501
 The extension_isolated_deps.py module row states that every Ouroboros-owned importer-cache
-sweep runs under the module lock (CPython's PathFinder sweep deletes snapshotted None
-entries by key, so overlapping sweeps raised KeyError) and that the lock spans only the
-sweep, never plugin import, register or handlers; the chapter had no text for it.
+sweep runs under the module RLock (CPython's PathFinder sweep deletes snapshotted None
+entries by key, so overlapping sweeps raised KeyError), that the helper holds it for the
+sweep alone while inject/release hold it across their wider dependency bookkeeping, and that
+neither span covers plugin import, register or handlers; the chapter had no text for it.

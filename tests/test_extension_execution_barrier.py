@@ -654,6 +654,7 @@ def test_overlapping_loads_never_overlap_their_importer_cache_sweeps(tmp_path, m
     import builtins
 
     builtins._ouro_sweep_meeting = threading.Barrier(2)
+    threads = []
     try:
         prepared = {}
         for label in ("sweep_one", "sweep_two"):
@@ -687,8 +688,10 @@ def test_overlapping_loads_never_overlap_their_importer_cache_sweeps(tmp_path, m
         first = threading.Thread(target=load, args=("sweep_one",), name="sweep-first")
         second = threading.Thread(target=load, args=("sweep_two",), name="sweep-second")
         first.start()
+        threads.append(first)
         assert first_paused.wait(GATE), "the first load never entered its importer-cache sweep"
         second.start()
+        threads.append(second)
         for thread in (first, second):
             thread.join(timeout=GATE * 2)
         assert not first.is_alive() and not second.is_alive(), "extension loads did not settle"
@@ -697,6 +700,12 @@ def test_overlapping_loads_never_overlap_their_importer_cache_sweeps(tmp_path, m
         for label in prepared:
             extension_loader.unload_extension(label)
     finally:
+        # A failed assertion can leave a load parked on a gate: open both and join
+        # every started load before its hooks, and then the patched lock, go away.
+        second_moved.set()
+        builtins._ouro_sweep_meeting.abort()
+        for thread in threads:
+            thread.join(timeout=GATE)
         for key in keys:
             sys.path_importer_cache.pop(key, None)
         del builtins._ouro_sweep_meeting
