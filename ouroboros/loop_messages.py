@@ -5,6 +5,7 @@ Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
 
 from __future__ import annotations
 
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 from ouroboros.config import runtime_setting
 
 import hashlib
@@ -683,7 +684,7 @@ def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) ->
 
     An unchanged reprepare reuses the visible row. A fallback, owner switch or
     recovery rewrite gets fresh facts rather than inheriting another route's
-    window and tariff. Sent history is never rewritten; the named standalone
+    window and tariff. Sent history is never rewritten; the producer-labelled standalone
     rows let refusal recovery address obsolete snapshots. The 15-round reminder
     is unchanged. The caller remeasures including this line before sending.
     """
@@ -691,13 +692,13 @@ def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) ->
 
     usage = ctx.accumulated_usage
     plan = ctx.context_fit_plan
-    source = [m for m in ctx.messages if m.get("name") != CONTEXT_FACTS_NAME]
+    source = [m for m in ctx.messages if m.get(HOST_CONTEXT_KIND_KEY) != CONTEXT_FACTS_NAME]
     source.append({"role": "system", "content": json.dumps(ctx.tool_schemas, ensure_ascii=False, sort_keys=True)})
     key = (ctx.round_idx, ctx.active_model, ctx.active_context_mode, ctx.active_effort,
            str(getattr(plan, "route_fp", "")), str(getattr(plan, "status", "")),
            bool(getattr(plan, "stale", False)), int(getattr(plan, "window_tokens", 0) or 0),
            context_reclaim_transcript_sha256(source))
-    visible = any(m.get("name") == CONTEXT_FACTS_NAME and m.get("content") == usage.get("_context_facts_line")
+    visible = any(m.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME and m.get("content") == usage.get("_context_facts_line")
                   for m in ctx.messages)
     if tuple(usage.get("_context_facts_key") or ()) == key and visible:
         return False
@@ -712,7 +713,7 @@ def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) ->
         money = {"budget_remaining_usd": _loop()._wrapup_global_remaining(),
                  "ceiling_usd": getattr(getattr(tool_ctx, "_cost_ceiling", None), "root_cap_usd", None)}
     line = context_facts_line(ctx, money=money, measured=measured)
-    ctx.messages.append({"role": "user", "name": CONTEXT_FACTS_NAME, "content": line})
+    ctx.messages.append({"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": line})
     usage["_context_facts_round"] = ctx.round_idx
     usage["_context_facts_key"] = key
     usage["_context_facts_line"] = line

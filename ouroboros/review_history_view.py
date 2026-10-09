@@ -275,8 +275,11 @@ def _decision_aliases(history: dict, entry: dict) -> list[tuple[list, Any]]:
                             commit_items.extend({"severity": "advisory", "item": item, "reason": reason,
                                 "tag": "triad", "verdict": "FAIL", **({"model": model} if model else {})}
                                 for item, reason, model in diagnostics)
+                        verdict = wave.get("verdict")
+                        if not isinstance(verdict, dict):
+                            continue  # answer aliases above still apply; scalar verdict has no nested mirrors
                         for field in ("critical_findings", "advisory_findings", "additional_findings"):
-                            for k, item in enumerate((wave.get("verdict") or {}).get(field) or []):
+                            for k, item in enumerate(verdict.get(field) or []):
                                 original = dict(item) if isinstance(item, dict) else item
                                 if (isinstance(original, dict) and original.get("seat_id") == row.get("seat_id")
                                         and original.get("part") == row.get("part")):
@@ -306,11 +309,13 @@ def preserved_review_fields(history: dict) -> list[dict]:
     aliases = {tuple(path) for entry in decision_entries(history) if entry["bound_decision"]
                for path, _ in _decision_aliases(history, entry)}
     for i, wave in enumerate(history.get("rounds") or []):
-        for field in ("critical_findings", "advisory_findings", "additional_findings"):
-            fields.extend({"path": ["rounds", i, "verdict", field, j], "reason": "unbound_verdict_mirror",
-                           "review_record_id": wave.get("review_record_id")}
-                          for j, _ in enumerate((wave.get("verdict") or {}).get(field) or [])
-                          if ("rounds", i, "verdict", field, j) not in aliases)
+        verdict = wave.get("verdict")
+        if isinstance(verdict, dict):  # legacy scalar verdicts stay verbatim in history
+            for field in ("critical_findings", "advisory_findings", "additional_findings"):
+                fields.extend({"path": ["rounds", i, "verdict", field, j], "reason": "unbound_verdict_mirror",
+                               "review_record_id": wave.get("review_record_id")}
+                              for j, _ in enumerate(verdict.get(field) or [])
+                              if ("rounds", i, "verdict", field, j) not in aliases)
         for j, output in enumerate(wave.get("reviewer_outputs") or []):
             fields.extend({"path": ["rounds", i, "reviewer_outputs", j, key], "source": wave.get("source"), "reason": "unknown_producer_field"}
                           for key in output if key not in output_keys)
