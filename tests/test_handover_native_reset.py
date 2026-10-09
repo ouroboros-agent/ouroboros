@@ -60,7 +60,7 @@ def test_main_dual_token_reset_survives_wait_reprepare_and_adopts_new_envelope(
         message.pop("nativeContinuation", None)
     # A synchronous Main round seals one clock line into the repaired send and, once it
     # answers, appends exactly that line to the canonical transcript (``send_clock``).
-    sent = _without_context_facts(gateway.uploads[-1][0]["messages"])
+    sent = _without_context_facts(gateway.uploads[-1][0]["messages"], physical=True)
     clock = [] if asynchronous else [sent[-1]]
     assert not clock or clock[0]["content"].startswith(CLOCK_NOTE_PREFIX)
     assert _without_context_facts(ctx.messages) == expected + clock
