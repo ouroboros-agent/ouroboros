@@ -415,7 +415,7 @@ def test_a_routing_act_recorded_during_the_turn_rides_the_next_real_request(main
     sent = gateway.uploads[0][0]
     from tests.test_subscription_main_wait import _without_context_facts
 
-    protocol = _without_context_facts(sent["messages"])
+    protocol = _without_context_facts(sent["messages"], physical=True)
     texts = [json.dumps(message["content"], ensure_ascii=False) for message in protocol]
     assert ROUTING_RECEIPTS_HEADER in texts[-2] and "steer_task → Build (root-b): delivered" in texts[-2]
     assert sent["messages"][-1]["content"].startswith(sc.CLOCK_NOTE_PREFIX)

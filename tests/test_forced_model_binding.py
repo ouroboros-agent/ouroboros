@@ -264,7 +264,7 @@ def test_ordinary_round_uses_the_same_actor_or_active_plan_binding(acting, fallb
     assert payload["account"] == {"mode": "pin", "profileId": "fallback-only" if fallback else "actor-only"}
     from tests.test_subscription_main_wait import _without_context_facts
 
-    assert _without_context_facts(_unclocked(payload["messages"])) == acting.messages
+    assert _without_context_facts(_unclocked(payload["messages"]), physical=True) == acting.messages
 
 
 TURN = {"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "the-running-turn"}}
