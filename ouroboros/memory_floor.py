@@ -38,9 +38,10 @@ from ouroboros import memory_view_legacy as legacy
 from ouroboros.utils import estimate_tokens
 
 # The ladder, old before new and people last: host fact lines of this room's tasks
-# (F1), other live rooms without notes (F1b), retold records, the whole first block too, as one line per room
-# (F3), my oldest pages and parts (F5), this room's retold page (F4), my longest replies
-# (F2), then people's words: other rooms' (F6, only when the view shows them) and this room's (F7).
+# (F1), other live rooms without notes (F1b), retold records, whole or not, as one line per room
+# (F3), my oldest pages, parts and accounts (F5; a record an account tells stays its address line), this
+# room's retold page (F4), my longest replies (F2), then people's words: other rooms' (F6, only when the
+# view shows them) and this room's (F7).
 LADDER = ("F1", "F1b", "F3", "F5", "F4", "F2", "F6", "F7")
 # The only steps an owner-selected Low or Nano target takes: facts, headers,
 # pointers and old retold memory; my replies and people's words answer to the window alone.
@@ -52,7 +53,7 @@ MODES = ("max", "low", "nano")  # the starting-mode order the window may lower t
 _COLLAPSING = ("F1", "F1b")  # many elements, one line: the first element carries it
 _SHOWN = (("F2", "{} of my replies"), ("F7", "{} lines of people in this room"),
           ("F6", "{} lines of people in other rooms"), ("F4", "{} records of this room's page"),
-          ("F5", "{} pages or parts of my story"), ("F3", "the retold records of {} rooms (one line per room)"),
+          ("F5", "{} pages, parts or accounts of my story"), ("F3", "the retold records of {} rooms (one line per room)"),
           ("F1", "{} task fact lines"), ("F1b", "{} other open rooms"))
 # One name set per closing ``floor_note`` can print (``memory_read_path``, with or without the
 # chronicle_write sentence): the shortest view takes the longest.
@@ -88,7 +89,7 @@ def floor_elements(snapshot: mv.MemoryViewSnapshot) -> List[Tuple[str, str, str,
         "F3": [(room_id, "\n".join(map(legacy.retold_record, group)), legacy.room_pointer(group))
                for room_id, group in legacy.pointer_rooms(snapshot.story).items()],
         "F5": [(entry["id"], "\n".join(mv._page_lines(entry)), mv._page_pointer(entry))
-               for entry in snapshot.story if entry.get("kind") != "legacy"],
+               for entry in snapshot.story if entry.get("kind") != "legacy" and not entry.get("told_by")],
         "F4": [(item["id"], mv._retold(item), mv._retold(item, True))
                for item in [*room.get("legacy", ()), *room.get("under_parts", ())]],
         "F2": [(item["address"], item["line"], mv._row_pointer(item, "my reply")) for item in mine],
