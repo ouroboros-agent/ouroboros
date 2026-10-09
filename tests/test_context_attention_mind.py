@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import context_compaction as cc
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 from ouroboros.context_source_view import _EMERGENCY_LABELS
 from ouroboros.loop_messages import CONTEXT_FACTS_NAME
 from tests.test_context_reclaim_materializer import _request
@@ -105,8 +106,8 @@ def test_actual_refusal_runs_the_host_copies_rung_before_any_helper(tmp_path, mo
     from ouroboros import loop
 
     context = _ctx(tmp_path)
-    old_facts = {"role": "user", "name": CONTEXT_FACTS_NAME, "content": HOST * 5}
-    latest_facts = {"role": "user", "name": CONTEXT_FACTS_NAME, "content": "Current measured facts"}
+    old_facts = {"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": HOST * 5}
+    latest_facts = {"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": "Current measured facts"}
     context.messages.extend([*_tool("one"), {"role": "user", "content": OWNER}, old_facts, latest_facts])
     inner = context.tools._ctx
     assert not getattr(inner, "_last_context_observation", None)  # first refused request: no usable exposure
@@ -238,7 +239,7 @@ def test_facts_line_names_room_money_and_tariff_as_known_or_unknown(tmp_path, mo
     assert append_context_facts(context, money={"budget_remaining_usd": 12.5, "quota": "3 of 10 this hour"}) is True
     assert context.messages[:-1] == before  # appended as a new tail row, nothing before it rewritten
     line = context.messages[-1]["content"]
-    assert context.messages[-1]["role"] == "user" and context.messages[-1]["name"] == CONTEXT_FACTS_NAME
+    assert context.messages[-1]["role"] == "user" and context.messages[-1][HOST_CONTEXT_KIND_KEY] == CONTEXT_FACTS_NAME
     assert line.startswith(f"{CONTEXT_FACTS_HEADER} round 1 |")
     assert "model same-model" in line and "mode low" in line
     usage = context.accumulated_usage
@@ -289,7 +290,7 @@ def test_facts_refresh_for_changed_send_but_preserve_all_prior_rows(tmp_path, mo
         before = deepcopy(context.messages)
         assert append_context_facts(context, money={}), change
         assert context.messages[:-1] == before  # append outside the sent prefix
-        assert context.messages[-1]["name"] == CONTEXT_FACTS_NAME
+        assert context.messages[-1][HOST_CONTEXT_KIND_KEY] == CONTEXT_FACTS_NAME
         assert not append_context_facts(context, money={}), change
 
 

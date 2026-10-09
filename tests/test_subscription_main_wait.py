@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import loop, model_wait, usage_accounting as ua
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.llm_claudexor import cache_key_for_model
 from ouroboros.loop_model_call import _reprepare_waiting_main
@@ -65,15 +66,20 @@ def main_call(live_wait, monkeypatch):
     return ctx, gateway, controller, events, decide, observations
 
 
-def _without_context_facts(messages):
+def _without_context_facts(messages, *, physical=False):
     """Compare protocol/source bytes independently of the required, validated facts tail."""
     from ouroboros.loop_messages import CONTEXT_FACTS_HEADER, CONTEXT_FACTS_NAME
 
-    facts = [row for row in messages if row.get("name") == CONTEXT_FACTS_NAME]
+    facts = ([row for row in messages if row.get("role") == "user" and isinstance(row.get("content"), str)
+              and row["content"].startswith(CONTEXT_FACTS_HEADER + " ")] if physical else
+             [row for row in messages if row.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME])
     assert facts, "Main dispatch/reprepare must include its own context facts"
     assert all(row["role"] == "user" and isinstance(row["content"], str)
                and row["content"].startswith(CONTEXT_FACTS_HEADER + " ") for row in facts)
-    return [row for row in messages if row.get("name") != CONTEXT_FACTS_NAME]
+    assert all("name" not in row for row in facts)
+    if physical:
+        assert all(HOST_CONTEXT_KIND_KEY not in row for row in facts)
+    return [row for row in messages if row not in facts]
 
 
 def _failed(code, route=ROUTE):
@@ -107,7 +113,7 @@ def test_native_account_repair_rebinds_real_physical_candidate_before_send(main_
     assert dispatched[1]["physical_context"]["capacity_total_tokens"] == 240_000
     assert observations[0]["model_route"] == ROUTE_B
     assert len(gateway.accepted_operations) == 2 and gateway.creates[0] != gateway.creates[1]
-    resent = _without_context_facts(gateway.uploads[1][0]["messages"])
+    resent = _without_context_facts(gateway.uploads[1][0]["messages"], physical=True)
     assert "nativeContinuation" not in resent[2]
     # A Main round's repaired send is a new host preparation: canonical rows, then its own
     # clock line. The bare async driver binds no Main clock.
@@ -162,7 +168,7 @@ def test_wait_reprepares_vision_from_canonical_images(main_call, monkeypatch, im
     canonical = _without_context_facts(ctx.messages)
     assert canonical[:-1] == original  # only the consumed clock may follow the exact source rows
     assert canonical[-2]["content"] == original[-1]["content"]
-    sent = [_without_context_facts(item[0]["messages"])[-2]["content"] for item in gateway.uploads]
+    sent = [_without_context_facts(item[0]["messages"], physical=True)[-2]["content"] for item in gateway.uploads]
     assert sent[0] == sent[1] and "image_url" not in str(sent)
     assert len(captions) == (1 if image_mode == "caption" else 0)
     assert canonical[-3]["content"] == "verified read A"

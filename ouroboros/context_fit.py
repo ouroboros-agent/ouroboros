@@ -464,7 +464,7 @@ def estimate_context_prompt_tokens(
         context_custody_proxy,
         custody_private_key,
     )
-    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
+    from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY, IMAGE_BLOCK_CHAR_EQUIVALENT
     from ouroboros.openai_chat_dispatch import direct_openai_context_projections
 
     def project(value: Any) -> Any:
@@ -490,7 +490,7 @@ def estimate_context_prompt_tokens(
 
     # These top-level host receipts remain canonical but are absent from sends.
     # Do not strip same-named keys inside native payloads or user/tool arguments.
-    hidden = {REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY, TOOL_RESULT_RECORD_KEY}
+    hidden = {HOST_CONTEXT_KIND_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY, TOOL_RESULT_RECORD_KEY}
     messages = [{key: value for key, value in message.items() if key not in hidden} for message in messages]
     projections = direct_openai_context_projections(
         messages, tools, provider=provider, reasoning_effort=reasoning_effort,

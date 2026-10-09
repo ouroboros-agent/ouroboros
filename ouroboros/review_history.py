@@ -305,7 +305,7 @@ def render_history_with_obligations(history: Any, *, drive_root: Any, repo_root:
     if task_id and drive_root is not None:
         from ouroboros.review_history_view import selected_review_history
         dispute = selected_review_history(dispute, drive_root=drive_root, task_id=task_id)["history"]
-    from ouroboros.tools.review_prompt_text import build_review_history_section
+    from ouroboros.tools.review_helpers import build_review_history_section
     section = build_review_history_section(dispute["rounds"], open_obligations=open_obligations)
     if dispute.get("authored_view"):
         section += "\n### Author's selected account of earlier review sources\n\n" + json.dumps(

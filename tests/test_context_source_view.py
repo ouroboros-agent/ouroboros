@@ -9,6 +9,7 @@ import json
 import pytest
 
 from ouroboros import context_compaction as cc
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 from ouroboros.artifacts import read_actor_source_bytes
 from ouroboros.context_source_view import _EMERGENCY_LABELS, emergency_address_view
 from ouroboros.loop_messages import CONTEXT_FACTS_NAME
@@ -68,15 +69,15 @@ def _assert_exact_restore(tmp_path, original, request, receipt):
         assert row["role"] == "user" and not row.get("tool_calls")  # source, never live protocol replay
 
 
-def test_only_producer_named_replaced_host_snapshots_become_addresses(tmp_path, monkeypatch):
+def test_only_producer_labelled_replaced_host_snapshots_become_addresses(tmp_path, monkeypatch):
     monkeypatch.setattr(cc, "_call_summarizer", lambda *_a, **_kw: pytest.fail("No helper for an address view"))
-    old_facts = {"role": "user", "name": CONTEXT_FACTS_NAME, "content": "Past exact facts. " * 1600}
-    old_roster = {"role": "user", "name": ROSTER_SNAPSHOT_NAME, "content": "Past full roster. " * 1600}
-    old_delta = {"role": "user", "name": ROSTER_UPDATE_NAME, "content": "Past delta. " * 1600}
+    old_facts = {"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": "Past exact facts. " * 1600}
+    old_roster = {"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_SNAPSHOT_NAME, "content": "Past full roster. " * 1600}
+    old_delta = {"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_UPDATE_NAME, "content": "Past delta. " * 1600}
     warning = {"role": "user", "content": "A warning that remains operative. " * 600}
-    latest_facts = {"role": "user", "name": CONTEXT_FACTS_NAME, "content": "Current full facts"}
-    latest_roster = {"role": "user", "name": ROSTER_SNAPSHOT_NAME, "content": "Current full roster"}
-    latest_delta = {"role": "user", "name": ROSTER_UPDATE_NAME, "content": "Current later change. " * 1000}
+    latest_facts = {"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": "Current full facts"}
+    latest_roster = {"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_SNAPSHOT_NAME, "content": "Current full roster"}
+    latest_delta = {"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_UPDATE_NAME, "content": "Current later change. " * 1000}
     messages = [*_prefix(), old_facts, warning, old_roster, old_delta,
                 {"role": "user", "content": OWNER}, latest_facts, latest_roster, latest_delta]
     before = deepcopy(messages)
@@ -97,9 +98,9 @@ def test_only_producer_named_replaced_host_snapshots_become_addresses(tmp_path, 
 
 def test_latest_delta_and_unlabelled_host_prose_do_not_replace_a_full_snapshot(tmp_path):
     messages = [*_prefix(),
-        {"role": "user", "name": ROSTER_SNAPSHOT_NAME, "content": "Full roster. " * 1600},
-        {"role": "user", "name": ROSTER_UPDATE_NAME, "content": "Later delta. " * 1600},
-        {"role": "user", "name": CONTEXT_FACTS_NAME, "content": "Only facts row. " * 1600},
+        {"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_SNAPSHOT_NAME, "content": "Full roster. " * 1600},
+        {"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_UPDATE_NAME, "content": "Later delta. " * 1600},
+        {"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": "Only facts row. " * 1600},
         {"role": "user", "content": "[CONTEXT_FACTS] unlabelled legacy text " * 1600},
         {"role": "user", "content": "[INDEPENDENT_ROOTS] unlabelled legacy roster " * 1600},
         {"role": "user", "content": "[Context view receipt] still relevant warning " * 1600}]
@@ -186,10 +187,10 @@ def test_short_unit_stays_raw_while_an_independent_large_unit_shrinks(tmp_path, 
         large = _tool("large")
         tail = []
     else:
-        small = [{"role": "user", "name": CONTEXT_FACTS_NAME, "content": "small"}]
-        large = [{"role": "user", "name": ROSTER_SNAPSHOT_NAME, "content": "Large old roster. " * 2000}]
-        tail = [{"role": "user", "name": CONTEXT_FACTS_NAME, "content": "current facts"},
-                {"role": "user", "name": ROSTER_SNAPSHOT_NAME, "content": "current roster"}]
+        small = [{"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": "small"}]
+        large = [{"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_SNAPSHOT_NAME, "content": "Large old roster. " * 2000}]
+        tail = [{"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": "current facts"},
+                {"role": "user", HOST_CONTEXT_KIND_KEY: ROSTER_SNAPSHOT_NAME, "content": "current roster"}]
     messages = [*_prefix(), *small, divider, *large, *tail]
     rebuilt, receipt = emergency_address_view(messages, _request(messages, 1), rung=rung,
                                              drive_root=tmp_path, task_id="source-view")
@@ -260,8 +261,8 @@ def test_first_main_refusal_recovers_unobserved_body_on_same_model_and_effort(ma
     assert before_observation == [None]
     assert f.inputs[0]["model"] == f.inputs[1]["model"]
     assert f.inputs[0]["reasoning_effort"] == f.inputs[1]["reasoning_effort"]
-    first_facts = [row for row in f.inputs[0]["messages"] if row.get("name") == CONTEXT_FACTS_NAME]
-    retry_facts = [row for row in f.inputs[1]["messages"] if row.get("name") == CONTEXT_FACTS_NAME]
+    first_facts = [row for row in f.inputs[0]["messages"] if row.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME]
+    retry_facts = [row for row in f.inputs[1]["messages"] if row.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME]
     assert first_facts and retry_facts
     assert first_facts[-1] in retry_facts  # already sent facts remain exact history
     assert retry_facts[-1] != first_facts[-1]  # the rebuilt send gets a fresh measured line

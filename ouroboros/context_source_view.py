@@ -11,7 +11,7 @@ from dataclasses import replace
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from ouroboros import context_compaction as compaction
-from ouroboros.context_budget import ContextReclaimRequest, ContextReclaimReceipt, _AtomicUnit, _Selection, _SelectedUnit
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY, ContextReclaimRequest, ContextReclaimReceipt, _AtomicUnit, _Selection, _SelectedUnit
 from ouroboros.tool_result_record import read_tool_result_record
 
 EmergencyRung = Literal["host_copies", "bodies"]
@@ -39,9 +39,9 @@ def _obsolete_host_rows(messages: Sequence[Mapping[str, Any]]) -> set[int]:
     for full_name, names in ((CONTEXT_FACTS_NAME, {CONTEXT_FACTS_NAME}),
                             (ROSTER_SNAPSHOT_NAME, {ROSTER_SNAPSHOT_NAME, ROSTER_UPDATE_NAME})):
         latest = max((i for i, row in enumerate(messages)
-                      if row.get("role") == "user" and row.get("name") == full_name), default=-1)
+                      if row.get("role") == "user" and row.get(HOST_CONTEXT_KIND_KEY) == full_name), default=-1)
         obsolete.update(i for i, row in enumerate(messages[:max(0, latest)])
-                        if row.get("role") == "user" and row.get("name") in names)
+                        if row.get("role") == "user" and row.get(HOST_CONTEXT_KIND_KEY) in names)
     return obsolete
 
 
