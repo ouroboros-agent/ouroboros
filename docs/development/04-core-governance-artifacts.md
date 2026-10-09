@@ -118,14 +118,12 @@ mode's projection of the two books (ARCHITECTURE §6 "Context fitting, retry, an
 compaction"); Max binds `DEVELOPMENT.md` to the active repository — a path fact,
 never a guess from message text. Tier-0 identity and constitutional context
 stays full in every mode. Predicted Max pressure never swaps in Low documents,
-with one physical exception: when the route window is known and even the
-shortest memory view (every floor step applied) with the books, tools and reply
-reserve cannot fit on the calibrated estimate — a refusal that is inevitable —
-the task starts in the next physically possible mode (Max → Low → Nano,
-`memory_floor.physical_mode`, checkpoint `context_fit_physical_mode`). Otherwise
-only actual provider overflow may use a task-local Low projection, then at most
-one same-route strictly-smaller call, and none of it changes owner mode or P3
-commit review. Disclosed residual: an explicit per-task handbook override
+at startup or on a route change. Memory granularity still fits the known
+window; an estimate that misses it remains a disclosed estimate. Only actual
+size-refusal recovery may select task-local book navigation, after the earlier
+recovery steps. Owner Low/Nano and already-lowered task projections retain
+their sizing behavior; owner mode and P3 applicability never change.
+Disclosed residual: an explicit per-task handbook override
 (`context_requires_self_body_docs`) wins in Max only: Low and Nano ignore it
 (issue #1019), as does a delegated subagent child in every mode (issue #1026); the
 sibling `context_requires_development` flag is ignored on the same paths.
@@ -150,25 +148,24 @@ in `tests/test_loop_misc.py`.
 
 ### Invariant: Compaction must earn its rewrite
 
-Helper compaction is deficit-triggered and low-water-sized: a positive deficit
-against the binding boundary (the smaller known of owner target and route
-capacity) requests at most one pass per route+round, sized deficit plus
-ceil(boundary / `context_budget.RECLAIM_LOW_WATER_DIVISOR`) — a structural
-constant pinned by `tests/test_context_budget_ssot.py`, not a setting — so the pass lands
-below the boundary rather than at it; requested margin and achieved headroom are
-separate checkpoint facts, never conflated. The materializer then checkpoints the
-exact actor-visible source before summarizing and publishes only completely
-covered, bound units with provenance and a strictly smaller ContextFit size (same
-image proxy/density). Only typed summarizer overflow may split sources; capsules
-retain the original provenance union. Trigger, sizing and route+round rules
-belong to ARCHITECTURE §6 "Context fitting, retry, and compaction"; the
-materializer adds no threshold, timer, route or retry policy.
+Predicted pressure supplies facts for the mind, not an automatic helper call.
+After an actual size refusal, recovery first removes obsolete host copies and
+tries source-address reconstruction on the same model and effort. The signed
+helper remains a later recovery capability and an explicit tool operation;
+it checkpoints exact sources and publishes only completely covered, bound units
+with provenance and a strictly smaller ContextFit size. Only typed helper
+overflow may split sources. Requested margin and achieved headroom remain
+separate facts. ARCHITECTURE §6 "Context fitting, retry, and compaction" owns
+the order and sizing; the materializer adds no threshold, timer or retry policy.
 
-Authored views reuse that custody but follow the actor's note/source selection,
-so need not shrink. Preserve complete units, owner/new tail and schema residency;
-measure without new Main admission gates. Test actual loop wiring, not manually
-seeded observations: `tests/test_main_authored_context.py`, alongside the helper
-coverage in `tests/test_compaction.py`.
+Authored views reuse that custody for understood dialogue and completed tool
+units, follow the actor's own note/source selection and need not shrink.
+Preserve governing owner words, question/answer bindings, newer arrivals and
+opaque protocol units. Expanded authored selection must not expand what the
+automatic helper may rewrite. Exposure comes from the actual prepared send,
+not a redacted observability copy or a matching call id alone. Test the real
+loop wiring (`tests/test_main_authored_context.py`), including a cold resume;
+helper coverage remains in `tests/test_compaction.py`.
 
 ### Invariant: No silent truncation
 
@@ -184,10 +181,12 @@ If a core governance artifact cannot fit in the available context budget:
   context is incomplete.
 - A reviewer or agent operating without ARCHITECTURE.md MUST NOT be treated as
   operating with full context — findings may be incomplete.
-- Tools returning multi-model review findings (`commit_reviewed`,
-  `skill_review`, `preflight_review`, `review_change`) MUST be in
-  `UNTRUNCATED_TOOL_RESULTS` or carry an explicit per-tool limit; the default
-  15,000-char `DEFAULT_TOOL_RESULT_LIMIT` is not acceptable for review verdicts.
+- Main retains exact produced results before projecting one measured batch.
+  Status, error, source and delivered ranges remain visible; a requested range
+  is not an unsolicited whole body. No tool name exempts a duplicate book read
+  from the delivery budget. Producer-owned structured pages retain their own
+  disclosed pagination. Review decisions, statuses and reasons survive an
+  authored shortening; a partial view never supplies complete review authority.
 - Book **navigation** (`context_layout.book_navigation`: per chapter the
   authored introduction, physical path and H2-H4 inclusive complete-subtree
   ranges), a single-doc **navigation map** and a named on-demand pointer are
@@ -208,9 +207,8 @@ when a book cannot be loaded. This is not full context; loader gaps and failures
 to fit required inline material are separate facts. Retrieving source coverage
 remains diagnostic, not another assembly or commit gate.
 
-Enforcement: `tests/test_tool_capabilities.py` (the `UNTRUNCATED_TOOL_RESULTS`
-roster) and the truncation-floor coverage in
-`tests/test_owner_facing_honesty.py`.
+Enforcement: result-delivery coverage in `tests/test_tool_source_view.py` and
+the truncation-floor coverage in `tests/test_owner_facing_honesty.py`.
 
 ### Invariant: Owner-facing surfaces show the full text
 

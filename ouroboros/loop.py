@@ -395,6 +395,14 @@ def _record_transcript_prefix(ctx, messages, round_idx, accumulated_usage,
         accumulated_usage["prompt_prefix_breaks"] = int(accumulated_usage.get("prompt_prefix_breaks") or 0) + 1
 
 
+def _measure_tool_result_batch(ctx, messages, schemas, *, round_id):
+    """Measure on the adopted route, including a same-round fallback or rebind."""
+    return _measure_main_context_view(
+        getattr(ctx, "context_fit_plan", None), messages, schemas,
+        getattr(ctx, "active_context_mode", "max"),
+        getattr(ctx, "active_effort", "medium"), round_id)
+
+
 def _reset_turn_state(ctx: Any) -> None:
     """Clear the per-turn state this turn owns; nothing durable is touched."""
     ctx._presence_completion, ctx._presence_completion_accepted = None, False
@@ -651,6 +659,7 @@ def run_llm_loop(
             # Delivery/finalization in the same round must use that applied route.
             limit_ctx.active_model = ctx.active_model = active_model
             limit_ctx.active_use_local = ctx.active_use_local = active_use_local
+            ctx.context_fit_plan, ctx.active_context_mode = context_fit_plan, active_context_mode
             if (msg is None and str(accumulated_usage.get("_last_llm_error_kind") or "") == "llm_output_exhausted"
                     and not provider_no_call_source(accumulated_usage, False)[0]):
                 # Output exhaustion is no outage, the primary's (no route walk) or a configured
@@ -706,7 +715,9 @@ def run_llm_loop(
             limit_ctx.budget_tail = "tool"
             handle_tool_calls(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,
-                messages, llm_trace, emit_progress
+                messages, llm_trace, emit_progress, tool_schemas=tool_schemas,
+                fit_candidate=functools.partial(_measure_tool_result_batch, ctx,
+                    round_id=f"{accumulated_usage.setdefault('execution_id', new_execution_id())}:round:{round_idx}")
             )
             from ouroboros.loop_delivery import finish_completed_stop
             stopped = finish_completed_stop(tools, limit_ctx, emit_progress, budget_remaining_usd, cost_ceiling)
@@ -869,6 +880,7 @@ from ouroboros.loop_budget import (  # noqa: E402, F401 -- intentional public re
     _finish_tool_round_budget,
     _check_budget_limits,
     _resolve_task_cost_ceiling,
+    _wrapup_global_remaining,
     _TREE_ACCOUNTING_MAX_STALE_SEC,
     _loop_tree_accounting,
     _soft_land_exhausted_ceiling,

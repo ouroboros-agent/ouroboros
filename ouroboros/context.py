@@ -290,13 +290,19 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     }
     try:
         from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
+        from ouroboros.review_history_view import current_plan_history
+        from types import SimpleNamespace
 
         state = load_plan_review_state(canonical_root, task_id)
         wave = current_plan_review_wave(state)
-        if wave is not None or state.get("current_attempt") or state.get("legacy_v1"):
+        if state.get("waves") or state.get("current_attempt") or state.get("legacy_v1"):
+            history, operative = current_plan_history(SimpleNamespace(drive_root=canonical_root, task_id=task_id), state=state)
             projection["plan_review_authority"] = {
                 "current_attempt": state.get("current_attempt") or {},
-                "current_wave": wave,
+                "current_wave": {key: wave[key] for key in (
+                    "cycle_index", "request_fingerprint", "spec_hash", "aggregate", "closed", "paid",
+                    "custody_pending", "wave_artifact") if key in wave} if wave is not None else None,
+                "dispute_history": history, "operative_subject": operative,
                 "legacy_v1_projection": state.get("legacy_v1_projection") or {},
                 "waves_omitted": int(state.get("waves_omitted") or 0),
                 "source": source,
@@ -304,13 +310,21 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     except Exception as exc:
         projection["plan_review_authority"] = {
             "status": "authority_source_unavailable", "source": source,
+            "code": "PLAN_REVIEW_SOURCE_UNAVAILABLE",
             "error": type(exc).__name__,
             "rule": "Do not treat the current plan/review authority as complete.",
         }
+    from ouroboros.review_history import review_dispute_history
+
+    for repo in dict.fromkeys(str(p) for p in (task.get("workspace_root"), getattr(env, "repo_dir", None)) if p):
+        history = review_dispute_history(drive_root=canonical_root, repo_root=repo, task_id=task_id)
+        if history.get("rounds") or history.get("gaps"):
+            projection.setdefault("commit_review_authority", []).append({"repo_root": repo, "dispute_history": history})
     return projection
 
 
-def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None, captured_at: str = "") -> str:
+def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None,
+                          captured_at: str = "", supplementary_messages_out: Optional[List[Dict[str, Any]]] = None) -> str:
     declared = task_input_sources(task) == "declared"
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
@@ -374,6 +388,12 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         "ui_language": {"tag": _ui_language_tag() or "en", "chosen": bool(_ui_language_tag())},
     }
     runtime_data.update(_task_authority_projection(env, task))
+    if supplementary_messages_out is not None:
+        from ouroboros.review_history_view import capture_review_history_messages
+
+        runtime_data, supplemental = capture_review_history_messages(runtime_data, task_id=str(task.get("id") or ""),
+            drive_root=pathlib.Path(task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root))
+        supplementary_messages_out.extend(supplemental)
     if declared:
         runtime_data["task_constraint"] = task.get("task_constraint") or getattr(ctx, "task_constraint", {})
     runtime_data["operational_reality_rule"] = (
@@ -1072,6 +1092,7 @@ def _capture_context_core(
     if declared:
         _validate_declared_input_task(task)
     captured_at = utc_now_iso()  # one capture instant for the runtime fact and every snapshot label
+    supplementary_messages: List[Dict[str, Any]] = []
     base_prompt = safe_read(
         env.repo_path("prompts/SYSTEM.md"),
         fallback="You are Ouroboros. Your base prompt could not be loaded."
@@ -1212,7 +1233,8 @@ def _capture_context_core(
         dynamic_parts.append(installed_skills)
     dynamic_parts.extend([
         snapshot_labelled(_drive_state_section(context_env), captured_at),
-        build_runtime_section(env, task, ctx=ctx, captured_at=captured_at),
+        build_runtime_section(env, task, ctx=ctx, captured_at=captured_at,
+                              supplementary_messages_out=supplementary_messages),
         (
             "## Task Contract Discipline\n\n"
             "For non-trivial work, state your success criteria early in your plan or reasoning, "
@@ -1304,6 +1326,7 @@ def _capture_context_core(
         compact_reference_docs=is_child,
         dynamic_head_text="\n\n".join(head_parts),
         memory_view_json=view_json,
+        supplementary_messages_json=json.dumps(supplementary_messages, ensure_ascii=False, sort_keys=True),
     )
 
 

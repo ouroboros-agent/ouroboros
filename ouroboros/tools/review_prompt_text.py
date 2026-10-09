@@ -174,7 +174,10 @@ _CONVERGENCE_RULE_TEXT = (
 _HISTORY_VERIFICATION_ONLY_RULE = (
     "Use prior review history and obligation records for verification only. "
     "Do NOT manufacture a new FAIL from historical text alone. Any new FAIL must be "
-    "grounded in the CURRENT diff or CURRENT repository artifacts shown in this prompt."
+    "grounded in the CURRENT diff or CURRENT repository artifacts shown in this prompt. "
+    "An author's rejection is not reviewer agreement, and a verdict on an earlier subject "
+    "does not approve this revision. To revisit a rejected alternative, address its earlier "
+    "rationale and explain the new evidence or changed requirement."
 )
 
 
@@ -189,10 +192,15 @@ def format_review_history_entry(entry: object, *, default_severity: str = "advis
         tags += [f"model={entry['model']}"] if entry.get("model") else []
         tags += [f"obligation={entry['obligation_id']}"] if entry.get("obligation_id") else []
         label = str(entry.get("item") or entry.get("reason") or "?")
-        reason = single_line(entry.get("reason", ""))
+        reason = str(entry.get("reason") or "")
         tag_prefix = " ".join(f"[{tag}]" for tag in tags)
-        return f"[{severity}] {tag_prefix} {label}: {reason}".strip()
-    return single_line(entry)
+        rendered = f"[{severity}] {tag_prefix} {label}: {reason}".strip()
+        details = {key: value for key, value in entry.items()
+                   if key not in {"severity", "tag", "model", "obligation_id", "item", "reason"}}
+        if details:
+            rendered += "\n" + format_prompt_code_block(json.dumps(details, ensure_ascii=False, indent=2, default=str), "json")
+        return rendered
+    return str(entry or "")
 
 
 def build_review_history_section(
@@ -221,6 +229,12 @@ def build_review_history_section(
                 f"{prefix}{format_review_history_entry(finding, default_severity=default)}"
                 for finding in findings
             )
+        # Preserve the recorded subject, raw answers, author rationale and
+        # verdicts as data. A findings-only rendering loses the resolved dispute.
+        details = {key: value for key, value in entry.items()
+                   if key not in {"attempt", "commit_message", "critical", "advisory"}}
+        if details:
+            lines.append(format_prompt_code_block(json.dumps(details, ensure_ascii=False, indent=2, default=str), "json"))
         lines.append("")
 
     obligations_block = build_obligations_block(open_obligations)
@@ -269,7 +283,7 @@ def build_obligations_block(open_obligations: list | None) -> str:
             "obligation_id": getattr(ob, "obligation_id", "?"),
             "item": getattr(ob, "item", "?"),
             "severity": getattr(ob, "severity", ""),
-            "reason_excerpt": format_obligation_excerpt(getattr(ob, "reason", "")),
+            "reason": redact_prompt_secrets(str(getattr(ob, "reason", "")))[0],
         }
         for ob in open_obligations
     ]

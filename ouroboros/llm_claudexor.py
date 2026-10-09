@@ -34,6 +34,8 @@ from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepa
 from ouroboros.observability import persist_call
 from ouroboros.owner_pause import launch_admission, OwnerPauseRefused, model_handed_off
 from ouroboros.transport_custody import ProviderNotDispatched
+from ouroboros.tool_result_record import TOOL_RESULT_RECORD_KEY
+from ouroboros.review_history_view import REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY
 from ouroboros.usage_accounting import (
     PhysicalAttemptPreparationFailed, current_physical_attempt_context, current_usage_scope,
     execute_physical_attempt, execute_physical_attempt_async, last_physical_attempt_capture)
@@ -294,7 +296,8 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
     prepared = project_declared_system_prefix(target, scrub_native_custody(_MessageShapingMixin._normalize_system_message_placement(messages)))
     for message in prepared:
         for name in ("_context_capsule", "acceptance_observation", "_acceptance_observation", "review_feedback",
-                     "reasoning", "reasoning_details", "reasoning_content", "response_id", "stop_reason", "_stable_prefix_blocks"):
+                     "reasoning", "reasoning_details", "reasoning_content", "response_id", "stop_reason", "_stable_prefix_blocks",
+                     TOOL_RESULT_RECORD_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY):
             message.pop(name, None)
         # A direct provider's refusal is assistant content, not routing metadata.
         # Preserve both text parts verbatim when a response carries both fields;

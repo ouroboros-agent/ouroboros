@@ -393,6 +393,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         self._raw_transcript: Optional[str] = None
         self._episode_usage: Dict[str, Any] = {}
         self._tool_receipts: List[Dict[str, Any]] = []
+        self._pending_staged_reads: list = []
         self._inspection_ctx: Any = None  # the registry's context: the reader stamps `last_read_view` on it
         self._tool_calls_total = 0
         self._rounds_used = 0
@@ -453,6 +454,10 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         record_context_view(self._inspection_ctx, messages, schemas)
         for receipt in self._tool_receipts:
             receipt["delivered"] = True
+        from ouroboros.delegate_output import acknowledge_staged_output_delivery
+        for execution, projected, shown in self._pending_staged_reads:
+            acknowledge_staged_output_delivery(self._inspection_ctx, execution, projected, shown_ranges=shown)
+        self._pending_staged_reads.clear()
 
     def _apply_working_view(self, messages: list, schemas: list, round_idx: int) -> bool:
         from ouroboros.context_budget import ContextReclaimRequest
@@ -1054,8 +1059,13 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         remaining = dispatch_deadline_remaining_sec()
         if remaining is not None:
             timeout = min(timeout, max(0.0, remaining))
+        def execute():
+            from ouroboros.delegate_output import staged_read_delivery_scope
+            with staged_read_delivery_scope():
+                return registry.execute_result(name, args)
+
         with abandoned_on_timeout(timeout) as submit:
-            future = submit(registry.execute, name, args)
+            future = submit(execute)
             try:
                 return future_result(future, timeout)
             except (TimeoutError, concurrent.futures.TimeoutError):
@@ -1090,6 +1100,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         args: Optional[Dict[str, Any]] = None
         outcome = "executed"
         extent: Dict[str, Any] = {}
+        typed_result = None
         source_gap = ""
         source_ref = {}
         verdict = validation_by_id.get(call_id)
@@ -1140,7 +1151,10 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                         else:
                             result = _compact_context(self._inspection_ctx, **args)
                     else:
-                        result = str(self._execute_bounded(registry, name, args))
+                        from ouroboros.tools.tool_result import ToolResult
+                        returned = self._execute_bounded(registry, name, args)
+                        typed_result = returned if isinstance(returned, ToolResult) else None
+                        result = typed_result.text if typed_result is not None else str(returned)
                 except _ToolAbandoned as exc:
                     # The worker may still settle; its value is never read. The
                     # receipt names the gap, the reviewer gets the host's own
@@ -1190,6 +1204,9 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                     # loop reduced after the last build: the receipt credits
                     # exactly what the reviewer received.
                     extent = self._read_extent(full, sent)
+                    if typed_result is not None and typed_result.meta.get("read_view"):
+                        self._pending_staged_reads.append(({"result": full, "tool_result": typed_result},
+                                                           {"result": result}, [[0, sent]]))
         # Host-observed evidence (bounded): which artifacts THIS episode
         # actually opened — disclosure, never a claim of full-surface coverage.
         self._tool_calls_total += 1
