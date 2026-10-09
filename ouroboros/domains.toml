@@ -35,10 +35,8 @@
 # operations reuse the existing file/source reader (D15 -> D05) rather than
 # inventing a second parser, source resolver or review-coverage store.
 
-# Canonical working-view metadata/projections belong to D03. The author-history
-# custody leaf belongs with D05's task-source storage: its strict D05 -> D06 edge
-# only reuses validate_author_disposition for supplied identity-bound records,
-# not reviewer policy, verdict selection or paid dispatch.
+# Canonical working-view metadata/projections belong to D03. Plan author-source
+# retention belongs to the D06 review stack and reaches D05's source store lazily.
 
 [meta]
 reference_tree = "ouroboros_v7_wip @ 9f691656e7e756c483f72ef549418c0e7a1b8054 (frozen)"
@@ -576,7 +574,7 @@ D20 = "Presence"
 "ouroboros/tools/plan_packet.py" = "D06"
 "ouroboros/tools/plan_render.py" = "D06"
 "ouroboros/tools/plan_review.py" = "D06"
-"ouroboros/tools/plan_author_history.py" = "D05"
+"ouroboros/tools/plan_author_history.py" = "D06"
 "ouroboros/tools/plan_review_artifacts.py" = "D06"
 "ouroboros/tools/plan_review_collect.py" = "D06"
 "ouroboros/tools/plan_review_references.py" = "D06"
@@ -806,7 +804,6 @@ allowed = [
   "D05->D01",
   "D05->D02",
   "D05->D04",
-  "D05->D06",
   "D05->D09",
   "D05->D10",
   "D05->D11",
@@ -974,6 +971,7 @@ lazy_only = [
   "D04->D15",
   "D04->D16",
   "D04->D20",
+  "D05->D06",
   "D05->D07",
   "D05->D08",
   "D05->D14",

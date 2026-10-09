@@ -363,7 +363,7 @@ def _deliver_tool_results(
     tool_schemas: Optional[list],
     fit_candidate: Optional[FitCandidate],
     llm_trace: Dict[str, Any],
-    review_updates: Optional[list] = None,
+    pending_messages: Optional[list] = None,
 ) -> List[Dict[str, Any]]:
     """First-show views for one batch: measured when the caller supplied the
     frame, whole (truthful best effort, no invented cap) when it did not.
@@ -381,7 +381,7 @@ def _deliver_tool_results(
         shaped = list(candidate)
         for index, row in enumerate(results, len(candidate) - len(results)):
             shaped[index] = {**candidate[index], "content": with_producer_source(row, candidate[index]["content"])}
-        return fit_candidate([*shaped, *(review_updates or [])], schemas)
+        return fit_candidate([*shaped, *(pending_messages or [])], schemas)
 
     rows, receipt = project_tool_result_batch(
         results, messages, list(tool_schemas or []),
@@ -1284,6 +1284,7 @@ def handle_tool_calls(
 def _maybe_auto_attach_image(
     exec_result: Dict[str, Any],
     tools: Optional[ToolRegistry],
+    *, staged_messages: Optional[list] = None,
 ) -> Optional[Dict[str, str]]:
     """Same-round image attachment for tool results that explicitly offer one.
 
@@ -1335,6 +1336,9 @@ def _maybe_auto_attach_image(
         ctx = getattr(tools, "_ctx", None)
         if ctx is None:
             return
+        if staged_messages is not None:
+            ctx = copy.copy(ctx)
+            ctx.messages = staged_messages  # Never rebind the shared live context.
         observation = {"status": "unavailable"}
         from ouroboros.tools.vision import attach_local_image_to_context
 
@@ -1407,7 +1411,12 @@ def process_tool_results(
         from ouroboros.review_history_view import review_context_updates
         review_pending = dict(ctx._pending_review_context)
         review_updates, _ = review_context_updates(ctx, families=review_pending, messages=messages)
-    views = _deliver_tool_results(ctx, results, messages, tool_schemas, fit_candidate, llm_trace, review_updates)
+    # Materialize the same image blocks once before fitting the completed batch.
+    # Publish them only after its contiguous tool results and resident updates.
+    image_messages: list = []
+    image_observations = [_maybe_auto_attach_image(row, tools, staged_messages=image_messages) for row in results]
+    views = _deliver_tool_results(ctx, results, messages, tool_schemas, fit_candidate, llm_trace,
+                                  [*review_updates, *image_messages])
 
     for exec_result, view in zip(results, views):
         if ctx is not None:
@@ -1567,11 +1576,10 @@ def process_tool_results(
     # tool messages answering the same assistant turn: the user(image) injection
     # then preserves tool-result contiguity BY CONSTRUCTION instead of relying on
     # the transport's adjacency repair to fix an interleaving we created ourselves.
-    by_call = {row["tool_call_id"]: row for row in llm_trace["tool_calls"][-len(results):]}
-    for exec_result in results:
-        observation = _maybe_auto_attach_image(exec_result, tools)
+    messages.extend(image_messages)
+    for row, observation in zip(llm_trace["tool_calls"][-len(results):], image_observations):
         if observation:
-            by_call[exec_result["tool_call_id"]]["image_attachment"] = observation
+            row["image_attachment"] = observation
 
     return error_count
 

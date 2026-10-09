@@ -32,7 +32,7 @@ def _capture(ctx):
     return [{"role": "system", "content": json.dumps(prefix)}, {"role": "user", "content": "Finish the authorized deck."}, *tail]
 
 
-def _apply(ctx, messages, *, note=NOTE, transfers=(), fit=None):
+def _apply(ctx, messages, *, note=NOTE, transfers=(), review_notes=(), expected_view_revision="", fit=None):
     """Actual tool observation, complete tool batch, materialization and publication."""
     schemas, observed_fits = [], []
     def measure(candidate, tools):
@@ -42,9 +42,10 @@ def _apply(ctx, messages, *, note=NOTE, transfers=(), fit=None):
     ctx.messages = messages
     ctx.active_context_mode = "max"
     record_context_view(ctx, messages, schemas)
-    response = _compact_context(ctx, working_note=note, keep_unit_ids=[], review_transfers=list(transfers))
+    response = _compact_context(ctx, working_note=note, keep_unit_ids=[], review_transfers=list(transfers),
+                                review_notes=list(review_notes), expected_view_revision=expected_view_revision)
     assert "requested" in response, response
-    messages.append(call("compact_context", {"working_note": note, "keep_unit_ids": []}, "compact"))
+    messages.append(call("compact_context", {"working_note": note, "keep_unit_ids": [], "review_notes": list(review_notes), "expected_view_revision": expected_view_revision}, "compact"))
     execution = {"fn_name": "compact_context", "is_error": False, "tool_call_id": "compact",
                  "result": response, "args_for_log": {"working_note": note}, "trace_ref": {}}
     process_tool_results([execution], messages, {"tool_calls": []}, lambda _: None, tools,

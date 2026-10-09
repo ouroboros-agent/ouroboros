@@ -238,7 +238,7 @@ def plan_review_dispute_history(drive_root: Any, task_id: str, state: dict) -> d
         for finding in wave.get("findings") or []:
             answers = [d for d in wave.get("dispositions") or []
                        if d.get("finding_id") == finding.get("finding_id")]
-            row = {"cycle_index": wave.get("cycle_index"), "request_fingerprint": wave.get("request_fingerprint"),
+            row = {"decision_kind": "plan_finding", "cycle_index": wave.get("cycle_index"), "request_fingerprint": wave.get("request_fingerprint"),
                    "spec_hash": wave.get("spec_hash"), "finding_id": finding.get("finding_id"),
                    "remark": finding.get("summary"),
                    "status": {"reviewer_class": finding.get("class"), "aggregate": wave.get("aggregate"),
@@ -250,13 +250,18 @@ def plan_review_dispute_history(drive_root: Any, task_id: str, state: dict) -> d
                 decisions_seen.add(identity)
                 decision_rows.append({**row, "source": address(ref, "findings / dispositions / reviewer_outputs")})
         if wave.get("author_disposition"):
-            row = {"cycle_index": wave.get("cycle_index"), "request_fingerprint": wave.get("request_fingerprint"),
+            row = {"decision_kind": "plan_author", "cycle_index": wave.get("cycle_index"), "request_fingerprint": wave.get("request_fingerprint"),
                    "remark": "Author disposition", "status": wave["author_disposition"],
                    "reason": wave["author_disposition"].get("rationale")}
             identity = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
             if identity not in decisions_seen:
                 decisions_seen.add(identity)
                 decision_rows.append({**row, "source": address(ref, "author_disposition")})
+        if wave.get("closure_notes"):
+            decision_rows.append({"decision_kind": "plan_closure", "cycle_index": wave.get("cycle_index"),
+                "request_fingerprint": wave.get("request_fingerprint"), "remark": "Recorded closure notes",
+                "status": {"aggregate": wave.get("aggregate"), "closed": wave.get("closed")},
+                "reason": copy.deepcopy(wave["closure_notes"]), "source": address(ref, "closure_notes")})
 
     def project(wave: dict, ref: dict) -> dict:
         # These are semantic inputs/decisions, never the recursive copies of
@@ -396,7 +401,7 @@ def plan_review_dispute_history(drive_root: Any, task_id: str, state: dict) -> d
         ref = selection.pop("source_ref")
         selection["source"] = address(ref)
         author = selection["author_disposition"]
-        decision_rows.append({"request_fingerprint": selection["fingerprint"],
+        decision_rows.append({"decision_kind": "plan_author", "request_fingerprint": selection["fingerprint"],
             "review_fingerprint": selection["review_fingerprint"], "remark": "Selected author plan",
             "review_wave_artifact": selection.get("review_wave_artifact"),
             "status": author, "reason": author["rationale"], "source": address(ref, "author_disposition")})
@@ -404,6 +409,7 @@ def plan_review_dispute_history(drive_root: Any, task_id: str, state: dict) -> d
             retain_once(selection, key, key, address(ref, key))
     if author_plan:
         ref = ((state.get("current_attempt") or {}).get("author_subject") or {}).get("source_ref") or {}
+        author_plan["source"] = address(ref)
         for key in ("spec", "plan_prose"):
             retain_once(author_plan, key, key, address(ref, key))
     return {"status": "source_unavailable" if gaps else "complete", "rule": DISPUTE_HISTORY_RULE,

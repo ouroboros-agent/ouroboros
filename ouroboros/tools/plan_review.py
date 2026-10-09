@@ -730,7 +730,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_IN_FLIGHT: {hold}")
     # C-01: the hold above is the ONE exit before the supersede; every other cap/rail exit follows it.
     try:
-        _record_plan_review_attempt_with_reference(ctx, state_root, task_id, fingerprint=fingerprint)
+        _record_plan_review_attempt_with_reference(ctx, state_root, task_id, fingerprint=fingerprint,
+            submitted_subject={"spec": spec, "plan_prose": request.plan} if plan_review_wave(state, fingerprint) is None else None)
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}")
     previous_override: Optional[dict] = None

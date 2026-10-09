@@ -9,11 +9,11 @@ import copy
 import json
 from typing import Any
 
-from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
 from ouroboros.review_records import validate_author_disposition
 
 
 def _read(drive_root: Any, task_id: str, ref: dict) -> dict:
+    from ouroboros.artifacts import read_actor_source_bytes
     value = json.loads(read_actor_source_bytes(drive_root, task_id, ref))
     if (not isinstance(value, dict) or value.get("kind") != "plan_author_subject"
             or (not isinstance(value.get("spec"), dict) and not value.get("source_unavailable"))):
@@ -22,6 +22,7 @@ def _read(drive_root: Any, task_id: str, ref: dict) -> dict:
 
 
 def _persist(drive_root: Any, task_id: str, value: dict) -> dict:
+    from ouroboros.artifacts import store_actor_source_bytes
     return store_actor_source_bytes(drive_root, task_id, category="context_checkpoints",
         source_id=f"plan-author-{value['fingerprint']}", extension="json",
         data=json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8"))
@@ -75,7 +76,7 @@ def retain_previous_selection(drive_root: Any, task_id: str, state: dict) -> Non
 
 
 def record_attempt(drive_root: Any, task_id: str, *, fingerprint: str, status: str, reason: str,
-                   author_subject: dict | None) -> dict:
+                   author_subject: dict | None, submitted_subject: dict | None = None) -> dict:
     """The existing locked attempt producer, with author-source retention first."""
     from ouroboros import task_results as results
 
@@ -84,13 +85,28 @@ def record_attempt(drive_root: Any, task_id: str, *, fingerprint: str, status: s
     if status not in results._PLAN_REVIEW_ATTEMPT_STATUSES:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
 
+    submitted = None
+    if submitted_subject is not None:
+        try:
+            submitted = _persist(drive_root, task_id, {"kind": "plan_submitted_subject", "fingerprint": fingerprint,
+                "spec": submitted_subject["spec"], "plan_prose": submitted_subject["plan_prose"]})
+        except (OSError, ValueError):
+            # A failed new source must not leave an old closed plan current.
+            record_attempt(drive_root, task_id, fingerprint=fingerprint, status="unavailable",
+                           reason="submitted_source_unavailable", author_subject=None)
+            raise
+
     def record(state: dict) -> dict:
+        previous = state.get("current_attempt") or {}
+        retained = submitted or (previous.get("submitted_subject") if previous.get("fingerprint") == fingerprint else None)
         retain_previous_selection(drive_root, task_id, state)
         selected = retain_author_selection(drive_root, task_id, state, author_subject, fingerprint) if author_subject is not None else None
         state["current_attempt"] = {"fingerprint": fingerprint, "status": status,
                                     "reason": str(reason or "")[:results._PLAN_REVIEW_REASON_MAX_CHARS]}
         if selected is not None:
             state["current_attempt"]["author_subject"] = selected
+        elif retained:
+            state["current_attempt"]["submitted_subject"] = retained
         return state
 
     return results._update_plan_review_state(drive_root, task_id, record)
@@ -150,3 +166,17 @@ def author_selections(drive_root: Any, task_id: str, state: dict) -> tuple[list,
             identities.add(identity)
             distinct.append(selection)
     return distinct, gaps
+
+
+def current_submitted_plan(drive_root: Any, task_id: str, state: dict) -> dict | None:
+    """Exact current input even when no reviewer could start; no stance or verdict."""
+    from ouroboros.artifacts import read_actor_source_bytes
+    attempt = state.get("current_attempt") or {}
+    ref = attempt.get("submitted_subject")
+    if not ref:
+        return None
+    value = json.loads(read_actor_source_bytes(drive_root, task_id, ref))
+    if (value.get("kind") != "plan_submitted_subject" or value.get("fingerprint") != attempt.get("fingerprint")
+            or not isinstance(value.get("spec"), dict) or not isinstance(value.get("plan_prose"), str)):
+        raise ValueError("submitted plan source identity mismatch")
+    return {**value, "source_ref": ref, "authority": "Submitted for review; no reviewer verdict or author-finish selection."}

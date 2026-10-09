@@ -180,12 +180,13 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
         identity = {k: row[k] for k in ("review_record_id", "revision", "attempt", "subject") if k in row}
         for seat in row.get("reviewers") or []:
             for part, answer in (seat.get("answers") or {}).items():
-                decision_rows.append({**identity, "seat_id": seat.get("seat_id"), "part": part,
+                decision_rows.append({**identity, "decision_kind": "review_part", "seat_id": seat.get("seat_id"), "part": part,
+                    "source": (seat.get("response") or {}).get("source"),
                     "remark": answer.get("items") or answer.get("findings") or answer.get("summary"),
                     "status": {"recorded_verdict": answer.get("verdict"), "response_status": answer.get("status")},
                     "reason": copy.deepcopy(answer)})
         for decision in row.get("author_decisions") or []:
-            decision_rows.append({**identity, "remark": "Explicit author decision", "status": decision.get("disposition"),
+            decision_rows.append({**identity, "decision_kind": "author_decision", "remark": "Explicit author decision", "status": decision.get("disposition"),
                                   "reason": decision.get("rationale"), "source": decision.get("source_ref")})
     return {"kind": "review_dispute_history", "status": "source_unavailable" if gaps else "complete",
             "rounds": rounds, "decision_rows": decision_rows, "gaps": gaps,

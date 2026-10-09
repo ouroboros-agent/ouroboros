@@ -264,12 +264,7 @@ def test_llm_extraction_size_bounds_have_meaningful_headroom():
         for module in (llm, *_LEAVES)
     }
     assert counts["ouroboros.llm"] <= 750
-    from ouroboros.size_ratchet_manifest import BAND_PATHS
-    # The managed-session adapter entered the documented band; every other
-    # extraction leaf retains the original headroom check.
-    assert "ouroboros/llm_claudexor.py" in BAND_PATHS
-    assert all(count <= (1500 if name == "ouroboros.llm_claudexor" else 1000)
-               for name, count in counts.items()), counts
+    assert all(count <= 1000 for count in counts.values()), counts
 
 
 def test_llm_leaf_import_graph_is_acyclic_and_shallow():

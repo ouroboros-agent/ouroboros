@@ -281,6 +281,9 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     from ouroboros.main_context_authority import project_main_task_authority
 
     projection = project_main_task_authority(task, drive_root=canonical_root)
+    from ouroboros.main_context_authority import project_predecessor_review_views
+    projection = project_predecessor_review_views(projection, drive_root=canonical_root,
+        repo_roots=(task.get("workspace_root"), getattr(env, "repo_dir", None)))
     task_id = str(task.get("id") or "").strip()
     if not task_id:
         return projection
