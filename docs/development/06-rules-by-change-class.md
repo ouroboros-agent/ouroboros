@@ -253,10 +253,10 @@ Enforcement: the failure-path tests the first bullet mandates, plus `tests/test_
 
 #### Cognitive Artifact Integrity
 
-- Preserve exact cognitive sources before replacing their view: authored understanding, signed helper output and model-free addresses have different provenance. Keep governing words, outcomes and decisions; an omission marker proves no understanding or review. Enforce through DEVELOPMENT §4 "Compaction must earn its rewrite" and its tests.
-- Governance residency is per mode and per actor, never universal; a new reasoning flow follows the per-flow context-delivery registry (DEVELOPMENT §4 "Core Governance Artifacts", "When adding a new reasoning flow") and never relies on touched-file inclusions.
+- Preserve sources, governing words, outcomes and decisions across authored understanding, signed drafts and model-free addresses; omissions prove no understanding or review (DEVELOPMENT §4 "Compaction must earn its rewrite").
+- Follow DEVELOPMENT §4's per-mode/actor governance registry, never opportunistic touched-file inclusions.
 
-CHECKLISTS item 11(f) reviews source preservation and authorship.
+- Test account publication separately from selection: sources stay version-bound, non-exclusive and locally foldable; reselection, later source changes and missing history remain visible (`tests/test_common_story.py`). CHECKLISTS 11(f) reviews preservation/authorship.
 
 ### Android platform development
 
