@@ -509,6 +509,7 @@ def owned(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "DATA_DIR", isolated)
     monkeypatch.setattr(claudexor_daemon, "_MANAGER", None)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))  # Windows expanduser reads only this
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("attach-only must never manage an engine")
