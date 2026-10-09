@@ -92,7 +92,6 @@ from ouroboros.llm_openai_compatible import (
     _RESPONSE_METADATA_LABEL_MAX_CHARS,  # noqa: F401
 )
 from ouroboros.llm_pricing import (
-    _GenerationCostMixin,  # noqa: F401
     add_usage,  # noqa: F401
     fetch_cloudru_pricing,  # noqa: F401
     fetch_openrouter_pricing,  # noqa: F401
@@ -156,7 +155,6 @@ class LLMClient(
     _GigaChatLaneMixin,
     _LocalLaneMixin,
     _OpenAICompatibleLaneMixin,
-    _GenerationCostMixin,
 ):
     """LLM API wrapper. Routes calls to OpenRouter or a local llama-cpp-python server."""
 

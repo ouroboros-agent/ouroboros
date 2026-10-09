@@ -11,9 +11,38 @@ split, re-cut on the v7next tip); review_state.py re-exports every name.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Dict, List, Optional
+
+
+@dataclass(frozen=True)
+class ReviewStateMutation:
+    """An opt-in mutation result with an explicit changed-state fact.
+
+    Only audited mutators use this result. False permits a save comparison,
+    never a skipped lock/load or omission of load/persistence normalization.
+    """
+
+    value: Any
+    changed: bool
+
+
+class ReviewStateLockError(TimeoutError):
+    """Keep acquisition facts while preserving callers' TimeoutError contract."""
+
+    def __init__(self, lock_path: Any, outcome: Dict[str, Any]) -> None:
+        super().__init__(f"Could not acquire review state lock for {lock_path}")
+        self.lock_outcome = dict(outcome)
+        self.reported_cause = json.dumps(self.lock_outcome, separators=(",", ":"))
+
+
+def _dataclass_mapping(value: Any) -> Dict[str, Any]:
+    """Let the JSON encoder recurse without dataclasses.asdict's deep copies."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: getattr(value, field.name) for field in fields(value)}
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _rs():
@@ -429,7 +458,7 @@ def _merge_attempt(existing: CommitAttemptRecord, incoming: CommitAttemptRecord)
         triad_raw_results=list(getattr(incoming, "triad_raw_results", None) or getattr(existing, "triad_raw_results", None) or []),
         scope_raw_result=dict(getattr(incoming, "scope_raw_result", None) or getattr(existing, "scope_raw_result", None) or {}),
         author_disposition=dict(incoming.author_disposition or existing.author_disposition),
-        review_input=dict(incoming.review_input or existing.review_input),
+        review_input=dict(getattr(incoming, "review_input", None) or getattr(existing, "review_input", None) or {}),
         # Once an attempt physically dispatched a paid triad/scope wave the fact is
         # durable: a later terminal update on the same row must never launder it.
         paid=bool(getattr(incoming, "paid", False) or getattr(existing, "paid", False)),

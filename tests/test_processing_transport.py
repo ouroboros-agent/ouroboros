@@ -33,7 +33,6 @@ def transport(tmp_path, monkeypatch):
     monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True)
     monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_CACHE", {})
     monkeypatch.setattr(LLMClient, "_get_supported_parameters", lambda *a: None)
-    monkeypatch.setattr(LLMClient, "_fetch_generation_cost", lambda *a: None)
     sent = []
 
     class Response:

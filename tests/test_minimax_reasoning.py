@@ -218,7 +218,8 @@ def test_loop_retains_continuation_and_delivers_only_final_content(isolated, mon
     monkeypatch.setattr(client, "default_model", lambda: "minimax::MiniMax-M3.1")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
 
-    def handle(calls, _tools, _logs, _task, _executor, messages, _trace, _progress):
+    def handle(calls, _tools, _logs, _task, _executor, messages, _trace, _progress,
+               *, fit_candidate=None, tool_schemas=None):
         messages.append({"role": "tool", "tool_call_id": calls[0]["id"], "content": "Sunny"})
         return 0
 
@@ -341,7 +342,8 @@ def test_incomplete_minimax_stream_keeps_unknown_and_never_resends(isolated, mak
         _call(client, [{"role": "user", "content": "lookup"}], stream=True, asynchronous=asynchronous)
     assert len(sent) == 1 and response.is_closed
     assert _capture_on_chain(caught.value).state == "unresolved"
-    assert [(row["state"], row["revision"]) for row in rows(isolated)] == [("unresolved", 3)]
+    assert [(row["state"], row["revision"]) for row in rows(isolated)] == [("unresolved", 4)]
+    assert rows(isolated)[0]["physical_failure"]
 
 
 @pytest.mark.parametrize("missing", ["split", "continuation"])

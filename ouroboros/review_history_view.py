@@ -1,10 +1,11 @@
 """An author's chosen view of exact review history, without changing review authority.
 
-The history producer owns retrieval and current facts. Pure projection accepts full producer history; runtime hooks use the existing
-readers and task-result writer, without a second history store. Specs, current
-author stance, decision rows, gaps, substantive attachments and unknown fields
-stay in the mandatory part. Only exact-bound dispute fields become selectable
-bodies. No attachment-to-spec transfer is inferred here.
+The history producer owns retrieval and current facts. Pure projection accepts
+full producer history; runtime hooks use existing readers and the task-result
+writer, without a second history store. Specs, typed decision facts, gaps,
+substantive attachments and unknown fields stay in the mandatory part. Explicit
+actor notes may shorten source-bound decision prose. Exact-bound dispute fields
+become selectable bodies. No attachment-to-spec transfer is inferred here.
 
 Root wiring supplies these body bindings as source_refs of the typed transcript
 units, then retains the EXACT resulting actor capsule only after the complete
@@ -148,6 +149,223 @@ def split_review_history(history: dict, *, operative_subject: Any = None) -> dic
     return {"mandatory": mandatory, "bodies": bodies}
 
 
+_DECISION_KINDS = frozenset({"plan_finding", "plan_author", "plan_closure", "review_part", "author_decision"})
+
+
+def _decision_ref(source: Any) -> dict | None:
+    if not isinstance(source, Mapping):
+        return None
+    return _immutable_ref(source.get("source_ref") or source.get("ref") or source)
+
+
+def decision_entries(history: dict) -> list[dict]:
+    """Source-owned decision identities, independent of their display position.
+
+    Only the two typed history producers name these kinds. Unknown/legacy rows
+    remain full; equal prose from another source is not the same decision.
+    """
+    entries = []
+    for index, row in enumerate(history.get("decision_rows") or []):
+        if not isinstance(row, dict):
+            continue
+        ref = _decision_ref(row.get("source"))
+        kind = row.get("decision_kind")
+        binding = None
+        if kind in _DECISION_KINDS and ref is not None:
+            value = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"source", "revision"}}
+            binding = body_binding({"source_ref": ref}, "decision:" + kind, value)
+        entries.append({"index": index, "row": row, "bound_decision": binding,
+                        "reason": "not_selected" if binding else "unbound_or_legacy_decision"})
+    return entries
+
+
+def _decision_alias(binding: dict) -> dict:
+    return {"representation": "resident_review_decision", "bound_decision": copy.deepcopy(binding),
+            "read": "The resident decision index carries the recorded or explicitly actor-authored remark/reason; this exact source retains the original."}
+
+
+def _set_existing(value: Any, path: list, replacement: Any) -> None:
+    """A known producer path may already be addressed by ordinary body compaction."""
+    try:
+        parent = _at(value, path[:-1])
+        if ((isinstance(parent, dict) and path[-1] in parent)
+                or (isinstance(parent, list) and isinstance(path[-1], int))):
+            parent[path[-1]] = copy.deepcopy(replacement)
+    except (KeyError, IndexError, TypeError):
+        pass
+
+
+def _decision_aliases(history: dict, entry: dict) -> list[tuple[list, Any]]:
+    """Explicit semantic mirrors owned by plan/commit producers, never a field-name walk."""
+    row, binding = entry["row"], entry["bound_decision"]
+    source = _decision_ref(row.get("source"))
+    alias, paths = _decision_alias(binding), []
+    kind = row["decision_kind"]
+    for i, wave in enumerate(history.get("rounds") or []):
+        if not isinstance(wave, dict):
+            continue
+        base = ["rounds", i]
+        if kind.startswith("plan_") and _decision_ref(wave.get("source")) == source:
+            if kind == "plan_finding":
+                fid = row.get("finding_id")
+                for field in ("findings", "dispositions"):
+                    for j, item in enumerate(wave.get(field) or []):
+                        if isinstance(item, dict) and item.get("finding_id") == fid:
+                            # Keep identity/status keys beside the exact semantic source.
+                            shown = {k: copy.deepcopy(v) for k, v in item.items()
+                                     if k not in {"summary", "recommendation", "rationale"}}
+                            paths.append(([*base, field, j], {**shown, "authored_view": alias}))
+                for j, actor in enumerate(wave.get("reviewers") or []):
+                    carried = actor.get("carried_findings") if isinstance(actor, dict) else None
+                    if isinstance(carried, list):
+                        for k, item in enumerate(carried):
+                            if isinstance(item, dict) and item.get("finding_id") == fid:
+                                paths.append(([*base, "reviewers", j, "carried_findings", k],
+                                    {**{name: copy.deepcopy(value) for name, value in item.items()
+                                        if name not in {"summary", "recommendation", "rationale"}}, "authored_view": alias}))
+            elif kind == "plan_author":
+                paths.append(([*base, "author_disposition", "rationale"], alias))
+            else:
+                paths.append(([*base, "closure_notes"], alias))
+        if kind == "author_decision":
+            for j, decision in enumerate(wave.get("author_decisions") or []):
+                if isinstance(decision, dict) and _decision_ref(decision.get("source_ref")) == source:
+                    paths.append(([*base, "author_decisions", j, "rationale"], alias))
+        if kind == "review_part" and wave.get("review_record_id") == row.get("review_record_id"):
+            for j, seat in enumerate(wave.get("reviewers") or []):
+                if seat.get("seat_id") == row.get("seat_id") and _decision_ref((seat.get("response") or {}).get("source")) == source:
+                    answer = (seat.get("answers") or {}).get(row.get("part"))
+                    if isinstance(answer, dict):
+                        # These are the structured answer's semantic carriers; all other
+                        # typed verdict/count/coverage fields retain their exact values.
+                        for field in ("items", "findings", "discarded", "summary", "reason", "recommendation", "error"):
+                            if field in answer:
+                                value = answer[field]
+                                if isinstance(value, list):
+                                    # Item/verdict/severity/obligation identities remain inline.
+                                    value = [{**{k: copy.deepcopy(v) for k, v in item.items()
+                                                if k not in {"reason", "summary", "recommendation"}},
+                                              "authored_view": alias} if isinstance(item, dict) else item for item in value]
+                                else:
+                                    value = alias
+                                paths.append(([*base, "reviewers", j, "answers", row["part"], field], value))
+                        # The aggregate verdict repeats the same normalized findings.
+                        # Bind by exact structured value within this source-owned seat;
+                        # never assign an unrelated finding merely by matching its prose.
+                        items = [item for field in ("items", "findings", "discarded")
+                                 for item in answer.get(field, []) if isinstance(item, dict)]
+                        # commit_review's _review_entry view drops slot_id and adds
+                        # tag=triad. Reconstruct that exact producer projection only.
+                        commit_items = [{"severity": item.get("severity"), "item": item.get("item"),
+                            "reason": item.get("reason"), "tag": "triad", "verdict": "FAIL",
+                            **({"model": item["model"]} if item.get("model") else {}),
+                            **({"obligation_id": item["obligation_id"]} if item.get("obligation_id") else {})}
+                            for item in answer.get("findings", []) if item.get("verdict") == "FAIL"]
+                        if answer.get("status") != "responded":
+                            error = str(answer.get("error") or "")
+                            model = (seat.get("requested") or {}).get("model") or ""
+                            diagnostics = []
+                            if error:
+                                diagnostics.append((f"review_{row['part']}_unanswered", f"Part '{row['part']}' unanswered: {error}", model))
+                            for item in answer.get("discarded") or []:
+                                diagnostics.append((str(item.get("item", "?")),
+                                    f"not counted ({row['part']} answer unanswered: {error or 'invalid'}); "
+                                    f"the seat's {str(item.get('severity') or 'advisory')} FAIL said: {item.get('reason', '')}",
+                                    item.get("model") or model))
+                            commit_items.extend({"severity": "advisory", "item": item, "reason": reason,
+                                "tag": "triad", "verdict": "FAIL", **({"model": model} if model else {})}
+                                for item, reason, model in diagnostics)
+                        for field in ("critical_findings", "advisory_findings", "additional_findings"):
+                            for k, item in enumerate((wave.get("verdict") or {}).get(field) or []):
+                                original = dict(item) if isinstance(item, dict) else item
+                                if (isinstance(original, dict) and original.get("seat_id") == row.get("seat_id")
+                                        and original.get("part") == row.get("part")):
+                                    original = {key: value for key, value in original.items() if key not in {"seat_id", "part"}}
+                                if original in items or item in commit_items:
+                                    paths.append(([*base, "verdict", field, k], {
+                                        **{key: copy.deepcopy(value) for key, value in item.items()
+                                           if key not in {"reason", "summary", "recommendation"}}, "authored_view": alias}))
+    if kind == "plan_author":
+        for i, selection in enumerate(history.get("author_selections") or []):
+            if _decision_ref(selection.get("source")) == source:
+                paths.append((["author_selections", i, "author_disposition", "rationale"], alias))
+        author = history.get("current_author_plan")
+        if isinstance(author, dict) and _decision_ref(author.get("source") or author.get("source_ref")) == source:
+            paths.append((["current_author_plan", "author_disposition", "rationale"], alias))
+    return paths
+
+
+def preserved_review_fields(history: dict) -> list[dict]:
+    """Unknown producer extensions stay full and are named, never silently summarized."""
+    fields = []
+    output_keys = {"slot_id", "model", "request_model", "route", "text", "text_source", "error", "request_source",
+        "delivery_class", "review_thread_id", "review_turn_id", "review_thread_receipt", "auth_route_receipt",
+        "profile_continuity_receipt", "applied_profile", "prompt_ref", "response_ref"}
+    answer_keys = {"status", "verdict", "critical", "coverage", "error", "items", "findings", "discarded",
+                   "summary", "reason", "recommendation"}
+    aliases = {tuple(path) for entry in decision_entries(history) if entry["bound_decision"]
+               for path, _ in _decision_aliases(history, entry)}
+    for i, wave in enumerate(history.get("rounds") or []):
+        for field in ("critical_findings", "advisory_findings", "additional_findings"):
+            fields.extend({"path": ["rounds", i, "verdict", field, j], "reason": "unbound_verdict_mirror",
+                           "review_record_id": wave.get("review_record_id")}
+                          for j, _ in enumerate((wave.get("verdict") or {}).get(field) or [])
+                          if ("rounds", i, "verdict", field, j) not in aliases)
+        for j, output in enumerate(wave.get("reviewer_outputs") or []):
+            fields.extend({"path": ["rounds", i, "reviewer_outputs", j, key], "source": wave.get("source"), "reason": "unknown_producer_field"}
+                          for key in output if key not in output_keys)
+        for j, seat in enumerate(wave.get("reviewers") or []):
+            for part, answer in (seat.get("answers") or {}).items():
+                fields.extend({"path": ["rounds", i, "reviewers", j, "answers", part, key],
+                               "source": (seat.get("response") or {}).get("source"),
+                               "reason": "unknown_producer_field"} for key in answer if key not in answer_keys)
+    return fields
+
+
+def project_decision_notes(history: dict, notes: Sequence[dict], *, source_history: dict | None = None) -> tuple[dict, list, list]:
+    """Apply explicit authored words to typed semantic entries and their mirrors.
+
+    This is a model view only. Canonical records/decisions never change. Missing
+    or stale entries stay full without vetoing other entries or ordinary work.
+    """
+    projected = copy.deepcopy(history)
+    original = source_history if source_history is not None else history
+    operative_subject = projected.get("operative_subject")
+    valid = {}
+    for note in notes or []:
+        try:
+            binding = _binding(note.get("bound_decision"))
+            if not all(isinstance(note.get(k), str) and note[k].strip() for k in ("remark", "reason")):
+                continue
+            valid[_sha(binding)] = {"bound_decision": binding, "remark": note["remark"], "reason": note["reason"]}
+        except (ValueError, TypeError, AttributeError):
+            continue
+    applied, unshortened = [], []
+    for entry in decision_entries(original):
+        binding, row = entry["bound_decision"], entry["row"]
+        note = valid.get(_sha(binding)) if binding else None
+        if note is None:
+            unshortened.append({"bound_decision": binding, "decision_kind": row.get("decision_kind"),
+                               "finding_id": row.get("finding_id"), "reason": entry["reason"]})
+            continue
+        index_row = projected["decision_rows"][entry["index"]]
+        index_row.update(remark=note["remark"], reason=note["reason"], authored_view={
+            "authorship": "actor", "bound_decision": binding,
+            "rule": "Actor's short account of this decision, not a changed critic or author verdict."})
+        if row.get("decision_kind") == "plan_author" and isinstance(index_row.get("status"), dict):
+            index_row["status"].pop("rationale", None)  # reason is resident once, status remains typed
+        for path, alias in _decision_aliases(original, entry):
+            _set_existing(projected, path, alias)
+        if (row.get("decision_kind") == "plan_author" and isinstance(operative_subject, dict)
+                and _decision_ref(operative_subject.get("source_ref") or operative_subject.get("source")) == _decision_ref(row.get("source"))):
+            _set_existing(operative_subject, ["author_disposition", "rationale"], _decision_alias(binding))
+        applied.append(copy.deepcopy(note))
+    used = {_sha(n["bound_decision"]) for n in applied}
+    unshortened.extend({"bound_decision": note["bound_decision"], "reason": "stale_or_unknown_decision"}
+                      for key, note in valid.items() if key not in used)
+    return projected, applied, unshortened
+
+
 def operative_review_subject(review: dict) -> Any:
     """Resolve only an explicitly selected author or exact current-wave source."""
     history = review.get("dispute_history") or {}
@@ -169,8 +387,73 @@ def operative_review_subject(review: dict) -> Any:
     return operative
 
 
+def _address_runtime_review_mirrors(runtime: dict, history: dict) -> None:
+    """De-duplicate known model-only authority carriers against the resident index.
+
+    The source state/gate operands are not modified. This runs before the Runtime
+    prefix freezes, so a later authored index view cannot leave a hidden raw copy.
+    Unknown identities stay full. Only documented authority-envelope edges recur.
+    """
+    authors = {_sha(_decision_ref(e["row"]["source"])): e for e in decision_entries(history)
+               if e["bound_decision"] and e["row"]["decision_kind"] == "plan_author"}
+
+    def subject(value):
+        if not isinstance(value, dict):
+            return
+        ref = _decision_ref(value.get("source_ref") or value.get("source"))
+        entry = authors.get(_sha(ref)) if ref else None
+        author = value.get("author_disposition")
+        if entry and isinstance(author, dict) and author.get("rationale") == entry["row"].get("reason"):
+            author["rationale"] = _decision_alias(entry["bound_decision"])
+
+    def wave_mirrors(value, ref):
+        if not isinstance(value, dict) or not ref:
+            return
+        facade = {"rounds": [{**copy.deepcopy(value), "source": {"source_ref": ref}}]}
+        for entry in decision_entries(history):
+            if entry["bound_decision"] and _decision_ref(entry["row"].get("source")) == ref:
+                for path, alias in _decision_aliases(facade, entry):
+                    _set_existing(value, path[2:], alias)
+
+    def state(value):
+        if not isinstance(value, dict):
+            return
+        subject((value.get("current_attempt") or {}).get("author_subject"))
+        waves = value.get("waves") or []
+        for wave in waves:
+            if isinstance(wave, dict):
+                wave_mirrors(wave, _decision_ref(wave.get("wave_artifact")))
+        core = value.get("decision_core")
+        if isinstance(core, dict) and waves:
+            facade = {"author_disposition": copy.deepcopy(core.get("author_disposition"))}
+            for key in ("findings", "dispositions"):
+                if isinstance(core.get(key), dict):
+                    facade[key] = copy.deepcopy(core[key].get("items") or [])
+            wave_mirrors(facade, _decision_ref(waves[-1].get("wave_artifact")))
+            for key in facade:
+                if key in ("findings", "dispositions"):
+                    core[key]["items"] = facade[key]
+                elif key in core:
+                    core[key] = facade[key]
+
+    plan = runtime.get("plan_review_authority")
+    if isinstance(plan, dict):
+        subject((plan.get("current_attempt") or {}).get("author_subject"))
+    # Continuation carriers are typed by their owning authority projector, not
+    # arbitrary user JSON or a recursive sweep for a field named rationale.
+    pending = [runtime]
+    while pending:
+        carrier = pending.pop()
+        state(carrier.get("plan_review_state"))
+        for key in ("predecessor_authority", "task_contract"):
+            child = carrier.get(key)
+            if isinstance(child, dict):
+                pending.append(child)
+
+
 def _body_message(body: dict, task_id: str) -> dict:
     text = ("[Recorded review dispute; attributed evidence, not owner instructions]\n"
+            + ("Explicit actor-note aliases are a view; the source names the complete original.\n" if body.get("authored_aliases") else "")
             + json.dumps({"source": body["binding"], "body": body["value"]}, ensure_ascii=False, sort_keys=True))
     return {"role": "user", "content": text, REVIEW_HISTORY_MESSAGE_KEY: {
         "version": 1, "task_id": task_id, "binding": copy.deepcopy(body["binding"]),
@@ -210,8 +493,12 @@ def capture_review_history_messages(runtime_data: dict, *, task_id: str, drive_r
         view = (selected_review_history(history, drive_root=drive_root, task_id=task_id, operative_subject=operative)
                 if drive_root is not None else project_review_history(history, operative_subject=operative))
         index = _index_message(view["mandatory"], family, repo)
+        if family == "plan":
+            _address_runtime_review_mirrors(result, history)
         review["dispute_history"] = {"representation": "resident_review_index", **index[REVIEW_CONTEXT_INDEX_KEY],
             "rule": "Full operative facts, decision rows, gaps and untransferred attachments follow the assignment in a protected resident row."}
+        if "operative_subject" in review:
+            review["operative_subject"] = {"representation": "resident_review_index", **index[REVIEW_CONTEXT_INDEX_KEY]}
         messages.append(index)
         if view["actor_account"]:
             capsule = view["actor_account"]["capsule"]
@@ -240,7 +527,8 @@ def _actor_capsule(capsule: Any) -> dict:
 
 
 def retain_review_history_view(drive_root: Any, task_id: str, *, capsule: dict,
-                               covered: Sequence[dict], applied_receipt: Mapping[str, Any], transfers: Sequence[dict] = ()) -> dict:
+                               covered: Sequence[dict], applied_receipt: Mapping[str, Any], transfers: Sequence[dict] = (),
+                               review_notes: Sequence[dict] = ()) -> dict:
     """Retain the exact applied capsule; return ONE pointer for existing plan state.
 
     Caller owns publication order: complete fit/apply first, then this write and
@@ -253,7 +541,7 @@ def retain_review_history_view(drive_root: Any, task_id: str, *, capsule: dict,
         raise ValueError("Only an applied authored view can select review history")
     meta = _actor_capsule(capsule)
     bindings = [_binding(ref) for ref in covered]
-    if not bindings and not transfers:
+    if not bindings and not transfers and not review_notes:
         raise ValueError("Selected view covers no exact review body")
     inherited = {_sha(_binding(ref)) for ref in meta.get("source_refs", [])
                  if isinstance(ref, Mapping) and ref.get("kind") == BODY_KIND}
@@ -261,6 +549,7 @@ def retain_review_history_view(drive_root: Any, task_id: str, *, capsule: dict,
         raise ValueError("Covered source is absent from the applied capsule lineage")
     record = {"kind": VIEW_KIND, "version": _VIEW_VERSION, "task_id": task_id,
               "capsule": copy.deepcopy(capsule), "covered": bindings, "transfers": copy.deepcopy(list(transfers)),
+              "review_notes": copy.deepcopy(list(review_notes)),
               "applied_view_revision": applied_receipt.get("view_revision")}
     raw = _bytes(record)
     ref = store_actor_source_bytes(drive_root, task_id, category="context_checkpoints",
@@ -288,7 +577,7 @@ def load_review_history_view(selection: Mapping[str, Any], source_reader: Callab
     covered = [_binding(ref) for ref in record["covered"]]
     inherited = {_sha(_binding(ref)) for ref in meta.get("source_refs", [])
                  if isinstance(ref, Mapping) and ref.get("kind") == BODY_KIND}
-    if (not covered and not record.get("transfers")) or any(_sha(ref) not in inherited for ref in covered):
+    if (not covered and not record.get("transfers") and not record.get("review_notes")) or any(_sha(ref) not in inherited for ref in covered):
         raise ValueError("Selected capsule does not carry its covered sources")
     return record
 
@@ -306,7 +595,8 @@ def project_review_history(history: dict, *, operative_subject: Any = None,
     split = split_review_history(history, operative_subject=operative_subject)
     shown = copy.deepcopy(history)
     answer = {**split, "history": shown, "actor_account": None, "selection_status": "absent",
-              "covered_bindings": [], "unmatched_bindings": [], "selection_gaps": []}
+              "covered_bindings": [], "unmatched_bindings": [], "selection_gaps": [],
+              "preserved_fields": preserved_review_fields(history)}
     if selection is None:
         return answer
     try:
@@ -337,10 +627,23 @@ def project_review_history(history: dict, *, operative_subject: Any = None,
             "representation": "actor_authored_view", "original": copy.deepcopy(body["binding"]),
             "selected_view": copy.deepcopy(selection["source_ref"])}
         answer["covered_bindings"].append(copy.deepcopy(body["binding"]))
+    if record.get("review_notes"):
+        shown, notes, unshortened = project_decision_notes(shown, record["review_notes"], source_history=history)
+        answer["mandatory"], _, _ = project_decision_notes(answer["mandatory"], record["review_notes"], source_history=history)
+        answer["history"] = shown
+        answer["review_notes"] = notes
+        answer["unshortened_decisions"] = unshortened
+        for body in remaining:
+            value = _at(shown, body["path"])
+            if value != body["value"]:
+                body["value"] = copy.deepcopy(value)
+                body["authored_aliases"] = True
+    else:
+        notes = []
     answer["bodies"] = remaining
     answer["unmatched_bindings"] = [ref for ident, ref in wanted.items() if ident not in used]
-    answer["selection_status"] = "applied" if used or transferred else "not_applicable"
-    if used or transferred:
+    answer["selection_status"] = "applied" if used or transferred or notes else "not_applicable"
+    if used or transferred or notes:
         account = {"capsule": copy.deepcopy(record["capsule"]),
                    "source_ref": copy.deepcopy(selection["source_ref"]),
                    "rule": "Author's account of named earlier sources, not a new reviewer verdict."}
@@ -427,7 +730,7 @@ def publish_review_history_view(ctx: Any, capsule: dict, receipt: dict, *, trans
     task = str(ctx.task_id)
     meta = _actor_capsule(capsule)
     covered = [ref for ref in meta.get("source_refs", []) if isinstance(ref, dict) and ref.get("kind") == BODY_KIND]
-    if not covered and not transfers:
+    if not covered and not transfers and pointer is None:
         return None
     pointer = pointer or retain_review_history_view(root, task, capsule=capsule, covered=covered,
                                                    applied_receipt=receipt, transfers=transfers)
@@ -466,12 +769,20 @@ def current_plan_history(ctx: Any, *, state: dict | None = None) -> tuple[dict, 
                 "spec", "plan_prose", "fingerprint", "review_fingerprint", "author_disposition") if key in author}
             operative["source_ref"] = ((state.get("current_attempt") or {}).get("author_subject") or {}).get("source_ref")
         else:
+            from ouroboros.tools.plan_author_history import current_submitted_plan
+            submitted = current_submitted_plan(root, str(ctx.task_id), state)
+            if submitted is not None:
+                return history, submitted
             wave = authority_wave(root, str(ctx.task_id), current_plan_review_wave(state))
             operative = ({key: copy.deepcopy(wave[key]) for key in (
                 "spec", "plan_prose", "spec_hash", "request_fingerprint", "cycle_index", "spec_source_ref", "wave_artifact") if key in wave}
                 if wave is not None else None)
-    except PlanReviewSourceUnavailable:
-        operative = None  # the shared history already carries the exact source gap
+    except (PlanReviewSourceUnavailable, OSError, ValueError, TypeError) as exc:
+        operative = None
+        if (state.get("current_attempt") or {}).get("submitted_subject"):
+            history["status"] = "source_unavailable"
+            history.setdefault("gaps", []).append({"code": "PLAN_SUBMITTED_SOURCE_UNAVAILABLE",
+                "source_ref": state["current_attempt"]["submitted_subject"], "reason": str(exc)})
     return history, operative
 
 
@@ -491,10 +802,12 @@ def review_context_updates(ctx: Any, *, families: Mapping[str, str] | None = Non
     Exact bodies already in canonical messages are not appended twice. Current
     index snapshots remain append-only until the actor's checkpointed compaction.
     """
+    pending = dict(families if families is not None else getattr(ctx, "_pending_review_context", {}) or {})
+    if not pending:
+        return [], {}
     from ouroboros.review_history import review_dispute_history
 
     root, task = getattr(ctx, "budget_drive_root", None) or ctx.drive_root, str(ctx.task_id)
-    pending = dict(families if families is not None else getattr(ctx, "_pending_review_context", {}) or {})
     known = {_sha(row[REVIEW_HISTORY_MESSAGE_KEY].get("binding")) for row in messages
              if isinstance(row.get(REVIEW_HISTORY_MESSAGE_KEY), dict)}
     indexes = {(_sha(row[REVIEW_CONTEXT_INDEX_KEY])) for row in messages if isinstance(row.get(REVIEW_CONTEXT_INDEX_KEY), dict)}
@@ -529,7 +842,49 @@ def attachment_transfer_options(ctx: Any) -> dict:
             "rule": "Attachments stay full until you explicitly declare their decisions and reasons transferred to these current spec decisions using review_transfers with your working_note. This checks identity, not semantic completeness."}
 
 
-def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Sequence[dict]) -> tuple[dict | None, dict | None, list, Any]:
+def review_note_options(ctx: Any) -> dict:
+    histories = [current_plan_history(ctx)[0]]
+    from ouroboros.review_history import review_dispute_history
+    root = getattr(ctx, "budget_drive_root", None) or ctx.drive_root
+    repo = getattr(ctx, "repo_dir", None)
+    if repo is not None:
+        histories.append(review_dispute_history(drive_root=root, repo_root=repo, task_id=str(ctx.task_id)))
+    entries = [entry for history in histories for entry in decision_entries(history)]
+    selected = {}
+    for history in histories:
+        shown = selected_review_history(history, drive_root=root, task_id=str(ctx.task_id))
+        selected.update({_sha(n["bound_decision"]): n for n in shown.get("review_notes", [])})
+    return {"preserved_fields": [field for history in histories for field in preserved_review_fields(history)],
+        "entries": [{"bound_decision": entry["bound_decision"],
+        "decision_kind": entry["row"].get("decision_kind"), "finding_id": entry["row"].get("finding_id"),
+        "status": {k: v for k, v in entry["row"].get("status", {}).items() if k != "rationale"}
+                  if isinstance(entry["row"].get("status"), dict) else entry["row"].get("status"),
+        "representation": "actor_review_note" if _sha(entry["bound_decision"]) in selected else "full",
+        "note": selected.get(_sha(entry["bound_decision"])),
+        "reason": "selected" if _sha(entry["bound_decision"]) in selected else entry["reason"],
+        "source": entry["row"].get("source")}
+        for entry in entries],
+        "rule": "Use review_notes with your working_note to keep an attributed short remark and reason per exact decision. Missing or stale notes keep that decision full; statuses and authority never change. Unknown producer fields and substantive attachments remain verbatim."}
+
+
+def _available_review_notes(ctx, notes):
+    options = review_note_options(ctx)
+    current = {_sha(e["bound_decision"]): e["bound_decision"] for e in options["entries"] if e["bound_decision"]}
+    accepted, gaps = [], []
+    for note in notes or []:
+        try:
+            binding = _binding(note.get("bound_decision"))
+            if _sha(binding) not in current:
+                raise ValueError("stale_or_unknown_decision")
+            if not all(isinstance(note.get(k), str) and note[k].strip() for k in ("remark", "reason")):
+                raise ValueError("short_remark_and_reason_missing")
+            accepted.append({"bound_decision": binding, "remark": note["remark"], "reason": note["reason"]})
+        except (ValueError, TypeError, AttributeError) as exc:
+            gaps.append({"bound_decision": note.get("bound_decision") if isinstance(note, dict) else None,
+                         "reason": str(exc)})
+    return list({_sha(n["bound_decision"]): n for n in accepted}.values()), gaps, options
+
+def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Sequence[dict], review_notes: Sequence[dict] = ()) -> tuple[dict | None, dict | None, list, Any]:
     """Retain a candidate capsule, without publishing the task's selected pointer."""
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.task_results import load_task_result
@@ -540,13 +895,17 @@ def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Seq
         and (row["content"][0].get("_context_capsule") or {}).get("unit_id") == "view:" + str(receipt.get("selection_fingerprint") or "")), None)
     if capsule is None:
         return None, None, [], None
-    root, task = getattr(ctx, "budget_drive_root", None) or ctx.drive_root, str(ctx.task_id)
     covered = [ref for ref in _actor_capsule(capsule).get("source_refs", []) if isinstance(ref, dict) and ref.get("kind") == BODY_KIND]
-    inherited = []
+    if not covered and not transfers and not review_notes and not any(REVIEW_CONTEXT_INDEX_KEY in row for row in candidate):
+        return None, capsule, [], None  # Ordinary authored notes do not open review state.
+    root, task = getattr(ctx, "budget_drive_root", None) or ctx.drive_root, str(ctx.task_id)
+    inherited, old_notes = [], []
     saved = (load_task_result(root, task, strict=True) or {}).get(SELECTED_VIEW_FIELD)
     if saved:
         try:
-            inherited = load_review_history_view(saved, lambda ref: read_actor_source_bytes(root, task, ref)).get("transfers") or []
+            previous_view = load_review_history_view(saved, lambda ref: read_actor_source_bytes(root, task, ref))
+            inherited = previous_view.get("transfers") or []
+            old_notes = previous_view.get("review_notes") or []
         except (OSError, ValueError, KeyError, TypeError):
             pass  # full bodies + visible selection gap remain the reader's fallback
     accepted = []
@@ -559,10 +918,15 @@ def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Seq
             except (ValueError, TypeError, KeyError):
                 pass  # changed current spec restores attachments
         accepted = list({_sha(row): row for row in accepted}.values())
-    if not covered and not accepted:
+    chosen_notes, note_gaps, options = _available_review_notes(ctx, [*old_notes, *review_notes])
+    if options is not None:
+        chosen_keys = {_sha(n["bound_decision"]) for n in chosen_notes}
+        receipt["review_notes"] = {"applied": chosen_notes, "preserved_fields": options["preserved_fields"], "unshortened": [*note_gaps, *[
+            entry for entry in options["entries"] if not entry["bound_decision"] or _sha(entry["bound_decision"]) not in chosen_keys]]}
+    if not covered and not accepted and not chosen_notes:
         return None, capsule, [], saved
     pointer = retain_review_history_view(root, task, capsule=capsule, covered=covered,
-                                         applied_receipt=receipt, transfers=accepted)
+                                         applied_receipt=receipt, transfers=accepted, review_notes=chosen_notes)
     return pointer, capsule, accepted, saved
 
 

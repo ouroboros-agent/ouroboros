@@ -93,7 +93,8 @@ def owner_protected_texts(ctx) -> tuple:
 def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = False,
                      expected_view_revision: str = "", working_note: str | None = None,
                      keep_unit_ids: List[str] | None = None, restore_unit_refs: List[dict] | None = None,
-                     schema_names: List[str] | None = None, review_transfers: List[dict] | None = None, **kwargs) -> str:
+                     schema_names: List[str] | None = None, review_transfers: List[dict] | None = None,
+                     review_notes: List[dict] | None = None, **kwargs) -> str:
     """Inspect or queue a replacement through the existing context materializer.
 
     The explicit authored view (inspect / working_note / restore) addresses the dialogue
@@ -135,10 +136,11 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
         # Keep the full reader hint on the pinned observation, outside this O(N) reply.
         restore_checkpoint = ({key: checkpoint[key] for key in ("kind", "root", "path", "size", "sha256")}
                               if checkpoint else None)
-        from ouroboros.review_history_view import attachment_transfer_options
+        from ouroboros.review_history_view import attachment_transfer_options, review_note_options
         transfers = attachment_transfer_options(ctx) if getattr(ctx, "task_id", "") else {}
         return json.dumps({
             **({"review_attachment_transfer": transfers} if transfers else {}),
+            **({"review_decisions": review_note_options(ctx)} if getattr(ctx, "task_id", "") else {}),
             "view_revision": observed["revision"],
             "units": [{"unit_id": unit.unit_id, "raw_sha256": unit.raw_sha256, "kind": unit_kind(observed["messages"], unit),
                        "eligible": unit.unit_id not in protected,
@@ -172,6 +174,7 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
                 or any(values is not None and (not isinstance(values, list)
                        or not all(isinstance(v, str) and v for v in values))
                        for values in (keep_unit_ids, schema_names))
+                or review_notes is not None and not isinstance(review_notes, list)
                 or restore_unit_refs is not None and (not isinstance(restore_unit_refs, list)
                     or not all(isinstance(ref, dict) for ref in restore_unit_refs))):
             return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
@@ -194,6 +197,7 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
             keep_unit_ids = [unit.unit_id for unit in units if unit.start >= anchor]
         ctx._pending_compaction = {
             "observed": observed, "working_note": working_note, "review_transfers": list(review_transfers or []),
+            "review_notes": list(review_notes or []),
             "expected_view_revision": observed["revision"],
             "keep_unit_ids": None if keep_unit_ids is None else tuple(keep_unit_ids),
             "restore_unit_refs": tuple(restore_unit_refs or ()),
@@ -201,9 +205,9 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
         }
         return "Working view requested. The next complete tool boundary preserves exact sources and checks the full candidate before applying it; the resulting receipt reports actual changes."
 
-    if review_transfers:
+    if review_transfers or review_notes:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
-            text="review_transfers requires your working_note; ordinary helper compaction cannot declare decision transfer."))
+            text="review_transfers and review_notes require your working_note; helper compaction cannot author your decision account."))
     keep_last_n = max(2, min(6 if keep_last_n is None else keep_last_n, 20))
 
     ctx._pending_compaction = keep_last_n
@@ -249,6 +253,10 @@ def get_tools() -> List[ToolEntry]:
                             "required": ["checkpoint_ref", "unit_id", "raw_sha256"]},
                             "description": "Read exact checkpoint-local units back as labelled sources, never live tool protocol replay."},
                         "schema_names": {"type": "array", "items": {"type": "string"}, "description": "Nano only: desired canonical schemas. This selects residency, never execution permissions. Low/Max retain their full permitted envelope."},
+                        "review_notes": {"type": "array", "items": {"type": "object", "properties": {
+                            "bound_decision": {"type": "object"}, "remark": {"type": "string"}, "reason": {"type": "string"}},
+                            "required": ["bound_decision", "remark", "reason"], "additionalProperties": False},
+                            "description": "With working_note: your short attributed remark and reason for exact decisions from inspect.review_decisions. Canonical status/verdict/authority remain unchanged. Missing/stale entries stay full and are disclosed; no host clipping or automatic summary."},
                         "review_transfers": {"type": "array", "items": {"type": "object", "properties": {
                             "source": {"type": "object"}, "operative_spec_sha256": {"type": "string"},
                             "decision_ids": {"type": "array", "items": {"type": "string"}}},

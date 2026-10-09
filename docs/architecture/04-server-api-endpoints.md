@@ -63,6 +63,10 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | GET | `/api/claudexor/status` | daemon adds nullable `last_exit` and `memory`: a saved host exit observation plus a read of the already-running engine, never a wake (§9) |
 | POST | `/api/claudexor/quota/refresh` | |
 | POST | `/api/claudexor/wake` | |
+| GET | `/api/claudexor/maintenance/harnesses` | passive inspection; optional fresh/latest check |
+| POST | `/api/claudexor/maintenance/operations` | Idempotency-Key; 202 operation handle |
+| GET | `/api/claudexor/maintenance/operations/{operation_id}` | retained engine facts |
+| POST | `/api/claudexor/maintenance/operations/{operation_id}/cancel` | acknowledgement does not prove termination |
 | POST | `/api/claudexor/login` | |
 | GET | `/api/claudexor/login/{job_id}` | |
 | DELETE | `/api/claudexor/login/{job_id}` | |

@@ -161,4 +161,3 @@ def emergency_address_view(
         checkpoint_ref=checkpoint_ref, capsule_refs=capsule_refs,
         source_refs=compaction._unique_refs([*source_refs, checkpoint_ref]),
     )
-

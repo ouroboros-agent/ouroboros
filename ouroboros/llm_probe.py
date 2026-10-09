@@ -430,7 +430,7 @@ def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
     from ouroboros.transport_custody import is_loopback_base_url
     try:
         if provider_for_model(model) == "claudexor":
-            from ouroboros.llm_claudexor import model_catalog
+            from ouroboros.llm_claudexor import catalog_admits_model, model_catalog
             from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
             source, native_model = parse_claudexor_model(model)
             account = (model_role_option(MODEL_ACCOUNTS_KEY, model_role)
@@ -453,7 +453,7 @@ def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
                     and (not account or catalog.get("credentialProfileId") == account)
                     and (not effective.get("accountFingerprint")
                          or catalog.get("accountFingerprint") == effective["accountFingerprint"])
-                    and any(item.get("id") == native_model for item in catalog.get("models", []))):
+                    and catalog_admits_model(catalog, native_model)):
                 return {"kind": "upstream_catalog", "source": source,
                         "observed_at": catalog["observedAt"], "provenance": catalog["provenance"],
                         "credential_profile_id": catalog.get("credentialProfileId"),

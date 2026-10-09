@@ -6748,6 +6748,36 @@ textarea.chat-input {
     line-height: var(--line-meta);
 }
 .agent-family-rows { display: flex; flex-direction: column; gap: 8px; }
+.harness-maintenance-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    min-width: 0;
+}
+.harness-maintenance-line {
+    flex: 1 1 auto;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+    overflow-wrap: anywhere;
+}
+.harness-maintenance-actions { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.harness-maintenance-notice,
+.harness-maintenance-details {
+    flex-basis: 100%;
+    min-width: 0;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+    overflow-wrap: anywhere;
+}
+.harness-maintenance-notice[data-tone="warn"] { color: var(--status-warn-fg); }
+.harness-maintenance-details summary { color: var(--text-primary); cursor: pointer; }
+.harness-maintenance-details dl { margin: var(--space-2) 0; }
+.harness-maintenance-details dt { color: var(--text-meta); }
+.harness-maintenance-details dd { margin: 0 0 var(--space-1); color: var(--text-primary); }
+.harness-maintenance-details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 /* Account rows are purpose-built (identity left, actions right), not the
    settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
    columns inverted the proportions and its align-items:end sank the text.

@@ -176,7 +176,10 @@ _SCHEDULE_SUBAGENT_DESCRIPTION = (
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.tools.control_maintenance import maintenance_tool_entries
+
     return [
+        *maintenance_tool_entries(),
         ToolEntry("finish_task", {"name": "finish_task",
             "description": "Select the complete answer and request completion of your current task. "
                 "Use finish after considering the observed work, or stop with a rationale naming unfinished work. "

@@ -1740,7 +1740,7 @@
             "candidate_raw_size_bytes": 737,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "1h",
             "cost_final": true
           }
@@ -1919,7 +1919,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": false
           }
@@ -1928,8 +1928,8 @@
       }
     },
     {
-      "id": "openrouter.dispatch.generation_cost_backfill",
-      "route": "usage without cost triggers the OpenRouter generation-cost fetch",
+      "id": "openrouter.dispatch.missing_cost_stays_nonfinal",
+      "route": "usage without cost keeps the answer and nonfinal money without a generation GET",
       "spec": {
         "env": {
           "OPENROUTER_API_KEY": "or-fixture-key"
@@ -1952,15 +1952,6 @@
               "usage": {
                 "prompt_tokens": 200,
                 "completion_tokens": 10
-              }
-            }
-          },
-          {
-            "kind": "response",
-            "status_code": 200,
-            "json": {
-              "data": {
-                "total_cost": 0.0077
               }
             }
           }
@@ -2007,10 +1998,10 @@
               "report_source": null
             },
             "response_finish_reason": "stop",
-            "cost": 0.0077,
+            "cost": null,
             "provider": "openrouter",
             "resolved_model": "x-ai/grok-4.5",
-            "cost_final": true,
+            "cost_final": false,
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
@@ -2068,16 +2059,6 @@
               "model": "x-ai/grok-4.5"
             },
             "payload_sha256": "f1b47abdc717d4734c08a823b6396cdd0d044f43637f54b397556190e9daadd1"
-          },
-          {
-            "transport": "requests.get",
-            "url": "https://openrouter.ai/api/v1/generation?id=gen-fixture-2",
-            "headers": [
-              "Authorization"
-            ],
-            "timeout": 5,
-            "payload": {},
-            "payload_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
           }
         ],
         "physical_attempts": [
@@ -2089,12 +2070,27 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": false
           }
         ],
-        "unused_script_steps": 0
+        "unused_script_steps": 0,
+        "pricing_calls": [
+          {
+            "model": "x-ai/grok-4.5",
+            "prompt_tokens": 200,
+            "completion_tokens": 10,
+            "cache_usage": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "prompt_cache_ttl": null,
+              "cache_write_tokens_by_ttl": null
+            },
+            "allow_live_fetch": true,
+            "provider": "openrouter"
+          }
+        ]
       }
     },
     {
@@ -2254,7 +2250,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -2486,7 +2482,7 @@
             "candidate_raw_size_bytes": 566,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -2661,7 +2657,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -2804,9 +2800,9 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           }
         ],
         "unused_script_steps": 0
@@ -3106,7 +3102,7 @@
             "candidate_raw_size_bytes": 885,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "1h",
             "cost_final": true
           }
@@ -3266,7 +3262,7 @@
             "candidate_raw_size_bytes": 150,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -3490,7 +3486,7 @@
             "candidate_raw_size_bytes": 586,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "5m",
             "cost_final": true
           }

@@ -25,7 +25,8 @@ from ouroboros.llm_attempt import (
     _finalized_physical_candidate,
     _is_structured_context_overflow_exception,
 )
-from ouroboros.usage_accounting import PhysicalAttemptCapture, UsageAccountingError, current_physical_attempt_context
+from ouroboros.usage_accounting import UsageAccountingError, current_physical_attempt_context
+from ouroboros.transport_custody import outcome_unknown_on_chain
 
 # The moved warnings keep the logger identity they were emitted under.
 log = logging.getLogger("ouroboros.llm")
@@ -358,8 +359,7 @@ class _LocalLaneMixin:
                     or context_overflow_message(err)):
                 raise LocalContextTooLargeError(err) from exc
             # Exception-owned capture proves this attempt; prior ContextVar may be unrelated.
-            capture = getattr(exc, "physical_attempt_capture", None)
-            if isinstance(capture, PhysicalAttemptCapture) and capture.state in {"dispatched", "unresolved"}:
+            if outcome_unknown_on_chain(exc):
                 raise  # Outer custody owns an unknown physical outcome.
             log.warning("Local model request failed: %s", exc)
             raise

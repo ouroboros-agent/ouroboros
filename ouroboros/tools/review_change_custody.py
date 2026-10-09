@@ -56,14 +56,15 @@ def pending_round_attempt(ctx: Any, *, root: pathlib.Path, retry_key: str) -> Op
     the rerun collects it instead of paying for a second physical review; only a
     NEW paid wave meets the per-task cycle ceiling. An unreadable review state
     raises: it is not evidence that nothing is owed."""
-    from ouroboros.review_state import _utc_now, make_repo_key, update_state
+    from ouroboros.review_state import ReviewStateMutation, _utc_now, make_repo_key, update_state
 
     repo_key, task_id = make_repo_key(root), str(getattr(ctx, "task_id", "") or "")
 
-    def _active(state: Any) -> list:
-        state.expire_stale_attempts(now_ts=_utc_now())
-        return [item for item in state.get_active_attempts(repo_key=repo_key)
+    def _active(state: Any) -> ReviewStateMutation:
+        expired = state.expire_stale_attempts(now_ts=_utc_now())
+        rows = [item for item in state.get_active_attempts(repo_key=repo_key)
                 if item.tool_name == TOOL_NAME and item.task_id == task_id and item.review_retry_key == retry_key]
+        return ReviewStateMutation(rows, changed=bool(expired))
 
     rows = update_state(pathlib.Path(ctx.drive_root), _active)
     return rows[-1] if rows else None

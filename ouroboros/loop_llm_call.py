@@ -32,7 +32,7 @@ from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
 from ouroboros.send_clock import main_send_scope
 from ouroboros.task_pacing import main_loop_wire_options
-from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death
+from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death, outcome_unknown_on_chain
 from ouroboros._usage_response import OUTPUT_LIMIT_FINISH_REASONS, output_exhaustion_facts, provider_cost_value as _provider_cost_value, response_finish_reason
 from ouroboros.usage_accounting import PhysicalAttemptContext, UsageAccountingError, bind_physical_attempt_context, last_physical_attempt_capture
 from ouroboros.utils import (
@@ -774,10 +774,11 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if status_code is not None and 400 <= status_code <= 499:
         return LlmErrorClassification("provider_error", False, status_code, provider_code)
     capture = getattr(exc, "physical_attempt_capture", None)
-    if str(getattr(capture, "state", "") or "") in {"dispatched", "unresolved"}:
+    if outcome_unknown_on_chain(exc):
         # The provider may still finish a request whose socket outcome is
-        # unknown. Neither a same-model retry nor a different paid fallback is
-        # safe until a typed terminal provider fact exists.
+        # unknown, even when an earlier usage frame settled its exact price.
+        # Money does not establish a terminal response. Typed provider errors
+        # above retain their existing classifications and retry policy.
         return LlmErrorClassification(
             "provider_outcome_unknown", False, status_code, provider_code,
         )
@@ -849,7 +850,7 @@ def _normalize_usage_cost(
     if use_local:
         cost = 0.0
         display_model = f"{model} (local)"
-    elif provider_reported_cost and cost is None:
+    elif cost is None and (provider_reported_cost or usage.get("cost_invalid")):
         # Invalid reported cost stays unknown under the shared trust predicate.
         log.warning(
             "Provider reported an invalid cost (type=%s, value=%s) for %s; recording "

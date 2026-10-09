@@ -143,7 +143,7 @@ class Gateway:
         self.catalog_reads = 0
         self.capture_requests = []
 
-    def operations(self):
+    def operations(self, **_kwargs):
         self.catalog_reads += 1
         return deepcopy(self.operation_catalog)
 
@@ -767,14 +767,24 @@ def test_gigachat_async_tools_still_refuse_before_provider_io(setup, monkeypatch
 @pytest.mark.parametrize("profile", [None, "account-b"])
 @pytest.mark.parametrize("fails", [False, True])
 @pytest.mark.parametrize("requested_model", [None, "exact-model"])
-def test_catalog_metadata_uses_exact_optional_profile_and_closes(setup, monkeypatch, profile, fails, requested_model):
+@pytest.mark.parametrize("admission_supported", [False, True])
+def test_catalog_metadata_uses_exact_optional_profile_and_closes(setup, monkeypatch, profile, fails,
+                                                               requested_model, admission_supported):
+    from ouroboros import llm_capability_policy
+
     root, gateway, client = setup
-    monkeypatch.setattr(transport, "read_owned_gateway", lambda: gateway)
+    monkeypatch.setattr(llm_capability_policy, "read_owned_gateway", lambda: gateway)
     catalog = {"source": "opaque-source", "route": {"credentialProfileId": profile}, "models": []}
+    if admission_supported:
+        gateway.operation_catalog = [{"method": "GET", "path": "/v2/model-sources/:id/models",
+            "parameters": [{"name": "includeAdmission", "location": "query", "enum": ["true", "false"]}]}]
 
     def read(source, credential_profile_id, **kwargs):
         assert source == "opaque-source" and credential_profile_id == profile
-        assert kwargs == ({"requested_model": requested_model} if requested_model else {})
+        expected = {"requested_model": requested_model} if requested_model else {}
+        if requested_model and admission_supported:
+            expected["include_admission"] = True
+        assert kwargs == expected
         if fails:
             raise ClaudexorUnavailable("catalog_unavailable", "No catalog evidence")
         return catalog
@@ -786,6 +796,7 @@ def test_catalog_metadata_uses_exact_optional_profile_and_closes(setup, monkeypa
     else:
         assert client.claudexor_model_catalog("opaque-source", profile, requested_model=requested_model) is catalog
     assert gateway.closed == 1 and not gateway.creates and not ledger(root)
+    assert gateway.catalog_reads == int(requested_model is not None)
 
 
 def test_cold_actual_model_call_still_ensures_engine_after_unknown_metadata(setup, monkeypatch):

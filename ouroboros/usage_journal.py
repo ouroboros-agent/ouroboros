@@ -168,6 +168,7 @@ def _validate_records(records: Sequence[Dict[str, Any]]) -> None:
             raise UsageLedgerCorrupt("usage baseline folded_attempt_count does not match the block")
 
     states: Dict[str, str] = {}
+    previous_rows: Dict[str, dict] = {}
     late: set = set()
     expected = 1
     for row in records:
@@ -215,7 +216,9 @@ def _validate_records(records: Sequence[Dict[str, Any]]) -> None:
             pre_compaction_seq = carried
         else:
             pre_compaction_closed = True
-        validate_transition(row, previous, attempt_id in late, sequence)
+        validate_transition(row, previous, attempt_id in late, sequence,
+                            previous_row=previous_rows.get(attempt_id))
+        previous_rows[attempt_id] = row
         states[attempt_id] = state
         if late_receipt_eligible(row):
             late.add(attempt_id)

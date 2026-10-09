@@ -363,7 +363,7 @@ def _deliver_tool_results(
     tool_schemas: Optional[list],
     fit_candidate: Optional[FitCandidate],
     llm_trace: Dict[str, Any],
-    review_updates: Optional[list] = None,
+    pending_messages: Optional[list] = None,
 ) -> List[Dict[str, Any]]:
     """First-show views for one batch: measured when the caller supplied the
     frame, whole (truthful best effort, no invented cap) when it did not.
@@ -381,7 +381,7 @@ def _deliver_tool_results(
         shaped = list(candidate)
         for index, row in enumerate(results, len(candidate) - len(results)):
             shaped[index] = {**candidate[index], "content": with_producer_source(row, candidate[index]["content"])}
-        return fit_candidate([*shaped, *(review_updates or [])], schemas)
+        return fit_candidate([*shaped, *(pending_messages or [])], schemas)
 
     rows, receipt = project_tool_result_batch(
         results, messages, list(tool_schemas or []),
@@ -1284,6 +1284,7 @@ def handle_tool_calls(
 def _maybe_auto_attach_image(
     exec_result: Dict[str, Any],
     tools: Optional[ToolRegistry],
+    *, staged_messages: Optional[list] = None,
 ) -> Optional[Dict[str, str]]:
     """Same-round image attachment for tool results that explicitly offer one.
 
@@ -1335,6 +1336,9 @@ def _maybe_auto_attach_image(
         ctx = getattr(tools, "_ctx", None)
         if ctx is None:
             return
+        if staged_messages is not None:
+            ctx = copy.copy(ctx)
+            ctx.messages = staged_messages  # Never rebind the shared live context.
         observation = {"status": "unavailable"}
         from ouroboros.tools.vision import attach_local_image_to_context
 
@@ -1348,7 +1352,7 @@ def _maybe_auto_attach_image(
 
 
 def reclaim_trace_refs(tool_ctx: Any) -> Dict[str, Any]:
-    """Per-task {tool_call_id: trace_ref} accumulated as tool results append."""
+    """Legacy diagnostic map; exact compaction custody belongs to each result row."""
     refs = getattr(tool_ctx, "_tool_trace_refs", None)
     return refs if isinstance(refs, dict) else {}
 
@@ -1400,14 +1404,19 @@ def process_tool_results(
         record_tool_activity(ctx, exec_result)
     from ouroboros.artifacts import task_id_for_artifacts
 
-    results = prepare_producer_sources(results, ctx.drive_root if ctx is not None else None,
+    results = prepare_producer_sources(results, getattr(ctx, "drive_root", None),
                                        task_id_for_artifacts(ctx) if ctx is not None else "")
     review_updates, review_pending = [], {}
     if ctx is not None and getattr(ctx, "_pending_review_context", None):
         from ouroboros.review_history_view import review_context_updates
         review_pending = dict(ctx._pending_review_context)
         review_updates, _ = review_context_updates(ctx, families=review_pending, messages=messages)
-    views = _deliver_tool_results(ctx, results, messages, tool_schemas, fit_candidate, llm_trace, review_updates)
+    # Materialize the same image blocks once before fitting the completed batch.
+    # Publish them only after its contiguous tool results and resident updates.
+    image_messages: list = []
+    image_observations = [_maybe_auto_attach_image(row, tools, staged_messages=image_messages) for row in results]
+    views = _deliver_tool_results(ctx, results, messages, tool_schemas, fit_candidate, llm_trace,
+                                  [*review_updates, *image_messages])
 
     for exec_result, view in zip(results, views):
         if ctx is not None:
@@ -1444,8 +1453,8 @@ def process_tool_results(
             except Exception:
                 log.debug("Failed to acknowledge injected delegate wake", exc_info=True)
 
-        # Retain the pre-truncation trace ref per tool_call_id so the context
-        # reclaim materializer can bind exact tool CAS refs into its capsules.
+        # Keep the call-ID map for diagnostic callers. Compaction takes exact
+        # provenance from the occurrence-bound record on the canonical row.
         trace_ref = exec_result.get("trace_ref")
         if ctx is not None and isinstance(trace_ref, dict) and trace_ref:
             refs = getattr(ctx, "_tool_trace_refs", None)
@@ -1567,11 +1576,10 @@ def process_tool_results(
     # tool messages answering the same assistant turn: the user(image) injection
     # then preserves tool-result contiguity BY CONSTRUCTION instead of relying on
     # the transport's adjacency repair to fix an interleaving we created ourselves.
-    by_call = {row["tool_call_id"]: row for row in llm_trace["tool_calls"][-len(results):]}
-    for exec_result in results:
-        observation = _maybe_auto_attach_image(exec_result, tools)
+    messages.extend(image_messages)
+    for row, observation in zip(llm_trace["tool_calls"][-len(results):], image_observations):
         if observation:
-            by_call[exec_result["tool_call_id"]]["image_attachment"] = observation
+            row["image_attachment"] = observation
 
     return error_count
 

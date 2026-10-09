@@ -257,6 +257,13 @@ def test_api_token_normalization_preserves_missing_zero_and_body_error_contracts
     rejected, cost, final = ua.usage_from_response({
         "error": {"code": 429, "message": "rate limited"}, "usage": None,
     })
+    assert (rejected["prompt_tokens"], rejected["completion_tokens"]) == (None, None)
+    assert cost is None and final is False
+
+    rejected, cost, final = ua.usage_from_response({
+        "error": {"code": 429, "message": "rate limited"},
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+    })
     assert (rejected["prompt_tokens"], rejected["completion_tokens"]) == (0, 0)
     assert cost == 0.0 and final is True
 

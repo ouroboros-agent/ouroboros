@@ -390,7 +390,7 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
             protected_texts=owner_protected_texts(tool_ctx),
         )
         receipt = asdict(result)
-        if receipt["status"] == "no_op" and proposal.get("review_transfers"):
+        if receipt["status"] == "no_op" and (proposal.get("review_transfers") or proposal.get("review_notes")):
             from ouroboros.review_history_view import retain_transfer_only_checkpoint
             try:
                 receipt = retain_transfer_only_checkpoint(tool_ctx, observed["messages"], receipt)
@@ -400,7 +400,7 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
             from ouroboros.review_history_view import prepare_review_view, refresh_compacted_review_context
             try:
                 review_pointer, review_capsule, review_transfers, expected_selection = prepare_review_view(
-                    tool_ctx, candidate, receipt, proposal.get("review_transfers") or [])
+                    tool_ctx, candidate, receipt, proposal.get("review_transfers") or [], proposal.get("review_notes") or [])
                 candidate = (refresh_compacted_review_context(tool_ctx, candidate, selection=review_pointer)
                              if review_pointer else refresh_compacted_review_context(tool_ctx, candidate))
             except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -691,6 +691,7 @@ def _handle_model_wait_control(
     """
     from ouroboros.cancel_intents import STOP_POLICY_IMMEDIATE, active_intent, stop_policy
     from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait
+    from ouroboros.transport_custody import outcome_unknown_on_chain
 
     reason = error.control_reason
     # Routed ONCE: whatever this rail re-raises is final for the loop (the
@@ -756,7 +757,7 @@ def _handle_model_wait_control(
         owner_ctx=getattr(ctx.tools, "_ctx", None),
     )
     capture = getattr(error, "physical_attempt_capture", None)
-    unknown = getattr(capture, "state", "") in {"dispatched", "unresolved"}
+    unknown = outcome_unknown_on_chain(error)
     ctx.accumulated_usage["ledger_attempt_ids"] = list(dict.fromkeys([
         *ctx.accumulated_usage.get("ledger_attempt_ids", []),
         *getattr(error, "ledger_attempt_ids", []),

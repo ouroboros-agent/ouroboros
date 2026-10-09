@@ -24,7 +24,7 @@ class ReviewActorRecord:
     parsed_items: List[Dict[str, Any]] = field(default_factory=list)
     tokens_in: int = 0
     tokens_out: int = 0
-    cost_usd: float = 0.0
+    cost_usd: Optional[float] = None
     slot: int = 0
     slot_id: str = ""  # the id the row physically ran under, carried not re-derived
     prompt_ref: Dict[str, Any] = field(default_factory=dict)
@@ -33,7 +33,7 @@ class ReviewActorRecord:
     reset_at: str = ""
     http_status: Optional[int] = None
     transport_status: str = ""
-    reported_cause: str = ""  # the engine's reported words for a failed run; opaque, "" = none
+    reported_cause: str = ""  # the failing owner's reported cause; opaque, "" = none
     operation_id: str = ""
     operation_state: str = "settled"
     late_result_pending: bool = False
@@ -128,7 +128,7 @@ def _actor_record(
         parsed_items=parsed_items or [],
         tokens_in=int(actor.get("tokens_in", 0) or 0),
         tokens_out=int(actor.get("tokens_out", 0) or 0),
-        cost_usd=float(actor.get("cost_estimate", 0.0) or 0.0),
+        cost_usd=(float(actor["cost_estimate"]) if actor.get("cost_estimate") is not None else None),
         slot=idx + 1,
         slot_id=str(actor.get("slot_id") or ""),
         prompt_ref=dict(actor.get("prompt_ref") or {}),

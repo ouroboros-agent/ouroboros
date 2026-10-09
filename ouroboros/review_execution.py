@@ -852,7 +852,7 @@ def run_delegated_review_session(
                 thread_id = ensure_review_thread(
                     gateway, custody, thread_id, route=route, root=root,
                     surface=surface, slot_id=slot_id, task_id=task_id)
-                existing_project = project_id
+                existing_project = project_id  # the retained thread now needs this registration
             invocation_id = custody.new_invocation_id()
             seconds = bounded_seconds(timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS)
             run_request = prepare_review_session_request(
@@ -890,7 +890,7 @@ def run_delegated_review_session(
             if not requested:
                 # No durable request means no POST; only a fresh registration is retirable.
                 _retire_orphaned_review_registration(
-                    custody, gateway, custody_drive, project_id, definite_refusal=not recovering,
+                    custody, gateway, custody_drive, project_id if not existing_project else "", definite_refusal=not recovering,
                     reason="start_request_row_unwritable",
                     invocation_id=invocation_id, surface=surface, slot_id=slot_id)
                 raise ReviewRouteUnavailable(
@@ -919,7 +919,7 @@ def run_delegated_review_session(
                 definite = isinstance(exc, OwnerPauseRefused) or 400 <= status < 500
                 # Only a definite 4xx proves the registration never bound a run.
                 _retire_orphaned_review_registration(
-                    custody, gateway, custody_drive, project_id,
+                    custody, gateway, custody_drive, project_id if not existing_project else "",
                     definite_refusal=definite and not recovering,
                     reason=code, invocation_id=invocation_id, surface=surface, slot_id=slot_id)
                 if definite and not recovering:

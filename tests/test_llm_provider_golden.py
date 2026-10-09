@@ -499,8 +499,8 @@ def _install_model_operation_fake(stack: contextlib.ExitStack, recorder: _Record
 def _ledger_projection(root: pathlib.Path) -> List[Dict[str, Any]]:
     """Ordered physical attempts (by their first transition) with their stable
     accounting facts. The usage store keeps one current row per attempt, so the
-    golden records each attempt's final state and how many transitions it took
-    (its ``revision``)."""
+    golden records its final state and durable row revisions (state transitions
+    and retained evidence updates) under the historical ``transitions`` key."""
     from tests._usage_store_testing import attempt_rows_in_start_order
 
     attempts: List[Dict[str, Any]] = []

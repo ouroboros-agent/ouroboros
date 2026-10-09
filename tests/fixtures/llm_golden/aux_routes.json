@@ -72,7 +72,7 @@
             "candidate_raw_size_bytes": 167,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           }
         ],
         "unused_script_steps": 0
@@ -167,7 +167,7 @@
             "candidate_raw_size_bytes": 130,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": false
           }
@@ -876,7 +876,7 @@
             "candidate_raw_size_bytes": 338,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }

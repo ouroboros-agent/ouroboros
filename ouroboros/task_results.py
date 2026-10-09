@@ -1050,12 +1050,14 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
     if not isinstance(attempt, dict):
         raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt must be an object")
     if attempt:
-        if set(attempt) - {"fingerprint", "status", "reason", "author_subject"} or not {"fingerprint", "status", "reason"} <= set(attempt):
+        if set(attempt) - {"fingerprint", "status", "reason", "author_subject", "submitted_subject"} or not {"fingerprint", "status", "reason"} <= set(attempt):
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt shape is invalid")
         if not _PLAN_REVIEW_HASH_RE.fullmatch(str(attempt.get("fingerprint") or "")):
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt fingerprint is invalid")
         if str(attempt.get("status") or "") not in _PLAN_REVIEW_ATTEMPT_STATUSES:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
+        if "submitted_subject" in attempt and not isinstance(attempt["submitted_subject"], dict):
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: submitted subject source is invalid")
         if "author_subject" in attempt:
             subject = attempt["author_subject"]
             if (not isinstance(subject, dict) or not isinstance(subject.get("source_ref"), dict)
@@ -1268,12 +1270,13 @@ def record_plan_review_attempt(
     status: str = "open",
     reason: str = "",
     author_subject: Optional[Dict[str, Any]] = None,
+    submitted_subject: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Select one canonical plan fingerprint as current (open | unavailable | rail_degraded)."""
     from ouroboros.tools.plan_author_history import record_attempt
 
     return record_attempt(results_drive_root, task_id, fingerprint=fingerprint, status=status,
-                          reason=reason, author_subject=author_subject)
+                          reason=reason, author_subject=author_subject, submitted_subject=submitted_subject)
 
 
 def mark_current_plan_review_unavailable(

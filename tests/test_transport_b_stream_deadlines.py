@@ -114,7 +114,6 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(pricing, "estimate_cost_optional", lambda *a, **k: None)
     monkeypatch.setattr(ua, "_reservation_cost", lambda request: 1.0)
     monkeypatch.setattr(LLMClient, "_get_supported_parameters", lambda *a, **k: None)
-    monkeypatch.setattr(LLMClient, "_fetch_generation_cost", lambda *a, **k: None)
     monkeypatch.setenv("TOTAL_BUDGET", "100")
     with ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="stream-task", root_task_id="stream-task")):
         yield tmp_path
@@ -390,13 +389,14 @@ def test_tool_call_without_type_is_structurally_complete(isolated, payload_key, 
     assert result["_stream_receipt"]["anomalies"]["count"] == 0 and rows(isolated)[-1]["state"] == "settled"
 
 
-def test_clean_close_with_a_missing_expected_choice_stays_unknown(isolated):
+def test_clean_close_with_a_missing_expected_choice_keeps_response_unknown_and_price(isolated):
     """``n=2``, one choice finished, the body closes without ``[DONE]`` and without the second
-    choice: the wire is genuinely incomplete, so this is the unknown outcome, not a rejection."""
+    choice: the reply remains an unknown outcome, while its received price is final."""
     wire = sse(chunk({"role": "assistant", "content": "only one"}, "stop", usage=completion()["usage"]), done=False)
     with pytest.raises(IncompleteProviderStream):
         run_driver(lambda **kw: WireResponse(wire), payload(stream=True, n=2), target())
-    assert rows(isolated)[-1]["state"] == "unresolved"
+    assert rows(isolated)[-1]["state"] == "settled"
+    assert rows(isolated)[-1]["cost_usd"] == 0.25 and rows(isolated)[-1]["cost_final"] is True
 
 
 def test_later_usage_snapshot_overrides_an_earlier_one(isolated):
@@ -631,7 +631,8 @@ def test_exhaustion_preserves_earlier_paid_capture(isolated, monkeypatch, asynch
     assert not is_pre_dispatch_transport_failure(caught.value)
     assert caught.value.physical_attempt_capture.state == "unresolved"
     assert caught.value.physical_attempt_capture.attempt_id == rows(isolated)[0]["attempt_id"]
-    assert [(row["state"], row["revision"]) for row in rows(isolated)] == [("unresolved", 3)]
+    assert [(row["state"], row["revision"]) for row in rows(isolated)] == [("unresolved", 4)]
+    assert rows(isolated)[0]["physical_failure"]
 
 
 def test_expired_initial_window_reserves_nothing(isolated, monkeypatch):
@@ -807,7 +808,11 @@ def test_native_incomplete_blocks_or_message_cannot_return_tools(isolated, monke
     monkeypatch.setattr(requests, "post", lambda *a, **k: WireResponse(sse(*events, done=False)))
     with pytest.raises(IncompleteProviderStream):
         LLMClient()._chat_anthropic(target("anthropic"), MESSAGES, TOOLS, "high", 1024, "auto", stream=True)
-    assert rows(isolated)[-1]["state"] == "unresolved"
+    row = rows(isolated)[-1]
+    if omit == "message_stop":
+        assert row["state"] == "settled" and row["cost_usd"] == 0.4
+    else:
+        assert row["state"] == "unresolved"  # No final message_delta was accepted.
 
 
 def test_native_unusable_body_after_message_stop_is_rejected_and_settled(isolated, monkeypatch):

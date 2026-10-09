@@ -81,6 +81,8 @@ class _ReviewAttemptHistory:
     unknown_outcome_seen: bool = False
 
     def observe(self, error: Any = None) -> None:
+        from ouroboros.transport_custody import stream_incomplete_on_chain
+
         capture = getattr(error, "physical_attempt_capture", None)
         if capture is None:
             try:
@@ -105,7 +107,7 @@ class _ReviewAttemptHistory:
         self.dispatched = True
         self.capture_state = state
         status = getattr(capture, "provider_status_code", None)
-        if state in {"dispatched", "unresolved"} and not (
+        if (state in {"dispatched", "unresolved"} or stream_incomplete_on_chain(error, exclude_rejected=True)) and not (
             isinstance(status, int) and not isinstance(status, bool)
             and 400 <= status <= 599
         ):
@@ -134,6 +136,7 @@ def _review_exception_projection(
     """Project one failed actor while retaining earlier rail custody."""
     from ouroboros.review_execution import ReviewRouteUnavailable
     from ouroboros.usage_accounting import BudgetExceeded, UsageAccountingError
+    from ouroboros.transport_custody import stream_incomplete_on_chain
 
     failure_custody = dict(executor_custody or {})
     capture = getattr(exc, "physical_attempt_capture", None)
@@ -154,6 +157,8 @@ def _review_exception_projection(
         history.provider_status_code = None
     if capture_state:
         failure_custody["physical_attempt_state"] = capture_state
+    if stream_incomplete_on_chain(exc, exclude_rejected=True):
+        failure_custody["stream_incomplete"] = True
     http_status = next((value for value in (
         getattr(exc, "status_code", None),
         getattr(getattr(exc, "response", None), "status_code", None),
@@ -199,7 +204,7 @@ def _review_exception_projection(
     )
     failure_code = (
         "provider_outcome_unknown"
-        if dispatched and physical_state in {"dispatched", "unresolved"}
+        if dispatched and (history.unknown_outcome_seen or physical_state in {"dispatched", "unresolved"})
         and not isinstance(http_status, int)
         else str(getattr(exc, "code", "") or "")
     )
@@ -265,6 +270,8 @@ def _attach_worker_exception_facts(
     actor: Any, exc: BaseException, retry_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Carry typed capture/status facts onto a synthetic worker actor."""
+    from ouroboros.transport_custody import stream_incomplete_on_chain
+
     if isinstance(actor, dict):
         usage = dict(actor.get("usage") or {})
     else:
@@ -273,6 +280,8 @@ def _attach_worker_exception_facts(
     capture_state = str(getattr(capture, "state", "") or "").strip().lower()
     if capture_state:
         usage["physical_attempt_state"] = capture_state
+    if stream_incomplete_on_chain(exc, exclude_rejected=True):
+        usage["stream_incomplete"] = True
     for key in ("pending_invocation_id", "delegated_run_id"):
         value = str((retry_state or {}).get(key) or "").strip()
         if value and key not in usage:
@@ -886,7 +895,7 @@ def finalize_review_actor(actor: Any, *, operation_id: str, late: bool = False) 
     if malformed_physical_state:
         terminal_provider_status = None
     capture_outcome_unknown = (
-        physical_attempt_state in {"dispatched", "unresolved"}
+        (physical_attempt_state in {"dispatched", "unresolved"} or failure_custody.get("stream_incomplete") is True)
         and terminal_provider_status is None
     )
     legacy_unknown = str(getattr(actor, "failure_code", "") or "") == "provider_outcome_unknown"

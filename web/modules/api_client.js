@@ -60,6 +60,32 @@ export function jsonPost(url, payload = {}, options = {}) {
     }, options);
 }
 
+/** Passive inspection; the host never starts an engine for this read. */
+export function harnessMaintenanceInventory({ harness = '', fresh = false, checkLatest = false } = {}) {
+    const params = new URLSearchParams();
+    if (harness) params.set('harness', harness);
+    if (fresh) params.set('fresh', 'true');
+    if (checkLatest) params.set('checkLatest', 'true');
+    return fetchJson(`/api/claudexor/maintenance/harnesses${params.size ? `?${params}` : ''}`, { cache: 'no-store' });
+}
+
+/** Reuse both key and body when the reply to an accepted request was lost. */
+export function startHarnessMaintenance(payload, idempotencyKey) {
+    return fetchJson('/api/claudexor/maintenance/operations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(payload),
+    });
+}
+
+export function harnessMaintenanceOperation(operationId) {
+    return fetchJson(`/api/claudexor/maintenance/operations/${encodeURIComponent(operationId)}`, { cache: 'no-store' });
+}
+
+export function cancelHarnessMaintenance(operationId) {
+    return fetchJson(`/api/claudexor/maintenance/operations/${encodeURIComponent(operationId)}/cancel`, { method: 'POST' });
+}
+
 /**
  * Run the read-only publication preflight for one selected skill. Domain
  * states, including repairable findings, remain successful JSON responses;
@@ -260,6 +286,10 @@ export function updateStrategyForPlan(plan = {}) {
 }
 
 export const apiClient = {
+    harnessMaintenanceInventory,
+    startHarnessMaintenance,
+    harnessMaintenanceOperation,
+    cancelHarnessMaintenance,
     /** Read a recent window or replay one opaque, room-bound history page. */
     chatHistory: ({ chatId = 1, cursor = null, signal } = {}) => {
         const params = new URLSearchParams();

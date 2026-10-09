@@ -9,7 +9,9 @@ import pytest
 from ouroboros.artifacts import read_actor_source_bytes
 from ouroboros.context_input_selection import historical_inputs_exhibit
 from tests.test_historical_inputs import _input
-from tests.test_main_authored_context import main_loop  # noqa: F401
+from tests import test_main_authored_context as context_fixtures
+
+main_loop = context_fixtures.main_loop
 
 
 @pytest.mark.parametrize("failed_root", ["first", "second"])

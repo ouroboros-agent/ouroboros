@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 
 from ouroboros import knowledge as knowledge_store
-from ouroboros.knowledge import INDEX_FILE, OVERVIEW_TOPIC
+from ouroboros.knowledge import INDEX_FILE as INDEX_FILE, OVERVIEW_TOPIC as OVERVIEW_TOPIC
 from ouroboros.knowledge import sanitize_topic as _sanitize_topic
 from ouroboros.tools.arg_feedback import ignored_argument_note
 from ouroboros.tools.registry import ToolEntry, ToolContext

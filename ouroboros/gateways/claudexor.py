@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+from ouroboros.gateways.claudexor_maintenance import ClaudexorMaintenanceGateway
 from ouroboros.effort_evidence import validated_effort_resolution
 from ouroboros.observability import timed_phase
 
@@ -90,20 +92,13 @@ _ATTEMPT_RECORD = "attempt.yaml"
 
 
 class ClaudexorUnavailable(RuntimeError):
-    """Typed lane refusal: the delegated route cannot run right now.
+    """Typed engine or transport failure; callers classify by ``code``, not prose.
 
-    Carries the machine-readable ``code`` so callers classify instead of matching
-    prose. Never raised for an ordinary in-run failure — only for "this transport
-    is not usable".
-
-    ``required_actions`` retains the daemon's TOP-LEVEL ``ControlProblem.requiredActions``
-    string list when the refusal carried one (e.g. the reconcile 409's
-    ``retry_setup_reconciliation``), bounded to the daemon's own wire limit. It is
-    a preserved fact for the typed error seam, not a client action framework.
+    ``problem`` retains the received ControlProblem; ``required_actions`` is its
+    bounded top-level compatibility projection. Neither executes recovery actions.
     """
 
-    # What the engine REPORTED about a failed run ("" = nothing reported); set only by
-    # ``run_failure_error``. An opaque fact: carried and shown, never branched on.
+    # What the engine reported about a failed run or request; diagnostic, never policy.
     reported_cause = ""
     retry_after = ""  # The received HTTP Retry-After header, never a local backoff.
 
@@ -406,7 +401,7 @@ def run_message_supported(operations: list[dict]) -> bool:
     )
 
 
-class ClaudexorGateway:
+class ClaudexorGateway(ClaudexorMaintenanceGateway):
     """Thin typed client over the Claudexor ``/v2`` control API."""
 
     def __init__(self, endpoint: Optional[DaemonEndpoint] = None, *, home: Optional[pathlib.Path] = None):
@@ -507,7 +502,7 @@ class ClaudexorGateway:
             ) from exc
 
     def _problem(self, response: httpx.Response) -> ClaudexorUnavailable:
-        """Translate a ControlProblem body into a typed refusal."""
+        """Keep ControlProblem authority; nested lookup causes are diagnostics only."""
         code = f"http_{response.status_code}"
         message = response.text[:500]
         context: Dict[str, Any] = {}
@@ -546,7 +541,11 @@ class ClaudexorGateway:
                                           status_code=response.status_code)
                 or ClaudexorUnavailable(code, message, status_code=response.status_code,
                                         required_actions=required_actions))
+        error.problem = body if isinstance(body, dict) else {"code": code, "message": message}
         error.retry_after = response.headers.get("Retry-After", "")
+        if isinstance(context.get("cause"), dict):
+            facts = {key: context[key] for key in ("stage", "cause", "preflight") if key in context}
+            error.reported_cause = run_failure_cause({"safeMessage": json.dumps(facts, ensure_ascii=False)})
         return error
 
     # -- operations ------------------------------------------------------------
@@ -640,7 +639,7 @@ class ClaudexorGateway:
                            credential_profile_id: Optional[str] = None, *,
                            requested_model: Optional[str] = None,
                            timeout_sec: Optional[float] = None,
-                           view: Optional[str] = None) -> Dict[str, Any]:
+                           view: Optional[str] = None, include_admission: bool = False) -> Dict[str, Any]:
         """Preserve the exact-profile catalog envelope; an omitted pin means engine Auto."""
         from urllib.parse import quote, urlencode
 
@@ -652,6 +651,8 @@ class ClaudexorGateway:
             query["credentialProfileId"] = credential_profile_id
         if requested_model is not None:
             query["requestedModel"] = requested_model
+        if include_admission:
+            query["includeAdmission"] = "true"
         if query:
             path += "?" + urlencode(query)
         return _model_object(self._request("GET", path, **({"timeout_sec": timeout_sec} if timeout_sec is not None else {})))

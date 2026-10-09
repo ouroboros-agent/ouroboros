@@ -1480,7 +1480,9 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int, slot_prompt_ch
             "slots (" + ", ".join(f"{slot.slot_id}:{slot.model}<={int(limits[slot.slot_id]):,}" for slot in api_slots)
             + "), so fewer than the review quorum remain callable and NO reviewer was called. "
             "A constitutional plan carries BIBLE.md and ARCHITECTURE.md in full (W3): configure "
-            "reviewer slots with a larger context window, or shrink the declared evidence."
+            "reviewer slots with a larger context window, or shrink the declared evidence. "
+            "If earlier review history is the excess, compact_context can retain your own source-bound working_note "
+            "before you submit this plan again; the current spec and decision index remain full."
         )
     return callable_slots, oversize, error
 
