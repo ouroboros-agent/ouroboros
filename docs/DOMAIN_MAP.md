@@ -9,16 +9,16 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | domain | name | modules | proposed |
 |---|---|---:|---:|
 | D01 | Agent core & main loop | 45 | 0 |
-| D02 | LLM client, routing & providers | 39 | 0 |
+| D02 | LLM client, routing & providers | 40 | 0 |
 | D03 | Context assembly, fit & compaction | 18 | 0 |
 | D04 | Tool execution: registry, access & typed results | 22 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 34 | 0 |
 | D06 | Review stack | 77 | 0 |
-| D07 | Delegation, subagents & Claudexor | 62 | 0 |
-| D08 | Supervisor: queue, workers, events & runtime control | 58 | 0 |
+| D07 | Delegation, subagents & Claudexor | 64 | 0 |
+| D08 | Supervisor: queue, workers, events & runtime control | 59 | 0 |
 | D09 | Cancellation, owner control & process custody | 15 | 0 |
 | D10 | Git, update & release machinery | 31 | 0 |
-| D11 | Gateway, server & Web UI | 71 | 0 |
+| D11 | Gateway, server & Web UI | 72 | 0 |
 | D12 | Settings & configuration | 19 | 0 |
 | D13 | Safety, guards & runtime mode | 9 | 0 |
 | D14 | Skills & extensions | 57 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 23 | 0 |
 | D19 | Frozen contracts (ABI) | 11 | 0 |
 | D20 | Presence | 12 | 0 |
-| **total** | | **677** | **0** |
+| **total** | | **682** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -271,6 +271,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/openai_chat_custom.py`
 - `ouroboros/openai_chat_dispatch.py`
 - `ouroboros/openrouter_attribution.py`
+- `ouroboros/openrouter_cost.py`
 - `ouroboros/pricing.py`
 - `ouroboros/provider_models.py`
 - `ouroboros/reasoning_artifacts.py`
@@ -486,7 +487,9 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/effort_evidence.py`
 - `ouroboros/gateways/__init__.py`
 - `ouroboros/gateways/claudexor.py`
+- `ouroboros/gateways/claudexor_maintenance.py`
 - `ouroboros/gateways/claudexor_run_events.py`
+- `ouroboros/harness_maintenance.py`
 - `ouroboros/nanny_pacing.py`
 - `ouroboros/subagent_bootstrap.py`
 - `ouroboros/subagent_dispatch_notes.py`
@@ -519,6 +522,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/schedule_contract.py`
 - `ouroboros/tools/control.py`
 - `ouroboros/tools/control_events.py`
+- `ouroboros/tools/control_maintenance.py`
 - `ouroboros/tools/control_routing.py`
 - `ouroboros/tools/control_runtime.py`
 - `ouroboros/tools/followup.py`
@@ -643,6 +647,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/gateway/extension_receipts.py`
 - `ouroboros/gateway/extensions.py`
 - `ouroboros/gateway/files.py`
+- `ouroboros/gateway/harness_maintenance.py`
 - `ouroboros/gateway/history.py`
 - `ouroboros/gateway/history_contracts.py`
 - `ouroboros/gateway/history_paging.py`

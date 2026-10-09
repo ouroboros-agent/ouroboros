@@ -665,12 +665,13 @@ def test_provider_test_attempts_are_physically_accounted_without_chat_side_effec
     assert client.probe_provider_readiness("openai/test", settings=settings)["ok"] is True
     assert client.probe_provider_readiness("openai/test", settings=settings)["error"] == "Rate limited"
 
-    # One current row per attempt; revision 3 = reserved, dispatched, terminal.
+    # One current row per attempt; the failed probe also retains its failure before terminalization.
     finals = [row for row in ledger_rows(tmp_path) if row.get("kind") == "attempt"]
     assert len({row["attempt_id"] for row in finals}) == len(finals) == 2
     assert sorted(row["state"] for row in finals) == ["settled", "unresolved"]
+    assert sorted((row["state"], row["revision"]) for row in finals) == [("settled", 3), ("unresolved", 4)]
+    assert next(row for row in finals if row["state"] == "unresolved")["physical_failure"]
     for row in finals:
-        assert row["revision"] == 3
         assert row["task_id"] == "system:provider_test"
         assert row["root_task_id"] == "system:provider_test"
         assert row["category"] == "provider_test"

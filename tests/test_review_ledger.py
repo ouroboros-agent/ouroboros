@@ -300,11 +300,12 @@ def test_verdict_pass_fail_quorum_failed_not_dispatched_and_pending():
     assert budget["verdict"]["aggregate"] == "NOT_DISPATCHED" and set(budget["verdict"]["per_row"].values()) == {"NOT_DISPATCHED"}
 
     pending_rows = _panel()
-    pending_rows[2] = _raw("s3", "google/gemini", "pending", operation_state="in_flight", late_result_pending=True)
+    pending_rows[2] = _raw("s3", "google/gemini", "pending", cost_usd=None,
+                           operation_state="in_flight", late_result_pending=True)
     pending = rl.build_commit_gate_record(_facts(pending_rows)).to_dict()
     assert pending["state"] == "pending" and pending["verdict"]["aggregate"] == "NOT_PERFORMED"
     assert pending["verdict"]["reason"] == "review_late_result_pending"
-    assert pending["cost"]["unknown"] is True  # the open seat has no cost yet
+    assert pending["cost"]["unknown"] is True  # this seat has not reported an amount
 
     # a gate that blocked never reads as PASS even with clean answers
     blocked = rl.build_commit_gate_record(_facts(_panel(), blocked=True, block_reason="owner_stopped")).to_dict()["verdict"]

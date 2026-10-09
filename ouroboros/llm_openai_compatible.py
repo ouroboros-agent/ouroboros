@@ -38,7 +38,7 @@ from ouroboros.request_wire_recovery import (
 )
 from ouroboros.utils import sanitize_tool_result_for_log
 from ouroboros.config import runtime_setting
-from ouroboros._usage_response import observed_processing_mode
+from ouroboros._usage_response import observed_processing_mode, provider_cost_value
 
 
 # The moved warnings keep the logger identity they were emitted under.
@@ -403,8 +403,16 @@ class _OpenAICompatibleLaneMixin:
         prompt_cache_ttl: Optional[str] = None,
         wire_completion: Any = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
-        usage = resp_dict.get("usage") or {}
+        """Normalize a reply without generation lookup; skip_cost_fetch also skips tariffs."""
+        usage = dict(resp_dict.get("usage") or {})
+        price_candidates = (
+            usage.get("cost"), usage.get("total_cost"), resp_dict.get("total_cost_usd"),
+        )
+        usage["cost"] = next((cost for value in price_candidates
+                              if (cost := provider_cost_value(value)) is not None), None)
+        usage.pop("cost_invalid", None)  # Host fact, never a provider usage extension.
+        if usage["cost"] is None and any(value is not None for value in price_candidates):
+            usage["cost_invalid"] = True
         if "service_tier" in resp_dict:
             usage["service_tier"] = resp_dict["service_tier"]
         attach_processing_receipt(target, usage)
@@ -538,14 +546,6 @@ class _OpenAICompatibleLaneMixin:
                 if cache_write:
                     usage["cache_write_tokens"] = int(cache_write)
 
-        if target.get("supports_openrouter_extensions") and not skip_cost_fetch:
-            if usage.get("cost") is None:
-                gen_id = resp_dict.get("id") or ""
-                if gen_id:
-                    cost = self._fetch_generation_cost(gen_id, target)
-                    if cost is not None:
-                        usage["cost"] = cost
-
         usage["provider"] = str(target.get("provider") or "openrouter")
         usage["resolved_model"] = str(target.get("usage_model") or target.get("resolved_model") or "")
         if prompt_cache_ttl and not usage.get("prompt_cache_ttl"):
@@ -554,7 +554,8 @@ class _OpenAICompatibleLaneMixin:
         _write_split = self._cache_write_split(usage)
         if _write_split and not usage.get("cache_write_tokens_by_ttl"):
             usage["cache_write_tokens_by_ttl"] = _write_split
-        if usage.get("cost") is None and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+        if (usage.get("cost") is None and not usage.get("cost_invalid")
+                and (usage.get("prompt_tokens") or usage.get("completion_tokens"))):
             from ouroboros.pricing import estimate_cost_optional
 
             estimated_cost = estimate_cost_optional(

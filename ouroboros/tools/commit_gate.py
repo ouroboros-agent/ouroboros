@@ -830,6 +830,7 @@ def _invalidate_advisory(
 
 def _check_overlapping_review_attempt(ctx: ToolContext) -> Optional[str]:
     from ouroboros.review_state import (
+        ReviewStateMutation,
         _REVIEW_ATTEMPT_GRACE_SEC,
         _REVIEW_ATTEMPT_TTL_SEC,
         make_repo_key,
@@ -845,11 +846,12 @@ def _check_overlapping_review_attempt(ctx: ToolContext) -> Optional[str]:
     ctx._review_cyber_pending = ""
 
     def _mutate(state):
-        state.expire_stale_attempts(now_ts=_utc_now())
-        return [
+        expired = state.expire_stale_attempts(now_ts=_utc_now())
+        rows = [
             item for item in state.get_active_attempts(repo_key=repo_key)
             if item.tool_name in REVIEWED_MUTATIVE_TOOLS
         ]
+        return ReviewStateMutation(rows, changed=bool(expired))
 
     try:
         active_attempts = update_state(pathlib.Path(ctx.drive_root), _mutate)

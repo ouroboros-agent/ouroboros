@@ -556,14 +556,14 @@ class TestNoProxyLlmChat:
 
         assert len(closed_clients) >= 1, "httpx.Client must be closed even after exception"
 
-    def test_chat_no_proxy_skips_generation_cost_fetch(self):
-        """chat(no_proxy=True) does not call _fetch_generation_cost (proxy/OS path)."""
+    def test_chat_no_proxy_makes_no_metadata_get(self):
+        """chat(no_proxy=True) normalizes the received usage without metadata HTTP."""
         from ouroboros.llm import LLMClient
 
         llm = LLMClient()
         mock_resp = mock.Mock()
         mock_resp.model_dump.return_value = {
-            "id": "gen-abc123",  # has a generation id — would trigger cost fetch normally
+            "id": "gen-abc123",
             "choices": [{"message": {"role": "assistant", "content": "ok"}}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }
@@ -575,7 +575,7 @@ class TestNoProxyLlmChat:
                 mock_oa = mock.Mock()
                 mock_oa.chat.completions.create.return_value = mock_resp
                 mock_openai_cls.return_value = mock_oa
-                with mock.patch.object(llm, "_fetch_generation_cost") as mock_cost:
+                with mock.patch("requests.get") as metadata_get:
                     with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test"}, clear=False):
                         llm.chat(
                             messages=[{"role": "user", "content": "hi"}],
@@ -583,7 +583,7 @@ class TestNoProxyLlmChat:
                             max_tokens=8,
                             no_proxy=True,
                         )
-                    mock_cost.assert_not_called()
+                    metadata_get.assert_not_called()
 
     def test_chat_no_proxy_false_uses_cached_client(self):
         """chat(no_proxy=False, default) uses the shared cached client, not a new one."""

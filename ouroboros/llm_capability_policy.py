@@ -6,7 +6,8 @@ optional parameters a route refuses, and the reasoning-effort band it will
 actually run. This module owns that knowledge (process caches over a durable
 capability-evidence store), the classifier that decides whether a failure was a
 parameter rejection at all, and the one-shot payload repair that follows from
-it.
+it. Claudexor metadata discovery and requested-model admission use the engine's
+negotiated declaration, without inventing a model row or a capability claim.
 """
 
 
@@ -18,6 +19,8 @@ import logging
 import time
 from typing import Any, Dict, Optional, Set
 
+from ouroboros.claudexor_daemon import read_owned_gateway
+from ouroboros.gateways.claudexor import operation_query_supported
 from ouroboros.llm_attempt import (
     _is_provider_policy_refusal,
     _is_structured_context_overflow_exception,
@@ -44,6 +47,37 @@ _OPTIONAL_DROPPABLE_PARAMS = _OPTIONAL_SAMPLING_PARAMS + (
 
 # Shared by the classifier and floor predicate; bare "required" is too broad.
 _MANDATORY_VALUE_MARKERS = ("mandatory", "cannot be disabled", "must be enabled")
+
+
+def model_catalog(source: str, credential_profile_id: str | None = None, *,
+                  requested_model: str | None = None, timeout_sec: float | None = None) -> dict:
+    """Metadata-only transport; the capability evidence owner interprets the envelope."""
+    gateway = read_owned_gateway()
+    try:
+        started = time.monotonic()
+        hint = {"requested_model": requested_model} if requested_model is not None else {}
+        if requested_model is not None and operation_query_supported(
+                gateway.operations(**({"timeout_sec": timeout_sec} if timeout_sec is not None else {})),
+                method="GET", path="/v2/model-sources/:id/models", name="includeAdmission", value="true"):
+            hint["include_admission"] = True
+        if timeout_sec is not None:
+            timeout_sec = max(0.000001, timeout_sec - (time.monotonic() - started))
+        return gateway.list_source_models(source, credential_profile_id, **hint,
+                                          **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
+    finally:
+        gateway.close()
+
+
+def catalog_admits_model(catalog: dict, model: str) -> bool:
+    """An exact engine admission permits an attempt, without inventing a model row.
+
+    Older engines retain membership semantics. Source/account/freshness binding
+    belongs to the caller; this is neither entitlement nor generation evidence.
+    """
+    admission = catalog.get("admission")
+    return (any(isinstance(row, dict) and row.get("id") == model for row in catalog.get("models", []))
+            or (isinstance(admission, dict) and admission.get("requestedModel") == model
+                and admission.get("inventoryAbsence") == "advisory"))
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:

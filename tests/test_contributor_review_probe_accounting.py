@@ -60,7 +60,7 @@ try:
 except Exception as exc:
     result = f"{type(exc).__name__}: {exc}"
 from ouroboros import usage_store
-rows = [{key: row.get(key) for key in ("model", "state", "cost_usd", "cost_final", "task_id", "category")}
+rows = [{key: row.get(key) for key in ("model", "state", "cost_usd", "cost_final", "task_id", "category", "physical_failure")}
         for row in usage_store.read_usage_records(pathlib.Path(drive)) if row.get("kind") == "attempt"]
 print(json.dumps({"result": result, "sends": sends, "rows": rows}))
 '''
@@ -137,13 +137,15 @@ def test_isolated_key_probes_are_attempts_of_the_runs_own_ledger(tmp_path):
     # Each outcome is honest in the drive's ledger, and the paid answer stays recorded
     # although the preflight failed after it: refusal and timeout keep their money
     # unknown, the unreadable answer is settled without a price, the unsent connect is
-    # released, the provider's 200-body error is its documented free settlement.
+    # released, and a 200-body error without usage has no proof of a free settlement.
     rows = first["rows"]
     assert [(row["model"], row["state"]) for row in rows] == [
         (_ONE, "unresolved"), (_ONE, "settled"), (_ONE, "unresolved"), (_ONE, "released"),
         (_ONE, "settled"), (_TWO, "settled")]
     assert [(row["cost_usd"], row["cost_final"]) for row in rows if row["state"] == "settled"] == [
-        (None, False), (0.25, True), (0.0, True)]
+        (None, False), (0.25, True), (None, False)]
+    assert rows[-1]["physical_failure"]["stage"] == "response_body_error"
+    assert rows[-1]["physical_failure"]["evidence_ref"]
     assert {(row["task_id"], row["category"]) for row in rows} == {("system:review_key_probe", "provider_test")}
     # Candidates and ledger rows are recorded on the drive; no key under test is.
     assert not [path for path in drive.rglob("*") if path.is_file() and b"probe-key-" in path.read_bytes()]

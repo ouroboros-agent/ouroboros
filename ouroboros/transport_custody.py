@@ -145,13 +145,27 @@ def _capture_on_chain(error: BaseException) -> Any:
     return capture
 
 
+def stream_incomplete_on_chain(error: BaseException, *, exclude_rejected: bool = False) -> bool:
+    """Read the stream fact; terminal local rejection keeps its separate policy."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "stream_incomplete", False):
+            return not (exclude_rejected and getattr(current, "stream_rejected", False))
+        current = transport_exception_cause(current)
+    return False
+
+
 def outcome_unknown_on_chain(error: BaseException) -> bool:
-    """Whether ``error``'s chain carries a dispatched attempt without a terminal provider fact.
+    """Whether the response is incomplete or has no terminal provider fact.
 
     Provider-independent: a generic API exception, or a wrapper whose explicit
     cause carries the capture, reads exactly like the typed Claudexor error.
+    A received price can settle money while the response remains incomplete.
     """
-    return getattr(_capture_on_chain(error), "state", None) in {"dispatched", "unresolved"}
+    return (stream_incomplete_on_chain(error, exclude_rejected=True)
+            or getattr(_capture_on_chain(error), "state", None) in {"dispatched", "unresolved"})
 
 
 def _requests_protocol_death(exc: BaseException) -> Any:
@@ -230,7 +244,8 @@ def is_retryable_transport_death(exc: BaseException) -> bool:
     capture = _capture_on_chain(exc)
     if (
         capture is None
-        or str(getattr(capture, "state", "") or "") not in ("dispatched", "unresolved")
+        or str(getattr(capture, "state", "") or "") not in ("dispatched", "unresolved", "settled")
+        or not outcome_unknown_on_chain(exc)
         or str(getattr(capture, "provider", "") or "") == "local"
         or bool(getattr(capture, "route_is_loopback", False))
     ):
@@ -285,6 +300,8 @@ def attempt_custody_event_fields(error: BaseException) -> dict:
     if capture is not None:
         fields["physical_attempt_id"] = str(getattr(capture, "attempt_id", "") or "")
         fields["attempt_custody_state"] = str(getattr(capture, "state", "") or "")
+        if stream_incomplete_on_chain(error):
+            fields["stream_incomplete"] = True
         provider_error_type = str(getattr(capture, "provider_error_type", "") or "")
         if provider_error_type:
             fields["provider_error_type"] = provider_error_type

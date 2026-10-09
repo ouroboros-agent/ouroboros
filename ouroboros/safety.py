@@ -37,6 +37,9 @@ DEFAULT_POLICY = POLICY_CHECK
 
 # Must cover every built-in exported from ouroboros/tools; invariant-tested.
 TOOL_POLICY: Dict[str, str] = {
+    # Typed host maintenance enforces existing actor/resource/Pause authority.
+    "inspect_harness": POLICY_SKIP,
+    "maintain_harness": POLICY_SKIP,
     # Read-only / trivially safe.
     "read_file": POLICY_SKIP,
     "list_files": POLICY_SKIP,

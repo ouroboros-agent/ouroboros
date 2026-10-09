@@ -1045,12 +1045,23 @@ def test_external_review_cost_report_never_turns_unknown_into_zero():
     assert [(surface, actor["slot_id"]) for surface, actor in actors][-1] == ("pool", "scope_slot_1")
     assert evidence[0]["prompt_ref"] == {"manifest_ref": "prompt-1"}
     assert report["reported_actor_cost_usd"] == 0.03
-    assert report["unreported_or_unknown_cost_slots"] == ["scope_slot_1"]
+    assert report["reported_cost_slots"] == ["slot_1", "slot_2", "slot_3", "scope_slot_1"]
+    assert report["unreported_or_unknown_cost_slots"] == []
     assert "not treated as $0" in report["note"]
-    # An open seat has no cost yet (unknown, never $0); a seat never dispatched is no actor.
-    pending = _actors([{**triad[0], "status": "pending"}])
-    assert _review_evidence_and_cost(pending)[1]["unreported_or_unknown_cost_slots"] == ["slot_1"]
+    # A seat never dispatched remains outside the actor report.
     assert _record_actors({"rows": [{"seat_id": "x", "status": "not_dispatched"}]}) == []
+
+
+@pytest.mark.parametrize("status", ["pending", "responded"])
+@pytest.mark.parametrize("cost", [0.01, 0.0, None])
+def test_external_review_cost_report_keeps_amount_knowledge_separate_from_lifecycle(status, cost):
+    actors = _actors([{"slot_id": "slot_1", "model_id": "reviewer", "status": status, "cost_usd": cost}])
+    evidence, report = _review_evidence_and_cost(actors)
+    assert evidence[0]["status"] == status
+    assert report["reported_actor_cost_usd"] == (cost if cost is not None else 0.0)
+    assert report["reported_cost_slots"] == (["slot_1"] if cost is not None else [])
+    assert report["unreported_or_unknown_cost_slots"] == ([] if cost is not None else ["slot_1"])
+    assert "core usage ledger remains the monetary authority" in report["note"]
 
 
 def test_exit_classification_separates_infra_from_genuine_blocks():

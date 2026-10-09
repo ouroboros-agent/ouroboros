@@ -11,7 +11,9 @@ from ouroboros.review_evidence import (
     build_task_acceptance_evidence,
 )
 from ouroboros.review_substrate import ReviewRunResult, task_acceptance_is_clean
-from tests.test_main_authored_context import main_loop  # noqa: F401
+from tests import test_main_authored_context as context_fixtures
+
+main_loop = context_fixtures.main_loop
 
 
 @pytest.fixture(params=["captured_preview", "never_captured", "source_unavailable"])

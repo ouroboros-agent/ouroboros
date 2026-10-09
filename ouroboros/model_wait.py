@@ -46,7 +46,7 @@ class ModelWaitInterrupted(RuntimeError):
         self.previous_error = cause
         if cause is not None:
             for name in ("physical_attempt_capture", "ledger_attempt_ids", "model_result", "usage",
-                         "model_role_route", "operation_id", "route"):
+                         "model_role_route", "operation_id", "route", "stream_incomplete", "stream_rejected"):
                 if hasattr(cause, name):
                     setattr(self, name, getattr(cause, name))
 
@@ -740,6 +740,8 @@ class TaskModelWait:
                                 row["credential_harness"] = harness
                                 self._publish(row)
                         if row["auto_continue"]:
+                            from ouroboros.llm_claudexor import catalog_admits_model
+
                             account = kwargs.get("model_account_override")
                             if account is None:
                                 account = model_role_option(MODEL_ACCOUNTS_KEY, role)
@@ -748,7 +750,7 @@ class TaskModelWait:
                             if (catalog.get("source") == source
                                     and (not account or catalog.get("credentialProfileId") == account)
                                     and not (unproven and not account and catalog.get("credentialProfileId") == unproven)
-                                    and any(item.get("id") == native_model for item in catalog.get("models", []))):
+                                    and catalog_admits_model(catalog, native_model)):
                                 resolution = "resource_available"
                                 return kwargs
                     except ClaudexorUnavailable:

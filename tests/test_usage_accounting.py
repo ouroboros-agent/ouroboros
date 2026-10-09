@@ -1259,7 +1259,8 @@ def test_body_error_zero_usage_settles_confirmed_zero():
     # of an HTTP-200) that billed zero tokens is a request rejected before
     # generation — settle a confirmed $0, not an unknown cost that holds the bound.
     normalized, cost, final = ua.usage_from_response(
-        {"error": {"code": 429, "message": "rate limited"}, "choices": None, "usage": None}
+        {"error": {"code": 429, "message": "rate limited"}, "choices": None,
+         "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
     )
     assert cost == 0.0
     assert final is True
@@ -1284,7 +1285,8 @@ def test_body_error_storm_does_not_phantom_exhaust_budget(data_root):
     # accumulating a phantom unresolved sum that exhausts the finite budget.
     class _BodyErrResp:
         def model_dump(self):
-            return {"error": {"code": 429, "message": "rate limited"}, "usage": None}
+            return {"error": {"code": 429, "message": "rate limited"},
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
 
     for i in range(7):
         ua.execute_physical_attempt(

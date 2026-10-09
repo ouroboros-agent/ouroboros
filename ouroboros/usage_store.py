@@ -431,6 +431,25 @@ class Txn:
         return exceeds_limit(self.totals(root_task_id, billing_group_id), limit)
 
     # -- writes
+    def record_evidence(self, attempt_id: str, fields: dict, *, expected_revision: int) -> bool:
+        """CAS physical evidence only; money, state and projection debt stay unchanged."""
+        if not self.writable or self.committed:
+            raise UsageAccountingError("usage store transaction is not writable")
+        if not fields or set(fields) - {"physical_failure", "provider_receipt_binding"}:
+            raise ValueError("unsupported physical evidence fields")
+        record = self.conn.execute("SELECT extra, revision FROM attempts WHERE attempt_id=?",
+                                   (str(attempt_id),)).fetchone()
+        if record is None or record["revision"] != expected_revision:
+            return False
+        extra = json.loads(record["extra"])
+        if "physical_failure" in extra:
+            fields = {key: value for key, value in fields.items() if key != "physical_failure"}
+        if not fields or all(extra.get(key) == value for key, value in fields.items()):
+            return True
+        extra.update(fields)
+        return self.conn.execute("UPDATE attempts SET extra=?, revision=revision+1 WHERE attempt_id=? AND revision=?",
+                                 (_json(extra), str(attempt_id), expected_revision)).rowcount == 1
+
     def ack_dirty_owner(self, owner_id: str, revision: int) -> bool:
         """A concurrent receipt with a later revision keeps its projection debt."""
         if not self.writable or self.committed:
@@ -464,7 +483,7 @@ class Txn:
                                          "seq": seq, "ts": str(row.get("ts") or utc_now_iso())})
         validate_row_fields(materialized, seq)
         validate_transition(materialized, None if previous is None else str(previous.get("state") or ""),
-                            late_receipt_eligible(previous), seq)
+                            late_receipt_eligible(previous), seq, previous_row=previous)
         columns = _encode(materialized)
         stamps = {} if previous is None else self.conn.execute(
             "SELECT seq_first, ts_reserved AS _ts_reserved, ts_dispatched AS _ts_dispatched FROM attempts "

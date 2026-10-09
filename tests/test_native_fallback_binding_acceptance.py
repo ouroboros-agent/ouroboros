@@ -144,7 +144,8 @@ def test_native_loop_fallback_then_symbolic_return_uses_real_role_account_and_fi
     assert [manifest["model_role"] for manifest in request_manifests] == [role, "fallback:0", role]
     # One current row per attempt, in start order; each keeps its dispatch context.
     rows = attempt_rows_in_start_order(ctx.drive_root)
-    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 3), ("settled", 3), ("settled", 3)]
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4), ("settled", 3), ("settled", 3)]
+    assert rows[0]["physical_failure"]["stage"] == "raised_exception"
     dispatched = rows
     assert len({row["attempt_id"] for row in dispatched}) == 3
     assert [row["physical_context"]["capacity_total_tokens"] for row in dispatched] == [900_000, 240_000, 900_000]
@@ -241,7 +242,8 @@ def test_lost_create_reply_without_operation_id_cannot_authorize_new_generation(
     assert set(gateway.creates) == {original_key[0]}
     assert gateway.uploads[0][0]["account"] == {"mode": "pin", "profileId": "account-a"}
     rows = ledger(ctx.drive_root)
-    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 3)]
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4)]
+    assert rows[0]["physical_failure"]["stage"] == "raised_exception"
     assert len({row["attempt_id"] for row in rows}) == 1
     assert not gateway.acks
 

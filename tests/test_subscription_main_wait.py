@@ -99,7 +99,8 @@ def test_native_account_repair_rebinds_real_physical_candidate_before_send(main_
         answer, _cost, _mode = _dispatch(ctx)
         assert answer["content"] == result()["message"]["content"]
     rows = ledger(ctx.drive_root)  # one current row per attempt: the released send, then the answered one
-    assert [(row["state"], row["revision"]) for row in rows] == [("released", 3), ("settled", 3)]
+    assert [(row["state"], row["revision"]) for row in rows] == [("released", 4), ("settled", 3)]
+    assert rows[0]["physical_failure"]["stage"] == "raised_exception"
     dispatched = dispatched_attempts(ctx.drive_root)
     assert dispatched[0]["physical_context"]["route_fp"] == "capacity-account-a"
     assert dispatched[1]["physical_context"]["route_fp"] == "capacity-account-b"

@@ -111,7 +111,8 @@ def test_plan_executor_carries_wait_and_admitted_wallet_without_main_capture(tmp
     assert observed == [(owner, wallet, None, None)]
 
 
-def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wait, monkeypatch):
+@pytest.mark.parametrize("advisory", [False, True])
+def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wait, monkeypatch, advisory):
     _root, gateway, client, _owner, _events, _decide = live_wait
     monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"light": "account-a"}))
     monkeypatch.setattr(model_wait.time, "sleep", lambda _seconds: None)
@@ -125,7 +126,8 @@ def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wa
         assert profile == "account-a" and len(gateway.accepted_operations) == 1
         polls.append(profile)
         return {"source": source, "credentialProfileId": "account-b" if len(polls) == 1 else "account-a",
-                "models": [{"id": "exact-model"}]}
+                "models": [] if advisory else [{"id": "exact-model"}],
+                "admission": {"requestedModel": "exact-model", "inventoryAbsence": "advisory" if advisory else "authoritative"}}
 
     monkeypatch.setattr(client, "claudexor_model_catalog", catalog)
     client.chat([], MODEL, model_role="light")

@@ -700,7 +700,8 @@ class ReviewCoordinator:
                 model=slot.model,
                 status="error",
                 error=sanitize_tool_result_for_log(error_msg),
-                transport_status=_transport_error_status(exc),
+                transport_status=_transport_error_status(
+                    exc, failure_phase=str(failure_custody.get("review_failure_phase") or "")),
                 failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 reported_cause=str(getattr(exc, "reported_cause", "") or ""),

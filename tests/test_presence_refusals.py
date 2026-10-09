@@ -745,9 +745,10 @@ def test_inline_turn_repeats_a_dispatched_transport_death_as_a_no_effect_attempt
 
     # Exactly two physical attempts: the dead send stays unresolved at its bound, the repeat settles.
     assert llm.calls == 2
-    # One current row per attempt (revision 3: reserved, dispatched, terminal).
+    # Failure evidence advances the first row's revision without adding a call.
     attempts = _ledger(tmp_path)
-    assert [(row["state"], row["revision"]) for row in attempts] == [("unresolved", 3), ("settled", 3)]
+    assert [(row["state"], row["revision"]) for row in attempts] == [("unresolved", 4), ("settled", 3)]
+    assert attempts[0]["physical_failure"]["stage"] == "raised_exception"
     assert ua.usage_projection(tmp_path)["unresolved_upper_bound_usd"] == 1.0
     # No effect between them: the repeat is the same logical request, and before either send
     # no tool had run and nothing had been spoken; the transport heard the answer once, after it landed.

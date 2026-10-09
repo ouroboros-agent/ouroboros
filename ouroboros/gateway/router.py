@@ -98,6 +98,7 @@ def collect_routes(
         api_claudexor_wake,
     )
     from ouroboros.gateway.claudexor_quota import api_claudexor_quota_refresh
+    from ouroboros.gateway.harness_maintenance import harness_maintenance_routes
     from ouroboros.gateway.onboarding import (
         api_onboarding_complete,
         api_onboarding_subagents_preview,
@@ -304,6 +305,7 @@ def collect_routes(
         # own account surface; zero auth logic on this side.
         Route("/api/review-pool", endpoint=api_review_pool, methods=["GET"]),
         Route("/api/claudexor/status", endpoint=api_claudexor_status, methods=["GET"]),
+        *harness_maintenance_routes(),
         Route(
             "/api/claudexor/quota/refresh",
             endpoint=api_claudexor_quota_refresh,

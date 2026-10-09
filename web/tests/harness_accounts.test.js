@@ -448,7 +448,7 @@ test('the groups rebuild wraps in preserveCardFocus so a family-mounted login ca
     const source = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
     const wrap = source.indexOf('preserveCardFocus(host, () => {');
     assert.ok(wrap >= 0, 'renderRows must wrap its rebuild in preserveCardFocus');
-    const rebuild = source.indexOf('host.innerHTML = accountGroups(');
+    const rebuild = source.indexOf('host.innerHTML =', wrap);
     const repaint = source.indexOf('state.loginCard?.render();');
     const close = source.indexOf('\n    });', wrap);
     assert.ok(wrap < rebuild && rebuild < repaint && repaint < close,

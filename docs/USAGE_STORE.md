@@ -61,7 +61,10 @@ network-bound runs inside it.
   `unresolved` and an abandoned settlement accept ONE late receipt
   (`settle_reason="late_receipt"`) or a typed never-started release. Ordinary
   terminal rows are immutable; an identical repeat returns the stored row, a
-  conflicting one is refused.
+  conflicting one is refused. A bound exact-attempt provider-price fact also
+  permits successful `settled` nonfinal → final refinement; it cannot release
+  that attempt or replace an already final price. This exception leaves the
+  open-set/continuation ownership predicate unchanged.
 - `mark_dispatched` re-checks known spend against the global, root and group
   limits and the owner Pause/admission fences in the same transaction.
 - Recovery that raced a settlement passes `expected_revision`; the UPDATE
@@ -70,6 +73,11 @@ network-bound runs inside it.
 - `Txn.record_recovery` updates only custody metadata and the row revision; money
   and late-receipt rights stay unchanged. Definitive terminal/gone observations
   suppress HTTP probes; retained receipts still settle.
+- `Txn.record_evidence` merges only physical-failure and opaque provider-binding
+  evidence under a revision check. These additive `extra` fields require no
+  column/index migration on an existing database. The original physical failure,
+  HTTP-200 body errors included, is retained in private CAS before retry. Failure, administrative
+  closure, answer completeness and monetary finality remain independent.
 - One-shot kinds compare identity, not payload: a subscription session's later
   model or token observation replays the stored row.
 - Nonfinite money is refused before anything is written.
@@ -140,7 +148,8 @@ only its own budget.
    from the imported summaries; one-shot identities are stored.
 3. An install whose pre-ledger import never completed imports its `llm_usage`
    events and `state.json` totals in the same job (source hashes, archived
-   copies under `archive/usage_import/`, the watermark).
+   copies under `archive/usage_import/`, the watermark). Ambiguity is disclosed;
+   no log is rewritten and no attempt invented.
 4. Publish the store by atomic rename; record the header's epoch/sequence, the
    source size, hash and counts in `meta.import`; continue the marker at the
    journal's `[epoch, last seq]` so the `state.json` projection never sees a
@@ -181,7 +190,96 @@ evidence: the imported journal and the archive segments, a plain id scan
 without chain verification. Evidence that cannot be read is unknown, never an
 orphan accusation.
 
-## 9. Residuals
+## 9. Explicit OpenRouter price reconciliation
+
+From a source checkout with its dependencies installed:
+
+```bash
+python scripts/reconcile_openrouter_cost.py --attempt-id ID
+python scripts/reconcile_openrouter_cost.py --attempt-id ID --fetch
+python scripts/reconcile_openrouter_cost.py --attempt-id ID --apply
+```
+
+Repeat `--attempt-id` to select several physical attempts; duplicate selections
+are processed once. `--data-root PATH` selects an existing store, otherwise the
+configured data root is used. Inspect is the default: no HTTP or monetary
+mutation. `--fetch` permits one GET per selected attempt without a retained
+price (5-second connect / 15-second read allowance, no redirect, retry or sleep).
+`--apply` independently permits applying a retained validated receipt. Combine
+both flags for an explicit fetch-and-apply. Output is JSON; exit 1 means at
+least one selected attempt could not complete the requested action.
+
+`openrouter_cost.py` owns generation metadata parsing and private receipt CAS.
+New sends bind the original endpoint and credential SHA-256, then the first
+observed generation ID as soon as headers or body expose it, so a later stream
+failure does not lose the price lookup identity; contradictory IDs record a conflict. The explicit GET
+uses the settings/route resolver and requires that exact endpoint/fingerprint,
+without rotating keys. Missing legacy bindings cannot be guessed from a peer,
+model, timestamp or arbitrary request ID. Custom endpoints supplied only through
+an embedded client's constructor need a matching caller-supplied target to the
+receipt producer; the source command resolves the configured OpenRouter route.
+
+Received prices, including zero, outrank absent token counters and error shape.
+An explicitly malformed price stays unknown even when a token tariff is
+available; the host-derived `cost_invalid` usage fact survives normalization,
+settlement and loop projection. A valid alternate price wins, including zero.
+Absent/null prices still permit the existing nonfinal token estimate.
+Generation 404, 401, 403, 429, mismatched ID and absent/invalid money are distinct
+non-price outcomes. `Retry-After` is retained for an operator's next invocation;
+the command never schedules another lookup. A valid retained price needs no
+current key. It is read from the deterministic
+`physical_<attempt>_openrouter_price` call manifest before any GET, with source
+hash/identity verification. Non-price observations use the companion `lookup`
+manifest; a later failed lookup cannot displace a retained price.
+
+`openrouter_cost.apply_retained_receipt` validates the retained provider bytes
+and submits a neutral exact-attempt price fact with an opaque binding. Shared
+ledger/store rules compare that binding without interpreting provider IDs,
+endpoints or credential grammar.
+`usage_accounting.apply_provider_price_receipt` owns the revision-checked
+price-only transition and returns `applied`, `duplicate`, `stale`, `conflict`
+or `ineligible`. It preserves token, cache, processing, attribution and failure
+facts. A different final price is a conflict, never last-write-wins. Receipt
+retention precedes application; repeating `--apply` recovers an interrupted run.
+Existing dirty-owner maintenance refreshes terminal task/root projections after
+the ledger write, including after restart. Completed review attribution permits
+price recovery; live review operations (including late acceptance after the
+author task ends), live owners and post-task work remain protected. Price
+uncertainty grants no continuation rights. Applying a price to an unresolved attempt closes its monetary row, removing that row's model-handoff blocker; separate live ownership checks and incomplete-response facts remain. Refining an already-settled nonfinal row never expands the open-attempt set.
+
+Standalone command custody uses the selected data root's existing current queue
+snapshot, never the imported process's empty maps. Missing or stale ownership
+evidence refuses task-backed mutation. The existing direct-root projection
+also protects listed owners; incomplete or unreadable projections retain
+custody. Absent/empty direct-root projections carry no proof that every direct
+stack ended. Explicit `system:<source>` accounting
+scopes from one-shot provider/capability probes are not task-backed review
+owners; real review task IDs still require review-operation custody. The final
+ownership recheck and monetary revision CAS cannot atomically fence a task
+restart in another process; that cross-process race remains.
+
+An exact price received before a later read, close, rejection or cancellation
+error settles money without proving
+that the response completed. The existing `stream_incomplete` fact keeps Main's
+unknown-response policy, Presence's configured bounded transport-death retry,
+revoked-control no-resend and diagnostic response outcomes independent of the
+monetary capture state. Timeout, local-route, Stop and deadline exclusions
+remain in their existing consumers. Diagnostic events carry `stream_incomplete`
+beside monetary custody state; typed terminal local rejection keeps its existing
+provider-error policy. Async first-generation binding runs in a joined worker;
+failed binding can recover from the stream receipt using the explicit attempt
+reservation after ambient accounting context is cleared.
+Generation binding is a post-dispatch evidence write: synchronous binding and
+its joined async worker use the existing bounded money-lock acquisition (up to
+45 seconds), not the sliced pre-send wait. Stop/cancellation may wait for that
+bound at this point; no new timeout or retry policy is introduced.
+
+Ordinary sends, normalizers, startup and maintenance perform no OpenRouter
+generation GET. There is no automatic historical correction or automatic
+application of fetch-only previews. Explicit use on live history requires the
+operator's separate authorization; installation alone changes no old money.
+
+## 10. Residuals
 
 - Durability on a name-tier mount is best effort, as it was for the journal:
   the store relies on the mount's own write and rename semantics.

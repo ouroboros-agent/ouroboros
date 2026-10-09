@@ -24,7 +24,9 @@ from ouroboros.review_source_closure import retain_review_request_sources
 from ouroboros.review_substrate import ReviewRequest, run_review_request
 from tests.test_acceptance_delivery import _CLEAN_VERDICT, _EpisodeLLM, _fake_session, _tool_call
 from tests.test_acceptance_source_first import _SOURCE_PATH, _prepared_request
-from tests.test_main_authored_context import main_loop  # noqa: F401
+from tests import test_main_authored_context as context_fixtures
+
+main_loop = context_fixtures.main_loop
 
 
 _OLD = "HISTORICAL-AUDIENCE-EXECUTIVE-74a2"

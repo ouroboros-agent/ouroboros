@@ -342,7 +342,8 @@ def test_incomplete_minimax_stream_keeps_unknown_and_never_resends(isolated, mak
         _call(client, [{"role": "user", "content": "lookup"}], stream=True, asynchronous=asynchronous)
     assert len(sent) == 1 and response.is_closed
     assert _capture_on_chain(caught.value).state == "unresolved"
-    assert [(row["state"], row["revision"]) for row in rows(isolated)] == [("unresolved", 3)]
+    assert [(row["state"], row["revision"]) for row in rows(isolated)] == [("unresolved", 4)]
+    assert rows(isolated)[0]["physical_failure"]
 
 
 @pytest.mark.parametrize("missing", ["split", "continuation"])

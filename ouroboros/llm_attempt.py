@@ -464,6 +464,7 @@ def _attempt_request(
     })
     from ouroboros.send_clock import record_candidate, split_clock_note
     from ouroboros.vision_routing import note_candidate_images
+    from ouroboros.openrouter_cost import binding_for_target
 
     # The same bytes carry the Main clock line; its clock-free twin identifies
     # the candidate across two samples (the forced-final admission predicate).
@@ -490,6 +491,7 @@ def _attempt_request(
         submitted_processing_mode=submitted_processing_mode(target, payload),
         processing_basis=copy.deepcopy(target.get("processing_basis")),
         effort=effort_request_facts(target, payload),
+        provider_receipt_binding=binding_for_target(target),
         candidate_clock_free_sha256=(
             hashlib.sha256(_canonical_candidate_bytes(clock_free)).hexdigest()
             if clock_note is not None else None

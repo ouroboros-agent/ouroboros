@@ -148,7 +148,7 @@ ouroboros/ — agent core and shared runtime (§6)
   usage_accounting.py, usage_admission.py, _usage_wait.py — physical attempts (reserved → dispatched → settled or unresolved) with global/root/group admission; group binding and review-wave admission; pre-send lock slices (§6 Budget tracking)
   _usage_rows.py, _usage_money.py, _usage_response.py, usage_ledger.py, skill_review_usage.py — the one reducer, exact Decimal cash, the accounting usage normalizer, shared row rules and the money lock, the read-only Skill Review projection (§6 Usage ledger substrate vs. accounting policy)
   _usage_cache_splits.py — process-local cache split by task/provider/route/review; a missing entry prices a full cache write (§6)
-  usage_store.py, usage_journal.py — `state/usage.sqlite` and its one-time journal import (docs/USAGE_STORE.md)
+  usage_store.py, usage_journal.py, openrouter_cost.py — `state/usage.sqlite`, its journal import and explicit OpenRouter price receipts (docs/USAGE_STORE.md)
   cost_projection.py — the one task-cost projection for every producer: `accounted_upper_bound_usd`, null as None and never $0.00 (§6 Budget tracking)
   delegate_custody.py, delegate_custody_reconcile.py, delegate_state_sweep.py, delegate_custody_usage.py, delegate_custody_memo.py — Durable delegated-run custody, reconciliation, sweeps, usage and process memo; ownership stays OWNED/FOREIGN/UNKNOWN (§6 Nanny, transport and custody)
   delegate_hold.py — unknown-provider hold in supervised_wait until the leaf wakes; never resends (§6 Context fitting)
@@ -311,7 +311,7 @@ ouroboros/ — agent core and shared runtime (§6)
   extension_process_runner.py — Extension child processes: scrubbed env, per-skill deps, timeouts, graceful host errors
   extension_route_stream.py — Portable stdio response frames and ASGI relay for out-of-process extension routes (§3 Out-of-process extension responses)
   extension_ui_validation.py — The host-owned declarative-schema-v1 widget validator
-  extension_isolated_deps.py — In-process bridge for isolated-dependency extensions; `_ExecutionBarrier` is a non-reentrant reader/writer lease over the shared `sys.path` seam, polled rather than blocking the ASGI loop
+  extension_isolated_deps.py — Non-reentrant reader/writer leases for `sys.path`, polled asynchronously; dependency RLock also serializes owned importer-cache sweeps against double deletion, not plugin execution
   extension_health.py — Durable process-qualified per-skill health at `data/state/skills/<name>/health.json`; server observation is authoritative, worker observation a handoff-qualified view
   extension_plugin_api.py, extension_registry_state.py, extension_liveness.py, extension_child_catalog.py, extension_import_staging.py, extension_surface_names.py — The extension runtime's leaves: the `PluginAPI` handed to `register(api)`, live-surface registries, liveness, child-catalog validation, staged import trees, provider-safe surface naming
   skill_token.py — Opaque Host Service token minting/validation (§12)
@@ -406,6 +406,7 @@ ouroboros/ — agent core and shared runtime (§6)
     mcp.py — MCP HTTP surface over the shared MCPManager
     claudexor_accounts.py — Agent accounts HTTP surface: thin proxies over the owned daemon (status, wake, login and its job actions, credential profiles); no auth logic or browser exposure of the daemon token; `reads` classifies catalog/accounts/quota as `ok|not_read|failed`, and only `ok` makes even an empty collection authoritative (§3 Agent accounts; routes: §4)
     claudexor_quota.py — POST /api/claudexor/quota/refresh: one explicit owner refresh delegated exactly once to the engine's quota POST; no lifecycle start or retry; GET /api/claudexor/status stays passive
+    harness_maintenance.py — Owner maintenance HTTP surface over the shared host service (§6 Vendor program maintenance; routes: §4)
     host_service.py — Loopback-only Host Service API (§12)
     host_notify.py — POST /notify beside the Host Service: a granted skill's sentence becomes one signed `skill_notice` System row in the owner's chat (§12)
     history.py — Shared Chat room/quiz/media/review/terminal projection and cost-breakdown factories

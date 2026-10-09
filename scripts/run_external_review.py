@@ -718,8 +718,8 @@ def _contributor_execution_receipts(
 def _review_evidence_and_cost(actors: list[tuple[str, dict]]) -> tuple[list[dict], dict]:
     """A neutral seat-level evidence/cost report.
 
-    A zero or missing seat cost is never presented as proof that the call was
-    free: every dispatched seat without a reported positive cost is unreported.
+    Reported zero and positive amounts stay known independently of lifecycle;
+    missing amounts stay unknown. The report does not establish billing finality.
     """
     evidence: list[dict] = []
     reported_cost = 0.0
@@ -735,7 +735,7 @@ def _review_evidence_and_cost(actors: list[tuple[str, dict]]) -> tuple[list[dict
             "response_ref": actor["response_ref"],
         })
         cost = actor.get("usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0:
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
             reported_cost += float(cost)
             reported_slots.append(slot)
         else:

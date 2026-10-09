@@ -1229,7 +1229,7 @@
             "candidate_raw_size_bytes": 262,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           },
           {
             "source": "llm.anthropic",
@@ -1335,7 +1335,7 @@
             "candidate_raw_size_bytes": 244,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           }
         ],
         "unused_script_steps": 0

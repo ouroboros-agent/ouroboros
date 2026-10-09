@@ -391,7 +391,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     "ouroboros/review_projection.py": ("ouroboros/review_substrate.py", "_sub", frozenset({
         "DIALOGUE_STATUS_VALUES", "HARDNESS_ADVISORY_VISIBLE", "HARDNESS_HARD_GATE",
         "MAX_PROJECTED_ACTOR_FINDINGS", "OUTCOME_TIER_BEST_EFFORT", "OUTCOME_TIER_BLOCKED",
-        "OUTCOME_TIER_SOLVED", "disclosed_list_projection", "panel_reason",
+        "OUTCOME_TIER_SOLVED", "TYPED_FAILURE_FACT_KEYS", "disclosed_list_projection", "panel_reason",
         "projected_finding_row", "provider_for_model", "redact_projection",
         "review_binding_hash", "review_executions_from_actor_usage",
     })),

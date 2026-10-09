@@ -65,6 +65,7 @@ import {
 import { openConfirmDialog } from './confirm_dialog.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import { createLoginCardController, normalizeProfileName, preserveCardFocus } from './harness_login_cards.js';
+import { createHarnessMaintenanceController } from './harness_maintenance.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -963,6 +964,7 @@ const state = {
     store: claudexorStatus,
     loginCard: null,
     loginFamily: '',
+    maintenance: null,
     disposers: [],
     removeError: '',
     removeNotice: '',
@@ -991,6 +993,8 @@ export function renderAgentAccountsSection() {
                 rotates across a family's enabled, signed-in accounts; a disabled account keeps its
                 login and stays out of rotation. Accounts live in Ouroboros's own agent home; your
                 personal logins are never read or imported.
+                Program updates replace files in place and may interrupt new starts. Returning to
+                an earlier version may require a download. Retry a waiting task separately.
             </div>
             <div id="harness-accounts-error" class="settings-inline-status" data-tone="error" hidden></div>
             <div id="harness-accounts-groups" class="agent-family-list"></div>
@@ -1064,11 +1068,12 @@ export function harnessFamilyMarkup(group, payload, facets) {
             <div class="agent-family-head">
                 <div class="agent-family-id">
                     <h4>${harnessIdentityMarkup(group.harness, { label: group.label })}</h4>
-                    <span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>
+                    ${group.maintenanceOnly ? '' : `<span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>`}
                     ${nextUp ? `<span class="ui-status" data-tone="muted" data-next-up>${escapeHtml(nextUp)}</span>` : ''}
                 </div>
-                <button type="button" class="btn btn-default" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
+                ${group.maintenanceOnly ? '' : `<button type="button" class="btn btn-default" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>`}
             </div>
+            <div data-family-maintenance="${escapeHtml(group.harness)}"></div>
             <div class="agent-family-login" data-family-login="${escapeHtml(group.harness)}"></div>
             <div class="agent-family-rows">${body}</div>
         </section>
@@ -1120,11 +1125,17 @@ function renderRows() {
     // card's own render can see it. The capture must therefore wrap the
     // whole rebuild: same SSOT helper, one level up.
     preserveCardFocus(host, () => {
-        host.innerHTML = accountGroups(payload, {
+        const groups = accountGroups(payload, {
             accountsRead,
             catalogKnown: state.store.catalogKnown,
-        })
-            .map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead })).join('');
+        });
+        for (const harness of state.maintenance?.harnesses || []) {
+            if (!groups.some((group) => group.harness === harness)) groups.push({
+                harness, label: familyLabel(harness, payload, { catalogKnown: state.store.catalogKnown }),
+                rows: [], maintenanceOnly: true,
+            });
+        }
+        host.innerHTML = groups.map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead })).join('');
         host.querySelectorAll('[data-harness-login]').forEach((button) => {
             button.addEventListener('click', () => {
                 if (!state.initialized) return;
@@ -1176,6 +1187,7 @@ function renderRows() {
             });
         });
         state.loginCard?.render();
+        state.maintenance?.render();
     });
 }
 
@@ -1258,6 +1270,7 @@ export async function wakeDaemon() {
             : String(result?.error || 'request failed');
     }
     renderRows();
+    void state.maintenance?.refresh({ fresh: true });
 }
 
 // Harness ids are conservative tokens; escape defensively for the attribute
@@ -1304,6 +1317,7 @@ export async function startLogin(harness, profile) {
 
 /** Read the shared status once (the Refresh button, and the first paint). */
 export function refreshHarnessStatus() {
+    void state.maintenance?.refresh({ fresh: true });
     return state.store.refresh();
 }
 
@@ -1319,14 +1333,14 @@ async function refreshHarnessStatusOnActivation() {
     // the panel can keep useful context.  That retained snapshot is not fresh
     // evidence for an owner-triggered write: a transient outage must never
     // turn yesterday's `stale + ready` into a wake request.
-    if (state.store.error) return null;
+    if (state.store.error) return state.maintenance?.refresh({ fresh: true });
     const daemon = snapshot?.daemon || state.store.snapshot?.daemon || {};
     if (String(daemon.state || '') === 'stale'
         && String(daemon.runtime?.state || '') === 'ready'
         && !daemon.ownership_problem) {
-        return wakeDaemon();
+        await wakeDaemon();
     }
-    return null;
+    return state.maintenance?.refresh({ fresh: true });
 }
 
 /**
@@ -1344,6 +1358,13 @@ async function _init(store) {
     state.removeNotice = '';
     state.wakeError = '';
     state.wakeBusy = false;
+    state.maintenance = createHarnessMaintenanceController({
+        host: () => document.getElementById('harness-accounts-groups'),
+        onInventory: renderRows,
+        onSettled: () => state.store.refresh(),
+        visible: () => !document.hidden
+            && document.getElementById('harness-accounts-groups')?.offsetParent != null,
+    });
     ensureLoginCard();
     document.getElementById('btn-harness-refresh')
         ?.addEventListener('click', () => {
@@ -1353,7 +1374,7 @@ async function _init(store) {
             // re-read. SAME predicate the LABEL uses (renderRows), so the two
             // cannot disagree again.
             return refreshActionKind(state.store.snapshot) === 'refresh'
-                ? state.store.refresh()
+                ? refreshHarnessStatus()
                 : wakeDaemon();
         });
     // The SHARED surface binding: the visibility predicate that lets this
@@ -1364,7 +1385,10 @@ async function _init(store) {
     // have gone quietly dead on arrival while its comment still promised that
     // a daemon coming up is picked up without a reload.
     state.disposers.push(bindStatusSurface(state.store, {
-        listener: () => renderRows(),
+        listener: (view) => {
+            renderRows();
+            if (!view?.loading) state.maintenance?.poll();
+        },
         elementId: 'harness-accounts-groups',
         onActivate: refreshHarnessStatusOnActivation,
     }));
@@ -1373,6 +1397,7 @@ async function _init(store) {
     // page may not be visible yet, and the panel would sit on "Checking
     // daemon…" until the first tick (#125).
     state.store.refresh();
+    void state.maintenance.refresh();
     renderRows();
     return true;
 }
@@ -1392,6 +1417,8 @@ function _destroy() {
         try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
     }
     state.initialized = false;
+    state.maintenance?.dispose();
+    state.maintenance = null;
     const card = state.loginCard;
     if (!card) return true;
     card.detach();

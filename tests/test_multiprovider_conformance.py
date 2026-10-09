@@ -353,7 +353,8 @@ def test_model_operation_host_control_cancels_without_fabricating_result_or_rele
     assert "returned" not in observed
     assert observed["raised"]["code"] == "model_operation_interrupted"
     assert observed["raised"]["control_reason"] == "cancelled"
-    assert (observed["physical_attempts"][0]["state"], observed["physical_attempts"][0]["transitions"]) == ("unresolved", 3)
+    # Failure evidence adds one row revision, not another physical dispatch.
+    assert (observed["physical_attempts"][0]["state"], observed["physical_attempts"][0]["transitions"]) == ("unresolved", 4)
     assert len(observed["sends"]) == 1
     assert observed["model_control"]["create_posts"] == observed["model_control"]["operations"] == 1
     assert observed["model_control"]["cancels"] == [["op-0", "host_cancelled"]]

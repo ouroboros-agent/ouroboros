@@ -45,10 +45,12 @@ def _wrapped_provider_error(provider: str, exc: Exception) -> RuntimeError:
 
 def _provider_outcome_is_unknown(exc: Exception) -> bool:
     """Whether paid work started without a typed terminal provider outcome."""
+    from ouroboros.transport_custody import outcome_unknown_on_chain
+
     capture = getattr(exc, "physical_attempt_capture", None)
     return bool(
         isinstance(capture, PhysicalAttemptCapture)
-        and capture.state in {"dispatched", "unresolved"}
+        and outcome_unknown_on_chain(exc)
         and capture.provider_status_code is None
     )
 

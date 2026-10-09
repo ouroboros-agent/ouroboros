@@ -198,7 +198,7 @@
             "candidate_raw_size_bytes": 264,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           },
           {
             "source": "llm.chat",
@@ -425,7 +425,7 @@
             "candidate_raw_size_bytes": 289,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           },
           {
             "source": "llm.chat",
@@ -435,7 +435,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -652,7 +652,7 @@
             "candidate_raw_size_bytes": 269,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           },
           {
             "source": "llm.chat",
@@ -662,7 +662,7 @@
             "candidate_raw_size_bytes": 268,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -889,7 +889,7 @@
             "candidate_raw_size_bytes": 307,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           },
           {
             "source": "llm.chat",
@@ -899,7 +899,7 @@
             "candidate_raw_size_bytes": 218,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -990,7 +990,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           }
         ],
         "unused_script_steps": 0
@@ -1231,9 +1231,9 @@
             "candidate_raw_size_bytes": 332,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -1243,7 +1243,7 @@
             "candidate_raw_size_bytes": 332,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -1477,9 +1477,9 @@
             "candidate_raw_size_bytes": 307,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -1489,7 +1489,7 @@
             "candidate_raw_size_bytes": 218,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -1682,9 +1682,9 @@
             "candidate_raw_size_bytes": 307,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -1694,7 +1694,7 @@
             "candidate_raw_size_bytes": 218,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           }
         ],
         "unused_script_steps": 0
@@ -1926,9 +1926,9 @@
             "candidate_raw_size_bytes": 327,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -1938,7 +1938,7 @@
             "candidate_raw_size_bytes": 221,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -2161,9 +2161,9 @@
             "candidate_raw_size_bytes": 289,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -2173,7 +2173,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -2390,7 +2390,7 @@
             "candidate_raw_size_bytes": 289,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           },
           {
             "source": "llm.chat",
@@ -2400,7 +2400,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -2634,9 +2634,9 @@
             "candidate_raw_size_bytes": 307,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -2646,7 +2646,7 @@
             "candidate_raw_size_bytes": 218,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -2825,7 +2825,7 @@
             "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": false
           }
@@ -3056,7 +3056,7 @@
             "candidate_raw_size_bytes": 566,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -3313,9 +3313,9 @@
             "candidate_raw_size_bytes": 449,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -3325,7 +3325,7 @@
             "candidate_raw_size_bytes": 449,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 4,
             "prompt_cache_ttl": "",
             "cost_final": true
           }
@@ -3501,9 +3501,9 @@
             "candidate_raw_size_bytes": 442,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "settled",
-            "transitions": 3,
+            "transitions": 5,
             "prompt_cache_ttl": "",
-            "cost_final": true
+            "cost_final": false
           },
           {
             "source": "llm.chat",
@@ -3513,7 +3513,7 @@
             "candidate_raw_size_bytes": 338,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           }
         ],
         "unused_script_steps": 0
@@ -3622,7 +3622,7 @@
             "candidate_raw_size_bytes": 169,
             "candidate_measurement_kind": "canonical_json_v1",
             "state": "unresolved",
-            "transitions": 3
+            "transitions": 4
           }
         ],
         "unused_script_steps": 1

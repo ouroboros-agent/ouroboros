@@ -13,7 +13,10 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
-from tests.test_main_authored_context import call, main_loop  # noqa: F401
+from tests import test_main_authored_context as context_fixtures
+from tests.test_main_authored_context import call
+
+main_loop = context_fixtures.main_loop
 
 
 def _input(f, system, user):
