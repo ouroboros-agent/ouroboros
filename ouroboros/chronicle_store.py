@@ -922,7 +922,48 @@ class ChronicleStore:
         later = revisions[revisions.index(state["revision"]) + 1:] if known else []
         folded = db.execute("SELECT part_id FROM folded WHERE member_id=?", (found["id"],)).fetchone()
         return {**state, "missing": False, "revision_known": known, "current_revision": revisions[-1],
-                "later_corrections": later, "status_now": self._status(db, found), "folded_into": folded[0] if folded else None}
+                "later_corrections": later, "status_now": self._status(db, found), "folded_into": folded[0] if folded else None,
+                "nested_changes": self._nested_source_changes(db, found)}
+
+    def _nested_source_changes(self, db, source) -> List[Dict[str, Any]]:
+        """Changes inside retained account/part sources, independent of current display or fold ownership.
+
+        Account edges retain exact cited revisions/statuses. Parts retain member IDs only, so their
+        members' corrections and decisions are reported without inventing a revision read by the part.
+        Visit only this source graph; a repeated node's immutable edges need expanding just once.
+        """
+        changes, todo, expanded = [], [(source, [])], set()
+        while todo:
+            parent, path = todo.pop()
+            if parent["id"] in expanded:
+                continue
+            expanded.add(parent["id"])
+            if parent["kind"] == "account":
+                refs = parent.get("sources") or ()
+            elif parent["kind"] == "part":
+                refs = [{"id": ident} for ident in (parent.get("covers") or {}).get("member_ids") or ()]
+            else:
+                continue
+            via = [*path, parent["id"]]
+            for ref in refs:
+                member = self._get(db, ref["id"])
+                if member is None:
+                    continue
+                revision = ref.get("revision")
+                revisions = self._revisions(db, member["id"])
+                later = (revisions[revisions.index(revision) + 1:] if revision in revisions else
+                         revisions[1:] if revision is None else [])
+                for (body,) in db.execute("SELECT body FROM records WHERE target=? AND kind IN ('correction','decision') "
+                                          "ORDER BY sequence", (member["id"],)):
+                    event = json.loads(body)
+                    if (event["kind"] == "correction" and event["id"] not in later
+                            or event["kind"] == "decision" and revision is not None
+                            and ref.get("status") == self._status(db, member)):
+                        continue
+                    changes.append({"source_id": member["id"], "kind": member["kind"], "room_id": member["room_id"],
+                                    "via": via, "revision": revision, "event": event})
+                todo.append((member, via))
+        return changes
 
     def _selection_of(self, db, account_id) -> Optional[Dict[str, Any]]:
         """The latest selection of an account (the one that acts), or None while it was never selected."""
@@ -956,7 +997,7 @@ class ChronicleStore:
                 "SELECT sequence,body FROM records WHERE " + " AND ".join(where) + " ORDER BY sequence", args)]
 
     def room_records(self, room_id: Any, *, after_seq: int = 0) -> List[Dict[str, Any]]:
-        """A room's pages, parts, notes, legacy sections and gaps, without rejected drafts.
+        """A room's pages, parts, accounts, notes, legacy sections and gaps, without rejected drafts.
 
         Each is interpreted (``_interpret``): ``current_text`` with the mind's corrections under
         the original, ``revision``, ``corrections``, ``status`` for pages and parts and ``folded_into``.

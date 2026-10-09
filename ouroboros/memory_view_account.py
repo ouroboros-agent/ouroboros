@@ -25,6 +25,29 @@ def _date(value: Any) -> str:
     return str(value or "")[:10] or "date not recorded"
 
 
+def source_change_lines(src: Mapping[str, Any]) -> List[str]:
+    """Signed changes below a cited source; shared by the story and exact account reader.
+
+    These facts do not rewrite any narrative. A part has no recorded member revision, unlike an
+    account's frozen source edge, so its member changes carry no invented incorporation claim.
+    """
+    lines = []
+    for change in src.get("nested_changes") or ():
+        event, ident = change["event"], change["source_id"]
+        revision = change.get("revision")
+        basis = (f"cited revision {revision}; later change not in that source account" if revision else
+                 "part member; member revision was not recorded")
+        kind = event["kind"] if event["kind"] == "correction" else "acceptance" if event["accepted"] else "rejection"
+        lines.append(f"- {kind} of nested source {change['kind']} {ident} (room {change['room_id']}) "
+                     f"via {' -> '.join(change['via'])}; {basis}; original account text unchanged")
+        lines.append(f"  {event['kind']} {event['id']} by mind ({draft_signer(event.get('author'))}) "
+                     f"at {event.get('ts') or 'time not recorded'}; memory_read(node_id='{event['id']}')")
+        lines.append(indented(str(event.get("text") if event["kind"] == "correction" else event.get("reason") or "")))
+        args = f", revision='{revision}'" if revision else ""
+        lines.append(f"  source: memory_read(node_id='{ident}'{args})")
+    return lines
+
+
 def _source_lines(entry: Mapping[str, Any]) -> List[str]:
     """One line per source: what it is, where, which revision the account read, and what changed since."""
     lines = []
@@ -48,6 +71,7 @@ def _source_lines(entry: Mapping[str, Any]) -> List[str]:
             lines.append(f"- its source {src['id']}, a draft then, I have since accepted")
         if src.get("folded_into"):
             lines.append(f"- its source {src['id']} has since been folded into part {src['folded_into']} (not in this account)")
+        lines.extend(source_change_lines(src))
     return lines
 
 

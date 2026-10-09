@@ -251,7 +251,7 @@ class MemoryViewSnapshot:
     spec: ViewSpec
     store_status: Dict[str, Any]  # {"state": "active" | an import kind, "reason"?}
     frontier: Dict[str, Any]  # {"status", "pos"} of the legacy frontier
-    story: Tuple[Dict[str, Any], ...] = ()  # legacy pointers, then pages and parts, in story order
+    story: Tuple[Dict[str, Any], ...] = ()  # legacy records, pages, parts and selected accounts; told_by keeps source addresses, in story order
     room: Optional[Dict[str, Any]] = None  # the current room's facts and texts
     live_rooms: Tuple[Dict[str, Any], ...] = ()
     marks: Tuple[Dict[str, Any], ...] = ()

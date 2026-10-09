@@ -59,6 +59,7 @@ from ouroboros.chronicle_store import (SPEAKERS, ChronicleStore, PublishResult, 
                                        source_time_span, verify_quotes)
 from ouroboros.dialogue_provenance import memory_row_header, render_row_text, row_author
 from ouroboros.knowledge import focus_signature
+from ouroboros.memory_view_account import source_change_lines
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolEntry
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
@@ -724,7 +725,7 @@ def _source_section(src: Dict[str, Any]) -> str:
     if src.get("folded_into"):
         facts.append(f"since folded into part {src['folded_into']}")
     read = f"memory_read(node_id={src.get('id')}, revision={src.get('revision')}) reads that version; without revision, as it acts now"
-    return "; ".join([head, *facts, read])
+    return "\n".join(["; ".join([head, *facts, read]), *source_change_lines(src)])
 
 
 def _as_of(store: ChronicleStore, record: Dict[str, Any], revision: str) -> Tuple[Dict[str, Any], List[str]]:
