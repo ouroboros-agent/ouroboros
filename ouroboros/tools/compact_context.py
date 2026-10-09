@@ -150,7 +150,7 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
                       for unit in units],
             "schema_names": [s["function"]["name"] for s in observed["tool_schemas"]],
             "rule": ("This revision names the observed messages; schemas are listed separately. Units are complete tool "
-                     "units, earlier records, your own completed replies (kind assistant) and host prose rows (kind host); "
+                     "units, earlier records, your own completed replies (kind assistant) and completed prose rows (kind user; eligibility distinguishes governing owner words); "
                      "a unit with eligible=false carries the owner's words and stays whole. Select complete unit IDs to "
                      "keep, write one working_note, and preserve original sources. The system view, the assignment and "
                      "newer owner/tool messages remain untouched."),

@@ -253,10 +253,10 @@ Enforcement: the failure-path tests the first bullet mandates, plus `tests/test_
 
 #### Cognitive Artifact Integrity
 
-- Cognitive artifacts (identity.md, scratchpad, task reflections, review outputs, pattern register) must not use hardcoded `[:N]` truncation. When content must be shortened, summarize explicitly — attempts, changes and conclusions survive — and disclose the omission with a resolvable reference; an omission marker alone is disclosure, not sufficiency (BIBLE P1).
+- Preserve exact cognitive sources before replacing their view: authored understanding, signed helper output and model-free addresses have different provenance. Keep governing words, outcomes and decisions; an omission marker proves no understanding or review. Enforce through DEVELOPMENT §4 "Compaction must earn its rewrite" and its tests.
 - Governance residency is per mode and per actor, never universal; a new reasoning flow follows the per-flow context-delivery registry (DEVELOPMENT §4 "Core Governance Artifacts", "When adding a new reasoning flow") and never relies on touched-file inclusions.
 
-Enforcement: review-only — CHECKLISTS item 11(f) scores the no-`[:N]` rule in commit review.
+CHECKLISTS item 11(f) reviews source preservation and authorship.
 
 ### Android platform development
 

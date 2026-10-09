@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
 from ouroboros.delegate_custody import RunCustody as _RunCustody
-from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import truncate_review_artifact
 

@@ -15,7 +15,9 @@ from ouroboros.loop_messages import CONTEXT_FACTS_NAME
 from ouroboros.peer_roster import ROSTER_SNAPSHOT_NAME, ROSTER_UPDATE_NAME
 from ouroboros.tool_result_record import TOOL_RESULT_RECORD_KEY, make_tool_result_record
 from tests.test_context_reclaim_materializer import _request, _SPEC
-from tests.test_main_authored_context import main_loop  # noqa: F401 -- shared pytest fixture
+from tests.test_main_authored_context import main_loop as _main_loop
+
+main_loop = _main_loop
 
 BODY = "Exact producer bytes: Ж, e\u0301, emoji 🧠.\r\n" * 1000 + "CONSEQUENTIAL-TAIL\r\n"
 OWNER = "Keep the original contract until the replacement is verified."

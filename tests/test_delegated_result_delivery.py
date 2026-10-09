@@ -14,7 +14,10 @@ from dataclasses import replace
 
 import pytest
 
-from tests.test_main_authored_context import call, main_loop  # noqa: F401
+from tests.test_main_authored_context import call
+from tests.test_main_authored_context import main_loop as _main_loop
+
+main_loop = _main_loop
 import pathlib
 
 from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture applies on import)

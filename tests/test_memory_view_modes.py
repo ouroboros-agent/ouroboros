@@ -394,7 +394,6 @@ def test_a_route_switch_keeps_max_books_and_moves_its_memory_fact_to_the_new_win
     from ouroboros.tools.registry import ToolRegistry
 
     core, plan = _built(tmp_path / "w", monkeypatch)
-    need = _needs(core, plan)
     roomy = plan(10_000_000)
     for name, window, mode in (("smaller", 1, "max"), ("same", 10_000_000, "max")):
         root = tmp_path / name

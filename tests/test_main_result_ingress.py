@@ -16,7 +16,10 @@ from ouroboros import context, loop, loop_tool_execution
 from ouroboros.artifacts import read_actor_source_bytes
 from ouroboros.tools.registry import ToolEntry
 from ouroboros.tools.tool_result import ToolResult
-from tests.test_main_authored_context import call, main_loop  # noqa: F401
+from tests.test_main_authored_context import call
+from tests.test_main_authored_context import main_loop as _main_loop
+
+main_loop = _main_loop
 
 
 pytestmark = pytest.mark.serial
