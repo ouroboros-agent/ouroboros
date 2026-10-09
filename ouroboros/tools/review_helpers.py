@@ -813,6 +813,15 @@ def check_worktree_readiness(
                 "the official CI lane still enforces"
             )
 
+    try:  # 6. Touched reference books' balance: a warning; official CI refuses a grown book.
+        from ouroboros.reference_books import BOOK_GROWTH_RULE, book_balances, render_book_balance
+        if status_result is not None and (repo_dir / "ouroboros" / "reference_books.py").is_file():
+            touched = parse_changed_paths_from_porcelain(status_result.stdout or "")
+            warnings.extend(f"official CI will enforce: {render_book_balance(b)}. {BOOK_GROWTH_RULE}"
+                            for b in book_balances(repo_dir, touched) if b.owed)
+    except Exception:
+        pass
+
     return warnings
 
 

@@ -410,7 +410,12 @@ def _open_ready_slot(
     wid: int, slot: Any, row: Dict[str, Any], expected_sha: str, owner_chat_id: int,
     started: float, attempt: int,
 ) -> None:
-    """Open the ready slot before the diagnostic checkout comparison."""
+    """Open the ready slot before the diagnostic checkout comparison.
+
+    Ancestry of the observed checkout against the baseline is diagnostic only:
+    a descendant stays in the supervisor log; a non-descendant or an unavailable
+    check also warns the owner chat; no baseline skips the comparison.
+    """
     with _queue_lock:
         owned = (_pool().WORKERS.get(wid) is slot
                  and not getattr(slot, "readiness_exhausted", False))
@@ -447,6 +452,9 @@ def _release_booting_slot(
     wid: int, slot: Any, started: float, attempt: int, reason: str, **detail: Any,
 ) -> None:
     """Hand a booting slot to the crash detector: ``reaping`` cleared if it is still ours, one typed row.
+
+    "Ours" means still registered in the pool and not readiness-exhausted; any other
+    slot is left untouched and the row records ``slot_released=False``.
 
     ``died_during_boot`` carries the exit code; ``watcher_error`` carries the error type and message.
     """

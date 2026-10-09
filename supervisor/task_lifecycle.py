@@ -535,6 +535,10 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
        watchdog to retry, and the outcome is ``failed`` — the caller must not
        report a cancellation that did not happen.
 
+    A workspace task's cancelled result carries ``artifact_attribution:
+    "shared_unproven"``: the shared tree is captured outside the normal
+    patch-capture seam, so its diff does not prove which actor authored it.
+
     ``deliver=False`` suppresses the per-task salvage chat delivery (cascade
     sweeps deliver ONE root message with a children digest instead).
     """

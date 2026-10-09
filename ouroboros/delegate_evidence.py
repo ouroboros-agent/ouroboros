@@ -344,6 +344,10 @@ def acceptance_patch_dispositions(drive_root: Any, task_id: str) -> Dict[str, An
     disposition recorded", never "reviewed clean"; an unreadable log is the
     typed ``evidence_read_failed`` marker, never an empty-therefore-clean
     section (the ``task_execution_evidence`` rule, GR6-4).
+
+    Rows keep the newest ``_ACCEPT_PATCH_DISPOSITION_CAP`` (20) entries and
+    ``omitted`` counts the rest. ``unreviewed_delegated_apply`` is set when any
+    applied row of the ``delegated`` pipeline exists, judged before the cap.
     """
     from ouroboros import delegate_custody as custody
     from ouroboros.utils import truncate_review_artifact

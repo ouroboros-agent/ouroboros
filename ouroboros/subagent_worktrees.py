@@ -14,6 +14,10 @@ not ``.git`` scoped). Tree-proportional work never runs under it (#1241):
 listing, classifying, hashing, populating, copying (and re-recording the copied
 bytes' stat) and deleting a snapshot's files happen outside the lock, so one
 huge inventory delays only its own task.
+
+Registry updates are whole-file read-modify-write, O(rows). Eligible untracked
+text is hashed into the target's object database; once the pin or branch is
+deleted those blobs are unreachable loose objects until ``git gc``.
 """
 
 from __future__ import annotations

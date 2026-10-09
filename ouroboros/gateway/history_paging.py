@@ -3,7 +3,8 @@
 A page is counted in the room's rows, never in bytes of the shared chain: the
 newest page holds the room's newest rows however far back they lie, and each
 older page the next older ones (owner decisions 2026-10-05, DESIGN "History
-edges"). Archives a Project's lens rules out are skipped unread
+edges"). The chat and progress streams keep separate quotas (``human``,
+``progress``), each counted by its own predicate. Archives a Project's lens rules out are skipped unread
 (``history_segments``); only a physical read ceiling can end a page early.
 """
 

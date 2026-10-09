@@ -1,2 +1,0 @@
-122
-Document the function-local platform-lock exception in the stdlib-only pre-import body switch, which cannot import the mutable platform layer.

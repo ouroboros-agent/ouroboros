@@ -1,2 +1,0 @@
-1276
-One Design System rule for the new delivered-document reader: it reads only the delivered copy as a bounded stream within one timeout, answers a refused one with its cause, reuses the chat Markdown mount with softBreaks and the shared .btn.btn-default controls, disposes on close/release (of the grouped item)/closeTransient/destroy, keeps its authored name and text out of the language overlay with data-i18n-authored, and names its enforcing tests including the Project room, navigation and translated-UI browser scenarios; no existing rule covered in-app document reading.

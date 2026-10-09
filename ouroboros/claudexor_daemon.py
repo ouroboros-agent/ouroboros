@@ -595,8 +595,8 @@ class OwnedClaudexorDaemon:
     def clear_start_failure_latch(self, *, cleared_by: str) -> bool:
         """Release the spawn latch; True when one was set (a durable row names who released it).
 
-        Callers: the periodic sweep and the owner's Refresh (the two retriers),
-        and a successful attach. Restart/Panic clear it by constructing a new manager.
+        The sweep, owner Refresh and successful attach call this; Restart/Panic build a new manager.
+        Another caller may spawn between release and retry; the retry joins that child.
         """
         with self._lock:
             record, self._last_start_failure = self._last_start_failure, None

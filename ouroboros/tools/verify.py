@@ -172,7 +172,9 @@ def _check_has_exit_masking(argv: List[str]) -> tuple[bool, list[str]]:
 
 
 # Public name for the SECOND consumer: run_command/run_script read the same
-# sensor to disclose a masked green in their result envelope.
+# sensor to disclose a masked green in their result envelope: on an exit-0 result
+# they append one EXIT_MASKING_NOTE and publish `exit_masking_reasons` in the
+# result meta; status and exit code are unchanged and no receipt is written.
 check_exit_masking = _check_has_exit_masking
 
 
@@ -845,6 +847,7 @@ def _verify_and_record(
     if kind == "artifact_observation":
         paths = [str(p) for p in (artifact_paths or []) if str(p or "").strip()]
         obs_status, detail = _observe_artifacts(ctx, paths)
+        # 20 paths stored; _outcome_receipts' identity carries the omitted count and full-set hash.
         receipt.update({"status": obs_status, "paths": paths[:20], "summary": detail})
         if not append_verification_receipt(drive_root, task_id, redact_process_data(receipt)):
             return _receipt_custody_failure(kind, f"{obs_status}: {detail}")

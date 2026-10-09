@@ -216,6 +216,14 @@ def is_retryable_transport_death(exc: BaseException) -> bool:
     and — the classifier's locality gate — NOT a local provider or a loopback
     route, whose dead server is not a network fault worth paying for again. A
     missing capture proves nothing and fails closed.
+
+    The repeat policy lives in ``loop_llm_call``: only an inline Presence turn
+    repeats, at most ``_TRANSPORT_DEATH_RETRIES`` times per round, each repeat a
+    separate ledger attempt with an unresolved upper bound. The round-keyed
+    record (``TRANSPORT_DEATHS_KEY``) counts repeats and keeps their failure
+    class; an exhausted budget or an expiring task deadline ends the round with
+    ``llm_non_retryable_same_request``, and while the record stands only a
+    further typed death (or the free pre-dispatch redial) may send again.
     """
     if is_pre_dispatch_transport_failure(exc):
         return False  # the free released class: the two predicates are never both true

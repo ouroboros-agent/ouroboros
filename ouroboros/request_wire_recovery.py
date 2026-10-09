@@ -2,6 +2,18 @@
 
 This leaf owns request-shape adaptation, never provider/model/API choice. Learnable
 actions stay pending until exact success; task-local degraded-rung repairs never persist.
+
+Actions are ``set_value``, ``drop_field`` and ``replace_dialect``, at most
+``_MAX_COMPOSED_ACTIONS`` per call. A positive enum bound to the effort field needs no
+scalar echo: the retry value is the highest comparable lower tier, or the known minimum
+when every advertised tier is higher. Negative quotes prescribe nothing, a value
+rejection never drops its carrier, and the mandatory-reasoning floor and the
+unsupported-carrier drop remain. Only a normalized success bound to the exact settled
+physical capture teaches ``state/request_wire_compatibility.json`` (entries expire after
+14 days); unsettled attempts never teach. A returned response discloses
+``usage.request_wire`` after ``validate_wire_attempt_identity`` even when monetary
+settlement failed; ``request_wire_history`` is a bounded, ordered disclosure, while
+``usage_store.py`` / ``state/usage.sqlite`` owns money.
 """
 
 from __future__ import annotations

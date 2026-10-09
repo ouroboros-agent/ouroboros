@@ -1,2 +1,0 @@
-385
-Review fixes of the current-state change: invariant 6 names the pending registrations, the first-door grace and the measured signal; invariants 10, 24 and 28 state exactly which paths are converted and point at the follow-up issue for the rest.

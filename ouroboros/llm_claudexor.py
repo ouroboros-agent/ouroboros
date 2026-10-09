@@ -1,6 +1,6 @@
 """Caller-owned physical accounting; one engine operation rejoins lost control, private CAS precedes ACK.
 Only durable dispatched results update the caller's live turn slot; unknown/no-start/legacy outcomes preserve it.
-Pre-dispatch pricing reads that slot; route changes clear it. Deadlines/Stop stay unchanged (ARCHITECTURE §6).
+Pre-dispatch pricing reads that slot; route changes clear it. The engine version gate reads the last successful handshake; a failed probe never un-proves an engine already observed at the minimum. Deadlines/Stop stay unchanged (ARCHITECTURE §6).
 """
 
 from __future__ import annotations

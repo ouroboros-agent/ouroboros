@@ -1,4 +1,8 @@
-"""Effective task status helpers shared by tools and gateways."""
+"""Effective task status helpers shared by tools and gateways.
+
+Only pooled execution owners enter worker-boot orphan inference; direct,
+presence and unknown owners are never inferred dead from a later worker boot.
+"""
 
 from __future__ import annotations
 

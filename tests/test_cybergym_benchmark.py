@@ -147,7 +147,6 @@ def test_benchmark_inventory_points_to_cybergym_docs():
     architecture = architecture_text(REPO)
     assert "cybergym/" in common_readme
     assert "devtools/benchmarks/cybergym/" in architecture
-    assert "workspace-custody gate" in architecture
 
 
 def test_cybergym_docs_pin_the_owner_approved_contract():

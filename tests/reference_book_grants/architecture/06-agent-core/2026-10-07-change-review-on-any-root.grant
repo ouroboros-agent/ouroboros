@@ -1,7 +1,0 @@
-2783
-The "Change review on any root" subsection for the new `review_change` tool: the commit gate's reviewer wave
-without the landing (one frozen subject, at most one paid wave, one ledger record, no test run), its root
-resolution and typed call errors, the checklist layer from `body_fact`, panel composition (adds-only on the
-body outside Cyber Pro, `reviewers` as the panel elsewhere, `reason_missing`), `coupling_only` outside the
-quorum, free reuse of a settled record, the per-root cycle cap, enforcement that never locks another root, and
-`commit_reviewed` refusing any root but the system repository.

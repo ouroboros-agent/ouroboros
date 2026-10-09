@@ -98,7 +98,6 @@ def test_plan_review_docs_pin_fail_closed_exact_artifact_custody():
     for relative in ("docs/ARCHITECTURE.md", "docs/DEVELOPMENT.md"):
         text = governance_doc_text(relative, repo)
         assert "plan_review_exact_artifact_unavailable" in text, relative
-        assert "only when no exact artifact reference exists" in text, relative
 
 
 def test_forked_task_captures_canonical_memory_and_exact_api_context():

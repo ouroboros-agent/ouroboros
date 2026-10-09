@@ -780,6 +780,10 @@ def _wait_window(
     the tool's entry timeout, which each caller keeps at ``clamp + margin`` or
     more. Inside the finalization reserve the executor's 1 s floor stays the
     bounded exit.
+
+    The task waits pass minimum 0 and ``NESTED_SETTLEMENT_MARGIN_SEC``, so they end
+    that far inside the executor's emission; ``await_messages`` passes minimum 1 and
+    margin 1, and its last poll sleep is clipped to the remaining window.
     """
     from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
     from ouroboros.task_pacing import effective_finalization_reserve_sec

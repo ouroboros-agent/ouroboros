@@ -245,7 +245,8 @@ def fit_dialogue_view(packet: str, own: dict, capacity_chars: int, *, measure=le
     """Keep the whole conversation when it fits this delivery's actual measure, else the
     largest NEWEST run of conversation rows, the cut named in the footer with its exact
     line range. Only the inline conversation yields room; governance, the operative inputs
-    and the pointer stay intact. Progress and host rows are never inline."""
+    and the pointer stay intact. Progress and host rows are never inline. When even zero rows
+    do not fit, the zero-row view is returned and the over-capacity core is left untrimmed."""
     full, facts = dialogue_view(own)
     if measure(packet) <= capacity_chars or full not in packet:
         return packet, facts
@@ -297,7 +298,12 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                          native_mandatory_chars: int, data_root: Any = "",
                          frozen: dict | None = None, session_root: str = "", task_id: str = "",
                          session_limits: dict | None = None) -> dict:
-    """Project a fresh request, or reuse the recorded delivery at collection."""
+    """Project a fresh request, or reuse the recorded delivery at collection.
+
+    Each slot's fit lands in ``dialogue_delivery``; a session slot with an engine bound also
+    records ``input_limit`` (the bound, the measured ``prompt_chars``, ``fits``). A frozen
+    delivery replays the recorded inputs and never re-fits against live context.
+    """
     if frozen is not None:
         from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs
         return frozen_delivery_inputs(frozen, slots)

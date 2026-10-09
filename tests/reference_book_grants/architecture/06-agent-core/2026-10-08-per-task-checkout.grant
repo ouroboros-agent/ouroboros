@@ -1,4 +1,0 @@
-373
-The subject operation's paragraphs say the checkout token is a digest of the task id and the retry key, so the path is per task and round,
-that a task's own open operation of the round is collected before any reuse lookup,
-and that a wave failing before it settled its own custody keeps a checkout an earlier wave retained.

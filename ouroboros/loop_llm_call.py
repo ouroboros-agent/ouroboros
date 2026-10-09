@@ -1062,7 +1062,11 @@ def provider_no_call_source(accumulated_usage: Dict[str, Any], deadline_exhauste
     wall makes one more forced call a second full retry window; the deadline_local
     rail keeps its grace call, so ``deadline_exhausted`` suppresses the wall. A round
     still holding an unresolved attempt (its transport-death record: written at a grant,
-    cleared only by a usable response) forbids the resend whatever the sticky kind."""
+    cleared only by a usable response) forbids the resend whatever the sticky kind.
+    Sources: ``provider_outcome_unknown_no_resend``, ``resource_refusal_no_resend`` and
+    ``same_route_refusal_no_resend`` (typed refusals), ``retry_wall_exhausted_no_repay``
+    (``RETRY_WALL_EXHAUSTED_KEY``, a per-invocation bool on the shared usage dict). The
+    rail stamps ``provider_unavailable`` except for ``resource_refusal_no_resend``."""
     if (str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown"
             or accumulated_usage.get("_pending_transport_outcome") or isinstance(accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)):
         return "provider_outcome_unknown_no_resend", False

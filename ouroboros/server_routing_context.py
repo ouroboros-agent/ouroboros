@@ -4,6 +4,13 @@ Projections only: which root tasks a chat can steer, what a project's last
 result says about where its work lives, what the Main lane can see, and how a
 chat maps to a project. Nothing here delivers a message or picks a target —
 that judgment belongs to the decision turn (BIBLE P5).
+
+Main's manifest lists each project's registry ``working_dir`` and the last 20
+chat rows with text from every room (people's words whole, other rows
+truncated). Project rooms and Main read recent root results and live roots as
+bounded typed projections, never raw result text; a project's last result is
+found through the registry row's ``last_task_result_id`` pointer (stamped by
+roots only), with a bounded scan as fallback.
 """
 
 from __future__ import annotations

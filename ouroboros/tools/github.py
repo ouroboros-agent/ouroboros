@@ -1,4 +1,11 @@
-"""GitHub tools: issues, pull requests, comments, checks."""
+"""GitHub tools: issues, pull requests, comments, checks.
+
+``_gh_run`` is the structured transport read; ``_gh_cmd`` projects it onto the string ABI.
+``GH_TARGET_INVALID`` / ``GH_TARGET_REQUIRED`` refusals enter the tool-result sidecar. A target
+or missing-CLI refusal raised before the invocation's first ``gh`` launch is published
+``completed_no_effect``. The checks reader's literal ``gh api`` annotation path is the one
+subcall that does not take the explicit repo.
+"""
 
 from __future__ import annotations
 

@@ -98,7 +98,8 @@ global remaining) and the per-task cap minus its planning margin. A lane's
 global remaining is its own budget; root reservations do not disable this
 earlier stop. SW1's UI root and the evolution root also follow this path.
 
-Read settled spend and unknown-cost counts from `state/usage_attempts.jsonl`;
+Read settled spend and unknown-cost counts through `run_live_lanes.lane_spend`
+from `state/usage.sqlite`, with journal fallback for an older seed;
 `llm_usage` omits review/synthesis spend and cannot be the stand's money source.
 Admit only while `spent + reserved(in flight) + reservation ≤ cap`. If only
 in-flight reservations prevent admission, wait for settlement and recheck;
@@ -172,7 +173,7 @@ is explicitly unavailable, never passed.
 After the lane server stops, on every outcome, `traces.py` copies its
 journals into `lanes/<id>_a<n>/traces/` with the data-root layout kept:
 `logs/*.jsonl`, `logs/*.log` with the rotated `server.log.<n>` backups, `task_results/*.json`,
-`state/{advisory_review.json,usage_attempts.jsonl,queue_snapshot.json,evolution_campaign.json}`
+`state/{advisory_review.json,usage.sqlite,usage_attempts.jsonl,queue_snapshot.json,evolution_campaign.json}`
 and the observability call manifests `observability/calls/*/*.json`, for
 the lane root and every `state/headless_tasks/<id>/data` fork. Never
 `settings.json`, `memory/`, the gzip payload blobs or credential stores.

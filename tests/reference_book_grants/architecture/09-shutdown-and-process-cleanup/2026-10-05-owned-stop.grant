@@ -1,5 +1,0 @@
-353
-The one bounded stop of owned processes (who starts it, who joins it, the stamp before any wait, the
-deadline inside the launcher grace, the next start's retry) and the ownership set that replaces the
-data/state walk. It replaces "Cleanup may delay exit: no absolute bound" and the os.walk sentences; the
-mechanism it describes is larger than the sentences it removes.

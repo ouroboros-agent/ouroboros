@@ -1,13 +1,9 @@
-"""Task pacing SSOT (v6.54.4): ONE urgency system for a task's time budget.
+"""Task pacing SSOT: time milestones, intrinsic pacing and review-budget inputs.
 
-Absorbs the milestone CONTENT logic that lived inline in ``loop.py`` (deadline
-50/25/10% TIME BUDGET notes and the v6.53.0 intrinsic no-deadline pacing) and
-adds the acceptance-review budget layer: the finalization reserve, a budget
-snapshot, and the improvement-pass gates driven by ``task_contract.budget_profile``
-(``improvement_policy`` fixed | adaptive; the legacy ``until_deadline`` /
-``stall_rounds_threshold`` aliases were removed in the 7.0 ABI window, Q10=A).
+Owns milestone notes, the finalization reserve, budget snapshots and improvement-pass
+gates driven by ``task_contract.budget_profile`` (``improvement_policy`` fixed | adaptive).
 
-Design contract (owner-decided, sprint v6.55):
+Design contract:
 - Pacing notes fire only on milestone triggers, never per round (prompt-cache
   friendly), their wording is TASK-NEUTRAL, and note identification is by the
   checkpoint metadata — never a regex strip of transcript text.
@@ -16,6 +12,10 @@ Design contract (owner-decided, sprint v6.55):
   obligation gate unconditionally — a deadline never hangs on review passes.
 - ``loop.py`` keeps only transport (message append + checkpoint emit); every
   threshold, text, and time computation lives here.
+- Time, cost and intrinsic notes carry ``resource_facts`` (``with_resource_facts``):
+  per-tool call/error counts, producer-reported durations, own/tree/delegated ledger
+  buckets and the unreserved global remainder. Only tool name, error flag and reported
+  duration are read; no argv, stdout or sleep/poll classification selects behaviour.
 """
 
 from __future__ import annotations

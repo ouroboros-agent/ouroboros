@@ -1,4 +1,0 @@
-389
-The module tree names the new review_run_isolation.py leaf (the isolated contributor review's data-root
-switch, pinned reviewer panel, run cap and attach-only identities), and the claudexor_daemon.py row names
-its explicit attach-only selection of a host home.

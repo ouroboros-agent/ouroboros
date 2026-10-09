@@ -704,7 +704,7 @@ def _check_dispatch_fences(scope: UsageScope, root: pathlib.Path) -> None:
 
 
 def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
-    """Atomically check global/root/group limits and record a ``reserved`` attempt."""
+    """Atomically check global/root/group limits and record a ``reserved`` attempt whose row carries the applied global limit, its source and revision."""
     request, scope = _merge_scope(request)
     root = _drive_root(scope.drive_root)
     from ouroboros._usage_wait import send_acquisition

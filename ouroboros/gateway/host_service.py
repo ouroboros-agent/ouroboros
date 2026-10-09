@@ -1139,10 +1139,10 @@ async def _api_ui_language(request: Request) -> JSONResponse:
 async def _api_ws_message(request: Request) -> JSONResponse:
     """WS-out bridge: relay a namespaced extension WS event to browser clients.
 
-    Identity is derived from the token (never the body); the host re-derives the
-    ``ext_<len>_<token>_<short>`` namespace, so an out-of-process child/companion
-    cannot spoof another skill's events. ``ws_handler`` is a manifest permission,
-    not an owner grant, mirroring the in-process ``send_ws_message`` check.
+    Identity is derived from the token (never the body); the host re-derives the ``ext_<len>_<token>_<short>``
+    namespace, so a child/companion cannot spoof another skill's events. ``ws_handler`` is a manifest permission,
+    not an owner grant (as in-process ``send_ws_message``). A refused relay is a 429 with ``Retry-After`` and
+    ``retry_after_sec``/``dropped_in_burst`` in the body.
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:

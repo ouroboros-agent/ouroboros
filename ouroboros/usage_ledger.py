@@ -216,6 +216,8 @@ USAGE_LOCK_TIMEOUT_SEC = 45.0
 def _locked(root: pathlib.Path, *, timeout_sec: float = USAGE_LOCK_TIMEOUT_SEC) -> Iterator[Callable[[], bool]]:
     # Bounded maintenance and post-response custody. Task-owned pre-send policy
     # supplies short acquisition slices; it never retries the transaction body.
+    # Waits at most USAGE_LOCK_TIMEOUT_SEC; a lock with a recorded live owner is
+    # never evicted by age, and the 90 s stale age applies to ownerless locks.
     with _named_lock(root, LOCK_REL.name, timeout_sec=timeout_sec, stale_sec=90.0) as heartbeat:
         yield heartbeat
 

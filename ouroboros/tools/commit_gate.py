@@ -968,17 +968,24 @@ def compose_commit_panel(ctx: ToolContext, reviewers: Sequence[str], reason: str
 
 
 def release_diagnostics(ctx: ToolContext, paths: Optional[List[str]], source: str) -> Dict[str, Any]:
-    """``preflight_review(deterministic_only=True)``: every release-metadata finding of the
-    worktree or the index, with no sync, staging, tests, provider or review state."""
+    """Free release metadata and a separately labelled worktree book balance.
+
+    No sync, staging, tests, provider, readiness pipeline or review state.
+    """
     if source not in ("worktree", "index"):
         return {"status": "error", "failure_code": "PREFLIGHT_SOURCE_REQUIRED",
                 "message": "deterministic_only requires explicit source=worktree or source=index."}
     from ouroboros import body_candidate
     from ouroboros.commit_admission import release_metadata_diagnostics
+    from ouroboros.reference_books import BOOK_ENTRYPOINTS, book_balance_note
 
+    repo = pathlib.Path(ctx.repo_dir)
+    note = (book_balance_note(repo, paths if paths is not None else BOOK_ENTRYPOINTS.values())
+            if (repo / "ouroboros" / "reference_books.py").is_file() else "")
     return {**release_metadata_diagnostics(
-        ctx.repo_dir, paths, source=source, neutral_allowed=True if source == "index" else body_candidate.is_bound(ctx)),
-            "deterministic_only": True, "review_freshness": False}
+        repo, paths, source=source, neutral_allowed=True if source == "index" else body_candidate.is_bound(ctx)),
+            "deterministic_only": True, "review_freshness": False,
+            "book_balance": {"source": "worktree", "note": note}}
 
 
 def deterministic_preflight(ctx: ToolContext, commit_message: str, paths: Optional[List[str]]) -> str:

@@ -1,12 +1,11 @@
-"""Durable review ledger: one record per authoritative review wave.
+"""Durable records for commit-gate and review_change operations.
 
 A record (``state/review_ledger/<record_id>.json``, contract v1 stamped through
 ``contracts.schema_versions``) states what was reviewed, who was asked, what each seat
 was asked to run and observed to run, what came back and how the gate read it
 (ARCHITECTURE §6 "Review ledger record"). The hot index (``index.jsonl`` beside it) is a
-bounded projection appended AFTER the record and its retained sources exist, so it never
-names a source the installation does not hold (ARCHITECTURE §10 "hot indexes may rotate
-only after the source is retained").
+bounded projection appended after the record and its retained sources exist
+(ARCHITECTURE §10.1 "Continuity data-flow map").
 
 Honesty rules enforced here: ``unknown`` is a value, never zero or a blank (an observed
 model nobody reported is not a distinct model); a ``pending`` record has no final verdict

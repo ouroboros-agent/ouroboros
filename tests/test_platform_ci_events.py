@@ -66,7 +66,8 @@ def test_desktop_pr_matrix_keeps_merge_checkout_and_pr_base_evidence_secret_free
     assert WORKFLOW["permissions"] == {"contents": "read"}
     job = WORKFLOW["jobs"]["full-test"]
     assert "secrets." not in json.dumps(job)
-    assert not job.get("permissions")
+    # The book-growth exception reads PR label events, without any write grant.
+    assert job["permissions"] == {"contents": "read", "pull-requests": "read"}
     checkout = job["steps"][0]
     assert checkout["uses"] == "actions/checkout@v4"
     assert checkout["with"] == {"fetch-depth": 0}  # Default PR checkout tests the merge ref.

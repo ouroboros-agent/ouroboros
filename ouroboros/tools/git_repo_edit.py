@@ -11,6 +11,7 @@ import pathlib
 import subprocess
 from typing import Dict, List, Optional
 
+from ouroboros.reference_books import book_balance_note
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tool_access import ResolvedResourceBinding, canonical_data_root
 from ouroboros.tools.tool_result import publish_no_effect
@@ -271,6 +272,9 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
             "data/skills/native copy remains unchanged until launcher reseed."
         )
+    book_note = book_balance_note(binding_items[0].base_path, written_paths) if system_target else ""
+    if book_note:
+        result += "\n" + book_note
     protected_written = _git().protected_paths_in(written_paths) if system_target else []
     if protected_written and _git().mode_allows_protected_write(_git()._current_runtime_mode()):
         result += "\n\n" + _git().core_patch_notice(protected_written)
@@ -467,6 +471,9 @@ def _str_replace_editor(
             "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
             "data/skills/native copy remains unchanged until launcher reseed."
         )
+    book_note = book_balance_note(binding.base_path, [rel_path]) if system_target and binding is not None else ""
+    if book_note:
+        result += "\n" + book_note
     if system_target and _git().is_protected_runtime_path(norm) and _git().mode_allows_protected_write(_git()._current_runtime_mode()):
         result += "\n\n" + _git().core_patch_notice([norm])
     return result

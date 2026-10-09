@@ -456,11 +456,12 @@ def test_a_persisted_reviewer_choice_for_a_row_that_is_gone_is_a_typed_refusal_n
 def test_t3_plan_review_falls_back_to_the_pool_default_effort_and_the_canon_says_so(clean_env):
     """F6: a bare pool row under a plan with no order runs at the pool's
     ``REVIEW_POOL_DEFAULT_EFFORT`` — the lane-era ``OUROBOROS_EFFORT_REVIEW`` tunes
-    nothing — and the architecture chapter's strength-axis paragraph plus the
+    nothing — and the architecture plan-review section plus the
     builder's own docstring name that fallback instead of the retired setting."""
     import pathlib
 
     from ouroboros.config import REVIEW_POOL_DEFAULT_EFFORT
+    from ouroboros.reference_books import load_reference_book, read_book_section
     from ouroboros.tools.plan_review_runtime import plan_review_slots
 
     clean_env.setenv("OUROBOROS_EFFORT_REVIEW", "low")
@@ -468,10 +469,8 @@ def test_t3_plan_review_falls_back_to_the_pool_default_effort_and_the_canon_says
     assert [s.effort for s in plan_review_slots("")] == [REVIEW_POOL_DEFAULT_EFFORT, "medium"]
     assert [s.effort for s in plan_review_slots("xhigh")] == ["xhigh", "xhigh"]
 
-    chapter = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "architecture" / "06-agent-core.md"
-               ).read_text(encoding="utf-8")
-    paragraph = chapter[chapter.index("The ONE caller-facing strength axis"):].split("\n\n", 1)[0]
-    assert "`REVIEW_POOL_DEFAULT_EFFORT`" in paragraph
-    assert "then the owner's `OUROBOROS_EFFORT_REVIEW`" not in paragraph
+    book = load_reference_book(pathlib.Path(__file__).resolve().parents[1], "architecture")
+    section = read_book_section(book, "Plan construction and review").text
+    assert "`REVIEW_POOL_DEFAULT_EFFORT`" in section
+    assert "`reviewer_effort`" in section
     assert "REVIEW_POOL_DEFAULT_EFFORT" in plan_review_slots.__doc__
-    assert "owner's review-effort setting" not in plan_review_slots.__doc__

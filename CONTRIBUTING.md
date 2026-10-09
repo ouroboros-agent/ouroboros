@@ -118,9 +118,16 @@ That is the one fast recipe (node lane, then every default-lane test in a single
 xdist run); a bare `pytest tests/` runs the same tests in one process and takes
 many times longer. Like CI's default lanes it leaves out the opt-in marker
 lanes (`size_ratchet`, `browser`, `ui_browser`, `portable_detail`,
-`skill_smoke`, `integration`); a change that touches repository size or a
-reference-book chapter also runs `python -m pytest tests/ -m size_ratchet`. `python scripts/run_tests.py tests/test_x.py` forwards a
-focused run. Inside Ouroboros a reviewed commit (`commit_reviewed` /
+`skill_smoke`, `integration`). A change that touches repository size or a
+reference-book chapter also runs the size lane against its contribution base:
+
+```bash
+OURO_SIZE_RATCHET_BASE_REF=upstream/ouroboros python -m pytest -o addopts="" tests/ -m size_ratchet
+```
+
+Use the exact target-base SHA when verifying a frozen range. Without a base,
+the reference-book comparison is skipped. `python scripts/run_tests.py tests/test_x.py`
+forwards a focused run. Inside Ouroboros a reviewed commit (`commit_reviewed` /
 `vcs_commit_reviewed`) runs the complete battery in its hermetic gate unless
 `skip_tests` is set, so running it by hand first is optional rather than a
 second requirement; for a pull request, CI is that gate. If the full battery could

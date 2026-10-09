@@ -988,7 +988,17 @@ def supervised_wait(
     checkpoint_reason: str = "",
     wait_once: Optional[Callable[..., str]] = None,
 ) -> ToolResult:
-    """Renew quiet windows internally and return only a meaningful wake batch."""
+    """Renew quiet windows internally and return only a meaningful wake batch.
+
+    The journal cursor is durable, so it survives worker restarts. ``cache_horizon_note``
+    is attached once per wake, only when the time since the last model response exceeds
+    the applied cache horizon. ``checkpoint_after_sec`` is a one-shot wake: an earlier
+    real event consumes it, and it never repeats. Renewal runs on a fixed three-second
+    tick with no backoff and no durable outage latch. A read that delivered no daemon
+    answer is a quiet renewal: ``observation_read_timeout`` is our own read bound
+    expiring, ``daemon_unreachable`` is a socket that carried nothing; only the latter
+    opens an outage episode (one owner line, plus one line when a read is answered again).
+    """
 
     reason_text = str(checkpoint_reason or "").strip()
     ignored_note = ""

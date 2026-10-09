@@ -824,6 +824,10 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
     the emissions' ``requested_count`` sum, surfaced under that exact name on
     swarm-intent rollups.
 
+    The rollup's ``depth`` block comes from ``depth_evidence.build_depth_summary``
+    (the task contract's request against what the child subtree reached); a read
+    failure there drops only ``depth``, never the fan-out numbers.
+
     OMITTED (no reliable structured source today): ``observed_max_concurrency`` —
     child task results carry only ``ts``/``updated_at``, not a per-child running-start
     vs finish timestamp, so true overlap cannot be derived honestly here — and

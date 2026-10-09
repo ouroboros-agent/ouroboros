@@ -514,7 +514,13 @@ def test_delegate_start_recipes_match_the_fresh_start_schema():
     # the delegate_start schema (the SSOT sent every round), and the prompt
     # only names the lane — a copy there would be the duplication class the
     # audit removed. Any recipe the prompt GAINS must still be schema-valid.
-    tolerant = {"docs/CHECKLISTS.md", "prompts/SYSTEM.md"}
+    # The two reference books are map-level: whether they carry a recipe at all
+    # is prose, not contract, so they are tolerant too (decision 7A); any recipe
+    # they do carry must still be schema-valid.
+    tolerant = {
+        "docs/CHECKLISTS.md", "prompts/SYSTEM.md",
+        "docs/ARCHITECTURE.md", "docs/DEVELOPMENT.md",
+    }
     for relative in (*recipe_paths, "docs/CHECKLISTS.md"):
         text = governance_doc_text(relative, repo)
         recipes = re.findall(r"\bdelegate_start\(([^)]*)\)", text, flags=re.DOTALL)
@@ -524,7 +530,11 @@ def test_delegate_start_recipes_match_the_fresh_start_schema():
         for recipe in recipes:
             assert re.search(r"\bprompt\s*=", recipe), (relative, recipe)
             if not re.search(r"\bretry_of\s*=", recipe):
-                direct_selector = re.search(r"\bsubagent_id\s*=", recipe)
+                # continue_from is the schema's third start selector: a NEW run
+                # bound to a settled predecessor.
+                assert "continue_from" in schema["properties"]
+                direct_selector = re.search(
+                    r"\b(?:subagent_id|continue_from)\s*=", recipe)
                 actor_first_snapshot = re.fullmatch(
                     r"\s*prompt\s*=\s*(['\"])\1\s*", recipe,
                 )

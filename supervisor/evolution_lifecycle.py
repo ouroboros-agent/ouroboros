@@ -360,6 +360,7 @@ def evolution_block_reason() -> str:
     Evolution campaigns are self-modification work, so they require runtime
     mode ``advanced`` or ``pro``. In ``light`` (conversation-only) mode they are
     hard-blocked before any campaign state, queue entry, or expensive round.
+    Consulted at the owner and post-task entry points and idle enqueue; ``worker_assignment`` repeats it.
     Returns ``""`` when evolution is allowed.
     """
     from ouroboros.config import get_runtime_mode
@@ -537,7 +538,10 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
                                 transaction: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Attach a cycle, or refresh its base under Q immediately before its receipt.
 
-    Clear positive-refusal proof BEFORE admission; interruptions keep orphan custody.
+    A commit-less transaction with positive never-admitted proof from the same campaign source
+    and objective is returned as is: one transaction/task is retained, with no Git probe, history or write.
+    The refresh (the Q-held preparation call) renews base_head/base_branch/objective_fp/cycle and clears that
+    proof BEFORE admission; interruptions keep orphan custody.
     """
     previous = campaign.get("active_transaction")
     previous = previous if isinstance(previous, dict) else {}
@@ -907,21 +911,17 @@ def link_evolution_rescue(drive_root: pathlib.Path, rescue_info: Dict[str, Any])
 def _bump_objective_repeat_count(campaign: Dict[str, Any], tx: Dict[str, Any]) -> None:
     """BUG3: count one non-absorbing cycle against its objective fingerprint.
 
-    Cumulative PER-FINGERPRINT (not a consecutive streak), so a blocked objective that is
-    re-proposed NON-consecutively (interleaved with other no_op work) still accumulates toward
-    the pause gate. ``setdefault`` tolerates campaigns persisted before this field existed; a
-    transaction without an ``objective_fp`` (e.g. a tx-less idle cycle) is skipped, never
-    bucketed under the empty key.
+    Cumulative PER-FINGERPRINT (not a consecutive streak), so a re-proposed blocked objective
+    still accumulates toward the pause gate. A transaction without an ``objective_fp`` is
+    skipped, never bucketed under the empty key.
     """
     fp = str((tx or {}).get("objective_fp") or "")
     if not fp:
         return
     counts = campaign.setdefault("objective_repeat_counts", {})
     counts[fp] = int(counts.get(fp, 0) or 0) + 1
-    # Layer B: also mark this objective attempted-and-dropped so the chooser (Layer A) can be
-    # told not to re-propose it. This is a campaign-local signal, NOT a backlog status flip:
-    # the backlog item stays "open" (the work is genuinely unsolved), we only stop FEEDING it
-    # back to the evolution objective chooser.
+    # Layer B: mark the objective attempted-and-dropped so the chooser stops re-proposing it;
+    # a campaign-local signal, the backlog item stays "open".
     dropped = campaign.setdefault("dropped_objective_fps", [])
     if fp not in dropped:
         dropped.append(fp)
@@ -1174,7 +1174,10 @@ def update_evolution_campaign_after_task(
     rounds: int,
     transaction: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Record an evolution cycle outcome in the active campaign file."""
+    """Record an evolution cycle outcome in the active campaign file.
+
+    A terminal whose task and transaction are already in history is a replay: nothing is recounted,
+    and only missing cleanup, restart and owner-report effects are completed."""
     from supervisor import state
 
     state.assert_test_data_path(state.STATE_PATH)
@@ -1269,10 +1272,7 @@ def update_evolution_campaign_after_task(
             row = {
                 "task_id": str(task_id or ""),
                 "ts": utc_now_iso(),
-                # ABI-3 (fix-round-3): the honest cost name — this row reaches
-                # /api/state through the evolution snapshot. Stored legacy rows
-                # (cost_usd) keep resolving deprecated-wins at the readers and
-                # at the /api/state projection boundary.
+                # Honest cost name: this row reaches /api/state through the evolution snapshot.
                 "accounted_upper_bound_usd": float(cost_usd) if cost_available else None,
                 "cost_accounting_status": "available" if cost_available else "unavailable",
                 "outcome_axes": axes,
@@ -1419,10 +1419,8 @@ def build_evolution_task_text(cycle: int) -> str:
                 f"- {row.get('task_id')}: execution={execution_status}, objective={objective_status}; "
                 f"rounds={row.get('rounds', 0)}; cost={row_cost}"
             )
-    # Fix B (C10.2): surface the durable improvement backlog and recent solve-capability
-    # as optional CONTEXT, never a directive. Ouroboros decides what (if anything) to act
-    # on — an evolution cycle is NOT obligated to draw from the backlog or repeat past
-    # patterns. Injecting them is LLM-first steering, not a hardcoded work order.
+    # The durable backlog and recent solve-capability are optional CONTEXT, never a directive:
+    # a cycle is not obligated to draw from the backlog or repeat past patterns.
     try:
         from ouroboros.evolution_checkpoints import build_solve_capability_digest
         from ouroboros.improvement_backlog import format_backlog_digest

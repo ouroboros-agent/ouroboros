@@ -181,7 +181,12 @@ def _parse_payload(raw: Any) -> Mapping[str, Any]:
 
 
 def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
-    """Strict parser for stored JSON strings and owner-supplied JSON objects."""
+    """Strict parser for stored JSON strings and owner-supplied JSON objects.
+
+    The list-level and per-row ``enabled`` must be booleans (a row omitting it is
+    enabled). A session row's ``access`` defaults to ``full``; an API row has none
+    and refuses the key.
+    """
     from ouroboros.model_slots import normalize_processing_preference
 
     payload = _parse_payload(raw)

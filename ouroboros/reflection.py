@@ -1,4 +1,13 @@
-"""Generate post-task process-memory reflections for non-trivial/error runs."""
+"""Generate post-task process-memory reflections for non-trivial/error runs.
+
+Prompt inputs: the run's exact initial text (never a prefix) after the
+``run_origin`` provenance, and the all-calls listing from
+``post_task_synthesis.build_trace_summary(all_calls=True)``. When that listing
+cut an argument or a failed/repeated call's answer, the redacted per-call record
+(with ``round_id`` when known) is retained through ``retain_memory_source`` and
+named as optional reading. The prompt is fitted by the consolidation seam; an
+unknown Light window skips its token fit check.
+"""
 
 from __future__ import annotations
 
@@ -362,8 +371,9 @@ def record_memory_action_skip(events: pathlib.Path, action: Dict[str, Any], reas
     and ``apply_memory_actions`` on a bound action — so the event names the reason
     and, as ``input_ref``, what the seam that dropped the lesson had retained: the
     validator's exact task-input prompt (the rejected reflection text itself is not
-    retained), a bound action's exact task-source copy of its reflection entry, or
-    the canonical log pointer. It can warn, never raise: an audit-write failure
+    retained), a bound action's exact task-source copy of its reflection entry, else
+    ``source_unavailable`` for a project-scoped task or the canonical log pointer.
+    It can warn, never raise: an audit-write failure
     must not discard the independent later lessons of the same batch."""
     try:
         recorded = append_jsonl(events, {"ts": utc_now_iso(), "type": "reflection_memory_action_skipped",

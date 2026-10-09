@@ -1,16 +1,14 @@
-// S3 (Q2/HQ1): the shared three-action task stop/hurry control.
+// The shared task control menu used by Chat live cards and the Activity tab:
+// "Wrap up" (soft finalize-then-stop), "Hurry up" (typed task-local hurry
+// control, never a chat message), "Pause"/"Resume" (root-only, whole tree; the
+// request_id survives uncertain or latch_pending replies until a confirmed
+// Pause or Resume retires it) and "Stop now" (hard stop). Dismissing the menu
+// continues the run. While a cancel intent is pending, the only offered action
+// is "Stop now", the monotonic escalation of the same durable stop intent;
+// "Hurry up" is refused then and never offered.
 //
-// One dropdown of exactly three owner-decided actions — "Wrap up"
-// (soft finalize-then-stop), "Hurry up" (typed task-local hurry control,
-// NO chat message ever), "Stop now" (hard stop). Dismissing the
-// menu continues the run (the dismiss affordance replaced the old separate
-// "keep running" confirm). While a cancel intent is already pending, the only
-// offered action is "Stop now" — the monotonic escalation of the
-// SAME durable stop intent; "Hurry up" is refused then and never offered.
-//
-// Chat live cards and the Activity tab consume the SAME module (owner
-// product-wide parity), so eligibility gates differ per surface but the
-// actions, endpoint bindings, request-id retry, and refusals do not.
+// Eligibility gates differ per surface; endpoints, stop policy, request-id
+// retry and verbatim refusals are shared.
 
 import { cancelTask, hurryTask, pauseTask, resumeTask } from './api_client.js';
 import { showToast } from './toast.js';
@@ -116,8 +114,8 @@ export function taskControlActions({ cancelPending = false, budgetPaused = false
     // The host-attested pause fact gates the offer; the server re-validates
     // (replay_unsafe and sibling checks answer 409 with the reason).
     if (budgetPaused) return resumeVisible ? [ACTION_STOP_NOW] : [ACTION_RESUME, ACTION_STOP_NOW];
-    // Owner Batch4: Pause saves the WHOLE tree exactly (sent work finishes,
-    // new work is fenced) until an explicit Resume; Stop still ends it.
+    // Pause saves the WHOLE tree exactly (sent work finishes, new work is
+    // fenced) until an explicit Resume; Stop still ends it.
     return wholeTree ? [ACTION_FINALIZE, ACTION_HURRY, ACTION_PAUSE, ACTION_STOP_NOW]
         : [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW];
 }

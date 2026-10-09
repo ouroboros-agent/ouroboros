@@ -136,6 +136,10 @@ def request_worker_stop(proc):
     This Process still owns its native Popen. It is NOT an attached PID/watch:
     Process.kill retains multiprocessing's native exited-child checks, including
     on Darwin, and works before the child installs or can service its lifeline.
+
+    Panic budget: local child owners get 250 ms (``request_worker_owned_stops``),
+    the lifeline bounds its callback at 500 ms, and this backstop requests the
+    native kill at 750 ms whatever the lifeline did.
     """
     import threading
 

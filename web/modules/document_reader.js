@@ -3,6 +3,11 @@
  * "Document reading"). It reads only the exact delivered copy — the live
  * frame's inline bytes or the immutable task-artifact route — never a current
  * file path, and it reads at most DOCUMENT_READER_MAX_BYTES of it.
+ *
+ * The body is streamed to that byte bound and the read aborts after the read
+ * timeout; a transport failure offers Retry. Every close path (`close`,
+ * `chat_media.release`, `closeTransient`, `destroy`) aborts the in-flight read
+ * and disposes Markdown enhancements, so a late answer paints nothing.
  */
 
 import { apiFetch } from './api_client.js';

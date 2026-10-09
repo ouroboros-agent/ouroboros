@@ -1,4 +1,15 @@
-"""History/cost endpoints extracted from server.py."""
+"""History/cost endpoints extracted from server.py.
+
+One mapper (``_assemble_history_response``) serves recent and older selections.
+A recent read with an unreadable source still projects the rows the recent
+collector can read, leaves that stream's ``coverage`` span null, adds
+``<stream>_source_unavailable`` to ``window.truncated_by`` and answers
+``has_more`` with null cursors and ``reason_code=history_source_unavailable``.
+A cursor-bound source failure (invalid cursor, unreadable chain, ``OSError``)
+returns an error body with the exact input cursor as ``next_cursor`` and
+``has_more`` true, so the same request can be repeated. ``has_more`` forces
+``window.complete`` false; gaps and older pages also leave it false.
+"""
 
 from __future__ import annotations
 

@@ -435,7 +435,12 @@ def _install_managed_repo(context: BootstrapContext, manifest: dict[str, Any], *
 
 
 def ensure_managed_repo(context: BootstrapContext) -> str:
-    """Ensure REPO_DIR is a managed git clone backed by the embedded bundle."""
+    """Ensure REPO_DIR is a managed git clone backed by the embedded bundle.
+
+    An existing directory without ``.git`` is archived under
+    ``data/archive/managed_repo`` before the first clone. A manifest mismatch on
+    a git checkout only refreshes the managed remote metadata; the checkout stays.
+    """
     manifest = load_bundle_manifest(context)
     if not context.repo_dir.exists():
         return _install_managed_repo(context, manifest, reason="missing")
@@ -584,7 +589,11 @@ def _per_skill_version_resync(
     *,
     drive_root: pathlib.Path | None = None,
 ) -> int:
-    """Re-seed only marker-owned native skills whose seed version changed."""
+    """Re-seed only marker-owned native skills whose seed version changed.
+
+    Payload drift at an equal manifest version is logged as a warning and the
+    installed files are kept; it never blocks.
+    """
     if not seed_dir.is_dir() or not native_root.is_dir():
         return 0
     upgraded = 0

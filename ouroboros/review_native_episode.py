@@ -14,6 +14,12 @@ the provider window, owner deadline and paid ledger retain their own bounds.
 Every provider call is its own paid row; format repair reuses the final answer.
 Observed source coverage is diagnostic evidence beside that answer, never a
 quorum decision or a reason to buy another review.
+
+Landing: one ``[EPISODE_BUDGET]`` notice is posted per working view when the
+send reaches ``native_landing_at(bound)``; an applied authored view re-arms it.
+A non-delivering or incomplete end keeps a bounded, redacted
+``native_terminal_round`` copy and the ``native_*`` counters on the actor usage
+row, errored episodes included (``failure_custody``).
 """
 
 from __future__ import annotations

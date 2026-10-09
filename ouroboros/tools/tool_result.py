@@ -1,4 +1,13 @@
-"""Typed internal tool results with a byte-compatible legacy text adapter."""
+"""Typed internal tool results with a byte-compatible legacy text adapter.
+
+Host route and safety notes trail the producer payload in ``text``. When notes are
+added, ``producer_text`` keeps the payload captured before composition and
+``host_annotations`` the notes, both outside the bounded ``meta``; annotated ``text``
+and the typed status stay authoritative. Unannotated results leave both fields empty.
+``loop_tool_execution`` stores ``producer_text`` as a separate task source exposed as
+``PRODUCER_RESULT_SOURCE_JSON`` (distinct from ``FULL_RESULT_SOURCE_JSON``) and
+re-appends the notes when the annotated text is truncated.
+"""
 
 from __future__ import annotations
 

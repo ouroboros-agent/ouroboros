@@ -1,2 +1,0 @@
-29
-Panic's cleanup clause names the system-notification icons beside the indicator: stop_tray_before_exit and request_tray_cleanup now remove both, and an icon left behind outlives the process.

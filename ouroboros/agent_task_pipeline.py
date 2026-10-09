@@ -1,4 +1,17 @@
-"""Post-task result emission, memory work, reflections, and review context."""
+"""Post-task result emission, memory work, reflections, and review context.
+
+``emit_task_results`` derives the loop outcome once, emits the lifecycle and
+usage events, registers the final answer in the durable outbox, stores the
+result (``_store_task_result`` via ``write_task_result``, which stamps
+``task_result_schema``) and dispatches the root-only post-task synthesis
+(checkpointed by ``post_task_checkpoint``).
+
+``total_rounds``/``prompt_tokens``/``completion_tokens`` on the stored result
+come from the usage ledger (``reconstruct_task_cost``); the loop's own tally
+rides ``loop_outcome.usage``. A capture the ledger could not read is ``None``
+(unknown), never zero. A task exception is ``failure.kind = "runtime"``, not a
+provider failure (``derive_loop_outcome``).
+"""
 
 from __future__ import annotations
 

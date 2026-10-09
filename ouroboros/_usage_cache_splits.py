@@ -5,6 +5,11 @@ re-exported from there. Nothing here is
 durable and nothing is locked: a lost, evicted or stale entry only makes the
 money reservation price the whole prompt as a fresh cache write again, which is
 the conservative direction, so a torn read can never under-reserve.
+
+A settled attempt stores its cached-token count per task, provider, route,
+review surface and processing mode; entries expire with the cache TTL. The
+count is read only to estimate the next reservation and never becomes a charge
+source: settled cost comes from the provider's reported usage.
 """
 
 from __future__ import annotations

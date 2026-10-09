@@ -473,7 +473,9 @@ def nomination_write_form(entry: Mapping[str, Any]) -> dict[str, Any]:
     ``summary`` is malformed, the legacy generic ``frontmatter`` is refused
     rather than dropped, and non-blank content beside edits or a summary is
     ambiguous. Returns ``write_knowledge_note`` arguments; a refusal raises
-    ``ValueError`` carrying its typed reason."""
+    ``ValueError`` carrying its typed reason: ``invalid_nomination`` (``frontmatter``,
+    non-list ``edits``, non-text or blank ``summary``), ``ambiguous_nomination``
+    (content beside edits or a summary) or ``empty_nomination`` (no content)."""
     edits, content = entry.get("edits", []), entry.get("content")
     if "frontmatter" in entry:
         raise ValueError("invalid_nomination: frontmatter is not an automatic field; revise the summary with summary")
@@ -588,7 +590,10 @@ def write_knowledge_note(
     the same locked write through the ordinary metadata merge, beside ``edits``,
     beside one ``old_str`` replacement, or alone with no ``old_str``/``content``.
     History retains the authored ``edits`` and, only when supplied, ``summary``;
-    the delta says whether the body bytes and the resident summary changed.
+    the delta carries ``old_chars``/``new_chars``/``change_chars``, the
+    ``removed_headings`` and ``body_changed``/``summary_changed`` (heading and
+    changed flags are ``None`` when a side has no parsed source). The history row
+    also records ``old_chars``/``new_chars``.
 
     ``archive``/``restore`` require an existing revision and own only the
     ``archive: {at, reason}`` field, never body bytes. The tool's optional

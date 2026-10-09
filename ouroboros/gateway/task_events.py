@@ -3,6 +3,13 @@
 The existing ``gateway.tasks`` exports remain the route and injection surface.
 Both transports share current result/lineage projections and all five sources;
 v2 owns only read positions, never event persistence or task state.
+
+v2 cursor: one byte offset per root and source over the complete
+archive-plus-live chain, valid while archives stay immutable and retained.
+Only an explicit ``created_at`` on the task result bounds the scan (API
+admission stamps it for generated ids); a result without it, such as a
+caller-supplied id, keeps the full cold scan. Skipped archive bytes still
+count in the offset.
 """
 
 from __future__ import annotations

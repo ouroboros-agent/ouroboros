@@ -964,6 +964,11 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     The persisted projection carries totals only; the per-root map is never written.
     The ledger read is the writer's slim snapshot (``usage_writer_snapshot``): only what this
     function persists is rendered; the loop's llm_usage path writes once per turn, direct callers on call.
+
+    Writes are ordered by the ledger's ``(compaction_epoch, seq)`` marker, compared under STATE_LOCK:
+    a lower epoch, or a same-epoch lower seq, is stale and skipped; an equal or higher marker writes.
+    The projection stays untouched, returning False, on a quarantined ledger (``integrity_degraded``),
+    an unparseable fresh or saved marker, a lock timeout, or an unavailable ``state.json``.
     """
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:

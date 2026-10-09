@@ -1,2 +1,0 @@
-825
-A new design rule: name the current-state record before any reader that would derive it from history; a history fold on an ordinary path is reviewed as a defect.

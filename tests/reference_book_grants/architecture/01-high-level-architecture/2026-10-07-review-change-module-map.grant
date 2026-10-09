@@ -1,4 +1,0 @@
-661
-Module-map rows for `tools/review_change.py` (the reviewed-change wave on any registered root) and
-`review_body_fact.py` (whether a root is the body, and the checklist layer that follows), plus one clause
-naming the plan-review timeout envelope `review_change` uses.

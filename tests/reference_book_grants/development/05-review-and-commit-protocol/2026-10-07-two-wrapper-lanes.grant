@@ -1,6 +1,0 @@
-726
-The wrapper paragraphs say which lane runs what: the operator lane is the commit gate's review-only
-cycle in the runtime's isolated checkout (its pending custody keeps the checkout), the contributor lane
-runs the proposal's hermetic tests in an isolated checkout of the frozen subject before `review_change`
-(`tests_preflight_blocked` before any seat is paid; a pass lands on the record of the same tree through
-`review_ledger.attach_tests_evidence`, any other tree leaves `NOT_RUN`). Integrator decisions R2/R3.

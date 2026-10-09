@@ -130,6 +130,9 @@ const SUBSTRATE_NOTE = {
     native_only: 'no harness run recorded',
 };
 
+// A well-formed `executor_observation` (this task, run/attempt/harness ids, integer
+// revision) without execution evidence yields a progress chip labelled `last update`
+// that keeps the requested/observed model source; `sourceTs` and revision let keepStickyExecutorChip drop older updates.
 export function executorChip(evt) {
     const raw = evt?.executor_observation;
     const observation = raw && raw.task_id === String(evt?.subagent_task_id || evt?.task_id || '')

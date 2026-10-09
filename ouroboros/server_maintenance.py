@@ -240,15 +240,12 @@ def _periodic_supervisor_maintenance(
 
 
 def _run_periodic_custody_sweep(stop_event: Any = None, latch: Any = None) -> None:
-    """The ~600 s custody block, OFF the thread that answers workers (INV-B).
-
-    Skill-payload hashing, the orphaned-process reaper, delegated-run reconciliation
-    (gateway handshake, custody replays, registration retirement) and the
-    settled-terminal cursor cost seconds to minutes — longer than any worker ack
-    wait. The caller took ``_CUSTODY_SWEEP_LOCK`` without blocking (busy => skip,
-    never queue); this pass releases it in ``finally``. Nothing serializes it
-    against assignment, so each step reads its CANDIDATES before the shared live
-    set, and the generation is re-read before every mutation."""
+    """Keep slow hashing, reaping and reconciliation off the worker-ack thread (INV-B).
+    The caller's nonblocking latch skips busy passes; ``finally`` releases that latch.
+    Assignment stays concurrent: read candidates before live sets and recheck the
+    generation before each mutation. Spawn only after releasing a failed-start latch,
+    at most once per sweep; healthy installs never spawn or wait here.
+    """
     try:
         try:
             if _stop_requested(stop_event):
@@ -678,6 +675,9 @@ def _startup_prune_sweeps(*, preserve_task_sources=False, recovery_report=None):
 
 
 def _run_deferred_startup_prunes():
+    """Retry owed housekeeping; clear each duty only after success.
+    Tree/source pruning waits for gap-free recovery and complete recovery links;
+    mailbox and service-log duties retry independently, preserving protected trees."""
     from ouroboros.startup_task_files import startup_tree_exclusions
     from ouroboros.headless import prune_task_trees
     if not _STARTUP_RECOVERY_GAPS[0] and (_STARTUP_TREES_OWED[0] or _STARTUP_SOURCE_PRUNES_OWED[0]):

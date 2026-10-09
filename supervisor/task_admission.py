@@ -1,4 +1,10 @@
-"""Atomic admission transitions for the managed task queue."""
+"""Atomic admission transitions for the managed task queue.
+
+Ingress ids are guarded by token-owned reservations: ``reserve_task_admission``
+runs before the caller creates drives, attachments or workspace artifacts, a
+different token on a live id is refused as ``duplicate_task_id``, and only the
+owning token can release it. A retry cannot therefore create a second task.
+"""
 
 from __future__ import annotations
 

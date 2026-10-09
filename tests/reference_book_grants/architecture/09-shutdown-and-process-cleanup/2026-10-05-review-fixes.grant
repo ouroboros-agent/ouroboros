@@ -1,2 +1,0 @@
-200
-Review fixes of the owned stop: contended registrations land in owned_processes.pending/, the first shutdown door starts the grace and stamps every pending stop, a signal needs the measured identity; records an older release left on disk are indexed once by a boot side thread.

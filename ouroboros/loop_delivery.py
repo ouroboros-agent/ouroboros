@@ -1,7 +1,16 @@
 """Delivery candidates and delivery control: child-result dispositions, the
 delivery evidence state, acceptance bindings, candidate publish/replace/degrade,
 the delivery-control prompt cycle, the subagent handoff and the no-tool final
-answer. Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
+answer. Extracted from loop.py (v7 L-B split); loop.py re-exports every name.
+
+Completion is an author act: ``finish_task`` (``presence_finish`` for presence
+tasks) selects ``action=finish|stop`` with complete ``answer`` bytes or an
+``answer_sha256`` naming the retained candidate or the latest whole held
+response. Every held no-tool round appends the assistant row and a host row to
+the transcript, where held bytes resolve from. A lineage that has not seen a
+host control episode (``control_episode_seen``) stays a plain final. Facts Main
+observed are frozen before its batch executes; only feedback positively exposed
+in a returned request counts as seen."""
 
 from __future__ import annotations
 
@@ -321,7 +330,7 @@ def observed_delivery_evidence(tool_ctx: Any, llm_trace: Dict[str, Any], **bound
 
 def _delivery_evidence_state(tools: ToolRegistry, ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -> tuple[int, str]:
     """Track the shared answer-invalidating evidence fingerprint (every retention,
-    nomination, post-tool, control, publication and delivery path). UNKNOWN (#1224)
+    nomination, post-tool, control, publication, delivery and forced-exit path). UNKNOWN (#1224)
     bumps no revision, keeps the last KNOWN fingerprint and supersedes no binding —
     missing evidence is not a change; a KNOWN candidate compared against it is
     re-retained explicitly by its caller, its unverifiable approval superseded."""

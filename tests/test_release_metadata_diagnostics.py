@@ -127,6 +127,10 @@ def _diagnose(ctx, source, **kwargs):
 @pytest.mark.parametrize("outcome", ["clean", "blocked", "unavailable"])
 def test_diagnostic_has_no_effects_even_with_pending_managed_review(candidate, monkeypatch, source, outcome):
     ctx = candidate
+    # Exercise the real book helper too, including remote and merge-base reads.
+    _write(ctx.repo_dir, {"ouroboros/reference_books.py": "# book contract\n"})
+    _git(ctx.repo_dir, "remote", "add", "canonical", "https://github.com/razzant/ouroboros.git")
+    _git(ctx.repo_dir, "update-ref", "refs/remotes/canonical/ouroboros", "HEAD")
     if outcome == "blocked":
         _broken(ctx.repo_dir)
     else:
@@ -163,7 +167,8 @@ def test_diagnostic_has_no_effects_even_with_pending_managed_review(candidate, m
     real_run = admission.subprocess.run
 
     def only_reads(argv, *args, **kwargs):
-        assert argv[0] == "git" and not set(argv[1:]) & {"add", "write-tree", "commit", "reset", "update-index"}
+        assert argv[0] == "git" and not set(argv[1:]) & {
+            "add", "write-tree", "commit", "reset", "update-index", "update-ref", "fetch", "push", "checkout"}
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(admission.subprocess, "run", only_reads)
@@ -171,9 +176,74 @@ def test_diagnostic_has_no_effects_even_with_pending_managed_review(candidate, m
     result = _diagnose(ctx, source, reviewer="api-scout", goal="release", scope="carriers")
     assert result["status"] == outcome, result
     assert result["source"] == source and result["review_freshness"] is False
+    assert result["book_balance"]["source"] == "worktree"
+    assert "refs/remotes/canonical/ouroboros" in result["book_balance"]["note"]
     assert "snapshot_hash" not in result and "review_reference" not in result
     assert _snapshot(ctx.repo_dir.parent) == before
     assert vars(ctx) == context_before
+
+
+@pytest.mark.parametrize("source", ["worktree", "index"])
+@pytest.mark.parametrize("geometry", ["published", "candidate"])
+def test_free_tool_json_reports_cumulative_books_with_an_explicit_byte_source(candidate, source, geometry):
+    """A free call sees committed contribution growth even on a clean candidate;
+    staged and worktree book bytes subsequently diverge without mislabelling."""
+    ctx = candidate
+    repo = ctx.repo_dir
+    chapter = "docs/architecture/01-one.md"
+    body = "# One\n\nAn authored introduction.\n"
+    _write(repo, {"ouroboros/reference_books.py": "# book contract\n", chapter: body,
+                  "docs/ARCHITECTURE.md": "# Architecture\n\nThe map.\n\n## Chapters\n\n"
+                                          "- [One](architecture/01-one.md)\n"})
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "book base")
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "remote", "add", "official-renamed", "git@github.com:razzant/ouroboros.git")
+    _git(repo, "update-ref", "refs/remotes/official-renamed/ouroboros", base)
+    _write(repo, {chapter: body + "Committed growth.\n"})
+    _git(repo, "commit", "-qam", "grow")
+    if geometry == "candidate":
+        linked = repo.parent / "linked"
+        _git(repo, "worktree", "add", "-qb", "candidate/task", str(linked), "HEAD")
+        ctx.serving_repo_dir, ctx.repo_dir = repo, linked
+        ctx.task_metadata = {"body_candidate": {"path": str(linked)}}
+        repo = linked
+        assert (repo / ".git").is_file()
+    else:
+        _git(repo, "remote", "add", "origin", "https://github.com/contributor/ouroboros.git")
+        _git(repo, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        _git(repo, "branch", "--set-upstream-to=origin/feature")
+    clean = _diagnose(ctx, source)
+    note = clean["book_balance"]["note"]
+    assert "+0 B vs HEAD" in note and "+18 B vs refs/remotes/official-renamed/ouroboros" in note
+    assert base in note and "nothing owed" not in note
+    # Index and worktree deliberately carry different book growth.
+    _write(repo, {chapter: body + "Committed growth.\nStaged.\n"})
+    _git(repo, "add", chapter)
+    _write(repo, {chapter: body + "Committed growth.\nWorktree differs.\n"})
+    expected_release = admission.release_metadata_diagnostics(
+        repo, source=source, neutral_allowed=source == "index" or geometry == "candidate")
+    result = _diagnose(ctx, source)
+    assert all(result[key] == value for key, value in expected_release.items())
+    assert result["review_freshness"] is False and result["deterministic_only"] is True
+    assert result["source"] == source and result["book_balance"]["source"] == "worktree"
+    note = result["book_balance"]["note"]
+    assert "+18 B vs HEAD" in note and "+36 B vs refs/remotes/official-renamed/ouroboros" in note
+    assert "Local commits are not blocked" in note
+    assert _diagnose(ctx, source, paths=["change.py"])["book_balance"]["note"] == ""
+
+
+@pytest.mark.parametrize("source", ["worktree", "index"])
+def test_free_book_diagnostic_distinguishes_foreign_and_unknown_baseline(candidate, source):
+    # A foreign project can have the same docs paths without the body contract.
+    assert _diagnose(candidate, source)["book_balance"]["note"] == ""
+    _write(candidate.repo_dir, {"ouroboros/reference_books.py": "# book contract\n"})
+    _git(candidate.repo_dir, "add", ".")
+    _git(candidate.repo_dir, "commit", "-qm", "body contract")
+    result = _diagnose(candidate, source)
+    assert result["status"] == "not_applicable"
+    assert "contribution unknown" in result["book_balance"]["note"]
+    assert "nothing owed" not in result["book_balance"]["note"]
 
 
 @pytest.mark.parametrize("source", ["worktree", "index"])

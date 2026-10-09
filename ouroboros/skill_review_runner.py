@@ -1,3 +1,13 @@
+"""Skill review lifecycle: job file, history, events and post-review reconciliation.
+
+Writes ``review_job.json`` and the ``skill_review_*`` events. The result payload
+keeps the review verdict, ``deps_*`` and ``extension_*`` outcomes as separate
+fields, so a failed dependency install or extension load never rewrites the
+verdict. A replayed (unchanged) verdict dispatches no reviewer panel but still
+resumes dependency installation when it is executable. Review auto-enable only
+fires while no ``enabled.json`` exists, so it never overrides an owner disable.
+"""
+
 from __future__ import annotations
 
 import contextlib

@@ -1,2 +1,0 @@
-597
-The Plan/review authority row names the per-wave review ledger record as a canonical source, its hot-index row as the bounded projection, load_record plus per-row source_refs as the actor-readable refs, and the ledger's own honesty rules (index row only after record and sources exist, pending settles by revision, unobserved model is unknown).

@@ -489,7 +489,7 @@ def claim_task_acceptance_review_cycle(
     *,
     claimed_by_task_id: str,
 ) -> Dict[str, Any]:
-    """Atomically dedupe and claim one paid root-acceptance panel dispatch."""
+    """Atomically claim one paid root-acceptance panel dispatch; a prior claim for the binding or paid identity answers ``unknown`` (never a second dispatch)."""
 
     binding_fields = {
         key: str((review_binding or {}).get(key) or "").strip().lower()

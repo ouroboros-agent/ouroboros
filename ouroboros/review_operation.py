@@ -17,8 +17,9 @@ existing immutable artifact store plus one pointer in the task result
 refuses those sends at $0. Owner decisions reach the operation as the canonical
 wait row's ``pending_action`` (the author's mailbox is the author's), and only a
 controller proven live — this process's registration, or another process of
-this server generation with the exact pid birth and a pointer still open — may
-be told to act. A panel whose controller died is discovered by the existing
+this server generation with the exact pid birth and custody session and a
+pointer still open that matches panel, slot and attempt, with no Stop/Panic or
+unreadable stop state (``review_operation_controller``) — may be told to act. A panel whose controller died is discovered by the existing
 maintenance pass.
 
 Collection here is PURE: it restores an exact completed producer outcome, reads

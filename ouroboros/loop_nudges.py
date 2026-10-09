@@ -546,6 +546,11 @@ def _nanny_finalization_message(
     """The honest nanny reminder for a harness-dispatched child at finalization —
     or '' when no reminder is deserved.
 
+    A nanny with no durable delegated start gets NANNY_DID_NOT_DELEGATE; an unsettled
+    start gets NANNY_DELEGATED_RUN_PENDING (wait or cancel, so no duplicate run starts);
+    NANNY_METERED_OVERRUN is emitted when the delegated runs succeeded but the nanny kept
+    burning metered rounds. Each is a one-shot advisory disclosure, not a gate.
+
     F4 (2026-08-10 saga): the old reminder accused children whose delegated
     runs CRASHED of "choosing" not to delegate, and fired even with the verbs
     policy-hidden. Two structural facts fix both: the task's own visible

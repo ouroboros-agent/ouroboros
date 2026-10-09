@@ -1,4 +1,15 @@
-"""Checkpoint-bound, complete-input context-reclaim materialization."""
+"""Checkpoint-bound, complete-input context-reclaim materialization.
+
+Eligible units are completed assistant-call plus contiguous matching-result slices.
+Owner turns and malformed, interrupted or visually opaque slices stay verbatim, and an
+unfinished Anthropic native unit is ineligible. Selection stops once the predicted
+reclaim reaches the goal. A non-empty selection first writes an exact private checkpoint,
+then summarizes complete, gap-free hashed map/fold input into a labelled third-person
+host record (user role), each original restorable from the checkpoint. The automatic
+Main pass uses raw units first; typed provider refusal alone permits capsule re-folding.
+Eligible units must appear completely in the persisted physical projection
+(``exposed_context_units``); unknown exposure keeps a unit raw. ``goal_reached`` in the receipt reports whether the measured reclaim met the goal.
+"""
 
 from __future__ import annotations
 
@@ -1303,8 +1314,10 @@ def compact_tool_history_llm(
     returns facts before any checkpoint or paid helper call. Zero means that
     a real overflow has not supplied a measurable deficit, not that no shrink helps.
     ``provider_refused`` (the provider's typed refusal of this very request) also
-    admits earlier capsules, after every raw unit, as the last resort.
-    ``protected_texts`` (the task's typed owner corpus) keeps owner rows whole in an
+    admits earlier capsules, after every raw unit, as the last resort; a re-folded
+    capsule is one generation up and keeps its lineage. Adjacent replaced units of an
+    automatic pass merge into one record without another paid fold, each original
+    still restorable. ``protected_texts`` keeps governing source rows whole in an
     explicit authored view; automatic and count-only passes never touch dialogue rows.
     """
 

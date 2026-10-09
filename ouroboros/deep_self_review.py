@@ -19,7 +19,11 @@ Both deliveries ride the shared review executor seam: the product
 is free markdown (``triad_review`` shape ``report``), a bound landing before
 the final answer delivers the collected draft marked INCOMPLETE, and the host
 prepends a provenance header naming the delivery, model, rounds, receipts,
-coverage and completeness so consecutive reports stay comparable.
+coverage and completeness so consecutive reports stay comparable. A mandatory
+read left partial, missing or unobserved is recorded as a ``capability_delta``
+in the usage. A typed failure (``execution_status="infra_failed"``) keeps the
+previous ``memory/deep_review.md`` (the caller overwrites it only on success);
+``BudgetExceeded`` propagates to the agent's budget-pause rail.
 """
 
 from __future__ import annotations

@@ -51,6 +51,13 @@ def _check_budget_limits(
     budget_remaining_usd: Optional[float],
     cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Budget decision after every unfinished spending round, tool and no-tool alike.
+
+    ``ctx.budget_tail`` names the tail, and a cold Resume re-enters the tail
+    recorded in ``resume_point.budget_tail``; only the tool tail advances nanny
+    baselines and arms tool controls (see ``_finish_no_tool_round_budget``). An
+    accepted answer returns before this check, so it buys no extra paid final.
+    """
     accumulated_usage = ctx.accumulated_usage
     raw_task_cost = accumulated_usage.get("cost")
     task_cost = float(raw_task_cost) if raw_task_cost is not None else None

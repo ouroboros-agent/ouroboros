@@ -589,7 +589,8 @@ def routing_target_label(
 # "Not started: …" on a promote and "Not moved: …" on a scope bind. The receipt
 # under the owner's message, the host-initiated System row and the picker's
 # 409 toast all read this table; the browser renders the sentence verbatim (no
-# client table). A reason without a row stays raw ("Not started (<reason>)")
+# client table). Tool results to the agent read the same table: they keep the
+# machine prefix and code, then append these words. A reason without a row stays raw ("Not started (<reason>)")
 # so a new refusal is visible before it has words.
 ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "workspace_unusable": "the working folder can't be used",

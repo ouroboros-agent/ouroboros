@@ -1,5 +1,0 @@
-107
-The commit checklist was split into the universal Change Review Checklist and
-the Ouroboros Body Layer; the four checklist item references in this chapter
-(size_cap_paydown, perf_lifecycle) now name the layer, the renumbered item and
-the item key instead of the retired section name.

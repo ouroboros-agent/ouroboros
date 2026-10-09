@@ -100,7 +100,8 @@ def test_system_states_the_chronicle_contract_and_each_writer_in_one_home():
     assert "`chronicle_write`, `memory_mark`" in tools and "`memory/chronicle/*`" in tools
     assert "chronicle page and part drafts in their own name" in tools
     # Everything the host guarantees a child at start, its memory marks included (memory_view.ROLE_DEFAULTS).
-    assert "its room's page, the memory marks of that room and the global ones, my whole assignment" in delegation
+    start = next(c for c in _claims(delegation) if "never my whole dialogue history" in c)
+    assert all(part in start for part in ("room's page", "global memory marks", "whole assignment", "verbatim"))
     assert "which I accept or reject" not in delegation  # a child that schedules a grandchild does not decide
     flat = " ".join(system.split())
     assert "nothing project-related is hidden" not in flat

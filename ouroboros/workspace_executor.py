@@ -239,7 +239,7 @@ def execute(
     """Run in the configured backend. Host/interpreter ``env_overlay`` applies
     only locally: host paths/PATH must not leak into Docker. Explicit target_env
     is separate and reaches either backend, through inert aliases in Docker.
-    """
+    In a body candidate or system copy, Docker must map the source copy and its sibling ``.env`` directory (else refused)."""
     executor = executor_ref_from_ctx(ctx)
     if executor is None:
         raise ValueError("no executor_ref configured")
@@ -1112,7 +1112,8 @@ def service_logs(ctx: Any, name: str, tail: int) -> dict[str, Any] | None:
 
 
 def _stop_service_record(record: _ExecutorService, *, wait: bool = True) -> dict[str, Any]:
-    """Stop one owned process and finalize its local log before forgetting env."""
+    """Stop one owned process and finalize its local log before forgetting env.
+    Unconfirmed termination keeps the record for later cleanup; Docker records only dispatch cleanup."""
     def failed(message: str) -> dict[str, Any]:
         payload = _service_payload(record)
         payload.update(stop_failed=True, cleanup_dispatched=False,

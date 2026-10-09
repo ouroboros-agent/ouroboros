@@ -19,7 +19,9 @@ the author waits holding the conversation, as before. Persistence failure lends
 nothing. ``continuation_version`` is negotiated per request; only a version-1 consumer
 takes the initial envelope, so only there is an author-selected output "released"
 early (Advisory ``pending_review=finish`` and the Cyber rule). Releasing keeps the
-author for the panel's criticism; a PASS never publishes by itself. Each released or
+author for the panel's criticism; a PASS never publishes by itself. A pending release
+is bound to its selection and panel: a new selection clears it, and a skipped park
+never publishes it at a later unrelated review. Each released or
 terminal output has a host-minted ``output_ref`` bound to the author's selection
 revision and destination: re-finalizing a released selection sends nothing again, a
 new selection is new speech even with identical text. Exact wire fields:

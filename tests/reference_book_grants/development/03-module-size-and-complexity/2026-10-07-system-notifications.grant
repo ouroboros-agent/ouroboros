@@ -1,2 +1,0 @@
-298
-The notifications invariant names the delivery claims the bridge may make (show_native_notification's submitted, and unknown, which may still be one; the OS owns the sound), that delivery never asks for OS permission, and that Sound off skips a legacy notify_owner bridge without that method, whose hidden-window balloon cannot be silenced; the old capability-evidence sentence is replaced, not appended.

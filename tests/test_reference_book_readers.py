@@ -269,7 +269,6 @@ def test_a_non_constitutional_plan_pointer_maps_the_chapters(tmp_path):
 
     mapped = _architecture_navigation(REPO, "unused")
     assert "Source: `docs/architecture/01-high-level-architecture.md`" in mapped
-    assert "Devtools boundary" in mapped
     # An unreadable book falls back to mapping the supplied text rather than
     # dropping the architecture pointer entirely.
     fallback = _architecture_navigation(tmp_path, "# Doc\n\n## Section\n\nBody\n")

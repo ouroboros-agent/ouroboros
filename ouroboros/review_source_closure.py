@@ -6,6 +6,11 @@ union, task-filtered trajectory and artifact manifest. These are immutable
 snapshots, not a copy of an execution drive. Opaque prose is never path-rewritten.
 The returned request carries both original provenance and actual reader paths;
 missing named bytes refuse dispatch, while an absent optional log is disclosed.
+
+Snapshots live under ``source_handles/review_inputs/request-*/`` of the task
+artifact store (historical mode retains only the frozen subject). Packet custody
+(``acceptance_retrieving.retain_review_source``) does not rebind external readers;
+a missing original reader root refuses with ``original_reader_root_unavailable``.
 """
 from __future__ import annotations
 

@@ -5,7 +5,7 @@ on the system repository, the same action ``commit_reviewed(preflight_reviewer=â
 takes, so a preflight has no pipeline of its own: one ledger record, the record's
 reuse, its budget and its ceiling. A ``surface=preflight`` record never answers the
 commit panel (the reuse key carries the surface). ``deterministic_only`` keeps the
-free release-metadata diagnostics (``commit_gate.release_diagnostics``);
+free release metadata and labelled worktree book balance (``commit_gate.release_diagnostics``);
 ``advisory_review`` stays callable under the old name. ``review_status`` is the
 read-only diagnostic of commit attempts, open obligations and commit-readiness debt.
 """
@@ -85,9 +85,10 @@ def _preflight_review_params() -> Dict[str, Any]:
             "review_rebuttal": _param("string", "Your answer to the previous findings; buys a new look."),
             "paths": _param("array", "deterministic_only: limit the diagnostics to these paths.",
                             items={"type": "string"}),
-            "deterministic_only": _param("boolean", "Only diagnose release metadata, free: no reviewer, staging, "
-                                                    "tests or record; requires source.", default=False),
-            "source": _param("string", "deterministic_only: worktree reads current files; index reads staged blobs.",
+            "deterministic_only": _param("boolean", "Free release diagnostics and worktree book balance before "
+                                                    "buying review; no reviewer, staging, tests or record; requires source.", default=False),
+            "source": _param("string", "Release metadata: worktree reads current files; index reads staged blobs. "
+                                      "Book balance is separately labelled worktree.",
                              enum=["worktree", "index"]),
         },
         "required": [],
@@ -99,8 +100,8 @@ _PREFLIGHT_DESCRIPTION = (
     "worktree via review_change(subject=worktree, surface=preflight, reviewers=[reviewer]), also used by "
     "commit_reviewed(preflight_reviewer=...). Informational, never a gate or an answer for the commit panel; "
     "unchanged worktree reuses its settled record free. No tests here; commit_reviewed runs them. "
-    "deterministic_only=True requires source=worktree|index and returns free release diagnostics instead. "
-    "Returns review_change's JSON."
+    "deterministic_only=True requires source=worktree|index and returns free release diagnostics plus a separately "
+    "labelled worktree book balance instead. Returns a review record or the free diagnostic JSON."
 )
 
 _REVIEW_STATUS_DESCRIPTION = (

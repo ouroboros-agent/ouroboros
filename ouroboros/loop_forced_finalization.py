@@ -2,6 +2,16 @@
 and the absorption gate, forced children acceptance, swarm-action enforcement,
 forced services and owner-directive drain, the one forced model call, stale and
 fallback candidates and the forced final answer.
+
+A forced rail makes one model call on the task's own messages and tool schemas,
+executes no tool and buys no repair call: a reply that still asks for a tool is
+a preamble and falls back to the retained or host text. A second call happens
+only to answer owner directives that arrived during the first.
+
+Every rail records through ``_record_forced_finalization``, whose acceptance
+write is a ledger entry, never a gate: a task eligible for a panel that did not
+run gets an eligible bypass record with trigger ``bypassed_<reason_code>``; a
+panel that already ran, or a host decision already recorded, is not overwritten.
 Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
 
 from __future__ import annotations

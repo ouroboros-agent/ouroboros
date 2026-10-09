@@ -1,2 +1,0 @@
-1104
-The component map gains the row of the new tools/review_change_custody.py (the custody side of a review_change wave and the rejoin of a pending round) and the row of tools/review_subject.py now names both halves of the module — the managed resolution delta and the subject as an object (spec, freeze, isolated checkout at the round's path, the three identities) — instead of the resolution delta alone.

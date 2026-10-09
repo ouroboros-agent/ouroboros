@@ -1,2 +1,0 @@
-1466
-The MainApi bridge gains shell_info, request_native_notifications and show_native_notification with its submitted/unknown/refusal answers; the notifications paragraph gains the system-notification-first rule (the old "claims no Notification Center delivery" clause is replaced) and the Sound-off rule for an app without it; the storage paragraph names pywebview's private-mode erase and the desktop_shell.js disclosure for apps before 7.2.0, and desktop_shell.js gets its module row. No older text describes either mechanism.
