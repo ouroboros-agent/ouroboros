@@ -131,8 +131,13 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # for same-tree mail: the forward_to_worker description names its peer addressees
     # as any other task in the caller's tree (parent, sibling, any task sharing the
     # root) and says Presence observation gaps are disclosed inside the tree too.
+    # Rolled again for source-addressed delivery (owner Q4): read_file gains the
+    # additive `max_chars` view budget (an exact piece of one window after start_char,
+    # the header naming the next cursor) and start_char's description names the
+    # code-point basis and the partial-view address; no parameter changed type,
+    # default or required status.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "25ab2df2f9cc9c65e4971b7d4e2a5d1013041933aa070849639a01c9a4398e83"
+        "6d9ce17efdc2b5d637ef7b69b70956e8eed17f9ae5754f160058c517c6b3fee6"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

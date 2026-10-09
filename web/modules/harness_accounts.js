@@ -180,6 +180,8 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
         rows = freshRowsFor(alias);
     }
     let worst = null;
+    // A fully used ratio without a valid future reset is non-blocking and shown as
+    // "availability not proven", unless an explicit active cooldown is in effect.
     // The runtime's own bar, per snapshot: spent when a constraint is cooling down OR
     // its window is fully used with a future reset — ANY constraint, not just the highest
     // ratio. Reading exhaustion off `worst` alone hid a cooling constraint whenever
@@ -941,6 +943,9 @@ export function removeAccountConfirmBody(name, family) {
         + 'unavailable until you repoint them.';
 }
 
+// A refused deletion stays an error (removeAccount throws). Only a receipt whose
+// disposition is vendor-owned, left unchanged and scoped to the OS user yields the
+// retained-credential warning; any other receipt yields no notice.
 export function vendorCredentialRetainedNotice(receipt, name, family) {
     const disposition = receipt?.vendorCredentialDisposition;
     if (!disposition || disposition.owner !== 'vendor'

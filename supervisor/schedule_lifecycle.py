@@ -7,6 +7,13 @@ seams, so the durable file keeps one writer discipline while the module that
 owns dispatch stays readable in one window (DEVELOPMENT "Paying down a size
 cap"). Callers reach these through ``supervisor.queue``; nothing here is a
 second scheduler or a second store.
+
+Restore of a suppressed skill row rechecks skill presence, manifest declaration,
+``supervised_task`` permission and readiness. A blocked row comes back disabled
+as ``restored_not_ready`` (marker lifted, change recorded); an absent or
+unknowable skill or schedule is ``manifest_absent`` with ``changed=false`` and
+the suppression kept. A consumed one-shot is ``consumed_not_rearmed`` until a
+fresh ``trigger.run_at`` is authored.
 """
 
 from __future__ import annotations

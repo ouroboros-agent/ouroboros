@@ -1,2 +1,0 @@
-441
-The module tree gains the desktop_notifications.py row: the launcher-owned system-notification adapters (macOS, Windows' per-notification balloon icon kept until its click, Linux) and their submitted/unknown/refusal answers are a new module with no older row to replace; the launcher_background.py row names DesktopApi, the bridge's alert half MainApi now inherits, in place.

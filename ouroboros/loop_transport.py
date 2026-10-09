@@ -258,7 +258,10 @@ def fallback_chain_allowed(
     Existing outage pacing bounds repeated attempts; no lifetime pass limit is added.
     An eligible unknown outcome tries them first, not the same route again; a declared
     wait on the primary (``switch_model(primary="wait")``) keeps its refusals and
-    outages on the primary's own wait instead of paid alternatives.
+    outages on the primary's own wait instead of paid alternatives. A context overflow
+    reaches the configured routes only after the primary's own recovery ladder
+    (``loop_model_call._recover_context_overflow``) left the round unanswered: the
+    candidates inherit the compacted view (owner decision 7A, rung f).
     """
     usage = accumulated_usage or {}
     if bool(getattr(ctx, "exact_model_route", False)):
@@ -276,7 +279,7 @@ def fallback_chain_allowed(
         return False
     if last_error_kind == "provider_outcome_unknown":
         return new_generation_after_unknown(ctx, accumulated_usage)
-    return last_error_kind not in ("context_overflow", "deadline_exhausted", "llm_output_exhausted")
+    return last_error_kind not in ("deadline_exhausted", "llm_output_exhausted")
 
 
 def reconcile_transport_wait(

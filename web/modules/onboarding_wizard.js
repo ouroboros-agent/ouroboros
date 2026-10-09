@@ -469,9 +469,9 @@ import { accountRowFacts } from './harness_accounts.js';
         if (error) return syncCurrentStepActionState();
         if (['accounts', 'providers'].includes(state.currentStep)) applyModelDefaults(false);
         if (['accounts', 'providers', 'models', 'review_mode', 'budget'].includes(state.currentStep)) {
-            // Preview is enrichment, never a navigation gate. Refresh in the
-            // background after the step has a valid complete draft; Finish
-            // checks the receipt only if generated rows still own the editor.
+            // Preview is enrichment, never a navigation or model-discovery gate. Refresh (also Retry) in the background
+            // after a valid draft; it replaces generated rows only and keeps owner-edited models, reviewers and subagents.
+            // Finish checks the receipt only if generated rows still own the editor.
             if (agentsStep) void agentsStep.refreshSubagentsPreview({ force: true });
         }
         const index = STEP_ORDER.indexOf(state.currentStep);

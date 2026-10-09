@@ -1,6 +1,0 @@
-443
-The wake paragraph now says what a wake sees after the owner's answer 3A: the Main turn's own view
-(the integrator's spec with Main as its room, since a wake has no chat of its own), its "This room (Main)"
-byte for byte as the Main turn renders it, plus the words of people in the other live rooms, my own
-replies there staying one memory_read by address. The old text described a wake without a room that saw
-Main as one line.

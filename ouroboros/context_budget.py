@@ -441,7 +441,8 @@ REVIEW_LEDGER_INDEX_WARN_BYTES = 64_000_000
 # compact custody projection, never deletion.
 EVENTS_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
 # Warn before the observed 242-of-253 retained-drive corpus becomes routine;
-# count only direct children because startup health is an interactive path.
+# count only direct child directories of state/headless_tasks and task_drives
+# (no recursive sizing) because startup health is an interactive path.
 RETAINED_EXECUTION_DRIVES_WARN_COUNT = 200
 
 

@@ -109,6 +109,12 @@ class PresenceDeliveryRecorder:
     Only this Host receipt writer owns these keys. Other chat writers and
     rotation do not invalidate its incrementally maintained projection. A new
     Host rebuilds once; an ambiguous required write discards the projection.
+
+    ``record`` reports ``history_coverage``: ``indexed`` (the last rebuild plus this
+    writer's own writes; concurrent chat writers are not re-scanned) or ``gapped``
+    (a retained row was malformed, so ``duplicate=false`` is not proof of absence).
+    A physically unreadable archive raises rather than reading as empty history.
+    Each append starts on a JSONL record boundary, even after a torn tail.
     """
 
     def __init__(self, data_dir: Path) -> None:

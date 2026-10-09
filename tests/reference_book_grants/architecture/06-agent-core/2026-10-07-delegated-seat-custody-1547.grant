@@ -1,9 +1,0 @@
-1587
-The "Late completion and typed refusals" section gains the delegated-seat custody paragraph for
-#1547: a rejoin after process loss runs for the remainder of the run's ORIGINAL window computed from
-saved facts (durable START_REQUESTED/STARTED rows, else the frozen row's awaiting_since) floored at
-the settlement margin; a transient failure to observe a live run keeps polling instead of ending the
-seat, and an unobservable run projects in_flight through the typed ReviewPollUnavailable; a success
-first seen at the deadline read is accepted and extracted outside the slot's expired deadline while
-the calendar deadline, Stop/Panic and the absolute ceiling stay stop axes. No older text displaced:
-the chapter sat 504 bytes under its limit before this change.

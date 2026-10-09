@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.tools.arg_feedback import payload_item_feedback, with_argument_notes
 from ouroboros.config import get_runtime_mode
+from ouroboros.reference_books import book_balance_note
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
     is_protected_runtime_path,
@@ -233,6 +234,8 @@ def _finish_mutation(
     # does from git._repo_write / _str_replace_editor (the protected-write contract
     # in ARCHITECTURE "Safety and runtime mode" and SYSTEM.md "Safety-critical
     # files"): the mode ALLOWS the write, and the notice is what keeps it visible.
+    book_note = book_balance_note(binding.base_path, changed_paths)
+    footer += f"\n{book_note}" if book_note else ""
     protected = protected_paths_in(changed_paths)
     if protected and mode_allows_protected_write(_runtime_mode()):
         footer += "\n\n" + core_patch_notice(protected)

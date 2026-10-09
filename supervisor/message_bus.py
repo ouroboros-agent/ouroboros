@@ -1,4 +1,7 @@
-"""Queue-based bridge between UI/skill transports and the supervisor."""
+"""Queue-based bridge between UI/skill transports and the supervisor.
+
+Chat, media, typing and log frames never carry A2A synthetic chats to the browser; ``project_thread`` is stamped from Project registry membership (not a numeric range), so external transport ids stay unstamped.
+"""
 
 from __future__ import annotations
 
@@ -1129,10 +1132,7 @@ class LocalChatBridge:
     def push_log(self, event: dict):
         """Stream append_jsonl events to UI."""
         if self._broadcast_fn and not is_a2a_chat_id(event.get("chat_id")):
-            # Task-scoped events arrive already addressed
-            # (supervisor/log_addressing.py); an unaddressable event keeps the
-            # legacy chat-0 default, which Main still admits. A2A synthetic
-            # chats are machine traffic and never enter the human stream.
+            # Task-scoped events arrive addressed (supervisor/log_addressing.py); an unaddressable one keeps the chat-0 default (Main admits it).
             frame = {"type": "log", "data": event, "chat_id": int(event.get("chat_id") or 0)}
             stamp_project_thread(DATA_DIR, frame)
             self._broadcast_fn(frame)

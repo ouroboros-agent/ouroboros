@@ -1,3 +1,0 @@
-610
-The continuation rule names the idempotent helper projection, its position after the
-parent spread, sized omissions, and preservation of existing preview wrappers on rebuild.

@@ -1,7 +1,0 @@
-487
-The pr_merge receipt paragraph (#1333) now says where the reviewed facts come from: the host review
-record named by review_record_id (subject kind/base/head/tree, verdicts, panel size) or else a
-declared_only declaration, the two typed pre-effect refusals for a missing and an unreadable record,
-the subject_kind_not_committed and reviewed_base_differs gaps that keep such a record from covers_head,
-and that the PR body and the card name the source. The one-clause recovery sentence is replaced in
-place, not appended to.

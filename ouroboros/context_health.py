@@ -235,6 +235,9 @@ def _memory_health_lines(env: Any) -> List[str]:
 def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") -> str:
     """Render the health-invariant WARNING block for one reader's context.
 
+    Called once when a task's context is built (a task-start snapshot, not
+    refreshed per round).
+
     ``task_id`` names the READING task so delegated-run obligations can shape
     their instruction clause by ownership: the obligations stay globally
     visible (owner doctrine — a preserved-and-invisible result is how work

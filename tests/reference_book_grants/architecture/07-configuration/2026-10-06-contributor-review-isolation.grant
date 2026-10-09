@@ -1,3 +1,0 @@
-92
-A read under the settings integrity pin takes no settings lock, so nothing is created beside a pinned
-file the process does not own.

@@ -800,6 +800,12 @@ def _watch_task(
     quiet: bool,
     timeout_sec: float,
 ) -> None:
+    """Follow a task's event stream until its terminal result.
+
+    Streams with POST v2 (resumable cursor); falls back to GET with a sequence
+    number only when the first connection, before any event, fails with HTTP 405.
+    Replays are deduplicated by log identity over the most recent 4096 identities.
+    """
     cursor: Optional[dict] = None
     legacy_seq = 0
     legacy = False

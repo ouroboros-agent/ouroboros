@@ -93,8 +93,10 @@ def pending_invocations(
 def request_body(drive_root: Any, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Resolve the canonical replay envelope, legacy inline first, then raw CAS.
 
-    Unreadable references leave the request unknown for the caller's existing
-    refusal paths; never rebuild a paid invocation from current settings.
+    The raw CAS blob holds the full unredacted envelope, stored before the
+    start-requested row. Unreadable references leave the request unknown for
+    the caller's existing refusal paths; never rebuild a paid invocation from
+    current settings.
     """
     inline = row.get("request")
     if isinstance(inline, dict) and inline:

@@ -31,6 +31,11 @@ results and admitted rows with missing receipts remain unknown. Dispatch
 possibility lives monotonically on the row and receipt. Deletion reads the
 receipt from the table's exact root and preserves accepted or unknown obligations.
 
+A refusal at admission is a hold, not a stored witness. An older admission
+consumes only its own firing point, never a later authored one. A custody re-run
+of an already-possible occurrence is marked again even after its row is deleted
+or a successor occurrence replaced it.
+
 A recurring row that waited keeps ONE overdue occurrence (no catch-up burst) and,
 once admitted, moves to the next FUTURE cron point: a delayed run may land
 between two cron instants. That reading of "the row waits" is the author's.

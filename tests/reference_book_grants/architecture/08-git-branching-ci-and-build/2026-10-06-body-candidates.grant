@@ -1,2 +1,0 @@
-553
-Candidate branches, the two private pin namespaces and the serving push's reachable-annotated-tags rule (#1539): linked worktrees share one tag namespace, a fact the chapter did not hold.

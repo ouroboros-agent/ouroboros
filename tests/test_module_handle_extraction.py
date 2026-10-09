@@ -359,6 +359,10 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "ouroboros/loop_messages.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_record_owner_directive",
+        # context-attention 5A: the per-round facts line measures through the
+        # loop's fit wrapper so the measurement is the one the round records.
+        "_measure_round_main_fit",
+        "_wrapup_global_remaining",
     })),
     "ouroboros/loop_model_call.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_RoundModelCallContext", "_account_compaction_usage", "_append_or_merge_user_message",
@@ -437,6 +441,9 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         # #1196: a budget-pause HOLD ended by control rejoins the model-wait rails and
         # merges its forced trace like every other controlled exit.
         "_merge_finalization_trace",
+        # context-attention 7A: the model-free refusal rungs publish their rebuilt
+        # transcript through the same seal every other sanctioned rewrite uses.
+        "seal_task_transcript",
     })),
 }
 

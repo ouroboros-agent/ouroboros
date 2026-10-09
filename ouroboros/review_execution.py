@@ -6,6 +6,11 @@ policy above the seam (attempt rails, persistence, parsing, actor projection,
 quorum) and knows only that a route exists.
 
 The dependency runs one way: this module never imports the coordinator.
+
+A session verdict is trusted as structured output only when the run reports
+``outputConformance == "passed"``; otherwise it falls to the strict parse, then
+light-model extraction, and any landing below the requested ``outputSchema`` is
+disclosed as ``capability_delta``.
 """
 
 from __future__ import annotations

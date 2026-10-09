@@ -648,22 +648,40 @@ def build_goal_section(
     return "\n".join(sections)
 
 
-def review_history_with_obligations(history: Any, *, drive_root: Any, repo_root: Any) -> str:
+def review_history_with_obligations(history: Any, *, drive_root: Any, repo_root: Any, task_id: str = "") -> str:
     """The prior-rounds section with the repository's durable open obligations
     (anti-thrashing across restarts) — the ONE owner for every brief that carries
     history: the gate's packet, the retrieving seats' brief and the public builder,
     so a brief rebuilt outside the gate reads the history the seat was sent.
-    Best-effort: unreadable state states the history it has, never fails."""
+    Unreadable state is a source gap beside the available history, never a
+    claim that the durable obligations are empty. This is not a verdict gate."""
     open_obligations: list = []
+    gap = ""
     if drive_root is not None and repo_root is not None:
         try:
-            from ouroboros.review_state import load_state, make_repo_key
+            from ouroboros.review_state import _load_state_unlocked, make_repo_key
 
-            state = load_state(pathlib.Path(drive_root))
+            state = _load_state_unlocked(pathlib.Path(drive_root), strict_attempt_authority=True)
             open_obligations = state.get_open_obligations(repo_key=make_repo_key(pathlib.Path(repo_root)))
-        except Exception:
-            open_obligations = []
-    return build_review_history_section(list(history or []), open_obligations=open_obligations)
+        except Exception as exc:
+            gap = ("\nREVIEW_HISTORY_SOURCE_UNAVAILABLE: durable obligations could not be read "
+                   f"({type(exc).__name__}); source: {pathlib.Path(drive_root) / 'state/advisory_review.json'}. "
+                   "The available history below is incomplete.\n")
+    from ouroboros.review_history import review_dispute_history
+
+    dispute = review_dispute_history(history, drive_root=drive_root, repo_root=repo_root, task_id=task_id)
+    if task_id and drive_root is not None:
+        from ouroboros.review_history_view import selected_review_history
+        dispute = selected_review_history(dispute, drive_root=drive_root, task_id=task_id)["history"]
+    section = build_review_history_section(dispute["rounds"], open_obligations=open_obligations)
+    if dispute.get("authored_view"):
+        section += "\n### Author's selected account of earlier review sources\n\n" + json.dumps(
+            dispute["authored_view"], ensure_ascii=False, sort_keys=True) + "\n"
+    if dispute["decision_rows"] or dispute["gaps"]:
+        section += "\n### Recorded review dispute index\n\n```json\n" + json.dumps({
+            "status": dispute["status"], "decision_rows": dispute["decision_rows"], "gaps": dispute["gaps"]},
+            ensure_ascii=False, sort_keys=True, default=str) + "\n```\n"
+    return gap + section
 
 
 def build_scope_section(scope: str = "") -> str:
@@ -794,6 +812,15 @@ def check_worktree_readiness(
                 f"size-ratchet validator unavailable ({type(exc).__name__}); "
                 "the official CI lane still enforces"
             )
+
+    try:  # 6. Touched reference books' balance: a warning; official CI refuses a grown book.
+        from ouroboros.reference_books import BOOK_GROWTH_RULE, book_balances, render_book_balance
+        if status_result is not None and (repo_dir / "ouroboros" / "reference_books.py").is_file():
+            touched = parse_changed_paths_from_porcelain(status_result.stdout or "")
+            warnings.extend(f"official CI will enforce: {render_book_balance(b)}. {BOOK_GROWTH_RULE}"
+                            for b in book_balances(repo_dir, touched) if b.owed)
+    except Exception:
+        pass
 
     return warnings
 

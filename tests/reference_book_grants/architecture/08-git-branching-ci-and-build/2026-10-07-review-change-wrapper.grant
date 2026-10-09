@@ -1,4 +1,0 @@
-137
-The dev-script list says run_external_review.py is an operator wrapper over the runtime review_change
-operation whose contributor lane reviews a committed base..head proposal by the installed body's review flow
-and rules.

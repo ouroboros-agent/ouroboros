@@ -489,7 +489,7 @@ def claim_task_acceptance_review_cycle(
     *,
     claimed_by_task_id: str,
 ) -> Dict[str, Any]:
-    """Atomically dedupe and claim one paid root-acceptance panel dispatch."""
+    """Atomically claim one paid root-acceptance panel dispatch; a prior claim for the binding or paid identity answers ``unknown`` (never a second dispatch)."""
 
     binding_fields = {
         key: str((review_binding or {}).get(key) or "").strip().lower()
@@ -1270,22 +1270,10 @@ def record_plan_review_attempt(
     author_subject: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Select one canonical plan fingerprint as current (open | unavailable | rail_degraded)."""
-    if not _PLAN_REVIEW_HASH_RE.fullmatch(str(fingerprint or "")):
-        raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt fingerprint is invalid")
-    if status not in _PLAN_REVIEW_ATTEMPT_STATUSES:
-        raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
+    from ouroboros.tools.plan_author_history import record_attempt
 
-    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
-        state["current_attempt"] = {
-            "fingerprint": fingerprint,
-            "status": status,
-            "reason": str(reason or "")[:_PLAN_REVIEW_REASON_MAX_CHARS],
-        }
-        if author_subject is not None:
-            state["current_attempt"]["author_subject"] = copy.deepcopy(author_subject)
-        return state
-
-    return _update_plan_review_state(results_drive_root, task_id, _record)
+    return record_attempt(results_drive_root, task_id, fingerprint=fingerprint, status=status,
+                          reason=reason, author_subject=author_subject)
 
 
 def mark_current_plan_review_unavailable(
@@ -1450,6 +1438,9 @@ def record_plan_review_wave(
         raise ValueError("PLAN_REVIEW_STATE_INVALID: wave fingerprint is invalid")
 
     def _record(state: Dict[str, Any]) -> Dict[str, Any]:
+        from ouroboros.tools.plan_author_history import retain_previous_selection
+
+        retain_previous_selection(results_drive_root, task_id, state)
         selected = state.get("current_attempt") or {}
         retained_author = (selected.get("author_subject") or {}).get("review_fingerprint") == fingerprint
         previous = [w for w in state.get("waves") or [] if str(w.get("request_fingerprint") or "") == fingerprint]

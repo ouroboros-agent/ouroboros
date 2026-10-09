@@ -1,4 +1,10 @@
-"""Explicit foreground quota refresh through the owned Claudexor daemon."""
+"""Explicit foreground quota refresh through the owned Claudexor daemon.
+
+Discovers the already-running daemon, handshakes under the client's default 60 s read
+bound, then delegates once to the engine's quota POST under the refresh timeout (default
+and ceiling 90 s). The route starts no daemon, retries nothing and never exposes the
+daemon token.
+"""
 
 from __future__ import annotations
 

@@ -30,6 +30,11 @@ def project_helper_predecessor_authority(
     again. Answers/core fields keep that producer's whole-or-pointer semantics.
     Omission sizes count serialized characters (without a string's quotes);
     old name-only omissions have unknown sizes, represented by null.
+
+    A delegated child's contract applies it after the parent contract spread, and
+    direct work-order sessions apply it to their own contract, so both receive the
+    same brief. The brief does not carry the omitted evidence; its source names the
+    reader for the full result.
     """
     if not isinstance(authority, Mapping) or not authority:
         return {}

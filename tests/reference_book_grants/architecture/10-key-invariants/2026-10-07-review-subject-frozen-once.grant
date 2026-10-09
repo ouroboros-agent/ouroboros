@@ -1,2 +1,0 @@
-639
-Invariant 30: a review subject is frozen once (root, kind, parent, tree, diff_sha), read everywhere from its own root or isolated checkout, governed by the installed body, and every review identity derives from the frozen subject; the same head with a different base is a different subject.

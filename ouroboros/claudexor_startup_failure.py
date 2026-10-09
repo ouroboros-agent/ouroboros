@@ -22,6 +22,11 @@ from text):
   ``staleReplacementFailed``, ``root-authority.ts`` ``assertRootAuthorityAdmits``).
   The durable shape is an engine-emitted typed startup receipt (Claudexor
   #300); when it lands, the string half of this module retires.
+
+``heap_exhausted`` is diagnostic; this module derives no ceiling from host RAM.
+Managed launch applies the engine's heap recommendation through
+``ClaudexorRuntimeManager._daemon_command``. The daemon inherits ``NODE_OPTIONS``
+unchanged, and an explicit heap option there overrides the recommendation.
 """
 
 from __future__ import annotations

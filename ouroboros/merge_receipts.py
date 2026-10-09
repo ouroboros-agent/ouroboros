@@ -435,7 +435,11 @@ def _outcome(pr: Optional[Dict[str, Any]], gh_api: Gh, *, own_effect_ok: bool, e
 
 
 def _publish(ctx: Any, gh: Gh, gh_api: Gh, receipt: Dict[str, Any], drive_root: Any, task_id: str) -> Dict[str, Any]:
-    """PR body block (confirmed by readback) and the task-card row, each with its own gap."""
+    """PR body block (confirmed by readback) and the task-card row, each with its own gap.
+
+    The read/PATCH/readback is not atomic: a concurrent body edit can be overwritten.
+    The receipt row stays authoritative; the body block is its projection.
+    """
     block = public_block(receipt)
     body_status: Dict[str, Any] = {"status": "gap"}
     # Re-read at the publication boundary, not the pre-merge snapshot. An edit

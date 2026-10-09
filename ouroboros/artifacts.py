@@ -976,7 +976,7 @@ def materialize_tool_args_source(drive_root: Any, call: Dict[str, Any]) -> tuple
 def materialize_tool_result_source(
     drive_root: Union[pathlib.Path, str], task_id: str, call: Dict[str, Any],
 ) -> tuple[Any, bool, Dict[str, Any]]:
-    """Materialize a result under existing redaction; metadata carries its source or gap."""
+    """Materialize a result under existing redaction; metadata carries its source or gap. A partial result reads its verified actor source, then a matching redacted projection (re-persisted best-effort), else a source_unavailable gap."""
     result = call.get("result")
     legacy_match = (
         _LEGACY_TOOL_RESULT_TRUNCATION_RE.search(result)

@@ -1,2 +1,0 @@
-176
-The once-per-boot scan exception becomes: migration and repair are explicit lifecycle jobs; ordinary startup does not reconstruct unrelated history.

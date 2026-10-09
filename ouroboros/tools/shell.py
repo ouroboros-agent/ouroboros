@@ -21,6 +21,7 @@ import uuid
 from typing import Dict, List  # noqa: F401
 
 from ouroboros.owner_pause import OwnerPauseRefused
+from ouroboros.tool_capabilities import RESULT_VIEW_PARAMS
 from ouroboros.tools.tool_result import launch_refusal_result, _publish_tool_result
 from ouroboros.artifacts import copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch  # noqa: F401
 from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs  # noqa: F401
@@ -606,6 +607,9 @@ def _run_script(
     executor_active = _executor_can_run_cwd(ctx, resolved_workdir)
     active_workspace_script = binding.root == "active_workspace"
     if active_workspace_script:
+        # Workspace scripts stage in an owned per-run dir under <cwd>/.ouroboros/tmp_scripts: the run's
+        # own .gitignore keeps it out of raw Git status, and workspace_patch_rules._TOP_LEVEL_EXCLUDE_DIRS
+        # keeps ".ouroboros" out of patches. Task-drive runs stage under <task_drive>/tmp_scripts.
         root = resolved_workdir / ".ouroboros" / "tmp_scripts"
     else:
         try:
@@ -742,6 +746,7 @@ def get_tools() -> List[ToolEntry]:
 	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
 	                    ),
 	                },
+	                **RESULT_VIEW_PARAMS,
 	            }, "required": ["cmd"]},
         }, _run_shell, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
         ToolEntry("run_script", {
@@ -786,6 +791,7 @@ def get_tools() -> List[ToolEntry]:
 	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
 	                    ),
 	                },
+	                **RESULT_VIEW_PARAMS,
 	            }, "required": ["script"]},
         }, _run_script, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
     ]

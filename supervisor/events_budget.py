@@ -533,7 +533,8 @@ def _handle_budget_resume_child(evt: Dict[str, Any], ctx: Any) -> None:
     """Owner Q9: a resumed root's model SELECTS one budget-paused child to continue.
 
     The requester must be the live parent/root of the target (its tree, not any
-    tree); the grant itself goes through the ONE resume seam, so every typed
+    tree): a root selects any stored descendant, an intermediate parent only its
+    direct children. The grant itself goes through the ONE resume seam, so every typed
     refusal (money, cancel intent, deadline, lifetime, root still paused) is the
     same the owner would receive. The outcome is recorded as an event the
     requesting task can read back; nothing is auto-fanned-out.

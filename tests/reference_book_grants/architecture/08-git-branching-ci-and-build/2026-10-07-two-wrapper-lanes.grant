@@ -1,5 +1,0 @@
-309
-The dev-script entry for run_external_review.py describes its two lanes: the commit gate's
-non-committing cycle over the staged index in the runtime's isolated checkout (the operator lane,
-integrator decision R3) and the contributor lane's hermetic test preflight before `review_change`
-(integrator decision R2).

@@ -1,4 +1,0 @@
-249
-The memory view paragraph now says a page or part is dated and placed by its room's own rows at read time
-(memory_inventory.record_period, the period memory_read prints too; a retold record without rows keeps its
-block's period, labelled), never by the aggregate the journal recorded.

@@ -1,3 +1,0 @@
-133
-Module-map rows: presence_delivery.py names the reflection's task-lineage receipt reader, and jsonl_tail.py
-names the reflection receipts among the JsonlChainSnapshot readers sharing its complete-row reader.

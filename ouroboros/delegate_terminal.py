@@ -1,4 +1,12 @@
-"""One durable non-panic terminal boundary for delegated custody."""
+"""One durable non-panic terminal boundary for delegated custody.
+
+Refreshing a stored terminal result never touches its ``delegated_runs_*``
+counters, which stay the snapshot of the original terminal write;
+``actual_substrate`` and the envelope evidence mirror follow live custody.
+``refresh_recently_settled_terminals`` scans the custody event log from the
+byte-offset cursor ``state/delegate_terminal_refresh_cursor.json`` and reads at
+most ``_REFRESH_SCAN_CAP_BYTES`` (5 MB) per tick.
+"""
 
 from __future__ import annotations
 
@@ -689,6 +697,11 @@ def refresh_disposed_reconciliation(drive_root: Any, run_id: str, *, reader_task
     under each result writer's lock. Other debt, lifecycle, cost, counters,
     reasons and review evidence retain their meaning; this never audits or
     controls a live execution and never creates a missing result.
+
+    The debt is removed from the starter task, and from its retry chain only
+    when ``_confirmed_retry_chain`` validates it for ``reader_task_id``; an
+    unreadable custody log, or a run that is not both settled and
+    patch-disposed, clears nothing. Returns the number of results cleared.
     """
     from ouroboros.delegate_shared import _confirmed_retry_chain
     from ouroboros.task_results import write_task_result

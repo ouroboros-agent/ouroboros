@@ -1,4 +1,0 @@
-515
-Module-map row for `tools/review_checklist.py`: the layered change-review checklist as the review
-surfaces read it, the layer loader, and `checklist_fingerprint` (sha256 of the layered text plus the
-executing install's `docs/CHECKLISTS.md` blob as `rules_source`) that every review ledger record carries.

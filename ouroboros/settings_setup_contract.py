@@ -515,6 +515,17 @@ def wizard_authors_safety_light() -> bool:
 
 
 def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, str | None]:
+    """Structural validation shared by the desktop and web wizard.
+
+    Returns ``(prepared_settings, None)`` or ``({}, error)``. Requires a remote key
+    or URL, a local model source, or an agent subscription (a pending connection or
+    a selected Claudexor model); a local-only setup must route at least one active
+    lane locally. Main is required unless a subscription is pending; Light, Vision,
+    Consciousness and Fallback are not validated, so empty keeps its inheritance
+    semantics. Enforcement and runtime mode are closed enums, budgets finite and
+    positive, the MiniMax region is closed, and a Hugging Face local source needs a
+    filename. Credential length is checked only on fields changed in the payload,
+    so an unchanged short stored value cannot discard the whole form."""
     subscriptions_connected, skip_presets = parse_subscription_intent(data)
     pending_subscription = subscriptions_connected and not skip_presets
     selected_subscription = provider_for_model(_string(data.get("OUROBOROS_MODEL"))) == "claudexor"

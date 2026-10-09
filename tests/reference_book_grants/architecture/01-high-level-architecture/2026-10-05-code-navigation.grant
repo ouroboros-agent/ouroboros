@@ -1,2 +1,0 @@
-2145
-Module-map rows for the new code_navigation.py, code_occurrences.py and code_import_candidates.py leaves replace nothing; the code_intelligence.py and query_code.py rows are rewritten in place, and a short Code navigation section states why the schema-4 cache keeps only local facts and why import matches stay candidates. Operation detail lives in docs/code-navigation.md, outside this chapter.

@@ -6,6 +6,13 @@ helpers — referenced via the ``git_ops`` module object (``_g.X``) so a test th
 monkeypatches ``git_ops.REPO_DIR`` / ``_managed_update_target`` / ``_git_dir`` /
 ``DRIVE_ROOT`` is followed by these primitives. Control plane: ``ouroboros.gateway.control``
 orchestrates lock → kill workers → re-plan → rescue → tx marker → apply → smoke → restart.
+
+Transaction marker fields: ``m0_tree`` is the mechanical-merge tree, the baseline an assisted
+resolution is reviewed against; it is pinned when the merge is materialized and backfilled on
+resume only while absent, else ``m0_missing_reason`` records the gap, and the commit gate checks
+only that one of the two is present. ``tests_evidence`` is resolver-writable forensics that
+survives phase writes. ``stash_sha`` / ``local_work_carrier`` name the stash holding the owner's
+local work until it is restored; ``failed_update_ref`` is the branch that keeps a rolled-back attempt.
 """
 
 from __future__ import annotations
@@ -1002,7 +1009,8 @@ def _recover_assisted_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dic
         rescue_info: Dict[str, Any] = {}
         if not has_progress:
             # The server's owner-control path must be resident before the
-            # re-materialized conflict markers land in the live tree (#283).
+            # re-materialized conflict markers land in the live tree (#283); it imports
+            # the first-party ``ouroboros`` and ``supervisor`` packages.
             from supervisor.worker_chat_lane import preload_owner_control_path
 
             preload_owner_control_path()

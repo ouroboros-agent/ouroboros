@@ -1,4 +1,10 @@
-"""Reviewed behavior and exact event facts for one presence turn."""
+"""Reviewed behavior and exact event facts for one presence turn.
+
+The framing keeps the event's recorded source text separate from host attachment context and
+states that being shown an event does not establish who its author addresses; the addressee is
+not computed here. Sends are reported only from host delivery receipts, never from tool names
+or from a send having been prepared.
+"""
 
 from __future__ import annotations
 

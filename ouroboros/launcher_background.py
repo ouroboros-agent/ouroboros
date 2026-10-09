@@ -9,6 +9,13 @@ the question quits. A quit request (the indicator's Quit, Cmd+Q, sign-out, shutd
 and Panic never reach the question and are never cancelled. An alert never raises a
 window hidden on purpose. Linux and other hosts have no indicator: closing quits.
 
+Second launch: a manual one shows the running window (``activate_running_instance`` -> ``Background.listen``),
+an automatic one only logs. Windows signals a named auto-reset kernel event derived from the PID-lock
+path; elsewhere the loser sends SIGURG to the PID in the lock file (an older launcher without a handler
+ignores it). A lock loser never truncates the lock file. The listener starts right after the lock is
+taken; a request that arrives before pywebview has shown the window is kept until then and cancels a
+quiet start.
+
 ``DesktopApi`` is the page's alert half of the window bridge (``launcher.MainApi`` inherits it): the
 attention cue, the shell's own facts, and the system notifications of ``desktop_notifications``,
 whose click opens the window and hands the page its token; it also carries the painted palette to

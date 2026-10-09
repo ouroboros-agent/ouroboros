@@ -1,4 +1,0 @@
-560
-Two tool-registration rules with their enforcing tests: a host wrapper that forwards tool keywords
-takes its own parameters positional-only (#1574), and a read-only producer reports an admitted,
-absent target as a typed miss only after its admission guards (#1074).

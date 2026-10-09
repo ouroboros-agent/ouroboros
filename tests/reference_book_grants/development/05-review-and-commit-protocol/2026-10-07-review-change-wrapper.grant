@@ -1,6 +1,0 @@
-379
-The external PR review paragraph names the runtime review_change operation the script wraps (staged index or
-a committed base..head proposal), the installed-body execution that replaces the target-base re-run (a
-checkout already containing the proposal is refused before spend), the missing or mismatched review record as
-an INCOMPLETE cause and the operation's NOT_RUN tests; the pending-custody sentence names the record instead of
-the retired candidate checkout. The predecessor-base refusal sentence is removed.

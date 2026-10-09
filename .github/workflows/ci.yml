@@ -68,6 +68,10 @@ jobs:
       (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')
       || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
       || github.event_name == 'workflow_dispatch'
+    # The growth-mode step reads the pull request's label events.
+    permissions:
+      contents: read
+      pull-requests: read
     runs-on: ubuntu-latest
     env:
       # This job installs pytest-xdist/pytest-timeout below, so the preflight
@@ -141,6 +145,21 @@ jobs:
         timeout-minutes: 60
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
+      # Whom the reference-book rule binds (scripts/book_growth_mode.py): the size
+      # lane below blocks, warns or passes a grown book by this mode.
+      - name: Decide the reference-book growth mode
+        id: book_mode
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          EVENT: ${{ github.event_name }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: python scripts/book_growth_mode.py
       # OFFICIAL-CI-ONLY enforcement of the repository size gates: manifest
       # exactness against this tree plus the pairwise base-vs-tip shrink-only
       # transition. Local runs exclude the `size_ratchet` marker and surface
@@ -157,6 +176,7 @@ jobs:
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          OURO_BOOK_GROWTH_MODE: ${{ steps.book_mode.outputs.mode }}
         run: python -m pytest tests/ -m size_ratchet -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/size"
       - name: Guard extracted transport imports stay out of core
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
@@ -220,6 +240,10 @@ jobs:
       || startsWith(github.ref, 'refs/tags/v')
       || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
       || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros' && github.repository == 'razzant/ouroboros')
+    # The growth-mode step reads the pull request's label events.
+    permissions:
+      contents: read
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
@@ -284,6 +308,21 @@ jobs:
         timeout-minutes: 60
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
+      # Whom the reference-book rule binds (scripts/book_growth_mode.py): the size
+      # lane below blocks, warns or passes a grown book by this mode.
+      - name: Decide the reference-book growth mode
+        id: book_mode
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          EVENT: ${{ github.event_name }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: python scripts/book_growth_mode.py
       # Same size-ratchet enforcement contract as quick-test (see its comment).
       # PRs carry their base SHA; branch pushes carry event.before; dispatch runs leave
       # the env empty and tag pushes carry an all-zeros before — both degrade to
@@ -295,6 +334,7 @@ jobs:
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          OURO_BOOK_GROWTH_MODE: ${{ steps.book_mode.outputs.mode }}
         run: python -m pytest tests/ -m size_ratchet -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/size"
       - name: Guard extracted transport imports stay out of core
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}

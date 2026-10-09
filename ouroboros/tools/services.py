@@ -1,4 +1,11 @@
-"""Task-scoped long-running service manager."""
+"""Task-scoped long-running service manager.
+
+``service_execution_facts`` is the only source of the sleep ``services`` selector:
+the real Popen return code for host and local-executor services; a Docker service
+reports no return code (its ``kill -0`` probe status is not the service's) and an
+inconclusive probe reads ``unknown``. The park loop polls it about every second as
+host work, never a model round.
+"""
 
 from __future__ import annotations
 
@@ -191,6 +198,15 @@ def _stop_record(record: ServiceRecord, *, wait: bool = True) -> None:
 def _finalize_service_log_for_drive(
     drive_root: pathlib.Path, record: ServiceRecord, *, log_path: pathlib.Path | None = None,
 ) -> Dict[str, Any]:
+    """Capture a service log's tail and full blob, then delete the live log.
+
+    Secrets known to ``record`` are masked in both. The live log is deleted only
+    once its blob is stored (or it is already gone); an oversized log
+    (``full_log_omitted``) or a failed capture (``errors``) leaves it in place and
+    reports ``retained_live_log_path``. The executor stop path calls this before it
+    forgets the record's secret values, and only after termination is confirmed; an
+    unconfirmed stop keeps the record for a later cleanup.
+    """
     result: Dict[str, Any] = {"deleted_live_log": False, "full_log_ref": {}, "tail": "", "errors": []}
     log_path = log_path if log_path is not None else record.log_path
     try:

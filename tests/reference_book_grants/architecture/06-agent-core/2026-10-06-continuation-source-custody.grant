@@ -1,2 +1,0 @@
-133
-Snapshot adoption retains unresolved source requests and verified ranges alongside the successor request; the existing apply gate covers the cumulative patch.

@@ -1,6 +1,0 @@
-748
-The "Change review on any root" subsection names how a composed panel reaches the wave:
-`reviewer_slot_config.composed_review_panel`, a context-local override every slot reader sees for
-exactly that wave (pool threads inherit it through `contextvars.copy_context`; a concurrent wave keeps
-the configured panel), disclosed as the one deviation from the DEVELOPMENT 06 plan-review rule that
-`reviewer_effort` travels as an argument and never as a contextvar (integrator decision R9.2).

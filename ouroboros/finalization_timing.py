@@ -3,6 +3,13 @@
 Task-local clocks follow the last model answer through the existing event queue
 and journal. Durable copies omit the sidecar because monotonic origins cannot
 survive a reboot. Observability re-exports the public helpers for existing callers.
+
+Latency stamps are telemetry, never gates. Upstream of this module:
+``chat.jsonl`` inbound rows carry ``message_accepted_at``, ``task_received``
+carries ``activity_emitted_at``, and request/response manifests and ``llm_round``
+carry ``first_request_at``/``first_answer_at``. This module adds the finalization
+phases, which ride the live final event, and one ``task_finalization_timing`` row
+in ``events.jsonl`` written after the sender returns.
 """
 
 from __future__ import annotations

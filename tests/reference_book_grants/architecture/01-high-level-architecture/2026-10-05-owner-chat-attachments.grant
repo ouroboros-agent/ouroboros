@@ -1,2 +1,0 @@
-506
-The module map names chat_uploads.py (the one owner-attachment store), confined_files.py (its confined reader) and gateway/attachment_contracts.py (the typed attachment shapes).

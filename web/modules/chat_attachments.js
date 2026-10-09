@@ -332,8 +332,11 @@ function keptFrame(frame) {
  * (or echoed before a deferred dispatch): the frame waits for the next fact. A saved row
  * with none of the three came from a host process that has since ended (a restart came
  * between): whether it reached the agent is unknown and Send again would only rejoin
- * it, so its bubble says "Saved; delivery not confirmed" and the frame is dropped. Nothing
- * here resends by itself or deletes an upload: those stay on the host.
+ * it, so its bubble says "Saved; delivery not confirmed" and the frame is dropped. Bubble
+ * labels (markIngressSaved): `Input saved` on `ingress_dispatched` and `ingress_pending`,
+ * `Saved, not delivered.` (frame kept) on `ingress_undispatched`. `count` feeds the chat
+ * instance's `hasPendingWork`, which keeps a Project room holding one hidden instead of
+ * destroying it. Nothing here resends by itself or deletes an upload: those stay on the host.
  */
 export function createUnconfirmedSends({ send, root, onDomWrite, showToast, storage = null, storageKey = '' }) {
     const frames = new Map();  // id -> { frame, views, ts, restored }

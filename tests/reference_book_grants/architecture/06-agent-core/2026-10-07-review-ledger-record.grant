@@ -1,2 +1,0 @@
-3695
-The "Review ledger record" subsection: the one durable per-wave record the commit gate writes after aggregation (subject, brief, panel with normalized observed-model distinctness, per-seat requested/effective/observed facts and retained source refs, verdict reduction), its honesty rules (pending settles by revision, $0 exits are NOT_DISPATCHED, author continuation notes a decision instead of buying a record) and the retain-before-index rule of its hot index.

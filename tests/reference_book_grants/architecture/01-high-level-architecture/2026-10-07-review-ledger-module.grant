@@ -1,2 +1,0 @@
-471
-The module map row for ouroboros/review_ledger.py: the durable per-wave review ledger record, its hot index and contract version, what it records and that the gate writes it after aggregation without reading it.

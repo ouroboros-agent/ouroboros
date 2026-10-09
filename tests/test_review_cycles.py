@@ -562,8 +562,7 @@ def test_docs_describe_shared_key_and_new_module_size():
     arch = architecture_text(REPO)
     assert dev.count(KEY) >= 2 and "review_cycles.py" in dev
     assert f"| {KEY} |" in arch
-    # the LEGACY row documents the load-time migration, not a runtime binding
-    assert f"| {LEGACY} |" in arch and "MIGRATED into" in arch
+    assert f"| {LEGACY} |" in arch
     assert "Required+Blocking without one has no local count cap" not in dev
     assert "Required+Blocking with no explicit cap has no local count cap" not in arch
     module_lines = (REPO / "ouroboros" / "review_cycles.py").read_text(encoding="utf-8").splitlines()

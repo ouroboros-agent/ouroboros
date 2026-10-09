@@ -1,4 +1,0 @@
-386
-`commit_reviewed` lands only in the system repository and refuses any other `root` with a typed
-TOOL_ARG_ERROR; a project copy or another registered root is reviewed with `review_change` and committed there
-with ordinary git.
