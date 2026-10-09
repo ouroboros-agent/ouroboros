@@ -345,7 +345,7 @@ def test_partial_index_publication_repeated_operation_recovers_truthfully(tmp_pa
 def test_legacy_index_prose_is_disclosed_until_authored_overview_and_presence_still_reads(tmp_path):
     _, registry, address, note = setup(tmp_path)
     legacy = f"Older prose about {TOPIC}: {SUMMARY}\n"
-    (address.shelf / store.INDEX_FILE).write_text(legacy)
+    (address.shelf / store.INDEX_FILE).write_text(legacy, encoding="utf-8", newline="")
     receipt(transition(registry, note))
     text = registry.execute("knowledge_list", {})
     assert legacy in text and "may still mention archived notes" in text

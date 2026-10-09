@@ -98,7 +98,7 @@ def snapshot(root):
 
 def verdict(drive):
     path = task_artifact_dir_path(drive, "parent") / "subagent_patch_verdict_child.json"
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def assert_unabsorbed(drive):
