@@ -333,12 +333,12 @@ def _save_state_unlocked(drive_root: pathlib.Path, state: AdvisoryReviewState) -
     path = drive_root / _STATE_RELPATH
     path.parent.mkdir(parents=True, exist_ok=True)
     _prepare_state_for_persistence(state)
-    # Legacy/in-memory callers may construct pre-author-disposition
-    # CommitAttemptRecord objects directly.  Normalize the additive field before
-    # dataclasses.asdict so persistence remains backward compatible.
+    # Legacy/in-memory callers may construct records predating these additive
+    # mappings. Normalize before asdict without replacing an existing binding.
     for attempt in state.attempts:
-        if not hasattr(attempt, "author_disposition"):
-            setattr(attempt, "author_disposition", {})
+        for name in ("author_disposition", "review_input"):
+            if not hasattr(attempt, name):
+                setattr(attempt, name, {})
     data: Dict[str, Any] = {
         "state_version": _STATE_SCHEMA_VERSION,
         "schema_version": _STATE_SCHEMA_VERSION,

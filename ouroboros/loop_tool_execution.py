@@ -1348,7 +1348,7 @@ def _maybe_auto_attach_image(
 
 
 def reclaim_trace_refs(tool_ctx: Any) -> Dict[str, Any]:
-    """Per-task {tool_call_id: trace_ref} accumulated as tool results append."""
+    """Legacy diagnostic map; exact compaction custody belongs to each result row."""
     refs = getattr(tool_ctx, "_tool_trace_refs", None)
     return refs if isinstance(refs, dict) else {}
 
@@ -1400,7 +1400,7 @@ def process_tool_results(
         record_tool_activity(ctx, exec_result)
     from ouroboros.artifacts import task_id_for_artifacts
 
-    results = prepare_producer_sources(results, ctx.drive_root if ctx is not None else None,
+    results = prepare_producer_sources(results, getattr(ctx, "drive_root", None),
                                        task_id_for_artifacts(ctx) if ctx is not None else "")
     review_updates, review_pending = [], {}
     if ctx is not None and getattr(ctx, "_pending_review_context", None):
@@ -1444,8 +1444,8 @@ def process_tool_results(
             except Exception:
                 log.debug("Failed to acknowledge injected delegate wake", exc_info=True)
 
-        # Retain the pre-truncation trace ref per tool_call_id so the context
-        # reclaim materializer can bind exact tool CAS refs into its capsules.
+        # Keep the call-ID map for diagnostic callers. Compaction takes exact
+        # provenance from the occurrence-bound record on the canonical row.
         trace_ref = exec_result.get("trace_ref")
         if ctx is not None and isinstance(trace_ref, dict) and trace_ref:
             refs = getattr(ctx, "_tool_trace_refs", None)

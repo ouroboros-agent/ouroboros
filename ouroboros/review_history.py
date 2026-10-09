@@ -113,8 +113,6 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
     task/checkout attempt bindings. Links survive heavy-payload retirement; a
     legacy missing link remains a gap beside whatever the attempt still knows.
     """
-    from ouroboros.review_ledger import load_record
-
     if isinstance(history, dict) and history.get("kind") == "review_dispute_history":
         return copy.deepcopy(history)
     rounds, gaps, seen_text, records, done, visiting, referenced = [], [], {}, {}, set(), set(), set()
@@ -139,6 +137,7 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
         if rid in done:
             continue
         try:
+            from ouroboros.review_ledger import load_record
             record = load_record(drive_root, rid)
             if not record:
                 raise ValueError("known review record is unavailable")
@@ -150,7 +149,7 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
             visiting.add(rid)
             stack.append((rid, True))
             stack.extend((p, False) for p in reversed(prior))
-        except (OSError, KeyError, TypeError, ValueError) as exc:
+        except (ImportError, OSError, KeyError, TypeError, ValueError) as exc:
             gaps.append(_gap(str(exc), record_id=rid))
             done.add(rid)
     if previous_records is None:
@@ -280,3 +279,38 @@ def wave_history_input(drive_root: Any, facts: dict, subject: dict, record_id: s
     except (OSError, TypeError, ValueError) as exc:
         return {"previous_records": [], "gaps": [_gap(
             f"wave input binding could not be read ({type(exc).__name__})", record_id=record_id)]}
+
+
+def render_history_with_obligations(history: Any, *, drive_root: Any, repo_root: Any, task_id: str = "") -> str:
+    """The prior-rounds section with the repository's durable open obligations
+    (anti-thrashing across restarts) — the ONE owner for every brief that carries
+    history: the gate's packet, the retrieving seats' brief and the public builder,
+    so a brief rebuilt outside the gate reads the history the seat was sent.
+    Unreadable state is a source gap beside the available history, never a
+    claim that the durable obligations are empty. This is not a verdict gate."""
+    open_obligations: list = []
+    gap = ""
+    if drive_root is not None and repo_root is not None:
+        try:
+            from ouroboros.review_state import _load_state_unlocked, make_repo_key
+
+            state = _load_state_unlocked(pathlib.Path(drive_root), strict_attempt_authority=True)
+            open_obligations = state.get_open_obligations(repo_key=make_repo_key(pathlib.Path(repo_root)))
+        except Exception as exc:
+            gap = ("\nREVIEW_HISTORY_SOURCE_UNAVAILABLE: durable obligations could not be read "
+                   f"({type(exc).__name__}); source: {pathlib.Path(drive_root) / 'state/advisory_review.json'}. "
+                   "The available history below is incomplete.\n")
+    dispute = review_dispute_history(history, drive_root=drive_root, repo_root=repo_root, task_id=task_id)
+    if task_id and drive_root is not None:
+        from ouroboros.review_history_view import selected_review_history
+        dispute = selected_review_history(dispute, drive_root=drive_root, task_id=task_id)["history"]
+    from ouroboros.tools.review_prompt_text import build_review_history_section
+    section = build_review_history_section(dispute["rounds"], open_obligations=open_obligations)
+    if dispute.get("authored_view"):
+        section += "\n### Author's selected account of earlier review sources\n\n" + json.dumps(
+            dispute["authored_view"], ensure_ascii=False, sort_keys=True) + "\n"
+    if dispute["decision_rows"] or dispute["gaps"]:
+        section += "\n### Recorded review dispute index\n\n```json\n" + json.dumps({
+            "status": dispute["status"], "decision_rows": dispute["decision_rows"], "gaps": dispute["gaps"]},
+            ensure_ascii=False, sort_keys=True, default=str) + "\n```\n"
+    return gap + section

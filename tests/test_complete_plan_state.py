@@ -74,7 +74,7 @@ def test_large_operative_values_persist_once_and_rehydrate_for_consumers(tmp_pat
     assert task_results.load_plan_review_state(tmp_path, "large-plan")["cycles_paid"] == 1
 
 
-def test_full_plan_review_disposition_repeat_and_tail_delta(_harness):
+def test_full_plan_review_disposition_repeat_and_tail_delta(_harness, monkeypatch):
     from tests.test_plan_review_engine import CLEAN, _call, _control, _finding, _state, _user_text
     from ouroboros.tools.plan_review import _apply_disposition
 
@@ -99,6 +99,14 @@ def test_full_plan_review_disposition_repeat_and_tail_delta(_harness):
     assert _raw_state(_harness.drive, "task-1")["waves"][-1]["spec"] == {}
     changed = deepcopy(spec)
     changed["in_scope"][0] = changed["in_scope"][0].replace("TAIL_A", "TAIL_B")
+    # Full prior subjects now travel with the dispute. A too-small synthetic
+    # reviewer window refuses before payment; a larger declared route tests the
+    # persistence/continuity contract without deleting history to make it fit.
+    refused = _call(ctx, changed, goal=goal)
+    assert "PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE" in refused
+    assert len(substrate.calls) == 1 and _state(_harness)["cycles_paid"] == 1
+    from ouroboros import reviewer_window
+    monkeypatch.setattr(reviewer_window, "reviewer_context_window", lambda *a, **k: 2_000_000)
     assert _control(_call(ctx, changed, goal=goal))["outcome"] == "GREEN"
     assert len(substrate.calls) == 2 and _state(_harness)["cycles_paid"] == 2
     sent = _user_text(substrate.calls[-1]["request"].messages[-1]["content"])

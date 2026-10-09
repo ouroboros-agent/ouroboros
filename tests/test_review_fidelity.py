@@ -905,3 +905,18 @@ class TestGitCommitFailureForensicMetadata:
             ca = state.attempts[-1]
             assert ca.triad_models == ctx._last_triad_models
             assert ca.scope_model == ctx._last_scope_model
+
+
+def test_additive_review_input_legacy_default_and_existing_binding_survive(tmp_path):
+    from ouroboros.review_state import AdvisoryReviewState, save_state, load_state
+    legacy, bound = _make_commit_attempt([]), _make_commit_attempt([])
+    legacy.attempt, bound.attempt = 1, 2
+    bound.review_input = {"previous_records": ["rl-exact"], "rebuttal": {"sha256": "a" * 64}}
+    state = AdvisoryReviewState()
+    state.attempts = [legacy, bound]
+    assert not hasattr(legacy, "review_input")
+    save_state(tmp_path, state)
+    loaded = {row.attempt: row for row in load_state(tmp_path).attempts}
+    assert loaded[1].review_input == {}
+    assert loaded[2].review_input == bound.review_input
+    assert legacy.review_input == {} and bound.review_input["previous_records"] == ["rl-exact"]

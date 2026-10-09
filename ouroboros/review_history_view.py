@@ -491,10 +491,12 @@ def review_context_updates(ctx: Any, *, families: Mapping[str, str] | None = Non
     Exact bodies already in canonical messages are not appended twice. Current
     index snapshots remain append-only until the actor's checkpointed compaction.
     """
+    pending = dict(families if families is not None else getattr(ctx, "_pending_review_context", {}) or {})
+    if not pending:
+        return [], {}
     from ouroboros.review_history import review_dispute_history
 
     root, task = getattr(ctx, "budget_drive_root", None) or ctx.drive_root, str(ctx.task_id)
-    pending = dict(families if families is not None else getattr(ctx, "_pending_review_context", {}) or {})
     known = {_sha(row[REVIEW_HISTORY_MESSAGE_KEY].get("binding")) for row in messages
              if isinstance(row.get(REVIEW_HISTORY_MESSAGE_KEY), dict)}
     indexes = {(_sha(row[REVIEW_CONTEXT_INDEX_KEY])) for row in messages if isinstance(row.get(REVIEW_CONTEXT_INDEX_KEY), dict)}
@@ -540,8 +542,10 @@ def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Seq
         and (row["content"][0].get("_context_capsule") or {}).get("unit_id") == "view:" + str(receipt.get("selection_fingerprint") or "")), None)
     if capsule is None:
         return None, None, [], None
-    root, task = getattr(ctx, "budget_drive_root", None) or ctx.drive_root, str(ctx.task_id)
     covered = [ref for ref in _actor_capsule(capsule).get("source_refs", []) if isinstance(ref, dict) and ref.get("kind") == BODY_KIND]
+    if not covered and not transfers and not any(REVIEW_CONTEXT_INDEX_KEY in row for row in candidate):
+        return None, capsule, [], None  # Ordinary authored notes do not open review state.
+    root, task = getattr(ctx, "budget_drive_root", None) or ctx.drive_root, str(ctx.task_id)
     inherited = []
     saved = (load_task_result(root, task, strict=True) or {}).get(SELECTED_VIEW_FIELD)
     if saved:

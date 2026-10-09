@@ -263,3 +263,18 @@ def test_task_selection_locked_compare_preserves_lifecycle_and_rejects_stale_wri
     assert load_task_result(tmp_path, ctx.task_id, strict=True)[SELECTED_VIEW_FIELD] == first
     second = publish_review_history_view(ctx, capsule(bound, text="New account"), {"status": "applied"}, expected_selection=first)
     assert second != first and load_task_result(tmp_path, ctx.task_id, strict=True)[SELECTED_VIEW_FIELD] == second
+
+
+def test_no_review_updates_or_sources_do_not_require_review_state(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import review_history_view as view, task_results
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unrelated authored context must not open review task state")
+    monkeypatch.setattr(task_results, "load_task_result", forbidden)
+    empty = SimpleNamespace()
+    assert view.review_context_updates(empty) == ([], {})
+    assert view.review_context_updates(empty, families={}) == ([], {})
+    account = capsule([])
+    meta = account["content"][0]["_context_capsule"]
+    meta["unit_id"] = "view:ordinary"
+    assert view.prepare_review_view(empty, [account], {"selection_fingerprint": "ordinary"}, ()) == (None, account, [], None)

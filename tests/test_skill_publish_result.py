@@ -491,7 +491,9 @@ def test_typed_failed_publish_is_delivered_to_the_next_llm_turn():
     )
 
     assert errors == 1
-    assert messages == [{"role": "tool", "tool_call_id": "publish-1", "content": result}]
+    assert [{k: v for k, v in row.items() if k != "_tool_result_record"} for row in messages] == [
+        {"role": "tool", "tool_call_id": "publish-1", "content": result}]
+    assert messages[0]["_tool_result_record"]["facts"]["is_error"] is True
     assert trace["tool_calls"][0]["status"] == "tool_reported_failure"
     assert trace["tool_calls"][0]["skill_publish_attempt"]["status"] == "scanner_blocked"
 
