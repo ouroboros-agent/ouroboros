@@ -1411,12 +1411,19 @@ def process_tool_results(
         from ouroboros.review_history_view import review_context_updates
         review_pending = dict(ctx._pending_review_context)
         review_updates, _ = review_context_updates(ctx, families=review_pending, messages=messages)
-    # Materialize the same image blocks once before fitting the completed batch.
-    # Publish them only after its contiguous tool results and resident updates.
-    image_messages: list = []
-    image_observations = [_maybe_auto_attach_image(row, tools, staged_messages=image_messages) for row in results]
-    views = _deliver_tool_results(ctx, results, messages, tool_schemas, fit_candidate, llm_trace,
-                                  [*review_updates, *image_messages])
+    from ouroboros.tools.owner_delivery import pending_owner_dialogue, acknowledge_owner_dialogue
+    dialogue_updates = pending_owner_dialogue(ctx)
+    # Eviction sees old + new images on one private candidate. Adopt that exact
+    # projection only after fitting, with new images after the whole tool block.
+    # Eviction replaces content-list entries; the rest of each old row is reused.
+    image_history = [{**row, "content": list(row["content"])} if isinstance(row.get("content"), list)
+                     else row for row in messages]
+    history_count = len(messages)
+    image_observations = [_maybe_auto_attach_image(row, tools, staged_messages=image_history) for row in results]
+    image_messages = image_history[history_count:]
+    views = _deliver_tool_results(ctx, results, image_history[:history_count], tool_schemas, fit_candidate, llm_trace,
+                                  [*review_updates, *dialogue_updates, *image_messages])
+    messages[:] = image_history[:history_count]
 
     for exec_result, view in zip(results, views):
         if ctx is not None:
@@ -1566,6 +1573,8 @@ def process_tool_results(
     # These resident facts and exact bodies were included before allocation. Append
     # only after the complete assistant/tool block, before an owner-wait can park.
     messages.extend(review_updates)
+    messages.extend(dialogue_updates)
+    acknowledge_owner_dialogue(ctx, dialogue_updates)
     if ctx is not None:
         pending = dict(getattr(ctx, "_pending_review_context", {}) or {})
         for key, value in review_pending.items():
