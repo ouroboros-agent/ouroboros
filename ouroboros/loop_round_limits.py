@@ -993,13 +993,31 @@ def _publish_reclaimed_transcript(ctx: Any, rebuilt: list) -> None:
 
 
 def _run_emergency_address_pass(ctx: Any, disposition: Any, *, rung: str) -> Any:
-    """Model-free rungs: obsolete host copies, then unnoted tool bodies, become typed facts with addresses."""
+    """Publish a model-free source view, measuring the sealed candidate with its next facts line."""
     from ouroboros.context_budget import ContextReclaimRequest
     from ouroboros.context_compaction import context_reclaim_transcript_sha256, emergency_address_view
     from ouroboros.tools.compact_context import owner_protected_texts
+    from ouroboros.loop_messages import append_context_facts
 
     measurement = disposition.measurement
     tool_ctx = ctx.tools._ctx
+
+    def measure_candidate(messages: list) -> int:
+        trial = copy.copy(ctx)
+        trial.messages = copy.deepcopy(messages)
+        trial.accumulated_usage = dict(ctx.accumulated_usage)
+        trial.tools = copy.copy(ctx.tools)
+        trial.tools._ctx = copy.copy(tool_ctx)
+        trial.tools._ctx.messages = trial.messages
+        trial.tools._ctx._accumulated_usage = trial.accumulated_usage
+        # The baseline is the current refused transcript, not a hypothetical
+        # reprepare with another facts line. Only replacements earn new send facts.
+        if messages is not ctx.messages:
+            _loop().seal_task_transcript(trial.messages)
+            append_context_facts(trial)
+        measured = _loop()._measure_round_main_fit(trial, automatic_pass_used=True)
+        return measured.measurement.estimated_input_tokens
+
     request = ContextReclaimRequest(
         route_fp=measurement.route_fp, round_id=measurement.round_id,
         transcript_sha256=context_reclaim_transcript_sha256(ctx.messages),
@@ -1009,6 +1027,8 @@ def _run_emergency_address_pass(ctx: Any, disposition: Any, *, rung: str) -> Any
     rebuilt, receipt = emergency_address_view(
         ctx.messages, request, rung=rung,
         protected_texts=owner_protected_texts(tool_ctx),
+        observation=getattr(tool_ctx, "_last_context_observation", {}) or {},
+        measure_candidate=measure_candidate,
         trace_refs_by_tool_call_id=reclaim_trace_refs(tool_ctx),
         drive_root=pathlib.Path(ctx.drive_root or ctx.drive_logs.parent), task_id=ctx.task_id,
     )
