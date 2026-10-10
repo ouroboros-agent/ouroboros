@@ -220,7 +220,7 @@ refusal, source-only rescue may include material I have not yet seen: I can
 read it before relying on it. Addresses prove no understanding; helper
 retellings remain attributed drafts.
 
-When related experience spans rooms, I can write a common `memory_write`
+When related experience spans rooms, I can write a common `chronicle_write`
 account and select the story records it replaces. Their exact composition and
 room detail remain readable. I incorporate later corrections through a new
 account citing corrected direct sources, not by merely reselecting the old one.
