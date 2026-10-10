@@ -580,14 +580,11 @@ export function createChatMedia({
         }, undefined, item);
         listen(action('copy'), 'click', async () => {
             try {
-                const blob = await sourceBlob(sourceRef, mime);
-                if (navigator.clipboard?.write && typeof ClipboardItem === 'function') {
-                    await navigator.clipboard.write([new ClipboardItem({ [blob.type || mime]: blob })]);
-                } else if (navigator.clipboard?.writeText) {
-                    await navigator.clipboard.writeText(source);
-                } else {
-                    throw new Error('Clipboard access is unavailable');
+                if (!navigator.clipboard?.write || typeof ClipboardItem !== 'function') {
+                    throw new Error('copying images is not available here. Use Open in new tab or Download.');
                 }
+                const blob = await sourceBlob(sourceRef, mime);
+                await navigator.clipboard.write([new ClipboardItem({ [blob.type || mime]: blob })]);
                 showToast('Image copied.', 'ok');
             } catch (error) {
                 showToast(`Could not copy image: ${error?.message || error}`, 'error');

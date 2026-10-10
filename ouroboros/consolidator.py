@@ -412,10 +412,12 @@ def _call_consolidation_llm(
                 provider=route["provider"], reasoning_effort=values["reasoning_effort"],
             ) * density)
         window = int(evidence.window_tokens) if is_known(evidence, require_fresh=True) else None
-        output_reserve = values["max_tokens"]
+        from ouroboros.response_limits import ResponseLimit
+        output_reserve = ResponseLimit(**(getattr(evidence, "response_limit", {}) or {})).ceiling(values["max_tokens"])
         if values["use_local"]:
             from ouroboros.llm_local import local_context_limits
             _local_window, output_reserve = local_context_limits(output_reserve)
+        values["max_tokens"] = output_reserve
         limit = window - output_reserve if window is not None else None
         binding = dict(route_fp=evidence.route_fp, capacity_tokens=window, output_reserve_tokens=output_reserve)
         byte_limit = (input_limit["input_bytes"] if input_limit

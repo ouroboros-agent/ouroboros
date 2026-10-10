@@ -117,11 +117,11 @@ def review_row_call_usd(row: Any, *, allow_live_fetch: bool = True) -> Optional[
     its ``slot_id``, ``model``, ``profile_id`` and ``processing_preference``.
 
     A full call is the row's calibrated input cap inside its reviewer window (the fit ladder's
-    bound, at most ``REVIEW_PROMPT_TOKEN_BUDGET``) plus the review output reservation, priced
-    by the reservation math a review wave is admitted with. A packet reviewer makes one such
-    call per review; a reading reviewer makes several, each reserved as it is sent, so this
-    never bounds a whole review. ``None`` is unknown, never zero; a local route is the known
-    zero (``pricing.estimate_cost_optional`` prices route ``local`` at ``0.0``).
+    bound, at most ``REVIEW_PROMPT_TOKEN_BUDGET``) plus the review output reservation within the
+    route's known maximum response, priced by the reservation math a review wave is admitted with.
+    A packet reviewer makes one such call per review; a reading reviewer makes several, each
+    reserved as it is sent, so this never bounds a whole review. ``None`` is unknown, never zero;
+    a local route is the known zero (``pricing.estimate_cost_optional`` prices route ``local`` at ``0.0``).
 
     ``allow_live_fetch=False`` keeps the whole measurement in this process: the tariff AND
     the reviewer window are read as already held (an unevidenced window prices at the full
@@ -137,11 +137,11 @@ def review_row_call_usd(row: Any, *, allow_live_fetch: bool = True) -> Optional[
         if review_model_uses_local(model) if use_local is None else use_local:
             return 0.0
         from ouroboros.reviewer_window import reviewer_context_window, reviewer_window_binding, window_scaled_reserves
-        from ouroboros.tools.review_multi_model import _review_output_budget
+        from ouroboros.tools.review_multi_model import review_output_allowance
         from ouroboros.usage_admission import review_wave_admission
 
-        output = _review_output_budget()
-        window = reviewer_context_window(model, allow_fetch=allow_live_fetch, **reviewer_window_binding(row))
+        window = reviewer_context_window(model, allow_fetch=allow_live_fetch, **(binding := reviewer_window_binding(row)))
+        output = review_output_allowance(model, window, **binding)
         reserve, margin = window_scaled_reserves(window, output_reserve=output, tokenizer_margin=50_000)
         prompt = max(0, calibrated_input_token_limit(
             model, context_window=window, output_reserve=reserve, tokenizer_margin=margin))

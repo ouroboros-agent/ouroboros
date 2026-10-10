@@ -214,6 +214,14 @@ without becoming an allowlist. A saved unknown model remains editable; a
 catalog refresh preserves the real input, selection and composition. Escape
 or blur closes suggestions without assigning a value. Selected, hover, focus,
 disabled and invalid states have different meanings and remain distinguishable.
+Availability never rewrites a selection: a Claude `[1m]` variant whose base
+model a usable account lists reads Available, noting that the engine checks the
+variant at session start, and an unread catalog reads Not checked. Maximum
+response sits beside the context window as Auto or a whole number for this
+exact model, server and account; Apply acknowledges it outside the Settings
+draft, and a route change clears it. Web search is its own Source and Model:
+Auto lists the routes it may use, a chosen source is strict, and skills, MCP
+and browser tools stay independent.
 
 Tabs expose one selected view and one keyboard entry point. Arrow keys and
 Home/End move through available tabs; restoring a selected tab reveals it by
@@ -1092,6 +1100,8 @@ file (owner choice 1C/2A/3A/4A/5A/6A with mobile first-class).
   visible and finger-sized under a coarse pointer; a long name wraps to two lines
   and the card's dialog shows it whole. Open/Save succeed only when the desktop
   bridge says so; a copied link is a fallback, never reported as opened.
+  The photo's Copy to clipboard puts the image itself there or says it could
+  not (Open in new tab and Download stay); it never copies an address instead.
 - **The same view everywhere:** the sender's bubble, another tab and the replay
   after reload or restart render the one server view of each attachment. The
   stored text still names the files for the model; only the exact tail the web
@@ -1297,7 +1307,9 @@ retains the engine's reset forecast and keeps automatic continuation without
 claiming quota exhaustion or guaranteed availability. It never offers sign-in.
 Only confirmed quota pauses the execution clock; authentication and unconfirmed
 availability waits consume it. Calendar deadlines remain fixed. Configured
-fallback routes are tried before a wait card is shown.
+fallback routes are tried before a wait card is shown. Work continuing on a
+fallback is not a wait: nothing claims the primary recovered, the model alone
+asks to return, and only the primary's own accepted reply counts as a return.
 
 A submitted action is shown as pending until the task reports its application.
 A saved Settings change and a still-pending task change are disclosed separately.
@@ -1402,13 +1414,29 @@ a server entry):
    card the chip repeats the header and is dropped.
 2. **Name** — `--type-body` semibold, `--text-primary`. The one primary thing.
 3. **Identity detail** (email, plan) — `--type-meta`, `--text-meta`.
-4. **Status** — dot + text from the status pairs.
+4. **Status** — dot + a factual label from the status pairs. On Agents cards,
+   use one short availability label; its sentence is the title, and is said
+   under the head when it adds a specific pin, model or limit. Other row types
+   keep the status wording their own contract requires.
 5. **Meta line** — `--type-meta`, `--text-meta`, on its own line under the
    name. Quantities are stated in human words ("38% used · resets in 2h"), and
    an instant is humanized. A row never leads with a raw ISO timestamp.
-6. **Actions** — docked right, legible at rest. A control rendered at
-   secondary ink reads as disabled; if the owner can click it, it is
+6. **Actions** — docked right in a slot of their own, legible at rest. A control
+   rendered at secondary ink reads as disabled; if the owner can click it, it is
    `--text-primary`.
+
+**Information has a place, not a permanent caption.** A row keeps its identity,
+primary choices and current exceptions visible (a specific refusal, a mark that
+no longer acts, an error); a rule shared by every row is said once for the
+section, never as a caption on every row; history, provenance, stored spellings
+and secondary explanations wait behind one explicit disclosure that pointer and
+keyboard open, never behind hover alone. New copy serves a concrete decision or error and adds meaning no
+control or status already carries: a checked box is not re-said beside it, and
+an unsaved draft is said once by the editor or its host page, not on every row. A conditional
+line never moves the control that caused it: controls own stable slots, and a
+line an edit toggles opens beside or below them. Clarity comes from placement,
+never from smaller text, tooltip-only meaning or a line quota; real exceptions
+all stay.
 
 For a row with one action and a durable result, the result occupies the flexible
 left side and the neutral action stays docked on the right. Field-level actions
@@ -1454,8 +1482,8 @@ suggestion's transport is the selected source; any id can still be typed. The
 stored spellings (`provider::model`, `claudexor::source=model`,
 `harness=model`) are serialization authored by the editor: never required from
 the owner, never a field placeholder or help-text instruction, never the
-primary displayed value; the exact stored id may appear in a meta line or
-tooltip. A configured-subagent reference is the one place a stored spelling
+primary displayed value; the exact stored id may appear in secondary details
+(Agents use Details & history). A configured-subagent reference is the one place a stored spelling
 names a thing: a roster row is labelled by its handle — its route target plus
 the facets that row really runs with, defaults omitted — because a friendlier
 stored label rots as soon as the owner re-points the row. The route identity chip names the source (API · OpenAI, Codex · model,

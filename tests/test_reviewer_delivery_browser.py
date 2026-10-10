@@ -181,6 +181,6 @@ def test_a_marked_row_round_trips_through_the_real_gateway(subscription_ui, sett
         page.locator("#btn-reload-settings").click()
     facts = page.locator("[data-subagent-review-facts]").first
     # Save's own re-read and Reload each repaint the card before their pool read lands.
-    expect(facts, "a custom endpoint has no known tariff; unknown is never zero").to_contain_text("cost unknown")
-    expect(facts).to_contain_text("In the review pool")
+    expect(facts, "a custom endpoint has no known tariff; unknown is never zero").to_have_text("cost unknown")
+    expect(page.locator("[data-subagent-delivery-cost]").first).to_have_text("cost unknown")
     roles.capture(page, "reviewer-real-gateway-marked")

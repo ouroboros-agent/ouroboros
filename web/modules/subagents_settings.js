@@ -18,7 +18,7 @@ import {
 import { modelChooserHtml, bindModelChoosers } from './model_chooser.js';
 import { mergeModelCatalog, catalogReadNote, mergeHarnessModelCatalog } from './settings_catalog.js';
 import {
-    harnessMap, reviewTwinAllowed, rowIdentity, rowMeta, rowStatus, rowStatusReason, sessionRouteVerdict,
+    harnessMap, reviewTwinAllowed, rowIdentity, rowMeta, rowStatus, rowStatusReason, rowTaskRun, sessionRouteVerdict,
 } from './subagent_status_primitives.js';
 import { revealNewRow } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
@@ -257,13 +257,13 @@ export function reviewCostText(row, cost = null) {
     return row?.delivery === 'packet' ? text : `${text}; a reading reviewer makes several`;
 }
 
-/** What actually ran the last time this row reviewed, with its review record. */
+/** What actually ran the last time this row reviewed, with its review record (the card's "Last review"). */
 export function lastReviewRunText(entry) {
     const text = describeExecutionEvidence(entry?.effective || !entry?.observed_model ? entry
         : { ...entry, effective: { model: entry.observed_model } });
     if (!text) return '';
     const record = String(entry?.review_record_id || entry?.record_id || '');
-    return `Last run as ${text}${record ? ` (record ${record})` : ''}`;
+    return `${text}${record ? ` · record ${record}` : ''}`;
 }
 
 const reviewCostKey = (row, inherited) => JSON.stringify([
@@ -271,47 +271,57 @@ const reviewCostKey = (row, inherited) => JSON.stringify([
 ]);
 const UNKNOWN_COST = Object.freeze({ usd_per_review: null, basis: 'unknown' });
 
-function reviewFacts(row, state) {
-    const marked = row.review_eligible === true;
-    const facts = [];
-    if (marked) facts.push(row.enabled === false ? 'Switched off, so not in the review pool' : 'In the review pool');
-    facts.push(reviewCostText(row, state.reviewCosts?.get(reviewCostKey(row, state.processingPreference)) || null));
-    const session = row.route?.kind === ROUTE_KIND_AGENT_SESSION;
-    if (marked && !row.effort && !(session && compoundSessionEffort(row.route.target_id))) {
-        facts.push(`reviews at ${REVIEW_POOL_DEFAULT_EFFORT} effort`);
-    }
-    return facts.join(' · ');
+// Each review fact has the one place its meaning gives it (docs/DESIGN.md §6):
+// the mark itself is the checkbox; a marked row switched off is a current
+// exception under the head; a marked twin's repeat stays visible; the price or
+// seat is the row's Review cost in Details and, for a marked API row, beside
+// its delivery choice; the last review is history in Details.
+function reviewCost(row, state) {
+    return reviewCostText(row, state.reviewCosts?.get(reviewCostKey(row, state.processingPreference)) || null);
 }
 
-function reviewNotes(row, state, index) {
+function reviewException(row) {
+    return row.review_eligible === true && row.enabled === false ? 'Switched off, so not in the review pool.' : '';
+}
+
+function reviewRepeat(row, state, index) {
     const items = state.setting?.items || [];
     const twin = row.review_eligible === true ? sameEngineAs(items, index, state.processingPreference) : -1;
-    const notes = twin >= 0 && items[twin]?.review_eligible === true
-        ? [`Repeat of Subagent ${twin + 1}: another independent run of the same model, not a different reviewer.`] : [];
+    return twin >= 0 && items[twin]?.review_eligible === true
+        ? `Repeat of Subagent ${twin + 1}: another independent run of the same model, not a different reviewer.` : '';
+}
+
+function lastReview(row, state) {
     const pool = state.reviewPool || {};
-    const executed = (pool.pool || []).find((item) => item?.subagent_id === row.subagent_id)?.last_execution
-        || pool.last_executions?.[row.subagent_id];
-    const last = lastReviewRunText(executed);
-    if (last) notes.push(last);
-    return notes.join(' ');
+    return lastReviewRunText((pool.pool || []).find((item) => item?.subagent_id === row.subagent_id)?.last_execution
+        || pool.last_executions?.[row.subagent_id]);
+}
+
+// A marked row without its own effort reviews at the pool default, unless its compound route names one;
+// the effort select's Default option says so, where the owner reads the effort.
+function effortDefaultLabel(row) {
+    const session = row.route?.kind === ROUTE_KIND_AGENT_SESSION;
+    return row.review_eligible === true && !row.effort && !(session && compoundSessionEffort(row.route.target_id))
+        ? `Default (reviews at ${REVIEW_POOL_DEFAULT_EFFORT})` : 'Default effort';
 }
 
 /**
  * The lanes-to-pool migration receipt that decided the shown document (`GET /api/review-pool`
- * `migration`): what happened to the owner's review settings, in one sentence. A `history`
- * receipt describes an earlier document the owner has since re-saved, so it says nothing.
+ * `migration`), split by meaning: `current` is what still acts (a failed migration, an
+ * environment catalog in force), `history` the conversion receipt kept behind "Reviewer origin".
+ * A `history` receipt describes an earlier document the owner has since re-saved, so it says nothing.
  */
 function migrationNote(migration) {
-    if (!migration || migration.source === 'history') return '';
+    if (!migration || migration.source === 'history') return { current: '', history: '' };
     const snapshot = migration.snapshot ? `snapshot ${migration.snapshot}` : 'no snapshot was written';
     if (migration.outcome === 'error') {
-        return `Review migration failed: ${migration.error || 'reason not recorded'}; your lanes were kept; ${snapshot}. Mark reviewers here and save to finish.`;
+        return { current: `Review migration failed: ${migration.error || 'reason not recorded'}; your lanes were kept; ${snapshot}. Mark reviewers here and save to finish.`, history: '' };
     }
-    const inForce = migration.source === 'environment' ? ' The catalog from the environment runs instead of these rows.' : '';
+    const current = migration.source === 'environment' ? 'The catalog from the environment runs instead of these rows.' : '';
     if (migration.outcome === 'factory') {
-        return `This install had no review settings, so factory reviewers were set up (rows marked “${MINTED_FROM.factory_default}”); ${snapshot}.${inForce}`;
+        return { current, history: `This install had no review settings, so factory reviewers were set up (rows whose origin is “${MINTED_FROM.factory_default}”); ${snapshot}.` };
     }
-    return `Rows marked “${MINTED_FROM.review_lane}” were converted from your review lanes; ${snapshot} keeps their previous value.${inForce}`;
+    return { current, history: `Rows whose origin is “${MINTED_FROM.review_lane}” were converted from your review lanes; ${snapshot} keeps their previous value.` };
 }
 
 /** The pool rows whose model has no credentials in this install (`pool_without_credentials`); every row is the loud fact. */
@@ -333,32 +343,44 @@ function reviewPoolSummary(state) {
     if (items.length && !marked) empty = 'No row is marked Reviewer, so reviews will not run and will report “not performed”.';
     else if (marked && !pool) empty = 'Every row marked Reviewer is switched off, so reviews will not run and will report “not performed”.';
     const payload = state.reviewPool || {};
+    const migration = migrationNote(payload.migration);
     let note = payload.load_error || '';
     if (!note && payload.config_error) note = `The saved review pool has an error: ${payload.config_error}`;
-    note = [note, migrationNote(payload.migration), credentialsNote(payload)].filter(Boolean).join(' ');
+    note = [note, migration.current, credentialsNote(payload)].filter(Boolean).join(' ');
     return {
         count: `Reviewers: ${pool}`,
-        stays: marked ? 'Off stops delegation only: review stays on for rows marked Reviewer.' : '',
-        empty, confirm: Boolean(items.length && !pool), note,
+        // Said when it matters: Delegation off leaves review on for the marked rows.
+        stays: marked && !state.setting?.enabled ? 'Delegation is off; rows marked Reviewer still review.' : '',
+        empty, confirm: Boolean(items.length && !pool), note, history: migration.history,
     };
 }
 
-function reviewMarkHtml(row, state, index) {
-    const minted = MINTED_FROM[row.minted_from] || '';
-    return `
-                <div class="available-subagent-review">
-                    <label class="available-subagent-reviewer"><input class="ui-checkbox" type="checkbox" data-subagent-field="review_eligible" aria-label="Subagent ${index + 1} reviews"${row.review_eligible === true ? ' checked' : ''}> Reviewer</label>
-                    <span class="available-subagent-review-facts" data-subagent-review-facts>${escapeHtml(reviewFacts(row, state))}</span>
-                    ${minted ? `<span class="available-subagent-minted" data-subagent-minted>${escapeHtml(minted)}</span>` : ''}
-                </div>`;
+// Saved/draft intent is ONE editor fact (docs/DESIGN.md §6): the cards carry availability only.
+// Its slot stays in the toolbar in every state, so the first edit never re-wraps what sits above the rows.
+const INTENT = {
+    draft: { label: 'Unsaved changes', tone: 'neutral' },
+    generated: { label: 'Generated draft', tone: 'neutral' },
+    saved: { label: 'Saved', tone: 'ok' },
+};
+
+function editorIntent(state, hasPageDirtyIndicator) {
+    // Settings already names the dirty draft in its Save bar; keep this slot empty
+    // there. The wizard has no page indicator and still needs the editor's word.
+    if (state.dirty && hasPageDirtyIndicator) return { label: '', title: '', tone: 'neutral' };
+    const intent = INTENT[state.dirty ? 'draft' : state.baseline] || INTENT.saved;
+    return { ...intent, title: intent.label };
 }
 
-function reviewDeliveryHtml(row, index) {
-    if (row.review_eligible !== true || row.route.kind !== ROUTE_KIND_API_MODEL) return '';
-    return selectHtml(`data-subagent-field="delivery" aria-label="Review delivery for Subagent ${index + 1}"`, [{ label: '', options: [
-        { value: 'native', label: 'Reads the work itself' },
-        { value: 'packet', label: 'Packet — for models without tool calling' },
-    ] }], row.delivery === 'packet' ? 'packet' : 'native');
+function reviewDeliveryHtml(row, state, index) {
+    if (row.route.kind !== ROUTE_KIND_API_MODEL) return '';
+    // Rendered for every API row and shown while it is marked: the mark toggles it in place.
+    return `<div class="ui-field available-subagent-field" data-subagent-delivery-field${row.review_eligible === true ? '' : ' hidden'}>
+                    <label class="ui-field">Review delivery ${selectHtml(`data-subagent-field="delivery" aria-label="Review delivery for Subagent ${index + 1}"`, [{ label: '', options: [
+                        { value: 'native', label: 'Reads the work itself' },
+                        { value: 'packet', label: 'Packet — for models without tool calling' },
+                    ] }], row.delivery === 'packet' ? 'packet' : 'native')}</label>
+                    <span class="ui-field-help" data-subagent-delivery-cost>${escapeHtml(reviewCost(row, state))}</span>
+                </div>`;
 }
 
 export function validateAvailableSubagentsSetting(setting, { uniqueEngines = false, processingPreference = '' } = {}) {
@@ -432,6 +454,10 @@ function connectedHarnessIds(snapshot) {
         .map((row) => String(row.harness || '')));
 }
 
+// The row disclosures whose open state outlives a repaint, by kind.
+const DISCLOSURES = { details: 'data-subagent-details', processing: 'data-processing-details' };
+const disclosureKind = (node) => Object.keys(DISCLOSURES).find((kind) => node?.hasAttribute?.(DISCLOSURES[kind])) || '';
+
 function focusSnapshot(host, doc) {
     const active = doc?.activeElement;
     if (!active || !host?.contains?.(active)) return null;
@@ -439,6 +465,7 @@ function focusSnapshot(host, doc) {
     return {
         rowId: row?.dataset?.subagentRow || '',
         field: active.dataset?.subagentField || '',
+        summary: active.tagName === 'SUMMARY' ? disclosureKind(active.parentElement) : '',
         start: typeof active.selectionStart === 'number' ? active.selectionStart : null,
         end: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
         scrollTop: host.scrollTop,
@@ -449,12 +476,48 @@ function restoreFocus(host, saved) {
     if (!saved) return;
     const rows = host.querySelectorAll?.('[data-subagent-row]') || [];
     const row = [...rows].find((item) => item.dataset?.subagentRow === saved.rowId);
-    const field = row?.querySelector?.(`[data-subagent-field="${saved.field}"]`);
+    const field = saved.field ? row?.querySelector?.(`[data-subagent-field="${saved.field}"]`)
+        : saved.summary ? row?.querySelector?.(`[${DISCLOSURES[saved.summary]}] > summary`) : null;
     if (field?.focus) field.focus({ preventScroll: true });
     if (saved.start !== null && field?.setSelectionRange) {
         field.setSelectionRange(saved.start, saved.end);
     }
     host.scrollTop = saved.scrollTop;
+}
+
+// Account evidence for a saved model's availability qualifier: only a confirmed
+// Accounts read narrows the catalog's carriers; the catalog read still labels it.
+function verifiedAccountSnapshot(state) {
+    return state.accountsKnown ? state.snapshot : null;
+}
+
+// Session access choices; one list, so a further native profile lands in one place.
+const ACCESS_CHOICES = [
+    { value: 'full', label: 'Full system access' },
+    { value: 'workspace_write', label: 'Working files' },
+];
+const ACCESS_HELP = 'Full system access (the default) can reach outside the working folder. The selected agent must support it. Explicit task restrictions still apply.';
+
+// History, provenance and the row's secondary facts, behind one explicit disclosure
+// (docs/DESIGN.md §6): Last review and Last task run are different events.
+function rowDetailsHtml(row, state, rowKey) {
+    const session = row.route.kind === ROUTE_KIND_AGENT_SESSION;
+    const review = lastReview(row, state);
+    const task = rowTaskRun(row, state);
+    const stored = session ? '' : String(row.route.target_id || '').trim();
+    const minted = MINTED_FROM[row.minted_from] || '';
+    const fact = (label, value, attrs) => `<div${value ? '' : ' hidden'}${attrs ? ` ${attrs}` : ''}><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`;
+    return `<details class="model-role-details available-subagent-details" data-subagent-details>
+                <summary>Details &amp; history</summary>
+                <dl class="available-subagent-facts">
+                    <div><dt>Review cost</dt><dd data-subagent-review-facts>${escapeHtml(reviewCost(row, state))}</dd></div>
+                    ${fact('Last review', review, 'data-subagent-last-review')}
+                    ${fact('Last task run', task, 'data-subagent-last-task')}
+                    ${session ? '' : fact('Stored as', stored, 'data-subagent-stored')}
+                    ${minted ? fact('Origin', minted, 'data-subagent-minted') : ''}
+                    ${session ? `<div><dt>Access</dt><dd id="actor-${escapeHtml(rowKey)}-access-help">${ACCESS_HELP}</dd></div>` : ''}
+                </dl>
+            </details>`;
 }
 
 export function availableSubagentRowMarkup(row, state, index = 0) {
@@ -471,16 +534,17 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
         catalogKnown: state.catalogKnown, accountsKnown: state.accountsKnown,
     });
     const modelOptions = sessionModelOptions(accountScopedModelCatalog(harnesses[split.harness], row.route.credential_profile_id), split.model, {
-        catalogKnown: state.catalogKnown,
+        catalogKnown: state.catalogKnown, snapshot: verifiedAccountSnapshot(state), pin: row.route.credential_profile_id,
     });
     const profileOptions = profileOptionsFor(
         (indexProfilesByHarness(state.snapshot)[split.harness]) || [],
         row.route.credential_profile_id || '',
-        { accountsKnown: state.accountsKnown && Boolean(split.harness) },
+        { accountsKnown: state.accountsKnown && Boolean(split.harness), labelled: true },
     );
     const status = rowStatus(row, state);
     const reason = rowStatusReason(status);
-    const notes = reviewNotes(row, state, index);
+    const exception = reviewException(row);
+    const repeat = reviewRepeat(row, state, index);
     const errors = rowErrors(row, index, new Set());
     const meta = rowMeta(row, state, errors);
     const invalid = Boolean(row._uiAttempted) && errors.length > 0;
@@ -489,42 +553,45 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
         label: identity.label, channel: identity.channel,
         className: 'available-subagent-route-identity',
     });
+    const field = (label, control) => `<label class="ui-field available-subagent-field">${label} ${control}</label>`;
+    // Head: the title side wraps within itself; the Reviewer mark and the actions own
+    // the end slot, so no fact of any length moves them (docs/DESIGN.md §6).
     return `
         <article class="available-subagent-row" data-subagent-row="${escapeHtml(rowKey)}" aria-labelledby="${escapeHtml(headingId)}"${invalid ? ' data-invalid' : ''}>
             <div class="available-subagent-head">
-                <label class="available-subagent-enable" title="Owner switch: a switched-off subagent keeps its configuration and stays editable; no new delegation selects it and it does not review."><input class="ui-checkbox" type="checkbox" data-subagent-field="enabled" aria-label="Subagent ${ordinal} enabled for new work"${row.enabled === false ? '' : ' checked'}></label>
-                <h4 class="available-subagent-heading" id="${escapeHtml(headingId)}">Subagent ${ordinal}</h4>
-                <div class="available-subagent-route-identity-wrap">${routeIdentity}</div>
-                <span class="settings-inline-status" data-subagent-status data-tone="${escapeHtml(status.tone)}" title="${escapeHtml(status.text)}">${escapeHtml(status.label)}</span>
-                ${reviewMarkHtml(row, state, index)}
+                <div class="available-subagent-title">
+                    <label class="available-subagent-enable" title="Owner switch: a switched-off subagent keeps its configuration and stays editable; no new delegation selects it and it does not review."><input class="ui-checkbox" type="checkbox" data-subagent-field="enabled" aria-label="Subagent ${ordinal} enabled for new work"${row.enabled === false ? '' : ' checked'}></label>
+                    <h4 class="available-subagent-heading" id="${escapeHtml(headingId)}">Subagent ${ordinal}</h4>
+                    <div class="available-subagent-route-identity-wrap">${routeIdentity}</div>
+                    <span class="settings-inline-status" data-subagent-status data-tone="${escapeHtml(status.tone)}" title="${escapeHtml(status.text)}">${escapeHtml(status.label)}</span>
+                </div>
                 <div class="available-subagent-actions">
+                    <label class="available-subagent-reviewer"><input class="ui-checkbox" type="checkbox" data-subagent-field="review_eligible" aria-label="Subagent ${ordinal} reviews"${row.review_eligible === true ? ' checked' : ''}> Reviewer</label>
                     <button type="button" class="btn btn-default" data-subagent-duplicate aria-label="Duplicate Subagent ${ordinal}">Duplicate</button>
                     <button type="button" class="btn btn-default" data-subagent-remove aria-label="Remove Subagent ${ordinal}">Remove</button>
                 </div>
             </div>
             <div class="available-subagent-status-reason" data-subagent-status-reason${reason ? '' : ' hidden'}>${escapeHtml(reason)}</div>
+            <div class="available-subagent-status-reason" data-subagent-review-exception${exception ? '' : ' hidden'}>${escapeHtml(exception)}</div>
+            <div class="available-subagent-meta" data-subagent-review-notes${repeat ? '' : ' hidden'}>${escapeHtml(repeat)}</div>
+            <div class="available-subagent-route">
+                ${field('Source', selectHtml(`data-subagent-field="route" aria-label="Source for Subagent ${ordinal}"`, routeGroups, encodeRouteChoice(row)))}
+                <div class="ui-field available-subagent-field available-subagent-field-model">Model ${session
+                    ? modelChooserHtml(`data-subagent-field="model" aria-label="Agent session model for Subagent ${ordinal}"`, split.model, `actor-${rowKey}-models`, modelOptions, { placeholder: 'Engine default model' })
+                    : routeModelInputHtml(`data-subagent-field="model" aria-label="${split.subscription ? 'Subscription' : 'API'} model for Subagent ${ordinal}"`, row.route, state.apiModels, `actor-${rowKey}-models`)}</div>
+                ${routeSupportsAccount(row.route)
+                    ? field('Account', selectHtml(`data-subagent-field="account" aria-label="Account for Subagent ${ordinal}"`, [{ label: '', options: profileOptions }], row.route.credential_profile_id || ''))
+                    : ''}
+                ${field('Reasoning effort', effortSelectHtml(`data-subagent-field="effort" aria-label="Reasoning effort for Subagent ${ordinal}"`, row.effort || '', 'route default', effortDefaultLabel(row)))}
+                ${session ? field('Access', selectHtml(`id="actor-${escapeHtml(rowKey)}-access" data-subagent-field="access" aria-label="Access for Subagent ${ordinal}"`, [{ label: '', options: ACCESS_CHOICES }], row.access || 'full')) : ''}
+                ${reviewDeliveryHtml(row, state, index)}
+            </div>
             <label class="available-subagent-purpose ui-field">Description
                 <textarea class="ui-control" data-subagent-field="recommended_use" rows="1" aria-label="Description for Subagent ${ordinal}" placeholder="When should Ouroboros choose this subagent?">${escapeHtml(row.recommended_use)}</textarea>
             </label>
-            <div class="available-subagent-route">
-                ${selectHtml(`data-subagent-field="route" aria-label="Source for Subagent ${ordinal}"`, routeGroups, encodeRouteChoice(row))}
-                ${session
-                    ? modelChooserHtml(`data-subagent-field="model" aria-label="Agent session model for Subagent ${ordinal}"`, split.model, `actor-${rowKey}-models`, modelOptions, { placeholder: 'Engine default model' })
-                    : routeModelInputHtml(`data-subagent-field="model" aria-label="${split.subscription ? 'Subscription' : 'API'} model for Subagent ${ordinal}"`, row.route, state.apiModels, `actor-${rowKey}-models`)}
-                ${routeSupportsAccount(row.route)
-                    ? selectHtml(`data-subagent-field="account" aria-label="Account for Subagent ${ordinal}"`, [{ label: '', options: profileOptions }], row.route.credential_profile_id || '')
-                    : ''}
-                ${effortSelectHtml(`data-subagent-field="effort" aria-label="Reasoning effort for Subagent ${ordinal}"`, row.effort || '', 'route default')}
-                ${reviewDeliveryHtml(row, index)}
-                ${session ? selectHtml(`id="actor-${escapeHtml(rowKey)}-access" data-subagent-field="access" aria-label="Access for Subagent ${ordinal}"`, [{ label: '', options: [
-                    { value: 'full', label: 'Full system access (default)' },
-                    { value: 'workspace_write', label: 'Working files' },
-                ] }], row.access || 'full') : ''}
-            </div>
-            <div class="available-subagent-meta" data-subagent-review-notes data-run-history${notes ? '' : ' hidden'}>${escapeHtml(notes)}</div>
+            <div id="actor-${escapeHtml(rowKey)}-meta" class="available-subagent-meta ui-field-help" data-subagent-meta${meta.qualifier ? ' data-availability-qualifier' : ''}${meta.tone ? ` data-tone="${escapeHtml(meta.tone)}"` : ''}${meta.text ? '' : ' hidden'}>${escapeHtml(meta.text)}</div>
             ${processingDetailsHtml(`data-subagent-field="processing_preference" aria-label="Processing for Subagent ${ordinal}"`, row.processing_preference, state.processingPreference)}
-            ${session ? `<div class="ui-field-help" id="actor-${escapeHtml(rowKey)}-access-help">Full system access can reach outside the working folder. The selected agent must support it. Explicit task restrictions still apply.</div>` : ''}
-            <div id="actor-${escapeHtml(rowKey)}-meta" class="available-subagent-meta ui-field-help" data-subagent-meta${meta.history ? ' data-run-history' : ''}${meta.tone ? ` data-tone="${escapeHtml(meta.tone)}"` : ''} title="${escapeHtml(meta.text)}"${meta.text ? '' : ' hidden'}>${escapeHtml(meta.text)}</div>
+            ${rowDetailsHtml(row, state, rowKey)}
         </article>`;
 }
 
@@ -566,6 +633,7 @@ export function createAvailableSubagentsEditor({
     allowUnloadedOmission = false,
     previewGenerated = null,
     baseline = 'saved',
+    hasPageDirtyIndicator = false,
 } = {}) {
     const getDoc = typeof doc === 'function' ? doc : () => doc;
     const getWin = typeof win === 'function' ? win : () => win;
@@ -598,6 +666,8 @@ export function createAvailableSubagentsEditor({
         // the loaded route so an edited row never shows its old route's price.
         reviewPool: null, reviewCosts: new Map(), loadedItems: [], loadedFingerprint: '',
         allowEmptyReviewPool: false,
+        // `${_uiKey}:${kind}` of each open row disclosure: a repaint or a reload re-opens it.
+        openDisclosures: new Set(),
     };
 
     function host() {
@@ -650,6 +720,16 @@ export function createAvailableSubagentsEditor({
         if (confirm) confirm.hidden = !summary.confirm;
         const note = container.querySelector('[data-review-pool-note]');
         if (note) Object.assign(note, { textContent: summary.note, hidden: !summary.note });
+        const history = container.querySelector('[data-review-pool-history]');
+        if (history) history.hidden = !summary.history;
+        const historyText = container.querySelector('[data-review-pool-history-text]');
+        if (historyText) historyText.textContent = summary.history;
+        const intent = editorIntent(state, hasPageDirtyIndicator);
+        const intentEl = container.querySelector('[data-subagents-intent]');
+        if (intentEl) {
+            Object.assign(intentEl, { textContent: intent.label, title: intent.title });
+            intentEl.dataset.tone = intent.tone;
+        }
     }
 
     // Patch verdicts and inherited intent in place, preserving the caret.
@@ -682,23 +762,37 @@ export function createAvailableSubagentsEditor({
                 Object.assign(statusEl, { textContent: status.label, title: status.text });
                 statusEl.dataset.tone = status.tone;
             }
-            const reasonEl = el.querySelector('[data-subagent-status-reason]');
-            if (reasonEl) {
-                const reason = rowStatusReason(status);
-                Object.assign(reasonEl, { textContent: reason, hidden: !reason });
+            // Every line below the head is patched in place: a Reviewer or row switch never rebuilds the card.
+            const show = (selector, text) => {
+                const node = el.querySelector(selector);
+                if (node) Object.assign(node, { textContent: text, hidden: !text });
+            };
+            show('[data-subagent-status-reason]', rowStatusReason(status));
+            show('[data-subagent-review-exception]', reviewException(row));
+            show('[data-subagent-review-notes]', reviewRepeat(row, state, index));
+            const delivery = el.querySelector('[data-subagent-delivery-field]');
+            if (delivery) delivery.hidden = row.review_eligible !== true;
+            const cost = reviewCost(row, state);
+            for (const selector of ['[data-subagent-review-facts]', '[data-subagent-delivery-cost]']) {
+                const node = el.querySelector(selector);
+                if (node) node.textContent = cost;
             }
-            const facts = el.querySelector('[data-subagent-review-facts]');
-            if (facts) facts.textContent = reviewFacts(row, state);
-            const notesEl = el.querySelector('[data-subagent-review-notes]');
-            if (notesEl) {
-                const notes = reviewNotes(row, state, index);
-                Object.assign(notesEl, { textContent: notes, hidden: !notes });
+            const effortDefault = el.querySelector('[data-subagent-field="effort"] option[value=""]');
+            if (effortDefault) effortDefault.textContent = effortDefaultLabel(row);
+            for (const [selector, text] of [['[data-subagent-last-review]', lastReview(row, state)],
+                ['[data-subagent-last-task]', rowTaskRun(row, state)],
+                ['[data-subagent-stored]', String(row.route.target_id || '').trim()]]) {
+                const fact = el.querySelector(selector);
+                if (!fact) continue;
+                fact.hidden = !text;
+                const value = fact.querySelector?.('dd');
+                if (value) value.textContent = text;
             }
             const meta = rowMeta(row, state, rowErrs);
             const metaEl = el.querySelector('[data-subagent-meta]');
             if (!metaEl) return;
-            Object.assign(metaEl, { hidden: !meta.text, textContent: meta.text, title: meta.text });
-            metaEl.toggleAttribute('data-run-history', Boolean(meta.history));
+            Object.assign(metaEl, { hidden: !meta.text, textContent: meta.text });
+            metaEl.toggleAttribute('data-availability-qualifier', Boolean(meta.qualifier));
             if (meta.tone) metaEl.dataset.tone = meta.tone;
             else delete metaEl.dataset.tone;
         });
@@ -749,12 +843,22 @@ export function createAvailableSubagentsEditor({
                 else row.enabled = false;
                 markDirty();
             });
-            // A mark changes this card's controls and the repeat captions of its twins.
+            // A mark is patched in place like the row switch (its delivery field, effort default,
+            // review lines and its twins' repeat notes): rebuilding would move the box under the pointer.
             rowElement.querySelector('[data-subagent-field="review_eligible"]')?.addEventListener('change', (event) => {
                 if (event.target.checked) row.review_eligible = true;
                 else delete row.review_eligible;
-                markDirty({ structural: true });
-                paint();
+                markDirty();
+            });
+            rowElement.querySelectorAll('details').forEach((details) => {
+                const kind = disclosureKind(details);
+                if (!kind) return;
+                const key = `${rowElement.dataset.subagentRow}:${kind}`;
+                details.open = state.openDisclosures.has(key);
+                details.addEventListener('toggle', () => {
+                    if (details.open) state.openDisclosures.add(key);
+                    else state.openDisclosures.delete(key);
+                });
             });
             rowElement.querySelector('[data-subagent-field="delivery"]')?.addEventListener('change', (event) => {
                 if (event.target.value === 'packet') row.delivery = 'packet';
@@ -823,7 +927,6 @@ export function createAvailableSubagentsEditor({
         state.signature = nextSignature;
         const errors = validationErrors();
         const diagnostics = diagnosticsText(state.diagnostics);
-        const source = state.source ? `Source: ${state.source}.` : '';
         const readProblem = [state.statusError
             ? 'Live agent availability could not be read. Saved rows remain unchanged.' : '', state.modelCatalogNote].filter(Boolean).join(' ');
         if (discoveryOnly && container.querySelector('.available-subagents-list')) {
@@ -836,39 +939,45 @@ export function createAvailableSubagentsEditor({
                 updateRouteControlOptions(el, desired);
                 el.querySelector('.available-subagent-route-identity-wrap').innerHTML = desired.querySelector('.available-subagent-route-identity-wrap').innerHTML;
             });
-            container.querySelector('.available-subagents-source').textContent = [source, readProblem].filter(Boolean).join(' ');
+            Object.assign(container.querySelector('[data-subagents-read-problem]'), { textContent: readProblem, hidden: !readProblem });
             Object.assign(container.querySelector('[data-subagents-diagnostics]'), { textContent: diagnostics.join(' · '), hidden: !diagnostics.length });
             renderValidation();
             return true;
         }
         disposeChoosers();
         const pool = reviewPoolSummary(state);
+        const intent = editorIntent(state, hasPageDirtyIndicator);
+        // Lines a row edit can toggle (the empty pool, the validation summary) sit below the rows:
+        // a conditional line never moves the control that caused it (docs/DESIGN.md §6).
         container.innerHTML = `
             <div class="available-subagents-toolbar">
-                <label class="local-toggle ui-field ui-field-inline">
-                    <input class="ui-checkbox" type="checkbox" data-subagents-enabled aria-label="Available subagents enabled" ${state.setting.enabled ? 'checked' : ''} ${state.loaded ? '' : 'disabled'}>
-                    Enabled
+                <label class="local-toggle ui-field ui-field-inline" title="Off: new tasks do not delegate to these rows; rows marked Reviewer still review.">
+                    <input class="ui-checkbox" type="checkbox" data-subagents-enabled aria-label="Delegation to these subagents" ${state.setting.enabled ? 'checked' : ''} ${state.loaded ? '' : 'disabled'}>
+                    Delegation
                 </label>
                 <span class="available-subagents-count">${state.setting.items.length}/${MAX_AVAILABLE_SUBAGENTS}</span>
                 <span class="available-subagents-count" data-review-pool-count>${escapeHtml(pool.count)}</span>
+                <span class="settings-inline-status available-subagents-intent" data-subagents-intent data-tone="${intent.tone}" title="${escapeHtml(intent.title)}">${intent.label}</span>
                 <button type="button" class="btn btn-default" data-subagent-add
                     ${!state.loaded || state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS ? 'disabled' : ''}>Add subagent</button>
             </div>
             <div class="available-subagents-source" data-review-pool-stays ${pool.stays ? '' : 'hidden'}>${escapeHtml(pool.stays)}</div>
-            <div class="available-subagents-review-empty" data-review-pool-empty data-tone="warn" ${pool.empty ? '' : 'hidden'}>
-                <span data-review-pool-empty-text>${escapeHtml(pool.empty)}</span>
-                <label class="local-toggle ui-field-inline" data-review-pool-confirm ${pool.confirm ? '' : 'hidden'}><input class="ui-checkbox" type="checkbox" data-review-pool-allow-empty ${state.allowEmptyReviewPool ? 'checked' : ''}> Save without reviewers</label>
-            </div>
             <div class="available-subagents-diagnostics" data-review-pool-note ${pool.note ? '' : 'hidden'}>${escapeHtml(pool.note)}</div>
-            <div class="available-subagents-source">${escapeHtml([source, readProblem].filter(Boolean).join(' '))}</div>
+            <details class="model-role-details" data-review-pool-history ${pool.history ? '' : 'hidden'}><summary>Reviewer origin</summary>
+                <div class="available-subagents-source" data-review-pool-history-text>${escapeHtml(pool.history)}</div></details>
+            <div class="available-subagents-source" data-subagents-read-problem ${readProblem ? '' : 'hidden'}>${escapeHtml(readProblem)}</div>
             <div data-subagents-diagnostics class="available-subagents-diagnostics" ${diagnostics.length ? '' : 'hidden'}>${escapeHtml(diagnostics.join(' · '))}</div>
-            <div data-subagents-validation class="available-subagents-diagnostics" data-tone="error" ${errors.length ? '' : 'hidden'}>${escapeHtml(errors[0] || '')}</div>
             <div class="available-subagents-list">
                 ${state.loaded
                     ? state.setting.items.map((row, index) => availableSubagentRowMarkup(row, state, index)).join('')
                         || '<div class="available-subagents-empty">No subagents configured. Add one, or leave the list empty to make no actors available.</div>'
                     : '<div class="available-subagents-empty">The saved configuration could not be loaded, so this editor will not replace it.</div>'}
-            </div>`;
+            </div>
+            <div class="available-subagents-review-empty" data-review-pool-empty data-tone="warn" ${pool.empty ? '' : 'hidden'}>
+                <span data-review-pool-empty-text>${escapeHtml(pool.empty)}</span>
+                <label class="local-toggle ui-field-inline" data-review-pool-confirm ${pool.confirm ? '' : 'hidden'}><input class="ui-checkbox" type="checkbox" data-review-pool-allow-empty ${state.allowEmptyReviewPool ? 'checked' : ''}> Save without reviewers</label>
+            </div>
+            <div data-subagents-validation class="available-subagents-diagnostics" data-tone="error" ${errors.length ? '' : 'hidden'}>${escapeHtml(errors[0] || '')}</div>`;
         container.querySelector('[data-subagents-enabled]')?.addEventListener('change', (event) => {
             state.setting.enabled = Boolean(event.target.checked);
             markDirty();
@@ -1206,6 +1315,7 @@ export function availableSubagentsHasExplicitDraft(settings) {
 
 export function initSubagentsSection({
     onChange,
+    hasPageDirtyIndicator = false,
     onJudged,
     isOuterDraftClean,
     onGeneratedApply,
@@ -1215,6 +1325,7 @@ export function initSubagentsSection({
     destroySubagentsSection();
     settingsEditor = createAvailableSubagentsEditor({
         store,
+        hasPageDirtyIndicator,
         onChange: typeof onChange === 'function' ? onChange : () => {},
         onJudged: typeof onJudged === 'function' ? onJudged : () => {},
         isOuterDraftClean: typeof isOuterDraftClean === 'function' ? isOuterDraftClean : () => true,

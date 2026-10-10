@@ -298,7 +298,7 @@ def test_chips_and_meta_lines_declare_their_own_foreground() -> None:
     """Root cause #2. A rule that declares a size and no colour inherits
     near-white --text-primary — invisible in the CSS, loudest on screen."""
     region = _migrated_style_region() + _decommented(_read("web/settings.css"))
-    for selector in (".harness-chip", ".available-subagent-review", ".harness-account-main strong"):
+    for selector in (".harness-chip", ".available-subagent-facts dd", ".harness-account-main strong"):
         bodies = [
             body for sel, body in RULE.findall(region) if sel.strip() == selector
         ]

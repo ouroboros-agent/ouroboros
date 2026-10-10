@@ -309,6 +309,13 @@ export const apiClient = {
         return fetchJson('/api/chat/upload', { method: 'POST', body }, { rejectOkFalse: true });
     },
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
+    /** @returns {Promise<import('./model_route_types.js').WebSearchRoute>} */
+    webSearchPreview: (selection = {}) => fetchJson(
+        `/api/settings?${new URLSearchParams({ websearch_preview: '1', ...selection })}`, { cache: 'no-store' }),
+    /** @returns {Promise<import('./model_route_types.js').ResponseLimitPreview>} */
+    responseLimitPreview: ({ model, local = false, account = '' }) => fetchJson(
+        `/api/settings?${new URLSearchParams({ response_limit_preview: '1', model, local: String(Boolean(local)), account })}`,
+        { cache: 'no-store' }),
     /** @param {{key: string}|{mcp_server_id: string}} selector @returns {Promise<{value: string}>} */
     revealSettingsSecret: (selector) => jsonPost('/api/settings/secret', selector),
     /** @returns {Promise<import('./api_types.js').UiPreferencesResponse>} */
@@ -358,6 +365,7 @@ export const apiClient = {
     /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
     ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),
     logsTail: (name, limit = 2000) => fetchJson(`/api/logs/${encodeURIComponent(name)}?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
+    /** @returns {Promise<import('./model_route_types.js').ResponseLimitAckResponse|Object>} */
     ownerCapabilityAck: (payload) => jsonPost('/api/owner/capability-ack', payload),
     /** @returns {Promise<import('./api_types.js').OpenAICompatibleModelsResponse>} */
     openAICompatibleModels: (payload) => jsonPost('/api/openai-compatible/models', payload),

@@ -830,9 +830,9 @@ textarea::placeholder {
   margin-top: 10px;
 }
 
-/* Mirror of the settings.css compact card (docs/DESIGN.md §6 row anatomy):
-   the wizard loads only this sheet. Same rhythm tokens, the wizard's own
-   surface tokens. */
+/* Mirror of the settings.css open card (docs/DESIGN.md §6 row anatomy): the
+   wizard loads only this sheet. Same anatomy and rhythm tokens, the wizard's
+   own surface tokens. */
 .available-subagents-editor {
   display: flex;
   flex-direction: column;
@@ -841,7 +841,6 @@ textarea::placeholder {
 }
 
 .available-subagents-toolbar,
-.available-subagent-head,
 .available-subagent-actions {
   display: flex;
   flex-wrap: wrap;
@@ -851,6 +850,8 @@ textarea::placeholder {
 
 .available-subagents-toolbar .btn-default,
 .available-subagent-actions { margin-left: auto; }
+
+.available-subagents-intent { min-width: 8rem; }
 
 .available-subagents-count,
 .available-subagents-source,
@@ -874,12 +875,15 @@ textarea::placeholder {
 .available-subagent-row {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--panel-3);
+  container: subagentcard / inline-size;
 }
+
+.available-subagent-row [hidden] { display: none; }
 
 /* An entry the owner tried to finish with an error is emphasised, not dimmed. */
 .available-subagent-row[data-invalid] {
@@ -887,12 +891,40 @@ textarea::placeholder {
   background: var(--status-error-bg);
 }
 
+/* The Reviewer mark and the actions keep the end slot; the head wraps by card width only. */
+.available-subagent-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.available-subagent-title {
+  display: flex;
+  flex: 1 1 16rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+  min-height: 34px;
+}
+
+/* Source beside a wide Model, then Account / Effort / Access; the card's own width picks the columns. */
 .available-subagent-route {
   display: grid;
-  /* A track minimum yields to the container: the viewport query does not know
-     the wizard column width, so the floor is capped at 100% of the row. */
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 120px), 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-2);
+}
+
+.available-subagent-field-model { grid-column: span 2; }
+
+@container subagentcard (max-width: 34rem) {
+  .available-subagent-route { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .available-subagent-field-model { grid-column: 1 / -1; }
+}
+
+@container subagentcard (max-width: 22rem) {
+  .available-subagent-route { grid-template-columns: minmax(0, 1fr); }
 }
 
 .available-subagent-heading {
@@ -972,18 +1004,9 @@ textarea::placeholder {
   resize: vertical;
 }
 
-.available-subagent-meta {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.available-subagent-meta { overflow-wrap: anywhere; }
 
-.available-subagent-meta[data-run-history] {
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-
-/* Why a row will not run, in words: the status title needs a hover a phone lacks. */
+/* A current exception in words: the status title needs a hover a phone lacks. */
 .available-subagent-status-reason {
   color: var(--status-warn-fg);
   font-size: var(--type-meta);
@@ -996,28 +1019,44 @@ textarea::placeholder {
   padding: 0 11px;
 }
 
-/* Reviewer mark, its price and origin share the card head: an unmarked card keeps its height. */
-.available-subagent-review {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  color: var(--text-meta);
-  font-size: var(--type-meta);
-}
-
 .available-subagent-reviewer {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  color: var(--text-primary);
+  min-height: 34px;
+  color: var(--text);
+  font-size: var(--type-body);
   cursor: pointer;
 }
 
-.available-subagent-minted {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--surface-border);
-  border-radius: var(--radius);
+.available-subagent-facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-1) 0 0;
+}
+
+.available-subagent-facts > div {
+  display: grid;
+  grid-template-columns: minmax(0, 8rem) minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.available-subagent-facts dt {
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  font-weight: 600;
+}
+
+.available-subagent-facts dd {
+  margin: 0;
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  overflow-wrap: anywhere;
+}
+
+@container subagentcard (max-width: 28rem) {
+  .available-subagent-facts > div { grid-template-columns: minmax(0, 1fr); gap: 0; }
 }
 
 .available-subagents-review-empty {
@@ -1244,10 +1283,6 @@ textarea::placeholder {
     margin-top: 8px;
   }
 
-  .available-subagent-route {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .harness-login-card p {
     display: block;
   }
@@ -1315,10 +1350,6 @@ textarea::placeholder {
   }
 
   .summary-kv {
-    grid-template-columns: 1fr;
-  }
-
-  .available-subagent-route {
     grid-template-columns: 1fr;
   }
 

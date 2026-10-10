@@ -614,8 +614,15 @@ def _summarizer_spec() -> Dict[str, Any]:
             route.update({"provider": "unknown", "resolved_model": model, "base_url": ""})
     route["route_fp"] = _sha256(_canonical_bytes(route))
     route["effort"] = "low"
-    route["output_budget"] = _SUMMARY_OUTPUT_TOKENS
+    from ouroboros.response_limits import response_allowance
+    route["output_budget"] = response_allowance(model, _SUMMARY_OUTPUT_TOKENS, use_local=use_local,
+                                                model_role="light", allow_fetch=True)
     return route
+
+
+def _output_budget(spec: Dict[str, Any]) -> int:
+    """One summarizer send's allowance; a spec without a known maximum keeps the shipped budget."""
+    return int(spec.get("output_budget") or _SUMMARY_OUTPUT_TOKENS)
 
 
 _SUMMARY_CONTRACT_DIGEST = _sha256(_canonical_bytes({
@@ -699,7 +706,7 @@ def _call_summarizer(
         "model_role": "light",
         "model": str(spec.get("model") or ""),
         "reasoning_effort": str(spec.get("effort") or "low"),
-        "max_tokens": int(spec.get("output_budget") or _SUMMARY_OUTPUT_TOKENS),
+        "max_tokens": _output_budget(spec),
         "use_local": use_local,
         # One sticky session per data root: without it a system-less prompt gets
         # no OpenRouter session_id/OpenAI key, so sibling map/fold calls may land
@@ -722,6 +729,9 @@ def _call_summarizer(
             )
             for _usage in observed_usage:
                 _record_usage(usage_total, _usage)
+            from ouroboros._usage_response import OUTPUT_LIMIT_FINISH_REASONS, response_finish_reason
+            if observed_usage and response_finish_reason(observed_usage[-1], message)[1] in OUTPUT_LIMIT_FINISH_REASONS:
+                return {}
             if executable:
                 parsed = _parse_structured_summaries(message)
                 if parsed:
@@ -752,6 +762,9 @@ def _call_summarizer(
         raise _UnitSummaryFailure(
             f"summary call failed: {type(exc).__name__}: {exc}",
         ) from exc
+    from ouroboros._usage_response import OUTPUT_LIMIT_FINISH_REASONS, response_finish_reason
+    if response_finish_reason(_usage, message)[1] in OUTPUT_LIMIT_FINISH_REASONS:
+        return {}
     return _parse_json_summaries(message.get("content"))
 
 
@@ -937,7 +950,7 @@ def _select_units(
         if unit.predicted_reclaim_tokens <= 0:
             continue
         source_tokens = max(1, len(unit.source_text.encode("utf-8")) // 4)
-        summary_budget = min(_SUMMARY_OUTPUT_TOKENS, max(
+        summary_budget = min(max(1, _output_budget(spec) - 128), max(
             512, min(source_tokens // 2, max(512, int(request.reclaim_goal_tokens))),
         ))
         memo_key = _negative_memo_key(unit, summary_budget_tokens=summary_budget, spec=spec)
@@ -1397,9 +1410,19 @@ def compact_tool_history_llm(
     leaves_by_root: Dict[str, List[_Part]] = {part.root_id: [] for part in initial_parts}
     summaries: Dict[str, str] = {}
     failed_roots: set[str] = set()
-    for offset in range(0, len(initial_parts), _BLOCKS_PER_BATCH):
+    batches, batch, allowance = [], [], 0
+    for part in initial_parts:
+        cost = summary_budgets[part.root_id] + 128
+        if batch and (len(batch) >= _BLOCKS_PER_BATCH or allowance + cost > _output_budget(spec)):
+            batches.append(batch)
+            batch, allowance = [], 0
+        batch.append(part)
+        allowance += cost
+    if batch:
+        batches.append(batch)
+    for batch in batches:
         leaves, batch_map, failed = _map_complete_parts(
-            initial_parts[offset:offset + _BLOCKS_PER_BATCH], drive_root=root,
+            batch, drive_root=root,
             task_id=str(task_id or "context_compaction"), spec=spec,
             summary_budgets=summary_budgets, usage_total=usage_total)
         for leaf in leaves:

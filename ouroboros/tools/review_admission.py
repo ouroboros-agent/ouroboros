@@ -160,7 +160,7 @@ def fit_triad_prompt(api_models: list, assemble, current_files_section: str,
         window = _rv.reviewer_context_window(slot_model, **bindings[index])
         output_reserve, tokenizer_margin = _rv.window_scaled_reserves(
             window,
-            output_reserve=_rv._review_output_budget(),
+            output_reserve=_rv._review_output_budget(), model_id=slot_model, binding=bindings[index],
             tokenizer_margin=50_000,
         )
         return max(0, _rv.calibrated_input_token_limit(
@@ -717,12 +717,13 @@ def commit_gate_paid_seats(prepared, exited) -> list:
     substrate opens with (the packet's message pair; a native episode's first send:
     instructions, its OWN two-part brief and tool schemas — later rounds reserve
     themselves) and that send's output reservation, so the wave is priced the way
-    ``reserve_attempt`` prices it."""
+    ``reserve_attempt`` prices it, the exact route's known response maximum included."""
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_native_episode import native_first_send_chars
+    from ouroboros.reviewer_window import reviewer_window_binding
     from ouroboros.reviewer_slot_config import row_plan_retrieves
     from ouroboros.tools.review_multi_model import (
-        TRIAD_ROLE_HINT, TRIAD_USER_TURN, _review_output_budget, triad_api_messages,
+        TRIAD_ROLE_HINT, TRIAD_USER_TURN, review_output_allowance, triad_api_messages,
     )
     from ouroboros.triad_review import REVIEW_TWO_PART_OBJECT_CONTRACT
     from ouroboros.review_evidence import commit_review_evidence_section
@@ -734,6 +735,7 @@ def commit_gate_paid_seats(prepared, exited) -> list:
     routes = list(prepared.get("routes") or row_plan.get("routes") or [])
     slot_ids = list(row_plan.get("slot_ids") or [])
     tasks = list(row_plan.get("session_tasks") or [])
+    profiles, local = list(row_plan.get("session_profiles") or []), list(row_plan.get("use_local") or [])
     seats, packet_chars = [], None
     for index, model in enumerate(models):
         route = routes[index] if index < len(routes) else "api_chat"
@@ -754,8 +756,10 @@ def commit_gate_paid_seats(prepared, exited) -> list:
                     layer=str(prepared.get("layer") or "body"))
                 packet_chars = len(json.dumps({"messages": messages}, ensure_ascii=False, default=str))
             chars = packet_chars
-        seats.append({"surface": "multi_model_review", "slot_id": slot_id, "model": str(model or ""),
-                      "prompt_chars": chars, "max_completion_tokens": int(_review_output_budget())})
+        binding = reviewer_window_binding({"slot_id": slot_id, "session_profile": profiles[index] if index < len(profiles) else "",
+                                           "use_local": local[index] if index < len(local) else None})
+        seats.append({"surface": "multi_model_review", "slot_id": slot_id, "model": str(model or ""), "prompt_chars": chars,
+                      "max_completion_tokens": review_output_allowance(str(model or ""), **binding)})
     return seats
 
 

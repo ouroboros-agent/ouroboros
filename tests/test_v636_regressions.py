@@ -488,7 +488,8 @@ def test_vlm_child_reads_credential_named_runtime_content(tmp_path, monkeypatch)
         drive_root=str(data),
         task_constraint={"mode": "local_readonly_subagent"},
     )
-    monkeypatch.setattr(vision, "_downscale_image_for_vlm", lambda raw, mime: (raw, mime))
+    from tests.test_vision import _real_png_bytes
+    img.write_bytes(_real_png_bytes())
     payload, err = vision._load_local_image_payload(ctx, str(img))
     assert payload is not None and err == ""
 

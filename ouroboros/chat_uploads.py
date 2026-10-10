@@ -57,6 +57,15 @@ _PENDING_LOCK = threading.Lock()
 PLACEHOLDER_TEXTS = ("(image attached)", "(file attached)")
 
 
+def attachment_placeholder(image_base64: Any, metadata: dict | None) -> str:
+    """The same canonical empty-caption text at acceptance and batch dispatch."""
+    metadata = metadata or {}
+    image_ref = any(isinstance(ref, dict) and ref.get("kind") == "image"
+                    for ref in metadata.get("chat_attachments") or ())
+    return ("(image attached)" if image_base64 or image_ref else
+            "(file attached)" if metadata.get("chat_attachment_uploads") or metadata.get("chat_attachments") else "")
+
+
 def uploads_dir(data_dir: Any = None) -> pathlib.Path:
     """``<data>/uploads``; without ``data_dir`` the data root is resolved per call."""
     if data_dir is None:

@@ -104,7 +104,7 @@ def test_subscription_accounts_roundtrip_existing_editors(role_ui, width):
     assert page.locator("[data-review-pool-count]").inner_text() == "Reviewers: 3"
     direct.scroll_into_view_if_needed()
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-    controls = direct.locator(".available-subagent-review")
+    controls = direct.locator(".available-subagent-actions, [data-subagent-delivery-field]")
     boxes = controls.locator("select, input, label").evaluate_all(
         "els => els.filter(e => !e.hidden).map(e => {const b=e.getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height}})")
     assert boxes and all(b["x"] >= 0 and b["x"] + b["w"] <= width for b in boxes)
@@ -170,12 +170,13 @@ def test_a_reviewer_row_names_its_delivery_cost_and_last_run(role_ui):
     page = open_agents(ui)
     rows = page.locator("[data-subagent-row]")
     native, direct, agent = rows.nth(0), rows.nth(1), rows.nth(2)
-    page.wait_for_function("() => document.querySelector('[data-subagent-review-notes]:not([hidden])')")
-    assert "uses a session seat and time" in native.locator("[data-subagent-review-facts]").inner_text()
-    assert native.locator("[data-subagent-review-notes]").inner_text() == (
-        "Last run as API model · gpt-test · account personal (record rev_42)")
-    facts = direct.locator("[data-subagent-review-facts]").inner_text()
-    assert "In the review pool" in facts and "≈$0.42 per full call (route tariff)" in facts
+    page.wait_for_function("() => document.querySelector('[data-subagent-last-review]:not([hidden])')")
+    # Cost and history are row facts behind Details & history; a marked API row also prices its delivery.
+    assert native.locator("[data-subagent-review-facts]").text_content() == "uses a session seat and time"
+    assert native.locator("[data-subagent-last-review] dd").text_content() == (
+        "API model · gpt-test · account personal · record rev_42")
+    facts = direct.locator("[data-subagent-review-facts]").text_content()
+    assert facts == direct.locator("[data-subagent-delivery-cost]").inner_text() == "≈$0.42 per full call (route tariff)"
     assert "reading reviewer" not in facts, "the several-calls clause belongs to a reading row"
     assert agent.locator("[data-subagent-field=\"delivery\"]").count() == 0, "delivery is for API reviewers"
     delivery = direct.locator('[data-subagent-field="delivery"]')
@@ -185,7 +186,7 @@ def test_a_reviewer_row_names_its_delivery_cost_and_last_run(role_ui):
     delivery.select_option("native")
     # An edited route is priced only after it is saved: never its old price.
     direct.locator('[data-subagent-field="model"]').fill("gpt-api-next")
-    assert "≈$0.42" not in direct.locator("[data-subagent-review-facts]").inner_text()
+    assert "≈$0.42" not in direct.locator("[data-subagent-review-facts]").text_content()
     with page.expect_response("**/api/settings"):
         page.locator("#btn-save-settings").click()
     items = saved_catalog(ui)["items"]

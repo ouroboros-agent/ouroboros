@@ -17,12 +17,15 @@ def test_reviewer_effort_override_caption_and_saved_preference(role_ui, tmp_path
     page = roles.open_agents(ui)
     rows = page.locator("[data-subagent-row]")
     pinned, unset = rows.nth(0), rows.nth(1)
-    # A reviewer without its own effort reviews at the review default, and says so.
-    assert "reviews at" not in pinned.locator("[data-subagent-review-facts]").inner_text()
-    facts = unset.locator("[data-subagent-review-facts]")
-    assert "reviews at high effort" in facts.inner_text()
+    # A reviewer without its own effort reviews at the review default; its effort select says so.
+    default = 'option[value=""]'
+    assert pinned.locator(f'[data-subagent-field="effort"] {default}').inner_text() == "Default effort"
+    facts = unset.locator(f'[data-subagent-field="effort"] {default}')
+    assert facts.inner_text() == "Default (reviews at high)"
+    unset.locator('[data-subagent-field="review_eligible"]').uncheck()
+    assert facts.inner_text() == "Default effort", "an unmarked row runs at its route default"
+    unset.locator('[data-subagent-field="review_eligible"]').check()
     unset.locator('[data-subagent-field="effort"]').select_option('medium')
-    assert "reviews at" not in facts.inner_text()
     unset.scroll_into_view_if_needed()
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     page.screenshot(path=str(tmp_path / f"effort-reviewer-{width}.png"))

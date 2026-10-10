@@ -115,9 +115,9 @@ ouroboros/ — agent core and shared runtime (§6)
   transcript_prefix.py — append-only transcript between the sends of one loop execution; a break is a recorded `prompt_prefix_break` fact, never a blocked send (§6 Task lifecycle)
   loop_transport.py — transport-outage wait episodes and provider-failure terminal text (§6 Context fitting)
   loop_delivery.py — delivery candidates and the delivery-control protocol (§6 Task lifecycle)
-  loop_budget.py, loop_forced_finalization.py, loop_messages.py, loop_model_call.py, loop_nudges.py, loop_round_limits.py — leaves of `loop.py`, one rail each: budget, forced finalization (the one forced model call), owner-message plumbing, the per-round model call with context fit and fallback chain, nudges, round limits
+  loop_budget.py, loop_forced_finalization.py, loop_messages.py, loop_model_call.py, primary_route_observation.py, loop_nudges.py, loop_round_limits.py — leaves of `loop.py`, one rail each: budget, forced finalization (the one forced model call), owner-message plumbing, the per-round model call with context fit and fallback chain, a fallback's non-generating primary facts, nudges, round limits
   task_pacing.py — pacing SSOT: deadline/cost milestones, finalization reserve, typed `CostCeiling`, owner of the main-loop payload-shaping options (§6 Budget tracking)
-  vision_routing.py — send-time image routing for Main, VLM and caption sends: pixels unless the exact route's evidence says no (§6 Vision and local image evidence)
+  vision_routing.py, vision_image_limits.py, image_preparation.py — owner-mode image routing for Main, explicit VLM/caption sends, known route limits and shared byte preparation (§6 Vision and local image evidence)
   fallback_cooldown.py — per-process 429-aware cooldown for the `OUROBOROS_MODEL_FALLBACKS` chain; advisory, not a swarm-wide governor
   model_concurrency.py — per-(model, use_local) semaphore (`OUROBOROS_MODEL_MAX_CONCURRENCY`), per-process only, so one task's loop, children and pings cannot exhaust a model's rate limit
   project_naming.py — SSOT for LLM-first project naming with deterministic fallback, shared by admission (no model call), card conversion and the lazy turn namer
@@ -199,7 +199,7 @@ ouroboros/ — agent core and shared runtime (§6)
   context_mode_compat.py — normalizes and persists the `OUROBOROS_CONTEXT_MODE`/`OUROBOROS_CONTEXT_MODE_AUTO_LOW` pair during `load_settings()` (§7 Default settings)
   memory_view.py, memory_view_legacy.py — the resident memory view, one render by role (`ViewSpec`); a retold old record whole or as one address line (§6 Durable memory)
   memory_floor.py — the memory view's physical floor: what a window cannot hold becomes address lines, people's words last (§6 Context fitting)
-  capability_evidence.py — sourced capability and token-density evidence (`data/state/capability_evidence.json`); windows size sends and grant no review authority; also the `image_input` namespace (§6 Prompt size, density and windows)
+  capability_evidence.py, response_limits.py — sourced capability, token-density and maximum-response evidence (`data/state/capability_evidence.json`); windows size sends and grant no review authority; also the `image_input` namespace (§6 Prompt size, density and windows)
   context_layout.py — doc-layout SSOT: `book_navigation` is a book's compact view; ARCHITECTURE is composed in Max and navigated in Low/Nano; reduction relocates behind a visible pointer, never truncates silently (§6 Context fitting)
   reference_books.py — the ordered Architecture/Development reader and validator; free worktree book balance against the cached official development merge-base (an unavailable base is unknown, never paid; no fetch or local block; DEVELOPMENT "Documentation contract")
   local_model_server.py — read-only local formatter measurement and serving-process probe
@@ -368,7 +368,7 @@ ouroboros/ — agent core and shared runtime (§6)
   gateway/ — Gateway Boundary v1: browser-facing route ownership and the frontend contract SSOT (Gateway Boundary v1 below)
     contracts.py — Active WS/HTTP envelope contract owner
     decision_contracts.py, history_contracts.py, attachment_contracts.py, schedule_contracts.py — Typed contract leaves re-exported by contracts.py: decision families (each ingress owns runtime validation), paged Chat history, owner attachments, schedule responses
-    ui_i18n_contracts.py — Typed interface-language envelopes (`/api/ui/i18n*`), separate for contracts.py's size cap; browser twin `web/modules/ui_i18n_types.js`
+    ui_i18n_contracts.py, model_route_contracts.py — interface-language envelopes (`/api/ui/i18n*`) and model-route previews, separate for contracts.py's size cap; browser twins `web/modules/ui_i18n_types.js`, `model_route_types.js`
     endpoint_index.py — `HTTP_ENDPOINTS` index, re-exported by contracts.py; routers own the Route objects
     schema.py — Executable gateway contract: JSON Schema derived from the TypedDicts, validating ingress
     router.py — Starlette route collector for /api/* and /ws (§4)
@@ -424,7 +424,7 @@ ouroboros/ — agent core and shared runtime (§6)
     registry_core.py, registry_guards.py, registry_guard_process.py, tool_context.py — Registry load/schema/dispatch, the capability/resource/update/skill guards, process admission and observations, `ToolContext`/`BrowserState` (protocol: contracts/tool_context.py) (§6 Safety and runtime mode)
     git.py — Git/write tools with the deterministic, test and one-wave review commit gates and the author's optional preflight (§6 Git and commit review)
     git_plumbing.py, git_repo_edit.py, git_vcs_ops.py, git_review_cycle.py, git_evolution.py — The git tool's leaves: plumbing, the uncommitted repo write and edit surface, VCS inspection and rollback, staging plus the optional preflight and the one-wave two-part review, evolution-campaign authority at the reviewed-commit and publication boundaries
-    search.py — Web search tool (OpenAI Responses API, LLM-first overridable defaults)
+    search.py — `web_search`, one leg per Source/Model of `ouroboros/search_routes.py` (§6 Web access mechanisms)
     browser.py — Playwright browser tools with per-ToolContext lifecycle and thread affinity (§6 MCP and browser-facing external tools)
     vision.py — Vision LLM tools for browser screenshots and uploaded images
     vision_process.py — Tracked vision-child IPC: validated receipts, result recovery, parent-owned cancellation

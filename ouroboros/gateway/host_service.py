@@ -538,8 +538,9 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                     incoming, inline_image = await run_sync_to_completion(_inject_identity, ctx, skill_name, payload)
                 except ValueError as exc:
                     return _json_error(str(exc), 400)
-                logged = text.strip() or image_caption.strip() or (  # as accept_local_message logs it
-                    "(image attached)" if inline_image else "(file attached)" if incoming else "")
+                # Reuse the accepted byte-proven kinds; same_message still checks every incoming digest/name.
+                logged = text.strip() or image_caption.strip() or chat_uploads.attachment_placeholder(
+                    inline_image, {"chat_attachments": inbound.get("attachments"), "chat_attachment_uploads": incoming})
                 if not chat_uploads.same_message(inbound, logged, incoming):
                     return _json_error("client_message_id was already used for a different message", 409)
                 state = _operation_state(ctx, rows, inbound)
@@ -740,8 +741,8 @@ def _inject_attachment_uploads(
     ``stage_task_attachments`` and the secret-name rule see one upload family.
     Returns ``(chat_attachment_uploads specs, measured display refs, the inline photo's
     byte-proven image mime or "")``. Inline bytes are parked ONCE, and the owner sees
-    one bubble. A proven image alone still feeds vision and routed staging unchanged;
-    beside files it is staged first with them, because every lane drops the inline
+    one bubble. The original inline image is always staged, including a solitary
+    photo, so later explicit readers retain its pixels. Every lane drops the inline
     copy once uploads stage. Inline bytes that prove no image are no photo: they are
     staged as an ordinary file and never reach vision under the transport's label.
     Each spec carries its ref's measured identity, which staging verifies while copying.
@@ -752,17 +753,16 @@ def _inject_attachment_uploads(
     specs: list[dict[str, Any]] = []
     sources = _confined_inject_sources(ctx, skill_name, payload.get("attachments"))
 
-    def park(source: Any, name: str, mime: str = "", *, staged: bool = True) -> None:
+    def park(source: Any, name: str, mime: str = "") -> None:
         stored, ref = store_upload(source, name, data_dir=ctx.data_dir)
         cleanup.callback(stored.unlink, missing_ok=True)
         refs.append(ref)
-        if staged:
-            specs.append({"path": str(stored), "label": name, "mime": mime or ref["mime"],
-                          "size": ref["size"], "sha256": ref["sha256"]})
+        specs.append({"path": str(stored), "label": name, "mime": mime or ref["mime"],
+                      "size": ref["size"], "sha256": ref["sha256"]})
 
     data, image = _inline_image_bytes(payload)
     if data:  # parked first: a proven image's ref is refs[0]
-        park(data, chat_uploads.inline_image_name(data), staged=bool(sources) or not image)
+        park(data, chat_uploads.inline_image_name(data))
     for source, name, mime in sources:
         park(source, name, mime)
     return specs, refs, refs[0]["mime"] if image else ""

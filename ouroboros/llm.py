@@ -641,20 +641,31 @@ class LLMClient(
         ``model`` is named explicitly, so the one image policy sends its pixels
         (``purpose`` "vlm" for a VLM tool, "caption" for a send-time caption);
         it never captions here, so a caption cannot recurse into another."""
-        from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send, query_image_url
+        from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+        from ouroboros.vision_image_limits import query_image_messages
+        from ouroboros.model_wait import current_model_wait
+        from contextlib import nullcontext
 
-        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for img in images:
-            if "url" in img or "base64" in img:  # the URL a refusal of this image is remembered by
-                content.append({"type": "image_url", "image_url": {"url": query_image_url(img)}})
-            else:
-                log.warning("vision_query: skipping image with unknown format: %s", list(img.keys()))
+        canonical = query_image_messages(prompt, images)
+        sent = {}
 
-        messages = prepare_messages_for_send([{"role": "user", "content": content}], routing=VisionRoutingContext(
-            model, self, {}, use_local=use_local, model_role=model_role,
-            model_account_override=model_account_override), purpose=purpose)
-        response_msg, usage = self.chat(
-            messages=messages,
+        def prepare(values):
+            from ouroboros.vision_routing import _has_image, _image_digest, _is_image
+
+            messages = prepare_messages_for_send(canonical, routing=VisionRoutingContext(
+                values["model"], self, {}, use_local=values.get("use_local", False),
+                model_role=values.get("model_role", model_role),
+                model_account_override=values.get("model_account_override")), purpose=purpose)
+            parts = [part for message in messages for part in message.get("content", [])]
+            sent.update(model=values["model"], digests=[_image_digest(part) for part in parts if _is_image(part)],
+                        note=" ".join(part["text"] for part in parts[1:] if part.get("type") == "text"))
+            if _has_image(canonical) and not sent["digests"]:
+                error = ValueError(f"VLM_NO_IMAGE_PIXELS: {values['model']}: {sent['note']}")
+                error.vision_query_receipt = dict(sent)
+                raise error
+            return {**values, "messages": messages}
+
+        values = prepare(dict(
             model=model,
             tools=None,
             reasoning_effort=reasoning_effort,
@@ -667,7 +678,15 @@ class LLMClient(
             model_operation_observer=model_operation_observer,
             model_account_override=model_account_override,
             processing_preference=processing_preference,
-        )
+        ))
+        waiter = current_model_wait()
+        with waiter.register_reprepare(model_role, prepare) if waiter else nullcontext():
+            try:
+                response_msg, usage = self.chat(**values)
+            except Exception as exc:
+                exc.vision_query_receipt = dict(sent)
+                raise
+        usage = {**usage, "_vision_query_receipt": dict(sent)}
         text = response_msg.get("content") or ""
         return text, usage
 

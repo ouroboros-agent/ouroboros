@@ -339,7 +339,7 @@ class LocalChatBridge:
         clean_text = str(text or "").strip()
         if self.panic.request(clean_text):
             return
-        if not clean_text and not image_base64:
+        if not clean_text and not image_base64 and not (task_metadata or {}).get("chat_attachment_uploads"):
             return
         import uuid
 
@@ -350,10 +350,9 @@ class LocalChatBridge:
         metadata = dict(task_metadata or {})
         if str(project_id or "").strip():
             metadata.setdefault("project_id", str(project_id).strip())
-        log_text = clean_text or str(image_caption or "").strip() or (
-            "(image attached)" if image_base64 else "(file attached)"
-            if metadata.get("chat_attachment_uploads") else ""
-        )
+        from ouroboros.chat_uploads import attachment_placeholder
+
+        log_text = clean_text or str(image_caption or "").strip() or attachment_placeholder(image_base64, metadata)
         placeholder = not clean_text  # a web caption is the gateway's own ``[user attachment: …]`` label
         # The canonical row precedes echo/dispatch: neither WS nor Queue survives
         # restart. Its returned witness lets dequeue validation avoid a chat scan.

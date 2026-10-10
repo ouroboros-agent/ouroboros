@@ -44,59 +44,34 @@ class TestSupportsVision:
 
 
 class TestWebAttachmentBlocks:
-    def test_first_image_attachment_resolves_upload(self, tmp_path, monkeypatch):
+    def test_attachment_acceptance_binds_bytes_without_a_redundant_inline_image(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
         import ouroboros.gateway.ws as ws_mod
+        from ouroboros.chat_uploads import store_upload
+        from tests.test_live_image_delivery import pixels
 
-        uploads = tmp_path / "uploads"
-        uploads.mkdir(parents=True)
-        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
-        (uploads / ("a" * 32 + "_cat.png")).write_bytes(png)
+        stored, reference = store_upload(pixels(), "cat.png", data_dir=tmp_path)
         monkeypatch.setattr(ws_mod, "DATA_DIR", tmp_path)
-
-        b64, mime, caption = ws_mod._first_image_attachment([
-            {"filename": "a" * 32 + "_cat.png", "mime": "image/png", "display_name": "cat.png"},
+        calls = []
+        bridge = SimpleNamespace(ui_send=lambda text, **kwargs: calls.append((text, kwargs)))
+        ws_mod._accept_with_attachments(bridge, "look", {"task_metadata": {}}, [
+            {"filename": stored.name, "mime": "video/mp4", "display_name": "cat.png"},
+            {"filename": "../settings.json", "mime": "image/png"},
         ])
-        assert base64.b64decode(b64) == png
-        assert mime == "image/png"
-        assert "cat.png" in caption
-
-    def test_the_bytes_not_the_frame_decide_what_is_an_image(self, tmp_path, monkeypatch):
-        import ouroboros.gateway.ws as ws_mod
-
-        uploads = tmp_path / "uploads"
-        uploads.mkdir(parents=True)
-        (uploads / ("b" * 32 + "_page.png")).write_bytes(b"<html><script>x</script></html>")
-        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 28
-        (uploads / ("c" * 32 + "_clip.mp4")).write_bytes(jpeg)
-        monkeypatch.setattr(ws_mod, "DATA_DIR", tmp_path)
-
-        assert ws_mod._first_image_attachment(
-            [{"filename": "b" * 32 + "_page.png", "mime": "image/png"}]) == ("", "", ""), "HTML is no image"
-        b64, mime, _caption = ws_mod._first_image_attachment(
-            [{"filename": "c" * 32 + "_clip.mp4", "mime": "video/mp4"}])
-        assert base64.b64decode(b64) == jpeg and mime == "image/jpeg", "a JPEG is one, whatever its name"
-
-    def test_traversal_and_non_image_rejected(self, tmp_path, monkeypatch):
-        import ouroboros.gateway.ws as ws_mod
-
-        (tmp_path / "uploads").mkdir(parents=True)
-        secret = tmp_path / "settings.json"
-        secret.write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(ws_mod, "DATA_DIR", tmp_path)
-
-        assert ws_mod._first_image_attachment(
-            [{"filename": "../settings.json", "mime": "image/png"}]
-        ) == ("", "", "")
-        assert ws_mod._first_image_attachment(
-            [{"filename": "doc.pdf", "mime": "application/pdf"}]
-        ) == ("", "", "")
+        _text, kwargs = calls[0]
+        assert "image_base64" not in kwargs
+        metadata = kwargs["task_metadata"]
+        assert metadata["chat_attachments"][0]["mime"] == "image/png"
+        assert metadata["chat_attachment_uploads"][0]["sha256"] == reference["sha256"]
+        assert metadata["chat_attachment_uploads"][1]["path"] == ""
 
     def test_build_user_content_attaches_caption_metadata(self):
         from ouroboros.context import build_user_content
 
+        from tests.test_live_image_delivery import pixels
         content = build_user_content({
             "text": "look",
-            "image_base64": "QUJD",
+            "image_base64": base64.b64encode(pixels()).decode(),
             "image_mime": "image/png",
             "image_caption": "[user attachment: cat.png]",
         })

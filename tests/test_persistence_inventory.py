@@ -408,6 +408,11 @@ class _PathResolver:
     def _locals(self, scope: ast.AST, consts: dict[str, str],
                 nodes: list[ast.AST]) -> dict[str, str]:
         local: dict[str, str] = {}
+        if self.current.name == "image_preparation.py" and getattr(scope, "name", "") == "retain_original":
+            # Both callers (context.build_user_content and tools.vision's loader)
+            # pass their data owner's uploads/views. Bind only this parameter,
+            # never a generic directory name in other writers.
+            local["directory"] = "uploads/views"
         created_dirs = {node.func.value.id for node in nodes
                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                         and node.func.attr == "mkdir" and isinstance(node.func.value, ast.Name)}
@@ -872,6 +877,7 @@ def _covers(scan_path: str, pattern: str, scan_prefix_ok: bool = True) -> bool:
 
 def test_scan_is_populated_and_pinned():
     paths = scan_data_paths()
+    assert "uploads/views/*_*" in paths, "the shared original-retention writer must remain scanned"
     missing_sentinels = sorted(SENTINELS - paths)
     assert not missing_sentinels, (
         f"scanner regressed — sentinel paths vanished: {missing_sentinels}"

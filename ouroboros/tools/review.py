@@ -917,9 +917,9 @@ def _triad_governance_usable_window(api_models: list, api_slots: list) -> int:
 
     usable: dict = {}
     for model, slot in zip(api_models, api_slots):
-        window = reviewer_context_window(model, **reviewer_window_binding(slot))
+        window = reviewer_context_window(model, **(binding := reviewer_window_binding(slot)))
         output_reserve, tokenizer_margin = window_scaled_reserves(
-            window, output_reserve=_review_output_budget(), tokenizer_margin=50_000)
+            window, output_reserve=_review_output_budget(), tokenizer_margin=50_000, model_id=model, binding=binding)
         usable[slot.slot_id] = max(0, int(window) - int(output_reserve) - int(tokenizer_margin))
     return _quorum_input_token_limit(list(usable), usable) if usable else 0
 

@@ -894,28 +894,29 @@ def _api_owner_safety_mode_sync(request: Request, body: Any) -> JSONResponse:
 
 
 async def api_acknowledge_capability(request: Request) -> JSONResponse:
-    """Record a route-fingerprinted owner acknowledgement of a model's context
-    window (Capability Evidence: ASSERTED). Auditable and NON-generic — it covers
-    only the exact provider+model+base_url+headers/options it was issued for, and
-    is invalidated by any route change. CI/headless may supply the same ack via
-    config, but it must carry the same fingerprint (no repo-wide trust flag).
+    """Acknowledge a context window or response maximum for an exact route.
+    Provider, model, endpoint and applicable headers/options bind the assertion;
+    headless acknowledgements need the same fingerprint, never repo-wide trust.
 
-    NOT an owner SETTINGS write, and deliberately unguarded by
-    ``owner_write_guard``: `record_owner_ack` writes its own route-fingerprinted
-    evidence file and never touches settings.json, so it holds no settings lock
-    and answers no `settings_locked`. It wore the decorator for one release,
-    where it translated exceptions that cannot be raised while implying to every
-    reader that the endpoint was lock-guarded — under a genuinely held lock the
-    five settings writers refused 503 and this one recorded its acknowledgement
-    and answered 200. Widening the settings lock to cover an unrelated ledger
-    would have made the decorator true at the price of coupling a capability ack
-    to whether some settings save is in flight; the decorator was the wrong
-    claim, so the claim went."""
+    Context and output acknowledgements have independent records and timestamps.
+    They write the evidence store, never settings.json, so this endpoint deliberately
+    has no ``owner_write_guard`` or settings lock and cannot answer ``settings_locked``."""
     body = await _json_body_or_empty(request)
     provider = str((body or {}).get("provider") or "").strip()
     model = str((body or {}).get("model") or "").strip()
     if not provider or not model:
         return json_error("'provider' and 'model' are required", 400)
+    if "max_output_tokens" in (body or {}):
+        from ouroboros.response_limits import record_response_ack
+        try:
+            record = await asyncio.to_thread(record_response_ack, request_drive_root(request),
+                provider=provider, model=model, base_url=str(body.get("base_url") or ""),
+                options=body.get("options"), max_output_tokens=body["max_output_tokens"],
+                expected_route_fp=str(body.get("route_fp") or ""))
+            _owner_audit(request, "response_cap_ack", record)
+            return JSONResponse({"ok": True, "ack": record})
+        except (ValueError, TypeError) as exc:
+            return json_error(str(exc), 400)
     try:
         window_tokens = int((body or {}).get("window_tokens") or 0)
     except (TypeError, ValueError):
@@ -960,6 +961,17 @@ async def api_review_pool(request: Request) -> JSONResponse:
 
 async def api_settings_get(request: Request) -> JSONResponse:
     settings, _, _ = apply_runtime_provider_defaults(load_settings())
+    if request.query_params.get("websearch_preview") == "1":
+        from ouroboros.search_routes import resolve_web_search_route
+        return JSONResponse(resolve_web_search_route(settings=settings,
+            backend=request.query_params.get("backend"), model=request.query_params.get("model")))
+    if request.query_params.get("response_limit_preview") == "1":
+        from ouroboros.response_limits import response_limit_preview
+        model = str(request.query_params.get("model") or settings.get("OUROBOROS_MODEL") or "")
+        route = _active_main_route(settings, model_override=model,
+            use_local_override=request.query_params.get("local") == "true")
+        return JSONResponse(await asyncio.to_thread(response_limit_preview, request_drive_root(request), route,
+            account=request.query_params.get("account", ""), settings=settings))
     safe = {k: v for k, v in settings.items()}
     for key in SECRET_SETTING_KEYS:
         if safe.get(key):

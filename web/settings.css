@@ -487,7 +487,6 @@
 }
 
 .available-subagents-toolbar,
-.available-subagent-head,
 .available-subagent-actions {
     display: flex;
     flex-wrap: wrap;
@@ -499,6 +498,13 @@
 .available-subagents-toolbar .btn-default,
 .available-subagent-actions {
     margin-left: auto;
+}
+
+/* Reserve the intent slot even when Settings' Save bar owns the dirty word:
+   the first edit never re-wraps or collapses a toolbar line above the cards. */
+.available-subagents-intent {
+    min-width: 8rem;
+    min-height: calc(var(--type-meta) * var(--line-meta));
 }
 
 .available-subagents-count,
@@ -522,17 +528,23 @@
     gap: var(--space-2);
 }
 
-/* Compact card (docs/DESIGN.md §6 row anatomy): head → Description → route
-   controls → one meta line. Inner rhythm is one space token and the card
-   padding three, so three cards fit a laptop-height Settings body. */
+/* Open card (docs/DESIGN.md §6 row anatomy): head → current exceptions →
+   labelled Source and Model, then Account / Effort / Access → Description →
+   one meta line → Processing and Details & history. The card is a size
+   container, so its own width, not the viewport, picks the field columns. */
 .available-subagent-row {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     padding: var(--space-3);
     border: 1px solid var(--surface-border);
     border-radius: var(--radius);
     background: var(--surface-card-soft);
+    container: subagentcard / inline-size;
+}
+
+.available-subagent-row [hidden] {
+    display: none;
 }
 
 /* An entry the owner tried to save with an error is emphasised, not dimmed. */
@@ -541,12 +553,52 @@
     background: var(--status-error-bg);
 }
 
+/* The title side wraps inside its own basis; the Reviewer mark and the actions
+   keep the end slot. Whether the head wraps depends on the card width only, so
+   no status word or caption moves the Reviewer box (docs/DESIGN.md §6). */
+.available-subagent-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-2);
+}
+
+.available-subagent-title {
+    display: flex;
+    flex: 1 1 16rem;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    min-width: 0;
+    min-height: 34px;
+}
+
+/* Source beside a wide Model, then Account / Effort / Access; fewer columns as
+   the card narrows. Tracks yield to the card (minmax(0, …)). */
 .available-subagent-route {
     display: grid;
-    /* A track minimum yields to the container: the viewport query does not know
-       the Settings column width, so the floor is capped at 100% of the row. */
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: var(--space-2);
+}
+
+.available-subagent-field-model {
+    grid-column: span 2;
+}
+
+@container subagentcard (max-width: 34rem) {
+    .available-subagent-route {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .available-subagent-field-model {
+        grid-column: 1 / -1;
+    }
+}
+
+@container subagentcard (max-width: 22rem) {
+    .available-subagent-route {
+        grid-template-columns: minmax(0, 1fr);
+    }
 }
 
 .available-subagent-heading {
@@ -567,7 +619,7 @@
     cursor: pointer;
 }
 
-/* Two short words on one line; the full sentence is the status's title. */
+/* One short availability word; the full sentence is the status's title. */
 .available-subagent-head .settings-inline-status {
     min-width: 0;
     white-space: nowrap;
@@ -597,17 +649,11 @@
 }
 
 .available-subagent-meta {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.available-subagent-meta[data-run-history] {
-    white-space: normal;
     overflow-wrap: anywhere;
 }
 
-/* Why a row will not run, in words: the status title needs a hover a phone lacks. */
+/* A current exception in words (a specific refusal, a marked row switched off):
+   the status title needs a hover a phone lacks. */
 .available-subagent-status-reason {
     color: var(--status-warn-fg);
     font-size: var(--type-meta);
@@ -620,28 +666,48 @@
     padding: 0 11px;
 }
 
-/* Reviewer mark, its price and origin wrap as one line under the route. */
-.available-subagent-review {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--space-2);
-    color: var(--text-meta);
-    font-size: var(--type-meta);
-}
-
 .available-subagent-reviewer {
     display: inline-flex;
     align-items: center;
     gap: var(--space-1);
+    min-height: 34px;
     color: var(--text-primary);
+    font-size: var(--type-body);
     cursor: pointer;
 }
 
-.available-subagent-minted {
-    padding: 0 var(--space-2);
-    border: 1px solid var(--surface-border);
-    border-radius: var(--radius);
+/* Details & history: label beside value, stacked on a narrow card. */
+.available-subagent-facts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin: var(--space-1) 0 0;
+}
+
+.available-subagent-facts > div {
+    display: grid;
+    grid-template-columns: minmax(0, 8rem) minmax(0, 1fr);
+    gap: var(--space-2);
+}
+
+.available-subagent-facts dt {
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    font-weight: 600;
+}
+
+.available-subagent-facts dd {
+    margin: 0;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    overflow-wrap: anywhere;
+}
+
+@container subagentcard (max-width: 28rem) {
+    .available-subagent-facts > div {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0;
+    }
 }
 
 .available-subagents-review-empty {
@@ -906,10 +972,6 @@
     .settings-custom-secret-row {
         grid-template-columns: 1fr;
         align-items: stretch;
-    }
-
-    .available-subagent-route {
-        grid-template-columns: 1fr;
     }
 
     .available-subagents-toolbar .btn-default {

@@ -251,7 +251,7 @@ class _MessageShapingMixin:
                         else:
                             block.pop("cache_control", None)
                         # Known host metadata never leaves the send copy.
-                        for key in ("_caption", "_source_path", "_context_capsule"):
+                        for key in ("_caption", "_source_path", "_original_image_url", "_context_capsule"):
                             block.pop(key, None)
         return cleaned
 

@@ -49,7 +49,7 @@ const INPUT_FIELDS = [
     // on the Available subagents rows.
     ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
     ['s-extra-ca-bundle', 'OUROBOROS_EXTRA_CA_BUNDLE'],
-    ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
+    ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-source', 'OUROBOROS_WEBSEARCH_BACKEND', 'auto'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
     ['s-local-source', 'LOCAL_MODEL_SOURCE'], ['s-local-filename', 'LOCAL_MODEL_FILENAME'], ['s-local-chat-format', 'LOCAL_MODEL_CHAT_FORMAT'],
     ['s-subagent-worktree-root', 'OUROBOROS_SUBAGENT_WORKTREE_ROOT'], ['s-subagent-projects-root', 'OUROBOROS_SUBAGENT_PROJECTS_ROOT'],
     ['s-evo-budget', 'OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD', '0'],
@@ -485,6 +485,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         })
         .catch(() => { /* about version is best-effort */ });
     let currentSettings = {};
+    let searchSelectionEdited = false;
     let extensionRefreshPending = false;
     let settingsLoaded = false;
     let settingsBaseline = '';
@@ -503,6 +504,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     modelRoles.mount();
     initMcpSettings({ onChange: onSettingsEdited });
     initSubagentsSection({
+        hasPageDirtyIndicator: true,
         onChange: () => onSettingsEdited(),
         // A judged roster may clear only the validation footer it authored.
         // A cadence or other field error keeps its typed subject and survives.
@@ -675,6 +677,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         page.querySelectorAll('[data-provider-test-status]').forEach((el) => setInlineStatus(el, '', 'muted'));
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, storedOrFallback(s[key], fallback)));
+        searchSelectionEdited = false;
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
         modelRoles.load(s, { ...setupContract, modelSlots: setupModelSlots().map((slot) => ({
             ...slot, inputId: slot.settingsInputId,
@@ -741,6 +744,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         syncPolicyState(page, s?._meta);
         syncPostTaskEvolutionUi();
         refreshSafetySkipCounter();  // fire-and-forget; fills the 24h audited-skip note
+        void refreshSearchPreview();  // fire-and-forget; describes the applied search Source/Model
     }
 
     function syncMoreProvidersDisclosure() {
@@ -904,6 +908,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }
     }
 
+    function collectSearchSelection() {
+        const backend = byId('s-websearch-source').value;
+        let model = byId('s-websearch-model').value.trim();
+        // Preserve untouched legacy settings. An edited native Anthropic id uses
+        // the existing routed spelling so dispatch can recognize the new intent.
+        if (searchSelectionEdited && backend === 'anthropic' && model
+                && !model.includes('::') && !model.startsWith('anthropic/')) model = `anthropic::${model}`;
+        return { backend, model };
+    }
+
     function collectBody() {
         const fieldValue = (id) => byId(id)?.value || '';
         const mutativeInput = byId('s-allow-mutative-subagents');
@@ -925,6 +939,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             const value = fieldValue(id).trim();
             body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || '';
         });
+        body.OUROBOROS_WEBSEARCH_MODEL = collectSearchSelection().model;
         VALUE_FIELDS
             // Owner-only keys travel through their audited owner endpoints, never
             // the generic settings POST (safety_mode joined runtime/context, r4).
@@ -1141,9 +1156,27 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // ask the owner to discard "unsaved settings" that do not exist.
     const onServerSettingEdited = (event) => {
         if (event?.target?.closest?.('[data-notify-settings], [data-autostart-settings]')) return;
+        if (event?.target?.closest?.('[data-response-limit]')) return;   // a maximum is an evidence acknowledgement, not a setting
         if (event?.target?.closest?.('[data-i18n-settings]')) return;   // the interface language saves through its own endpoint
         onSettingsEdited();
     };
+    let searchPreviewSequence = 0;
+    async function refreshSearchPreview() {
+        const sequence = ++searchPreviewSequence;
+        const target = byId('s-websearch-preview');
+        if (!target?.isConnected) return;
+        try {
+            const data = await apiClient.webSearchPreview(searchSelectionEdited ? collectSearchSelection() : {});
+            if (sequence !== searchPreviewSequence || !target.isConnected) return;
+            // The help text already says skills, MCP and browser tools stay independent.
+            const legacy = data.ignored_legacy_model ? ` Anthropic does not apply the saved model ${data.ignored_legacy_model}; edit Source or Model to change it.`
+                : data.unapplied_model ? ` No built-in search serves the saved model ${data.unapplied_model}; Auto uses provider defaults.` : '';
+            target.textContent = data.error || `Eligible routes: ${(data.legs || []).map((leg) => `${leg.source}${leg.model ? ` · ${leg.model}` : ''}`).join(' → ') || 'none'}. Uses saved account credentials.${legacy}`;
+        } catch (_) { if (sequence === searchPreviewSequence && target.isConnected) target.textContent = 'Search routes could not be checked. Your choices are kept.'; }
+    }
+    const onSearchSelectionEdited = () => { searchSelectionEdited = true; void refreshSearchPreview(); };
+    byId('s-websearch-source')?.addEventListener('change', onSearchSelectionEdited);
+    byId('s-websearch-model')?.addEventListener('input', onSearchSelectionEdited);
     page.addEventListener('input', onServerSettingEdited);
     page.addEventListener('change', onServerSettingEdited);
     page.addEventListener('click', (event) => {

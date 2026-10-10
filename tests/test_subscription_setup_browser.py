@@ -288,9 +288,10 @@ def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subsc
     reviewer = page.locator('[data-subagent-row]').first
     assert reviewer.locator('[data-subagent-field="review_eligible"]').is_checked()
     assert page.locator('[data-review-pool-count]').inner_text() == 'Reviewers: 1'
-    assert 'reviews at high effort' in reviewer.locator('[data-subagent-review-facts]').inner_text()
+    default_effort = reviewer.locator('[data-subagent-field="effort"] option[value=""]')
+    assert default_effort.inner_text() == 'Default (reviews at high)'
     reviewer.locator('[data-subagent-field="effort"]').select_option('high')
-    assert 'reviews at high effort' not in reviewer.locator('[data-subagent-review-facts]').inner_text()
+    assert reviewer.locator('[data-subagent-field="effort"]').input_value() == 'high'
     reviewer.scroll_into_view_if_needed()
     capture(page, "reviewer-row-editable")
     page.click('#next-btn')

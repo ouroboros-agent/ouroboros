@@ -381,14 +381,19 @@ export function renderSettingsPage() {
                          duplicates one there. -->
 
                     <div class="form-section">
-                        <h3>Other Model Slots</h3>
+                        <h3>Web search</h3>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
-                                <label for="s-websearch-model">Web Search Model</label>
-                                <input id="s-websearch-model" placeholder="gpt-5.2" class="ui-control" name="s-websearch-model" type="text" aria-describedby="s-websearch-model-help">
-                                <div class="settings-inline-note ui-field-help" id="s-websearch-model-help">OpenAI model for <code>web_search</code>. Requires <code>OPENAI_API_KEY</code> and an empty Legacy Base URL.</div>
+                                <label for="s-websearch-source">Source</label>
+                                <select id="s-websearch-source" class="ui-control"><option value="auto">Auto</option><option value="openai">OpenAI</option><option value="openrouter">OpenRouter</option><option value="anthropic">Anthropic</option><option value="ddgs">ddgs</option></select>
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-websearch-model">Model</label>
+                                <input id="s-websearch-model" placeholder="Auto: source defaults" class="ui-control" name="s-websearch-model" type="text" aria-describedby="s-websearch-model-help">
+                                <div class="settings-inline-note ui-field-help" id="s-websearch-model-help">Built-in <code>web_search</code> only. Skills, MCP and browser tools remain independent choices. Empty uses source defaults.</div>
                             </div>
                         </div>
+                        <div class="ui-field-help" id="s-websearch-preview" role="status"></div>
                     </div>
                 </section>
 
@@ -1031,7 +1036,7 @@ export function renderSettingsPage() {
                         title="Restart the agent process">Restart now</button>
                 </div>
                 <div class="settings-footer-status">
-                    <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
+                    <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator">Unsaved changes</span>
                     <div id="settings-restart-status" class="settings-inline-status" role="status" aria-live="polite" hidden></div>
                     <div id="settings-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
                 </div>

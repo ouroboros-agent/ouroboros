@@ -133,7 +133,7 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
 
         _emit_usage(ctx, usage, vlm_model)
 
-        return text or "(no response from VLM)"
+        return _vlm_response(text, usage)
     except Exception as e:
         from ouroboros.llm_claudexor import propagate_model_error
         if "operation_id" in locals():
@@ -151,16 +151,15 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
                             [*locals().get("shot", ()), *locals().get("images", ())])
 
 
-_IMAGE_MAGIC: List[tuple] = [
-    (b'\x89PNG\r\n\x1a\n', "image/png"),
-    (b'\xff\xd8\xff', "image/jpeg"),
-    (b'GIF87a', "image/gif"),
-    (b'GIF89a', "image/gif"),
-]
-_IMAGE_WEBP_MAGIC = (b'RIFF', b'WEBP')
 _VLM_MAX_FILE_BYTES = 20 * 1024 * 1024
+# Existing host request budget, not a claim about every provider.
 _VLM_MAX_PROVIDER_BYTES = 6 * 1024 * 1024
-_VLM_MAX_IMAGE_SIDE = 1600
+
+
+def _vlm_response(text: str, usage: dict) -> str:
+    """Keep the host's disclosure even when the model omits it from its answer."""
+    note = (usage.get("_vision_query_receipt") or {}).get("note")
+    return "\n\n".join(part for part in (note, text or "(no response from VLM)") if part)
 
 
 @model_waitable(client_parameter="client")
@@ -221,93 +220,22 @@ def _path_is_under(path: "pathlib.Path", root: "pathlib.Path") -> bool:
 
 
 def _downscale_image_for_vlm(raw: bytes, mime: str) -> Tuple[bytes, str]:
-    """Cap very large image payloads before sending them to the VLM provider.
-
-    Raises ``ValueError`` on an image PIL cannot fully decode: a truncated
-    PNG keeps a parseable header, and forwarding its bytes turns into a
-    non-retryable provider 400 ("Could not process image") that kills the
-    task rounds later. Fail here, where the caller still maps errors to a
-    tool-visible ⚠️ message. Without PIL the check is skipped (permissive).
-    """
-    if len(raw) <= _VLM_MAX_PROVIDER_BYTES:
-        try:
-            from PIL import Image
-            import io
-        except Exception:
-            return raw, mime
-        try:
-            with Image.open(io.BytesIO(raw)) as img:
-                img.load()
-                if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
-                    return raw, mime
-        except Image.DecompressionBombError:
-            # A VALID but very large image. Not corruption — forward it; the
-            # size rails below/above are what bound it.
-            return raw, mime
-        except Exception as exc:
-            # A truncated-but-renderable file (a partially downloaded JPEG) still
-            # yields a usable frame under Pillow's tolerant mode; only refuse what
-            # cannot be rendered at all, which is the zero-padded-PNG class that
-            # used to reach the provider and come back as a non-retryable 400.
-            try:
-                from PIL import ImageFile
-
-                previous = ImageFile.LOAD_TRUNCATED_IMAGES
-                ImageFile.LOAD_TRUNCATED_IMAGES = True
-                try:
-                    with Image.open(io.BytesIO(raw)) as img:
-                        img.load()
-                        if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
-                            return raw, mime
-                finally:
-                    ImageFile.LOAD_TRUNCATED_IMAGES = previous
-            except Exception:  # noqa: BLE001 - genuinely undecodable, fall through
-                pass
-            else:
-                return raw, mime
-            raise ValueError(
-                f"⚠️ IMAGE_UNDECODABLE: {type(exc).__name__}: {exc} — the image cannot "
-                "be rendered at all (truncated or corrupt beyond recovery); re-capture "
-                "it instead of retrying the attach."
-            ) from exc
-
-    try:
-        from PIL import Image
-        import io
-
-        with Image.open(io.BytesIO(raw)) as img:
-            img.load()
-            if img.mode != "RGB":
-                background = Image.new("RGB", img.size, (255, 255, 255))
-                alpha = img.getchannel("A") if img.mode in {"RGBA", "LA"} else None
-                background.paste(img.convert("RGB"), mask=alpha)
-                img = background
-            else:
-                img = img.copy()
-            max_side = min(_VLM_MAX_IMAGE_SIDE, max(img.size))
-            for quality in (85, 75, 65, 55):
-                candidate = img.copy()
-                candidate.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-                out = io.BytesIO()
-                candidate.save(out, format="JPEG", quality=quality, optimize=True)
-                data = out.getvalue()
-                if len(data) <= _VLM_MAX_PROVIDER_BYTES:
-                    return data, "image/jpeg"
-                max_side = max(64, int(max_side * 0.75))
-    except Exception:
-        log.debug("Failed to downscale VLM image payload", exc_info=True)
-    if len(raw) <= _VLM_MAX_PROVIDER_BYTES:
-        return raw, mime
-    raise _ProviderCapExceeded(
-        f"⚠️ VLM_IMAGE_TOO_LARGE: image payload exceeds {int(_VLM_MAX_PROVIDER_BYTES / 1024 / 1024)}MB provider cap"
-    )
+    """Compatibility wrapper for the shared, detail-preserving byte preparer."""
+    payload = _image_payload_from_bytes(raw, mime)
+    import base64
+    return base64.b64decode(payload["base64"]), payload["mime"]
 
 
 def _image_payload_from_bytes(raw: bytes, mime: str) -> Dict[str, str]:
     import base64
+    from ouroboros.image_preparation import ImagePayloadTooLarge, prepare_image_bytes
 
-    capped_raw, capped_mime = _downscale_image_for_vlm(raw, mime)
-    return {"base64": base64.b64encode(capped_raw).decode(), "mime": capped_mime}
+    try:
+        prepared = prepare_image_bytes(raw, max_bytes=_VLM_MAX_PROVIDER_BYTES)
+    except ImagePayloadTooLarge as exc:
+        raise _ProviderCapExceeded(str(exc)) from exc
+    return {"base64": base64.b64encode(prepared.data).decode(), "mime": prepared.mime,
+            "note": prepared.note}
 
 
 def _image_payload_from_base64(image_base64: str, mime: str) -> Dict[str, str]:
@@ -315,8 +243,8 @@ def _image_payload_from_base64(image_base64: str, mime: str) -> Dict[str, str]:
 
     try:
         raw = base64.b64decode(image_base64, validate=True)
-    except Exception:
-        return {"base64": image_base64, "mime": mime}
+    except Exception as exc:
+        raise ValueError("IMAGE_UNDECODABLE: invalid base64 image") from exc
     return _image_payload_from_bytes(raw, mime)
 
 
@@ -347,13 +275,20 @@ def _vlm_failure(ctx: Any, label: str, error: BaseException, model: str, images:
     A refusal by the chosen route is the route's answer, shown as is and never
     retried here; a completed one (400/422, 404/415) is remembered for this task, so
     neither a VLM call nor a Main send gives these images to that route again."""
-    from ouroboros.vision_routing import completed_image_refusal, query_image_digests, record_image_refusal
+    from ouroboros.vision_routing import query_image_digests, record_image_refusal
+    from ouroboros.vision_image_limits import prepare_query_images, refusal_identity
 
-    refusal = completed_image_refusal(error)
-    if refusal is not None:
-        record_image_refusal(getattr(ctx, "_accumulated_usage", None), model, query_image_digests(images),
-                             {**refusal, "via": "vlm", "model": str(model or "")})
+    def prepared_digests(route: str) -> list:
+        try:
+            return query_image_digests(prepare_query_images(images, route))
+        except (OSError, ValueError):  # a refusal record never replaces the typed failure
+            return query_image_digests(images)
+
     capture = getattr(error, "physical_attempt_capture", None)
+    model, refusal, digests = refusal_identity(error, model, prepared_digests)
+    if refusal is not None:
+        record_image_refusal(getattr(ctx, "_accumulated_usage", None), model, digests,
+                             {**refusal, "via": "vlm", "model": str(model or "")})
     status = getattr(capture, "provider_status_code", None) or getattr(error, "status_code", None)
     meta = {
         "model": str(model or ""),
@@ -419,7 +354,15 @@ def _vlm_route(client: Any, requested_model: str = "", *, ctx: Any = None,
     this task is passed over too, even when it was named explicitly."""
     from ouroboros.vision_routing import choose_image_model, query_image_digests, refusal_check
 
-    refused = refusal_check(getattr(ctx, "_accumulated_usage", None), query_image_digests(images))
+    from ouroboros.vision_image_limits import prepare_query_images
+
+    def refused(model):
+        try:
+            prepared = prepare_query_images(images, model)
+        except (OSError, ValueError) as exc:  # this route's known limits cannot carry the image
+            return f"this image could not be prepared for the route's known limits: {exc}"
+        check = refusal_check(getattr(ctx, "_accumulated_usage", None), query_image_digests(prepared))
+        return check(model) if check else ""
     wait = current_model_wait()
     override = wait.overrides.get("vision") if wait is not None else None
     if override:
@@ -536,10 +479,10 @@ def _read_file_parity_block(ctx: Any, fp: "pathlib.Path") -> str:
     return _runtime_data_read_block(ctx, fp)
 
 
-def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optional[Dict[str, str]], str]:
+def _load_local_image_payload(ctx: ToolContext, file_path: str, *, retain_original: bool = False) -> Tuple[Optional[Dict[str, str]], str]:
     """Validate a LOCAL image path against the SAME trust boundary the agent already
     holds via read_file/run_command (allowed roots + protected-artifact read_bytes
-    policy + size cap + fail-closed MIME sniff), then return a downscaled provider
+    policy + size cap), then return a validated, detail-preserving image
     payload ``{"base64", "mime"}``. On any rejection returns ``(None, message)``.
     LOCAL FILES ONLY — no URL, no base64 (no new exfiltration surface). Shared by
     vlm_query(file_path=...) and view_image so both enforce identical checks.
@@ -580,21 +523,24 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optiona
         raw = fp.read_bytes()
     except Exception as e:
         return None, _refuse(ctx, f"⚠️ Failed to read image file: {e}")
-    # Fail closed: only recognized image bytes (by magic number) may be used.
-    mime = next((kind for magic, kind in _IMAGE_MAGIC if raw[:len(magic)] == magic), "")
-    if not mime and raw[:4] == _IMAGE_WEBP_MAGIC[0] and raw[8:12] == _IMAGE_WEBP_MAGIC[1]:
-        mime = "image/webp"
-    if not mime:
-        return None, _refuse(ctx, (
-            "⚠️ File does not appear to be a supported image (PNG/JPEG/GIF/WEBP). "
-            "Only image files are accepted."
-        ))
+    source_path = str(fp)
+    if retain_original:
+        # Retain the admitted bytes BEFORE decoding/conversion, even on refusal.
+        from ouroboros.image_preparation import retain_original as retain
+        try:
+            source_path = str(retain(pathlib.Path(ctx.drive_root) / "uploads" / "views", raw, fp.name))
+        except OSError:
+            log.warning("Could not retain image original; source stays at %s", fp, exc_info=True)
+    from ouroboros.image_preparation import image_mime
     try:
-        return _image_payload_from_bytes(raw, mime), ""
+        payload = _image_payload_from_bytes(raw, image_mime(raw))
+        if retain_original:
+            payload["source_path"] = source_path
+        return payload, ""
     except _ProviderCapExceeded as e:
-        return None, _refuse(ctx, str(e), code="VLM_ERROR")
+        return None, _refuse(ctx, f"{e}. Original: {source_path}", code="VLM_ERROR")
     except ValueError as e:
-        return None, _refuse(ctx, str(e))
+        return None, _refuse(ctx, f"⚠️ Not a supported image representation: {e}. Original: {source_path}")
 
 
 def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64: str = "", image_mime: str = "image/png", file_path: str = "", model: str = "") -> str:
@@ -647,7 +593,7 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
 
         _emit_usage(ctx, usage, vlm_model)
 
-        return text or "(no response from VLM)"
+        return _vlm_response(text, usage)
     except Exception as e:
         from ouroboros.llm_claudexor import propagate_model_error
         if "operation_id" in locals():
@@ -697,34 +643,19 @@ def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, st
     captions/omits image blocks for routes that cannot see them."""
     if not path:
         return False, _refuse(ctx, "⚠️ Provide a local image file path.")
-    payload, err = _load_local_image_payload(ctx, path)
+    messages = getattr(ctx, "messages", None)
+    if not isinstance(messages, list):
+        return False, "⚠️ VIEW_IMAGE_UNAVAILABLE: no active conversation to attach the image to."
+    payload, err = _load_local_image_payload(ctx, path, retain_original=True)
     if err:
         return False, err
     b64, mime = payload["base64"], payload["mime"]
 
-    messages = getattr(ctx, "messages", None)
-    if not isinstance(messages, list):
-        return False, "⚠️ VIEW_IMAGE_UNAVAILABLE: no active conversation to attach the image to."
-
     import pathlib
-    import base64 as _b64
-    from ouroboros.utils import utc_now_iso
 
     src_name = pathlib.Path(path).name
-    ts = utc_now_iso().replace(":", "").replace("-", "")[:15]
-    ext = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}.get(mime, "img")
-    view_dir = pathlib.Path(ctx.drive_root) / "uploads" / "views"
-    try:
-        view_dir.mkdir(parents=True, exist_ok=True)
-        # Use the stem + the ACTUAL (possibly downscaled, e.g. PNG->JPEG) mime extension —
-        # src_name already carries an extension, so f"{src_name}.{ext}" would double it.
-        view_path = view_dir / f"{ts}_{pathlib.Path(path).stem}.{ext}"
-        view_path.write_bytes(_b64.b64decode(b64))
-        source_path = str(view_path)
-    except Exception:
-        source_path = str(pathlib.Path(path).expanduser().resolve())
-
-    caption = f"[image: {src_name}]"
+    source_path = payload["source_path"]
+    caption = f"[image: {src_name}; original: {source_path}" + (f"; {payload['note']}]" if payload.get("note") else "]")
     from ouroboros.loop import _append_or_merge_user_content
 
     _append_or_merge_user_content(messages, [
@@ -739,6 +670,7 @@ def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, st
     return True, (
         f"'{src_name}' is now attached as a local image block. Vision-capable remote routes can "
         f"inspect it inline; blind/local routes may receive a caption or placeholder at send time. "
+        f"Original: {source_path}. {payload.get('note', '')} "
         f"It was read from local disk; this is NOT a web tool."
     )
 

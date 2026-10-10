@@ -7,6 +7,7 @@ loop.py re-exports every name."""
 from __future__ import annotations
 
 import functools
+import logging
 import json
 import copy
 import pathlib
@@ -16,7 +17,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros import task_pacing
 from ouroboros.config import get_light_model
-from ouroboros.context import build_user_content
+from ouroboros.context import build_incoming_user_content
 from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.llm import LLMClient, add_usage
 from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, emit_llm_usage_event
@@ -83,6 +84,19 @@ def _stamp_owner_delivery(
     }
 
 
+def _owner_content(entry: Dict[str, Any], drive_root: Any, task_id: str) -> Any:
+    """This delivery's content; its words survive an unexpected image-composition failure.
+
+    The drain has already marked the entry seen, so a raise here would consume it unread.
+    """
+    try:
+        return build_incoming_user_content(entry, drive_root, task_id)
+    except Exception as exc:  # noqa: BLE001 - per-file outcomes are typed inside; this is the residue
+        logging.getLogger(__name__).warning("owner content composition failed", exc_info=True)
+        return (f"{entry.get('text') or ''}\n\n[attached images were not composed: "
+                f"{type(exc).__name__}: {exc}; any attached files remain as listed]").strip()
+
+
 def _drain_incoming_messages(
     messages: List[Dict[str, Any]],
     incoming_messages: queue.Queue,
@@ -100,7 +114,7 @@ def _drain_incoming_messages(
         try:
             injected = incoming_messages.get_nowait()
             if isinstance(injected, dict):
-                owner_content = build_user_content(injected)
+                owner_content = _owner_content(injected, drive_root, task_id)
                 _loop()._record_owner_directive(
                     owner_ctx,
                     source="direct_incoming",
@@ -213,10 +227,11 @@ def _drain_incoming_messages(
                     str(getattr(owner_ctx, "budget_drive_root", "") or "") or drive_root,
                     entry.get("late_answer"), dmsg,
                 )
+            owner_content = _owner_content({**entry, "text": model_msg}, drive_root, task_id)
             _loop()._record_owner_directive(
                 owner_ctx,
                 source="owner_mailbox",
-                content=model_msg,
+                content=owner_content,
                 msg_id=str(entry.get("msg_id") or ""),
             )
             _stamp_owner_delivery(
@@ -228,8 +243,13 @@ def _drain_incoming_messages(
             )
             from ouroboros.client_surface import noted_owner_text
 
-            _loop()._append_or_merge_user_message(
-                messages, _loop()._owner_marked_content(noted_owner_text(owner_ctx, entry, model_msg)),
+            if isinstance(owner_content, list):
+                owner_content = [dict(block) for block in owner_content]
+                owner_content[0]["text"] = noted_owner_text(owner_ctx, entry, owner_content[0]["text"])
+            else:
+                owner_content = noted_owner_text(owner_ctx, entry, owner_content)
+            _loop()._append_or_merge_user_content(
+                messages, _loop()._owner_marked_content(owner_content),
                 slot=owner_ctx,
             )
             acknowledge_transcript_entry(drive_root, task_id, entry)

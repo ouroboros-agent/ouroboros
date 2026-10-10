@@ -51,19 +51,26 @@ _MANDATORY_VALUE_MARKERS = ("mandatory", "cannot be disabled", "must be enabled"
 
 def model_catalog(source: str, credential_profile_id: str | None = None, *,
                   requested_model: str | None = None, timeout_sec: float | None = None) -> dict:
-    """Metadata-only transport; the capability evidence owner interprets the envelope."""
-    gateway = read_owned_gateway()
+    """Metadata-only transport under one connect, negotiation and read budget; the capability
+    evidence owner interprets the envelope. An elapsed budget reads nothing more."""
+    started = time.monotonic()
+    gateway = read_owned_gateway(**({} if timeout_sec is None else {"timeout_sec": timeout_sec}))
+
+    def budget() -> dict:
+        if timeout_sec is None:
+            return {}
+        remaining = timeout_sec - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("Model metadata observation deadline elapsed")
+        return {"timeout_sec": remaining}
+
     try:
-        started = time.monotonic()
         hint = {"requested_model": requested_model} if requested_model is not None else {}
         if requested_model is not None and operation_query_supported(
-                gateway.operations(**({"timeout_sec": timeout_sec} if timeout_sec is not None else {})),
+                gateway.operations(**budget()),
                 method="GET", path="/v2/model-sources/:id/models", name="includeAdmission", value="true"):
             hint["include_admission"] = True
-        if timeout_sec is not None:
-            timeout_sec = max(0.000001, timeout_sec - (time.monotonic() - started))
-        return gateway.list_source_models(source, credential_profile_id, **hint,
-                                          **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
+        return gateway.list_source_models(source, credential_profile_id, **hint, **budget())
     finally:
         gateway.close()
 
@@ -134,6 +141,12 @@ class _CapabilityPolicyMixin:
                 )
                 return
             rows = resp.json().get("data", []) or []
+            from ouroboros.response_limits import record_catalog_limits
+            from ouroboros.capability_evidence import canonical_evidence_root
+            record_catalog_limits(canonical_evidence_root(),
+                [(m.get("id"), (m.get("top_provider") or {}).get("max_completion_tokens")) for m in rows],
+                provider="openrouter", base_url="https://openrouter.ai/api/v1",
+                field="top_provider.max_completion_tokens", source="OpenRouter")
             for m in rows:
                 mid = m.get("id") or ""
                 sp = m.get("supported_parameters")

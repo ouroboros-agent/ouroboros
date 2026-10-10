@@ -12,6 +12,10 @@ pytestmark = pytest.mark.serial
 
 @pytest.mark.parametrize("settlement_fails", [False, True])
 def test_empty_completed_search_keeps_paid_liability_on_fallback_error(root, monkeypatch, settlement_fails):
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "auto")
     calls = []
     def create(**kwargs):
         calls.append(1)

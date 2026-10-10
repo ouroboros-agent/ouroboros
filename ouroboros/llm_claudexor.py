@@ -308,7 +308,7 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
         content = message.get("content")
         for block in content if isinstance(content, list) else []:
             if isinstance(block, dict):
-                for name in ("_caption", "_source_path", "_context_capsule", "cache_control"):
+                for name in ("_caption", "_source_path", "_original_image_url", "_context_capsule", "cache_control"):
                     block.pop(name, None)
         if message.get("role") == "tool" and isinstance(content, list) and content and all(
             isinstance(block, dict) and block.get("type") == "text" for block in content

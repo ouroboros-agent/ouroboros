@@ -543,6 +543,9 @@ def _apply_round_route_overrides(ctx: Any, tools: ToolRegistry, messages: List[D
     previous = route[:2]
     model, use_local, effort = _loop()._apply_runtime_overrides(ctx, *route)
     role, ctx.active_role_override = getattr(ctx, "active_role_override", None), None
+    if role and getattr(ctx, "primary_route", None):
+        from ouroboros.primary_route_observation import record_primary_return_request
+        record_primary_return_request(ctx, model, use_local, role)
     if (model, use_local) != previous or role:
         context_fit_plan, active_context_mode = _loop()._rebind_context_fit_plan(
             context_fit_plan, tools, messages, model=model, use_local=use_local, preferred_mode=preferred_mode,
@@ -605,7 +608,7 @@ def _rebind_context_fit_plan(
     )
     known_window = is_known(evidence, require_fresh=True)
     window_tokens = int(getattr(evidence, "window_tokens", 0) or 0)
-    output_reserve = main_output_reserve_tokens(use_local=bool(route.get("use_local", use_local)))
+    output_reserve = main_output_reserve_tokens(use_local=bool(route.get("use_local", use_local)), evidence=evidence)
     preferred = preferred_mode or getattr(plan, "preferred_mode", "")
     preferred = preferred if preferred in {"low", "max", "nano"} else "max"
     rebound = replace(
@@ -965,6 +968,8 @@ def _dispatch_round_model(
                 tool_calls_at_handover=tool_count,
             )
         ctx.tools._ctx._pending_model_wait_handover = None
+    from ouroboros.primary_route_observation import record_round_route_result
+    record_round_route_result(ctx, role, accepted=result[0] is not None)
     observed = ctx.accumulated_usage.get("_model_route")
     if (plan is not None and isinstance(observed, dict)
             and observed != getattr(plan, "model_route", {})):
@@ -1432,6 +1437,10 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
     a helper pass or a mode downgrade. Only the provider's typed refusal of the actual
     request opens the ordered recovery (``_recover_context_overflow``).
     """
+    from ouroboros.primary_route_observation import observe_primary_route
+    observation = observe_primary_route(ctx)
+    if observation:
+        _loop()._append_or_merge_user_message(ctx.messages, observation)
     facts = getattr(ctx.tools._ctx, "_route_facts_pending", "")
     if facts and ctx.defer_resource_wait is None:  # the acting route's first own round after a switch
         ctx.tools._ctx._route_facts_pending = ""
