@@ -316,9 +316,10 @@ def project_decision_groups(history: dict, notes: Sequence[dict], *, source_hist
             gaps.append({"selection": copy.deepcopy(note), "reason": str(exc)})
             continue
         group_id = "group:" + _note_key(note)
+        source = note.get("account_source") or {"source_ref": selected_source, "note_index": index}
         groups.append({"decision_kind": "actor_history_group", "authorship": "actor", "group_ref": group_id,
             "remark": note["remark"], "reason": note["reason"], "covered_decisions": len(selected),
-            "source": {"source_ref": copy.deepcopy(selected_source), "field": f"review_notes[{index}]"},
+            "source": {"source_ref": copy.deepcopy(source["source_ref"]), "field": f"review_notes[{source['note_index']}]"},
             "rule": "Author's account of selected historical decisions; no new closure or reviewer verdict."})
         replaced.update({entry["index"]: group_id for entry in selected})
     if not groups:
@@ -488,12 +489,8 @@ def retain_review_history_view(drive_root: Any, task_id: str, *, capsule: dict,
     return {"kind": VIEW_KIND, "version": _VIEW_VERSION, "task_id": task_id, "source_ref": ref}
 
 
-def load_review_history_view(selection: Mapping[str, Any], source_reader: Callable[[dict], bytes]) -> dict:
-    """Read one selected task source. The supplied reader binds its owner/root."""
-    if (not isinstance(selection, Mapping) or selection.get("kind") != VIEW_KIND
-            or selection.get("version") != _VIEW_VERSION or not selection.get("task_id")):
-        raise ValueError("Invalid selected review history pointer")
-    ref = selection.get("source_ref")
+def _read_history_view_source(ref: dict, task_id: str, source_reader: Callable[[dict], bytes]) -> dict:
+    """The same immutable source reader serves a selection and its authored groups."""
     identity = _immutable_ref(ref)
     if identity is None:
         raise ValueError("Selected review history has no immutable source")
@@ -502,14 +499,37 @@ def load_review_history_view(selection: Mapping[str, Any], source_reader: Callab
         raise ValueError("Selected review history source checksum mismatch")
     record = json.loads(raw.decode("utf-8"))
     if (not isinstance(record, dict) or record.get("kind") != VIEW_KIND
-            or record.get("version") != _VIEW_VERSION or record.get("task_id") != selection["task_id"]):
+            or record.get("version") != _VIEW_VERSION or record.get("task_id") != task_id):
         raise ValueError("Selected review history source owner mismatch")
+    return record
+
+
+def load_review_history_view(selection: Mapping[str, Any], source_reader: Callable[[dict], bytes]) -> dict:
+    """Read one selected task source and verify the exact earlier group accounts."""
+    if (not isinstance(selection, Mapping) or selection.get("kind") != VIEW_KIND
+            or selection.get("version") != _VIEW_VERSION or not selection.get("task_id")):
+        raise ValueError("Invalid selected review history pointer")
+    record = _read_history_view_source(selection.get("source_ref"), selection["task_id"], source_reader)
     metas = [_actor_capsule(capsule) for capsule in selected_actor_capsules(record)]
     covered = [_binding(ref) for ref in record["covered"]]
     inherited = {_sha(_binding(ref)) for meta in metas for ref in meta.get("source_refs", [])
                  if isinstance(ref, Mapping) and ref.get("kind") == BODY_KIND}
     if (not covered and not record.get("transfers") and not record.get("review_notes")) or any(_sha(ref) not in inherited for ref in covered):
         raise ValueError("Selected capsule does not carry its covered sources")
+    sources = {_sha(selection["source_ref"]): record}
+    for note in record.get("review_notes") or []:
+        source = note.get("account_source")
+        if source is None:
+            continue
+        if not isinstance(source, dict) or type(source.get("note_index")) is not int:
+            raise ValueError("Invalid earlier group account source")
+        ref, index = source.get("source_ref"), source["note_index"]
+        key = _sha(ref)
+        if key not in sources:
+            sources[key] = _read_history_view_source(ref, selection["task_id"], source_reader)
+        earlier = sources[key].get("review_notes") or []
+        if not 0 <= index < len(earlier) or _group_note_payload(earlier[index]) != _group_note_payload(note):
+            raise ValueError("Earlier group account does not match the exact authored payload")
     return record
 
 
@@ -866,6 +886,12 @@ def _note_key(note: dict) -> str:
     return _sha(sorted(_sha(binding) for binding in _note_bindings(note)))
 
 
+def _group_note_payload(note: dict) -> dict:
+    if "bound_decisions" not in note:
+        raise ValueError("Earlier account is not a historical group")
+    return {"bound_decisions": _note_bindings(note), "remark": note["remark"], "reason": note["reason"]}
+
+
 def _available_review_notes(ctx, notes):
     options = review_note_options(ctx)
     current = {_sha(e["bound_decision"]): e for e in options["entries"] if e["bound_decision"]}
@@ -884,7 +910,22 @@ def _available_review_notes(ctx, notes):
         except (ValueError, TypeError, AttributeError) as exc:
             gaps.append({"selection": copy.deepcopy(note),
                          "reason": str(exc)})
-    return list({_note_key(n): n for n in accepted}.values()), gaps, options
+    # Explicit later selections replace earlier equal or fully covered groups.
+    # Disjoint and partially overlapping accounts retain their authored meaning.
+    latest = {}
+    for note in accepted:
+        key = _note_key(note)
+        latest.pop(key, None)
+        latest[key] = note
+    chosen, later_groups = [], []
+    for note in reversed(list(latest.values())):
+        if "bound_decisions" in note:
+            members = {_sha(binding) for binding in _note_bindings(note)}
+            if any(members <= newer for newer in later_groups):
+                continue
+            later_groups.append(members)
+        chosen.append(note)
+    return list(reversed(chosen)), gaps, options
 
 def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Sequence[dict], review_notes: Sequence[dict] = ()) -> tuple[dict | None, dict | None, list, Any]:
     """Retain a candidate capsule, without publishing the task's selected pointer."""
@@ -903,13 +944,16 @@ def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Seq
     if not covered and not transfers and not review_notes and not any(REVIEW_CONTEXT_INDEX_KEY in row for row in candidate):
         return None, capsule, [], None  # Ordinary authored notes do not open review state.
     root, task = getattr(ctx, "budget_drive_root", None) or ctx.drive_root, str(ctx.task_id)
-    inherited, old_notes = [], []
+    inherited, old_notes, group_sources = [], [], {}
     saved = (load_task_result(root, task, strict=True) or {}).get(SELECTED_VIEW_FIELD)
     if saved:
         try:
             previous_view = load_review_history_view(saved, lambda ref: read_actor_source_bytes(root, task, ref))
             inherited = previous_view.get("transfers") or []
             old_notes = previous_view.get("review_notes") or []
+            group_sources = {_sha(_group_note_payload(note)): copy.deepcopy(note.get("account_source") or {
+                "source_ref": saved["source_ref"], "note_index": index})
+                for index, note in enumerate(old_notes) if "bound_decisions" in note}
         except (OSError, ValueError, KeyError, TypeError):
             pass  # full bodies + visible selection gap remain the reader's fallback
     accepted = []
@@ -918,6 +962,11 @@ def prepare_review_view(ctx: Any, candidate: list, receipt: dict, transfers: Seq
         accepted, transfer_gaps = available_attachment_transfers(history, operative, [*inherited, *transfers])
         receipt["review_transfers"] = {"applied": accepted, "unapplied": transfer_gaps}
     chosen_notes, note_gaps, options = _available_review_notes(ctx, [*old_notes, *review_notes])
+    for note in chosen_notes:
+        if "bound_decisions" in note and (source := group_sources.get(_sha(_group_note_payload(note)))):
+            # Only verified inherited text supplies this anchor. Tool-supplied
+            # fields were discarded by normalization; changed prose is new authorship.
+            note["account_source"] = source
     if options is not None:
         chosen_keys = {_sha(binding) for n in chosen_notes for binding in _note_bindings(n)}
         receipt["review_notes"] = {"applied": chosen_notes, "preserved_fields": options["preserved_fields"], "unshortened": [*note_gaps, *[

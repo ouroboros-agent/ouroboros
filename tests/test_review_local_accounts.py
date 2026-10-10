@@ -7,6 +7,8 @@ from copy import deepcopy
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from ouroboros import review_history_view as view
 from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
 from ouroboros.context_compaction import context_units, unit_kind
@@ -318,3 +320,92 @@ def test_old_settled_fail_and_linked_open_obligation_survive_another_history_gro
     assert prior["verdict"]["aggregate"] == "FAIL"
     assert [review_ledger.load_record(drive, rid) for rid in records] == canonical
     assert review_dispute_history(drive_root=drive, repo_root=root, task_id=ctx.task_id)["open_obligations"]
+
+
+def _groups(messages):
+    return [row for row in _index(messages)[-1]["decision_rows"] if row["decision_kind"] == "actor_history_group"]
+
+
+def _tail_fold(ctx, messages, note):
+    before = deepcopy(messages)
+    before.extend([call("read_file", {"path": "unrelated.txt"}, "unrelated-tail"),
+                   {"role": "tool", "tool_call_id": "unrelated-tail", "content": "Unrelated measured tail. " * 1000}])
+    unit = context_units(before, scope="dialogue")[-1]
+    after, receipt, _ = apply_local(ctx, before, note, remove=[unit.unit_id])
+    assert receipt["status"] == "applied"
+    assert after[:unit.start] == before[:unit.start], "An unchanged earlier group rewrote the prefix"
+    return after, receipt
+
+
+def test_explicit_larger_group_retires_covered_groups_preserves_disjoint_and_exact_old_source(harness, monkeypatch):
+    ctx, _, _ = _three(harness, monkeypatch)
+    bindings = [e["bound_decision"] for e in view.review_note_options(ctx)["entries"] if e["groupable"]]
+    assert len(bindings) >= 3
+    notes = [{"bound_decisions": [binding], "remark": f"Account {i}", "reason": f"Exact earlier reason {i}."}
+             for i, binding in enumerate(bindings[:3])]
+    before, first, _ = apply_local(ctx, _capture(ctx), FIRST, all_units=True, review_notes=notes)
+    source = first["selected_review_history_view"]["source_ref"]
+    original = read_actor_source_bytes(ctx.drive_root, ctx.task_id, source)
+    merged, receipt, _ = apply_local(ctx, before, SECOND, all_units=True, review_notes=[
+        {"bound_decisions": bindings[:2], "remark": "Merged account", "reason": "The newer account replaces both earlier reasons."}])
+    groups = _groups(merged)
+    assert len(groups) == 2 and {g["remark"] for g in groups} == {"Account 2", "Merged account"}
+    assert not any(g["reason"] in {notes[0]["reason"], notes[1]["reason"]} for g in groups)
+    disjoint = next(g for g in groups if g["remark"] == "Account 2")
+    assert disjoint["source"] == {"source_ref": source, "field": "review_notes[2]"}
+    assert read_actor_source_bytes(ctx.drive_root, ctx.task_id, source) == original
+    assert _groups(_capture(ctx)) == groups
+    saved = view.load_review_history_view(receipt["selected_review_history_view"],
+        lambda ref: read_actor_source_bytes(ctx.drive_root, ctx.task_id, ref))
+    assert len(saved["review_notes"]) == 2
+
+
+def test_unchanged_group_source_and_final_prefix_survive_two_unrelated_tail_folds(harness, monkeypatch):
+    ctx, _, _ = _three(harness, monkeypatch)
+    bindings = [e["bound_decision"] for e in view.review_note_options(ctx)["entries"] if e["groupable"]]
+    grouped, first, _ = apply_local(ctx, _capture(ctx), FIRST, all_units=True, review_notes=[
+        {"bound_decisions": bindings, "remark": "Closed history", "reason": "The accepted premise may be revisited when requirements change."}])
+    original_group = deepcopy(_groups(grouped)[0])
+    original_source = first["selected_review_history_view"]["source_ref"]
+    raw = read_actor_source_bytes(ctx.drive_root, ctx.task_id, original_source)
+    for index in range(2):
+        grouped, receipt = _tail_fold(ctx, grouped, f"Independent tail account {index}.")
+        assert _groups(grouped) == [original_group]
+        assert receipt["selected_review_history_view"]["source_ref"] != original_source
+    assert len(actor_notes(grouped)) == 3
+    assert _groups(_capture(ctx)) == [original_group]
+    assert read_actor_source_bytes(ctx.drive_root, ctx.task_id, original_source) == raw
+    reads = []
+    def reader(ref):
+        reads.append(ref["sha256"])
+        return read_actor_source_bytes(ctx.drive_root, ctx.task_id, ref)
+    view.load_review_history_view(receipt["selected_review_history_view"], reader)
+    assert original_source["sha256"] in reads, "The anchored source must be verified by the existing exact reader"
+
+
+def test_changed_group_prose_gets_new_source_and_model_cannot_supply_old_anchor(harness, monkeypatch):
+    from ouroboros.artifacts import store_actor_source_bytes
+    ctx, _, _ = _three(harness, monkeypatch)
+    bindings = [e["bound_decision"] for e in view.review_note_options(ctx)["entries"] if e["groupable"]]
+    note = {"bound_decisions": bindings, "remark": "The same members", "reason": "My earlier understanding."}
+    first, receipt, _ = apply_local(ctx, _capture(ctx), FIRST, all_units=True, review_notes=[note])
+    old_source = receipt["selected_review_history_view"]["source_ref"]
+    old_bytes = read_actor_source_bytes(ctx.drive_root, ctx.task_id, old_source)
+    anchor = {"source_ref": old_source, "note_index": 0}
+    changed = {**note, "reason": "The corrected understanding changes the earlier explanation.", "account_source": anchor}
+    revised, receipt, _ = apply_local(ctx, first, SECOND, all_units=True, review_notes=[changed])
+    pointer = receipt["selected_review_history_view"]
+    group = _groups(revised)[0]
+    assert group["reason"] == changed["reason"] and group["source"]["source_ref"] == pointer["source_ref"]
+    assert group["source"]["source_ref"] != old_source
+    assert _groups(_capture(ctx)) == [group]
+    assert read_actor_source_bytes(ctx.drive_root, ctx.task_id, old_source) == old_bytes
+    saved = view.load_review_history_view(pointer, lambda ref: read_actor_source_bytes(ctx.drive_root, ctx.task_id, ref))
+    assert "account_source" not in saved["review_notes"][0]
+    # Cold parsing rejects a source with the same membership but another actor text.
+    saved["review_notes"][0]["account_source"] = anchor
+    invalid_ref = store_actor_source_bytes(ctx.drive_root, ctx.task_id, category="context_checkpoints",
+        source_id="mismatched-group-source", extension="json", data=json.dumps(saved).encode("utf-8"))
+    with pytest.raises(ValueError, match="exact authored payload"):
+        view.load_review_history_view({**pointer, "source_ref": invalid_ref},
+            lambda ref: read_actor_source_bytes(ctx.drive_root, ctx.task_id, ref))
