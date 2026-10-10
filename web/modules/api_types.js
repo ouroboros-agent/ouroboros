@@ -1179,10 +1179,9 @@
  */
 
 /**
- * PROVENANCE for each independent facet of GET /api/claudexor/status. An empty
- * collection cannot say whether the daemon was ASKED: the owned Claudexor daemon
- * starts lazily, so an idle machine served empty lists that every consumer read
- * as "no account connected" while real accounts sat in the agent home.
+ * PROVENANCE for each independent facet of GET /api/claudexor/status. An empty collection
+ * cannot say whether the lazily started daemon was ASKED: an idle machine's empty lists
+ * read as "no account connected" while real accounts sat in the agent home.
  * "ok" — read, the matching collection is AUTHORITATIVE (empty means empty);
  * "not_read" — never asked: no daemon, or discovery/handshake died before the
  * fan-out (which leaves every facet untouched); "failed" — asked, and no
@@ -1239,6 +1238,7 @@
  * @property {ClaudexorReadState=} resource_capabilities_read Operations-catalog evidence, independent of reads.catalog (agent capabilities).
  * @property {ClaudexorStatusReads=} reads
  * @property {boolean=} unified_accounts
+ * @property {Object<string, {observed_at: ?string, stale: boolean, error: ?string}>=} facets Per facet; a failed or unasked facet serves its last read, stale.
  * @property {SubagentLastDelegation=} subagent_last_delegation
  * @property {string=} error
  */

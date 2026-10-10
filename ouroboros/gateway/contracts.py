@@ -1179,12 +1179,12 @@ class ClaudexorStatusResponse(TypedDict, total=False):
     resource_capabilities: Dict[str, bool]
     resource_capabilities_read: ClaudexorReadState
     reads: ClaudexorStatusReads
-    # UNIFIED ACCOUNT MODEL feature fact (additive-optional): True only when the engine's own
-    # /v2/operations catalog was read and advertises `GET /v2/account-pools` (every default CLI login
-    # becomes a named registry row, `harnessAccounts` empties, pool routing rides `profiles.accountPools`).
-    # False, or absent on an older backend, means the legacy native-pseudo-row rendering; an unreadable
-    # catalog fails closed to False.
+    # UNIFIED ACCOUNT MODEL feature fact (additive-optional): True only when the read /v2/operations catalog
+    # advertises `GET /v2/account-pools` (default CLI logins become named registry rows, `harnessAccounts`
+    # empties, routing rides `profiles.accountPools`); False or absent: legacy pseudo-rows (unreadable: False).
     unified_accounts: bool
+    # Per facet: `observed_at`, `stale`, `error`; a failed or unasked facet serves its last read (stale).
+    facets: Dict[str, Dict[str, Any]]
     subagent_last_delegation: Dict[str, Any]
     error: str
 

@@ -1083,10 +1083,13 @@ export function createClaudexorStatusStore({
             // the detail resolution above — a banner that assembled the sentence
             // itself printed "could not be read" over an `unreachable` daemon
             // and silently dropped the one explanation the owner had.
+            // A failed facet's own typed error (`facets.<name>.error`) is the exact detail;
+            // a backend without it leaves the daemon's last_error as before.
             const state = facet(name);
             const daemonError = String(inner.snapshot?.daemon?.last_error || '');
+            const own = String(inner.snapshot?.facets?.[name]?.error || '');
             const detail = inner.error
-                || (state === READ_FAILED || state === READ_INDETERMINATE ? daemonError : '');
+                || (state === READ_FAILED ? own || daemonError : state === READ_INDETERMINATE ? daemonError : '');
             return statusUnavailableNote(state, { error: detail, facet: name, subject });
         },
         refresh,
