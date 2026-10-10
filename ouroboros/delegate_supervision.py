@@ -996,8 +996,9 @@ def supervised_wait(
     real event consumes it, and it never repeats. Renewal runs on a fixed three-second
     tick with no backoff and no durable outage latch. A read that delivered no daemon
     answer is a quiet renewal: ``observation_read_timeout`` is our own read bound
-    expiring, ``daemon_unreachable`` is a socket that carried nothing; only the latter
-    opens an outage episode (one owner line, plus one line when a read is answered again).
+    expiring, ``daemon_unreachable`` a socket that carried nothing, an engine busy code a
+    GET the daemon could not serve; only ``daemon_unreachable`` opens an outage episode
+    (one owner line, plus one line when a read is answered again).
     """
 
     reason_text = str(checkpoint_reason or "").strip()

@@ -82,6 +82,11 @@ _OBSERVATION_RETRYABLE_ERRORS = (
 # all key on ``daemon_unreachable`` for reasons that have nothing to do with an
 # observation.
 _OBSERVATION_READ_TIMEOUT = "observation_read_timeout"
+# The engine's typed 503 answers that it cannot serve now (its local RPC timed out or is
+# down, or it serves recovery only). For a GET they are the same retryable observation
+# hole, under the engine's own code: never an outage line or a model wake. A POST keeps
+# the refusal, since a lost answer never proves a mutation was not accepted.
+DAEMON_BUSY_CODES = frozenset({"daemon_busy", "daemon_unavailable", "daemon_recovery_only"})
 
 
 def _observation_reason(exc: BaseException) -> str:
@@ -110,8 +115,8 @@ class ClaudexorUnavailable(RuntimeError):
         self.code = str(code or "claudexor_unavailable")
         self.status_code = int(status_code or 0)
         self.required_actions = tuple(required_actions or ())
-        # Read-only observers may retry this exact HTTP read without claiming
-        # anything about the worker. A received HTTP refusal still wins.
+        # Read-only observers may retry this exact HTTP read without claiming anything
+        # about the worker. A received refusal still wins, except a GET's DAEMON_BUSY_CODES.
         self.observation_timeout = bool(observation_timeout)
         # Which hole it was, for the observer only (``_observation_reason``):
         # a read bound that expired against a live daemon is not the same fact
@@ -501,7 +506,7 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
                 observation_reason=_observation_reason(exc) if retryable else "",
             ) from exc
         if response.status_code >= 400:
-            raise self._problem(response)
+            raise self._problem(response, method)
         if raw_bytes:
             return response.content
         if not response.content:
@@ -514,7 +519,7 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
                 f"Claudexor returned a non-JSON body for {method} {path}: {exc}",
             ) from exc
 
-    def _problem(self, response: httpx.Response) -> ClaudexorUnavailable:
+    def _problem(self, response: httpx.Response, method: str = "") -> ClaudexorUnavailable:
         """Keep ControlProblem authority; nested lookup causes are diagnostics only."""
         code = f"http_{response.status_code}"
         message = response.text[:500]
@@ -556,6 +561,8 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
                                         required_actions=required_actions))
         error.problem = body if isinstance(body, dict) else {"code": code, "message": message}
         error.retry_after = response.headers.get("Retry-After", "")
+        if method == "GET" and response.status_code == 503 and code in DAEMON_BUSY_CODES:
+            error.observation_timeout, error.observation_reason = True, code
         if isinstance(context.get("cause"), dict):
             facts = {key: context[key] for key in ("stage", "cause", "preflight") if key in context}
             error.reported_cause = run_failure_cause({"safeMessage": json.dumps(facts, ensure_ascii=False)})

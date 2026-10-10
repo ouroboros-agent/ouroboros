@@ -1043,8 +1043,8 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     the real task deadline; its three-second beat is not a network deadline. A transport
     failure that delivered no daemon answer there (typed per class:
     ``observation_read_timeout`` for our own bound expiring, ``daemon_unreachable`` for a
-    socket that carried nothing) retains unknown observation and the same run, without
-    model wake.
+    socket that carried nothing, the engine's own ``DAEMON_BUSY_CODES`` answer to that GET)
+    retains unknown observation and the same run, without model wake.
     Legacy caller-sized waits preserve their last-poll expiry contract.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
