@@ -175,7 +175,7 @@ def test_desktop_hover_opens_press_pins_escape_and_outside_close(direct_server_w
             _wait(page, "el.dataset.open === 'true'")
             page.click(HEAD)
             page.mouse.move(20, 200)
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(1300)  # longer than the 1 s close an unpinned strip would get
             assert _facts(page)["open"] == "true", "pinned: leaving does not close"
             # Esc closes and returns focus to the button.
             page.keyboard.press("Escape")

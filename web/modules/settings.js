@@ -59,7 +59,7 @@ const INPUT_FIELDS = [
     ['s-max-rounds', 'OUROBOROS_MAX_ROUNDS', 'unlimited'], ['s-task-lifetime', 'OUROBOROS_TASK_ABS_CEILING_SEC', 'unlimited'],
 ];
 const VALUE_FIELDS = [
-    // Effort is not a Settings draft: the range is read-only here and edited in the chat composer.
+    // Effort is not a Settings draft: the range is edited in the chat composer alone, and Settings has no effort section.
     ['s-consciousness-autonomy', 'OUROBOROS_CONSCIOUSNESS_AUTONOMY', 'act'],
     ['s-review-enforcement', 'OUROBOROS_REVIEW_ENFORCEMENT', 'advisory'], ['s-task-review-mode', 'OUROBOROS_TASK_REVIEW_MODE', 'auto'], ['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced'],
     // Shared paid-review-cycle cap (plan review / task acceptance / commit gate);
