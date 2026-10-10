@@ -396,9 +396,11 @@ def _finishing_reviews(drive_root: Any, row: Dict[str, Any], task_id: str) -> bo
 def _activity_pause_cause(row: dict, fence: dict) -> str:
     """Explain a parked census row from its existing typed control, never its phase name."""
     hold = row.get("_budget_pause_hold") or {}
-    if isinstance(hold, dict) and hold.get("reason") in {"owner_restart_hold", "saved_work_hold"}:
+    if isinstance(hold, dict) and hold.get("reason") in {"owner_restart_hold", "saved_work_hold"} \
+            and not hold.get("selected"):
         # saved_work_hold: work saved before the application stopped waits for Resume
         # after it started again (#1563); the published cause vocabulary is unchanged.
+        # A hold the owner's Resume already released explains no later pause.
         return "restart"
     if fence.get("cause") == "owner_pause":
         return "owner"
