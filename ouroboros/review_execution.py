@@ -687,14 +687,21 @@ _CLAUDEXOR_MAX_SECONDS = 604_800
 
 
 def _minted_review_root(root: str, drive: Any) -> bool:
-    """A tree minted for one review: a view the review stack built under the data root
-    (isolated checkout, retained inputs; never an owner project or the system repository)
-    or a checkout the subagent worktree registry holds (a child's copy, a body candidate)."""
+    """A tree minted for one review: an isolated review checkout (``<data>/state/review_checkouts``),
+    a retained review-input snapshot (``source_handles/review_inputs`` of a task under the data
+    root) or a checkout the subagent worktree registry holds (a child's copy, a body candidate).
+    Any other root, an owner's project or the system repository, keeps its registration
+    wherever it lives, even under the data root."""
     import pathlib
 
     from ouroboros.subagent_worktrees import registered_checkout
+    from ouroboros.tools.review_subject import CHECKOUT_SUBDIR
 
-    return pathlib.Path(root).resolve().is_relative_to(pathlib.Path(drive).resolve()) or registered_checkout(root)
+    path, data = pathlib.Path(root).resolve(), pathlib.Path(drive).resolve()
+    parts = path.relative_to(data).parts if path.is_relative_to(data) else ()
+    return (parts[:2] == ("state", CHECKOUT_SUBDIR)
+            or any(parts[i:i + 2] == ("source_handles", "review_inputs") for i in range(len(parts) - 1))
+            or registered_checkout(root))
 
 
 def _retire_orphaned_review_registration(

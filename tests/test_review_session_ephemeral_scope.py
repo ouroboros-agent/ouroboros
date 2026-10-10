@@ -22,15 +22,23 @@ fake_route = __fake_route
 from tests._review_session_route_shared import _run_session_directly  # noqa: E402
 
 
-@pytest.mark.parametrize("where", ["review_checkout", "elsewhere"])
+_ROOTS = {
+    "review_checkout": ("state", "review_checkouts", "tok", "repo"),
+    "review_inputs": ("artifacts", "t-plan", "source_handles", "review_inputs", "request-1"),
+    # An owner's project that happens to live under the data root is not a minted tree.
+    "owner_under_data": ("workspace",),
+}
+
+
+@pytest.mark.parametrize("where", ["review_checkout", "review_inputs", "owner_under_data", "elsewhere"])
 def test_a_minted_review_tree_starts_ephemeral_without_a_project_request(fake_route, tmp_path, where):
-    root = tmp_path / "state" / "review_checkouts" / "tok" / "repo" if where == "review_checkout" else "/tmp/fake-repo"
-    if where == "review_checkout":
+    root = tmp_path.joinpath(*_ROOTS[where]) if where in _ROOTS else "/tmp/fake-repo"
+    if where in _ROOTS:
         root.mkdir(parents=True)
     _run_session_directly(tmp_path, root=str(root))
     gateway = fake_route.instances[-1]
     [request] = gateway.start_requests
-    if where == "review_checkout":
+    if where in ("review_checkout", "review_inputs"):
         assert request["scope"] == {"kind": "project", "root": str(root), "ephemeral": True}
         assert gateway.project_lookups == [] and gateway.registrations == []
     else:  # not a tree the host minted: the registration flow is unchanged
