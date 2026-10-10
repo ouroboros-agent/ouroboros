@@ -51,23 +51,27 @@ test('the Agents status line names the refused facet and its error under a runni
     assert.match(daemonStatusLine(legacy).text, /were not read: quota_probe_failed: read died\./);
 });
 
-test("a stale facet the server remembers keeps its own value with its own time", async () => {
-    // Another client refreshed the shared server memory to q2 at 10:05; this client last saw q1.
-    const q1 = [{ subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ id: 'q1' }] }];
-    const q2 = [{ subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ id: 'q2' }] }];
-    const first = { ...runningWithRefusedQuota(), quota: q1, reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
-    const remembered = { ...runningWithRefusedQuota({
+test("a refused quota read keeps this client's last value with this client's own time", async () => {
+    // This client read q1 at 10:00; a foreground refresh then showed it q3 (the server's memory never
+    // saw it); another client refreshed the server memory to q2 at 10:05; now the quota read fails.
+    const q = (id) => [{ subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ id }] }];
+    const ok = { ...runningWithRefusedQuota({ quota: { observed_at: '2026-10-10T10:00:00Z', stale: false, error: null } }),
+        quota: q('q1'), reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    const refused = { ...runningWithRefusedQuota({
         quota: { observed_at: '2026-10-10T10:05:00Z', stale: true, error: 'daemon_busy' },
-    }), quota: q2 };
+    }), quota: q('q2') };
     const legacy = { ...runningWithRefusedQuota(), quota: [] };   // no `facets`: an older backend
-    const serve = [first, remembered, first, legacy];
-    const store = createClaudexorStatusStore({ fetchImpl: async () => okResponse(serve.shift()), doc: fakeDoc() });
+    const serve = [ok, refused, ok, legacy];
+    const store = createClaudexorStatusStore({ fetchImpl: async () => okResponse(structuredClone(serve.shift())), doc: fakeDoc() });
+    await store.refresh();
+    store.snapshot.quota = q('q3');   // what a successful foreground refresh merges into the snapshot
+    await store.refresh();
+    assert.deepEqual(store.snapshot.quota, q('q3'), 'no rollback of what this client already showed');
+    assert.equal(store.snapshot.facets.quota.observed_at, '2026-10-10T10:00:00Z', "this client's own stamp, not the server's");
+    assert.equal(store.snapshot.facets.quota.stale, true);
+    assert.equal(store.snapshot.facets.quota.error, 'daemon_busy', "this read's own error");
     await store.refresh();
     await store.refresh();
-    assert.deepEqual(store.snapshot.quota, q2, "the server's own last value, not this client's older one");
-    assert.equal(store.snapshot.facets.quota.observed_at, '2026-10-10T10:05:00Z');
-    await store.refresh();
-    await store.refresh();
-    assert.deepEqual(store.snapshot.quota, q1, 'without server memory the client keeps its own last value');
+    assert.deepEqual(store.snapshot.quota, q('q1'), 'an older backend keeps the client value as before');
     store.dispose();
 });
