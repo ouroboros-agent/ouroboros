@@ -27,7 +27,7 @@ import pathlib
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -843,6 +843,12 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         404 ``project_not_registered``, so registration is a required step, not an
         optimization. Re-registering an existing root returns the existing id.
         """
+        return self.project_registration(root)[0]
+
+    def project_registration(self, root: str) -> Tuple[str, Optional[bool]]:
+        """One keyed ``POST /v2/projects``: ``(project_id, created)``. ``created`` is the
+        engine's own answer whether THIS request registered the root, ``None`` when the
+        answer carries no such field (an engine that predates it): presence decides."""
         body = self._request(
             "POST", "/v2/projects",
             json_body={"root": str(root)},
@@ -851,7 +857,8 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         project_id = str((body or {}).get("id") or "") if isinstance(body, dict) else ""
         if not project_id:
             raise ClaudexorUnavailable("malformed_response", "project registration returned no id")
-        return project_id
+        created = body.get("created")
+        return project_id, created if isinstance(created, bool) else None
 
     def remove_project(self, project_id: str) -> Dict[str, Any]:
         """Retire a project registration. Non-destructive: artifacts are retained."""
