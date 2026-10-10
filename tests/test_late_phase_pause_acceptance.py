@@ -48,7 +48,9 @@ def test_pause_during_sent_late_acceptance_collects_it_once_and_releases_when_no
         late, tmp_path, monkeypatch, registered):  # noqa: F811
     """Pause is accepted after delivery (with and without a RUNNING row); the already
     dispatched panel finishes and is collected once — never re-sent — and the delivered
-    answer stays exactly as it was. Nothing was left to defer, so the Pause releases itself."""
+    answer stays exactly as it was. Owner 2026-10-08 (full variant): with no writer left
+    the tree reads Paused while its launched reviewers finish separately; a live writer
+    keeps it Pausing. Nothing was left to defer, so the Pause releases itself."""
     from ouroboros.owner_pause import read_fence
     from supervisor.owner_pause_control import request_owner_pause
     from tests._budget_pause_exact_helpers import _install_queue
@@ -67,9 +69,14 @@ def test_pause_during_sent_late_acceptance_collects_it_once_and_releases_when_no
         if registered:
             workers.RUNNING[f.tid] = {"task": f.task, "attempt": 1, "worker_id": 0}
         pause = request_owner_pause(f.tid, request_id="late-acceptance-pause")
-        assert pause["ok"] and pause["state"] == "requested", pause
-        assert _census(f.root)[f.tid] == "budget_pausing"
-        assert _tick(q) == [] and read_fence(f.root, f.tid)["state"] == "requested"  # sent work still settling
+        expected = "requested" if registered else "paused"
+        assert pause["ok"] and pause["state"] == expected, pause
+        assert _census(f.root)[f.tid] == ("budget_pausing" if registered else "budget_paused")
+        _tick(q)
+        fence = read_fence(f.root, f.tid)
+        assert fence["state"] == expected  # a live writer keeps Pausing; reviewers alone never do
+        if not registered:
+            assert fence["finishing_reviews"], fence  # still finishing, shown separately
     finally:
         workers.RUNNING.clear()
         release.set()

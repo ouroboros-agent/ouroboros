@@ -77,6 +77,9 @@ _LIVE: Dict[str, "ReviewOperation"] = {}
 _BOUND: contextvars.ContextVar[Optional["ReviewOperation"]] = contextvars.ContextVar(
     "ouroboros_review_operation", default=None)
 _SELF: Dict[int, Dict[str, Any]] = {}
+# Operations a paused author detached from that have since closed in THIS process
+# (owner id -> closed at): what the resumed author's notice may state as known.
+_CLOSED_DETACHED: Dict[str, str] = {}
 
 
 def controller_identity() -> Dict[str, Any]:
@@ -214,6 +217,9 @@ class ReviewOperation:
         self.control_state = ""
         self._drains = 0
         self._dispatched = False
+        # The owner paused the author while this operation's launched reviewers
+        # ran: the author took pending rows and parked (``review_custody``).
+        self.author_detached = False
         self._control, self._checked_at = "", float("-inf")
         parent_task = parent.task if isinstance(parent.task, dict) else {}
         metadata = getattr(parent.tool_context, "task_metadata", None)
@@ -297,6 +303,8 @@ class ReviewOperation:
                 return
             self.closed = True
             _LIVE.pop(self.owner_id, None)
+            if self.author_detached:
+                _CLOSED_DETACHED[self.owner_id] = utc_now_iso()
         self.wait.close()
         if not self.checkpointed:
             return
@@ -500,8 +508,17 @@ def review_operation_scope(*, request: Any, slots: List[Any], usage_ctx: Any,
         with _LOCK:
             _LIVE[binding.operation.owner_id] = binding.operation
         if sends:
-            binding.refused, restore = _retain_before_dispatch(
-                binding.operation, request, slots, sends, usage_ctx, root)
+            from ouroboros.review_pause import author_fence_closed
+
+            if author_fence_closed(parent):
+                # A NEW panel under the owner's accepted Pause never starts: every
+                # send slot is refused at $0, exactly as a fenced tool handoff is.
+                from ouroboros.owner_pause import NOT_STARTED_TEXT
+
+                binding.refused = {slot_id: NOT_STARTED_TEXT for slot_id in sends}
+            else:
+                binding.refused, restore = _retain_before_dispatch(
+                    binding.operation, request, slots, sends, usage_ctx, root)
     operation = binding.operation
     operation.enter()
     try:

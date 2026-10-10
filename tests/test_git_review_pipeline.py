@@ -217,7 +217,7 @@ class TestAutoPushBehavior:
         # ordinary warning-only tests run after the tag and before the push.
         managed_tests_pos = source.index("_managed_post_commit_tests_gate(")
         tag_pos = source.index("tag_info =")
-        ordinary_tests_pos = source.index("_post_commit_result(ctx, commit_message")
+        ordinary_tests_pos = source.index("run_operation(ctx, _post_commit_result, ctx, commit_message")
         push_pos = source.rindex("push_status = _auto_push")
         assert managed_tests_pos < tag_pos < ordinary_tests_pos < push_pos
 

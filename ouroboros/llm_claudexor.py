@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any
 
-from ouroboros import config, context_fit
+from ouroboros import _usage_wait, config, context_fit
 from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 from ouroboros._usage_response import provider_cost_value
 from ouroboros.anthropic_native_custody import scrub_native_custody
@@ -813,7 +813,8 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 if prepared:
                     invocation.payload = payload = _request(target, prepared["messages"], prepared.get("tools"), prepared)
                 request, before = _accounted_request(invocation)
-                result = execute_physical_attempt(request, invocation.receive, extractor=invocation.extract_usage, before_dispatch=before)
+                result = execute_physical_attempt(request, invocation.receive, extractor=invocation.extract_usage, before_dispatch=before,
+                                                  late_owner=_usage_wait.late_transport_custody(invocation))
                 all_operations_not_started = False  # even a discarded substituted response ran
                 invocation.capture = last_physical_attempt_capture()
                 if substitution.admit(invocation, result):
@@ -821,8 +822,7 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
-                adopt_turn_state((prepared or parameters).get("model_turn_state"),
-                                 invocation.payload, result)
+                adopt_turn_state((prepared or parameters).get("model_turn_state"), invocation.payload, result)
                 return rotation.disclose(substitution.disclose(invocation.finish(result)))
         except ClaudexorModelNotDispatched as error:
             all_operations_not_started &= getattr(getattr(error, "physical_attempt_capture", None), "state", None) == "released"
@@ -857,7 +857,7 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 raise cause from None
             raise
         finally:
-            invocation.close()
+            _usage_wait.close_unless_abandoned(invocation)  # an owner Pause's abandoned wait: the sender closes it
     raise AssertionError("Unreachable model preparation loop")
 
 
@@ -923,7 +923,7 @@ def recover_model_attempt(drive_root, row: dict, *, gateway_factory=None):
 
 
 async def chat_claudexor_async(target: dict, messages: list, tools: list | None, **parameters: Any) -> tuple[dict, dict]:
-    """Offload synchronous I/O and joined accounting; adopt its capture in this caller."""
+    """Offload I/O; accounting follows sender custody through cancellation or Pause."""
     target = (await asyncio.to_thread(prepare_processing_target, target)
               if target.get("processing_preference") and "processing_preferences" not in target else target)
     payload = _request(target, messages, tools, parameters)
@@ -946,7 +946,8 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                     return await invocation.offload(invocation.receive)
 
                 result = await execute_physical_attempt_async(
-                    request, receive, extractor=invocation.extract_usage, before_dispatch=prepare)
+                    request, receive, extractor=invocation.extract_usage, before_dispatch=prepare,
+                    late_owner=_usage_wait.late_transport_custody(invocation))
                 all_operations_not_started = False
                 invocation.capture = last_physical_attempt_capture()
                 if await invocation.offload(substitution.admit, invocation, result):
@@ -954,8 +955,7 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
-                adopt_turn_state((prepared or parameters).get("model_turn_state"),
-                                 invocation.payload, result)
+                adopt_turn_state((prepared or parameters).get("model_turn_state"), invocation.payload, result)
                 return rotation.disclose(substitution.disclose(await invocation.offload(invocation.finish, result)))
         except ClaudexorModelNotDispatched as error:
             all_operations_not_started &= getattr(getattr(error, "physical_attempt_capture", None), "state", None) == "released"
@@ -992,5 +992,5 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
             raise
         finally:
             if not invocation.defer_close:
-                invocation.close()
+                _usage_wait.close_unless_abandoned(invocation)
     raise AssertionError("Unreachable model preparation loop")

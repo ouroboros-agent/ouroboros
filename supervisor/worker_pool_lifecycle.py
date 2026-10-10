@@ -675,6 +675,7 @@ def kill_workers_for_update(
             disable_reason="managed_update",
             preserve_pending=True,
             preserve_running_task_ids=set(preserve_running_task_ids or ()),
+            retain_saved_work=True,  # the update's restart returns what was saved (#1563)
             reconcile_review_custody=False,  # Final death proof below owns this batch.
         )
         if kill_ok is False:

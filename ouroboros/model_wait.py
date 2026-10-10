@@ -164,7 +164,7 @@ def execution_elapsed_seconds(meta: dict, now: float) -> float:
         return 0.0
     if started <= 0 or not math.isfinite(started):
         return 0.0
-    sleeping = meta.get("sleep_parked_at")  # a pooled model sleep in progress (worker_owner_wait)
+    sleeping = meta.get("sleep_parked_at")  # a warm sleep or owner Pause (worker_owner_wait)
     return max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta)
                - (max(0.0, now - float(sleeping)) if isinstance(sleeping, (int, float)) else 0.0))
 
@@ -392,7 +392,7 @@ class TaskModelWait:
 
     def executed_seconds(self, *, now: float | None = None) -> float:
         """Live execution time: elapsed minus the quota union minus budget pause,
-        minus a model sleep in progress (``model_sleep`` folds it into the paused
+        minus a warm sleep or owner Pause (``model_sleep`` folds it into the paused
         carrier when the task runs again, so it is never subtracted twice)."""
         stamp = time.monotonic() if now is None else now
         sleeping = self.sleep_started_monotonic
@@ -780,6 +780,27 @@ class TaskModelWait:
                     "local_answer_task_attempt": self.attempt,
                     "local_answer_owner_birth": self.answer_owner_birth}
 
+    def rotate_answer_consumer(self) -> None:
+        """A warm return after this receiver abandoned a sent wait (owner Pause).
+
+        The exact old consumer identity is retired positively and durably, and a
+        fresh one is minted before the next send: an answer to the abandoned
+        attempt can never be read as the new call's, and the custody census sees
+        the new live call under its own identity. The scope stays open.
+        """
+        with self.lock:
+            old, bound = self.answer_consumer_id, self.answer_consumer_bound
+            self.answer_consumer_id = uuid.uuid4().hex
+            self.answer_consumer_bound = False
+        if bound:
+            try:
+                retire_model_consumers(self.canonical_root, self.task_id, {old: self.attempt})
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning("Abandoned model consumer retirement could not persist for %s",
+                                                    self.task_id, exc_info=True)
+                _retain_retirement_witness(self.canonical_root, self.task_id, {old: self.attempt})
+
     def close(self) -> None:
         with self.lock:
             self.closed = True
@@ -793,6 +814,24 @@ class TaskModelWait:
             import logging
             logging.getLogger(__name__).warning("Model consumer retirement could not persist for %s", self.task_id,
                                                 exc_info=True)
+            # The receiver IS closed on a live host: keep that positive fact for the
+            # addressed repair owner (#1554); never a second census or a PID test.
+            _retain_retirement_witness(self.canonical_root, self.task_id, {self.answer_consumer_id: self.attempt})
+
+
+def _retain_retirement_witness(root: Any, task_id: str, consumers: dict[str, int]) -> None:
+    """A positive receiver closure whose durable retirement failed: retain the exact
+    witness (``local_custody_repair``), so the addressed recovery owner retries the
+    SAME writer instead of inferring death from the platform later."""
+    try:
+        from ouroboros.local_custody_repair import retain_witness
+
+        retain_witness(root, task_id, reason="receiver_closed_retirement_unwritten",
+                       model_consumers=dict(consumers))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Retirement witness for %s could not be retained", task_id,
+                                            exc_info=True)
 
 
 def retire_model_consumers(root: Any, task_id: str, consumers: dict[str, int]) -> None:

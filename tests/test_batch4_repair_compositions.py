@@ -110,7 +110,15 @@ def test_unstarted_pause_restart_explicit_resume_preserves_identity(tmp_path, mo
     workers.PENDING.append(task)
     assert request_owner_pause("root", request_id="pause-unstarted")["ok"]
     _restart_door(tmp_path, monkeypatch, workers)
-    assert budget_hold_fact(task)["reason"] == "owner_restart_hold"
+    # Owner 2026-10-08 (quiz d2f7532b): the owner's Restart names its never-started row in
+    # its restart transaction (returned after the acknowledged exit) instead of holding it.
+    import json
+
+    from ouroboros import delegate_recovery as dr
+
+    active = json.loads(dr._active_restart_transaction_path(tmp_path).read_text(encoding="utf-8"))
+    assert dr._read_restart_transaction(tmp_path, active["transaction_id"])["queue_ids"] == ["root"]
+    assert budget_hold_fact(task) is None
     result = q.resume_budget_paused_task("root")
     assert result["ok"], result
     assert workers.PENDING == [task] and task["_admission_owner_token"] == "same-token"

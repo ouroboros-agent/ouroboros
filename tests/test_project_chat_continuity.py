@@ -256,6 +256,7 @@ def test_active_chat_activity_contract_mirrors_direct_turn_shape():
     additional_keys = {
         "required_question", "required_question_unavailable", "project_admission_hold", "pause_cause", "owner_wait",
         "status", "outcome_axes", "reason_code", "root_phase_checkpoint", "timeout_retry_from", "original_task_id",
+        "finishing_reviews",
     }
     assert {key: value for key, value in fields.items() if key not in additional_keys} == ActiveDirectTurn.__annotations__
     assert set(fields) - set(ActiveDirectTurn.__annotations__) == additional_keys

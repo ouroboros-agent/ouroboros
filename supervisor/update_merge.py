@@ -184,9 +184,9 @@ def release_assisted_writer_gate_after_task(
     try:
         if active_update_tx():
             return False
-        from supervisor.workers import open_repo_writer_admission
+        from supervisor.workers import open_repo_writer_admission_after_update_abort
 
-        return open_repo_writer_admission(expected_reason=reason)
+        return open_repo_writer_admission_after_update_abort(expected_reason=reason)
     finally:
         release_update_lock(lock_fh)
 
@@ -546,7 +546,10 @@ def _finish_rollback(
     # Publish the verified checkout through the same owner as ordinary reset.
     _record_checkout_facts({"current_branch": branch, "current_sha": pre})
     stash_note = result.note
-    gate_reason = "managed_update:rollback"
+    # Keep the resolver's immutable release identity if a same-process handoff
+    # fails after clearing the tx; its task_done hook can then retry that gate.
+    gate_reason = (assisted_writer_gate_reason(tx) if reopen_writer_admission and tx.get("task_id")
+                   else "managed_update:rollback")
     try:
         from supervisor.workers import close_repo_writer_admission
 
@@ -579,11 +582,13 @@ def _finish_rollback(
         return False, "rollback restored the repository but could not clear update transaction; " + stash_note
     if reopen_writer_admission:
         try:
-            from supervisor.workers import open_repo_writer_admission
+            from supervisor.workers import open_repo_writer_admission_after_update_abort
 
-            open_repo_writer_admission(expected_reason=gate_reason)
+            if not open_repo_writer_admission_after_update_abort(expected_reason=gate_reason):
+                return False, "rollback restored the repository; saved-work handoff remains held; " + stash_note
         except Exception:
             _g.log.warning("rollback restored the repository but could not reopen writer admission", exc_info=True)
+            return False, "rollback restored the repository but could not reopen writer admission; " + stash_note
     message = f"rolled back to {pre[:12]}"
     if tx.get("failed_update_ref"):
         message += f"; the attempt is preserved on branch {tx['failed_update_ref']}"
@@ -940,6 +945,18 @@ def _recover_assisted_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dic
             _log_supervisor({"type": "managed_update_assisted_materialization_interrupted",
                              "ok": ok, "msg": msg})
             return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": msg}
+    if state == "committed" and tx.get("postcommit_resume"):
+        # An explicit Pause retained the exact commit and its unfinished gates.
+        # The resolver's normal Resume/rejoin rechecks SHA/binding and reruns the
+        # gates. Boot grants neither success nor rollback for this owner hold.
+        saved = tx["postcommit_resume"]
+        binding = ((saved.get("post_fingerprint") or {}).get("binding") or {}) if isinstance(saved, dict) else {}
+        sha = str(tx.get("merge_commit") or "")
+        tree_rc, tree, _error = _g.git_capture(["git", "rev-parse", f"{sha}^{{tree}}"])
+        unchanged = (sha and _rev_parse("HEAD") == sha and tree_rc == 0
+                     and tree == binding.get("tree_sha"))
+        return {"finalized": False, "reason": "assisted_postcommit_paused" if unchanged
+                else "assisted_postcommit_changed"}
     if state == "committed":
         # Only pending_boot_smoke proves that exact-binding verification, post-commit
         # tests, and the pre-restart smoke all passed. A commit found under an assisted
@@ -1156,6 +1173,7 @@ def managed_assisted_postcommit(tx: Dict[str, Any], commit_sha: str) -> Tuple[bo
         "phase": "pending_boot_smoke",
         "merge_commit": commit_sha,
         "pre_restart_smoke": _PRE_RESTART_SMOKE_PENDING,
+        "postcommit_resume": {},
     })
     smoke = update_restart_smoke()
     if smoke.get("ok"):
@@ -1230,7 +1248,7 @@ def abort_orphaned_assisted_tx(
         try:
             from supervisor.workers import ensure_worker_pool_started
 
-            if not ensure_worker_pool_started(allow_disabled_restart=True):
+            if ok and not ensure_worker_pool_started(allow_disabled_restart=True):
                 _g.log.warning(
                     "abort_orphaned_assisted_tx: worker pool remains explicitly disabled"
                 )

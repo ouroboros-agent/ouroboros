@@ -112,3 +112,53 @@ def test_only_private_producer_classification_marks_replaced_host_rows():
     before = deepcopy(rows)
     assert _obsolete_host_rows(rows) == {1, 2, 4}
     assert rows == before
+
+
+def test_working_checkpoint_keeps_canonical_host_rows_exposure_and_selected_review(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import owner_wait, working_checkpoint as wc
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.review_history_view import publish_review_history_view, selected_review_history
+    from ouroboros.task_results import load_task_result, write_task_result
+    from tests._budget_pause_exact_helpers import _loop_ctx
+    from tests.test_review_history_view import fixture, persisted
+
+    ctx, limit = _loop_ctx(tmp_path, "task-review")
+    write_task_result(tmp_path, ctx.task_id, "running")
+    history = fixture()
+    pointer, reader, authored = persisted(tmp_path, history, {"reviewer_outputs[0].text"})
+    publish_review_history_view(ctx, authored, {}, pointer=pointer)
+    host = {"role": "user", context_budget.HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME,
+            "content": "Exact host facts before Pause."}
+    native = {"type": "thinking", "thinking": "Retained native reasoning", "signature": "opaque-signature"}
+    limit.messages[:0] = [host, {"role": "assistant", "content": [native]}, authored]
+    ctx._last_context_observation = {"messages": deepcopy(limit.messages), "exposed_units": [
+        {"unit_id": "already-exposed", "raw_sha256": "a" * 64}], "physical_source_status": "observed_projection"}
+    ctx._inspected_context_view = {"view_revision": "b" * 64}
+    ctx._pending_compaction = {"working_note": "The actor's pending note", "expected_view_revision": "b" * 64}
+    ctx._historical_author_inputs = {"source_ref": pointer["source_ref"]}
+    expected = owner_wait.continuation_state(ctx, limit.messages, limit.llm_trace,
+                                            limit.accumulated_usage, 4, limit.tool_schemas, limit.owner_msg_seen)
+    wc.save_round(limit, "pre_effect")
+    handoff = wc.prepare_recovery(tmp_path, ctx.task_id, from_attempt=1, cause="restart")
+    saved = wc.load_recovery(ctx, handoff)
+    assert saved["messages"] == expected["messages"]
+    assert saved["context_observations"] == expected["context_observations"]
+    fresh, _ = _loop_ctx(tmp_path, "task-review", attempt=2)
+    messages, trace, usage, seen = [], {}, {}, set()
+    owner_wait.restore_continuation_state(SimpleNamespace(_ctx=fresh), saved, messages, trace, usage, seen)
+    assert messages == expected["messages"]  # includes private host tags, native blocks and exact capsule
+    assert fresh._last_context_observation == ctx._last_context_observation
+    assert fresh._pending_compaction == ctx._pending_compaction
+    assert wc.close_unanswered_calls(messages, "interruption") == ["call_b"]
+    assert messages[-1]["tool_call_id"] == "call_b" and "UNKNOWN" in messages[-1]["content"]
+    assert sum(row.get("tool_call_id") == "call_a" for row in messages) == 1
+    physical = _physical_candidate({"messages": messages})["messages"]
+    assert context_budget.HOST_CONTEXT_KIND_KEY not in physical[0]
+    assert physical[0]["content"] == host["content"] and messages[0] == host
+    assert physical[1]["content"] == [native]
+    write_task_result(tmp_path, ctx.task_id, "running", task_attempt=2)
+    assert load_task_result(tmp_path, ctx.task_id)["selected_review_history_view"] == pointer
+    view = selected_review_history(history, drive_root=tmp_path, task_id=ctx.task_id)
+    assert view["selection_status"] == "applied" and view["actor_account"]["capsule"] == authored
+    assert read_actor_source_bytes(tmp_path, ctx.task_id, pointer["source_ref"]) == reader(pointer["source_ref"])

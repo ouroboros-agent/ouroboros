@@ -365,6 +365,13 @@ CURRENT_PRODUCER_CONTRACTS = {
     # Owner Batch4: a call the owner's Pause fenced before its launch handoff never
     # ran; it is the substrate's answer, homed with the other runtime refusals.
     "OWNER_PAUSE_NOT_STARTED": (True, "blocked"),
+    # git_managed_postcommit: a managed merge whose post-commit gates Pause refused, and a
+    # retained commit whose binding changed before Resume. Both publish typed results; the
+    # bare texts carry no marker the adapter types, as for CANDIDATE_ALREADY_BOUND above.
+    "OWNER_PAUSE": (False, "ok"),
+    "native:LEGACY_BLOCKED:OWNER_PAUSE": (True, "blocked"),
+    "MANAGED_UPDATE_POSTCOMMIT_CHANGED": (False, "ok"),
+    "native:LEGACY_TOOL_ERROR:MANAGED_UPDATE_POSTCOMMIT_CHANGED": (True, "error"),
     "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": (True, "unavailable"),
     "STOP_ACTION_CONFLICT": (True, "blocked"),
     "SAFETY_ADVICE": (False, "ok"),

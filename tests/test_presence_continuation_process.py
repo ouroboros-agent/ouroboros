@@ -362,7 +362,9 @@ def test_stop_ends_parked_full_agent_without_another_model_call(tmp_path):
         final = eventually(lambda: (reply if (reply := host.work(first["turn_ref"])).status_code == 200 else None))
         assert final.json()["text"] == "" and not final.json()["outputs"]
         assert len(host.inputs()) == 2
-        assert host.client.get("/fixture/live").json() == []
+        # The durable terminal is readable before handle_task's finally closes its
+        # model receiver (the race the teardown-order test exposes): require closure.
+        eventually(lambda: host.client.get("/fixture/live").json() == [])
         (tmp_path / "consumer-facts.json").write_text(json.dumps({"stop": final.json(), "model_calls": 2}))
     finally:
         host.close()
@@ -428,7 +430,9 @@ def test_second_park_exposes_late_child_without_changing_initial_replay(tmp_path
         assert final.json()["child_work_ref"] == child_ref, final.text
         assert final.json()["status"] in {"completed", "cancelled"}
         assert len(host.inputs()) == (4 if ending == "stop" else 5)
-        assert host.client.get("/fixture/live").json() == []
+        # Polling reads the durable terminal before handle_task's finally closes
+        # its model receiver. Require actual closure too; terminal is not its ACK.
+        eventually(lambda: host.client.get("/fixture/live").json() == [])
         assert host.turn().json() == initial
         assert json.loads(record_path.read_text())["presence_continuation"]["initial"] == record["presence_continuation"]["initial"]
         assert host.work(child_ref).json() == child.json()  # independent work survives the author's end
@@ -445,6 +449,37 @@ def test_second_park_exposes_late_child_without_changing_initial_replay(tmp_path
         # the real manager-backed event bus. Both support processes must be
         # joined by the fixture, before the parent's group assertion runs.
         assert cleanup["event_bus_children"] and cleanup["resource_tracker_pid"], cleanup
+
+
+def test_terminal_poll_precedes_author_teardown_but_cleanup_must_finish(tmp_path):
+    """Deterministically expose the stop/advisory race; never infer cleanup from HTTP 200."""
+    host = Host(tmp_path, 1, "advisory", "late_child_close_barrier")
+    try:
+        initial, record, _ = second_park_with_late_child(host)
+        ref = initial["continuation_ref"]
+        assert host.client.post("/fixture/stop", json={"task_id": ref}).status_code == 200
+        marker = tmp_path / "before-author-close.json"
+        blocked = eventually(lambda: json.loads(marker.read_text()) if marker.exists() else None)
+        assert blocked["task_id"] == ref and blocked["closed"] is False
+        assert blocked["status"] in {"completed", "cancelled"}
+        final = host.work(ref)
+        assert final.status_code == 200 and final.json()["status"] == blocked["status"]
+        assert final.json()["child_work_ref"] == LATE_CHILD
+        assert host.client.get("/fixture/live").json() == [ref]
+        assert len(host.inputs()) == 4
+        assert host.client.post("/fixture/release-close").status_code == 200
+        eventually(lambda: host.client.get("/fixture/live").json() == [])
+        assert host.work(ref).json() == final.json()
+        assert host.turn().json() == initial and len(host.inputs()) == 4
+        assert host.work(LATE_CHILD).status_code == 202
+        (tmp_path / "teardown-order-facts.json").write_text(json.dumps({
+            "blocked": blocked, "terminal": final.json(), "initial": record["presence_continuation"]["initial"],
+            "receiver_closed_after_release": True, "model_calls": 4}, indent=2))
+    finally:
+        host.close()
+    cleanup = json.loads((tmp_path / "process-cleanup-1.json").read_text())
+    assert cleanup["remaining_children"] == [] and cleanup["resource_tracker_joined"]
+    assert cleanup["event_bus_children"] and cleanup["resource_tracker_pid"], cleanup
 
 
 @pytest.mark.parametrize("mode", ["blocking", "advisory"])

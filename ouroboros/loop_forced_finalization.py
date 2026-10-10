@@ -24,7 +24,9 @@ import queue
 import time
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from ouroboros._usage_wait import receiver_abandonable
 from ouroboros.loop_llm_call import forced_response_is_incomplete, forced_response_parts
+from ouroboros.model_wait import ModelWaitInterrupted
 from ouroboros.outcomes import ACCEPTANCE_FINALIZED_UNACCEPTED, REASON_DELIVERY_CONTROL_DEGRADED
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE, TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_MODEL_FINAL, set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
@@ -735,7 +737,7 @@ def _drain_forced_owner_directives(
         ctx.task_id,
         ctx.event_queue,
         seen,
-        owner_ctx=tools._ctx,
+        owner_ctx=tools._ctx, defer_content_ack=True,
     )
     directives = getattr(tools._ctx, "_owner_directives", None)
     after = len(directives) if isinstance(directives, list) else 0
@@ -794,6 +796,7 @@ def _forced_physical_context(ctx: _RoundLimitContext, messages: List[Dict[str, A
     return _physical_context_for_fit(disposition)
 
 
+@receiver_abandonable()
 def _call_forced_model_once(
     ctx: _RoundLimitContext, *, initial_messages: Any = None, admitted_request: Any = None,
     admission: Optional[Dict[str, Any]] = None,
@@ -1218,7 +1221,8 @@ def _forced_final_answer(
     _loop()._append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""
     response_meta: Dict[str, Any] = {}
-    for attempt in range(1 if single_semantic_turn else 2):
+    attempt = 0
+    while attempt < (1 if single_semantic_turn else 2):
         try:
             ctx.accumulated_usage.pop("_forced_response_meta", None)
             if attempt == 0 and _admitted_request is not None:
@@ -1227,6 +1231,13 @@ def _forced_final_answer(
             else:
                 forced = _loop()._call_forced_model_once(ctx)
             extracted, response_meta = forced_response_parts(forced, ctx.accumulated_usage)
+        except ModelWaitInterrupted as error:
+            # Rejoin the loop's control rails; Pause is not a failed final draft
+            # and must never fall through into publication of a fallback final.
+            controlled = _loop()._handle_model_wait_control(ctx, error)
+            if controlled is not None:
+                return controlled
+            continue  # only an actual warm Resume returns; retry the same intent
         except BudgetExceeded:
             _loop()._drain_forced_owner_directives(ctx, llm_trace)
             raise
@@ -1267,6 +1278,7 @@ def _forced_final_answer(
             "[FORCED_OWNER_REFRESH] Answer all current directives; ignore the stale draft."
             + _forced_subject_prompt(ctx, llm_trace),
         )
+        attempt += 1
 
     # Control resolution runs BEFORE the incomplete branch: a retained candidate
     # recovered from a control body must not be discarded as a truncated draft,

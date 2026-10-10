@@ -134,6 +134,71 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
     return text, usage, llm_trace
 
 
+def _restore_saved_clocks(ctx: Any, task: Dict[str, Any]) -> None:
+    """Bind this start's continuation carriers and restore the clocks they saved.
+
+    Runtime/ContextFit must disclose the original ceiling, so the saved state is
+    read here once: an owner-wait handoff, an exact pause grant (#1196), or a
+    same/new-ID retry continuing a frozen working checkpoint (#1563).
+    """
+    ctx.owner_wait_resume = task.get("_owner_wait_resume")
+    ctx.budget_pause_resume = task.get("_budget_pause_resume")
+    ctx.working_recovery = task.get("_working_recovery")
+    from ouroboros.owner_wait import load_owner_wait
+    saved_wait = load_owner_wait(ctx)
+    if not saved_wait and ctx.budget_pause_resume:
+        from ouroboros.budget_pause import load_budget_pause
+        saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
+    if not saved_wait and isinstance(ctx.working_recovery, dict):
+        from ouroboros.working_checkpoint import load_recovery
+        try:
+            saved_wait = load_recovery(ctx)  # same/new-ID recovery continues its clocks
+        except Exception:
+            saved_wait = {}  # the loop discloses the unreadable source itself
+    if saved_wait and ctx.model_wait_context is not None:
+        model_state = saved_wait.get("model_wait") or {}
+        if (saved_wait.get("_working_handoff") or {}).get("source_task_id", ctx.task_id) != ctx.task_id:
+            # A new execution keeps the cumulative clock, without importing
+            # the old task owner's model-choice/control overrides.
+            model_state = {key: model_state[key] for key in ("quota_clock", "budget_paused_sec")
+                           if key in model_state}
+        # started_at stays the ORIGINAL start; the granted paused interval is
+        # the separate carrier the finite lifetime subtracts (#1196). A budget
+        # grant supplies the CURRENT cumulative value; an owner-wait restart
+        # of a previously paused task has none to supply, and the serializer's
+        # own saved carrier is used instead (``restore_continuation``, F5).
+        ctx.model_wait_context.restore_continuation(
+            model_state, started_at=ctx.task_started_at,
+            budget_paused_sec=(ctx.budget_pause_resume or {}).get("paused_duration_sec"))
+
+
+def _retire_working_checkpoint(ctx: Any, task: Dict[str, Any]) -> None:
+    """This attempt's working checkpoint after its result/pause became durable (#1563)."""
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+    from ouroboros.working_checkpoint import discard, live_park
+    from supervisor.terminal_delivery import terminal_answer_receipts
+
+    root = getattr(ctx, "budget_drive_root", None) or getattr(ctx, "drive_root", None)
+    task_id = str(task.get("id") or "")
+    if not task_id or not root:
+        return
+    # Result and outbox writers have fail-soft paths: their return is not proof
+    # of persistence. Keep the only saved cognition until a durable owner holds it.
+    try:
+        attempt = int(getattr(ctx, "task_attempt", None) or task.get("_attempt") or 1)
+        for source_root in {pathlib.Path(root), pathlib.Path(getattr(ctx, "drive_root", None) or root)}:
+            row = load_task_result(source_root, task_id, strict=True) or {}
+            if (row.get("status") in _TRULY_TERMINAL_STATUSES
+                    and int(row.get("task_attempt") or 0) == attempt) or live_park(
+                        source_root, task_id, attempt, verify_source=True):
+                discard(root, task_id)
+                return
+        if terminal_answer_receipts(root, task_id).get("state") in {"owed", "delivered"}:
+            discard(root, task_id)
+    except Exception:
+        log.warning("Working checkpoint retained for %s: terminal persistence unconfirmed", task_id, exc_info=True)
+
+
 def _sync_task_project_scope(task: Dict[str, Any], ctx: Any) -> None:
     project_id = str(getattr(ctx, "project_id", "") or "").strip()
     if project_id and not str(task.get("project_id") or "").strip():
@@ -669,22 +734,7 @@ class OuroborosAgent:
         ctx.task_started_at = self._task_started_ts
         ctx.owner_wait_callback = getattr(self, "owner_wait_callback", None)
         ctx.review_wait_callback = getattr(self, "review_wait_callback", None)  # Presence review park (#1536)
-        ctx.owner_wait_resume = task.get("_owner_wait_resume")
-        ctx.budget_pause_resume = task.get("_budget_pause_resume")
-        from ouroboros.owner_wait import load_owner_wait
-        saved_wait = load_owner_wait(ctx)  # Runtime/ContextFit must disclose the original ceiling.
-        if not saved_wait and ctx.budget_pause_resume:
-            from ouroboros.budget_pause import load_budget_pause
-            saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
-        if saved_wait and ctx.model_wait_context is not None:
-            # started_at stays the ORIGINAL start; the granted paused interval is
-            # the separate carrier the finite lifetime subtracts (#1196). A budget
-            # grant supplies the CURRENT cumulative value; an owner-wait restart
-            # of a previously paused task has none to supply, and the serializer's
-            # own saved carrier is used instead (``restore_continuation``, F5).
-            ctx.model_wait_context.restore_continuation(
-                saved_wait.get("model_wait") or {}, started_at=ctx.task_started_at,
-                budget_paused_sec=(ctx.budget_pause_resume or {}).get("paused_duration_sec"))
+        _restore_saved_clocks(ctx, task)
 
         if self._event_queue is not None:
             # Optional runtime seam consumed by loop.py.  Unit/direct contexts
@@ -895,10 +945,10 @@ class OuroborosAgent:
 
     def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._busy = True
-        _continuation = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
+        _continuation = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or task.get("_working_recovery") or {}
         start_time = float(_continuation.get("started_at") or time.time())
         self._task_started_ts = start_time
-        self._last_progress_ts = start_time
+        self._last_progress_ts = time.time()  # this worker is newly active; lifetime keeps its original start
         self._pending_events = []
         # Preserve chat_id=0; it is a real session, not missing.
         _raw_chat = task.get("chat_id")
@@ -1078,6 +1128,7 @@ class OuroborosAgent:
                 ctx=ctx,
                 event_queue=self._event_queue,
             )
+            _retire_working_checkpoint(self.tools._ctx, task)  # retire only after durable persistence readback
             return list(self._pending_events)
 
         except BudgetPauseRequested as exc:
@@ -1088,6 +1139,7 @@ class OuroborosAgent:
             from ouroboros.budget_pause import pause_event
 
             self._pending_events.append(pause_event(task, exc.pause))
+            _retire_working_checkpoint(self.tools._ctx, task)  # its exact pause source supersedes it
             return list(self._pending_events)
 
         except BudgetExceeded as exc:
@@ -1166,6 +1218,7 @@ class OuroborosAgent:
                 ctx=self.tools._ctx,
                 event_queue=self._event_queue,
             )
+            _retire_working_checkpoint(self.tools._ctx, task)
             return list(self._pending_events)
 
         finally:

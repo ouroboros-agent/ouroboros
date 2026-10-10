@@ -60,6 +60,7 @@ from ouroboros.usage_accounting import (
     UsageAccountingError,
     UsageScope,
     current_usage_scope,
+    last_physical_attempt_capture,
     usage_scope,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
@@ -495,7 +496,7 @@ class ReviewCoordinator:
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
         start = time.time()
-        attempt_history = _ReviewAttemptHistory()
+        attempt_history = _ReviewAttemptHistory(incoming_capture=last_physical_attempt_capture())
         try:
             prompt_ref = persist_call(
                 self._custody_drive_root(),

@@ -534,7 +534,7 @@ def test_emergency_cleanup_joins_the_one_owned_stop(monkeypatch):
     server._emergency_process_cleanup(port_sweep=False)
 
     assert stop_calls == [server.DATA_DIR]
-    assert worker_calls == [{"force": True, "archive_service_logs": False}]
+    assert worker_calls == [{"force": True, "archive_service_logs": False, "retain_saved_work": True}]  # #1563
 
 
 def test_emergency_cleanup_during_restart_marks_tasks_cancelled(monkeypatch):

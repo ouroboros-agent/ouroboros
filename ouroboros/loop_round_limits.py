@@ -105,9 +105,25 @@ def _drain_incoming_messages(
     event_queue: Optional[queue.Queue],
     _owner_msg_seen: set,
     owner_ctx: Any = None,
+    defer_content_ack: bool = False,
 ) -> Dict[str, Any]:
-    """Injects dialogue; returns typed controls."""
+    """Injects dialogue; returns typed controls.
+
+    ``defer_content_ack``: an owner/peer CONTENT entry is acknowledged only once
+    a saved state holds it (``working_checkpoint``: the next ``ready`` save, a
+    returned result's final save, or the published exact pause), so a crash in
+    between delivers it again instead of losing it. Control kinds are
+    acknowledged at once.
+    """
     controls: Dict[str, Any] = {}
+
+    def ack_content(entry: Dict[str, Any]) -> None:
+        if defer_content_ack and owner_ctx is not None:
+            from ouroboros.working_checkpoint import defer_content_ack as defer
+
+            defer(owner_ctx, lambda: acknowledge_transcript_entry(drive_root, task_id, entry))
+        else:
+            acknowledge_transcript_entry(drive_root, task_id, entry)
     if owner_ctx is not None and getattr(owner_ctx, "last_owner_delivery", None) is not None:
         owner_ctx.last_owner_delivery = None
     while not incoming_messages.empty():
@@ -203,7 +219,7 @@ def _drain_incoming_messages(
                 )
                 if provenance == "system" and isinstance(entry.get("review_feedback"), dict) and messages:
                     messages[-1].setdefault("review_feedback", []).append(dict(entry["review_feedback"]))
-                acknowledge_transcript_entry(drive_root, task_id, entry)
+                ack_content(entry)
                 continue
             if kind == KIND_QUIZ_ANSWER:
                 _loop()._record_owner_directive(
@@ -214,7 +230,7 @@ def _drain_incoming_messages(
                     entry, task_id, event_queue,
                     lambda text: _loop()._append_or_merge_user_message(messages, text, slot=owner_ctx),
                 )
-                acknowledge_transcript_entry(drive_root, task_id, entry)
+                ack_content(entry)
                 continue
             # A LATE quiz answer: the owner's row and this entry's text are the
             # owner's own words; the model reads (and the owner corpus keeps) the
@@ -252,7 +268,7 @@ def _drain_incoming_messages(
                 messages, _loop()._owner_marked_content(owner_content),
                 slot=owner_ctx,
             )
-            acknowledge_transcript_entry(drive_root, task_id, entry)
+            ack_content(entry)
             if event_queue is not None:
                 try:
                     event_queue.put_nowait({
@@ -310,16 +326,19 @@ def _run_round_compaction(
     elif isinstance(pending, dict) or pending is None:
         messages = _run_authored_context_view(messages, ctx, pending, selected_names)
     else:
-        ctx.tools._ctx._pending_compaction = None
-        messages, receipt, usage = _loop().compact_tool_history_llm(
-            messages,
-            keep_recent=max(0, int(pending)),
-            drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
-            task_id=ctx.task_id,
-            negative_memo=reclaim_negative_memo(ctx.tools._ctx),
-            trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
-            exposed_units=(getattr(ctx.tools._ctx, "_last_context_observation", {}) or {}).get("exposed_units", []),
-        )
+        from ouroboros._usage_wait import receiver_abandonable
+
+        with receiver_abandonable():
+            messages, receipt, usage = _loop().compact_tool_history_llm(
+                messages,
+                keep_recent=max(0, int(pending)),
+                drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
+                task_id=ctx.task_id,
+                negative_memo=reclaim_negative_memo(ctx.tools._ctx),
+                trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
+                exposed_units=(getattr(ctx.tools._ctx, "_last_context_observation", {}) or {}).get("exposed_units", []),
+            )
+        ctx.tools._ctx._pending_compaction = None  # an interrupted request survives the pause
         _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
             "checkpoint_kind": "context_reclaim_manual",
             "round": ctx.round_idx,
@@ -754,10 +773,20 @@ def _handle_model_wait_control(
             reason = error.control_reason
             break
     if reason == "owner_pause":
-        # Raised only BEFORE request bytes (a pre-dispatch wait or the send's
-        # launch handoff): nothing is in flight, the loop pauses exactly here.
+        # Before request bytes (a pre-dispatch wait or the send's launch
+        # handoff) nothing is in flight. After them the receiver abandoned its
+        # local wait: the sender settles and retains the late answer, which is
+        # never adopted; the loop pauses at the previous ready point.
         from ouroboros.budget_pause import enter_owner_pause
 
+        if getattr(error, "receiver_abandoned", False):
+            abandoned = list(getattr(error, "ledger_attempt_ids", None) or [])
+            ctx.accumulated_usage["ledger_attempt_ids"] = list(dict.fromkeys([
+                *ctx.accumulated_usage.get("ledger_attempt_ids", []), *abandoned]))
+            owner_ctx = getattr(ctx.tools, "_ctx", None)
+            if owner_ctx is not None:
+                owner_ctx._abandoned_model_attempts = list(dict.fromkeys([
+                    *(getattr(owner_ctx, "_abandoned_model_attempts", None) or []), *abandoned]))
         enter_owner_pause(ctx)
         return None
     if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling", "accounting_wait_expired"}:
@@ -774,7 +803,7 @@ def _handle_model_wait_control(
     controls = _drain_incoming_messages(
         ctx.messages, ctx.incoming_messages or queue.Queue(), ctx.drive_root,
         ctx.task_id, ctx.event_queue, ctx.owner_msg_seen if ctx.owner_msg_seen is not None else set(),
-        owner_ctx=getattr(ctx.tools, "_ctx", None),
+        owner_ctx=getattr(ctx.tools, "_ctx", None), defer_content_ack=True,
     )
     capture = getattr(error, "physical_attempt_capture", None)
     unknown = outcome_unknown_on_chain(error)

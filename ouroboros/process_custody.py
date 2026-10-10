@@ -181,6 +181,7 @@ def spawn_supervised(
     residual — such a child is unledgered and the reaper cannot see it.
     ``on_spawn`` publishes the Popen into its existing owner before custody I/O;
     it must not wait or persist. Callback failure follows normal spawn cleanup.
+    The returned Popen retains its exact durable row as ``_ouroboros_custody``.
     """
     if new_process_group:
         merged = dict(subprocess_new_group_kwargs())
@@ -193,7 +194,7 @@ def spawn_supervised(
     try:
         if on_spawn is not None:
             on_spawn(proc)
-        record_process(
+        proc._ouroboros_custody = record_process(
             drive_root,
             pid=proc.pid,
             cmd=cmd,

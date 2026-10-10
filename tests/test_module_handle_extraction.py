@@ -151,6 +151,12 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_evolution_commit_authority", "_preserve_evolution_orphan",
         "_record_commit_attempt", "_record_evolution_commit_intent", "run_cmd",
     })),
+    "ouroboros/tools/git_managed_postcommit.py": ("ouroboros/tools/git.py", "_git", frozenset({
+        "_acquire_git_lock", "_format_commit_result", "_managed_commit_gate_failure",
+        "_managed_post_commit_tests_gate", "_post_commit_result", "_publish_post_commit_test_fact",
+        "_record_commit_attempt", "_release_git_lock", "_verify_reviewed_commit_binding",
+        "record_bound_commit_success", "run_cmd",
+    })),
     "ouroboros/tools/git_plumbing.py": ("ouroboros/tools/git.py", "_git", frozenset({
         "_BINARY_EXTENSIONS", "acquire_exclusive_file_lock", "format_protected_paths",
         "get_runtime_mode", "run_cmd", "system_repo_dir_for", "unlink_lockfile",
@@ -350,7 +356,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         '_drain_incoming_messages', '_emit_checkpoint_event', '_finalize_forced_services',
         '_finalize_task_services', '_force_plan_decision', '_force_plan_disclosure',
         '_force_plan_reminder', '_forced_delegation_note', '_forced_fallback_result',
-        '_forced_orphan_note', '_forced_unaccepted_binding', '_live_delivery_candidate',
+        '_forced_orphan_note', '_forced_unaccepted_binding', '_handle_model_wait_control', '_live_delivery_candidate',
         '_load_direct_child_results', '_prepare_forced_prompt', '_project_child_result_dispositions',
         '_publish_delivery_candidate', '_record_forced_acceptance_bypass', '_record_forced_finalization',
         '_replace_delivery_candidate', '_resolve_forced_delivery_control_body', '_server_web_allowed_by_task',

@@ -132,6 +132,8 @@ def test_sent_review_settles_after_pause_and_author_close_with_original_group(en
             assert release.wait(10)
             # The callback was bound in the operation, not in its now-closed author.
             observations.append(model_poll_control())
+            # A ledger "dispatched" row is not a physical handoff: this fake sender
+            # never handed bytes to an executor, so it earned no Pause exception.
             with pytest.raises(PhysicalDispatchInterrupted, match="owner_pause"):
                 require_physical_dispatch_window()
             ua.settle_attempt(reservation, {"prompt_tokens": 3, "completion_tokens": 2},
@@ -146,6 +148,9 @@ def test_sent_review_settles_after_pause_and_author_close_with_original_group(en
             assert sent.wait(5)
             operation = next(op for op in review_operation._LIVE.values() if op.task_id == TASK)
             assert request_owner_pause(TASK, request_id="pause-after-send")["ok"]
+            # The author's own context carries no review episode: it stays fenced.
+            with pytest.raises(PhysicalDispatchInterrupted, match="owner_pause"):
+                require_physical_dispatch_window()
         write_task_result(f.root, TASK, "completed", result="author finished")
         assert parent.closed
     finally:

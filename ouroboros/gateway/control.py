@@ -378,10 +378,10 @@ async def api_update_check(_request: Request) -> JSONResponse:
 def _respawn_workers_after_failed_update() -> None:
     """Revive workers when an update aborts after they were stopped (no restart follows)."""
     try:
-        from supervisor.workers import ensure_worker_pool_started, open_repo_writer_admission
+        from supervisor.workers import ensure_worker_pool_started, open_repo_writer_admission_after_update_abort
 
-        open_repo_writer_admission()
-        ensure_worker_pool_started(allow_disabled_restart=True)
+        if open_repo_writer_admission_after_update_abort():
+            ensure_worker_pool_started(allow_disabled_restart=True)
     except Exception:
         log.warning("update_apply: failed to respawn workers after aborted update", exc_info=True)
 
@@ -440,14 +440,23 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
     if blocked:
         open_repo_writer_admission()
         return [f"active:{label}" for label in blocked]
+    from supervisor import workers as worker_state
+    from supervisor.restart_retention import capture_update_returns
+
+    try:
+        with worker_state._queue_lock:
+            update_returns = capture_update_returns(DRIVE_ROOT, worker_state.RUNNING, worker_state.WORKERS,
+                                                   return_ids=())
+    except Exception as exc:
+        return [f"saved_work_handoff:{type(exc).__name__}: {exc}"]
     preserve_running_task_ids: set[str] = set()
+    return_ids: set[str] = set()
     if reason != "manual_rollback":
         try:
             import uuid
 
             from ouroboros.delegate_recovery import prepare_planned_restart_handoffs
             from ouroboros.owner_wait import prepare_owner_wait_handoffs
-            from supervisor import workers as worker_state
 
             restart_transaction_id = uuid.uuid4().hex
             owner_wait_ids = prepare_owner_wait_handoffs(
@@ -459,10 +468,20 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
                 restart_transaction_id=restart_transaction_id,
                 additional_task_ids=owner_wait_ids,
             )
+            from supervisor.restart_retention import prepare_restart_returns
+
+            # The update's restart returns active work and the runnable queue (#1563).
+            return_ids = prepare_restart_returns(DRIVE_ROOT, worker_state.RUNNING, list(worker_state.PENDING),
+                                                transaction_id=restart_transaction_id,
+                                                direct=worker_state.direct_chat_turns(),
+                                                owner_wait_ids=preserve_running_task_ids)
         except Exception as exc:
             open_repo_writer_admission()
             log.warning("Managed update owner-wait handoff preparation failed", exc_info=True)
             return [f"owner_wait_handoff:{type(exc).__name__}: {exc}"]
+    with worker_state._queue_lock:
+        for task_id, captured in update_returns["rows"].items():
+            captured["returning"] = task_id in return_ids
     update_progress.advance("stopping_workers")
     survivors = kill_workers_for_update(
         result_reason="Task interrupted by an owner-requested managed update.",
@@ -492,7 +511,9 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
         _custody_ok, custody_blockers = quiesce_custodied_services(DRIVE_ROOT)
     except Exception as exc:
         custody_blockers = [f"custody_ledger:{type(exc).__name__}: {exc}"]
-    return [f"service:{label}" for label in failed] + custody_blockers
+    blockers = [f"service:{label}" for label in failed] + custody_blockers
+    update_returns["quiesced"] = not blockers
+    return blockers
 
 
 def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:

@@ -12,6 +12,8 @@ def test_exact_pause_cause_comes_from_marker(reason):
 def test_owner_tree_and_restart_hold_do_not_inherit_a_budget_label():
     assert _activity_pause_cause({"_budget_pause": {"reason": "budget"}}, {"cause": "owner_pause"}) == "owner"
     assert _activity_pause_cause({"_budget_pause_hold": {"reason": "owner_restart_hold"}}, {}) == "restart"
+    # #1563: work saved before the application stopped waits under the same published cause.
+    assert _activity_pause_cause({"_budget_pause_hold": {"reason": "saved_work_hold"}}, {}) == "restart"
     assert _activity_pause_cause({}, {}) == "unknown"
     assert _activity_pause_cause({"reason_code": "budget_exhausted"}, {}) == "budget"
 

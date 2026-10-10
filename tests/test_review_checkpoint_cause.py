@@ -97,6 +97,104 @@ def test_real_session_checkpoint_preserves_lock_cause_before_any_post(tmp_path, 
         assert actor.raw_text == "[]" and not actor.reported_cause
 
 
+@pytest.mark.parametrize("state", ["unresolved", "settled", "future_state"])
+def test_session_checkpoint_excludes_incoming_caller_capture(tmp_path, fake_route, state):
+    from ouroboros import usage_accounting as ua
+    from ouroboros.review_state import ReviewStateLockError
+    from ouroboros.review_substrate import ReviewCoordinator
+
+    incoming = ua.PhysicalAttemptCapture(
+        attempt_id="unrelated-previous-attempt", model="unrelated/model",
+        provider="synthetic", state=state, candidate_measurement_kind="opaque",
+    )
+
+    def checkpoint(_invocation_id):
+        raise ReviewStateLockError(tmp_path / "lock", {"reason": "contention", "errno": None})
+
+    token = ua._LAST_PHYSICAL_ATTEMPT.set(incoming)
+    try:
+        actor = ReviewCoordinator(llm=FakeLLM(), drive_root=tmp_path)._run_slot(
+            _agent_request(), _agent_slot(), pending_invocation_checkpoint=checkpoint,
+        )
+        assert fake_route.instances[-1].start_requests == []
+        assert actor.status == "error"
+        assert actor.failure_code == "review_custody_checkpoint_unwritable"
+        assert actor.operation_state == "settled"
+        assert actor.usage["review_failure_phase"] == "authority"
+        assert "physical_attempt_state" not in actor.usage
+        assert actor.transport_status == "authority_error"
+        assert '"reason":"contention"' in actor.reported_cause
+        assert actor.response_ref
+        assert ua.last_physical_attempt_capture() is incoming
+        assert incoming.state == state
+    finally:
+        ua._LAST_PHYSICAL_ATTEMPT.reset(token)
+
+
+@pytest.mark.parametrize("later_capture", ["unchanged", "cleared", "released"])
+def test_session_checkpoint_retains_same_actor_retry_capture(
+    tmp_path, fake_route, monkeypatch, later_capture,
+):
+    from ouroboros import usage_accounting as ua
+    from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAttemptResult
+    from ouroboros.review_state import ReviewStateLockError
+    from ouroboros.review_substrate import ReviewCoordinator
+
+    incoming = ua.PhysicalAttemptCapture(
+        attempt_id="unrelated-previous-attempt", model="unrelated/model",
+        provider="synthetic", state="settled", provider_status_code=503,
+        candidate_measurement_kind="opaque",
+    )
+    own = ua.PhysicalAttemptCapture(
+        attempt_id="this-actor-attempt", model="api/model-a", provider="synthetic",
+        state="unresolved", candidate_measurement_kind="opaque",
+    )
+    execute = AgentSessionReviewExecutor.execute
+    attempts = []
+
+    def empty_then_checkpoint(executor):
+        attempts.append(True)
+        if len(attempts) == 1:
+            # A legacy empty result exposes its physical fact only in the
+            # execution context. The second attempt refuses before any POST.
+            ua.adopt_physical_attempt_capture(own)
+            return ReviewAttemptResult(message={"content": ""}, usage={}, raw_text="")
+        if later_capture == "cleared":
+            ua.adopt_physical_attempt_capture(None)
+        elif later_capture == "released":
+            ua.adopt_physical_attempt_capture(ua.PhysicalAttemptCapture(
+                attempt_id="this-actor-unsent-retry", model="api/model-a",
+                provider="synthetic", state="released", candidate_measurement_kind="opaque",
+            ))
+        return execute(executor)
+
+    def checkpoint(_invocation_id):
+        raise ReviewStateLockError(tmp_path / "lock", {"reason": "contention", "errno": None})
+
+    monkeypatch.setattr(AgentSessionReviewExecutor, "execute", empty_then_checkpoint)
+    token = ua._LAST_PHYSICAL_ATTEMPT.set(incoming)
+    try:
+        actor = ReviewCoordinator(llm=FakeLLM(), drive_root=tmp_path)._run_slot(
+            _agent_request(), _agent_slot(), pending_invocation_checkpoint=checkpoint,
+        )
+    finally:
+        ua._LAST_PHYSICAL_ATTEMPT.reset(token)
+
+    assert len(attempts) == 2
+    assert fake_route.instances[-1].start_requests == []
+    assert actor.status == "error"
+    assert actor.failure_code == "provider_outcome_unknown"
+    assert actor.operation_state == "custody_lost"
+    assert actor.late_result_pending is True
+    assert actor.usage["physical_attempt_state"] == "unresolved"
+    assert actor.http_status is None
+    assert "provider_status_code" not in actor.usage
+    assert actor.usage["review_failure_phase"] == "authority"
+    assert actor.transport_status == "authority_error"
+    assert '"reason":"contention"' in actor.reported_cause
+    assert actor.response_ref
+
+
 @pytest.mark.parametrize("scenario,expected", [
     ("authority", "authority_error"), ("authority_unsent", "authority_error"),
     ("provider", "provider_transport_error"), ("unsent", "not_dispatched"),

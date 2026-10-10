@@ -114,8 +114,8 @@ export function taskControlActions({ cancelPending = false, budgetPaused = false
     // The host-attested pause fact gates the offer; the server re-validates
     // (replay_unsafe and sibling checks answer 409 with the reason).
     if (budgetPaused) return resumeVisible ? [ACTION_STOP_NOW] : [ACTION_RESUME, ACTION_STOP_NOW];
-    // Pause saves the WHOLE tree exactly (sent work finishes, new work is
-    // fenced) until an explicit Resume; Stop still ends it.
+    // Pause saves the WHOLE tree until an explicit Resume: new work is fenced,
+    // members' own runs get a stop, launched reviewers finish; Stop still ends it.
     return wholeTree ? [ACTION_FINALIZE, ACTION_HURRY, ACTION_PAUSE, ACTION_STOP_NOW]
         : [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW];
 }

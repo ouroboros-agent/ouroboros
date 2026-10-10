@@ -379,10 +379,12 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert _notrequired_fields(ActiveChatActivity) == {
         "model_waits", "task_attempt", "required_question", "required_question_unavailable", "project_admission_hold", "pause_cause", "owner_wait",
         "status", "outcome_axes", "reason_code", "root_phase_checkpoint", "timeout_retry_from", "original_task_id",
-    }, "ActiveChatActivity adds optional outcome/retry evidence without changing required activity facts"
+        "finishing_reviews",
+    }, "ActiveChatActivity adds optional outcome/retry/review evidence without changing required activity facts"
     activity_fields = get_type_hints(ActiveChatActivity, include_extras=True)
     question_keys = {"required_question", "required_question_unavailable", "project_admission_hold", "pause_cause", "owner_wait"}
     question_keys |= {"status", "outcome_axes", "reason_code", "root_phase_checkpoint", "timeout_retry_from", "original_task_id"}
+    question_keys |= {"finishing_reviews"}
     assert {key: value for key, value in activity_fields.items() if key not in question_keys} == get_type_hints(ActiveDirectTurn, include_extras=True), (
         "ActiveChatActivity must mirror ActiveDirectTurn's field shape so one client reducer hydrates both"
     )
@@ -398,6 +400,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         assert activity_schema["properties"].pop(field)["type"] == "string"
     for field in ("outcome_axes", "root_phase_checkpoint"):
         assert activity_schema["properties"].pop(field)["type"] == "object"
+    assert activity_schema["properties"].pop("finishing_reviews")["type"] == "boolean"
     assert not question_keys & set(activity_schema["required"])
     assert activity_schema == json_schema_for(ActiveDirectTurn), (
         "the shared activity shape must preserve flat keys, types and requiredness"

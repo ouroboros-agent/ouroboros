@@ -87,8 +87,8 @@ def _first_process(tmp_path, monkeypatch, *, sent_at_iso: str) -> dict:
     from ouroboros.tools.plan_review_runtime import _plan_row_from_actor
     from ouroboros.usage_accounting import UsageScope
 
-    monkeypatch.setattr(custody, "utc_now_iso", lambda: sent_at_iso)
     release = threading.Event()
+    published = threading.Event()
     slot = _slot(timeout_sec=0.05)
     request = _request()
     key = custody._attempt_key(request, slot)
@@ -96,20 +96,34 @@ def _first_process(tmp_path, monkeypatch, *, sent_at_iso: str) -> dict:
     def run_slot(_slot, _operation_id, retry_state, _deadline, _checkpoint):
         retry_state["pending_invocation_id"] = INVOCATION
         retry_state["delegated_run_id"] = RUN_ID
+        published.set()
         assert release.wait(10)
         raise TimeoutError(f"delegated review session {RUN_ID} exceeded the slot budget")
 
+    # This fixture represents an ALREADY dispatched remote invocation. A busy
+    # worker can spend the entire 50 ms window in its started-event publication,
+    # before run_slot has submitted anything. Let that publication happen before
+    # collecting the timeout actor; keep the real timeout and worker settlement.
+    # No token is manufactured by the collector, and the real actor must copy it.
+    original_timeout_actor = custody._late_or_timeout_actor
+
+    def dispatched_timeout_actor(*args, **kwargs):
+        assert published.wait(10), "the delegated worker never published its invocation"
+        return original_timeout_actor(*args, **kwargs)
+
     ctx = SimpleNamespace(drive_root=tmp_path, task_id=TASK_ID)
     try:
-        [actor] = custody.run_custodied_review_slots(
-            request=request, slots=[slot], usage_ctx=ctx, task_id=TASK_ID, usage_meta={},
-            review_usage_scope=UsageScope(drive_root=tmp_path, task_id=TASK_ID),
-            run_slot=run_slot, error_actor=_error_actor,
-        )
+        with monkeypatch.context() as process:
+            process.setattr(custody, "utc_now_iso", lambda: sent_at_iso)
+            process.setattr(custody, "_late_or_timeout_actor", dispatched_timeout_actor)
+            [actor] = custody.run_custodied_review_slots(
+                request=request, slots=[slot], usage_ctx=ctx, task_id=TASK_ID, usage_meta={},
+                review_usage_scope=UsageScope(drive_root=tmp_path, task_id=TASK_ID),
+                run_slot=run_slot, error_actor=_error_actor,
+            )
     finally:
         release.set()
-    _wait_worker_gone(key)
-    monkeypatch.undo()
+        _wait_worker_gone(key)
     assert actor.operation_state == "in_flight"
     assert actor.usage["pending_invocation_id"] == INVOCATION
     row = _plan_row_from_actor(asdict(actor), slot)
@@ -175,6 +189,39 @@ def _second_process(tmp_path, row: dict, *, deadline_at: str, timeout_sec=None) 
 
 
 SPENT_OWNER_DEADLINE = "2000-01-01T00:00:00Z"
+
+
+def test_rejoin_after_worker_startup_outlasts_the_collection_window(tmp_path, monkeypatch):
+    """A busy worker still supplies real invocation custody before this fixture rejoins it."""
+    import ouroboros.review_custody as custody
+
+    expired = threading.Event()
+    original_clock = custody.monotonic_now
+    original_emit = custody._emit_operation
+    deadline = None
+
+    def observe_clock(slot_id=None):
+        nonlocal deadline
+        now = original_clock(slot_id)
+        if deadline is None:
+            deadline = now + 0.05
+        elif now >= deadline:
+            expired.set()
+        return now
+
+    def delayed_start(*args, **kwargs):
+        if kwargs.get("phase") == "started":
+            assert expired.wait(10), "the collector never reached its real timeout"
+        return original_emit(*args, **kwargs)
+
+    with monkeypatch.context() as startup:
+        startup.setattr(custody, "monotonic_now", observe_clock)
+        startup.setattr(custody, "_emit_operation", delayed_start)
+        row = _first_process(tmp_path, monkeypatch, sent_at_iso=_past_iso(200))
+    assert expired.is_set()
+    actor, remaining = _second_process(tmp_path, row, deadline_at="", timeout_sec=MAX_SECONDS)
+    assert actor.status == "ok"
+    assert remaining == pytest.approx(MAX_SECONDS - 200, abs=5)
 
 
 def test_restart_rejoin_inherits_the_remaining_original_window(tmp_path, monkeypatch):

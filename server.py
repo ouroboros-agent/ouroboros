@@ -169,8 +169,13 @@ def _restart_current_process(host: str, port: int) -> None:
         from ouroboros.server_restart import _RESTARTABLE_UPDATE_PHASES
         from supervisor.update_merge import read_update_tx_strict
 
-        if any((DATA_DIR / "state" / name).exists() for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
+        panic_flag = DATA_DIR / "state" / "panic_stop.flag"
+        if panic_flag.exists() and panic_flag.read_text(encoding="utf-8").strip() == "panic":
             os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+        elif (DATA_DIR / "state" / "owner_restart_no_resume.flag").exists():
+            from ouroboros.server_restart import arm_owner_restart_transaction
+
+            arm_owner_restart_transaction()  # only the work THIS owner Restart named returns
         else:
             status, tx = read_update_tx_strict()
             if status == "valid" and tx.get("phase") in _RESTARTABLE_UPDATE_PHASES:
@@ -1064,13 +1069,18 @@ def _perform_supervisor_restart(
     try:
         from ouroboros.delegate_recovery import prepare_planned_restart_handoffs
         from ouroboros.owner_wait import prepare_owner_wait_handoffs
+        from supervisor.restart_retention import prepare_restart_returns
+        from supervisor.workers import direct_chat_turns
 
+        owner_waits = prepare_owner_wait_handoffs(ctx.DRIVE_ROOT, ctx.RUNNING, restart_transaction_id)
         planned_handoffs = prepare_planned_restart_handoffs(
             ctx.DRIVE_ROOT, ctx.RUNNING,
             restart_transaction_id=restart_transaction_id,
-            additional_task_ids=prepare_owner_wait_handoffs(
-                ctx.DRIVE_ROOT, ctx.RUNNING, restart_transaction_id),
+            additional_task_ids=owner_waits,
         )
+        # The planned restart also returns active work and the runnable queue (#1563).
+        prepare_restart_returns(ctx.DRIVE_ROOT, ctx.RUNNING, list(ctx.PENDING), transaction_id=restart_transaction_id,
+                                direct=direct_chat_turns(), owner_wait_ids=planned_handoffs)
     except Exception:
         log.debug("Planned self-restart delegate handoff preparation failed", exc_info=True)
     restart_kill_kwargs = _managed_update_pending_kwargs()
@@ -1083,6 +1093,7 @@ def _perform_supervisor_restart(
         result_reason=cleanup_reason,
         stop_source="server_shutdown",
         preserve_running_task_ids=planned_handoffs,
+        retain_saved_work=True,
         **restart_kill_kwargs,
     )
     try:  # a field update: a stale snapshot never erases a control written meanwhile (#1307)
@@ -1581,10 +1592,11 @@ def _actual_bound_port() -> int:
 
 
 def _restart_cleanup_kwargs() -> dict:
-    """Keep owner Restart from re-opening daemon custody after its stop."""
+    """Keep owner Restart from re-opening daemon custody after its stop; every
+    application stop keeps saved work and accepted queue for the next boot (#1563)."""
     if _owner_restart_requested.is_set():
-        return {"reconcile_delegate_custody": False}
-    return {}
+        return {"reconcile_delegate_custody": False, "retain_saved_work": True}
+    return {"retain_saved_work": True}
 
 
 def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:

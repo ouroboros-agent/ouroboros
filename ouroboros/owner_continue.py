@@ -64,6 +64,10 @@ TECHNICAL_REASON_CODES = frozenset({
     "reaper_wedged_worker_alive", "round_limit", "execution_deadline", "absolute_ceiling",
     "task_exception", "workers_unavailable", "worker_pool_unavailable", "finalization_grace",
     "idle_timeout", "worker_crash_signal", "worker_crash_retry_exhausted",
+    # A worker that died after an owner wait or with budget-continuation evidence
+    # is not retried automatically (replaying would repeat effects), and its saved
+    # source is retained: an explicit Continue is exactly its manual path (#1543).
+    "worker_crash_owner_wait", "worker_crash_budget_pausing",
 })
 # The loop's forced-finalization rails that are technical limits: an extracted
 # best-effort answer settles ``completed``, the host fallback ``failed``
