@@ -1780,7 +1780,7 @@ body.resizing-panels { user-select: none; }
     overflow: hidden;
     container-type: inline-size;
     container-name: livecard;
-    /* So the convert-to-project recolor (.is-project) fades in calmly (P3). */
+    /* Conversion to the shared Project entry fades in calmly (P3). */
     transition: border-color 250ms ease, background-color 250ms ease, box-shadow 250ms ease;
 }
 

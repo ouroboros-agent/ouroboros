@@ -81,7 +81,9 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate, attachCopy })
         for (const taskId of shadow.subjects) under.subjects.add(taskId);
         // The receipt owns the transfer time. Conversion supplies no invented
         // date while its durable row is still in flight; ordering stays intact.
-        if (shadow.kind === 'receipt' && under.kind === 'card') stampTime(under, shadow.ts);
+        if (shadow.kind === 'receipt') for (const row of rows.values()) {
+            if (row.id === shadow.id && row.kind === 'card') stampTime(row, shadow.ts);
+        }
         if (shadow.kind === 'receipt' && under.node.dataset.receipt) {
             delete under.node.dataset.receipt;
             under.node.classList.remove('project-handoff--unsaved');
@@ -215,7 +217,7 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate, attachCopy })
         if (copy) footer.append(copy);
         const row = { key: kind === 'card' ? `card:${taskId}` : id, id, node, status, secondary, kind, taskId, projectId,
             time, ts: '', subjects: new Set([taskId]), followed: new Set([taskId]), shadows: [], detail: null, pending: false, checked: false, epoch: 0 };
-        stampTime(row, ts);
+        stampTime(row, ts || (kind === 'card' ? anchor?.ts : ''));
         if (kind === 'receipt' && anchor) {
             // Duplicate delivery is not evidence that a differently named
             // execution supersedes its subject: one receipt, the rest shadowed.

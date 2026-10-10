@@ -1084,8 +1084,6 @@ export function createChatInstance({
             record.turnProjectBtn = null;
             record.cancelRunBtn = null;
             record.finished = true;
-            // Recolor on the next frame so the 250ms fuchsia fade actually animates.
-            requestAnimationFrame(() => record.root.classList.add('is-project'));
             signalChatFreed();  // subtle "this chat is free again" composer cue
         });
     }
@@ -2307,12 +2305,13 @@ export function createChatInstance({
             ${timeHtml}
         `;
         if (attachments.length) chatMedia.mountAttachments(bubble, attachments, shown);
-        if (['project_handoff', 'project_started'].includes(systemType) && handoffs) handoffs.mount(bubble, {
+        const projectEntry = handoffs && ['project_handoff', 'project_started'].includes(systemType);
+        if (projectEntry) handoffs.mount(bubble, {
             taskId, projectId, projectName, title: opts.taskName || text, handoffId: opts.handoffId, ts,
             kind: systemType === 'project_started' ? 'started' : 'receipt' });
-        else {
+        if (!bubble.classList.contains('project-handoff')) {
             if (!isProgress && shown) chatMedia.attachCopyControl(bubble, String(shown));
-            if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName,
+            if (!projectEntry && PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName,
                 terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary' });
         }
         syncSavedProjectContext(bubble, opts.originProjected, opts.originId);

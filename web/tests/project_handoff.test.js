@@ -178,29 +178,50 @@ test('an ordinary message reconciles only itself; the feed is scanned when an an
         assert.equal(h.scans(), before, 'a steady census tick scans nothing');
     } finally { h.done(); }
 });
-test('two converted cards of one owner message share an identity and both stay visible', () => {
-    // A direct turn and the root it promoted share the origin-based handoff id;
-    // converting both must never hide the card the owner just clicked.
-    const h = setup(async () => null);
-    try {
-        const first = h.mount('t1direct', 'origin', { kind: 'card' });
-        const second = h.mount('t2promoted', 'origin', { kind: 'card' });
-        assert.equal(second.anchor, second.node);
-        assert.equal(first.node.hidden, false); assert.equal(second.node.hidden, false);
-        const receipt = h.mount('t1direct', 'origin', { kind: 'receipt' });
-        assert.equal(receipt.node.hidden, true, 'the durable receipt folds under a visible card');
-        h.controller.snapshot(census([{ activity_id: 't2promoted', phase: 'working' }]));
-        assert.equal(phaseNode(second.node).textContent, 'Working');
-        assert.equal(phaseNode(first.node).textContent, 'Activity unconfirmed', 'each card paints its own subject');
-        const started = new Element(); started.dataset = { systemType: 'project_started', taskId: 't1direct', projectId: 'p' };
-        h.nodes.delete(first.node); h.controller.snapshot(census());
-        assert.equal(receipt.node.hidden, true, 'a surviving card keeps representing the transfer');
-        h.controller.reconcile(started);
-        assert.equal(started.hidden, true, 'the survivor inherits the evicted card\'s own subjects');
-        h.nodes.delete(second.node); h.controller.snapshot(census());
-        assert.equal(receipt.node.hidden, false, 'the receipt takes over only when no card remains');
-    } finally { h.done(); }
-});
+for (const receiptFirst of [true, false]) {
+    test(`converted cards share their receipt time, not titles or status, receipt ${receiptFirst ? 'first' : 'last'}`, () => {
+        // A direct turn and its promoted roots share one transfer identity.
+        // All stay visible and use that event's time, including a later card.
+        const h = setup(async () => null);
+        const ts = '2026-10-08T13:58:00Z', time = formatMsgTime(ts);
+        try {
+            let receipt;
+            if (receiptFirst) receipt = h.mount('t1direct', 'origin', { kind: 'receipt', ts });
+            const first = h.mount('t1direct', 'origin', { kind: 'card', title: 'Direct work' });
+            const second = h.mount('t2promoted', 'origin', { kind: 'card', title: 'Promoted work' });
+            assert.equal(second.anchor, second.node);
+            if (!receiptFirst) {
+                for (const card of [first, second]) assert.equal(card.node.querySelector('.msg-time').hidden, true);
+                receipt = h.mount('t1direct', 'origin', { kind: 'receipt', ts });
+            }
+            const third = h.mount('t3later', 'origin', { kind: 'card', title: 'Later sibling work' });
+            const cards = [first, second, third];
+            assert.equal(third.anchor, third.node);
+            assert.deepEqual(cards.map(card => card.node.hidden), [false, false, false]);
+            assert.equal(receipt.node.hidden, true, 'the durable receipt folds under a visible card');
+            h.controller.snapshot(census([{ activity_id: 't2promoted', phase: 'working' },
+                { activity_id: 't3later', phase: 'queued' }]));
+            assert.deepEqual(cards.map(card => phaseNode(card.node).textContent),
+                ['Activity unconfirmed', 'Working', 'Queued'], 'each card paints its own subject');
+            assert.deepEqual(cards.map(card => card.node.querySelector('.project-handoff-title').textContent),
+                ['Direct work', 'Promoted work', 'Later sibling work']);
+            assert.deepEqual(cards.map(card => {
+                const clock = card.node.querySelector('.msg-time');
+                return { hidden: clock.hidden, text: clock.textContent, title: clock.title };
+            }), cards.map(() => ({ hidden: false, text: time.short, title: time.full })),
+            'every visible card carries the same recorded transfer time');
+            const started = new Element(); started.dataset = { systemType: 'project_started', taskId: 't1direct', projectId: 'p' };
+            h.nodes.delete(first.node); h.controller.snapshot(census());
+            assert.equal(receipt.node.hidden, true, 'a surviving card keeps representing the transfer');
+            h.controller.reconcile(started);
+            assert.equal(started.hidden, true, 'the survivor inherits the evicted card\'s own subjects');
+            h.nodes.delete(second.node); h.controller.snapshot(census());
+            assert.equal(receipt.node.hidden, true, 'the later card still represents the transfer');
+            h.nodes.delete(third.node); h.controller.snapshot(census());
+            assert.equal(receipt.node.hidden, false, 'the receipt takes over only when no card remains');
+        } finally { h.done(); }
+    });
+}
 test('every folded receipt survives two evictions: the shadow chain is inherited, not cut', () => {
     const h = setup(async () => null);
     try {
