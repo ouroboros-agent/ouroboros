@@ -6,6 +6,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from ouroboros.cost_projection import CostPresentation
+from ouroboros.gateway.claudexor_contracts import (  # noqa: F401 -- public re-exports
+    ClaudexorReadState, ClaudexorStatusReads, ClaudexorPassiveReadError, ClaudexorQuotaResponse,
+)
 
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.attachment_contracts import (  # noqa: F401 -- public re-exports
@@ -1150,20 +1153,6 @@ class TaskDetailResponse(TypedDict, total=False):
     error: str
 
 
-ClaudexorReadState = Literal["ok", "not_read", "failed"]
-
-
-class ClaudexorStatusReads(TypedDict):
-    """Independent status facets: harnesses/catalog, profiles/accounts and quota.
-    ok means authoritative (including empty); not_read means never asked, including
-    a discovery failure before fan-out; failed means no usable answer to a read.
-    The login-capability manifest filter fails open and is not a reported facet."""
-
-    catalog: ClaudexorReadState
-    accounts: ClaudexorReadState
-    quota: ClaudexorReadState
-
-
 class ClaudexorStatusResponse(TypedDict, total=False):
     """``GET /api/claudexor/status`` — owned-daemon lifecycle plus the daemon's
     own catalog/account/quota truth, each stamped with its read state. Read-only;
@@ -1577,7 +1566,7 @@ __all__ = [
     "TaskCostBreakdown",
     "TaskDetailResponse",
     "ClaudexorReadState",
-    "ClaudexorStatusReads",
+    "ClaudexorStatusReads", "ClaudexorPassiveReadError", "ClaudexorQuotaResponse",
     "ClaudexorStatusResponse",
     "ClaudexorLoginJobResponse",
     "ClaudexorLoginJobProblem",

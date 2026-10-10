@@ -409,6 +409,7 @@ ouroboros/ — agent core and shared runtime (§6)
     marketplace.py — ClawHub and OuroborosHub HTTP surface
     mcp.py — MCP HTTP surface over the shared MCPManager
     claudexor_accounts.py — Thin owned-daemon status/login/account proxies; no auth logic or browser token. `reads` classifies catalog/accounts/quota, `resource_capabilities_read` operations; only a successful read proves absence (§3 Agent accounts; §4)
+    claudexor_passive.py, claudexor_contracts.py — passive quota read and envelope types (docs/PASSIVE_QUOTA_READ.md)
     claudexor_quota.py — Owned-daemon refresh/reset/receipt proxies; catalog negotiation, exact key/body and typed errors, no start/retry/browser token (§3 Agent accounts; §4)
     harness_maintenance.py — Owner maintenance HTTP surface over the shared host service (§6 Vendor program maintenance; routes: §4)
     host_service.py — Loopback-only Host Service API (§12)
