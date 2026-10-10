@@ -385,8 +385,10 @@ def test_a_busy_answer_to_a_read_is_an_observation_hole_and_a_post_keeps_its_ref
             gateway.handshake()
     assert (read.value.code, read.value.status_code) == (code, 503)
     assert read.value.observation_timeout is True and read.value.observation_reason == code
+    assert read.value.observation_answered is True, "the engine itself answered: the transport is intact"
     assert (write.value.code, write.value.status_code) == (code, 503)
     assert write.value.observation_timeout is False and write.value.observation_reason == ""
+    assert write.value.observation_answered is False
 
 
 @pytest.mark.parametrize("status,code", [(503, "idempotency_status_unavailable"), (500, "daemon_busy")])
@@ -397,8 +399,11 @@ def test_other_received_answers_to_a_read_stay_refusals(status, code):
     assert caught.value.observation_timeout is False and caught.value.observation_reason == ""
 
 
-def _supervised_busy(tmp_path, monkeypatch, *, busy_reads, busy_handshake=False):
-    """The real supervision loop over the real observing wait and gateway."""
+def _supervised_busy(tmp_path, monkeypatch, *, busy_reads, busy_handshake=False, code="daemon_busy",
+                     later_handshakes_busy=False, handshakes=None):
+    """The real supervision loop over the real observing wait and gateway. ``later_handshakes_busy``:
+    the engine was healthy when the wait began and then answers every route, the handshake
+    included, with ``code`` (a recovery-only window)."""
     ctx = _delegating_ctx(tmp_path, acting=False)
     notes, sleeps, reads = [], [], []
     ctx.emit_progress_fn = lambda text, *, incident=None: notes.append((text, incident))
@@ -409,9 +414,14 @@ def _supervised_busy(tmp_path, monkeypatch, *, busy_reads, busy_handshake=False)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
 
+    handshakes = [] if handshakes is None else handshakes
+
     def handler(request):
         if request.url.path == "/v2/handshake":
-            return _busy() if busy_handshake else httpx.Response(
+            handshakes.append(request.method)
+            if busy_handshake or (later_handshakes_busy and len(handshakes) > 1):
+                return _busy(code)
+            return httpx.Response(
                 200, json={"compatible": True, "protocolMajor": 3, "engine": {"version": "3.25.1", "sha": "f"}})
         if request.url.path == "/v2/agent-capabilities":
             return httpx.Response(200, json={"harnesses": [{"id": "fixture", "liveInput": "mid_turn"}]})
@@ -420,7 +430,7 @@ def _supervised_busy(tmp_path, monkeypatch, *, busy_reads, busy_handshake=False)
         assert request.url.path == "/v2/runs/run-busy", request.url.path
         reads.append(request.method)
         if len(reads) <= busy_reads:
-            return _busy()
+            return _busy(code)
         return httpx.Response(200, json={"lastSeq": 1, "summary": {
             "state": "succeeded", "effectiveAccess": "readonly", "runDir": str(run_dir),
         }, "primaryOutput": {"kind": "answer", "text": "complete result", "truncated": False}})
@@ -430,12 +440,25 @@ def _supervised_busy(tmp_path, monkeypatch, *, busy_reads, busy_handshake=False)
     return result, sleeps, notes, reads
 
 
-def test_busy_reads_are_skipped_quietly_on_the_same_beat(tmp_path, monkeypatch):
-    result, sleeps, notes, reads = _supervised_busy(tmp_path, monkeypatch, busy_reads=2)
+@pytest.mark.parametrize("code", sorted(gateway_module.DAEMON_BUSY_CODES))
+def test_busy_reads_are_skipped_quietly_on_the_same_beat(tmp_path, monkeypatch, code):
+    result, sleeps, notes, reads = _supervised_busy(tmp_path, monkeypatch, busy_reads=2, code=code)
     assert result["status"] == "terminal" and result["state"] == "succeeded", result
     assert reads == ["GET"] * 3, "two busy beats, then the answered read"
     assert sleeps == [delegate_supervision._TICK_SEC] * 2, "the cadence stays the three-second beat"
-    assert notes == [], "a busy daemon answered: no outage line"
+    assert notes == [], "the daemon itself answered: no outage line, even for its daemon_unreachable"
+
+
+def test_a_recovery_only_window_keeps_the_transport_instead_of_rehandshaking_into_a_refusal(tmp_path, monkeypatch):
+    """While the engine serves recovery only it refuses every route, the handshake included.
+    The loop keeps the transport the engine answered on, so no rebuilt handshake turns the
+    window into a refusal that wakes the model (reviewer repro, 10.10)."""
+    handshakes = []
+    result, sleeps, notes, reads = _supervised_busy(tmp_path, monkeypatch, busy_reads=2, code="daemon_recovery_only",
+                                                    later_handshakes_busy=True, handshakes=handshakes)
+    assert result["status"] == "terminal" and result["state"] == "succeeded", result
+    assert handshakes == ["POST"], "one handshake: the answered transport was kept"
+    assert reads == ["GET"] * 3 and sleeps == [delegate_supervision._TICK_SEC] * 2 and notes == []
 
 
 def test_a_busy_answer_to_a_post_still_wakes_the_model(tmp_path, monkeypatch):

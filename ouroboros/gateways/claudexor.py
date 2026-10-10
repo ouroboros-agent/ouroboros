@@ -86,7 +86,8 @@ _OBSERVATION_READ_TIMEOUT = "observation_read_timeout"
 # down, or it serves recovery only). For a GET they are the same retryable observation
 # hole, under the engine's own code: never an outage line or a model wake. A POST keeps
 # the refusal, since a lost answer never proves a mutation was not accepted.
-DAEMON_BUSY_CODES = frozenset({"daemon_busy", "daemon_unavailable", "daemon_recovery_only"})
+DAEMON_BUSY_CODES = frozenset({"daemon_busy", "daemon_unavailable", "daemon_recovery_only",
+                               "daemon_unreachable"})
 
 
 def _observation_reason(exc: BaseException) -> str:
@@ -107,6 +108,7 @@ class ClaudexorUnavailable(RuntimeError):
     # What the engine reported about a failed run or request; diagnostic, never policy.
     reported_cause = ""
     retry_after = ""  # The received HTTP Retry-After header, never a local backoff.
+    observation_answered = False  # The engine itself answered the read (a typed 503): the transport is intact.
 
     def __init__(self, code: str, message: str, *, status_code: int = 0,
                  required_actions: tuple[str, ...] = (), observation_timeout: bool = False,
@@ -562,7 +564,7 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         error.problem = body if isinstance(body, dict) else {"code": code, "message": message}
         error.retry_after = response.headers.get("Retry-After", "")
         if method == "GET" and response.status_code == 503 and code in DAEMON_BUSY_CODES:
-            error.observation_timeout, error.observation_reason = True, code
+            error.observation_timeout, error.observation_reason, error.observation_answered = True, code, True
         if isinstance(context.get("cause"), dict):
             facts = {key: context[key] for key in ("stage", "cause", "preflight") if key in context}
             error.reported_cause = run_failure_cause({"safeMessage": json.dumps(facts, ensure_ascii=False)})

@@ -1236,7 +1236,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
             return json.dumps({
                 "status": "observation_pending", "run_id": rid,
                 "reason": exc.observation_reason or exc.code, "detail": str(exc),
-                "waited_sec": time.monotonic() - started,
+                "waited_sec": time.monotonic() - started, "answered": exc.observation_answered,
             })
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid).text
     finally:
