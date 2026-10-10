@@ -218,6 +218,53 @@ def test_multiple_note_selection_loss_restores_sources_with_gap(harness, monkeyp
         row for row in before if view.REVIEW_HISTORY_MESSAGE_KEY in row]
 
 
+def test_standalone_restore_keeps_selected_review_group_and_indexes(harness, monkeypatch):
+    ctx, sub, _ = _three(harness, monkeypatch)
+    group = [e["decision_ref"] for e in view.review_note_options(ctx)["entries"] if e["groupable"]]
+    assert group
+    messages, receipt, _ = apply_local(ctx, _capture(ctx), FIRST, all_units=True, review_notes=[{
+        "bound_decisions": group, "remark": "Earlier presentation alternatives.",
+        "reason": "I chose charts under the prior owner contract."}])
+    assert receipt["status"] == "applied" and "actor_history_group" in str(_index(messages))
+    # An ordinary later review appends its new index while the earlier selected
+    # snapshot remains in the sent prefix. Restoration must retain both.
+    ctx.messages = messages
+    result = _call(ctx, plan="Check the final chart labels.")
+    messages.append(call("plan_task", {}, "later-plan"))
+    tools = SimpleNamespace(_ctx=ctx)
+    process_tool_results([{"fn_name": "plan_task", "is_error": False,
+        "tool_call_id": "later-plan", "result": str(result), "args_for_log": {}, "trace_ref": {}}],
+        messages, {"tool_calls": []}, lambda _: None, tools,
+        fit_candidate=lambda *_: {"accepted": True}, tool_schemas=[])
+    assert len(_index(messages)) == 2
+    saved = deepcopy(load_task_result(ctx.drive_root, ctx.task_id, strict=True))
+    pointer = saved[view.SELECTED_VIEW_FIELD]
+    selected_bytes = read_actor_source_bytes(ctx.drive_root, ctx.task_id, pointer["source_ref"])
+    notes, indexes, cold = actor_notes(messages), _index(messages), _capture(harness.make_ctx())
+    ref = next(ref for ref in receipt["source_refs"] if "unit_id" in ref)
+    record_context_view(ctx, messages, [])
+    args = {"restore_unit_refs": [ref]}
+    response = _compact_context(ctx, **args)
+    assert "requested" in response
+    messages.append(call("compact_context", args, "restore"))
+    process_tool_results([{"fn_name": "compact_context", "is_error": False,
+        "tool_call_id": "restore", "result": response, "args_for_log": args, "trace_ref": {}}],
+        messages, {"tool_calls": []}, lambda _: None, tools,
+        fit_candidate=lambda *_: {"accepted": True}, tool_schemas=[])
+    before = deepcopy(messages)
+    frame = SimpleNamespace(tools=tools, tool_schemas=[], fit_candidate=lambda *_: {"accepted": True}, round_idx=5,
+        drive_root=ctx.drive_root, drive_logs=ctx.drive_root / "logs", task_id=ctx.task_id,
+        event_queue=None, emit_progress=lambda _: None)
+    after = _run_authored_context_view(messages, frame, ctx._pending_compaction, None)
+    assert ctx._context_view_receipt["status"] == "applied"
+    assert not ctx._context_view_receipt["selection_fingerprint"]
+    assert after[:len(before)] == before and len(after) == len(before) + 2
+    assert actor_notes(after) == notes and _index(after) == indexes
+    assert load_task_result(ctx.drive_root, ctx.task_id, strict=True) == saved
+    assert read_actor_source_bytes(ctx.drive_root, ctx.task_id, pointer["source_ref"]) == selected_bytes
+    assert _capture(harness.make_ctx()) == cold and len(sub.calls) == 4
+
+
 def test_legacy_singleton_extends_to_two_surviving_accounts(harness, monkeypatch):
     from ouroboros.artifacts import store_actor_source_bytes
     from ouroboros.task_results import write_task_result
