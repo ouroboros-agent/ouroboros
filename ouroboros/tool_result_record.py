@@ -14,6 +14,20 @@ from typing import Any, Mapping
 TOOL_RESULT_RECORD_KEY = "_tool_result_record"
 
 
+def logical_tool_result_text(content: Any) -> str | None:
+    """Text-only cache wrappers preserve bytes; opaque content is not a text view."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content and all(
+        isinstance(block, dict) and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+        and not (block.keys() - {"type", "text", "cache_control"})
+        for block in content
+    ):
+        return "".join(block["text"] for block in content)
+    return None
+
+
 def _facts(value: Mapping[str, Any] | None) -> dict:
     facts = copy.deepcopy(dict(value or {}))
     facts["status"] = facts.get("status") or "unknown"
@@ -51,7 +65,7 @@ def read_tool_result_record(message: Mapping[str, Any]) -> dict:
     reason = "record_missing"
     if isinstance(record, Mapping):
         invocation = record.get("invocation")
-        text = message.get("content")
+        text = logical_tool_result_text(message.get("content"))
         if record.get("version") != 1 or not isinstance(record.get("facts"), Mapping):
             reason = "record_unrecognized"
         elif not isinstance(invocation, Mapping) or not invocation.get("invocation_id"):

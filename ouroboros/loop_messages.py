@@ -613,6 +613,16 @@ def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
     components = _context_components(ctx, measured=measured)
     if components:
         parts.append("largest " + ", ".join(f"{label} ~{tokens:,}" for label, tokens in components))
+    previous = usage.get("_last_round_cache_usage") or {}
+    read, total = previous.get("cached_tokens"), previous.get("prompt_tokens")
+    share = (f"{int(read):,}/{int(total):,} tokens ({100 * read / total:.1f}%)"
+             if read is not None and total is not None and total > 0 else "unknown")
+    cache = f"previous usable input cache {share}"
+    if previous:
+        cache += f" [round {previous['round']}, {previous.get('provider') or 'provider unknown'}, {previous.get('model') or 'model unknown'}]"
+        written = previous.get("cache_write_tokens")
+        cache += f"; write {int(written):,} tokens" if written is not None else "; write unknown"
+    parts.append(cache)
     cost = usage.get("cost")
     parts.append((f"recorded cost ${float(cost):.2f}" + (" (total not final)" if usage.get("cost_final") is False else ""))
                  if cost is not None else "cost unknown")

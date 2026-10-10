@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import pathlib
+from dataclasses import asdict
 from typing import Any
 
 
@@ -16,12 +17,13 @@ def _gap(reason: str, **source: Any) -> dict:
     return {"code": "REVIEW_HISTORY_SOURCE_UNAVAILABLE", "reason": reason, "source": source}
 
 
-def _attempts(drive_root: Any, repo_root: Any, task_id: str) -> list:
+def _attempts(drive_root: Any, repo_root: Any, task_id: str, *, state: Any = None) -> list:
     from ouroboros.review_state import _load_state_unlocked, make_repo_key
 
     if drive_root is None or repo_root is None or not task_id:
         return []
-    state = _load_state_unlocked(pathlib.Path(drive_root), strict_attempt_authority=True)
+    if state is None:
+        state = _load_state_unlocked(pathlib.Path(drive_root), strict_attempt_authority=True)
     key = make_repo_key(pathlib.Path(repo_root))
     # Exact task/repository identity, never the lifecycle reader's legacy fallback
     # and never root_task_id (a sibling task's paid budget is not its dispute).
@@ -116,8 +118,12 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
     if isinstance(history, dict) and history.get("kind") == "review_dispute_history":
         return copy.deepcopy(history)
     rounds, gaps, seen_text, records, done, visiting, referenced = [], [], {}, {}, set(), set(), set()
+    state = None
     try:
-        attempts = _attempts(drive_root, repo_root, task_id)
+        from ouroboros.review_state import _load_state_unlocked, make_repo_key
+        if drive_root is not None and repo_root is not None:
+            state = _load_state_unlocked(pathlib.Path(drive_root), strict_attempt_authority=True)
+        attempts = _attempts(drive_root, repo_root, task_id, state=state)
     except (OSError, TypeError, ValueError) as exc:
         attempts = []
         gaps.append(_gap(f"attempt bindings could not be read ({type(exc).__name__})", task_id=task_id))
@@ -175,22 +181,33 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
                     {"slot_id", "model", "model_id", "status", "text", "raw_text", "findings", "items"}}
                     for raw in row.triad_raw_results if isinstance(raw, dict)]})
     rounds.extend(copy.deepcopy(list(history or [])))
+    open_obligations = ([asdict(row) for row in state.get_open_obligations(repo_key=make_repo_key(pathlib.Path(repo_root)))]
+                        if state is not None else [])
+    open_ids = {row["obligation_id"] for row in open_obligations}
+    open_records = {row.review_record_id for row in attempts if open_ids.intersection(row.obligation_ids or [])}
+    heads = [rid for rid in ids if rid not in referenced]
     decision_rows = []
     for row in rounds:
         identity = {k: row[k] for k in ("review_record_id", "revision", "attempt", "subject") if k in row}
+        role = ("current" if row.get("review_record_id") in heads else "historical")
+        if row.get("state") != "settled" or row.get("review_record_id") in open_records:
+            role = "open"
         for seat in row.get("reviewers") or []:
             for part, answer in (seat.get("answers") or {}).items():
                 decision_rows.append({**identity, "decision_kind": "review_part", "seat_id": seat.get("seat_id"), "part": part,
+                    "history_role": role if answer.get("status") == "responded" else "open",
                     "source": (seat.get("response") or {}).get("source"),
                     "remark": answer.get("items") or answer.get("findings") or answer.get("summary"),
                     "status": {"recorded_verdict": answer.get("verdict"), "response_status": answer.get("status")},
                     "reason": copy.deepcopy(answer)})
         for decision in row.get("author_decisions") or []:
             decision_rows.append({**identity, "decision_kind": "author_decision", "remark": "Explicit author decision", "status": decision.get("disposition"),
+                                  "history_role": "open" if decision.get("disposition") in {"partial", "deferred"} else role,
                                   "reason": decision.get("rationale"), "source": decision.get("source_ref")})
-    return {"kind": "review_dispute_history", "status": "source_unavailable" if gaps else "complete",
+    from ouroboros.review_history_view import canonical_decision_projection
+    return canonical_decision_projection({"kind": "review_dispute_history", "status": "source_unavailable" if gaps else "complete",
             "rounds": rounds, "decision_rows": decision_rows, "gaps": gaps,
-            "record_heads": [rid for rid in ids if rid not in referenced]}
+            "open_obligations": open_obligations, "record_heads": heads})
 
 
 def retain_author_decision(drive_root: Any, record: dict, decision: dict) -> dict:
@@ -315,3 +332,80 @@ def render_history_with_obligations(history: Any, *, drive_root: Any, repo_root:
             "status": dispute["status"], "decision_rows": dispute["decision_rows"], "gaps": dispute["gaps"]},
             ensure_ascii=False, sort_keys=True, default=str) + "\n```\n"
     return gap + section
+
+
+def review_decision_aliases(history: dict, entry: dict) -> list[tuple[list, Any]]:
+    """The ledger-history producer owns the exact answer and aggregate projections.
+
+    Unknown renderer shapes remain full; equal prose alone is never identity.
+    """
+    from ouroboros.review_history_view import _decision_ref, _decision_alias
+    row, binding = entry["row"], entry["bound_decision"]
+    source = _decision_ref(row.get("source"))
+    alias, paths, kind = _decision_alias(binding), [], row["decision_kind"]
+    for i, wave in enumerate(history.get("rounds") or []):
+        if not isinstance(wave, dict):
+            continue
+        base = ["rounds", i]
+        if kind == "author_decision":
+            for j, decision in enumerate(wave.get("author_decisions") or []):
+                if isinstance(decision, dict) and _decision_ref(decision.get("source_ref")) == source:
+                    paths.append(([*base, "author_decisions", j, "rationale"], alias))
+        if kind == "review_part" and wave.get("review_record_id") == row.get("review_record_id"):
+            for j, seat in enumerate(wave.get("reviewers") or []):
+                if seat.get("seat_id") == row.get("seat_id") and _decision_ref((seat.get("response") or {}).get("source")) == source:
+                    answer = (seat.get("answers") or {}).get(row.get("part"))
+                    if isinstance(answer, dict):
+                        # These are the structured answer's semantic carriers; all other
+                        # typed verdict/count/coverage fields retain their exact values.
+                        for field in ("items", "findings", "discarded", "summary", "reason", "recommendation", "error"):
+                            if field in answer:
+                                value = answer[field]
+                                if isinstance(value, list):
+                                    # Item/verdict/severity/obligation identities remain inline.
+                                    value = [{**{k: copy.deepcopy(v) for k, v in item.items()
+                                                if k not in {"reason", "summary", "recommendation"}},
+                                              "authored_view": alias} if isinstance(item, dict) else item for item in value]
+                                else:
+                                    value = alias
+                                paths.append(([*base, "reviewers", j, "answers", row["part"], field], value))
+                        # The aggregate verdict repeats the same normalized findings.
+                        # Bind by exact structured value within this source-owned seat;
+                        # never assign an unrelated finding merely by matching its prose.
+                        items = [item for field in ("items", "findings", "discarded")
+                                 for item in answer.get(field, []) if isinstance(item, dict)]
+                        # commit_review's _review_entry view drops slot_id and adds
+                        # tag=triad. Reconstruct that exact producer projection only.
+                        commit_items = [{"severity": item.get("severity"), "item": item.get("item"),
+                            "reason": item.get("reason"), "tag": "triad", "verdict": "FAIL",
+                            **({"model": item["model"]} if item.get("model") else {}),
+                            **({"obligation_id": item["obligation_id"]} if item.get("obligation_id") else {})}
+                            for item in answer.get("findings", []) if item.get("verdict") == "FAIL"]
+                        if answer.get("status") != "responded":
+                            error = str(answer.get("error") or "")
+                            model = (seat.get("requested") or {}).get("model") or ""
+                            diagnostics = []
+                            if error:
+                                diagnostics.append((f"review_{row['part']}_unanswered", f"Part '{row['part']}' unanswered: {error}", model))
+                            for item in answer.get("discarded") or []:
+                                diagnostics.append((str(item.get("item", "?")),
+                                    f"not counted ({row['part']} answer unanswered: {error or 'invalid'}); "
+                                    f"the seat's {str(item.get('severity') or 'advisory')} FAIL said: {item.get('reason', '')}",
+                                    item.get("model") or model))
+                            commit_items.extend({"severity": "advisory", "item": item, "reason": reason,
+                                "tag": "triad", "verdict": "FAIL", **({"model": model} if model else {})}
+                                for item, reason, model in diagnostics)
+                        verdict = wave.get("verdict")
+                        if not isinstance(verdict, dict):
+                            continue  # answer aliases above still apply; scalar verdict has no nested mirrors
+                        for field in ("critical_findings", "advisory_findings", "additional_findings"):
+                            for k, item in enumerate(verdict.get(field) or []):
+                                original = dict(item) if isinstance(item, dict) else item
+                                if (isinstance(original, dict) and original.get("seat_id") == row.get("seat_id")
+                                        and original.get("part") == row.get("part")):
+                                    original = {key: value for key, value in original.items() if key not in {"seat_id", "part"}}
+                                if original in items or item in commit_items:
+                                    paths.append(([*base, "verdict", field, k], {
+                                        **{key: copy.deepcopy(value) for key, value in item.items()
+                                           if key not in {"reason", "summary", "recommendation"}}, "authored_view": alias}))
+    return paths

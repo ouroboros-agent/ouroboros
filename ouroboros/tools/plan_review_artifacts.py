@@ -194,7 +194,7 @@ def plan_review_dispute_history(drive_root: Any, task_id: str, state: dict) -> d
     The explicit stack avoids a Python recursion limit becoming a history cap.
     """
     from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
-    from ouroboros.task_results import plan_review_wave
+    from ouroboros.task_results import plan_review_wave, current_plan_review_wave
     from ouroboros.tools.plan_author_history import author_selections
 
     rounds, gaps, decision_rows = [], [], []
@@ -269,7 +269,7 @@ def plan_review_dispute_history(drive_root: Any, task_id: str, state: dict) -> d
         keys = ("cycle_index", "request_fingerprint", "previous_fingerprint", "spec_hash",
                 "evidence_manifest_hash", "plan_prose_hash", "spec", "plan_prose", "aggregate",
                 "closed", "paid", "custody_pending", "findings", "dispositions", "author_disposition",
-                "closure_notes", "reviewed_at", "disposition_recorded_at", "addressed")
+                "closure_notes", "reviewed_at", "disposition_recorded_at", "addressed", "open_ids")
         view = {key: copy.deepcopy(wave[key]) for key in keys if key in wave}
         view["source"] = address(ref)
         if wave.get("spec_source_ref"):
@@ -412,9 +412,24 @@ def plan_review_dispute_history(drive_root: Any, task_id: str, state: dict) -> d
         author_plan["source"] = address(ref)
         for key in ("spec", "plan_prose"):
             retain_once(author_plan, key, key, address(ref, key))
-    return {"status": "source_unavailable" if gaps else "complete", "rule": DISPUTE_HISTORY_RULE,
+    current = current_plan_review_wave(state) or {}
+    current_refs = [current.get("wave_artifact"),
+                   ((state.get("current_attempt") or {}).get("author_subject") or {}).get("source_ref")]
+    for row in decision_rows:
+        ref = row["source"].get("source_ref")
+        wave = next((wave for wave in rounds if wave["source"].get("source_ref") == ref), None)
+        row["history_role"] = "current" if ref in current_refs else "historical"
+        if wave and (not wave.get("closed") or wave.get("custody_pending")
+                or row.get("finding_id") in (wave.get("open_ids") or [])
+                or any(d.get("decision") == "defer" and d.get("finding_id") == row.get("finding_id")
+                       for d in wave.get("dispositions") or [])):
+            row["history_role"] = "open"
+        if isinstance(row.get("status"), dict) and row["status"].get("disposition") in {"partial", "deferred"}:
+            row["history_role"] = "open"
+    from ouroboros.review_history_view import canonical_decision_projection
+    return canonical_decision_projection({"status": "source_unavailable" if gaps else "complete", "rule": DISPUTE_HISTORY_RULE,
             "rounds": rounds, "decision_rows": decision_rows, "gaps": gaps, "current_author_plan": author_plan,
-            "author_selections": selections}
+            "author_selections": selections})
 
 
 _PLAN_REVIEW_TRANSPORT_KEYS = frozenset({
@@ -1234,3 +1249,45 @@ def standing_findings_lineage(state_root: Any, task_id: str, state: Dict[str, An
                 pending.discard(sid)  # a real answer (or no seat) in this wave ended the obligation
         wave = earlier
     return standing
+
+
+def plan_decision_aliases(history: dict, entry: dict) -> list[tuple[list, Any]]:
+    """The plan producer's model-only mirrors of its one canonical decision row."""
+    from ouroboros.review_history_view import _decision_ref, _decision_alias
+    row, binding = entry["row"], entry["bound_decision"]
+    source = _decision_ref(row.get("source"))
+    alias, paths, kind = _decision_alias(binding), [], row["decision_kind"]
+    for i, wave in enumerate(history.get("rounds") or []):
+        if not isinstance(wave, dict):
+            continue
+        base = ["rounds", i]
+        if kind.startswith("plan_") and _decision_ref(wave.get("source")) == source:
+            if kind == "plan_finding":
+                fid = row.get("finding_id")
+                for field in ("findings", "dispositions"):
+                    for j, item in enumerate(wave.get(field) or []):
+                        if isinstance(item, dict) and item.get("finding_id") == fid:
+                            # Keep identity/status keys beside the exact semantic source.
+                            shown = {k: copy.deepcopy(v) for k, v in item.items()
+                                     if k not in {"summary", "recommendation", "rationale"}}
+                            paths.append(([*base, field, j], {**shown, "authored_view": alias}))
+                for j, actor in enumerate(wave.get("reviewers") or []):
+                    carried = actor.get("carried_findings") if isinstance(actor, dict) else None
+                    if isinstance(carried, list):
+                        for k, item in enumerate(carried):
+                            if isinstance(item, dict) and item.get("finding_id") == fid:
+                                paths.append(([*base, "reviewers", j, "carried_findings", k],
+                                    {**{name: copy.deepcopy(value) for name, value in item.items()
+                                        if name not in {"summary", "recommendation", "rationale"}}, "authored_view": alias}))
+            elif kind == "plan_author":
+                paths.append(([*base, "author_disposition", "rationale"], alias))
+            else:
+                paths.append(([*base, "closure_notes"], alias))
+    if kind == "plan_author":
+        for i, selection in enumerate(history.get("author_selections") or []):
+            if _decision_ref(selection.get("source")) == source:
+                paths.append((["author_selections", i, "author_disposition", "rationale"], alias))
+        author = history.get("current_author_plan")
+        if isinstance(author, dict) and _decision_ref(author.get("source") or author.get("source_ref")) == source:
+            paths.append((["current_author_plan", "author_disposition", "rationale"], alias))
+    return paths

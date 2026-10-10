@@ -328,13 +328,15 @@ def seal_task_transcript(
     B and this one. The finalizer marks schemas only if a slot remains; keeping
     both message boundaries could exceed the cap and lose the rolling seal.
     """
+    from ouroboros.tool_result_record import logical_tool_result_text
+
     for msg in messages:
         if msg.get("role") != "tool":
             continue
         content = msg.get("content")
-        if isinstance(content, list):
+        if isinstance(content, list) and (plain := logical_tool_result_text(content)) is not None:
             # Flatten the old sealed boundary before choosing a new one.
-            msg["content"] = extract_plain_text_from_content(content)
+            msg["content"] = plain
     first_user = next((m for m in messages if m.get("role") == "user"), None)
     if isinstance(first_user, dict) and isinstance(first_user.get("content"), list):
         # Drop this function's own previous task-message marker, so exactly one
@@ -351,7 +353,11 @@ def seal_task_transcript(
         _mark_task_message(first_user)
         return
 
-    seal_candidate_idx = tool_indices[-(keep_active + 1)]
+    seal_candidate_idx = next((i for i in reversed(tool_indices[:len(tool_indices) - keep_active])
+                               if (logical_tool_result_text(messages[i].get("content")) or "").strip()), None)
+    if seal_candidate_idx is None:
+        _mark_task_message(first_user)
+        return
 
     prefix_text_len = sum(
         len(extract_plain_text_from_content(m.get("content", "")))
@@ -365,11 +371,8 @@ def seal_task_transcript(
         return
 
     candidate = messages[seal_candidate_idx]
-    plain_text = str(candidate.get("content", ""))
-    if not plain_text.strip():
-        # Anthropic 400s on cache_control attached to an empty text block; never seal
-        # an empty tool output as the cache anchor (turns the whole task unanswerable).
-        plain_text = "(no tool output)"
+    # An empty output remains exact; provider-only padding belongs to the send copy.
+    plain_text = logical_tool_result_text(candidate.get("content"))
     candidate["content"] = [
         {
             "type": "text",

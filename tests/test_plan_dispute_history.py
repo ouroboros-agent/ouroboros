@@ -26,6 +26,11 @@ def _history(h, ctx):
     return _task_authority_projection(SimpleNamespace(drive_root=h.drive), {"id": ctx.task_id})["plan_review_authority"]
 
 
+def _resident_reason(history, alias):
+    assert alias["representation"] == "resident_review_decision"
+    return next(row["reason"] for row in history["decision_rows"] if row.get("decision_ref") == alias["decision_ref"])
+
+
 def _first_two_rounds(h, monkeypatch):
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "6")
     h.workspace.joinpath("notes.md").write_text(OWNER_CHOICES, encoding="utf-8")
@@ -58,7 +63,8 @@ def test_three_round_dispute_reaches_cold_author_and_new_reviewer(harness, monke
     author = _history(harness, ctx)
     dispute = author["dispute_history"]
     assert dispute["status"] == "complete"
-    assert any(d.get("rationale") == RATIONALE for r in dispute["rounds"] for d in r.get("dispositions", []))
+    assert any(RATIONALE in _resident_reason(dispute, d["authored_view"])["author_rationales"]
+               for r in dispute["rounds"] for d in r.get("dispositions", []))
     assert any(r.get("text") == raw for wave in dispute["rounds"] for r in wave["reviewer_outputs"])
     assert "session_task" not in json.dumps(dispute)
     assert "request_messages" not in json.dumps(dispute)
@@ -176,7 +182,7 @@ def test_selected_author_subject_keeps_its_source_and_no_invented_verdict(harnes
     assert selected["review_fingerprint"] == critic["request_fingerprint"]
     assert selected["fingerprint"] != critic["request_fingerprint"]
     assert "aggregate" not in selected and "verdict" not in selected
-    assert selected["author_disposition"]["rationale"] == "Accept caption advice; preserve the earlier chart choice."
+    assert _resident_reason(author["dispute_history"], selected["author_disposition"]["rationale"]) == "Accept caption advice; preserve the earlier chart choice."
     assert len(sub.calls) == 2
 
 
@@ -210,7 +216,7 @@ def test_successive_author_selections_survive_cold_new_attempt(harness, monkeypa
     _call(cold, {**DECK_SPEC, "invariants": ["Final version sent to a critic"]}, plan="New critic version")
     history = _history(harness, cold)["dispute_history"]
     assert history["status"] == "complete", history["gaps"]
-    assert [p["author_disposition"]["rationale"] for p in history["author_selections"]] == reasons
+    assert [_resident_reason(history, p["author_disposition"]["rationale"]) for p in history["author_selections"]] == reasons
     assert all("verdict" not in p and "aggregate" not in p for p in history["author_selections"])
     prepared = _user_text(sub.calls[-1]["request"].messages[1]["content"])
     assert all(reason in prepared for reason in reasons)
@@ -230,7 +236,8 @@ def test_disposition_rationale_is_retained_exact_before_hot_projection(harness, 
     assert "ERROR" not in answer
     record_plan_review_attempt(harness.drive, ctx.task_id, fingerprint="f" * 64)
     history = _history(harness, harness.make_ctx())["dispute_history"]
-    assert any(d.get("rationale") == rationale for wave in history["rounds"] for d in wave.get("dispositions", []))
+    assert any(rationale in _resident_reason(history, d["authored_view"])["author_rationales"]
+               for wave in history["rounds"] for d in wave.get("dispositions", []))
     assert any(rationale in row["reason"].get("author_rationales", [])
                for row in history["decision_rows"] if isinstance(row["reason"], dict))
     wave = next(w for w in _state(harness)["waves"] if w["request_fingerprint"] == first["request_fingerprint"])
@@ -258,12 +265,12 @@ def test_reachable_legacy_author_stance_is_retained_on_next_attempt(harness, mon
     if missing_source:
         (task_artifact_dir_path(harness.drive, "task-1", create=False) / ref["path"]).unlink()
         before = artifacts.plan_review_dispute_history(harness.drive, "task-1", _state(harness))
-        assert before["author_selections"][0]["author_disposition"]["rationale"] == "Genuine older stance"
+        assert _resident_reason(before, before["author_selections"][0]["author_disposition"]["rationale"]) == "Genuine older stance"
     record_plan_review_attempt(harness.drive, "task-1", fingerprint="e" * 64)
     history = artifacts.plan_review_dispute_history(harness.drive, "task-1", _state(harness))
     [selection] = history["author_selections"]
     assert selection["selected_source_ref"] == ref
-    assert selection["author_disposition"]["rationale"] == "Genuine older stance"
+    assert _resident_reason(history, selection["author_disposition"]["rationale"]) == "Genuine older stance"
     assert history["current_author_plan"] is None
     assert history["status"] == "source_unavailable"
     assert any("legacy author selection" in gap["reason"] for gap in history["gaps"])
@@ -288,7 +295,8 @@ def test_lost_selected_source_keeps_known_stance_and_exact_critic_without_blocki
     for state in (selected, record_plan_review_attempt(tmp_path, "task-1", fingerprint="c" * 64)):
         history = artifacts.plan_review_dispute_history(tmp_path, "task-1", state)
         assert history["status"] == "source_unavailable"
-        assert history["author_selections"][0]["author_disposition"] == author
+        selected_author = history["author_selections"][0]["author_disposition"]
+        assert {**selected_author, "rationale": _resident_reason(history, selected_author["rationale"])} == author
         assert history["rounds"][0]["request_fingerprint"] == critic["request_fingerprint"]
         assert "spec" not in history["author_selections"][0]  # no invented replacement plan
     assert state["current_attempt"]["fingerprint"] == "c" * 64 and state["cycles_paid"] == 0

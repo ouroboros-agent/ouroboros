@@ -357,7 +357,8 @@ def project_predecessor_review_views(runtime: dict, *, drive_root: Any, repo_roo
                 history = review_dispute_history(drive_root=drive_root, repo_root=repo, task_id=owner)
                 if history.get("rounds") or history.get("gaps"):
                     histories.append(("commit", history, None))
-            refs = [selection["source_ref"], view._actor_capsule(selected["capsule"]).get("checkpoint_ref")]
+            capsules = view.selected_actor_capsules(selected)
+            refs = [selection["source_ref"], *(view._actor_capsule(c).get("checkpoint_ref") for c in capsules)]
             contexts = []
             for family, history, operative in histories:
                 projected = view.project_review_history(history, operative_subject=operative,
@@ -370,7 +371,7 @@ def project_predecessor_review_views(runtime: dict, *, drive_root: Any, repo_roo
                 if family == "plan":
                     view._address_runtime_review_mirrors({"predecessor_authority": node}, history)
             source_reads, gaps = _predecessor_review_readers(drive_root, owner, refs, inherited=inherited)
-            account = selected["capsule"]["content"][0]["text"]
+            account = "\n\n".join(c["content"][0]["text"] for c in capsules)
             historical = {"task_id": owner, "source": copy.deepcopy(source), "contexts": contexts,
                 "authored_account": {"text": account, "source_ref": selection["source_ref"], "authorship": "predecessor_actor"},
                 "source_reads": source_reads, "source_gaps": gaps,
