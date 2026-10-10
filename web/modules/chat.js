@@ -428,8 +428,9 @@ export function createChatInstance({
     });
     function disposeLiveCard(id, preserveWaits = false) {
         if (!preserveWaits) modelWaits.forget(id);
-        liveCardRecords.get(id)?.timelineDispose?.();
-        liveCardRecords.get(id)?.root?.remove();
+        const record = liveCardRecords.get(id);
+        record?.timelineDispose?.();
+        if (record?.root) releaseMessageNode(record.root);
         liveCardRecords.delete(id);
     }
     const markReviewAnchor = (r, on = false) => setReviewAnchor(r, on, setLiveCardPhase);
@@ -571,7 +572,8 @@ export function createChatInstance({
     }
 
     // Main-only: transfer receipts are Main history rows.
-    const handoffs = isMain ? createProjectHandoffs({ feed: messagesDiv, fetchDetail: fetchTaskDetailStrict, mutate: withStableViewport }) : null;
+    const handoffs = isMain ? createProjectHandoffs({ feed: messagesDiv, fetchDetail: fetchTaskDetailStrict,
+        mutate: withStableViewport, attachCopy: chatMedia.attachCopyControl }) : null;
 
     let childHoldRead = false;
     async function refreshChildProjectHolds() {
@@ -2305,12 +2307,14 @@ export function createChatInstance({
             ${timeHtml}
         `;
         if (attachments.length) chatMedia.mountAttachments(bubble, attachments, shown);
-        if (!isProgress && shown) chatMedia.attachCopyControl(bubble, String(shown));
         if (['project_handoff', 'project_started'].includes(systemType) && handoffs) handoffs.mount(bubble, {
-            taskId, projectId, projectName, title: opts.taskName || text, handoffId: opts.handoffId,
+            taskId, projectId, projectName, title: opts.taskName || text, handoffId: opts.handoffId, ts,
             kind: systemType === 'project_started' ? 'started' : 'receipt' });
-        else if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName,
-            terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary' });
+        else {
+            if (!isProgress && shown) chatMedia.attachCopyControl(bubble, String(shown));
+            if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName,
+                terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary' });
+        }
         syncSavedProjectContext(bubble, opts.originProjected, opts.originId);
         wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
         stampNodeTimestamp(bubble, ts);
