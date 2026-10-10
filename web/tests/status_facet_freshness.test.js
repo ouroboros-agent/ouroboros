@@ -50,3 +50,24 @@ test('the Agents status line names the refused facet and its error under a runni
     legacy.daemon.last_error = 'quota_probe_failed: read died';
     assert.match(daemonStatusLine(legacy).text, /were not read: quota_probe_failed: read died\./);
 });
+
+test("a stale facet the server remembers keeps its own value with its own time", async () => {
+    // Another client refreshed the shared server memory to q2 at 10:05; this client last saw q1.
+    const q1 = [{ subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ id: 'q1' }] }];
+    const q2 = [{ subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ id: 'q2' }] }];
+    const first = { ...runningWithRefusedQuota(), quota: q1, reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    const remembered = { ...runningWithRefusedQuota({
+        quota: { observed_at: '2026-10-10T10:05:00Z', stale: true, error: 'daemon_busy' },
+    }), quota: q2 };
+    const legacy = { ...runningWithRefusedQuota(), quota: [] };   // no `facets`: an older backend
+    const serve = [first, remembered, first, legacy];
+    const store = createClaudexorStatusStore({ fetchImpl: async () => okResponse(serve.shift()), doc: fakeDoc() });
+    await store.refresh();
+    await store.refresh();
+    assert.deepEqual(store.snapshot.quota, q2, "the server's own last value, not this client's older one");
+    assert.equal(store.snapshot.facets.quota.observed_at, '2026-10-10T10:05:00Z');
+    await store.refresh();
+    await store.refresh();
+    assert.deepEqual(store.snapshot.quota, q1, 'without server memory the client keeps its own last value');
+    store.dispose();
+});

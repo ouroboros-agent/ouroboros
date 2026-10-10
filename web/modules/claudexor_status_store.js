@@ -608,7 +608,10 @@ export function createClaudexorStatusStore({
         }
         if (!payload) return;
         const held = inner.snapshot;
-        if (held && facetReadState(payload, FACET_QUOTA) !== READ_OK) {
+        // A server that remembers the facet serves its last answered value WITH that value's
+        // observed_at (`facets.quota.stale`); keep them together. Only a backend without that
+        // memory leaves this client's own last value to stand in.
+        if (held && facetReadState(payload, FACET_QUOTA) !== READ_OK && payload.facets?.[FACET_QUOTA]?.stale !== true) {
             payload = { ...payload, quota: held.quota, quota_absences: held.quota_absences, resources: held.resources };
         }
         // Agent discovery (reads.catalog) is independent of the operations catalog.
