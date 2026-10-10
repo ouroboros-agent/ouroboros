@@ -1097,7 +1097,6 @@
  * @property {string=} reason
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} TaskEventCursor
  * @property {number} v
@@ -1105,20 +1104,17 @@
  * @property {string} view
  * @property {Object<string, Object<string, number>>} positions
  */
-
 /**
  * @typedef {Object} TaskEventsRequest
  * @property {number} v
  * @property {number=} wait
  * @property {?TaskEventCursor=} cursor
  */
-
 /**
  * @typedef {Object} TaskListResponse
  * @property {Object[]} tasks
  * @property {Object=} queue
  */
-
 /**
  * Read-time "where did the money go" projection on GET /api/tasks/{task_id}
  * (ROOT tasks only; computed from the physical-attempt ledger at read time,
@@ -1140,7 +1136,6 @@
  * @property {boolean} cost_final
  * @property {"physical_attempt_ledger"} authority
  */
-
 /**
  * GET /api/tasks/{task_id} — the public task-result envelope (open shape;
  * stored task-result keys pass through) plus additive typed projections.
@@ -1177,7 +1172,6 @@
  * @property {string=} error
  * @property {ContinuationOffer=} continuation_offer
  */
-
 /**
  * PROVENANCE for each independent facet of GET /api/claudexor/status. An empty
  * collection cannot say whether the daemon was ASKED: the owned Claudexor daemon
@@ -1190,7 +1184,6 @@
  * Facets are independent: one fanned-out read can fail while its siblings land.
  * @typedef {"ok"|"not_read"|"failed"} ClaudexorReadState
  */
-
 /**
  * Independent facets: ok=authoritative, not_read=never asked, failed=no usable answer. Empty without ok proves nothing.
  * @typedef {Object} ClaudexorStatusReads
@@ -1198,7 +1191,6 @@
  * @property {ClaudexorReadState} accounts
  * @property {ClaudexorReadState} quota
  */
-
 /**
  * Last settled external leaf projected for the Available-subagents editor.
  * `selected_subagent_id` is optional only for pre-migration receipts, which
@@ -1225,7 +1217,6 @@
  * @property {string=} attempt_id
  * @property {Object=} fallback
  */
-
 /**
  * @typedef {Object} ClaudexorStatusResponse
  * @property {Object=} daemon
@@ -1242,7 +1233,22 @@
  * @property {SubagentLastDelegation=} subagent_last_delegation
  * @property {string=} error
  */
-
+/**
+ * @typedef {Object} ClaudexorPassiveReadError
+ * @property {string} code
+ * @property {number=} status_code
+ */
+/**
+ * @typedef {Object} ClaudexorQuotaResponse
+ * @property {'quota'} view
+ * @property {Object} profiles
+ * @property {Array<Object>} quota
+ * @property {Array<Object>} quota_absences
+ * @property {boolean} unified_accounts
+ * @property {ClaudexorStatusReads} reads
+ * @property {Object<'discovery'|'accounts'|'quota', ClaudexorPassiveReadError>} read_errors
+ * @property {Object<string, number>} timings_ms
+ */
 /**
  * One required bare daemon job per operation. Create/input/snapshot metadata and deviceCode stay beside it; attach commands need the proven packaged role.
  * @typedef {Object} ClaudexorLoginJobResponse
@@ -1258,7 +1264,6 @@
  * @property {('posix'|'powershell')=} attach_shell
  * @property {boolean=} ok
  */
-
 /**
  * Typed engine job error; marked retryable probe 503 and bounded engine actions pass through.
  * @typedef {Object} ClaudexorLoginJobProblem
@@ -1266,14 +1271,12 @@
  * @property {string=} code
  * @property {Array<string>=} required_actions
  */
-
 /**
  * @typedef {Object} ClaudexorVendorCredentialDisposition
  * @property {'vendor'} owner
  * @property {'left_unchanged'} state
  * @property {'os_user'} scope
  */
-
 /**
  * Exact daemon receipt from deleting one credential-profile binding.
  * @typedef {Object} ClaudexorCredentialProfileDeleteResponse
@@ -1289,13 +1292,11 @@
  * @property {number} schema_version
  * @property {Object[]} tasks  // each row carries status/retained/restorable
  */
-
 /**
  * @typedef {Object} ScheduleUpsertResponse
  * @property {boolean} ok  // follows schedule.audit: an incomplete audit is not ok
  * @property {Object} schedule
  */
-
 /**
  * @typedef {Object} ScheduleActionResponse
  * @property {boolean} ok  // the requested state was ACHIEVED and both audit records landed (restored_not_ready: changed, not ok)
@@ -1309,7 +1310,6 @@
  * @property {Object=} schedule
  * @property {string[]=} allowed
  */
-
 /**
  * Legacy DELETE response: the ScheduleActionResponse subset read by previous callers.
  * @typedef {Object} ScheduleDeleteResponse

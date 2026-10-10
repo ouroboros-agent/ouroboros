@@ -796,9 +796,14 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         rows = body.get("harnesses") if isinstance(body, dict) else None
         return [row for row in (rows or []) if isinstance(row, dict)]
 
-    def quota_state(self, *, view: str = "") -> Dict[str, Any]:
-        """GET /v2/quota once, retaining its one-epoch evidence envelope."""
-        body = self._request("GET", "/v2/quota" + ("?view=resources" if view == "resources" else ""))
+    def quota_state(self, *, view: Optional[str] = None) -> Dict[str, Any]:
+        """GET one quota epoch; pass resource or freshness selectors to the engine.
+
+        Old engines may ignore/refuse a selector; claudexor_passive owns fallback.
+        """
+        from urllib.parse import urlencode
+
+        body = self._request("GET", "/v2/quota" + (f"?{urlencode({'view': view})}" if view else ""))
         return body if isinstance(body, dict) else {}
 
     def refresh_quota(self, *, target: Optional[Dict[str, str]] = None,

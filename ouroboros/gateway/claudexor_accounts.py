@@ -530,9 +530,14 @@ def _facet_outcome(
 
 async def api_claudexor_status(request: Request) -> JSONResponse:
     """GET /api/claudexor/status[?include=models] — owned-daemon state plus the
-    daemon's own account/quota/catalog truth. Read-only; never spawns."""
+    daemon's own account/quota/catalog truth. ``?view=quota`` reads only the
+    passive quota and account roster. Read-only; never spawns."""
     include_models = "models" in str(request.query_params.get("include") or "")
     try:
+        if request.query_params.get("view") == "quota":
+            from ouroboros.gateway.claudexor_passive import _quota_payload
+
+            return JSONResponse(await asyncio.to_thread(_quota_payload))
         return JSONResponse(await asyncio.to_thread(_status_payload, include_models))
     except Exception as exc:
         log.exception("api_claudexor_status failed")
