@@ -270,8 +270,11 @@ export function createEffortRangeControl({
     }
 
     /* --- open / pin state machine --- */
+    // Focus keeps a hover-opened strip open only when the keyboard put it there: browsers report
+    // a handle focused after a mouse press as :focus-visible, so the last input decides instead.
+    let keyboardFocus = false;
     const stillHere = () => {
-        try { return Boolean(el.matches(':hover') || el.querySelector(':focus-visible')); } catch { return false; }
+        try { return Boolean(el.matches(':hover') || (keyboardFocus && el.contains(doc.activeElement))); } catch { return false; }
     };
     // The open strip forgives a mouse that drifts a little: inside the zone (the control plus a
     // margin) it stays; outside, it closes after the delay unless the mouse comes back first. A
@@ -325,10 +328,10 @@ export function createEffortRangeControl({
     }
     // Every input is independent of the padding it decides (words, button, borders, the row),
     // so a resize that follows a new padding finds the same answer.
-    function fit() {
+    function measure() {
         const rowStyle = styleOf(row);
         const room = widthOf(row) - px(rowStyle?.paddingLeft) - px(rowStyle?.paddingRight) - 1;  // 1 px of slack
-        if (!(room > 0) || !state.open) return;  // not laid out: a hidden pane, the unit-test DOM
+        if (!(room > 0)) return null;  // not laid out: a hidden pane, the unit-test DOM
         const words = segs.reduce((sum, seg) => sum + widthOf(seg.firstElementChild), 0);
         const elStyle = styleOf(el);
         const chrome = widthOf(head) + px(elStyle?.borderLeftWidth) + px(elStyle?.borderRightWidth)
@@ -345,10 +348,15 @@ export function createEffortRangeControl({
             mode = 'overflow';
             pad = SEG_PAD.alone;
         }
-        el.style.setProperty('--effort-seg-pad', `${pad}px`);
-        el.dataset.fit = mode;
-        el.dataset.tight = String(pad <= SEG_PAD.beside);
-        if (mode === 'inline') delete row.dataset.effortSolo;
+        return { mode, pad };
+    }
+    function fit() {
+        const fitted = state.open ? measure() : null;
+        if (!fitted) return;
+        el.style.setProperty('--effort-seg-pad', `${fitted.pad}px`);
+        el.dataset.fit = fitted.mode;
+        el.dataset.tight = String(fitted.pad <= SEG_PAD.beside);
+        if (fitted.mode === 'inline') delete row.dataset.effortSolo;
         else row.dataset.effortSolo = 'true';
     }
     // A strip that scrolls shows where it continues and keeps the moved handle in view.
@@ -382,7 +390,6 @@ export function createEffortRangeControl({
     function settleClosed() {
         if (el.dataset.fit && el.dataset.fit !== 'inline') void body.offsetWidth;
         delete el.dataset.fit;
-        delete el.dataset.tight;
         if (row?.dataset) delete row.dataset.effortSolo;
     }
     // A layout change (opening, a resize, a new padding) moves the marks with the words at once;
@@ -430,9 +437,11 @@ export function createEffortRangeControl({
         }
     };
     const onDocPointerDown = (event) => {
+        keyboardFocus = false;
         if (state.open && !el.contains(event.target)) { state.pinned = false; setOpen(false); }
     };
     const onDocKeyDown = (event) => {
+        keyboardFocus = true;
         if (event.key !== 'Escape' || !state.open) return;
         state.pinned = false;
         setOpen(false);
@@ -443,7 +452,18 @@ export function createEffortRangeControl({
         clearTimeout(leaveTimer);
         leaveTimer = 0;
         stopTracking();
-        if (!state.open) { clearTimeout(hoverTimer); hoverTimer = setTimeout(() => { if (!state.destroyed) setOpen(true); }, HOVER_OPEN_MS); }
+        if (!state.open) {
+            clearTimeout(hoverTimer);
+            hoverTimer = setTimeout(() => {
+                if (state.destroyed) return;
+                // Hover opens only where the round button stays under the mouse. Alone or
+                // scrolling, the pills step aside and the strip moves under a still pointer, so a
+                // click meant to pin would land on a level: there the press opens it, as on touch.
+                const fitted = measure();
+                if (fitted && fitted.mode !== 'inline') return;
+                setOpen(true);
+            }, HOVER_OPEN_MS);
+        }
     };
     const onLeave = (event) => {
         if (event.pointerType !== 'mouse') return;
@@ -466,7 +486,7 @@ export function createEffortRangeControl({
         beginDrag(which);
         if (!handleEl) dragTo(which, start);
         const grab = valueAt(event, which) - state.view[which];
-        handles[which].focus({ preventScroll: true });
+        handles[which].focus({ preventScroll: true, focusVisible: false });  // no keyboard ring after a mouse press
         try { strip.setPointerCapture(event.pointerId); } catch { /* a synthetic event */ }
         const move = (ev) => {
             if (ev.pointerId !== event.pointerId || !state.drag) return;
@@ -496,6 +516,7 @@ export function createEffortRangeControl({
         else if (event.key === 'End') target = N;
         else return;
         event.preventDefault?.();
+        keyboardFocus = true;
         commit(snapRange(applyHandle(state.shown, which, clamp(target, 0, N))));
         revealHandle(which);
     };

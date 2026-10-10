@@ -23,7 +23,7 @@ export function initDashboard({ state }) {
         ${renderPageHeader({
             title: 'Dashboard',
             icon: PAGE_ICONS.dashboard,
-            description: 'Monitor logs, evolution, costs, activity, and update state from one view.',
+            description: 'Monitor logs, activity, costs, updates, and evolution from one view.',
             tabsHtml: renderTabStrip({
                 items: DASHBOARD_TABS.map((tab) => ({
                     ...tab,

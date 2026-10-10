@@ -170,6 +170,14 @@ def test_desktop_hover_opens_press_pins_escape_and_outside_close(direct_server_w
             page.wait_for_timeout(500)
             assert _facts(page)["open"] == "true", "not before the delay"
             _wait(page, "el.dataset.open === 'false'", timeout=3_000)
+            # A mouse press on a level of a hover-opened strip does not hold it open afterwards.
+            page.hover(HEAD)
+            _wait(page, "el.dataset.open === 'true'")
+            page.wait_for_timeout(450)
+            x, y = _segment_center(page, "medium")
+            page.mouse.click(x, y)
+            page.mouse.move(20, 200)
+            _wait(page, "el.dataset.open === 'false'", timeout=3_000)
             # Hover again, then a press pins it: leaving no longer closes.
             page.hover(HEAD)
             _wait(page, "el.dataset.open === 'true'")
@@ -213,7 +221,7 @@ def test_a_tight_row_keeps_one_line_while_the_strip_closes(direct_server_with_da
         try:
             _open_chat(page, url, width=1440)
             # Narrow the composer row until the strip only fits beside the pills below full padding.
-            for width in range(1100, 900, -10):
+            for width in range(1120, 820, -8):
                 page.set_viewport_size({"width": width, "height": 900})
                 page.click(HEAD)
                 _wait(page, "el.dataset.open === 'true'")
@@ -224,7 +232,7 @@ def test_a_tight_row_keeps_one_line_while_the_strip_closes(direct_server_with_da
                 page.keyboard.press("Escape")
                 _wait(page, "el.dataset.open === 'false'")
             else:
-                pytest.fail("no viewport between 1100 and 910 px gave an inline strip below full padding")
+                pytest.fail("no viewport between 1120 and 828 px gave an inline strip below full padding")
             closed_height = page.evaluate(f"() => document.querySelector('{CONTROL}').parentElement.getBoundingClientRect().height")
             heights = page.evaluate(f"""() => new Promise((resolve) => {{
                 const row = document.querySelector('{CONTROL}').parentElement;
@@ -304,8 +312,18 @@ def test_project_pane_strip_stands_alone_and_shows_the_same_value(direct_server_
             width = page.locator("#project-panel").bounding_box()["width"]
             assert 340 <= width <= 440.5, width
             closed = _facts(page, panel)
-            page.click(f"{panel} .chat-effort-head")
+            # The strip would stand alone here, so hovering does not open it under a still mouse:
+            # the press opens it (pinned), and that press saves nothing.
+            saves = []
+            page.on("request", lambda r: saves.append(r.url) if r.url.endswith("/api/owner/effort-range") else None)
+            page.hover(f"{panel} .chat-effort-head")
+            page.wait_for_timeout(450)
+            assert _facts(page, panel)["open"] == "false", "no hover-open where the pills would step aside"
+            page.mouse.down()
+            page.mouse.up()
             _wait(page, "el.dataset.open === 'true'", panel)
+            page.wait_for_timeout(300)
+            assert saves == [], saves
             page.wait_for_timeout(300)
             opened = _facts(page, panel)
             assert opened["fit"] == "solo" and not opened["pillsShown"], opened

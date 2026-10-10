@@ -939,6 +939,14 @@
 [data-autostart-settings] .settings-inline-note {
     padding-left: calc(var(--local-toggle-box) + var(--local-toggle-gap));
 }
+/* Both rows sit in the card's one column, so a note is as far from its own checkbox in either
+   row, and an empty note takes no room. */
+[data-autostart-settings] [data-background-row]:not([hidden]) {
+    display: contents;
+}
+[data-autostart-settings] .settings-inline-status:empty {
+    display: none;
+}
 /* A row's plain note (no tone, no dot) reads in meta ink, like the shared note. */
 [data-autostart-settings] .settings-inline-status:not([data-tone]) {
     color: var(--text-meta);

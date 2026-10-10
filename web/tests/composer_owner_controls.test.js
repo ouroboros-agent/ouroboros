@@ -30,6 +30,7 @@ function mount({ hover = false, save, win } = {}) {
     const doc = stubDocument();
     const row = doc.createElement('div');
     row.className = 'chat-toolbar-row';
+    row.getBoundingClientRect = () => ({ top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 });  // not laid out: no fit
     const toasts = [];
     const refreshes = [];
     const layouts = [];
@@ -365,6 +366,63 @@ test('a strip that scrolls keeps the handle that moved in view, clear of the fad
     assert.equal(m.strip.dataset.scroll, 'start');
 });
 
+test('hover opens only where the button stays under the mouse; alone or scrolling, the press opens it', async () => {
+    const doc = stubDocument();
+    const row = doc.createElement('div');
+    row.className = 'chat-toolbar-row';
+    const pills = doc.createElement('div');
+    pills.className = 'chat-composer-pills';
+    const swarm = doc.createElement('button');
+    swarm.getBoundingClientRect = () => ({ width: 220 });
+    pills.appendChild(swarm);
+    row.appendChild(pills);
+    const styles = new Map([[row, { paddingLeft: '8px', paddingRight: '8px', columnGap: '8px' }]]);
+    const win = { ...hoverWindow(true), getComputedStyle: (node) => styles.get(node) || {} };
+    const control = createEffortRangeControl({ row, doc, win, saveEffortRange: async (triple) => ({ effort_range: triple }), showToast: () => {} });
+    const el = control.el;
+    el.querySelector('.chat-effort-head').getBoundingClientRect = () => ({ width: 30 });
+    el.querySelectorAll('.chat-effort-seg').forEach((seg) => {
+        Object.defineProperty(seg, 'firstElementChild', { value: { getBoundingClientRect: () => ({ width: 32 }) } });
+    });
+    const enter = () => el.listeners.get('pointerenter').forEach((fn) => fn({ pointerType: 'mouse' }));
+    const leave = () => el.listeners.get('pointerleave').forEach((fn) => fn({ pointerType: 'mouse', clientX: 900, clientY: 900 }));
+    row.getBoundingClientRect = () => ({ width: 440 });  // a Project pane: the strip would stand alone
+    enter();
+    await sleep(220);
+    assert.equal(control.isOpen(), false, 'no hover-open where the pills would step aside under the mouse');
+    leave();
+    row.getBoundingClientRect = () => ({ width: 900 });  // room beside the pills: the button stays put
+    enter();
+    await sleep(220);
+    assert.equal(control.isOpen(), true, 'hover opens beside the pills');
+    control.destroy();
+});
+
+test('a mouse press on a level does not keep a hover-opened strip from closing; keyboard focus does', async () => {
+    const m = mount({ hover: true });
+    m.control.syncState({ effort_range: { min: 'low', recommended: 'medium', max: 'high' } });
+    m.enter();
+    await sleep(200);
+    m.doc.fire('pointerdown', { target: m.head });  // the document sees every press first
+    m.down(100);
+    m.up(100);
+    await m.settle();
+    assert.equal(m.doc.activeElement, m.handles.rec, 'the press focused the handle');
+    m.leave('mouse', { x: 600, y: 10 });
+    await sleep(1150);
+    assert.equal(m.control.isOpen(), false, 'a mouse press does not hold the strip open');
+    m.enter();
+    await sleep(200);
+    m.doc.fire('keydown', { key: 'ArrowRight' });   // the last input was the keyboard
+    m.key('rec', 'ArrowRight');
+    await m.settle();
+    m.handles.rec.focus();
+    m.leave('mouse', { x: 600, y: 10 });
+    await sleep(1150);
+    assert.equal(m.control.isOpen(), true, 'keyboard focus inside keeps it open');
+    m.escape();
+});
+
 test('fit: beside the pills when the strip fits there, alone when it does not, scrolling only below the tightest padding', () => {
     const doc = stubDocument();
     const row = doc.createElement('div');
@@ -407,7 +465,9 @@ test('fit: beside the pills when the strip fits there, alone when it does not, s
     open(708);
     assert.deepEqual(facts(), ['inline', '8px', 'false', undefined], 'the owner row: beside the pills at full padding');
     close();
-    assert.deepEqual([el.dataset.fit, el.dataset.tight, row.dataset.effortSolo], [undefined, undefined, undefined], 'closing restores the pills');
+    assert.deepEqual([el.dataset.fit, row.dataset.effortSolo], [undefined, undefined], 'closing restores the pills');
+    assert.deepEqual([el.style.getPropertyValue('--effort-seg-pad'), el.dataset.tight], ['8px', 'false'],
+        'the fitted padding stays while the strip collapses (the next open fits again)');
     open(560);
     assert.deepEqual(facts(), ['solo', '8px', 'false', 'true'], 'no room beside the pills: they step aside');
     sized(swarm, 0);                  // hidden pills measure 0: the width seen before hiding stays
