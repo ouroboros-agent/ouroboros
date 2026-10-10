@@ -758,8 +758,10 @@ def last_assistant_text(messages: List[Dict[str, Any]]) -> str:
     terminal answer when provider-death prevents a fresh final response, so
     useful work is never silently discarded (workspace files persist on disk
     regardless)."""
+    from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
+
     for m in reversed(messages or []):
-        if isinstance(m, dict) and m.get("role") == "assistant":
+        if isinstance(m, dict) and m.get("role") == "assistant" and not m.get(HOST_CONTEXT_KIND_KEY):
             content = m.get("content")
             if isinstance(content, str) and content.strip():
                 return content
