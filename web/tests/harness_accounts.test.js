@@ -2011,6 +2011,7 @@ test('the refresh button routes the click through the same predicate as its labe
     const store = createClaudexorStatusStore({
         fetchImpl: async (url, init = {}) => {
             requests.push(`${init.method || 'GET'} ${url}`);
+            if (url.endsWith('/quota/refresh')) return fakeResponse(200, { snapshots: [], absences: [], refreshed_at: null });
             if ((init.method || 'GET') === 'POST') return fakeResponse(200, WAKE_UP);
             return fakeResponse(200, statusBody);
         },
@@ -2031,12 +2032,13 @@ test('the refresh button routes the click through the same predicate as its labe
             'a sleeping daemon was only re-read, so the button could not help');
 
         // Daemon live (the wake committed an answering reading) -> the press
-        // stays a plain re-read, and the label agrees.
+        // refreshes quota and re-reads status, and the label agrees.
         statusBody = WAKE_UP;
         requests.length = 0;
         await click();
         assert.ok(requests.every((r) => !r.includes('/api/claudexor/wake')),
             'a live daemon was provisioned by a button that says Refresh');
+        assert.ok(requests.includes('POST /api/claudexor/quota/refresh'));
         assert.ok(requests.some((r) => r.startsWith('GET ')), 'the live press did not re-read');
         assert.equal(elements['btn-harness-refresh'].textContent, 'Refresh');
     } finally {

@@ -29,7 +29,7 @@ function errorText(data) {
 }
 
 export async function fetchJson(url, init = {}, options = {}) {
-    const response = await apiFetch(url, init);
+    const response = await (options.fetchImpl || apiFetch)(url, init);
     let data = null;
     try {
         data = await response.json();
@@ -58,6 +58,25 @@ export function jsonPost(url, payload = {}, options = {}) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     }, options);
+}
+
+/** Exact-profile refresh; omitted target keeps the existing full refresh. */
+export function refreshAccountResources(target, options = {}) {
+    return jsonPost('/api/claudexor/quota/refresh', target ? { target } : {}, options);
+}
+
+/** The caller retains BOTH request and key until this logical operation settles. */
+export function createAccountReset(request, key, options = {}) {
+    return fetchJson('/api/claudexor/account-resets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: JSON.stringify(request),
+    }, options);
+}
+
+export function getAccountReset(operationId, options = {}) {
+    return fetchJson(`/api/claudexor/account-resets/${encodeURIComponent(operationId)}`,
+        { cache: 'no-store' }, options);
 }
 
 /** Passive inspection; the host never starts an engine for this read. */
@@ -362,6 +381,8 @@ export const apiClient = {
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),
+    /** The owner's effort range, saved as one ordered triple. @param {{min: string, recommended: string, max: string}} range */
+    ownerEffortRange: (range) => jsonPost('/api/owner/effort-range', range),
     /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
     ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),
     logsTail: (name, limit = 2000) => fetchJson(`/api/logs/${encodeURIComponent(name)}?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),

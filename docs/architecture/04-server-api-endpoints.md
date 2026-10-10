@@ -60,8 +60,10 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/settings` | |
 | POST | `/api/settings/secret` | |
 | GET | `/api/review-pool` | |
-| GET | `/api/claudexor/status` | daemon adds nullable `last_exit` and `memory`: a saved host exit observation plus a read of the already-running engine, never a wake (§9) |
-| POST | `/api/claudexor/quota/refresh` | |
+| GET | `/api/claudexor/status` | `last_exit`/`memory` (§9), resource-catalog read evidence (§3); never wakes |
+| POST | `/api/claudexor/quota/refresh` | full or exact account (§3) |
+| POST | `/api/claudexor/account-resets` | exact request and Idempotency-Key (§3) |
+| GET | `/api/claudexor/account-resets/{operation_id}` | receipt inspection (§3) |
 | POST | `/api/claudexor/wake` | |
 | GET | `/api/claudexor/maintenance/harnesses` | passive inspection; optional fresh/latest check |
 | POST | `/api/claudexor/maintenance/operations` | Idempotency-Key; 202 operation handle |
@@ -77,6 +79,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/owner/runtime-mode` | |
 | POST | `/api/owner/auto-grant` | |
 | POST | `/api/owner/context-mode` | |
+| POST | `/api/owner/effort-range` | |
 | POST | `/api/owner/safety-mode` | |
 | POST | `/api/owner/skills/{skill}/presence-runtime` | |
 | POST | `/api/owner/capability-ack` | |

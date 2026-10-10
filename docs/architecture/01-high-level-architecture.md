@@ -26,7 +26,7 @@ web/ — Web UI, a SPA of ES modules; chapter 3 owns the pages and the modules n
     skills.js, marketplace.js, skill_review_card.js, skill_publish_flow.js — Skills page, ClawHub marketplace, Skill Review cards, publish dialog (§3 Skills and Widgets)
     settings_ui.js, settings_catalog.js, settings_controls.js, settings_secrets.js, settings_local_model.js, settings_autostart.js, mcp_settings.js — Settings page leaves: catalog refresh, control binders, secret Show/Hide, local-model form, host sign-in toggle, MCP cards (§3 Settings)
     model_roles.js, model_chooser.js — the Models editor and editable chooser shared by Settings, onboarding and route editors; catalog arrival never assigns a value (§3 Navigation)
-    subagents_settings.js, subagent_status_primitives.js, route_editor_primitives.js, harness_accounts.js, harness_login_cards.js, claudexor_status_store.js — Agents surfaces: the Available-subagents editor with its Reviewer marks, route and status primitives, account and login cards; `claudexor_status_store.js` is the single client store over `GET /api/claudexor/status` (§3 Agent accounts)
+    subagents_settings.js, subagent_status_primitives.js, route_editor_primitives.js, harness_accounts.js, account_resources.js, harness_login_cards.js, claudexor_status_store.js — Agents editors; account/resource/login views share one status/action store (§3 Agent accounts)
     onboarding_agents_step.js, onboarding_overlay.js, project_create.js, utils.js — first-run accounts step; the wizard frame's sandbox policy, kept in one place because it is a security boundary; New Project dialog; shared utilities (§2; §3 Project rooms)
     review_command.js — `/review` chooser and send (§3 Chat and Projects)
     review_presentation.js, review_record_card.js, review_dom_patch.js, harness_presentation.js — read-side Review Checkpoint grouping, one review record's panel and reviewer lines (`formatReviewProjection`), keyed DOM patching, the sole owner of harness identity markup (§3 Child cards and executor presentation)
@@ -390,7 +390,7 @@ ouroboros/ — agent core and shared runtime (§6)
     logs.py — Read-only runtime log tail
     onboarding.py — `POST /api/onboarding/complete`: install-time latch, validation, live engine read, preset compile, one settings write under lock; a typed 503 persists nothing, except `settings_save_timeout`, the unknown outcome (§2)
     onboarding_host.py — GET /onboarding: side-effect-free wizard page served as ES modules
-    owner_settings.py — Settings-lock-as-precondition and `CommitBoundary` (Gateway Boundary v1 below)
+    owner_settings.py — Settings-lock-as-precondition and `CommitBoundary` (Gateway Boundary v1 below); owner_effort.py — the effort range
     settings_secrets.py — Explicit single-secret Settings reads; passive Settings responses stay masked (§3 Settings and onboarding)
     settings.py — /api/settings and /api/owner/*; `GET /api/review-pool`: the pool in catalog order, excluded rows with reasons, last runs, per-row cost, the migration receipt; an unreadable catalog is a typed `config_error`, never a 500 (§7 Review pool)
     presence_settings.py — Owner-facing runtime overrides and working-folder selection for reviewed Presence behavior skills
@@ -408,8 +408,8 @@ ouroboros/ — agent core and shared runtime (§6)
     skill_publish.py — Read-only publish preflight with scan cache; one five-state response; no task or GitHub effect (§6 Skill publication)
     marketplace.py — ClawHub and OuroborosHub HTTP surface
     mcp.py — MCP HTTP surface over the shared MCPManager
-    claudexor_accounts.py — Agent accounts HTTP surface: thin proxies over the owned daemon (status, wake, login and its job actions, credential profiles); no auth logic or browser exposure of the daemon token; `reads` classifies catalog/accounts/quota as `ok|not_read|failed`, and only `ok` makes even an empty collection authoritative (§3 Agent accounts; routes: §4)
-    claudexor_quota.py — POST /api/claudexor/quota/refresh: one explicit owner refresh delegated exactly once to the engine's quota POST; no lifecycle start or retry; GET /api/claudexor/status stays passive
+    claudexor_accounts.py — Thin owned-daemon status/login/account proxies; no auth logic or browser token. `reads` classifies catalog/accounts/quota, `resource_capabilities_read` operations; only a successful read proves absence (§3 Agent accounts; §4)
+    claudexor_quota.py — Owned-daemon refresh/reset/receipt proxies; catalog negotiation, exact key/body and typed errors, no start/retry/browser token (§3 Agent accounts; §4)
     harness_maintenance.py — Owner maintenance HTTP surface over the shared host service (§6 Vendor program maintenance; routes: §4)
     host_service.py — Loopback-only Host Service API (§12)
     host_notify.py — POST /notify beside the Host Service: a granted skill's sentence becomes one signed `skill_notice` System row in the owner's chat (§12)
