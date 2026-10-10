@@ -5,7 +5,6 @@ import { renderSubagentsSection } from './subagents_settings.js';
 import { languageBlockHtml } from './settings_language.js';
 import { modelRolesHost } from './model_roles.js';
 import { bindSecretReveal } from './settings_secrets.js';
-import { EFFORT_RANGE_SUMMARY_TEMPLATE } from './effort_levels.js';
 
 // Reads as a sequence: keys → secrets → which API models → who among the agents
 // does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
@@ -376,36 +375,6 @@ export function renderSettingsPage() {
                 </section>
 
                 <section class="settings-panel" data-settings-panel="behavior">
-                    <div class="form-section" data-autostart-settings hidden>
-                        <h3>Startup &amp; background</h3>
-                        <div class="settings-section-copy">
-                            Applies immediately to the host computer running Ouroboros, including when you
-                            connect from another device. Signing in preserves Panic stops and saved pauses.
-                            In the background, tasks, schedules and Telegram keep working; an icon reopens
-                            the window or quits.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-autostart-toggle>
-                                Start Ouroboros on the host computer when you sign in
-                            </label>
-                            <div class="settings-inline-status" data-autostart-status role="status" aria-live="polite"></div>
-                            <div data-background-row hidden>
-                                <label class="local-toggle ui-field ui-field-inline">
-                                    <input type="checkbox" class="ui-checkbox" data-background-toggle>
-                                    When the window is closed, keep Ouroboros running in the background
-                                </label>
-                                <div class="settings-inline-status" data-background-status role="status" aria-live="polite"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Reasoning Effort</h3>
-                        <!-- The range is edited in the chat alone (the round Effort button next to Swarm); this line reads the saved document. -->
-                        <div class="settings-section-copy" data-effort-range-summary>${EFFORT_RANGE_SUMMARY_TEMPLATE}</div>
-                    </div>
-
                     <div class="form-section">
                         <h3>Review Enforcement</h3>
                         <div class="settings-section-copy"><code>Advisory</code> keeps review visible but non-blocking. <code>Blocking</code> stops commits and reviewed-skill activation when critical findings remain unresolved.</div>
@@ -720,6 +689,33 @@ export function renderSettingsPage() {
                                 <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1" class="ui-control" name="s-clawhub-registry-url" type="text" aria-describedby="s-clawhub-registry-url-help">
                                 <div class="settings-inline-note ui-field-help" id="s-clawhub-registry-url-help">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Last on the tab: set once, and on a browser or Docker host it only explains
+                         why the switches cannot be used (docs/DESIGN.md §5 "Order by importance"). -->
+                    <div class="form-section" data-autostart-settings hidden>
+                        <h3>Startup &amp; background</h3>
+                        <div class="settings-section-copy">
+                            Applies immediately to the host computer running Ouroboros, including when you
+                            connect from another device. Signing in preserves Panic stops and saved pauses.
+                            In the background, tasks, schedules and Telegram keep working; an icon reopens
+                            the window or quits.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-autostart-toggle>
+                                Start Ouroboros on the host computer when you sign in
+                            </label>
+                            <div class="settings-inline-status" data-autostart-status role="status" aria-live="polite"></div>
+                            <div data-background-row hidden>
+                                <label class="local-toggle ui-field ui-field-inline">
+                                    <input type="checkbox" class="ui-checkbox" data-background-toggle>
+                                    When the window is closed, keep Ouroboros running in the background
+                                </label>
+                                <div class="settings-inline-status" data-background-status role="status" aria-live="polite"></div>
+                            </div>
+                            <div class="settings-inline-note" id="settings-autostart-note" data-autostart-shared-note role="status" aria-live="polite" hidden></div>
                         </div>
                     </div>
                 </section>
