@@ -437,7 +437,9 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
                 receipt = retain_transfer_only_checkpoint(tool_ctx, observed["messages"], receipt)
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 receipt.update(status="selection_failed", review_selection_error=str(exc))
-        if receipt["status"] == "applied":
+        if receipt["status"] == "applied" and receipt.get("selection_fingerprint"):
+            # Only an authored selection changes review presentation. Restoring
+            # source rows leaves the existing selected account and indexes intact.
             from ouroboros.review_history_view import prepare_review_view, refresh_compacted_review_context
             try:
                 review_pointer, review_capsule, review_transfers, expected_selection = prepare_review_view(
@@ -485,10 +487,12 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
             ctx.emit_progress("Context view kept unchanged: the review selection was not durably published.")
     if receipt["status"] == "applied":
         receipt["view_revision"] = receipt["after_transcript_sha256"] = context_reclaim_transcript_sha256(candidate)
+        source_append = bool(receipt.get("restored_unit_refs")) and not receipt.get("selection_fingerprint") and schemas == current_tools
         current_tools[:] = schemas
-        invalidate_task_cache_splits(ctx.task_id)
-        prune_reclaim_trace_refs(tool_ctx, candidate)
-        sanction_rewrite(tool_ctx, "compaction")
+        if not source_append:
+            invalidate_task_cache_splits(ctx.task_id)
+            prune_reclaim_trace_refs(tool_ctx, candidate)
+            sanction_rewrite(tool_ctx, "compaction")
     tool_ctx._pending_compaction = None
     tool_ctx._pending_tool_schema_names = None
     tool_ctx._context_view_receipt = receipt

@@ -100,8 +100,8 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
     The explicit authored view (inspect / working_note / restore) addresses the dialogue
     scope: complete tool units, capsules, the actor's own completed replies and host prose
     rows, all under the same positional, hash-bound unit ids. Rows carrying the owner's
-    typed words are listed but never eligible. The count-only request (no note) keeps the
-    automatic tool-unit reader and the helper.
+    typed words are listed but never eligible. Standalone restoration keeps current
+    units/schemas and authors no note; count-only requests keep the helper.
     """
     from ouroboros.context_compaction import context_units, owner_protected_unit_ids, unit_kind
     from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
@@ -160,6 +160,13 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
                      "select several to merge their account and sources. The system view, the assignment and "
                      "newer owner/tool messages remain untouched."),
         }, ensure_ascii=False, separators=(",", ":"))
+    if working_note is None and restore_unit_refs:
+        if (any(value is not None for value in (keep_last_n, keep_unit_ids, schema_names))
+                or review_transfers or review_notes):
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+                text="Standalone restore_unit_refs keeps current units, schemas and review accounts. "
+                     "Omit other selectors, or supply working_note to combine restoration with an authored view."))
+        working_note = ""
     if working_note is not None:
         # This invocation is a response to the actor's recorded physical send.
         # The host already owns that causal binding; echoing its hash is only
@@ -228,7 +235,8 @@ def get_tools() -> List[ToolEntry]:
                 "name": "compact_context",
                 "description": (
                     "Request complete-input context reclaim. "
-                    "Supply your working_note to author the replacement, or omit it for helper summarization of old "
+                    "Use restore_unit_refs alone to add labelled sources without a helper or actor note. "
+                    "Supply working_note for an authored view; without either, request helper summarization of old "
                     "completed tool units. An authored view addresses complete tool units, earlier records, your own "
                     "completed replies and host prose rows (inspect lists them with kind and eligibility); the owner's "
                     "words and your typed owner-directed dialogue, the assignment and the system view stay whole. "
@@ -248,12 +256,12 @@ def get_tools() -> List[ToolEntry]:
                     "properties": {
                         "inspect": {"type": "boolean", "description": "Return and pin the last observed view revision, complete unit IDs, source references and current schema names without changing context."},
                         "expected_view_revision": {"type": "string", "description": "Optional view_revision from inspect, checked exactly. Omitted binds the actual model-send view that produced this call; inspect is not required to replace all completed units."},
-                        "working_note": {"type": "string", "description": "Your account of the selected material, corrections and unresolved work, placed at its first replaced unit. Earlier notes remain unless selected too. Omission keeps legacy helper compaction."},
+                        "working_note": {"type": "string", "description": "Your account of the selected material, corrections and unresolved work, placed at its first replaced unit. Earlier notes remain unless selected too. Omission without restoration keeps legacy helper compaction."},
                         "keep_unit_ids": {"type": "array", "items": {"type": "string"}, "description": "Exact inspected complete units to retain raw; takes precedence over keep_last_n, empty keeps none eligible. If both selectors are omitted, an authored note keeps all. Owner words, the assignment, the system view and the newer tail are preserved whatever the selection."},
                         "restore_unit_refs": {"type": "array", "items": {"type": "object", "properties": {
                             "checkpoint_ref": {"type": "object"}, "unit_id": {"type": "string"}, "raw_sha256": {"type": "string"}},
                             "required": ["checkpoint_ref", "unit_id", "raw_sha256"]},
-                            "description": "Read exact checkpoint-local units back as labelled sources, never live tool protocol replay."},
+                            "description": "Read exact checkpoint-local units back as labelled sources, never live tool protocol replay. A nonempty list may be used alone: no helper, no actor note, current units and schemas unchanged. Supply working_note to combine it with other view selectors."},
                         "schema_names": {"type": "array", "items": {"type": "string"}, "description": "Nano only: desired canonical schemas. This selects residency, never execution permissions. Low/Max retain their full permitted envelope."},
                         "review_notes": {"type": "array", "items": {"type": "object", "properties": {
                             "bound_decision": {"anyOf": [{"type": "object"}, {"type": "string"}]},

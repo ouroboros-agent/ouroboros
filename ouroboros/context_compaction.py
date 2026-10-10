@@ -1254,33 +1254,40 @@ def _authored_view(
                 restore, drive_root=drive_root, task_id=task_id, request=request)
         except (OSError, ValueError, TypeError, KeyError):
             return messages, _receipt("source_unavailable", before_sha=before_sha, **facts), None
-        fingerprint = _sha256(_canonical_bytes({"observed": observed_sha, "removed": [u.unit_id for u in removed],
-                                               "working_note": request.working_note, "restore": restore}))
-        selection = _Selection(tuple(_SelectedUnit(u, 0, "") for u in removed), fingerprint, 0)
-        checkpoint_ref = _persist_reclaim_checkpoint(observed, request, selection,
-                                                     drive_root=drive_root, task_id=task_id)
-        if checkpoint_ref is None:
-            return messages, _receipt("checkpoint_failed", before_sha=before_sha, selection=selection, **facts), None
-        source_refs = _unique_refs([ref for u in removed for ref in (*u.source_refs, {
-            "checkpoint_ref": checkpoint_ref, "unit_id": u.unit_id, "raw_sha256": u.raw_sha256})])
-        source = [m for u in removed for m in observed[u.start:u.end + 1]]
-        combined = _unit_from_slice(source, 0, len(source) - 1, trace_refs_by_tool_call_id=trace_refs,
-                                    measurement_density=request.measurement_density)
-        combined = replace(combined, unit_id=f"view:{fingerprint}", generation=max((u.generation for u in removed), default=0),
-                           lineage_hashes=_unique_strings([h for u in removed for h in u.lineage_hashes]),
-                           source_refs=source_refs)
-        note, note_ref = _capsule_message(_SelectedUnit(combined, 0, ""), request.working_note,
-                                         [_part(combined.unit_id, combined.source_text)], checkpoint_ref, request)
-        note["content"][0]["_context_capsule"]["authorship"] = "actor"
-        note["role"] = "assistant"
-        note["content"][0]["text"] = "[Actor-authored working view; exact source retained by checkpoint]\n" + request.working_note.strip()
-        note["content"][0]["_context_capsule"]["visible_sha256"] = _sha256(note["content"][0]["text"])
-        replacements = {u.start: (u.end, [], []) for u in removed}
-        at = removed[0].start if removed else len(observed)
-        replacements[at] = (removed[0].end if removed else at - 1,
-                            [*restored, note], [*restored_capsules, note_ref])
-        candidate, capsule_refs = _materialize_replacements(messages, replacements)
-        facts["source_refs"] = _unique_refs([*source_refs, checkpoint_ref, *facts["restored_unit_refs"]])
+        if not removed and not request.working_note.strip():
+            # Append after the complete current turn, including arrivals after an
+            # older inspected view. No prior prefix, account or checkpoint changes.
+            at = len(messages)
+            candidate, capsule_refs = _materialize_replacements(messages, {at: (at - 1, restored, restored_capsules)})
+            facts["source_refs"] = facts["restored_unit_refs"]
+        else:
+            fingerprint = _sha256(_canonical_bytes({"observed": observed_sha, "removed": [u.unit_id for u in removed],
+                                                   "working_note": request.working_note, "restore": restore}))
+            selection = _Selection(tuple(_SelectedUnit(u, 0, "") for u in removed), fingerprint, 0)
+            checkpoint_ref = _persist_reclaim_checkpoint(observed, request, selection,
+                                                         drive_root=drive_root, task_id=task_id)
+            if checkpoint_ref is None:
+                return messages, _receipt("checkpoint_failed", before_sha=before_sha, selection=selection, **facts), None
+            source_refs = _unique_refs([ref for u in removed for ref in (*u.source_refs, {
+                "checkpoint_ref": checkpoint_ref, "unit_id": u.unit_id, "raw_sha256": u.raw_sha256})])
+            source = [m for u in removed for m in observed[u.start:u.end + 1]]
+            combined = _unit_from_slice(source, 0, len(source) - 1, trace_refs_by_tool_call_id=trace_refs,
+                                        measurement_density=request.measurement_density)
+            combined = replace(combined, unit_id=f"view:{fingerprint}", generation=max((u.generation for u in removed), default=0),
+                               lineage_hashes=_unique_strings([h for u in removed for h in u.lineage_hashes]),
+                               source_refs=source_refs)
+            note, note_ref = _capsule_message(_SelectedUnit(combined, 0, ""), request.working_note,
+                                             [_part(combined.unit_id, combined.source_text)], checkpoint_ref, request)
+            note["content"][0]["_context_capsule"]["authorship"] = "actor"
+            note["role"] = "assistant"
+            note["content"][0]["text"] = "[Actor-authored working view; exact source retained by checkpoint]\n" + request.working_note.strip()
+            note["content"][0]["_context_capsule"]["visible_sha256"] = _sha256(note["content"][0]["text"])
+            replacements = {u.start: (u.end, [], []) for u in removed}
+            at = removed[0].start if removed else len(observed)
+            replacements[at] = (removed[0].end if removed else at - 1,
+                                [*restored, note], [*restored_capsules, note_ref])
+            candidate, capsule_refs = _materialize_replacements(messages, replacements)
+            facts["source_refs"] = _unique_refs([*source_refs, checkpoint_ref, *facts["restored_unit_refs"]])
     try:
         fit = dict(fit_candidate(copy.deepcopy(candidate), copy.deepcopy(list(tool_schemas))))
     except Exception as exc:
