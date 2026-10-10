@@ -162,10 +162,25 @@ def _complete_root(tmp_path, workers):
     write_task_result(tmp_path, ROOT, STATUS_COMPLETED, chat_id=0, root_task_id=ROOT, result="done")
 
 
+def _acknowledged_restart(queue, workers):
+    """A returning Restart (owner 2026-10-08, quiz d2f7532b): its acknowledged transaction
+    returns the formerly runnable queue; a holding stop would keep it for Resume instead."""
+    from ouroboros import delegate_recovery
+    from supervisor.restart_retention import prepare_restart_returns
+
+    import uuid
+
+    transaction_id = uuid.uuid4().hex  # every Restart is its own fresh transaction
+    prepare_restart_returns(queue.DRIVE_ROOT, workers.RUNNING, workers.PENDING, transaction_id=transaction_id)
+    row = delegate_recovery._read_restart_transaction(queue.DRIVE_ROOT, transaction_id)
+    delegate_recovery._write_restart_transaction(queue.DRIVE_ROOT, {**row, "status": "normal_exit_acknowledged"})
+
+
 def _restart(queue, workers, monkeypatch):
-    """A new process: empty queue memory, empty owner-fence read cache, then restore."""
+    """A new process after a Restart: empty queue memory, empty owner-fence read cache, then restore."""
     from ouroboros import owner_pause
 
+    _acknowledged_restart(queue, workers)
     assert queue.persist_queue_snapshot(reason="test_before_restart")
     workers.PENDING[:] = []
     workers.RUNNING.clear()
@@ -492,6 +507,7 @@ def _restart_from(queue, workers, monkeypatch, snapshot_text):
     """A new process that finds THIS older snapshot (its later publications were lost)."""
     from ouroboros import owner_pause
 
+    _acknowledged_restart(queue, workers)
     workers.PENDING[:] = []
     workers.RUNNING.clear()
     queue.BUDGET_ROOT_FENCES.clear()

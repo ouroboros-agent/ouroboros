@@ -1354,6 +1354,8 @@ def _return_physical_claim(attempt_id: str) -> None:
 
 def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> str:
     """Route a raised provider send to its honest terminal ledger state."""
+    if getattr(exc, "receiver_abandoned", False):  # owner Pause: the sender settles it late; still dispatched
+        return "dispatched"
     payload = _retain_physical_failure(reservation, exc=exc)
     if release_pre_dispatch_attempt(reservation, exc):
         _return_physical_claim(reservation.attempt_id)
@@ -1466,6 +1468,7 @@ def execute_physical_attempt(
     *,
     extractor: Callable[[Any], Tuple[Dict[str, Any], Optional[float], bool]] = usage_from_response,
     before_dispatch: Optional[Callable[[AttemptReservation], Optional[Dict[str, Any]]]] = None,
+    late_owner: Optional[Callable[[Any, Optional[BaseException]], None]] = None,
 ) -> Any:
     """Execute one synchronous provider send with durable lifecycle accounting."""
     _LAST_PHYSICAL_ATTEMPT.set(None)
@@ -1487,8 +1490,9 @@ def execute_physical_attempt(
             raise
         raise failure from exc
     try:
-        from ouroboros._usage_wait import model_send
-        response = model_send(reservation, send)
+        from ouroboros._usage_wait import late_settler, model_send
+        response = model_send(reservation, send, settle_late=late_settler(
+            reservation, request, extractor, manifest_ref, dispatch_capture, late_owner))
     except BaseException as exc:
         terminal_state = "dispatched"
         try:
@@ -1532,10 +1536,10 @@ async def execute_physical_attempt_async(
     *,
     extractor: Callable[[Any], Tuple[Dict[str, Any], Optional[float], bool]] = usage_from_response,
     before_dispatch: Optional[Callable[[AttemptReservation], Any]] = None,
+    late_owner: Optional[Callable[[Any, Optional[BaseException]], None]] = None,
 ) -> Any:
     _LAST_PHYSICAL_ATTEMPT.set(None)
-    from ouroboros._usage_wait import postresponse_off_loop, presend_off_loop
-    from ouroboros.llm_observability import retain_cancelled_response
+    from ouroboros._usage_wait import model_send_async, postresponse_off_loop, presend_off_loop, retain_unadopted
 
     reservation = await presend_off_loop(reserve_attempt, request, on_cancel=lambda held: (
         _pre_dispatch_failure(held, request, asyncio.CancelledError())))
@@ -1570,22 +1574,18 @@ async def execute_physical_attempt_async(
                 reservation, request, terminal_state, candidate_manifest_ref=manifest_ref, exc=exc,
             )
             raise
-        return await postresponse_off_loop(
-            _account_response, reservation, request, response, extractor, manifest_ref,
-            retain_on_cancel=lambda exact, capture: retain_cancelled_response(
-                replace(request, drive_root=reservation.drive_root,
-                                    task_id=(reservation.scope or UsageScope()).task_id or request.task_id), exact, capture),
-        )
+        return await postresponse_off_loop(_account_response, reservation, request, response, extractor, manifest_ref,
+                                           retain_on_cancel=retain_unadopted(request, reservation))
 
 
-    from ouroboros._usage_wait import model_send_async
     try:
-        return await model_send_async(reservation, complete,
-            retain_on_cancel=lambda response, capture: retain_cancelled_response(
-                replace(request, drive_root=reservation.drive_root,
-                        task_id=(reservation.scope or UsageScope()).task_id or request.task_id), response, capture))
+        return await model_send_async(reservation, complete, retain_on_cancel=retain_unadopted(request, reservation),
+            retain_on_abandon=retain_unadopted(request, reservation, control_reason="owner_pause_abandoned"),
+            late_owner=late_owner)
     except BaseException as exc:
-        if getattr(exc, "model_sender_cancelled_before_entry", False):
+        if getattr(exc, "receiver_abandoned", False):
+            _record_attempt_capture(reservation, request, "dispatched", candidate_manifest_ref=manifest_ref, exc=exc)
+        elif getattr(exc, "model_sender_cancelled_before_entry", False):
             await presend_off_loop(_pre_dispatch_failure, reservation, request, exc, candidate_manifest_ref=manifest_ref)
         elif getattr(exc, "model_sender_not_started", False):
             terminal_state = await presend_off_loop(_terminalize_failed_attempt, reservation, exc)

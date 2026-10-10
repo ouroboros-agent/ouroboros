@@ -610,31 +610,13 @@ def pid_is_alive(pid: int) -> bool:
     """Observe process presence; access denial remains alive, not signal authority.
 
     Windows probes OpenProcess/GetExitCodeProcess, never os.kill(pid, 0): there
-    signal 0 is CTRL_C_EVENT, delivered to the pid's whole console group."""
+    signal 0 is CTRL_C_EVENT, delivered to the pid's whole console group. An
+    unexplained Windows open failure reads as dead here, never as provably gone."""
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        _STILL_ACTIVE = 259
-        _ERROR_ACCESS_DENIED = 5
-        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if not handle:
-            # A live but access-protected process reads as alive; anything else (invalid parameter -> no such pid) reads as dead.
-            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
-        try:
-            code = ctypes.wintypes.DWORD()
-            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True  # opened but unreadable -> fail SAFE toward alive
-            return int(code.value) == _STILL_ACTIVE
-        finally:
-            _kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:  # EPERM: it exists and refuses us; anything else undeterminable reads as present
-        pass
-    return True
+        return _windows_process_state(pid) in {"running", "denied", "unreadable"}
+    return not pid_provably_gone(pid)  # EPERM: it exists and refuses us
 
 
 def signal_pid(pid: int, signum: int = 0) -> bool:
@@ -647,17 +629,23 @@ def signal_pid(pid: int, signum: int = 0) -> bool:
 
 
 def pid_is_signalable(pid: int) -> bool:
-    """Whether this caller can signal a PID: POSIX signal-zero, Windows presence.
-
-    This is distinct from identity/ownership and from an access-denied live PID."""
-    if pid <= 0:
-        return False
-    return pid_is_alive(pid) if IS_WINDOWS else signal_pid(pid)
+    """Whether this caller can signal a PID (POSIX signal-zero, Windows presence); not identity/ownership."""
+    return pid > 0 and (pid_is_alive(pid) if IS_WINDOWS else signal_pid(pid))
 
 
 def pid_provably_gone(pid: int) -> bool:
-    """Positive absence from the platform presence reader; denial is not death."""
-    return not pid_is_alive(pid)
+    """Positive absence only (#1554): POSIX ESRCH; Windows no such pid
+    (ERROR_INVALID_PARAMETER) or a readable exit code. Access denial, EPERM and
+    every unexplained error are not death; a zombie is the caller's question."""
+    if pid <= 0:
+        return True
+    if IS_WINDOWS:
+        return _windows_process_state(pid) in {"no_such_pid", "exited"}
+    try:
+        os.kill(pid, 0)
+        return False
+    except OSError as exc:
+        return isinstance(exc, ProcessLookupError)
 
 
 # Windows locking via LockFileEx: unlike msvcrt.locking(), works on empty files.
@@ -1258,10 +1246,8 @@ def get_system_memory() -> str:
             mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
             return f"{mem_bytes / (1024**3):.1f} GB"
         elif os_name == "Linux":
-            out = subprocess.check_output(
-                ["awk", '/MemTotal/ {print $2/1024/1024 " GB"}', "/proc/meminfo"],
-            ).strip().decode()
-            return out
+            return subprocess.check_output(
+                ["awk", '/MemTotal/ {print $2/1024/1024 " GB"}', "/proc/meminfo"]).strip().decode()
         elif os_name == "Windows":
             out = _hidden_run(
                 ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory", "/value"],
@@ -1443,19 +1429,32 @@ if IS_WINDOWS:
         ]
 
 
-def _windows_process_start_time(pid: int) -> str:
-    handle = _kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ""
+def _windows_query(pid: int, read: Callable[[Any], Any]) -> tuple:
+    """``(open_error, read(handle))`` under one limited-query handle; error 0 when opened."""
+    if not (handle := _kernel32.OpenProcess(0x1000, False, int(pid))):  # PROCESS_QUERY_LIMITED_INFORMATION
+        return ctypes.get_last_error() or -1, None
     try:
-        created, exited, kernel, user = (ctypes.wintypes.FILETIME() for _ in range(4))
-        if not _kernel32.GetProcessTimes(
-            handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user),
-        ):
-            return ""
-        return f"win-filetime:{(created.dwHighDateTime << 32) | created.dwLowDateTime}"
+        return 0, read(handle)
     finally:
         _kernel32.CloseHandle(handle)
+
+
+def _windows_process_start_time(pid: int) -> str:
+    def created(handle: Any) -> str:
+        times = [ctypes.wintypes.FILETIME() for _ in range(4)]
+        return (f"win-filetime:{(times[0].dwHighDateTime << 32) | times[0].dwLowDateTime}"
+                if _kernel32.GetProcessTimes(handle, *(ctypes.byref(item) for item in times)) else "")
+    return _windows_query(pid, created)[1] or ""
+
+
+def _windows_process_state(pid: int) -> str:
+    """``running``/``exited``/``unreadable`` once opened; else ``denied``, ``no_such_pid`` or ``error``."""
+    def exit_code(handle: Any) -> Optional[int]:
+        code = ctypes.wintypes.DWORD()
+        return int(code.value) if _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) else None
+    error, code = _windows_query(pid, exit_code)
+    return (("denied" if error == 5 else "no_such_pid" if error == 87 else "error") if error
+            else "unreadable" if code is None else "running" if code == 259 else "exited")
 
 
 def _windows_breakaway_flags() -> int:

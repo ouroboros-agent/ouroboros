@@ -102,6 +102,24 @@ def main(root, generation, mode, scenario="incoming"):
     reconciled = reconcile_orphaned_running_tasks(h.data)
     inner_inference = loop.call_llm_with_retry
     inference_release = threading.Event()
+    close_release = threading.Event()
+    if scenario == "late_child_close_barrier":
+        from ouroboros.model_wait import TaskModelWait
+        from ouroboros.task_results import load_task_result
+
+        scenario = "late_child"
+        original_close = TaskModelWait.close
+
+        def close_after_release(waiter):
+            if any(agent.tools._ctx.model_wait_context is waiter for agent in h.agents):
+                terminal = load_task_result(h.data, waiter.task_id)
+                assert terminal["status"] in {"completed", "cancelled", "failed"}
+                (root / "before-author-close.json").write_text(json.dumps({
+                    "task_id": waiter.task_id, "status": terminal["status"], "closed": waiter.closed}))
+                assert close_release.wait(30), "test failed to release author teardown"
+            return original_close(waiter)
+
+        patch.setattr(TaskModelWait, "close", close_after_release)
 
     def inference(llm, messages, *args, **kwargs):
         tools = args[1] if len(args) > 1 else []
@@ -200,6 +218,7 @@ def main(root, generation, mode, scenario="incoming"):
 
     async def shutdown(_request):
         inference_release.set()
+        close_release.set()
         h.release.set()
         server.should_exit = True
         return JSONResponse({"stopping": True})
@@ -223,6 +242,10 @@ def main(root, generation, mode, scenario="incoming"):
         h.release.set()
         return JSONResponse({"released": True})
 
+    async def release_close(_request):
+        close_release.set()
+        return JSONResponse({"released": True})
+
     async def review_state(_request):
         return JSONResponse({"reviews": len(h.reviews), "model_calls": h.calls,
                              "held": h.entered.is_set() and not h.release.is_set()})
@@ -243,6 +266,7 @@ def main(root, generation, mode, scenario="incoming"):
                        Route("/fixture/panic", panic, methods=["POST"]),
                        Route("/fixture/release-inference", release_inference, methods=["POST"]),
                        Route("/fixture/release-review", release_review, methods=["POST"]),
+                       Route("/fixture/release-close", release_close, methods=["POST"]),
                        Route("/fixture/review-state", review_state),
                        Route("/fixture/proactive", proactive, methods=["POST"]),
                        Route("/fixture/restart", restart, methods=["POST"]),
@@ -256,6 +280,7 @@ def main(root, generation, mode, scenario="incoming"):
         server.run(sockets=[sock])
     finally:
         inference_release.set()
+        close_release.set()
         h.release.set()
         if h.entered.is_set():
             assert h.settled.wait(15)

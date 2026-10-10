@@ -325,7 +325,7 @@ def request_sleep(ctx: Any, chosen: Dict[str, Any], mode: str) -> Dict[str, Any]
 
 
 def begin(ctx: Any) -> None:
-    """The sleep interval starts: excluded from execution until the task runs again."""
+    """A warm sleep or owner Pause starts: excluded until the task runs again."""
     waiter = getattr(ctx, "model_wait_context", None)
     if waiter is not None:
         waiter.sleep_started_monotonic = time.monotonic()

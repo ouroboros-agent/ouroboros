@@ -22,6 +22,7 @@ import queue
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from ouroboros import working_checkpoint
 from ouroboros.config import get_context_mode
 from ouroboros.observability import timed_phase
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_FINALIZED_UNACCEPTED, reviewable_effect_projection
@@ -1200,6 +1201,34 @@ def _void_presence_completion(tool_ctx: Any, messages: list) -> None:
         tool_ctx._presence_completion, tool_ctx._presence_completion_accepted = None, False
 
 
+def resume_delivery_candidate(tools: ToolRegistry, working: dict, schemas: list) -> bool:
+    """Restore completion tools and identify an interrupted finalization boundary."""
+    if getattr(tools._ctx, "_delivery_control_required", False):
+        completion_schema(tools, schemas)
+    return bool(working and (working.get("working") or {}).get("boundary") == "candidate"
+                and getattr(tools._ctx, "_delivery_candidate", None) is not None)
+
+
+def _prepare_delivery_candidate(content: Any, tools: ToolRegistry, limit_ctx: Any, llm_trace: dict,
+                                *, explicit: bool, resumed: bool) -> tuple[bool, Any]:
+    """Select/save prose before gates; recovery retains its old evidence binding."""
+    if resumed or explicit:
+        control, content = ("retained" if resumed else "fresh"), content
+    else:
+        control, content = _loop()._resolve_delivery_control(content, tools, limit_ctx, llm_trace)
+    if control == "retry":
+        return False, content
+    _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
+    fresh = control == "fresh" and (explicit or str(content or "").strip())
+    candidate = (_loop()._replace_delivery_candidate(tools, limit_ctx, llm_trace, str(content or ""), control="candidate")
+                 if fresh else getattr(tools._ctx, "_delivery_candidate", None))
+    if isinstance(candidate, DeliveryCandidate):
+        content = candidate.full_text
+    if fresh or resumed:
+        working_checkpoint.save_or_log(limit_ctx, "candidate")  # this attempt survives another interruption
+    return True, content
+
+
 def _no_tool_final_answer(
     content: Any,
     limit_ctx: _RoundLimitContext,
@@ -1208,7 +1237,7 @@ def _no_tool_final_answer(
     incoming_messages: queue.Queue,
     owner_msg_seen: set,
     emit_progress: Callable[[str], None],
-    *, review_only: bool = False, explicit_candidate: bool = False,
+    *, review_only: bool = False, explicit_candidate: bool = False, resume_candidate: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Run the no-tool finalization gates; ``None`` requests another model round."""
     messages = limit_ctx.messages
@@ -1219,22 +1248,10 @@ def _no_tool_final_answer(
         if transcript_growth_signature(messages) != before:
             _void_presence_completion(tools._ctx, messages)
         return None
-    control_state, controlled_content = ("fresh", content) if explicit_candidate else _loop()._resolve_delivery_control(
-        content, tools, limit_ctx, llm_trace,
-    )
-    if control_state == "retry":
+    ready, content = _prepare_delivery_candidate(content, tools, limit_ctx, llm_trace,
+                                                 explicit=explicit_candidate, resumed=resume_candidate)
+    if not ready:
         return held()
-    content = controlled_content
-    _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
-    if control_state == "fresh" and (explicit_candidate or str(content or "").strip()):
-        candidate = _loop()._replace_delivery_candidate(
-            tools, limit_ctx, llm_trace, str(content or ""), control="candidate",
-        )
-        content = candidate.full_text
-    else:
-        candidate = getattr(tools._ctx, "_delivery_candidate", None)
-        if isinstance(candidate, _loop().DeliveryCandidate):
-            content = candidate.full_text
 
     stopping = (getattr(tools._ctx, "_completion_selected", None) or {}).get("action") == "stop"
     if not stopping:
@@ -1393,7 +1410,7 @@ def _no_tool_final_answer(
                 admission_agent._accepting_owner_messages = False
                 post_controls = _loop()._drain_incoming_messages(
                     messages, incoming_messages, limit_ctx.drive_root, limit_ctx.task_id,
-                    limit_ctx.event_queue, owner_msg_seen, owner_ctx=tools._ctx,
+                    limit_ctx.event_queue, owner_msg_seen, owner_ctx=tools._ctx, defer_content_ack=True,
                 )
         if len(getattr(tools._ctx, "_owner_directives", []) or []) > before_directives:
             with admission_lock:
@@ -1510,7 +1527,7 @@ def finish_completed_stop(tools: ToolRegistry, ctx: Any, emit_progress: Any,
     if request.get("action") != "stop":
         return None
     controls = _loop()._drain_incoming_messages(ctx.messages, ctx.incoming_messages, ctx.drive_root,
-        ctx.task_id, ctx.event_queue, ctx.owner_msg_seen, owner_ctx=tools._ctx)
+        ctx.task_id, ctx.event_queue, ctx.owner_msg_seen, owner_ctx=tools._ctx, defer_content_ack=True)
     from ouroboros.loop_messages import owner_source_sha256
     from ouroboros.deadline_utils import dispatch_window_remaining_sec
     if request["observation"].get("owner_source_sha256") != owner_source_sha256(tools._ctx):

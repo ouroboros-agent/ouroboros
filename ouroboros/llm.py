@@ -389,7 +389,8 @@ class LLMClient(
                 return result
             finally:
                 try:
-                    await _http_client.aclose()
+                    from ouroboros._usage_wait import aclose_after_model_send
+                    await aclose_after_model_send(_http_client)
                 except Exception:
                     pass
         client = self._get_async_remote_client(target)

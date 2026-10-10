@@ -361,23 +361,43 @@ def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: 
                 and int(pause.get("task_attempt") or 0) == int(row.get("_attempt") or 1)):
             return True
         # The owner paused this RUNNING root's tree: it is settling toward its
-        # boundary (sent work finishing), not working (ouroboros/owner_pause.py).
-        from types import SimpleNamespace
-
-        from ouroboros.owner_pause import member_fence
-
-        state = member_fence(SimpleNamespace(
-            task_id=task_id, root_task_id=str(row.get("root_task_id") or task_id),
-            budget_drive_root=str(row.get("budget_drive_root") or drive_root))).get("state")
+        # boundary (its own sent work stopping), not working (ouroboros/owner_pause.py).
+        state = _owner_fence_state(drive_root, row, task_id)
         return None if state == "unknown" else state == "requested"
     except Exception:
         return None
 
 
+def _owner_fence_state(drive_root: Any, row: Dict[str, Any], task_id: str) -> str:
+    """The member's owner-Pause fence state (``requested``/``paused``/``unknown``/``""``)."""
+    from types import SimpleNamespace
+
+    from ouroboros.owner_pause import member_fence
+
+    return str(member_fence(SimpleNamespace(
+        task_id=task_id, root_task_id=str(row.get("root_task_id") or task_id),
+        budget_drive_root=str(row.get("budget_drive_root") or drive_root))).get("state") or "")
+
+
+def _finishing_reviews(drive_root: Any, row: Dict[str, Any], task_id: str) -> bool:
+    """Whether review work the owner's Pause lets finish still runs, as its census recorded it.
+    The census names tasks and model sends alike, so it is never a reviewer count."""
+    try:
+        from ouroboros.owner_pause import read_fence
+
+        fence = read_fence(pathlib.Path(row.get("budget_drive_root") or drive_root),
+                           str(row.get("root_task_id") or task_id))
+        return fence.get("state") == "paused" and bool(fence.get("finishing_reviews"))
+    except Exception:
+        return False
+
+
 def _activity_pause_cause(row: dict, fence: dict) -> str:
     """Explain a parked census row from its existing typed control, never its phase name."""
     hold = row.get("_budget_pause_hold") or {}
-    if isinstance(hold, dict) and hold.get("reason") == "owner_restart_hold":
+    if isinstance(hold, dict) and hold.get("reason") in {"owner_restart_hold", "saved_work_hold"}:
+        # saved_work_hold: work saved before the application stopped waits for Resume
+        # after it started again (#1563); the published cause vocabulary is unchanged.
         return "restart"
     if fence.get("cause") == "owner_pause":
         return "owner"
@@ -392,6 +412,30 @@ def _activity_pause_cause(row: dict, fence: dict) -> str:
     if row.get("reason_code") == "owner_paused":
         return "owner"
     return "unknown"
+
+
+def _direct_activity_pause_projection(drive_root: Any, row: dict, availability: Any) -> dict:
+    """Project a direct actor's saved warm Pause without changing its registry.
+
+    A requested fence alone cannot say the author reached its boundary. The
+    existing owner-wait record supplies that fact; the settled root fence then
+    supplies Paused and the separate review count, just as for managed tasks.
+    """
+    activity = dict(row)
+    task_id = str(row.get("activity_id") or "")
+    state = _owner_fence_state(drive_root, row, task_id)
+    if state == "unknown":
+        activity["phase"] = "unknown"
+        if availability is not None:
+            availability["complete"] = False
+    elif state in {"requested", "paused"}:
+        from supervisor.owner_pause_control import _warm_paused_direct_turn
+
+        if _warm_paused_direct_turn(pathlib.Path(row.get("budget_drive_root") or drive_root), task_id):
+            activity.update(phase="budget_paused" if state == "paused" else "budget_pausing", pause_cause="owner")
+            if state == "paused" and (finishing := _finishing_reviews(drive_root, row, task_id)):
+                activity["finishing_reviews"] = finishing
+    return activity
 
 
 def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *, direct_turns=None, availability=None) -> list:
@@ -410,7 +454,7 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
     relabelled a managed task. Never raises.
     """
     direct_rows = direct_turns if direct_turns is not None else _direct_turns_snapshot_safe()
-    activities = [dict(row) for row in direct_rows]
+    activities = [_direct_activity_pause_projection(drive_root, row, availability) for row in direct_rows]
     bindings = task_bindings if isinstance(task_bindings, dict) else {}
     try:
         from supervisor import queue as queue_mod
@@ -464,6 +508,8 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 **({"pause_cause": _activity_pause_cause(
                     row, fence_rows.get(str(row.get("root_task_id") or task_id), {}))}
                    if phase in {"budget_paused", "budget_pausing"} else {}),
+                **({"finishing_reviews": finishing} if phase == "budget_paused" and (
+                    finishing := _finishing_reviews(drive_root, row, task_id)) else {}),
                 "started_at": started_at,
                 "task_attempt": int(row.get("_attempt") or 1),
                 **{key: row[key] for key in ("timeout_retry_from", "original_task_id") if row.get(key)},
@@ -490,6 +536,8 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 pausing = _managed_task_budget_pausing(drive_root, row, task_id)
                 if pausing is not False:
                     phase = "unknown" if pausing is None else "budget_pausing"
+                elif _owner_fence_state(drive_root, row, task_id) == "paused":
+                    phase = "budget_paused"  # its stack parked warm under a settled Pause
                 else:
                     phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
                 activities.append(_activity(task_id, row, phase, started_at))
@@ -502,7 +550,10 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
             if latch.get("cause") != "owner_pause" or root_id in visible:
                 continue
             facts = _task_activity_facts(drive_root, root_id)
-            if facts.get("late_phase") == "paused":
+            # The fence's own census is the truth of "Paused": reviewers already
+            # launched finish separately and never keep the tree Pausing.
+            if facts.get("late_phase") == "paused" or _owner_fence_state(
+                    drive_root, {"root_task_id": root_id}, root_id) == "paused":
                 phase = "budget_paused"
             elif (facts.get("finalizing") or post_task_synthesis_in_flight(drive_root, root_id)
                   or task_has_live_review_operation(drive_root, root_id, sent_only=True)):

@@ -164,28 +164,34 @@ def restart_current_process(
         except Exception:
             log.exception("Direct re-exec failed; attempting spawned restart fallback.")
     try:
+        from ouroboros import delegate_recovery
         from ouroboros.config import DATA_DIR
         from ouroboros.process_custody import spawn_supervised
 
-        spawn_supervised(
-            argv,
-            drive_root=pathlib.Path(DATA_DIR),
-            # daemon, NOT session: the replacement IS the next server
-            # generation. A session-scoped entry carries this dying
-            # generation's session id, so the new server's startup reap
-            # would see it as a foreign-session process and SIGKILL itself.
-            # daemon scope is always a reaper survivor (launcher-managed
-            # lifecycle), which is correct for a long-lived top-level server.
-            purpose="server_restart_fallback",
-            scope="daemon",
-            # Windows: the successor keeps the caller's console group, as exec
-            # would (a new group ignores CTRL+C). POSIX fallback: a new session,
-            # so a failed custody write kills only the successor and the
-            # caller's terminal hangup does not reach it.
-            new_process_group=not IS_WINDOWS,
-            cwd=str(repo_dir),
-            env=env,
-        )
+        # Hold publication across Popen and custody: an early child must read
+        # the completed receipt, never consume its token before it is bound.
+        with delegate_recovery.direct_restart_transaction(
+            DATA_DIR, env.get(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, ""),
+        ) as transaction:
+            proc = spawn_supervised(
+                argv,
+                drive_root=pathlib.Path(DATA_DIR),
+                # daemon, NOT session: the replacement IS the next server
+                # generation. Session scope would make startup reap itself.
+                purpose="server_restart_fallback",
+                scope="daemon",
+                # Windows keeps CTRL+C; POSIX isolates custody failure cleanup
+                # and the successor from the caller's terminal hangup.
+                new_process_group=not IS_WINDOWS,
+                cwd=str(repo_dir),
+                env=env,
+            )
+            if transaction and transaction.get("supervisor_pid") == os.getpid():
+                try:
+                    transaction["direct_spawn_successor"] = proc._ouroboros_custody
+                    delegate_recovery._write_restart_transaction(DATA_DIR, transaction)
+                except Exception:
+                    log.exception("Spawned successor could not bind restart returns; saved work remains held.")
         log.info("Spawned the replacement server process.")
     except Exception:
         log.exception("Spawned restart fallback failed; no successor was started.")

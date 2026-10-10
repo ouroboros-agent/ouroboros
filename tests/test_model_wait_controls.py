@@ -412,8 +412,8 @@ def test_real_main_control_preserves_candidate_without_new_summary(main_call, mo
     gateway.dispatch = ["response_received", "not_started"]
     held = []
 
-    def hold(content, limit, trace, actual_tools, *_args, explicit_candidate=False):
-        assert explicit_candidate is False, "this fixture holds the first ordinary answer"
+    def hold(content, limit, trace, actual_tools, *_args, explicit_candidate=False, resume_candidate=False):
+        assert explicit_candidate is False and resume_candidate is False, "this fixture holds the first ordinary answer"
         held.append(loop._replace_delivery_candidate(actual_tools, limit, trace, content, control="hold_for_verification"))
         if stop == "wrap_unknown":
             gateway.pending = True

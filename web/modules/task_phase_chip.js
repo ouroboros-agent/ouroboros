@@ -25,15 +25,20 @@ const CHIP = {
     thinking: () => tr('task.chip.thinking', 'Thinking'),
     queued: () => tr('task.chip.queued', 'Queued'),
     ownerWait: () => tr('task.chip.waiting_for_answer', 'Waiting for your answer'),
+    reviewWorkFinishing: () => tr('task.chip.review_work_finishing', 'review work finishing'),
 };
 
-export function pausePhaseLabel(phase, cause = '') {
+export function pausePhaseLabel(phase, cause = '', finishingReviews = false) {
     const label = phase === 'budget_pausing' ? CHIP.pausing() : CHIP.paused();
     const reasons = { budget: ['budget', 'budget limit'], owner: ['owner', 'owner pause'],
         restart: ['restart', 'after restart'], sleep: ['sleep', 'sleep'] };
     const reason = reasons[cause];
-    return reason ? fmt('{state} · {reason}', { state: label,
+    const text = reason ? fmt('{state} · {reason}', { state: label,
         reason: tr(`task.pause_cause.${reason[0]}`, reason[1]) }) : label;
+    // Owner 2026-10-08: reviewers already launched finish separately and visibly.
+    // The census names tasks and model sends alike, so the chip names no count.
+    return finishingReviews ? fmt('{state} · {finishing}', { state: text,
+        finishing: CHIP.reviewWorkFinishing() }) : text;
 }
 
 export function activityWaitPhase(activity = {}) {
@@ -58,7 +63,8 @@ function outcomeView(outcome) {
 // summaries. Outcome and ongoing finalization are independent; a Failed label
 // never animates merely because the task still has post-task work.
 export function taskActivityPresentation({ phase = 'working', outcome = '', ended = false,
-    finalizing = false, ownerWait = '', modelWaiting = false, hold = '', pauseCause = '', stopPolicy = '' } = {}) {
+    finalizing = false, ownerWait = '', modelWaiting = false, hold = '', pauseCause = '', stopPolicy = '',
+    finishingReviews = false } = {}) {
     if (ended) return outcomeView(outcome);
     if (stopPolicy) {
         const motion = ['working', 'thinking', 'finalizing'].includes(phase) && !modelWaiting && !ownerWait && !hold;
@@ -68,7 +74,9 @@ export function taskActivityPresentation({ phase = 'working', outcome = '', ende
     let current;
     if (phase === 'unknown') current = phaseView('unknown', CHIP.unconfirmed(), 'warn');
     else if (['budget_paused', 'budget_pausing'].includes(phase)) {
-        const label = [pausePhaseLabel(phase, pauseCause), hold].filter(Boolean).join(' · ');
+        // Only a settled Pause names the reviews it lets finish (owner 2026-10-08).
+        const finishing = phase === 'budget_paused' && Boolean(finishingReviews);
+        const label = [pausePhaseLabel(phase, pauseCause, finishing), hold].filter(Boolean).join(' · ');
         current = phaseView(phase === 'budget_paused' ? 'paused' : 'working', label,
             phase === 'budget_paused' ? 'warn' : 'working waiting', false, true);
     } else if (ownerWait === 'owner_wait') current = phaseView('waiting', CHIP.ownerWait(), 'warn', false, true);
@@ -108,6 +116,7 @@ export function censusTaskPhase(activity, detail = null, connected = true, model
         phase: connected && activity && !activity._activityUnconfirmed ? activity.phase || 'unknown' : 'unknown',
         ownerWait: activityWaitPhase(activity || {}), modelWaiting,
         hold: activity?.project_admission_hold?.label || '', pauseCause: activity?.pause_cause || '',
+        finishingReviews: Boolean(activity?.finishing_reviews),
     });
 }
 
@@ -124,6 +133,7 @@ function recordPhase(record = {}, terminalPhase = 'done') {
         ownerWait,
         modelWaiting: Boolean(record.modelWaiting), hold: record.projectHold,
         pauseCause: record.pauseCause, stopPolicy: record.cancelPendingPolicy,
+        finishingReviews: Boolean(record.finishingReviews),
     });
 }
 
@@ -153,6 +163,7 @@ export function syncParkedPhase(record, phase = '', activity = {}) {
     record.parkedPhase = parked;
     record.pauseCause = cause;
     record.censusPhase = phase;
+    record.finishingReviews = parked === 'budget_paused' && Boolean(activity.finishing_reviews);
     const desired = desiredLiveCardPhase(record);
     return setLiveCardPhase(record, desired.phase, desired.text, desired.className, desired.secondary);
 }

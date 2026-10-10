@@ -715,7 +715,10 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # 349 -> 351: review_history_view retains the selected authored capsule and the
 # transfer-only checkpoint as review-history-view / review-transfer files in the
 # existing context_checkpoints CAS (two section-7 rows; retention is unchanged).
-EXPECTED_SCAN_PATHS = 351
+# 351 -> 353 (#1563 saved work): the rolling per-attempt working checkpoint,
+# ``task_results/artifacts/<task>/source_handles/working`` and its ``*.json`` file
+# (``ouroboros/working_checkpoint.py``; one row beside the source-handle rows).
+EXPECTED_SCAN_PATHS = 353
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts

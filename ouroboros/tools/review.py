@@ -1449,13 +1449,13 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
         )
         if pending_block is not None:
             return pending_block
-    failed_actors = [
-        _review_actor_label(r) for r in triad_raw
-        if r.get("status") not in ("responded", "not_dispatched")]
+    failed_actors = [_review_actor_label(r) for r in triad_raw
+                     if r.get("status") not in ("responded", "not_dispatched")]
     quorum = verdict["quorum"]
-    if verdict["aggregate"] == "QUORUM_FAILED":
+    if verdict["aggregate"] in ("QUORUM_FAILED", "NOT_DISPATCHED"):  # a wave that sent nothing ($0) has no quorum
         ctx._last_review_block_reason = "review_quorum"
-        unavailable_str = ", ".join(failed_actors) if failed_actors else ", ".join(errored_models)
+        unavailable_str = ", ".join(failed_actors or errored_models or (sorted(  # each $0 refusal names its cause
+            {str(r.get("raw_text") or "") for r in triad_raw}) if verdict["aggregate"] == "NOT_DISPATCHED" else []))
         blocked_msg = (
             f"⚠️ REVIEW_BLOCKED: Only {quorum['responded']} of {quorum['assigned']} review "
             f"models responded successfully (minimum {quorum['required']} required). "

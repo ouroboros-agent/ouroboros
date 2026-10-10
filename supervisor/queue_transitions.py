@@ -283,7 +283,7 @@ def _resume_unstarted_owner_paused_root(q: Any, task: Dict[str, Any], fence: Dic
     """
     from ouroboros.owner_pause import FENCE_RELEASED, launch_lock, read_fence, set_fence_state
     from supervisor.events_budget import (
-        BUDGET_HOLD_KEY, HOLD_OWNER_RESTART, budget_hold_fact, hold_root_resume_descendants,
+        BUDGET_HOLD_KEY, HOLD_OWNER_RESTART, HOLD_SAVED_WORK, budget_hold_fact, hold_root_resume_descendants,
     )
 
     task_id = str(task.get("id") or "")
@@ -292,7 +292,9 @@ def _resume_unstarted_owner_paused_root(q: Any, task: Dict[str, Any], fence: Dic
     if not safe and not admitted:
         return {"ok": False, "error": error, "action": "cancel_or_new_run"}
     hold = budget_hold_fact(task)
-    if hold and hold.get("reason") != HOLD_OWNER_RESTART:
+    # This explicit root Resume releases both its Pause and its app-stop hold.
+    # All other holds, observed effects and durable write gates still bind.
+    if hold and hold.get("reason") not in {HOLD_OWNER_RESTART, HOLD_SAVED_WORK}:
         return {"ok": False, "error": str(hold.get("reason") or "selection_owner_held")}
     if observation.get("blockers"):
         return {"ok": False, "error": "predecessor_writers_unsettled", "blockers": observation["blockers"]}
@@ -346,6 +348,17 @@ def pending_member_replay_safe(q: Any, member: Dict[str, Any]) -> Tuple[bool, st
 
     if member.get("_owner_hold"):
         return False, "owner_held"
+    if "_working_recovery" in member:
+        # A locator alone does not authorize Resume: read its exact frozen source
+        # and the target attempt's durable launch evidence, as assignment does.
+        from supervisor.task_admission import _working_resume_granted
+
+        try:
+            if _working_resume_granted(member, q.DRIVE_ROOT):
+                return True, ""
+        except (OSError, ValueError, TypeError, KeyError):
+            log.warning("Saved work Resume evidence unavailable for %s", member.get("id"), exc_info=True)
+        return False, "dispatch_outcome_unknown"
     if not restore_allowed(member):
         return False, "dispatch_outcome_unknown"
     if member.get("_owner_hold"):
@@ -396,6 +409,15 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
     external = observation = None
     with q._queue_lock:
         located = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
+    if located is None:
+        # A member parked WARM under the owner's Pause (its stack retained while a
+        # started critic finishes) wakes on the fence; the owner's own Resume and
+        # a model's selection reach it here.
+        from supervisor.budget_resume import resume_warm_owner_pause_root
+
+        warm = resume_warm_owner_pause_root(task_id, selected_by=selected_by)
+        if warm is not None:
+            return warm
     if located is None and not selected_by:
         # An answered root's paused remainder (D10) resumes through its own grant.
         from supervisor.budget_resume import resume_late_phase
@@ -442,12 +464,12 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
         external = observe_task_runs(result_root, task_id, reason="budget_resume_uncovered_cost",
                                      request_stop=not owner_paused)
         if owner_paused:
-            from supervisor.continuation_admission import conflicting_writers
+            from supervisor.continuation_admission import action_writers
 
             # A saved loop is not proof that its handed tools/processes ended.
             # Observe the existing whole-tree custody owner off the queue lock.
             try:
-                external["owner_pause_tree"] = {"fence": owner_fence, "blockers": conflicting_writers(
+                external["owner_pause_tree"] = {"fence": owner_fence, "blockers": action_writers(
                     q, root_task_id, drive_root=result_root,
                     owner_pause_fence_id=str(owner_fence.get("fence_id") or "") if fence_closed(owner_fence) else "")}
             except Exception as exc:
@@ -459,10 +481,10 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
                 and str(located_state.get("root_task_id") or task_id) == task_id):
             # An owner-paused root whose own dispatch was already admitted resumes
             # only over this fresh, off-lock whole-tree observation (Pause A).
-            from supervisor.continuation_admission import conflicting_writers
+            from supervisor.continuation_admission import action_writers
 
             try:
-                observation["owner_pause_blockers"] = conflicting_writers(
+                observation["owner_pause_blockers"] = action_writers(
                     q, task_id, drive_root=result_root, owner_pause_fence_id=str(owner_fence["fence_id"]))
             except Exception as exc:
                 observation["owner_pause_blockers"] = [{"kind": "tree_census_unreadable", "detail": str(exc)[:200]}]

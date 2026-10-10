@@ -2128,16 +2128,38 @@ def test_a_failing_post_commit_gate_stops_publication(monkeypatch):
     # starts at the TAG, not at the push. Pinned in source because driving the
     # whole commit path here would assert on mock scaffolding instead of the
     # ordering that matters.
+    import ast
+
     src = inspect.getsource(git_module._repo_commit_push)
     assert "gate_failure = _managed_post_commit_tests_gate(" in src
-    guard = src.index("if gate_failure:")
-    assert guard < src.index("_auto_tag_on_version_bump("), (
-        "the version tag is created before the gate's verdict is read"
-    )
-    assert guard < src.index("_auto_push("), "the push happens before the gate's verdict is read"
-    assert guard < src.index("managed_assisted_postcommit("), (
-        "the managed-update path runs before the gate's verdict is read"
-    )
+    tree = ast.parse(src)
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                 and isinstance(node.test, ast.Name) and node.test.id == "gate_failure")
+    assert isinstance(guard.body[0], ast.Return) and guard.body[0].value.id == "gate_failure"
+    effects = {"_auto_tag_on_version_bump": [], "_auto_push_after_review": [], "_auto_push": [],
+               "_finish_managed_commit": []}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        target = node.func.id
+        if target == "run_operation" and len(node.args) > 1 and isinstance(node.args[1], ast.Name):
+            target = node.args[1].id  # Pause now gates tagging through the real wrapper.
+        if target in effects:
+            effects[target].append(node.lineno)
+    assert {name: len(lines) for name, lines in effects.items()} == {
+        "_auto_tag_on_version_bump": 1, "_auto_push_after_review": 2, "_auto_push": 0,
+        "_finish_managed_commit": 1}
+    assert all(guard.lineno < line for lines in effects.values() for line in lines), effects
+    finish = ast.parse(inspect.getsource(git_module._finish_managed_commit))
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "run_operation" and len(node.args) > 1
+               and isinstance(node.args[1], ast.Name) and node.args[1].id == "managed_assisted_postcommit"
+               for node in ast.walk(finish)), "the shared managed tail must gate smoke admission"
+    push = ast.parse(inspect.getsource(git_module._auto_push_after_review))
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "run_operation" and len(node.args) > 1
+               and isinstance(node.args[1], ast.Name) and node.args[1].id == "_auto_push"
+               for node in ast.walk(push)), "the guarded wrapper must still gate the actual push"
     # ...and the helper records the terminal failed attempt rather than dropping it.
     helper = inspect.getsource(git_module._managed_post_commit_tests_gate)
     assert 'block_reason="post_commit_tests_failed"' in helper

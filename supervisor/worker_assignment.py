@@ -548,7 +548,7 @@ def assign_tasks() -> None:
                 _pool().PENDING.pop(chosen_idx)
                 w.busy_task_id = task["id"]
                 now_ts = time.time()
-                resume = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
+                resume = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or task.get("_working_recovery") or {}
                 _pool().RUNNING[task["id"]] = {
                     "task": dict(task), "worker_id": w.wid,
                     "started_at": float(resume.get("started_at") or now_ts), "last_heartbeat_at": now_ts,

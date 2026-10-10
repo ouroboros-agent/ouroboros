@@ -1,8 +1,9 @@
 """The durable queue snapshot: what a restart finds and what it may restore.
 
 The snapshot is written under the queue lock from the live PENDING/RUNNING rows and
-the acceptance fences beside them, and restored only while PENDING is empty and the
-file is young enough to describe the world the supervisor is waking into.
+the acceptance fences beside them, and restored only while PENDING is empty.
+Accepted work survives at any age; only a fresh acknowledged Restart transaction
+returns it to ordinary admission. Other application stops require explicit Resume.
 """
 
 from __future__ import annotations
@@ -167,6 +168,10 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "_cancel_intent_authority_hold": t.get("_cancel_intent_authority_hold"),
                 "_owner_wait_resume": t.get("_owner_wait_resume"),
                 "_budget_pause_resume": t.get("_budget_pause_resume"),
+                # The accepted successor may stop again before first dispatch.
+                # Keep its frozen cognition source; the original attempt's
+                # rolling checkpoint is not this successor's start authority.
+                **({"_working_recovery": t["_working_recovery"]} if "_working_recovery" in t else {}),
                 # The durable non-dispatch hold (#1196) and any recorded
                 # selection: a restart must not silently make a held row runnable.
                 "_budget_pause_hold": t.get("_budget_pause_hold"),
@@ -331,7 +336,8 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     Project holds retain custody through age/receipt uncertainty without
     dispatch permission, beside (never instead of) Restart holds, and refuse a
     possible handoff's replay themselves; a fresh host-unscoped possible handoff
-    is held, never replayed. Every other row needs a fresh snapshot.
+    is held, never replayed. Accepted work without a returning transaction waits
+    for explicit Resume regardless of age, beside any Project verification hold.
     Returns retained rows, unseen pause ids, consumed task ids, and the roots'
     pre-park rows. Unseen pauses use those transient rows to apply the ordinary
     latch generation rule before parking erased their prior selection.
@@ -343,12 +349,20 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import (HOLD_OWNER_RESTART, HOLD_PANIC, HOLD_RESTORE_REFUSED_PREFIX,
                                           hold_budget_row, hold_restored_budget_pause)
-    from supervisor.restart_retention import (hold_after_stop, hold_for_owner_restart, never_started, pause_ids,
+    from supervisor.restart_retention import (fresh_return_transaction, hold_after_stop, hold_for_owner_restart,
+                                              hold_stopped_queue, never_started, panic_recorded, pause_ids,
+                                              recover_saved_running,
                                               retained_pending, saved_sleep_hold_reason, unseen_pause)
     from supervisor.schedule_occurrence import restore_allowed
 
     sleep_hold_reason = saved_sleep_hold_reason(_queue().DRIVE_ROOT)
     owner_restart, panic = sleep_hold_reason == HOLD_OWNER_RESTART, sleep_hold_reason == HOLD_PANIC
+    # A returning stop (fresh acknowledged Restart/update) names what it returns;
+    # any other stop holds the same saved work for an explicit Resume. Panic never returns.
+    panicked = panic or panic_recorded(_queue().DRIVE_ROOT)  # it wins over an owner Restart's flag
+    transaction = {} if panicked else fresh_return_transaction(_queue().DRIVE_ROOT)
+    returning_queue = set(transaction.get("queue_ids") or []) | set(transaction.get("return_ids") or [])
+    stop_cause = "panic" if panicked else "restart_unacknowledged" if owner_restart else "app_stop"
     prior_roots = {str(task["id"]): copy.deepcopy(task) for task in
                    snapshot_pending + [row.get("task") for row in running_rows if isinstance(row, dict)]
                    if isinstance(task, dict) and task.get("id")
@@ -361,6 +375,7 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
             if unseen_pause(task, before):
                 unseen.add(str(task.get("id") or ""))
     direct_rows: list = []
+    direct_saved: list = []
     for task_id in direct_caught:
         task_id = str(task_id or "")
         if not task_id:
@@ -376,9 +391,10 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                     pause = {**wait, "is_direct_chat": True}
         except Exception:
             continue
-        if not (stored and pause and pause.get("source_ref") and pause.get("is_direct_chat")):
+        saved_pause = bool(stored and pause and pause.get("source_ref") and pause.get("is_direct_chat"))
+        if not stored or not (saved_pause or stored.get("_is_direct_chat")):
             continue
-        attempt = int(pause.get("task_attempt") or 1)
+        attempt = int((pause or {}).get("task_attempt") or 1) if saved_pause else int(stored.get("task_attempt") or 1)
         record: dict = {
             "id": task_id, "type": "task", "chat_id": stored.get("chat_id"), "_is_direct_chat": True,
             "_attempt": attempt, "root_task_id": task_id, "depth": 0,
@@ -387,11 +403,18 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                     "task_contract", "title", "text", "budget_drive_root"):
             if stored.get(key) not in (None, ""):
                 record[key] = stored[key]
-        direct_rows.append({"task": record, "attempt": attempt})
+        (direct_rows if saved_pause else direct_saved).append({"task": record, "attempt": attempt})
     before_park = {str(row["task"].get("id") or ""): pause_ids(row["task"]) for row in running_rows
                    if isinstance(row, dict) and isinstance(row.get("task"), dict)}
     parked = _park_pausing_running_rows(list(running_rows) + direct_rows, snapshot_pending,
         sleep_hold_reason=sleep_hold_reason)
+    taken = {str(task.get("id") or "") for task in list(snapshot_pending) + parked}
+    # Interrupted work whose state was saved returns (or waits) under its own id
+    # instead of the shutdown fence's cancellation (#1563).
+    parked += recover_saved_running(
+        [row for row in list(running_rows) + direct_saved if isinstance(row, dict)
+         and str((row.get("task") or {}).get("id") or "") not in taken],
+        _queue().DRIVE_ROOT, transaction=transaction, cause=stop_cause)
     unseen.update(str(task.get("id") or "") for task in parked
                   if unseen_pause(task, before_park.get(str(task.get("id") or ""), ("", ""))))
     retained = []
@@ -414,6 +437,12 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
             # An existing Project hold is custody; its revalidation reads the owner-wait authority.
             if task.get("_project_admission_restore_hold") or restore_owner_wait_allowed(_queue().DRIVE_ROOT, task):
                 retained.append(task)
+            else:  # a refused cold handoff keeps its exact wait source, held for Resume
+                handoff = dict(task)
+                handoff.pop("_owner_wait_resume", None)
+                retained.extend(recover_saved_running(
+                    [{"task": handoff, "attempt": int(task.get("_attempt") or 1)}], _queue().DRIVE_ROOT,
+                    transaction={}, cause=stop_cause))
         else:
             # Age or an unavailable receipt cannot erase accepted Project work;
             # assignment still requires positive original no-dispatch authority.
@@ -427,8 +456,11 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
             elif not project_hold and host_unscoped(task) and not stale and dispatch != "none" and schedule_replay:
                 project_hold = {"reason": "project_routing_fence_lookup_failed",
                                 "detail": "The task may already have reached a worker; automatic recovery is not authorized."}
+            saved_or_accepted = never_started(task) or isinstance(task.get("_working_recovery"), dict)
             if retained_pending(task, sleep_hold_reason=sleep_hold_reason):
                 row = task
+            elif str(task.get("id") or "") in returning_queue and saved_or_accepted and schedule_replay:
+                row = task  # the fresh Restart returns it: ordinary admission, at any age
             elif owner_restart and never_started(task) and schedule_replay:
                 row = hold_for_owner_restart(dict(task), _queue().DRIVE_ROOT)
             elif owner_restart and (not schedule_replay or not never_started(task)) or dispatch == "possible" and not project_hold:
@@ -436,8 +468,15 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                 hold_budget_row(row, reason="dispatch_outcome_unknown",
                                 detail="an assignment may have reached a worker; reconcile its receipt before resuming",
                                 result_root=_queue().DRIVE_ROOT)
-            elif not project_hold and (not schedule_replay or stale):
-                continue  # a possibly-dispatched/unprovable schedule-born row is never replayed; stale rows expire
+            elif not project_hold and not schedule_replay:
+                continue  # a possibly-dispatched/unprovable schedule-born row is never replayed
+            elif saved_or_accepted:
+                # Quit/crash retain ALL accepted work for explicit Resume (#1563).
+                # Project verification is independent: healing it cannot release
+                # the owner's application-stop hold, even for a fresh snapshot.
+                row = hold_stopped_queue(dict(task), _queue().DRIVE_ROOT, stop_cause)
+            elif not project_hold and stale:
+                continue  # no provable never-started fact: the old snapshot-age rule still decides
             else:
                 row = task  # Project custody is retained, not replayed: terminal/cancel checks below still run
             retained.append({**row, "_project_admission_restore_hold": project_hold} if project_hold else row)
@@ -744,7 +783,7 @@ def _record_queue_restore(
 def restore_pending_from_snapshot(
     max_age_sec: int = 900, *, terminalized: Optional[list] = None,
 ) -> int:
-    """Restore recent pending tasks from queue snapshot.
+    """Restore retained pending tasks from the queue snapshot.
 
     Returns the PENDING count revived; ``terminalized`` separately collects
     surviving RUNNING ids fenced with cancel intents for the caller to name.
@@ -803,6 +842,10 @@ def restore_pending_from_snapshot(
                          if task_id not in live_direct and task_id not in pending_ids]
         snapshot_pending, unseen_pauses, consumed_rows, prior_roots = _retain_snapshot_pending(
             snapshot_pending, running_rows, stale=stale, direct_caught=direct_caught)
+        from supervisor.restart_retention import consume_return_transaction, fresh_return_transaction
+
+        # This boot decided the returns; a later stop can never reuse the transaction.
+        consume_return_transaction(_queue().DRIVE_ROOT, fresh_return_transaction(_queue().DRIVE_ROOT))
         fenced_running = _fence_snapshot_running_rows(
             running_rows
             + [{"id": task_id} for task_id in direct_caught]

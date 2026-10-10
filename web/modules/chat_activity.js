@@ -416,8 +416,8 @@ const PAUSING_PHASES = new Set(['budget_pausing', 'pausing']);
  */
 export function restartConfirmBody(activities) {
     const lines = [
-        'Running tasks stop. Tasks already paused stay paused.',
-        'Queued tasks that have not started are kept on hold under the same task, and wait for your Resume.',
+        'Running tasks stop, then eligible saved work resumes after the restart. Tasks already paused stay paused.',
+        'Runnable queued tasks return to the queue. Existing holds and limits still apply.',
         'Saved settings apply after the restart.',
     ];
     if (!Array.isArray(activities) || activities.some((row) => row?.phase === 'unknown')) {

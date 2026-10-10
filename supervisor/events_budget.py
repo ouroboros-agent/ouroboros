@@ -644,9 +644,11 @@ HOLD_CONTINUATION_WRITER = "continuation_writer_unsettled"
 # explicit Resume after the owner's next launch does (a Restart holds it the
 # same way under ``owner_restart_hold``).
 HOLD_PANIC = "panic_hold"
+# Quit, crash, Panic or an unacknowledged restart: explicit same-ID Resume (restart_retention).
+HOLD_SAVED_WORK = "saved_work_hold"
 SELECTABLE_HOLD_REASONS = frozenset({
     HOLD_ROOT_FENCE_LIFTED, HOLD_ROOT_FENCE_MEMBER_SELECTION, HOLD_OWNER_RESTART, HOLD_CONTINUATION_WRITER,
-    HOLD_PANIC})
+    HOLD_PANIC, HOLD_SAVED_WORK})
 # Malformed acceptance-fence evidence in the snapshot fails the restore closed
 # for ordinary rows; a saved exact pause is retained under this hold instead.
 HOLD_INVALID_ACCEPTANCE_FENCE_SNAPSHOT = HOLD_RESTORE_REFUSED_PREFIX + "invalid_acceptance_fence_snapshot"
@@ -704,12 +706,11 @@ def budget_resume_dispatch_allowed(q: Any, task: Dict[str, Any]) -> bool:
 
 def hold_budget_row(task: Dict[str, Any], *, reason: str, detail: str = "",
                     extra: Optional[Dict[str, Any]] = None,
-                    result_root: Optional[pathlib.Path] = None) -> Dict[str, Any]:
+                    result_root: Optional[pathlib.Path] = None, existing_result_only: bool = False) -> Dict[str, Any]:
     """Hold one queued row: typed, visible, never dropped and never cancelled.
 
-    The row stays PENDING with its own identity; any spent resume handoff is
-    removed so no stale grant can dispatch, and the typed reason is projected
-    onto the task result so the owner and the model read the same fact.
+    Keep the PENDING identity, remove stale resume grants and project the same
+    reason to the result. Restore can require valid existing result authority.
     """
     hold = {"reason": str(reason), "detail": str(detail or "")[:300], "held_at": utc_now_iso(),
             "selected": False, "dispatchable": False, **(extra or {})}
@@ -719,11 +720,15 @@ def hold_budget_row(task: Dict[str, Any], *, reason: str, detail: str = "",
         try:
             write_task_result(
                 result_root, str(task.get("id") or ""), STATUS_SCHEDULED,
-                reason_code=(HOLD_OWNER_RESTART if reason == HOLD_OWNER_RESTART else
+                reason_code=(reason if reason in {HOLD_OWNER_RESTART, HOLD_SAVED_WORK} else
                              "owner_paused" if hold.get("cause") == "owner_pause" else "budget_paused"),
-                resource_limit={"status": "budget_hold", "auto_resume": False,
-                                "exact_continuation": False,
+                resource_limit={"status": "budget_hold", "auto_resume": False, "exact_continuation": False,
                                 "resume_policy": "explicit_selection_same_seam", **hold},
+                # Restoring accepted work must not manufacture a scheduled
+                # receipt over missing/corrupt authority. Keep the queue hold.
+                _field_projector=(lambda current, incoming: incoming if current else None)
+                    if existing_result_only else None,
+                strict_existing_dict=existing_result_only,
             )
         except Exception:
             log.debug("Budget hold projection failed for %s", task.get("id"), exc_info=True)
@@ -837,7 +842,7 @@ def observe_held_budget_selection(q: Any, task_id: str) -> Dict[str, Any]:
     invalidates this observation rather than inheriting its permission.
     """
     from supervisor.queue_transitions import pending_member_replay_safe
-    from supervisor.continuation_admission import conflicting_writers
+    from supervisor.continuation_admission import action_writers
 
     try:
         with q._queue_lock:
@@ -847,7 +852,7 @@ def observe_held_budget_selection(q: Any, task_id: str) -> Dict[str, Any]:
             authority = _held_selection_authority(q, task)
         candidate = authority["task"]
         predecessor = str(((candidate.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id") or "")
-        blockers = conflicting_writers(q, predecessor) if predecessor else []
+        blockers = action_writers(q, predecessor) if predecessor else []
         safe, error = pending_member_replay_safe(q, candidate)
         return {"candidate": task, "authority": authority, "blockers": blockers,
                 "safe": safe, "unsafe_error": error}
@@ -973,7 +978,23 @@ def live_root_resume_grant(q: Any, root_task_id: str, result_root: pathlib.Path)
     if (row.get("state") not in {STATE_RESUME_GRANTED, STATE_RESUMED}
             or not str(row.get("pause_id") or "").strip()
             or not str(grant.get("grant_id") or "").strip() or grant.get("revoked_at")):
-        return {}
+        return _warm_root_resume_grant(pathlib.Path(root_drive or result_root), root_task_id)
     return {"grant_id": str(grant["grant_id"]),
             "generation": int(row.get("resume_generation") or 0),
             "pause_id": str(row.get("pause_id") or "")}
+
+
+def _warm_root_resume_grant(result_root: pathlib.Path, root_task_id: str) -> Dict[str, Any]:
+    """A root that parked WARM under the owner's Pause has no pause row: its Resume
+    grant rides the released fence (``budget_resume.resume_warm_owner_pause_root``).
+    A newer Pause mints a new closed fence without it, so the old grant is dead."""
+    from ouroboros.owner_pause import fence_closed, read_fence
+
+    try:
+        fence = read_fence(result_root, root_task_id)
+    except Exception:
+        return {}
+    grant = fence.get("resume_grant") if isinstance(fence.get("resume_grant"), dict) else {}
+    if fence_closed(fence) or not str(grant.get("grant_id") or "").strip() or grant.get("revoked_at"):
+        return {}
+    return {"grant_id": str(grant["grant_id"]), "generation": int(grant.get("generation") or 0), "pause_id": ""}

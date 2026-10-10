@@ -15,6 +15,7 @@ import pathlib
 from ouroboros.tools import (
     git,
     git_evolution,
+    git_managed_postcommit,
     git_plumbing,
     git_repo_edit,
     git_review_cycle,
@@ -25,7 +26,7 @@ from ouroboros.tools import (
 REPO = pathlib.Path(__file__).parents[1]
 TOOLS = REPO / "ouroboros" / "tools"
 
-_LEAVES = (git_plumbing, git_review_cycle, git_evolution, git_repo_edit, git_vcs_ops)
+_LEAVES = (git_plumbing, git_review_cycle, git_managed_postcommit, git_evolution, git_repo_edit, git_vcs_ops)
 
 _MOVED_OWNERS = {
     "_BINARY_EXTENSIONS": git_plumbing,
@@ -49,6 +50,10 @@ _MOVED_OWNERS = {
     "_run_reviewed_stage_cycle": git_review_cycle,
     "_stage_candidate_for_review": git_review_cycle,
     "_verify_reviewed_commit_binding": git_review_cycle,
+    "_finish_managed_commit": git_managed_postcommit,
+    "_managed_commit_paused": git_managed_postcommit,
+    "_managed_post_commit_tests_gate": git_managed_postcommit,
+    "_resume_managed_commit": git_managed_postcommit,
     "_check_evolution_commit_stage": git_evolution,
     "_evolution_commit_authority": git_evolution,
     "_evolution_publication_stopped_result": git_evolution,

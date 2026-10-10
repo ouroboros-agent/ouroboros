@@ -17,9 +17,11 @@ TARGET = "b" * 40
 
 
 @pytest.fixture(autouse=True)
-def _reset_writer_admission():
+def _reset_writer_admission(monkeypatch):
+    import supervisor.restart_retention as retention
     import supervisor.workers as workers
 
+    monkeypatch.setattr(retention, "_update_returns", {})
     workers.open_repo_writer_admission()
     yield
     workers.open_repo_writer_admission()

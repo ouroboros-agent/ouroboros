@@ -605,6 +605,18 @@ def _auto_push(repo_dir: pathlib.Path) -> str:
         return " [push failed — will retry later]"
 
 
+def _auto_push_after_review(ctx: ToolContext, *, publication_paused: bool = False) -> str:
+    """A completed commit remains completed when Pause refuses its later push."""
+    from ouroboros.owner_pause import OwnerPauseRefused, run_operation
+
+    try:
+        if publication_paused:
+            raise OwnerPauseRefused("owner_pause")
+        return run_operation(ctx, _auto_push, ctx.repo_dir)
+    except OwnerPauseRefused as exc:
+        return f" [push not started: owner pause ({exc})]"
+
+
 MAX_TEST_OUTPUT = 8000
 _consecutive_test_failures: int = 0
 
@@ -736,54 +748,6 @@ def _managed_committing_phase_error(managed_tx: Dict[str, Any]) -> Optional[str]
             "preserved for recovery, nothing was committed, and restart/recovery "
             "is required."
         )
-
-
-def _managed_post_commit_tests_gate(
-    ctx, commit_message: str, commit_start: float, skip_tests: bool,
-    test_warning_ref, managed_tx: Dict[str, Any],
-    fingerprints: Tuple[Dict[str, Any], Dict[str, Any]] = ({}, {}),
-) -> Optional[str]:
-    """BLOCKING post-commit test gate for managed-update merges only: a failed
-    suite rolls the assisted merge back instead of shipping a warning (ordinary
-    commits keep the warning-only contract later in the flow). The gate is
-    MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
-    can wave a managed merge through untested. The shared runner reuses a
-    PROCESS-HELD proof only when candidate files, source index, HEAD and the
-    effective test/environment contract match, after the distinct post-commit
-    baseline checks. A commit changes HEAD and requires a fresh run; repeated
-    checks of the same subject may reuse it. The authority is the ctx record;
-    durable ``tests_evidence`` tx copy is resolver-writable forensics and a
-    forged tree there never suppresses this run; a restart loses the proof
-    and requires a fresh run. The terminal record carries the
-    same review metadata/fingerprints as every sibling failure record, so an
-    operator can reconstruct WHICH reviewed revision the gate rejected."""
-    if not managed_tx:
-        return None
-    del skip_tests  # deliberately ignored for managed merges
-    # The shared runner rechecks the post-commit baseline before comparing the
-    # complete workload. A tree-only fast path here would skip both checks.
-    post_test_error = _post_commit_result(
-        ctx, commit_message, False, test_warning_ref, force=True,
-    )
-    if not post_test_error:
-        return None
-    failure = test_warning_ref[0].strip() or post_test_error
-    failure = _managed_commit_gate_failure("assisted_post_commit_tests_failed", failure)
-    pre_fingerprint, post_fingerprint = fingerprints
-    _record_commit_attempt(
-        ctx, commit_message, "failed",
-        block_reason="post_commit_tests_failed", block_details=failure,
-        duration_sec=time.time() - commit_start, phase="post_commit_tests",
-        pre_review_fingerprint=(pre_fingerprint or {}).get("fingerprint", ""),
-        post_review_fingerprint=(post_fingerprint or {}).get("fingerprint", ""),
-        fingerprint_status="matched",
-        triad_models=getattr(ctx, "_last_triad_models", []),
-        scope_model=getattr(ctx, "_last_scope_model", ""),
-        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
-    )
-    return failure
 
 
 def _review_binding_failure(
@@ -1105,6 +1069,41 @@ def _commit_request_refusals(ctx: ToolContext, *, root: str, preflight_reviewer:
     return None, f"⚠️ TOOL_ARG_ERROR: {error} Nothing was staged, reviewed or recorded."
 
 
+def _commit_reviewed_candidate(ctx, commit_message, started_at, managed_tx):
+    """Admit the reviewed Git commit and return its SHA or its recorded refusal/error.
+
+    A completed review grants no later effect. The command joins outside the
+    launch lock, so Pause stays prompt and an admitted command keeps its result.
+    """
+    from ouroboros.owner_pause import OwnerPauseRefused, run_operation
+
+    try:
+        run_operation(ctx, run_cmd, ["git", "commit", "-m", commit_message], cwd=ctx.repo_dir)
+        return run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip(), ""
+    except OwnerPauseRefused as exc:
+        message = (f"⚠️ OWNER_PAUSE_NOT_STARTED: Commit NOT STARTED ({exc}). "
+                   "The reviewed candidate and review results are retained; no commit, tag or push was started.")
+        _record_commit_attempt(ctx, commit_message, "blocked", block_reason="owner_pause",
+                               block_details=message, duration_sec=time.time() - started_at,
+                               phase="commit", triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+                               scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}))
+        return "", _publish_tool_result(ctx, ToolResult(status="blocked", code="OWNER_PAUSE_NOT_STARTED", text=message))
+    except Exception as exc:
+        error = f"⚠️ GIT_ERROR (commit): {_sanitize_git_error(str(exc))}"
+        if managed_tx:
+            from supervisor.update_merge import restore_assisted_resolution_after_commit_error
+            restore_assisted_resolution_after_commit_error(managed_tx)
+        _record_commit_attempt(ctx, commit_message, "failed",
+                               block_reason="infra_failure", block_details=error,
+                               duration_sec=time.time() - started_at,
+                               triad_models=getattr(ctx, "_last_triad_models", []),
+                               scope_model=getattr(ctx, "_last_scope_model", ""),
+                               triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+                               scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+                               degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
+        return "", error
+
+
 def _repo_commit_push(ctx: ToolContext, commit_message: str,
                        paths: Optional[List[str]] = None,
                        skip_tests: bool = False,
@@ -1140,6 +1139,8 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                block_reason="managed_update_in_progress", block_details=_managed_block,
                                duration_sec=0.0, phase="preflight")
         return _managed_block
+    if _managed_tx and _managed_tx.get("postcommit_resume"):
+        return _resume_managed_commit(ctx, _managed_tx, _commit_start)
     attribution_binding = None
     if _managed_tx:
         paths = None  # a managed merge always stages the WHOLE resolved tree (ignore paths)
@@ -1254,23 +1255,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             if _phase_error:
                 return _fail(_phase_error)
 
-        try:
-            run_cmd(["git", "commit", "-m", commit_message], cwd=ctx.repo_dir)
-            commit_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
-        except Exception as e:
-            err_msg = f"⚠️ GIT_ERROR (commit): {_sanitize_git_error(str(e))}"
-            if _managed_tx:
-                from supervisor.update_merge import restore_assisted_resolution_after_commit_error
-                restore_assisted_resolution_after_commit_error(_managed_tx)
-            _record_commit_attempt(ctx, commit_message, "failed",
-                                   block_reason="infra_failure", block_details=err_msg,
-                                   duration_sec=time.time() - _commit_start,
-                                   triad_models=getattr(ctx, "_last_triad_models", []),
-                                   scope_model=getattr(ctx, "_last_scope_model", ""),
-                                   triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                                   scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                                   degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
-            return err_msg
+        from ouroboros.owner_pause import OwnerPauseRefused, run_operation
+
+        commit_sha, commit_error = _commit_reviewed_candidate(ctx, commit_message, _commit_start, _managed_tx)
+        if commit_error:
+            return commit_error
         binding_ok, binding_detail = _verify_reviewed_commit_binding(
             pathlib.Path(ctx.repo_dir),
             commit_sha,
@@ -1293,6 +1282,16 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 managed_tx=_managed_tx,
             )
         reviewed_binding = post_fingerprint.get("binding", {}) or {}
+        if _managed_tx:
+            # Persist this continuation only when a later phase refuses Pause.
+            # It is a commit/binding receipt, never proof that tests or smoke passed.
+            _managed_tx.update(merge_commit=commit_sha, postcommit_resume={
+                "commit_message": commit_message, "pre_fingerprint": pre_fingerprint,
+                "post_fingerprint": post_fingerprint,
+                "review_context": {key: getattr(ctx, key, None) for key in (
+                    "_last_triad_models", "_last_scope_model", "_last_triad_raw_results",
+                    "_last_scope_raw_result", "_review_degraded_reasons", "_author_commit_record")},
+            })
         gate_failure = _managed_post_commit_tests_gate(
             ctx, commit_message, _commit_start, skip_tests, test_warning_ref, _managed_tx,
             fingerprints=(pre_fingerprint, post_fingerprint),
@@ -1304,6 +1303,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         # diverge from origin). The official version tag is handled on the owner's terms.
         tag_info = ""
         created_tag = ""
+        publication_paused = False
         if not _managed_tx:
             if evolution_claim:
                 _, authority_error = _check_evolution_commit_stage(ctx, commit_message, _commit_start, phase="pre_tag_authority", commit_sha=commit_sha)
@@ -1311,18 +1311,19 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                     containment = _preserve_evolution_orphan(ctx, commit_sha)
                     return f"{authority_error}\n\n{containment}"
             reviewed_tag = str(reviewed_binding.get("expected_tag") or "")
-            tag_info = _auto_tag_on_version_bump(
-                pathlib.Path(ctx.repo_dir),
-                commit_message,
-                expected_commit_sha=commit_sha,
-                expected_tag=reviewed_tag,
-            )
+            try:
+                tag_info = run_operation(
+                    ctx, _auto_tag_on_version_bump, pathlib.Path(ctx.repo_dir), commit_message,
+                    expected_commit_sha=commit_sha, expected_tag=reviewed_tag)
+            except OwnerPauseRefused as exc:
+                publication_paused = True
+                tag_info = f" [tag not started: owner pause ({exc})]"
             created_tag = reviewed_tag if tag_info == f" [tagged: {reviewed_tag}]" else ""
         binding_ok, binding_detail = _verify_reviewed_commit_binding(
             pathlib.Path(ctx.repo_dir),
             commit_sha,
             post_fingerprint,
-            verify_expected_tag=not bool(_managed_tx),
+            verify_expected_tag=not bool(_managed_tx) and not publication_paused,
         )
         if not binding_ok:
             binding_msg = (
@@ -1347,11 +1348,15 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             )
             if receipt_error:
                 return receipt_error
-        if not _managed_tx:
+        if not _managed_tx and not publication_paused:
             # Ordinary self-modification contract: post-commit tests are reported
             # as a warning. Managed-update merges already ran them as the BLOCKING
             # assisted_post_commit_tests gate right after the commit above.
-            _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
+            try:
+                run_operation(ctx, _post_commit_result, ctx, commit_message, skip_tests, test_warning_ref)
+            except OwnerPauseRefused as exc:
+                publication_paused = True
+                tag_info += f" [post-commit tests not started: owner pause ({exc})]"
         push_status = ""
         if not _managed_tx and evolution_claim:
             publication_error = _evolution_publication_stopped_result(
@@ -1360,7 +1365,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             )
             if publication_error:
                 return publication_error
-            push_status = _auto_push(ctx.repo_dir) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
+            push_status = _auto_push_after_review(ctx, publication_paused=publication_paused) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
         ctx.last_reviewed_commit_sha = commit_sha
         body_candidate.record_reviewed_commit(ctx, commit_sha)
         if attribution_binding is not None:
@@ -1376,31 +1381,17 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 )
             except Exception:
                 log.warning("mutation baseline advance failed after commit", exc_info=True)
-        record_bound_commit_success(ctx, commit_message, _commit_start, pre_fingerprint, post_fingerprint)
-        ctx._coupling_review_history = {}  # the subject's coupling rounds end with its commit (the attempt rows keep them)
+        if not _managed_tx:  # a managed merge records its success after its post-commit phase
+            record_bound_commit_success(ctx, commit_message, _commit_start, pre_fingerprint, post_fingerprint)
+            ctx._coupling_review_history = {}  # the subject's coupling rounds end with its commit (the attempt rows keep them)
     finally:
         _release_git_lock(lock)
     if _managed_tx:
-        # Inline pre-restart smoke + tx transition (auto_merge parity); on failure it rolls back
-        # and the agent is told. No push (the merge lands locally; restart + boot finalize seal it).
-        from supervisor.update_merge import managed_assisted_postcommit
-
-        _ok_pc, _msg_pc = managed_assisted_postcommit(_managed_tx, commit_sha)
-        ctx.last_push_succeeded = False
-        if not _ok_pc:
-            # Smoke failed and the merge was rolled back — do NOT advertise an 'OK: committed'
-            # result (callers key on the leading text). Return the failure first + record it.
-            _record_commit_attempt(ctx, commit_message, "failed",
-                                   block_reason="managed_update_smoke_failed", block_details=_msg_pc,
-                                   duration_sec=time.time() - _commit_start)
-            return _msg_pc
-        return _publish_post_commit_test_fact(
-            ctx,
-            _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc,
-            test_warning_ref[0],
-        )
+        return _finish_managed_commit(
+            ctx, _managed_tx, commit_sha, commit_message, _commit_start, test_warning_ref,
+            (pre_fingerprint, post_fingerprint))
     if not evolution_claim:
-        push_status = _auto_push(ctx.repo_dir) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
+        push_status = _auto_push_after_review(ctx, publication_paused=publication_paused) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
     return _publish_reviewed_commit(
         ctx, commit_message, commit_sha, tag_info, test_warning_ref[0], paths, push_status,
     )
@@ -1544,6 +1535,14 @@ from ouroboros.tools.git_review_cycle import (  # noqa: E402,F401
     _run_reviewed_stage_cycle,
     _stage_candidate_for_review,
     _verify_reviewed_commit_binding,
+)
+
+
+from ouroboros.tools.git_managed_postcommit import (  # noqa: E402,F401
+    _finish_managed_commit,
+    _managed_commit_paused,
+    _managed_post_commit_tests_gate,
+    _resume_managed_commit,
 )
 
 

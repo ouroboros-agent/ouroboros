@@ -434,8 +434,8 @@ def test_same_round_delivery_uses_the_route_changed_inside_model_call(tmp_path, 
         call.active_model, call.active_use_local = "local-destination", True
         return {"role": "assistant", "content": "finished"}, 0, "max"
 
-    def final(_content, limit, trace, tools, *_args, explicit_candidate=False):
-        assert not explicit_candidate  # This fixture's first ordinary reply stays plain.
+    def final(_content, limit, trace, tools, *_args, explicit_candidate=False, resume_candidate=False):
+        assert not explicit_candidate and not resume_candidate  # This fixture's first ordinary reply stays plain.
         assert limit.active_model == tools._ctx.active_model == "local-destination"
         assert limit.active_use_local is tools._ctx.active_use_local is True
         return "finished", limit.accumulated_usage, trace
@@ -542,7 +542,8 @@ def _run_loop(tmp_path, monkeypatch, rounds, registry=None):
 
     monkeypatch.setattr(loop, "_call_round_model", call_round)
     monkeypatch.setattr(loop, "_no_tool_final_answer",
-                        lambda _content, limit, trace, *_args, explicit_candidate=False: ("finished", limit.accumulated_usage, trace))
+                        lambda _content, limit, trace, *_args, explicit_candidate=False, resume_candidate=False:
+                        ("finished", limit.accumulated_usage, trace))
     monkeypatch.setattr(loop, "handle_tool_calls", tools_then_steering)
     registry = registry if registry is not None else ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     loop.run_llm_loop(

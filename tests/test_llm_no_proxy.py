@@ -374,6 +374,52 @@ def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection(monkeypatch
     assert captured_kwargs[1]["extra_body"]["provider"]["require_parameters"] is True
     fake_http_client.close.assert_called_once()
 
+    # The successful retry learns a route-scoped repair in the durable wire
+    # store. A later call must use it on its FIRST send, without another 404.
+    with patch.object(client, "_make_no_proxy_client", return_value=(fake_oa_client, fake_http_client)), \
+         patch("requests.get", side_effect=AssertionError("no_proxy must not fetch capabilities")):
+        learned_msg, _ = client._chat_remote(
+            target, messages, None, "medium", 1024, "auto", 0.2, no_proxy=True,
+        )
+    assert learned_msg["content"] == "ok"
+    assert len(captured_kwargs) == 3
+    assert "temperature" not in captured_kwargs[2]
+    assert captured_kwargs[2]["extra_body"]["reasoning"]["effort"] == "medium"
+    assert captured_kwargs[2]["extra_body"]["provider"]["require_parameters"] is True
+    assert fake_http_client.close.call_count == 2
+
+
+def test_chat_remote_no_proxy_uses_warm_capabilities_without_a_rejection(monkeypatch):
+    """A prior catalog fetch can omit temperature before the first no_proxy send."""
+    from ouroboros.llm import LLMClient
+
+    model = "anthropic/claude-opus-4.8"
+    monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True)
+    LLMClient._SUPPORTED_PARAMS_CACHE[model] = {"max_tokens", "reasoning"}
+    client = LLMClient(api_key="test-or-key")
+    target = client._resolve_remote_target(model)
+    response = MagicMock(model_dump=lambda: {
+        "choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": None}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    })
+    fake_oa_client, fake_http_client = MagicMock(), MagicMock()
+    fake_oa_client.chat.completions.create.return_value = response
+
+    with patch.object(client, "_make_no_proxy_client", return_value=(fake_oa_client, fake_http_client)), \
+         patch("requests.get", side_effect=AssertionError("no_proxy must not fetch capabilities")):
+        msg, _ = client._chat_remote(
+            target, [{"role": "user", "content": "hello"}], None,
+            "medium", 1024, "auto", 0.2, no_proxy=True,
+        )
+
+    assert msg["content"] == "ok"
+    fake_oa_client.chat.completions.create.assert_called_once()
+    payload = fake_oa_client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in payload
+    assert payload["extra_body"]["reasoning"]["effort"] == "medium"
+    assert payload["extra_body"]["provider"]["require_parameters"] is True
+    fake_http_client.close.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Test: plan_review ReviewCoordinator path calls LLM with no_proxy=True

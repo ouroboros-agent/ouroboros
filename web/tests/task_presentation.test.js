@@ -606,6 +606,19 @@ test('Batch4: chat feeds every census phase to its card', () => {
     assert.match(hydrate, /syncParkedPhase\(record, v\.phase, v\);/);
 });
 
+test('an owner Pause shows the review work it lets finish, and the line clears when it ends', () => {
+    const record = chipRecord();
+    assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner', finishing_reviews: true }), true);
+    assert.equal(record.phaseEl.textContent, 'Paused · owner pause · review work finishing');
+    assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner', finishing_reviews: true }), false,
+        'an unchanged fact writes nothing');
+    assert.doesNotMatch(record.phaseEl.textContent, /\d/, 'the census names tasks and sends alike: never a count');
+    assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner' }), true);
+    assert.equal(record.phaseEl.textContent, 'Paused · owner pause');
+    syncParkedPhase(record, 'budget_pausing', { pause_cause: 'owner', finishing_reviews: true });
+    assert.equal(record.phaseEl.textContent, 'Pausing… · owner pause', 'only a settled Pause names finishing review work');
+});
+
 test('pause causes come only from current typed facts and update without a phase transition', () => {
     const record = chipRecord();
     for (const [pause_cause, label] of [['budget', 'budget limit'], ['owner', 'owner pause'], ['restart', 'after restart'], ['sleep', 'sleep']]) {
