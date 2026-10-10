@@ -115,35 +115,21 @@ REVIEW_SEVERITY_THRESHOLDS = """\
 
 
 REPO_ANTI_PATTERN_LOCK_GUARD = """\
-Before returning, do a deliberate SECOND pass focused on a materially
-DIFFERENT concern class. This is a semantic breadth check, not a numeric
-finding quota: zero or one FAIL is valid, and you must never manufacture a
-finding merely to increase the count. For example:
-if your FAIL is `code_quality`, re-examine `tests_affected` and
-`self_consistency`; if `cross_platform`, re-examine `security_issues` and
-`architecture_doc`; if `version_bump`, re-examine `changelog_and_badge`
-and `self_consistency`. Update PASS entries in-place if your second pass
-uncovers new FAILs — return only one JSON array, not two.
+Before returning, challenge the behavior promised by this change and by your
+proposed fixes with a realistic supported counterexample or event sequence.
+Check what the facts establish and whether they justify the resulting decision
+for the actor and resource involved. Use existing evidence where sufficient.
+This check adds no required output or review stage; the checklist's existing
+evidence requirements still apply.
 """
 
 
-# The core layer's guard names only universal items: a reviewer of a subject that
-# is not the body has no `version_bump`, `changelog_and_badge` or `self_consistency`.
-REPO_ANTI_PATTERN_LOCK_GUARD_CORE = """\
-Before returning, do a deliberate SECOND pass focused on a materially
-DIFFERENT concern class. This is a semantic breadth check, not a numeric
-finding quota: zero or one FAIL is valid, and you must never manufacture a
-finding merely to increase the count. For example:
-if your FAIL is `code_quality`, re-examine `tests_affected` and
-`capability_regression`; if `cross_platform`, re-examine `security_issues` and
-`architecture_doc`; if `changelog_accuracy`, re-examine `perf_lifecycle`
-and `secrets_check`. Update PASS entries in-place if your second pass
-uncovers new FAILs — return only one JSON array, not two.
-"""
+# Both layers use the same behavioral countercheck; keep the exported core name.
+REPO_ANTI_PATTERN_LOCK_GUARD_CORE = REPO_ANTI_PATTERN_LOCK_GUARD
 
 
 def anti_pattern_lock_guard(layer: str = "body") -> str:
-    """The triad's second-pass guard for a checklist layer (`review_body_fact.layer_for`)."""
+    """The shared behavioral countercheck for either checklist layer."""
     return REPO_ANTI_PATTERN_LOCK_GUARD if layer == "body" else REPO_ANTI_PATTERN_LOCK_GUARD_CORE
 
 
