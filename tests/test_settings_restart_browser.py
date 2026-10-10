@@ -204,7 +204,9 @@ def test_pending_survives_reconnect_draft_and_restart_request(settings_server, e
             assert response.ok, response.text()
             open_settings()
             page.locator('[data-settings-tab="agents"]').click()
-            meta = page.locator('[data-subagent-meta]').first
+            # A past failure is history behind Details & history, never a standing caption.
+            page.locator('[data-subagent-details] > summary').first.click()
+            meta = page.locator('[data-subagent-last-task] dd').first
             expect(meta).to_contain_text('failed (quota_exhausted)', timeout=30_000)
             expect(meta).to_contain_text('2026-09-18T12:00:00Z')
             assert meta.evaluate("node => getComputedStyle(node).whiteSpace") == 'normal'
@@ -213,10 +215,12 @@ def test_pending_survives_reconnect_draft_and_restart_request(settings_server, e
             page.screenshot(path=str(evidence / f'subagent-history-{engine}.png'))
             session_card = page.locator('[data-subagent-row]').nth(1)
             expect(session_card.locator('[data-subagent-field="access"]')).to_have_value('full')
-            expect(session_card.locator('[data-subagent-meta]')).to_contain_text('Last run:')
+            session_card.locator('[data-subagent-details] > summary').click()
+            expect(session_card.locator('[data-subagent-last-task] dd')).to_contain_text('codex session')
+            expect(session_card.locator('[data-subagent-last-task] dd')).not_to_contain_text('settings')
             session_card.screenshot(path=str(evidence / f'subagent-access-history-{engine}.png'))
             session_card.locator('[data-subagent-field="access"]').select_option('workspace_write')
-            expect(session_card.locator('[data-subagent-meta]')).to_contain_text('Earlier settings:')
+            expect(session_card.locator('[data-subagent-last-task] dd')).to_contain_text('Earlier settings · ')
             # Editing a catalog that marks no reviewer asks the owner to confirm it again.
             page.locator('[data-review-pool-allow-empty]').check()
             save()

@@ -543,13 +543,13 @@ def _finalized_physical_candidate(
 
 
 def bound_reply_allowance(target: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Set a rendered-Nano Main candidate's wire allowance: the one place that does.
+    """Apply the exact-route output maximum, then Nano's window-room policy.
 
     ``context_budget.reply_allowance_tokens`` on THIS candidate: its own bounded count
     (system, messages, tools) times the density Main measured with, against the bound
     capacity (the local lane: its confirmed serving window); the local server's exact
-    count replaces the estimate, needs no slack and may raise it. Low and Max are left
-    alone (their floor is the ceiling, so the rule would return it: no measurement). A
+    count replaces the estimate and needs no slack. Low and Max retain the caller's
+    allowance up to the separate known output maximum (no window-room shrink). A
     payload without a numeric field (the web-search Responses body) is left alone too;
     the field is never created. An exact shortfall is the typed local overflow before
     any send, carrying this candidate's facts; an estimate never refuses.
@@ -558,8 +558,11 @@ def bound_reply_allowance(target: Dict[str, Any], payload: Dict[str, Any]) -> Di
     from ouroboros.context_fit import bounded_prompt_tokens_for_payload
 
     context = current_physical_attempt_context()
-    field = next((key for key in ("max_completion_tokens", "max_tokens")
+    field = next((key for key in ("max_completion_tokens", "max_tokens", "max_output_tokens")
                   if isinstance(payload.get(key), int) and not isinstance(payload.get(key), bool)), None)
+    if field is not None:
+        from ouroboros.response_limits import response_limit_for_target
+        payload = {**payload, field: response_limit_for_target(target).ceiling(payload[field])}
     if context is None or field is None or context.rendered_mode != "nano":
         return payload
     window, measured, exact = context.capacity_total_tokens, target.get("local_input_measurement") or {}, False

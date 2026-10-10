@@ -43,7 +43,7 @@ def _open_agents_tab(page, url: str) -> None:
     page.wait_for_selector(".settings-shell", timeout=15_000)
     page.click('[data-settings-tab="agents"]')
     page.wait_for_selector("#available-subagents-editor .available-subagent-row", timeout=20_000)
-    # The list at the top of the scroll body: "three cards fit a laptop-height body" is a
+    # The list at the top of the scroll body: "two open cards fit a laptop-height body" is a
     # claim about the cards, not about the section's heading and copy above them.
     page.evaluate("() => document.querySelector('.available-subagents-list').scrollIntoView({block: 'start'})")
 
@@ -73,14 +73,16 @@ def _agents_panel_add_reveals_the_new_card(page) -> None:
 
 
 def _agents_panel_typing_reads_draft(page) -> None:
-    """A keystroke into a SAVED card (no structural repaint) turns every head status to
-    Draft at once, patched in place — the caret stays in the field being typed into."""
+    """A keystroke into a SAVED card (no structural repaint) turns the ONE editor intent to
+    Unsaved changes, patched in place — the caret stays in the field being typed into."""
     field = page.locator('.available-subagent-row [data-subagent-field="recommended_use"]').first
     field.click()
     page.keyboard.type(" ")
     page.wait_for_function(
         """() => [...document.querySelectorAll('[data-subagent-status]')]
-            .every((el) => el.textContent.startsWith('Draft · '))
+            .every((el) => !el.textContent.includes('·'))
+            && document.querySelector('[data-subagents-intent]')?.textContent === ''
+            && !document.querySelector('#settings-unsaved-indicator')?.hidden
             && document.activeElement === document.querySelector(
                 '.available-subagent-row [data-subagent-field="recommended_use"]')""",
         timeout=5_000,
@@ -89,8 +91,8 @@ def _agents_panel_typing_reads_draft(page) -> None:
 
 @pytest.mark.ui_browser
 def test_ui_smoke_agents_panel_list_editor(direct_server_with_data):
-    """Settings → Agents: three compact subagent cards fit a laptop-height body; typing turns
-    the head status to Draft in place; Add reveals the appended card with the caret in it and
+    """Settings → Agents: two open subagent cards fit a laptop-height body; typing turns
+    the editor intent to Unsaved changes in place; Add reveals the appended card with the caret in it and
     no error; only a Save attempt (whichever validation aborts it) turns the empty route into
     a section-level line plus a tinted, self-naming card, and the fix typed into the card
     clears line, tint and footer together; a later Add is an invitation again; a card's
@@ -112,7 +114,8 @@ def test_ui_smoke_agents_panel_list_editor(direct_server_with_data):
             try:
                 page = browser.new_page(viewport={"width": 1440, "height": 900})
                 _open_agents_tab(page, url)
-                assert page.evaluate(_AGENTS_PANEL_VISIBLE_ROWS_JS, ".available-subagent-row") >= 3
+                # Open editors, not a compact list (owner's choice): every field stays in view.
+                assert page.evaluate(_AGENTS_PANEL_VISIBLE_ROWS_JS, ".available-subagent-row") >= 2
                 # This roster marks no Reviewer; the owner's explicit choice keeps the empty
                 # pool out of the validation this test is about (it is decided per load).
                 page.check('[data-review-pool-allow-empty]')

@@ -65,7 +65,7 @@ def test_review_effort_default_carriers_stay_in_sync():
     root = pathlib.Path(__file__).resolve().parents[1]
     editor = (root / "web" / "modules" / "subagents_settings.js").read_text(encoding="utf-8")
     assert "export const REVIEW_POOL_DEFAULT_EFFORT = 'high';" in editor
-    assert "reviews at ${REVIEW_POOL_DEFAULT_EFFORT} effort" in editor
+    assert "Default (reviews at ${REVIEW_POOL_DEFAULT_EFFORT})" in editor
     # The surface effort keys are retired (review pool: effort lives on the reviewer
     # row); the read seam migrates them, so they are no shipped default any more.
     assert "OUROBOROS_EFFORT_REVIEW" not in SETTINGS_DEFAULTS

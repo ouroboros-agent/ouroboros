@@ -403,7 +403,8 @@ def _admit_chat_task(
             except Exception as exc:
                 _pool()._report_binding_failure(task["id"], pid, exc, path="direct_project_turn")
         if not task["text"]:
-            task["text"] = "(image attached)" if image_data else ""
+            from ouroboros.chat_uploads import attachment_placeholder
+            task["text"] = attachment_placeholder(image_data, task_metadata)
         # A Main turn is named lazily: the turn queue below fires the namer on
         # the first non-addressing tool call (owner decision Q7=A, 16.09), so a
         # greeting costs no naming call and a working turn gets a title as its

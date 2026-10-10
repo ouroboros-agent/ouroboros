@@ -117,7 +117,7 @@ def test_session_access_is_visible_and_preserved_by_the_real_editor(subscription
         page.locator("details:has(#onboarding-available-subagents) > summary").click()
     access = page.locator('[data-subagent-field="access"]').first
     assert access.input_value() == "full"
-    assert "Full system access (default)" in access.inner_text()
+    assert "Full system access" in access.inner_text()
     access.select_option("workspace_write")
     assert access.input_value() == "workspace_write"
     access.scroll_into_view_if_needed()

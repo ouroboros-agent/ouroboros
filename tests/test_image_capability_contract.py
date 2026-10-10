@@ -50,7 +50,7 @@ SEES = "z-ai/glm-5.3-flash"           # recorded input_modalities: ["text", "ima
 OPENAI_TEXT_ONLY = "openai/o3-mini"   # recorded input_modalities: ["text", "file"]
 UNKNOWN = "acme/never-listed-1"
 
-PNG = b"\x89PNG\r\n\x1a\nfixture-image"
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
 PNG_B64 = base64.b64encode(PNG).decode()
 IMAGE_URL = f"data:image/png;base64,{PNG_B64}"
 

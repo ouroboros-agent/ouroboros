@@ -51,6 +51,7 @@ from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.provider_models import provider_for_model, supports_vision
 from ouroboros.utils import emit_cognitive_operation_event, utc_now_iso
+from ouroboros.vision_image_limits import prepare_caption_image, prepare_route_images, refusal_identity, sent_caption_identity
 from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
@@ -645,23 +646,18 @@ def _caption_for_block(
     task_id: str = "",
     event_queue: Any = None,
 ) -> Tuple[str, str]:
-    """``(caption, failure)``: a paid caption, or why the attempt failed; both empty when no route.
+    """Return (caption, failure), both empty if no route can accept these pixels.
 
-    A route that refused this image earlier in the task is not asked for its
-    caption; a caption route's own completed refusal is remembered the same way.
+    Each candidate's prepared-byte identity governs its refusal and memo lookup.
     """
     memo = accumulated_usage.setdefault("_vision_caption_memo", {})
-    url = _image_url_from_block(block)
-    url_digest = _url_digest(url)
-    model = resolve_vision_caption_model(ctx, llm, use_local=bool(getattr(ctx, "use_local", False)),
-                                         refused=refusal_check(accumulated_usage, [url_digest]))
-    # Reuse already completed visual work even when its generating account is
-    # unavailable later; the caption is content, not that account's capability.
+    model, url, url_digest, preparation_note, failure = prepare_caption_image(block, ctx, llm, accumulated_usage)
+    # Completed captions remain reusable after their generating account is unavailable.
     key = f"{url_digest}|{model}|v1"
     if memo.get(key):
         return str(memo[key]), ""
     if not model or not url:
-        return "", ""
+        return "", failure
     call_id = new_call_id("vision_caption")
     prompt_ref = {}
 
@@ -693,7 +689,7 @@ def _caption_for_block(
             raise TimeoutError("owner deadline leaves no window for a vision caption")
         text, usage = llm.vision_query(
             _CAPTION_PROMPT,
-            [{"url": url}],
+            [{"url": url, "_original_image_url": block.get("_original_image_url") or _image_url_from_block(block)}],
             model=model,
             reasoning_effort=resolve_effort("task"),
             timeout=transport_timeout_with_deadline(
@@ -710,10 +706,11 @@ def _caption_for_block(
         # NOT memoized: a memoized failure used to block every retry for this
         # image for the rest of the task. A completed refusal only takes this
         # route out of this image's caption candidates.
-        refusal = completed_image_refusal(exc)
+        model, refusal, digests = refusal_identity(exc, model, lambda _route: [url_digest])
         if refusal is not None:
-            record_image_refusal(accumulated_usage, model, [url_digest], {**refusal, "via": "caption", "model": model})
+            record_image_refusal(accumulated_usage, model, digests, {**refusal, "via": "caption", "model": model})
         return "", f"{type(exc).__name__}: {exc}"
+    model, key, preparation_note = sent_caption_identity(usage, model, key, preparation_note)
     try:
         from ouroboros.llm import add_usage
 
@@ -728,6 +725,8 @@ def _caption_for_block(
     except Exception:
         pass
     caption = str(text or "").strip()
+    if caption and preparation_note:
+        caption = preparation_note + " " + caption
     if drive_root is not None:
         try:
             persist_call(
@@ -743,7 +742,8 @@ def _caption_for_block(
     operation("finished")
     if not caption:
         return "", f"{model} returned an empty caption"
-    memo[key] = caption
+    if key:
+        memo[key] = caption
     return caption, ""
 
 
@@ -818,11 +818,13 @@ def _project(messages: List[Dict[str, Any]], routing: VisionRoutingContext, purp
     if mode == "inline":
         if lane:
             return _rewrite(messages, lambda block: _lane_marker(lane, block))
+        messages = prepare_route_images(messages, routing.model)
         return _rewrite(messages, lambda block: _refused_marker(block, refused)) if refused else messages
     if mode == "auto" and not lane:
         verdict = _image_input_verdict(routing.model, model_role=routing.model_role,
                                        model_account_override=routing.model_account_override)
         if verdict is not False:
+            messages = prepare_route_images(messages, routing.model)
             return _rewrite(messages, lambda block: _refused_caption(block, routing, refused)) if refused else messages
         reason = _metadata_says_no(routing.model)
     elif lane:

@@ -187,7 +187,8 @@ def test_web_search_uses_official_openai_responses(monkeypatch):
         search_module._web_search(request_ctx, "latest news", model="gpt-5.2")
     )
 
-    assert result == {"answer": "fresh answer", "answer_type": "summary", "sources": [], "backend": "openai_responses"}
+    assert {key: result[key] for key in ("answer", "answer_type", "sources", "backend")} == {"answer": "fresh answer", "answer_type": "summary", "sources": [], "backend": "openai_responses"}
+    assert result["legs_tried"][0]["model"] == "gpt-5.2"
     assert calls["api_key"] == "openai-key"
     assert calls["base_url"] is None
     assert calls["kwargs"]["model"] == "gpt-5.2"
@@ -805,7 +806,8 @@ def test_terminal_openrouter_status_allows_next_backend(ctx, monkeypatch):
 
     result = json.loads(_web_search(ctx, "terminal OpenRouter query"))
 
-    assert result == {"answer": "recovered", "backend": "anthropic_server_tool"}
+    assert result["answer"] == "recovered" and result["backend"] == "anthropic_server_tool"
+    assert [leg["outcome"] for leg in result["legs_tried"]] == ["failed", "succeeded"]
 
 
 def test_explicit_web_503_allows_one_safe_retry(ctx, patch_env, monkeypatch):

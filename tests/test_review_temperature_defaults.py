@@ -155,7 +155,7 @@ def test_actual_review_authors_reach_strict_raw_dispatch(setup, monkeypatch, sur
     monkeypatch.setattr(LLMClient, "claudexor_model_catalog", staticmethod(lambda source, profile=None, **_kw: {
         "source": source, "credentialProfileId": profile or "account-a", "accountFingerprint": "fingerprint-a",
         "observedAt": ce.utc_now_iso(), "provenance": "fixture",
-        "models": [{"id": "exact-model", "contextWindow": 800_000}]}))
+        "models": [{"id": "exact-model", "contextWindow": 800_000, "maxOutputTokens": 4096}]}))
     ctx = ToolContext(repo_dir=root, drive_root=root, task_id="task-one")
     if surface == "triad":
         async def triad():
@@ -183,6 +183,7 @@ def test_actual_review_authors_reach_strict_raw_dispatch(setup, monkeypatch, sur
     payload = gateway.uploads[0][0]
     assert "temperature" not in payload["options"]
     assert "default_temperature" not in payload["options"]
+    assert "maxOutputTokens" not in payload["options"]
     assert payload["account"] == {"mode": "pin", "profileId": "account-a"}
     assert len(gateway.accepted_operations) == 1 and ledger(root)[-1]["state"] == "settled"
 

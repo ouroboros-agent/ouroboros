@@ -22,7 +22,7 @@ An owner endpoint changes one decision inside a document it does not own, so `_o
 
 ### LLM output token budgets
 
-Providers name the same output budget differently: OpenRouter and Anthropic-compatible calls send `max_tokens`, every official direct OpenAI Chat route `max_completion_tokens`; direct OpenAI also sends the requested `reasoning_effort`. Model-name prefixes are not capability authority; only exact-route, success-confirmed wire evidence may adapt a request. The budgets are floors; the constants are the numeric SSOT:
+Providers name the output budget differently: OpenRouter and Anthropic-compatible calls send `max_tokens`, official direct OpenAI Chat `max_completion_tokens` (with the requested `reasoning_effort`). Model-name prefixes are not capability authority; only exact-route, success-confirmed wire evidence adapts a request. The budgets are floors, lowered only by a route's known maximum response; the constants are the numeric SSOT:
 
 | Surface | Output-token budget |
 |---------|---------------------|

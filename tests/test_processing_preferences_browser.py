@@ -28,8 +28,8 @@ def test_processing_settings_save_reopen_and_actor_reference(role_ui):
     page.locator('[data-settings-tab="agents"]').click()
     actor = page.locator('[data-subagent-row]').first
     assert 'Fast (from Models)' in actor.locator('[data-processing-summary]').text_content()
-    assert actor.locator('summary').evaluate(marker) == '"▸ "'
-    actor.locator('summary').click()
+    assert actor.locator('[data-processing-details] > summary').evaluate(marker) == '"▸ "'
+    actor.locator('[data-processing-details] > summary').click()
     # The first row is a reviewer: its processing is the processing of its reviews.
     assert actor.locator('[data-subagent-field="review_eligible"]').is_checked()
     actor.locator('[data-subagent-field="processing_preference"]').select_option('economy')
@@ -40,7 +40,7 @@ def test_processing_settings_save_reopen_and_actor_reference(role_ui):
         {detail:{read_state:'transport',errors:[{error:'offline'}]}}))""")
     assert field.evaluate('e => e === window.processingModelNode && document.activeElement === e')
     assert field.evaluate('e => [e.selectionStart, e.selectionEnd]') == [1, 4]
-    assert actor.locator('details').evaluate('e => e.open')
+    assert actor.locator('[data-processing-details]').evaluate('e => e.open')
     assert actor.locator('[data-subagent-field="processing_preference"]').input_value() == 'economy'
     roles.capture(page, 'processing-actor-reference-and-inline')
     with page.expect_response('**/api/settings'):

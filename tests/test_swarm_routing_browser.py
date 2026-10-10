@@ -90,8 +90,16 @@ def test_swarm_admission_precedes_model_and_survives_replay_and_reload(
     message_id = uuid.uuid4().hex if caption_only else ""
     token, task_id = _derived_identity(message_id, "swarm", 0) if message_id else ("", "")
     raw = f"  {marker}\nRead the repository, then ask which evidence to use.  \n"
-    caption = f"[user attachment: {marker}.png]"
+    # A wordless send is logged under the host placeholder (the gateway no longer
+    # captions uploads); the marker reaches the model as the image's own label.
+    caption = "(image attached)"
     first_request = []
+
+    def for_this_message(task):
+        # The placeholder objective names no marker; a caption case's id is fixed up front.
+        if caption_only:
+            return (task.get("origin_message_ref") or {}).get("client_message_id") == message_id
+        return marker in str(task.get("objective") or "")
 
     def first_agent_request(body):
         match = bool(body.get("tools")) and marker in body_text(body)
@@ -101,7 +109,7 @@ def test_swarm_admission_precedes_model_and_survives_replay_and_reload(
             # alone could hide a routing actor admitting a root mid-request.
             snapshot = oracle.queue_snapshot()
             admitted = [row["task"] for phase in ("pending", "running") for row in snapshot.get(phase, [])
-                        if marker in str(row.get("task", {}).get("objective") or "")]
+                        if for_this_message(row.get("task", {}))]
             observed_id = admitted[0]["id"] if len(admitted) == 1 else ""
             first_request.append({
                 "body": body, "admitted_roots": admitted, "observed_root_id": observed_id,

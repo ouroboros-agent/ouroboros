@@ -253,7 +253,8 @@ test('a subagent row offers its account under the name the Accounts tab gives it
     });
     const option = html.match(/<option value="codex-default"[^>]*>([^<]*)<\/option>/);
     assert.ok(option, 'the pinned account is offered');
-    assert.equal(option[1], 'Account: native@example.com · codex-default (pinned)');
+    // The field is labelled Account, so the option names the account alone.
+    assert.equal(option[1], 'native@example.com · codex-default (pinned)');
 });
 
 test('configured identity ignores stale daemon labels until the catalog read is proven', () => {

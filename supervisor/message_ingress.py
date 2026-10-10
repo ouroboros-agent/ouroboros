@@ -330,14 +330,14 @@ def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, d
     ``rejoined``. After a crash, reads disclose a lost host session; nothing redispatches.
     """
     from ouroboros.project_dialogue import build_owner_message_ref
+    from ouroboros.chat_uploads import attachment_placeholder
     from supervisor import message_bus
 
     chat_id = int(message["chat_id"])
     message_id = str(message["client_message_id"])
     source = str(message["source"])
-    logged = text.strip() or str(message.get("image_caption") or "").strip() or (
-        "(image attached)" if message.get("image_base64")
-        else "(file attached)" if (message.get("task_metadata") or {}).get("chat_attachment_uploads") else ""
+    logged = text.strip() or str(message.get("image_caption") or "").strip() or attachment_placeholder(
+        message.get("image_base64"), message.get("task_metadata")
     )
     if not logged:
         raise ValueError("message is empty")

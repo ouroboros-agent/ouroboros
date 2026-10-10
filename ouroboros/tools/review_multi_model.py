@@ -90,6 +90,15 @@ def _review_output_budget() -> int:
     return max(8192, min(raw, 65536))
 
 
+def review_output_allowance(model: str, window: int = 0, **binding) -> int:
+    """The review reservation within the exact route's known maximum response; unknown keeps it.
+    A ``window`` from ``reviewer_context_window`` supplies the account it was observed on."""
+    from ouroboros.response_limits import response_allowance
+    from ouroboros.reviewer_window import observed_binding
+
+    return response_allowance(str(model or ""), _review_output_budget(), **observed_binding(window, binding))
+
+
 def triad_api_messages(prompt: str, stable_prefix_len: int, content: str,
                        *, layer: str = "body") -> tuple:
     """The exact api-row message pair of a triad panel, and the BIBLE text it

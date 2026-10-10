@@ -130,7 +130,8 @@ def _light_fit(binding: Mapping[str, Any]) -> Tuple[Optional[int], Callable[[str
             task, allow_fetch=bool(binding["use_local"]) or provider_for_model(binding["model"]) == "claudexor")
         density = _route_calibration_ratio(None, evidence.route_fp, route["model"])
         window = int(evidence.window_tokens) if is_known(evidence, require_fresh=True) else None
-        reserve = ANSWER_RESERVE_TOKENS
+        from ouroboros.response_limits import ResponseLimit
+        reserve = ResponseLimit(**(getattr(evidence, "response_limit", {}) or {})).ceiling(ANSWER_RESERVE_TOKENS)
         if binding["use_local"]:
             from ouroboros.llm_local import local_context_limits
 

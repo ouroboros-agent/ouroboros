@@ -210,9 +210,10 @@ def test_registered_vision_tool_reaches_real_child_from_preset(child_fixture, ca
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=root)
     registry._ctx.task_id = "image-task"
     registry._ctx.task_attempt = 1
-    # URL avoids image decoder fixtures; invalid base64 exercises the existing
-    # permissive screenshot fixture path. The controlled child does not inspect pixels.
-    registry._ctx.browser_state.last_screenshot_b64 = "fixture-not-base64"
+    # A URL stays remote; a valid 1x1 PNG passes the shared byte check unchanged
+    # (invalid base64 is refused before any route). The child does not inspect pixels.
+    registry._ctx.browser_state.last_screenshot_b64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
     args = {"prompt": "Describe only this image"}
     if name == "vlm_query":
         args["image_url"] = "https://example.invalid/fixture.png"

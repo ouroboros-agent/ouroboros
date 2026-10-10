@@ -805,6 +805,14 @@
               "applied_actions": [],
               "task_local": false,
               "attempt_id_present": true
+            },
+            "_vision_query_receipt": {
+              "model": "google/gemini-3.6-flash",
+              "digests": [
+                "d9a91006648a07994f921b2656d13eb568d38f94120b8b6f369cdd3786d28e86",
+                "8aaea11f65ce8bda38dd376b60575ac8a00294263f5d47cefb63a0b18467f8d2"
+              ],
+              "note": ""
             }
           },
           "ledger_attempt_count": 1

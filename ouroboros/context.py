@@ -76,6 +76,16 @@ log = logging.getLogger(__name__)
 _LARGE_CONTEXT_SECTION_CHARS = LARGE_CONTEXT_SECTION_CHARS
 
 
+def build_incoming_user_content(entry: Dict[str, Any], drive_root: Any, task_id: str) -> Any:
+    """Build only this delivery's images, never the task's historical manifest."""
+    task = {**entry, "drive_root": drive_root, "id": task_id}
+    if "attachment_manifest" in entry or "attachment_manifest_ref" in entry:
+        task["attachment_images"] = entry.get("attachment_manifest") or []
+        task["task_contract"] = {key: entry[key] for key in
+                                 ("attachment_manifest", "attachment_manifest_ref") if key in entry}
+    return build_user_content(task)
+
+
 def build_user_content(task: Dict[str, Any]) -> Any:
     from ouroboros.presence_context import frame_presence_user_content
 
@@ -121,16 +131,34 @@ def build_user_content(task: Dict[str, Any]) -> Any:
         # before staging) still folds its caption into the lead text block.
         image_caption = task.get("image_caption", "")
         combined_text = "\n".join(part for part in (image_caption, text if text != image_caption else "") if part) or "Analyze the screenshot"
-        content: List[Dict[str, Any]] = [
-            {"type": "text", "text": combined_text},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{task.get('image_mime', 'image/jpeg')};base64,{image_b64}"},
-                # Eviction metadata (stripped before provider calls): the K-newest
-                # image policy replaces older blocks with this caption.
-                "_caption": str(image_caption or "")[:200],
-            },
-        ]
+        import base64
+        from ouroboros.image_preparation import prepare_image_bytes, retain_original
+        content: List[Dict[str, Any]] = [{"type": "text", "text": combined_text}]
+        try:
+            raw = base64.b64decode(image_b64, validate=True)
+        except ValueError:
+            raw = None
+            content.append({"type": "text", "text": "Image pixels unavailable: the inline image is not valid base64."})
+        if raw is not None:
+            source_path = ""
+            if task.get("drive_root"):
+                try:  # a failed copy loses the re-view address, not this turn's pixels
+                    source_path = str(retain_original(pathlib.Path(task["drive_root"]) / "uploads" / "views",
+                                                      raw, "inline.image"))
+                except OSError:
+                    log.warning("inline image original was not retained", exc_info=True)
+            original = f" Original: {source_path}" if source_path else ""
+            try:
+                prepared = prepare_image_bytes(raw, max_bytes=8 * 1024 * 1024)
+            except ValueError as exc:
+                content.append({"type": "text", "text": f"Image pixels unavailable: {exc}.{original}"})
+            else:
+                if prepared.note or original:
+                    content.append({"type": "text", "text": (prepared.note + original).strip()})
+                content.append({"type": "image_url", "image_url": {
+                    "url": f"data:{prepared.mime};base64,{base64.b64encode(prepared.data).decode('ascii')}"},
+                    "_caption": str(image_caption or ""),
+                    "_source_path": source_path})
     else:
         content = [{"type": "text", "text": text or "(empty message)"}]
     content.extend(attachment_image_blocks)
@@ -179,22 +207,28 @@ def _build_attachment_image_blocks(task: Dict[str, Any]) -> List[Dict[str, Any]]
         relpath = str(entry.get("relpath") or "").strip()
         if not relpath:
             continue
+        label = str(entry.get("label") or pathlib.Path(relpath).name).strip()
         try:
             img_path = (artifact_dir / relpath).resolve(strict=False)
-            if not img_path.is_file():
-                continue
-            # Skip NATIVE injection of an oversized image so a large attachment can't blow the
-            # context / provider request with a huge data URL (parity with ws._MAX_NATIVE_IMAGE_BYTES
-            # = 8 MB). It stays manifest-readable via read_file / view_image (which downscales).
+            if not img_path.is_relative_to(artifact_dir.resolve()) or (artifact_dir / relpath).is_symlink():
+                raise ValueError("image path escapes its staged artifact owner")
+            # Keep the existing admission budget; exceeding it is visible while
+            # the complete original remains accessible through the manifest.
             if img_path.stat().st_size > 8 * 1024 * 1024:
-                continue
-            mime = str(entry.get("mime") or "image/png").strip() or "image/png"
-            b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
-        except Exception:
-            log.debug("attachment image blocks: skipped %s on error", relpath, exc_info=True)
+                raise ValueError("image exceeds the 8 MiB automatic attachment read budget")
+            raw = img_path.read_bytes()
+            from hashlib import sha256
+            from ouroboros.image_preparation import prepare_image_bytes
+            if entry.get("sha256") and sha256(raw).hexdigest() != entry["sha256"]:
+                raise ValueError("staged image no longer matches its captured identity")
+            prepared = prepare_image_bytes(raw, max_bytes=8 * 1024 * 1024)
+            mime = prepared.mime
+            b64 = _b64.b64encode(prepared.data).decode("ascii")
+        except (OSError, ValueError) as exc:
+            blocks.append({"type": "text", "text":
+                           f"[image: {label}] Pixels unavailable: {exc}. Original: artifact_store/{relpath}."})
             continue
-        label = str(entry.get("label") or img_path.name).strip() or img_path.name
-        caption = f"[image: {label}]"
+        caption = f"[image: {label}; original: {img_path}" + (f"; {prepared.note}]" if prepared.note else "]")
         blocks.append({"type": "text", "text": caption})
         blocks.append({
             "type": "image_url",
@@ -427,6 +461,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "artifact transport; do not use runtime_data/uploads as artifact transport"
         )
     try:
+        from ouroboros.search_routes import resolve_web_search_route
         from ouroboros.config import get_allow_mutative_subagents
         from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
         from ouroboros.workspace_copies import workspace_copy_source_is_system
@@ -440,6 +475,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             ),
             "write_surfaces": sorted(VALID_WRITE_SURFACES),
             "web_search_backend": runtime_setting("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
+            "web_search_route": resolve_web_search_route(),
             "main_web_search": {
                 "mode": runtime_setting("OUROBOROS_MAIN_WEB_SEARCH", "off"),
                 "engine": runtime_setting("OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "auto"),

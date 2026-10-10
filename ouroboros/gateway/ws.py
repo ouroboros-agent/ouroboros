@@ -31,45 +31,6 @@ def set_event_loop(loop: asyncio.AbstractEventLoop | None) -> None:
     _event_loop = loop
 
 
-_MAX_NATIVE_IMAGE_BYTES = 8 * 1024 * 1024
-
-
-def _first_image_attachment(attachments: Any) -> tuple[str, str, str]:
-    """Resolve the first image upload into (base64, mime, caption).
-
-    Attachments reference files already stored by /api/chat/upload under
-    data/uploads/ — only a stored upload id is accepted, read through the
-    upload store's confined open (no traversal, no link followed), so the WS
-    frame cannot read arbitrary paths. "Image" and its mime are proven from the
-    bytes, never taken from the frame. Non-image/missing/oversized attachments
-    keep the text-label-only behavior.
-    """
-    if not isinstance(attachments, list):
-        return "", "", ""
-    import base64
-
-    for item in attachments:
-        if not isinstance(item, dict):
-            continue
-        name = chat_uploads.upload_id(item.get("filename"))
-        if not name:
-            continue
-        try:
-            handle, observed = chat_uploads.open_upload(name, DATA_DIR)
-            with handle:
-                if observed.st_size > _MAX_NATIVE_IMAGE_BYTES:
-                    continue
-                data = handle.read(_MAX_NATIVE_IMAGE_BYTES + 1)
-        except OSError:
-            continue
-        mime, kind = chat_uploads.detect_media(data[:64], name[33:])
-        if kind != "image" or len(data) > _MAX_NATIVE_IMAGE_BYTES:
-            continue
-        caption = str(item.get("display_name") or name)
-        return base64.b64encode(data).decode("ascii"), mime, f"[user attachment: {caption}]"
-    return "", "", ""
-
-
 def _chat_attachment_uploads(attachments: Any) -> list[dict]:
     """Resolve EVERY desktop-chat attachment (any type) to a staging spec.
 
@@ -121,9 +82,11 @@ def _accept_with_attachments(bridge: Any, payload: str, send_kwargs: dict, attac
     identity, which ``stage_task_attachments`` verifies while copying: a path swapped
     after this measurement stages nothing else. An unavailable ref stages nothing.
     """
+    uploads = _chat_attachment_uploads(attachments)
     refs = chat_uploads.refs_for_frame(attachments, DATA_DIR)
-    for spec, ref in zip(send_kwargs["task_metadata"].get("chat_attachment_uploads") or [], refs):
+    for spec, ref in zip(uploads, refs):
         spec.update({"path": ""} if ref.get("unavailable") else {"size": ref["size"], "sha256": ref["sha256"]})
+    send_kwargs["task_metadata"]["chat_attachment_uploads"] = uploads
     send_kwargs["task_metadata"]["chat_attachments"] = refs
     bridge.ui_send(payload, **send_kwargs)
 
@@ -407,7 +370,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                     continue
 
             payload = msg.get("content", "") if msg_type == "chat" else msg.get("cmd", "")
-            if msg_type in ("chat", "command") and payload:
+            if msg_type in ("chat", "command") and (payload or (msg_type == "chat" and msg.get("attachments"))):
                 try:
                     from ouroboros.client_surface import normalize_client_surface
                     from supervisor.message_bus import try_get_bridge
@@ -422,9 +385,6 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                             continue
                         force_plan = bool(msg.get("force_plan"))
                         client_surface = normalize_client_surface(msg.get("client_surface"))
-                        image_b64, image_mime, image_caption = _first_image_attachment(
-                            msg.get("attachments")
-                        )
                         try:
                             thread_id = int(msg.get("chat_id") or 1)
                         except (TypeError, ValueError):
@@ -433,13 +393,8 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                             "force_plan": force_plan,
                             "force_plan_source": "swarm" if force_plan else "",
                         }
-                        # v6.52.0 (P1, full desktop unify): forward the WHOLE attachment
-                        # set (any type) so the worker stages all of them through the
-                        # shared substrate — not just the first image. Flows to
-                        # task["metadata"]["chat_attachment_uploads"] like force_plan.
-                        uploads = _chat_attachment_uploads(msg.get("attachments"))
-                        if uploads:
-                            task_metadata["chat_attachment_uploads"] = uploads
+                        # Attachment inspection belongs to the ordered acceptance
+                        # worker, so this socket can receive Panic during disk I/O.
                         if client_surface is not None:
                             # Sending-surface observables ride task_metadata
                             # (the force_plan rail): they pass the bus whitelist
@@ -451,9 +406,6 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                             broadcast=True,
                             sender_session_id=str(msg.get("sender_session_id", "") or ""),
                             client_message_id=str(msg.get("client_message_id", "") or ""),
-                            image_base64=image_b64,
-                            image_mime=image_mime,
-                            image_caption=image_caption,
                             task_metadata=task_metadata,
                             chat_id=thread_id,
                             project_id=str(msg.get("project_id", "") or ""),

@@ -522,7 +522,9 @@ def test_transport_inline_photo_is_parked_once_and_still_reaches_vision(tmp_path
     from tests.test_host_service_api import FakeBridge
 
     bridge = FakeBridge()
-    photo = base64.b64encode(JPEG).decode("ascii")
+    from tests.test_live_image_delivery import pixels
+    original = pixels("JPEG")
+    photo = base64.b64encode(original).decode("ascii")
     response = _skill_client(tmp_path, bridge).post(
         "/chat/inject", headers={"X-Skill-Token": "token"},
         json={"text": "", "image_base64": photo, "image_mime": "image/jpeg", "image_caption": "кадр",
@@ -530,10 +532,12 @@ def test_transport_inline_photo_is_parked_once_and_still_reaches_vision(tmp_path
     assert response.status_code == 202
     message = bridge.messages[0]
     assert message["image_base64"] == photo, "vision input is unchanged"
-    assert "chat_attachment_uploads" not in message["task_metadata"], "routed staging still owns the photo"
+    (spec,) = message["task_metadata"]["chat_attachment_uploads"]
     (ref,) = message["task_metadata"]["chat_attachments"]
-    assert ref["name"] == "photo.jpg" and ref["kind"] == "image" and ref["sha256"] == hashlib.sha256(JPEG).hexdigest()
-    assert (tmp_path / "uploads" / ref["upload"]).read_bytes() == JPEG
+    assert ref["name"] == "photo.jpg" and ref["kind"] == "image" and ref["sha256"] == hashlib.sha256(original).hexdigest()
+    assert spec["sha256"] == ref["sha256"] and spec["size"] == len(original)
+    assert pathlib.Path(spec["path"]).read_bytes() == original
+    assert (tmp_path / "uploads" / ref["upload"]).read_bytes() == original
     assert len(list((tmp_path / "uploads").iterdir())) == 1
 
     # The worker's canonical writer: one row with the ref, one echo frame without a second photo.
@@ -806,9 +810,17 @@ def test_an_inline_photo_beside_files_reaches_the_model_with_them(tmp_path, monk
     images = agent.task["attachment_images"]
     assert [row["label"] for row in images] == ["photo.png"] and images[0]["mime"] == "image/png"
     assert "image_base64" not in agent.task, "staged once, never also injected inline"
-    # Alone, the inline photo keeps its own rail (no upload spec), as before.
+    # Alone, the photo uses the same original-retaining staging rail, once.
     _inject(client, text="", image_base64=base64.b64encode(png).decode("ascii"))
-    assert "chat_attachment_uploads" not in bridge.messages[1]["task_metadata"]
+    alone = bridge.messages[1]
+    spec, = alone["task_metadata"]["chat_attachment_uploads"]
+    assert pathlib.Path(spec["path"]).read_bytes() == png
+    workers._run_chat_task(agent, 42, "", (alone["image_base64"], alone["image_mime"]),
+                           task_metadata=alone["task_metadata"])
+    from ouroboros.context import build_user_content
+    image, = [block for block in build_user_content(agent.task) if block["type"] == "image_url"]
+    assert base64.b64decode(image["image_url"]["url"].split(",", 1)[1]) == png
+    assert len(agent.task["attachment_images"]) == 1 and "image_base64" not in agent.task
 
 
 def test_replay_shows_an_upload_deleted_or_rewritten_since_as_unavailable(files_app, tmp_path, monkeypatch):

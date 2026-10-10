@@ -162,11 +162,11 @@ def test_a_switched_off_reviewer_keeps_its_mark_and_leaves_the_pool(role_ui):
     card = page.locator("[data-subagent-row]").first
     assert not card.locator('[data-subagent-field="enabled"]').is_checked()
     assert card.locator('[data-subagent-field="review_eligible"]').is_checked()
-    assert "Switched off, so not in the review pool" in card.locator("[data-subagent-review-facts]").inner_text()
-    assert "In the review pool" in page.locator("[data-subagent-row]").nth(1).locator(
-        "[data-subagent-review-facts]").inner_text()
+    assert card.locator("[data-subagent-review-exception]").inner_text() == "Switched off, so not in the review pool."
+    assert page.locator("[data-subagent-row]").nth(1).locator("[data-subagent-review-exception]").is_hidden()
     assert page.locator("[data-review-pool-count]").inner_text() == "Reviewers: 1"
-    assert "review stays on for rows marked Reviewer" in page.locator("[data-review-pool-stays]").inner_text()
+    page.locator("[data-subagents-enabled]").uncheck()
+    assert "rows marked Reviewer still review" in page.locator("[data-review-pool-stays]").inner_text()
     roles.capture(page, "roster-handles-switched-off-row")
 
 

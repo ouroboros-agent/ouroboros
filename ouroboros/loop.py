@@ -413,6 +413,8 @@ def _reset_turn_state(ctx: Any) -> None:
     ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
     ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
     ctx.route_wait_on_primary, ctx.active_role_override, ctx._route_facts_pending = False, None, ""
+    ctx._primary_route_observation, ctx._accepted_route_binding, ctx._primary_return_requested = None, None, None
+    ctx._accepted_model_route = None
 
 
 def _initial_round_route(ctx: Any, llm: LLMClient, initial_effort: str) -> tuple:

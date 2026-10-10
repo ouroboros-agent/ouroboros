@@ -333,6 +333,7 @@ def per_slot_input_token_limits(
         )
         slot_output_reserve, slot_margin = window_scaled_reserves(
             window, output_reserve=output_reserve, tokenizer_margin=tokenizer_margin,
+            model_id=str(model), binding=binding,
         )
         limits[key] = max(0, calibrated_input_token_limit(
             str(model),

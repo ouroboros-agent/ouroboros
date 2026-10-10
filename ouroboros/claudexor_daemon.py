@@ -1239,7 +1239,7 @@ def owned_engine_version() -> str:
     return get_owned_daemon().engine_version
 
 
-def read_owned_gateway() -> Any:
+def read_owned_gateway(*, timeout_sec: Optional[float] = None) -> Any:
     """Connect to the owned engine for metadata, without starting or repairing it.
 
     Discovery is explicitly owned-only, including on unprovisioned installs.
@@ -1252,7 +1252,7 @@ def read_owned_gateway() -> Any:
     endpoint = attached_endpoint(home) if home is not None else discover_daemon_at(owned_config_dir())
     gateway = ClaudexorGateway(endpoint)
     try:
-        gateway.handshake()
+        gateway.handshake(**({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
         if home is None:
             get_owned_daemon()._remember_stop_targets(endpoint)
     except Exception:

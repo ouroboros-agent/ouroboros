@@ -32,7 +32,7 @@ import logging
 import pathlib
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
@@ -149,6 +149,7 @@ class CapabilityEvidence:
     credential_profile_id: str = ""
     account_fingerprint: str = ""
     provenance: str = ""
+    response_limit: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -165,6 +166,7 @@ class CapabilityEvidence:
             "credential_profile_id": self.credential_profile_id,
             "account_fingerprint": self.account_fingerprint,
             "provenance": self.provenance,
+            "response_limit": self.response_limit,
         }
 
 
@@ -956,7 +958,7 @@ def record_owner_ack(
             "source_id", "credential_profile_id", "account_fingerprint",
         )):
             raise ValueError("Subscription capability acknowledgement requires an exact account binding")
-        binding_evidence = _claudexor_metadata_evidence(model, base_url, headers, options)
+        binding_evidence = _claudexor_metadata_evidence(model, base_url, headers, options, evidence_root=drive_root)
         if binding_evidence.stale or not binding_evidence.provenance or binding_evidence.route_fp != fp:
             raise ValueError("Subscription account binding is not current; refresh the selected route")
     record = {
@@ -1012,13 +1014,14 @@ def _cached_evidence(record: Dict[str, Any], fp: str, model: str, provider: str,
 
 
 def _claudexor_metadata_evidence(model: str, base_url: str, headers: Any,
-                                options: Any) -> CapabilityEvidence:
+                                options: Any, *, evidence_root=None, record: bool = True) -> CapabilityEvidence:
     """Resolve advertised capacity on the catalog's actual account, never CLI policy.
 
     Auto discovery may select an account, but does not pin the subsequent operation.
     The caller carries this binding as advertised preparation evidence and rebinds
     on the operation's actual route before its next call. A profile name without
-    an account fingerprint cannot reuse a prior account's cached capacity.
+    an account fingerprint cannot reuse a prior account's cached capacity. The same
+    read's output maximum is returned beside it and stored unless ``record`` is off.
     """
     from ouroboros.llm import LLMClient
     from ouroboros.provider_models import parse_claudexor_model
@@ -1052,18 +1055,24 @@ def _claudexor_metadata_evidence(model: str, base_url: str, headers: Any,
     bound = bool(profile and fingerprint and provenance and parse_deadline_ts(observed))
     if not bound:
         window = 0
+    from dataclasses import asdict
+    from ouroboros.response_limits import metadata_limit, positive_limit, record_metadata_limit
+    output = dict(provider="claudexor", model=model, base_url=base_url, options=options,
+                  maximum=max((positive_limit(item.get("maxOutputTokens")) for item in matches), default=0) if bound else 0,
+                  source="Claudexor model catalog maxOutputTokens", observed_at=observed)
+    limit = record_metadata_limit(evidence_root or canonical_evidence_root(), **output) if record else metadata_limit(**output)
     return CapabilityEvidence(
         window, STATUS_CONFIRMED if window else STATUS_UNPROBEABLE,
         SOURCE_PROVIDER_METADATA, fp, model, "claudexor", ts=observed,
         detail="advertised account capacity" if window else "account capacity unknown",
         stale=_age_seconds(observed) > _CONFIRMED_TTL_SEC,
         source_id=source, credential_profile_id=profile,
-        account_fingerprint=fingerprint, provenance=provenance,
+        account_fingerprint=fingerprint, provenance=provenance, response_limit=asdict(limit),
     )
 
 
 def _openai_compatible_metadata_window(
-    model: str, base_url: str, allow_fetch: bool, api_key: Optional[str] = None, *, provider: str = "",
+    model: str, base_url: str, allow_fetch: bool, api_key: Optional[str] = None, *, provider: str = "", evidence_root=None,
 ) -> int:
     """CW6 (v6.34.0): an OpenAI-compatible server (vLLM, Ollama, LM Studio, TGI, ...)
     commonly publishes the per-model window in GET {base_url}/models — under
@@ -1093,9 +1102,14 @@ def _openai_compatible_metadata_window(
         # The saved model is normally provider-prefixed (e.g. ``openai-compatible::llama-3``)
         # while /models lists the BARE id — match either spelling.
         wanted = {str(model), str(model).split("::", 1)[-1]}
-        for item in (items or []):
-            if not isinstance(item, dict) or str(item.get("id") or item.get("name") or "") not in wanted:
-                continue
+        matched = [item for item in (items or []) if isinstance(item, dict)
+                   and str(item.get("id") or item.get("name") or "") in wanted]
+        from ouroboros.response_limits import positive_limit, record_metadata_limit
+        # A listing that was read is an observation even when it publishes no maximum.
+        record_metadata_limit(evidence_root or canonical_evidence_root(), provider=provider, model=model,
+            base_url=base_url, maximum=max((positive_limit(item.get("max_output_tokens")) for item in matched), default=0),
+            source="/models max_output_tokens")
+        for item in matched:
             sources = [item, item.get("meta") if isinstance(item.get("meta"), dict) else {}]
             for src in sources:
                 for key in ("max_model_len", "context_length", "context_window", "max_context_length"):
@@ -1212,7 +1226,7 @@ def _generative_probe_window(
     )
 
 
-def probe(
+def _probe_window(
     drive_root: Any,
     *,
     provider: str,
@@ -1286,7 +1300,7 @@ def probe(
 
     if subscription:
         try:
-            ev = _claudexor_metadata_evidence(model, base_url, headers, options)
+            ev = _claudexor_metadata_evidence(model, base_url, headers, options, evidence_root=drive_root)
         except Exception as exc:
             # Prior evidence may survive only on this exact account binding.
             # Catalog/auth failures never authorize a generation probe or fallback.
@@ -1354,6 +1368,16 @@ def probe(
                                 detail="no provider window metadata; sizing evidence is unknown")
     _store_evidence(drive_root, "probes", fp, ev.to_json())
     return ev
+
+
+def probe(drive_root: Any, **route) -> CapabilityEvidence:
+    """Resolve independent context and output facts; one owner's window ack cannot suppress output discovery."""
+    from dataclasses import asdict
+    from ouroboros.response_limits import probe_response_limit
+
+    evidence = _probe_window(drive_root, **route)
+    evidence.response_limit = asdict(probe_response_limit(drive_root, evidence, route))
+    return evidence
 
 
 # Cache-inclusive prompt totals are measurable; GigaChat's and MiniMax's

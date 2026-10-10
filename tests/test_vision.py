@@ -243,8 +243,7 @@ class TestLLMVisionQuery(unittest.TestCase):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
 
-        with patch.object(vision, "_VLM_MAX_PROVIDER_BYTES", 20_000), \
-             patch.object(vision, "_VLM_MAX_IMAGE_SIDE", 256):
+        with patch.object(vision, "_VLM_MAX_PROVIDER_BYTES", 20_000):
             capped, mime = vision._downscale_image_for_vlm(buf.getvalue(), "image/png")
 
         self.assertEqual(mime, "image/jpeg")
