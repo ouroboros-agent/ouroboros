@@ -113,7 +113,12 @@ def test_actual_refusal_runs_the_host_copies_rung_before_any_helper(tmp_path, mo
     assert not getattr(inner, "_last_context_observation", None)  # first refused request: no usable exposure
     inner._owner_directives = [{"role": "user", "content": OWNER}]
     events, sends = [], []
-    monkeypatch.setattr(loop, "_measure_round_main_fit", _measure_cycle([_fit()]))
+    def measure(trial, **_kwargs):
+        from ouroboros.loop_model_call import _remember_main_fit
+        measured = _fit(estimated_input=cc._context_tokens_for_messages(trial.messages, 1.0), goal=1)
+        _remember_main_fit(trial, measured)
+        return measured
+    monkeypatch.setattr(loop, "_measure_round_main_fit", measure)
     monkeypatch.setattr(loop, "_run_main_reclaim", lambda *_a, **_kw: pytest.fail("the helper must not run before rung a"))
 
     def dispatch(ctx, disposition, *, candidate_predicate=None, max_tokens=None, **_kwargs):

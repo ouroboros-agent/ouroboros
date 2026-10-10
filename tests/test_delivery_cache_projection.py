@@ -128,8 +128,12 @@ def test_typed_error_and_empty_result_remain_known_through_real_main_seals_and_a
                 sealed_seen |= isinstance(row["content"], list)
     assert sealed_seen
     messages = f.inputs[7]["messages"]
-    rebuilt, receipt = emergency_address_view(messages, _request(messages, 1), rung="bodies",
-                                              drive_root=f.ctx.drive_root, task_id=f.ctx.task_id)
+    # Reclaim through the failed command, rather than stopping after the first
+    # successful unit. Exposure comes from the real usable Main observation.
+    goal = cc.context_units(messages)[0].context_size_tokens
+    request = replace(_request(messages, 1), reclaim_goal_tokens=goal)
+    rebuilt, receipt = emergency_address_view(messages, request, rung="bodies",
+        observation=f.ctx._last_context_observation, drive_root=f.ctx.drive_root, task_id=f.ctx.task_id)
     assert receipt.status == "applied"
     visible = "\n".join(row["content"][0]["text"] for row in rebuilt if cc._capsule_metadata(row)[1])
     assert "SHELL_EXIT_ERROR" in visible and '"exit_code":17' in visible and '"is_error":true' in visible

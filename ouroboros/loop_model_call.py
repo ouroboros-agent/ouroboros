@@ -1479,11 +1479,12 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
     return _recover_context_overflow(ctx, failed_capture, cost, prepared=prepared)
 
 
-# The ordered recovery after the provider's typed context refusal (owner decision 7A).
+# Ordered recovery after a typed context refusal; unconfirmed exposure is a late
+# source-only rescue, after ordinary same-model recovery and before configured fallback.
 # Each rung is applied at most once per route/round and is followed by one strictly
 # smaller retry against the latest refused candidate; prediction alone never opens it.
 # The configured fallback chain and the named refusal with Continue follow in the caller.
-OVERFLOW_RUNGS: Tuple[str, ...] = ("host_copies", "bodies", "helper", "memory", "low")
+OVERFLOW_RUNGS: Tuple[str, ...] = ("host_copies", "bodies", "helper", "memory", "low", "unseen_bodies")
 WAKE_DELIVERY_STEP = "wake_delivery"  # the change applied before the ladder, when there was one
 
 
@@ -1541,7 +1542,7 @@ def _recover_context_overflow(ctx: _RoundModelCallContext, failed_capture: Any, 
 
 def _apply_overflow_rung(ctx: _RoundModelCallContext, rung: str, fit: Any) -> bool:
     """Apply one rung to the live transcript; True when the candidate actually changed."""
-    if rung in ("host_copies", "bodies"):
+    if rung in ("host_copies", "bodies", "unseen_bodies"):
         return _run_emergency_address_pass(ctx, fit, rung=rung).status == "applied"
     if rung == "memory":
         return _coarsen_memory_view(ctx, fit)

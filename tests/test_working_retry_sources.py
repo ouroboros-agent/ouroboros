@@ -37,7 +37,7 @@ def restored(tmp_path, monkeypatch, request):
     write_task_result(root, old.task_id, "running", task_attempt=1, admitted_dispatch_attempt=1)
     raw = [*_prefix(), *_tool(text="Exact previous result, Ж.\r\n" * 1000)]
     reclaim = _request(raw, 1)
-    projected, receipt = emergency_address_view(raw, reclaim, rung="bodies", drive_root=root, task_id=old.task_id)
+    projected, receipt = emergency_address_view(raw, reclaim, rung="unseen_bodies", drive_root=root, task_id=old.task_id)
     assert receipt.status == "applied"
     limit.messages = projected
     old._task_acceptance_reviewed = True
