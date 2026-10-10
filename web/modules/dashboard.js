@@ -1,16 +1,18 @@
 import { bindTabStrip, renderPageHeader, renderTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 
+// By importance and expected use (docs/DESIGN.md §5): the log first and by default, then what
+// runs now and what it costs, then updates and Evolution (off by default).
 const DASHBOARD_TABS = [
     { value: 'logs', label: 'Logs' },
-    { value: 'evolution', label: 'Evolution' },
+    { value: 'activity', label: 'Activity' },
     { value: 'costs', label: 'Costs' },
     { value: 'updates', label: 'Updates' },
-    { value: 'activity', label: 'Activity' },
+    { value: 'evolution', label: 'Evolution' },
 ];
 // Static guard markers: renderTabStrip emits data-dashboard-tab="logs",
-// data-dashboard-tab="evolution", data-dashboard-tab="costs",
-// data-dashboard-tab="updates", and data-dashboard-tab="activity" from
+// data-dashboard-tab="activity", data-dashboard-tab="costs",
+// data-dashboard-tab="updates", and data-dashboard-tab="evolution" from
 // DASHBOARD_TABS at runtime.
 
 export function initDashboard({ state }) {

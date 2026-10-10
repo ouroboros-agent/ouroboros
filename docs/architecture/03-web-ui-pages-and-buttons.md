@@ -167,7 +167,7 @@ An out-of-process extension response streams through `extension_route_stream.py`
 
 ### Dashboard
 
-Dashboard groups Logs, Evolution, Costs, Updates and Activity under the common tab binder; each sub-tab owns its loading and refresh policy instead of running every expensive reader while hidden. Charting uses the bundled Chart.js (§3 Widgets page).
+Dashboard groups Logs, Activity, Costs, Updates and Evolution under the common tab binder; each sub-tab owns its loading and refresh policy instead of running every expensive reader while hidden. Charting uses the bundled Chart.js (§3 Widgets page).
 
 Logs merges live WebSocket log frames with bounded REST backfill from the events, tools, progress and supervisor logs: chronological order, dedupe across live and reconnect overlap, bounded grouped task cards, raw record on demand, and the shared presentation of `log_events.js`. A failed backfill names the unavailable sources in a separate status row while live events continue; clearing the panel deletes no log. Mounted unfinished child cards refresh their holds through `/api/tasks?queue_only=1`. `project_admission_hold` (a gateway contract field) carries the host's label, reason and detail, not a phase; a missing or unreadable queue never proves recovery, and parked phases, Stop and terminal outrank it (`chat_activity.js`).
 
