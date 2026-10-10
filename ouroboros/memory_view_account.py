@@ -3,12 +3,12 @@
 An account (``chronicle_store.publish_account``) is my own text over exact source versions of
 several rooms. It enters ``## My story`` only through my selection (``select_account``): the
 acting selection says whether it is shown and which named records of the story it tells
-instead (``told_by``). A told record keeps its address line under the account, so the
-horizon stays; its room page keeps its detail (``memory_view._capture_room``). The account
-block names the time of writing, each source with the version it read and its room, and
-every change a source has had since: a later correction (its words), my rejection or
-acceptance of a draft, a local fold, a source not in this chronicle. The host records those
-facts; it never rewrites the account's meaning.
+instead (``told_by``). The resident block keeps its period, counts and one exact composition
+reader instead of a row per source or replaced record; the room keeps its detail
+(``memory_view._capture_room``). New corrections and rejections stay whole beside the
+unchanged account until a newly authored account cites their source versions. Mere
+correction or re-selection of an old account does not update its frozen edges. The host
+reports these facts, draft decisions, folds and gaps; it never rewrites meaning.
 
 Only facts of the records, never a reason to read them. Nothing here reads a file.
 """
@@ -49,7 +49,7 @@ def source_change_lines(src: Mapping[str, Any]) -> List[str]:
 
 
 def _source_lines(entry: Mapping[str, Any]) -> List[str]:
-    """One line per source: what it is, where, which revision the account read, and what changed since."""
+    """Only changed or unavailable source facts; unchanged composition lives in the account reader."""
     lines = []
     for src in entry.get("sources") or ():
         where = src.get("room_label") or f"room {src.get('room_id')}"
@@ -58,12 +58,14 @@ def _source_lines(entry: Mapping[str, Any]) -> List[str]:
         if src.get("missing"):
             lines.append(f"{head}; not in this chronicle: its words are not here")
             continue
-        lines.append(f"{head}; memory_read(node_id='{src['id']}', revision='{src['revision']}')")
+        then, now = src.get("status"), src.get("status_now")
+        if (not src.get("revision_known") or src.get("later_fixes") or then != now
+                or src.get("folded_into") or src.get("nested_changes")):
+            lines.append(f"{head}; memory_read(node_id='{src['id']}', revision='{src['revision']}')")
         if not src.get("revision_known"):
             lines.append(f"  that revision of {src['id']} is not in this chronicle; its current one is {src.get('current_revision')}")
         for fix in src.get("later_fixes") or ():
             lines.append(f"- later correction of its source {src['id']} (not in this account):\n{indented(fix)}")
-        then, now = src.get("status"), src.get("status_now")
         if now == "rejected" and then != "rejected":
             lines.append(f"- my later rejection of its source {src['id']} (not in this account):\n"
                          + indented(src.get("rejection") or "reason not read"))
@@ -76,18 +78,14 @@ def _source_lines(entry: Mapping[str, Any]) -> List[str]:
 
 
 def account_lines(entry: Mapping[str, Any]) -> List[str]:
-    """The account's block under its header: its words, when I wrote it from how many sources, then each source."""
+    """My words and a bounded composition pointer, followed by pending source changes in full."""
     count = len(entry.get("sources") or ())
     return [indented(entry["text"]),
             f"- written {entry.get('written') or 'date not recorded'} by me ({entry.get('signer')}) from {count} "
             f"source{'' if count == 1 else 's'}; their rows span the period above, not every event in it",
+            f"- exact composition, source versions and selections: memory_read(node_id='{entry['id']}'); "
+            f"shown by selection {entry['selection']}",
             *_source_lines(entry)]
-
-
-def told_line(entry: Mapping[str, Any]) -> str:
-    """A record of the story told through an account: still named by its address and period."""
-    return (f"- told through this account: {entry['label']}; {entry['period']}; {entry['kind']} {entry['id']}; "
-            f"memory_read(node_id='{entry['id']}')")
 
 
 def accounts_line(status: Mapping[str, Any]) -> str:
@@ -119,9 +117,9 @@ def account_entries(store: ChronicleStore, label: Callable[..., str], units: Map
             sources.append({**src, "room_label": label(src.get("room_id")),
                             "later_fixes": [f["text"] for f in own if f["kind"] == "correction" and f.get("id") in later],
                             "rejection": next((f["reason"] for f in own if f["kind"] == "rejection"), "")})
-        rooms = list(dict.fromkeys(src["room_label"] for src in sources))
-        entries.append({"kind": "account", "id": record["id"], "room_id": str(record["room_id"]), "label": ", ".join(rooms),
-                        "period": period_text(period), "first": period.first,
+        entries.append({"kind": "account", "id": record["id"], "room_id": str(record["room_id"]), "label": "My account across rooms",
+                        "period": period_text(period), "source_period": period.span, "period_basis": period.source,
+                        "first": period.first,
                         "text": str(record.get("current_text") or ""), "status": "",
                         "signer": draft_signer(record.get("author")), "stamp": "", "fixes": [], "quotes": [],
                         "written": _date(record.get("ts")), "sources": sources, "replaces": list(selection.get("replaces") or ()),

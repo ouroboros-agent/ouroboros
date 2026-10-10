@@ -25,7 +25,7 @@ same bytes for every focus that carries a story (Main, any room's root, consciou
 Presence and a delegated child alike). Every unfolded record of it is whole — the old
 retelling too, no block privileged — until the physical floor or my own selection says
 otherwise: an account I wrote across rooms, once selected, stands in the story and tells the
-records it names in their place (``memory_view_account``), each still an address line; the
+records it names in their place (``memory_view_account``), their count, period and exact composition still visible; the
 room page keeps their detail. Texts of records keep their words and are indented by two
 spaces, so their own ``## `` lines never read as sections.
 
@@ -44,11 +44,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ouroboros import chat_chain, memory_inventory
 from ouroboros.chronicle_import import LEGACY_ROOM_ID, LEGACY_ROOM_LABEL, legacy_frontier, row_lineage
-from ouroboros.chronicle_store import CHILD_DRAFT_RIGHT, ChronicleStore, draft_signer
+from ouroboros.chronicle_store import CHILD_DRAFT_RIGHT, ChronicleStore, draft_signer, source_time_span
 from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
 from ouroboros.dialogue_provenance import (RoomLabelResolver, is_presence_task, render_memory_row, render_row_text,
                                            row_class)
-from ouroboros.memory_view_account import account_entries, account_lines, accounts_line, told_line, told_map
+from ouroboros.memory_view_account import account_entries, account_lines, accounts_line, told_map
 from ouroboros.memory_view_legacy import INDENT, indented as _indented, retold_lines
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -366,6 +366,7 @@ def _story_pages(store: ChronicleStore, label: Callable[..., str],
             keyed.append(((period.first, record["sequence"]), {
                 "kind": record["kind"], "id": record["id"], "room_id": room,
                 "label": str(_mapping(record.get("metadata")).get("room_label") or label(room)),
+                "source_period": period.span, "period_basis": period.source,
                 "period": _period(period.span, period.note()), "text": str(record.get("current_text") or ""),
                 "status": str(record.get("status") or ""), "signer": draft_signer(record.get("author")),
                 "stamp": _stamp_summary(record.get("host_stamp")), "fixes": _fixes(store, record, fixes), "quotes": record.get("quotes") or []}))
@@ -397,6 +398,9 @@ def _capture_story(store: ChronicleStore, root: pathlib.Path, label: Callable[..
                  "span": _legacy_span(unit.ts_span), "rows": unit.rows if unit.raw == "exact" else None,
                  "chars": unit.retelling_chars, "messages": pointer.get("messages"),
                  "gap": _gap_detail(store, pointer) if gap else ""}
+        period = memory_inventory.record_period(store, {**pointer, "id": unit.record_id, "kind": "legacy"},
+                                                {unit.record_id: unit})
+        entry.update(source_period=period.span, period_basis=period.source)
         if not gap and unit.record_id in words:
             entry["text"] = words[unit.record_id]
         story.append(entry)
@@ -759,23 +763,33 @@ _STORY_INTRO = ("Sealed pages and parts, and my accounts across rooms, oldest fi
 
 
 def _page_pointer(entry: Mapping[str, Any]) -> str:
-    return f"- {entry['label']}; {entry['period']}; {entry['kind']} {entry['id']}; memory_read(node_id='{entry['id']}')"
+    selection = f"; selection {entry['selection']}" if entry.get("selection") else ""
+    return f"- {entry['label']}; {entry['period']}; {entry['kind']} {entry['id']}; memory_read(node_id='{entry['id']}'){selection}"
 
 
 def _told_lines(account_id: str, told: List[Dict[str, Any]]) -> List[str]:
-    """The address lines of what an account tells in its place; what a told account told in turn stays named under it."""
-    lines: List[str] = []
+    """One count and period over the selected records, nested selections included; exact IDs stay in the reader."""
+    children: Dict[str, List[Dict[str, Any]]] = {}
     for item in told:
-        if item["told_by"] == account_id:
-            lines.append(told_line(item))
-            if item["kind"] == "account":
-                lines += [INDENT + line for line in _told_lines(item["id"], told)]
-    return lines
+        children.setdefault(item["told_by"], []).append(item)
+    records, pending = [], [account_id]
+    while pending:
+        for item in children.get(pending.pop(), ()):
+            records.append(item)
+            pending.append(item["id"])
+    if not records:
+        return []
+    spans = [_mapping(item.get("source_period")) for item in records]
+    span = source_time_span([s[key] for s in spans for key in ("start", "end") if s.get(key)],
+                            incomplete=any(not s or s.get("incomplete") for s in spans))
+    basis = " (includes block periods)" if any(item.get("period_basis") in ("block", "mixed") for item in records) else ""
+    return [f"- {len(records)} story records told through this account (including nested selections); "
+            f"{_period(span)}{basis}; exact records and selections in the composition reader"]
 
 
 def _page_lines(entry: Mapping[str, Any]) -> List[str]:
     head = f"### {entry['label']} · {entry['period']} · {entry['kind']} {entry['id']}"
-    if entry.get("kind") == "account":  # its words, when and from what I wrote it, each source and its later changes
+    if entry.get("kind") == "account":  # its words, compact composition, and new source changes still in full
         return ["", head, *account_lines(entry)]
     lines = ["", head, _indented(entry["text"]), *(f"- quote ({q.get('speaker')}, {q.get('address')}): {q.get('text')}" for q in entry.get("quotes") or ())]
     if entry.get("status") == "draft":
@@ -868,7 +882,7 @@ def render_story(snapshot: MemoryViewSnapshot, level: FloorLevel = FULL_VIEW) ->
     """Block B's tail, ``## My story``: the retold old memory, then my pages and parts, then the status.
 
     Every unfolded retold record is whole, then my pages, parts and selected accounts; a
-    record an account tells is one address line under it. Its bytes depend only on the
+    records an account tells retain their combined period and count with its composition reader. Its bytes depend only on the
     chronicle, the room labels, the helper route and ``level`` (the physical floor's; the
     empty level renders the full view): F3 turns a room's retold records into one line, F5
     my oldest pages, parts and accounts into address lines.

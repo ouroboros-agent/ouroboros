@@ -174,7 +174,11 @@ def test_a_childs_account_and_selection_are_refused_and_the_mind_writes_them(dat
     kid = {"id": "kid00001", "chat_id": 1, "delegation_role": "subagent", "root_task_id": "root0001"}
     story = mv.render_story(mv.capture_memory_view(data, kid, mv.view_spec_for_task(kid, data)))
     assert "Both arcs, as I see them." in story and "The first arc." not in story and "The second arc." in story
-    assert f"- told through this account: Main; 2026-10-01 00:00 → 2026-10-01 00:00; page {first['node_id']}; " in story
+    assert "1 story records told through this account (including nested selections); 2026-10-01 00:00 → 2026-10-01 00:00" in story
+    assert f"memory_read(node_id='{account['node_id']}')" in story
+    reader = registry_for(data, "kid00001", CHILD_META, mode, monkeypatch)
+    exact = reader.execute("memory_read", {"node_id": account["node_id"]})
+    assert f"replaces 1: {first['node_id']};" in exact and f"revision {first['node_id']} used" in exact
 
 
 def test_a_childs_refused_note_does_not_activate_the_chronicle(data, monkeypatch):

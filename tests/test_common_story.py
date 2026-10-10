@@ -3,7 +3,7 @@
 An account is my own text over exact source versions of several rooms; it is provenance, never
 ownership: publishing it seals no row, folds nothing, moves no head and leaves every source free
 to inform another account or to be folded locally. Selection is a separate act: it shows the
-account in the story in place of the records it names, which stay address lines under it and
+account in the story in place of the records it names, whose count, period and composition reader stay visible and
 keep their detail on their room's page. A later correction, rejection or fold of a source is
 visible as not in the account; the account's own basis never changes, and a copied or missing
 source is a disclosed gap, not fabricated text. Root and child read the same account; a nanny
@@ -135,12 +135,15 @@ def test_selection_replaces_only_the_named_records_and_the_rest_stay_whole(tmp_p
     assert chosen.ok and chosen.record["kind"] == "selection" and chosen.current_head is None
     story = _story(tmp_path)
     block = _block(story, g)
-    assert block.startswith(f"\n### Project Alpha [chat_id={alpha}], Main · 2026-09-03 00:00 → 2026-09-03 00:03 · account {g}\n")
+    assert block.startswith(f"\n### My account across rooms · 2026-09-03 00:00 → 2026-09-03 00:03 · account {g}\n")
     assert f"  {G_TEXT}\n- written " in block and "by me (root, task t1) from 2 sources; their rows span the period above, not every event in it" in block
-    assert f"- source: page {a1} of Project Alpha [chat_id={alpha}], revision {a1}; memory_read(node_id='{a1}', revision='{a1}')" in block
-    assert f"- source: page {b1} of Main, revision {b1}; memory_read(node_id='{b1}', revision='{b1}')" in block
-    told = f"- told through this account: Project Alpha [chat_id={alpha}]; 2026-09-03 00:03 → 2026-09-03 00:03; page {a1}; memory_read(node_id='{a1}')"
-    assert told in block and "Alpha asked again and I counted." not in story  # A1 by address under the account
+    assert f"exact composition, source versions and selections: memory_read(node_id='{g}')" in block
+    assert "1 story records told through this account (including nested selections); 2026-09-03 00:03 → 2026-09-03 00:03" in block
+    exact = _memory_read(_ctx(tmp_path), node_id=g)
+    assert f"source page {a1} (room {alpha}): revision {a1} used" in exact
+    assert f"source page {b1} (room 1): revision {b1} used" in exact
+    assert f"shown=True; replaces 1: {a1};" in exact
+    assert "Alpha asked again and I counted." not in story  # A1's meaning now lives in the selected account
     assert f"### Main · 2026-09-03 00:00 → 2026-09-03 00:01 · page {b1}\n  Main started" in story  # B1 stays whole
     assert "A helper's draft about Beta." in story  # H1 untouched
     assert "\nMy accounts across rooms: 1 written, 1 in the common view.\n" in story + "\n"
@@ -182,10 +185,11 @@ def test_latest_explicit_selection_wins_overlap_without_reordering_accounts(tmp_
 
     def assert_told_by(account, other):
         story = _story(tmp_path)
-        address = f"; {target_kind} {target}; memory_read(node_id='{target}')"
-        assert address in _block(story, account)
+        assert "1 story records told through this account" in _block(story, account)
+        assert next(e for e in _snapshot(tmp_path).story if e["id"] == target)["told_by"] == account
+        assert f"replaces 1: {target};" in _memory_read(_ctx(tmp_path), node_id=account)
         if other is not None:
-            assert address not in _block(story, other)
+            assert "story records told through this account" not in _block(story, other)
             # A new selection changes display ownership, not the accounts' chronology.
             assert story.index(f" · account {g1}\n") < story.index(f" · account {g2}\n")
         assert _story(tmp_path, KID) == story
@@ -230,15 +234,21 @@ def test_reselecting_an_account_reveals_it_after_two_or_three_link_replacement(t
     initial = _story(tmp_path)
     assert f"Synthetic account body {chain_length}." in initial
     assert "Synthetic account body 1." not in initial
-    # The existing nested-address path keeps the original sources behind the replaced accounts.
-    assert all(f"memory_read(node_id='{ident}')" in initial for ident in [a1, b1, *accounts[:-1]])
+    # One composition pointer retains the nested path to every exact source and selection.
+    assert f"{chain_length + 1} story records told through this account" in initial
+    assert f"memory_read(node_id='{accounts[-1]}')" in initial
+    assert all(ident in _memory_read(_ctx(tmp_path), node_id=accounts[0]) for ident in (a1, b1))
+    for current, previous in zip(accounts[1:], accounts):
+        assert f"replaces 1: {previous};" in _memory_read(_ctx(tmp_path), node_id=current)
 
     assert _write(tmp_path, kind="selection", target_id=accounts[0], replaces=[accounts[-1], a1, b1],
                   reason="Return to the earlier understanding, keeping its exact sources.")["ok"]
     chosen = _story(tmp_path)
     assert "Synthetic account body 1." in chosen
     assert all(f"Synthetic account body {index + 1}." not in chosen for index in range(1, chain_length))
-    assert all(f"memory_read(node_id='{ident}')" in chosen for ident in [a1, b1, *accounts[1:]])
+    assert f"{chain_length + 1} story records told through this account" in chosen
+    assert f"memory_read(node_id='{accounts[0]}')" in chosen
+    assert f"replaces 3: {accounts[-1]}, {a1}, {b1};" in _memory_read(_ctx(tmp_path), node_id=accounts[0])
     assert not next(e for e in _snapshot(tmp_path).story if e["id"] == accounts[0]).get("told_by")
     assert _story(tmp_path, KID) == chosen
 
@@ -302,7 +312,8 @@ def test_two_accounts_cite_one_source_and_a_local_fold_over_it_still_works(tmp_p
     assert G_TEXT in story and G2_TEXT in story  # two useful accounts coexist
     assert f"- its source {a1} has since been folded into part {local.record['id']} (not in this account)" in _block(story, g)
     assert f"part {local.record['id']}" in story and "Alpha, told once." in story  # the new local part is new, whole
-    assert "Beta asked and I answered." not in story and f"told through this account: Project Beta [chat_id={beta}]" in _block(story, g2.record["id"])
+    assert "Beta asked and I answered." not in story and "1 story records told through this account" in _block(story, g2.record["id"])
+    assert f"replaces 1: {c1};" in _memory_read(_ctx(tmp_path), node_id=g2.record["id"])
 
 
 # --- C. a later correction of a source, and a changed or missing source identity ---------------------
@@ -427,11 +438,10 @@ def test_a_new_record_after_the_account_is_open_and_a_later_account_replaces_onl
     later = _story(tmp_path)
     block = _block(later, g_next)
     assert NEXT_TEXT in block and G_TEXT not in later
-    assert f"- told through this account: Project Alpha [chat_id={alpha}], Main; 2026-09-03 00:00 → 2026-09-03 00:03; account {g}; memory_read(node_id='{g}')" in block
-    assert f"page {a3}; memory_read(node_id='{a3}')" in block
-    assert f"page {a1}; memory_read(node_id='{a1}')" in later and f"page {b1}; memory_read(node_id='{b1}')" in later  # G's told records stay named
+    assert "4 story records told through this account (including nested selections); 2026-09-01 00:02 → 2026-09-03 00:03" in block
+    assert f"replaces 2: {g}, {a3};" in _memory_read(_ctx(tmp_path), node_id=g_next)
+    assert f"replaces 2: {a1}, {b1};" in _memory_read(_ctx(tmp_path), node_id=g)
     assert "\nMy accounts across rooms: 2 written, 1 in the common view (the rest one memory_read away).\n" in later + "\n"
-    assert f"  - told through this account: Project Alpha [chat_id={alpha}]; 2026-09-03 00:03 → 2026-09-03 00:03; page {a1}; " in later  # under G's line
     assert store.get(g)["text"] == G_TEXT and store.get(g)["sources"][0]["revision"] == a1
 
 
@@ -481,13 +491,16 @@ def test_the_floor_takes_an_account_like_a_page_and_keeps_what_it_tells_named(tm
     assert "legacy-b01-r1" not in "".join(f3.values()) and "Main was quiet." not in "".join(f3.values())
     assert mf.fit_memory_view(snapshot, {"margin": None, "physical": None, "budget": None}) == mv.FULL_VIEW
     full = mv.render_story(snapshot)
-    assert "Main was quiet." not in full and "- told through this account: Main; 2026-09-02 00:00 → 2026-09-02 00:03 (block period); legacy legacy-b01-r1; memory_read(node_id='legacy-b01-r1')" in full
+    represented = "2 story records told through this account (including nested selections); 2026-09-02 00:00 → 2026-09-03 00:03 (includes block periods)"
+    assert "Main was quiet." not in full and represented in full
     level = mv.FloorLevel((("F5", (g,)),))
     short = mv.render_story(snapshot, level)
     assert G_TEXT not in short and "### My older pages, parts and accounts, by address" in short
     label, period, _kind = _block(full, g).split("\n")[1][4:].split(" · ")  # "### <label> · <period> · account <id>"
     assert f"- {label}; {period}; account {g}; memory_read(node_id='{g}')" in short and period == "2026-09-03 00:00 → 2026-09-03 00:03"
-    assert f"page {a1}; memory_read(node_id='{a1}')" in short and "legacy-b01-r1')" in short  # the horizon holds
+    assert represented in short  # the horizon holds even when the account itself is addressed
+    exact = _memory_read(_ctx(tmp_path), node_id=g)
+    assert f"replaces 2: {a1}, legacy-b01-r1;" in exact
     assert mv.snapshot_from_json(mv.snapshot_json(snapshot)) == snapshot
     note = mf.floor_note(level, window_tokens=100_000, mode="max")
     assert "1 pages, parts or accounts of my story" in note
@@ -545,7 +558,7 @@ def test_chronicle_write_publishes_and_selects_an_account_and_a_child_is_refused
     listing = _memory_read(_ctx(tmp_path))
     assert re.search(rf"^\[account {written['node_id']}; room 1; mind \(root turn0001\); based on 2 sources, ", listing, re.M)
     read = _memory_read(_ctx(tmp_path), node_id=written["node_id"])
-    assert f"selection {chosen['node_id']} by mind (root turn0001) (seq {chosen['sequence']}):\nshown=True; replaces 1; through it" in read
+    assert f"selection {chosen['node_id']} by mind (root turn0001) (seq {chosen['sequence']}):\nshown=True; replaces 1: {a1}; through it" in read
     withdrawn = _write(tmp_path, kind="selection", target_id=written["node_id"], replaces=[], shown=False, reason="later")
     assert withdrawn["ok"] and withdrawn["shown"] is False and G_TEXT not in _story(tmp_path)
     # The selection record itself reads back with its target and list.
