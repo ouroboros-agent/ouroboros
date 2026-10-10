@@ -72,7 +72,7 @@ def test_outward_speech_survives_while_the_unrelated_large_tool_body_folds(main_
     request = _request(messages, 1)
     if recovery == "emergency":
         from ouroboros.context_source_view import emergency_address_view
-        rebuilt, receipt = emergency_address_view(messages, request, rung="bodies",
+        rebuilt, receipt = emergency_address_view(messages, request, rung="unseen_bodies",
                                                   drive_root=f.ctx.drive_root, task_id=f.ctx.task_id)
     else:
         if recovery == "helper":
