@@ -230,7 +230,7 @@ ouroboros/ — agent core and shared runtime (§6)
   delegate_supervision.py — event-only sleeping-nanny loop: quiet windows renew without a model call (§6 Delegated subagents)
   delegate_target_drift.py — read-only authority-tree drift evidence, never attributed to the child (§6 Delegated subagents)
   delegate_recovery.py, delegate_continuation.py, delegate_pending.py — exact-leaf recovery for a proven crash or planned restart; `continue_from` after any stop; durable pending-invocation replay with the original idempotency key (§6 Delegated subagents)
-  delegate_registration_policy.py, delegate_readonly_inputs.py — `persistent_registration` and STARTED-row field tables; readonly lineage inputs
+  delegate_registration_policy.py, delegate_readonly_inputs.py — `resolve_registration` and STARTED-row field tables; readonly lineage inputs
   delegate_terminal.py — terminal reconciliation and custody-audit persistence, audit-only in both directions; the typed `terminal_custody_notice` card row (§6 Delegated subagents)
   subagent_dispatch_notes.py — executor-note exports shared with `agent.py`; the note/blocked-outcome pair is implemented in `agent_dispatch.py`
   subagent_messages.py, subagents.py, subagent_history.py — durable child-message identity shared by frame, recovery and replay; subagent envelopes dispatching through `subagent_runtime`; the compact helper receipt for context and owner UI, never admission (§6 Delegated subagents; Route health)
