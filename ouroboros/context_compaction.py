@@ -450,12 +450,14 @@ def unit_kind(messages: Sequence[Mapping[str, Any]], unit: _AtomicUnit) -> UnitK
 def owner_protected_unit_ids(
     messages: Sequence[Mapping[str, Any]], units: Sequence[_AtomicUnit], protected_texts: Sequence[str],
 ) -> frozenset:
-    """Host rows carrying any typed owner text (``tools.compact_context.owner_protected_texts``)
-    are never folded; a mixed row stays whole."""
+    """Keep governing words and typed outward dialogue whole, without promoting
+    the actor's speech to owner authority. A mixed owner row stays whole."""
     texts = [text for text in protected_texts if text]
     return frozenset(
-        unit.unit_id for unit in units if texts and unit_kind(messages, unit) == "user"
-        and any(text in (_plain_text(messages[unit.start].get("content")) or "") for text in texts))
+        unit.unit_id for unit in units
+        if messages[unit.start].get(HOST_CONTEXT_KIND_KEY) == "owner_dialogue"
+        or (texts and unit_kind(messages, unit) == "user"
+            and any(text in (_plain_text(messages[unit.start].get("content")) or "") for text in texts)))
 
 
 def _source_atoms(messages: Sequence[Mapping[str, Any]]) -> Counter:
@@ -1220,7 +1222,7 @@ def _authored_view(
         return messages, _receipt("binding_mismatch", before_sha=before_sha, **facts), None
     protected = owner_protected_unit_ids(observed, units, protected_texts)
     authored = [u for u in units if (_capsule_metadata(observed[u.start])[1] or {}).get("authorship") == "actor"]
-    removed = [u for u in units if (u.unit_id not in keep or u in authored) and u.unit_id not in protected]
+    removed = [u for u in units if u.unit_id not in keep and u.unit_id not in protected]
     if exposed_units is not None:
         exposed = {(ref.get("unit_id"), ref.get("raw_sha256")) for ref in exposed_units}
         removed = [u for u in removed if (u.unit_id, u.raw_sha256) in exposed]
@@ -1230,15 +1232,21 @@ def _authored_view(
     restore = [ref for ref in facts["restored_unit_refs"] if not any(
         meta["unit_id"] == ref.get("unit_id") and meta["source_unit_sha256"] == ref.get("raw_sha256")
         and meta["checkpoint_ref"] == ref.get("checkpoint_ref") for meta in visible_sources)]
-    same_note = (len(authored) == 1 and removed == authored
-                 and observed[authored[0].start]["content"][0]["text"].partition("\n")[2] == request.working_note.strip())
-    messages_unchanged = not restore and (same_note or not removed and not request.working_note.strip())
+    same_note = next((u for u in reversed(authored)
+        if (not removed or removed == [u])
+        and observed[u.start]["content"][0]["text"].partition("\n")[2] == request.working_note.strip()), None)
+    messages_unchanged = not restore and (same_note is not None or not removed and not request.working_note.strip())
     schemas_unchanged = (list(observed_tool_schemas) == list(tool_schemas) if observed_tool_schemas is not None
                          else request.schema_names is None)
     no_op = messages_unchanged and schemas_unchanged
     if messages_unchanged:
         facts["retained_unit_ids"] = tuple(u.unit_id for u in units)
     checkpoint_ref, selection, capsule_refs = None, None, []
+    if same_note is not None and messages_unchanged:
+        # A transfer-only request names this exact observed account, never the
+        # first of several notes. No new source or actor text is manufactured.
+        meta = _capsule_metadata(observed[same_note.start])[1]
+        selection = _Selection((), meta["unit_id"].removeprefix("view:"), 0)
     candidate = messages
     if not messages_unchanged:
         try:

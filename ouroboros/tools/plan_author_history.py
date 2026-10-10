@@ -180,3 +180,70 @@ def current_submitted_plan(drive_root: Any, task_id: str, state: dict) -> dict |
             or not isinstance(value.get("spec"), dict) or not isinstance(value.get("plan_prose"), str)):
         raise ValueError("submitted plan source identity mismatch")
     return {**value, "source_ref": ref, "authority": "Submitted for review; no reviewer verdict or author-finish selection."}
+
+
+def address_runtime_review_mirrors(runtime: dict, history: dict) -> None:
+    """De-duplicate known model-only authority carriers against the resident index.
+
+    The source state/gate operands are not modified. This runs before the Runtime
+    prefix freezes, so a later authored index view cannot leave a hidden raw copy.
+    Unknown identities stay full. Only documented authority-envelope edges recur.
+    """
+    from ouroboros.review_history_view import _sha, _decision_ref, decision_entries, _decision_alias, _set_existing
+    from ouroboros.tools.plan_review_artifacts import plan_decision_aliases
+
+    authors = {_sha(_decision_ref(e["row"]["source"])): e for e in decision_entries(history)
+               if e["bound_decision"] and e["row"]["decision_kind"] == "plan_author"}
+
+    def subject(value):
+        if not isinstance(value, dict):
+            return
+        ref = _decision_ref(value.get("source_ref") or value.get("source"))
+        entry = authors.get(_sha(ref)) if ref else None
+        author = value.get("author_disposition")
+        if entry and isinstance(author, dict) and author.get("rationale") == entry["row"].get("reason"):
+            author["rationale"] = _decision_alias(entry["bound_decision"])
+
+    def wave_mirrors(value, ref):
+        if not isinstance(value, dict) or not ref:
+            return
+        facade = {"rounds": [{**copy.deepcopy(value), "source": {"source_ref": ref}}]}
+        for entry in decision_entries(history):
+            if entry["bound_decision"] and _decision_ref(entry["row"].get("source")) == ref:
+                for path, alias in plan_decision_aliases(facade, entry):
+                    _set_existing(value, path[2:], alias)
+
+    def state(value):
+        if not isinstance(value, dict):
+            return
+        subject((value.get("current_attempt") or {}).get("author_subject"))
+        waves = value.get("waves") or []
+        for wave in waves:
+            if isinstance(wave, dict):
+                wave_mirrors(wave, _decision_ref(wave.get("wave_artifact")))
+        core = value.get("decision_core")
+        if isinstance(core, dict) and waves:
+            facade = {"author_disposition": copy.deepcopy(core.get("author_disposition"))}
+            for key in ("findings", "dispositions"):
+                if isinstance(core.get(key), dict):
+                    facade[key] = copy.deepcopy(core[key].get("items") or [])
+            wave_mirrors(facade, _decision_ref(waves[-1].get("wave_artifact")))
+            for key in facade:
+                if key in ("findings", "dispositions"):
+                    core[key]["items"] = facade[key]
+                elif key in core:
+                    core[key] = facade[key]
+
+    plan = runtime.get("plan_review_authority")
+    if isinstance(plan, dict):
+        subject((plan.get("current_attempt") or {}).get("author_subject"))
+    # Continuation carriers are typed by their owning authority projector, not
+    # arbitrary user JSON or a recursive sweep for a field named rationale.
+    pending = [runtime]
+    while pending:
+        carrier = pending.pop()
+        state(carrier.get("plan_review_state"))
+        for key in ("predecessor_authority", "task_contract"):
+            child = carrier.get(key)
+            if isinstance(child, dict):
+                pending.append(child)

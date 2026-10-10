@@ -138,9 +138,11 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
                               if checkpoint else None)
         from ouroboros.review_history_view import attachment_transfer_options, review_note_options
         transfers = attachment_transfer_options(ctx) if getattr(ctx, "task_id", "") else {}
+        decisions = review_note_options(ctx) if getattr(ctx, "task_id", "") else {}
+        observed["review_decisions"] = copy.deepcopy(decisions)
         return json.dumps({
             **({"review_attachment_transfer": transfers} if transfers else {}),
-            **({"review_decisions": review_note_options(ctx)} if getattr(ctx, "task_id", "") else {}),
+            **({"review_decisions": decisions} if decisions else {}),
             "view_revision": observed["revision"],
             "units": [{"unit_id": unit.unit_id, "raw_sha256": unit.raw_sha256, "kind": unit_kind(observed["messages"], unit),
                        "eligible": unit.unit_id not in protected,
@@ -153,8 +155,9 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
             "schema_names": [s["function"]["name"] for s in observed["tool_schemas"]],
             "rule": ("This revision names the observed messages; schemas are listed separately. Units are complete tool "
                      "units, earlier records, your own completed replies (kind assistant) and completed prose rows (kind user; eligibility distinguishes governing owner words); "
-                     "a unit with eligible=false carries the owner's words and stays whole. Select complete unit IDs to "
-                     "keep, write one working_note, and preserve original sources. The system view, the assignment and "
+                     "a unit with eligible=false carries protected dialogue and stays whole. Select complete unit IDs to "
+                     "keep and write a local working_note. Earlier notes stay where they are unless selected for replacement; "
+                     "select several to merge their account and sources. The system view, the assignment and "
                      "newer owner/tool messages remain untouched."),
         }, ensure_ascii=False, separators=(",", ":"))
     if working_note is not None:
@@ -175,18 +178,13 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
                        or not all(isinstance(v, str) and v for v in values))
                        for values in (keep_unit_ids, schema_names))
                 or review_notes is not None and not isinstance(review_notes, list)
+                or review_transfers is not None and not isinstance(review_transfers, list)
                 or restore_unit_refs is not None and (not isinstance(restore_unit_refs, list)
                     or not all(isinstance(ref, dict) for ref in restore_unit_refs))):
             return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
                 text="Invalid context view request: use a prose working_note, arrays of exact unit/schema names and checkpoint reference objects."))
-        if review_transfers:
-            from ouroboros.review_history_view import current_plan_history, validate_attachment_transfers
-            try:
-                history, operative = current_plan_history(ctx)
-                review_transfers = validate_attachment_transfers(history, operative, review_transfers)
-            except (ValueError, TypeError, KeyError, OSError) as exc:
-                return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
-                    text=f"Review attachment transfer was not selected: {exc}. Inspect current sources/spec, then declare exact transfers with your working_note."))
+        from ouroboros.review_history_view import resolve_observed_review_notes
+        review_notes = resolve_observed_review_notes(review_notes or [], observed)
         if keep_unit_ids is None and keep_last_n is not None:
             # keep_last_n counts completed tool units; everything from the N-th most recent
             # tool unit onward (prose rows between and after them included) stays raw.
@@ -194,7 +192,8 @@ def _compact_context(ctx, keep_last_n: int | None = None, *, inspect: bool = Fal
             units = context_units(observed["messages"], scope="dialogue")
             tool_units = [unit for unit in units if unit_kind(observed["messages"], unit) == "tool"]
             anchor = tool_units[-count].start if len(tool_units) >= count else 0
-            keep_unit_ids = [unit.unit_id for unit in units if unit.start >= anchor]
+            keep_unit_ids = [unit.unit_id for unit in units if unit.start >= anchor
+                             or unit_kind(observed["messages"], unit) == "capsule"]
         ctx._pending_compaction = {
             "observed": observed, "working_note": working_note, "review_transfers": list(review_transfers or []),
             "review_notes": list(review_notes or []),
@@ -232,9 +231,10 @@ def get_tools() -> List[ToolEntry]:
                     "Supply your working_note to author the replacement, or omit it for helper summarization of old "
                     "completed tool units. An authored view addresses complete tool units, earlier records, your own "
                     "completed replies and host prose rows (inspect lists them with kind and eligibility); the owner's "
-                    "words, the assignment and the system view always stay whole. "
+                    "words and your typed owner-directed dialogue, the assignment and the system view stay whole. "
                     "Select exact keep_unit_ids or explicitly keep_last_n recent tool units raw; "
-                    "an authored note without either keeps all units. A selected older assistant tool call and all of its "
+                    "an authored note without either keeps all units. Earlier notes remain in place unless your exact "
+                    "keep selection replaces them; choose several for an explicit merged account. A selected older assistant tool call and all of its "
                     "contiguous matching results stay atomic; Ouroboros checkpoints their exact "
                     "actor-visible bytes before replacing them with summaries whose metadata points "
                     "to the checkpoint/CAS evidence. Active context becomes summarized; raw evidence "
@@ -246,7 +246,7 @@ def get_tools() -> List[ToolEntry]:
                     "properties": {
                         "inspect": {"type": "boolean", "description": "Return and pin the last observed view revision, complete unit IDs, source references and current schema names without changing context."},
                         "expected_view_revision": {"type": "string", "description": "Optional view_revision from inspect, checked exactly. Omitted binds the actual model-send view that produced this call; inspect is not required to replace all completed units."},
-                        "working_note": {"type": "string", "description": "One coherent account of current understanding, corrections and unresolved work. Supplying it selects your authored view; omission keeps legacy helper compaction."},
+                        "working_note": {"type": "string", "description": "Your account of the selected material, corrections and unresolved work, placed at its first replaced unit. Earlier notes remain unless selected too. Omission keeps legacy helper compaction."},
                         "keep_unit_ids": {"type": "array", "items": {"type": "string"}, "description": "Exact inspected complete units to retain raw; takes precedence over keep_last_n, empty keeps none eligible. If both selectors are omitted, an authored note keeps all. Owner words, the assignment, the system view and the newer tail are preserved whatever the selection."},
                         "restore_unit_refs": {"type": "array", "items": {"type": "object", "properties": {
                             "checkpoint_ref": {"type": "object"}, "unit_id": {"type": "string"}, "raw_sha256": {"type": "string"}},
@@ -254,9 +254,11 @@ def get_tools() -> List[ToolEntry]:
                             "description": "Read exact checkpoint-local units back as labelled sources, never live tool protocol replay."},
                         "schema_names": {"type": "array", "items": {"type": "string"}, "description": "Nano only: desired canonical schemas. This selects residency, never execution permissions. Low/Max retain their full permitted envelope."},
                         "review_notes": {"type": "array", "items": {"type": "object", "properties": {
-                            "bound_decision": {"type": "object"}, "remark": {"type": "string"}, "reason": {"type": "string"}},
-                            "required": ["bound_decision", "remark", "reason"], "additionalProperties": False},
-                            "description": "With working_note: your short attributed remark and reason for exact decisions from inspect.review_decisions. Canonical status/verdict/authority remain unchanged. Missing/stale entries stay full and are disclosed; no host clipping or automatic summary."},
+                            "bound_decision": {"anyOf": [{"type": "object"}, {"type": "string"}]},
+                            "bound_decisions": {"type": "array", "items": {"anyOf": [{"type": "object"}, {"type": "string"}]}},
+                            "remark": {"type": "string"}, "reason": {"type": "string"}},
+                            "required": ["remark", "reason"], "additionalProperties": False},
+                            "description": "With working_note: bound_decision keeps one decision's status with your short remark/reason. Alternatively bound_decisions explicitly replaces a group of closed historical decisions with your account. Use exact bindings or decision_ref values from this observed view; positional IDs alone do not bind a version. Current contracts/statuses, open/deferred/pending facts and gaps stay visible. Missing/stale entries stay full with reasons; no new verdict, host clipping or helper summary."},
                         "review_transfers": {"type": "array", "items": {"type": "object", "properties": {
                             "source": {"type": "object"}, "operative_spec_sha256": {"type": "string"},
                             "decision_ids": {"type": "array", "items": {"type": "string"}}},
