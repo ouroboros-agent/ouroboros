@@ -1132,8 +1132,10 @@ Ouroboros body the questions apply with the `Critical surface whitelist` of the
 Ouroboros Body Layer; on another root (`review_change`, core layer) with the
 universal whitelist of the Change Review Checklist, against the subject's own
 documents. A packet seat (a model without tools) is not asked this part, and the
-record says so. This part finds cross-module bugs, broken implicit contracts and
-hidden regressions outside the diff. Reading coverage (host-observed native
+record says so. This part follows the assumptions and consequences of the change across
+relevant producers and consumers, including connections between changed
+modules. Review the behavior the change creates, alters or relies on.
+Reading coverage (host-observed native
 receipts; a session's `harness_observed` journal; unobserved where neither is
 available) is diagnostic: preserve the received verdict and quorum participation,
 disclose gaps, and leave further reading to the agent's judgment (BIBLE P3).
@@ -1145,8 +1147,8 @@ PASS entries are mandatory for items with no problems and carry 1–2 sentences 
 a concrete artifact or code path actually checked — a bare "PASS" or single-word
 reason is a reviewer failure. Multiple FAIL entries for one item are valid when they
 describe distinct root causes; do not merge unrelated coupling bugs, emit duplicate
-PASS entries, or emit PASS for an item that also has a FAIL. The `Anti pattern-lock
-guard` (the second pass after a single FAIL) rides Part 1 once
+PASS entries, or emit PASS for an item that also has a FAIL. The behavioral countercheck
+is included once in Part 1
 (`ouroboros/tools/review_prompt_text.py`). The gate forwards only `verdict == "FAIL"`
 entries; PASS rows keep coverage and reasoning auditable in the record's per-seat
 answers. The matrix is validated before findings are classified
@@ -1171,7 +1173,6 @@ aggregates `NOT_PERFORMED`, never PASS.
 
 - Any critical FAIL must cite a concrete file, symbol, prompt, doc, test, config, or sibling flow.
 - If the reviewer cannot point to an exact touchpoint, the FAIL must be advisory, not critical.
-- Coupling affects only unchanged code outside the diff. The diff itself remains fully reviewable in Part 1.
 - For narrative / prose / cross-surface findings, apply the shared `Critical surface whitelist`
   defined in the Change Review Checklist section above, with the body's carriers named in the
   Ouroboros Body Layer when the subject is the body. Only release metadata, tool schema,
