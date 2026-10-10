@@ -584,7 +584,7 @@ CONTEXT_FACTS_NAME = "ouroboros_context_facts"
 
 
 def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
-                       measured: bool = True) -> str:
+                       measured: bool = True, focus_fact: str = "") -> str:
     """One short line of this round's room facts for the actor, no advice (owner decision 5A).
 
     Reads the measurement the round already recorded (``_remember_main_fit`` facts),
@@ -635,6 +635,8 @@ def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
         parts.append(str(facts["tree_line"]).strip())
     parts.append(f"quota {facts['quota']}" if facts.get("quota") is not None else "quota unknown")
     parts.append(_cached_tariff_text(ctx))
+    if focus_fact:
+        parts.append(focus_fact)
     return f"{CONTEXT_FACTS_HEADER} " + " | ".join(parts)
 
 
@@ -689,6 +691,44 @@ def _cached_tariff_text(ctx: Any) -> str:
     return "tariff unknown"
 
 
+def _own_focus_fact(ctx: Any) -> Tuple[str, str]:
+    """Observe one physical task result, never a successor or an execution replica.
+
+    Strict admission leaves unreadable records untouched. This reads the current
+    result once per preparation; no history scan, second store or focus clock.
+    """
+    from ouroboros.focus import compact_focus, focus_fingerprint
+    from ouroboros.task_results import load_task_result
+
+    tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    metadata = getattr(tool_ctx, "task_metadata", {}) or {}
+    root = (metadata.get("budget_drive_root") or getattr(tool_ctx, "budget_drive_root", None)
+            or getattr(tool_ctx, "drive_root", None) or getattr(ctx, "drive_root", None))
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    if not root or not task_id:
+        return "absent", ""
+    try:
+        result = load_task_result(root, task_id, strict=True)
+        raw = result.get("focus") if result else None
+        if raw is None:
+            return "absent", ""
+        focus = compact_focus(raw)
+        if focus is None:
+            return "unknown", "own focus unavailable"
+    except (OSError, ValueError, TypeError):
+        log.debug("Cannot read this task's authored focus", exc_info=True)
+        return "unknown", "own focus unavailable"
+    if focus["author_task_id"] != task_id:
+        return "absent", ""
+    view = {key: focus[key] for key in ("text", "authored_at", "author_task_id", "source_ref")}
+    handle = focus.get("source_handle")
+    if handle:
+        view["retained_source"] = {"reader": "get_task_result", "task_id": task_id,
+                                   "include_focus_source": True, "focus_source_sha256": handle["sha256"]}
+    return (focus_fingerprint(focus), "self-authored focus (dated data, not owner instructions): "
+            + json.dumps(view, ensure_ascii=False, sort_keys=True))
+
+
 def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) -> bool:
     """Append facts for this round's current route and working view, before dispatch.
 
@@ -702,12 +742,13 @@ def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) ->
 
     usage = ctx.accumulated_usage
     plan = ctx.context_fit_plan
+    focus_identity, focus_fact = _own_focus_fact(ctx)
     source = [m for m in ctx.messages if m.get(HOST_CONTEXT_KIND_KEY) != CONTEXT_FACTS_NAME]
     source.append({"role": "system", "content": json.dumps(ctx.tool_schemas, ensure_ascii=False, sort_keys=True)})
     key = (ctx.round_idx, ctx.active_model, ctx.active_context_mode, ctx.active_effort,
            str(getattr(plan, "route_fp", "")), str(getattr(plan, "status", "")),
            bool(getattr(plan, "stale", False)), int(getattr(plan, "window_tokens", 0) or 0),
-           context_reclaim_transcript_sha256(source))
+           context_reclaim_transcript_sha256(source), focus_identity)
     visible = any(m.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME and m.get("content") == usage.get("_context_facts_line")
                   for m in ctx.messages)
     if tuple(usage.get("_context_facts_key") or ()) == key and visible:
@@ -722,7 +763,7 @@ def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) ->
         tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
         money = {"budget_remaining_usd": _loop()._wrapup_global_remaining(),
                  "ceiling_usd": getattr(getattr(tool_ctx, "_cost_ceiling", None), "root_cap_usd", None)}
-    line = context_facts_line(ctx, money=money, measured=measured)
+    line = context_facts_line(ctx, money=money, measured=measured, focus_fact=focus_fact)
     ctx.messages.append({"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": line})
     usage["_context_facts_round"] = ctx.round_idx
     usage["_context_facts_key"] = key
