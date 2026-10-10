@@ -1,7 +1,5 @@
-"""Caller-owned physical accounting; one engine operation rejoins lost control, private CAS precedes ACK.
-Only durable dispatched results update the caller's live turn slot; unknown/no-start/legacy outcomes preserve it.
-Pre-dispatch pricing reads that slot; route changes clear it. The engine version gate reads the last successful handshake; a failed probe never un-proves an engine already observed at the minimum. Deadlines/Stop stay unchanged (ARCHITECTURE §6).
-"""
+"""Caller-owned physical accounting and engine continuation; private CAS precedes ACK.
+Dispatch, turn-slot, pricing and engine-version semantics: ARCHITECTURE §6."""
 
 from __future__ import annotations
 
@@ -26,8 +24,7 @@ from ouroboros.effort_evidence import model_effort_usage
 from ouroboros.gateways.claudexor import (ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
                                           operation_query_supported, _READ_TIMEOUT_SEC)
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch, effort_request_facts
-from ouroboros.llm_capability_policy import (
-    model_catalog as model_catalog, catalog_admits_model as catalog_admits_model)
+from ouroboros.llm_capability_policy import model_catalog as model_catalog, catalog_admits_model as catalog_admits_model
 from ouroboros.send_clock import stamp_clock_note
 from ouroboros.llm_substitution import (
     AccountRotation, SubstitutionBudget, substitution_fact, failed_account_preference,
