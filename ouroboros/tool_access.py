@@ -701,6 +701,15 @@ def _resolve_target_in_selected_base(
         anchored = delegated_capture_read_target(
             canonical_data_root(ctx), task_id_for_artifacts(ctx),
             safe_relpath(path_text), resolved_base)
+        if anchored is not None and anchored.exists():
+            return anchored
+        if anchored is not None or not (resolved_base / safe_relpath(path_text)).exists():
+            from ouroboros.source_retention import retained_actor_source_read_target
+
+            retained = retained_actor_source_read_target(
+                canonical_data_root(ctx), task_id_for_artifacts(ctx), safe_relpath(path_text))
+            if retained is not None:
+                return retained
         if anchored is not None:
             return anchored
     resolved = (resolved_base / safe_relpath(path_text)).resolve(strict=False)
