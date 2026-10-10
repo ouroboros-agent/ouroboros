@@ -39,6 +39,8 @@
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import { createAccountResourcesController, resourcePanelId, resourceReadGap,
+    resourceSummary, targetFor } from './account_resources.js';
 import {
     FACET_ACCOUNTS,
     FACET_CATALOG,
@@ -194,7 +196,7 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     const scopedSpent = [];
     for (const snap of rows) {
         for (const constraint of snap.constraints || []) {
-            const used = Number(constraint.used_ratio);
+            const used = constraint.used_ratio;
             const fact = quotaConstraintFact(constraint, nowMs);
             const spent = fact.exhausted;
             const models = Array.isArray(constraint.applies_to_models)
@@ -217,7 +219,7 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
                 exhaustedResetsAt = fact.resetsAt;
             }
             unknown ||= fact.unknown;
-            if (!Number.isFinite(used)) continue;
+            if (typeof used !== 'number' || !Number.isFinite(used)) continue;
             if (!worst || used > worst.used) {
                 worst = { used, resetsAt: fact.unknown ? ''
                     : String(constraint.resets_at || constraint.cooldown_until || '') };
@@ -355,12 +357,8 @@ export function daemonAnswered(payload) {
     return STATUS_FACETS.some((facet) => facetReadState(payload, facet) === READ_OK);
 }
 
-// The Refresh button's honest label. It only ever RE-READS while the daemon is
-// alive, but with a sleeping daemon a plain re-read returns the same nothing
-// forever — so there it becomes an explicit owner action that STARTS the
-// daemon, and the label says so rather than hiding the side effect. ONE
-// predicate behind BOTH the label and the click, so they cannot drift apart
-// again (they were written separately once, and did).
+// Refresh updates resources while the daemon is alive. For a sleeping daemon,
+// the same predicate gives both the button and its handler an explicit start.
 export function refreshActionKind(payload) {
     return daemonAnswered(payload) ? 'refresh' : 'wake';
 }
@@ -651,7 +649,7 @@ export function quotaSubjectAliases(row, payload) {
     return row.profile_id === `${row.harness}-default` ? [''] : [];
 }
 
-export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Date.now() } = {}) {
+export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Date.now(), action = {} } = {}) {
     // Line 2: everything that is NOT the account itself, in human words and at
     // muted ink. Order is the owner's — how much of the window is left, which
     // plan, who it is, when we last checked. (The former "Managed by the X
@@ -665,9 +663,11 @@ export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Dat
         // its login is.
         parts.push('disabled — excluded from rotation');
     }
-    parts.push(quotaSummary(payload?.quota || [], row.harness, row.profile_id,
+    const resources = resourceSummary(row, payload, { known: quotaRead === READ_OK, action });
+    parts.push(resourceReadGap(action) ? resources : quotaSummary(payload?.quota || [], row.harness, row.profile_id,
         { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload),
           absences: payload?.quota_absences || [] }).label);
+    if (!resourceReadGap(action) && resources) parts.push(resources);
     const identity = row.identity || {};
     if (identity.plan) parts.push(String(identity.plan));
     // The email is metadata only while it is not already the row's name.
@@ -964,6 +964,7 @@ const state = {
     store: claudexorStatus,
     loginCard: null,
     loginFamily: '',
+    resources: null,
     maintenance: null,
     disposers: [],
     removeError: '',
@@ -1007,7 +1008,7 @@ export function renderAgentAccountsSection() {
 }
 
 export function accountRowFacts(row, payload,
-                                { accountsRead = READ_OK, quotaRead = READ_OK, nowMs = Date.now() } = {}) {
+                                { accountsRead = READ_OK, quotaRead = READ_OK, nowMs = Date.now(), action = {} } = {}) {
     // Each projection is gated by ITS OWN facet: the identity claim is the
     // ACCOUNTS read, the window is the QUOTA read, and one lands while the
     // other refuses. The panel used to render both off the retained snapshot
@@ -1021,18 +1022,22 @@ export function accountRowFacts(row, payload,
     // than dressing a remembered percentage as current, and it never paints the
     // row red, because the exhausted styling is a claim about RIGHT NOW and the
     // reset it promises may already have happened.
+    if (action.resourceRead) quotaRead = READ_OK;
+    if (action.activity === 'refresh' && action.error) quotaRead = READ_FAILED;
     return {
         badge: verificationBadge(row, { known: accountsRead === READ_OK }),
         quota: quotaSummary(payload?.quota || [], row.harness, row.profile_id,
-            { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload),
+            { quotaRead: resourceReadGap(action) ? READ_FAILED : quotaRead,
+              nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload),
               absences: payload?.quota_absences || [] }),
         name: accountName(row),
-        meta: accountMetaLine(row, payload, { quotaRead, nowMs }),
+        meta: accountMetaLine(row, payload, { quotaRead, nowMs, action }),
     };
 }
 
 function rowHtml(row, payload, facets = {}) {
-    const { badge, quota, name, meta } = accountRowFacts(row, payload, facets);
+    const action = facets.store?.resourceAction?.(targetFor(row)) || {};
+    const { badge, quota, name, meta } = accountRowFacts(row, payload, { ...facets, action });
     const loginAction = rowLoginAction(row, payload);
     // Row ACTIONS follow the engine's own routes, never the row's looks: a
     // named registry row (every row on a unified engine, the named profiles on
@@ -1050,6 +1055,7 @@ function rowHtml(row, payload, facets = {}) {
             </div>
             <div class="harness-account-meta muted">${escapeHtml(meta)}</div>
             <div class="harness-account-actions">
+                <button type="button" class="btn btn-default" data-resources aria-expanded="false" aria-controls="${escapeHtml(resourcePanelId(row))}">▸ Resources</button>
                 <button type="button" class="btn btn-default" data-harness-login>${escapeHtml(loginAction.label)}</button>${rowActions}
             </div>
         </div>
@@ -1104,10 +1110,11 @@ function renderRows() {
     // flight it says that instead of inviting a second one.
     const refreshEl = document.getElementById('btn-harness-refresh');
     if (refreshEl) {
+        const resourceBusy = state.store.resourceAction?.(null).busy;
         refreshEl.textContent = state.wakeBusy
             ? 'Starting the agent daemon…'
-            : refreshActionLabel(state.store.snapshot);
-        refreshEl.disabled = Boolean(state.wakeBusy);
+            : resourceBusy ? 'Refreshing…' : refreshActionLabel(state.store.snapshot);
+        refreshEl.disabled = Boolean(state.wakeBusy || resourceBusy);
     }
     if (!host) return;
     const errorBox = document.getElementById('harness-accounts-error');
@@ -1124,7 +1131,7 @@ function renderRows() {
     // innerHTML rebuild destroys a focused paste-code/name input before the
     // card's own render can see it. The capture must therefore wrap the
     // whole rebuild: same SSOT helper, one level up.
-    preserveCardFocus(host, () => {
+    const repaint = () => preserveCardFocus(host, () => {
         const groups = accountGroups(payload, {
             accountsRead,
             catalogKnown: state.store.catalogKnown,
@@ -1135,7 +1142,8 @@ function renderRows() {
                 rows: [], maintenanceOnly: true,
             });
         }
-        host.innerHTML = groups.map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead })).join('');
+        host.innerHTML = groups.map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead, store: state.store })).join('');
+        state.resources?.mount(host, accountRows(payload), payload, quotaRead);
         host.querySelectorAll('[data-harness-login]').forEach((button) => {
             button.addEventListener('click', () => {
                 if (!state.initialized) return;
@@ -1189,6 +1197,8 @@ function renderRows() {
         state.loginCard?.render();
         state.maintenance?.render();
     });
+    if (state.resources) state.resources.preserve(host, repaint);
+    else repaint();
 }
 
 async function toggleAccountEnabled(harness, profileId, enabled) {
@@ -1315,7 +1325,7 @@ export async function startLogin(harness, profile) {
         ?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
 }
 
-/** Read the shared status once (the Refresh button, and the first paint). */
+/** Read the shared status once for passive consumers and first paint. */
 export function refreshHarnessStatus() {
     void state.maintenance?.refresh({ fresh: true });
     return state.store.refresh();
@@ -1354,6 +1364,7 @@ export function initHarnessAccounts({ store = claudexorStatus } = {}) {
 async function _init(store) {
     _destroy();
     state.store = store;
+    state.resources = createAccountResourcesController({ store, render: renderRows });
     state.removeError = '';
     state.removeNotice = '';
     state.wakeError = '';
@@ -1370,11 +1381,10 @@ async function _init(store) {
         ?.addEventListener('click', () => {
             if (!state.initialized) return;
             // A sleeping daemon cannot be re-read into existence: there the
-            // button is the owner's explicit start. Live, it stays a plain
-            // re-read. SAME predicate the LABEL uses (renderRows), so the two
-            // cannot disagree again.
+            // button is the owner's explicit start. Live, it refreshes account
+            // resources, then re-reads status with the same store.
             return refreshActionKind(state.store.snapshot) === 'refresh'
-                ? refreshHarnessStatus()
+                ? refreshAllAccounts()
                 : wakeDaemon();
         });
     // The SHARED surface binding: the visibility predicate that lets this
@@ -1400,6 +1410,17 @@ async function _init(store) {
     void state.maintenance.refresh();
     renderRows();
     return true;
+}
+
+async function refreshAllAccounts() {
+    void state.maintenance?.refresh({ fresh: true });
+    if (!state.store.refreshResources) return state.store.refresh();
+    if (state.store.resourceAction(null).busy) return;
+    state.removeError = '';
+    const result = await state.store.refreshResources();
+    if (!result) state.removeError = state.store.resourceAction(null).error || 'Account refresh did not complete';
+    else await state.store.refresh();
+    renderRows();
 }
 
 /**

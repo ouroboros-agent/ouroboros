@@ -133,10 +133,11 @@ _ROUTE_TO_PROJECT_DESCRIPTION = (
 )
 
 # The new root's starting effort: one optional choice shared by both verbs that mint a
-# root from a conversation. Child actors keep their configured profiles (schedule_subagent).
+# root from a conversation; applied in Cyber Pro only (a root starts at the owner's
+# recommended level otherwise). Child actors decide theirs in schedule_subagent(effort=…).
 _ROOT_EFFORT_PARAM = {"type": "string", "enum": list(EFFORT_SCALE), "description": (
-    "Optional: the reasoning effort the NEW task starts on, chosen for this work (it can still "
-    "switch_model later). Omit for the configured Task default. A request: the route may adapt it.")}
+    "Optional: the reasoning effort the NEW task starts on; applied in Cyber Pro only — otherwise the "
+    "task starts at my human's recommended level and the result says so. Omit for that level.")}
 
 
 _SCHEDULE_SUBAGENT_DESCRIPTION = (
@@ -412,7 +413,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
                 "effort": {"type": "string", "enum": list(EFFORT_SCALE),
-                           "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
+                           "description": "Reasoning effort for the next round, inside my human's effort range. Main keeps its level outside Cyber Pro (delegate deeper thinking: schedule_subagent(effort=…)); a child, an evolution task or a wake moves inside the range; a pinned or model-named focus keeps its level. Leave empty to keep current."},
                 "primary": {"type": "string", "enum": ["return", "wait"],
                             "description": ("Omit to keep the current route. Return to this turn's primary route: its model, role and account policy "
                                             "(Auto stays Auto) plus the owner's wait-card choice; effort stays. 'return': "
@@ -499,10 +500,10 @@ from ouroboros.tools.control_runtime import (  # noqa: E402, F401 -- intentional
 # v7next F2 (D07): moved spans live in their owner leaves; re-exported here
 # so this facade stays the single import surface for callers and tests.
 from ouroboros.tools.control_subagent_spec import (  # noqa: E402, F401 -- intentional public re-exports
-    RETIRED_SCHEDULE_PARAMS,
     VALID_SUBTASK_MEMORY_MODES,
     _INTERNAL_SCHEDULE_OPTIONS,
     _validated_schedule_fields,
+    requested_child_effort,
     schedule_subagent_param_names,
     schedule_subagent_properties,
 )

@@ -28,6 +28,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -371,6 +372,18 @@ def account_catalog_supported(operations: list[dict], path: str) -> bool:
     return operation_query_supported(operations, method="GET", path=path, name="view", value="accounts")
 
 
+def account_resource_capabilities(operations: list[dict]) -> dict[str, bool]:
+    """Negotiate resource presentation and direct controls from the serving catalog."""
+    def resource_view(method):
+        return operation_query_supported(operations, method=method, path="/v2/quota",
+                                         name="view", value="resources")
+
+    ids = {row.get("id") for row in operations if isinstance(row, dict)}
+    return {"read": resource_view("GET"), "refresh": resource_view("POST"),
+            "reset": "post:account-resets" in ids,
+            "inspect_reset": "get:account-resets.id" in ids}
+
+
 def model_failure_evidence_supported(operations: list[dict]) -> bool:
     return operation_query_supported(operations, method="POST", path="/v2/model-operations",
                                      name="captureFailureEvidence", value="true")
@@ -628,8 +641,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
 
     def list_model_sources(self, *, view: Optional[str] = None) -> Dict[str, Any]:
         """Return the engine's opaque source ids and credential-harness bindings."""
-        from urllib.parse import urlencode
-
         path = "/v2/model-sources"
         if view is not None:
             path += "?" + urlencode({"view": view})
@@ -641,8 +652,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
                            timeout_sec: Optional[float] = None,
                            view: Optional[str] = None, include_admission: bool = False) -> Dict[str, Any]:
         """Preserve the exact-profile catalog envelope; an omitted pin means engine Auto."""
-        from urllib.parse import quote, urlencode
-
         path = f"/v2/model-sources/{quote(str(source), safe='')}/models"
         query = {}
         if view is not None:
@@ -666,8 +675,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         reply. A cancelled or still-writing upload remains a typed refusal; this
         method never creates another upload or inference to hide that outcome.
         """
-        from urllib.parse import quote
-
         key = _model_idempotency_key(idempotency_key)
         if not isinstance(request, dict):
             raise ClaudexorUnavailable("invalid_model_payload", "Model request must be a JSON object")
@@ -732,8 +739,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
 
     def get_model_operation(self, operation_id: str, *,
                             timeout_sec: Optional[float] = None) -> Dict[str, Any]:
-        from urllib.parse import quote
-
         return _model_operation(self._request(
             "GET", f"/v2/model-operations/{quote(str(operation_id), safe='')}",
             timeout_sec=timeout_sec,
@@ -747,8 +752,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         The caller ACKs after retaining the result under its own custody contract.
         ``raw_bytes`` keeps exact JSON encoding; size, digest, UTF-8 and object checks apply.
         """
-        from urllib.parse import quote
-
         ref = _model_payload_ref(expected_ref)
         data = self._request(
             "GET", f"/v2/model-operations/{quote(str(operation_id), safe='')}/result",
@@ -765,8 +768,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
 
     def acknowledge_model_result(self, operation_id: str, sha256: str) -> Dict[str, Any]:
         """Acknowledge only the exact result the caller has retained; no implicit ACK."""
-        from urllib.parse import quote
-
         return _model_operation(self._request(
             "POST", f"/v2/model-operations/{quote(str(operation_id), safe='')}/ack",
             json_body={"sha256": sha256},
@@ -774,8 +775,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
 
     def cancel_model_operation(self, operation_id: str, *, reason_code: str = "") -> Dict[str, Any]:
         """Request cancellation; the returned engine lifecycle, not this POST, proves settlement."""
-        from urllib.parse import quote
-
         control = {"action": "cancel"}
         if reason_code:
             control["reasonCode"] = reason_code
@@ -797,19 +796,29 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         rows = body.get("harnesses") if isinstance(body, dict) else None
         return [row for row in (rows or []) if isinstance(row, dict)]
 
-    def quota_state(self) -> Dict[str, Any]:
+    def quota_state(self, *, view: str = "") -> Dict[str, Any]:
         """GET /v2/quota once, retaining its one-epoch evidence envelope."""
-        body = self._request("GET", "/v2/quota")
+        body = self._request("GET", "/v2/quota" + ("?view=resources" if view == "resources" else ""))
         return body if isinstance(body, dict) else {}
 
-    def refresh_quota(self) -> Dict[str, Any]:
+    def refresh_quota(self, *, target: Optional[Dict[str, str]] = None,
+                      view: str = "") -> Dict[str, Any]:
         """POST /v2/quota once, returning the foreground evidence envelope."""
         return self._request(
             "POST",
-            "/v2/quota",
-            json_body={},
+            "/v2/quota" + ("?view=resources" if view == "resources" else ""),
+            json_body={"target": target} if target is not None else {},
             timeout_sec=get_claudexor_quota_refresh_timeout_sec(),
         )
+
+    def create_account_reset(self, request: Dict[str, Any], *, idempotency_key: str) -> Dict[str, Any]:
+        """One explicit direct operation; replay retains the caller's exact key/body."""
+        return self._request("POST", "/v2/account-resets", json_body=request,
+                             headers={"Idempotency-Key": idempotency_key},
+                             timeout_sec=get_claudexor_quota_refresh_timeout_sec())
+
+    def get_account_reset(self, operation_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/v2/account-resets/{quote(operation_id, safe='')}")
 
     def quota_snapshots(self) -> List[Dict[str, Any]]:
         body = self.quota_state()
@@ -864,8 +873,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         actual-file list distinguishes absence from an explicit refusal; its
         path remains authoritative when a legacy record has no repoRoot.
         """
-        from urllib.parse import quote
-
         target = str(root)
         body = self._request("GET", f"/v2/trust?repoRoot={quote(target, safe='')}")
         entries = body.get("entries") if isinstance(body, dict) else None
@@ -939,8 +946,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         self, thread_id: str, request: Dict[str, Any], *, idempotency_key: str,
     ) -> Dict[str, Any]:
         """Append one turn through the public v3 thread pipeline."""
-        from urllib.parse import quote
-
         body = self._request(
             "POST", f"/v2/threads/{quote(str(thread_id), safe='')}/turns",
             json_body=dict(request), headers={"Idempotency-Key": str(idempotency_key)},
@@ -951,8 +956,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
 
     def get_thread(self, thread_id: str) -> Dict[str, Any]:
         """Read turns, native-session bindings, and continuity receipts."""
-        from urllib.parse import quote
-
         body = self._request("GET", f"/v2/threads/{quote(str(thread_id), safe='')}")
         return body if isinstance(body, dict) else {}
 
@@ -977,8 +980,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         retention-reclaimed run with a 410 tombstone — all of which surface here as
         typed ``ClaudexorUnavailable`` refusals, never as a silent empty body.
         """
-        from urllib.parse import quote
-
         try:
             response = self._client.request(
                 "GET", f"/v2/runs/{quote(str(run_id), safe='')}/artifacts/{quote(str(path), safe='/')}")
@@ -1000,8 +1001,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         HTTP refusals and partial streams never become an empty successful file;
         the existing small diagnostic-artifact reader keeps its bytes contract.
         """
-        from urllib.parse import quote
-
         digest, size = hashlib.sha256(), 0
         response = None
         try:
@@ -1034,8 +1033,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
 
     def apply_run(self, run_id: str, request: Dict[str, Any], *, idempotency_key: str) -> Dict[str, Any]:
         """Apply the existing run product; the caller retains intent and custody."""
-        from urllib.parse import quote
-
         return _model_object(self._request(
             "POST", f"/v2/runs/{quote(str(run_id), safe='')}/apply", json_body=request,
             headers={"Idempotency-Key": idempotency_key},
@@ -1043,8 +1040,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
 
     def decide_run(self, run_id: str, request: Dict[str, Any], *, idempotency_key: str) -> Dict[str, Any]:
         """Submit an explicit disposition through the existing engine decision route."""
-        from urllib.parse import quote
-
         body = self._request("POST", f"/v2/runs/{quote(str(run_id), safe='')}/decision", json_body=request,
                              headers={"Idempotency-Key": idempotency_key})
         if not isinstance(body, dict):
@@ -1069,8 +1064,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         failures, a bodyless 404 (``no such run``), the 501 of an engine build with
         no answer service, and any other refusal without a typed status.
         """
-        from urllib.parse import quote
-
         path = (f"/v2/runs/{quote(str(run_id), safe='')}"
                 f"/interactions/{quote(str(interaction_id), safe='')}/answer")
         try:
@@ -1120,8 +1113,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         verb classifies by code AND status. A 2xx without a typed outcome is
         ``malformed_response``.
         """
-        from urllib.parse import quote
-
         path = f"/v2/runs/{quote(str(run_id), safe='')}/messages"
         payload: Dict[str, Any] = {"text": str(text)}
         if expected_attempt_id:
@@ -1196,8 +1187,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         route exists on 3.5.0 engines already; unified-model engines serve the
         migrated default logins through it too, because those are ordinary
         registry rows there."""
-        from urllib.parse import quote
-
         body = self._request(
             "PATCH",
             f"/v2/credential-profiles/{quote(str(harness_id), safe='')}"
@@ -1216,8 +1205,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         counterpart for a native CLI login — that account belongs to the
         vendor's own CLI, and simulating a sign-out here would claim an effect
         this process cannot have."""
-        from urllib.parse import quote
-
         body = self._request(
             "DELETE",
             f"/v2/credential-profiles/{quote(str(harness_id), safe='')}"
@@ -1228,8 +1215,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
     def harness_models(self, harness_id: str) -> List[Dict[str, Any]]:
         """GET /v2/harnesses/:id/models — the discovered model list (owner
         directive: models are a dropdown fed by discovery, never free input)."""
-        from urllib.parse import quote
-
         body = self._request("GET", f"/v2/harnesses/{quote(str(harness_id), safe='')}/models")
         models = body.get("models") if isinstance(body, dict) else None
         return [row for row in (models or []) if isinstance(row, dict)]
@@ -1238,8 +1223,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
                               credential_profile_id: Optional[str] = None,
                               view: Optional[str] = None) -> Dict[str, Any]:
         """Retain the catalog envelope for an explicitly negotiated view."""
-        from urllib.parse import quote, urlencode
-
         path = f"/v2/harnesses/{quote(str(harness_id), safe='')}/models"
         query = {}
         if view is not None:
@@ -1272,8 +1255,6 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         route answers 404, which the caller must treat as a typed capability
         gap, not a bug.
         """
-        from urllib.parse import quote
-
         base = f"/v2/setup/jobs/{quote(str(job_id), safe='')}"
         if op == "snapshot":
             body = self._request("GET", f"{base}/snapshot")

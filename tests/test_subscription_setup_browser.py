@@ -162,14 +162,18 @@ def subscription_ui():
             engine = os.environ.get("OUROBOROS_UI_BROWSER_ENGINE", "chromium")
             if engine not in {"chromium", "webkit", "firefox"}:
                 raise ValueError(f"Unsupported browser engine: {engine}")
-            browser = getattr(pw, engine).launch(headless=True)
+            browser = getattr(pw, engine).launch(
+                headless=True, executable_path=os.environ.get("OUROBOROS_UI_BROWSER_EXECUTABLE") or None)
             try:
-                page = browser.new_page(viewport={"width": 1360, "height": 900},
-                                        has_touch=os.environ.get("OUROBOROS_UI_HAS_TOUCH") == "1")
-                page.route_web_socket('**/ws', lambda ws: ws.send(json.dumps({"type": "heartbeat"})))
-                page.route("**/api/**", respond)
-                page.on("pageerror", lambda error: page_errors.append(str(error)))
-                yield {"page": page, "url": f"http://127.0.0.1:{server.server_port}",
+                def new_page(**options):
+                    page = browser.new_page(viewport={"width": 1360, "height": 900},
+                                            has_touch=os.environ.get("OUROBOROS_UI_HAS_TOUCH") == "1", **options)
+                    page.route_web_socket('**/ws', lambda ws: ws.send(json.dumps({"type": "heartbeat"})))
+                    page.route("**/api/**", respond)
+                    page.on("pageerror", lambda error: page_errors.append(str(error)))
+                    return page
+
+                yield {"page": new_page(), "new_page": new_page, "url": f"http://127.0.0.1:{server.server_port}",
                        "posts": posts, "reads": reads, "fixture": fixture,
                        "settings": settings, "errors": page_errors, "backend": backend, "bootstrap": bootstrap}
                 assert not page_errors
@@ -289,7 +293,7 @@ def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subsc
     assert reviewer.locator('[data-subagent-field="review_eligible"]').is_checked()
     assert page.locator('[data-review-pool-count]').inner_text() == 'Reviewers: 1'
     default_effort = reviewer.locator('[data-subagent-field="effort"] option[value=""]')
-    assert default_effort.inner_text() == 'Default (reviews at high)'
+    assert default_effort.inner_text() == 'Auto (reviews at the top of the chat range)'
     reviewer.locator('[data-subagent-field="effort"]').select_option('high')
     assert reviewer.locator('[data-subagent-field="effort"]').input_value() == 'high'
     reviewer.scroll_into_view_if_needed()
