@@ -164,13 +164,15 @@ def test_budget_abort_after_real_outward_send_preserves_pending_speech_on_restor
     restored, count = [], f.events.qsize()
     restore_continuation_state(f.registry, saved, restored, {}, {}, set())
     closed = close_unanswered_calls(restored, "budget pause")
-    publish_pending_owner_dialogue(f.ctx, restored)
+    from ouroboros.loop_round_limits import _run_round_compaction
+    from tests.test_context_view_tool import _context
+    restored, _ = _run_round_compaction(restored, _context(f.ctx.drive_root, f.ctx, [], monkeypatch))
     assert closed == ["say", "large"]
     assert _dialogue(restored) == pending and not pending_owner_dialogue(f.ctx)
     assert f.events.qsize() == count  # restoring words never dispatches a send
-    assert restored[-1] == pending[0]
-    assert [r.get("tool_call_id") for r in restored[-3:-1]] == ["say", "large"]
-    facts = _facts(restored[-1])
+    position = restored.index(pending[0])
+    assert [r.get("tool_call_id") for r in restored[position-2:position]] == ["say", "large"]
+    facts = _facts(restored[position])
     assert facts["transport_mode"] == ("live" if live else "deferred")
     assert facts["delivery_confirmation"] == facts["read_confirmation"] == "unknown"
 

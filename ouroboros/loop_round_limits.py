@@ -316,7 +316,9 @@ def _run_round_compaction(
     when it changed (owner 6C). The note follows any reclaim so it is never
     folded into a rewrite, and precedes the acceptance observation and the seal."""
     from ouroboros.peer_roster import maybe_append_roster_note
+    from ouroboros.tools.owner_delivery import publish_pending_owner_dialogue
 
+    publish_pending_owner_dialogue(ctx.tools._ctx, messages)
     # Only an explicit manual reclaim runs here; Main fit owns automatic decisions.
     usage: Optional[Dict[str, Any]] = None
     pending = getattr(ctx.tools._ctx, "_pending_compaction", None)
