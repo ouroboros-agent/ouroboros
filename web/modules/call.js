@@ -1,12 +1,25 @@
-/** A room call owns its microphone, socket and playback until its room is destroyed.
- * One room hook carries the actual chat id and decorates destroy; hiding the room keeps the call.
- * Captions bind output stream ids to item ids before PCM; bytes queued are never heard bytes.
+/** A room call: its microphone, socket and playback live until the room is destroyed.
+ * The server names every phase and every ending; the page bounds only a socket that never
+ * answers at all. Captions name speech items before their audio, so playback acknowledgements
+ * count heard samples only. The composer surface, the light, captions and the shell mark are
+ * the sibling call_* modules; this one owns the session and puts them together for a room.
  */
 import { apiClient } from './api_client.js';
-import { decodeFrame, encodeFrame, newerEpoch } from './call_worklet.js';
+import { openExternalViaHostBridge, shellBridgeApi } from './ui_helpers.js';
+import { decodeFrame, encodeFrame, levelFromRms, newerEpoch } from './call_worklet.js';
+import { createCallCapsule } from './call_capsule.js';
+import { createCallCaptions } from './call_captions.js';
+import { createCallLight } from './call_light.js';
+import { CALL_VISUAL } from './call_aura.js';
+import { trackCallMark } from './call_mark.js';
 
-const CONNECT_TIMEOUT_MS = 15000; // Bound a dead handshake, never the conversation.
+// Transport bound for a socket that delivers no message at all; every phase reports itself.
+const SOCKET_ANSWER_MS = 15000;
+export const NEW_APP_URL = 'https://ouroboros-agent.ai/install/';
+const ACTIVE = new Set(['permission', 'admission', 'preparing', 'connecting', 'live', 'reconnecting', 'closing']);
+const SERVER_STATES = new Set(['preparing', 'connecting', 'live', 'reconnecting', 'closing', 'closed']);
 let microphoneOwner = null;
+const rooms = new Set();  // every mounted room call, for the shell mark and "Go to the call"
 
 export function callAvailability(env = globalThis) {
     let telegram = Boolean(env.Telegram?.WebApp)
@@ -15,83 +28,43 @@ export function callAvailability(env = globalThis) {
         telegram ||= Boolean(env.parent?.Telegram?.WebApp)
             || env.parent?.document?.documentElement?.dataset?.ouroborosHost === 'telegram';
     } catch { /* Cross-origin parents expose no host facts. */ }
-    if (telegram) return { supported: false, hidden: true, reason: 'Calls are unavailable in the Telegram Mini App.' };
-    if (!env.isSecureContext) return { supported: false, reason: 'Calls need HTTPS or localhost to use the microphone.' };
-    if (typeof env.navigator?.mediaDevices?.getUserMedia !== 'function')
-        return { supported: false, reason: 'This browser cannot access a microphone.' };
+    if (telegram) return { supported: false, hidden: true, code: 'telegram' };
+    if (typeof env.navigator?.mediaDevices?.getUserMedia !== 'function') {
+        // The desktop app's own WebView hides the microphone when its build cannot ask for it.
+        if (shellBridgeApi(env)) return { supported: false, code: 'old_app' };
+        return { supported: false, code: env.isSecureContext === false ? 'insecure' : 'no_microphone_api' };
+    }
+    if (!env.isSecureContext) return { supported: false, code: 'insecure' };
     if (!env.AudioContext || !env.AudioWorkletNode || !('audioWorklet' in env.AudioContext.prototype))
-        return { supported: false, reason: 'This browser does not support live audio. Open it in a current browser.' };
-    if (!env.WebSocket) return { supported: false, reason: 'This browser does not support call connections.' };
-    return { supported: true, reason: '' };
+        return { supported: false, code: 'no_live_audio' };
+    if (!env.WebSocket) return { supported: false, code: 'no_call_socket' };
+    return { supported: true, code: '' };
 }
 
-// The call service's reasons are codes; the owner reads these words and the code stays in the title.
-const REASON_WORDS = {
-    finished: '',
-    owner_stop: 'You stopped the call.',
-    owner_bye: 'The call was left from another screen.',
-    peers_left: 'Everyone left the call.',
-    max_minutes: 'The call reached its time limit in Settings.',
-    budget_exceeded: 'The spending limit is reached; raise it in Settings to call.',
-    engine_unavailable: 'The voice service could not be reached; the log has the details.',
-    reconnect_failed: 'The voice connection was lost and could not be restored.',
-    admission_failed: 'The call could not start; the log has the details.',
-    session_cap: 'Starting a fresh voice session.',
-    go_away: 'The voice service is moving the session.',
-    context_length: 'Fitting the conversation to the voice model.',
-    transport_lost: 'The voice connection dropped.',
-};
-const ENGINE_ERROR_WORDS = {
-    authentication: 'The voice service refused the API key; check it in Settings.',
-    invalid_request: 'The voice service refused the call setup.',
-    rate_limit: 'The voice service asked to slow down.',
-    context_length: 'The conversation does not fit the voice model.',
-    transport: 'The voice connection dropped.',
-    protocol: 'The voice service sent a message the call could not read.',
-    backpressure: 'The voice connection fell behind.',
-    provider: 'The voice service failed.',
-};
-
-/** Owner words for a server reason code (`kind` or `kind:detail`); an unknown code still reads as words. */
-export function reasonWords(state, code = '') {
-    const value = String(code || '');
-    if (!value) return '';
-    const colon = value.indexOf(':');
-    const kind = colon < 0 ? value : value.slice(0, colon);
-    if (kind === 'engine_error') return ENGINE_ERROR_WORDS[value.slice(colon + 1)] || 'The voice service reported an error.';
-    if (Object.hasOwn(REASON_WORDS, kind)) return REASON_WORDS[kind];
-    return state === 'reconnecting' ? 'Restoring the voice connection.' : 'The call ended.';
-}
-
-export function statePresentation(state, reason = '', muted = false, code = '') {
-    const labels = { idle: 'Call', connecting: 'Connecting…', live: muted ? 'Muted' : 'Listening',
-        reconnecting: 'Reconnecting…', closing: 'Leaving…', closed: 'Call ended', failed: 'Call failed' };
-    return { label: labels[state] || 'Call state unavailable', reason, code,
-        active: ['connecting', 'live', 'reconnecting', 'closing'].includes(state),
-        tone: state === 'failed' ? 'danger' : state === 'live' ? 'ok'
-            : state === 'reconnecting' ? 'warn' : 'muted' };
-}
-
+/** A media error as the page's own code; the capsule says it in words. */
 export function mediaFailure(error) {
-    const reasons = { NotAllowedError: 'Microphone access was denied. Allow it in your browser or system settings.',
-        NotFoundError: 'No microphone was found. Connect one and try again.',
-        NotReadableError: 'The microphone could not be opened. Check whether another app is using it.',
-        SecurityError: 'The browser blocked microphone access.' };
-    return reasons[error?.name] || error?.message || 'The call could not be opened.';
+    return { NotAllowedError: 'permission_denied', SecurityError: 'permission_denied', NotFoundError: 'no_microphone',
+        OverconstrainedError: 'no_microphone', NotReadableError: 'microphone_unreadable' }[error?.name] || 'call_failed';
+}
+
+function outputLatency(context) {
+    const seconds = Number(context?.outputLatency) || Number(context?.baseLatency) || 0;
+    return seconds > 0 ? seconds : 0;
 }
 
 export class CallSession {
     constructor({ chatId, env = globalThis, open = apiClient.openCall,
-        socket = path => apiClient.callSocket(path), changed = () => {}, caption = () => {} }) {
+        socket = path => apiClient.callSocket(path), changed = () => {}, caption = () => {},
+        level = () => {}, settled = () => {} }) {
         this.chatId = chatId;
         this.env = env;
         this.open = open;
         this.makeSocket = socket;
         this.changed = changed;
         this.caption = caption;
+        this.level = level;
+        this.settled = settled;
         this.state = 'idle';
-        this.reason = '';
-        this.reasonCode = '';
         this.generation = 0;
         this.captureGeneration = 0;
         this.items = new Map();
@@ -99,33 +72,47 @@ export class CallSession {
         this.seq = 0;
         this.epoch = 0;
         this.muted = false;
+        this.clear();
     }
 
-    setState(state, reason = '', code = '') {
+    /** Facts of the current attempt; a new attempt starts from none. */
+    clear() {
+        Object.assign(this, { callId: '', code: '', detail: '', action: '', words: '', phase: '',
+            activity: { working: false, label: '' }, liveSince: 0 });
+    }
+
+    get active() { return ACTIVE.has(this.state); }
+
+    view() {
+        const { state, code, detail, action, words, phase, muted, callId, liveSince } = this;
+        return { state, code, detail, action, words, phase, muted, callId, liveSince,
+            activity: { ...this.activity }, active: this.active };
+    }
+
+    setState(state, facts = {}) {
+        Object.assign(this, facts);
         this.state = state;
-        this.reason = reason;
-        this.reasonCode = code;
-        this.changed(statePresentation(state, reason, this.muted, code));
+        if (state === 'live' && !this.liveSince) this.liveSince = Date.now();
+        this.changed(this.view());
     }
 
     send(message) {
         if (this.socket?.readyState === 1) this.socket.send(JSON.stringify(message));
     }
 
-    async start(selection = {}) {
-        if (statePresentation(this.state).active) return;
+    async start() {
+        if (this.active) return;
+        this.clear();
         const capability = callAvailability(this.env);
-        if (!capability.supported) { this.setState('failed', capability.reason); return; }
-        if (microphoneOwner && microphoneOwner !== this) {
-            this.setState('failed', 'Another room is using the microphone. Leave that call first.'); return;
-        }
+        if (!capability.supported) { this.setState('failed', { code: capability.code }); return; }
+        if (microphoneOwner && microphoneOwner !== this) { this.setState('failed', { code: 'microphone_busy' }); return; }
         microphoneOwner = this;
         const generation = ++this.generation;
         const current = () => this.generation === generation;
         this.items.clear(); this.played.clear();
         this.seq = this.epoch = 0;
         this.muted = false;
-        this.setState('connecting');
+        this.setState('permission');
         try {
             const context = new this.env.AudioContext({ latencyHint: 'interactive' });
             this.context = context;
@@ -136,7 +123,8 @@ export class CallSession {
                 channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
             if (!current()) { media.getTracks().forEach(track => track.stop()); return; }
             this.media = media;
-            for (const track of media.getAudioTracks()) track.onended = () => this.fail('The microphone was disconnected.');
+            for (const track of media.getAudioTracks()) track.onended = () => this.fail('microphone_lost');
+            this.setState('admission');
             await resume;
             if (!current()) return;
             await context.audioWorklet.addModule(new URL('./call_worklet.js', import.meta.url));
@@ -144,19 +132,19 @@ export class CallSession {
             const node = new this.env.AudioWorkletNode(context, 'ouroboros-call-audio', {
                 numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1 });
             this.node = node;
-            node.onprocessorerror = () => this.fail('Live audio stopped working. Leave the call and try again.');
+            node.onprocessorerror = () => this.fail('audio_failed');
             node.port.onmessage = ({ data }) => { if (current()) this.onAudio(data); };
             this.source = context.createMediaStreamSource(media);
             this.source.connect(node);
             node.connect(context.destination);
-            const result = await this.open({ chat_id: this.chatId,
-                client_message_id: this.env.crypto.randomUUID(), ...selection });
+            const result = await this.open({ chat_id: this.chatId, client_message_id: this.env.crypto.randomUUID() });
             if (!result?.call_id || typeof result.ws_path !== 'string') throw new Error('The server did not return a call address.');
             if (!current()) { this.releaseAdmission(result.ws_path, context.sampleRate); return; }
+            this.callId = String(result.call_id);
             const socket = this.makeSocket(result.ws_path);
             this.socket = socket;
             socket.binaryType = 'arraybuffer';
-            this.timer = this.env.setTimeout(() => this.fail('The call did not connect in time.'), CONNECT_TIMEOUT_MS);
+            this.timer = this.env.setTimeout(() => this.fail('socket_silent'), SOCKET_ANSWER_MS);
             socket.onopen = () => {
                 if (!current()) return;
                 this.send({ type: 'hello', protocol: 1, role: 'owner', mic: true, speaker: true,
@@ -165,17 +153,26 @@ export class CallSession {
             };
             socket.onmessage = ({ data }) => {
                 if (!current()) return;
-                try { this.receive(data); } catch (error) { this.fail(mediaFailure(error)); }
+                this.env.clearTimeout(this.timer);  // the socket answers: phases now speak for themselves
+                try { this.receive(data); } catch { this.fail('protocol_mismatch'); }
             };
-            socket.onerror = () => { if (current()) this.fail('The call connection failed. Check your connection and try again.'); };
-            socket.onclose = () => { if (current()) this.fail('The call connection closed. Start a new call to reconnect.'); };
-        } catch (error) { if (current()) this.fail(mediaFailure(error), String(error?.body?.code || '')); }
+            socket.onerror = () => { if (current()) this.fail('socket_closed'); };
+            socket.onclose = (event) => {
+                if (current()) this.fail('socket_closed', { detail: String(event?.reason || ''), closeCode: event?.code || 0 });
+            };
+        } catch (error) {
+            if (!current()) return;
+            // An admission refusal carries the server's code and the owner's words.
+            if (error?.body?.ok === false || error?.status) this.fail(String(error.body?.code || 'call_not_started'),
+                { words: String(error.body?.error || error.message || '') });
+            else this.fail(mediaFailure(error));
+        }
     }
 
     /** A leave during admission still closes the admitted turn when its address arrives. */
     releaseAdmission(path, rate) {
         const socket = this.makeSocket(path);
-        const timer = this.env.setTimeout(() => socket.close(), CONNECT_TIMEOUT_MS);
+        const timer = this.env.setTimeout(() => socket.close(), SOCKET_ANSWER_MS);
         socket.onopen = () => {
             socket.send(JSON.stringify({ type: 'hello', protocol: 1, role: 'owner', mic: false, speaker: false, rate, label: 'Owner' }));
             socket.send(JSON.stringify({ type: 'bye', reason: 'left' }));
@@ -191,14 +188,20 @@ export class CallSession {
     }
 
     setMuted(muted) {
-        this.muted = muted;
+        if (!this.active) return;
+        this.muted = Boolean(muted);
         this.capture();
-        this.send({ type: 'mute', muted });
-        this.changed(statePresentation(this.state, this.reason, muted, this.reasonCode));
+        this.send({ type: 'mute', muted: this.muted });
+        this.changed(this.view());
     }
 
     onAudio(data) {
-        if (data.type === 'error') { this.fail(data.reason); return; }
+        if (data.type === 'error') { this.fail('audio_failed', { detail: String(data.reason || '') }); return; }
+        if (data.type === 'level') {
+            this.level({ mic: levelFromRms(data.mic), out: levelFromRms(data.out), playing: Boolean(data.playing),
+                latency: outputLatency(this.context) });
+            return;
+        }
         if (data.type === 'played') {
             const last = this.played.get(data.item_id) || 0;
             if (data.item_id && Number.isInteger(data.played_ms) && data.played_ms > last) {
@@ -209,7 +212,7 @@ export class CallSession {
         if (data.type !== 'capture' || this.muted || data.generation !== this.captureGeneration
             || !['live', 'reconnecting'].includes(this.state) || this.socket?.readyState !== 1) return;
         // One second of unsent microphone PCM is a broken uplink, not useful live speech.
-        if (this.socket.bufferedAmount > data.rate * 2) { this.fail('The connection is too slow to send live audio.'); return; }
+        if (this.socket.bufferedAmount > data.rate * 2) { this.fail('slow_uplink'); return; }
         this.socket.send(encodeFrame({ epoch: this.epoch, seq: this.seq++, rate: data.rate, pcm: data.pcm }));
     }
 
@@ -221,22 +224,17 @@ export class CallSession {
             if (newerEpoch(frame.epoch, this.epoch)) this.flush(frame.epoch);
             if (frame.epoch !== this.epoch) return;
             const item_id = this.items.get(frame.stream);
-            if (!item_id) throw new Error('Playback arrived without its speech item. Reconnect after the server is updated.');
+            if (!item_id) throw new Error('Playback arrived without its speech item.');
             this.node.port.postMessage({ type: 'audio', ...frame, item_id }, [frame.pcm.buffer]);
             return;
         }
         if (typeof data !== 'string' || new TextEncoder().encode(data).length > 16 * 1024)
             throw new Error('The server sent an invalid call message.');
         const msg = JSON.parse(data);
-        if (msg.type === 'state') {
-            if (!['connecting', 'live', 'reconnecting', 'closing', 'closed'].includes(msg.state))
-                throw new Error('The server sent an unknown call state.');
-            this.env.clearTimeout(this.timer);
-            const code = String(msg.reason || '');
-            if (msg.state === 'closed') { this.stop('closed', reasonWords(msg.state, code), code); return; }
-            this.setState(msg.state, reasonWords(msg.state, code), code);
-            this.capture();
-            if (msg.state === 'closing') this.node?.port.postMessage({ type: 'flush', epoch: (this.epoch + 1) & 65535 });
+        if (msg.type === 'state') this.receiveState(msg);
+        else if (msg.type === 'activity') {
+            this.activity = { working: msg.activity === 'working', label: String(msg.label || '').slice(0, 200) };
+            this.changed(this.view());
         } else if (msg.type === 'flush') {
             if (!Number.isInteger(msg.epoch) || msg.epoch < 0 || msg.epoch > 65535) throw new Error('Invalid playback epoch.');
             this.flush(msg.epoch);
@@ -250,8 +248,20 @@ export class CallSession {
                 if (!Number.isInteger(stream) || stream < 0 || stream > 65535) throw new Error('Invalid speech stream.');
                 this.items.set(stream, msg.item_id);
             }
-            if (msg.text) this.caption(msg);
-        } else throw new Error('The server sent an unknown call message.');
+            this.caption({ ...msg, call_id: this.callId });
+        }
+        // A message type this page does not know belongs to a newer server: it changes nothing here.
+    }
+
+    receiveState(msg) {
+        if (!SERVER_STATES.has(msg.state)) return;  // a newer server's phase; the next known one follows
+        const facts = { code: String(msg.reason || '') };
+        for (const key of ['phase', 'detail', 'action']) if (typeof msg[key] === 'string') facts[key] = msg[key];
+        if (msg.state === 'closed') { this.stop('closed', facts); return; }
+        if (msg.state === 'live') Object.assign(facts, { phase: facts.phase || '', detail: facts.detail || '' });
+        this.setState(msg.state, facts);
+        this.capture();
+        if (msg.state === 'closing') this.node?.port.postMessage({ type: 'flush', epoch: (this.epoch + 1) & 65535 });
     }
 
     flush(epoch) {
@@ -261,9 +271,20 @@ export class CallSession {
         this.node?.port.postMessage({ type: 'flush', epoch });
     }
 
-    fail(reason, code = '') { this.stop('failed', reason, code); }
+    fail(code, facts = {}) { this.stop('failed', { code, ...facts }); }
 
-    stop(state = 'closed', reason = '', code = '') {
+    /** The owner's own End: everything stops and the composer comes back. */
+    end() { if (this.active) this.stop('ended', { code: 'owner_end' }); }
+
+    /** Back to the composer after the owner read how the last call ended. */
+    dismiss() {
+        if (this.active) return;
+        this.clear();
+        this.setState('idle');
+    }
+
+    stop(state = 'closed', facts = {}) {
+        const wasActive = this.active;
         this.generation++;
         this.env.clearTimeout(this.timer);
         for (const track of this.media?.getTracks() || []) { track.onended = null; track.enabled = false; track.stop(); }
@@ -281,119 +302,114 @@ export class CallSession {
         }
         this.items.clear(); this.played.clear();
         if (microphoneOwner === this) microphoneOwner = null;
-        this.setState(state, reason, code);
+        this.activity = { working: false, label: '' };
+        this.setState(state, facts);
+        if (wasActive) this.settled(this.view());
     }
 }
 
-const PHONE = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2A19.8 19.8 0 0 1 3.1 5.2 2 2 0 0 1 5.1 3h3a2 2 0 0 1 2 1.7l.5 2.8a2 2 0 0 1-.6 1.8L8.7 10.6a16 16 0 0 0 4.7 4.7l1.3-1.3a2 2 0 0 1 1.8-.6l2.8.5A2 2 0 0 1 22 16.9Z"/></svg>';
-
-export function mountCall({ page, chatId, env = globalThis }) {
+/** The room call: Talk in the composer, the live capsule, its light, caption bubbles and the mark. */
+export function mountCall({ page, chatId, env = globalThis, ws = null, label = () => 'Main',
+    onScreen = () => true, reveal = () => {}, openSettings = () => {}, onSettled = () => {} }) {
     const doc = page.ownerDocument;
-    const attach = page.querySelector('.chat-attach-btn');
-    const composer = attach?.closest('.chat-input-wrap');
+    const composer = page.querySelector('.chat-input-wrap');
     const available = callAvailability(env);
-    if (!composer || available.hidden) return { destroy() {}, leave() {} };
-    if (!doc.querySelector('link[data-call-style]')) {
-        const sheet = doc.createElement('link');
-        sheet.rel = 'stylesheet'; sheet.href = new URL('../call.css', import.meta.url).href;
-        sheet.dataset.callStyle = ''; doc.head.append(sheet);
-    }
-    const button = doc.createElement('button');
-    button.type = 'button'; button.className = 'chat-attach-btn call-button';
-    button.innerHTML = PHONE; button.title = 'Call'; button.setAttribute('aria-label', 'Call');
-    button.disabled = !available.supported;
-    attach.after(button);
-    const strip = doc.createElement('section');
-    strip.className = 'call-strip'; strip.setAttribute('aria-label', 'Live call');
-    strip.innerHTML = `<div class="call-actions"><span class="ui-status call-state" role="status" aria-live="polite"></span>
-        <button type="button" class="btn btn-default call-mute" aria-pressed="false" hidden>Mute</button>
-        <button type="button" class="btn btn-danger call-leave" hidden>Leave</button></div>
-        <div class="call-reason"></div><div class="call-captions" role="log" aria-live="polite" data-i18n-authored></div>
-        <details class="call-options"><summary>Call options</summary><div class="call-fields">
-        <label class="ui-field">Engine<select class="ui-control call-engine"><option value="">Use Settings</option><option value="openai">OpenAI</option><option value="google">Google</option></select></label>
-        <label class="ui-field">Model<input class="ui-control call-model" placeholder="Use Settings"></label>
-        <label class="ui-field">Voice<input class="ui-control call-voice" placeholder="Use Settings"></label></div></details>`;
-    composer.prepend(strip);
-    const status = strip.querySelector('.call-state');
-    const reason = strip.querySelector('.call-reason');
-    const captions = strip.querySelector('.call-captions');
-    const mute = strip.querySelector('.call-mute');
-    const leave = strip.querySelector('.call-leave');
-    const options = strip.querySelector('.call-options');
-    const engine = strip.querySelector('.call-engine');
-    const model = strip.querySelector('.call-model');
-    const voice = strip.querySelector('.call-voice');
-    reason.id = `call-reason-${page.id}`;
-    button.setAttribute('aria-describedby', reason.id);
+    const noop = { destroy() {}, leave() {}, retains: () => false };
+    if (!composer || available.hidden) return noop;
+    const styled = ensureStylesheet(doc);
     let destroyed = false;
-    const session = new CallSession({ chatId, env, changed(view) {
-        if (destroyed) return;
-        strip.hidden = view.label === 'Call ended' && !view.reason;
-        status.textContent = view.label; status.dataset.tone = view.tone;
-        reason.textContent = view.reason; reason.hidden = !view.reason; reason.title = view.code || '';
-        button.disabled = !available.supported || view.active;
-        chooser.disabled = !available.supported || view.active;
-        mute.hidden = leave.hidden = !view.active;
-        mute.textContent = session.muted ? 'Unmute' : 'Mute';
-        mute.setAttribute('aria-pressed', String(session.muted));
-        engine.disabled = model.disabled = voice.disabled = view.active;
-        options.hidden = view.active;
-    }, caption(msg) {
-        // The strip is a current utterance view; complete finalized speech lives in room history.
-        captions.textContent = `${msg.speaker === 'owner' ? 'You' : 'Ouroboros'}: ${msg.text}`;
-    } });
-    strip.hidden = available.supported;
-    reason.textContent = available.reason;
-    if (!available.supported) button.title = available.reason;
-    const open = () => {
-        if (!available.supported) return;
-        const selection = {};
-        for (const [key, input] of [['engine', engine], ['model', model], ['voice', voice]])
-            if (input.value.trim()) selection[key] = input.value.trim();
-        captions.textContent = '';
-        session.start(selection);
-    };
-    button.addEventListener('click', open);
-    mute.addEventListener('click', () => session.setMuted(!session.muted));
-    const end = () => { if (available.supported) session.stop(); };
-    leave.addEventListener('click', end);
+    let entry = null;
+    const visible = () => !destroyed && onScreen() && doc.visibilityState !== 'hidden';
+    const light = createCallLight({ env, visible, heard: now => capsule.heard(now), voice: () => capsule.voice(),
+        draw: state => capsule.draw(state) });
+    const captions = createCallCaptions({ feed: page.querySelector('#chat-messages, .chat-messages'), ws, doc });
+    const session = new CallSession({ chatId, env,
+        changed(view) { if (destroyed) return; light.setActive(view.active); capsule.render(); entry?.changed(); },
+        caption(msg) { captions.update(msg); capsule.caption(msg); },
+        level(levels) { light.level(levels); },
+        settled(view) { captions.finish(); onSettled(view); },
+    });
+    // Talk starts a call; a surface that cannot hold one answers the press with its sheet.
+    const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, styled, view: () => session.view(),
+        talk: () => session.start(),
+        mute: () => session.setMuted(!session.muted),
+        end: () => session.end(),
+        dismiss: () => session.dismiss(),
+        act: action => act(action) });
+    light.attach(capsule.wrap);
+    entry = trackCallMark({ session, label, onScreen, reveal, page, env, sign: () => CALL_VISUAL.mark(doc),
+        wake: () => light.wake() });
+    rooms.add(entry);
+
+    async function act(action) {
+        if (action.kind === 'retry') return session.start();
+        if (action.kind === 'reveal') return [...rooms].find(room => room.session.active && room !== entry)?.reveal();
+        if (action.kind === 'settings') {
+            session.dismiss();
+            await openSettings(action.tab);
+            const target = action.focus && doc.getElementById(action.focus);
+            target?.closest('details')?.setAttribute('open', '');
+            target?.scrollIntoView?.({ block: 'center' });
+            target?.focus?.({ preventScroll: true });
+            return undefined;
+        }
+        if (action.kind === 'open_browser' || action.kind === 'get_app') {
+            const url = action.kind === 'get_app' ? NEW_APP_URL : String(env.location?.href || '');
+            try {
+                const opened = await openExternalViaHostBridge(url, { win: env, doc, toast: () => {} });
+                capsule.note(opened?.degraded === 'copy-link' ? 'copied' : '');
+            } catch { capsule.note('copy_failed', url); }
+        }
+        return undefined;
+    }
+
+    const end = () => session.end();
     const panic = event => { if (event.target.closest?.('[data-chat-command="panic"], [data-chat-command="restart"]')) end(); };
     doc.addEventListener('click', panic, true);
-    env.addEventListener('pagehide', end);
-    const showOptions = event => { event.preventDefault(); strip.hidden = false; options.open = true; engine.focus(); };
-    button.addEventListener('contextmenu', showOptions);
-    const chooser = doc.createElement('button');
-    chooser.type = 'button'; chooser.className = 'chat-attach-btn call-choose';
-    chooser.setAttribute('aria-label', 'Call options'); chooser.title = 'Call options';
-    chooser.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
-    chooser.disabled = !available.supported;
-    button.after(chooser);
-    chooser.addEventListener('click', showOptions);
-    button.addEventListener('keydown', event => { if (event.key === 'ArrowDown') showOptions(event); });
-    const drafts = new Map();
-    let selectedEngine = '';
-    engine.addEventListener('change', () => {
-        drafts.set(selectedEngine, { model: model.value, voice: voice.value });
-        selectedEngine = engine.value;
-        model.value = drafts.get(selectedEngine)?.model || '';
-        voice.value = drafts.get(selectedEngine)?.voice || '';
-    });
+    env.addEventListener?.('pagehide', end);
     return {
+        session,
         leave: end,
+        retains: () => session.active,
         destroy() {
             if (destroyed) return;
-            destroyed = true; end();
-            doc.removeEventListener('click', panic, true); env.removeEventListener('pagehide', end);
-            button.remove(); chooser.remove(); strip.remove();
+            end();
+            destroyed = true;
+            doc.removeEventListener('click', panic, true);
+            env.removeEventListener?.('pagehide', end);
+            rooms.delete(entry);
+            entry.destroy();
+            light.destroy();
+            captions.destroy();
+            capsule.destroy();
         },
     };
 }
 
-/** Only a destroyed room hangs up; leave() also runs when the room just leaves the screen
- * (Settings, a Project, a notification), and the call goes on like a phone call. */
-export function mountRoomCall({ room, mount = mountCall, ...options }) {
-    const call = mount(options);
-    const { destroy } = room;
+/** The call's stylesheet, once per document; resolves when it applies (or failed to load). */
+function ensureStylesheet(doc) {
+    let link = doc.querySelector('link[data-call-style]');
+    if (!link) {
+        link = doc.createElement('link');
+        link.rel = 'stylesheet'; link.href = new URL('../call.css', import.meta.url).href;
+        link.dataset.callStyle = '';
+        doc.head.append(link);
+    }
+    if (link.dataset.loaded || link.sheet) return Promise.resolve();
+    return new Promise((resolve) => {
+        const done = () => { link.dataset.loaded = '1'; resolve(); };
+        link.addEventListener('load', done, { once: true });
+        link.addEventListener('error', done, { once: true });
+    });
+}
+
+/** A room's call keeps the room while it lasts: hiding the room keeps the call (like a phone
+ * call), destroying it hangs up, and `hasPendingWork` holds a Project room for the whole
+ * non-terminal lifetime. When the call ends, `release` lets go of a hidden room nothing else holds. */
+export function mountRoomCall({ room, mount = mountCall, release = () => {}, ...options }) {
+    const call = mount({ ...options, onSettled: () => queueMicrotask(release) });
+    const { destroy, hasPendingWork } = room;
     room.destroy = () => { call.destroy(); destroy(); };
+    room.hasPendingWork = () => call.retains() || Boolean(hasPendingWork?.());
     return call;
 }

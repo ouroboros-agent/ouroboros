@@ -1,5 +1,7 @@
-/** PCM transport and sample-counted playback share one implementation with the worklet.
- * Conversion to the engine's rate belongs to the server; this side uses the device rate.
+/** PCM transport, sample-counted playback and the levels the call's light shows share one
+ * implementation with the worklet. Conversion to the engine's rate belongs to the server;
+ * this side uses the device rate. Levels are measured where the sound is: the microphone as
+ * captured, playback as rendered (never as queued, since an answer arrives faster than it plays).
  */
 export const HEADER_SIZE = 16;
 export const MAX_FRAME_PAYLOAD = 64 * 1024;
@@ -8,6 +10,59 @@ export const JITTER_MS = 40;
 // Physical memory bound: a provider sends a whole answer many times faster than it plays,
 // so a long answer queues here; frames are held only as they arrive, nothing is preallocated.
 export const MAX_BUFFER_SECONDS = 600;
+// Perceptual range of a voice level: quieter than the floor is silence (exactly 0), louder than
+// the ceiling is full; the curve lets quiet speech still move the light.
+export const LEVEL_FLOOR_DB = -55;
+export const LEVEL_CEILING_DB = -12;
+const LEVEL_CURVE = 0.6;
+// Envelope time constants (seconds): the light answers a voice at once and lets go slowly.
+export const LEVEL_ATTACK_S = 0.05;
+export const LEVEL_RELEASE_S = 0.25;
+
+/** One window's RMS (linear, 0..1) as a display level 0..1. */
+export function levelFromRms(rms) {
+    if (!(rms > 0)) return 0;
+    const span = (20 * Math.log10(rms) - LEVEL_FLOOR_DB) / (LEVEL_CEILING_DB - LEVEL_FLOOR_DB);
+    return span <= 0 ? 0 : Math.min(1, span) ** LEVEL_CURVE;
+}
+
+/** One envelope step that does not depend on the frame rate (60 Hz, 120 Hz or a throttled 30 Hz). */
+export function followLevel(current, target, dt) {
+    const tau = target > current ? LEVEL_ATTACK_S : LEVEL_RELEASE_S;
+    return current + (target - current) * (1 - Math.exp(-Math.max(0, dt) / tau));
+}
+
+/** Mean squares of the captured and the rendered samples, reported once per window.
+ * Silence after silence reports nothing new, so an idle call posts no messages at all. */
+export class LevelMeter {
+    constructor(windowSamples, report) {
+        this.size = windowSamples;
+        this.report = report;
+        this.mic = 0;
+        this.out = 0;
+        this.count = 0;
+        this.silent = true;
+    }
+
+    measure(input, output, playing, time = 0) {
+        const count = Math.max(input?.length || 0, output?.length || 0);
+        for (let i = 0; i < count; i++) {
+            const mic = input?.[i] || 0;
+            const out = output?.[i] || 0;
+            this.mic += mic * mic;
+            this.out += out * out;
+        }
+        this.count += count;
+        if (!count || this.count < this.size) return;
+        const mic = Math.sqrt(this.mic / this.count);
+        const out = Math.sqrt(this.out / this.count);
+        this.mic = this.out = this.count = 0;
+        const silent = !mic && !out && !playing;
+        if (silent && this.silent) return;
+        this.silent = silent;
+        this.report({ type: 'level', mic, out, playing: Boolean(playing), t: time });
+    }
+}
 
 export function encodeFrame({ kind = 1, epoch = 0, seq = 0, rate, stream = 0, pcm }) {
     if (!(pcm instanceof Int16Array) || pcm.byteLength > MAX_FRAME_PAYLOAD)
@@ -129,11 +184,15 @@ if (typeof globalThis.registerProcessor === 'function') {
         constructor() {
             super();
             this.rate = globalThis.sampleRate;
-            this.capture = new Int16Array(Math.round(this.rate * CAPTURE_MS / 1000));
+            this.windowSamples = Math.round(this.rate * CAPTURE_MS / 1000);
+            this.capture = new Int16Array(this.windowSamples);
+            this.mono = new Float32Array(128);
             this.offset = 0;
             this.enabled = false;
             this.generation = 0;
             this.playback = new PlaybackBuffer(this.rate, message => this.port.postMessage(message));
+            // Metering runs whether or not capture sends: playback keeps lighting a muted call.
+            this.meter = new LevelMeter(this.windowSamples, message => this.port.postMessage(message));
             this.port.onmessage = ({ data }) => {
                 try {
                     if (data.type === 'audio') this.playback.push(data);
@@ -147,22 +206,35 @@ if (typeof globalThis.registerProcessor === 'function') {
             };
         }
 
+        mix(channels) {
+            const length = channels[0].length;
+            if (this.mono.length !== length) this.mono = new Float32Array(length);
+            for (let i = 0; i < length; i++) {
+                let value = 0;
+                for (const channel of channels) value += channel[i] / channels.length;
+                this.mono[i] = value;
+            }
+            return this.mono;
+        }
+
         process(inputs, outputs) {
             const channels = inputs[0];
-            if (this.enabled && channels?.length) {
-                for (let i = 0; i < channels[0].length; i++) {
-                    let value = 0;
-                    for (const channel of channels) value += channel[i] / channels.length;
-                    this.capture[this.offset++] = pcm16(value);
+            const mono = channels?.length ? this.mix(channels) : null;
+            if (this.enabled && mono) {
+                for (let i = 0; i < mono.length; i++) {
+                    this.capture[this.offset++] = pcm16(mono[i]);
                     if (this.offset === this.capture.length) {
                         this.port.postMessage({ type: 'capture', pcm: this.capture, rate: this.rate,
                             generation: this.generation }, [this.capture.buffer]);
-                        this.capture = new Int16Array(Math.round(this.rate * CAPTURE_MS / 1000));
+                        // The posted buffer was transferred (its array is now empty): a fresh window.
+                        this.capture = new Int16Array(this.windowSamples);
                         this.offset = 0;
                     }
                 }
             }
-            if (outputs[0]?.[0]) this.playback.render(outputs[0][0]);
+            const output = outputs[0]?.[0];
+            if (output) this.playback.render(output);
+            this.meter.measure(mono, output, this.playback.playing, globalThis.currentTime);
             return true;
         }
     }

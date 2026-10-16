@@ -298,10 +298,28 @@ function closeNotificationReaders() {
     for (const inst of projectInstances.values()) inst.closeTransient?.();
 }
 
-// Every room carries the call button; hiding a room keeps its call, destroying it hangs up.
+// Every room carries Talk. A call keeps its room while it lasts (`hasPendingWork`): leaving the
+// screen hides a Project room instead of destroying it, the shell's mark leads back, and when the
+// call ends a hidden room that nothing else holds is released. Destroying a room hangs up.
 function withRoomCall(room) {
+    const project = () => lastProjectRows.find((row) => row.id === room.projectId) || null;
     import('./modules/call.js').then(({ mountRoomCall }) => {
-        if (room.page.isConnected) mountRoomCall({ page: room.page, chatId: room.chatId, room });
+        if (!room.page.isConnected) return;
+        mountRoomCall({
+            room, page: room.page, chatId: room.chatId, ws,
+            label: () => (room.projectId ? project()?.name || room.projectId : 'Main'),
+            onScreen: () => (room.projectId
+                ? navState.activeProjectId === room.projectId && !room.page.hidden
+                : state.activePage === 'chat' && !navState.activeProjectId),
+            reveal: () => (room.projectId
+                ? project() && openProjectPanel(project(), { openOnly: true })
+                : showPage('chat')),
+            openSettings: (tab) => openSettingsTab(tab),
+            release: () => {
+                if (room.projectId && navState.activeProjectId !== room.projectId
+                    && projectInstances.get(room.projectId) === room) destroyProjectInstance(room.projectId);
+            },
+        });
     });
     return room;
 }

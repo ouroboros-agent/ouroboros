@@ -28,8 +28,7 @@ export const SETTINGS_INPUT_FIELDS = [
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
     // Optional task bounds: a positive integer or "unlimited" (SSOT: ouroboros/settings_scales.py); a blank is refused by the server.
     ['s-max-rounds', 'OUROBOROS_MAX_ROUNDS', 'unlimited'], ['s-task-lifetime', 'OUROBOROS_TASK_ABS_CEILING_SEC', 'unlimited'],
-    ['s-call-engine', 'OUROBOROS_CALL_ENGINE', 'openai'],
-    ['s-call-model-openai', 'OUROBOROS_CALL_MODEL_OPENAI'], ['s-call-voice-openai', 'OUROBOROS_CALL_VOICE_OPENAI'],
+    // Live calls run on one engine, Google's Gemini Live: its model and voice are the call's only routes.
     ['s-call-model-google', 'OUROBOROS_CALL_MODEL_GOOGLE'], ['s-call-voice-google', 'OUROBOROS_CALL_VOICE_GOOGLE'],
     ['s-call-native-search', 'OUROBOROS_CALL_NATIVE_SEARCH', 'true'],
     ['s-call-max-minutes', 'OUROBOROS_CALL_MAX_MINUTES'], ['s-presence-call-max-minutes', 'OUROBOROS_PRESENCE_CALL_MAX_MINUTES'],
@@ -108,7 +107,7 @@ const PROVIDER_CARDS = [
     {
         id: 'google', title: 'Google', hint: 'Gemini live calls',
         fields: [{ id: 's-google', settingKey: 'GOOGLE_API_KEY', label: 'Google API Key', placeholder: 'Google AI Studio key' }],
-        note: 'Choose Google in Models → Live calls to use this key for voice calls.',
+        note: 'Live calls (Talk) use this key; the same key is in Models → Live calls.',
     },
     {
         id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
@@ -394,30 +393,19 @@ export function renderSettingsPage() {
                     </div>
                     <div class="form-section">
                         <h3>Live calls</h3>
-                        <div class="settings-section-copy">Voice calls in any room. Set API keys in Accounts or Stored Secrets. Changes apply to the next call.</div>
+                        <div class="settings-section-copy">Talk with Ouroboros by voice in any room: press Talk in an empty message field. Calls run on Google’s Gemini Live with the Google AI key below, the same key as Accounts → Google. Changes apply to the next call.</div>
                         <div class="form-grid two">
-                            <div class="form-field ui-field">
-                                <label for="s-call-engine">Engine</label>
-                                <select id="s-call-engine" class="ui-control"><option value="openai">OpenAI</option><option value="google">Google</option></select>
-                            </div>
+                            ${secretField({ id: 's-call-google-key', settingKey: 'GOOGLE_API_KEY', label: 'Google AI key', placeholder: 'Google AI Studio key' })}
                             <div class="form-field ui-field">
                                 <label for="s-call-native-search">Google native search</label>
                                 <select id="s-call-native-search" class="ui-control"><option value="false">Off</option><option value="true">On</option></select>
                             </div>
                             <div class="form-field ui-field">
-                                <label for="s-call-model-openai">OpenAI call model</label>
-                                <input id="s-call-model-openai" class="ui-control" type="text" placeholder="Use engine default">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-call-voice-openai">OpenAI voice</label>
-                                <input id="s-call-voice-openai" class="ui-control" type="text" placeholder="Use engine default">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-call-model-google">Google call model</label>
+                                <label for="s-call-model-google">Gemini Live model</label>
                                 <input id="s-call-model-google" class="ui-control" type="text" placeholder="Use engine default">
                             </div>
                             <div class="form-field ui-field">
-                                <label for="s-call-voice-google">Google voice</label>
+                                <label for="s-call-voice-google">Voice</label>
                                 <input id="s-call-voice-google" class="ui-control" type="text" placeholder="Use engine default">
                             </div>
                             <div class="form-field ui-field">
