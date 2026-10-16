@@ -67,23 +67,25 @@ def history_rows(messages: Sequence[Mapping]) -> List[Dict[str, Any]]:
     return rows
 
 
-def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[Mapping]) -> Tuple[Dict[str, Any], ...]:
+def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[Mapping],
+                 ratio: float = 1.0) -> Tuple[Dict[str, Any], ...]:
     """The newest rows a fresh session can replay within half the room beside the call view.
 
     A long call's own words would otherwise fill a reopened window before anyone speaks;
     the rows left out are named by count, since they stay in the room's transcript.
-    Without a route fact nothing bounds the replay.
+    Without a route fact nothing bounds the replay. ``ratio`` is the route's density, as
+    for the watermarks: the room is the provider's count, the estimates are chars/4.
     """
     rows = history_rows(messages)
     if fact is None:
         return tuple(rows)
     system = messages[0] if messages and messages[0].get("role") == "system" else {}
-    budget = max(0, (_room(fact) - _view_tokens(text_of(system.get("content")), tool_schemas)) // 2)
+    budget = max(0, (_room(fact) - _view_tokens(text_of(system.get("content")), tool_schemas, ratio)) // 2)
     kept: List[Dict[str, Any]] = []
     spent = 0
     for item in reversed(rows):
         content = item.get("content")
-        cost = estimate_tokens(content if isinstance(content, str) else text_of(content))
+        cost = math.ceil(estimate_tokens(content if isinstance(content, str) else text_of(content)) * ratio)
         if spent + cost > budget:
             break
         kept.append(item)

@@ -432,7 +432,7 @@ class _LiveCall:
 
     def _history_view(self) -> Tuple[Dict[str, Any], ...]:
         """The newest call rows a fresh session replays (``live_session_view.history_view``)."""
-        return history_view(self.route.fact, self.messages, self.tool_schemas)
+        return history_view(self.route.fact, self.messages, self.tool_schemas, calibration_ratio(self.ctx))
 
     async def _reconnect(self, reason: str, *, resume: bool) -> None:
         if self.closing or self.reconnecting:

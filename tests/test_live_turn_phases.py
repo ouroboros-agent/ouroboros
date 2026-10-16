@@ -114,6 +114,21 @@ def test_a_fresh_session_replays_the_newest_rows_that_fit_and_names_the_rest(har
     assert len(call._history_view()) == 61  # the task row and every utterance when no route fact bounds it
 
 
+def test_the_routes_density_scales_the_replay_and_the_kept_view():
+    from types import SimpleNamespace
+
+    from ouroboros.live_session_view import compression_watermarks, history_view
+
+    fact = SimpleNamespace(window_tokens=8_192 + 4_000, reply_allowance_tokens=8_192)
+    view = "view " * 400
+    messages = [{"role": "system", "content": view}] + [
+        {"role": "user", "content": f"utterance {index} " + "word " * 40} for index in range(60)]
+    plain, dense = history_view(fact, messages, [], 1.0), history_view(fact, messages, [], 1.5)
+    assert 1 < len(dense) < len(plain)  # the same room holds fewer rows when the route counts them larger
+    (start, kept), (dense_start, dense_kept) = (compression_watermarks(fact, view, [], ratio) for ratio in (1.0, 1.5))
+    assert start == dense_start == 4_000 and dense_kept > kept  # the room is fixed; the view it keeps weighs more
+
+
 def _density(root):
     from ouroboros.capability_evidence import resolve_main_token_density, route_fingerprint
 
