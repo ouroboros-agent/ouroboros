@@ -142,3 +142,38 @@ def test_world_subagents_and_reflections_keep_names_and_state(tmp_path, monkeypa
     assert section.full_text == "## Execution reflections\n\nthe whole text"
     assert section.operative_view == ("## Execution reflections\n\n- 2026-10-16T10:00 | task | t0\n"
                                       "- 2026-10-16T10:00 | task | t1\nHistorical automatic reflections: 4 row(s) ...")
+
+
+def test_runtime_view_counts_schedules_candidates_and_the_letter_and_keeps_authority_exact():
+    import copy
+    import json
+
+    from ouroboros.context_sections import runtime_host_section
+
+    held = [{"id": f"s{i}", "name": "Daily check " * 10, "status": "held", "followup_hold": True} for i in range(17)]
+    data = {"runtime_mode": "advanced", "git_head": "abc123",
+            "task_contract": {"objective": "Exact owner words", "grants": ["read every source"]},
+            "capabilities": {"filesystem": {"writable_roots": ["task_drive", "user_files"], "profile": "full"},
+                             "mutative_subagent_surfaces": ["external_workspace"]},
+            "scheduled_tasks": {"active": [{"id": "a"}], "held": held, "waiting": [], "omitted_count": 4},
+            "body_candidates": [{"id": f"c{i}", "path": "/candidates/" + "deep/" * 10 + str(i)} for i in range(6)],
+            "official_update": {"status": "update_available", "letter": {"state": "ready", "relation": "pending",
+                                                                       "text": "What changes in this update. " * 40}}}
+    before = copy.deepcopy(data)
+    section = runtime_host_section(data)
+    assert section.full_text == "## Runtime context\n\n" + json.dumps(data, ensure_ascii=False, indent=2)
+    view = json.loads(section.operative_view.split("\n\n", 1)[1])
+    schedules = view["scheduled_tasks"]
+    assert (schedules["held"]["count"], schedules["active"]["count"], schedules["waiting"]["count"]) == (17, 1, 0)
+    assert schedules["omitted_count"] == 4 and view["body_candidates"]["count"] == 6
+    letter = view["official_update"]["letter"]
+    assert letter["text"] == {"chars": len(data["official_update"]["letter"]["text"]),
+                              "details": "retained full runtime section"}
+    assert (letter["state"], letter["relation"], view["official_update"]["status"]) == ("ready", "pending",
+                                                                                         "update_available")
+    # Authority stays exact: the contract, the filesystem affordances, the surfaces, the scalars.
+    for key in ("runtime_mode", "git_head", "task_contract"):
+        assert view[key] == data[key]
+    assert view["capabilities"] == data["capabilities"]
+    assert "Daily check" not in section.operative_view and "Daily check" in section.full_text
+    assert len(section.operative_view) < len(section.full_text) / 3 and data == before

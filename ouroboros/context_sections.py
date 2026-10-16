@@ -295,28 +295,36 @@ def _drive_state_section(env: Any) -> str:
                        "read_file(root='runtime_data', path='state/state.json')")
 
 
-def runtime_host_section(data: dict, coordination: str = "") -> HostSection:
-    """Retain scalar facts and authority; address only the producer's observational lists.
+# The runtime facts the operative view shows by exact count (lists) or size (prose), never by value:
+# observations and history the mind can read back, not its authority. Everything else stays exact.
+_RUNTIME_COUNTED_LISTS = (
+    ("capabilities", "delegation", "reviewer_slots_last"),
+    ("capabilities", "delegation", "subagents_last_executions"),
+    ("current_chat", "running_tasks"), ("current_chat", "addressable_root_tasks"),
+    ("main_routing_manifest", "projects"), ("main_routing_manifest", "root_tasks"),
+    ("project_routing_manifest", "root_tasks"),
+    ("scheduled_tasks", "active"), ("scheduled_tasks", "held"), ("scheduled_tasks", "waiting"),
+    ("scheduled_tasks", "delete_pending"), ("body_candidates",),
+)
+_RUNTIME_SIZED_TEXTS = (("official_update", "letter", "text"),)
 
-    Grants, constraints, task contracts, origin words, review obligations and the
-    coordination ledger remain exact. Unknown/new fields stay whole until their
-    producer explicitly gives them an operative form.
+
+def runtime_host_section(data: dict, coordination: str = "") -> HostSection:
+    """Retain scalar facts and authority; show the producer's observational lists by exact count.
+
+    Grants, constraints, task contracts, origin words, review obligations, the filesystem
+    affordances and the coordination ledger remain exact. Lists of past runs, routing rows,
+    schedules and body candidates become ``{"count": n}``; the update letter's prose its
+    character count. Unknown/new fields stay whole until their producer gives them a form.
     """
     projected = copy.deepcopy(data)
-    for path in (
-        ("capabilities", "delegation", "reviewer_slots_last"),
-        ("capabilities", "delegation", "subagents_last_executions"),
-        ("current_chat", "running_tasks"), ("current_chat", "addressable_root_tasks"),
-        ("main_routing_manifest", "projects"), ("main_routing_manifest", "root_tasks"),
-        ("project_routing_manifest", "root_tasks"),
-    ):
-        node = projected
-        for key in path[:-1]:
-            node = node.get(key) if isinstance(node, dict) else None
-        if isinstance(node, dict) and isinstance(node.get(path[-1]), list):
-            node[path[-1]] = {"count": len(node[path[-1]]), "details": "retained full runtime section"}
+    for paths, kind, fact in ((_RUNTIME_COUNTED_LISTS, list, "count"), (_RUNTIME_SIZED_TEXTS, str, "chars")):
+        for path in paths:
+            node = projected
+            for key in path[:-1]:
+                node = node.get(key) if isinstance(node, dict) else None
+            if isinstance(node, dict) and isinstance(node.get(path[-1]), kind):
+                node[path[-1]] = {fact: len(node[path[-1]]), "details": "retained full runtime section"}
     heading = "## Runtime context\n\n"
     return HostSection("runtime", heading + json.dumps(data, ensure_ascii=False, indent=2) + coordination,
                        heading + json.dumps(projected, ensure_ascii=False, indent=2) + coordination)
-
-
