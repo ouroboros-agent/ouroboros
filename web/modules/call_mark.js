@@ -31,9 +31,8 @@ function mount(env, sign) {
     root.setAttribute('role', 'region');
     root.setAttribute('aria-label', 'Call in progress');
     root.hidden = true;
-    root.innerHTML = '<button type="button" class="call-mark-open"><span class="call-mark-label">In call</span>'
-        + '<span class="call-mark-room" data-i18n-skip></span><span class="call-mark-time" data-i18n-skip></span></button>'
-        + '<button type="button" class="call-mark-end">End</button>';
+    root.innerHTML = `<button type="button" class="call-mark-open"><span class="call-mark-label">In call</span><span class="call-mark-room" data-i18n-skip></span><span class="call-mark-time" data-i18n-skip></span></button>
+        <button type="button" class="call-mark-end">End</button>`;
     // The visual's own small sign leads the mark, as it leads Talk.
     if (sign) root.querySelector('.call-mark-open').prepend(sign());
     doc.body.append(root);
