@@ -68,7 +68,7 @@ from ouroboros.context_sections import (  # re-export the existing context surfa
     build_knowledge_sections,
     runtime_host_section,
 )
-from ouroboros.section_floor import capture_sections
+from ouroboros.section_floor import HostSection, capture_sections
 from ouroboros.contracts.task_contract import normalize_bool, task_input_sources
 from ouroboros.memory import Memory, render_scratchpad_markdown
 from ouroboros.update_letter import official_update_projection  # contract: never raises
@@ -764,12 +764,13 @@ def build_memory_sections(memory: Memory, partition: str = "all", *, include_scr
             header = "## Scratchpad (from `memory/scratchpad.md` — PARTIAL: trimmed to the section budget; re-read via read_file(root='runtime_data', path='memory/scratchpad.md') for the full working memory)"
         else:
             header = "## Scratchpad (from `memory/scratchpad.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/scratchpad.md'))"
-        sections.append(header + "\n\n" + scratchpad_body)
+        sections.append(HostSection("scratchpad", header + "\n\n" + scratchpad_body))  # tier zero: an id, no view
 
     if include_stable:
         identity_raw = memory.load_identity()
         _warn_if_over_budget("identity", identity_raw)
-        sections.append("## Identity (from `memory/identity.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw)
+        sections.append(HostSection("identity", "## Identity (from `memory/identity.md` — already loaded; do not re-read "
+                                    "via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw))
         world_raw = memory.load_world_profile().strip()
         if world_raw:
             # Generated profile is full; oversize is a generation-discipline bug.
