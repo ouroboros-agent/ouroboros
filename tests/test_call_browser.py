@@ -331,6 +331,11 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 page.set_viewport_size({"width": width, "height": 900})
                 _no_sideways_scroll(page, f"live light {width}")
             page.set_viewport_size({"width": 1280, "height": 900})
+            _state(page, state="preparing", phase="memory")
+            expect(state).to_have_text("Preparing memory…")
+            _shot(page, f"{engine}-light-1280-preparing")
+            _state(page, state="live")
+            expect(state).to_have_text("Listening")
             _shot(page, f"{engine}-light-1280-listening")
             page.evaluate("__callTest.speak(0.4)")
             page.wait_for_function("parseFloat(getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
