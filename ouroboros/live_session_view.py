@@ -96,6 +96,32 @@ def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[
     return tuple(kept)
 
 
+def text_estimate(instructions: str, history: Sequence[Mapping], tool_schemas: Sequence[Mapping]) -> int:
+    """The fit estimator's own count of the text a fresh session is opened with (the density basis)."""
+    from ouroboros.context_fit import estimate_context_prompt_tokens
+
+    return int(estimate_context_prompt_tokens([{"role": "system", "content": instructions}, *history],
+                                              list(tool_schemas) or None))
+
+
+def record_density_witness(route: Any, estimate: int, text_tokens: int) -> None:
+    """Teach the next call's fit how its route counts text: the same witness a text turn's usage writes.
+
+    The first response of a session opened with the call view, and sent no other text before it,
+    counts exactly that text (Gemini's ``promptTokensDetails`` TEXT: system instruction, tool
+    declarations, replayed rows). Its ratio to the fit estimator's count is the route's density,
+    kept in the one observation store under the route identity the fit reads (``known_route``).
+    """
+    if estimate <= 0 or text_tokens <= 0:
+        return
+    from ouroboros.capability_evidence import MAIN_DENSITY_BASIS, canonical_evidence_root, record_token_density
+    from ouroboros.provider_models import normalize_model_identity
+
+    record_token_density(canonical_evidence_root(), normalize_model_identity(route.engine.model),
+                         prompt_chars=estimate * 4, prompt_tokens=text_tokens, source="live_usage",
+                         route_fp=route.evidence_fp, basis=MAIN_DENSITY_BASIS)
+
+
 def calibration_ratio(ctx: Any) -> float:
     """The fitted projection's calibration ratio for the active mode (1.0 when unknown)."""
     plan = getattr(ctx, "context_fit_plan", None)

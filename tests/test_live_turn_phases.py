@@ -112,3 +112,52 @@ def test_a_fresh_session_replays_the_newest_rows_that_fit_and_names_the_rest(har
     unbounded = _replace(call.route, fact=None)
     call.route = unbounded
     assert len(call._history_view()) == 61  # the task row and every utterance when no route fact bounds it
+
+
+def _density(root):
+    from ouroboros.capability_evidence import resolve_main_token_density, route_fingerprint
+
+    return resolve_main_token_density(root, route_fingerprint(provider=ENGINE_GOOGLE, model="gemini-3.8-live"),
+                                      "gemini-3.8-live")
+
+
+def test_the_first_response_teaches_the_next_fit_how_the_route_counts_text(harness, monkeypatch):
+    from ouroboros import capability_evidence
+    from ouroboros.gateways.realtime_engine import ResponseDone
+    from ouroboros.live_session_view import text_estimate
+
+    h = harness()
+    monkeypatch.setattr(capability_evidence, "canonical_evidence_root", lambda: h.root)
+    monkeypatch.setattr(capability_evidence, "_DENSITY_MEMO", {})  # the process-wide write throttle
+    h.messages[0]["content"] = "Память Уробороса. " * 3000  # a view large enough to measure
+    engine = h.start()
+    assert _wait_for(lambda: (STATE_LIVE, "") in h.hub.states)
+    estimate = text_estimate(engine.config.instructions, engine.config.history, engine.config.tools)
+    engine.push(ResponseDone(item_id="a1", status="completed", usage={"text_input_tokens": round(estimate * 1.2)}))
+    # The witness sits under the identity the call's fit reads (``known_route``), on the fit's own basis.
+    assert _wait_for(lambda: _density(h.root)[1] == "fresh_route_usage")
+    assert abs(_density(h.root)[0] - 1.2) < 0.01
+    h.stop()
+    h.finish()
+
+
+def test_text_sent_before_the_first_response_leaves_no_witness(harness, monkeypatch):
+    from ouroboros import capability_evidence
+    from ouroboros.call_protocol import PeerControl
+    from ouroboros.gateways.realtime_engine import ContextItem, ResponseDone
+    from ouroboros.live_session_view import text_estimate
+
+    h = harness()
+    monkeypatch.setattr(capability_evidence, "canonical_evidence_root", lambda: h.root)
+    monkeypatch.setattr(capability_evidence, "_DENSITY_MEMO", {})  # the process-wide write throttle
+    h.messages[0]["content"] = "Память Уробороса. " * 3000
+    engine = h.start()
+    assert _wait_for(lambda: (STATE_LIVE, "") in h.hub.states)
+    h.hub.feed(PeerControl(peer_id="owner-1", role="owner", message={"type": "context", "text": "a typed line"}))
+    assert _wait_for(lambda: engine.sent_of(ContextItem))
+    estimate = text_estimate(engine.config.instructions, engine.config.history, engine.config.tools)
+    engine.push(ResponseDone(item_id="a1", status="completed", usage={"text_input_tokens": round(estimate * 1.2)}))
+    assert _wait_for(lambda: h.ledger.settled)
+    h.stop()
+    h.finish()
+    assert _density(h.root) == (1.0, "cold_estimate")  # the session held more text than it was opened with

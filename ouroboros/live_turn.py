@@ -53,7 +53,9 @@ from ouroboros.gateways.realtime_engine import (
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
 from ouroboros.live_call_route import call_minutes_ceiling, initial_call_schemas, native_search_enabled, resolve_call_route
-from ouroboros.live_session_view import calibration_ratio, compression_watermarks, history_view
+from ouroboros.live_session_view import (
+    calibration_ratio, compression_watermarks, history_view, record_density_witness, text_estimate,
+)
 from ouroboros.live_tool_batch import ToolBatchWorker, text_of
 from ouroboros.usage_accounting import BudgetExceeded
 
@@ -166,6 +168,9 @@ class _LiveCall:
         self.reconnecting = False
         self.reconnects = 0
         self.resume_handle = ""
+        # (session epoch, its opening config): the first response's text count becomes the route's
+        # density witness unless other text reached the session before it.
+        self.witness: Optional[Tuple[int, SessionConfig]] = None
         self.response_open = False
         self.budget_error: Optional[BudgetExceeded] = None
         self.failure: Optional[Tuple[str, str]] = None
@@ -400,8 +405,9 @@ class _LiveCall:
         # The history view holds every transcript row up to this count; context recorded
         # after it, while the connection was pending, is delivered once the session is live.
         history, cut = ((), -1) if resume_handle else (self._history_view(), len(self.messages))
+        config = self._session_config(history=history, resume_handle=resume_handle)
         try:
-            await engine.open(self._session_config(history=history, resume_handle=resume_handle))
+            await engine.open(config)
         except asyncio.CancelledError:
             try:  # the call ended while connecting: whatever was opened is closed at once
                 await asyncio.wait_for(engine.close("cancelled"), timeout=BATCH_SETTLE_WAIT_S)
@@ -409,6 +415,7 @@ class _LiveCall:
                 log.debug("cancelled engine close failed", exc_info=True)
             raise
         self.engine, self.epoch, self.session_started = engine, self.epoch + 1, time.monotonic()
+        self.witness = None if resume_handle else (self.epoch, config)
         self.input_ms = 0.0  # a new session counts its input audio from zero
         self.hub.set_engine_rates(self.input_rate, self.output_rate)
         if self.empty_since is None and not self.hub.peers():
@@ -462,6 +469,8 @@ class _LiveCall:
             if isinstance(command, (ContextItem, ToolResult, UpdateTools)) and not self.closing:
                 self._queued.append((len(self.messages), command))  # audio and playback marks are transient; context waits
             return
+        if isinstance(command, (ContextItem, ToolResult, UpdateTools)):
+            self.witness = None  # the session now holds more text than it was opened with
         try:
             await engine.send(command)
         except LiveEngineRefusal as exc:
@@ -887,6 +896,11 @@ class _LiveCall:
         key = event.response_id or event.item_id
         attempt = self._attempt_for(key, usage=dict(event.usage), raw_usage=dict(event.raw_usage), status=event.status)
         self.attempts.pop(key, None)
+        if self.witness and self.witness[0] == self.epoch:  # counted on the ledger thread, off the audio loop
+            opened, tokens = self.witness[1], int(event.usage.get("text_input_tokens") or 0)
+            self._record(self._settle_safely, lambda: record_density_witness(
+                self.route, text_estimate(opened.instructions, opened.history, opened.tools), tokens))
+        self.witness = None
         self.usage["live_responses"] += 1
         for name in USAGE_KEYS:
             self.usage["live_usage"][name] += int(event.usage.get(name) or 0)
