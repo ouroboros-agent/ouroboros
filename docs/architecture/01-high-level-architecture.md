@@ -392,7 +392,6 @@ ouroboros/ — agent core and shared runtime (§6)
     claudexor_images.py — requestKind=image upload and whole-result ACK (docs/IMAGE_GENERATION.md)
     image_api.py — Image API routes/credentials; one send, bounded results, cost evidence
     realtime_engine.py — Live engine commands, events and adapter registry (§6 Live calls)
-    realtime_openai.py — OpenAI live audio, function calls, usage and interruption (§6 Live calls)
     realtime_gemini.py — Gemini live audio, tool activation by resume and usage (§6 Live calls)
     realtime_transport.py — Bounded live websocket I/O, closure and typed failures (§6 Live calls)
     claudexor.py — Loopback descriptor/handshake/runs/quota; private token; owned daemon; `discover_daemon_at`: daemon/control-api.json (§6)

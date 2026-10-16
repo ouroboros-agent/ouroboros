@@ -186,7 +186,6 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/usage_accounting.py", "cost_usd", "_account_response"): ("ledger settlement call shared by sync and async received responses", 1),
         ("ouroboros/_usage_settlement.py", "cost_usd", "settlement_fields"): ("ledger settlement fields shared by received and abandoned attempts", 1),
         ("ouroboros/live_usage.py", "cost_usd", "settle_live_response"): ("ledger settlement of one billed live response", 1),
-        ("ouroboros/live_usage.py", "cost_usd", "record_transcription"): ("ledger settlement of a live call's transcription receipt", 1),
         ("ouroboros/live_usage.py", "cost_usd", "record_refused_live_response"): ("ledger settlement of a provider-billed response the call's budget refused", 1),
         ("ouroboros/usage_journal.py", "cost_usd", "legacy_candidates"): ("legacy usage telemetry import rows (the store's one-time migration)", 2),
         ("ouroboros/tools/imagegen.py", "cost_usd", "_recover_image"): ("original physical-attempt ledger settlement; public image receipts use actual_cost_usd/estimated_cost_usd", 1),

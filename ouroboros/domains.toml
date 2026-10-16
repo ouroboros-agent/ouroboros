@@ -309,7 +309,6 @@ D20 = "Presence"
 "ouroboros/gateways/claudexor_images.py" = "D07"
 "ouroboros/gateways/image_api.py" = "D02"
 "ouroboros/gateways/realtime_engine.py" = "D02"  # live-call engine vocabulary: typed commands/events + adapter registry
-"ouroboros/gateways/realtime_openai.py" = "D02"
 "ouroboros/gateways/realtime_gemini.py" = "D02"
 "ouroboros/gateways/realtime_transport.py" = "D02"
 "ouroboros/gateways/claudexor_maintenance.py" = "D07"

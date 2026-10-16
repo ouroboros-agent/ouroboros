@@ -207,25 +207,6 @@ def test_abandonment_is_unresolved_and_late_receipt_settles_same_attempt(live_ro
     assert row["cost_usd"] == pytest.approx(.001)
 
 
-def test_transcription_has_its_own_model_and_attempt(live_root, catalog_fixture):  # noqa: F811
-    import json
-    _, rows, response, _ = catalog_fixture
-    rows["transcribe-example"] = {"litellm_provider": "openai", "input_cost_per_audio_token": 3e-6}
-    response.content = json.dumps(rows).encode()
-    attempt = reserve(live_root)
-    settle(attempt, audio_input_tokens=100)
-    live.record_transcription(engine="openai", model="transcribe-example", call_id="call-1",
-        usage={"audio_input_tokens": 100}, raw_usage={"input_tokens": 100}, task_id="call-task", drive_root=live_root)
-    live.record_transcription(engine="openai", model="absent-transcription", call_id="call-1",
-        usage={"audio_input_tokens": 100}, raw_usage={}, task_id="call-task", drive_root=live_root)
-    rows = ledger_rows(live_root)
-    assert len({row["attempt_id"] for row in rows}) == 3
-    assert rows[1]["model"] == "transcribe-example" and rows[1]["source"] == "live_transcription"
-    assert rows[1]["cost_usd"] == pytest.approx(.0003)
-    assert rows[2]["cost_usd"] is None and rows[2]["cost_coverage"] == "partial"
-    assert accounting.usage_projection(live_root)["settled_usd"] == pytest.approx(.0013)
-
-
 @pytest.mark.parametrize("modality", [
     {"audio_input_tokens": 1}, {"audio_output_tokens": 1}, {"image_input_tokens": 1},
     {"input_token_details": {"audio_tokens": 1}}, {"prompt_tokens_details": {"image_tokens": 2}},
@@ -264,26 +245,6 @@ def test_provider_reported_price_still_wins_for_audio(live_root):
     accounting.settle_attempt(attempt, {"prompt_tokens": 100, "audio_input_tokens": 100}, cost_usd=.2, cost_final=True)
     row, = ledger_rows(live_root)
     assert row["cost_usd"] == .2 and row["cost_final"] is True
-
-
-def test_received_transcription_still_records_after_budget_exhaustion(live_root):
-    scope = accounting.UsageScope(drive_root=live_root, task_id="call-task", root_task_id="call-task",
-                                   global_limit_usd=.001, non_task_operation=True)
-    context = accounting.PhysicalAttemptContext(profile="owner_nano", rendered_mode="nano",
-        measurement_basis="cold_estimate", route_fp="route", round_id="round", target_total_tokens=None,
-        capacity_total_tokens=None, context_target_miss=False, automatic_pass_used=False)
-    with accounting.usage_scope(scope), accounting.bind_physical_attempt_context(context):
-        attempt = reserve(live_root)
-        settle(attempt, audio_input_tokens=100)
-        with accounting.capture_attempt_ids() as ids:
-            live.record_transcription(engine="openai", model="gpt-realtime-2.1", call_id="call-1",
-                usage={"audio_input_tokens": 100}, raw_usage={}, task_id="call-task", drive_root=live_root)
-        with pytest.raises(accounting.BudgetExceeded):
-            reserve(live_root)
-    rows = ledger_rows(live_root)
-    assert len(rows) == 2 and ids == [rows[1]["attempt_id"]]
-    assert rows[1]["rendered_mode"] == rows[1]["physical_context"]["rendered_mode"] == "nano"
-    assert accounting.usage_projection(live_root)["settled_usd"] == .002
 
 
 def test_matched_raw_modality_counts_and_measured_zero_are_priceable(live_root):
@@ -393,8 +354,6 @@ def test_in_loop_lookups_never_fetch_the_catalog(live_root):
     assert fetch.call_count == 0
     assert ledger_rows(live_root)[0]["reservation_upper_bound_usd"] is None  # unknown until warmed, never a wait
     settle(attempt, audio_input_tokens=10)
-    live.record_transcription(engine="openai", model="gpt-realtime-2.1", call_id="call-1",
-        usage={"audio_input_tokens": 10}, raw_usage={}, task_id="call-task", drive_root=live_root)
     assert fetch.call_count == 0
     assert live.warm_quote(engine="openai", model="gpt-realtime-2.1", drive_root=live_root)["catalog_id"] == "gpt-realtime-2.1"
     assert fetch.call_count == 1

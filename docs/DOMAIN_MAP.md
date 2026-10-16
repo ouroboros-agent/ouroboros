@@ -262,7 +262,6 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/gateways/image_api.py`
 - `ouroboros/gateways/realtime_engine.py`
 - `ouroboros/gateways/realtime_gemini.py`
-- `ouroboros/gateways/realtime_openai.py`
 - `ouroboros/gateways/realtime_transport.py`
 - `ouroboros/image_preparation.py`
 - `ouroboros/llm.py`

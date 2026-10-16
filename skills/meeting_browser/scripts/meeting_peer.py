@@ -34,7 +34,7 @@ MAGIC = b"OC"
 MAX_FRAME_PAYLOAD = 64 * 1024
 MAX_CONTROL_BYTES = 16 * 1024
 PEER_MESSAGE_TYPES = ("hello", "mute", "played", "context", "participant", "bye")
-SERVER_MESSAGE_TYPES = ("state", "caption", "flush")
+SERVER_MESSAGE_TYPES = ("state", "activity", "caption", "flush")
 STATE_CLOSED = "closed"
 
 HTTP_TIMEOUT_SEC = 10.0

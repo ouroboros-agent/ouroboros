@@ -29,7 +29,7 @@ def test_control_messages_accept_only_declared_types():
 
 
 def test_call_spec_survives_task_metadata():
-    spec = cp.CallSpec(call_id="c1", chat_id=1, engine=re_.ENGINE_OPENAI, model="gpt-realtime-2.1",
+    spec = cp.CallSpec(call_id="c1", chat_id=1, engine=re_.ENGINE_GOOGLE, model="gemini-3.8-live",
                        voice="marin", max_minutes=None)
     assert cp.CallSpec.from_metadata(spec.as_metadata()) == spec
     presence = cp.CallSpec(call_id="c2", chat_id=1099511627776, engine=re_.ENGINE_GOOGLE,

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 from ouroboros import live_awareness
 from ouroboros.call_protocol import CallSpec
-from ouroboros.gateways.realtime_engine import ENGINE_OPENAI
+from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE
 from ouroboros.utils import utc_now_iso
 from supervisor import workers
 from supervisor.active_activity import get_direct_activity_registry
@@ -35,7 +35,7 @@ def _log(root, direction, chat_id, text, **fields):
 
 
 def _spec(**overrides) -> CallSpec:
-    fields = dict(call_id="call-1", chat_id=1, engine=ENGINE_OPENAI, model="gpt-realtime-2.1", voice="marin",
+    fields = dict(call_id="call-1", chat_id=1, engine=ENGINE_GOOGLE, model="gemini-3.8-live", voice="Kore",
                   opened_by="owner", presence_binding_id="", max_minutes=0, label="Test call", client_message_id="cm-1")
     fields.update(overrides)
     return CallSpec(**fields)
