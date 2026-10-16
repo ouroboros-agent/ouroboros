@@ -617,7 +617,16 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     _collect_log_analysis_checks(env, checks)
     if not checks:
         return ""
-    return "## Health Invariants\n\n" + "\n".join(f"- {check}" for check in checks)
+    from ouroboros.section_floor import HostSection
+
+    heading = "## Health Invariants\n\n"
+    # OK is this producer's passing-check tag. Every other fact, including
+    # unknown health and outstanding custody obligations, remains exact.
+    passing = sum(check.startswith("OK:") for check in checks)
+    operative = [check for check in checks if not check.startswith("OK:")]
+    return HostSection("health_invariants", heading + "\n".join(f"- {check}" for check in checks),
+                       heading + "\n".join([*(f"- {check}" for check in operative),
+                                             f"- {passing} passing checks; details retained."]))
 
 
 def _compute_cache_hit_rate(env: Any) -> Optional[float]:

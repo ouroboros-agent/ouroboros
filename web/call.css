@@ -1,0 +1,40 @@
+/* The call composes the chat's existing controls and semantic palette. */
+.call-strip {
+    min-width: 0;
+    margin-bottom: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg-soft);
+    font-size: var(--type-body);
+    color: var(--text-primary);
+    line-height: var(--line-body);
+}
+.call-strip[hidden], .call-strip [hidden] { display: none; }
+.call-actions { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.call-state { flex: 1; }
+.call-reason, .call-options {
+    font-size: var(--type-meta);
+    color: var(--text-meta);
+    overflow-wrap: anywhere;
+}
+.call-reason { margin-top: var(--space-1); }
+.call-captions {
+    max-height: calc(var(--space-5) * 3);
+    overflow-y: auto;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    font-size: var(--type-body);
+    color: var(--text-primary);
+}
+.call-captions:not(:empty) { margin-block: var(--space-2); }
+.call-options summary { color: var(--text-primary); cursor: pointer; }
+.call-options summary:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+.call-fields { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-2); }
+.call-fields .ui-field { flex: 1 1 0; min-width: 0; }
+.call-fields .ui-control { width: 100%; min-width: 0; }
+.call-choose { flex-shrink: 0; padding-inline: var(--space-1); }
+.call-button:disabled { color: var(--text-disabled); cursor: not-allowed; }

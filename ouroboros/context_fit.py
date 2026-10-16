@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
 
 from ouroboros.context_layout import reference_doc_sections
 from ouroboros.reference_books import ReferenceBook
+from ouroboros.section_floor import HostSection, fit_host_sections, render_sections
 # Tool-result delivery (the whole-batch projection under the measured frame)
 # lives in ``tool_result_delivery``; the consolidator imports its contract here.
 from ouroboros.tool_result_delivery import project_tool_result_batch  # noqa: F401
@@ -163,7 +164,7 @@ class ContextFitPlan:
                 current_messages = [self.projection(start).system_message(), *json.loads(retained)]
         tail_json = (json.dumps(_request_tail(current_messages), ensure_ascii=False, sort_keys=True)
                      if current_messages is not None else None)
-        if self.core is not None and self.core.memory_view_json:
+        if self.core is not None and (self.core.memory_view_json or self.core.dynamic_sections or self.core.dynamic_head_sections):
             from ouroboros import memory_floor
             from ouroboros.context_budget import context_mode_limits
             from ouroboros.memory_view import snapshot_from_json
@@ -180,7 +181,7 @@ class ContextFitPlan:
             request += context_mode_limits(start, self.preferred_mode, output_reserve)[1]
             deficit = max(request - window_tokens if known_window and window_tokens else 0, int(refused_tokens or 0))
             if deficit > 0 or select_mode:
-                snapshot = snapshot_from_json(self.core.memory_view_json)
+                snapshot = snapshot_from_json(self.core.memory_view_json) if self.core.memory_view_json else None
                 contents, start = _view_projections(
                     self.core, {form: _governance_blocks(None, self.core, mode=form) for form in books},
                     self.user_content_json, preferred=self.preferred_mode, start=start_mode, select=select_mode,
@@ -188,7 +189,9 @@ class ContextFitPlan:
                     window_tokens=window_tokens, known_window=known_window, output_reserve=output_reserve, ratio=ratio,
                     resident=True, current_messages=current_messages,  # actual running tail, enable_tools included
                     kept={mode: memory_floor.kept_level(snapshot, self.projection(mode).memory_facts)
-                          for mode in memory_floor.MODES},
+                          for mode in memory_floor.MODES} if snapshot is not None else None,
+                    kept_host={mode: self.projection(mode).memory_facts.get("host_sections_addressed", ())
+                               for mode in memory_floor.MODES},
                     saving={start: math.ceil(deficit / max(ratio, 0.01))})
 
         def narrowed(projection: ContextFitProjection) -> bool:
@@ -196,7 +199,9 @@ class ContextFitPlan:
             # cut window); equal counts from another level never keep a view's budget provenance.
             old, new = (dict(facts.get("floor") or {}) for facts in (projection.memory_facts or {},
                                                                      contents[projection.mode][1] or {}))
-            return any(old.get(key) != new.get(key) for key in ("steps", "by_budget", "target_tokens", "mode_switch"))
+            return (any(old.get(key) != new.get(key) for key in ("steps", "by_budget", "target_tokens", "mode_switch"))
+                    or projection.memory_facts.get("host_sections_addressed")
+                    != contents[projection.mode][1].get("host_sections_addressed"))
 
         def project(projection: Optional[ContextFitProjection]) -> Optional[ContextFitProjection]:
             if projection is not None and projection.mode in contents and narrowed(projection):
@@ -299,6 +304,10 @@ class ContextCore:
     memory_view_json: str = ""
     # Captured source rows follow the assignment, outside the immutable system view.
     supplementary_messages_json: str = "[]"
+    dynamic_sections: Tuple[HostSection, ...] = ()
+    dynamic_head_sections: Tuple[HostSection, ...] = ()
+    section_root: str = ""
+    section_task_id: str = ""
 
 
 def _render_context_system_content(
@@ -337,13 +346,16 @@ def _governance_blocks(env: Any, core: ContextCore, *, mode: str) -> Tuple[str, 
     return ("\n\n".join(static_parts), development)
 
 
-def _system_blocks(core: ContextCore, governance: Tuple[str, ...], story: str = "", room: str = "") -> List[Dict[str, Any]]:
+def _system_blocks(core: ContextCore, governance: Tuple[str, ...], story: str = "", room: str = "", *,
+                   addressed: Optional[Mapping[str, str]] = None) -> List[Dict[str, Any]]:
     # All stable items precede C, including D only when the captured core calls
     # for the full handbook. Never create an empty cache boundary.
     stable = (*governance, "\n\n".join(part for part in (core.semi_stable_text, story) if part))
+    head = render_sections(core.dynamic_head_sections, addressed) if addressed and core.dynamic_head_sections else core.dynamic_head_text
+    tail = render_sections(core.dynamic_sections, addressed) if addressed and core.dynamic_sections else core.dynamic_text
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}
             for text in stable if text.strip()] + [
-        {"type": "text", "text": "\n\n".join(part for part in (core.dynamic_head_text, room, core.dynamic_text) if part)},
+        {"type": "text", "text": "\n\n".join(part for part in (head, room, tail) if part)},
     ]
 
 
@@ -776,6 +788,7 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
                       ratio: float, start: Optional[str] = None, resident: bool = False,
                       current_messages: Optional[List[Dict[str, Any]]] = None,
                       kept: Optional[Mapping[str, Any]] = None, saving: Optional[Mapping[str, int]] = None,
+                      kept_host: Optional[Mapping[str, Any]] = None,
                       select: Optional[str] = None,
                       ) -> Tuple[Dict[str, Tuple[List[Dict[str, Any]], Dict]], str]:
     """Each mode's ``(system content, view receipt)`` and the mode the task starts in.
@@ -787,23 +800,58 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
     snapshot, so a new route re-renders both from the same capture; ``kept``/``saving`` narrow
     the shown views from their own levels and ``select`` is a mode an actual refusal chose
     (``ContextFitPlan.reproject_for_route``).
+    Host sections answer only to physical pressure on the chosen memory view,
+    before memory's window ladder. Their savings change the fixed part used by
+    ``mode_views``; both ladders use the same immutable capture.
     """
     form = {mode: "low" if core.compact_reference_docs or mode == "nano" else mode for mode in ("max", "low", "nano")}
-    if not core.memory_view_json:
-        return {mode: (_system_blocks(core, governance[form[mode]]), {}) for mode in form}, start or preferred
     from ouroboros import memory_floor
     from ouroboros.memory_view import snapshot_from_json
     from ouroboros.tool_policy import select_tool_schemas
     names = [schema["function"]["name"] for schema in tool_schemas or []] if resident else None
     sent = {mode: select_tool_schemas(tool_schemas or [], context_mode=mode, schema_names=names) for mode in form}
-    fixed = {mode: _request_tokens(_system_blocks(core, governance[form[mode]]), user_content_json,
-                supplementary_messages_json=core.supplementary_messages_json, current_messages=current_messages)
-             + tool_schema_tokens(list(sent[mode].schemas)) for mode in form}
-    views, start = memory_floor.mode_views(snapshot_from_json(core.memory_view_json), preferred=preferred, start=start,
+    snapshot = snapshot_from_json(core.memory_view_json) if core.memory_view_json else None
+    fixed, addressed, host_facts, remaining = {}, {}, {}, dict(saving or {})
+    for mode in form:
+        def measure(overrides, story="", room=""):
+            return _request_tokens(_system_blocks(core, governance[form[mode]], story, room, addressed=overrides),
+                user_content_json, supplementary_messages_json=core.supplementary_messages_json,
+                current_messages=current_messages) + tool_schema_tokens(list(sent[mode].schemas))
+
+        original_fixed = measure({})
+        showing = start or preferred
+        # A smaller mode may be selected by the memory floor below. Carry the
+        # shown host addresses into that candidate, never its unsent old view.
+        shown = (showing if kept_host is not None and memory_floor.MODES.index(mode)
+                 >= memory_floor.MODES.index(showing) else mode)
+        carried = (kept_host or {}).get(shown, ())
+        story, room = "", ""
+        if snapshot is not None and ((known_window and window_tokens > 0) or carried):
+            # Apply only the existing owner-selected projection here. Host
+            # details go before ANY memory step caused by the physical window.
+            story, room, _ = memory_floor.render_view_for_mode(snapshot, mode=mode, owner_mode=preferred,
+                window_tokens=None, known_window=False, output_reserve=output_reserve, ratio=ratio,
+                non_memory_tokens=original_fixed, kept=None if kept is None else kept.get(shown))
+        from ouroboros.context_budget import context_mode_limits
+
+        addressed[mode], host_facts[mode] = fit_host_sections(
+            (*core.dynamic_sections, *core.dynamic_head_sections), root=core.section_root, task_id=core.section_task_id,
+            measure=lambda overrides: measure(overrides, story, room), window_tokens=window_tokens,
+            known_window=known_window, output_reserve=context_mode_limits(mode, preferred, output_reserve)[1],
+            ratio=ratio, kept=carried)
+        fixed[mode] = measure(addressed[mode])
+        prior_saving = sum(int(row.get("tokens_saved") or 0) for row in carried)
+        remaining[mode] = max(0, remaining.get(mode, 0) - max(0, original_fixed - fixed[mode] - prior_saving))
+    if snapshot is None:
+        return {mode: (_system_blocks(core, governance[form[mode]], addressed=addressed[mode]),
+                       {"host_sections_addressed": host_facts[mode]} if host_facts[mode] else {})
+                for mode in form}, select or start or preferred
+    views, start = memory_floor.mode_views(snapshot, preferred=preferred, start=start,
         fixed_tokens_by_mode=fixed, tool_names=None if tool_schemas is None else {m: sent[m].chosen for m in form},
         window_tokens=window_tokens, known_window=known_window, output_reserve=output_reserve, ratio=ratio,
-        allow_mode_lowering=preferred != "max" or start in {"low", "nano"}, kept=kept, saving=saving, select=select)
-    return {mode: (_system_blocks(core, governance[form[mode]], story, room), receipt)
+        allow_mode_lowering=preferred != "max" or start in {"low", "nano"}, kept=kept, saving=remaining, select=select)
+    return {mode: (_system_blocks(core, governance[form[mode]], story, room, addressed=addressed[mode]),
+                   {**receipt, **({"host_sections_addressed": host_facts[mode]} if host_facts[mode] else {})})
             for mode, (story, room, receipt) in views.items()}, start
 
 
@@ -815,6 +863,8 @@ def build_context_fit_plan(
     preferred_mode: str,
     route_resolver: Callable[..., Tuple[Dict[str, Any], Any]],
     tool_schemas: Optional[List[Dict[str, Any]]] = None,
+    known_window_tokens: Optional[int] = None,
+    known_output_reserve_tokens: Optional[int] = None,
 ) -> ContextFitPlan:
     """Deterministically project one captured core into ordinary-task Max, Low and Nano.
 
@@ -822,6 +872,8 @@ def build_context_fit_plan(
     of its view, the tool schemas it would send (``tool_schemas``, Nano's selection of
     them) and its reply reserve; the physical floor decides what of my memory that
     mode shows only by address (``memory_floor.render_view_for_mode``).
+    ``known_output_reserve_tokens`` is a caller-resolved route's own reply allowance
+    (a live call's realtime route); without it the reserve is Main's send cap.
     """
     preferred = str(preferred_mode or "max").strip().lower()
     if preferred not in {"low", "max", "nano"}:
@@ -832,10 +884,16 @@ def build_context_fit_plan(
         task.get("delegation_role") or meta.get("delegation_role") or ""
     ).strip().lower() == "subagent"
     try:
-        route, evidence = route_resolver(task, allow_fetch=not is_subagent)
+        route, evidence = route_resolver(task, allow_fetch=not is_subagent and known_window_tokens is None)
     except Exception:
         log.debug("Context-fit route evidence unavailable; preserving Max", exc_info=True)
         route, evidence = _failed_route_evidence(task)
+
+    if known_window_tokens is not None:
+        if isinstance(known_window_tokens, bool) or not isinstance(known_window_tokens, int) or known_window_tokens <= 0:
+            raise ValueError("known_window_tokens must be a positive evidenced capacity")
+        evidence = SimpleNamespace(**{**vars(evidence), "window_tokens": known_window_tokens,
+                                      "status": "confirmed", "stale": False, "source": "caller_capability_evidence"})
 
     user_content = json.loads(core.user_content_json)
     # Keep the fit projection tied to the physical dispatch contract instead of
@@ -843,7 +901,13 @@ def build_context_fit_plan(
     # data-only fit representation to the high-level model loop.
     from ouroboros.capability_evidence import is_known
 
-    output_reserve = main_output_reserve_tokens(use_local=bool(route.get("use_local")), evidence=evidence)
+    if known_output_reserve_tokens is not None:
+        if (isinstance(known_output_reserve_tokens, bool) or not isinstance(known_output_reserve_tokens, int)
+                or known_output_reserve_tokens <= 0):
+            raise ValueError("known_output_reserve_tokens must be a positive evidenced allowance")
+        output_reserve = known_output_reserve_tokens
+    else:
+        output_reserve = main_output_reserve_tokens(use_local=bool(route.get("use_local")), evidence=evidence)
     # One observation store: witnesses are written at settlement into the
     # canonical host root, so a child task's own drive must not be consulted.
     ratio = _route_calibration_ratio(
@@ -930,6 +994,8 @@ def build_context_fit_plan(
             "semi_stable_text": core.semi_stable_text,
             "dynamic_head_text": core.dynamic_head_text,
             "dynamic_text": core.dynamic_text,
+            "host_sections": [(section.section_id, section.operative_view, section.reader)
+                              for section in (*core.dynamic_sections, *core.dynamic_head_sections)],
             "memory_view_json": core.memory_view_json,
             **({"supplementary_messages": json.loads(core.supplementary_messages_json)}
                if json.loads(core.supplementary_messages_json) else {}),

@@ -4,7 +4,7 @@ import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
 import { loadVersion, initMatrixRain } from './modules/utils.js';
 import { bindScrollFade } from './modules/scroll_fade.js';
-import { initChat, createChatInstance } from './modules/chat.js';
+import { initChat, createChatInstance as createChatRoom } from './modules/chat.js';
 import { createStateSnapshotSequencer } from './modules/chat_activity.js';
 import {
     buildProjectActivityIndex,
@@ -298,7 +298,18 @@ function closeNotificationReaders() {
     for (const inst of projectInstances.values()) inst.closeTransient?.();
 }
 
-mainChat = initChat(ctx);
+// Every room carries the call button; hiding a room keeps its call, destroying it hangs up.
+function withRoomCall(room) {
+    import('./modules/call.js').then(({ mountRoomCall }) => {
+        if (room.page.isConnected) mountRoomCall({ page: room.page, chatId: room.chatId, room });
+    });
+    return room;
+}
+function createChatInstance(options) {
+    return withRoomCall(createChatRoom(options));
+}
+
+mainChat = withRoomCall(initChat(ctx));
 initFiles(ctx);
 
 function hydrateOpenChatsFromState(data, snapshotRequestedAt) {

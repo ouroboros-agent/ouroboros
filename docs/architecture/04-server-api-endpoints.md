@@ -1,10 +1,10 @@
 # 4. Server API Endpoints
 
-Registry of the browser, CLI and Host Service routes, with non-loopback authentication, the selected main interface, file confinement and the WebSocket protocol. `ouroboros/gateway/router.py` owns the executable Route objects; the table mirrors them one row per route (shapes: `GET /api/contract`); tests check that nothing mounted is undocumented and nothing documented is unmounted.
+Browser, CLI and Host Service routes, with non-loopback authentication, the selected main interface and file confinement. `ouroboros/gateway/router.py` owns the executable Route objects, mirrored one per table row (shapes: `GET /api/contract`); tests enforce exact agreement between mounted and documented routes.
 
-With `OUROBOROS_NETWORK_PASSWORD` configured, non-loopback HTTP and WebSocket access requires authentication; loopback clients bypass the gate, and `/api/health` plus the middleware-owned login/logout paths stay reachable. Behind a proxy uvicorn trusts (`FORWARDED_ALLOW_IPS`, default loopback) the client and TLS are the forwarded ones (proxy duties: `docs/DEPLOYMENT.md`). Browser sessions use a server-keyed, expiring HttpOnly HMAC cookie, `Secure` only under TLS, so a plain-HTTP LAN session does not enter a login loop. An unauthenticated WebSocket gets the gate's 4401 close before `ws_endpoint` accepts it, which a browser sees only as a refused handshake (1006); so a 401 on the SPA's state or readiness read means signed out and opens `/auth/login?next=` back to the page, resending nothing queued or unsaved. Without a password, non-loopback access stays open by explicit operator choice.
+With `OUROBOROS_NETWORK_PASSWORD` configured, non-loopback HTTP and WebSocket require authentication; loopback clients bypass the gate, and `/api/health` plus middleware-owned login/logout paths stay reachable. Behind a proxy uvicorn trusts (`FORWARDED_ALLOW_IPS`, default loopback), forwarded client and TLS apply (proxy duties: `docs/DEPLOYMENT.md`). Browser sessions use a server-keyed, expiring HttpOnly HMAC cookie, `Secure` only under TLS, avoiding plain-HTTP LAN login loops. An unauthenticated WebSocket gets the gate's 4401 close before `ws_endpoint` accepts it, which a browser sees only as a refused handshake (1006); so a 401 on the SPA's state or readiness read means signed out and opens `/auth/login?next=` back to the page, resending nothing queued or unsaved. Without a password, non-loopback access stays open by explicit operator choice.
 
-`server_web.ServedUI` serves `/` and `/static/*` from `OUROBOROS_UI_DIR` (§7), once per server generation; one record answers serving, the builtin index's response-only `ouroboros-ui-owner` marker and `StateResponse.served_ui` (the applied source, not an asset digest), so they cannot disagree. A chosen directory is trusted and served unrewritten (no marker, no Telegram SDK); an unusable or core-exposing one leaves the builtin interface with its reason. Core paths (`core_paths` in `GET /api/contract`) and resources (`/onboarding/static/*`, the author kit) never follow the choice, so a broken or absent interface cannot take setup, sign-in or control with it (separate hosting, one origin: `docs/CLIENT_CONTRACT.md`).
+`server_web.ServedUI` serves `/` and `/static/*` from `OUROBOROS_UI_DIR` (§7) once per server generation. One record governs serving, the builtin index's response-only `ouroboros-ui-owner` marker and `StateResponse.served_ui` (applied source, not asset digest), preventing disagreement. A chosen directory is trusted and served unrewritten (no marker, no Telegram SDK); an unusable or core-exposing one leaves the builtin interface with its reason. Core paths (`core_paths` in `GET /api/contract`) and resources (`/onboarding/static/*`, the author kit) never follow the choice, preserving setup, sign-in and control despite a broken or absent interface (separate hosting, one origin: `docs/CLIENT_CONTRACT.md`).
 
 File-browser routes are contributed by `gateway/files.py::file_browser_routes()`; envelopes and their parity: §11. The loopback Host Service is a separate token-authenticated app assembled by `gateway/host_service.py::create_host_service_app`, not a second public owner API (§12).
 
@@ -141,6 +141,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | GET | `/api/logs/{name}` | |
 | POST | `/api/chat/upload` | |
 | DELETE | `/api/chat/upload` | pending uploads only, else 409 |
+| POST | `/api/call/open` | admits a live call in the room (§6), else a typed refusal |
 | POST | `/api/local-model/start` | |
 | POST | `/api/local-model/stop` | |
 | GET | `/api/local-model/status` | |
@@ -151,6 +152,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/mcp/test` | |
 | POST | `/api/mcp/import/preview` | |
 | WS | `/ws` | |
+| WS | `/ws/call/{call_id}` | the owner surface's call audio: PCM frames and `call_protocol` control |
 | STATIC | `/static/*` | |
 | STATIC | `/onboarding/static/*` | |
 | GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/identity` | |
@@ -166,6 +168,8 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | retains transport queue observations |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/ui/ws-message` | |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/call/open` | `call_peer` grant: a companion joins an admitted call, or with `presence` opens a Presence call |
+| WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/call/{call_id}/peer` | that companion's call audio |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/notify` | `notify_owner` grant: one signed `skill_notice` System row, no model turn |
 | WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/events` | |
 
@@ -177,7 +181,7 @@ Update-status, log-tail and schedule-list reads run off the event loop.
 
 `/ws` delivers live browser events; the queue, task, Project, review, skill, settings, cost and update owners persist the truth a reconnecting client rebuilds through REST and history. `gateway/ws.py` admits JSON objects, owned extension namespaces and `command` text and `chat` text/attachments. Chat acceptance (row → queue → echo) runs off the ASGI loop through `gateway._helpers.run_sync_to_completion`. Each socket chains its chats in receive order without awaiting them, so Panic and Restart stay responsive behind a held chat (§5 Bridge intake and commands); disconnect waits for received chats to settle (`settle_to_completion`). Authentication above governs admission; public sockets never carry Host Service or owned-daemon tokens.
 
-The browser opens one socket for the whole SPA. Feature modules subscribe, and the complete Project chat-id set is fetched, before the first open, so an early Project frame cannot pass for Main traffic. Every decoded frame reaches the generic `message` event and then its type-specific event, so Widgets consume reviewed namespaced events without a second socket.
+The whole SPA shares one browser socket. Before its first open, feature modules subscribe and the complete Project chat-id set is fetched, preventing early Project frames from passing for Main traffic. Every decoded frame reaches generic `message` then its type-specific event, so Widgets consume reviewed namespaced events without a second socket.
 
 #### WebSocket chat
 
@@ -199,10 +203,10 @@ Project chat, typing, media and log frames carry `chat_id`; each Project panel c
 
 Extension WebSocket traffic is namespaced by `extension_loader.extension_surface_name()`, so an extension cannot shadow a built-in type. On each incoming extension frame the gateway resolves the owning skill and reconciles whether its extension is still desired, reviewed, granted, enabled and live; out-of-process handlers run in their extension child off the event loop. A non-`None` result returns as `<request-type>.reply`; a missing or failed handler becomes a typed error log frame rather than ending the socket loop.
 
-Server broadcasts snapshot the client list and send to all clients concurrently, so one slow or half-open browser cannot head-of-line-block every other tab. Failed sends remove only the dead clients and append a durable `broadcast_partial_failure` event; the domain event stays owned by its durable producer. Restart shutdown closes remaining clients with code 1012 so they enter the ordinary reconnect path.
+Server broadcasts snapshot clients and send to all concurrently, so one slow or half-open browser cannot head-of-line-block other tabs. Failed sends remove only dead clients and append a durable `broadcast_partial_failure` event; the domain event retains its durable producer. Restart shutdown closes remaining clients with code 1012 for ordinary reconnect.
 
 #### Reconnect and recovery
 
 The browser reconnects with bounded exponential delay behind the reconnect overlay; a watchdog closes a silent seemingly-open connection: heartbeats prove stream liveness, not task progress. One served-page decision (`ws.js decideServedPage`) governs the post-open state read and the socket-down probe, so a transient drop cannot destroy in-page state. The core attests only pages it serves: without `served_ui` (an older core), or for its marked page while it serves builtin, `decide()` reloads on a changed or unprovable SHA (a restarted server must not keep old JS/CSS alive in PyWebView), and an unchanged one keeps the page and its queued frames (an unversioned `/api/state` with no remembered SHA keeps it too, accepting possibly stale assets); the marked page reloads once after a restart applied a directory or `none`, and an unmarked page owns its refresh and only reconnects. A failed/non-OK state read never reloads (a seconds-old server can answer 500); `web/modules/ws.js` owns the probe discipline and its one forced reload per disconnect episode.
 
-Each Chat instance handles `open` by resynchronizing archive-aware durable history and `close` by withdrawing online and accounting presentation; reconnect deduplication covers the overlap between live frames and REST replay, and large history parsing runs off the server event loop. Delivery is live plus replay, not a promise that every transient frame is persisted: durable chat rows, task results, queue snapshots, Project revisions, review ledgers, cost ledgers and lifecycle state remain the recovery authorities.
+Each Chat instance resynchronizes archive-aware durable history on `open` and withdraws online and accounting presentation on `close`; reconnect deduplication covers overlap of live frames and REST replay, and large history parsing runs off the server event loop. Live delivery plus replay does not guarantee every transient frame persists: durable chat rows, task results, queue snapshots, Project revisions, review ledgers, cost ledgers and lifecycle state remain the recovery authorities.
