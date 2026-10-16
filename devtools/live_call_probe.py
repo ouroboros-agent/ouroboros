@@ -536,6 +536,12 @@ class Probe:
                              thread_alive=self.thread.is_alive(), hub_closed=self.hub.closed,
                              checkpoint=task_result.get("live_call"), terminal_events=terminals, hub_stats=self.hub.stats())
             close_hub(self.spec.call_id)
+        if getattr(self, "spec", None) is not None:  # how the route counted the call view's text (the fit's witness)
+            from ouroboros.capability_evidence import canonical_evidence_root, resolve_main_token_density, route_fingerprint
+
+            density, basis = resolve_main_token_density(canonical_evidence_root(), route_fingerprint(
+                provider=self.spec.engine, model=self.spec.model), self.spec.model)
+            self.result["text_density"] = {"tokens_per_estimate": round(density, 3), "source": basis}
         with read(self.root / "data") as txn:
             rows = txn.attempts()
             transitions = {r["attempt_id"]: dict(r) for r in txn.conn.execute(
