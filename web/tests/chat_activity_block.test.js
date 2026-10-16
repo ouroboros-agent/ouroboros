@@ -193,7 +193,7 @@ for (const chatId of [1, 1234]) test(`canonical owner wait settles without a Pro
             { owner_wait_state: 'resumed', quiz_state: 'open' }, { wait_ended_at: TS, quiz_state: 'open' }]) {
             f.census([{ ...row, owner_wait }]);
             assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Working');
-            assert.equal(f.status(), 'Working...');
+            assert.equal(f.status(), 'Working');
         }
         f.census([{ ...row, owner_wait: undefined }]);
         assert.equal(f.status(), 'Activity unconfirmed');
@@ -202,7 +202,7 @@ for (const chatId of [1, 1234]) test(`canonical owner wait settles without a Pro
         f.census([{ ...row, phase: 'budget_paused', pause_cause: 'sleep' }]);
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Paused · sleep');
         f.census([{ ...row, owner_wait: undefined, required_question_unavailable: false }]);
-        assert.equal(f.status(), 'Working...', 'no quiz evidence invents no wait');
+        assert.equal(f.status(), 'Working', 'no quiz evidence invents no wait');
     } finally { f.close(); }
 });
 
@@ -218,7 +218,7 @@ test('ordinary unfinished speech cannot settle the evidence card', async () => {
         assert.equal(f.card().querySelector('[data-live-phase]').hidden, true);
         f.census([{ activity_id: TASK, chat_id: 1, kind: 'managed_task', phase: 'queued' }]);
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Queued');
-        assert.equal(f.status(), 'Queued...');
+        assert.equal(f.status(), 'Queued');
     } finally { f.close(); }
 });
 
@@ -258,7 +258,7 @@ test('required answer, unavailable wait, and parallel active work keep separate 
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Waiting for your answer');
         assert.equal(f.status(), 'Waiting for your answer');
         f.census([row, { activity_id: 'another', chat_id: 1, kind: 'managed_task', phase: 'working' }]);
-        assert.equal(f.status(), 'Working...', 'one waiting task cannot hide another task working');
+        assert.equal(f.status(), 'Working', 'one waiting task cannot hide another task working');
         f.census([{ ...row, required_question: null, required_question_unavailable: true }]);
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Activity unconfirmed');
         assert.equal(f.status(), 'Activity unconfirmed');
@@ -406,7 +406,7 @@ test('a managed Swarm root keeps the task card with Turn into project; an origin
         f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true, content: 'Planning the swarm.' });
         assert.ok(f.card());
         assert.ok(f.card().querySelector('[data-turn-into-project]'));
-        assert.equal(f.status(), 'Working...');
+        assert.equal(f.status(), 'Working');
         globalThis.window.__ouroTaskBindings = { 'bound-root': { project_id: 'p1', chat_id: 7 } };
         f.census([...managed(), ...managed('bound-root')]);
         f.emit('chat', { task_id: 'bound-root', role: 'assistant', is_progress: true, content: 'Bound work.' });
@@ -534,7 +534,7 @@ test('the header keeps the census verdict beside a block: Thinking… for a dire
         assert.equal(f.status(), 'Online');
         f.census(managed('root-m'));
         f.emit('chat', { task_id: 'root-m', role: 'assistant', is_progress: true, content: 'Working on it.' });
-        assert.equal(f.status(), 'Working...');
+        assert.equal(f.status(), 'Working');
         assert.equal(f.typingHidden(), true);
     } finally { f.close(); }
 });

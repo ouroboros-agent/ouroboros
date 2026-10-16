@@ -103,16 +103,16 @@ def get_tools():
                             "type": "string",
                             "enum": ["accepted", "rejected", "partial", "deferred"],
                             "default": "",
-                            "description": "Completion alias: any listed stance stages finish, including before first feedback; permission to finish follows review policy. With rationale after the first host review, Advisory may finish a revised result without another panel. Later tool effects or owner/evidence supersession need a new finish stance; a stop stands as recorded. Never creates reviewer PASS.",
+                            "description": "Completion alias: any listed stance stages finish, including before feedback; review policy still applies. After exposed feedback, Advisory may finish without another panel or a separate rationale. Later tool effects or owner/evidence supersession need a new finish stance; a stop stands as recorded. Never creates reviewer PASS.",
                         },
                         "rationale": {
                             "type": "string",
                             "default": "",
-                            "description": "Required reason for explicit finish/stop. For stop, plainly name unfinished work: the owner sees this on the task row. Alone it is evidence, not completion; with author_action it records the act without inventing a stance.",
+                            "description": "Required for stop: name unfinished work; the owner sees it on the task row. Optional for finish. Over an exposed local acceptance-preparation failure, state the caveat here for author_finish; without it, the host retains the preparation-failure cause, not a validation rejection. Alone it is evidence, not completion; with author_action it explains the act without inventing a stance.",
                         },
                         "author_action": {
                             "type": "string", "enum": ["finish", "stop"],
-                            "description": "Finish under current review policy, or stop with unfinished work; include rationale. Stop never authorizes a blocked action. When omitted, a recognized agent_disposition still stages finish.",
+                            "description": "Finish under current review policy, or stop with unfinished work and a rationale. Stop never authorizes a blocked action. When omitted, a recognized agent_disposition still stages finish.",
                         },
                         "acceptance_retry": {
                             "type": "object",
@@ -258,9 +258,9 @@ def _handle_task_acceptance_review(
     if disposition not in {"accepted", "rejected", "partial", "deferred"}:
         disposition = ""
     agent_rationale = " ".join(str(rationale or "").split()).strip()
-    if author_action and (author_action not in {"finish", "stop"} or not agent_rationale):
+    if author_action and author_action not in {"finish", "stop"}:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
-            text="ERROR: TOOL_ARG_ERROR: author_action requires finish|stop and a rationale."))
+            text="ERROR: TOOL_ARG_ERROR: author_action requires finish|stop."))
     # v6.54.4 obligations layer: normalized per-obligation dispositions ride the
     # same agent_decision envelope (the existing v6.54.0 mechanism, extended to
     # obligation granularity). The host loop applies them to the per-task

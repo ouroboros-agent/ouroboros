@@ -475,6 +475,58 @@ def continue_acceptance_wait(tools_ctx: Any, trace: dict, messages: list, task_i
     return False
 
 
+def _feedback_standing(tools_ctx: Any, llm_trace: Dict[str, Any], run: Dict[str, Any]) -> str:
+    """Why settled feedback cannot speak for a text-only rewrite at $0; "" when it can."""
+    from ouroboros.loop_delivery import delivery_subject_hash
+    from ouroboros.loop_messages import owner_source_sha256
+
+    reviewed_text = (run.get("request") or {}).get("subject", "")
+    if run.get("subject_hash") != delivery_subject_hash(tools_ctx, llm_trace, reviewed_text):
+        return "material"  # A held rewrite may have acquired new material after supersession.
+    if run.get("superseded_by_revision") and run.get("superseded_reason") != "delivery_candidate_replaced":
+        return "superseded"  # The existing subject/effect owner already invalidated this feedback.
+    reviewed_source = str(run.get("owner_source_sha256") or "")
+    if reviewed_source and reviewed_source != str(owner_source_sha256(tools_ctx) or ""):
+        return "owner_source"  # supersession is sticky, so premises are compared here
+    if not run.get("settled_feedback_delivered"):
+        return "unexposed"  # the settled feedback reaches Main before any decision rests on it
+    return ""
+
+
+def _previous_revision_pass(llm_trace: Dict[str, Any], run: Dict[str, Any]) -> bool:
+    """A rewrite Main nominated itself asked for its own review: the earlier PASS never stands in for it."""
+    reviewed_text = (run.get("request") or {}).get("subject", "")
+    nominated = [(call.get("request") or {}).get("subject") for call in llm_trace.get("acceptance_evidence_calls") or []
+                 if isinstance(call, dict) and call.get("status") == "deferred_to_host_acceptance"]
+    return str(run.get("aggregate_signal") or "").upper() == "PASS" and nominated[-1:] in ([], [reviewed_text])
+
+
+def delivery_approves_clean_feedback(tools_ctx: Any, llm_trace: Dict[str, Any], run: Dict[str, Any],
+                                     subject_hash: str) -> bool:
+    """Whether ordinary delivery approves the current subject from this clean feedback at $0.
+
+    Consult the same paid-run selector as ordinary delivery before considering a
+    text-only rewrite. Latest feedback may be B's PASS while delivery will replay
+    A's superseded FAIL; neither replay can authorize an informed finish of A."""
+    from ouroboros.review_substrate import task_acceptance_is_clean
+    from ouroboros.loop_acceptance_review import _prior_acceptance_run, acceptance_paid_identity
+
+    _, prior = _prior_acceptance_run(
+        tools_ctx, llm_trace, "", paid_identity=acceptance_paid_identity(subject_hash, llm_trace),
+    )
+    if prior is not None:
+        return (not prior.get("superseded_by_revision") and prior.get("subject_hash") == subject_hash
+                and task_acceptance_is_clean(SimpleNamespace(**prior)))
+    # No paid run matches the selected material: preserve the ordinary delivery
+    # rejoin for a genuinely new text-only rewrite of the latest exposed PASS.
+    if not run or not task_acceptance_is_clean(SimpleNamespace(**run)):
+        return False
+    if not run.get("superseded_by_revision"):
+        return run.get("subject_hash") == subject_hash
+    return (run.get("subject_hash") != subject_hash and not _feedback_standing(tools_ctx, llm_trace, run)
+            and _previous_revision_pass(llm_trace, run))
+
+
 def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
     """Rejoin paid work for an informed author selection. A rewrite keeps the earlier
     verdict's identity, never its authority over new material or premises: once the
@@ -485,8 +537,6 @@ def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
         _end_acceptance_terminal, _finish_cyber_acceptance,
         _set_applied_host_acceptance_impact, acceptance_run_pending,
     )
-    from ouroboros.loop_delivery import delivery_subject_hash
-    from ouroboros.loop_messages import owner_source_sha256
     from ouroboros.outcomes import ACCEPTANCE_ACCEPTED
 
     tools_ctx = ctx.tools._ctx
@@ -505,25 +555,16 @@ def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
         if (not run or not run.get("feedback_delivered")
                 or run.get("superseded_reason") != "delivery_candidate_replaced"):
             return None
-    reviewed_text = (run.get("request") or {}).get("subject", "")
-    if run.get("subject_hash") != delivery_subject_hash(tools_ctx, ctx.llm_trace, reviewed_text):
-        return None  # A held rewrite may have acquired new material after supersession.
-    if run.get("superseded_by_revision") and run.get("superseded_reason") != "delivery_candidate_replaced":
-        return None  # The existing subject/effect owner already invalidated this feedback.
+    standing = _feedback_standing(tools_ctx, ctx.llm_trace, run)
+    if standing in {"material", "superseded"}:
+        return None
     # Older owner premises cannot authorize this delivery (owner rule 4=A).
     # The panel keeps its physical custody and still arrives as advice.
-    reviewed_source = str(run.get("owner_source_sha256") or "")
-    if reviewed_source and reviewed_source != str(owner_source_sha256(tools_ctx) or ""):
-        tools_ctx._task_acceptance_pending = ""
-        return None
     tools_ctx._task_acceptance_pending = ""
-    if not run.get("settled_feedback_delivered"):
-        return None  # the settled feedback reaches Main before any decision rests on it
+    if standing:
+        return None  # older premises, or settled feedback that has not reached Main yet
     result = SimpleNamespace(**run)
-    nominated = [(call.get("request") or {}).get("subject") for call in ctx.llm_trace.get("acceptance_evidence_calls") or []
-                 if isinstance(call, dict) and call.get("status") == "deferred_to_host_acceptance"]
-    # A rewrite Main nominated itself asked for its own review: the earlier PASS never stands in for it.
-    if str(run.get("aggregate_signal") or "").upper() == "PASS" and nominated[-1:] in ([], [reviewed_text]):
+    if _previous_revision_pass(ctx.llm_trace, run):
         _set_applied_host_acceptance_impact(run, result, requires_revision=False)
         ctx.llm_trace.setdefault("review_decision", {}).update({
             "panel_id": str(run.get("panel_id") or ""),

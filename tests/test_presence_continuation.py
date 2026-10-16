@@ -543,10 +543,34 @@ def test_an_advisory_fail_is_answered_by_the_same_author_with_a_typed_stance(har
     assert author["rationale"] and author["enforcement"] == "advisory"
 
 
-def test_presence_finish_refuses_a_stance_without_its_rationale(harness):
+@pytest.mark.parametrize("stance", ["", "partial"])
+def test_an_advisory_fail_is_finished_without_a_separate_rationale(harness, monkeypatch, stance):
+    """The Presence door follows the common rule: an informed Advisory finish, stance optional, needs no rationale."""
+    h = harness
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    h.verdict = "FAIL"
+    corrected = ANSWER + " The backup window is 02:00-03:00 UTC."
+
+    def after_feedback(messages):
+        assert "acceptance-one: FAIL" in str(messages)
+        return finish("correct", message=corrected, **({"author_disposition": stance} if stance else {}))
+
+    h.script = [finish("nominate", message=ANSWER), after_feedback]
+    execution = h.start(event())
+    initial = execution.initial.result(timeout=30)
+    h.release.set()
+    final = execution.result.result(timeout=60)
+    assert final.text == corrected and h.calls == 2 and len(h.reviews) == 1
+    decision = load_task_result(h.data, initial.task_id)["review_status"]["acceptance_decision"]
+    assert (decision["reason"], decision["status"]) == ("author_finish", "finalized_unaccepted")
+    author = decision["author_disposition"]
+    assert (author["disposition"], author["reviewer_signal"], author["source"]) == (stance, "FAIL", "presence_finish")
+    assert author["rationale"] == "Explicit completion selection."
+
+
+def test_presence_finish_refuses_an_unknown_stance(harness):
     from ouroboros.tools.presence import _finish_presence
 
     ctx = SimpleNamespace(task_contract={"capability_ceiling": {}}, _completion_request=None)
-    for disposition, rationale in (("accepted", ""), ("approved", "why")):
-        text = _finish_presence(ctx, "message", message=ANSWER, author_disposition=disposition, rationale=rationale)
-        assert "author_disposition" in text and ctx._completion_request is None
+    text = _finish_presence(ctx, "message", message=ANSWER, author_disposition="approved", rationale="why")
+    assert "author_disposition" in text and ctx._completion_request is None

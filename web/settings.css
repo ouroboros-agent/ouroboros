@@ -1343,3 +1343,27 @@
     .mcp-header-row { grid-template-columns: minmax(0, 1fr); }
     .mcp-server-card-head { flex-wrap: wrap; }
 }
+
+/* ---- Airy dopamine (DESIGN.md design bible) -------------------------------------------------------------------
+   A segmented choice is the one capsule control: neutral options standing on the rest shadow, the chosen one in its
+   tone (crimson; Advisory's warn tint) and still standing, no outline. Hover and press change colour, never height. */
+:root[data-theme] .ui-segment {
+    border-color: transparent;
+    border-radius: var(--pill-radius);
+    background: var(--surface-capsule);
+    box-shadow: var(--elev-rest);
+    transition: var(--motion-tone);
+}
+:root[data-theme] .ui-segment:not(:disabled):not(.active):hover {
+    border-color: transparent; background: var(--surface-capsule-hover); color: var(--text-primary);
+}
+:root[data-theme] .ui-segment:not(:disabled):active { transform: none; filter: var(--press); }
+:root[data-theme] .settings-effort-btn.active,
+:root[data-theme] [data-enforcement-group] .settings-effort-btn[data-effort-value="blocking"].active {
+    border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink);
+}
+:root[data-theme] [data-enforcement-group] .settings-effort-btn[data-effort-value="advisory"].active {
+    border-color: transparent; background: var(--tone-amber); color: var(--status-warn-fg);
+}
+:root[data-theme] .ui-segment:disabled { box-shadow: none; }
+:root[data-theme] .settings-effort-btn:disabled:hover { border-color: transparent; background: var(--surface-capsule); }

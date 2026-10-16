@@ -488,7 +488,7 @@ _MARK_MATERIAL = """buttons => {
 
 
 def test_project_glyph_is_a_tinted_mark_never_a_solid_tile(project_chat):
-    """DESIGN "Visual intent": hue names identity, fill strength names importance. The
+    """DESIGN "Design bible" (principle 3): hue says identity, fill strength importance. The
     glyph only identifies the Project, so in each theme it is project ink on a tint,
     readable, and lighter than the name it marks: never a second button in the row."""
     page, expect = project_chat["page"], project_chat["expect"]
@@ -531,9 +531,10 @@ def test_entry_free_area_presses_its_reference_while_text_and_copy_stay_their_ow
             page.mouse.click(x, y)
 
     def free_point(entry):
-        # The card padding under the destination row is neither text nor a control.
+        # The card padding under the destination row is neither text nor a control (clear of the rounded corner,
+        # which takes no pointer events).
         box = entry.bounding_box()
-        return box["x"] + 6, box["y"] + box["height"] - 4
+        return box["x"] + 16, box["y"] + box["height"] - 6
 
     for entry, task_id, project_id in ((start, "creation", "alpha"), (transfer, "transfer", "beta")):
         # The entry adds no stop and no name: the reference is the one door, keyboard included.
@@ -629,7 +630,7 @@ def test_a_press_begun_on_a_control_or_text_or_gone_astray_never_navigates(proje
                       "after": page.evaluate("handoffListeners()")})
 
     left, top, right, bottom = edges(transfer)
-    free = (left + 6, bottom - 4)
+    free = (left + 16, bottom - 6)  # in the padding, clear of the rounded corner (which takes no pointer events)
     free_area = '.project-handoff, .project-handoff-heading, .project-handoff-footer'
     feed_top = page.locator('#chat-messages').bounding_box()["y"]
     c_left, c_top, c_right, c_bottom = edges(transfer.locator('.chat-message-copy'))

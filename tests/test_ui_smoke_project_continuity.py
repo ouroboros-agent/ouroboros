@@ -6,7 +6,7 @@ through real browser flows using the common server fixture.
 Observable scenarios include:
 1. A stale history rebuild (response assembled before the send was logged)
    must not erase the owner's optimistic bubble or its routing receipt.
-2. A chat opened AFTER a managed task started shows Working... from the
+2. A chat opened AFTER a managed task started shows Working from the
    /api/state activity snapshot, and the snapshot's absence concludes it.
 3. An early final answer holds the card on "Finalizing…" —
    task_cost_finalized does not resolve it, the settled task_done does.
@@ -252,7 +252,7 @@ def test_ui_smoke_stale_history_rebuild_keeps_owner_bubble(direct_server_with_da
 
 @pytest.mark.ui_browser
 def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data):  # noqa: F811
-    """A chat that missed every typing frame still shows queue-backed Working...;
+    """A chat that missed every typing frame still shows queue-backed Working;
     the next authoritative snapshot without the task concludes it."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -286,7 +286,7 @@ def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data)
                     )
 
                 page.route("**/api/state*", _inject)
-                _goto_main_ready(page, url, "Working...")
+                _goto_main_ready(page, url, "Working")
                 # The managed activity arrives purely from the snapshot: this
                 # page never saw a typing frame or a progress card.
 
@@ -557,7 +557,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 history = {"messages": []}
                 page.route("**/api/state*", _inject)
                 page.route("**/api/chat/history*", lambda route: route.fulfill(content_type="application/json", body=json.dumps(history)))
-                _goto_main_ready(page, url, "Working...")
+                _goto_main_ready(page, url, "Working")
 
                 page.evaluate(
                     """() => window.__ouroWs.emit('chat', {
@@ -668,7 +668,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 rehome_card = '.chat-live-card[data-task-id="rehome-root"]'
                 state["activities"] = [_activity("rehome-root")]
                 page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
-                _wait_status(page, "Working...")
+                _wait_status(page, "Working")
                 page.evaluate(
                     """() => window.__ouroWs.emit('chat', {
                         type: 'chat', role: 'assistant', is_progress: true,
@@ -756,7 +756,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 reusable_card = '.chat-live-card[data-task-id="active"]'
                 state["activities"] = [_activity("active")]
                 page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
-                _wait_status(page, "Working...")
+                _wait_status(page, "Working")
                 page.evaluate(
                     """() => window.__ouroWs.emit('chat', {
                         type: 'chat', role: 'assistant', is_progress: true,
@@ -798,7 +798,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     }""",
                     arg=reusable_card,
                 )
-                _wait_status(page, "Working...")
+                _wait_status(page, "Working")
                 page.evaluate(
                     """() => window.__ouroWs.emit('log', {
                         type: 'log', chat_id: 1,
@@ -1000,7 +1000,7 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                     project_chat,
                 )
                 page.wait_for_selector(f"{card} [data-cancel-run]", timeout=10_000)
-                _panel_status_is(page, "Working...")
+                _panel_status_is(page, "Working")
 
                 # Early final prose does not conclude while post-task work runs.
                 page.evaluate(
@@ -1011,7 +1011,7 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                     })""",
                     project_chat,
                 )
-                _panel_status_is(page, "Working...")
+                _panel_status_is(page, "Working")
                 # Make the next request barrier strictly newer than the live
                 # progress frame even on a millisecond-resolution browser clock.
                 page.wait_for_timeout(20)

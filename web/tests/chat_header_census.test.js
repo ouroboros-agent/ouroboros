@@ -133,7 +133,7 @@ for (const chatId of [1, 7]) {
             fx.census([{ ...row, phase: 'budget_paused', pause_cause: 'owner' }], true);
             assert.equal(fx.status(), 'Paused · owner pause', 'same-row Pause outranks stale model facts');
             fx.census([row, { ...other, phase: 'working' }], true);
-            assert.equal(fx.status(), 'Working...', 'managed work keeps its existing priority');
+            assert.equal(fx.status(), 'Working', 'managed work keeps its existing priority');
             fx.census([{ ...row, kind: 'managed_task' }, { ...other, kind: 'direct_chat' }], true);
             assert.equal(fx.status(), 'Queued', 'an active managed observation stays in the managed priority branch');
         } finally { fx.instance.destroy(); restoreDom(fx.prior); }
@@ -161,7 +161,7 @@ for (const chatId of [1, 7]) {
                 assert.equal(fx.card(row.activity_id).querySelector('[data-wait-id]'), null);
             }
             fx.close();
-            assert.equal(fx.status(), 'Reconnecting...');
+            assert.equal(fx.status(), 'Reconnecting…');
             fx.handlers.get('chat')({ task_id: row.activity_id, chat_id: chatId, role: 'assistant',
                 content: 'Done', system_type: 'task_summary', task_terminal_status: 'completed', ts: '2026-10-11T00:00:01Z' });
             show('queued');
@@ -422,7 +422,7 @@ test('R2 a terminal census retires only its linked Sending receipt without a typ
         const input = globalThis.document.byId.get('chat-input');
         const send = () => globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
         input.value = 'Complete this request'; send(); await fx.settle();
-        assert.equal(fx.status(), 'Sending...');
+        assert.equal(fx.status(), 'Sending');
         const row = { activity_id: 'completed-before-receipt', client_message_id: 'cm-send', chat_id: 1,
             kind: 'direct_chat', phase: 'thinking', status: 'completed',
             root_phase_checkpoint: { post_task_synthesis: 'completed' } };
@@ -430,7 +430,7 @@ test('R2 a terminal census retires only its linked Sending receipt without a typ
         assert.equal(fx.status(), 'Online');
         fx.state.messageId = 'second-send'; input.value = 'Another request'; send(); await fx.settle();
         fx.census([row], true);
-        assert.equal(fx.status(), 'Sending...', 'an old completion cannot retire a different request');
+        assert.equal(fx.status(), 'Sending', 'an old completion cannot retire a different request');
         fx.census([{ activity_id: 'second', client_message_id: 'second-send', chat_id: 1,
             kind: 'direct_chat', phase: 'thinking' }], true);
         assert.equal(fx.status(), 'Thinking');
@@ -524,7 +524,7 @@ for (const kind of ['', undefined, 'direct_chat', 'managed_task', 'future_kind']
             const fx = makeInstance();
             try {
                 fx.census(seed, true);
-                assert.equal(fx.status(), kind === 'managed_task' ? 'Working...' : 'Thinking');
+                assert.equal(fx.status(), kind === 'managed_task' ? 'Working' : 'Thinking');
                 fx.census([], complete);
                 assert.equal(fx.status(), complete ? 'Online' : 'Activity unconfirmed');
             } finally { fx.instance.destroy(); restoreDom(fx.prior); }
@@ -548,7 +548,7 @@ test('a typing frame is a receipt: Sending... steps to the census verdict, never
         input.value = 'hello';
         globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
         await fx.settle();
-        assert.equal(fx.status(), 'Sending...', 'the owner\'s own unconfirmed send owns the header');
+        assert.equal(fx.status(), 'Sending', 'the owner\'s own unconfirmed send owns the header');
 
         // The census answers the receipt's read with the turn listed: the header
         // moves Sending... -> Thinking... with no Online in between.
@@ -560,8 +560,8 @@ test('a typing frame is a receipt: Sending... steps to the census verdict, never
         await fx.settle();
         assert.equal(fx.status(), 'Thinking');
         assert.ok(stateCalls() > before, 'the receipt pulled the authoritative census at once');
-        assert.ok(seen.includes('Sending...'), `the send was observed: ${seen.join(' > ')}`);
-        assert.ok(!seen.slice(seen.indexOf('Sending...')).includes('Online'), `no Online blink: ${seen.join(' > ')}`);
+        assert.ok(seen.includes('Sending'), `the send was observed: ${seen.join(' > ')}`);
+        assert.ok(!seen.slice(seen.indexOf('Sending')).includes('Online'), `no Online blink: ${seen.join(' > ')}`);
 
         // A receipt whose census does not list the turn settles at Online.
         fx.state.census = { active_chat_activities: [], active_chat_activities_complete: true, supervisor_ready: true };
@@ -574,7 +574,7 @@ test('a typing frame is a receipt: Sending... steps to the census verdict, never
         input.value = 'again';
         globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
         await fx.settle();
-        assert.equal(fx.status(), 'Sending...');
+        assert.equal(fx.status(), 'Sending');
         fx.handlers.get('typing')({ chat_id: 1, activity_id: 'turn-2', kind: 'direct_chat', client_message_id: 'cm-send' });
         await fx.settle();
         assert.equal(fx.status(), 'Online', 'the settled read retired the send the census never listed');
@@ -583,7 +583,7 @@ test('a typing frame is a receipt: Sending... steps to the census verdict, never
         input.value = 'once more';
         globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
         await fx.settle();
-        assert.equal(fx.status(), 'Sending...');
+        assert.equal(fx.status(), 'Sending');
         fx.state.fail = true;
         fx.handlers.get('typing')({ chat_id: 1, activity_id: 'turn-3', kind: 'direct_chat', client_message_id: 'cm-send' });
         await fx.settle();
@@ -610,13 +610,13 @@ test('#1403: an unrelated System row keeps Working and Sending; a refusal settle
         fx.census([], true);
         await send('first', 'cm-first');
         await send('second', 'cm-second');
-        assert.equal(fx.status(), 'Sending...');
+        assert.equal(fx.status(), 'Sending');
         notice();
-        assert.equal(fx.status(), 'Sending...', 'nor retires a submission it does not name');
+        assert.equal(fx.status(), 'Sending', 'nor retires a submission it does not name');
         // A host refusal names the submission it answers: only that one settles.
         notice({ system_type: 'task_admission_notice', content: '🚫 Budget exhausted. Task rejected.',
             client_message_id: 'cm-first' });
-        assert.equal(fx.status(), 'Sending...', 'the other submission is still unanswered');
+        assert.equal(fx.status(), 'Sending', 'the other submission is still unanswered');
         notice({ system_type: 'command_reply', content: '🧠 Background consciousness: on', client_message_id: 'cm-second' });
         assert.equal(fx.status(), 'Online');
         // A legacy unkeyed model final still ends the unscoped turn, as documented.
@@ -656,7 +656,7 @@ test('a progress-only root the census omits loses Stop authority at once, then s
             content: 'Working.', ts: '2026-09-14T09:59:00Z',
         });
         assert.ok(fx.card(id).querySelector('[data-cancel-run]'), 'the cancelable progress row granted Stop');
-        assert.equal(fx.status(), 'Working...');
+        assert.equal(fx.status(), 'Working');
         // The queue census omits the root: Stop has no row to target, and the
         // card is handed to the durable-detail read (one /api/tasks call).
         fx.census([], true, Date.now() + 1_000);

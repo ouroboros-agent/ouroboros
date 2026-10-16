@@ -10,9 +10,11 @@ transferred into the parent’s folder.
 The parent stays the sole committer: applying stages changes but never
 commits; the parent reviews and runs ``commit_reviewed`` itself.
 
-Only the immediate parent integrates a child. A bound copy returns to its
-recorded source under the parent's current write rights; legacy patches target
-the active repo. Descendant patches still bubble up one level at a time.
+Only the immediate parent integrates a child; the one exception is a root the
+owner's explicit Continue created, which may decide a finished direct child of
+its recorded predecessor (``_continued_lineage``). A bound copy returns to its
+recorded source under the deciding task's current write rights; legacy patches
+target the active repo. Descendant patches still bubble up one level at a time.
 """
 
 from __future__ import annotations
@@ -59,8 +61,32 @@ def _record_integration_disposition(
     disposition: str,
     reason: str,
     default_reason: str,
+    lineage: Dict[str, str] | None = None,
+    verdict: str = "",
 ) -> str:
-    """Stamp only a genuinely completed apply/verify/reject operation."""
+    """Stamp only a genuinely completed apply/verify/reject operation.
+
+    An owner-Continue successor's decision is its own verdict, confirmed on the
+    canonical custody marks the next successor reads; the task-tree row binds the
+    child's own root/parent, which this task is not, so it stays unwritten.
+    ``verdict`` is the writer's artifact path, empty when that write failed.
+    """
+    if lineage:
+        from ouroboros.tool_access_paths import canonical_data_root
+
+        try:
+            landed = _recorded_decision(canonical_data_root(ctx), [str(getattr(ctx, "task_id", "") or "")],
+                                        child_task_id, lineage["child_result_sha256"])
+        except Exception:
+            landed = {}
+        if not landed:
+            retained = ("a later Continue successor can read the retained verdict artifact above"
+                        if verdict else "the verdict artifact was not written either; no retained decision "
+                        "has been confirmed")
+            return ("\n⚠️ INTEGRATE_DISPOSITION_FAILED: this decision's custody record did not land or cannot "
+                    f"be read, so acceptance evidence omits it; {retained}.")
+        return (f"\nDecided as the owner-Continue successor of {lineage['original_parent_task_id']}: "
+                "the verdict is the decision record; that task's tree ledger is unchanged.")
     from ouroboros.tools.join_ledger import _record_current_child_result_disposition
     recorded = _record_current_child_result_disposition(
         ctx,
@@ -464,7 +490,7 @@ def _is_host_minted_projects_tree(path: pathlib.Path) -> bool:
 
 def _verify_directory_direct_result(
     ctx: ToolContext, child_task_id: str, reason: str, target: pathlib.Path,
-    manifest: Dict[str, Any], artifact_dir: pathlib.Path,
+    manifest: Dict[str, Any], artifact_dir: pathlib.Path, lineage: Dict[str, str] | None = None,
 ) -> str:
     """Verify only registered postimages; direct effects are never replayed or rolled back."""
     from ouroboros.artifacts import stream_artifact_file
@@ -528,10 +554,12 @@ def _verify_directory_direct_result(
     verdict = _write_verdict(
         ctx, child_task_id, outcome=outcome, reason=f"{reason + '. ' if reason else ''}{detail}",
         files=sorted(verified), manifest=manifest, applied=False, conflicts=conflicts, protected=[], target=str(target),
+        lineage=lineage,
     )
     if conflicts:
         return f"⚠️ INTEGRATE_DIRECTORY_OUTPUT_MISMATCH: {detail}. Verdict: {verdict or '(unwritten)'}."
-    warning = _record_integration_disposition(ctx, child_task_id, "integrated", reason, detail)
+    warning = _record_integration_disposition(
+        ctx, child_task_id, "integrated", reason, detail, lineage=lineage, verdict=verdict)
     return f"OK: {detail} Verdict: {verdict or '(unwritten)'}.{warning}"
 
 
@@ -546,13 +574,15 @@ def _handle_external_workspace_integration(
     child_result: Dict[str, Any],
     touched: List[str],
     file_rows: List[Dict[str, Any]] = (),
+    lineage: Dict[str, str] | None = None,
 ) -> str:
     def refused(code: str, outcome: str, detail: str, target: Any = "",
                 files: List[str] = touched, conflicts: List[str] = ()) -> str:
         """An early refusal keeps its audit verdict and custody row; no disposition."""
         verdict = _write_verdict(
             ctx, child_task_id, outcome=outcome, reason=reason or detail, files=files, manifest=manifest,
-            applied=False, conflicts=list(conflicts) or [detail], protected=[], target=str(target or ""))
+            applied=False, conflicts=list(conflicts) or [detail], protected=[], target=str(target or ""),
+            lineage=lineage)
         from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
         text = (f"⚠️ {code}: {detail}. Verdict: {verdict or '(unwritten)'}. "
                 "Captured result retained; nothing was transferred or marked integrated.")
@@ -577,7 +607,7 @@ def _handle_external_workspace_integration(
 
     if manifest.get("capture_kind") == "directory_direct":
         return _verify_directory_direct_result(
-            ctx, child_task_id, reason, target, manifest, patch_path.parent,
+            ctx, child_task_id, reason, target, manifest, patch_path.parent, lineage=lineage,
         )
     # Parse all captured paths without an ancestor repo's subdirectory prefix. Git
     # ignores a ceiling equal to its cwd and never searches the ceiling itself, so the
@@ -610,11 +640,12 @@ def _handle_external_workspace_integration(
     verdict = _write_verdict(
         ctx, child_task_id, outcome=outcome, reason=reason, files=authoritative_touched,
         manifest=manifest, applied=False, conflicts=missing or ([detail] if detail else []),
-        protected=[], target=str(target))
+        protected=[], target=str(target), lineage=lineage)
     if verified:
         warning = _record_integration_disposition(
             ctx, child_task_id, "integrated", reason,
-            "verified child result at its recorded shared target; no transfer to parent")
+            "verified child result at its recorded shared target; no transfer to parent",
+            lineage=lineage, verdict=verdict)
         prefix = ("OK: cooperative no-op — work is ALREADY in the shared coop tree. " if coop else
                   f"✅ Verified external_workspace child {child_task_id}: ")
         checkpoint = " The host attempts a best-effort checkpoint commit of this tree when the root task finalizes." if coop else ""
@@ -626,6 +657,109 @@ def _handle_external_workspace_integration(
                 f"{missing}. Verdict: {verdict or '(unwritten)'}. Captured result retained.")
     return (f"⚠️ INTEGRATE_EXTERNAL_WORKSPACE_MISMATCH: child {child_task_id} result does not verify in {target}: "
             f"{detail}. Verdict: {verdict or '(unwritten)'}. Captured result retained.")
+
+
+# The verdict outcomes after which the ordinary path records a task-tree disposition
+# (integrated or irrelevant) are decisions; conflicts, refusals and mismatches observe.
+_DECIDED_VERDICTS = frozenset({
+    "applied", "rejected", "verified_shared_workspace", "coop_already_in_tree",
+    "verified_registered_outputs", "direct_result_observed",
+})
+
+
+def _recorded_decision(drive: Any, task_ids: List[str], child_task_id: str, result_sha: str,
+                       *, retained: bool = False) -> Dict[str, Any]:
+    """Find a decision on this result in the chain's canonical custody marks.
+
+    Only the child's own parent writes hash-less rows (the ordinary path); a
+    successor's row carries its exact result hash. An unreadable store raises:
+    unknown is not "none recorded". No rendered, bounded projection is read.
+    Only the Continue gate also checks retained artifacts: it can refuse a new
+    decision whose old row was lost, never pretend that row reached acceptance.
+    """
+    from ouroboros.delegate_custody_current import marks
+    from ouroboros.tools.patch_verdict import retained_verdicts
+
+    for task_id in task_ids:
+        rows = list(marks(drive, task_id).get("patch_verdicts", []))
+        if retained:
+            rows.extend({**v, "task_id": task_id, "disposition": v.get("outcome")}
+                        for v in retained_verdicts(drive, task_id, child_task_id))
+        for row in rows:
+            if (row.get("child_task_id") == child_task_id and row.get("disposition") in _DECIDED_VERDICTS
+                    and row.get("child_result_sha256", result_sha) == result_sha):
+                return row
+    return {}
+
+
+def _continued_lineage(
+    ctx: ToolContext, child_task_id: str, child_parent: str,
+) -> Tuple[Dict[str, str], str]:
+    """``(verdict lineage, refusal)`` for a child this task did not start.
+
+    Explicit owner Continue transfers a product decision, not child control: a root
+    created from the child's parent (the hash-verified
+    ``continued_by`` chain, ``owner_continue.continuation_chain``) may accept or
+    reject that parent's FINISHED native self_worktree/external_workspace result,
+    once: a decision anyone on the chain recorded on this exact result stands.
+    Room, folder, metadata and automatic retries grant nothing; ``_is_own_child`` and
+    the stop/resume/discard/override rights built on it are unchanged; the ordinary
+    pipeline still checks the product, its target and this task's current authority.
+    """
+    from ouroboros.owner_continue import continuation_chain
+    from ouroboros.task_status import (
+        ARTIFACT_NONTERMINAL_STATUSES, SETTLED_STATUSES, load_effective_task_result,
+        task_has_live_queue_ownership,
+    )
+    from ouroboros.tool_access_paths import canonical_data_root
+    from ouroboros.tools.join_ledger import (
+        _child_disposition_lineage, _child_result_sha256, _current_child_result_disposition,
+    )
+    from ouroboros.workspace_copies import copy_binding
+
+    parent_tid = str(getattr(ctx, "task_id", "") or "").strip()
+    drive = canonical_data_root(ctx)
+    chain = continuation_chain(drive, child_parent, parent_tid) if child_parent else []
+    if not chain:
+        return {}, (
+            f"⚠️ INTEGRATE_LINEAGE_FORBIDDEN: {child_task_id} is not a direct child of this task "
+            f"(its parent is {child_parent or '(unknown)'!r}, not {parent_tid!r}). Top-only routing: "
+            "integrate only your own immediate children; descendant patches bubble up one parent at a time."
+        )
+    current = load_effective_task_result(drive, child_task_id) or {}
+    constraint = current.get("task_constraint") if isinstance(current.get("task_constraint"), dict) else {}
+    surface, status = str(constraint.get("surface") or ""), str(current.get("status") or "")
+    if _child_disposition_lineage(current) != (child_parent, child_parent, child_task_id):
+        problem = f"it is not a direct child of the predecessor root {child_parent}"
+    elif surface not in ("self_worktree", "external_workspace"):
+        problem = f"its {surface or 'unrecorded'} surface is not a native self_worktree/external_workspace result"
+    elif surface == "self_worktree" and not (copy_binding(current) or current.get("workspace_copy")):
+        problem = "its legacy self_worktree capture records no source to return to"
+    elif (status not in SETTLED_STATUSES
+          or str(current.get("artifact_status") or "") in ARTIFACT_NONTERMINAL_STATUSES
+          or task_has_live_queue_ownership(drive, child_task_id)):
+        problem = f"it is not provably finished (status {status or 'unknown'!r}; a worker may still own it)"
+    elif (decided := _current_child_result_disposition(current)) in ("integrated", "irrelevant"):
+        problem = f"{child_parent} already marked this exact result {decided}; inspect the target instead"
+    else:
+        result_sha = _child_result_sha256(current)
+        try:
+            prior = _recorded_decision(drive, chain, child_task_id, result_sha, retained=True)
+            covered = ("this exact result" if prior.get("child_result_sha256") else
+                       "this child's result without a result hash, which covers every revision")
+            problem = (f"{prior.get('task_id') or 'an earlier task'} already recorded the decision "
+                       f"{prior.get('disposition')!r} for {covered}; it stands, inspect the target "
+                       "instead") if prior else ""
+        except Exception as exc:
+            problem = (f"its decision records cannot be read ({type(exc).__name__}), so an earlier decision "
+                       "cannot be ruled out")
+        if not problem:
+            return {"decision_authority": "owner_continue", "original_parent_task_id": child_parent,
+                    "child_result_sha256": result_sha}, ""
+    return {}, (
+        f"⚠️ INTEGRATE_LINEAGE_FORBIDDEN: {child_task_id} is a child of {child_parent}, from which the "
+        f"owner's Continue created this task, but {problem}. Nothing was applied, verified or recorded."
+    )
 
 
 def _integrate_subagent_patch(
@@ -650,7 +784,8 @@ def _integrate_subagent_patch(
     touched += [str(p) for p in (manifest.get("untracked_included") or [])]
 
     # Top-only routing: integrate only your OWN immediate children. A descendant
-    # patch must bubble up through its own parent, not jump levels into this repo.
+    # patch must bubble up through its own parent, not jump levels into this repo;
+    # the owner's explicit Continue is the one recorded exception (_continued_lineage).
     parent_tid = str(getattr(ctx, "task_id", "") or "").strip()
     child_parent = str((child_result or {}).get("parent_task_id") or "").strip()
     if not parent_tid:
@@ -658,12 +793,9 @@ def _integrate_subagent_patch(
             "⚠️ INTEGRATE_LINEAGE_FORBIDDEN: this task has no task_id, so child lineage cannot be "
             "verified. Integration is only allowed from the task whose task_id is the child's parent."
         )
-    if child_parent != parent_tid:
-        return (
-            f"⚠️ INTEGRATE_LINEAGE_FORBIDDEN: {child_task_id} is not a direct child of this task "
-            f"(its parent is {child_parent or '(unknown)'!r}, not {parent_tid!r}). Top-only routing: "
-            "integrate only your own immediate children; descendant patches bubble up one parent at a time."
-        )
+    lineage, refusal = ({}, "") if child_parent == parent_tid else _continued_lineage(ctx, child_task_id, child_parent)
+    if refusal:
+        return refusal
 
     # genesis projects are standalone deliverables (the project directory itself),
     # NOT live-body patches. Machine-enforce the documented invariant that a genesis
@@ -680,7 +812,7 @@ def _integrate_subagent_patch(
     if decision == "reject":
         verdict_path = _write_verdict(
             ctx, child_task_id, outcome="rejected", reason=reason, files=touched,
-            manifest=manifest, applied=False, conflicts=[], protected=[],
+            manifest=manifest, applied=False, conflicts=[], protected=[], lineage=lineage,
         )
         disposition_warning = _record_integration_disposition(
             ctx,
@@ -688,6 +820,8 @@ def _integrate_subagent_patch(
             "irrelevant",
             reason,
             "rejected the child result after review",
+            lineage=lineage,
+            verdict=verdict_path,
         )
         direct_note = (" Direct effects remain in the folder; rejecting this result does not undo them."
                        if manifest.get("capture_kind") == "directory_direct" else "")
@@ -702,7 +836,7 @@ def _integrate_subagent_patch(
             return "⚠️ INTEGRATE_DIRECTORY_SURFACE_MISMATCH: direct folder results require external_workspace."
         return _handle_external_workspace_integration(
             ctx, child_task_id=child_task_id, reason=reason, requested_target=str(target_root or "").strip(),
-            patch_path=patch_path, manifest=manifest, child_result=child_result, touched=touched,
+            patch_path=patch_path, manifest=manifest, child_result=child_result, touched=touched, lineage=lineage,
         )
 
     status = str(manifest.get("status") or "")
@@ -738,7 +872,7 @@ def _integrate_subagent_patch(
             patch_path=patch_path,
             manifest=manifest,
             child_result=child_result,
-            touched=touched, file_rows=file_rows,
+            touched=touched, file_rows=file_rows, lineage=lineage,
         )
 
 
@@ -794,7 +928,7 @@ def _integrate_subagent_patch(
             _write_verdict(
                 ctx, child_task_id, outcome="blocked_protected", reason=reason, files=touched,
                 manifest=manifest, applied=False, conflicts=[], protected=[p.path for p in protected],
-                target=str(target),
+                target=str(target), lineage=lineage,
             )
             return protected_write_block_message(
                 path=protected[0].path,
@@ -877,7 +1011,7 @@ def _integrate_subagent_patch(
         _write_verdict(
             ctx, child_task_id, outcome="partially_applied" if partial_applied else "conflict", reason=reason, files=touched,
             manifest=manifest, applied=partial_applied, conflicts=conflicts or [stderr[:500]],
-            protected=[p.path for p in protected], target=str(target),
+            protected=[p.path for p in protected], target=str(target), lineage=lineage,
         )
         detail = ("Integration did not finish cleanly." if apply_attempted else
                   "Result preparation failed. No file or patch apply was attempted.")
@@ -900,7 +1034,7 @@ def _integrate_subagent_patch(
     verdict_path = _write_verdict(
         ctx, child_task_id, outcome="applied", reason=reason, files=touched,
         manifest=manifest, applied=True, conflicts=[], protected=[p.path for p in protected],
-        target=str(target),
+        target=str(target), lineage=lineage,
     )
     diffstat = str(manifest.get("diffstat") or "").strip()
     note = ""
@@ -912,6 +1046,8 @@ def _integrate_subagent_patch(
         "integrated",
         reason,
         "applied and staged the child result in the parent worktree",
+        lineage=lineage,
+        verdict=verdict_path,
     )
     return (
         f"✅ Integrated subagent patch from {child_task_id} into {target} ({len(touched)} file(s), staged).{note}\n"
@@ -1028,7 +1164,11 @@ def get_tools() -> List[ToolEntry]:
                     "Integrate a mutative child's result or record a rejection: self_worktree uses "
                     "a source-bound apply/stage into its recorded source under your current write authority (clean copies support 3-way synthesis); native external_workspace "
                     "verifies files already in the shared tree WITHOUT reapplying. Genesis is a standalone "
-                    "directory, not a repo patch. This never commits; self-modification still requires your "
+                    "directory, not a repo patch. After the owner's Continue, the new root may also accept or reject "
+                    "the FINISHED native result of a direct child of its recorded predecessor (same checks; a "
+                    "decision already recorded on that exact result stands; the verdict names the original "
+                    "parent; old helpers stay outside its control). "
+                    "This never commits; self-modification still requires your "
                     "commit_reviewed. For best-of-N pick a child "
                     "and integrate it, or integrate several to synthesize. Own-body protected-path changes require "
                     "pro runtime mode (and, for a nested acting parent, protected_paths_grant). Conflicts "

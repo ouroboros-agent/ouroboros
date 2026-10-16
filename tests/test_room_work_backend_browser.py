@@ -348,7 +348,8 @@ def test_main_sheet_follows_real_roots_through_pause_resume_and_finish(direct_se
                     assert row["target"] == "card", row
                     assert cards[task_id] and row["name"] == cards[task_id], ("a row names its card", row, cards)
                 assert alpha["more"] and alpha["moreId"] == ALPHA, alpha
-                assert page.locator("#page-chat .ui-chrome-group[data-disclosure='open']").count() == 1
+                # One Shade unfolds under Main's bar, which marks itself open (DESIGN "Room work status").
+                assert page.locator("#page-chat .chat-page-header[data-rw-open] .rw-shade:not([hidden])").count() == 1
                 assert opened["active"]["inSurface"], "a pointer open lands in the list"
                 evidence.shot(page, "02-main-open-1100")
 

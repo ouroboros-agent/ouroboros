@@ -39,10 +39,10 @@ ROOM_FACTS = """(scope) => {
         const secondary = row.querySelector('.rw-secondary');
         return {
             id: row.dataset.id, kind: row.dataset.kind, tone: row.dataset.tone, slot: row.dataset.slot,
-            settled: row.dataset.settled === '1', open: row.dataset.open === '1', flow: row.dataset.flow,
+            settled: row.dataset.settled === '1', open: row.dataset.open === '1',
             reading: row.dataset.reading || '', name: text(row.querySelector('.rw-name')),
             word: text(row.querySelector('.rw-word')), secondary: shown(secondary) ? text(secondary) : '',
-            place: text(row.querySelector('.rw-place')), target: main?.dataset.target || '',
+            target: main?.dataset.target || '', state: text(row.querySelector('.rw-state')),
             label: main?.getAttribute('aria-label') || '', expanded: main?.getAttribute('aria-expanded'),
             question: Boolean(row.querySelector('.rw-pill-question')), resume: Boolean(row.querySelector('.rw-pill-resume')),
             more: Boolean(row.querySelector('.rw-more')), moreId: row.querySelector('.rw-more')?.dataset.id || '',
@@ -58,7 +58,10 @@ ROOM_FACTS = """(scope) => {
     return {
         exists: Boolean(trigger), tone: trigger?.dataset.tone || '', disabled: Boolean(trigger?.disabled),
         hidden: Boolean(trigger?.hidden), expanded: trigger?.getAttribute('aria-expanded') || '',
-        badge: text(trigger?.querySelector('.status-badge')), amber: shown(trigger?.querySelector('.rw-amber')),
+        badge: text(trigger?.querySelector('.status-badge')), amber: trigger?.dataset.wait === '1',
+        markColor: (() => { const dots = trigger?.querySelector('.rw-dots'), one = trigger?.querySelector('.rw-mark');
+            const mark = dots && !dots.hidden ? dots.querySelector('span') : one;
+            return mark ? getComputedStyle(mark).backgroundColor : ''; })(),
         waitNote: shown(trigger?.querySelector('.rw-sr')), surfaceHidden: surface ? surface.hidden : null,
         rows, groups: [...(surface?.querySelectorAll('.rw-group') || [])].map(text),
         note: shown(note) ? text(note) : '', back: shown(back) ? text(back) : '',
@@ -96,6 +99,7 @@ _CLIPBOARD = """(() => {
 # Long names in the languages the product is used in; a row shows two lines, focus shows all.
 LONG_NAME = ("Сверить итоговые ссылки отчёта с первоисточниками и собрать таблицу расхождений для приложения Б "
              "— einschließlich der Übersetzungsvarianten aller Zitate, Quellenangaben und Anmerkungen")
+LONGER_NAME = f"{LONG_NAME} — {LONG_NAME}"  # clamps at two lines even in a Shade as wide as the bar
 ASK_TEXT = "Please check which evidence the weekly summary should cite, and ask me before you choose."
 PROJECT = {"id": "rw-proj", "name": "Archive evidence review", "chat_id": 42, "lifecycle": "active", "visible_revision": 0}
 OTHER_PROJECT = {"id": "rw-proj-two", "name": "Release notes", "chat_id": 43, "lifecycle": "active",
@@ -354,7 +358,7 @@ def capture(page, name):
 
 def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui):
     history = {1: [*reading(10), owner(ASK_TEXT, "cm-ask", 30),
-                   progress("rw-live", "Comparing the cited pages.", 31, suggested_name=LONG_NAME),
+                   progress("rw-live", "Comparing the cited pages.", 31, suggested_name=LONGER_NAME),
                    progress("rw-access", "Preparing the quota check.", 32, suggested_name="Check the subscription quota"),
                    progress("rw-pausing", "Collecting appendix evidence.", 33, suggested_name="Collect appendix evidence"),
                    progress("rw-failfin", "Rebuilding the index.", 34, suggested_name="Rebuild the citation index"),
@@ -378,8 +382,9 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
         ])
     page = open_app(room_ui, transport)
     closed = wait_facts(page, "main", lambda f: f["tone"] == "live" and not f["disabled"], "a live control")
-    # Moving work with something waiting keeps its live chip and adds one amber dot, said in words too.
+    # Moving work with something waiting keeps its live word and turns its one mark amber, said in words too.
     assert closed["amber"] and closed["waitNote"], closed
+    assert closed["markColor"] == "rgb(245, 158, 11)", closed  # the same mark is painted amber, not a second dot
     assert closed["surfaceHidden"] and closed["expanded"] == "false"
     trigger(page).click()
     opened = wait_facts(page, "main", lambda f: len(f["rows"]) == 7 and row(f, "rw-unknown")["name"]
@@ -406,9 +411,13 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
     assert by["rw-ask"]["name"].startswith("Reply to “Please check which evidence"), by["rw-ask"]
     assert by["rw-ask"]["target"] == "card", "the owner's own message is the row's place"
     # Names: the card's coined name whole in the DOM; census-only work reads its detail; else a neutral name.
-    assert by["rw-live"]["name"] == LONG_NAME and by["rw-live"]["target"] == "card"
-    assert by["rw-live"]["label"].startswith(f"Go to task: {LONG_NAME}, Working")
-    assert by["rw-unknown"]["place"] == "Not in loaded messages" and by["rw-unknown"]["target"] == "details"
+    assert by["rw-live"]["name"] == LONGER_NAME and by["rw-live"]["target"] == "card"
+    assert by["rw-live"]["label"].startswith(f"Go to task: {LONGER_NAME}, Working")
+    # Work outside the loaded messages says so in its name for assistive technology and in its details (5A),
+    # never as a visible line of its own: every row's second line is its state.
+    assert "Not in loaded messages" in by["rw-unknown"]["label"] and by["rw-unknown"]["target"] == "details"
+    assert by["rw-unknown"]["state"].startswith("Activity unconfirmed") and "loaded" not in by["rw-unknown"]["state"]
+    assert page.locator("#page-chat .rw-place").count() == 0
     assert by["rw-queued"]["name"].startswith("Task"), by["rw-queued"]
     # Three dots are work (moving only for confirmed motion); one dot is a single fact.
     assert by["rw-live"]["dots"] and by["rw-queued"]["dots"] and not by["rw-access"]["dots"]
@@ -866,7 +875,7 @@ def test_project_shade_hold_outside_press_switch_and_latest_root(room_ui):
     main = wait_facts(page, "main", lambda f: f["exists"], "Main's control")
     assert main["disabled"] and main["rows"] == [], "Main never lists a Project's work"
     open_project(page, PROJECT)
-    closed = wait_facts(page, "project", lambda f: f["tone"] == "wait" and not f["disabled"], "the Project's control")
+    closed = wait_facts(page, "project", lambda f: f["tone"] == "held" and not f["disabled"], "the Project's control")
     capture(page, "project-closed")
     trigger(page, "project").click()
     shade = wait_facts(page, "project", lambda f: [item["id"] for item in f["rows"]] == ["p-hold"]
@@ -874,6 +883,7 @@ def test_project_shade_hold_outside_press_switch_and_latest_root(room_ui):
     evidence("project-shade", {"closed": closed, "open": shade})
     held = row(shade, "p-hold")
     assert (held["word"], held["tone"]) == ("Waiting for Project access", "wait"), held
+    settle_unfold(page, "project")
     geometry = page.evaluate("""() => { const box = s => document.querySelector(s).getBoundingClientRect();
         const bar = box('#project-panel .project-panel-bar'), shade = box('#project-panel .rw-shade'), panel = box('#project-panel');
         return {bar: [bar.left, bar.bottom, bar.right], shade: [shade.left, shade.top, shade.right, shade.bottom],
@@ -982,22 +992,140 @@ def test_keyboard_focus_escape_and_independent_controls(room_ui):
 # ------------------------------------------------------------------------------------------------
 # Responsive light/dark geometry and screenshots over real scrolling content.
 
-_GROUP_GEOMETRY = """() => {
-    const box = (el) => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, right: r.right, bottom: r.bottom }; };
-    const group = document.querySelector('#page-chat .ui-chrome-group');
+_BAR_GEOMETRY = """(scope) => {
+    const bar = scope === 'main' ? document.querySelector('#page-chat .chat-page-header')
+        : document.querySelector('#project-panel .project-panel-bar');
+    const box = (el) => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, bottom: r.bottom }; };
     const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
-    const controls = [...group.querySelectorAll('.ui-chrome-control')].filter(visible)
-        .map((el) => ({ name: el.classList.contains('rw-trigger') ? 'status' : (el.dataset.chatCommand || el.id || el.tagName), ...box(el) }));
-    const sheet = document.querySelector('#page-chat .rw-sheet');
+    const trigger = bar.querySelector('.rw-trigger');
+    const badge = trigger.querySelector('.status-badge');
+    const title = bar.querySelector('.app-page-title');
+    const neighbours = [...bar.querySelectorAll('button, .chat-budget-pill')]
+        .filter((el) => visible(el) && el !== trigger && !trigger.contains(el) && !el.closest('.rw-shade-anchor'))
+        .map((el) => ({ name: el.id || el.dataset.chatCommand || String(el.className).split(' ')[0], ...box(el) }));
+    const shade = bar.parentElement.querySelector('.rw-shade') || bar.querySelector('.rw-shade');
     const alpha = (color) => { const m = color.match(/rgba?\\(([^)]+)\\)/); if (!m) return color === 'transparent' ? 0 : 1;
         const parts = m[1].split(/[ ,/]+/).filter(Boolean); return parts.length > 3 ? parseFloat(parts[3]) : 1; };
-    const reachable = [...(sheet?.querySelectorAll('.rw-more, .rw-main') || [])].filter(visible).every((el) => {
+    const reachable = [...(shade?.querySelectorAll('.rw-more, .rw-main') || [])].filter(visible).every((el) => {
         const r = el.getBoundingClientRect(); const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
         return Boolean(hit) && (hit === el || el.contains(hit)); });
-    return { group: box(group), controls, sheet: sheet.hidden ? null : box(sheet),
-        sheetAlpha: alpha(getComputedStyle(sheet).backgroundColor), groupAlpha: alpha(getComputedStyle(group).backgroundColor),
-        reachable, vw: innerWidth, vh: innerHeight, pageOverflow: document.documentElement.scrollWidth - innerWidth };
+    return { bar: box(bar), title: box(title), trigger: box(trigger), neighbours, word: badge.textContent.trim(),
+             clipped: badge.scrollWidth > badge.clientWidth + 0.5, amber: trigger.dataset.wait === '1',
+             shade: shade && !shade.hidden ? box(shade) : null, shadeAlpha: shade ? alpha(getComputedStyle(shade).backgroundColor) : null,
+             reachable, vw: innerWidth, vh: innerHeight, overflow: document.documentElement.scrollWidth - innerWidth };
 }"""
+
+# The model-wait owner's own row shape (web/tests/model_wait.test.js), for the access-wait word.
+_ACCESS_WAIT = {"wait_id": "w-geo", "revision": 1, "task_attempt": 1, "role": "main", "reason": "quota",
+                "model": "claudexor::source-a=same-model", "source": "source-a", "credential_harness": "codex",
+                "credential_profile_id": "personal", "auto_continue": True, "state": "waiting", "worker_slot_held": True}
+
+
+def header_states(room):
+    """Named census states that give the room's header its different words, one after another."""
+    where = {} if room == "main" else {"chat_id": PROJECT["chat_id"], "project_id": PROJECT["id"]}
+    ask = activity("g-ask", kind="direct_chat", client_message_id="cm-geo", **waited("q-geo"), **where)
+    states = [
+        ("idle", []),
+        ("live", [activity("g-live", **where)]),
+        ("queued", [activity("g-queued", "queued", **where)]),
+        ("finalizing", [activity("g-fin", "finalizing", **where)]),
+        ("access", [activity("g-access", model_waits={"w-geo": _ACCESS_WAIT}, **where)]),
+        ("answer", [ask]),
+        ("pausing", [activity("g-pausing", "budget_pausing", pause_cause="owner", **where)]),
+        ("paused", [activity("g-paused", "budget_paused", pause_cause="owner", **where)]),
+        ("unknown", [activity("g-unknown", "unknown", **where)]),
+        # A fresh question (its own id and quiz): the client remembers a question that left the census.
+        ("live+answer", [activity("g-live", **where), activity("g-ask2", kind="direct_chat", client_message_id="cm-geo2",
+                                                             **waited("q-geo2"), **where)]),
+    ]
+    if room == "project":
+        # The host's longest current hold label (ouroboros/project_admission.py) stays whole in a Project's bar.
+        states.append(("hold", [activity("g-hold", "queued", project_admission_hold={
+            "label": "Waiting for task scope verification"}, **where)]))
+    return states
+
+
+# The words the producer gives each named state (the access wait has no card here, so it may read as work).
+HEADER_WORDS = {"idle": "Online", "live": "Working", "queued": "Queued", "finalizing": "Finalizing…",
+                "answer": "Waiting for your answer", "pausing": "Pausing…", "paused": "Paused · owner pause",
+                "unknown": "Activity unconfirmed", "live+answer": "Working",
+                "hold": "Waiting for task scope verification"}
+
+
+def settle_unfold(page, room):
+    """Wait until the room's Shade has finished unfolding (its 170 ms entrance slides it 6px), so geometry reads its
+    resting place rather than a frame of the animation."""
+    root = "#page-chat" if room == "main" else "#project-panel"
+    page.wait_for_function("""(root) => { const s = document.querySelector(`${root} .rw-shade`);
+        return Boolean(s) && !s.hidden && !(s.getAnimations?.() || []).some((a) => a.playState === 'running'); }""",
+                           arg=root, timeout=10_000)
+    settle_frames(page)
+
+
+def settled_bar(page, room, expected, previous, timeout=15):
+    """The bar once the census has repainted it: the expected word when known, else a word that changed from the
+    previous state's and held still for a moment (a census read lands asynchronously, more so under load)."""
+    deadline, last, stable = time.monotonic() + timeout, None, 0
+    while time.monotonic() < deadline:
+        sample = page.evaluate(_BAR_GEOMETRY, room)
+        if expected is not None and sample["word"] == expected:
+            settle_frames(page)
+            return page.evaluate(_BAR_GEOMETRY, room)
+        if expected is None and (previous is None or sample["word"] != previous["word"]):
+            stable = stable + 1 if last and last["word"] == sample["word"] else 0
+            if stable >= 3:
+                return sample
+        last = sample
+        page.wait_for_timeout(100)
+    raise AssertionError(("the header never settled", room, expected, last))
+
+
+def assert_word_never_moves_the_bar(page, transport, room, tag):
+    """Every word the header can say leaves the bar's height and every other control's box where they were,
+    keeps the word whole (the title yields first) and overflows nothing."""
+    samples, previous = {}, None
+    for name, activities in header_states(room):
+        transport.activities = activities
+        transport.refresh()
+        samples[name] = previous = settled_bar(page, room, HEADER_WORDS.get(name), previous)
+    evidence(f"bar-words-{room}-{tag}", samples)
+    words = [sample["word"] for sample in samples.values()]
+    assert len(set(words)) >= 7, ("the census states reached the header as different words", words)
+    first = samples["idle"]
+    for name, sample in samples.items():
+        assert abs(sample["bar"]["h"] - first["bar"]["h"]) <= 0.5, ("a word never resizes the bar", name, sample, first)
+        assert abs(sample["trigger"]["h"] - first["trigger"]["h"]) <= 0.5, ("the status never wraps", name, sample)
+        assert abs(sample["title"]["x"] - first["title"]["x"]) <= 0.5, ("the title keeps its place", name, sample)
+        assert [n["name"] for n in sample["neighbours"]] == [n["name"] for n in first["neighbours"]], (name, sample)
+        moved = [(a, b) for a, b in zip(first["neighbours"], sample["neighbours"])
+                 if any(abs(a[k] - b[k]) > 0.5 for k in ("x", "y", "w", "h"))]
+        assert not moved, ("a word never moves a neighbouring control", name, sample["word"], moved)
+        assert not sample["clipped"], ("the status word stays whole; the title ellipsizes first", name, sample)
+        assert sample["overflow"] <= 0, (name, sample)
+    # The amber mark says only that a question waits beside another word, never beside its own.
+    assert samples["live+answer"]["amber"] and samples["live+answer"]["word"] == samples["live"]["word"], samples
+    assert samples["answer"]["word"] == "Waiting for your answer" and not samples["answer"]["amber"], samples["answer"]
+    assert not any(sample["amber"] for name, sample in samples.items() if name != "live+answer"), samples
+    if room == "project":
+        assert samples["hold"]["word"] == "Waiting for task scope verification", samples["hold"]
+
+
+@pytest.mark.parametrize("width,height", [(390, 844), (1040, 720), (1440, 860)])
+def test_header_words_never_move_a_neighbour_or_resize_the_bar(room_ui, width, height):
+    long_project = {**PROJECT, "name": "Archive evidence review — cross-checking every cited page against its source"}
+    transport = Transport(room_ui["page"], history={1: reading(8), 42: reading(6, 0, "Project")},
+                          projects=[long_project])
+    page = open_app(room_ui, transport, theme="light", viewport={"width": width, "height": height})
+    tag = f"{width}x{height}"
+    assert_word_never_moves_the_bar(page, transport, "main", tag)
+    capture(page, f"bar-words-main-{tag}")
+    transport.activities = []
+    transport.refresh()
+    open_project(page, long_project)
+    assert_word_never_moves_the_bar(page, transport, "project", tag)
+    capture(page, f"bar-words-project-{tag}")
+    evidence(f"bar-words-console-{tag}", transport.console)
 
 
 def assert_project_backing(page):
@@ -1013,7 +1141,7 @@ def assert_project_backing(page):
 
 @pytest.mark.parametrize("theme", ["dark", "light"])
 @pytest.mark.parametrize("width,height", [(1100, 722), (390, 844)])
-def test_status_sheet_and_shade_geometry_light_dark_and_screenshots(room_ui, width, height, theme):
+def test_shade_geometry_light_dark_and_screenshots(room_ui, width, height, theme):
     history = {1: [*reading(14), progress("rw-live", "Comparing the cited pages.", 30, suggested_name=LONG_NAME),
                    progress("rw-pausing", "Collecting appendix evidence.", 31, suggested_name="Collect appendix evidence"),
                    *reading(6, 32, "Later")],
@@ -1028,53 +1156,42 @@ def test_status_sheet_and_shade_geometry_light_dark_and_screenshots(room_ui, wid
                              project_admission_hold={"label": "Waiting for Project access"})])
     page = open_app(room_ui, transport, theme=theme, viewport={"width": width, "height": height})
     tag = f"{width}x{height}-{theme}"
-    wait_facts(page, "main", lambda f: f["tone"] == "live", "a live control")
-    page.locator("#chat-messages").evaluate("el => { el.scrollTop = Math.round(el.scrollHeight * 0.5); }")
-    page.wait_for_timeout(250)
-    closed = page.evaluate(_GROUP_GEOMETRY)
-    capture(page, f"main-closed-{tag}")
-    trigger(page).click()
-    wait_facts(page, "main", lambda f: len(f["rows"]) == 3 and row(f, "rw-far")["name"] == "Index the archived notes",
-               "three rows")
-    page.wait_for_timeout(300)  # the unfold animation
-    opened = page.evaluate(_GROUP_GEOMETRY)
-    capture(page, f"main-open-{tag}")
-    evidence(f"geometry-main-{tag}", {"closed": closed, "open": opened})
-    heights = {round(control["h"], 1) for control in closed["controls"]}
-    assert len(heights) == 1, ("text controls in one floating group share height", closed["controls"])
-    moved = [(a, b) for a, b in zip(closed["controls"], opened["controls"])
-             if any(abs(a[k] - b[k]) > 0.5 for k in ("x", "y", "w", "h"))]
-    assert not moved, ("opening moves no neighbouring target", moved)
-    sheet, group = opened["sheet"], opened["group"]
-    assert abs(sheet["y"] - group["bottom"]) <= 1.5, ("the sheet continues its group", sheet, group)
-    assert abs(sheet["x"] - group["x"]) <= 1.5 and abs(sheet["right"] - group["right"]) <= 1.5, (sheet, group)
-    assert sheet["x"] >= 0 and sheet["right"] <= opened["vw"] and sheet["bottom"] <= opened["vh"], opened
-    assert opened["sheetAlpha"] == 1 and opened["groupAlpha"] == 1, "content never shows through the open chrome"
-    assert opened["reachable"], "every row target is the element hit at its centre"
-    assert opened["pageOverflow"] <= 0, opened
-    # The sheet scrolls within itself when it is taller than its cap.
-    page.keyboard.press("Escape") if facts(page)["active"]["inSurface"] else trigger(page).click()
-    wait_facts(page, "main", lambda f: f["surfaceHidden"], "closed")
-
-    open_project(page, PROJECT)
-    wait_facts(page, "project", lambda f: f["tone"] == "live", "the Project's live control")
-    page.locator("#panel-pchat-rw-proj .chat-messages, #pchat-rw-proj-messages").first.evaluate(
-        "el => { el.scrollTop = Math.round(el.scrollHeight * 0.5); }")
-    # Wait for the panel's opening transition before judging its settled material.
-    page.wait_for_function("getComputedStyle(document.querySelector('#project-panel')).opacity === '1'")
-    assert_project_backing(page)
-    capture(page, f"project-closed-{tag}")
-    trigger(page, "project").click()
-    wait_facts(page, "project", lambda f: len(f["rows"]) == 2, "two Project rows")
-    page.wait_for_timeout(300)
-    shade = page.evaluate("""() => { const box = s => { const r = document.querySelector(s).getBoundingClientRect();
-            return {x: r.x, y: r.y, right: r.right, bottom: r.bottom}; };
-        return {bar: box('#project-panel .project-panel-bar'), shade: box('#project-panel .rw-shade'),
-                panel: box('#project-panel'), vw: innerWidth, vh: innerHeight,
-                overflow: document.documentElement.scrollWidth - innerWidth}; }""")
-    evidence(f"geometry-project-{tag}", shade)
-    capture(page, f"project-open-{tag}")
-    assert_project_backing(page)
+    for room in ("main", "project"):
+        if room == "project":
+            open_project(page, PROJECT)
+            page.locator("#panel-pchat-rw-proj .chat-messages, #pchat-rw-proj-messages").first.evaluate(
+                "el => { el.scrollTop = Math.round(el.scrollHeight * 0.5); }")
+            # Wait for the panel's opening transition before judging its settled material.
+            page.wait_for_function("getComputedStyle(document.querySelector('#project-panel')).opacity === '1'")
+            assert_project_backing(page)
+        else:
+            page.locator("#chat-messages").evaluate("el => { el.scrollTop = Math.round(el.scrollHeight * 0.5); }")
+        wait_facts(page, room, lambda f: f["tone"] == "live", f"the {room} live control")
+        page.wait_for_timeout(250)
+        closed = page.evaluate(_BAR_GEOMETRY, room)
+        capture(page, f"{room}-closed-{tag}")
+        trigger(page, room).click()
+        wait_facts(page, room, lambda f: len(f["rows"]) == (3 if room == "main" else 2), f"the {room} rows")
+        settle_unfold(page, room)
+        opened = page.evaluate(_BAR_GEOMETRY, room)
+        capture(page, f"{room}-open-{tag}")
+        evidence(f"geometry-{room}-{tag}", {"closed": closed, "open": opened})
+        moved = [(a, b) for a, b in zip(closed["neighbours"], opened["neighbours"])
+                 if any(abs(a[k] - b[k]) > 0.5 for k in ("x", "y", "w", "h"))]
+        assert not moved, ("opening moves no neighbouring control", moved)
+        assert abs(opened["bar"]["h"] - closed["bar"]["h"]) <= 0.5, ("opening never resizes the bar", closed, opened)
+        shade, bar = opened["shade"], opened["bar"]
+        assert shade, opened
+        assert abs(shade["y"] - bar["bottom"]) <= 1.5, ("the Shade unfolds from the bar's bottom edge", shade, bar)
+        assert shade["x"] >= bar["x"] - 0.5 and shade["x"] + shade["w"] <= bar["x"] + bar["w"] + 0.5, (shade, bar)
+        assert shade["x"] >= 0 and shade["x"] + shade["w"] <= opened["vw"] and shade["bottom"] <= opened["vh"], opened
+        assert opened["shadeAlpha"] == 1, "content never shows through the Shade"
+        assert opened["reachable"], "every row target is the element hit at its centre"
+        assert opened["overflow"] <= 0, opened
+        if room == "project":
+            assert_project_backing(page)
+        page.keyboard.press("Escape") if facts(page, room)["active"]["inSurface"] else trigger(page, room).click()
+        wait_facts(page, room, lambda f: f["surfaceHidden"], f"the {room} Shade closed")
     # Falsify the same consumer oracle, rather than accepting a new source spelling.
     panel = page.locator("#project-panel")
     original_style = panel.get_attribute("style")
@@ -1085,7 +1202,4 @@ def test_status_sheet_and_shade_geometry_light_dark_and_screenshots(room_ui, wid
     finally:
         panel.evaluate("(el, value) => value === null ? el.removeAttribute('style') : el.setAttribute('style', value)", original_style)
     assert_project_backing(page)
-    assert abs(shade["shade"]["y"] - shade["bar"]["bottom"]) <= 1.5, shade
-    assert shade["shade"]["x"] >= shade["panel"]["x"] - 0.5 and shade["shade"]["right"] <= shade["panel"]["right"] + 0.5
-    assert shade["shade"]["right"] <= shade["vw"] and shade["shade"]["bottom"] <= shade["vh"] and shade["overflow"] <= 0
     evidence(f"console-{tag}", transport.console)

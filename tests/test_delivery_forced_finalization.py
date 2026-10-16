@@ -1371,8 +1371,9 @@ def test_child_result_change_during_host_panel_supersedes_pass(tmp_path, monkeyp
     assert "TASK ACCEPTANCE REFRESH" in str(messages[-1]["content"])
 
 
+@pytest.mark.parametrize("enforcement", ["advisory", "blocking"])
 def test_child_result_change_after_host_panel_requires_replacement_and_fresh_panel(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, enforcement,
 ):
     import ouroboros.loop as loop
     import ouroboros.review_substrate as review_substrate
@@ -1454,6 +1455,7 @@ def test_child_result_change_after_host_panel_requires_replacement_and_fresh_pan
         return loop._no_tool_final_answer(text, ctx, trace, registry, queue.Queue(), set(),
                                           lambda _text: None, **kwargs)
 
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
     first = answer_after_reading("Answer based on child result v1.")
 
     assert first is None
@@ -1467,14 +1469,29 @@ def test_child_result_change_after_host_panel_requires_replacement_and_fresh_pan
 
     answer = "Replacement answer incorporating late child result v2."
     _select_completion(registry, ctx, trace, answer=answer)
-    second = answer_after_reading(answer, explicit_candidate=True)
+    if enforcement == "advisory":
+        # The exposed PASS already informed this explicit finish: no new feedback round.
+        second = loop._no_tool_final_answer(answer, ctx, trace, registry, queue.Queue(), set(),
+                                            lambda _text: None, explicit_candidate=True)
+    else:
+        second = answer_after_reading(answer, explicit_candidate=True)
 
     assert second is not None
     text, _usage, returned_trace = second
     assert text == "Replacement answer incorporating late child result v2."
-    assert panel_calls["count"] == 2
     assert registry._ctx._task_acceptance_reviewed is True
     binding = returned_trace["delivery_candidate"]["acceptance_binding"]
+    decision = returned_trace["acceptance_decision"]
+    if enforcement == "advisory":
+        # The informed explicit finish over exposed feedback ends without another panel;
+        # the PASS stays the earlier panel's signal and never approves the new material.
+        assert panel_calls["count"] == 1
+        assert (decision["status"], decision["reason"]) == ("finalized_unaccepted", "author_finish")
+        assert decision["author_disposition"]["reviewer_signal"] == "PASS"
+        assert binding["authoritative"] is False
+        return
+    assert panel_calls["count"] == 2
+    assert decision["status"] == "accepted"
     assert binding["authoritative"] is True
     assert binding["acceptance_status"] == "pass"
 

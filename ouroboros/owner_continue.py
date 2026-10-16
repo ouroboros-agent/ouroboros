@@ -3,7 +3,9 @@
 Owner Batch4 (1A/4A/8A): Continue is a NEW root in the same room and folder
 that reads the interrupted work; it is never a resurrection of the old task,
 never offered after the owner's own Stop, a Panic or a finished answer, and it
-adopts no old children. The successor model decides whether and how to go on
+adopts no old children: it may only accept or reject a direct child's finished
+native result through ``integrate_subagent_patch`` under the recorded relation.
+The successor model decides whether and how to go on
 (LLM-first) and asks in the existing conversation when unsure — the host
 carries facts, not a policy. This module is the protocol's data half; the
 queue admission is ``supervisor/continuation_admission.py``.
@@ -454,9 +456,10 @@ def work_order_text(predecessor_task_id: str, cause: str, sources: Dict[str, Any
     lines = [
         f"[CONTINUE] Continue was requested for task {predecessor_task_id}, which was interrupted "
         f"(recorded cause: {cause or 'technical interruption'}). This is a NEW task in the same "
-        "conversation and folder; the old task is not resumed and its helpers are not yours, but its "
-        "stopped delegated runs are yours to continue with delegate_start(subagent_id=..., continue_from=<run_id>, "
-        "prompt=...) instead of redoing them.",
+        "conversation and folder; the old task is not resumed and its helpers are not yours to steer; a "
+        "helper's FINISHED native result can be accepted or rejected with integrate_subagent_patch(task_id=...), "
+        "and the old task's stopped delegated runs are yours to continue with delegate_start(subagent_id=..., "
+        "continue_from=<run_id>, prompt=...) instead of redoing them.",
         result_line,
         "Decide whether and how to continue; if the right next step is unclear (for example the work "
         "may no longer be wanted), ask the owner in this conversation instead of guessing.",
@@ -542,8 +545,8 @@ def mark_claim_admitted(drive_root: Any, predecessor_task_id: str, nonce: str) -
     patch_document(pathlib.Path(drive_root), predecessor_task_id, update)
 
 
-def recorded_continuation(drive_root: Any, predecessor_task_id: str, task_id: str) -> bool:
-    """Is ``task_id`` a root the owner's Continue created from ``predecessor_task_id``?
+def continuation_chain(drive_root: Any, predecessor_task_id: str, task_id: str) -> List[str]:
+    """The verified roots from ``predecessor_task_id`` to ``task_id``, both included, or ``[]``.
 
     Read from the recorded claims only: each ``continued_by`` binding on an
     earlier root's own result names its successor (hash-verified), so a chain of
@@ -553,22 +556,29 @@ def recorded_continuation(drive_root: Any, predecessor_task_id: str, task_id: st
     from ouroboros.task_results import load_task_result
 
     current, target, seen = str(predecessor_task_id or ""), str(task_id or ""), set()
+    chain: List[str] = []
     while current and target and current not in seen:
         seen.add(current)
+        chain.append(current)
         try:
             result = load_task_result(drive_root, current, strict=True) or {}
         except Exception:
-            return False
+            return []
         claim = result.get("continued_by") if isinstance(result.get("continued_by"), dict) else {}
         binding = claim.get("binding") if isinstance(claim.get("binding"), dict) else {}
         successor = str(claim.get("successor_task_id") or "")
         if (not successor or binding.get("successor_task_id") != successor
                 or claim.get("binding_sha256") != binding_sha(binding)):
-            return False
+            return []
         if successor == target:
-            return True
+            return [*chain, target]
         current = successor
-    return False
+    return []
+
+
+def recorded_continuation(drive_root: Any, predecessor_task_id: str, task_id: str) -> bool:
+    """The existing yes/no form of the verified explicit-Continue chain."""
+    return bool(continuation_chain(drive_root, predecessor_task_id, task_id))
 
 
 def continuation_offer(result: Dict[str, Any], task_id: str) -> Dict[str, Any]:

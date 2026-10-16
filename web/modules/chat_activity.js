@@ -1066,18 +1066,19 @@ export function positiveTaskTerminalFact(row) {
 /**
  * Whether an unkeyed live row ends the unscoped Main turn: only a legacy model final does.
  * Voice confers no finality (DESIGN), so a System row concludes nothing; one answering a
- * submission names its `client_message_id`, and only that `Sending...` settles.
+ * submission names its `client_message_id`, and only that `Sending` settles.
  */
 export function unkeyedFrameEndsTurn(row) {
     return String(row?.role || '') !== 'system';
 }
 
 /**
- * One header reducer: offline > active managed work > pausing > direct turns > pending submissions
- * > finalizing wrap-up (ended work, any kind, in its post-task work) > access wait > queued work > answer
- * wait > unknown > paused > Project hold > idle. A queued task ranks below an unacknowledged submission; neither
- * admission nor a connected socket proves execution or readiness. Idle says Starting until the supervisor confirms
- * readiness. Tasks are counted independently, so one paused task never hides another working.
+ * One header producer: the word, its tone (live, queued, wait for the owner's own question, held, unknown, starting,
+ * offline, online) and its dots together; a call's operation, never its word, picks the tone. Precedence: offline >
+ * active managed work > pausing > direct turns > pending submissions > finalizing wrap-up (ended work in its post-task
+ * work) > access wait > queued > answer wait > unknown > paused > Project hold > idle, which says Starting until the
+ * supervisor confirms readiness: neither admission nor a connected socket proves execution. Tasks are counted
+ * independently, so one paused task never hides another working; `showDots` is the transcript's typing row.
  */
 export function computeDerivedChatStatus({
     isConnected = true,
@@ -1093,23 +1094,22 @@ export function computeDerivedChatStatus({
     supervisorStarting = false,
     modelActivity = null,
 } = {}) {
-    if (!isConnected) return { kind: 'offline', text: 'Reconnecting...', showDots: false };
-    const observed = modelActivity && { kind: modelActivity.waiting ? 'online' : 'thinking', text: modelActivity.text, showDots: modelActivity.motion };
-    if (hasActiveLiveCard || activeManagedCount > 0) return (activeManagedCount > 0 && observed) || { kind: 'thinking', text: 'Working...', showDots: !hasActiveLiveCard };
-    // Sent work still finishing under the owner's Pause: settling, not working.
-    if (pausingManagedCount > 0) return { kind: 'thinking', text: 'Pausing…', showDots: true };
-    if (activeDirectCount > 0) return observed || { kind: 'thinking', text: taskActivityPresentation({ phase: 'working' }).text, showDots: true };
-    if (pendingSubmissionsCount > 0) return { kind: 'thinking', text: 'Sending...', showDots: true };
-    if (finalizingCount > 0 || hasFinalizingLiveCard) return { kind: 'thinking', text: taskActivityPresentation({ phase: 'finalizing' }).text, showDots: true };
-    if (waitingModelCount > 0) return { kind: 'online', text: 'Waiting for access', showDots: false };
-    if (queuedManagedCount > 0) return { kind: 'thinking', text: 'Queued...', showDots: true };
-    if (waitingOwnerCount > 0) return { kind: 'online', text: tr('task.chip.waiting_for_answer', 'Waiting for your answer'), showDots: false };
-    if (unknownActivityCount > 0) return { kind: 'online', text: 'Activity unconfirmed', showDots: false };
-    // Mixed or unknown causes stay generic; paused work never claims Running.
-    if (pausedManagedCount > 0) return { kind: 'online', text: pausePhaseLabel('budget_paused', pausedCause), showDots: false };
-    if (projectWaitLabel) return { kind: 'online', text: projectWaitLabel, showDots: false };
-    if (supervisorStarting) return { kind: 'starting', text: 'Starting…', showDots: false };
-    return { kind: 'online', text: 'Online', showDots: false };
+    const view = (kind, text, tone, showDots = false) => ({ kind, text, tone, showDots, dots: tone === 'live' ? 'moving' : tone === 'queued' ? 'still' : 'one' });
+    if (!isConnected) return view('offline', 'Reconnecting…', 'offline');
+    const observed = modelActivity && view(modelActivity.waiting ? 'online' : 'thinking', modelActivity.text, ['unknown', 'queued'].includes(modelActivity.operation) ? modelActivity.operation : modelActivity.waiting ? 'held' : 'live', modelActivity.motion);
+    if (hasActiveLiveCard || activeManagedCount > 0) return (activeManagedCount > 0 && observed) || view('thinking', taskActivityPresentation({ phase: 'working' }).text, 'live', !hasActiveLiveCard);
+    if (pausingManagedCount > 0) return view('thinking', pausePhaseLabel('budget_pausing'), 'held', true); // settling under the owner's Pause
+    if (activeDirectCount > 0) return observed || view('thinking', taskActivityPresentation({ phase: 'working' }).text, 'live', true);
+    if (pendingSubmissionsCount > 0) return view('thinking', tr('task.chip.sending', 'Sending'), 'live', true);
+    if (finalizingCount > 0 || hasFinalizingLiveCard) return view('thinking', taskActivityPresentation({ phase: 'finalizing' }).text, 'live', true);
+    if (waitingModelCount > 0) return view('online', tr('task.chip.waiting_for_access', 'Waiting for access'), 'held');
+    if (queuedManagedCount > 0) return view('thinking', taskActivityPresentation({ phase: 'queued' }).text, 'queued', true);
+    if (waitingOwnerCount > 0) return view('online', tr('task.chip.waiting_for_answer', 'Waiting for your answer'), 'wait');
+    if (unknownActivityCount > 0) return view('online', tr('task.chip.activity_unconfirmed', 'Activity unconfirmed'), 'unknown');
+    if (pausedManagedCount > 0) return view('online', pausePhaseLabel('budget_paused', pausedCause), 'held'); // never claims Running
+    if (projectWaitLabel) return view('online', projectWaitLabel, 'held');
+    if (supervisorStarting) return view('starting', 'Starting…', 'starting');
+    return view('online', 'Online', 'online');
 }
 
 // Count census activity and unfinished cards; parked/waiting rows retain their own state.

@@ -601,7 +601,7 @@ def _finish_cyber_acceptance(ctx: _TaskAcceptanceContext, result: Any) -> bool:
     stance = ctx.llm_trace.get("acceptance_decision") or {}
     author = build_author_disposition(
         disposition=str(stance.get("agent_disposition") or ""), action="finish",
-        rationale=str(selected.get("rationale") or stance.get("agent_rationale") or "Explicit completion selection."),
+        rationale=str(selected.get("rationale") or stance.get("agent_rationale") or "").strip() or "Explicit completion selection.",
         subject_hash=delivery_subject_hash(tool_ctx, ctx.llm_trace, ctx.content),
         reviewer_signal="" if pending else str(getattr(result, "aggregate_signal", "") or ""),
         enforcement="advisory", source=str(selected.get("source") or "finish_task"),
@@ -629,12 +629,10 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     action = str(intent.get("author_action") or "finish")
     if action != "stop" and review_enforcement_blocks(_loop().get_review_enforcement()):
         return False
-    feedback = next((run for run in reversed(ctx.llm_trace.get("review_runs") or [])
-                     if isinstance(run, dict) and run.get("authority") == "host_root"
-                     and run.get("feedback_delivered")), None)
+    from ouroboros.loop_delivery import completion_feedback
+
     outcome = ctx.llm_trace.get("acceptance_review_outcome") or {}
-    if not feedback and outcome.get("feedback_delivered"):
-        feedback = outcome
+    feedback = completion_feedback(ctx.llm_trace) or None
     disposition = str(stance.get("agent_disposition") or "")
     if not intent or (disposition and disposition not in {"accepted", "rejected", "partial", "deferred"}):
         return False
@@ -647,6 +645,8 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
         from ouroboros.acceptance_settlement import acceptance_wait_chosen, panel_awaiting_this_turn
 
         awaited = panel_awaiting_this_turn(ctx.tools._ctx, ctx.llm_trace)
+        if awaited is not None and acceptance_run_pending(awaited):
+            return False  # Delivery owns a running panel: wait, or release while the author stays for criticism.
         waiting = awaited or feedback
         # A no-panel host outcome (refused launch, unavailable review) has no
         # reviewer left to settle: its exposure is the settled feedback. Only a
@@ -654,6 +654,7 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
         if acceptance_wait_chosen(ctx.tools._ctx) and waiting and waiting is not outcome and (
                 acceptance_run_pending(waiting) or not waiting.get("settled_feedback_delivered")):
             return False
+        from ouroboros.acceptance_settlement import delivery_approves_clean_feedback
         from ouroboros.loop_delivery import delivery_evidence_fingerprint
         from ouroboros.tool_capabilities import completion_observation_calls
 
@@ -662,14 +663,16 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
                 or intent.get("owner_directives") != len(getattr(ctx.tools._ctx, "_owner_directives", []) or [])
                 or intent.get("evidence_fingerprint") != delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)):
             return False
+        if delivery_approves_clean_feedback(ctx.tools._ctx, ctx.llm_trace, feedback, ctx.review_binding["binding_hash"]):
+            return False  # Clean approval stays clean: ordinary delivery approves it at $0.
     from ouroboros.review_records import build_author_disposition
 
     author = build_author_disposition(
-        disposition=disposition, rationale=str(stance.get("agent_rationale") or ""),
+        disposition=disposition, rationale=str(stance.get("agent_rationale") or "").strip() or "Explicit completion selection.",
         subject_hash=ctx.review_binding["binding_hash"],
         reviewer_signal=str((feedback or {}).get("aggregate_signal") or ""),
         enforcement="blocking" if review_enforcement_blocks(_loop().get_review_enforcement()) else "advisory",
-        action=action,
+        action=action, source=str((getattr(ctx.tools._ctx, "_completion_selected", None) or {}).get("source") or "author"),
     )
     from ouroboros.task_results import project_task_acceptance_review_capacity
 
@@ -822,7 +825,7 @@ def _apply_task_acceptance_result(
         capsule = (f"[Acceptance review outcome] {result.aggregate_signal}. "
                    + _slot_cause_clause(result)
                    + " No clean acceptance was established. Inspect this outcome, request another review only if useful and permitted, "
-                   "or choose author_action='stop'. Advisory may explicitly finish with a rationale; Blocking still requires fresh approval.")
+                   "or choose author_action='stop' with a rationale. Advisory may explicitly finish; Blocking still requires fresh approval.")
     if pass_ok:
         _loop()._set_acceptance_decision(ctx.llm_trace, {
             "status": ACCEPTANCE_REVISION_REQUESTED,
@@ -944,7 +947,7 @@ def _offer_acceptance_refusal(ctx: _TaskAcceptanceContext, reason: str, *, host_
         (f"Acceptance host processing failed: {reason}. Original reviewer evidence is retained; no replacement review was called. " if host_failure else
          f"Acceptance review could not start: {reason}. No new reviewer was called. ") +
         "You may preserve corrections or stop; Blocking grants no advancement without fresh review. "
-        "Advisory may finish explicitly with a rationale."), "review_feedback": [{
+        "Advisory may finish explicitly; stop requires a rationale."), "review_feedback": [{
             "task_id": ctx.task_id, "outcome_binding_hash": binding}]})
     _loop()._set_acceptance_decision(ctx.llm_trace, {"status": ACCEPTANCE_REVISION_REQUESTED,
         "reason": "review_outcome_received", "source": "task_acceptance_review",
@@ -1129,7 +1132,7 @@ def _prior_acceptance_run(
 
     def _matches(run: Any) -> bool:
         return isinstance(run, dict) and (
-            str(run.get("binding_hash") or "") == binding_hash
+            bool(binding_hash and str(run.get("binding_hash") or "") == binding_hash)
             or bool(identity and str(run.get("paid_identity") or "") == identity)
         )
 
