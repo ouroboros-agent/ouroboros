@@ -879,7 +879,9 @@ def test_the_call_view_opens_with_memory_the_web_and_the_room_chat():
     from ouroboros.live_call_route import CALL_INITIAL_TOOL_NAMES
     from ouroboros.tool_capabilities import COGNITIVE_MEMORY_TOOL_NAMES
 
-    assert set(CALL_INITIAL_TOOL_NAMES) == set(COGNITIVE_MEMORY_TOOL_NAMES) | {"web_search", "send_user_message"}
+    # Pointers in the call view are read_file addresses, and long work becomes a task, from the first open.
+    assert set(CALL_INITIAL_TOOL_NAMES) == set(COGNITIVE_MEMORY_TOOL_NAMES) | {
+        "web_search", "send_user_message", "read_file", "promote_chat_to_task"}
 
 
 def test_a_call_nobody_attaches_to_ends_after_the_rejoin_grace(harness, monkeypatch, tmp_path):
