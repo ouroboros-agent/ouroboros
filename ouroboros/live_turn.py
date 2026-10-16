@@ -166,6 +166,7 @@ class _LiveCall:
         self.closing = False
         self.reconnecting = False
         self.reconnects = 0
+        self.unproven_reopens = 0  # sessions reopened since one last completed a response
         self.resume_handle = ""
         # (session epoch, its opening config): the first response's text count becomes the route's
         # density witness unless other text reached the session before it.
@@ -436,6 +437,12 @@ class _LiveCall:
     async def _reconnect(self, reason: str, *, resume: bool) -> None:
         if self.closing or self.reconnecting:
             return
+        if self.unproven_reopens >= RECONNECT_ATTEMPTS:
+            # Sessions that open and die before answering anything are not a lost connection to
+            # resume again: each reopen is paid, so the call ends with its next step instead.
+            self.failure = ("live_engine_unavailable", f"reopened sessions kept ending ({reason})")
+            self._begin_close("reconnect_failed", detail=f"the session kept ending right after it opened ({reason})")
+            return
         self.reconnecting, self.state = True, STATE_RECONNECTING
         self.hub.send_state(STATE_RECONNECTING, reason)
         old, self.engine = self.engine, None
@@ -452,7 +459,7 @@ class _LiveCall:
         for attempt_no in range(RECONNECT_ATTEMPTS):
             try:
                 await self._open_engine(resume_handle=handle)
-                self.reconnects += 1
+                self.reconnects, self.unproven_reopens = self.reconnects + 1, self.unproven_reopens + 1
                 self.reconnecting = False
                 return
             except Exception:
@@ -895,6 +902,7 @@ class _LiveCall:
         key = event.response_id or event.item_id
         attempt = self._attempt_for(key, usage=dict(event.usage), raw_usage=dict(event.raw_usage), status=event.status)
         self.attempts.pop(key, None)
+        self.unproven_reopens = 0  # a completed response proves the session it came from
         if self.witness and self.witness[0] == self.epoch:  # counted on the ledger thread, off the audio loop
             opened, tokens = self.witness[1], int(event.usage.get("text_input_tokens") or 0)
             self._record(self._settle_safely, lambda: record_density_witness(

@@ -46,7 +46,9 @@ def transport_error(exc: Exception) -> EngineError:
     A server close that names its reason (Gemini closes a session over quota with
     1011 and the sentence "You exceeded your current quota…") keeps that sentence and
     is not retried: reopening cannot change it, and the owner reads the provider's own
-    words. A close without a reason is a lost connection and resumes.
+    words. A server error close (1011) without a reason ends the same way, with the
+    owner's Try again: automatic reopening would repeat a paid session the server just
+    failed. A connection lost without a close frame (1006) or closed normally resumes.
     """
     status = getattr(getattr(exc, "response", None), "status_code", None)
     received = getattr(exc, "rcvd", None)
@@ -66,6 +68,8 @@ def transport_error(exc: Exception) -> EngineError:
         return EngineError("protocol", "Live provider rejected the websocket payload.")
     if code is not None and code not in (1000, 1001, 1006) and sentence:
         return EngineError("provider_closed", sentence)
+    if code == 1011:
+        return EngineError("provider_closed", "The live provider ended the session with an internal error.")
     return EngineError("transport", "Live provider connection lost; delivery may be incomplete.", True)
 
 

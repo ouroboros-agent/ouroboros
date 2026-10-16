@@ -129,6 +129,47 @@ def test_the_routes_density_scales_the_replay_and_the_kept_view():
     assert start == dense_start == 4_000 and dense_kept > kept  # the room is fixed; the view it keeps weighs more
 
 
+def test_a_replayed_row_weighs_its_tool_call_arguments_too():
+    from types import SimpleNamespace
+
+    from ouroboros.live_session_view import history_view
+
+    fact = SimpleNamespace(window_tokens=8_192 + 4_000, reply_allowance_tokens=8_192)
+    call = {"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": "x" * 40_000}}
+    messages = [{"role": "system", "content": "view"},
+                {"role": "user", "content": "please write it"},
+                {"role": "assistant", "content": "", "tool_calls": [call]},  # empty words, 10k tokens of arguments
+                {"role": "tool", "tool_call_id": "c1", "content": "written"}]
+    view = history_view(fact, messages, [])
+    assert not any(item.get("tool_calls") for item in view)  # the arguments do not ride in for free
+    assert view[0]["content"].startswith("[Earlier in this call:") and view[-1]["content"] == "written"
+    small = dict(call, function={"name": "write_file", "arguments": "{}"})
+    messages[2] = {"role": "assistant", "content": "", "tool_calls": [small]}
+    assert any(item.get("tool_calls") for item in history_view(fact, messages, []))  # a small call still replays
+
+
+def test_sessions_that_die_before_answering_end_the_call_instead_of_reopening_forever(harness, monkeypatch):
+    from ouroboros.gateways.realtime_engine import ResponseDone
+
+    monkeypatch.setattr(live_turn, "RECONNECT_ATTEMPTS", 2)
+    h = harness()
+    engine = h.start()
+    engine.push(ResponseDone(item_id="a1", status="completed", usage={}))  # the first session answered
+    engine.end_stream()
+    assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
+    second = h.llm.engines[1]
+    second.push(ResponseDone(item_id="a2", status="completed", usage={}))  # an answer proves the reopened one too
+    second.end_stream()
+    assert _wait_for(lambda: len(h.llm.engines) == 3 and h.llm.engines[2].config is not None)
+    h.llm.engines[2].end_stream()  # from here every reopened session dies before answering anything
+    assert _wait_for(lambda: len(h.llm.engines) == 4 and h.llm.engines[3].config is not None)
+    h.llm.engines[3].end_stream()
+    text, usage, _trace = h.finish()
+    assert len(h.llm.engines) == 4  # two unproven reopens, then no more paid sessions
+    assert usage["live_call"]["ended"] == "reconnect_failed"
+    assert any(word[0] == "closed" and "kept ending" in word[1] and word[2] == "retry" for word in h.hub.words)
+
+
 def _density(root):
     from ouroboros.capability_evidence import resolve_main_token_density, route_fingerprint
 

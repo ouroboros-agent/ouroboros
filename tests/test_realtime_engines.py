@@ -475,8 +475,10 @@ def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
     assert error.kind == "provider_closed" and not error.retryable
     assert error.message.startswith("You exceeded your current quota") and "AIza" not in error.message
     assert "https://" not in error.message
-    lost = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1011, reason="")))
-    assert lost.kind == "transport" and lost.retryable  # a close without words is a lost connection: resume
+    failed = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1011, reason="")))
+    assert failed.kind == "provider_closed" and not failed.retryable  # a server error without words: Try again
+    lost = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1006, reason="")))
+    assert lost.kind == "transport" and lost.retryable  # a connection lost without a close frame resumes
     normal = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1000, reason="bye")))
     assert normal.kind == "transport" and normal.retryable
     too_big = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1007, reason=(

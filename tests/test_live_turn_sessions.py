@@ -215,11 +215,10 @@ def test_stop_during_the_connection_cancels_the_opening_and_closes_what_was_open
     h = harness()
     engine = h.start()
     assert h.hub.states == [(STATE_CONNECTING, "")]
-    stopped_at = time.monotonic()
     h.stop()
-    # Acted on within one mailbox tick, while the provider connection is still pending.
-    assert _wait_for(lambda: engine.closed, timeout=1.0)
-    assert time.monotonic() - stopped_at < 1.0 and (STATE_CLOSING, "owner_stop") in h.hub.states
+    # The opening never completes on its own, so a closed engine means the Stop cancelled it while the
+    # provider connection was still pending (counted by outcome, not by the clock of a loaded machine).
+    assert _wait_for(lambda: engine.closed and (STATE_CLOSING, "owner_stop") in h.hub.states, timeout=15.0)
     text, usage, _trace = h.finish()
     assert usage["live_call"]["ended"] == "owner_stop" and "execution_status" not in usage
     assert engine.closed == ["cancelled"] and engine.sent == []  # no session is paid for

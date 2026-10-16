@@ -67,6 +67,14 @@ def history_rows(messages: Sequence[Mapping]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _replayed_tokens(item: Mapping) -> int:
+    """What one replayed row weighs: its text, its images (the bounded proxy) and the earlier tool
+    calls it carries as text, whose arguments can dwarf an assistant row's words."""
+    from ouroboros.context_fit import estimate_context_prompt_tokens
+
+    return int(estimate_context_prompt_tokens([dict(item)]))
+
+
 def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[Mapping],
                  ratio: float = 1.0) -> Tuple[Dict[str, Any], ...]:
     """The newest rows a fresh session can replay within half the room beside the call view.
@@ -84,8 +92,7 @@ def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[
     kept: List[Dict[str, Any]] = []
     spent = 0
     for item in reversed(rows):
-        content = item.get("content")
-        cost = math.ceil(estimate_tokens(content if isinstance(content, str) else text_of(content)) * ratio)
+        cost = math.ceil(_replayed_tokens(item) * ratio)
         if spent + cost > budget:
             break
         kept.append(item)
