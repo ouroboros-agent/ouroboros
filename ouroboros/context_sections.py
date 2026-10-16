@@ -54,9 +54,10 @@ def build_knowledge_sections(
         if overview_text.strip():
             reader = f"knowledge_read(topic='{OVERVIEW_TOPIC}', scope='global')"
             heading = f"## Shared understanding\n\nSource: {reader}.\n\n"
-            # The whole authored orientation stays inline: the overview marks no complete
-            # operative view, and no structural slice of it (a first paragraph) is one.
-            sections.append(HostSection("shared_understanding", heading + overview_text, reader=reader))
+            # The whole authored orientation is the full text. Its operative view is its own
+            # outline and the summary Ouroboros authored for it, never a slice of its prose.
+            sections.append(HostSection("shared_understanding", heading + overview_text,
+                                        _shared_understanding_view(overview, overview_text, reader), reader=reader))
         else:
             sections.append(_SHARED_UNDERSTANDING_GAP)  # present but empty is still unauthored
     except FileNotFoundError:
@@ -81,13 +82,19 @@ def build_knowledge_sections(
             text = f"Knowledge navigation unavailable: {type(exc).__name__}; knowledge_list(scope={address.scope!r})."
         if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
             log.warning("context: %s is large (%d chars)", label, len(text))
-        sections.append(f"{header}\n\n{text}")
+        # The durable knowledge index is tier zero: an id, never an operative view.
+        sections.append(HostSection("knowledge_index" if address is global_address else "project_knowledge_index",
+                                    f"{header}\n\n{text}"))
+    patterns_reader = "knowledge_read(topic='patterns', scope='global')"
+    pointer = f"Pattern Register details: {patterns_reader}."
     if include_pattern_body:
         text = safe_read(env.drive_path("memory/knowledge/patterns.md"))
         if text.strip():
-            sections.append(f"{pattern_header}\n\n{text}")
+            # The register's index entry stays in the knowledge index; its body is one read away.
+            sections.append(HostSection("pattern_register", f"{pattern_header}\n\n{text}",
+                                        f"{pattern_header}\n\n{pointer}", reader=patterns_reader))
     if not include_pattern_body:
-        sections.append("Pattern Register details: knowledge_read(topic='patterns', scope='global').")
+        sections.append(pointer)
     if pid:
         # Bounded per-project journal tail + workpad (multi-project, v6.32.0):
         # the project's durable progress memory rides along with its knowledge.
@@ -113,6 +120,22 @@ def build_knowledge_sections(
         except Exception:
             log.debug("project journal/workpad context injection failed", exc_info=True)
     return sections
+
+
+def _shared_understanding_view(overview: Any, text: str, reader: str) -> str:
+    """The overview's own headings verbatim, where its authored summary is, and its size.
+
+    The summary is the note's own ``summary`` field, rendered with the overview's entry in
+    the knowledge index; a note without one is a named gap, never prose taken from the body.
+    """
+    source = overview.source
+    headings = [source.text_at(item.span).strip() for item in source.headings] if source is not None else []
+    summary = ("Its authored summary is the overview entry of the knowledge index in this context"
+               if overview.summary.strip() else "It has no authored summary yet (no summary field)")
+    outline = "\n".join(headings) if headings else (
+        f"(its headings are unavailable: {overview.parse_error or 'the source did not parse'})")
+    return (f"## Shared understanding\n\nIts own headings, verbatim:\n{outline}\n\n{summary}; full text: {reader}. "
+            f"Its body is {len(text)} characters under {len(headings)} headings.")
 
 
 def _build_registry_digest(env: Any) -> str:

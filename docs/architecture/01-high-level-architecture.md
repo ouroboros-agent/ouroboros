@@ -6,6 +6,7 @@ Modules, devtools, gateway/CLI, host and data map. Packaged launcher recovers fa
 User → launcher.py (desktop/native) — the shared lifecycle; an immutable packaged shell, or source over an immutable seed on Android and the managed container (Runtime topology below; §2)
 launcher.py spawns server.py (Starlette+uvicorn) — HTTP + WebSocket on configurable host:port; bind host via `OUROBOROS_SERVER_HOST` (§4; §7)
 devtools/live_call_probe.py — Real live-call scenarios, synthetic owner audio, transcript and ledger evidence (§1 Devtools boundary)
+devtools/call_context_measure.py — A call's Gemini instruction on a disposable data copy: part sizes, relocated sections, counters (§1 Devtools boundary)
 web/ — Web UI, a SPA of ES modules; chapter 3 owns the pages and the modules not listed here (§3)
   modules/call.js — Room call control, microphone and socket lifetime, captions, playback acks (§6 Live calls)
   modules/call_worklet.js — Call PCM frames, device-rate capture, epoch-aware playback (§6 Live calls)

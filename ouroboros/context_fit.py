@@ -8,6 +8,7 @@ resolver so ``ouroboros.context`` remains the public compatibility surface.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -19,7 +20,7 @@ from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
 
 from ouroboros.context_layout import reference_doc_sections
 from ouroboros.reference_books import ReferenceBook
-from ouroboros.section_floor import HostSection, fit_host_sections, render_sections
+from ouroboros.section_floor import HostSection, capture_sections, fit_host_sections
 # Tool-result delivery (the whole-batch projection under the measured frame)
 # lives in ``tool_result_delivery``; the consolidator imports its contract here.
 from ouroboros.tool_result_delivery import project_tool_result_batch  # noqa: F401
@@ -138,6 +139,9 @@ class ContextFitPlan:
     evidence_source: str = ""
     nano_projection: Optional[ContextFitProjection] = None
     core: Optional["ContextCore"] = None  # the capture a new route re-renders the memory view from
+    # A live call's view: every host section with an operative view in that form from the
+    # first request, Nano from the start (``live_call_route.call_context_plan``).
+    call_view: bool = False
 
     def reproject_for_route(self, *, window_tokens: int, known_window: bool, ratio: float, output_reserve: int,
                             tool_schemas: Optional[List[Dict[str, Any]]], start_mode: Optional[str] = None,
@@ -192,7 +196,7 @@ class ContextFitPlan:
                           for mode in memory_floor.MODES} if snapshot is not None else None,
                     kept_host={mode: self.projection(mode).memory_facts.get("host_sections_addressed", ())
                                for mode in memory_floor.MODES},
-                    saving={start: math.ceil(deficit / max(ratio, 0.01))})
+                    saving={start: math.ceil(deficit / max(ratio, 0.01))}, call_view=self.call_view)
 
         def narrowed(projection: ContextFitProjection) -> bool:
             # A view whose level, budget and mode line did not move keeps its bytes (its floor note names its
@@ -308,6 +312,9 @@ class ContextCore:
     dynamic_head_sections: Tuple[HostSection, ...] = ()
     section_root: str = ""
     section_task_id: str = ""
+    # Block B's captured parts (subagents, review facts, identity, WORLD, deep review); their
+    # join is ``semi_stable_text``. Empty: the text is one part (a declared core, a test double).
+    semi_stable_sections: Tuple[HostSection, ...] = ()
 
 
 def _render_context_system_content(
@@ -326,13 +333,14 @@ def _render_context_system_content(
     return _system_blocks(core, _governance_blocks(env, core, mode=mode), story, room)
 
 
-def _governance_blocks(env: Any, core: ContextCore, *, mode: str) -> Tuple[str, ...]:
+def _governance_blocks(env: Any, core: ContextCore, *, mode: str) -> Tuple[Any, str]:
+    """``(A' parts, D)``: SYSTEM, BIBLE and the reference sections as identified parts, and the Max handbook."""
     # D-ARCH (owner, 2026-08-08): the reference-doc form follows the RENDERED
     # mode directly — ARCHITECTURE is full in max for every task class and the
     # nav map in low; DEVELOPMENT inclusion is the caller's mode-independent
     # decision carried on the core (the former per-task force_low_docs lever is
     # gone: workspace binding no longer shapes the docs).
-    static_parts = [core.base_prompt, "## BIBLE.md\n\n" + core.bible_md]
+    static_parts = [HostSection("system", core.base_prompt), HostSection("bible", "## BIBLE.md\n\n" + core.bible_md)]
     sections, development = reference_doc_sections(
         env,
         context_mode="low" if core.compact_reference_docs else mode,
@@ -343,20 +351,57 @@ def _governance_blocks(env: Any, core: ContextCore, *, mode: str) -> Tuple[str, 
     )
     static_parts.extend(sections)
     static_parts.extend(core.reference_book_errors)
-    return ("\n\n".join(static_parts), development)
+    return (capture_sections(static_parts, prefix="governance"), development)
 
 
-def _system_blocks(core: ContextCore, governance: Tuple[str, ...], story: str = "", room: str = "", *,
+def _parts_of(value: Any) -> Tuple[str, ...]:
+    """A block's captured parts; a plain text (an older core, a test double) is one part."""
+    if isinstance(value, str):
+        return (value,) if value else ()
+    return tuple(value)
+
+
+def _texts(parts: Any, addressed: Mapping[str, str]) -> List[str]:
+    """What this projection shows of each captured part: its whole text, or its floor address."""
+    return [addressed.get(part.section_id, part.full_text) if isinstance(part, HostSection) else part
+            for part in _parts_of(parts)]
+
+
+def _block(*groups: List[str]) -> str:
+    """``"\\n\\n".join`` inside each group, then over the non-empty groups: the joins the system text always had."""
+    return "\n\n".join(text for text in ("\n\n".join(group) for group in groups) if text)
+
+
+def _system_blocks(core: ContextCore, governance: Tuple[Any, ...], story: str = "", room: Any = "", *,
                    addressed: Optional[Mapping[str, str]] = None) -> List[Dict[str, Any]]:
-    # All stable items precede C, including D only when the captured core calls
-    # for the full handbook. Never create an empty cache boundary.
-    stable = (*governance, "\n\n".join(part for part in (core.semi_stable_text, story) if part))
-    head = render_sections(core.dynamic_head_sections, addressed) if addressed and core.dynamic_head_sections else core.dynamic_head_text
-    tail = render_sections(core.dynamic_sections, addressed) if addressed and core.dynamic_sections else core.dynamic_text
-    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}
-            for text in stable if text.strip()] + [
-        {"type": "text", "text": "\n\n".join(part for part in (head, room, tail) if part)},
-    ]
+    """``[A'▸, D?▸, B▸, C]`` from the captured parts, each shown whole or by its floor address.
+
+    All stable items precede C, including D only when the captured core calls for the full
+    handbook; an empty stable block is never sent. ``room`` is the memory view's room text,
+    or its parts (a call's live rooms follow it).
+    """
+    shown = addressed or {}
+    stable = [*(_block(_texts(value, shown)) for value in governance),
+              _block(_texts(core.semi_stable_sections or core.semi_stable_text, shown), [story] if story else [])]
+    changing = _block(_texts(core.dynamic_head_sections or core.dynamic_head_text, shown), _texts(room, shown),
+                      _texts(core.dynamic_sections or core.dynamic_text, shown))
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}} for text in stable if text.strip()] + [
+        {"type": "text", "text": changing}]
+
+
+def _call_live_rooms(snapshot: Any) -> Optional[HostSection]:
+    """A call's other live rooms as one host section: their names and state stay, notes and words one read away.
+
+    ``memory_view`` draws both forms: the whole block, and the same rooms without their
+    notes and words (each room's facts line still counts its notes; its reader opens it).
+    """
+    if snapshot is None or not snapshot.active or not snapshot.live_rooms:
+        return None
+    from ouroboros import memory_view as mv
+
+    alone = dataclasses.replace(snapshot, owner_words="", marks=(), room=None)
+    bare = tuple({**item, "notes": [], "words": []} for item in snapshot.live_rooms)
+    return HostSection("live_rooms", mv.render_room(alone), mv.render_room(dataclasses.replace(alone, live_rooms=bare)))
 
 
 def seal_task_transcript(
@@ -789,7 +834,7 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
                       current_messages: Optional[List[Dict[str, Any]]] = None,
                       kept: Optional[Mapping[str, Any]] = None, saving: Optional[Mapping[str, int]] = None,
                       kept_host: Optional[Mapping[str, Any]] = None,
-                      select: Optional[str] = None,
+                      select: Optional[str] = None, call_view: bool = False,
                       ) -> Tuple[Dict[str, Tuple[List[Dict[str, Any]], Dict]], str]:
     """Each mode's ``(system content, view receipt)`` and the mode the task starts in.
 
@@ -802,7 +847,9 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
     (``ContextFitPlan.reproject_for_route``).
     Host sections answer only to physical pressure on the chosen memory view,
     before memory's window ladder. Their savings change the fixed part used by
-    ``mode_views``; both ladders use the same immutable capture.
+    ``mode_views``; both ladders use the same immutable capture. ``call_view`` (a live
+    call) addresses every host section that has an operative view from the first
+    request, and the other live rooms become one such section beside the memory view.
     """
     form = {mode: "low" if core.compact_reference_docs or mode == "nano" else mode for mode in ("max", "low", "nano")}
     from ouroboros import memory_floor
@@ -811,10 +858,15 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
     names = [schema["function"]["name"] for schema in tool_schemas or []] if resident else None
     sent = {mode: select_tool_schemas(tool_schemas or [], context_mode=mode, schema_names=names) for mode in form}
     snapshot = snapshot_from_json(core.memory_view_json) if core.memory_view_json else None
+    live = _call_live_rooms(snapshot) if call_view else None
+    if live is not None:  # the memory floor then weighs the view without them; the host floor holds them
+        live_count, snapshot = len(snapshot.live_rooms), dataclasses.replace(snapshot, live_rooms=())
+    extra = (live,) if live is not None else ()
     fixed, addressed, host_facts, remaining = {}, {}, {}, dict(saving or {})
     for mode in form:
         def measure(overrides, story="", room=""):
-            return _request_tokens(_system_blocks(core, governance[form[mode]], story, room, addressed=overrides),
+            return _request_tokens(_system_blocks(core, governance[form[mode]], story, tuple(
+                part for part in (room, *extra) if part), addressed=overrides),
                 user_content_json, supplementary_messages_json=core.supplementary_messages_json,
                 current_messages=current_messages) + tool_schema_tokens(list(sent[mode].schemas))
 
@@ -834,11 +886,13 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
                 non_memory_tokens=original_fixed, kept=None if kept is None else kept.get(shown))
         from ouroboros.context_budget import context_mode_limits
 
+        governed = tuple(part for part in _parts_of(governance[form[mode]][0]) if isinstance(part, HostSection))
         addressed[mode], host_facts[mode] = fit_host_sections(
-            (*core.dynamic_sections, *core.dynamic_head_sections), root=core.section_root, task_id=core.section_task_id,
+            (*core.dynamic_sections, *core.dynamic_head_sections, *core.semi_stable_sections, *extra, *governed),
+            root=core.section_root, task_id=core.section_task_id,
             measure=lambda overrides: measure(overrides, story, room), window_tokens=window_tokens,
             known_window=known_window, output_reserve=context_mode_limits(mode, preferred, output_reserve)[1],
-            ratio=ratio, kept=carried)
+            ratio=ratio, kept=carried, operative=call_view)
         fixed[mode] = measure(addressed[mode])
         prior_saving = sum(int(row.get("tokens_saved") or 0) for row in carried)
         remaining[mode] = max(0, remaining.get(mode, 0) - max(0, original_fixed - fixed[mode] - prior_saving))
@@ -850,9 +904,14 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
         fixed_tokens_by_mode=fixed, tool_names=None if tool_schemas is None else {m: sent[m].chosen for m in form},
         window_tokens=window_tokens, known_window=known_window, output_reserve=output_reserve, ratio=ratio,
         allow_mode_lowering=preferred != "max" or start in {"low", "nano"}, kept=kept, saving=remaining, select=select)
-    return {mode: (_system_blocks(core, governance[form[mode]], story, room, addressed=addressed[mode]),
-                   {**receipt, **({"host_sections_addressed": host_facts[mode]} if host_facts[mode] else {})})
-            for mode, (story, room, receipt) in views.items()}, start
+    out = {}
+    for mode, (story, room, receipt) in views.items():
+        if live is not None:  # the receipt counts the rooms the call view shows beside the memory view
+            receipt = {**receipt, "blocks": {**receipt["blocks"], "live_rooms": live_count}}
+        out[mode] = (_system_blocks(core, governance[form[mode]], story, tuple(part for part in (room, *extra) if part),
+                                    addressed=addressed[mode]),
+                     {**receipt, **({"host_sections_addressed": host_facts[mode]} if host_facts[mode] else {})})
+    return out, start
 
 
 def build_context_fit_plan(
@@ -865,6 +924,8 @@ def build_context_fit_plan(
     tool_schemas: Optional[List[Dict[str, Any]]] = None,
     known_window_tokens: Optional[int] = None,
     known_output_reserve_tokens: Optional[int] = None,
+    known_route: Optional[Mapping[str, str]] = None,
+    call_view: bool = False,
 ) -> ContextFitPlan:
     """Deterministically project one captured core into ordinary-task Max, Low and Nano.
 
@@ -874,6 +935,10 @@ def build_context_fit_plan(
     mode shows only by address (``memory_floor.render_view_for_mode``).
     ``known_output_reserve_tokens`` is a caller-resolved route's own reply allowance
     (a live call's realtime route); without it the reserve is Main's send cap.
+    ``known_route`` (``provider``, ``model``, ``route_fp``) is that caller-resolved route
+    itself: its identity names the window evidence and the calibration witness, and
+    Main's route is not resolved. ``call_view`` renders a live call's view
+    (``_view_projections``), which starts in Nano.
     """
     preferred = str(preferred_mode or "max").strip().lower()
     if preferred not in {"low", "max", "nano"}:
@@ -883,11 +948,17 @@ def build_context_fit_plan(
     is_subagent = str(
         task.get("delegation_role") or meta.get("delegation_role") or ""
     ).strip().lower() == "subagent"
-    try:
-        route, evidence = route_resolver(task, allow_fetch=not is_subagent and known_window_tokens is None)
-    except Exception:
-        log.debug("Context-fit route evidence unavailable; preserving Max", exc_info=True)
-        route, evidence = _failed_route_evidence(task)
+    if known_route is not None:
+        route = {"provider": str(known_route["provider"]), "model": str(known_route["model"]), "use_local": False,
+                 "model_role": str(known_route.get("model_role") or "live_call")}
+        evidence = SimpleNamespace(route_fp=str(known_route["route_fp"]), status="unknown", stale=False,
+                                   window_tokens=0, source="caller_route")
+    else:
+        try:
+            route, evidence = route_resolver(task, allow_fetch=not is_subagent and known_window_tokens is None)
+        except Exception:
+            log.debug("Context-fit route evidence unavailable; preserving Max", exc_info=True)
+            route, evidence = _failed_route_evidence(task)
 
     if known_window_tokens is not None:
         if isinstance(known_window_tokens, bool) or not isinstance(known_window_tokens, int) or known_window_tokens <= 0:
@@ -920,7 +991,8 @@ def build_context_fit_plan(
     contents, initial_mode = _view_projections(
         core, {form: _governance_blocks(env, core, mode=form) for form in ("max", "low")}, core.user_content_json,
         preferred=preferred, tool_schemas=tool_schemas, window_tokens=int(evidence.window_tokens or 0),
-        known_window=known_window, output_reserve=output_reserve, ratio=ratio)
+        known_window=known_window, output_reserve=output_reserve, ratio=ratio,
+        start="nano" if call_view else None, call_view=call_view)
 
     from ouroboros.context_budget import context_mode_limits
     from ouroboros.tool_policy import select_tool_schemas
@@ -1033,4 +1105,5 @@ def build_context_fit_plan(
         } if route["provider"] == "claudexor" else {},
         evidence_source=str(getattr(evidence, "source", "") or ""),
         core=core,
+        call_view=call_view,
     )

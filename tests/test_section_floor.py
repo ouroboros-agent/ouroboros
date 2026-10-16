@@ -204,24 +204,50 @@ def test_runtime_keeps_scalars_authority_and_decisions_while_counting_observatio
     assert section.operative_view.endswith(ledger) and data == before
 
 
-def test_shared_understanding_stays_whole_since_its_source_marks_no_operative_view(tmp_path):
+def test_shared_understanding_view_is_its_outline_its_summary_place_and_its_size(tmp_path):
     from ouroboros.knowledge import resolve_knowledge_address, write_knowledge_note
 
     env, _memory = _make_env_and_memory(tmp_path)
-    # The second paragraph is as much the authored orientation as the first.
+    address = resolve_knowledge_address(env.drive_root, "overview", "global")
+    # The second paragraph is as much the authored orientation as the first: no slice of prose is a view.
     orientation = ("# Our orientation\n\nWe intend to understand the entire situation.\n\n"
                    "We commit to telling the owner before any irreversible step.\n")
-    body = "\n## Later material\n\nDetails that still belong to the shared understanding.\n" * 100
-    write_knowledge_note(resolve_knowledge_address(env.drive_root, "overview", "global"), orientation + body)
+    body = "".join(f"\n## 2026-10-{day:02d} — dated block\n\nDetails that belong to the shared understanding.\n"
+                   f"\n### A finer point of day {day}\n\nMore.\n" for day in range(1, 11))
+    write_knowledge_note(address, orientation + body)
     section = context.build_knowledge_sections(env)[0]
     assert isinstance(section, HostSection) and section.section_id == "shared_understanding"
-    assert section.full_text.endswith(orientation + body) and section.operative_view is None
-    # Under physical window pressure the floor addresses other host sections, never this one.
+    assert section.full_text.endswith(orientation + body)
+    view = section.operative_view
+    headings = ["# Our orientation"] + [line for day in range(1, 11) for line in (
+        f"## 2026-10-{day:02d} — dated block", f"### A finer point of day {day}")]
+    assert "\n".join(headings) in view  # its own headings, verbatim and in order
+    assert "We intend" not in view and "We commit" not in view and "Details that" not in view
+    assert "It has no authored summary yet (no summary field); full text: " \
+           "knowledge_read(topic='overview', scope='global')." in view
+    source_heading = "## Shared understanding\n\nSource: knowledge_read(topic='overview', scope='global').\n\n"
+    assert section.full_text.startswith(source_heading)
+    assert f"Its body is {len(section.full_text) - len(source_heading)} characters under 21 headings." in view
+    # Ouroboros's own summary field is named where it already renders: the knowledge index.
+    from ouroboros.knowledge import read_knowledge_note
+
+    assert write_knowledge_note(address, "", mode="edit", expected_revision=read_knowledge_note(address).revision,
+                                summary="Where we stand and what we hold to.").ok
+    summarized = context.build_knowledge_sections(env)
+    assert "Its authored summary is the overview entry of the knowledge index in this context" \
+        in summarized[0].operative_view
+    index = summarized[1]
+    assert index.section_id == "knowledge_index" and index.operative_view is None
+    assert "Where we stand and what we hold to." in index.full_text
+    # Under physical window pressure the floor addresses it like any host service block.
     addressed, receipts = section_floor.fit_host_sections(
         [section, _service("runtime", 20_000)], root=str(tmp_path), task_id="task-1",
         measure=lambda _addressed: 10 ** 6, window_tokens=50_000, known_window=True,
         output_reserve=RESERVE, ratio=1.0)
-    assert set(addressed) == {"runtime"} and [row["section_id"] for row in receipts] == ["runtime"]
+    assert set(addressed) == {"runtime", "shared_understanding"}
+    row = next(row for row in receipts if row["section_id"] == "shared_understanding")
+    assert (tmp_path / row["path"]).read_text(encoding="utf-8") == section.full_text
+    assert addressed["shared_understanding"].startswith(view)
 
 
 def test_health_keeps_every_nonpassing_line_and_counts_passes(tmp_path, monkeypatch):
