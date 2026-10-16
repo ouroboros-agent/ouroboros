@@ -20,9 +20,9 @@ from ouroboros.call_protocol import (
     STATE_CLOSING, STATE_CONNECTING, STATE_LIVE, PeerAudio, PeerInfo, PeerJoined, PeerLeft,
 )
 from ouroboros.gateways.realtime_engine import (
-    ENGINE_GOOGLE, ENGINE_OPENAI, SPEAKER_OUROBOROS, SPEAKER_OWNER,
+    ENGINE_GOOGLE, SPEAKER_OUROBOROS, SPEAKER_OWNER,
     AudioIn, AudioOut, Caption, ContextItem, GoAway, Interrupt, PlayedAudio,
-    ResponseDone, ResponseStarted, SpeechStarted, ToolCall, ToolResult, TranscriptionUsage,
+    ResponseDone, ResponseStarted, SpeechStarted, ToolCall, ToolResult,
 )
 from ouroboros.usage_accounting import BudgetExceeded
 from tests import test_live_turn as base
@@ -227,7 +227,6 @@ def test_stop_during_the_connection_cancels_the_opening_and_closes_what_was_open
     assert h.ledger.reserved == [] and h.ledger.abandoned == []
 
 
-
 def test_a_stop_beside_typed_words_closes_without_waiting_for_their_send(harness, monkeypatch, tmp_path):
     from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
 
@@ -395,7 +394,6 @@ def test_a_presence_calls_autonomous_rounds_are_capped_per_input_and_reset_by_sp
     h.finish()
 
 
-
 def test_the_calls_of_one_response_are_one_presence_round_however_they_arrive(harness):
     h = harness(spec=_spec(presence_binding_id="b" * 32, opened_by="skill"))
     h.ctx.inline_max_rounds = 1
@@ -447,11 +445,10 @@ def test_meeting_audio_already_sent_makes_the_delayed_caption_heard_not_owner_wo
     h.finish()
 
 
-
 def test_an_input_items_speaker_follows_the_audio_that_formed_it_however_late_the_events(harness):
     h = harness()
     engine = h.start()
-    second = b"\x01\x00" * 24000  # one second at 24 kHz
+    second = b"\x01\x00" * 16000  # one second at Gemini Live's 16 kHz input
     h.hub.feed(PeerJoined(PeerInfo("meeting-audio", "meeting", True, False)))
     h.hub.feed(PeerAudio("meeting-audio", "meeting", second))
     h.hub.feed(PeerAudio("meeting-audio", "meeting", second))  # 0-2000 ms: the meeting
@@ -528,7 +525,7 @@ def test_the_quote_is_warmed_on_the_ledger_thread_and_never_holds_the_open(harne
     release.set()
     assert _wait_for(lambda: h.ledger.warmed)
     (fields, thread_name), = h.ledger.warmed
-    assert fields == {"engine": ENGINE_OPENAI, "model": "gpt-realtime-2.1", "drive_root": h.root}
+    assert fields == {"engine": ENGINE_GOOGLE, "model": "gemini-3.8-live", "drive_root": h.root}
     assert thread_name.startswith("call-ledger")
     h.stop()
     h.finish()
@@ -559,53 +556,6 @@ def _ladder(h, full, addressed, nano=None):
         False, 128000, 32000, json.dumps("original input"), projection("max", full), projection("low", addressed),
         nano_projection=projection("nano", nano if nano is not None else addressed))
     h.messages[0]["content"] = full
-
-
-def test_the_first_open_uses_a_projection_that_fits_the_known_instruction_ceiling(harness):
-    h = harness()
-    core = "Protected tier zero. "
-    full = core + "Reference text. " * 20_000           # ~80k estimated tokens, above the 65,536 ceiling
-    addressed = core + "Read the full reference source."
-    _ladder(h, full, addressed)
-    engine = h.start()
-    assert engine.config.instructions == addressed and len(h.llm.engines) == 1
-    assert h.ctx.active_context_mode == "low" and engine.closed == []
-    h.stop()
-    _, _usage, trace = h.finish()
-    step, = trace["live_context_prefit"]
-    assert step["basis"] == "estimate" and step["limit_tokens"] == 65_536 and step["input_tokens"] > 65_536
-    assert (step["from"], step["to"]) == ("max", "low") and "live_context_recovery" not in trace
-
-
-def test_a_projection_under_the_ceiling_opens_as_prepared_and_an_unknown_route_has_no_prefit(harness):
-    h = harness()
-    full = "Protected tier zero. " + "Reference text. " * 2_000  # well under the ceiling
-    _ladder(h, full, "addressed")
-    engine = h.start()
-    assert engine.config.instructions == full and h.ctx.active_context_mode == "max"
-    h.stop()
-    _, _usage, trace = h.finish()
-    assert "live_context_prefit" not in trace
-    g = harness(spec=_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live", voice="Kore"))
-    huge = "Protected tier zero. " + "Reference text. " * 20_000
-    _ladder(g, huge, "addressed")
-    engine = g.start()
-    assert engine.config.instructions == huge  # no documented instruction ceiling: nothing is pre-fitted
-    g.stop()
-    g.finish()
-
-
-def test_an_estimate_above_the_smallest_projection_never_refuses_the_open(harness):
-    h = harness()
-    full = "Protected tier zero. " + "Reference text. " * 20_000
-    low = "Protected tier zero. " + "Reference text. " * 18_000
-    nano = "Protected tier zero. " + "Reference text. " * 17_000  # the ladder's floor is itself above the ceiling
-    _ladder(h, full, low, nano)
-    engine = h.start()
-    assert engine.config.instructions == nano and h.ctx.active_context_mode == "nano"
-    h.stop()
-    _, _usage, trace = h.finish()
-    assert [(s["from"], s["to"]) for s in trace["live_context_prefit"]] == [("max", "low"), ("low", "nano")]
 
 
 def test_a_slow_ledger_write_never_holds_the_audio_and_settles_after_its_reservation(harness):
@@ -644,7 +594,7 @@ def test_ledger_writes_run_inside_the_turns_bound_context(harness, monkeypatch):
     monkeypatch.setattr(live_turn, "run_live_turn", bound)
     h = harness()
     seen: list = []
-    for name in ("reserve_live_response", "settle_live_response", "record_transcription"):
+    for name in ("reserve_live_response", "settle_live_response"):
         def reading(*args, _write=getattr(h.ledger, name), _name=name, **fields):
             seen.append((_name, admitted.get()))
             return _write(*args, **fields)
@@ -652,30 +602,9 @@ def test_ledger_writes_run_inside_the_turns_bound_context(harness, monkeypatch):
     engine = h.start()
     engine.push(ResponseStarted(item_id="a1", response_id="r1"))
     engine.push(ResponseDone(item_id="a1", status="completed", usage={"audio_output_tokens": 3}, response_id="r1"))
-    engine.push(TranscriptionUsage(model="whisper-live", usage={"audio_input_tokens": 5}, raw_usage={}))
-    assert _wait_for(lambda: len(seen) == 3)
+    assert _wait_for(lambda: len(seen) == 2)
     assert sorted(seen) == [(name, "the task's root and group limits")
-                            for name in ("record_transcription", "reserve_live_response", "settle_live_response")]
-    h.stop()
-    h.finish()
-
-
-def test_a_refusal_without_numbers_still_reopens_one_rung_smaller(harness):
-    from ouroboros.context_fit import ContextFitPlan, ContextFitProjection
-    from ouroboros.gateways.realtime_engine import EngineError
-
-    h = harness()
-    core = "Protected tier zero. "
-    full, addressed = core + "Reference text. " * 200, core + "Read the full reference source."
-    projection = lambda mode, text: ContextFitProjection(mode, json.dumps(text), len(text), len(text), 1)
-    h.ctx.context_fit_plan = ContextFitPlan("capture", "max", "max", "model", "openai", "route", "confirmed",
-        False, 128000, 32000, json.dumps("original input"), projection("max", full), projection("low", addressed),
-        nano_projection=projection("nano", addressed))
-    h.messages[0]["content"] = full
-    engine = h.start()
-    engine.push(EngineError("context_length", json.dumps({"field": "session.instructions"})))
-    assert _wait_for(lambda: len(h.llm.engines) == 2 and h.engine().config is not None)
-    assert h.engine().config.instructions == addressed and h.ctx.active_context_mode == "low"
+                            for name in ("reserve_live_response", "settle_live_response")]
     h.stop()
     h.finish()
 

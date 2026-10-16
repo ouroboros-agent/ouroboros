@@ -24,10 +24,10 @@ from ouroboros.call_protocol import (
     CallSpec, PeerAudio, PeerControl, PeerInfo, PeerJoined, PeerLeft,
 )
 from ouroboros.gateways.realtime_engine import (
-    ENGINE_GOOGLE, ENGINE_OPENAI, SPEAKER_OUROBOROS, SPEAKER_OWNER,
+    ENGINE_GOOGLE, SPEAKER_OUROBOROS, SPEAKER_OWNER,
     AudioIn, AudioOut, Caption, Close, ContextItem, EngineError, GoAway, Interrupt, PlayedAudio,
     Ready, ResponseDone, ResponseStarted, ResumeCheckpoint, SpeechStarted, ToolCall, ToolCallCancelled, ToolResult,
-    TranscriptionUsage, UpdateTools,
+    UpdateTools,
 )
 from ouroboros.usage_accounting import BudgetExceeded
 
@@ -43,7 +43,7 @@ def _wait_for(predicate, timeout=10.0):
 
 
 def _spec(**overrides) -> CallSpec:
-    fields = dict(call_id="call-1", chat_id=1, engine=ENGINE_OPENAI, model="gpt-realtime-2.1", voice="marin",
+    fields = dict(call_id="call-1", chat_id=1, engine=ENGINE_GOOGLE, model="gemini-3.8-live", voice="Kore",
                   opened_by="owner", presence_binding_id="", max_minutes=0, label="Test call", client_message_id="cm-1")
     fields.update(overrides)
     return CallSpec(**fields)
@@ -66,7 +66,7 @@ class FakeEngine:
         self._queue = asyncio.Queue()
         self.config = config  # last: ``Harness.start`` returns on it, and a test may push at once
         if self.auto_ready:
-            self._queue.put_nowait(Ready({"input_rate": 24000, "output_rate": 24000}))
+            self._queue.put_nowait(Ready({"input_rate": 16000, "output_rate": 24000}))  # Gemini Live's wire rates
 
     async def send(self, command) -> None:
         self.sent.append(command)
@@ -119,7 +119,7 @@ class FakeHub:
         self.present = [OWNER]
         self.closed: list = []
         self.activity: list = []
-        self.words: list = []  # (state, detail, action, other_engine) of every state that carried words
+        self.words: list = []  # (state, detail, action) of every state that carried words
         self.ended_by_owner = False
 
     def set_engine_rates(self, input_rate, output_rate) -> None:
@@ -138,10 +138,10 @@ class FakeHub:
         self.flushes += 1
         return self.flushes
 
-    def send_state(self, state, reason="", *, phase="", detail="", action="", other_engine="") -> None:
+    def send_state(self, state, reason="", *, phase="", detail="", action="") -> None:
         self.states.append((state, reason))
-        if detail or action or other_engine:
-            self.words.append((state, detail, action, other_engine))
+        if detail or action:
+            self.words.append((state, detail, action))
 
     def send_activity(self, activity, label="") -> None:
         self.activity.append((activity, label))
@@ -341,86 +341,22 @@ def test_explicit_owner_bye_ends_the_call_but_meeting_bye_does_not(harness):
     assert usage["live_call"]["ended"] == "owner_bye" and "utterances" in text
 
 
-def test_actual_context_refusal_reopens_with_strictly_smaller_projection(harness):
-    from ouroboros.context_fit import ContextFitPlan, ContextFitProjection
-
-    h = harness()
-    core = "Protected tier zero. "
-    full, addressed = core + "Reference text. " * 200, core + "Read the full reference source."
-    projection = lambda mode, text: ContextFitProjection(mode, json.dumps(text), len(text), len(text), 1)
-    h.ctx.context_fit_plan = ContextFitPlan("capture", "max", "max", "model", "openai", "route", "confirmed",
-        False, 128000, 32000, json.dumps("original input"), projection("max", full), projection("low", addressed),
-        nano_projection=projection("nano", addressed))
-    h.messages[0]["content"] = full
-    engine = h.start()
-    refusal = EngineError("context_length", json.dumps({"limit_tokens": 65536, "input_tokens": 186324,
-                                                       "field": "session.instructions"}))
-    engine.push(refusal)
-    assert _wait_for(lambda: len(h.llm.engines) == 2 and h.engine().config is not None)
-    assert h.engine().config.instructions == addressed
-    assert h.engine().config.history == engine.config.history
-    assert h.ctx.active_context_mode == "low"
-    assert engine.closed == ["context_length"]
-    # No identical retry when the protected projection itself is refused.
-    h.engine().push(refusal)
-    _, usage, trace = h.finish()
-    assert len(h.llm.engines) == 2 and usage["execution_status"] == "infra_failed"
-    assert trace["live_context_recovery"][0]["input_tokens"] == 186324
-
-
 def test_the_session_opens_with_the_fitted_instructions_and_the_nano_view(harness):
     h = harness()
     engine = h.start()
     config = engine.config
     assert config.instructions == "You are Ouroboros, on a call."
     assert [schema["function"]["name"] for schema in config.tools] == ["knowledge_read", "web_search", "enable_tools"]
-    assert config.route.engine == ENGINE_OPENAI and config.route.model == "gpt-realtime-2.1" and config.route.voice == "marin"
-    assert config.native_search is False and config.resume_handle == ""
+    assert config.route.engine == ENGINE_GOOGLE and config.route.model == "gemini-3.8-live" and config.route.voice == "Kore"
+    assert config.native_search is True and config.resume_handle == ""  # Gemini's own search: on by default
     assert config.history == ({"role": "user", "content": "[Live call] A live voice call is open in this room."},)
-    assert h.llm.routes[0].engine == ENGINE_OPENAI
+    assert h.llm.routes[0].engine == ENGINE_GOOGLE
     assert _wait_for(lambda: (STATE_LIVE, "") in h.hub.states)
-    assert h.hub.states[0] == (STATE_CONNECTING, "") and h.hub.rates == (24000, 24000)
+    assert h.hub.states[0] == (STATE_CONNECTING, "") and h.hub.rates == (16000, 24000)
     h.stop()
     text, usage, trace = h.finish()
     assert [state for state, _ in h.hub.states] == [STATE_CONNECTING, STATE_LIVE, STATE_CLOSING, STATE_CLOSED]
     assert engine.sent_of(Close) and engine.closed == ["owner_stop"] and h.hub.closed == ["owner_stop"]
-
-
-def test_the_route_window_is_recorded_as_sourced_evidence_before_the_fit(tmp_path):
-    from ouroboros.live_call_route import resolve_call_route, window_evidence
-
-    route = resolve_call_route(_spec(), tmp_path)
-    assert route.window_tokens == 128_000 and route.fact.session_cap_minutes == 60
-    assert route.fact.instructions_cap_tokens == 65_536 and "observed" in route.fact.instructions_cap_source
-    evidence = window_evidence(tmp_path, _spec())
-    # A shipped documented fact is asserted evidence with its source and read date,
-    # never metadata the provider confirmed on the wire.
-    assert evidence["window_tokens"] == 128_000 and evidence["status"] == "asserted"
-    assert evidence["source"] == "documented_route_fact" and evidence["response_limit"]["source"] == "documented_route_fact"
-    assert evidence["response_limit"]["status"] == "asserted" and evidence["source"] != "provider_metadata"
-    assert "developers.openai.com" in evidence["detail"] and "read 2026-10-16" in evidence["detail"]
-    assert "instructions field ceiling 65536 tokens" in evidence["detail"]
-    assert evidence["response_limit"]["max_output_tokens"] == 32_000
-    google = resolve_call_route(_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live"), tmp_path)
-    assert google.window_tokens == 131_072 and google.fact.session_cap_minutes is None
-    assert google.fact.instructions_cap_tokens is None
-    unknown = resolve_call_route(_spec(model="gpt-realtime-future"), tmp_path)
-    assert unknown.fact is None and unknown.window_tokens is None and window_evidence(tmp_path, _spec(model="gpt-realtime-future")) is None
-
-
-def test_call_context_plan_passes_the_known_window_and_the_call_view(monkeypatch, tmp_path):
-    from ouroboros import live_call_route
-
-    monkeypatch.setattr(live_call_route, "initial_call_schemas", lambda tools, spec=None: [_schema("web_search")])
-    task = {"id": "t", "metadata": {"live_call": _spec().as_metadata()}}
-    assert live_call_route.call_context_plan({"id": "t", "metadata": {}}, None, tmp_path) is None
-    with_window = live_call_route.call_context_plan(task, None, tmp_path)
-    # The realtime route's own window AND reply allowance, not Main's send cap.
-    assert with_window.fit_kwargs == {"known_window_tokens": 128_000, "known_output_reserve_tokens": 32_000}
-    assert [s["function"]["name"] for s in with_window.tool_schemas] == ["web_search"]
-    unknown = {"id": "t", "metadata": {"live_call": _spec(model="gpt-realtime-future").as_metadata()}}
-    without = live_call_route.call_context_plan(unknown, None, tmp_path)
-    assert without.fit_kwargs == {} and without.spec.call_id == "call-1"
 
 
 def test_a_missing_hub_is_a_typed_failure_without_an_engine(harness, monkeypatch, tmp_path):
@@ -457,7 +393,7 @@ def test_audio_flows_both_ways_and_a_muted_peer_is_not_heard(harness, monkeypatc
     engine = h.start()
     h.hub.feed(PeerAudio(peer_id="owner-1", role="owner", pcm=b"\x01\x02" * 100))
     assert _wait_for(lambda: engine.sent_of(AudioIn))
-    assert engine.sent_of(AudioIn)[0] == AudioIn(pcm=b"\x01\x02" * 100, rate=24000)
+    assert engine.sent_of(AudioIn)[0] == AudioIn(pcm=b"\x01\x02" * 100, rate=16000)
     engine.push(AudioOut(pcm=b"\x09" * 50, rate=24000, item_id="item-a"))
     assert _wait_for(lambda: h.hub.played == [("item-a", b"\x09" * 50)])
     engine.push(AudioOut(pcm=b"\x0a" * 50, rate=24000, item_id="item-a"))
@@ -705,12 +641,10 @@ def test_responses_are_reserved_and_settled_and_transcription_is_recorded(harnes
     engine.push(ResponseStarted(item_id="a1", response_id="r1"))
     engine.push(ResponseDone(item_id="a1", status="completed", usage={"text_input_tokens": 10, "audio_output_tokens": 20},
                              raw_usage={"raw": 1}, response_id="r1"))
-    engine.push(TranscriptionUsage(model="whisper-live", usage={"audio_input_tokens": 5}, raw_usage={}))
-    assert _wait_for(lambda: h.ledger.settled and h.ledger.transcriptions)
+    assert _wait_for(lambda: h.ledger.settled)
     assert h.ledger.reserved[0]["response_key"] == "r1" and h.ledger.reserved[0]["rendered_mode"] == "nano"
     assert h.ledger.reserved[0]["call_id"] == "call-1" and h.ledger.reserved[0]["task_id"] == "t-call"
     assert h.ledger.settled == [("r1", "completed", {"text_input_tokens": 10, "audio_output_tokens": 20})]
-    assert h.ledger.transcriptions[0]["model"] == "whisper-live" and h.ledger.transcriptions[0]["engine"] == ENGINE_OPENAI
     h.stop()
     text, usage, _trace = h.finish()
     assert usage["live_responses"] == 1 and usage["live_usage"]["text_input_tokens"] == 10
@@ -821,7 +755,7 @@ def test_a_retryable_engine_error_reconnects_and_a_fatal_one_ends_the_call(harne
     assert usage["reason_code"] == "live_engine_error" and usage["live_call"]["ended"] == "authentication"
     assert "authentication: bad key" in text
     # The owner's surface gets the provider's sentence and the one next step beside the reason.
-    assert ("closed", "bad key", "settings", "") in h.hub.words
+    assert ("closed", "bad key", "settings") in h.hub.words
 
 
 def test_a_session_that_cannot_be_reopened_ends_the_call(harness, monkeypatch, tmp_path):
@@ -939,7 +873,6 @@ def test_native_search_follows_the_setting_for_gemini_only(monkeypatch, raw, exp
 
     monkeypatch.setenv("OUROBOROS_CALL_NATIVE_SEARCH", raw)
     assert native_search_enabled(_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live")) is expected
-    assert native_search_enabled(_spec()) is False
 
 
 def test_the_call_view_opens_with_memory_the_web_and_the_room_chat():
@@ -992,7 +925,7 @@ def test_a_missing_key_ends_the_call_with_its_own_words_and_the_settings_step(ha
     h = harness()
 
     def refuse(route):
-        raise LiveEngineRefusal("missing_credential", "Configure OPENAI_API_KEY for this live route.")
+        raise LiveEngineRefusal("missing_credential", "Configure GOOGLE_API_KEY for calls.")
 
     h.llm.open_live = refuse
     h.thread = threading.Thread(target=lambda: setattr(h, "result", live_turn.run_live_turn(
@@ -1004,7 +937,7 @@ def test_a_missing_key_ends_the_call_with_its_own_words_and_the_settings_step(ha
     text, usage, _trace = h.finish()
     # A typed refusal is not "the voice service could not be reached".
     assert usage["live_call"]["ended"] == "missing_credential" and usage["reason_code"] == "live_engine_refused"
-    assert ("closed", "Configure OPENAI_API_KEY for this live route.", "settings", "") in h.hub.words
+    assert ("closed", "Configure GOOGLE_API_KEY for calls.", "settings") in h.hub.words
     assert [state for state, _ in h.hub.states][:1] == [STATE_CONNECTING]
 
 
@@ -1018,30 +951,34 @@ def test_a_tool_batch_tells_the_surface_it_is_working_and_then_idle(harness):
     h.finish()
 
 
-def test_a_context_refusal_with_no_smaller_projection_ends_with_both_numbers(harness, monkeypatch):
+def test_a_call_compresses_from_its_watermarks(harness):
     h = harness()
-    monkeypatch.setattr(live_turn, "recover_call_context", lambda *args: False)
-    monkeypatch.setattr(live_turn, "_other_engine", lambda engine: "google")
-    engine = h.start()
-    engine.push(EngineError(kind="context_length", message=json.dumps(
-        {"field": "session.instructions", "limit_tokens": 65536, "input_tokens": 71200})))
-    text, usage, _trace = h.finish()
-    assert usage["live_call"]["ended"] == "context_too_large"
-    assert ("closed", "71,200 tokens of core memory; this engine holds 65,536", "other_engine", "google") in h.hub.words
-
-
-def test_a_google_call_compresses_from_its_watermarks_and_an_openai_call_leaves_the_default(harness):
-    google = harness(spec=_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live"))
-    config = google.start().config
+    config = h.start().config
     assert config.compress_at_tokens == 131_072 - 8_192
     assert config.compress_at_tokens > config.compress_to_tokens > 0  # the view plus half of the room to talk
-    google.stop()
-    google.finish()
-    openai = harness()
-    config = openai.start().config
-    assert (config.compress_at_tokens, config.compress_to_tokens) == (0, 0)
-    openai.stop()
-    openai.finish()
+    h.stop()
+    h.finish()
+
+
+def test_microphone_audio_is_labelled_with_the_rate_the_session_declares(harness):
+    h = harness()
+    engine = h.start()
+    assert _wait_for(lambda: (STATE_LIVE, "") in h.hub.states)
+    h.hub.feed(PeerAudio(peer_id="owner-1", role="owner", pcm=b"\x01\x00" * 320))
+    assert _wait_for(lambda: engine.sent_of(AudioIn))
+    assert engine.sent_of(AudioIn)[0].rate == 16000  # Gemini Live refuses audio at any other rate
+    h.stop()
+    h.finish()
+
+
+def test_a_provider_refusal_ends_the_call_with_its_own_words(harness):
+    h = harness()
+    engine = h.start()
+    words = "user system instruction has 140000 tokens and the sum is above the 131072 limit"
+    engine.push(EngineError(kind="invalid_request", message=words, retryable=False))
+    text, usage, _trace = h.finish()
+    assert usage["live_call"]["ended"] == "invalid_request" and words in text
+    assert ("closed", words, "retry") in h.hub.words
 
 
 def test_a_fresh_session_replays_the_newest_rows_that_fit_and_names_the_rest(harness):

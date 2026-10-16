@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Exercise a real live turn without starting installation services or audio devices.
 
-Run with the application's Python: ``python devtools/live_call_probe.py --engine
-openai --scenarios all --output-dir /tmp/live-call-unique``. Each invocation owns
-a fresh external directory; it retains JSON evidence, PCM, instructions and logs.
-The in-process path deliberately avoids server startup's update/daemon duties.
-Only the input fixture uses speech synthesis; Ouroboros speaks through Realtime.
+Run with the application's Python: ``python devtools/live_call_probe.py --scenarios
+all --output-dir /tmp/live-call-unique [--google-key-file F] [--data-copy DIR]``.
+Calls use Google Gemini Live (its key from ``--google-key-file`` or the settings
+source). ``--data-copy`` clones a data directory (APFS clone) into the run, so the
+call opens on a mature install's real memory instead of a fresh one; the source is
+never written. Each invocation owns a fresh external directory; it retains JSON
+evidence, PCM, instructions and logs. The in-process path deliberately avoids
+server startup's update/daemon duties. Only the input fixture uses speech synthesis
+(OpenAI TTS, or saved fixtures with ``--fixture-dir``); Ouroboros speaks through Gemini.
 """
 from __future__ import annotations
 
@@ -299,16 +303,15 @@ def speech_fixture(root: Path, label: str, key: str, reuse: str | None) -> bytes
     return synthesize(root, label, key)
 
 
-def money_evidence(rows: list[dict], events: list[dict], engine: str) -> tuple[bool, dict]:
+def money_evidence(rows: list[dict], events: list[dict]) -> tuple[bool, dict]:
     responses = [r for r in rows if r.get("source") == "live_response"]
-    transcriptions = [r for r in rows if r.get("source") == "live_transcription"]
     starts = [e.get("response_id") or e.get("item_id") for e in events if e["kind"] == "ResponseStarted"]
     done = [e.get("response_id") or e.get("item_id") for e in events if e["kind"] == "ResponseDone"]
     keys = [r.get("cost_evidence", {}).get("response_key") for r in responses]
     errors = []
     if not responses or sorted(keys) != sorted(starts) or sorted(keys) != sorted(done):
         errors.append("response starts, settlements and ledger attempts do not match one-to-one")
-    for row in responses + transcriptions:
+    for row in responses:
         evidence = row.get("cost_evidence", {})
         counts, quote = evidence.get("usage", {}), evidence.get("tariff_quote")
         if row.get("state") != "settled" or not evidence.get("raw_usage"):
@@ -321,22 +324,20 @@ def money_evidence(rows: list[dict], events: list[dict], engine: str) -> tuple[b
             errors.append("unpriced modalities: " + row["attempt_id"])
         if row in responses and not all(row.get(k) for k in ("ts_reserved", "ts_dispatched", "ts_final")):
             errors.append("missing reservation/dispatch/settlement proof: " + row["attempt_id"])
-    if engine == "openai" and not transcriptions:
-        errors.append("no separate transcription attempt")
     unknown = [r["attempt_id"] for r in rows if r.get("cost_usd") is None]
     if unknown:
         errors.append("total includes unknown-priced attempts")
     known = sum(r.get("cost_usd") or 0 for r in rows)
     return not errors, {"errors": errors, "attempts": rows, "known_estimated_usd": known,
                         "total_cost_usd": None if unknown else known, "unknown_attempts": unknown,
-                        "call_estimated_usd": sum(r.get("cost_usd") or 0 for r in responses + transcriptions)}
+                        "call_estimated_usd": sum(r.get("cost_usd") or 0 for r in responses)}
 
 
 class Probe:
-    def __init__(self, root: Path, engine: str, selected: set[str], timeout: float):
-        self.root, self.engine, self.selected, self.timeout = root, engine, selected, timeout
+    def __init__(self, root: Path, selected: set[str], timeout: float):
+        self.root, self.engine, self.selected, self.timeout = root, "google", selected, timeout
         self.evidence = Evidence(root)
-        self.result = {"engine": engine, "path": "in_process_make_agent", "scenarios": {
+        self.result = {"engine": self.engine, "path": "in_process_make_agent", "scenarios": {
             s: {"verdict": "NOT_RUN", "evidence": {"reason": "not selected" if s not in selected else "not reached"}}
             for s in SCENARIOS}, "total_cost_usd": None}
         self.agent = self.peer = self.thread = None
@@ -412,8 +413,7 @@ class Probe:
                     _handle_send_message({**event, "_is_direct_chat": True}, delivery)
 
         self.spec = CallSpec(uuid.uuid4().hex, WEB_UI_CHAT_ID, self.engine,
-                             settings[f"OUROBOROS_CALL_MODEL_{self.engine.upper()}"],
-                             settings[f"OUROBOROS_CALL_VOICE_{self.engine.upper()}"])
+                             settings["OUROBOROS_CALL_MODEL_GOOGLE"], settings["OUROBOROS_CALL_VOICE_GOOGLE"])
         self.hub = open_hub(self.spec)
         self.peer = OwnerPeer(self.hub, self.evidence)
         self.agent = make_agent(str(REPO), str(data), event_queue=EventQueue())
@@ -493,8 +493,9 @@ class Probe:
                 continued = [e for e in self.evidence.of("peer_audio", cut) if e["item_id"] in continued_items()]
                 truncated = [e for e in self.evidence.of("wire_received", cut)
                              if e["payload"].get("type") == "conversation.item.truncated"]
-                self.verdict("interruption", bool(commands and flushes and interrupted and
-                             (truncated or self.engine == "google") and continued and not self.hub.closed),
+                # Gemini truncates server-side: the host's flush, cut and continued speech are the proof.
+                self.verdict("interruption", bool(commands and flushes and interrupted and continued
+                             and not self.hub.closed),
                              commands=commands, flushes=flushes, truncated=truncated, rows=interrupted,
                              continued_audio_bytes=sum(e["bytes"] for e in continued))
             except Exception as exc:
@@ -540,7 +541,7 @@ class Probe:
             transitions = {r["attempt_id"]: dict(r) for r in txn.conn.execute(
                 "SELECT attempt_id, ts_reserved, ts_dispatched, ts_final FROM attempts")}
         rows = [{**r, **transitions[r["attempt_id"]]} for r in rows]
-        ok, facts = money_evidence(rows, self.evidence.rows, self.engine)
+        ok, facts = money_evidence(rows, self.evidence.rows)
         self.result.update(total_cost_usd=facts["total_cost_usd"], known_estimated_usd=facts["known_estimated_usd"])
         if "money" in self.selected:
             self.verdict("money", ok, **facts)
@@ -555,19 +556,23 @@ def _default_settings_source() -> str:
     return str(Path(data) / "settings.json")
 
 
-def prepare_settings(root: Path, source: Path, engine: str):
+def prepare_settings(root: Path, source: Path, google_key_file: str | None = None):
     from ouroboros.settings_defaults import SETTINGS_DEFAULTS
     from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
 
     original = json.loads(source.read_text(encoding="utf-8"))
     keys = {k: original.get(k, "") for k in ("OPENAI_API_KEY", "GOOGLE_API_KEY")}
-    settings = dict(SETTINGS_DEFAULTS)
+    if google_key_file:
+        keys["GOOGLE_API_KEY"] = Path(google_key_file).expanduser().read_text(encoding="utf-8").strip()
+    # A cloned data copy keeps its own settings (its memory and context choices); the run only
+    # swaps in the keys, direct models and a small budget.
+    path = root / "data/settings.json"
+    copied = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    settings = {**SETTINGS_DEFAULTS, **copied}
     settings.update(keys)
     settings.update(OUROBOROS_MODEL=OPENAI_DIRECT_DEFAULTS["main"],
                     OUROBOROS_MODEL_LIGHT=OPENAI_DIRECT_DEFAULTS["light"],
-                    OUROBOROS_MODEL_FALLBACKS=OPENAI_DIRECT_DEFAULTS["fallback"],
-                    OUROBOROS_CALL_ENGINE=engine, TOTAL_BUDGET="10")
-    path = root / "data/settings.json"
+                    OUROBOROS_MODEL_FALLBACKS=OPENAI_DIRECT_DEFAULTS["fallback"], TOTAL_BUDGET="10")
     path.touch(mode=0o600)
     write_json(path, settings)
     return settings, keys
@@ -579,15 +584,13 @@ async def run_probe(args):
     root = Path(args.output_dir)
     logging.basicConfig(filename=root / "runtime.log", level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    probe = Probe(root, args.engine, select_scenarios(args.scenarios), args.timeout)
-    settings, keys = prepare_settings(root, Path(args.settings_source), args.engine)
+    probe = Probe(root, select_scenarios(args.scenarios), args.timeout)
+    settings, keys = prepare_settings(root, Path(args.settings_source), args.google_key_file)
     probe.result["google_key_present"] = bool(keys["GOOGLE_API_KEY"])
-    if not keys["GOOGLE_API_KEY"]:
-        probe.result["gemini"] = {"verdict": "NOT_RUN", "reason": "GOOGLE_API_KEY is absent"}
-    required = "OPENAI_API_KEY" if args.engine == "openai" else "GOOGLE_API_KEY"
+    probe.result["data_copy"] = bool(args.data_copy)
     pump = None
     try:
-        if not keys[required] or not keys["OPENAI_API_KEY"]:
+        if not keys["GOOGLE_API_KEY"] or not (keys["OPENAI_API_KEY"] or args.fixture_dir):
             for name in probe.selected:
                 probe.result["scenarios"][name]["evidence"] = {"reason": "selected engine or speech fixture credential absent"}
             return probe.result
@@ -629,8 +632,9 @@ async def run_probe(args):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--engine", choices=("openai", "google"), default="openai")
     parser.add_argument("--scenarios", default="all", help=",".join(SCENARIOS))
+    parser.add_argument("--google-key-file", help="a file holding the Google AI key for Gemini Live (read, never printed)")
+    parser.add_argument("--data-copy", help="a data directory cloned (APFS clone) into the run: a mature install's memory")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--settings-source", default=_default_settings_source(),
                         help="the install whose provider keys the probe uses (read, never written)")
@@ -644,6 +648,10 @@ def main(argv=None) -> int:
         result = asyncio.run(run_probe(args))
         return int(bool(result.get("failure")) or any(r["verdict"] == "FAIL" for r in result["scenarios"].values()))
     root = output_root(args.output_dir)
+    if args.data_copy:
+        # Copy-on-write clone: the run reads and writes its own copy; the source is never touched.
+        (root / "data").mkdir(mode=0o700)
+        subprocess.run(["cp", "-c", "-R", str(Path(args.data_copy).resolve()) + "/.", str(root / "data")], check=True)
     before = daemon_list()
     write_json(root / "daemons-before.json", before)
     helper = runpy.run_path(str(REPO / "ouroboros/test_environment.py"))

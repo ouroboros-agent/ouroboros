@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import copy
 import math
-import uuid
 from dataclasses import dataclass, replace
 from typing import Mapping
 
@@ -249,19 +248,6 @@ def _settlement(quote, evidence, usage, raw_usage, status):
 def settle_live_response(attempt: LiveAttempt, *, usage: Mapping, raw_usage: Mapping, status: str) -> None:
     normalized, cost = _settlement(attempt._quote, attempt._evidence, usage, raw_usage, status)
     accounting.settle_attempt(attempt._reservation, normalized, cost_usd=cost, cost_final=False)
-
-
-def record_transcription(*, engine: str, model: str, call_id: str, usage: Mapping,
-                         raw_usage: Mapping, task_id: str, drive_root) -> None:
-    context = accounting.current_physical_attempt_context()
-    quote = _warmed_quote(model, engine, drive_root)
-    mode = context.rendered_mode if context else ""
-    evidence = {"call_id": call_id, "response_key": f"transcription:{uuid.uuid4().hex}",
-                "rendered_mode": mode, "tariff_quote": quote}
-    normalized, cost = _settlement(quote, evidence, usage, raw_usage, "completed")
-    accounting.record_received_attempt(accounting.AttemptRequest(
-        model=model, provider=engine, task_id=task_id, drive_root=drive_root, source="live_transcription",
-        physical_context=context, rendered_mode=mode), normalized, cost_usd=cost)
 
 
 def record_refused_live_response(*, engine: str, model: str, call_id: str, response_key: str, task_id: str,

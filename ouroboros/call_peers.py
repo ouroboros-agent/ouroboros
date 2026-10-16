@@ -403,12 +403,11 @@ class LiveCallHub(cp.CallHub):
         for peer in self._peers.values():
             self._send(peer, text)
 
-    def send_state(self, state: str, reason: str = "", *, phase: str = "", detail: str = "", action: str = "",
-                   other_engine: str = "") -> None:
+    def send_state(self, state: str, reason: str = "", *, phase: str = "", detail: str = "",
+                   action: str = "") -> None:
         if state not in cp.CALL_STATES:
             raise ValueError("unknown call state")
-        extra = {key: value for key, value in (("phase", phase), ("detail", detail), ("action", action),
-                                                ("other_engine", other_engine)) if value}
+        extra = {key: value for key, value in (("phase", phase), ("detail", detail), ("action", action)) if value}
         with self._condition:
             self._state = dict(type="state", state=state, reason=reason, engine=self.spec.engine, **extra)
             self._broadcast(self._state)
@@ -430,7 +429,7 @@ class LiveCallHub(cp.CallHub):
         with self._condition:
             return tuple(peer.info for peer in self._peers.values())
 
-    def close(self, reason: str, *, detail: str = "", action: str = "", other_engine: str = "") -> None:
+    def close(self, reason: str, *, detail: str = "", action: str = "") -> None:
         with self._condition:
             if self._closed:
                 return
@@ -440,7 +439,7 @@ class LiveCallHub(cp.CallHub):
                 peer.tracks.clear()
             self.flush()
             if self._state.get("state") != cp.STATE_CLOSED:  # the driver's own closed state (and words) stands
-                self.send_state(cp.STATE_CLOSED, reason, detail=detail, action=action, other_engine=other_engine)
+                self.send_state(cp.STATE_CLOSED, reason, detail=detail, action=action)
             self._condition.notify_all()
 
 
@@ -484,7 +483,7 @@ def open_owner_hub(spec: cp.CallSpec) -> tuple[LiveCallHub, bool]:
 
 
 def close_hub(call_id: str, reason: str = "finished", **words: str) -> None:
-    """Close and forget a hub; ``words`` are ``detail``/``action``/``other_engine`` for its closed state."""
+    """Close and forget a hub; ``words`` are ``detail``/``action`` for its closed state."""
     with _REGISTRY_LOCK:
         hub = _HUBS.pop(call_id, None)
     if hub is not None:

@@ -116,18 +116,11 @@ def _call_setting(key: str, default: str = "") -> str:
 
 
 def _call_route() -> tuple[str, str, str]:
-    """``(engine, model, voice)`` from the owner's call settings; a missing model is a refusal."""
-    from ouroboros.llm_live import resolve_live_engine
-    from ouroboros.provider_models import PROVIDER_ENV_KEYS
-
-    engine = resolve_live_engine({key: _call_setting(key) for key in
-                                  ("OUROBOROS_CALL_ENGINE", PROVIDER_ENV_KEYS["google"])})
-    suffix = engine.upper()
-    model = _call_setting(f"OUROBOROS_CALL_MODEL_{suffix}")
+    """``(engine, model, voice)`` from the owner's call settings (Gemini Live); a missing model is a refusal."""
+    model = _call_setting("OUROBOROS_CALL_MODEL_GOOGLE")
     if not model:
-        raise PresenceCallRefused("presence_call_model_unset",
-                                  f"OUROBOROS_CALL_MODEL_{suffix} is empty for engine {engine}")
-    return engine, model, _call_setting(f"OUROBOROS_CALL_VOICE_{suffix}")
+        raise PresenceCallRefused("presence_call_model_unset", "OUROBOROS_CALL_MODEL_GOOGLE is empty")
+    return "google", model, _call_setting("OUROBOROS_CALL_VOICE_GOOGLE")
 
 
 def _call_max_minutes() -> int | None:

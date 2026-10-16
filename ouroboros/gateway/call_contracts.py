@@ -17,8 +17,9 @@ from ouroboros import call_protocol as cp
 
 
 class CallOpenRequest(TypedDict):
+    """Calls use Google Gemini Live; ``model``/``voice`` override the Settings defaults."""
+
     chat_id: int
-    engine: NotRequired[Literal["openai", "google"]]
     model: NotRequired[str]
     voice: NotRequired[str]
     client_message_id: NotRequired[str]
@@ -105,8 +106,7 @@ class CallState(TypedDict):
     engine: NotRequired[str]
     phase: NotRequired[str]
     detail: NotRequired[str]
-    action: NotRequired[Literal["settings", "retry", "other_engine"]]
-    other_engine: NotRequired[str]
+    action: NotRequired[Literal["settings", "retry"]]
 
 
 class CallActivity(TypedDict):

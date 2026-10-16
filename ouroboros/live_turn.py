@@ -18,9 +18,12 @@ context waits in a queue and no mail is acknowledged. The mailbox, the peers and
 the tool lane run from the first moment, so a Stop during the connection cancels
 the opening and closes whatever the provider opened. A tool result the transport
 refuses becomes a typed failure the model hears. The route's documented limits
-(window, reply allowance, instruction cap) shape the first open, so the call does
-not fail once to learn them; the price quote is warmed on the turn thread before
-the loop starts, so no catalog fetch ever runs on it. The driver returns the
+(window, reply allowance) shape the first open and Gemini's compression watermarks;
+a session the provider still refuses ends with the provider's own words. The price
+quote is warmed first on the ledger's thread, so no catalog fetch ever holds the
+open or runs on the call's loop. The phases the owner's surface shows (preparing,
+connecting, live) and every closing reason with its one next step come from here
+and the hub. The driver returns the
 loop's ordinary ``(text, usage, llm_trace)`` triple with a host-authored
 terminal (``terminal_origin=host_notice``) that points at the transcript.
 """
@@ -39,20 +42,17 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import (
-    ACTION_OTHER_ENGINE, ACTION_RETRY, ACTION_SETTINGS, PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING,
-    STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING, CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft,
+    ACTION_RETRY, ACTION_SETTINGS, PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING, STATE_CONNECTING,
+    STATE_LIVE, STATE_RECONNECTING, CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft,
 )
 from ouroboros.gateways.realtime_engine import (
     SPEAKER_OUROBOROS, SPEAKER_OWNER, USAGE_KEYS,
     AudioIn, AudioOut, Caption, Close, Closed, ContextItem, EngineError, GoAway, Interrupt, PlayedAudio, Ready,
     ResponseDone, ResponseStarted, ResumeCheckpoint, SessionConfig, SpeechStarted, ToolCall, ToolCallCancelled,
-    ToolResult, TranscriptionUsage, UpdateTools,
+    ToolResult, UpdateTools,
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
-from ouroboros.live_call_route import (
-    call_minutes_ceiling, fit_call_instructions, initial_call_schemas, native_search_enabled, recover_call_context,
-    resolve_call_route,
-)
+from ouroboros.live_call_route import call_minutes_ceiling, initial_call_schemas, native_search_enabled, resolve_call_route
 from ouroboros.live_tool_batch import ToolBatchWorker, images_of, text_of
 from ouroboros.usage_accounting import BudgetExceeded
 
@@ -76,7 +76,7 @@ _ACTION_BY_REASON = {
     "missing_credential": ACTION_SETTINGS, "authentication": ACTION_SETTINGS, "engine_refused": ACTION_SETTINGS,
     "rate_limit": ACTION_RETRY, "provider_closed": ACTION_RETRY, "provider_error": ACTION_RETRY,
     "invalid_request": ACTION_RETRY, "protocol": ACTION_RETRY, "backpressure": ACTION_RETRY,
-    "engine_unavailable": ACTION_RETRY, "reconnect_failed": ACTION_RETRY, "context_too_large": ACTION_OTHER_ENGINE,
+    "engine_unavailable": ACTION_RETRY, "reconnect_failed": ACTION_RETRY,
 }
 
 
@@ -144,6 +144,10 @@ class _LiveCall:
         self.context_captured_at = context_captured_at
         self.ctx = tools._ctx
         self.route = resolve_call_route(spec, drive_root)
+        # The PCM rates the engine wire takes and returns. Gemini Live takes 16 kHz input
+        # and refuses any other rate, so audio is labelled with what the session declares.
+        self.input_rate = 16000 if spec.engine == "google" else self.route.engine.input_rate
+        self.output_rate = self.route.engine.output_rate
         self.llm_trace: Dict[str, Any] = {"reasoning_notes": ["live_call"], "tool_calls": []}
         self.usage: Dict[str, Any] = {"_task_attempt": getattr(self.ctx, "task_attempt", None),
                                       "live_usage": {key: 0 for key in USAGE_KEYS}, "live_responses": 0}
@@ -270,7 +274,6 @@ class _LiveCall:
                                      asyncio.create_task(self.tools_lane.run_forever()),
                                      asyncio.create_task(self._deliver_forever())]
         try:
-            fit_call_instructions(self.ctx, self.messages, self.tool_schemas, self.route)
             opening = asyncio.create_task(self._open_engine())
             closed = asyncio.create_task(self._closed.wait())
             await asyncio.wait({opening, closed}, return_when=asyncio.FIRST_COMPLETED)
@@ -334,13 +337,9 @@ class _LiveCall:
     def _close_hub(self) -> None:
         """The closed state with its words and one next step, then the hub itself."""
         self.state = STATE_CLOSED
-        action, other = _ACTION_BY_REASON.get(self.close_reason, ""), ""
-        if action == ACTION_OTHER_ENGINE:
-            other = _other_engine(self.spec.engine)
-            action = action if other else ACTION_SETTINGS
         try:
-            self.hub.send_state(STATE_CLOSED, self.close_reason, detail=self.close_detail, action=action,
-                                other_engine=other)
+            self.hub.send_state(STATE_CLOSED, self.close_reason, detail=self.close_detail,
+                                action=_ACTION_BY_REASON.get(self.close_reason, ""))
             self.hub.close(self.close_reason)
         except Exception:
             log.debug("hub close failed", exc_info=True)
@@ -404,7 +403,7 @@ class _LiveCall:
         from ouroboros.utils import estimate_tokens
 
         fact = self.route.fact
-        if fact is None or self.spec.engine != "google":
+        if fact is None:
             return 0, 0
         reply = int(getattr(fact, "reply_allowance_tokens", 0) or 8_192)
         plan = getattr(self.ctx, "context_fit_plan", None)
@@ -440,7 +439,7 @@ class _LiveCall:
             raise
         self.engine, self.epoch, self.session_started = engine, self.epoch + 1, time.monotonic()
         self.input_ms = 0.0  # a new session counts its input audio from zero
-        self.hub.set_engine_rates(self.route.engine.input_rate, self.route.engine.output_rate)
+        self.hub.set_engine_rates(self.input_rate, self.output_rate)
         if self.empty_since is None and not self.hub.peers():
             # A call nobody attached to yet runs the same rejoin grace as one everyone left:
             # a peer whose socket never arrived must not hold the session (or a Presence slot).
@@ -470,7 +469,7 @@ class _LiveCall:
             return None
         system = self.messages[0] if self.messages and self.messages[0].get("role") == "system" else {}
         reply = int(getattr(fact, "reply_allowance_tokens", 0) or 8_192)
-        limit = int(fact.window_tokens) - (reply if self.spec.engine == "google" else int(fact.max_output_tokens))
+        limit = int(fact.window_tokens) - reply
         view = math.ceil(estimate_tokens(text_of(system.get("content"))) + estimate_tokens(json.dumps(self.tool_schemas)))
         return max(0, (limit - view) // 2)
 
@@ -675,7 +674,7 @@ class _LiveCall:
         if isinstance(event, PeerAudio):
             if (self.engine is not None and not self.closing and not self.reconnecting
                     and event.peer_id not in self.muted_peers):
-                rate = self.route.engine.input_rate
+                rate = self.input_rate
                 duration = len(event.pcm) * 500 / rate
                 if event.role == PEER_MEETING:
                     self.meeting_audio_since_caption = True
@@ -752,25 +751,16 @@ class _LiveCall:
             await self._drain()
             if self.fanout.pending:
                 self.fanout.flush()
-        elif isinstance(event, TranscriptionUsage):
-            self._record(self._settle_safely, lambda: _ledger().record_transcription(
-                engine=self.spec.engine, model=event.model, call_id=self.spec.call_id, usage=dict(event.usage),
-                raw_usage=dict(event.raw_usage), task_id=self.task_id, drive_root=self.drive_root))
         elif isinstance(event, ResumeCheckpoint):
             self.resume_handle = event.handle if event.resumable else ""
         elif isinstance(event, GoAway):
             asyncio.create_task(self._reconnect("go_away", resume=True))
         elif isinstance(event, EngineError):
-            if recover_call_context(self.ctx, self.messages, self.tool_schemas, event):
-                await self._reconnect("context_length", resume=False)
-            elif event.retryable:
+            if event.retryable:
                 asyncio.create_task(self._reconnect(f"engine_error:{event.kind}", resume=True))
             else:
                 self.failure = ("live_engine_error", f"{event.kind}: {event.message}")
-                if event.kind == "context_length":
-                    self._begin_close("context_too_large", detail=_size_words(event.message))
-                else:
-                    self._begin_close(event.kind, detail=event.message)
+                self._begin_close(event.kind, detail=event.message)
         elif isinstance(event, Closed):
             if not self.closing:
                 asyncio.create_task(self._reconnect(f"transport_lost:{event.reason}", resume=True))
@@ -779,8 +769,9 @@ class _LiveCall:
             self.hub.send_state(STATE_LIVE)
             effective = dict(event.effective or {})
             if effective.get("input_rate") or effective.get("output_rate"):
-                self.hub.set_engine_rates(int(effective.get("input_rate") or self.route.engine.input_rate),
-                                          int(effective.get("output_rate") or self.route.engine.output_rate))
+                self.input_rate = int(effective.get("input_rate") or self.input_rate)
+                self.output_rate = int(effective.get("output_rate") or self.output_rate)
+                self.hub.set_engine_rates(self.input_rate, self.output_rate)
 
     async def _barge_in(self) -> None:
         self.hub.flush()
@@ -1055,30 +1046,6 @@ class _LiveCall:
         except Exception:
             log.warning("live call %s checkpoint unwritten; mailbox content stays unacknowledged", self.spec.call_id, exc_info=True)
             return False
-
-
-def _other_engine(engine: str) -> str:
-    """The other engine when its key is set (the owner's one-click alternative), else ``""``."""
-    from ouroboros.llm_live import other_live_engine
-    from ouroboros.provider_models import PROVIDER_ENV_KEYS
-    from ouroboros.settings_integrity import runtime_setting
-
-    try:
-        return other_live_engine({name: runtime_setting(name, "") for name in PROVIDER_ENV_KEYS.values()}, engine)
-    except Exception:
-        return ""
-
-
-def _size_words(message: str) -> str:
-    """The provider's refusal numbers as plain words; its own text when it gave none."""
-    import json
-
-    try:
-        evidence = json.loads(message)
-        return (f"{int(evidence['input_tokens']):,} tokens of core memory; "
-                f"this engine holds {int(evidence['limit_tokens']):,}")
-    except (ValueError, TypeError, KeyError):
-        return str(message or "")[:300]
 
 
 def run_live_turn(

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import CallSpec
-from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, ENGINE_OPENAI, EngineRoute
+from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, EngineRoute
 from ouroboros.tool_capabilities import COGNITIVE_MEMORY_TOOL_NAMES
 
 log = logging.getLogger(__name__)
@@ -60,10 +60,6 @@ class RouteFact:
 # 16,384 (developers.openai.com/blog/realtime-api), so the number is route-specific and
 # re-probed when the route changes, never inherited by name.
 REALTIME_ROUTE_FACTS: Dict[Tuple[str, str], RouteFact] = {
-    (ENGINE_OPENAI, "gpt-realtime-2.1"): RouteFact(
-        128_000, 32_000, 60, "https://developers.openai.com/api/docs/models/gpt-realtime-2.1", "2026-10-16",
-        instructions_cap_tokens=65_536,
-        instructions_cap_source="provider refusal observed live on this route, read 2026-10-15"),
     (ENGINE_GOOGLE, "gemini-3.8-live"): RouteFact(
         131_072, 65_536, None, "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live", "2026-10-16"),
 }
