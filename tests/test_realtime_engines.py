@@ -475,6 +475,11 @@ def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
     assert lost.kind == "transport" and lost.retryable  # a close without words is a lost connection: resume
     normal = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1000, reason="bye")))
     assert normal.kind == "transport" and normal.retryable
+    too_big = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1007, reason=(
+        "user system instruction has 140000 tokens, the sum is above the 131072 limit"))))
+    assert too_big.kind == "invalid_request" and not too_big.retryable and "140000 tokens" in too_big.message
+    bare = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1007, reason="")))
+    assert bare.kind == "protocol"
     denied = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1008, reason="key fixture-key is invalid")))
     assert denied.kind == "authentication" and "fixture-key" not in denied.message
 

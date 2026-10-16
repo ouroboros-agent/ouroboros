@@ -58,6 +58,10 @@ def transport_error(exc: Exception) -> EngineError:
         return EngineError("rate_limit", "Live provider rate limit reached.", True)
     if status is not None and 400 <= status < 500 and status != 408:
         return EngineError("invalid_request", "Live provider rejected the session configuration.")
+    if code == 1007 and sentence:
+        # Gemini refuses a setup it cannot hold (e.g. an instruction above the window) this way,
+        # in its own words; reopening the same session cannot change them.
+        return EngineError("invalid_request", sentence)
     if code in (1002, 1003, 1007, 1009):
         return EngineError("protocol", "Live provider rejected the websocket payload.")
     if code is not None and code not in (1000, 1001, 1006) and sentence:
