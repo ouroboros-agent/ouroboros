@@ -25,6 +25,20 @@ def test_output_requires_new_external_temp_directory(tmp_path, monkeypatch):
         probe.output_root(str(root))
 
 
+def test_a_data_copy_never_carries_the_source_daemon_home(tmp_path):
+    source = tmp_path / "live"
+    (source / "claudexor" / "daemon").mkdir(parents=True)
+    (source / "claudexor" / "daemon" / "control-api.json").write_text("{}")
+    (source / "memory").mkdir()
+    (source / "memory" / "identity.md").write_text("me")
+    (source / "settings.json").write_text("{}")
+    (tmp_path / "run").mkdir()
+    copied = tmp_path / "run" / "data"
+    probe.copy_data(source, copied)
+    assert (copied / "memory" / "identity.md").read_text() == "me" and (copied / "settings.json").exists()
+    assert not (copied / "claudexor").exists()
+
+
 def test_scenario_selection_rejects_typos():
     assert probe.select_scenarios("opening,money") == {"opening", "money"}
     assert probe.select_scenarios("all") == set(probe.SCENARIOS)

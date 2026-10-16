@@ -651,6 +651,19 @@ async def run_probe(args):
     return probe.result
 
 
+def copy_data(source: Path, target: Path) -> None:
+    """A mature install's data, cloned file by file (``cp -c``) into the run; the source is only read.
+
+    One top-level entry at a time, and never the source's Claudexor home (its daemon's descriptor
+    and token would let the copy reach that daemon). Never one whole-tree clonefile(2): that held
+    APFS for minutes and froze the machine.
+    """
+    target.mkdir(mode=0o700)
+    for entry in sorted(source.iterdir()):
+        if entry.name != "claudexor":
+            subprocess.run(["cp", "-c", "-R", str(entry), str(target)], check=True)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenarios", default="all", help=",".join(SCENARIOS))
@@ -670,9 +683,7 @@ def main(argv=None) -> int:
         return int(bool(result.get("failure")) or any(r["verdict"] == "FAIL" for r in result["scenarios"].values()))
     root = output_root(args.output_dir)
     if args.data_copy:
-        # Copy-on-write clone: the run reads and writes its own copy; the source is never touched.
-        (root / "data").mkdir(mode=0o700)
-        subprocess.run(["cp", "-c", "-R", str(Path(args.data_copy).resolve()) + "/.", str(root / "data")], check=True)
+        copy_data(Path(args.data_copy).resolve(), root / "data")
     before = daemon_list()
     write_json(root / "daemons-before.json", before)
     helper = runpy.run_path(str(REPO / "ouroboros/test_environment.py"))
