@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import CallSpec
-from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, EngineRoute
+from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, GOOGLE_INPUT_RATE, GOOGLE_OUTPUT_RATE, EngineRoute
 from ouroboros.tool_capabilities import COGNITIVE_MEMORY_TOOL_NAMES
 
 log = logging.getLogger(__name__)
@@ -63,8 +63,6 @@ REALTIME_ROUTE_FACTS: Dict[Tuple[str, str], RouteFact] = {
         131_072, 65_536, None, "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live", "2026-10-16"),
 }
 EVIDENCE_SOURCE_DOCUMENTED = "documented_route_fact"   # the evidence store's source label for these rows
-# The PCM16 mono rates Gemini Live's wire takes and returns (16 kHz in, 24 kHz out).
-GEMINI_INPUT_RATE, GEMINI_OUTPUT_RATE = 16_000, 24_000
 
 
 @dataclass(frozen=True)
@@ -98,7 +96,7 @@ def resolve_call_route(spec: CallSpec, drive_root: Any) -> CallRoute:
     from ouroboros.capability_evidence import route_fingerprint
 
     route = EngineRoute(engine=spec.engine, model=spec.model, voice=spec.voice,
-                        input_rate=GEMINI_INPUT_RATE, output_rate=GEMINI_OUTPUT_RATE)
+                        input_rate=GOOGLE_INPUT_RATE, output_rate=GOOGLE_OUTPUT_RATE)
     fact = REALTIME_ROUTE_FACTS.get((spec.engine, spec.model))
     fp = route_fingerprint(provider=spec.engine, model=spec.model)
     if fact is not None:

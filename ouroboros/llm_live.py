@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ouroboros.gateways.realtime_engine import EngineRoute, LiveEngine, SessionConfig
+from ouroboros.gateways.realtime_engine import (
+    GOOGLE_INPUT_RATE, GOOGLE_OUTPUT_RATE, EngineRoute, LiveEngine, SessionConfig,
+)
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
 from ouroboros.provider_models import PROVIDER_ENV_KEYS
 from ouroboros.settings_integrity import runtime_setting
@@ -30,7 +32,7 @@ def make_live_engine(client, route: EngineRoute) -> LiveEngine:
     if not key:
         raise LiveEngineRefusal("missing_credential", f"Configure {PROVIDER_ENV_KEYS['google']} for calls.")
     engine = GeminiLiveEngine(api_key=key)
-    engine.route = replace(route, input_rate=16000, output_rate=24000)
+    engine.route = replace(route, input_rate=GOOGLE_INPUT_RATE, output_rate=GOOGLE_OUTPUT_RATE)
     return engine
 
 

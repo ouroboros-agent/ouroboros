@@ -147,10 +147,9 @@ class _LiveCall:
         self.context_captured_at = context_captured_at
         self.ctx = tools._ctx
         self.route = resolve_call_route(spec, drive_root)
-        # The PCM rates the engine wire takes and returns. Gemini Live takes 16 kHz input
-        # and refuses any other rate, so audio is labelled with what the session declares.
-        self.input_rate = 16000 if spec.engine == "google" else self.route.engine.input_rate
-        self.output_rate = self.route.engine.output_rate
+        # The PCM rates the engine wire takes and returns (Gemini Live: 16 kHz in, 24 kHz out);
+        # audio is labelled with what the session declares, and a Ready that names others wins.
+        self.input_rate, self.output_rate = self.route.engine.input_rate, self.route.engine.output_rate
         self.llm_trace: Dict[str, Any] = {"reasoning_notes": ["live_call"], "tool_calls": []}
         self.usage: Dict[str, Any] = {"_task_attempt": getattr(self.ctx, "task_attempt", None),
                                       "live_usage": {key: 0 for key in USAGE_KEYS}, "live_responses": 0}

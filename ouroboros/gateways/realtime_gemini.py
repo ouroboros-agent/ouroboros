@@ -20,6 +20,7 @@ from ouroboros.gateways.realtime_engine import (
     ResponseDone, ResponseStarted, ResumeCheckpoint, SpeechStarted, ToolCall,
     ToolCallCancelled, ToolResult, ToolsApplied, UpdateTools, USAGE_KEYS, register_engine,
 )
+from ouroboros.gateways.realtime_engine import GOOGLE_INPUT_RATE as INPUT_RATE, GOOGLE_OUTPUT_RATE as OUTPUT_RATE
 from ouroboros.gateways.realtime_transport import (
     EVENT_QUEUE_SIZE, LiveEngineRefusal, RealtimeTransport, check_audio,
     function_schemas, image_part, provider_sentence, transport_error,
@@ -180,9 +181,9 @@ class GeminiLiveEngine(RealtimeTransport):
 
     async def _send_command(self, command):
         if isinstance(command, AudioIn):
-            check_audio(command, 16000)
+            check_audio(command, INPUT_RATE)
             await self._write({"realtimeInput": {"audio": {
-                "mimeType": "audio/pcm;rate=16000", "data": base64.b64encode(command.pcm).decode("ascii")}}})
+                "mimeType": f"audio/pcm;rate={INPUT_RATE}", "data": base64.b64encode(command.pcm).decode("ascii")}}})
         elif isinstance(command, ContextItem):
             if self._item_id:
                 if len(self._context) >= EVENT_QUEUE_SIZE:
@@ -257,7 +258,7 @@ class GeminiLiveEngine(RealtimeTransport):
             self._ready.set()
             if self._initial_setup:
                 self._initial_setup = False
-                self._emit(Ready({"model": self._config.route.model, "input_rate": 16000, "output_rate": 24000,
+                self._emit(Ready({"model": self._config.route.model, "input_rate": INPUT_RATE, "output_rate": OUTPUT_RATE,
                                   "native_search": self._config.native_search, **message["setupComplete"]}))
             elif self._activating_tools is not None:
                 self._emit(ToolsApplied(tuple(tool["name"] for tool in function_schemas(self._activating_tools))))
@@ -279,7 +280,7 @@ class GeminiLiveEngine(RealtimeTransport):
                 if audio.get("mimeType", "").split(";")[0] != "audio/pcm":
                     raise ValueError("unsupported output audio format")
                 if not self._discard_audio:
-                    self._emit(AudioOut(base64.b64decode(audio["data"], validate=True), 24000, self._item_id))
+                    self._emit(AudioOut(base64.b64decode(audio["data"], validate=True), OUTPUT_RATE, self._item_id))
             elif "text" in part and not part.get("thought"):
                 self._transcription("ouroboros", {"text": part["text"]})
         for key, speaker in (("inputTranscription", "owner"), ("outputTranscription", "ouroboros")):

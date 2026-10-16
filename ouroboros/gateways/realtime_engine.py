@@ -21,6 +21,8 @@ from typing import AsyncIterator, Callable, Dict, Mapping, Protocol, Tuple, Unio
 
 ENGINE_GOOGLE = "google"
 ENGINE_IDS = (ENGINE_GOOGLE,)
+# The PCM16 mono rates Gemini Live's wire takes and returns: 16 kHz in (it refuses any other), 24 kHz out.
+GOOGLE_INPUT_RATE, GOOGLE_OUTPUT_RATE = 16_000, 24_000
 
 SPEAKER_OWNER = "owner"
 SPEAKER_OUROBOROS = "ouroboros"
