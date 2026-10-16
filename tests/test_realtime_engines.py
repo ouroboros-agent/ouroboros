@@ -663,3 +663,22 @@ def test_colab_collects_google_without_treating_live_as_text_access(monkeypatch)
     assert colab.collect_colab_secrets()["GOOGLE_API_KEY"] == "google-test-key"
     assert ("GOOGLE_API_KEY", False) in requested
     assert ("OPENROUTER_API_KEY", True) in requested
+
+
+def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
+    from types import SimpleNamespace
+
+    from ouroboros.gateways.realtime_transport import transport_error
+
+    quota = SimpleNamespace(rcvd=SimpleNamespace(code=1011, reason=(
+        "You exceeded your current quota, please check your plan https://ai.google.dev/x key AIzaSyFAKEFAKEFAKE12")))
+    error = transport_error(quota)
+    assert error.kind == "provider_closed" and not error.retryable
+    assert error.message.startswith("You exceeded your current quota") and "AIza" not in error.message
+    assert "https://" not in error.message
+    lost = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1011, reason="")))
+    assert lost.kind == "transport" and lost.retryable  # a close without words is a lost connection: resume
+    normal = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1000, reason="bye")))
+    assert normal.kind == "transport" and normal.retryable
+    denied = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1008, reason="key fixture-key is invalid")))
+    assert denied.kind == "authentication" and "fixture-key" not in denied.message

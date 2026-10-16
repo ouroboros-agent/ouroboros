@@ -300,8 +300,9 @@ class GeminiLiveEngine(RealtimeTransport):
         if "error" in message:
             code = message["error"].get("code")
             kind = "authentication" if code in (401, 403) else "provider_error"
-            await self._fail(EngineError(kind, provider_sentence(message["error"].get("message"))
-                                         or "Gemini rejected a live event.", code in (408, 429, 500, 503)))
+            # An access refusal keeps the host's words: its provider text can echo credentials.
+            words = "" if kind == "authentication" else provider_sentence(message["error"].get("message"))
+            await self._fail(EngineError(kind, words or "Gemini rejected a live event.", code in (408, 429, 500, 503)))
 
 
 register_engine("google", GeminiLiveEngine)

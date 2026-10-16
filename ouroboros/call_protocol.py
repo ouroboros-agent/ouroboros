@@ -237,7 +237,11 @@ class CallHub:
         """Bump the output epoch, tell peers to drop older playback now; returns the epoch."""
         raise NotImplementedError
 
-    def send_state(self, state: str, reason: str = "") -> None:
+    def send_state(self, state: str, reason: str = "", *, phase: str = "", detail: str = "", action: str = "",
+                   other_engine: str = "") -> None:
+        raise NotImplementedError
+
+    def send_activity(self, activity: str, label: str = "") -> None:
         raise NotImplementedError
 
     def send_caption(self, speaker: str, text: str, final: bool, item_id: str = "") -> None:
@@ -246,5 +250,10 @@ class CallHub:
     def peers(self) -> "tuple[PeerInfo, ...]":
         raise NotImplementedError
 
-    def close(self, reason: str) -> None:
+    @property
+    def ended_by_owner(self) -> bool:
+        """The owner's surface said bye (a driver that has not opened its engine never opens it)."""
+        raise NotImplementedError
+
+    def close(self, reason: str, *, detail: str = "", action: str = "", other_engine: str = "") -> None:
         raise NotImplementedError

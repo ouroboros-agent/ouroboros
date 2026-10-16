@@ -513,13 +513,23 @@ def test_barge_in_still_cuts_an_item_whose_playback_caught_up_while_it_generates
 # --- the ledger: unknown stays unknown, refusals keep the charge, no fetch on the loop ------
 
 
-def test_the_quote_is_warmed_on_the_turn_thread_before_the_loop_starts(harness):
+def test_the_quote_is_warmed_on_the_ledger_thread_and_never_holds_the_open(harness):
     h = harness()
-    h.start()
+    release = threading.Event()
+    warm = h.ledger.warm_quote
+
+    def slow_warm(**fields):
+        release.wait(10)  # a catalog fetch that has not answered yet
+        return warm(**fields)
+
+    h.ledger.warm_quote = slow_warm
+    h.start()  # the engine opens while the quote is still being fetched
+    assert not h.ledger.warmed
+    release.set()
     assert _wait_for(lambda: h.ledger.warmed)
     (fields, thread_name), = h.ledger.warmed
     assert fields == {"engine": ENGINE_OPENAI, "model": "gpt-realtime-2.1", "drive_root": h.root}
-    assert thread_name == "call-under-test"
+    assert thread_name.startswith("call-ledger")
     h.stop()
     h.finish()
 

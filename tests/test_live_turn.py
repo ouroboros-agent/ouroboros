@@ -118,6 +118,9 @@ class FakeHub:
         self.rates = None
         self.present = [OWNER]
         self.closed: list = []
+        self.activity: list = []
+        self.words: list = []  # (state, detail, action, other_engine) of every state that carried words
+        self.ended_by_owner = False
 
     def set_engine_rates(self, input_rate, output_rate) -> None:
         self.rates = (input_rate, output_rate)
@@ -135,8 +138,13 @@ class FakeHub:
         self.flushes += 1
         return self.flushes
 
-    def send_state(self, state, reason="") -> None:
+    def send_state(self, state, reason="", *, phase="", detail="", action="", other_engine="") -> None:
         self.states.append((state, reason))
+        if detail or action or other_engine:
+            self.words.append((state, detail, action, other_engine))
+
+    def send_activity(self, activity, label="") -> None:
+        self.activity.append((activity, label))
 
     def send_caption(self, speaker, text, final, item_id="") -> None:
         self.captions.append((speaker, text, final, item_id))
@@ -144,7 +152,7 @@ class FakeHub:
     def peers(self):
         return tuple(self.present)
 
-    def close(self, reason) -> None:
+    def close(self, reason, **words) -> None:
         self.closed.append(reason)
 
     def feed(self, event) -> None:
@@ -808,10 +816,12 @@ def test_a_retryable_engine_error_reconnects_and_a_fatal_one_ends_the_call(harne
     first.push(EngineError(kind="rate_limited", message="slow down", retryable=True))
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
     second = h.engine()
-    second.push(EngineError(kind="auth", message="bad key", retryable=False))
+    second.push(EngineError(kind="authentication", message="bad key", retryable=False))
     text, usage, _trace = h.finish()
-    assert usage["reason_code"] == "live_engine_error" and usage["live_call"]["ended"] == "engine_error:auth"
-    assert "auth: bad key" in text
+    assert usage["reason_code"] == "live_engine_error" and usage["live_call"]["ended"] == "authentication"
+    assert "authentication: bad key" in text
+    # The owner's surface gets the provider's sentence and the one next step beside the reason.
+    assert ("closed", "bad key", "settings", "") in h.hub.words
 
 
 def test_a_session_that_cannot_be_reopened_ends_the_call(harness, monkeypatch, tmp_path):
@@ -956,3 +966,65 @@ def test_a_presence_call_opens_with_its_whole_ceiling_and_an_owner_call_with_the
     presence = [s["function"]["name"] for s in initial_call_schemas(registry, _spec(presence_binding_id="b" * 32))]
     assert "notes_read" not in owner and {"web_search", "enable_tools"} <= set(owner)
     assert presence == ["notes_read", "web_search", "enable_tools"]
+
+
+# --- what the owner's surface is told: phases, words, the next step, activity --------------------
+
+def test_an_owner_who_ends_the_call_while_it_prepares_never_opens_an_engine(harness):
+    h = harness()
+    h.hub.ended_by_owner = True  # the owner's surface said bye while the turn was reading memory
+    h.thread = threading.Thread(target=lambda: setattr(h, "result", live_turn.run_live_turn(
+        messages=h.messages, tools=h.tools, llm=h.llm, drive_logs=h.root / "logs", emit_progress=h.emit_progress,
+        incoming_messages=h.incoming, task_id="t-call", task_type="task", budget_remaining_usd=10.0,
+        event_queue=h.events, drive_root=h.root, spec=h.spec, task=h.task, context_captured_at=h.context_captured_at)),
+        daemon=True)
+    h.thread.start()
+    text, usage, _trace = h.finish()
+    assert h.llm.engines == [] and h.llm.routes == []  # nothing opened, nothing paid for
+    assert usage["live_call"]["ended"] == "owner_bye" and "reason_code" not in usage
+    assert h.hub.states[-1] == (STATE_CLOSED, "owner_bye") and h.hub.closed == ["owner_bye"]
+    assert all(state != STATE_CONNECTING for state, _reason in h.hub.states)
+
+
+def test_a_missing_key_ends_the_call_with_its_own_words_and_the_settings_step(harness):
+    from ouroboros.gateways.realtime_transport import LiveEngineRefusal
+
+    h = harness()
+
+    def refuse(route):
+        raise LiveEngineRefusal("missing_credential", "Configure OPENAI_API_KEY for this live route.")
+
+    h.llm.open_live = refuse
+    h.thread = threading.Thread(target=lambda: setattr(h, "result", live_turn.run_live_turn(
+        messages=h.messages, tools=h.tools, llm=h.llm, drive_logs=h.root / "logs", emit_progress=h.emit_progress,
+        incoming_messages=h.incoming, task_id="t-call", task_type="task", budget_remaining_usd=10.0,
+        event_queue=h.events, drive_root=h.root, spec=h.spec, task=h.task, context_captured_at=h.context_captured_at)),
+        daemon=True)
+    h.thread.start()
+    text, usage, _trace = h.finish()
+    # A typed refusal is not "the voice service could not be reached".
+    assert usage["live_call"]["ended"] == "missing_credential" and usage["reason_code"] == "live_engine_refused"
+    assert ("closed", "Configure OPENAI_API_KEY for this live route.", "settings", "") in h.hub.words
+    assert [state for state, _ in h.hub.states][:1] == [STATE_CONNECTING]
+
+
+def test_a_tool_batch_tells_the_surface_it_is_working_and_then_idle(harness):
+    h = harness()
+    engine = h.start()
+    engine.push(ToolCall(call_id="c1", name="web_search", arguments="{}"))
+    assert _wait_for(lambda: ("idle", "") in h.hub.activity)
+    assert h.hub.activity[:2] == [("working", "web_search"), ("idle", "")]
+    h.stop()
+    h.finish()
+
+
+def test_a_context_refusal_with_no_smaller_projection_ends_with_both_numbers(harness, monkeypatch):
+    h = harness()
+    monkeypatch.setattr(live_turn, "recover_call_context", lambda *args: False)
+    monkeypatch.setattr(live_turn, "_other_engine", lambda engine: "google")
+    engine = h.start()
+    engine.push(EngineError(kind="context_length", message=json.dumps(
+        {"field": "session.instructions", "limit_tokens": 65536, "input_tokens": 71200})))
+    text, usage, _trace = h.finish()
+    assert usage["live_call"]["ended"] == "context_too_large"
+    assert ("closed", "71,200 tokens of core memory; this engine holds 65,536", "other_engine", "google") in h.hub.words

@@ -53,7 +53,7 @@ def transport_error(exc: Exception) -> EngineError:
     code = getattr(received, "code", None)
     sentence = provider_sentence(getattr(received, "reason", ""))
     if status in (401, 403) or code == 1008:
-        return EngineError("authentication", sentence or "Live provider refused access.")
+        return EngineError("authentication", "Live provider refused access.")  # its text can echo credentials
     if status == 429:
         return EngineError("rate_limit", "Live provider rate limit reached.", True)
     if status is not None and 400 <= status < 500 and status != 408:

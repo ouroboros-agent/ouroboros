@@ -284,8 +284,9 @@ class OpenAIRealtimeEngine(RealtimeTransport):
                 retryable = code in ("server_error", "rate_limit_exceeded")
                 category = {"rate_limit_exceeded": "rate_limit", "invalid_api_key": "authentication",
                             "invalid_request_error": "invalid_request"}.get(code, "provider_error")
-                await self._fail(EngineError(category, provider_sentence(error.get("message"))
-                                             or "OpenAI rejected a live event.", retryable))
+                # An access refusal keeps the host's words: its provider text can echo credentials.
+                words = "" if category == "authentication" else provider_sentence(error.get("message"))
+                await self._fail(EngineError(category, words or "OpenAI rejected a live event.", retryable))
 
 
 register_engine("openai", OpenAIRealtimeEngine)
