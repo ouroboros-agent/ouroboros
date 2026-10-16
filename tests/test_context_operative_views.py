@@ -84,3 +84,61 @@ def test_health_view_names_the_reader_s_own_verb(tmp_path, monkeypatch):
     foreign = context_health.build_health_invariants(_env(tmp_path), task_id="task-reader").operative_view
     assert f"\n  - run {runs[0].run_id}, owner task {runs[0].task_id}\n" in foreign
     assert "this task" not in foreign
+
+
+def test_book_maps_keep_their_chapters_and_paths_and_retain_the_map(tmp_path):
+    from pathlib import Path
+
+    from ouroboros import context_layout
+    from ouroboros.reference_books import load_reference_book
+    from ouroboros.section_floor import HostSection
+
+    repo = Path(__file__).resolve().parents[1]
+    book = load_reference_book(repo, "architecture")
+    section = context_layout.book_map_section(book, "architecture_map")
+    assert isinstance(section, HostSection) and section.full_text == context_layout.book_navigation(book)
+    for chapter in book.chapters:
+        assert f"`{chapter.source_path}`" in section.operative_view
+    assert len(section.operative_view) < len(section.full_text) / 4
+    assert "(navigation map)" not in section.operative_view  # the per-chapter heading index stays retained
+    books = (book, load_reference_book(repo, "development"))
+    parts, development = context_layout.reference_doc_sections(None, context_mode="nano", include_development=True,
+                                                               books=books)
+    assert [getattr(part, "section_id", None) for part in parts][:2] == ["architecture_map", "development_map"]
+    full, _dev = context_layout.reference_doc_sections(None, context_mode="max", include_development=False,
+                                                        books=books)
+    assert not isinstance(full[0], HostSection) or full[0].operative_view is None  # Max keeps the book resident
+
+
+def test_world_subagents_and_reflections_keep_names_and_state(tmp_path, monkeypatch):
+    from ouroboros import context
+    from tests.test_cache_optimization import _make_env_and_memory
+
+    profile = "\n\n## System\n\nmacOS 26, arm64, 128 GB.\n\n## Available Tools\n\ngit, node, python.\n\n### Shell\n\nzsh.\n"
+    world = context._world_section(profile)
+    assert world.section_id == "world" and world.full_text.endswith("\n\n" + profile.strip())
+    # Its heading map addresses the file's own lines (the leading blank lines included).
+    assert "- System — lines 3-6" in world.operative_view and "  - Shell — lines 11-13" in world.operative_view
+    assert "macOS 26" not in world.operative_view and "path='memory/WORLD.md'" in world.operative_view
+
+    env, memory = _make_env_and_memory(tmp_path)
+    catalog = {"rows": [{"subagent_id": f"helper-{i}", "route_class": "API model", "effort": "auto",
+                         "review_eligible": i == 0, "recommended_use": "The owner's words about this row. " * 20}
+                        for i in range(3)]}
+    monkeypatch.setattr("ouroboros.subagent_runtime.current_model_visible_subagent_catalog", lambda: catalog)
+    core = context._capture_context_core(env, memory, {"id": "t1", "type": "task", "text": "hi"}, None, None)
+    subagents = next(part for part in core.semi_stable_sections if part.section_id == "subagents")
+    assert "- helper-0: API model, effort auto, reviews" in subagents.operative_view
+    assert "- helper-2: API model, effort auto" in subagents.operative_view
+    assert "owner's words" in subagents.full_text and "owner's words" not in subagents.operative_view
+    assert core.semi_stable_text == "\n\n".join(core.semi_stable_sections)
+    assert [part.section_id for part in core.semi_stable_sections if part.section_id in ("identity", "subagents")] \
+        == ["subagents", "identity"]
+
+    rows = [{"ts": "2026-10-16T10:00:00Z", "type": "late_review_settlement", "task_type": "task", "task_id": f"t{i}",
+             "reflection": "What happened and what I learned. " * 30} for i in range(2)]
+    section = context._reflections_section("execution_reflections", "## Execution reflections", rows,
+                                           "the whole text", "Historical automatic reflections: 4 row(s) ...")
+    assert section.full_text == "## Execution reflections\n\nthe whole text"
+    assert section.operative_view == ("## Execution reflections\n\n- 2026-10-16T10:00 | task | t0\n"
+                                      "- 2026-10-16T10:00 | task | t1\nHistorical automatic reflections: 4 row(s) ...")

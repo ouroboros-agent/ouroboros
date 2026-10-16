@@ -771,11 +771,11 @@ def build_memory_sections(memory: Memory, partition: str = "all", *, include_scr
         _warn_if_over_budget("identity", identity_raw)
         sections.append(HostSection("identity", "## Identity (from `memory/identity.md` — already loaded; do not re-read "
                                     "via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw))
-        world_raw = memory.load_world_profile().strip()
-        if world_raw:
+        world_file = memory.load_world_profile()
+        if world_file.strip():
             # Generated profile is full; oversize is a generation-discipline bug.
-            _warn_if_over_budget("world", world_raw)
-            sections.append(_world_section(world_raw))
+            _warn_if_over_budget("world", world_file.strip())
+            sections.append(_world_section(world_file))
 
     if partition == "all":
         registry_path = memory.drive_root / "memory" / "registry.md"
@@ -788,14 +788,14 @@ def build_memory_sections(memory: Memory, partition: str = "all", *, include_scr
     return sections
 
 
-def _world_section(world_raw: str) -> HostSection:
+def _world_section(world_file: str) -> HostSection:
     """WORLD.md whole, with its own heading map as the operative view (line ranges into the file)."""
     from ouroboros.context_layout import generate_doc_nav_map
 
     reader = "read_file(root='runtime_data', path='memory/WORLD.md', start_line=A, max_lines=N)"
     full = ("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to "
-            "regenerate if the host environment changes)\n\n" + world_raw)
-    headings = generate_doc_nav_map(world_raw, title="Environment Profile", rel_path="memory/WORLD.md",
+            "regenerate if the host environment changes)\n\n" + world_file.strip())
+    headings = generate_doc_nav_map(world_file, title="Environment Profile", rel_path="memory/WORLD.md",
                                     instructions=False).split("\n", 2)[2]  # below its own title line
     return HostSection("world", full, f"## Environment Profile (from `memory/WORLD.md`)\n\n{headings}\n\n"
                                       f"Its line ranges read with {reader}.")
