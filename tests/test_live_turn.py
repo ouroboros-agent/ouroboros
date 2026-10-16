@@ -1042,3 +1042,23 @@ def test_a_google_call_compresses_from_its_watermarks_and_an_openai_call_leaves_
     assert (config.compress_at_tokens, config.compress_to_tokens) == (0, 0)
     openai.stop()
     openai.finish()
+
+
+def test_a_fresh_session_replays_the_newest_rows_that_fit_and_names_the_rest(harness):
+    from dataclasses import replace as _replace
+
+    h = harness(spec=_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live"))
+    call = live_turn._LiveCall(messages=h.messages, tools=h.tools, llm=h.llm, drive_logs=h.root / "logs",
+                               emit_progress=h.emit_progress, incoming_messages=h.incoming, task_id="t-call",
+                               task_type="task", event_queue=h.events, drive_root=h.root, spec=h.spec)
+    small = _replace(call.route.fact, window_tokens=8_192 + 2_000)  # one reply plus a small room
+    call.route = _replace(call.route, fact=small)
+    for index in range(60):
+        h.messages.append({"role": "user" if index % 2 else "assistant", "content": f"utterance {index} " + "word " * 40})
+    view = call._history_view()
+    assert view[0]["role"] == "user" and view[0]["content"].startswith("[Earlier in this call:")
+    assert view[-1]["content"].startswith("utterance 59 ")
+    assert all(not str(item["content"]).startswith("utterance 0 ") for item in view)
+    unbounded = _replace(call.route, fact=None)
+    call.route = unbounded
+    assert len(call._history_view()) == 61  # the task row and every utterance when no route fact bounds it

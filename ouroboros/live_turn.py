@@ -453,12 +453,57 @@ class _LiveCall:
             if resume_handle or rows_then > cut:
                 await self._send(command)
 
+    def _history_budget(self) -> Optional[int]:
+        """Tokens a fresh session may spend replaying this call: half the room left to talk, or no bound.
+
+        Physical: a long call's own words would otherwise fill a reopened window before
+        anyone speaks. The newest rows travel; older ones are in the room's transcript,
+        which the view names.
+        """
+        import json
+        import math
+
+        from ouroboros.utils import estimate_tokens
+
+        fact = self.route.fact
+        if fact is None:
+            return None
+        system = self.messages[0] if self.messages and self.messages[0].get("role") == "system" else {}
+        reply = int(getattr(fact, "reply_allowance_tokens", 0) or 8_192)
+        limit = int(fact.window_tokens) - (reply if self.spec.engine == "google" else int(fact.max_output_tokens))
+        view = math.ceil(estimate_tokens(text_of(system.get("content"))) + estimate_tokens(json.dumps(self.tool_schemas)))
+        return max(0, (limit - view) // 2)
+
     def _history_view(self) -> Tuple[Dict[str, Any], ...]:
-        """The dialogue so far as items: text, plus the images a user row carries.
+        """The dialogue so far as items, newest first within the room a fresh session has.
 
         Both engines accept images on a user history item; an image on any other
-        row cannot travel in history, so its absence is named in the item.
+        row cannot travel in history, so its absence is named in the item. Rows
+        beyond the budget are named by count: they stay in the room's transcript.
         """
+        from ouroboros.utils import estimate_tokens
+
+        rows = self._history_rows()
+        budget = self._history_budget()
+        if budget is None:
+            return tuple(rows)
+        kept: List[Dict[str, Any]] = []
+        spent = 0
+        for item in reversed(rows):
+            cost = estimate_tokens(text_of(item.get("content")) if not isinstance(item.get("content"), str)
+                                   else item["content"])
+            if spent + cost > budget:
+                break
+            kept.append(item)
+            spent += cost
+        kept.reverse()
+        if len(kept) < len(rows):
+            note = (f"[Earlier in this call: {len(rows) - len(kept)} rows (speech, typed words, tool results) are not "
+                    "replayed into this session; they are in this room's transcript.]")
+            kept.insert(0, {"role": "user", "content": note})
+        return tuple(kept)
+
+    def _history_rows(self) -> List[Dict[str, Any]]:
         view: List[Dict[str, Any]] = []
         for msg in self.messages[1:] if self.messages and self.messages[0].get("role") == "system" else self.messages:
             role = str(msg.get("role") or "")
@@ -477,7 +522,7 @@ class _LiveCall:
                 if msg.get(key):
                     item[key] = msg[key]
             view.append(item)
-        return tuple(view)
+        return view
 
     async def _reconnect(self, reason: str, *, resume: bool) -> None:
         if self.closing or self.reconnecting:
