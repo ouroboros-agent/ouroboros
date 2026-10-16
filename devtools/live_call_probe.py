@@ -303,8 +303,16 @@ def speech_fixture(root: Path, label: str, key: str, reuse: str | None) -> bytes
     return synthesize(root, label, key)
 
 
+# A grounded response carries Gemini's search charge, which the public catalog prices nowhere; the
+# ledger keeps such a response unknown-priced by design (``live_usage``), a disclosure, not a gap.
+GROUNDING_UNPRICED = {"groundingMetadata", "grounding_metadata"}
+
+
 def money_evidence(rows: list[dict], events: list[dict]) -> tuple[bool, dict]:
     responses = [r for r in rows if r.get("source") == "live_response"]
+    grounded = [r["attempt_id"] for r in responses if r.get("cost_usd") is None
+                and set(r.get("cost_evidence", {}).get("unpriced") or ()) and
+                set(r.get("cost_evidence", {}).get("unpriced") or ()) <= GROUNDING_UNPRICED]
     starts = [e.get("response_id") or e.get("item_id") for e in events if e["kind"] == "ResponseStarted"]
     done = [e.get("response_id") or e.get("item_id") for e in events if e["kind"] == "ResponseDone"]
     keys = [r.get("cost_evidence", {}).get("response_key") for r in responses]
@@ -320,16 +328,17 @@ def money_evidence(rows: list[dict], events: list[dict]) -> tuple[bool, dict]:
             errors.append("audio included in text counter: " + row["attempt_id"])
         if not quote or not all(quote.get(k) for k in ("url", "fetched_at", "sha256", "entry")):
             errors.append("catalog quote unavailable: " + row["attempt_id"])
-        if row.get("cost_usd") is None:
+        if row.get("cost_usd") is None and row["attempt_id"] not in grounded:
             errors.append("unpriced modalities: " + row["attempt_id"])
         if row in responses and not all(row.get(k) for k in ("ts_reserved", "ts_dispatched", "ts_final")):
             errors.append("missing reservation/dispatch/settlement proof: " + row["attempt_id"])
     unknown = [r["attempt_id"] for r in rows if r.get("cost_usd") is None]
-    if unknown:
+    if set(unknown) - set(grounded):
         errors.append("total includes unknown-priced attempts")
     known = sum(r.get("cost_usd") or 0 for r in rows)
     return not errors, {"errors": errors, "attempts": rows, "known_estimated_usd": known,
                         "total_cost_usd": None if unknown else known, "unknown_attempts": unknown,
+                        "grounded_unknown_priced_attempts": grounded,
                         "call_estimated_usd": sum(r.get("cost_usd") or 0 for r in responses)}
 
 
@@ -464,7 +473,13 @@ class Probe:
                                and any(c["call_id"] == r["call_id"] for c in calls)]
                     facts.update(tool_calls=calls, tool_results=results,
                                  tool_latency_seconds=results[-1]["at"] - calls[0]["at"] if calls and results else None)
-                    passed &= bool(calls and results)
+                    grounded = [e for e in self.evidence.of("ResponseDone", since)
+                                if (e.get("raw_usage") or {}).get("groundingMetadata")]
+                    if name == "tool" and grounded and not calls:
+                        # Native search is on: Gemini's own Google Search answered, and its grounding is the evidence.
+                        facts.update(route="native_search", grounded_responses=len(grounded))
+                    else:
+                        passed &= bool(calls and results)
                     if name == "chat":
                         passed &= any("https://" in str(r.get("text", "")) and r.get("direction") == "out"
                                       for r in facts["chat_rows"])

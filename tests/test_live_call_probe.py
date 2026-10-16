@@ -76,6 +76,18 @@ def test_money_cannot_pass_incomplete_or_double_billed_evidence(change):
         assert facts["known_estimated_usd"] == .02
 
 
+def test_a_grounded_response_is_a_disclosed_unknown_price_and_any_other_unknown_still_fails():
+    rows, events = attempts()
+    rows[0]["cost_usd"] = None
+    rows[0]["cost_evidence"]["unpriced"] = ["groundingMetadata"]  # Gemini's search charge has no catalog tariff
+    ok, facts = probe.money_evidence(rows, events)
+    assert ok and facts["total_cost_usd"] is None and facts["known_estimated_usd"] == .02
+    assert facts["grounded_unknown_priced_attempts"] == ["response-attempt"]
+    rows[0]["cost_evidence"]["unpriced"] = ["groundingMetadata", "input_cost_per_audio_token"]
+    ok, facts = probe.money_evidence(rows, events)
+    assert not ok and facts["grounded_unknown_priced_attempts"] == []
+
+
 def test_observer_forwards_real_commands_and_records_only_audio_lengths(tmp_path):
     class Engine:
         _write = AsyncMock()
