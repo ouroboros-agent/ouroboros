@@ -1,14 +1,13 @@
 /* Live calls: Talk in the Send capsule, the live capsule in the text row's place, the sheet when
    Talk cannot work, caption bubbles, the shell's "In call" mark, and visual B (the living capsule)
-   last, as one block another visual replaces. Composition and the semantic palette come from
-   style.css and ui.css; the call adds only what is its own: the two voices' light. The capsule
-   writes its state on the composer (`.chat-input-wrap[data-call…]`), the light writes
-   `--call-mic` and `--call-out` there. */
+   last, as one block another visual replaces. Surfaces, shadows, tones, radii, type and motion are
+   the design bible's tokens (DESIGN.md "Airy dopamine", ui.css "One control, three tones"); the
+   call adds only what is its own: the two voices' light, the one light in the interface that
+   answers sound, on the capsule and never the room. The capsule writes its state on the composer
+   (`.chat-input-wrap[data-call…]`), the light writes `--call-mic` and `--call-out` there. */
 
 :root {
     --call-amber-rgb: 245, 158, 11;
-    /* A capsule as round as the composer at its one-line height, and a rounded sheet when taller. */
-    --call-row-radius: 26px;
     --call-touch-target: 44px;
     --call-words-leading: 1.2;
 }
@@ -38,15 +37,14 @@
 
 .chat-input-wrap[data-call] .chat-text-row {
     position: relative;
-    border-radius: var(--call-row-radius);
     container: call-row / inline-size;
 }
 
-/* Focus inside the capsule is a button's own ring, not the text field's frame. */
+/* Focus inside the capsule is a button's own ring, not the text field's: the composer keeps floating. */
 .chat-input-wrap[data-call]:not([data-call-view="keyboard"]) .chat-text-row:focus-within {
-    border-color: rgba(var(--neutral-rgb), 0.10);
-    background: rgba(var(--composer-rgb), 0.68);
-    box-shadow: inset 0 1px 0 rgba(var(--neutral-rgb), 0.04);
+    border-color: transparent;
+    background: var(--surface-float);
+    box-shadow: var(--elev-float);
 }
 
 .chat-input-wrap[data-call-view="voice"] .chat-text-row > :not(.call-capsule):not(.call-rim),
@@ -92,9 +90,14 @@
     inset: -6px -4px;
     padding: 0;
     border: 0;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     background: transparent;
     cursor: pointer;
+    transition: var(--motion-tone);
+}
+
+.chat-input-wrap[data-call-view="keyboard"] .call-visual-return:hover {
+    background: var(--tone-quiet-hover);
 }
 
 .call-words {
@@ -108,7 +111,7 @@
 
 .call-state {
     font-size: var(--type-body);
-    font-weight: 650;
+    font-weight: 500;
     color: var(--text-primary);
     white-space: nowrap;
     overflow: hidden;
@@ -140,6 +143,9 @@
     flex: none;
 }
 
+/* The call's controls are the bible's capsules: standing on the rest shadow in one of three tones, a state
+   changes their colour, never their height. Mute and Keyboard are neutral, Mute switched on takes the crimson
+   tone; End is the red tone; a sheet's next step is the primary action's crimson tone, Close neutral. */
 .call-btn {
     position: relative;
     flex: none;
@@ -149,21 +155,26 @@
     height: var(--composer-control-height);
     min-width: var(--composer-control-height);
     padding: 0 var(--space-3);
-    border-radius: 999px;
-    border: 1px solid rgba(var(--neutral-rgb), 0.12);
-    background: rgba(var(--composer-rgb), 0.38);
-    box-shadow: var(--composer-control-shadow);
+    border: 0;
+    border-radius: var(--pill-radius);
+    background: var(--surface-capsule);
+    box-shadow: var(--elev-rest);
     color: var(--text-primary);
     font: inherit;
     font-size: var(--composer-control-font-size);
-    font-weight: 700;
+    font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
-    transition: color 0.18s, background 0.18s, border-color 0.18s;
+    transition: var(--motion-tone);
 }
 
 .call-btn:hover {
-    background: rgba(var(--composer-hover-rgb), 0.58);
+    background: var(--surface-capsule-hover);
+}
+
+.call-btn:active,
+.call-mark-end:active {
+    filter: var(--press);
 }
 
 .call-btn:focus-visible,
@@ -174,11 +185,15 @@
     outline-offset: 2px;
 }
 
-/* Muted is the owner's own state: his voice's tone, as on his bubbles. */
-.call-mute[aria-pressed="true"] {
-    background: var(--user-bubble-from);
-    border-color: var(--user-border);
-    color: var(--user-sender);
+.call-mute[aria-pressed="true"],
+.call-action {
+    background: var(--tone-crimson);
+    color: var(--tone-crimson-ink);
+}
+
+.call-mute[aria-pressed="true"]:hover,
+.call-action:hover {
+    background: var(--tone-crimson-hover);
 }
 
 .call-keyboard {
@@ -189,25 +204,12 @@
 
 .call-end {
     padding: 0 var(--space-4);
-    border-color: transparent;
-    background: var(--accent);
-    color: #fff;
+    background: var(--tone-red);
+    color: var(--status-error-fg);
 }
 
 .call-end:hover {
-    background: var(--accent);
-    box-shadow: var(--composer-control-shadow), 0 0 0 3px var(--accent-18);
-}
-
-.call-action {
-    border-color: var(--accent-25);
-    background: var(--accent-08);
-    color: var(--accent);
-}
-
-.call-action:hover {
-    border-color: var(--accent-45);
-    background: var(--accent-18);
+    background: var(--tone-red-hover);
 }
 
 /* A finger gets a 44 px target; the capsule keeps its 32 px controls and its footprint. */
@@ -239,6 +241,11 @@
 
 /* ---- The sheet: how a call ended, or why Talk cannot work here ------------------------------ */
 
+/* It carries a sentence, so it is a card with the object radius; a failed call's card takes the amber tint. */
+.chat-input-wrap[data-call-view="sheet"] .chat-text-row {
+    border-radius: var(--radius-object);
+}
+
 .chat-input-wrap[data-call-view="sheet"] .call-capsule {
     flex-wrap: wrap;
     row-gap: var(--space-2);
@@ -267,7 +274,7 @@
 }
 
 .chat-input-wrap[data-call-tone="error"] .chat-text-row {
-    border-color: rgba(var(--call-amber-rgb), 0.7);
+    background: linear-gradient(var(--tone-amber), var(--tone-amber)), var(--surface-float);
 }
 
 /* ---- Captions: ordinary bubbles of the room while they are spoken --------------------------- */
@@ -280,6 +287,7 @@
 
 /* ---- The shell's "In call" mark ---------------------------------------------------------------- */
 
+/* It floats over moving content, so it is the float surface on the float shadow, glass in the dark room. */
 .call-mark {
     position: fixed;
     top: calc(env(safe-area-inset-top, 0px) + var(--space-2));
@@ -289,13 +297,12 @@
     align-items: center;
     gap: var(--space-1);
     max-width: calc(100vw - 2 * var(--space-4));
-    padding: 3px;
-    border-radius: 999px;
-    border: 1px solid rgba(var(--neutral-rgb), 0.12);
-    background: rgba(var(--menu-rgb), 0.9);
-    -webkit-backdrop-filter: blur(16px);
-    backdrop-filter: blur(16px);
-    box-shadow: var(--chrome-navigation-shadow);
+    padding: var(--space-1);
+    border-radius: var(--pill-radius);
+    background: var(--surface-float);
+    -webkit-backdrop-filter: var(--glass);
+    backdrop-filter: var(--glass);
+    box-shadow: var(--elev-float);
     transform: translateX(-50%);
 }
 
@@ -308,6 +315,7 @@
     white-space: nowrap;
 }
 
+/* The way back to the room is a quiet control: no body, a fill only under the pointer. */
 .call-mark-open {
     display: inline-flex;
     align-items: center;
@@ -316,21 +324,22 @@
     height: var(--chrome-control-h);
     padding: 0 var(--space-3);
     border: 0;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     background: transparent;
     color: var(--text-primary);
     font: inherit;
     font-size: var(--type-body);
     font-weight: 600;
     cursor: pointer;
+    transition: var(--motion-tone);
 }
 
 .call-mark-open:hover {
-    background: var(--menu-item-hover);
+    background: var(--tone-quiet-hover);
 }
 
 .call-mark .call-entry-mark {
-    color: var(--accent);
+    color: var(--tone-crimson-ink);
 }
 
 .call-mark-room {
@@ -358,13 +367,19 @@
     height: var(--chrome-control-h);
     padding: 0 var(--space-4);
     border: 0;
-    border-radius: 999px;
-    background: var(--accent);
-    color: #fff;
+    border-radius: var(--pill-radius);
+    background: var(--tone-red);
+    box-shadow: var(--elev-rest);
+    color: var(--status-error-fg);
     font: inherit;
     font-size: var(--composer-control-font-size);
-    font-weight: 700;
+    font-weight: 600;
     cursor: pointer;
+    transition: var(--motion-tone);
+}
+
+.call-mark-end:hover {
+    background: var(--tone-red-hover);
 }
 
 /* Where the navigation column is on screen, the mark sits at its foot, over no page's header:
@@ -376,7 +391,7 @@
         left: var(--space-3);
         width: calc(var(--sidebar-width) - 2 * var(--space-3));
         padding: var(--space-1);
-        border-radius: var(--radius-lg);
+        border-radius: var(--radius-object);
         transform: none;
     }
 
@@ -389,7 +404,7 @@
         column-gap: var(--space-2);
         height: auto;
         padding: var(--space-1) var(--space-2);
-        border-radius: var(--radius);
+        border-radius: var(--radius-inner);
         text-align: left;
     }
 
@@ -528,7 +543,7 @@
     bottom: 0;
     z-index: -1;
     height: var(--call-row-height, 50px);
-    border-radius: var(--call-row-radius);
+    border-radius: var(--pill-radius);
     pointer-events: none;
 }
 
