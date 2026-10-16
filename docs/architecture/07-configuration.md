@@ -46,10 +46,10 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 |-----|---------|-------------|
 | OPENROUTER_API_KEY | "" | OpenRouter credential |
 | OPENAI_API_KEY | "" | Official direct-OpenAI credential |
-| OPENAI_BASE_URL | "" | OpenAI base-URL override; legacy compatible endpoint (only with `OPENAI_API_KEY`); live calls still dial OpenAI |
+| OPENAI_BASE_URL | "" | OpenAI base-URL override; legacy compatible endpoint (only with `OPENAI_API_KEY`) |
 | OPENAI_COMPATIBLE_API_KEY | "" | OpenAI-compatible endpoint credential |
 | OPENAI_COMPATIBLE_BASE_URL | "" | OpenAI-compatible endpoint base URL; only with its own key (blank = no auth) |
-| GOOGLE_API_KEY | "" | Google AI (Gemini API) credential; used by the Gemini Live call engine |
+| GOOGLE_API_KEY | "" | Google AI (Gemini API) credential; calls need it |
 | CLOUDRU_FOUNDATION_MODELS_API_KEY | "" | Cloud.ru credential |
 | CLOUDRU_FOUNDATION_MODELS_BASE_URL | `https://foundation-models.api.cloud.ru/v1` | Cloud.ru base URL |
 | GIGACHAT_CREDENTIALS | "" | GigaChat auth key |
@@ -209,7 +209,7 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 | OUROBOROS_HOST_SERVICE_PORT | 8767 | Host Service port (loopback-only; §12) |
 | OUROBOROS_DESKTOP_KEEP_RUNNING | false | Closing the desktop window keeps Ouroboros running (Windows, macOS; `launcher_background.py`); disk-authored consent, absent until the owner chooses |
 | OUROBOROS_PRESENCE_MAX_ACTIVE | 2 | Cross-process Presence turn cap (UI-bounded 1-20) |
-| OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls (calls use Google Gemini Live and its `GOOGLE_API_KEY`) |
+| OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls |
 | OUROBOROS_CALL_VOICE_GOOGLE | "" | Gemini voice for calls (blank = provider default) |
 | OUROBOROS_CALL_NATIVE_SEARCH | true | Let Gemini Live use its native Google Search grounding in calls |
 | OUROBOROS_CALL_MAX_MINUTES | "" | Optional owner duration ceiling for a call (blank = none) |
