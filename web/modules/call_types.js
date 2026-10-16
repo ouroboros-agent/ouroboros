@@ -1,9 +1,9 @@
 /** Live audio uses a separate binary socket; the JSON /ws contract is unchanged. */
 
 /**
+ * Calls use Google Gemini Live; model and voice override the Settings defaults.
  * @typedef {Object} CallOpenRequest
  * @property {number} chat_id
- * @property {'openai'|'google'=} engine
  * @property {string=} model
  * @property {string=} voice
  * @property {string=} client_message_id
@@ -74,10 +74,22 @@
  * @property {string=} reason
  */
 /**
+ * A call's state; a closed one carries its reason's words (detail) and one next step (action).
  * @typedef {Object} CallState
  * @property {'state'} type
- * @property {'connecting'|'live'|'reconnecting'|'closing'|'closed'} state
+ * @property {'preparing'|'connecting'|'live'|'reconnecting'|'closing'|'closed'} state
  * @property {string} reason
+ * @property {string=} engine
+ * @property {string=} phase
+ * @property {string=} detail
+ * @property {'settings'|'retry'=} action
+ */
+/**
+ * What the call is doing between its words: a tool batch running (its tool names), then idle.
+ * @typedef {Object} CallActivity
+ * @property {'activity'} type
+ * @property {'working'|'idle'} activity
+ * @property {string} label
  */
 /**
  * @typedef {Object} CallCaption
