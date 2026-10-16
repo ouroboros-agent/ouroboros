@@ -123,7 +123,9 @@ export function createCallLight({ env = globalThis, visible = () => true, heard 
             if (nextMode === mode && nextVoice === speaker) return;
             mode = nextMode;
             speaker = nextVoice;
-            schedule();
+            // A call that ended draws its still state once; a live one draws on its next frame.
+            if (!active) draw({ mic: 0, out: 0, dt: 0, time: now() / 1000, mode, voice: speaker, owner: false, reduced: reduced() });
+            else schedule();
         },
         level,
         wake,

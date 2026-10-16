@@ -142,7 +142,8 @@ function ending(view) {
     const formatted = template.includes('{detail}');
     return { ...sheet, title: formatted ? fmt(template, { detail }) : template, formatted,
         actions: steps(view.action ? [view.action] : entry.actions || [entry.action]),
-        tone: entry.calm ? '' : 'error', light: entry.calm ? 'still' : 'error' };
+        // A call that failed is amber; a fact, or why this surface cannot call, is plain words.
+        tone: entry.calm ? '' : entry.sheet ? 'notice' : 'error', light: entry.calm || entry.sheet ? 'still' : 'error' };
 }
 
 /** Who is talking, from the captions and the light. Thinking runs from the owner's final words to

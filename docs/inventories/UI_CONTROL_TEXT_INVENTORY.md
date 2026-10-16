@@ -82,7 +82,7 @@ the same thing sit together: when your diff adds a row, read its neighbours.
 | Formatted | `btn btn-default` | modules/document_reader.js | 1 |
 | Import JSON… | `btn btn-default btn-sm` | modules/settings_language.js | 1 |
 | Import mcp.json | `btn btn-default btn-sm` | modules/settings_ui.js | 1 |
-| In call ' + ' | `call-mark-open` | modules/call_mark.js | 1 |
+| In call | `call-mark-open` | modules/call_mark.js | 1 |
 | Install | `btn btn-primary` | modules/ouroboroshub.js | 1 |
 | Install Local Runtime | `btn btn-secondary local-model-install-btn local-model-hidden` | modules/settings_ui.js | 1 |
 | Keep one per model | `btn btn-default` | modules/subagents_settings.js | 1 |
