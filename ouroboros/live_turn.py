@@ -385,8 +385,41 @@ class _LiveCall:
 
     def _session_config(self, *, history: Tuple[Dict[str, Any], ...] = (), resume_handle: str = "") -> SessionConfig:
         instructions = text_of(self.messages[0].get("content")) if self.messages and self.messages[0].get("role") == "system" else ""
+        compress_at, compress_to = self._watermarks(instructions)
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=tuple(self.tool_schemas),
-                             history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle)
+                             history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle,
+                             compress_at_tokens=compress_at, compress_to_tokens=compress_to)
+
+    def _watermarks(self, instructions: str) -> Tuple[int, int]:
+        """Where a self-compressing window starts sliding and how much it keeps; ``(0, 0)`` = provider default.
+
+        Physical: the route's input limit less one spoken reply is where compression must
+        start; it keeps the call view plus half of the room left for the conversation, so the
+        model always hears at least half of that room verbatim and compression runs once
+        per half-room, not every turn. The core (the system instruction) never slides out.
+        """
+        import json
+        import math
+
+        from ouroboros.utils import estimate_tokens
+
+        fact = self.route.fact
+        if fact is None or self.spec.engine != "google":
+            return 0, 0
+        reply = int(getattr(fact, "reply_allowance_tokens", 0) or 8_192)
+        plan = getattr(self.ctx, "context_fit_plan", None)
+        ratio = 1.0
+        if plan is not None:
+            try:
+                ratio = float(plan.projection(str(getattr(self.ctx, "active_context_mode", "") or plan.initial_mode))
+                              .calibration_ratio or 1.0)
+            except Exception:
+                ratio = 1.0
+        view = math.ceil((estimate_tokens(instructions) + estimate_tokens(json.dumps(self.tool_schemas))) * ratio)
+        start = int(fact.window_tokens) - reply
+        if view >= start:
+            return 0, 0  # no room to talk at all: the provider's own refusal speaks for itself
+        return start, view + (start - view) // 2
 
     async def _open_engine(self, *, resume_handle: str = "") -> None:
         if self.closing or self.hub.ended_by_owner:

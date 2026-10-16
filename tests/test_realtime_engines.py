@@ -682,3 +682,12 @@ def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
     assert normal.kind == "transport" and normal.retryable
     denied = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1008, reason="key fixture-key is invalid")))
     assert denied.kind == "authentication" and "fixture-key" not in denied.message
+
+
+def test_gemini_compression_starts_at_the_drivers_watermarks():
+    base = SessionConfig(EngineRoute("google", "gemini-3.8-live"), "core")
+    assert gemini.setup_message(base)["setup"]["contextWindowCompression"] == {"slidingWindow": {}}
+    marked = SessionConfig(EngineRoute("google", "gemini-3.8-live"), "core",
+                           compress_at_tokens=122_880, compress_to_tokens=106_000)
+    assert gemini.setup_message(marked)["setup"]["contextWindowCompression"] == {
+        "triggerTokens": 122_880, "slidingWindow": {"targetTokens": 106_000}}

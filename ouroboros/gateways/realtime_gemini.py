@@ -39,6 +39,18 @@ def normalize_usage(raw):
     return usage
 
 
+def compression(config):
+    """Sliding-window compression starting at the driver's watermarks (provider defaults without them).
+
+    Gemini keeps the system instruction and slides out the oldest spoken turns; the
+    defaults (80% of the window, keep half of that) would sit below a large call view.
+    """
+    if config.compress_at_tokens <= 0:
+        return {"slidingWindow": {}}
+    window = {"targetTokens": config.compress_to_tokens} if config.compress_to_tokens > 0 else {}
+    return {"triggerTokens": config.compress_at_tokens, "slidingWindow": window}
+
+
 def setup_message(config):
     declarations = [{**tool, "behavior": "NON_BLOCKING"} for tool in function_schemas(config.tools)]
     tools = [{"functionDeclarations": declarations}] if declarations else []
@@ -52,7 +64,7 @@ def setup_message(config):
         "systemInstruction": {"parts": [{"text": config.instructions}]},
         "tools": tools, "generationConfig": generation,
         "inputAudioTranscription": {}, "outputAudioTranscription": {},
-        "contextWindowCompression": {"slidingWindow": {}},
+        "contextWindowCompression": compression(config),
         "sessionResumption": {"handle": config.resume_handle} if config.resume_handle else {},
     }}
 

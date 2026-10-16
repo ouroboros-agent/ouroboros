@@ -73,6 +73,11 @@ class SessionConfig:
     history: Tuple[Mapping, ...] = ()
     native_search: bool = False
     resume_handle: str = ""
+    # Where a provider that compresses its own window starts (``compress_at_tokens``) and how
+    # much it keeps (``compress_to_tokens``): physical watermarks the driver derives from the
+    # call view's size, the route's input limit and its reply allowance; 0 = provider default.
+    compress_at_tokens: int = 0
+    compress_to_tokens: int = 0
 
 
 # ---- commands: driver -> engine -------------------------------------------------

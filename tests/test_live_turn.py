@@ -1028,3 +1028,17 @@ def test_a_context_refusal_with_no_smaller_projection_ends_with_both_numbers(har
     text, usage, _trace = h.finish()
     assert usage["live_call"]["ended"] == "context_too_large"
     assert ("closed", "71,200 tokens of core memory; this engine holds 65,536", "other_engine", "google") in h.hub.words
+
+
+def test_a_google_call_compresses_from_its_watermarks_and_an_openai_call_leaves_the_default(harness):
+    google = harness(spec=_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live"))
+    config = google.start().config
+    assert config.compress_at_tokens == 131_072 - 8_192
+    assert config.compress_at_tokens > config.compress_to_tokens > 0  # the view plus half of the room to talk
+    google.stop()
+    google.finish()
+    openai = harness()
+    config = openai.start().config
+    assert (config.compress_at_tokens, config.compress_to_tokens) == (0, 0)
+    openai.stop()
+    openai.finish()
