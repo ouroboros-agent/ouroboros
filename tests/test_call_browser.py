@@ -347,14 +347,34 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             _shot(page, f"{engine}-light-1280-ouroboros")
             _send(page, {"type": "flush", "epoch": 2})  # the owner barged in: playback stops, the light follows
             expect(state).to_have_text("Listening", timeout=10000)
+
+            # A phone: the same states at 390 px, both themes.
             page.set_viewport_size({"width": 390, "height": 844})
-            _state(page, state="preparing", phase="memory")
-            expect(state).to_have_text("Preparing memory…")
-            _shot(page, f"{engine}-light-390-preparing")
-            _state(page, state="live")
-            _shot(page, f"{engine}-light-390-listening")
-            page.emulate_media(color_scheme="dark")
-            _shot(page, f"{engine}-dark-390-listening")
+            epoch = 2
+            for scheme in ("light", "dark"):
+                page.emulate_media(color_scheme=scheme)
+                expect(page.locator("html")).to_have_attribute("data-theme", scheme)
+                _state(page, state="preparing", phase="memory")
+                expect(state).to_have_text("Preparing memory…")
+                _shot(page, f"{engine}-{scheme}-390-preparing")
+                _state(page, state="live")
+                expect(state).to_have_text("Listening")
+                _no_sideways_scroll(page, f"phone {scheme}")
+                _shot(page, f"{engine}-{scheme}-390-listening")
+                page.evaluate("__callTest.speak(0.4)")
+                _caption(page, "owner", f"item_phone_{scheme}", "Hi again")
+                expect(room.locator(".call-sub")).to_have_text("You’re speaking")
+                _shot(page, f"{engine}-{scheme}-390-owner")
+                page.evaluate("__callTest.speak(0)")
+                _caption(page, "owner", f"item_phone_{scheme}", "Hi again, one more question?", final=True)
+                expect(state).to_have_text("Thinking")
+                _shot(page, f"{engine}-{scheme}-390-thinking")
+                _socket(page, f"socket.speech('item_phone_ouro_{scheme}', {epoch}, 3000);")
+                expect(state).to_have_text("Ouroboros")
+                _shot(page, f"{engine}-{scheme}-390-ouroboros")
+                epoch += 1
+                _send(page, {"type": "flush", "epoch": epoch})
+                expect(state).to_have_text("Listening", timeout=10000)
             page.set_viewport_size({"width": 1280, "height": 900})
 
             # End: everything stops, the composer comes back with its Talk.
