@@ -433,6 +433,9 @@
     --call-ouro-rgb: 240, 86, 106;
     --call-ouro-2-rgb: 255, 122, 154;
     --call-ouro-hi-rgb: 255, 194, 201;
+    /* The light that travels round the capsule while Ouroboros prepares or thinks: white light in the
+       dark room; on white a neutral streak would read as a smudge, so there it is Ouroboros's crimson. */
+    --call-trace-rgb: var(--neutral-rgb);
     /* How bright a voice may make the lit area: light is additive on dark, a stain on white. */
     --call-glow: 1;
     /* What the wave strokes with, read once per theme by the visual. */
@@ -448,6 +451,7 @@
     --call-ouro-rgb: 201, 53, 69;
     --call-ouro-2-rgb: 224, 68, 95;
     --call-ouro-hi-rgb: 255, 154, 166;
+    --call-trace-rgb: 201, 53, 69;
     --call-glow: 0.55;
     --call-wave-idle: rgba(var(--neutral-rgb), 0.4);
 }
@@ -492,8 +496,8 @@
 
 /* Each layer owns its opacity (a shared `i` rule would outrank the voices' own). */
 .call-rim-trace {
-    background: conic-gradient(from var(--call-spin, 0deg), rgba(var(--neutral-rgb), 0.06) 0deg,
-        rgba(var(--neutral-rgb), 0.06) 250deg, rgba(var(--neutral-rgb), 0.95) 345deg, rgba(var(--neutral-rgb), 0.06) 360deg);
+    background: conic-gradient(from var(--call-spin, 0deg), rgba(var(--call-trace-rgb), 0.06) 0deg,
+        rgba(var(--call-trace-rgb), 0.06) 250deg, rgba(var(--call-trace-rgb), 0.95) 345deg, rgba(var(--call-trace-rgb), 0.06) 360deg);
     opacity: 0;
     transition: opacity 0.2s ease;
 }
