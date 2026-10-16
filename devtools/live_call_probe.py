@@ -652,20 +652,26 @@ async def run_probe(args):
 
 
 # Never copied: the source's Claudexor home (its daemon's descriptor and token would let the copy reach
-# that daemon) and the observability store (millions of request dumps a call never reads; copying it
-# took longer than everything else together on the owner's install).
-DATA_COPY_SKIPPED = ("claudexor", "observability")
+# that daemon), the observability store (millions of request dumps a call never reads; copying it took
+# longer than everything else together on the owner's install), and the state's engine runtimes and
+# review checkouts (caches of whole trees no call reads).
+DATA_COPY_SKIPPED = ("claudexor", "observability", "state/cx", "state/review_checkouts")
 
 
-def copy_data(source: Path, target: Path) -> None:
+def copy_data(source: Path, target: Path, *, skipped=DATA_COPY_SKIPPED, prefix: str = "") -> None:
     """A mature install's data, cloned file by file (``cp -c``) into the run; the source is only read.
 
-    One top-level entry at a time, never ``DATA_COPY_SKIPPED``, and never one whole-tree
-    clonefile(2): that held APFS for minutes and froze the machine.
+    One entry at a time (descending into a folder only when something inside it is skipped), never
+    ``skipped``, and never one whole-tree clonefile(2): that held APFS for minutes and froze the machine.
     """
     target.mkdir(mode=0o700)
     for entry in sorted(source.iterdir()):
-        if entry.name not in DATA_COPY_SKIPPED:
+        name = prefix + entry.name
+        if name in skipped:
+            continue
+        if entry.is_dir() and not entry.is_symlink() and any(s.startswith(name + "/") for s in skipped):
+            copy_data(entry, target / entry.name, skipped=skipped, prefix=name + "/")
+        else:
             subprocess.run(["cp", "-c", "-R", str(entry), str(target)], check=True)
 
 

@@ -30,6 +30,8 @@ def test_a_data_copy_never_carries_the_source_daemon_home_or_its_request_dumps(t
     (source / "claudexor" / "daemon").mkdir(parents=True)
     (source / "claudexor" / "daemon" / "control-api.json").write_text("{}")
     (source / "observability" / "calls").mkdir(parents=True)
+    (source / "state" / "cx" / "3.24.0").mkdir(parents=True)
+    (source / "state" / "queue_snapshot.json").write_text("{}")
     (source / "memory").mkdir()
     (source / "memory" / "identity.md").write_text("me")
     (source / "settings.json").write_text("{}")
@@ -38,6 +40,7 @@ def test_a_data_copy_never_carries_the_source_daemon_home_or_its_request_dumps(t
     probe.copy_data(source, copied)
     assert (copied / "memory" / "identity.md").read_text() == "me" and (copied / "settings.json").exists()
     assert not (copied / "claudexor").exists() and not (copied / "observability").exists()
+    assert (copied / "state" / "queue_snapshot.json").exists() and not (copied / "state" / "cx").exists()
 
 
 def test_scenario_selection_rejects_typos():
