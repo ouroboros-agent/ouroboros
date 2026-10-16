@@ -400,10 +400,15 @@
 }
 
 /* The rim: a light running along the capsule's own edge, in the speaker's colour family; the
-   layers cross-fade by opacity, never through a third colour. */
+   layers cross-fade by opacity, never through a third colour. It takes the edge's place inside
+   the row's box (the border steps aside), so the light never widens the composer. */
+.chat-input-wrap[data-call="live"] .chat-text-row {
+    border-color: transparent;
+}
+
 .call-rim {
     position: absolute;
-    inset: -1px;
+    inset: 0;
     z-index: 1;
     border-radius: inherit;
     pointer-events: none;
@@ -422,18 +427,20 @@
     -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
     -webkit-mask-composite: xor;
     mask-composite: exclude;
-    opacity: 0;
 }
 
+/* Each layer owns its opacity (a shared `i` rule would outrank the voices' own). */
 .call-rim-trace {
     background: conic-gradient(from var(--call-spin, 0deg), rgba(var(--neutral-rgb), 0.06) 0deg,
         rgba(var(--neutral-rgb), 0.06) 250deg, rgba(var(--neutral-rgb), 0.95) 345deg, rgba(var(--neutral-rgb), 0.06) 360deg);
+    opacity: 0;
     transition: opacity 0.2s ease;
 }
 
 .call-rim-listen {
     background: conic-gradient(from var(--call-spin, 0deg), rgba(var(--neutral-rgb), 0.12), rgba(var(--neutral-rgb), 0.45),
         rgba(var(--neutral-rgb), 0.12), rgba(var(--neutral-rgb), 0.32), rgba(var(--neutral-rgb), 0.12));
+    opacity: 0;
 }
 
 .call-rim-owner {
@@ -489,7 +496,6 @@
     display: block;
     border-radius: inherit;
     filter: blur(16px);
-    opacity: 0;
 }
 
 .call-aura-owner {

@@ -169,7 +169,8 @@ export function createTalkFacts() {
     };
 }
 
-export function createCallCapsule({ page, env = globalThis, visual, light, view, talk, mute, end, dismiss, act }) {
+export function createCallCapsule({ page, env = globalThis, visual, light, styled = Promise.resolve(), view, talk, mute,
+    end, dismiss, act }) {
     const doc = page.ownerDocument;
     const wrap = page.querySelector('.chat-input-wrap');
     const row = wrap.querySelector('.chat-text-row');
@@ -201,12 +202,15 @@ export function createCallCapsule({ page, env = globalThis, visual, light, view,
     let keyboard = false;    // the owner asked to type during this call
     let presented = { mode: 'idle' };
     let note = null;         // a sheet's follow-up line (a copied link)
+    let dressed = false;     // Talk appears with its own look, never unstyled before call.css applies
+    let gone = false;
     const talking = createTalkFacts();
 
     // --- Talk in the Send capsule -------------------------------------------------------
     const empty = () => !field.value.trim() && !preview?.querySelector('.attach-badge');
     const entryMode = () => (showing ? 'call' : group?.dataset.busy === '1' ? 'busy' : empty() ? 'talk' : 'send');
     function renderEntry() {
+        if (!dressed) return;
         const mode = entryMode();
         if (mode === 'talk') {
             // Built once per face: the chat writes its own label over it when it needs the button.
@@ -217,14 +221,22 @@ export function createCallCapsule({ page, env = globalThis, visual, light, view,
                 send.replaceChildren(mark, word);
                 send.title = 'Talk with Ouroboros';
                 send.dataset.callEntry = 'talk';
-                // Talk and Send keep one width, so typing the first letter moves nothing.
-                if (send.offsetWidth > 0) send.style.setProperty('--call-entry-width', `${send.offsetWidth}px`);
+                measureEntry();
             }
         } else if (send.dataset.callEntry === 'talk') {
             send.dataset.callEntry = 'send';
             if (mode !== 'busy') { send.textContent = 'Send'; send.title = 'Send message'; }
         }
     }
+    // Talk and Send keep one width, so typing the first letter moves nothing. Talk is measured
+    // whenever its size changes: the call's stylesheet arrives, fonts load, a hidden room is shown.
+    function measureEntry() {
+        if (send.dataset.callEntry !== 'talk' || !(send.offsetWidth > 0)) return;
+        const width = `${send.offsetWidth}px`;
+        if (send.style.getPropertyValue('--call-entry-width') !== width) send.style.setProperty('--call-entry-width', width);
+    }
+    const entrySizing = typeof env.ResizeObserver === 'function' ? new env.ResizeObserver(measureEntry) : null;
+    entrySizing?.observe(send);
     const entryObserver = new MutationObserver(renderEntry);
     entryObserver.observe(send, { childList: true });
     const previewObserver = preview ? new MutationObserver(renderEntry) : null;
@@ -309,7 +321,11 @@ export function createCallCapsule({ page, env = globalThis, visual, light, view,
         renderEntry();
     }
 
-    renderEntry();
+    styled.then(() => {
+        if (gone) return;
+        dressed = true;
+        renderEntry();
+    });
     return {
         wrap,
         row,
@@ -320,7 +336,9 @@ export function createCallCapsule({ page, env = globalThis, visual, light, view,
         heard(now) { talking.heard(now); render(); },
         note(kind, url = '') { note = kind ? { kind, url } : null; render(); },
         destroy() {
+            gone = true;
             entryObserver.disconnect();
+            entrySizing?.disconnect();
             previewObserver?.disconnect();
             row.removeEventListener('click', talkPress, true);
             row.removeEventListener('keydown', enterGuard, true);

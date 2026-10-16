@@ -316,7 +316,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     const available = callAvailability(env);
     const noop = { destroy() {}, leave() {}, retains: () => false };
     if (!composer || available.hidden) return noop;
-    ensureStylesheet(doc);
+    const styled = ensureStylesheet(doc);
     let destroyed = false;
     let entry = null;
     const visible = () => !destroyed && onScreen() && doc.visibilityState !== 'hidden';
@@ -330,7 +330,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         settled(view) { captions.finish(); onSettled(view); },
     });
     // Talk starts a call; a surface that cannot hold one answers the press with its sheet.
-    const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, view: () => session.view(),
+    const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, styled, view: () => session.view(),
         talk: () => session.start(),
         mute: () => session.setMuted(!session.muted),
         end: () => session.end(),
@@ -386,16 +386,21 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     };
 }
 
+/** The call's stylesheet, once per document; resolves when it applies (or failed to load). */
 function ensureStylesheet(doc) {
     let link = doc.querySelector('link[data-call-style]');
     if (!link) {
         link = doc.createElement('link');
         link.rel = 'stylesheet'; link.href = new URL('../call.css', import.meta.url).href;
         link.dataset.callStyle = '';
-        link.addEventListener('load', () => { link.dataset.loaded = '1'; }, { once: true });
         doc.head.append(link);
     }
-    return link;
+    if (link.dataset.loaded || link.sheet) return Promise.resolve();
+    return new Promise((resolve) => {
+        const done = () => { link.dataset.loaded = '1'; resolve(); };
+        link.addEventListener('load', done, { once: true });
+        link.addEventListener('error', done, { once: true });
+    });
 }
 
 /** A room's call keeps the room while it lasts: hiding the room keeps the call (like a phone

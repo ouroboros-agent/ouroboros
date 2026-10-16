@@ -444,7 +444,8 @@ test('the registered AudioWorklet captures at device rate, never echoes, and met
     globalThis.sampleRate = 48000;
     globalThis.currentTime = 3.5;
     globalThis.AudioWorkletProcessor = class {
-        constructor() { this.sent = []; this.port = { postMessage: msg => this.sent.push(msg) }; }
+        // A real port detaches what it transfers; so does this one.
+        constructor() { this.sent = []; this.port = { postMessage: (msg, transfer) => this.sent.push(transfer ? structuredClone(msg, { transfer }) : msg) }; }
     };
     globalThis.registerProcessor = (name, cls) => { assert.equal(name, 'ouroboros-call-audio'); Processor = cls; };
     try {
@@ -453,8 +454,12 @@ test('the registered AudioWorklet captures at device rate, never echoes, and met
         const kinds = () => processor.sent.map(msg => msg.type);
         processor.port.onmessage({ data: { type: 'capture', enabled: true, generation: 7 } });
         const output = new Float32Array(128);
-        for (let i = 0; i < 8; i++) processor.process([[new Float32Array(128).fill(0.5)]], [[output]]);
+        for (let i = 0; i < 16; i++) processor.process([[new Float32Array(128).fill(0.5)]], [[output]]);
         assert.deepEqual([...output], Array(128).fill(0));
+        // Every window is posted, not only the first: a transferred buffer is replaced by a whole new one.
+        const posted = processor.sent.filter(msg => msg.type === 'capture');
+        assert.equal(posted.length, 2);
+        assert.deepEqual(posted.map(msg => msg.pcm.length), [960, 960]);
         const captured = processor.sent.find(msg => msg.type === 'capture');
         assert.equal(captured.pcm.length, 960); assert.equal(captured.rate, 48000);
         assert.equal(captured.generation, 7); assert.equal(captured.pcm[0], 16384);

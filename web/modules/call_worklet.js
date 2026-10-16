@@ -184,15 +184,15 @@ if (typeof globalThis.registerProcessor === 'function') {
         constructor() {
             super();
             this.rate = globalThis.sampleRate;
-            const windowSamples = Math.round(this.rate * CAPTURE_MS / 1000);
-            this.capture = new Int16Array(windowSamples);
+            this.windowSamples = Math.round(this.rate * CAPTURE_MS / 1000);
+            this.capture = new Int16Array(this.windowSamples);
             this.mono = new Float32Array(128);
             this.offset = 0;
             this.enabled = false;
             this.generation = 0;
             this.playback = new PlaybackBuffer(this.rate, message => this.port.postMessage(message));
             // Metering runs whether or not capture sends: playback keeps lighting a muted call.
-            this.meter = new LevelMeter(windowSamples, message => this.port.postMessage(message));
+            this.meter = new LevelMeter(this.windowSamples, message => this.port.postMessage(message));
             this.port.onmessage = ({ data }) => {
                 try {
                     if (data.type === 'audio') this.playback.push(data);
@@ -226,7 +226,8 @@ if (typeof globalThis.registerProcessor === 'function') {
                     if (this.offset === this.capture.length) {
                         this.port.postMessage({ type: 'capture', pcm: this.capture, rate: this.rate,
                             generation: this.generation }, [this.capture.buffer]);
-                        this.capture = new Int16Array(this.capture.length);
+                        // The posted buffer was transferred (its array is now empty): a fresh window.
+                        this.capture = new Int16Array(this.windowSamples);
                         this.offset = 0;
                     }
                 }
