@@ -218,6 +218,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/focus.py`
 - `ouroboros/live_awareness.py`
 - `ouroboros/live_call_route.py`
+- `ouroboros/live_session_view.py`
 - `ouroboros/live_tool_batch.py`
 - `ouroboros/live_turn.py`
 - `ouroboros/loop.py`
