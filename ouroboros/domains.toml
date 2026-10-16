@@ -114,6 +114,7 @@ D20 = "Presence"
 "ouroboros/live_call_route.py" = "D01"  # live-call route, documented-window evidence, initial Nano view, minutes ceiling
 "ouroboros/live_tool_batch.py" = "D01"  # live-call tool lane: one serialized batch worker over handle_tool_calls
 "ouroboros/live_turn.py" = "D01"  # live voice-call driver: one engine session as the turn's model round
+"ouroboros/live_session_view.py" = "D01"  # live session window: compression watermarks and the replayed call rows
 "ouroboros/focus.py" = "D01"
 "ouroboros/agent_dispatch.py" = "D01"
 "ouroboros/agent_startup_checks.py" = "D01"

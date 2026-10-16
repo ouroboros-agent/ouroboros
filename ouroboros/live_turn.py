@@ -53,7 +53,8 @@ from ouroboros.gateways.realtime_engine import (
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
 from ouroboros.live_call_route import call_minutes_ceiling, initial_call_schemas, native_search_enabled, resolve_call_route
-from ouroboros.live_tool_batch import ToolBatchWorker, images_of, text_of
+from ouroboros.live_session_view import calibration_ratio, compression_watermarks, history_view
+from ouroboros.live_tool_batch import ToolBatchWorker, text_of
 from ouroboros.usage_accounting import BudgetExceeded
 
 log = logging.getLogger(__name__)
@@ -384,41 +385,11 @@ class _LiveCall:
 
     def _session_config(self, *, history: Tuple[Dict[str, Any], ...] = (), resume_handle: str = "") -> SessionConfig:
         instructions = text_of(self.messages[0].get("content")) if self.messages and self.messages[0].get("role") == "system" else ""
-        compress_at, compress_to = self._watermarks(instructions)
+        compress_at, compress_to = compression_watermarks(self.route.fact, instructions, self.tool_schemas,
+                                                          calibration_ratio(self.ctx))
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=tuple(self.tool_schemas),
                              history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle,
                              compress_at_tokens=compress_at, compress_to_tokens=compress_to)
-
-    def _watermarks(self, instructions: str) -> Tuple[int, int]:
-        """Where a self-compressing window starts sliding and how much it keeps; ``(0, 0)`` = provider default.
-
-        Physical: the route's input limit less one spoken reply is where compression must
-        start; it keeps the call view plus half of the room left for the conversation, so the
-        model always hears at least half of that room verbatim and compression runs once
-        per half-room, not every turn. The core (the system instruction) never slides out.
-        """
-        import json
-        import math
-
-        from ouroboros.utils import estimate_tokens
-
-        fact = self.route.fact
-        if fact is None:
-            return 0, 0
-        reply = int(getattr(fact, "reply_allowance_tokens", 0) or 8_192)
-        plan = getattr(self.ctx, "context_fit_plan", None)
-        ratio = 1.0
-        if plan is not None:
-            try:
-                ratio = float(plan.projection(str(getattr(self.ctx, "active_context_mode", "") or plan.initial_mode))
-                              .calibration_ratio or 1.0)
-            except Exception:
-                ratio = 1.0
-        view = math.ceil((estimate_tokens(instructions) + estimate_tokens(json.dumps(self.tool_schemas))) * ratio)
-        start = int(fact.window_tokens) - reply
-        if view >= start:
-            return 0, 0  # no room to talk at all: the provider's own refusal speaks for itself
-        return start, view + (start - view) // 2
 
     async def _open_engine(self, *, resume_handle: str = "") -> None:
         if self.closing or self.hub.ended_by_owner:
@@ -452,76 +423,9 @@ class _LiveCall:
             if resume_handle or rows_then > cut:
                 await self._send(command)
 
-    def _history_budget(self) -> Optional[int]:
-        """Tokens a fresh session may spend replaying this call: half the room left to talk, or no bound.
-
-        Physical: a long call's own words would otherwise fill a reopened window before
-        anyone speaks. The newest rows travel; older ones are in the room's transcript,
-        which the view names.
-        """
-        import json
-        import math
-
-        from ouroboros.utils import estimate_tokens
-
-        fact = self.route.fact
-        if fact is None:
-            return None
-        system = self.messages[0] if self.messages and self.messages[0].get("role") == "system" else {}
-        reply = int(getattr(fact, "reply_allowance_tokens", 0) or 8_192)
-        limit = int(fact.window_tokens) - reply
-        view = math.ceil(estimate_tokens(text_of(system.get("content"))) + estimate_tokens(json.dumps(self.tool_schemas)))
-        return max(0, (limit - view) // 2)
-
     def _history_view(self) -> Tuple[Dict[str, Any], ...]:
-        """The dialogue so far as items, newest first within the room a fresh session has.
-
-        Both engines accept images on a user history item; an image on any other
-        row cannot travel in history, so its absence is named in the item. Rows
-        beyond the budget are named by count: they stay in the room's transcript.
-        """
-        from ouroboros.utils import estimate_tokens
-
-        rows = self._history_rows()
-        budget = self._history_budget()
-        if budget is None:
-            return tuple(rows)
-        kept: List[Dict[str, Any]] = []
-        spent = 0
-        for item in reversed(rows):
-            cost = estimate_tokens(text_of(item.get("content")) if not isinstance(item.get("content"), str)
-                                   else item["content"])
-            if spent + cost > budget:
-                break
-            kept.append(item)
-            spent += cost
-        kept.reverse()
-        if len(kept) < len(rows):
-            note = (f"[Earlier in this call: {len(rows) - len(kept)} rows (speech, typed words, tool results) are not "
-                    "replayed into this session; they are in this room's transcript.]")
-            kept.insert(0, {"role": "user", "content": note})
-        return tuple(kept)
-
-    def _history_rows(self) -> List[Dict[str, Any]]:
-        view: List[Dict[str, Any]] = []
-        for msg in self.messages[1:] if self.messages and self.messages[0].get("role") == "system" else self.messages:
-            role = str(msg.get("role") or "")
-            if role not in ("user", "assistant", "tool"):
-                continue
-            content, text = msg.get("content"), text_of(msg.get("content"))
-            images = images_of(content)
-            if images and role == "user":
-                parts = [part for part in content if isinstance(part, dict) and part.get("type") in ("text", "image_url")]
-                item: Dict[str, Any] = {"role": role, "content": parts}
-            elif images:
-                item = {"role": role, "content": f"{text}\n[{len(images)} image(s) of this row cannot be replayed in history]"}
-            else:
-                item = {"role": role, "content": text}
-            for key in ("tool_calls", "tool_call_id", "name"):
-                if msg.get(key):
-                    item[key] = msg[key]
-            view.append(item)
-        return view
+        """The newest call rows a fresh session replays (``live_session_view.history_view``)."""
+        return history_view(self.route.fact, self.messages, self.tool_schemas)
 
     async def _reconnect(self, reason: str, *, resume: bool) -> None:
         if self.closing or self.reconnecting:

@@ -1,0 +1,114 @@
+"""What the owner's surface is told during a call: phases, closing words, activity, and session windows.
+
+Uses the driver harness of ``tests/test_live_turn.py`` (fake hub, engine, LLM and ledger).
+"""
+
+from __future__ import annotations
+
+import threading
+
+from ouroboros import live_turn
+from ouroboros.call_protocol import STATE_CLOSED, STATE_CONNECTING, STATE_LIVE, PeerAudio
+from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, AudioIn, EngineError, ToolCall
+from tests import test_live_turn as base
+from tests.test_live_turn import _spec, _wait_for
+
+harness = base.harness  # the same fixture, registered in this module
+
+
+def test_an_owner_who_ends_the_call_while_it_prepares_never_opens_an_engine(harness):
+    h = harness()
+    h.hub.ended_by_owner = True  # the owner's surface said bye while the turn was reading memory
+    h.thread = threading.Thread(target=lambda: setattr(h, "result", live_turn.run_live_turn(
+        messages=h.messages, tools=h.tools, llm=h.llm, drive_logs=h.root / "logs", emit_progress=h.emit_progress,
+        incoming_messages=h.incoming, task_id="t-call", task_type="task", budget_remaining_usd=10.0,
+        event_queue=h.events, drive_root=h.root, spec=h.spec, task=h.task, context_captured_at=h.context_captured_at)),
+        daemon=True)
+    h.thread.start()
+    text, usage, _trace = h.finish()
+    assert h.llm.engines == [] and h.llm.routes == []  # nothing opened, nothing paid for
+    assert usage["live_call"]["ended"] == "owner_bye" and "reason_code" not in usage
+    assert h.hub.states[-1] == (STATE_CLOSED, "owner_bye") and h.hub.closed == ["owner_bye"]
+    assert all(state != STATE_CONNECTING for state, _reason in h.hub.states)
+
+
+def test_a_missing_key_ends_the_call_with_its_own_words_and_the_settings_step(harness):
+    from ouroboros.gateways.realtime_transport import LiveEngineRefusal
+
+    h = harness()
+
+    def refuse(route):
+        raise LiveEngineRefusal("missing_credential", "Configure GOOGLE_API_KEY for calls.")
+
+    h.llm.open_live = refuse
+    h.thread = threading.Thread(target=lambda: setattr(h, "result", live_turn.run_live_turn(
+        messages=h.messages, tools=h.tools, llm=h.llm, drive_logs=h.root / "logs", emit_progress=h.emit_progress,
+        incoming_messages=h.incoming, task_id="t-call", task_type="task", budget_remaining_usd=10.0,
+        event_queue=h.events, drive_root=h.root, spec=h.spec, task=h.task, context_captured_at=h.context_captured_at)),
+        daemon=True)
+    h.thread.start()
+    text, usage, _trace = h.finish()
+    # A typed refusal is not "the voice service could not be reached".
+    assert usage["live_call"]["ended"] == "missing_credential" and usage["reason_code"] == "live_engine_refused"
+    assert ("closed", "Configure GOOGLE_API_KEY for calls.", "settings") in h.hub.words
+    assert [state for state, _ in h.hub.states][:1] == [STATE_CONNECTING]
+
+
+def test_a_tool_batch_tells_the_surface_it_is_working_and_then_idle(harness):
+    h = harness()
+    engine = h.start()
+    engine.push(ToolCall(call_id="c1", name="web_search", arguments="{}"))
+    assert _wait_for(lambda: ("idle", "") in h.hub.activity)
+    assert h.hub.activity[:2] == [("working", "web_search"), ("idle", "")]
+    h.stop()
+    h.finish()
+
+
+def test_a_call_compresses_from_its_watermarks(harness):
+    h = harness()
+    config = h.start().config
+    assert config.compress_at_tokens == 131_072 - 8_192
+    assert config.compress_at_tokens > config.compress_to_tokens > 0  # the view plus half of the room to talk
+    h.stop()
+    h.finish()
+
+
+def test_microphone_audio_is_labelled_with_the_rate_the_session_declares(harness):
+    h = harness()
+    engine = h.start()
+    assert _wait_for(lambda: (STATE_LIVE, "") in h.hub.states)
+    h.hub.feed(PeerAudio(peer_id="owner-1", role="owner", pcm=b"\x01\x00" * 320))
+    assert _wait_for(lambda: engine.sent_of(AudioIn))
+    assert engine.sent_of(AudioIn)[0].rate == 16000  # Gemini Live refuses audio at any other rate
+    h.stop()
+    h.finish()
+
+
+def test_a_provider_refusal_ends_the_call_with_its_own_words(harness):
+    h = harness()
+    engine = h.start()
+    words = "user system instruction has 140000 tokens and the sum is above the 131072 limit"
+    engine.push(EngineError(kind="invalid_request", message=words, retryable=False))
+    text, usage, _trace = h.finish()
+    assert usage["live_call"]["ended"] == "invalid_request" and words in text
+    assert ("closed", words, "retry") in h.hub.words
+
+
+def test_a_fresh_session_replays_the_newest_rows_that_fit_and_names_the_rest(harness):
+    from dataclasses import replace as _replace
+
+    h = harness(spec=_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live"))
+    call = live_turn._LiveCall(messages=h.messages, tools=h.tools, llm=h.llm, drive_logs=h.root / "logs",
+                               emit_progress=h.emit_progress, incoming_messages=h.incoming, task_id="t-call",
+                               task_type="task", event_queue=h.events, drive_root=h.root, spec=h.spec)
+    small = _replace(call.route.fact, window_tokens=8_192 + 2_000)  # one reply plus a small room
+    call.route = _replace(call.route, fact=small)
+    for index in range(60):
+        h.messages.append({"role": "user" if index % 2 else "assistant", "content": f"utterance {index} " + "word " * 40})
+    view = call._history_view()
+    assert view[0]["role"] == "user" and view[0]["content"].startswith("[Earlier in this call:")
+    assert view[-1]["content"].startswith("utterance 59 ")
+    assert all(not str(item["content"]).startswith("utterance 0 ") for item in view)
+    unbounded = _replace(call.route, fact=None)
+    call.route = unbounded
+    assert len(call._history_view()) == 61  # the task row and every utterance when no route fact bounds it
