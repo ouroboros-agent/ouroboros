@@ -722,15 +722,13 @@ def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: An
     action = str(decision.get("author_action") or "finish")
     merged["author_action"] = action
     merged.pop("agent_finish_intent", None)
-    feedback = next((run for run in reversed(trace.get("review_runs") or [])
-                     if isinstance(run, dict) and run.get("authority") == "host_root"
-                     and run.get("feedback_delivered")), None)
-    outcome = trace.get("acceptance_review_outcome") or {}
-    if not feedback and outcome.get("feedback_delivered"):
-        feedback = outcome
+    from ouroboros.loop_delivery import completion_feedback
+
+    feedback = completion_feedback(trace) or None
     if isinstance(observed, dict):
         feedback = observed.get("feedback") or None
-    explicit = ctx is not None and decision.get("explicit_finish") is True and bool(merged["agent_rationale"].strip())
+    explicit = (ctx is not None and decision.get("explicit_finish") is True
+                and (action != "stop" or bool(merged["agent_rationale"].strip())))
     from ouroboros.acceptance_preparation import STATUS_FAILED, preparation_exposed
 
     incident = observed.get("preparation") if isinstance(observed, dict) else trace.get("acceptance_preparation")
@@ -764,10 +762,10 @@ def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: An
             # fresh read, so an unverifiable stance is never honoured as ready.
             "evidence_fingerprint": observed.get("evidence_fingerprint", "") if isinstance(observed, dict) else observed_delivery_evidence(ctx, trace),
         }
-    from ouroboros.review_records import recorded_author_stop
-
-    if merged.get("agent_finish_intent") and recorded_author_stop(previous):
-        ctx._task_acceptance_reviewed = False  # the author's next decision reopens an honoured stop
+    if merged.get("agent_finish_intent") and (action == "stop" or merged.get("status") != ACCEPTANCE_ACCEPTED):
+        # A replay refusal (or stop) is not the author's next informed decision.
+        # Re-enter the ordinary freshness/control gates; clean approval needs no override.
+        ctx._task_acceptance_reviewed = False
     trace["acceptance_decision"] = merged
 
 

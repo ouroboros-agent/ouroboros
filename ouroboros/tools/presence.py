@@ -27,10 +27,9 @@ def _finish_presence(ctx: ToolContext, outcome: str, message: str = "", action: 
     if selected not in PRESENCE_OUTCOMES:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_OUTCOME_INVALID: choose message, silent, tool_delivered, or deferred.")))
     disposition = str(author_disposition or "").strip().lower()
-    if disposition and (disposition not in AUTHOR_DISPOSITIONS or not str(rationale or "").strip()):
+    if disposition and disposition not in AUTHOR_DISPOSITIONS:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
-            "ERROR: COMPLETION_ARGUMENT: author_disposition is accepted, rejected, partial or deferred, "
-            "with a rationale.")))
+            "ERROR: COMPLETION_ARGUMENT: author_disposition is accepted, rejected, partial or deferred.")))
     from ouroboros.tools.control_runtime import stage_completion_request
     reply_later = not message and answer_sha256 is None and selected in {"message", "deferred"}
     # The author's stance toward review criticism rides the existing agent decision of the
@@ -386,15 +385,15 @@ def get_tools() -> List[ToolEntry]:
                     "properties": {
                         "outcome": {"type": "string", "enum": list(PRESENCE_OUTCOMES)},
                         "action": {"type": "string", "enum": ["finish", "stop"], "default": "finish"},
-                        "rationale": {"type": "string", "description": "For stop, what remains unfinished; with author_disposition, why. Delivery outcome is independent."},
+                        "rationale": {"type": "string", "description": "Required for stop: what remains unfinished. Optional for finish, with or without author_disposition. Over an exposed local acceptance-preparation failure, state the caveat here for author_finish; without it, the host retains the preparation-failure cause, not a validation rejection. Delivery outcome is independent."},
                         "answer_sha256": {"type": "string", "description": "Select an offered complete answer instead of message or reply-later."},
                         "author_disposition": {
                             "type": "string", "enum": list(AUTHOR_DISPOSITIONS),
-                            "description": "Your stance toward the acceptance review's criticism of this answer, with a "
-                                           "rationale: accepted (you corrected it), rejected, partial or deferred. After "
-                                           "review feedback, an Advisory finish of the current answer (corrected or not) "
-                                           "needs it to end without another panel; without it a changed answer is a new "
-                                           "nomination. Never creates a reviewer PASS; Blocking still needs approval.",
+                            "description": "Optional stance toward the acceptance review's criticism of this answer: "
+                                           "accepted (you corrected it), rejected, partial or deferred. After exposed "
+                                           "review feedback, an explicit Advisory finish of the current answer (corrected "
+                                           "or not) ends without another panel, with or without it. Never creates a "
+                                           "reviewer PASS; Blocking still needs approval.",
                         },
                         "acceptance_subject": {
                             "type": "object",

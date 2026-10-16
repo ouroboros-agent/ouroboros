@@ -114,15 +114,21 @@ def test_received_outcome_keeps_live_custody_distinct(rows, terminal, expected):
     assert rows == before
 
 
-def test_invalid_task_author_action_publishes_typed_error(tmp_path, monkeypatch):
+@pytest.mark.parametrize("args,expected", [
+    ({"author_action": "abandon", "rationale": "Not a completion act."}, "author_action requires finish|stop"),
+    # A finish needs no separate rationale now; a stop still names its unfinished work.
+    ({"author_action": "stop", "rationale": " \n\t ", "claim": "Partial answer"},
+     "COMPLETION_ARGUMENT: stop requires a rationale naming unfinished work"),
+])
+def test_invalid_task_author_action_publishes_typed_error(tmp_path, monkeypatch, args, expected):
     from ouroboros.tools.registry import ToolRegistry
     from ouroboros.tools.tool_result import ToolResult
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **kw: (True, ""))
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    result = registry.execute_result("task_acceptance_review", {"author_action": "finish", "rationale": ""})
+    result = registry.execute_result("task_acceptance_review", args)
     assert isinstance(result, ToolResult)
     assert result.code == "TOOL_ARG_ERROR" and result.status == "error"
-    assert "author_action requires" in result.text
+    assert expected in result.text
 
 
 @pytest.mark.parametrize("kind", ["clean", "advisory"])

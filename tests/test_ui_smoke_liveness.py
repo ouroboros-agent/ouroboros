@@ -1,11 +1,11 @@
 """Behavioral liveness scenarios for the chat header pill (stream T).
 
-The class under test: "Working..." must be a claim the system can justify.
+The class under test: "Working" must be a claim the system can justify.
 L1 drives the owner's exact symptom end to end WITHOUT route stubs — durable
 disk state -> real gateway -> real browser — and asserts the pill CONVERGES to
-Online (every prior regression test only asserted that Working... appears).
+Online (every prior regression test only asserted that Working appears).
 L2 is the capability-preservation gate: a genuinely live managed task keeps
-its truthful Working... with no flicker and no durable-detail polling.
+its truthful Working with no flicker and no durable-detail polling.
 """
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def test_ui_smoke_orphan_swarm_card_converges_to_online(direct_server_with_data)
             page.wait_for_selector(card, timeout=30_000)
             # ... and the card-set reconcile closes it from the durable
             # task result, returning the pill to Online. Before the fix
-            # this stayed "Working..." across every reload and restart.
+            # this stayed "Working" across every reload and restart.
             page.wait_for_function(
                 """(sel) => document.querySelector(sel)?.dataset.finished === '1'""",
                 arg=card,
@@ -116,7 +116,7 @@ def test_ui_smoke_orphan_swarm_card_converges_to_online(direct_server_with_data)
 @pytest.mark.ui_browser
 def test_ui_smoke_live_managed_task_keeps_working_without_detail_polls(direct_server_with_data):  # noqa: F811
     """L2 (capability gate): a task the snapshot vouches for keeps an unbroken
-    truthful Working... — no flicker, and the reconcile never polls durable
+    truthful Working — no flicker, and the reconcile never polls durable
     detail for a snapshot-confirmed id."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -142,20 +142,20 @@ def test_ui_smoke_live_managed_task_keeps_working_without_detail_polls(direct_se
                 route.fulfill(content_type="application/json", body=json.dumps(payload))
 
             page.route("**/api/state*", _inject)
-            _goto_main_ready(page, url, "Working...")
+            _goto_main_ready(page, url, "Working")
             page.evaluate(
                 """() => {
                     window.__statusFlips = 0;
                     const el = document.querySelector('#chat-status');
                     window.__statusObserver = new MutationObserver(() => {
-                        if (el.textContent.trim() !== 'Working...') window.__statusFlips += 1;
+                        if (el.textContent.trim() !== 'Working') window.__statusFlips += 1;
                     });
                     window.__statusObserver.observe(el, {childList: true, characterData: true, subtree: true});
                 }"""
             )
             # Two full header-refresh cycles (3s interval) + margin.
             page.wait_for_timeout(7_000)
-            _wait_status(page, "Working...", timeout=1_000)
+            _wait_status(page, "Working", timeout=1_000)
             assert page.evaluate("() => window.__statusFlips") == 0
             assert page.evaluate("() => window.__taskDetailCalls.length") == 0
         finally:

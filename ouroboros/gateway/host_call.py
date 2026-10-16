@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 _REFUSAL_STATUS = {
     "presence_call_not_enabled": 403, "presence_origin_mismatch": 403, "presence_binding_wrong_transport": 403,
     "presence_event_invalid": 400, "presence_identity_missing": 400, "presence_call_invalid_setting": 400,
-    "presence_call_engine_unset": 503, "presence_call_model_unset": 503,
+    "presence_call_model_unset": 503,
     "presence_call_hub_unavailable": 503, "presence_call_not_started": 503,
 }
 

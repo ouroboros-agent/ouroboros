@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { activeModelWaits, mergeModelWaits } from '../modules/model_wait.js';
 import { summarizeProjectActivities } from '../modules/project_activity.js';
 import { chatStatusCounts, computeDerivedChatStatus } from '../modules/chat_activity.js';
-import { activityWaitPhase, censusTaskPhase, desiredLiveCardPhase, paintTaskPhase,
+import { activityWaitPhase, censusTaskPhase, desiredLiveCardPhase, modelActivityPresentation, paintTaskPhase,
     setInertCardPresentation, setLiveCardPhase, syncParkedPhase, taskActivityPresentation } from '../modules/task_phase_chip.js';
 
 function element(hidden = false) {
@@ -152,7 +152,7 @@ test('a known failed outcome remains static beside the actual late phase', () =>
 });
 
 test('the chat header says Finalizing… for ended work, never Working, while real work still wins', () => {
-    // 12.10: a failed root writing its reflection kept the header on "Working..." for ~19 min.
+    // 12.10: a failed root writing its reflection kept the header on "Working" for ~19 min.
     const finalizing = { activity_id: 'failed', kind: 'managed_task', phase: 'finalizing', status: 'failed',
         root_phase_checkpoint: { post_task_synthesis: 'running' } };
     const heldCard = { root: { isConnected: true }, groupId: 'failed', finished: false,
@@ -162,12 +162,12 @@ test('the chat header says Finalizing… for ended work, never Working, while re
     assert.equal(status([], [heldCard]), 'Finalizing…');
     assert.equal(status([['failed', finalizing]], [heldCard]), 'Finalizing…');
     const working = { activity_id: 'w', kind: 'managed_task', phase: 'working' };
-    assert.equal(status([['failed', finalizing], ['w', working]], [heldCard]), 'Working...');
+    assert.equal(status([['failed', finalizing], ['w', working]], [heldCard]), 'Working');
     const direct = { activity_id: 'd', kind: 'direct_turn', phase: 'working' };
     assert.notEqual(status([['failed', finalizing], ['d', direct]], [heldCard]), 'Finalizing…');
-    assert.equal(status([], [{ root: { isConnected: true }, groupId: 'x', finished: false }]), 'Working...');
+    assert.equal(status([], [{ root: { isConnected: true }, groupId: 'x', finished: false }]), 'Working');
     assert.equal(computeDerivedChatStatus({ ...chatStatusCounts(new Map([['failed', finalizing]]), []),
-        isConnected: false }).text, 'Reconnecting...');
+        isConnected: false }).text, 'Reconnecting…');
     // A direct-chat root wraps up the same way (gateway census kind direct_chat).
     const directFinalizing = { ...finalizing, activity_id: 'dr', kind: 'direct_chat' };
     const directCard = { ...heldCard, groupId: 'dr', direct: true };
@@ -280,4 +280,37 @@ test('Stop retains its existing active-operation movement without animating a pa
         assert.equal(taskActivityPresentation({ phase: 'working', stopPolicy, modelWaiting: true }).motion, false);
         assert.equal(taskActivityPresentation({ phase: 'working', stopPolicy, ended: true, outcome: 'done' }).text, 'Done');
     }
+});
+
+// One producer for the header (owner 15.10, 3C/4A): the word, its tone and its dots come together, and the tone
+// follows the call's operation, never its English word.
+test('the header producer pins word, tone and dots; a stop policy passes its own word through', () => {
+    const header = (fields) => {
+        const { text, tone, dots } = computeDerivedChatStatus(fields);
+        return [text, tone, dots];
+    };
+    const call = (phase) => header({ activeDirectCount: 1, modelActivity: modelActivityPresentation({ phase }) });
+    for (const phase of ['preparing', 'dispatching', 'awaiting_response', 'response_ready', 'response_received']) {
+        assert.equal(call(phase)[1], 'live', phase);
+        assert.equal(call(phase)[2], 'moving', phase);
+    }
+    assert.deepEqual(call('queued'), ['Queued', 'queued', 'still']);
+    // Rejoining waits on a call it already started: a single fact, one dot, never queued work.
+    assert.deepEqual(call('rejoining'), ['Rejoining', 'held', 'one']);
+    assert.deepEqual(call('unknown'), ['Activity unconfirmed', 'unknown', 'one']);
+    // A stop policy's view carries no operation: its own word stays (Cancelling…, Finalizing…), never Working.
+    for (const [stopPolicy, word] of [['immediate', 'Cancelling…'], ['finalize', 'Finalizing…']]) {
+        const view = taskActivityPresentation({ phase: 'working', stopPolicy });
+        assert.deepEqual(header({ activeManagedCount: 1, modelActivity: view }), [word, 'live', 'moving']);
+    }
+    assert.deepEqual(header({ queuedManagedCount: 1 }), ['Queued', 'queued', 'still']);
+    assert.deepEqual(header({ waitingOwnerCount: 1 }), ['Waiting for your answer', 'wait', 'one']);
+    // Amber belongs to the owner's question alone: pauses, access waits and holds are neutral facts.
+    assert.deepEqual(header({ pausedManagedCount: 1, pausedCause: 'owner' }), ['Paused · owner pause', 'held', 'one']);
+    assert.deepEqual(header({ pausingManagedCount: 1 }), ['Pausing…', 'held', 'one']);
+    assert.deepEqual(header({ waitingModelCount: 1 }), ['Waiting for access', 'held', 'one']);
+    assert.deepEqual(header({ projectWaitLabel: 'Waiting for Project verification' }), ['Waiting for Project verification', 'held', 'one']);
+    assert.deepEqual(header({ supervisorStarting: true }), ['Starting…', 'starting', 'one']);
+    assert.deepEqual(header({ isConnected: false, activeDirectCount: 1 }), ['Reconnecting…', 'offline', 'one']);
+    assert.deepEqual(header({}), ['Online', 'online', 'one']);
 });

@@ -7,8 +7,8 @@ commands the live driver sends, the typed events an engine emits, and the regist
 that maps an engine id to its adapter. Which context, which tools, when to speak and
 when to stay quiet belong to the mind and the live driver, never to an adapter.
 
-Adapters (``realtime_openai``, ``realtime_gemini``) translate this vocabulary to one
-provider wire and back. Every event keeps the provider's own identifiers so the
+The adapter (``realtime_gemini``; calls use Google Gemini Live only) translates this
+vocabulary to the provider wire and back. Every event keeps the provider's own identifiers so the
 ledger, the record and reconnect reconciliation can bind to them; audio is PCM16
 little-endian mono at the rate the route declares, and conversion between device
 and engine rates happens at the peer boundary, not here.
@@ -19,20 +19,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, Dict, Mapping, Protocol, Tuple, Union
 
-ENGINE_OPENAI = "openai"
 ENGINE_GOOGLE = "google"
-ENGINE_IDS = (ENGINE_OPENAI, ENGINE_GOOGLE)
+ENGINE_IDS = (ENGINE_GOOGLE,)
 
 SPEAKER_OWNER = "owner"
 SPEAKER_OUROBOROS = "ouroboros"
 
-# Gemini Live result scheduling; OpenAI ignores it (a late result plus one
-# coalesced ``response.create`` is its only delivery form). Barge-in and Stop use
+# Gemini Live result scheduling. Barge-in and Stop use
 # ``Interrupt``; no host rule decides that a result deserves to cut the speech.
 SCHEDULE_WHEN_IDLE = "when_idle"
 SCHEDULE_SILENT = "silent"
 
-# The one usage shape every adapter fills on ``ResponseDone``/``TranscriptionUsage``
+# The one usage shape the adapter fills on ``ResponseDone``
 # (missing = 0); the provider's own fields stay beside it in ``raw_usage``. Audio
 # counts never fold into text counts: they are priced separately.
 USAGE_KEYS = (
@@ -61,7 +59,7 @@ class SessionConfig:
     """Everything an engine needs to open or re-open one provider session.
 
     ``instructions`` is the turn's fitted system text (tier-0 whole); ``tools``
-    are ordinary registry schemas in the OpenAI function shape; ``history`` is a
+    are ordinary registry schemas in the function-call shape; ``history`` is a
     host-built view of earlier dialogue items for a rollover or a fresh session.
     ``resume_handle`` lets an engine that supports provider-side resumption
     continue a session instead of rebuilding it.
@@ -73,6 +71,11 @@ class SessionConfig:
     history: Tuple[Mapping, ...] = ()
     native_search: bool = False
     resume_handle: str = ""
+    # Where a provider that compresses its own window starts (``compress_at_tokens``) and how
+    # much it keeps (``compress_to_tokens``): physical watermarks the driver derives from the
+    # call view's size, the route's input limit and its reply allowance; 0 = provider default.
+    compress_at_tokens: int = 0
+    compress_to_tokens: int = 0
 
 
 # ---- commands: driver -> engine -------------------------------------------------
@@ -195,14 +198,6 @@ class ResponseDone:
     response_id: str = ""
 
 
-@dataclass(frozen=True)
-class TranscriptionUsage:
-    """Usage of a separate transcription model the engine ran for captions (its own price)."""
-
-    model: str
-    usage: Mapping = field(default_factory=dict)
-    raw_usage: Mapping = field(default_factory=dict)
-
 
 @dataclass(frozen=True)
 class ToolsApplied:
@@ -234,7 +229,7 @@ class Closed:
 
 EngineEvent = Union[
     Ready, AudioOut, Caption, SpeechStarted, ToolCall, ToolCallCancelled, ResponseStarted,
-    ResponseDone, TranscriptionUsage, ToolsApplied, ResumeCheckpoint, GoAway, EngineError, Closed,
+    ResponseDone, ToolsApplied, ResumeCheckpoint, GoAway, EngineError, Closed,
 ]
 
 

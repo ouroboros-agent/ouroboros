@@ -496,7 +496,7 @@ def test_genuine_socket_close_withdraws_main_authority_until_a_fresh_census(dire
             holding = True
             census["current_questions_complete"] = True
             page.evaluate("window.__refuseSockets = true; window.__ouroWs.ws.close()")
-            expect(status).to_have_text("Reconnecting...")
+            expect(status).to_have_text("Reconnecting…")
             expect(page.locator("#reconnect-overlay")).to_have_class(re.compile(r"\bvisible\b"))
             expect(resume).to_be_disabled()
             expect(stop).to_be_disabled()
@@ -547,7 +547,7 @@ def test_genuine_socket_close_withdraws_main_authority_until_a_fresh_census(dire
             before_open = page.evaluate("window.__readsAtOpen")
             assert page.evaluate("window.__closesAtOpen") == closes, \
                 "a close fell between the offline body and the reopen"
-            expect(status).not_to_have_text("Reconnecting...")
+            expect(status).not_to_have_text("Reconnecting…")
             expect(page.locator("#reconnect-overlay")).not_to_have_class(re.compile(r"\bvisible\b"))
             page.wait_for_timeout(1_500)
             views["reopened_census_held"] = authority()

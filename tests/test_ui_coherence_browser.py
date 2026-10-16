@@ -122,33 +122,6 @@ def test_scroll_fade_tracks_edges_late_content_and_stops_after_disposal(subscrip
     page.evaluate("shellFade.el.remove()")
 
 
-def test_matrix_respects_reduced_motion_changes_and_page_cleanup(subscription_ui):
-    page = subscription_ui["page"]
-    page.emulate_media(reduced_motion="reduce")
-    open_app(subscription_ui)
-    page.wait_for_selector("#matrix-rain", state="attached")
-    sample = "document.querySelector('#matrix-rain').toDataURL()"
-    first = page.evaluate(sample)
-    page.wait_for_timeout(200)
-    assert page.evaluate(sample) == first
-    setup_browser.capture(page, "shell-rain-reduced")
-    page.emulate_media(reduced_motion="no-preference")
-    page.wait_for_function("before => document.querySelector('#matrix-rain').toDataURL() !== before", arg=first)
-    page.emulate_media(reduced_motion="reduce")
-    page.wait_for_timeout(100)
-    frozen = page.evaluate(sample)
-    page.wait_for_timeout(200)
-    assert page.evaluate(sample) == frozen
-    page.evaluate("""() => {window.shellRain=document.querySelector('#matrix-rain');
-        window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:false}));}""")
-    assert page.locator("#matrix-rain").count() == 0
-    before = page.evaluate("[shellRain.width,shellRain.height,shellRain.toDataURL()]")
-    page.set_viewport_size({"width": 700, "height": 400})
-    page.emulate_media(reduced_motion="no-preference")
-    page.wait_for_timeout(200)
-    assert page.evaluate("[shellRain.width,shellRain.height,shellRain.toDataURL()]") == before
-
-
 @pytest.mark.parametrize("height", [260, 600])
 def test_photo_menu_escapes_gallery_crop_downloads_and_cleans_up(subscription_ui, height):
     page = subscription_ui["page"]

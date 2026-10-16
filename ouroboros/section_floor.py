@@ -56,10 +56,6 @@ def capture_sections(parts: Iterable[str], *, prefix: str) -> tuple[HostSection,
                  for i, part in enumerate(parts))
 
 
-def render_sections(sections: Iterable[HostSection], addressed: Mapping[str, str]) -> str:
-    return "\n\n".join(addressed.get(part.section_id, part.full_text) for part in sections)
-
-
 def labelled_section(section: HostSection, label: Callable[[str], str]) -> HostSection:
     """Apply the same snapshot label to both forms without losing the captured metadata."""
     return replace(section, full_text=label(section.full_text),
@@ -101,6 +97,12 @@ def _retain(root: pathlib.Path, path: str, text: str) -> None:
         os.unlink(temporary)
 
 
+def relocated_text(section: HostSection, reader: str) -> str:
+    """What a request shows of a relocated section: its operative view and the read of its retained bytes."""
+    return (section.operative_view + "\n\n"
+            + f"[Host section details omitted for the physical window; retained full text: {reader}.]")
+
+
 def _tokens(text: str) -> int:
     return estimate_tokens(json.dumps(text, ensure_ascii=False))
 
@@ -108,15 +110,17 @@ def _tokens(text: str) -> int:
 def fit_host_sections(
     sections: Iterable[HostSection], *, root: str, task_id: str,
     measure: Callable[[Mapping[str, str]], int], window_tokens: int, known_window: bool,
-    output_reserve: int, ratio: float, kept: Iterable[Mapping] = (),
+    output_reserve: int, ratio: float, kept: Iterable[Mapping] = (), operative: bool = False,
 ) -> tuple[dict[str, str], list[dict]]:
     """Address details in producer order only while the complete request exceeds its window.
 
     ``measure`` includes the chosen memory view, schemas and actual tail. It is
     recomputed after each substitution, so memory subsequently fits the smaller
     fixed part from the same capture. Previously shown addresses stay addressed;
-    unknown windows and owner targets never create new ones. A retention failure
-    keeps the complete section inline, never a pointer to unavailable bytes.
+    unknown windows and owner targets never create new ones. ``operative`` (a live
+    call, whose session window always fills) addresses every section that has an
+    operative view from the first request. A retention failure keeps the complete
+    section inline, never a pointer to unavailable bytes.
     """
     addressed: dict[str, str] = {}
     receipts: list[dict] = []
@@ -129,13 +133,12 @@ def fit_host_sections(
         if section.section_id in PROTECTED or section.operative_view is None or not root:
             continue
         carried = section.section_id in previous
-        if not carried and (not known_window or window_tokens <= 0
-                            or math.ceil(measure(addressed) * ratio) + output_reserve <= window_tokens):
+        if not carried and not operative and (not known_window or window_tokens <= 0
+                                              or math.ceil(measure(addressed) * ratio) + output_reserve <= window_tokens):
             continue
         path = section_address(task_id, section)
         reader = f"read_file(root='runtime_data', path={path!r})"
-        short = (section.operative_view + "\n\n"
-                 + f"[Host section details omitted for the physical window; retained full text: {reader}.]")
+        short = relocated_text(section, reader)
         saved = _tokens(section.full_text) - _tokens(short)
         if len(short) >= len(section.full_text) or saved <= 0:
             continue

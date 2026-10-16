@@ -18,9 +18,12 @@ context waits in a queue and no mail is acknowledged. The mailbox, the peers and
 the tool lane run from the first moment, so a Stop during the connection cancels
 the opening and closes whatever the provider opened. A tool result the transport
 refuses becomes a typed failure the model hears. The route's documented limits
-(window, reply allowance, instruction cap) shape the first open, so the call does
-not fail once to learn them; the price quote is warmed on the turn thread before
-the loop starts, so no catalog fetch ever runs on it. The driver returns the
+(window, reply allowance) shape the first open and Gemini's compression watermarks;
+a session the provider still refuses ends with the provider's own words. The price
+quote is warmed first on the ledger's thread, so no catalog fetch ever holds the
+open or runs on the call's loop. The phases the owner's surface shows (preparing,
+connecting, live) and every closing reason with its one next step come from here
+and the hub. The driver returns the
 loop's ordinary ``(text, usage, llm_trace)`` triple with a host-authored
 terminal (``terminal_origin=host_notice``) that points at the transcript.
 """
@@ -39,21 +42,21 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import (
-    PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING, STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING,
-    CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft,
+    ACTION_RETRY, ACTION_SETTINGS, PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING, STATE_CONNECTING,
+    STATE_LIVE, STATE_RECONNECTING, CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft,
 )
 from ouroboros.gateways.realtime_engine import (
     SPEAKER_OUROBOROS, SPEAKER_OWNER, USAGE_KEYS,
     AudioIn, AudioOut, Caption, Close, Closed, ContextItem, EngineError, GoAway, Interrupt, PlayedAudio, Ready,
     ResponseDone, ResponseStarted, ResumeCheckpoint, SessionConfig, SpeechStarted, ToolCall, ToolCallCancelled,
-    ToolResult, TranscriptionUsage, UpdateTools,
+    ToolResult, UpdateTools,
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
-from ouroboros.live_call_route import (
-    call_minutes_ceiling, fit_call_instructions, initial_call_schemas, native_search_enabled, recover_call_context,
-    resolve_call_route,
+from ouroboros.live_call_route import call_minutes_ceiling, initial_call_schemas, native_search_enabled, resolve_call_route
+from ouroboros.live_session_view import (
+    calibration_ratio, compression_watermarks, history_view, record_density_witness, text_estimate,
 )
-from ouroboros.live_tool_batch import ToolBatchWorker, images_of, text_of
+from ouroboros.live_tool_batch import ToolBatchWorker, text_of
 from ouroboros.usage_accounting import BudgetExceeded
 
 log = logging.getLogger(__name__)
@@ -70,6 +73,14 @@ PEER_GRACE_S = 20.0
 RECONNECT_ATTEMPTS = 3
 SESSION_CAP_MARGIN_S = 60.0
 BATCH_SETTLE_WAIT_S = 5.0
+
+# The one next step the owner's surface offers beside a closed call's reason.
+_ACTION_BY_REASON = {
+    "missing_credential": ACTION_SETTINGS, "authentication": ACTION_SETTINGS, "engine_refused": ACTION_SETTINGS,
+    "rate_limit": ACTION_RETRY, "provider_closed": ACTION_RETRY, "provider_error": ACTION_RETRY,
+    "invalid_request": ACTION_RETRY, "protocol": ACTION_RETRY, "backpressure": ACTION_RETRY,
+    "engine_unavailable": ACTION_RETRY, "reconnect_failed": ACTION_RETRY,
+}
 
 
 # ---- seams the lanes meet at (tests replace these) --------------------------------
@@ -136,6 +147,10 @@ class _LiveCall:
         self.context_captured_at = context_captured_at
         self.ctx = tools._ctx
         self.route = resolve_call_route(spec, drive_root)
+        # The PCM rates the engine wire takes and returns. Gemini Live takes 16 kHz input
+        # and refuses any other rate, so audio is labelled with what the session declares.
+        self.input_rate = 16000 if spec.engine == "google" else self.route.engine.input_rate
+        self.output_rate = self.route.engine.output_rate
         self.llm_trace: Dict[str, Any] = {"reasoning_notes": ["live_call"], "tool_calls": []}
         self.usage: Dict[str, Any] = {"_task_attempt": getattr(self.ctx, "task_attempt", None),
                                       "live_usage": {key: 0 for key in USAGE_KEYS}, "live_responses": 0}
@@ -148,10 +163,14 @@ class _LiveCall:
         self.started_at_iso = ""
         self.session_started = self.started
         self.close_reason = ""
+        self.close_detail = ""  # the provider's or the host's own sentence beside the reason
         self.closing = False
         self.reconnecting = False
         self.reconnects = 0
         self.resume_handle = ""
+        # (session epoch, its opening config): the first response's text count becomes the route's
+        # density witness unless other text reached the session before it.
+        self.witness: Optional[Tuple[int, SessionConfig]] = None
         self.response_open = False
         self.budget_error: Optional[BudgetExceeded] = None
         self.failure: Optional[Tuple[str, str]] = None
@@ -210,10 +229,15 @@ class _LiveCall:
         self.hub = _hub_for(self.spec.call_id)
         if self.hub is None:
             return self._terminal("no_hub", failure=("live_call_hub_missing", "the call's peer hub is not open"))
-        # The tariff quote is fetched here, on the turn thread, before the call's event
-        # loop exists; inside the loop every ledger lookup reads the warmed catalog only.
-        self._settle_safely(lambda: _ledger().warm_quote(engine=self.spec.engine, model=self.spec.model,
-                                                         drive_root=self.drive_root))
+        if self.hub.closed or self.hub.ended_by_owner:
+            # Ended while its memory was being prepared: no engine is opened or paid for.
+            self.close_reason = "owner_bye"
+            self._close_hub()
+            return self._terminal("owner_bye", failure=None)
+        # The tariff quote is fetched first on the ledger's own thread: the open never waits
+        # for it, and every ledger lookup queued behind it reads the warmed catalog.
+        self._record(self._settle_safely, lambda: _ledger().warm_quote(engine=self.spec.engine, model=self.spec.model,
+                                                                       drive_root=self.drive_root))
         try:
             asyncio.run(self._main())
         finally:
@@ -233,7 +257,6 @@ class _LiveCall:
         loop_mod = _loop()
         self._loop = asyncio.get_running_loop()
         self._hub_events, self._outbox = asyncio.Queue(), asyncio.Queue()
-        self.hub.send_state(STATE_CONNECTING)
         loop_mod._reset_turn_state(self.ctx)
         loop_mod._initialize_owner_directives(self.ctx, self.messages)
         self.tool_schemas, _extra = loop_mod._setup_dynamic_tools(
@@ -257,7 +280,6 @@ class _LiveCall:
                                      asyncio.create_task(self.tools_lane.run_forever()),
                                      asyncio.create_task(self._deliver_forever())]
         try:
-            fit_call_instructions(self.ctx, self.messages, self.tool_schemas, self.route)
             opening = asyncio.create_task(self._open_engine())
             closed = asyncio.create_task(self._closed.wait())
             await asyncio.wait({opening, closed}, return_when=asyncio.FIRST_COMPLETED)
@@ -270,6 +292,11 @@ class _LiveCall:
             except asyncio.CancelledError:
                 if not self.closing:
                     raise
+            except LiveEngineRefusal as exc:
+                # A typed refusal before any session (a missing key, a malformed route) keeps its own words.
+                self.failure = ("live_engine_refused", f"{exc.code}: {exc}")
+                self._begin_close("missing_credential" if exc.code == "missing_credential" else "engine_refused",
+                                  detail=str(exc))
             except Exception as exc:
                 log.warning("live call %s could not open its engine", self.spec.call_id, exc_info=True)
                 self.failure = ("live_engine_unavailable", f"{type(exc).__name__}: {exc}")
@@ -311,18 +338,31 @@ class _LiveCall:
         self._checkpoint()
         self.rooms.stop()
         self._reader_stop.set()
+        self._close_hub()
+
+    def _close_hub(self) -> None:
+        """The closed state with its words and one next step, then the hub itself."""
         self.state = STATE_CLOSED
-        self.hub.send_state(STATE_CLOSED, self.close_reason)
         try:
+            self.hub.send_state(STATE_CLOSED, self.close_reason, detail=self.close_detail,
+                                action=_ACTION_BY_REASON.get(self.close_reason, ""))
             self.hub.close(self.close_reason)
         except Exception:
             log.debug("hub close failed", exc_info=True)
 
-    def _begin_close(self, reason: str) -> None:
+    def _begin_close(self, reason: str, *, detail: str = "") -> None:
         if self.closing:
             return
         self.closing, self.close_reason, self.state = True, reason, STATE_CLOSING
+        self.close_detail = detail
         self._closed.set()
+
+    def _activity(self, activity: str, label: str = "") -> None:
+        """What the owner's surface shows while a tool batch runs (the tool's own name), and after it."""
+        try:
+            self.hub.send_activity(activity, label)
+        except Exception:
+            log.debug("call activity unsent", exc_info=True)
 
     def _terminal(self, reason: str, *, failure: Optional[Tuple[str, str]]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
         from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
@@ -350,16 +390,24 @@ class _LiveCall:
 
     def _session_config(self, *, history: Tuple[Dict[str, Any], ...] = (), resume_handle: str = "") -> SessionConfig:
         instructions = text_of(self.messages[0].get("content")) if self.messages and self.messages[0].get("role") == "system" else ""
+        compress_at, compress_to = compression_watermarks(self.route.fact, instructions, self.tool_schemas,
+                                                          calibration_ratio(self.ctx))
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=tuple(self.tool_schemas),
-                             history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle)
+                             history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle,
+                             compress_at_tokens=compress_at, compress_to_tokens=compress_to)
 
     async def _open_engine(self, *, resume_handle: str = "") -> None:
+        if self.closing or self.hub.ended_by_owner:
+            return  # the owner ended the call before its engine opened: nothing is opened or paid for
+        if not self.reconnecting:
+            self.hub.send_state(STATE_CONNECTING)
         engine = self.llm.open_live(self.route.engine)
         # The history view holds every transcript row up to this count; context recorded
         # after it, while the connection was pending, is delivered once the session is live.
         history, cut = ((), -1) if resume_handle else (self._history_view(), len(self.messages))
+        config = self._session_config(history=history, resume_handle=resume_handle)
         try:
-            await engine.open(self._session_config(history=history, resume_handle=resume_handle))
+            await engine.open(config)
         except asyncio.CancelledError:
             try:  # the call ended while connecting: whatever was opened is closed at once
                 await asyncio.wait_for(engine.close("cancelled"), timeout=BATCH_SETTLE_WAIT_S)
@@ -367,8 +415,9 @@ class _LiveCall:
                 log.debug("cancelled engine close failed", exc_info=True)
             raise
         self.engine, self.epoch, self.session_started = engine, self.epoch + 1, time.monotonic()
+        self.witness = None if resume_handle else (self.epoch, config)
         self.input_ms = 0.0  # a new session counts its input audio from zero
-        self.hub.set_engine_rates(self.route.engine.input_rate, self.route.engine.output_rate)
+        self.hub.set_engine_rates(self.input_rate, self.output_rate)
         if self.empty_since is None and not self.hub.peers():
             # A call nobody attached to yet runs the same rejoin grace as one everyone left:
             # a peer whose socket never arrived must not hold the session (or a Presence slot).
@@ -382,30 +431,8 @@ class _LiveCall:
                 await self._send(command)
 
     def _history_view(self) -> Tuple[Dict[str, Any], ...]:
-        """The dialogue so far as items: text, plus the images a user row carries.
-
-        Both engines accept images on a user history item; an image on any other
-        row cannot travel in history, so its absence is named in the item.
-        """
-        view: List[Dict[str, Any]] = []
-        for msg in self.messages[1:] if self.messages and self.messages[0].get("role") == "system" else self.messages:
-            role = str(msg.get("role") or "")
-            if role not in ("user", "assistant", "tool"):
-                continue
-            content, text = msg.get("content"), text_of(msg.get("content"))
-            images = images_of(content)
-            if images and role == "user":
-                parts = [part for part in content if isinstance(part, dict) and part.get("type") in ("text", "image_url")]
-                item: Dict[str, Any] = {"role": role, "content": parts}
-            elif images:
-                item = {"role": role, "content": f"{text}\n[{len(images)} image(s) of this row cannot be replayed in history]"}
-            else:
-                item = {"role": role, "content": text}
-            for key in ("tool_calls", "tool_call_id", "name"):
-                if msg.get(key):
-                    item[key] = msg[key]
-            view.append(item)
-        return tuple(view)
+        """The newest call rows a fresh session replays (``live_session_view.history_view``)."""
+        return history_view(self.route.fact, self.messages, self.tool_schemas, calibration_ratio(self.ctx))
 
     async def _reconnect(self, reason: str, *, resume: bool) -> None:
         if self.closing or self.reconnecting:
@@ -434,7 +461,7 @@ class _LiveCall:
                 await asyncio.sleep(0.5 * (2 ** attempt_no))
         self.reconnecting = False
         self.failure = ("live_engine_unavailable", f"the engine could not be reopened after {reason}")
-        self._begin_close("reconnect_failed")
+        self._begin_close("reconnect_failed", detail=f"the session ended ({reason}) and could not be reopened")
 
     async def _send(self, command: Any) -> None:
         engine = self.engine
@@ -442,6 +469,8 @@ class _LiveCall:
             if isinstance(command, (ContextItem, ToolResult, UpdateTools)) and not self.closing:
                 self._queued.append((len(self.messages), command))  # audio and playback marks are transient; context waits
             return
+        if isinstance(command, (ContextItem, ToolResult, UpdateTools)):
+            self.witness = None  # the session now holds more text than it was opened with
         try:
             await engine.send(command)
         except LiveEngineRefusal as exc:
@@ -558,7 +587,7 @@ class _LiveCall:
         if isinstance(event, PeerAudio):
             if (self.engine is not None and not self.closing and not self.reconnecting
                     and event.peer_id not in self.muted_peers):
-                rate = self.route.engine.input_rate
+                rate = self.input_rate
                 duration = len(event.pcm) * 500 / rate
                 if event.role == PEER_MEETING:
                     self.meeting_audio_since_caption = True
@@ -635,22 +664,16 @@ class _LiveCall:
             await self._drain()
             if self.fanout.pending:
                 self.fanout.flush()
-        elif isinstance(event, TranscriptionUsage):
-            self._record(self._settle_safely, lambda: _ledger().record_transcription(
-                engine=self.spec.engine, model=event.model, call_id=self.spec.call_id, usage=dict(event.usage),
-                raw_usage=dict(event.raw_usage), task_id=self.task_id, drive_root=self.drive_root))
         elif isinstance(event, ResumeCheckpoint):
             self.resume_handle = event.handle if event.resumable else ""
         elif isinstance(event, GoAway):
             asyncio.create_task(self._reconnect("go_away", resume=True))
         elif isinstance(event, EngineError):
-            if recover_call_context(self.ctx, self.messages, self.tool_schemas, event):
-                await self._reconnect("context_length", resume=False)
-            elif event.retryable:
+            if event.retryable:
                 asyncio.create_task(self._reconnect(f"engine_error:{event.kind}", resume=True))
             else:
                 self.failure = ("live_engine_error", f"{event.kind}: {event.message}")
-                self._begin_close(f"engine_error:{event.kind}")
+                self._begin_close(event.kind, detail=event.message)
         elif isinstance(event, Closed):
             if not self.closing:
                 asyncio.create_task(self._reconnect(f"transport_lost:{event.reason}", resume=True))
@@ -659,8 +682,9 @@ class _LiveCall:
             self.hub.send_state(STATE_LIVE)
             effective = dict(event.effective or {})
             if effective.get("input_rate") or effective.get("output_rate"):
-                self.hub.set_engine_rates(int(effective.get("input_rate") or self.route.engine.input_rate),
-                                          int(effective.get("output_rate") or self.route.engine.output_rate))
+                self.input_rate = int(effective.get("input_rate") or self.input_rate)
+                self.output_rate = int(effective.get("output_rate") or self.output_rate)
+                self.hub.set_engine_rates(self.input_rate, self.output_rate)
 
     async def _barge_in(self) -> None:
         self.hub.flush()
@@ -872,6 +896,11 @@ class _LiveCall:
         key = event.response_id or event.item_id
         attempt = self._attempt_for(key, usage=dict(event.usage), raw_usage=dict(event.raw_usage), status=event.status)
         self.attempts.pop(key, None)
+        if self.witness and self.witness[0] == self.epoch:  # counted on the ledger thread, off the audio loop
+            opened, tokens = self.witness[1], int(event.usage.get("text_input_tokens") or 0)
+            self._record(self._settle_safely, lambda: record_density_witness(
+                self.route, text_estimate(opened.instructions, opened.history, opened.tools), tokens))
+        self.witness = None
         self.usage["live_responses"] += 1
         for name in USAGE_KEYS:
             self.usage["live_usage"][name] += int(event.usage.get(name) or 0)

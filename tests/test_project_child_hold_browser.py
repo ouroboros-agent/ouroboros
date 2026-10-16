@@ -297,7 +297,7 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
             assert queue.persist_queue_snapshot()
             page.wait_for_function("text => document.querySelector('.chat-live-card[data-task-id=parent] [data-live-phase]')?.textContent === text", arg=WAIT)
             assert child_card.locator('[data-live-phase]').inner_text() == "Working"
-            assert page.locator('#chat-status').inner_text() == 'Working...'
+            assert page.locator('#chat-status').inner_text() == 'Working'
             # Deliver the real child hold response, then keep subsequent state
             # reads unresolved: another census cannot mask a missing async sync.
             show_child_hold = freeze_next_child_reply = True
@@ -329,7 +329,7 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
             queue.RUNNING["working-sibling"]={"task":{"id":"working-sibling","chat_id":1},"started_at":time.time(),"attempt":1}
             write_task_result(root,"working-sibling","running",chat_id=1)
             frame(page,"working-sibling",content="Independent sibling is working.")
-            page.wait_for_function("() => document.querySelector('#chat-status')?.textContent === 'Working...'")
+            page.wait_for_function("() => document.querySelector('#chat-status')?.textContent === 'Working'")
             shot(page, "real-working-sibling")
             # A live child's first review group must not enroll it in the root
             # census's missing-task polling; its review body is already present.
@@ -350,7 +350,7 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
                 with page.expect_response(lambda response: "queue_only=1" in response.url, timeout=10000):
                     pass
             assert not [url for url in request_count if url.split("?")[0].endswith("/api/tasks/review-child")]
-            assert page.locator('#chat-status').inner_text() == "Working..."
+            assert page.locator('#chat-status').inner_text() == "Working"
             shot(page, "working-review-child-no-detail-poll")
             assert not errors, errors
         except Exception:

@@ -86,7 +86,7 @@ export function modelActivityPresentation(activity) {
     const detail = [tr(`task.model_activity.${phase}`, labels[phase][1]), ...blockers
         .filter(row => Object.hasOwn(reasons, row?.kind))
         .map(row => tr(`task.model_activity.${row.kind}`, reasons[row.kind]))].join(' · ');
-    return { ...phaseView('working', labels[phase][0](), waiting ? 'working waiting' : 'working', !waiting, waiting), detail };
+    return { ...phaseView('working', labels[phase][0](), waiting ? 'working waiting' : 'working', !waiting, waiting), detail, operation: phase };
 }
 
 // One pure presentation over task facts, shared by cards, receipts and project

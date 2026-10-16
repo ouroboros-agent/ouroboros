@@ -149,7 +149,10 @@ class LiveCallHub(cp.CallHub):
         self._epoch = 0
         self._mix_at = 0.0
         self._closed = False
-        self._state = {"type": "state", "state": cp.STATE_CONNECTING, "reason": ""}
+        self._owner_bye = False
+        # Born preparing: the call's turn is reading memory before any engine socket exists.
+        self._state = {"type": "state", "state": cp.STATE_PREPARING, "reason": "", "engine": spec.engine,
+                       "phase": "memory"}
         self._counts = dict(input_dropped_samples=0, output_dropped_frames=0,
                             stale_frames=0, control_overflows=0)
 
@@ -162,6 +165,12 @@ class LiveCallHub(cp.CallHub):
     def closed(self) -> bool:
         with self._condition:
             return self._closed
+
+    @property
+    def ended_by_owner(self) -> bool:
+        """The owner's surface said bye: a driver that has not opened its engine yet never opens it."""
+        with self._condition:
+            return self._owner_bye
 
     def stats(self) -> dict[str, int]:
         with self._condition:
@@ -291,6 +300,8 @@ class LiveCallHub(cp.CallHub):
             if kind == "played" and not peer.info.speaker:
                 raise CallPeerError("audio_direction_forbidden")
             self._event(cp.PeerControl(peer_id, peer.info.role, dict(message)))
+            if kind == "bye" and peer.info.role == cp.PEER_OWNER:
+                self._owner_bye = True
             if kind == "mute":
                 peer.muted = message["muted"]
                 if peer.muted:
@@ -392,12 +403,21 @@ class LiveCallHub(cp.CallHub):
         for peer in self._peers.values():
             self._send(peer, text)
 
-    def send_state(self, state: str, reason: str = "") -> None:
+    def send_state(self, state: str, reason: str = "", *, phase: str = "", detail: str = "",
+                   action: str = "") -> None:
         if state not in cp.CALL_STATES:
             raise ValueError("unknown call state")
+        extra = {key: value for key, value in (("phase", phase), ("detail", detail), ("action", action)) if value}
         with self._condition:
-            self._state = dict(type="state", state=state, reason=reason)
+            self._state = dict(type="state", state=state, reason=reason, engine=self.spec.engine, **extra)
             self._broadcast(self._state)
+
+    def send_activity(self, activity: str, label: str = "") -> None:
+        """A tool batch runs (``working``, with the tool's own label) or ended (``idle``)."""
+        if activity not in ("working", "idle"):
+            raise ValueError("unknown call activity")
+        with self._condition:
+            self._broadcast(dict(type="activity", activity=activity, label=label))
 
     def send_caption(self, speaker: str, text: str, final: bool, item_id: str = "") -> None:
         if speaker not in ("owner", "ouroboros"):
@@ -409,7 +429,7 @@ class LiveCallHub(cp.CallHub):
         with self._condition:
             return tuple(peer.info for peer in self._peers.values())
 
-    def close(self, reason: str) -> None:
+    def close(self, reason: str, *, detail: str = "", action: str = "") -> None:
         with self._condition:
             if self._closed:
                 return
@@ -418,7 +438,8 @@ class LiveCallHub(cp.CallHub):
             for peer in self._peers.values():
                 peer.tracks.clear()
             self.flush()
-            self.send_state(cp.STATE_CLOSED, reason)
+            if self._state.get("state") != cp.STATE_CLOSED:  # the driver's own closed state (and words) stands
+                self.send_state(cp.STATE_CLOSED, reason, detail=detail, action=action)
             self._condition.notify_all()
 
 
@@ -461,8 +482,9 @@ def open_owner_hub(spec: cp.CallSpec) -> tuple[LiveCallHub, bool]:
         return hub, True
 
 
-def close_hub(call_id: str, reason: str = "finished") -> None:
+def close_hub(call_id: str, reason: str = "finished", **words: str) -> None:
+    """Close and forget a hub; ``words`` are ``detail``/``action`` for its closed state."""
     with _REGISTRY_LOCK:
         hub = _HUBS.pop(call_id, None)
     if hub is not None:
-        hub.close(reason)
+        hub.close(reason, **words)

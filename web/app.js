@@ -2,7 +2,7 @@
 
 import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
-import { loadVersion, initMatrixRain } from './modules/utils.js';
+import { loadVersion } from './modules/utils.js';
 import { bindScrollFade } from './modules/scroll_fade.js';
 import { initChat, createChatInstance as createChatRoom } from './modules/chat.js';
 import { createStateSnapshotSequencer } from './modules/chat_activity.js';
@@ -991,13 +991,11 @@ initUpdateStatus(ctx);
 
 initOnboardingOverlay();
 
-const disposeMatrixRain = initMatrixRain();
 const disposeScrollFades = Array.from(document.querySelectorAll('.scroll-fade-y'), bindScrollFade);
 window.addEventListener('pagehide', (event) => {
     if (event.persisted) return;
     disposeEvolution();
     disposeStorage?.destroy();
-    disposeMatrixRain();
     disposeScrollFades.forEach((dispose) => dispose());
 });
 loadVersion();

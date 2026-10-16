@@ -99,7 +99,7 @@ def test_owner_open_captures_settings_and_closes_hub_on_finished(owner, monkeypa
 
     calls = []
     monkeypatch.setattr(config, "load_settings", lambda: {
-        "OUROBOROS_CALL_ENGINE": "google", "OUROBOROS_CALL_MODEL_GOOGLE": "live-model",
+        "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "live-model",
         "OUROBOROS_CALL_VOICE_GOOGLE": "configured-voice", "OUROBOROS_CALL_MAX_MINUTES": "9"})
 
     def admit(chat_id, spec, on_finished):
@@ -124,7 +124,7 @@ def test_owner_admission_refusal_removes_hub(owner, monkeypatch):
     from ouroboros import config
     from supervisor import worker_chat_lane
 
-    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALL_MODEL_OPENAI": "test"})
+    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "test"})
     seen = []
 
     def admit(chat_id, spec, callback):
@@ -142,7 +142,7 @@ def test_owner_open_honours_a_chosen_model_and_a_second_surface_joins_the_rooms_
     from ouroboros import config
     from supervisor import worker_chat_lane
 
-    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALL_MODEL_OPENAI": "settings-model"})
+    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "settings-model"})
     admitted = []
 
     def admit(chat_id, spec, on_finished):
@@ -171,7 +171,7 @@ def test_two_surfaces_opening_a_room_at_once_share_one_call(monkeypatch):
     from ouroboros.gateway import call_ws
     from supervisor import worker_chat_lane
 
-    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALL_MODEL_OPENAI": "settings-model"})
+    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "settings-model"})
     admitted, both_built = [], threading.Barrier(2, timeout=5)
     build = call_ws.build_call_spec
 
@@ -390,7 +390,7 @@ def test_presence_admission_uses_binding_and_never_owner_entry(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("code,status", [("presence_call_busy", 409), ("presence_call_not_enabled", 403),
-                                         ("presence_call_engine_unset", 503)])
+                                         ("presence_call_model_unset", 503)])
 def test_a_presence_refusal_reaches_the_companion_in_plain_words(tmp_path, monkeypatch, code, status):
     from ouroboros.presence_call import PresenceCallRefused
 
@@ -479,7 +479,7 @@ def test_both_doors_close_after_terminal_state(door):
         hello(ws, role)
         hub.close("finished")
         assert ws.receive_json() == {"type": "flush", "epoch": hub.epoch}
-        assert ws.receive_json() == {"type": "state", "state": "closed", "reason": "finished"}
+        assert ws.receive_json() == {"type": "state", "state": "closed", "reason": "finished", "engine": "openai"}
         with pytest.raises(WebSocketDisconnect):
             ws.receive_text()
     assert not hub.peers()
@@ -543,7 +543,7 @@ def test_owner_unsupported_settings_and_admission_crash_are_typed(owner, monkeyp
     from ouroboros import config
     from supervisor import worker_chat_lane
 
-    settings = {"OUROBOROS_CALL_MODEL_OPENAI": "test", "OUROBOROS_CALL_MAX_MINUTES": "-2"}
+    settings = {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "test", "OUROBOROS_CALL_MAX_MINUTES": "-2"}
     monkeypatch.setattr(config, "load_settings", lambda: settings)
     monkeypatch.setattr(worker_chat_lane, "handle_call_direct", lambda *args: None, raising=False)
     response = owner.post("/api/call/open", json={"chat_id": 1})
@@ -559,3 +559,44 @@ def test_owner_unsupported_settings_and_admission_crash_are_typed(owner, monkeyp
     response = owner.post("/api/call/open", json={"chat_id": 1})
     assert response.status_code == 503 and response.json()["code"] == "call_admission_failed"
     assert get_hub(observed[0]) is None
+
+
+def test_a_turn_that_ends_before_its_driver_closes_the_hub_with_a_reason(owner, monkeypatch):
+    from ouroboros import config
+    from supervisor import worker_chat_lane
+
+    calls = []
+    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "g", "OUROBOROS_CALL_MODEL_GOOGLE": "m"})
+    monkeypatch.setattr(worker_chat_lane, "handle_call_direct",
+                        lambda chat_id, spec, on_finished: calls.append((spec, on_finished)) or {"admitted": True},
+                        raising=False)
+    response = owner.post("/api/call/open", json={"chat_id": 1})
+    spec, finished = calls[0]
+    with owner.websocket_connect(response.json()["ws_path"]) as ws:
+        hello(ws, "owner")
+        finished("turn", False)  # the turn failed while preparing: no driver ever closed the hub
+        assert ws.receive_json()["type"] == "flush"
+        closed = ws.receive_json()
+    assert closed == {"type": "state", "state": "closed", "reason": "preparation_failed", "engine": "google",
+                      "action": "retry"}
+    assert get_hub(spec.call_id) is None
+
+
+def test_owner_open_without_a_google_key_is_refused_at_once(owner, monkeypatch):
+    from ouroboros import config
+    from supervisor import worker_chat_lane
+
+    admitted = []
+    monkeypatch.setattr(worker_chat_lane, "handle_call_direct",
+                        lambda chat_id, spec, on_finished: admitted.append(spec) or {"admitted": True, "task_id": "t"},
+                        raising=False)
+    settings = {"OUROBOROS_CALL_MODEL_GOOGLE": "g-model", "OPENAI_API_KEY": "an-openai-key-opens-nothing"}
+    monkeypatch.setattr(config, "load_settings", lambda: settings)
+    response = owner.post("/api/call/open", json={"chat_id": 1})
+    assert response.status_code == 400 and response.json()["code"] == "missing_credential_google"
+    assert response.json()["error"] == "Calls need a Google AI key: add it in Settings." and admitted == []
+    settings["GOOGLE_API_KEY"] = "g"
+    response = owner.post("/api/call/open", json={"chat_id": 1})
+    assert response.status_code == 200, response.text
+    assert admitted[-1].engine == "google" and admitted[-1].model == "g-model"
+    close_hub(admitted[-1].call_id)

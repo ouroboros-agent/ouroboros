@@ -209,10 +209,7 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 | OUROBOROS_HOST_SERVICE_PORT | 8767 | Host Service port (loopback-only; §12) |
 | OUROBOROS_DESKTOP_KEEP_RUNNING | false | Closing the desktop window keeps Ouroboros running (Windows, macOS; `launcher_background.py`); disk-authored consent, absent until the owner chooses |
 | OUROBOROS_PRESENCE_MAX_ACTIVE | 2 | Cross-process Presence turn cap (UI-bounded 1-20) |
-| OUROBOROS_CALL_ENGINE | "openai" | Realtime engine a live call opens with (`openai` or `google`) |
-| OUROBOROS_CALL_MODEL_OPENAI | "gpt-realtime-2.1" | OpenAI Realtime model for calls |
-| OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls |
-| OUROBOROS_CALL_VOICE_OPENAI | "" | OpenAI voice for calls (blank = provider default) |
+| OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls (calls use Google Gemini Live and its `GOOGLE_API_KEY`) |
 | OUROBOROS_CALL_VOICE_GOOGLE | "" | Gemini voice for calls (blank = provider default) |
 | OUROBOROS_CALL_NATIVE_SEARCH | true | Let Gemini Live use its native Google Search grounding in calls |
 | OUROBOROS_CALL_MAX_MINUTES | "" | Optional owner duration ceiling for a call (blank = none) |

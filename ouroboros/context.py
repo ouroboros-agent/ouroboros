@@ -68,7 +68,7 @@ from ouroboros.context_sections import (  # re-export the existing context surfa
     build_knowledge_sections,
     runtime_host_section,
 )
-from ouroboros.section_floor import capture_sections
+from ouroboros.section_floor import HostSection, capture_sections
 from ouroboros.contracts.task_contract import normalize_bool, task_input_sources
 from ouroboros.memory import Memory, render_scratchpad_markdown
 from ouroboros.update_letter import official_update_projection  # contract: never raises
@@ -764,17 +764,18 @@ def build_memory_sections(memory: Memory, partition: str = "all", *, include_scr
             header = "## Scratchpad (from `memory/scratchpad.md` — PARTIAL: trimmed to the section budget; re-read via read_file(root='runtime_data', path='memory/scratchpad.md') for the full working memory)"
         else:
             header = "## Scratchpad (from `memory/scratchpad.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/scratchpad.md'))"
-        sections.append(header + "\n\n" + scratchpad_body)
+        sections.append(HostSection("scratchpad", header + "\n\n" + scratchpad_body))  # tier zero: an id, no view
 
     if include_stable:
         identity_raw = memory.load_identity()
         _warn_if_over_budget("identity", identity_raw)
-        sections.append("## Identity (from `memory/identity.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw)
-        world_raw = memory.load_world_profile().strip()
-        if world_raw:
+        sections.append(HostSection("identity", "## Identity (from `memory/identity.md` — already loaded; do not re-read "
+                                    "via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw))
+        world_file = memory.load_world_profile()
+        if world_file.strip():
             # Generated profile is full; oversize is a generation-discipline bug.
-            _warn_if_over_budget("world", world_raw)
-            sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_raw)
+            _warn_if_over_budget("world", world_file.strip())
+            sections.append(_world_section(world_file))
 
     if partition == "all":
         registry_path = memory.drive_root / "memory" / "registry.md"
@@ -787,20 +788,42 @@ def build_memory_sections(memory: Memory, partition: str = "all", *, include_scr
     return sections
 
 
+def _world_section(world_file: str) -> HostSection:
+    """WORLD.md whole, with its own heading map as the operative view (line ranges into the file)."""
+    from ouroboros.context_layout import generate_doc_nav_map
+
+    reader = "read_file(root='runtime_data', path='memory/WORLD.md', start_line=A, max_lines=N)"
+    full = ("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to "
+            "regenerate if the host environment changes)\n\n" + world_file.strip())
+    headings = generate_doc_nav_map(world_file, title="Environment Profile", rel_path="memory/WORLD.md",
+                                    instructions=False).split("\n", 2)[2]  # below its own title line
+    return HostSection("world", full, f"## Environment Profile (from `memory/WORLD.md`)\n\n{headings}\n\n"
+                                      f"Its line ranges read with {reader}.")
+
+
+def _reflection_header(entry: Dict[str, Any]) -> str:
+    ts_full = str(entry.get("ts", ""))
+    ts = ts_full[:16] if len(ts_full) >= 16 else ts_full
+    bits = [bit for bit in [ts, str(entry.get("task_type", "")).strip(), str(entry.get("task_id", "")).strip()] if bit]
+    return " | ".join(bits) or "unknown reflection"
+
+
+def _reflections_section(section_id: str, heading: str, shown: List[Dict[str, Any]], text: str,
+                         pointer: str) -> HostSection:
+    """Reflections whole, with one header line per shown row (and the historical pointer) as the view."""
+    rows = [f"- {_reflection_header(entry)}" + (" (project pointer)" if entry.get("type") == "project_reflection_pointer"
+                                                else "") for entry in shown[-20:]]
+    view = "\n".join([*rows, *([pointer] if pointer else [])])
+    return HostSection(section_id, f"{heading}\n\n{text}", f"{heading}\n\n{view}")
+
+
 def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 20, *, ctx: Any = None) -> str:
     if not entries:
         return ""
 
     blocks: List[str] = []
     for entry in entries[-limit:]:
-        ts_full = str(entry.get("ts", ""))
-        ts = ts_full[:16] if len(ts_full) >= 16 else ts_full
-        header_bits = [bit for bit in [
-            ts,
-            str(entry.get("task_type", "")).strip(),
-            str(entry.get("task_id", "")).strip(),
-        ] if bit]
-        header = " | ".join(header_bits) or "unknown reflection"
+        header = _reflection_header(entry)
 
         if str(entry.get("type", "")) == "project_reflection_pointer":
             # Bounded canonical pointer row (full text lives on the project
@@ -924,14 +947,14 @@ def build_recent_sections(memory: Memory, env: Any, task_id: str = "", project_i
 
     reflections_entries, reflections_coverage = memory.read_task_recent("task_reflections.jsonl", "", 20)
     shown, history = _split_reflection_rows(reflections_entries)
-    reflections_text = "\n\n".join(part for part in (
-        _format_recent_reflections(shown, limit=20, ctx=ctx),
-        _historical_reflections_pointer(
-            history, _canonical_runtime_reader(ctx, memory.drive_root, "logs/task_reflections.jsonl")
-            if history else "", f"this window ({coverage_line(reflections_coverage)})"),
-    ) if part)
+    pointer = _historical_reflections_pointer(
+        history, _canonical_runtime_reader(ctx, memory.drive_root, "logs/task_reflections.jsonl")
+        if history else "", f"this window ({coverage_line(reflections_coverage)})")
+    reflections_text = "\n\n".join(part for part in (_format_recent_reflections(shown, limit=20, ctx=ctx), pointer)
+                                    if part)
     if reflections_text:
-        sections.append("## Execution reflections\n\n" + reflections_text)
+        sections.append(_reflections_section("execution_reflections", "## Execution reflections", shown,
+                                             reflections_text, pointer))
         if history:
             sections.extend("Archived reflection source: " + _canonical_runtime_reader(ctx, memory.drive_root, path)
                             for path in reflections_coverage.get("archive_sources", []))
@@ -947,16 +970,13 @@ def build_recent_sections(memory: Memory, env: Any, task_id: str = "", project_i
             shown, history = _split_reflection_rows(list(iter_jsonl_objects(
                 project_reflections_path(_pid), max_entries=20,
             )))
-            project_text = "\n\n".join(part for part in (
-                _format_recent_reflections(shown, limit=20, ctx=ctx),
-                _historical_reflections_pointer(
-                    history, _project_reflections_reader(ctx, _pid) if history else "", "the newest 20"),
-            ) if part)
+            pointer = _historical_reflections_pointer(
+                history, _project_reflections_reader(ctx, _pid) if history else "", "the newest 20")
+            project_text = "\n\n".join(part for part in (_format_recent_reflections(shown, limit=20, ctx=ctx), pointer)
+                                         if part)
             if project_text:
-                sections.append(
-                    f"## Project execution reflections (this project's own: {_pid})\n\n"
-                    + project_text
-                )
+                sections.append(_reflections_section("project_execution_reflections",
+                    f"## Project execution reflections (this project's own: {_pid})", shown, project_text, pointer))
         except Exception:
             log.debug("project reflections read-back failed", exc_info=True)
 
@@ -1090,10 +1110,11 @@ def _capture_context_core(
 
         subagent_catalog = current_model_visible_subagent_catalog()
         if subagent_catalog:
-            semi_stable_parts.append(
-                "## Available subagents\n\n"
-                + json.dumps(subagent_catalog, ensure_ascii=False, indent=1)
-            )
+            rows = [f"- {row.get('subagent_id')}: {row.get('route_class')}, effort {row.get('effort')}"
+                    + (", reviews" if row.get("review_eligible") else "") for row in subagent_catalog.get("rows", ())]
+            semi_stable_parts.append(HostSection(
+                "subagents", "## Available subagents\n\n" + json.dumps(subagent_catalog, ensure_ascii=False, indent=1),
+                "## Available subagents\n\n" + "\n".join(rows)))
     except Exception:
         log.debug("Failed to build Available subagents catalog", exc_info=True)
     try:
@@ -1117,6 +1138,7 @@ def _capture_context_core(
             semi_stable_parts.append(deep_review)
 
     semi_stable_text = "\n\n".join(semi_stable_parts)
+    semi_stable_sections = capture_sections(semi_stable_parts, prefix="semi")
 
     from ouroboros.tools.tool_resolution import active_repo_dir_for
     active_root = str(active_repo_dir_for(ctx)) if ctx is not None else ""
@@ -1223,6 +1245,7 @@ def _capture_context_core(
         architecture_md=architecture_md,
         development_md=development_md,
         semi_stable_text=semi_stable_text,
+        semi_stable_sections=semi_stable_sections,
         dynamic_text="\n\n".join(dynamic_parts),
         dynamic_sections=capture_sections(dynamic_parts, prefix="dynamic"),
         dynamic_head_sections=capture_sections(head_parts, prefix="head"),
@@ -1302,6 +1325,8 @@ def build_context_fit_plan(
     tool_schemas: Optional[List[Dict[str, Any]]] = None,
     known_window_tokens: Optional[int] = None,
     known_output_reserve_tokens: Optional[int] = None,
+    known_route: Optional[Dict[str, str]] = None,
+    call_view: bool = False,
 ) -> ContextFitPlan:
     """Compatibility wrapper over the cohesive context-fit implementation."""
     core = _capture_context_core(env, memory, task, review_context_builder, ctx)
@@ -1314,6 +1339,7 @@ def build_context_fit_plan(
         tool_schemas=tool_schemas,
         known_window_tokens=known_window_tokens,
         known_output_reserve_tokens=known_output_reserve_tokens,
+        known_route=known_route, call_view=call_view,
     )
 
 
@@ -1345,14 +1371,16 @@ def build_llm_messages(
     *, tool_schemas: Optional[List[Dict[str, Any]]] = None,
     known_window_tokens: Optional[int] = None,
     known_output_reserve_tokens: Optional[int] = None,
+    known_route: Optional[Dict[str, str]] = None,
+    call_view: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """The first request of a task: the plan's projection for its starting mode, and the cap info.
 
     No model is called on this path: my memory is rendered, never prepared by a paid pass;
     a window too small for it addresses lines and pages instead.
     ``known_window_tokens`` and ``known_output_reserve_tokens`` supply the capacity and
-    reply allowance of a caller-resolved route; they never substitute an owner target
-    for unknown capacity.
+    reply allowance of a caller-resolved route (``known_route``: its identity); they never
+    substitute an owner target for unknown capacity. ``call_view``: a live call's view.
     """
     # Keep the legacy public shape while publishing the immutable plan on the
     # existing ToolContext for the ordinary loop.  Commit/scope reviewers do not
@@ -1367,6 +1395,7 @@ def build_llm_messages(
         tool_schemas=tool_schemas,
         known_window_tokens=known_window_tokens,
         known_output_reserve_tokens=known_output_reserve_tokens,
+        known_route=known_route, call_view=call_view,
     )
     if ctx is not None:
         ctx.context_fit_plan = plan

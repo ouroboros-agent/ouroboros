@@ -1,7 +1,7 @@
 /**
- * The room's work status in its header (DESIGN "Room work status"). The header's one status control
- * opens this room's current work: Main hangs a sheet from its header control group (ui.css "Floating
- * chrome"); a Project unfolds a Shade under its panel bar. Presentation only, over the chat instance's
+ * The room's work status in its bar (DESIGN "Room work status"). The bar's one status control, right after
+ * the room's title, paints the word, tone and dots the chat's producer gives it and opens this room's current
+ * work as one Shade under the bar, in Main and a Project alike. Presentation only, over the chat instance's
  * own owners; it keeps no task state, phase vocabulary, poller, pager, question index or permission:
  *   membership  this room's census (`activeDirectActivities`), the owner's unconfirmed sends
  *               (`pendingSubmissions`) and unfinished foreground cards the census does not list
@@ -120,23 +120,25 @@ export function createRoomWork({
     trigger.setAttribute('aria-haspopup', 'dialog');
     trigger.setAttribute('aria-expanded', 'false');
     trigger.setAttribute('aria-controls', `${uid}-surface`);
+    // The status's one mark follows its word, as on the sidebar's rows: three dots or one.
     const dots = marker('rw-dots');
-    const lead = decorative(element('span', 'rw-lead'));
-    const amber = decorative(element('span', 'rw-amber'));
-    // Said as well as drawn: moving work with something waiting names the wait in the control's name.
-    const waitNote = element('span', 'rw-sr', 'Some work is waiting');
+    const dot = decorative(element('span', 'rw-mark'));
+    // Said as well as drawn: work with a question waiting names the wait in the control's name.
+    const waitNote = element('span', 'rw-sr', 'A question waits for your answer');
     const caret = decorative(element('span', 'rw-caret'));
     const badgeParent = statusBadge.parentNode;
     const badgeNext = statusBadge.nextSibling || null;
     const panel = asPanel ? page.closest?.('.project-panel') || null : null;
-    const bar = panel?.querySelector?.('.project-panel-bar') || null;
-    const group = asPanel ? null : badgeParent?.closest?.('.ui-chrome-group') || null;
-    trigger.append(lead, dots, statusBadge, amber, waitNote, caret);
-    if (bar) bar.insertBefore(trigger, bar.querySelector('.project-panel-close'));
+    // One bar per room: the Project panel bar, or Main's header. The status follows the room's own title in the
+    // bar's title row, so a changing word takes the title's room and never moves a neighbour.
+    const bar = panel?.querySelector?.('.project-panel-bar') || (asPanel ? null : page.querySelector('.chat-page-header'));
+    trigger.append(statusBadge, dot, dots, waitNote, caret);
+    const titleRow = bar?.querySelector('.app-page-title-row');
+    if (titleRow) titleRow.appendChild(trigger);
     else badgeParent?.insertBefore(trigger, badgeNext);
 
-    // ---- the surface: Main's sheet continues its group; a Project's Shade hangs under its bar
-    const surface = element('div', asPanel ? 'rw-surface rw-shade' : 'rw-surface rw-sheet ui-chrome-sheet');
+    // ---- the surface: one Shade in every room, unfolding from the bottom edge of the room's bar
+    const surface = element('div', 'rw-surface rw-shade');
     surface.id = `${uid}-surface`;
     surface.hidden = true;
     surface.tabIndex = -1;  // where a pointer open lands: a landing point, never a control
@@ -148,15 +150,14 @@ export function createRoomWork({
     const note = element('p', 'rw-note');
     note.hidden = true;
     surface.append(list, note);
-    let shadeAnchor = null;
-    if (asPanel) {
-        // A zero-height anchor under the bar: the Shade follows the bar's real height at every width.
-        shadeAnchor = element('div', 'rw-shade-anchor');
-        shadeAnchor.appendChild(surface);
-        (bar || page.querySelector('.chat-panel-statusbar'))?.insertAdjacentElement('afterend', shadeAnchor);
-    } else {
-        (group || page.querySelector('.chat-page-header') || page).appendChild(surface);
-    }
+    // A zero-height anchor under the bar: the Shade follows the bar's real height at every width. Main's
+    // header floats over the transcript, so its anchor is the header's own last child at its bottom edge.
+    const shadeAnchor = element('div', 'rw-shade-anchor');
+    shadeAnchor.appendChild(surface);
+    if (asPanel) (bar || page.querySelector('.chat-panel-statusbar'))?.insertAdjacentElement('afterend', shadeAnchor);
+    else (bar || page).appendChild(shadeAnchor);
+    // The element that says "open" for CSS: the Project panel, or Main's header.
+    const openHost = panel || (asPanel ? null : bar);
 
     // ---- Back to reading: one explicit return to the passage a navigation left
     const back = element('button', 'rw-back');
@@ -377,9 +378,8 @@ export function createRoomWork({
         const word = element('span', 'rw-word');
         const secondary = element('span', 'rw-secondary');
         const where = element('span', 'rw-where');
-        const place = element('span', 'rw-place');
         const chev = decorative(element('span', 'rw-chev'));
-        where.append(place, chev);
+        where.append(chev);
         state.append(rowDots, rowLead, word, secondary, where);
         main.append(nameEl, state);
         const verb = element('span', 'rw-verb');
@@ -388,7 +388,7 @@ export function createRoomWork({
         detail.id = `${uid}-detail-${(detailSequence += 1)}`;
         detail.hidden = true;
         el.append(main, verb, moreSlot, detail);
-        view = { el, main, nameEl, dots: rowDots, lead: rowLead, word, secondary, where, place, chev, verb, moreSlot,
+        view = { el, main, nameEl, dots: rowDots, lead: rowLead, word, secondary, where, chev, verb, moreSlot,
             detail, question: null, resume: null, more: null, row: null, full: null, detailKey: '', attempt: undefined };
         // The name stays selectable text: a drag that selected it does not navigate.
         bindContentButton(main, () => activateRow(view.row), () => rowIsTarget(view.row));
@@ -428,11 +428,12 @@ export function createRoomWork({
         Object.assign(el.dataset, {
             id: row.id,
             slot: row.slot, kind: row.kind, tone: row.tone, settled: row.settled ? '1' : '0', open: isOpen ? '1' : '0',
-            // A moving, loaded row says its word on the name's line; every exception says it under the name.
-            flow: row.group === 'progress' && navigable && !row.settled ? 'moving' : 'exception',
         });
         const full = row.fullName || row.name;
-        const state = [row.view.text, row.view.secondary].filter(Boolean).join(' · ');
+        // Every row says its state under its name (5A). A row whose message is not loaded says so in its name for
+        // assistive technology and in its details; it is not a visible line of its own.
+        const place = !row.loaded && row.kind !== 'pending' ? tr('room_work.place.unloaded', 'Not in loaded messages') : '';
+        const state = [row.view.text, row.view.secondary, place].filter(Boolean).join(' · ');
         if (navigable || detailable) {
             main.setAttribute('role', 'button');
             main.tabIndex = 0;
@@ -461,10 +462,8 @@ export function createRoomWork({
         const secondary = String(row.view.secondary || '');
         if (view.secondary.textContent !== secondary) view.secondary.textContent = secondary;
         view.secondary.hidden = !secondary;
-        const place = !row.loaded && row.kind !== 'pending' ? tr('room_work.place.unloaded', 'Not in loaded messages') : '';
-        if (view.place.textContent !== place) view.place.textContent = place;
         view.chev.hidden = !detailable;
-        view.where.hidden = !place && !detailable;
+        view.where.hidden = !detailable;
         view.detail.hidden = !isOpen;
         if (isOpen) {
             const lines = describe(row);
@@ -650,26 +649,26 @@ export function createRoomWork({
     function paintTrigger() {
         const text = clean(statusBadge.textContent);
         const current = rows.filter((row) => !row.settled && !row.latest);
-        const tones = new Set(current.map((row) => row.tone));
         const listed = rows.length > 0;
-        // The badge's own class (setStatus) names the connection; its exceptions outrank work colours.
-        const kind = (String(statusBadge.className).match(/\b(online|starting|offline|error|thinking)\b/) || [])[1] || '';
-        const connection = ['offline', 'error', 'starting'].includes(kind) ? kind : '';
-        const tone = connection || (tones.has('live') ? 'live' : tones.has('wait') ? 'wait' : tones.has('queued') ? 'queued'
-            : tones.has('unknown') ? 'unknown' : kind === 'thinking' ? 'live' : kind || 'online');
+        // Word, tone and dots come together from the chat's producer (computeDerivedChatStatus via setStatus);
+        // the control paints them and never ranks row tones or reads a class name for a second opinion.
+        // Before the producer's first answer the room is not online yet: an unknown tone paints as offline.
+        const tone = statusBadge.dataset.tone || 'offline';
+        const dotsMode = statusBadge.dataset.dots || 'one';
         trigger.disabled = !listed;
         trigger.dataset.tone = tone;
         trigger.dataset.open = open ? '1' : '0';
         trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
         trigger.title = text;  // the whole status word, never clipped away (an extra, not the only path)
         caret.hidden = !listed;
-        const dotted = tone === 'live' || tone === 'queued';
-        dots.hidden = !dotted;
-        dots.dataset.state = tone === 'live' ? 'working' : 'queued';
-        lead.hidden = dotted;
-        // Moving work that also has something waiting keeps its live chip and adds one amber dot, said in words too.
-        const mixed = !connection && tones.has('live') && tones.has('wait');
-        amber.hidden = !mixed;
+        // Owner 15.10 (3C): live work keeps three moving dots, queued work three still dots; a fact is one dot.
+        dots.hidden = dotsMode === 'one';
+        dots.dataset.state = dotsMode === 'moving' ? 'working' : 'queued';
+        dot.hidden = !dots.hidden;
+        // One mark, one more fact (owner 16.10): the mark turns amber while a question waits for the owner's answer
+        // and the word does not already say so — beside Working, Queued, a pause or an access wait alike.
+        const mixed = !['offline', 'starting', 'wait'].includes(tone) && current.some((row) => row.question);
+        trigger.dataset.wait = mixed ? '1' : '0';
         waitNote.hidden = !mixed;
         if (!listed && open) close({ restoreFocus: false });
     }
@@ -691,8 +690,7 @@ export function createRoomWork({
         frozen = new Map();
         order = [];
         surface.hidden = false;
-        panel?.setAttribute('data-rw-open', '');
-        group?.setAttribute('data-disclosure', 'open');
+        openHost?.setAttribute('data-rw-open', '');
         render();
         // A pointer open lands on the (ring-less) list; a keyboard open enters its first real control.
         const first = viaKeyboard ? list.querySelector('.rw-main[tabindex="0"], .rw-action, .rw-more') : null;
@@ -705,8 +703,7 @@ export function createRoomWork({
         open = false;
         closeTaskControlMenu();
         surface.hidden = true;
-        panel?.removeAttribute('data-rw-open');
-        group?.removeAttribute('data-disclosure');
+        openHost?.removeAttribute('data-rw-open');
         frozen = null;
         order = [];
         expanded.clear();
@@ -924,8 +921,7 @@ export function createRoomWork({
             if (outsideClick) doc.removeEventListener('click', outsideClick, true);
             watcher?.disconnect();
             for (const dispose of disposers.splice(0)) dispose();
-            panel?.removeAttribute('data-rw-open');
-            group?.removeAttribute('data-disclosure');
+            openHost?.removeAttribute('data-rw-open');
             // The badge returns where the product put it; this module's nodes go.
             if (badgeParent?.isConnected) badgeParent.insertBefore(statusBadge, badgeNext?.parentNode === badgeParent ? badgeNext : null);
             trigger.remove();

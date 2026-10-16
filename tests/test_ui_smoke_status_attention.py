@@ -208,8 +208,8 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             assert card["titleScroll"] <= card["titleClient"] + 1, geometry
 
     def room_status(page, status_selector):
-        # A room says its status once, in its header's one status control (DESIGN
-        # "Room work status"): Main's floating group, a Project's panel bar. The
+        # A room says its status once, in its bar's one status control right after
+        # the title (DESIGN "Room work status"), in Main and a Project alike. The
         # cards stay in the chat column; the word is never read from two places.
         status = page.locator(status_selector)
         assert status.count() == 1, status_selector
@@ -292,7 +292,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert "error" not in child.get_attribute("class").split()
 
         page.wait_for_function(
-            "selector => document.querySelector(selector)?.textContent === 'Working...'",
+            "selector => document.querySelector(selector)?.textContent === 'Working'",
             arg=status_selector,
             timeout=30_000,
         )

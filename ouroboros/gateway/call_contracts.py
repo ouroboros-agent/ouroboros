@@ -17,8 +17,9 @@ from ouroboros import call_protocol as cp
 
 
 class CallOpenRequest(TypedDict):
+    """Calls use Google Gemini Live; ``model``/``voice`` override the Settings defaults."""
+
     chat_id: int
-    engine: NotRequired[Literal["openai", "google"]]
     model: NotRequired[str]
     voice: NotRequired[str]
     client_message_id: NotRequired[str]
@@ -97,9 +98,21 @@ class CallBye(TypedDict):
 
 
 class CallState(TypedDict):
+    """A call's state; a closed one carries its reason's words and one next step."""
+
     type: Literal["state"]
-    state: Literal["connecting", "live", "reconnecting", "closing", "closed"]
+    state: Literal["preparing", "connecting", "live", "reconnecting", "closing", "closed"]
     reason: str
+    engine: NotRequired[str]
+    phase: NotRequired[str]
+    detail: NotRequired[str]
+    action: NotRequired[Literal["settings", "retry"]]
+
+
+class CallActivity(TypedDict):
+    type: Literal["activity"]
+    activity: Literal["working", "idle"]
+    label: str
 
 
 class CallCaption(TypedDict):
@@ -139,7 +152,7 @@ class CallSocketContract(TypedDict):
 
 PEER_CONTROLS = {"hello": CallHello, "mute": CallMute, "played": CallPlayed,
                  "context": CallContext, "participant": CallParticipant, "bye": CallBye}
-SERVER_CONTROLS = {"state": CallState, "caption": CallCaption, "flush": CallFlush}
+SERVER_CONTROLS = {"state": CallState, "activity": CallActivity, "caption": CallCaption, "flush": CallFlush}
 
 
 def socket_contract() -> CallSocketContract:

@@ -329,6 +329,9 @@ def acceptance_patch_dispositions(drive_root: Any, task_id: str) -> Dict[str, An
             "reason": truncate_review_artifact(str(row.get("reason") or ""), limit=600),
             "patch_sha256": str(row.get("patch_sha256") or ""),
             **({"target_root": str(row["target_root"])} if row.get("target_root") else {}),
+            # An owner-Continue successor's decision names the child's own parent.
+            **({"original_parent_task_id": str(row["original_parent_task_id"])}
+               if row.get("original_parent_task_id") else {}),
             **({"verdict_artifact_write_failed": True}
                if row.get("verdict_artifact_write_failed") else {}),
         })

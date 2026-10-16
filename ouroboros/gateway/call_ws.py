@@ -53,15 +53,16 @@ async def read_call_body(request: Request) -> dict:
 def build_call_spec(payload: dict) -> cp.CallSpec:
     """Capture configured routing at admission; an explicit voice may be empty."""
     from ouroboros.config import load_settings
+    from ouroboros.llm_live import live_key_present
 
     settings = load_settings()
-    engine = payload.get("engine", settings.get("OUROBOROS_CALL_ENGINE", "openai"))
-    if engine not in ("openai", "google"):
-        raise CallPeerError("unsupported_call_engine")
-    model = payload.get("model") or settings.get(f"OUROBOROS_CALL_MODEL_{engine.upper()}", "")
+    if not live_key_present(settings):
+        # Said at once, before any turn starts: calls use Google Gemini Live and need its key.
+        raise CallPeerError("missing_credential_google")
+    model = payload.get("model") or settings.get("OUROBOROS_CALL_MODEL_GOOGLE", "")
     if not isinstance(model, str) or not model.strip():
         raise CallPeerError("call_model_missing")
-    voice = payload.get("voice", settings.get(f"OUROBOROS_CALL_VOICE_{engine.upper()}", ""))
+    voice = payload.get("voice", settings.get("OUROBOROS_CALL_VOICE_GOOGLE", ""))
     limit = settings.get("OUROBOROS_CALL_MAX_MINUTES")
     if limit not in (None, ""):
         try:
@@ -74,7 +75,7 @@ def build_call_spec(payload: dict) -> cp.CallSpec:
             raise CallPeerError("invalid_call_max_minutes") from None
     else:
         limit = None
-    return cp.CallSpec(uuid.uuid4().hex, payload["chat_id"], engine, model, voice,
+    return cp.CallSpec(uuid.uuid4().hex, payload["chat_id"], "google", model, voice,
                        max_minutes=limit, client_message_id=payload.get("client_message_id", ""))
 
 
@@ -86,9 +87,12 @@ def _admit_owner_call(payload: dict) -> dict:
     hub, created = open_owner_hub(spec)  # surfaces opening at once share one call, one paid session
     if not created:
         return {"call_id": hub.call_id, "ws_path": f"/ws/call/{hub.call_id}", "joined": True}
+    def finished(_task_id: str, ok: bool) -> None:
+        # The driver closes its own hub with its reason; a hub still open here never reached it.
+        close_hub(spec.call_id, "call_not_started" if ok else "preparation_failed", action=cp.ACTION_RETRY)
+
     try:
-        result = handle_call_direct(spec.chat_id, spec,
-                                    lambda _task_id, _ok: close_hub(spec.call_id))
+        result = handle_call_direct(spec.chat_id, spec, finished)
     except Exception:
         close_hub(spec.call_id, "admission_failed")
         raise
@@ -124,8 +128,8 @@ _OWNER_REFUSAL_WORDS = {
     "budget_exhausted": "The spending limit is reached; raise it in Settings to call.",
     "cost_accounting_unavailable": "Spending cannot be checked right now, so the call did not open.",
     "project_room_unavailable": "This project's room is not available for a call.",
-    "unsupported_call_engine": "Choose the OpenAI or Google live engine.",
-    "call_model_missing": "No live model is set for this engine in Settings (Models, Live calls).",
+    "missing_credential_google": "Calls need a Google AI key: add it in Settings.",
+    "call_model_missing": "No Gemini Live model is set in Settings (Models, Live calls).",
     "invalid_call_max_minutes": "The call's minute limit in Settings is not a positive whole number.",
     "invalid_call_request": "The call request was malformed.",
     "control_too_large": "The call request was too large.",

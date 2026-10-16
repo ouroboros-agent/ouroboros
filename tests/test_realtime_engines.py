@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-from dataclasses import replace
 import functools
 import json
 from pathlib import Path
@@ -10,12 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.gateways import realtime_gemini as gemini, realtime_openai as openai
+from ouroboros.gateways import realtime_gemini as gemini
 from ouroboros.gateways.realtime_engine import (
     AudioIn, AudioOut, Caption, Close, Closed, ContextItem, EngineError, EngineRoute,
     GoAway, Interrupt, PlayedAudio, Ready, ResponseDone, ResponseStarted,
-    SessionConfig, SpeechStarted, ToolCall, ToolCallCancelled,
-    ToolResult, ToolsApplied, TranscriptionUsage, UpdateTools, USAGE_KEYS,
+    SessionConfig, ToolCallCancelled,
+    ToolResult, ToolsApplied, UpdateTools, USAGE_KEYS,
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal, transport_error
 
@@ -85,8 +84,7 @@ async def feed(engine, socket, message):
 
 async def opened(provider, *, config=None, collect=True):
     connection = Connection()
-    cls = openai.OpenAIRealtimeEngine if provider == "openai" else gemini.GeminiLiveEngine
-    engine = cls(api_key="test-key-never-log", connector=connection)
+    engine = gemini.GeminiLiveEngine(api_key="test-key-never-log", connector=connection)
     config = config or SessionConfig(EngineRoute(provider, "unseen-model", voice="test-voice"), "Whole instructions", (TOOL,))
     events = []
 
@@ -96,7 +94,7 @@ async def opened(provider, *, config=None, collect=True):
 
     collector = asyncio.create_task(consume()) if collect else None
     await engine.open(config)
-    ready = {"type": "session.updated", "session": openai.session_update(config)["session"]} if provider == "openai" else {"setupComplete": {}}
+    ready = {"setupComplete": {}}
     await feed(engine, connection.sockets[0], ready)
     return engine, connection, events, collector
 
@@ -110,110 +108,6 @@ async def finished(engine, collector):
 
 def selected(events, kind):
     return [event for event in events if isinstance(event, kind)]
-
-
-@pytest.mark.parametrize("valid", [True, False])
-@run_async
-async def test_recorded_instruction_refusal_retains_only_capacity_evidence(valid):
-    engine, connection, events, collector = await opened("openai")
-    # Recorded from the real integrated probe, before any audio was sent.
-    error = {"type": "invalid_request_error", "code": "invalid_value", "param": "session.instructions",
-             "message": "Instructions cannot be longer than 65536 tokens, you have provided 186324 tokens."}
-    if not valid:
-        error["param"] = "session.tools"
-    await feed(engine, connection.sockets[0], {"type": "error", "error": error})
-    await finished(engine, collector)
-    event = selected(events, EngineError)[0]
-    if valid:
-        assert event.kind == "context_length" and not event.retryable
-        assert json.loads(event.message) == {"limit_tokens": 65536, "input_tokens": 186324, "field": "session.instructions"}
-    else:
-        assert event.kind == "provider"
-
-
-
-@run_async
-async def test_a_reworded_instruction_refusal_is_still_a_context_length_refusal():
-    engine, connection, events, collector = await opened("openai")
-    error = {"type": "invalid_request_error", "code": "invalid_value", "param": "session.instructions",
-             "message": "The instructions are too long for this session."}  # no numbers to read
-    await feed(engine, connection.sockets[0], {"type": "error", "error": error})
-    await finished(engine, collector)
-    event = selected(events, EngineError)[0]
-    assert event.kind == "context_length" and json.loads(event.message) == {"field": "session.instructions"}
-
-
-@run_async
-async def test_one_unreadable_input_yields_no_words_and_the_session_goes_on():
-    engine, connection, events, collector = await opened("openai")
-    socket = connection.sockets[0]
-    await feed(engine, socket, {"type": "conversation.item.input_audio_transcription.failed", "item_id": "noise",
-                                "content_index": 0, "error": {"type": "transcription_error",
-                                                              "code": "audio_unintelligible", "message": "unclear"}})
-    assert selected(events, Caption)[-1] == Caption("owner", "", True, "noise")
-    assert not selected(events, EngineError) and not socket.closed
-    await finished(engine, collector)
-
-@run_async
-async def test_native_vad_cancel_racing_host_interrupt_keeps_session_open():
-    engine, connection, events, collector = await opened("openai")
-    socket = connection.sockets[0]
-    await feed(engine, socket, {"type": "error", "error": {"type": "invalid_request_error",
-        "code": "response_cancel_not_active", "message": "Cancellation failed: no active response found", "param": None}})
-    assert not socket.closed and not selected(events, EngineError)
-    await engine.send(ContextItem("Continue the call", "owner_mailbox"))
-    assert socket.sent[-1]["item"]["content"][0]["text"] == "[owner_mailbox] Continue the call"
-    await finished(engine, collector)
-
-
-@pytest.mark.parametrize("name", ["text_tool_exchange.json", "audio_tool_exchange.json", "adapter_audio_exchange.json"])
-@run_async
-async def test_recorded_openai_exchange(name):
-    fixture = json.loads((WIRE / "openai" / name).read_text())
-    assert fixture["header"]["provenance"] == "recorded_live"
-    engine, connection, events, collector = await opened("openai")
-    socket = connection.sockets[0]
-    expected_audio = bytearray()
-    for row in fixture["events"]:
-        message = row["message"]
-        if row["direction"] == "server":
-            await feed(engine, socket, message)
-            if message["type"] == "response.output_audio.delta":
-                expected_audio.extend(base64.b64decode(message["delta"]))
-        elif message["type"] == "conversation.item.create":
-            item = message["item"]
-            if item["type"] == "function_call_output":
-                await engine.send(ToolResult(item["call_id"], item["output"]))
-                assert message in socket.sent
-            else:
-                await engine.send(ContextItem(item["content"][0]["text"], "fixture"))
-        elif message["type"] == "input_audio_buffer.append":
-            await engine.send(AudioIn(base64.b64decode(message["audio"]), 24000))
-            assert socket.sent[-1] == message
-    await finished(engine, collector)
-    done = selected(events, ResponseDone)
-    raw_done = [row["message"]["response"] for row in fixture["events"] if row["message"].get("type") == "response.done"]
-    assert len(done) == len(raw_done) == 2
-    assert [e.response_id for e in done] == [r["id"] for r in raw_done]
-    assert [e.raw_usage for e in done] == [r["usage"] for r in raw_done]
-    assert all(set(e.usage) == set(USAGE_KEYS) for e in done)
-    if name == "text_tool_exchange.json":
-        assert done[1].usage["cached_input_tokens"] > 0
-    else:
-        assert expected_audio and done[1].usage["audio_output_tokens"] > 0
-    calls = selected(events, ToolCall)
-    assert len(calls) == 1  # arguments.done and response.done carry the same call.
-    assert json.loads(calls[0].arguments) == {"query": "42" if name == "adapter_audio_exchange.json" else "fixture"}
-    assert calls[0].name == "lookup"
-    assert len(selected(events, ResponseStarted)) == 2
-    assert b"".join(e.pcm for e in selected(events, AudioOut)) == bytes(expected_audio)
-    assert any(e.final for e in selected(events, Caption))
-    if name == "adapter_audio_exchange.json":
-        transcript = selected(events, TranscriptionUsage)
-        assert len(transcript) == 1 and transcript[0].model == "gpt-4o-transcribe"
-        assert transcript[0].usage["audio_input_tokens"] == 11
-        assert transcript[0].usage["text_output_tokens"] == 6
-    assert not selected(events, EngineError)
 
 
 @run_async
@@ -247,7 +141,7 @@ async def test_documented_gemini_exchange_both_directions():
     assert not selected(events, EngineError)
 
 
-@pytest.mark.parametrize("provider,rate", [("openai", 24000), ("google", 16000)])
+@pytest.mark.parametrize("provider,rate", [("google", 16000)])
 @run_async
 async def test_session_configuration_audio_limits_and_history(provider, rate):
     config = SessionConfig(EngineRoute(provider, "custom-live", voice="chosen-voice"), "Full core", (TOOL,),
@@ -255,22 +149,19 @@ async def test_session_configuration_audio_limits_and_history(provider, rate):
     engine, connection, events, collector = await opened(provider, config=config)
     socket = connection.sockets[0]
     setup = socket.sent[0]
-    if provider == "openai":
-        session = setup["session"]
-        assert session["type"] == "realtime" and session["instructions"] == "Full core"
-        assert session["truncation"] == {"type": "retention_ratio", "retention_ratio": .8}
-        assert session["audio"]["input"]["turn_detection"] == {"type": "semantic_vad", "create_response": True, "interrupt_response": True}
-        assert session["audio"]["output"]["voice"] == "chosen-voice"
-        assert all(row["item"]["type"] == "message" for row in socket.sent[1:])
-    else:
-        setup = setup["setup"]
-        assert setup["systemInstruction"]["parts"] == [{"text": "Full core"}]
-        assert setup["tools"][0]["functionDeclarations"][0]["behavior"] == "NON_BLOCKING"
-        assert setup["tools"][1] == {"googleSearch": {}}
-        assert setup["sessionResumption"] == {}
-        assert setup["contextWindowCompression"] == {"slidingWindow": {}}
-        assert setup["generationConfig"]["responseModalities"] == ["AUDIO"]
-        assert socket.sent[1]["clientContent"]["turnComplete"] is False
+    setup = setup["setup"]
+    assert setup["systemInstruction"]["parts"] == [{"text": "Full core"}]
+    assert setup["tools"][0]["functionDeclarations"][0]["behavior"] == "NON_BLOCKING"
+    # The registry's JSON Schema rides whole as parametersJsonSchema: Gemini's OpenAPI-subset
+    # `parameters` field refuses keywords such as additionalProperties (close 1007, live).
+    assert setup["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"] == TOOL["function"]["parameters"]
+    assert "parameters" not in setup["tools"][0]["functionDeclarations"][0]
+    assert setup["tools"][1] == {"googleSearch": {}}
+    assert setup["sessionResumption"] == {}
+    assert setup["contextWindowCompression"] == {"slidingWindow": {}}
+    assert setup["generationConfig"]["responseModalities"] == ["AUDIO"]
+    assert setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] == "chosen-voice"
+    assert socket.sent[1]["clientContent"]["turnComplete"] is False
     assert selected(events, Ready)[0].effective["input_rate"] == rate
     await engine.send(AudioIn(PCM, rate))
     before = len(socket.sent)
@@ -280,53 +171,6 @@ async def test_session_configuration_audio_limits_and_history(provider, rate):
     await engine.send(PlayedAudio("played-item", 100))
     assert len(socket.sent) == before
     assert connection.options[0][1]["logger"].disabled
-    await finished(engine, collector)
-
-
-@run_async
-async def test_openai_tools_apply_only_on_matching_ack_and_results_coalesce():
-    engine, connection, events, collector = await opened("openai")
-    socket = connection.sockets[0]
-    await engine.send(UpdateTools((TOOL, NEW_TOOL)))
-    assert not selected(events, ToolsApplied)
-    await feed(engine, socket, {"type": "session.updated", "session": {"tools": []}})
-    assert not selected(events, ToolsApplied)
-    await feed(engine, socket, {"type": "session.updated", "session": socket.sent[-1]["session"]})
-    assert selected(events, ToolsApplied) == [ToolsApplied(("lookup", "read_file"))]
-    await feed(engine, socket, {"type": "response.created", "response": {"id": "response-1"}})
-    await engine.send(ToolResult("call-1", "first"))
-    await engine.send(ToolResult("call-2", "second"))
-    await asyncio.sleep(0)
-    assert not any(row["type"] == "response.create" for row in socket.sent)
-    await feed(engine, socket, {"type": "response.done", "response": {"id": "response-1", "status": "completed", "usage": {}}})
-    await eventually(lambda: any(row["type"] == "response.create" for row in socket.sent))
-    await engine.send(ToolResult("call-3", "third"))
-    await asyncio.sleep(0)
-    assert sum(row["type"] == "response.create" for row in socket.sent) == 1
-    await feed(engine, socket, {"type": "response.created", "response": {"id": "response-2"}})
-    await feed(engine, socket, {"type": "response.done", "response": {"id": "response-2", "status": "completed", "usage": {}}})
-    await eventually(lambda: sum(row["type"] == "response.create" for row in socket.sent) == 2)
-    await finished(engine, collector)
-
-
-@run_async
-async def test_openai_interrupt_uses_item_not_response_id_and_preserves_usage():
-    engine, connection, events, collector = await opened("openai")
-    socket = connection.sockets[0]
-    await feed(engine, socket, {"type": "response.created", "response": {"id": "response"}})
-    await feed(engine, socket, {"type": "response.output_audio.delta", "item_id": "audio-item", "content_index": 2,
-                                "delta": base64.b64encode(PCM).decode()})
-    await engine.send(Interrupt("audio-item", 123))
-    assert socket.sent[-2:] == [{"type": "response.cancel"}, {"type": "conversation.item.truncate", "item_id": "audio-item", "content_index": 2, "audio_end_ms": 123}]
-    with pytest.raises(LiveEngineRefusal):
-        await engine.send(Interrupt("audio-item", -1))
-    await feed(engine, socket, {"type": "input_audio_buffer.speech_started", "item_id": "owner-item", "audio_start_ms": 1250})
-    await feed(engine, socket, {"type": "conversation.item.input_audio_transcription.completed", "item_id": "owner-item",
-                                "transcript": "Hello", "usage": {"type": "tokens", "input_tokens": 4, "input_token_details": {"audio_tokens": 4}, "output_tokens": 2}})
-    assert selected(events, SpeechStarted) == [SpeechStarted("owner-item", 1250)]  # its place in the input audio
-    assert selected(events, TranscriptionUsage)[0].usage["audio_input_tokens"] == 4
-    assert selected(events, TranscriptionUsage)[0].usage["text_output_tokens"] == 2
-    assert selected(events, Caption)[-1] == Caption("owner", "Hello", True, "owner-item")
     await finished(engine, collector)
 
 
@@ -382,7 +226,7 @@ async def test_gemini_context_waits_for_idle_interrupt_is_local_and_cancellation
     await finished(engine, collector)
 
 
-@pytest.mark.parametrize("provider", ["openai", "google"])
+@pytest.mark.parametrize("provider", ["google"])
 @run_async
 async def test_transport_loss_is_retryable_and_close_is_final(provider):
     engine, connection, events, collector = await opened(provider)
@@ -397,12 +241,12 @@ async def test_transport_loss_is_retryable_and_close_is_final(provider):
     await finished(engine, collector)
 
 
-@pytest.mark.parametrize("provider", ["openai", "google"])
+@pytest.mark.parametrize("provider", ["google"])
 @run_async
 async def test_full_event_queue_fails_explicitly_and_stop_never_waits_for_consumer(provider):
     engine, connection, _, _ = await opened(provider, collect=False)
     socket = connection.sockets[0]
-    message = {"type": "input_audio_buffer.speech_started"} if provider == "openai" else {"sessionResumptionUpdate": {"resumable": False}}
+    message = {"sessionResumptionUpdate": {"resumable": False}}
     for _ in range(engine._events.maxsize):
         socket.incoming.put_nowait(message)
     await eventually(lambda: engine._closed_reason is not None)
@@ -424,14 +268,14 @@ def test_handshake_error_classification(status, retryable, kind):
 
 
 def test_usage_normalization_never_maps_undifferentiated_totals_to_text():
-    assert openai.normalize_usage({"input_tokens": 300, "output_tokens": 20}) == dict.fromkeys(USAGE_KEYS, 0)
     assert gemini.normalize_usage({"promptTokenCount": 300, "responseTokenCount": 20}) == dict.fromkeys(USAGE_KEYS, 0)
-    raw = {"input_token_details": {"text_tokens": 10, "audio_tokens": 20, "image_tokens": 3, "cached_tokens": 7,
-           "cached_tokens_details": {"text_tokens": 3, "audio_tokens": 4}}, "output_token_details": {"text_tokens": 4, "audio_tokens": 6}}
-    assert openai.normalize_usage(raw) == dict(zip(USAGE_KEYS, (10, 20, 3, 7, 4, 6)))
+    raw = {"promptTokensDetails": [{"modality": "TEXT", "tokenCount": 10}, {"modality": "AUDIO", "tokenCount": 20},
+                                   {"modality": "IMAGE", "tokenCount": 3}], "cachedContentTokenCount": 7,
+           "responseTokensDetails": [{"modality": "TEXT", "tokenCount": 4}, {"modality": "AUDIO", "tokenCount": 6}]}
+    assert gemini.normalize_usage(raw) == dict(zip(USAGE_KEYS, (10, 20, 3, 7, 4, 6)))
 
 
-@pytest.mark.parametrize("provider", ["openai", "google"])
+@pytest.mark.parametrize("provider", ["google"])
 @run_async
 async def test_llm_entry_point_resolves_captured_credentials_and_optional_open(provider, monkeypatch):
     from ouroboros import llm_live
@@ -442,29 +286,22 @@ async def test_llm_entry_point_resolves_captured_credentials_and_optional_open(p
     monkeypatch.setattr(realtime_transport, "connect", connection)
     monkeypatch.setattr(llm_live, "runtime_setting", lambda key, default="": "google-key" if key == "GOOGLE_API_KEY" else default)
     client = LLMClient()
-    targets = []
-    def resolve(model):
-        targets.append(model)
-        return {"api_key": "openai-key"}
-    monkeypatch.setattr(client, "resolve_remote_target", resolve)
     route = EngineRoute(provider, "custom-model", voice="chosen-voice")
     engine = client.open_live(route)
     assert not connection.sockets
-    assert engine.route.input_rate == (16000 if provider == "google" else 24000)
+    assert engine.route.input_rate == 16000
     await engine.close("unused")
     engine = await client.open_live(route, SessionConfig(route, "Instructions"))
     assert len(connection.sockets) == 1
-    if provider == "openai":
-        assert targets == ["openai::custom-model", "openai::custom-model"]
-        assert connection.options[0][1]["additional_headers"]["Authorization"] == "Bearer openai-key"
-    else:
-        url, options = connection.options[0]
-        # The key is a request header, as in Google's own Live clients, never part of the URL.
-        assert options["additional_headers"] == {"x-goog-api-key": "google-key"} and not targets
-        assert "google-key" not in url and "?" not in url
+    url, options = connection.options[0]
+    # The key is a request header, as in Google's own Live clients, never part of the URL.
+    assert options["additional_headers"] == {"x-goog-api-key": "google-key"}
+    assert "google-key" not in url and "?" not in url
     await engine.close("stop")
+    with pytest.raises(LiveEngineRefusal) as other:
+        client.open_live(EngineRoute("openai", "gpt-realtime-2.1"))
+    assert other.value.code == "engine"  # calls use Google Gemini Live only
     monkeypatch.setattr(llm_live, "runtime_setting", lambda *args: "")
-    monkeypatch.setattr(client, "resolve_remote_target", lambda *args: {"api_key": ""})
     with pytest.raises(LiveEngineRefusal) as missing:
         client.open_live(route)
     assert missing.value.code == "missing_credential"
@@ -496,10 +333,9 @@ async def test_gemini_resume_skips_history_and_search_and_voice_are_opt_in():
     assert "speechConfig" not in setup["generationConfig"] and not setup["tools"]
     assert len(connection.sockets[0].sent) == 1
     await finished(engine, collector)
-    assert "voice" not in openai.session_update(replace(config, route=EngineRoute("openai", "custom")))["session"]["audio"]["output"]
 
 
-@pytest.mark.parametrize("provider", ["openai", "google"])
+@pytest.mark.parametrize("provider", ["google"])
 @run_async
 async def test_tool_images_preserve_bytes_and_invalid_images_send_nothing(provider):
     engine, connection, events, collector = await opened(provider)
@@ -524,61 +360,25 @@ async def test_tool_images_preserve_bytes_and_invalid_images_send_nothing(provid
 async def test_oversized_result_images_refuse_before_partial_tool_output(monkeypatch):
     from ouroboros.gateways import realtime_transport
 
-    engine, connection, events, collector = await opened("openai")
+    engine, connection, events, collector = await opened("google")
     socket = connection.sockets[0]
+    await feed(engine, socket, {"toolCall": {"functionCalls": [{"id": "image-call", "name": "lookup", "args": {}}]}})
     before = len(socket.sent)
     monkeypatch.setattr(realtime_transport, "MAX_WIRE_BYTES", 300)
     with pytest.raises(LiveEngineRefusal) as refused:
         await engine.send(ToolResult("image-call", "result", images=(b"\x89PNG\r\n\x1a\n" + bytes(300),)))
     assert refused.value.code == "wire_size" and len(socket.sent) == before
-    await engine.send(ToolResult("image-call", "small result"))
-    assert socket.sent[-1]["item"]["output"] == "small result"
     await finished(engine, collector)
 
 
-@run_async
-async def test_openai_completed_calls_only_and_repeated_done_settles_once():
-    engine, connection, events, collector = await opened("openai")
-    socket = connection.sockets[0]
-    await feed(engine, socket, {"type": "response.function_call_arguments.delta", "call_id": "partial", "delta": "{"})
-    assert not selected(events, ToolCall)
-    response = {"type": "response.done", "response": {"id": "response", "status": "cancelled", "output": [
-        {"type": "function_call", "status": "incomplete", "id": "item1", "call_id": "partial", "name": "lookup", "arguments": "{"},
-        {"type": "function_call", "status": "completed", "id": "item2", "call_id": "complete", "name": "lookup", "arguments": "{}"}]}}
-    await feed(engine, socket, response)
-    await feed(engine, socket, response)
-    assert [e.call_id for e in selected(events, ToolCall)] == ["complete"]
-    assert len(selected(events, ResponseDone)) == 1
-    # Malformed arguments reach the host as the model produced them: the ordinary tool
-    # path answers with its typed argument error and the session stays open.
-    await feed(engine, socket, {"type": "response.function_call_arguments.done", "call_id": "bad", "name": "lookup", "arguments": "{"})
-    assert [(e.call_id, e.arguments) for e in selected(events, ToolCall)] == [("complete", "{}"), ("bad", "{")]
-    assert not selected(events, EngineError)
-    await finished(engine, collector)
-
-
-@pytest.mark.parametrize("wire_expiry", [False, True])
-@run_async
-async def test_openai_provider_session_limit_requests_host_rollover(wire_expiry, monkeypatch):
-    if not wire_expiry:
-        monkeypatch.setattr(openai, "SESSION_LIMIT_SECONDS", 0)
-    engine, connection, events, collector = await opened("openai")
-    if wire_expiry:
-        await feed(engine, connection.sockets[0], {"type": "error", "error": {"code": "session_expired"}})
-    await asyncio.wait_for(collector, 2)
-    assert events[-1] == Closed("session_limit")
-    assert not selected(events, EngineError)
-
-
-@pytest.mark.parametrize("provider", ["openai", "google"])
+@pytest.mark.parametrize("provider", ["google"])
 @run_async
 async def test_rejected_setup_wakes_waiting_sends_and_never_echoes_provider_body(provider):
     connection = Connection()
-    cls = openai.OpenAIRealtimeEngine if provider == "openai" else gemini.GeminiLiveEngine
-    engine = cls(api_key="fixture-key", connector=connection)
+    engine = gemini.GeminiLiveEngine(api_key="fixture-key", connector=connection)
     await engine.open(SessionConfig(EngineRoute(provider, "model"), "instructions"))
     pending = asyncio.create_task(engine.send(ContextItem("context", "room")))
-    error = {"type": "error", "error": {"code": "invalid_api_key", "message": "fixture-key"}} if provider == "openai" else {"error": {"code": 403, "message": "fixture-key"}}
+    error = {"error": {"code": 403, "message": "fixture-key"}}
     await feed(engine, connection.sockets[0], error)
     with pytest.raises(LiveEngineRefusal):
         await asyncio.wait_for(pending, 1)
@@ -588,14 +388,13 @@ async def test_rejected_setup_wakes_waiting_sends_and_never_echoes_provider_body
     assert isinstance(events[-1], Closed)
 
 
-@pytest.mark.parametrize("provider", ["openai", "google"])
+@pytest.mark.parametrize("provider", ["google"])
 @run_async
 async def test_stop_cleans_up_before_ready_or_during_pending_activation(provider):
     connection = Connection()
-    cls = openai.OpenAIRealtimeEngine if provider == "openai" else gemini.GeminiLiveEngine
-    engine = cls(api_key="fixture-key", connector=connection)
+    engine = gemini.GeminiLiveEngine(api_key="fixture-key", connector=connection)
     await engine.open(SessionConfig(EngineRoute(provider, "model"), "instructions"))
-    pending = asyncio.create_task(engine.send(AudioIn(PCM, 16000 if provider == "google" else 24000)))
+    pending = asyncio.create_task(engine.send(AudioIn(PCM, 16000)))
     await engine.send(Close("stop"))
     with pytest.raises(LiveEngineRefusal):
         await pending
@@ -663,3 +462,36 @@ def test_colab_collects_google_without_treating_live_as_text_access(monkeypatch)
     assert colab.collect_colab_secrets()["GOOGLE_API_KEY"] == "google-test-key"
     assert ("GOOGLE_API_KEY", False) in requested
     assert ("OPENROUTER_API_KEY", True) in requested
+
+
+def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
+    from types import SimpleNamespace
+
+    from ouroboros.gateways.realtime_transport import transport_error
+
+    quota = SimpleNamespace(rcvd=SimpleNamespace(code=1011, reason=(
+        "You exceeded your current quota, please check your plan https://ai.google.dev/x key AIzaSyFAKEFAKEFAKE12")))
+    error = transport_error(quota)
+    assert error.kind == "provider_closed" and not error.retryable
+    assert error.message.startswith("You exceeded your current quota") and "AIza" not in error.message
+    assert "https://" not in error.message
+    lost = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1011, reason="")))
+    assert lost.kind == "transport" and lost.retryable  # a close without words is a lost connection: resume
+    normal = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1000, reason="bye")))
+    assert normal.kind == "transport" and normal.retryable
+    too_big = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1007, reason=(
+        "user system instruction has 140000 tokens, the sum is above the 131072 limit"))))
+    assert too_big.kind == "invalid_request" and not too_big.retryable and "140000 tokens" in too_big.message
+    bare = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1007, reason="")))
+    assert bare.kind == "protocol"
+    denied = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1008, reason="key fixture-key is invalid")))
+    assert denied.kind == "authentication" and "fixture-key" not in denied.message
+
+
+def test_gemini_compression_starts_at_the_drivers_watermarks():
+    base = SessionConfig(EngineRoute("google", "gemini-3.8-live"), "core")
+    assert gemini.setup_message(base)["setup"]["contextWindowCompression"] == {"slidingWindow": {}}
+    marked = SessionConfig(EngineRoute("google", "gemini-3.8-live"), "core",
+                           compress_at_tokens=122_880, compress_to_tokens=106_000)
+    assert gemini.setup_message(marked)["setup"]["contextWindowCompression"] == {
+        "triggerTokens": 122_880, "slidingWindow": {"targetTokens": 106_000}}

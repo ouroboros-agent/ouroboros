@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import json
 from ouroboros import call_protocol as cp
 from ouroboros.call_peers import CallPeerError, LinearResampler, LiveCallHub, close_hub, get_hub, open_hub
 
@@ -286,3 +287,41 @@ def test_registry_refuses_conflicting_spec_and_closed_hub():
             open_hub(value)
     finally:
         close_hub(value.call_id)
+
+
+def test_a_hub_is_born_preparing_and_remembers_an_owner_bye():
+    spec = cp.CallSpec("born-preparing", 1, "google", "m")
+    hub = LiveCallHub(spec)
+    hub.join(cp.PeerInfo("p1", cp.PEER_OWNER, True, True), 24000)
+    first = json.loads(hub.next_outgoing("p1"))
+    assert first == {"type": "state", "state": "preparing", "reason": "", "engine": "google", "phase": "memory"}
+    assert not hub.ended_by_owner
+    hub.receive_control("p1", {"type": "bye"})
+    assert hub.ended_by_owner
+    meeting = LiveCallHub(cp.CallSpec("meeting-bye", 1, "google", "m"))
+    meeting.join(cp.PeerInfo("m1", cp.PEER_MEETING, True, True), 24000)
+    meeting.receive_control("m1", {"type": "bye"})
+    assert not meeting.ended_by_owner  # only the owner's surface ends a call this way
+
+
+def test_a_closed_state_keeps_the_drivers_words_and_close_adds_them_only_when_missing():
+    hub = LiveCallHub(cp.CallSpec("words", 1, "openai", "m"))
+    hub.join(cp.PeerInfo("p1", cp.PEER_OWNER, True, True), 24000)
+    hub.next_outgoing("p1"), hub.next_outgoing("p1")
+    hub.send_activity("working", "web_search")
+    assert json.loads(hub.next_outgoing("p1")) == {"type": "activity", "activity": "working", "label": "web_search"}
+    hub.send_state(cp.STATE_CLOSED, "provider_closed", detail="You exceeded your current quota.", action="retry")
+    hub.close("provider_closed")
+    states = []
+    while (message := hub.next_outgoing("p1")) is not None:
+        if isinstance(message, str) and json.loads(message)["type"] == "state":
+            states.append(json.loads(message))
+    assert states == [{"type": "state", "state": "closed", "reason": "provider_closed", "engine": "openai",
+                       "detail": "You exceeded your current quota.", "action": "retry"}]
+    other = LiveCallHub(cp.CallSpec("bare", 1, "openai", "m"))
+    other.join(cp.PeerInfo("p2", cp.PEER_OWNER, True, True), 24000)
+    other.next_outgoing("p2"), other.next_outgoing("p2")
+    other.close("call_not_started", action="retry")
+    tail = [json.loads(m) for m in iter(lambda: other.next_outgoing("p2"), None) if isinstance(m, str)]
+    assert tail[-1] == {"type": "state", "state": "closed", "reason": "call_not_started", "engine": "openai",
+                        "action": "retry"}

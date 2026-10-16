@@ -191,7 +191,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["finish", "stop"]}, "answer": {"type": "string", "description": "The complete answer, including a short correction."},
                 "answer_sha256": {"type": "string", "description": "Exact offered retained or whole held response hash."},
-                "rationale": {"type": "string", "description": "For stop, what remains unfinished; the owner reads it as the stop's cause on the task row."}, "acceptance_subject": {"type": "object", "properties": {"owner_source_sha256": {"type": "string"},
+                "rationale": {"type": "string", "description": "For stop, what remains unfinished; the owner reads it as the stop's cause on the task row. Optional for finish. Over an exposed local acceptance-preparation failure, state the caveat here for author_finish; without it, the host retains the preparation-failure cause, not a validation rejection."}, "acceptance_subject": {"type": "object", "properties": {"owner_source_sha256": {"type": "string"},
                     "effective_criteria": {"type": "string"}, "material_tool_indices": {"type": "array", "items": {"type": "integer"}},
                 }, "required": ["owner_source_sha256"]},
                 "pending_review": {"type": "string", "enum": ["wait", "finish"], "default": "wait"},

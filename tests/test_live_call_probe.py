@@ -39,30 +39,28 @@ def attempts():
     rows = [{"attempt_id": "response-attempt", "source": "live_response", "state": "settled",
              "cost_evidence": evidence, "prompt_tokens": 12, "cost_usd": .1,
              "ts_reserved": "start", "ts_dispatched": "sent", "ts_final": "settled"},
-            {"attempt_id": "transcription-attempt", "source": "live_transcription", "state": "settled",
-             "cost_evidence": {**evidence, "response_key": "transcription"}, "prompt_tokens": 12, "cost_usd": .02}]
+            {"attempt_id": "fixture-attempt", "source": "probe_speech_fixture", "state": "settled",
+             "cost_evidence": {**evidence, "response_key": "fixture"}, "prompt_tokens": 12, "cost_usd": .02}]
     events = [{"kind": "ResponseStarted", "response_id": "response"}, {"kind": "ResponseDone", "response_id": "response"}]
     return rows, events
 
 
 def test_money_matches_response_id_and_keeps_audio_separate():
     rows, events = attempts()
-    ok, facts = probe.money_evidence(rows, events, "openai")
+    ok, facts = probe.money_evidence(rows, events)
     assert ok and facts["total_cost_usd"] == pytest.approx(.12)
     rows[0]["prompt_tokens"] += 44
-    ok, facts = probe.money_evidence(rows, events, "openai")
+    ok, facts = probe.money_evidence(rows, events)
     assert not ok and any("audio included" in e for e in facts["errors"])
 
 
-@pytest.mark.parametrize("change", ["duplicate", "missing_done", "no_transcription", "unknown_price", "no_quote", "unresolved", "no_reservation"])
+@pytest.mark.parametrize("change", ["duplicate", "missing_done", "unknown_price", "no_quote", "unresolved", "no_reservation"])
 def test_money_cannot_pass_incomplete_or_double_billed_evidence(change):
     rows, events = attempts()
     if change == "duplicate":
         rows.append(dict(rows[0]))
     elif change == "missing_done":
         events.pop()
-    elif change == "no_transcription":
-        rows.pop()
     elif change == "unknown_price":
         rows[0]["cost_usd"] = None
     elif change == "no_quote":
@@ -71,7 +69,7 @@ def test_money_cannot_pass_incomplete_or_double_billed_evidence(change):
         rows[0].pop("ts_reserved")
     else:
         rows[0]["state"] = "unresolved"
-    ok, facts = probe.money_evidence(rows, events, "openai")
+    ok, facts = probe.money_evidence(rows, events)
     assert not ok and facts["errors"]
     if change == "unknown_price":
         assert facts["total_cost_usd"] is None
@@ -99,7 +97,7 @@ def test_observer_forwards_real_commands_and_records_only_audio_lengths(tmp_path
         assert engine.send.call_args_list[0].args == (audio,)
         assert engine.send.call_args_list[1].args == (result,)
         assert len(evidence.rows) == 1 and evidence.rows[0]["output"] == "weather result"
-        config = SessionConfig(EngineRoute("openai", "test"), "A complete instruction")
+        config = SessionConfig(EngineRoute("google", "test"), "A complete instruction")
         await observed.open(config)
         assert engine.open.call_args.args == (config,)
         assert (tmp_path / "instructions-1.txt").read_text() == config.instructions
@@ -112,7 +110,8 @@ def test_observer_forwards_real_commands_and_records_only_audio_lengths(tmp_path
 
 def test_owner_audio_uses_real_codec_and_engine_rate(tmp_path):
     async def run():
-        hub = LiveCallHub(CallSpec("call", 1, "openai", "test"))
+        hub = LiveCallHub(CallSpec("call", 1, "google", "test"))
+        hub.set_engine_rates(probe.RATE, 24000)  # an engine at the device's rate: frames pass through unchanged
         peer = probe.OwnerPeer(hub, probe.Evidence(tmp_path))
         # Drain the genuine mixer concurrently, as the driver does.
         received = bytearray()
@@ -138,7 +137,7 @@ def test_owner_audio_uses_real_codec_and_engine_rate(tmp_path):
 
 
 def test_failed_open_keeps_unexecuted_scenarios_not_run(tmp_path):
-    runner = probe.Probe(tmp_path, "openai", set(probe.SCENARIOS), 1)
+    runner = probe.Probe(tmp_path, set(probe.SCENARIOS), 1)
     runner.verdict("opening", False, error="rejected by provider")
     report = json.loads((tmp_path / "result.json").read_text())
     assert report["scenarios"]["opening"]["verdict"] == "FAIL"
@@ -190,7 +189,7 @@ def test_fixture_reuse_requires_matching_text_and_retains_provenance(tmp_path):
 
 def test_owner_microphone_keeps_sending_quiet_frames_between_utterances(tmp_path):
     async def run():
-        hub = LiveCallHub(CallSpec("call", 1, "openai", "test"))
+        hub = LiveCallHub(CallSpec("call", 1, "google", "test"))
         evidence = probe.Evidence(tmp_path)
         peer = probe.OwnerPeer(hub, evidence)
         evidence.note("Ready")

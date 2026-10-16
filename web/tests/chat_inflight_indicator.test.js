@@ -140,8 +140,10 @@ test('computeDerivedChatStatus: offline state when ws is disconnected', () => {
     });
     assert.deepEqual(status, {
         kind: 'offline',
-        text: 'Reconnecting...',
+        text: 'Reconnecting…',
+        tone: 'offline',
         showDots: false,
+        dots: 'one',
     });
 });
 
@@ -154,8 +156,10 @@ test('computeDerivedChatStatus: working state when active live card is present',
     });
     assert.deepEqual(status, {
         kind: 'thinking',
-        text: 'Working...',
+        text: 'Working',
+        tone: 'live',
         showDots: false,
+        dots: 'moving',
     });
 });
 
@@ -169,7 +173,9 @@ test('computeDerivedChatStatus: neutral work when only direct activity counts ar
     assert.deepEqual(status, {
         kind: 'thinking',
         text: 'Working',
+        tone: 'live',
         showDots: true,
+        dots: 'moving',
     });
 });
 
@@ -198,8 +204,10 @@ test('computeDerivedChatStatus: sending state with dots when local submissions a
     });
     assert.deepEqual(status, {
         kind: 'thinking',
-        text: 'Sending...',
+        text: 'Sending',
+        tone: 'live',
         showDots: true,
+        dots: 'moving',
     });
 });
 
@@ -213,7 +221,9 @@ test('computeDerivedChatStatus: idle server status remains Online', () => {
     assert.deepEqual(status, {
         kind: 'online',
         text: 'Online',
+        tone: 'online',
         showDots: false,
+        dots: 'one',
     });
 });
 
@@ -227,7 +237,9 @@ test('computeDerivedChatStatus: online idle state by default', () => {
     assert.deepEqual(status, {
         kind: 'online',
         text: 'Online',
+        tone: 'online',
         showDots: false,
+        dots: 'one',
     });
 });
 
@@ -326,7 +338,7 @@ test('computeDerivedChatStatus: priority order is preserved (offline > live card
         hasActiveLiveCard: true,
         activeDirectCount: 5,
         pendingSubmissionsCount: 3,
-    }).text, 'Reconnecting...');
+    }).text, 'Reconnecting…');
 
     // 2. Active live card beats direct work & sending & attention
     assert.equal(computeDerivedChatStatus({
@@ -334,7 +346,7 @@ test('computeDerivedChatStatus: priority order is preserved (offline > live card
         hasActiveLiveCard: true,
         activeDirectCount: 5,
         pendingSubmissionsCount: 3,
-    }).text, 'Working...');
+    }).text, 'Working');
 
     // 3. Direct work beats local pending submissions & attention
     assert.equal(computeDerivedChatStatus({
@@ -350,7 +362,7 @@ test('computeDerivedChatStatus: priority order is preserved (offline > live card
         hasActiveLiveCard: false,
         activeDirectCount: 0,
         pendingSubmissionsCount: 1,
-    }).text, 'Sending...');
+    }).text, 'Sending');
 
     // 5. No server activity means Online
     assert.equal(computeDerivedChatStatus({
@@ -374,17 +386,17 @@ test('computeDerivedChatStatus: paused work is not Working or Queued (#322)', ()
     // Restart hold (Batch4), so the header states the pause, not a cause.
     assert.deepEqual(
         computeDerivedChatStatus({ pausedManagedCount: 2 }),
-        { kind: 'online', text: 'Paused', showDots: false },
+        { kind: 'online', text: 'Paused', tone: 'held', showDots: false, dots: 'one' },
     );
     // Runnable queued work outranks the paused disclosure.
     assert.equal(
         computeDerivedChatStatus({ pausedManagedCount: 1, queuedManagedCount: 1 }).text,
-        'Queued...',
+        'Queued',
     );
     // Active work outranks both.
     assert.equal(
         computeDerivedChatStatus({ pausedManagedCount: 1, activeManagedCount: 1 }).text,
-        'Working...',
+        'Working',
     );
 });
 
@@ -420,6 +432,6 @@ test(`Batch4: a paused or pausing ${kind} card does not drive working header sta
     // Resumed: the census says working again and the released card drives Working.
     const resumed = chatStatusCounts(new Map([['p', { kind, phase: 'working' }]]),
         [{ root, groupId: 'p', direct: kind === 'direct_chat', finished: false, parkedPhase: '' }]);
-    assert.equal(computeDerivedChatStatus(resumed).text, kind === 'direct_chat' ? 'Working' : 'Working...');
+    assert.equal(computeDerivedChatStatus(resumed).text, kind === 'direct_chat' ? 'Working' : 'Working');
 });
 }

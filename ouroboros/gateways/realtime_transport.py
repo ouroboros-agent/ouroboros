@@ -30,19 +30,42 @@ class LiveEngineRefusal(ValueError):
         self.code = code
 
 
+def provider_sentence(text: object) -> str:
+    """A provider's own close or error sentence, bounded, with anything key- or URL-shaped removed."""
+    import re
+
+    words = " ".join(str(text or "").split())
+    words = re.sub(r"https?://\S+", "[link]", words)
+    words = re.sub(r"\b(?:AIza|sk-)[A-Za-z0-9_\-]{8,}", "[key]", words)
+    return words[:300]
+
+
 def transport_error(exc: Exception) -> EngineError:
-    """Classify status and close codes without echoing URLs, keys or audio."""
+    """Classify status and close codes without echoing URLs, keys or audio.
+
+    A server close that names its reason (Gemini closes a session over quota with
+    1011 and the sentence "You exceeded your current quota…") keeps that sentence and
+    is not retried: reopening cannot change it, and the owner reads the provider's own
+    words. A close without a reason is a lost connection and resumes.
+    """
     status = getattr(getattr(exc, "response", None), "status_code", None)
     received = getattr(exc, "rcvd", None)
     code = getattr(received, "code", None)
+    sentence = provider_sentence(getattr(received, "reason", ""))
     if status in (401, 403) or code == 1008:
-        return EngineError("authentication", "Live provider refused access.")
+        return EngineError("authentication", "Live provider refused access.")  # its text can echo credentials
     if status == 429:
         return EngineError("rate_limit", "Live provider rate limit reached.", True)
     if status is not None and 400 <= status < 500 and status != 408:
         return EngineError("invalid_request", "Live provider rejected the session configuration.")
+    if code == 1007 and sentence:
+        # Gemini refuses a setup it cannot hold (e.g. an instruction above the window) this way,
+        # in its own words; reopening the same session cannot change them.
+        return EngineError("invalid_request", sentence)
     if code in (1002, 1003, 1007, 1009):
         return EngineError("protocol", "Live provider rejected the websocket payload.")
+    if code is not None and code not in (1000, 1001, 1006) and sentence:
+        return EngineError("provider_closed", sentence)
     return EngineError("transport", "Live provider connection lost; delivery may be incomplete.", True)
 
 

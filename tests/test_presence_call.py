@@ -135,9 +135,8 @@ def test_a_call_needs_the_execution_call_runtime(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("profile_execution, override", [("call", None), ("", "call")])
 def test_an_enabled_binding_opens_one_live_turn_under_its_ceiling(tmp_path, monkeypatch, profile_execution, override):
-    monkeypatch.setenv("OUROBOROS_CALL_ENGINE", "openai")
-    monkeypatch.setenv("OUROBOROS_CALL_MODEL_OPENAI", "gpt-realtime-test")
-    monkeypatch.setenv("OUROBOROS_CALL_VOICE_OPENAI", "marin")
+    monkeypatch.setenv("OUROBOROS_CALL_MODEL_GOOGLE", "gemini-live-test")
+    monkeypatch.setenv("OUROBOROS_CALL_VOICE_GOOGLE", "Kore")
     monkeypatch.setenv("OUROBOROS_PRESENCE_CALL_MAX_MINUTES", "45")
     hub = _Hub(monkeypatch)
     drive_root, repo, binding = _setup(tmp_path, execution=profile_execution, override=override)
@@ -158,8 +157,8 @@ def test_an_enabled_binding_opens_one_live_turn_under_its_ceiling(tmp_path, monk
     admission = admit_presence_turn(drive_root=drive_root, authenticated_transport_skill=binding.transport_skill,
                                     binding_id=binding.binding_id, global_max_rounds=None)
     assert spec == CallSpec(
-        call_id=opened.call_id, chat_id=presence_chat_id(KEY), engine="openai", model="gpt-realtime-test",
-        voice="marin", opened_by=OPENED_BY_SKILL, presence_binding_id=binding.binding_id, max_minutes=45,
+        call_id=opened.call_id, chat_id=presence_chat_id(KEY), engine="google", model="gemini-live-test",
+        voice="Kore", opened_by=OPENED_BY_SKILL, presence_binding_id=binding.binding_id, max_minutes=45,
         label="Weekly sync", client_message_id="zoom:meeting-1:join",
     )
     assert task["chat_id"] == spec.chat_id and task["id"] == opened.task_id

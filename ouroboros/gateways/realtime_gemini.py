@@ -22,7 +22,7 @@ from ouroboros.gateways.realtime_engine import (
 )
 from ouroboros.gateways.realtime_transport import (
     EVENT_QUEUE_SIZE, LiveEngineRefusal, RealtimeTransport, check_audio,
-    function_schemas, image_part, transport_error,
+    function_schemas, image_part, provider_sentence, transport_error,
 )
 
 
@@ -39,8 +39,33 @@ def normalize_usage(raw):
     return usage
 
 
+def compression(config):
+    """Sliding-window compression starting at the driver's watermarks (provider defaults without them).
+
+    Gemini keeps the system instruction and slides out the oldest spoken turns; the
+    defaults (80% of the window, keep half of that) would sit below a large call view.
+    """
+    if config.compress_at_tokens <= 0:
+        return {"slidingWindow": {}}
+    window = {"targetTokens": config.compress_to_tokens} if config.compress_to_tokens > 0 else {}
+    return {"triggerTokens": config.compress_at_tokens, "slidingWindow": window}
+
+
+def declaration(tool):
+    """A registry function as Gemini's declaration: the whole JSON Schema rides as ``parametersJsonSchema``.
+
+    Gemini's older ``parameters`` field takes only an OpenAPI subset and refuses the session
+    over keywords such as ``additionalProperties`` or a list ``type`` (close 1007, observed live
+    on gemini-3.8-live 2026-10-17); ``parametersJsonSchema`` takes the schema as written.
+    """
+    shaped = {key: tool[key] for key in ("name", "description") if key in tool}
+    if "parameters" in tool:
+        shaped["parametersJsonSchema"] = tool["parameters"]
+    return {**shaped, "behavior": "NON_BLOCKING"}
+
+
 def setup_message(config):
-    declarations = [{**tool, "behavior": "NON_BLOCKING"} for tool in function_schemas(config.tools)]
+    declarations = [declaration(tool) for tool in function_schemas(config.tools)]
     tools = [{"functionDeclarations": declarations}] if declarations else []
     if config.native_search:
         tools.append({"googleSearch": {}})
@@ -52,7 +77,7 @@ def setup_message(config):
         "systemInstruction": {"parts": [{"text": config.instructions}]},
         "tools": tools, "generationConfig": generation,
         "inputAudioTranscription": {}, "outputAudioTranscription": {},
-        "contextWindowCompression": {"slidingWindow": {}},
+        "contextWindowCompression": compression(config),
         "sessionResumption": {"handle": config.resume_handle} if config.resume_handle else {},
     }}
 
@@ -299,8 +324,10 @@ class GeminiLiveEngine(RealtimeTransport):
             self._emit(GoAway(seconds))
         if "error" in message:
             code = message["error"].get("code")
-            kind = "authentication" if code in (401, 403) else "provider"
-            await self._fail(EngineError(kind, "Gemini rejected a live event.", code in (408, 429, 500, 503)))
+            kind = "authentication" if code in (401, 403) else "provider_error"
+            # An access refusal keeps the host's words: its provider text can echo credentials.
+            words = "" if kind == "authentication" else provider_sentence(message["error"].get("message"))
+            await self._fail(EngineError(kind, words or "Gemini rejected a live event.", code in (408, 429, 500, 503)))
 
 
 register_engine("google", GeminiLiveEngine)

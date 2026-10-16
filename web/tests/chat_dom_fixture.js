@@ -132,8 +132,14 @@ export class ElementStub {
         }
         if (selector === '.typing-bubble') return this.children.find((child) => child.classList.contains('typing-bubble')) || null;
         if (selector.startsWith('.')) {
+            // Document order, like the platform: a child, then its descendants, before the next child.
             const className = selector.slice(1).split(/[ :>\[]/)[0];
-            return this.children.find((child) => child.classList.contains(className)) || null;
+            for (const child of this.children) {
+                if (child.classList.contains(className)) return child;
+                const nested = child.querySelector?.(selector);
+                if (nested) return nested;
+            }
+            return null;
         }
         return null;
     }

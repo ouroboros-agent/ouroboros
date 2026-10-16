@@ -21,7 +21,7 @@ test('held task is stationary across hydrated Chat, Project and Main receipt', (
     const activities = computeHydratedDirectActivities(new Map(), [held], 7);
     const card = { root: { isConnected: true }, groupId: 'same-id', finished: false };
     const status = computeDerivedChatStatus(chatStatusCounts(activities, [card]));
-    assert.deepEqual(status, { kind: 'online', text: hold.label, showDots: false });
+    assert.deepEqual(status, { kind: 'online', text: hold.label, tone: 'held', showDots: false, dots: 'one' });
     assert.equal(summarizeProjectActivities([{ ...held, required_question_unavailable: true }]).label, hold.label);
     assert.equal(summarizeProjectActivities([held]).motion, false);
     assert.equal(handoffPhase(held, null).text, hold.label);
@@ -30,11 +30,11 @@ test('held task is stationary across hydrated Chat, Project and Main receipt', (
     assert.equal(handoffPhase(held, null, false).text, 'Activity unconfirmed');
 });
 
-for (const [phase, text, kind, showDots] of [
-    ['budget_pausing', 'Pausing…', 'thinking', true],
-    ['budget_paused', 'Paused', 'online', false],
-    ['unknown', 'Activity unconfirmed', 'online', false],
-    ['queued', hold.label, 'online', false],
+for (const [phase, text, kind, showDots, tone] of [
+    ['budget_pausing', 'Pausing…', 'thinking', true, 'held'],
+    ['budget_paused', 'Paused', 'online', false, 'held'],
+    ['unknown', 'Activity unconfirmed', 'online', false, 'unknown'],
+    ['queued', hold.label, 'online', false, 'held'],
 ]) {
     test(`Project hold preserves the ${phase} Chat header`, () => {
         const row = { ...held, phase };
@@ -42,12 +42,12 @@ for (const [phase, text, kind, showDots] of [
         const card = { root: { isConnected: true }, groupId: 'same-id', finished: false,
             parkedPhase: phase === 'queued' ? '' : phase, projectHold: hold.label };
         assert.deepEqual(computeDerivedChatStatus(chatStatusCounts(activities, [card])),
-            { kind, text, showDots });
+            { kind, text, tone, showDots, dots: 'one' });
         const resumed = computeHydratedDirectActivities(activities,
             [{ ...row, phase: 'working', project_admission_hold: undefined }], 7);
         card.parkedPhase = '';
         card.projectHold = '';
-        assert.equal(computeDerivedChatStatus(chatStatusCounts(resumed, [card])).text, 'Working...');
+        assert.equal(computeDerivedChatStatus(chatStatusCounts(resumed, [card])).text, 'Working');
     });
 }
 
@@ -55,7 +55,7 @@ test('same-ID recovery clears the hold; independent work and budget remain truth
     const activities = computeHydratedDirectActivities(new Map(), [held], 7);
     const recovered = computeHydratedDirectActivities(activities, [{ ...held, phase: 'working', project_admission_hold: undefined }], 7);
     assert.equal(recovered.get('same-id').project_admission_hold, undefined);
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(recovered, [])).text, 'Working...');
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(recovered, [])).text, 'Working');
     const sibling = { ...held, activity_id: 'sibling', phase: 'working', project_admission_hold: undefined };
     assert.equal(summarizeProjectActivities([held, sibling]).motion, true);
     assert.match(summarizeProjectActivities([held, sibling]).label, /Waiting for Project/);
@@ -178,9 +178,9 @@ test('held children do not claim room activity, while a real working sibling sti
     assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child])).text, hold.label);
     assert.equal(computeDerivedChatStatus(chatStatusCounts(new Map(), [child])).text, hold.label);
     const sibling = { groupId: 'sibling', root: { isConnected: true } };
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child, sibling])).text, 'Working...');
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child, sibling])).text, 'Working');
     child.projectHold = '';
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child])).text, 'Working...');
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child])).text, 'Working');
 });
 
 test('actual child queue hydration refreshes room status once and reconciles departure without polling reviews', async () => {
@@ -220,11 +220,11 @@ test('actual child queue hydration refreshes room status once and reconciles dep
             active_chat_activities_complete: true, supervisor_ready: true });
         const status = () => globalThis.document.byId.get('chat-status').textContent;
         snapshot(); await settle();
-        assert.equal(status(), 'Working...', 'the child has not entered its hold yet');
+        assert.equal(status(), 'Working', 'the child has not entered its hold yet');
         queue.pending = queue.running.splice(0);
         queue.pending[0].task.project_admission_hold = hold;
         snapshot();
-        assert.equal(status(), 'Working...', 'the snapshot finishes before its queue read');
+        assert.equal(status(), 'Working', 'the snapshot finishes before its queue read');
         await settle();
         assert.equal(status(), hold.label, 'the async queue response refreshes the header without another snapshot');
         const messages = globalThis.document.byId.get('chat-messages');
@@ -246,7 +246,7 @@ test('actual child queue hydration refreshes room status once and reconciles dep
         queue.pending[0].task.project_admission_hold = hold;
         snapshot(); await settle();
         frame('working-sibling');
-        assert.equal(status(), 'Working...', 'independent working card keeps room activity');
+        assert.equal(status(), 'Working', 'independent working card keeps room activity');
         handlers.get('log')({ chat_id: 7, data: { type: 'task_done', task_id: 'working-sibling', status: 'cancelled' } });
 
         childFrame('review-child');

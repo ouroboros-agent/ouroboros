@@ -123,9 +123,9 @@ test('the typed history discriminator survives a chat transport wrapper', () => 
 
 test('waiting has no computation animation and yields to real work and terminal truth', () => {
     assert.deepEqual(computeDerivedChatStatus({ waitingModelCount: 1, queuedManagedCount: 1 }), {
-        kind: 'online', text: 'Waiting for access', showDots: false,
+        kind: 'online', text: 'Waiting for access', tone: 'held', showDots: false, dots: 'one',
     });
-    assert.equal(computeDerivedChatStatus({ waitingModelCount: 1, activeManagedCount: 1 }).text, 'Working...');
+    assert.equal(computeDerivedChatStatus({ waitingModelCount: 1, activeManagedCount: 1 }).text, 'Working');
     assert.equal(desiredLiveCardPhase({ modelWaiting: true }).text, 'Waiting for access');
     assert.equal(desiredLiveCardPhase({ modelWaiting: true, cancelPendingPolicy: 'immediate' }).text, 'Cancelling…');
     assert.equal(desiredLiveCardPhase({ modelWaiting: true, finished: true }, 'done').text, 'Done');

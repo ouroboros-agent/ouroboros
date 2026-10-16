@@ -89,10 +89,13 @@ test('the mounted list holds its order while open, settles ended work and only n
         input.id = 'chat-input'; // Main has the id; only namespaced Project inputs gain its mirror class.
         page.appendChild(input);
         const header = node('chat-page-header', page);
+        // The product's bar: the title row (where the status goes) and the trailing commands (where it was).
+        const titleRow = node('app-page-title-row', node('app-page-title-block', header));
         const group = node('app-page-actions ui-chrome-group', header);
         const badge = doc.createElement('span');
         badge.className = 'status-badge thinking';
-        badge.textContent = 'Working...';
+        badge.textContent = 'Working';
+        Object.assign(badge.dataset, { tone: 'live', dots: 'moving' });  // what setStatus writes from the producer
         group.appendChild(badge);
         const messages = node('chat-messages', page);
         const activities = new Map([['t-run', { activity_id: 't-run', kind: 'managed_task', phase: 'working', chat_id: 1 }]]);
@@ -103,8 +106,12 @@ test('the mounted list holds its order while open, settles ended work and only n
             activeDirectActivities: activities, liveCardRecords: new Map(), pendingSubmissions: new Map(),
             revealQuestion: async (...args) => { reveals.push(args); return true; },
         });
-        const trigger = group.children.find((child) => child.classList.contains('rw-trigger'));
-        const surface = header.children.find((child) => child.classList.contains('rw-surface'));
+        // The status follows the room's title (1A) and its Shade hangs from the bar's bottom edge (one Shade).
+        const trigger = titleRow.children.find((child) => child.classList.contains('rw-trigger'));
+        assert.equal(group.children.some((child) => child.classList.contains('rw-trigger')), false);
+        const anchor = header.children.find((child) => child.classList.contains('rw-shade-anchor'));
+        const surface = anchor.children.find((child) => child.classList.contains('rw-surface'));
+        assert.ok(surface.classList.contains('rw-shade'));
         const list = surface.children[0];
         const ids = () => list.children.map((row) => row.dataset.id);
         assert.ok(trigger.contains(badge), 'the real status badge is the control’s word');
@@ -162,6 +169,7 @@ test('a pending send never replaces an already represented turn or leaves a ghos
         };
         const page = node('div', 'page', mount);
         const header = node('div', 'chat-page-header', page);
+        const titleRow = node('div', 'app-page-title-row', node('div', 'app-page-title-block', header));
         const group = node('div', 'app-page-actions ui-chrome-group', header);
         const badge = node('span', 'status-badge thinking', group);
         const messages = node('div', 'chat-messages', page);
@@ -171,8 +179,8 @@ test('a pending send never replaces an already represented turn or leaves a ghos
             ws: { isConnected: () => true }, reading: { cancel() {}, scroll() {} },
             activeDirectActivities: activities, liveCardRecords: records, pendingSubmissions: pending,
             stopEligible: () => true });
-        const trigger = group.children.find(el => el.classList.contains('rw-trigger'));
-        const list = header.children.find(el => el.classList.contains('rw-surface')).children[0];
+        const trigger = titleRow.children.find(el => el.classList.contains('rw-trigger'));
+        const list = header.children.find(el => el.classList.contains('rw-shade-anchor')).children[0].children[0];
         const turns = () => list.children.filter(el => el.dataset.id === 'turn-1');
         trigger.click();
         const card = node('div', 'chat-live-block', messages);
@@ -192,5 +200,52 @@ test('a pending send never replaces an already represented turn or leaves a ghos
         trigger.click(); trigger.click();
         assert.equal(turns().length, 1, 'reopening leaves no orphan Working row');
         assert.equal(turns()[0].dataset.settled, '0');
+    } finally { work?.destroy(); restoreDom(prior); }
+});
+
+test('the one mark after the word turns amber for the owner\'s question beside any other word; the control paints the producer\'s tone', () => {
+    const { prior, mount } = installDom(async () => ({ ok: true, json: async () => ({}) }));
+    let work;
+    try {
+        const node = (tag, cls, parent) => {
+            const el = document.createElement(tag); el.className = cls; parent.appendChild(el); return el;
+        };
+        const page = node('div', 'page', mount);
+        const header = node('div', 'chat-page-header', page);
+        const titleRow = node('div', 'app-page-title-row', node('div', 'app-page-title-block', header));
+        const group = node('div', 'app-page-actions ui-chrome-group', header);
+        const badge = node('span', 'status-badge thinking', group);
+        const messages = node('div', 'chat-messages', page);
+        const ask = { activity_id: 't-ask', kind: 'managed_task', phase: 'working', chat_id: 1,
+            owner_wait: { quiz_id: 'q-1', owner_wait_state: 'waiting', quiz_state: 'open' } };
+        const activities = new Map([['t-q', { activity_id: 't-q', kind: 'managed_task', phase: 'queued', chat_id: 1 }], ['t-ask', ask]]);
+        work = createRoomWork({ page, statusBadge: badge, messagesDiv: messages,
+            ws: { isConnected: () => true }, reading: { cancel() {}, scroll() {} },
+            activeDirectActivities: activities, liveCardRecords: new Map(), pendingSubmissions: new Map() });
+        const trigger = titleRow.children.find(el => el.classList.contains('rw-trigger'));
+        // The word leads; its one mark (three dots or one) follows it, and nothing else is a dot.
+        const order = trigger.children.map(el => el.className.split(' ').find(c => /^(status-badge|rw-mark|rw-dots|rw-caret)$/.test(c)))
+            .filter(Boolean);
+        assert.deepEqual(order, ['status-badge', 'rw-mark', 'rw-dots', 'rw-caret']);
+        assert.equal(trigger.children.some(el => el.classList.contains('rw-amber')), false);
+        const paint = (text, tone, dots) => {
+            badge.textContent = text;
+            Object.assign(badge.dataset, { tone, dots });
+            work.update();
+            return [trigger.dataset.tone, trigger.dataset.wait !== '1'];
+        };
+        // Before the producer's first answer (no tone on the badge) the control never claims Online.
+        work.update();
+        assert.equal(trigger.dataset.tone, 'offline');
+        // Queued outranks the answer wait in the word; the question still turns the mark amber.
+        assert.deepEqual(paint('Queued', 'queued', 'still'), ['queued', false]);
+        assert.deepEqual(paint('Working', 'live', 'moving'), ['live', false]);
+        assert.deepEqual(paint('Paused · owner pause', 'held', 'one'), ['held', false]);
+        // The word already says it: the mark keeps the word's own tone.
+        assert.deepEqual(paint('Waiting for your answer', 'wait', 'one'), ['wait', true]);
+        // Without a question there is no amber, whatever the word.
+        activities.delete('t-ask');
+        assert.deepEqual(paint('Queued', 'queued', 'still'), ['queued', true]);
+        assert.deepEqual(paint('Paused', 'held', 'one'), ['held', true]);
     } finally { work?.destroy(); restoreDom(prior); }
 });

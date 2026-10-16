@@ -52,14 +52,14 @@ test('the typed flag on my own echo says Input saved once, and Sending... stays'
     const f = fixture();
     try {
         await f.send('please look at the logs');
-        assert.equal(f.status(), 'Sending...');
+        assert.equal(f.status(), 'Sending');
         f.echo({ content: 'please look at the logs', sender_session_id: ME, client_message_id: 'cm-1', ingress_accepted: true });
         const [note] = f.notes('cm-1');
         assert.equal(note?.textContent, 'Input saved');
         assert.equal(note.className, 'msg-pending', 'the quiet delivery-note style, no new chrome');
         const kids = f.bubble('cm-1').children;
         assert.equal(kids.indexOf(note), kids.findIndex((node) => node.classList.contains('msg-time')) - 1, 'above the time');
-        assert.equal(f.status(), 'Sending...', 'a saved row is not a started turn');
+        assert.equal(f.status(), 'Sending', 'a saved row is not a started turn');
         f.echo({ content: 'please look at the logs', sender_session_id: ME, client_message_id: 'cm-1', ingress_accepted: true });
         assert.equal(f.notes('cm-1').length, 1, 'a repeated echo keeps one note');
         assert.equal(f.messages.children.filter((node) => node.classList.contains('user')).length, 1);
