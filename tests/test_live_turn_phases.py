@@ -170,6 +170,20 @@ def test_sessions_that_die_before_answering_end_the_call_instead_of_reopening_fo
     assert any(word[0] == "closed" and "kept ending" in word[1] and word[2] == "retry" for word in h.hub.words)
 
 
+def test_planned_handovers_never_end_a_quiet_call(harness, monkeypatch):
+    from ouroboros.gateways.realtime_engine import GoAway
+
+    monkeypatch.setattr(live_turn, "RECONNECT_ATTEMPTS", 2)
+    h = harness()
+    h.start()
+    for handed_over in range(3):  # three of the provider's own handovers while nobody speaks
+        h.llm.engines[-1].push(GoAway(time_left_s=5))
+        assert _wait_for(lambda: len(h.llm.engines) == handed_over + 2 and h.llm.engines[-1].config is not None)
+    h.stop()
+    text, usage, _trace = h.finish()
+    assert usage["live_call"]["ended"] == "owner_stop" and usage["live_call"]["reconnects"] == 3
+
+
 def _density(root):
     from ouroboros.capability_evidence import resolve_main_token_density, route_fingerprint
 
