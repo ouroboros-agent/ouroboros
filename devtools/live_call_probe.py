@@ -651,16 +651,21 @@ async def run_probe(args):
     return probe.result
 
 
+# Never copied: the source's Claudexor home (its daemon's descriptor and token would let the copy reach
+# that daemon) and the observability store (millions of request dumps a call never reads; copying it
+# took longer than everything else together on the owner's install).
+DATA_COPY_SKIPPED = ("claudexor", "observability")
+
+
 def copy_data(source: Path, target: Path) -> None:
     """A mature install's data, cloned file by file (``cp -c``) into the run; the source is only read.
 
-    One top-level entry at a time, and never the source's Claudexor home (its daemon's descriptor
-    and token would let the copy reach that daemon). Never one whole-tree clonefile(2): that held
-    APFS for minutes and froze the machine.
+    One top-level entry at a time, never ``DATA_COPY_SKIPPED``, and never one whole-tree
+    clonefile(2): that held APFS for minutes and froze the machine.
     """
     target.mkdir(mode=0o700)
     for entry in sorted(source.iterdir()):
-        if entry.name != "claudexor":
+        if entry.name not in DATA_COPY_SKIPPED:
             subprocess.run(["cp", "-c", "-R", str(entry), str(target)], check=True)
 
 
