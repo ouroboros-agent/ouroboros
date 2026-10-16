@@ -63,7 +63,8 @@ function unmount() {
 
 export function sync(env = globalThis) {
     const call = markedCall();
-    if (!call && !mounted) return;
+    // Mounted (hidden) from a call's first phase, so navigation away from its room is heard.
+    if (!mounted && ![...entries].some(entry => entry.session.active)) return;
     if (!entries.size) { unmount(); return; }
     const state = mounted || mount(env, [...entries][0]?.sign);
     state.current = call;

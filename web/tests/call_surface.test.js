@@ -103,7 +103,8 @@ test('a reasonless or unknown ending still shows the capsule: the call ended, an
 test('what this page finds itself, and surfaces that cannot hold a call, get words and the step that helps', () => {
     const failed = (code, extra) => callPresentation(live({ state: 'failed', code, ...extra }));
     const denied = failed('permission_denied');
-    assert.equal(denied.mode, 'sheet');
+    assert.deepEqual([denied.mode, denied.tone, denied.light], ['sheet', 'notice', 'still']);  // words, not an alarm
+    assert.deepEqual([failed('socket_silent').tone, failed('socket_silent').light], ['error', 'error']);
     assert.match(denied.title, /^Allow the microphone for Ouroboros in System Settings → Privacy & Security → Microphone \(or in the browser’s site settings\), then press Talk again\.$/);
     const old = failed('old_app');
     assert.match(old.title, /^This version of the Ouroboros app can’t use the microphone\. Talk works in your browser, or after you install the new app\.$/);
@@ -319,6 +320,31 @@ test('reduced motion shows whose voice in calm steps; an off-screen room runs no
     hidden.light.setActive(false);
     assert.deepEqual([hidden.props['--call-mic'], hidden.props['--call-out']], [0, 0]);
     assert.deepEqual(hidden.heard, [true, false]);
+});
+
+test('the light moves by itself only in moving phases, and an ended call draws its still state once', () => {
+    const drawn = [];
+    let time = 0;
+    const frames = [];
+    const env = { performance: { now: () => time }, requestAnimationFrame: fn => { frames.push(fn); return frames.length; },
+        cancelAnimationFrame() {}, matchMedia: () => ({ matches: false }),
+        document: { visibilityState: 'visible', addEventListener() {}, removeEventListener() {} } };
+    const light = createCallLight({ env, draw: state => drawn.push(state) });
+    light.attach({ style: { setProperty() {} } });
+    const step = () => { time += 16; const run = frames.splice(0); for (const fn of run) fn(time); return run.length; };
+    light.setActive(true);
+    light.setMode('listen', 'owner');
+    for (let i = 0; i < 5; i++) assert.equal(step(), 1);  // a gentle wave while listening, with no sound at all
+    assert.deepEqual([drawn.at(-1).mode, drawn.at(-1).voice], ['listen', 'owner']);
+    light.setMode('muted', 'owner');
+    assert.equal(step(), 1);
+    assert.equal(step(), 0);  // muted and silent: still, the loop stops
+    light.setActive(false);
+    const before = drawn.length;
+    light.setMode('error', '');
+    assert.equal(drawn.length, before + 1);  // drawn at once, without a frame loop
+    assert.deepEqual([drawn.at(-1).mode, drawn.at(-1).mic, drawn.at(-1).out], ['error', 0, 0]);
+    assert.equal(frames.length, 0);
 });
 
 test('the mark stands for the live call only while its room is off screen, with the call\'s own time', () => {

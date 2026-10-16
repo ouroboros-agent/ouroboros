@@ -304,6 +304,21 @@
     display: none;
 }
 
+/* Where the navigation column is on screen, the mark sits at its foot, over no page's header. */
+@media (min-width: 981px) {
+    .call-mark {
+        top: auto;
+        bottom: calc(env(safe-area-inset-bottom, 0px) + var(--space-5) + var(--space-3));
+        left: var(--space-3);
+        width: calc(var(--sidebar-width) - 2 * var(--space-3));
+        transform: none;
+    }
+
+    .call-mark-open {
+        flex: 1 1 auto;
+    }
+}
+
 .call-mark-open {
     display: inline-flex;
     align-items: center;
