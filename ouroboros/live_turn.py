@@ -39,8 +39,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import (
-    PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING, STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING,
-    CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft,
+    ACTION_OTHER_ENGINE, ACTION_RETRY, ACTION_SETTINGS, PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING,
+    STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING, CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft,
 )
 from ouroboros.gateways.realtime_engine import (
     SPEAKER_OUROBOROS, SPEAKER_OWNER, USAGE_KEYS,
@@ -70,6 +70,14 @@ PEER_GRACE_S = 20.0
 RECONNECT_ATTEMPTS = 3
 SESSION_CAP_MARGIN_S = 60.0
 BATCH_SETTLE_WAIT_S = 5.0
+
+# The one next step the owner's surface offers beside a closed call's reason.
+_ACTION_BY_REASON = {
+    "missing_credential": ACTION_SETTINGS, "authentication": ACTION_SETTINGS, "engine_refused": ACTION_SETTINGS,
+    "rate_limit": ACTION_RETRY, "provider_closed": ACTION_RETRY, "provider_error": ACTION_RETRY,
+    "invalid_request": ACTION_RETRY, "protocol": ACTION_RETRY, "backpressure": ACTION_RETRY,
+    "engine_unavailable": ACTION_RETRY, "reconnect_failed": ACTION_RETRY, "context_too_large": ACTION_OTHER_ENGINE,
+}
 
 
 # ---- seams the lanes meet at (tests replace these) --------------------------------
@@ -148,6 +156,7 @@ class _LiveCall:
         self.started_at_iso = ""
         self.session_started = self.started
         self.close_reason = ""
+        self.close_detail = ""  # the provider's or the host's own sentence beside the reason
         self.closing = False
         self.reconnecting = False
         self.reconnects = 0
@@ -210,10 +219,15 @@ class _LiveCall:
         self.hub = _hub_for(self.spec.call_id)
         if self.hub is None:
             return self._terminal("no_hub", failure=("live_call_hub_missing", "the call's peer hub is not open"))
-        # The tariff quote is fetched here, on the turn thread, before the call's event
-        # loop exists; inside the loop every ledger lookup reads the warmed catalog only.
-        self._settle_safely(lambda: _ledger().warm_quote(engine=self.spec.engine, model=self.spec.model,
-                                                         drive_root=self.drive_root))
+        if self.hub.closed or self.hub.ended_by_owner:
+            # Ended while its memory was being prepared: no engine is opened or paid for.
+            self.close_reason = "owner_bye"
+            self._close_hub()
+            return self._terminal("owner_bye", failure=None)
+        # The tariff quote is fetched first on the ledger's own thread: the open never waits
+        # for it, and every ledger lookup queued behind it reads the warmed catalog.
+        self._record(self._settle_safely, lambda: _ledger().warm_quote(engine=self.spec.engine, model=self.spec.model,
+                                                                       drive_root=self.drive_root))
         try:
             asyncio.run(self._main())
         finally:
@@ -233,7 +247,6 @@ class _LiveCall:
         loop_mod = _loop()
         self._loop = asyncio.get_running_loop()
         self._hub_events, self._outbox = asyncio.Queue(), asyncio.Queue()
-        self.hub.send_state(STATE_CONNECTING)
         loop_mod._reset_turn_state(self.ctx)
         loop_mod._initialize_owner_directives(self.ctx, self.messages)
         self.tool_schemas, _extra = loop_mod._setup_dynamic_tools(
@@ -270,6 +283,11 @@ class _LiveCall:
             except asyncio.CancelledError:
                 if not self.closing:
                     raise
+            except LiveEngineRefusal as exc:
+                # A typed refusal before any session (a missing key, a malformed route) keeps its own words.
+                self.failure = ("live_engine_refused", f"{exc.code}: {exc}")
+                self._begin_close("missing_credential" if exc.code == "missing_credential" else "engine_refused",
+                                  detail=str(exc))
             except Exception as exc:
                 log.warning("live call %s could not open its engine", self.spec.call_id, exc_info=True)
                 self.failure = ("live_engine_unavailable", f"{type(exc).__name__}: {exc}")
@@ -311,18 +329,35 @@ class _LiveCall:
         self._checkpoint()
         self.rooms.stop()
         self._reader_stop.set()
+        self._close_hub()
+
+    def _close_hub(self) -> None:
+        """The closed state with its words and one next step, then the hub itself."""
         self.state = STATE_CLOSED
-        self.hub.send_state(STATE_CLOSED, self.close_reason)
+        action, other = _ACTION_BY_REASON.get(self.close_reason, ""), ""
+        if action == ACTION_OTHER_ENGINE:
+            other = _other_engine(self.spec.engine)
+            action = action if other else ACTION_SETTINGS
         try:
+            self.hub.send_state(STATE_CLOSED, self.close_reason, detail=self.close_detail, action=action,
+                                other_engine=other)
             self.hub.close(self.close_reason)
         except Exception:
             log.debug("hub close failed", exc_info=True)
 
-    def _begin_close(self, reason: str) -> None:
+    def _begin_close(self, reason: str, *, detail: str = "") -> None:
         if self.closing:
             return
         self.closing, self.close_reason, self.state = True, reason, STATE_CLOSING
+        self.close_detail = detail
         self._closed.set()
+
+    def _activity(self, activity: str, label: str = "") -> None:
+        """What the owner's surface shows while a tool batch runs (the tool's own name), and after it."""
+        try:
+            self.hub.send_activity(activity, label)
+        except Exception:
+            log.debug("call activity unsent", exc_info=True)
 
     def _terminal(self, reason: str, *, failure: Optional[Tuple[str, str]]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
         from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
@@ -354,6 +389,10 @@ class _LiveCall:
                              history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle)
 
     async def _open_engine(self, *, resume_handle: str = "") -> None:
+        if self.closing or self.hub.ended_by_owner:
+            return  # the owner ended the call before its engine opened: nothing is opened or paid for
+        if not self.reconnecting:
+            self.hub.send_state(STATE_CONNECTING)
         engine = self.llm.open_live(self.route.engine)
         # The history view holds every transcript row up to this count; context recorded
         # after it, while the connection was pending, is delivered once the session is live.
@@ -434,7 +473,7 @@ class _LiveCall:
                 await asyncio.sleep(0.5 * (2 ** attempt_no))
         self.reconnecting = False
         self.failure = ("live_engine_unavailable", f"the engine could not be reopened after {reason}")
-        self._begin_close("reconnect_failed")
+        self._begin_close("reconnect_failed", detail=f"the session ended ({reason}) and could not be reopened")
 
     async def _send(self, command: Any) -> None:
         engine = self.engine
@@ -650,7 +689,10 @@ class _LiveCall:
                 asyncio.create_task(self._reconnect(f"engine_error:{event.kind}", resume=True))
             else:
                 self.failure = ("live_engine_error", f"{event.kind}: {event.message}")
-                self._begin_close(f"engine_error:{event.kind}")
+                if event.kind == "context_length":
+                    self._begin_close("context_too_large", detail=_size_words(event.message))
+                else:
+                    self._begin_close(event.kind, detail=event.message)
         elif isinstance(event, Closed):
             if not self.closing:
                 asyncio.create_task(self._reconnect(f"transport_lost:{event.reason}", resume=True))
@@ -935,6 +977,30 @@ class _LiveCall:
         except Exception:
             log.warning("live call %s checkpoint unwritten; mailbox content stays unacknowledged", self.spec.call_id, exc_info=True)
             return False
+
+
+def _other_engine(engine: str) -> str:
+    """The other engine when its key is set (the owner's one-click alternative), else ``""``."""
+    from ouroboros.llm_live import other_live_engine
+    from ouroboros.provider_models import PROVIDER_ENV_KEYS
+    from ouroboros.settings_integrity import runtime_setting
+
+    try:
+        return other_live_engine({name: runtime_setting(name, "") for name in PROVIDER_ENV_KEYS.values()}, engine)
+    except Exception:
+        return ""
+
+
+def _size_words(message: str) -> str:
+    """The provider's refusal numbers as plain words; its own text when it gave none."""
+    import json
+
+    try:
+        evidence = json.loads(message)
+        return (f"{int(evidence['input_tokens']):,} tokens of core memory; "
+                f"this engine holds {int(evidence['limit_tokens']):,}")
+    except (ValueError, TypeError, KeyError):
+        return str(message or "")[:300]
 
 
 def run_live_turn(

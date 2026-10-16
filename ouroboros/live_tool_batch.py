@@ -153,6 +153,7 @@ class ToolBatchWorker:
                 call._checkpoint()
                 continue
             self.running = True  # cleared by the worker thread itself, so a cancelled await never hides a running tool
+            call._activity("working", ", ".join(sorted({tc.name for _epoch, tc in batch})))
             try:
                 changes, grown = await asyncio.get_running_loop().run_in_executor(
                     self._pool, contextvars.copy_context().run, self._run_batch, [tc for _epoch, tc in batch])
@@ -163,6 +164,7 @@ class ToolBatchWorker:
             except Exception:
                 log.warning("live call %s tool batch failed", call.spec.call_id, exc_info=True)
                 changes, grown = [], False
+            call._activity("idle")
             # The latest session that asked for each call receives its result.
             epochs = {tc.call_id: self.claimed.pop(tc.call_id, epoch) for epoch, tc in batch}
             await self._forward_changes(changes, epochs)

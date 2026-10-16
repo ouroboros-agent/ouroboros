@@ -117,9 +117,11 @@ def _call_setting(key: str, default: str = "") -> str:
 
 def _call_route() -> tuple[str, str, str]:
     """``(engine, model, voice)`` from the owner's call settings; a missing model is a refusal."""
-    engine = _call_setting("OUROBOROS_CALL_ENGINE").lower()
-    if not engine:
-        raise PresenceCallRefused("presence_call_engine_unset", "OUROBOROS_CALL_ENGINE is empty")
+    from ouroboros.llm_live import resolve_live_engine
+    from ouroboros.provider_models import PROVIDER_ENV_KEYS
+
+    engine = resolve_live_engine({key: _call_setting(key) for key in
+                                  ("OUROBOROS_CALL_ENGINE", PROVIDER_ENV_KEYS["google"])})
     suffix = engine.upper()
     model = _call_setting(f"OUROBOROS_CALL_MODEL_{suffix}")
     if not model:

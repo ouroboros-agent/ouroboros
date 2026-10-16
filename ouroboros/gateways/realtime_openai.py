@@ -21,7 +21,7 @@ from ouroboros.gateways.realtime_engine import (
 )
 from ouroboros.gateways.realtime_transport import (
     LiveEngineRefusal, RealtimeTransport, check_audio, function_schemas, image_part,
-    transport_error, wire_text,
+    provider_sentence, transport_error, wire_text,
 )
 
 TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
@@ -283,8 +283,9 @@ class OpenAIRealtimeEngine(RealtimeTransport):
                     return
                 retryable = code in ("server_error", "rate_limit_exceeded")
                 category = {"rate_limit_exceeded": "rate_limit", "invalid_api_key": "authentication",
-                            "invalid_request_error": "invalid_request"}.get(code, "provider")
-                await self._fail(EngineError(category, "OpenAI rejected a live event.", retryable))
+                            "invalid_request_error": "invalid_request"}.get(code, "provider_error")
+                await self._fail(EngineError(category, provider_sentence(error.get("message"))
+                                             or "OpenAI rejected a live event.", retryable))
 
 
 register_engine("openai", OpenAIRealtimeEngine)

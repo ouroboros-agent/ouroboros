@@ -22,7 +22,7 @@ from ouroboros.gateways.realtime_engine import (
 )
 from ouroboros.gateways.realtime_transport import (
     EVENT_QUEUE_SIZE, LiveEngineRefusal, RealtimeTransport, check_audio,
-    function_schemas, image_part, transport_error,
+    function_schemas, image_part, provider_sentence, transport_error,
 )
 
 
@@ -299,8 +299,9 @@ class GeminiLiveEngine(RealtimeTransport):
             self._emit(GoAway(seconds))
         if "error" in message:
             code = message["error"].get("code")
-            kind = "authentication" if code in (401, 403) else "provider"
-            await self._fail(EngineError(kind, "Gemini rejected a live event.", code in (408, 429, 500, 503)))
+            kind = "authentication" if code in (401, 403) else "provider_error"
+            await self._fail(EngineError(kind, provider_sentence(message["error"].get("message"))
+                                         or "Gemini rejected a live event.", code in (408, 429, 500, 503)))
 
 
 register_engine("google", GeminiLiveEngine)

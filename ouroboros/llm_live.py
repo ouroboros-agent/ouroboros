@@ -14,6 +14,30 @@ from ouroboros.provider_models import PROVIDER_ENV_KEYS
 from ouroboros.settings_integrity import runtime_setting
 
 
+def live_key_present(settings, engine: str) -> bool:
+    """Whether the owner configured the direct key a live engine needs (``settings`` maps names to values)."""
+    name = PROVIDER_ENV_KEYS.get(engine, "")
+    return bool(name) and bool(str(settings.get(name) or "").strip())
+
+
+def resolve_live_engine(settings) -> str:
+    """The owner's engine choice; empty means Google when its key is set, otherwise OpenAI.
+
+    Google's window holds more of the mind and answers faster; OpenAI keeps calls open
+    for an install with only an OpenAI key. A choice never changes inside a call.
+    """
+    choice = str(settings.get("OUROBOROS_CALL_ENGINE") or "").strip().lower()
+    if choice:
+        return choice
+    return "google" if live_key_present(settings, "google") else "openai"
+
+
+def other_live_engine(settings, engine: str) -> str:
+    """The other engine when its key is set, for the one-click "use the other engine" step; else ""."""
+    other = "openai" if engine == "google" else "google"
+    return other if live_key_present(settings, other) else ""
+
+
 def make_live_engine(client, route: EngineRoute) -> LiveEngine:
     from ouroboros.gateways.realtime_openai import OpenAIRealtimeEngine
     from ouroboros.gateways.realtime_gemini import GeminiLiveEngine

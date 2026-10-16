@@ -29,12 +29,16 @@ PEER_ROLES = (PEER_OWNER, PEER_MEETING)
 OPENED_BY_OWNER = "owner_surface"
 OPENED_BY_SKILL = "skill"
 
+# A call is born preparing (its turn reads memory), connects to the engine, then is live.
+STATE_PREPARING = "preparing"
 STATE_CONNECTING = "connecting"
 STATE_LIVE = "live"
 STATE_RECONNECTING = "reconnecting"
 STATE_CLOSING = "closing"
 STATE_CLOSED = "closed"
-CALL_STATES = (STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING, STATE_CLOSING, STATE_CLOSED)
+CALL_STATES = (STATE_PREPARING, STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING, STATE_CLOSING, STATE_CLOSED)
+# The one next step a surface offers beside a closed call's reason.
+ACTION_SETTINGS, ACTION_RETRY, ACTION_OTHER_ENGINE = "settings", "retry", "other_engine"
 
 # Binary frame: fixed 16-byte header + PCM16LE mono payload.
 #   magic  2s  b"OC"
@@ -90,11 +94,15 @@ def decode_frame(data: bytes) -> AudioFrame:
 #   {"type": "participant", "label": str, "speaking": bool}   # who the platform says is speaking
 #   {"type": "bye", "reason": str}
 # Server -> peer:
-#   {"type": "state", "state": <CALL_STATES>, "reason": str}
+#   {"type": "state", "state": <CALL_STATES>, "reason": str, "engine": str,
+#    "phase": str, "detail": str, "action": ""|<ACTION_*>, "other_engine": str}
+#        phase names what a preparing call is doing ("memory"); detail is the provider's or the
+#        host's own sentence for a closed call; action and other_engine are its one next step
+#   {"type": "activity", "activity": "working"|"idle", "label": str}   # a tool batch runs
 #   {"type": "caption", "speaker": "owner"|"ouroboros", "text": str, "final": bool, "item_id": str}
 #   {"type": "flush", "epoch": int}                           # stop playback of older epochs now
 PEER_MESSAGE_TYPES = ("hello", "mute", "played", "context", "participant", "bye")
-SERVER_MESSAGE_TYPES = ("state", "caption", "flush")
+SERVER_MESSAGE_TYPES = ("state", "activity", "caption", "flush")
 MAX_CONTROL_BYTES = 16 * 1024
 
 

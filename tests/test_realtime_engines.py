@@ -128,7 +128,7 @@ async def test_recorded_instruction_refusal_retains_only_capacity_evidence(valid
         assert event.kind == "context_length" and not event.retryable
         assert json.loads(event.message) == {"limit_tokens": 65536, "input_tokens": 186324, "field": "session.instructions"}
     else:
-        assert event.kind == "provider"
+        assert event.kind == "provider_error"
 
 
 

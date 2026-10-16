@@ -53,11 +53,16 @@ async def read_call_body(request: Request) -> dict:
 def build_call_spec(payload: dict) -> cp.CallSpec:
     """Capture configured routing at admission; an explicit voice may be empty."""
     from ouroboros.config import load_settings
+    from ouroboros.llm_live import live_key_present, resolve_live_engine
 
     settings = load_settings()
-    engine = payload.get("engine", settings.get("OUROBOROS_CALL_ENGINE", "openai"))
+    engine = payload.get("engine") or resolve_live_engine(settings)
     if engine not in ("openai", "google"):
         raise CallPeerError("unsupported_call_engine")
+    if not live_key_present(settings, engine):
+        # Said at once, before any turn starts: a call without its engine's key cannot open.
+        auto = not payload.get("engine") and not str(settings.get("OUROBOROS_CALL_ENGINE") or "").strip()
+        raise CallPeerError("missing_live_key" if auto else f"missing_credential_{engine}")
     model = payload.get("model") or settings.get(f"OUROBOROS_CALL_MODEL_{engine.upper()}", "")
     if not isinstance(model, str) or not model.strip():
         raise CallPeerError("call_model_missing")
@@ -86,9 +91,12 @@ def _admit_owner_call(payload: dict) -> dict:
     hub, created = open_owner_hub(spec)  # surfaces opening at once share one call, one paid session
     if not created:
         return {"call_id": hub.call_id, "ws_path": f"/ws/call/{hub.call_id}", "joined": True}
+    def finished(_task_id: str, ok: bool) -> None:
+        # The driver closes its own hub with its reason; a hub still open here never reached it.
+        close_hub(spec.call_id, "call_not_started" if ok else "preparation_failed", action=cp.ACTION_RETRY)
+
     try:
-        result = handle_call_direct(spec.chat_id, spec,
-                                    lambda _task_id, _ok: close_hub(spec.call_id))
+        result = handle_call_direct(spec.chat_id, spec, finished)
     except Exception:
         close_hub(spec.call_id, "admission_failed")
         raise
@@ -125,6 +133,9 @@ _OWNER_REFUSAL_WORDS = {
     "cost_accounting_unavailable": "Spending cannot be checked right now, so the call did not open.",
     "project_room_unavailable": "This project's room is not available for a call.",
     "unsupported_call_engine": "Choose the OpenAI or Google live engine.",
+    "missing_live_key": "Calls need a Google AI or an OpenAI key: add one in Settings.",
+    "missing_credential_google": "Google calls need a Google AI key: add it in Settings, or choose OpenAI there.",
+    "missing_credential_openai": "OpenAI calls need an OpenAI key: add it in Settings, or choose Google there.",
     "call_model_missing": "No live model is set for this engine in Settings (Models, Live calls).",
     "invalid_call_max_minutes": "The call's minute limit in Settings is not a positive whole number.",
     "invalid_call_request": "The call request was malformed.",
