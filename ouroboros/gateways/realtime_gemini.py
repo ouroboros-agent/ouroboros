@@ -51,8 +51,21 @@ def compression(config):
     return {"triggerTokens": config.compress_at_tokens, "slidingWindow": window}
 
 
+def declaration(tool):
+    """A registry function as Gemini's declaration: the whole JSON Schema rides as ``parametersJsonSchema``.
+
+    Gemini's older ``parameters`` field takes only an OpenAPI subset and refuses the session
+    over keywords such as ``additionalProperties`` or a list ``type`` (close 1007, observed live
+    on gemini-3.8-live 2026-10-17); ``parametersJsonSchema`` takes the schema as written.
+    """
+    shaped = {key: tool[key] for key in ("name", "description") if key in tool}
+    if "parameters" in tool:
+        shaped["parametersJsonSchema"] = tool["parameters"]
+    return {**shaped, "behavior": "NON_BLOCKING"}
+
+
 def setup_message(config):
-    declarations = [{**tool, "behavior": "NON_BLOCKING"} for tool in function_schemas(config.tools)]
+    declarations = [declaration(tool) for tool in function_schemas(config.tools)]
     tools = [{"functionDeclarations": declarations}] if declarations else []
     if config.native_search:
         tools.append({"googleSearch": {}})

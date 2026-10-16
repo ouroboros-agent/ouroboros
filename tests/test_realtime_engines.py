@@ -152,6 +152,10 @@ async def test_session_configuration_audio_limits_and_history(provider, rate):
     setup = setup["setup"]
     assert setup["systemInstruction"]["parts"] == [{"text": "Full core"}]
     assert setup["tools"][0]["functionDeclarations"][0]["behavior"] == "NON_BLOCKING"
+    # The registry's JSON Schema rides whole as parametersJsonSchema: Gemini's OpenAPI-subset
+    # `parameters` field refuses keywords such as additionalProperties (close 1007, live).
+    assert setup["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"] == TOOL["function"]["parameters"]
+    assert "parameters" not in setup["tools"][0]["functionDeclarations"][0]
     assert setup["tools"][1] == {"googleSearch": {}}
     assert setup["sessionResumption"] == {}
     assert setup["contextWindowCompression"] == {"slidingWindow": {}}
