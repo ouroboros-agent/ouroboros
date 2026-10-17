@@ -600,3 +600,20 @@ def test_owner_open_without_a_google_key_is_refused_at_once(owner, monkeypatch):
     assert response.status_code == 200, response.text
     assert admitted[-1].engine == "google" and admitted[-1].model == "g-model"
     close_hub(admitted[-1].call_id)
+
+
+def test_an_emptied_model_field_opens_the_default_model(owner, monkeypatch):
+    from ouroboros import config
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+    from supervisor import worker_chat_lane
+
+    admitted = []
+    monkeypatch.setattr(worker_chat_lane, "handle_call_direct",
+                        lambda chat_id, spec, on_finished: admitted.append(spec) or {"admitted": True, "task_id": "t"},
+                        raising=False)
+    # Settings' Gemini Live model field says "Use engine default" when it is empty.
+    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "g", "OUROBOROS_CALL_MODEL_GOOGLE": ""})
+    response = owner.post("/api/call/open", json={"chat_id": 1})
+    assert response.status_code == 200, response.text
+    assert admitted[-1].model == SETTINGS_DEFAULTS["OUROBOROS_CALL_MODEL_GOOGLE"] == "gemini-3.8-live"
+    close_hub(admitted[-1].call_id)

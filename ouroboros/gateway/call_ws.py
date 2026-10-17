@@ -54,12 +54,15 @@ def build_call_spec(payload: dict) -> cp.CallSpec:
     """Capture configured routing at admission; an explicit voice may be empty."""
     from ouroboros.config import load_settings
     from ouroboros.llm_live import live_key_present
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
 
     settings = load_settings()
     if not live_key_present(settings):
         # Said at once, before any turn starts: calls use Google Gemini Live and need its key.
         raise CallPeerError("missing_credential_google")
-    model = payload.get("model") or settings.get("OUROBOROS_CALL_MODEL_GOOGLE", "")
+    # An emptied Settings field means the default model, as the field says ("Use engine default").
+    model = (payload.get("model") or settings.get("OUROBOROS_CALL_MODEL_GOOGLE")
+             or SETTINGS_DEFAULTS["OUROBOROS_CALL_MODEL_GOOGLE"])
     if not isinstance(model, str) or not model.strip():
         raise CallPeerError("call_model_missing")
     voice = payload.get("voice", settings.get("OUROBOROS_CALL_VOICE_GOOGLE", ""))
