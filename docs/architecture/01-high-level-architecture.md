@@ -8,7 +8,7 @@ launcher.py spawns server.py (Starlette+uvicorn) — HTTP + WebSocket on configu
 devtools/live_call_probe.py — Real live-call scenarios with synthetic owner audio and evidence (§1 Devtools boundary)
 devtools/call_context_measure.py — A call's instruction, measured on a data copy (§1 Devtools boundary)
 web/ — Web UI, a SPA of ES modules; chapter 3 owns the pages and the modules not listed here (§3)
-  modules/call.js, call_capsule.js, call_light.js, call_aura.js, call_card.js, call_mark.js, call_worklet.js — room call: Talk, capsule, light, card, In call mark, audio (§6)
+  modules/call.js, call_capsule.js, call_light.js, call_aura.js, call_card.js, call_mark.js, call_worklet.js, call_settings.js — room call: Talk, capsule, light, card, In call mark, audio, Settings (§6)
   ui.css — the shared stylesheet (§3 Navigation)
   modules/ — browser modules (§3)
     ui_primitives.js — safe-field, escaping and tone/status helpers (§3 Navigation)
