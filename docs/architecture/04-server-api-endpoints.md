@@ -152,7 +152,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/mcp/test` | |
 | POST | `/api/mcp/import/preview` | |
 | WS | `/ws` | |
-| WS | `/ws/call/{call_id}` | the owner surface's call audio: PCM frames and `call_protocol` control |
+| WS | `/ws/call/{call_id}` | the owner surface's call: PCM frames and `call_protocol` control |
 | STATIC | `/static/*` | |
 | STATIC | `/onboarding/static/*` | |
 | GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/identity` | |

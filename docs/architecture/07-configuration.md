@@ -211,9 +211,9 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 | OUROBOROS_PRESENCE_MAX_ACTIVE | 2 | Cross-process Presence turn cap (UI-bounded 1-20) |
 | OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls |
 | OUROBOROS_CALL_VOICE_GOOGLE | "" | Gemini voice for calls (blank = provider default) |
-| OUROBOROS_CALL_NATIVE_SEARCH | true | Let Gemini Live use its native Google Search grounding in calls |
-| OUROBOROS_CALL_MAX_MINUTES | "" | Optional owner duration ceiling for a call (blank = none) |
-| OUROBOROS_PRESENCE_CALL_MAX_MINUTES | "" | Optional owner duration ceiling for Presence calls, each holding a Presence slot throughout (blank = none) |
+| OUROBOROS_CALL_NATIVE_SEARCH | true | Gemini's own Google Search in calls |
+| OUROBOROS_CALL_MAX_MINUTES | "" | Optional duration ceiling for a call (blank = none) |
+| OUROBOROS_PRESENCE_CALL_MAX_MINUTES | "" | Optional duration ceiling for a Presence call, which holds a Presence slot (blank = none) |
 | LOCAL_MODEL_CHAT_FORMAT | "" | Local-model chat template override |
 | GITHUB_TOKEN | "" | GitHub token (push/PR/issues) |
 | GITHUB_REPO | "" | Personal `origin` repository |
