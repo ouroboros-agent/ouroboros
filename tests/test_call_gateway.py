@@ -251,6 +251,26 @@ def test_both_doors_audio_controls_output_flush_and_leave(door):
     assert hub.peers() == ()
 
 
+def test_owner_video_hello_and_frame_reach_hub_but_ungranted_host_video_is_refused(owner, hub, tmp_path):
+    image = b"\xff\xd8\xff" + b"frame"
+    with owner.websocket_connect(f"/ws/call/{hub.call_id}") as ws:
+        hello(ws, "owner", video=True)
+        joined = hub.next_event(EVENT_WAIT_S)
+        assert joined.peer.video is True
+        ws.send_bytes(cp.encode_frame(cp.VideoFrame(0, 0, "image/jpeg", image)))
+        assert hub.next_event(EVENT_WAIT_S) == cp.PeerVideo(joined.peer.peer_id, "owner", "image/jpeg", image)
+    seed_skill(tmp_path)
+    with TestClient(create_host_service_app(tmp_path), headers={"x-skill-token": "skill-token"}) as client:
+        response = client.post("/call/open", json={"call_id": hub.call_id, "role": "meeting"})
+        assert response.status_code == 200
+        with client.websocket_connect(response.json()["peer_path"]) as ws:
+            ws.send_json({"type": "hello", "protocol": 1, "role": "meeting", "mic": True,
+                          "speaker": False, "video": True, "rate": 16000})
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+            assert exc.value.code == 1008
+
+
 @pytest.mark.parametrize("message", ["not json", json.dumps({"type": "state", "state": "live"}),
     json.dumps({"type": "mute", "muted": "false"}),
     json.dumps({"type": "played", "item_id": "item", "played_ms": -1}),

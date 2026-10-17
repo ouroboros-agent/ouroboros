@@ -52,6 +52,7 @@ class HostCallOpenRequest(TypedDict):
     label: NotRequired[str]
     mic: NotRequired[bool]
     speaker: NotRequired[bool]
+    video: NotRequired[bool]
 
 
 class HostCallOpenResponse(TypedDict):
@@ -65,6 +66,7 @@ class CallHello(TypedDict):
     role: Literal["owner", "meeting"]
     mic: bool
     speaker: bool
+    video: NotRequired[bool]
     rate: int
     label: NotRequired[str]
 
@@ -145,6 +147,7 @@ class CallSocketContract(TypedDict):
     audio_header: str
     audio_header_bytes: int
     max_audio_payload_bytes: int
+    max_video_payload_bytes: int
     max_control_bytes: int
     peer_messages: Dict[str, str]
     server_messages: Dict[str, str]
@@ -161,6 +164,7 @@ def socket_contract() -> CallSocketContract:
         "host_peer_path": "/call/{call_id}/peer", "host_auth": "X-Skill-Token; call_peer grant",
         "protocol": cp.PROTOCOL_VERSION, "audio_header": "<2sBBHIIH: magic, version, kind, epoch, seq, rate, stream",
         "audio_header_bytes": cp.HEADER_SIZE, "max_audio_payload_bytes": cp.MAX_FRAME_PAYLOAD,
+        "max_video_payload_bytes": cp.MAX_VIDEO_FRAME_PAYLOAD,
         "max_control_bytes": cp.MAX_CONTROL_BYTES,
         "peer_messages": {name: cls.__name__ for name, cls in PEER_CONTROLS.items()},
         "server_messages": {name: cls.__name__ for name, cls in SERVER_CONTROLS.items()},

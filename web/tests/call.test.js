@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { apiClient } from '../modules/api_client.js';
 import { SETTINGS_INPUT_FIELDS, SECRET_KEYS, renderSettingsPage } from '../modules/settings_ui.js';
 import { CallSession, callAvailability, mediaFailure, mountRoomCall } from '../modules/call.js';
-import { decodeFrame, encodeFrame, followLevel, levelFromRms, LevelMeter, newerEpoch, pcm16, PlaybackBuffer,
-    playedMilliseconds, LEVEL_CEILING_DB, LEVEL_FLOOR_DB, MAX_FRAME_PAYLOAD, MAX_BUFFER_SECONDS } from '../modules/call_worklet.js';
+import { decodeFrame, encodeFrame, encodeVideoFrame, followLevel, levelFromRms, LevelMeter, newerEpoch, pcm16, PlaybackBuffer,
+    playedMilliseconds, LEVEL_CEILING_DB, LEVEL_FLOOR_DB, MAX_FRAME_PAYLOAD, MAX_VIDEO_FRAME_PAYLOAD, MAX_BUFFER_SECONDS } from '../modules/call_worklet.js';
 
 test('PCM uses the frozen 16-byte little-endian header, signed mono samples and wrapping counters', () => {
     const wire = encodeFrame({ kind: 2, epoch: 0x1234, seq: 0xabcdef12, rate: 48000,
@@ -70,6 +70,17 @@ test('framing rejects bad magic, version, kind, rate, lengths and oversized audi
     const zero = encodeFrame({ rate: 1, pcm: new Int16Array() });
     new DataView(zero).setUint32(10, 0, true);
     assert.throws(() => decodeFrame(zero), /sample rate/);
+});
+
+test('JPEG video uses its own bounded binary frame and format code', () => {
+    const data = new Uint8Array([255, 216, 255, 1, 2]);
+    const frame = decodeFrame(encodeVideoFrame({ epoch: 2, seq: 7, mime: 'image/jpeg', data }));
+    assert.deepEqual(frame, { kind: 3, epoch: 2, seq: 7, mime: 'image/jpeg', data });
+    assert.throws(() => encodeVideoFrame({ mime: 'image/webp', data }));
+    assert.throws(() => encodeVideoFrame({ mime: 'image/jpeg', data: new Uint8Array(MAX_VIDEO_FRAME_PAYLOAD + 1) }));
+    const bad = encodeVideoFrame({ mime: 'image/jpeg', data });
+    new DataView(bad).setUint32(10, 9, true);
+    assert.throws(() => decodeFrame(bad));
 });
 
 test('float capture saturates correctly and played time never rounds up unheard samples', () => {

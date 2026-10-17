@@ -40,20 +40,23 @@ CALL_STATES = (STATE_PREPARING, STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING
 # The one next step a surface offers beside a closed call's reason.
 ACTION_SETTINGS, ACTION_RETRY = "settings", "retry"
 
-# Binary frame: fixed 16-byte header + PCM16LE mono payload.
+# Binary frame: fixed 16-byte header + PCM16LE mono or JPEG/PNG payload.
 #   magic  2s  b"OC"
 #   ver    B   PROTOCOL_VERSION
-#   kind   B   FRAME_AUDIO_IN (peer -> server) | FRAME_AUDIO_OUT (server -> peer)
+#   kind   B   FRAME_AUDIO_IN | FRAME_AUDIO_OUT | FRAME_VIDEO_IN (peer -> server)
 #   epoch  H   output epoch (server bumps it on interruption; peers drop stale epochs)
 #   seq    I   per-peer, per-direction sequence
-#   rate   I   sample rate of the payload
+#   rate   I   audio sample rate; for video, 1 = JPEG and 2 = PNG
 #   stream H   peer-local stream id (0 = the peer's primary track)
 _HEADER = struct.Struct("<2sBBHIIH")
 HEADER_SIZE = _HEADER.size
 _MAGIC = b"OC"
 FRAME_AUDIO_IN = 1
 FRAME_AUDIO_OUT = 2
+FRAME_VIDEO_IN = 3
 MAX_FRAME_PAYLOAD = 64 * 1024
+MAX_VIDEO_FRAME_PAYLOAD = 512 * 1024
+VIDEO_FORMATS = {"image/jpeg": 1, "image/png": 2}
 
 
 @dataclass(frozen=True)
@@ -66,20 +69,38 @@ class AudioFrame:
     pcm: bytes
 
 
-def encode_frame(frame: AudioFrame) -> bytes:
+@dataclass(frozen=True)
+class VideoFrame:
+    epoch: int
+    seq: int
+    mime: str
+    data: bytes
+
+
+def encode_frame(frame: AudioFrame | VideoFrame) -> bytes:
+    if isinstance(frame, VideoFrame):
+        if frame.mime not in VIDEO_FORMATS or not 0 < len(frame.data) <= MAX_VIDEO_FRAME_PAYLOAD:
+            raise ValueError("video payload requires JPEG/PNG and at most 512 KiB")
+        return _HEADER.pack(_MAGIC, PROTOCOL_VERSION, FRAME_VIDEO_IN, frame.epoch & 0xFFFF,
+                            frame.seq & 0xFFFFFFFF, VIDEO_FORMATS[frame.mime], 0) + frame.data
     if len(frame.pcm) > MAX_FRAME_PAYLOAD or len(frame.pcm) % 2:
         raise ValueError("audio payload must be PCM16 and at most 64 KiB")
     return _HEADER.pack(_MAGIC, PROTOCOL_VERSION, frame.kind, frame.epoch & 0xFFFF,
                         frame.seq & 0xFFFFFFFF, frame.rate, frame.stream & 0xFFFF) + frame.pcm
 
 
-def decode_frame(data: bytes) -> AudioFrame:
+def decode_frame(data: bytes) -> AudioFrame | VideoFrame:
     if len(data) < HEADER_SIZE:
         raise ValueError("audio frame shorter than its header")
     magic, version, kind, epoch, seq, rate, stream = _HEADER.unpack_from(data)
     if magic != _MAGIC or version != PROTOCOL_VERSION:
         raise ValueError("not a live call audio frame of this protocol version")
     pcm = data[HEADER_SIZE:]
+    if kind == FRAME_VIDEO_IN:
+        mime = next((name for name, code in VIDEO_FORMATS.items() if code == rate), "")
+        if not mime or stream or not 0 < len(pcm) <= MAX_VIDEO_FRAME_PAYLOAD:
+            raise ValueError("malformed live call video frame")
+        return VideoFrame(epoch, seq, mime, pcm)
     if len(pcm) > MAX_FRAME_PAYLOAD or len(pcm) % 2 or kind not in (FRAME_AUDIO_IN, FRAME_AUDIO_OUT):
         raise ValueError("malformed live call audio frame")
     return AudioFrame(kind, epoch, seq, rate, stream, pcm)
@@ -87,7 +108,7 @@ def decode_frame(data: bytes) -> AudioFrame:
 
 # JSON control messages (text frames). Peer -> server:
 #   {"type": "hello", "protocol": 1, "role": "owner"|"meeting", "mic": bool, "speaker": bool,
-#    "rate": int, "label": str}
+#    "rate": int, "video": bool, "label": str}
 #   {"type": "mute", "muted": bool}
 #   {"type": "played", "item_id": str, "played_ms": int}     # playback acknowledgement
 #   {"type": "context", "text": str, "source": str}           # a peer-observed fact for the mind
@@ -191,6 +212,7 @@ class PeerInfo:
     speaker: bool
     label: str = ""
     skill: str = ""      # the reviewed skill a companion peer belongs to ("" for an owner surface)
+    video: bool = False
 
 
 @dataclass(frozen=True)
@@ -211,6 +233,14 @@ class PeerAudio:
     peer_id: str
     role: str
     pcm: bytes
+
+
+@dataclass(frozen=True)
+class PeerVideo:
+    peer_id: str
+    role: str
+    mime: str
+    data: bytes
 
 
 @dataclass(frozen=True)

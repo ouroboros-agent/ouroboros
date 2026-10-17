@@ -163,7 +163,7 @@ def _control(text: str) -> dict:
 
 
 async def serve_peer(websocket: WebSocket, hub: LiveCallHub, *, role: str,
-                     skill: str = "", mic: bool = True, speaker: bool = True) -> None:
+                     skill: str = "", mic: bool = True, speaker: bool = True, video: bool = False) -> None:
     """One shared parser/pump keeps owner and companion transport behavior equal."""
     await websocket.accept()
     peer_id = uuid.uuid4().hex
@@ -213,8 +213,11 @@ async def serve_peer(websocket: WebSocket, hub: LiveCallHub, *, role: str,
                 try:
                     frame = cp.decode_frame(event["bytes"])
                 except ValueError:
-                    raise CallPeerError("invalid_audio_frame") from None
-                hub.receive_audio(peer_id, frame)
+                    raise CallPeerError("invalid_call_frame") from None
+                if isinstance(frame, cp.VideoFrame):
+                    hub.receive_video(peer_id, frame)
+                else:
+                    hub.receive_audio(peer_id, frame)
                 continue
             message = _control(event.get("text") or "")
             if sender is None:
@@ -224,8 +227,10 @@ async def serve_peer(websocket: WebSocket, hub: LiveCallHub, *, role: str,
                     raise CallPeerError("peer_role_forbidden")
                 if (message["mic"] and not mic) or (message["speaker"] and not speaker):
                     raise CallPeerError("audio_direction_forbidden")
+                if message.get("video", False) and not video:
+                    raise CallPeerError("video_direction_forbidden")
                 hub.join(cp.PeerInfo(peer_id, role, message["mic"], message["speaker"],
-                                     message.get("label", ""), skill), message["rate"])
+                                     message.get("label", ""), skill, message.get("video", False)), message["rate"])
                 sender = asyncio.create_task(send_pending())
             else:
                 if message["type"] == "hello":
@@ -261,7 +266,7 @@ async def ws_call(websocket: WebSocket) -> None:
     if hub.spec.opened_by != cp.OPENED_BY_OWNER:
         await websocket.close(code=1008, reason="owner_call_required")
         return
-    await serve_peer(websocket, hub, role=cp.PEER_OWNER)
+    await serve_peer(websocket, hub, role=cp.PEER_OWNER, video=True)
 
 
 def call_routes() -> list:

@@ -5,6 +5,7 @@
  */
 export const HEADER_SIZE = 16;
 export const MAX_FRAME_PAYLOAD = 64 * 1024;
+export const MAX_VIDEO_FRAME_PAYLOAD = 512 * 1024;
 export const CAPTURE_MS = 20;
 export const JITTER_MS = 40;
 // Physical memory bound: a provider sends a whole answer many times faster than it plays,
@@ -78,11 +79,32 @@ export function encodeFrame({ kind = 1, epoch = 0, seq = 0, rate, stream = 0, pc
     return buffer;
 }
 
+export function encodeVideoFrame({ epoch = 0, seq = 0, mime, data }) {
+    const format = { 'image/jpeg': 1, 'image/png': 2 }[mime];
+    if (!format || !(data instanceof Uint8Array) || !data.byteLength || data.byteLength > MAX_VIDEO_FRAME_PAYLOAD)
+        throw new Error('Video payload requires JPEG/PNG and at most 512 KiB.');
+    const buffer = new ArrayBuffer(HEADER_SIZE + data.byteLength);
+    const view = new DataView(buffer);
+    view.setUint8(0, 79); view.setUint8(1, 67); view.setUint8(2, 1); view.setUint8(3, 3);
+    view.setUint16(4, epoch, true); view.setUint32(6, seq, true);
+    view.setUint32(10, format, true); view.setUint16(14, 0, true);
+    new Uint8Array(buffer, HEADER_SIZE).set(data);
+    return buffer;
+}
+
 export function decodeFrame(buffer) {
     if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < HEADER_SIZE)
         throw new Error('Audio frame is shorter than its header.');
     const view = new DataView(buffer);
     const bytes = buffer.byteLength - HEADER_SIZE;
+    if (view.getUint8(3) === 3 && view.getUint8(0) === 79 && view.getUint8(1) === 67
+        && view.getUint8(2) === 1 && bytes > 0 && bytes <= MAX_VIDEO_FRAME_PAYLOAD
+        && view.getUint16(14, true) === 0) {
+        const mime = { 1: 'image/jpeg', 2: 'image/png' }[view.getUint32(10, true)];
+        if (!mime) throw new Error('Malformed call video frame.');
+        return { kind: 3, epoch: view.getUint16(4, true), seq: view.getUint32(6, true), mime,
+            data: new Uint8Array(buffer.slice(HEADER_SIZE)) };
+    }
     if (view.getUint8(0) !== 79 || view.getUint8(1) !== 67 || view.getUint8(2) !== 1
         || ![1, 2].includes(view.getUint8(3)) || bytes % 2 || bytes > MAX_FRAME_PAYLOAD)
         throw new Error('Malformed call audio frame.');

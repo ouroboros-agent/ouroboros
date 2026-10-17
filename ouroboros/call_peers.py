@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from array import array
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -119,6 +119,7 @@ class _Peer:
     queued_audio: int = 0  # frames and controls in ``outgoing``, kept so a send never rescans it
     queued_controls: int = 0
     input_seq: int | None = None
+    video_seq: int | None = None
     output_seq: int = 0
     failure: str = ""
 
@@ -131,6 +132,7 @@ class PeerGrant:
     token_digest: str
     mic: bool
     speaker: bool
+    video: bool = False
 
 
 class LiveCallHub(cp.CallHub):
@@ -144,6 +146,8 @@ class LiveCallHub(cp.CallHub):
         self._peers: dict[str, _Peer] = {}
         self._grants: dict[tuple[str, str], PeerGrant] = {}
         self._events: deque = deque()
+        self._video_pending: OrderedDict[str, cp.PeerVideo] = OrderedDict()
+        self._last_video_at = 0.0
         self._audio_limit, self._control_limit = audio_queue_frames, control_queue_messages
         self._output_limit = output_queue_frames
         # The engine's wire rates (Gemini Live's by default) until the driver's engine confirms its own.
@@ -196,10 +200,10 @@ class LiveCallHub(cp.CallHub):
         if self._closed:
             raise CallPeerError("call_closed")
 
-    def grant_peer(self, skill: str, token_digest: str, *, mic: bool, speaker: bool) -> PeerGrant:
+    def grant_peer(self, skill: str, token_digest: str, *, mic: bool, speaker: bool, video: bool = False) -> PeerGrant:
         with self._condition:
             self._live()
-            grant = PeerGrant(skill, token_digest, mic, speaker)
+            grant = PeerGrant(skill, token_digest, mic, speaker, video)
             # Reopening a door cannot widen a previously admitted attachment.
             prior = self._grants.get((skill, token_digest))
             if prior is not None and prior != grant:
@@ -264,6 +268,7 @@ class LiveCallHub(cp.CallHub):
     def leave(self, peer_id: str, reason: str = "") -> None:
         with self._condition:
             if self._peers.pop(peer_id, None) is not None:
+                self._video_pending.pop(peer_id, None)
                 # Reserve MAX_PEERS extra lifecycle slots so a full control queue
                 # can never suppress the disconnect that frees its producer.
                 self._events.append(cp.PeerLeft(peer_id, reason))
@@ -300,6 +305,27 @@ class LiveCallHub(cp.CallHub):
             if excess:
                 del track.samples[:excess]
                 self._counts["input_dropped_samples"] += excess
+            self._condition.notify_all()
+            return True
+
+    def receive_video(self, peer_id: str, frame: cp.VideoFrame) -> bool:
+        from ouroboros.gateways.image_api import sniff_image_mime
+
+        with self._condition:
+            self._live()
+            peer = self._peers[peer_id]
+            if not peer.info.video or not isinstance(frame, cp.VideoFrame):
+                raise CallPeerError("video_direction_forbidden")
+            if (not 0 < len(frame.data) <= cp.MAX_VIDEO_FRAME_PAYLOAD
+                    or sniff_image_mime(frame.data) != frame.mime):
+                raise CallPeerError("invalid_video_frame")
+            delta = (frame.seq - peer.video_seq) & 0xFFFFFFFF if peer.video_seq is not None else 1
+            if frame.epoch != self._epoch or not 0 < delta < 0x80000000:
+                self._counts["stale_frames"] += 1
+                return False
+            peer.video_seq = frame.seq
+            self._video_pending.pop(peer_id, None)
+            self._video_pending[peer_id] = cp.PeerVideo(peer_id, peer.info.role, frame.mime, frame.data)
             self._condition.notify_all()
             return True
 
@@ -343,6 +369,10 @@ class LiveCallHub(cp.CallHub):
             while True:
                 if self._events:
                     return self._events.popleft()
+                now = time.monotonic()
+                if self._video_pending and now - self._last_video_at >= 1.0:
+                    self._last_video_at = now
+                    return self._video_pending.popitem(last=False)[1]
                 audio = self._mix()
                 if audio is not None:
                     return audio
@@ -351,6 +381,8 @@ class LiveCallHub(cp.CallHub):
                     return None
                 buffered = any(t.samples for p in self._peers.values() for t in p.tracks.values())
                 wake_in = max(0, self._mix_at - time.monotonic()) if buffered else remaining
+                if self._video_pending:
+                    wake_in = min(wake_in, max(0, self._last_video_at + 1.0 - time.monotonic()))
                 self._condition.wait(min(remaining, wake_in))
 
     def next_outgoing(self, peer_id: str) -> bytes | str | None:
@@ -407,6 +439,7 @@ class LiveCallHub(cp.CallHub):
                 peer.converter = LinearResampler(self._output_rate, peer.rate)
                 peer.outgoing.appendleft(cp.encode_control({"type": "flush", "epoch": self._epoch}))
                 peer.queued_audio, peer.queued_controls = 0, len(peer.outgoing)
+            self._video_pending.clear()
             return self._epoch
 
     def _broadcast(self, message: dict) -> None:

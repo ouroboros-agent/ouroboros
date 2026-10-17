@@ -99,7 +99,7 @@ async def api_host_call_open(request: Request) -> JSONResponse:
             # An already-open Presence call retains the same transport boundary.
             await _bounded_host_read(ctx, lambda: _binding(ctx, skill, hub.spec.presence_binding_id))
         hub.grant_peer(skill, _token_digest(raw_token), mic=payload.get("mic", True),
-                       speaker=payload.get("speaker", False))
+                       speaker=payload.get("speaker", False), video=payload.get("video", False))
         return JSONResponse({"call_id": call_id, "peer_path": f"/call/{call_id}/peer"})
     except HostServiceAuthError:
         return refusal("call_peer_forbidden", 403)
@@ -129,7 +129,7 @@ async def ws_host_call(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="call_peer_forbidden")
         return
     await serve_peer(websocket, hub, role=cp.PEER_MEETING, skill=skill,
-                     mic=grant.mic, speaker=grant.speaker)
+                     mic=grant.mic, speaker=grant.speaker, video=grant.video)
 
 
 def host_call_routes() -> list:

@@ -19,6 +19,20 @@ def test_audio_frame_round_trips_and_refuses_foreign_bytes():
         cp.encode_frame(cp.AudioFrame(cp.FRAME_AUDIO_OUT, 0, 0, 24000, 0, b"\x00"))  # odd PCM16 length
 
 
+def test_video_frame_has_its_own_bound_and_mime_code():
+    image = b"\xff\xd8\xff" + b"x" * 70001  # larger than the audio frame bound
+    frame = cp.VideoFrame(2, 9, "image/jpeg", image)
+    assert cp.decode_frame(cp.encode_frame(frame)) == frame
+    with pytest.raises(ValueError):
+        cp.encode_frame(cp.VideoFrame(0, 0, "image/jpeg", b"x" * (cp.MAX_VIDEO_FRAME_PAYLOAD + 1)))
+    with pytest.raises(ValueError):
+        cp.encode_frame(cp.VideoFrame(0, 0, "image/webp", image))
+    raw = bytearray(cp.encode_frame(frame))
+    raw[10] = 3  # unsupported MIME code
+    with pytest.raises(ValueError):
+        cp.decode_frame(bytes(raw))
+
+
 def test_control_messages_accept_only_declared_types():
     text = cp.encode_control({"type": "played", "item_id": "it_1", "played_ms": 1200})
     assert cp.decode_control(text) == {"type": "played", "item_id": "it_1", "played_ms": 1200}

@@ -21,18 +21,37 @@ import pytest
 from ouroboros import live_turn
 from ouroboros.call_protocol import (
     STATE_CLOSED, STATE_CLOSING, STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING,
-    CallSpec, PeerAudio, PeerControl, PeerInfo, PeerJoined, PeerLeft,
+    CallSpec, PeerAudio, PeerControl, PeerInfo, PeerJoined, PeerLeft, PeerVideo,
 )
 from ouroboros.gateways.realtime_engine import (
     ENGINE_GOOGLE, SPEAKER_OUROBOROS, SPEAKER_OWNER,
     AudioIn, AudioOut, Caption, Close, ContextItem, EngineError, GoAway, Interrupt, PlayedAudio,
     Ready, ResponseDone, ResponseStarted, ResumeCheckpoint, SpeechStarted, ToolCall, ToolCallCancelled, ToolResult,
-    UpdateTools,
+    UpdateTools, VideoIn,
 )
 from ouroboros.usage_accounting import BudgetExceeded
 
 _END = object()
 OWNER = PeerInfo(peer_id="owner-1", role="owner", mic=True, speaker=True, label="Anton")
+
+
+def test_peer_video_reaches_engine_only_during_live_state():
+    sent = []
+
+    async def send(command):
+        sent.append(command)
+
+    call = SimpleNamespace(state=STATE_CONNECTING, engine=object(), closing=False,
+                           reconnecting=False, _send=send)
+    frame = PeerVideo("owner-1", "owner", "image/jpeg", b"\xff\xd8\xff")
+    asyncio.run(live_turn._LiveCall._on_hub_event(call, frame))
+    assert sent == []
+    call.state = STATE_LIVE
+    asyncio.run(live_turn._LiveCall._on_hub_event(call, frame))
+    assert sent == [VideoIn("image/jpeg", frame.data)]
+    call.reconnecting = True
+    asyncio.run(live_turn._LiveCall._on_hub_event(call, frame))
+    assert len(sent) == 1
 
 
 def _wait_for(predicate, timeout=10.0):

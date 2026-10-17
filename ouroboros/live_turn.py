@@ -1,12 +1,9 @@
 """Live voice-call driver: one realtime engine session is the turn's model round.
 
-A call is an ordinary turn whose model speaks and listens (ARCHITECTURE §6 "Live
-calls"): the agent prepares the text turn's context, this driver opens the engine
-with that fitted system text and the room's Nano tool view (``live_call_route``)
-and pumps until the call ends: peer audio in, engine audio out through the hub,
-captions to peers and chat, runs tools on one serialized worker, drains owner mail
-and room rows, and reopens capped or lost sessions with a history view or resume
-handle. The price quote warms off the audio loop. Stop cancels opening. It returns
+A call is an ordinary turn whose model speaks and listens (ARCHITECTURE §6).
+This driver opens the fitted Nano view, pumps peer input and engine output,
+runs tools on one worker, drains mail and room rows, and reopens lost sessions.
+The price quote warms off the audio loop. Stop cancels opening. It returns
 the loop's triple with a host notice naming the transcript.
 """
 
@@ -26,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import (
     ACTION_RETRY, ACTION_SETTINGS, PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING, STATE_CONNECTING,
-    STATE_LIVE, STATE_RECONNECTING, CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft,
+    STATE_LIVE, STATE_RECONNECTING, CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft, PeerVideo,
 )
 from ouroboros.gateways.realtime_engine import (
     SPEAKER_OUROBOROS, SPEAKER_OWNER, USAGE_KEYS,
@@ -597,7 +594,10 @@ class _LiveCall:
             await self._send(item)
 
     async def _on_hub_event(self, event: Any) -> None:
-        if isinstance(event, PeerAudio):
+        if isinstance(event, PeerVideo):
+            if self.state == STATE_LIVE and self.engine is not None and not self.closing and not self.reconnecting:
+                await self._send(VideoIn(event.mime, event.data))
+        elif isinstance(event, PeerAudio):
             if (self.engine is not None and not self.closing and not self.reconnecting
                     and event.peer_id not in self.muted_peers):
                 rate = self.input_rate

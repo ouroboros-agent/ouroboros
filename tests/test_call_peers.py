@@ -42,6 +42,28 @@ def send(hub, values, peer_id="owner", rate=24000, seq=0, epoch=None, stream=0):
                                                   seq, rate, stream, pcm(values)))
 
 
+def test_video_grant_newest_frame_and_one_frame_per_second():
+    hub = hub_at_24k()
+    image = b"\xff\xd8\xff" + b"pixel"
+    join(hub)
+    frame = cp.VideoFrame(0, 0, "image/jpeg", image)
+    with pytest.raises(CallPeerError, match="video_direction_forbidden"):
+        hub.receive_video("owner", frame)
+    hub.join(cp.PeerInfo("camera", "owner", True, True, video=True), 24000)
+    assert isinstance(hub.next_event(0), cp.PeerJoined)
+    assert hub.receive_video("camera", frame)
+    assert hub.next_event(0) == cp.PeerVideo("camera", "owner", "image/jpeg", image)
+    assert hub.receive_video("camera", cp.VideoFrame(0, 1, "image/jpeg", image + b"old"))
+    assert hub.receive_video("camera", cp.VideoFrame(0, 2, "image/jpeg", image + b"new"))
+    assert hub.next_event(0) is None
+    hub._last_video_at -= 1.0
+    assert hub.next_event(0).data == image + b"new"
+    assert not hub.receive_video("camera", cp.VideoFrame(0, 2, "image/jpeg", image))
+    with pytest.raises(CallPeerError, match="invalid_video_frame"):
+        hub.receive_video("camera", cp.VideoFrame(0, 3, "image/png", image))
+    assert hub.next_event(0) is None
+
+
 @pytest.mark.parametrize("rates", [(48000, 16000), (48000, 24000), (44100, 24000), (32000, 16000)])
 def test_stateful_resampling_chunk_identity_and_round_trip_error(rates):
     source_rate, wire_rate = rates
