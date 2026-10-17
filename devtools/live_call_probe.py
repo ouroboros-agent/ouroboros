@@ -442,10 +442,18 @@ class Probe:
         await self.peer.speak(audio, name)
         if name in ("tool", "chat"):
             tool = "web_search" if name == "tool" else "send_user_message"
-            await self.wait(lambda: any(e["type"] == "ToolResult" and any(
-                c["name"] == tool and c["call_id"] == e["call_id"] for c in self.evidence.of("ToolCall", since))
-                for e in self.evidence.of("command", since)))
-            answer_after = self.evidence.of("command", since)[-1]["at"]
+
+            def ran():
+                return any(e["type"] == "ToolResult" and any(
+                    c["name"] == tool and c["call_id"] == e["call_id"] for c in self.evidence.of("ToolCall", since))
+                    for e in self.evidence.of("command", since))
+
+            def grounded():  # with native search on, Gemini's own Google Search may answer instead
+                return name == "tool" and any((e.get("raw_usage") or {}).get("groundingMetadata")
+                                              for e in self.evidence.of("ResponseDone", since))
+
+            await self.wait(lambda: ran() or grounded())
+            answer_after = self.evidence.of("command", since)[-1]["at"] if ran() else since
         else:
             answer_after = since
         await self.wait(lambda: any(e.get("speaker") == "ouroboros" and e.get("final")
