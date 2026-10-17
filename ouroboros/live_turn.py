@@ -65,14 +65,17 @@ SOURCE_CALL = "call"   # the owner-speech row source (live_awareness skips it)
 
 # Physical/transport bounds, not behaviour: the Stop tick, the ack wait before a
 # spoken row is written as generated, the rejoin grace of an empty room, the
-# reopen attempts per loss, the margin before a provider's session cap and the
+# reopen attempts per loss, how long a session stays up after its setup to count
+# as a working connection, the margin before a provider's session cap and the
 # wait for a running tool batch at close.
 MAILBOX_TICK_S = 0.25
 SPOKEN_ACK_GRACE_S = 10.0
 PEER_GRACE_S = 20.0
 RECONNECT_ATTEMPTS = 3
+SESSION_PROVEN_S = 10.0
 SESSION_CAP_MARGIN_S = 60.0
 BATCH_SETTLE_WAIT_S = 5.0
+PLANNED_HANDOVERS = ("go_away", "session_cap")  # the provider's or the host's own renewals, not losses
 
 # The one next step the owner's surface offers beside a closed call's reason.
 _ACTION_BY_REASON = {
@@ -166,7 +169,9 @@ class _LiveCall:
         self.closing = False
         self.reconnecting = False
         self.reconnects = 0
-        self.unproven_reopens = 0  # unplanned reopens since a session last spoke or heard anything
+        self.unproven_reopens = 0  # sessions in a row that ended, unplanned, before proving themselves
+        self.session_proven = False  # this session heard or said something
+        self.ready_at: Optional[float] = None  # when this session's setup was answered
         self.resume_handle = ""
         # (session epoch, its opening config): the first response's text count becomes the route's
         # density witness unless other text reached the session before it.
@@ -415,6 +420,7 @@ class _LiveCall:
                 log.debug("cancelled engine close failed", exc_info=True)
             raise
         self.engine, self.epoch, self.session_started = engine, self.epoch + 1, time.monotonic()
+        self.session_proven, self.ready_at = False, None
         self.witness = None if resume_handle else (self.epoch, config)
         self.input_ms = 0.0  # a new session counts its input audio from zero
         self.hub.set_engine_rates(self.input_rate, self.output_rate)
@@ -437,12 +443,17 @@ class _LiveCall:
     async def _reconnect(self, reason: str, *, resume: bool) -> None:
         if self.closing or self.reconnecting:
             return
-        if self.unproven_reopens >= RECONNECT_ATTEMPTS:
-            # Sessions that open and die before hearing or saying anything are not a lost connection
-            # to resume again: each reopen is paid, so the call ends with its next step instead.
-            self.failure = ("live_engine_unavailable", f"reopened sessions kept ending ({reason})")
-            self._begin_close("reconnect_failed", detail=f"the session kept ending right after it opened ({reason})")
-            return
+        if reason not in PLANNED_HANDOVERS:  # a planned handover neither proves nor condemns a session
+            # A session that heard or said something, or stayed up a while after its setup, was a
+            # working connection and its loss is resumed. Sessions that keep ending before that are
+            # not a lost connection to resume again: each reopen is paid, so the call ends instead.
+            lived = self.ready_at is not None and time.monotonic() - self.ready_at >= SESSION_PROVEN_S
+            self.unproven_reopens = 0 if self.session_proven or lived else self.unproven_reopens + 1
+            if self.unproven_reopens >= RECONNECT_ATTEMPTS:
+                self.failure = ("live_engine_unavailable", f"reopened sessions kept ending ({reason})")
+                self._begin_close("reconnect_failed",
+                                  detail=f"the session kept ending right after it opened ({reason})")
+                return
         self.reconnecting, self.state = True, STATE_RECONNECTING
         self.hub.send_state(STATE_RECONNECTING, reason)
         old, self.engine = self.engine, None
@@ -460,8 +471,6 @@ class _LiveCall:
             try:
                 await self._open_engine(resume_handle=handle)
                 self.reconnects += 1
-                if reason not in ("go_away", "session_cap"):  # a planned handover proves nothing either way
-                    self.unproven_reopens += 1
                 self.reconnecting = False
                 return
             except Exception:
@@ -641,7 +650,7 @@ class _LiveCall:
 
     async def _on_engine_event(self, event: Any) -> None:
         if isinstance(event, (Caption, ResponseDone)):
-            self.unproven_reopens = 0  # the session heard or said something: it is alive
+            self.session_proven = True  # the session heard or said something: it is alive
         if isinstance(event, AudioOut):
             if event.item_id not in self.cancelled_items:
                 if event.item_id and event.item_id != self.speaking_item:
@@ -688,7 +697,7 @@ class _LiveCall:
             if not self.closing:
                 asyncio.create_task(self._reconnect(f"transport_lost:{event.reason}", resume=True))
         elif isinstance(event, Ready):
-            self.state = STATE_LIVE
+            self.state, self.ready_at = STATE_LIVE, time.monotonic()
             self.hub.send_state(STATE_LIVE)
             effective = dict(event.effective or {})
             if effective.get("input_rate") or effective.get("output_rate"):

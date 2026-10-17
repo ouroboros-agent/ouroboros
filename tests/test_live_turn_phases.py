@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from ouroboros import live_turn
 from ouroboros.call_protocol import STATE_CLOSED, STATE_CONNECTING, STATE_LIVE, PeerAudio
 from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, AudioIn, EngineError, ToolCall
@@ -165,7 +167,7 @@ def test_sessions_that_die_before_answering_end_the_call_instead_of_reopening_fo
     assert _wait_for(lambda: len(h.llm.engines) == 4 and h.llm.engines[3].config is not None)
     h.llm.engines[3].end_stream()
     text, usage, _trace = h.finish()
-    assert len(h.llm.engines) == 4  # two unproven reopens, then no more paid sessions
+    assert len(h.llm.engines) == 4  # two sessions in a row ended unproven: no more paid sessions
     assert usage["live_call"]["ended"] == "reconnect_failed"
     assert any(word[0] == "closed" and "kept ending" in word[1] and word[2] == "retry" for word in h.hub.words)
 
@@ -182,6 +184,43 @@ def test_planned_handovers_never_end_a_quiet_call(harness, monkeypatch):
     h.stop()
     text, usage, _trace = h.finish()
     assert usage["live_call"]["ended"] == "owner_stop" and usage["live_call"]["reconnects"] == 3
+
+
+@pytest.mark.parametrize("proven_after_s, drops, engines, ended",
+                         [(0.0, 4, 5, "owner_stop"), (3600.0, 2, 2, "reconnect_failed")])
+def test_a_quiet_session_that_stayed_up_is_resumed_on_every_drop(harness, monkeypatch, proven_after_s, drops,
+                                                                engines, ended):
+    # Nobody speaks; each session's setup is answered and its connection then drops. A session that
+    # stayed up past SESSION_PROVEN_S was a working connection; one that ends sooner proves nothing.
+    monkeypatch.setattr(live_turn, "RECONNECT_ATTEMPTS", 2)
+    monkeypatch.setattr(live_turn, "SESSION_PROVEN_S", proven_after_s)
+    h = harness()
+    h.start()
+    for dropped in range(drops):
+        assert _wait_for(lambda: sum(state == STATE_LIVE for state, _ in h.hub.states) == dropped + 1)
+        h.llm.engines[-1].end_stream()
+        assert _wait_for(lambda: len(h.llm.engines) == dropped + 2 or h.hub.closed)
+    if ended == "owner_stop":
+        assert _wait_for(lambda: sum(state == STATE_LIVE for state, _ in h.hub.states) == engines)
+        h.stop()
+    text, usage, _trace = h.finish()
+    assert len(h.llm.engines) == engines and usage["live_call"]["ended"] == ended
+
+
+def test_a_planned_handover_neither_spends_nor_clears_the_unplanned_count(harness, monkeypatch):
+    from ouroboros.gateways.realtime_engine import GoAway
+
+    monkeypatch.setattr(live_turn, "RECONNECT_ATTEMPTS", 3)
+    h = harness()
+    h.start()
+    for lost in range(2):  # two sessions in a row end before proving themselves
+        h.llm.engines[-1].end_stream()
+        assert _wait_for(lambda: len(h.llm.engines) == lost + 2 and h.llm.engines[-1].config is not None)
+    h.llm.engines[-1].push(GoAway(time_left_s=5))  # the provider's own handover still opens a session
+    assert _wait_for(lambda: len(h.llm.engines) == 4 and h.llm.engines[-1].config is not None)
+    h.llm.engines[-1].end_stream()  # and the next unproven loss is the third in a row
+    text, usage, _trace = h.finish()
+    assert len(h.llm.engines) == 4 and usage["live_call"]["ended"] == "reconnect_failed"
 
 
 def _density(root):
