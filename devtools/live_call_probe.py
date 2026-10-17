@@ -667,12 +667,13 @@ def copy_data(source: Path, target: Path, *, skipped=DATA_COPY_SKIPPED, prefix: 
     target.mkdir(mode=0o700)
     for entry in sorted(source.iterdir()):
         name = prefix + entry.name
-        if name in skipped:
+        if name in skipped or entry.name.endswith(".lock"):  # a held lock means nothing in a copy
             continue
         if entry.is_dir() and not entry.is_symlink() and any(s.startswith(name + "/") for s in skipped):
             copy_data(entry, target / entry.name, skipped=skipped, prefix=name + "/")
-        else:
-            subprocess.run(["cp", "-c", "-R", str(entry), str(target)], check=True)
+        elif subprocess.run(["cp", "-c", "-R", str(entry), str(target)]).returncode and entry.exists():
+            # A live install keeps writing: an entry that vanished meanwhile is simply not copied.
+            raise RuntimeError(f"could not copy {entry}")
 
 
 def main(argv=None) -> int:
