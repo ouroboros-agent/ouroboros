@@ -230,6 +230,26 @@ def test_gemini_normalizes_reported_video_modality_as_input_tokens():
 
 
 @run_async
+async def test_image_history_replays_in_bounded_order_across_multiple_wire_commands():
+    image = b"\x89PNG\r\n\x1a\n" + bytes(1600000)
+    data = base64.b64encode(image).decode("ascii")
+    row = {"role": "user", "content": [{"type": "text", "text": "two slides"},
+        *({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}} for _ in range(2))]}
+    config = SessionConfig(EngineRoute("google", "gemini-3.8-live"), "instructions",
+                           history=({"role": "user", "content": "before"}, row,
+                                    {"role": "assistant", "content": "after"}))
+    engine, connection, _, collector = await opened("google", config=config)
+    commands = [sent["clientContent"] for sent in connection.sockets[0].sent[1:]]
+    assert len(commands) >= 2
+    assert all(len(json.dumps({"clientContent": command}).encode()) <= 4 * 1024 * 1024 for command in commands)
+    parts = [part for command in commands for turn in command["turns"] for part in turn["parts"]]
+    assert parts[0] == {"text": "before"} and parts[1] == {"text": "two slides"}
+    assert [base64.b64decode(part["inlineData"]["data"]) for part in parts if "inlineData" in part] == [image, image]
+    assert parts[-1] == {"text": "after"}
+    await finished(engine, collector)
+
+
+@run_async
 async def test_gemini_tool_activation_waits_for_result_then_fresh_checkpoint():
     engine, connection, events, collector = await opened("google")
     socket = connection.sockets[0]

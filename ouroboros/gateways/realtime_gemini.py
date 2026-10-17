@@ -24,7 +24,7 @@ from ouroboros.gateways.realtime_engine import (
 from ouroboros.gateways.realtime_engine import GOOGLE_INPUT_RATE as INPUT_RATE, GOOGLE_OUTPUT_RATE as OUTPUT_RATE
 from ouroboros.gateways.realtime_transport import (
     EVENT_QUEUE_SIZE, LiveEngineRefusal, RealtimeTransport, check_audio, check_video,
-    function_schemas, image_part, provider_sentence, transport_error,
+    function_schemas, image_part, provider_sentence, transport_error, wire_text,
 )
 
 
@@ -121,6 +121,43 @@ def history_turn(row):
     return {"role": "model" if role in ("assistant", "model") else "user", "parts": parts}
 
 
+def history_messages(rows):
+    """Replay in order under the wire bound, splitting a multi-image turn if needed."""
+    def payload(turns):
+        return {"clientContent": {"turns": turns, "turnComplete": False}}
+
+    pending = []
+    for row in rows:
+        turn = history_turn(row)
+        try:
+            wire_text(payload([*pending, turn]))
+        except LiveEngineRefusal as exc:
+            if exc.code != "wire_size":
+                raise
+            if pending:
+                yield payload(pending)
+                pending = []
+            parts = []
+            for part in turn["parts"]:
+                piece = {"role": turn["role"], "parts": [*parts, part]}
+                try:
+                    wire_text(payload([piece]))
+                except LiveEngineRefusal as part_exc:
+                    if part_exc.code != "wire_size" or not parts:
+                        raise
+                    yield payload([{"role": turn["role"], "parts": parts}])
+                    parts = [part]
+                    wire_text(payload([{"role": turn["role"], "parts": parts}]))
+                else:
+                    parts.append(part)
+            if parts:
+                pending = [{"role": turn["role"], "parts": parts}]
+        else:
+            pending.append(turn)
+    if pending:
+        yield payload(pending)
+
+
 class GeminiLiveEngine(RealtimeTransport):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -146,8 +183,8 @@ class GeminiLiveEngine(RealtimeTransport):
             raise LiveEngineRefusal("route", "Gemini requires a google live route.")
         setup_message(config)  # Refuse malformed tools before a socket is opened.
         if not config.resume_handle:
-            for row in config.history:
-                history_turn(row)
+            for _ in history_messages(config.history):
+                pass
         self._begin(config)
         try:
             await self._connect_session()
@@ -268,8 +305,8 @@ class GeminiLiveEngine(RealtimeTransport):
     async def _handle_message(self, message):
         if "setupComplete" in message:
             if self._initial_setup and not self._config.resume_handle and self._config.history:
-                await self._write({"clientContent": {"turns": [history_turn(row) for row in self._config.history],
-                                                     "turnComplete": False}})
+                for payload in history_messages(self._config.history):
+                    await self._write(payload)
             self._ready.set()
             if self._initial_setup:
                 self._initial_setup = False
