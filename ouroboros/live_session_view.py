@@ -1,13 +1,16 @@
-"""What a live session is opened with: its compression watermarks and the call rows it replays.
+"""What a live session is opened with: its compression watermarks and the call so far it carries.
 
 Pure functions over the call's route fact, its fitted messages and tool schemas, so the
 driver (``live_turn``) stays the lifecycle and these physical numbers are testable alone.
 The numbers are window physics, never judgment: the route's input limit less one spoken
 reply is the room a session has; the call view takes its share and the conversation the rest.
-A fresh session leaves its own speech one audio span (``CALL_AUDIO_SPAN_TOKENS``, at most half
-of the room) and replays the call so far as text in the rest: every row whole while it fits,
-then the oldest tool results, tool arguments and images shortened to a line, and only then the
-oldest rows named by count (``live_call_state`` renews the session before its audio outgrows it).
+A fresh session leaves its own speech one audio span (the route's held audio or
+``CALL_AUDIO_SPAN_TOKENS``, at most half of the room) and carries the call so far as text in
+the rest: every row whole while it fits, then the oldest tool results, tool arguments and images
+shortened to a line, and only then the oldest rows named by count (``live_call_state`` renews
+the session before its audio outgrows it). That text rides in the session's system instruction
+(``with_call_so_far``): Gemini Live drops a spoken session's oldest turns minutes into a call,
+whatever its window and compression settings say, and keeps only its system instruction.
 """
 
 from __future__ import annotations
@@ -53,10 +56,12 @@ def compression_watermarks(fact: Any, instructions: str, tool_schemas: Sequence[
 
 
 def audio_reserve(fact: Any, instructions: str, tool_schemas: Sequence[Mapping], ratio: float = 1.0) -> int:
-    """What a fresh session leaves for its own speech: the call's audio span, at most half of the room."""
+    """What a fresh session leaves for its own speech: the audio the route holds before it drops turns
+    (the call's audio span when that was never seen), at most half of the room."""
     if fact is None:
         return 0
-    return min(CALL_AUDIO_SPAN_TOKENS, max(0, _room(fact) - _view_tokens(instructions, tool_schemas, ratio)) // 2)
+    span = min(CALL_AUDIO_SPAN_TOKENS, int(getattr(fact, "held_audio_tokens", 0) or CALL_AUDIO_SPAN_TOKENS))
+    return min(span, max(0, _room(fact) - _view_tokens(instructions, tool_schemas, ratio)) // 2)
 
 
 def renewal_bounds(fact: Any, instructions: str, tool_schemas: Sequence[Mapping],
@@ -94,7 +99,7 @@ def history_rows(messages: Sequence[Mapping]) -> List[Dict[str, Any]]:
             item = {"role": role, "content": f"{text}\n[{len(images)} image(s) of this row cannot be replayed in history]"}
         else:
             item = {"role": role, "content": text}
-        for key in ("tool_calls", "tool_call_id", "name"):
+        for key in ("tool_calls", "tool_call_id", "name", "_context_source"):  # the source names a context row
             if msg.get(key):
                 item[key] = msg[key]
         rows.append(item)
@@ -174,6 +179,42 @@ def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[
     if len(kept) < len(rows):
         kept.insert(0, _omission_notice(len(rows) - len(kept)))
     return tuple(kept)
+
+
+# The heading of the call so far in a session's system instruction.
+CALL_SO_FAR_HEADING = "## This call so far"
+
+
+def _transcript_line(row: Mapping) -> str:
+    """One row of the call so far as a line: who spoke, or the bracketed name a context row carries."""
+    role, text = str(row.get("role") or ""), text_of(row.get("content")).strip()
+    if images_of(row.get("content")):
+        text = f"{text} [image shown here; replayed after this instruction]".strip()
+    if role == "assistant":
+        calls = [f"Ouroboros called {(call.get('function') or {}).get('name', '')} "
+                 f"{(call.get('function') or {}).get('arguments', '')}".rstrip() for call in row.get("tool_calls") or ()]
+        return "\n".join(part for part in (f"Ouroboros: {text}" if text else "", *calls) if part)
+    if role == "tool":
+        return f"Tool result ({row.get('name') or row.get('tool_call_id') or 'tool'}): {text}"
+    if not text or text.startswith("["):
+        return text
+    return f"[{row['_context_source']}] {text}" if row.get("_context_source") else f"Owner: {text}"
+
+
+def with_call_so_far(instructions: str, history: Sequence[Mapping]) -> Tuple[str, Tuple[Dict[str, Any], ...]]:
+    """The session's system instruction with the call so far, and the rows still replayed as turns.
+
+    The provider keeps a spoken session's system instruction and drops its oldest turns (measured
+    on Gemini Live 2026-10-18), so the call's transcript rides there; only a user row that still
+    carries images is replayed as a turn, since its pixels cannot be written into an instruction.
+    """
+    lines = [line for line in (_transcript_line(row) for row in history) if line]
+    if not lines:
+        return instructions, ()
+    block = (f"{CALL_SO_FAR_HEADING}\n\nWhat was said and done in this call before this session, oldest first; "
+             "this session's own turns continue it.\n\n" + "\n".join(lines))
+    images = tuple(row for row in history if row.get("role") == "user" and images_of(row.get("content")))
+    return (f"{instructions}\n\n{block}" if instructions else block), images
 
 
 def text_estimate(instructions: str, history: Sequence[Mapping], tool_schemas: Sequence[Mapping]) -> int:

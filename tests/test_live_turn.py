@@ -364,12 +364,13 @@ def test_the_session_opens_with_the_fitted_instructions_and_the_nano_view(harnes
     h = harness()
     engine = h.start()
     config = engine.config
-    assert config.instructions == "You are Ouroboros, on a call."
+    # The call so far rides in the instruction, which the provider keeps; no history turns.
+    assert config.instructions.startswith("You are Ouroboros, on a call.\n\n## This call so far")
     # The registry's Nano view, then the call's own hang-up.
     assert [schema["function"]["name"] for schema in config.tools] == ["knowledge_read", "web_search", "enable_tools", "end_call"]
     assert config.route.engine == ENGINE_GOOGLE and config.route.model == "gemini-3.8-live" and config.route.voice == "Kore"
     assert config.native_search is True and config.resume_handle == ""  # Gemini's own search: on by default
-    assert config.history == ({"role": "user", "content": "[Live call] A live voice call is open in this room."},)
+    assert config.instructions.endswith("\n[Live call] A live voice call is open in this room.") and config.history == ()
     assert h.llm.routes[0].engine == ENGINE_GOOGLE
     assert _wait_for(lambda: (STATE_LIVE, "") in h.hub.states)
     assert h.hub.states[0] == (STATE_CONNECTING, "") and h.hub.rates == (16000, 24000)
@@ -733,11 +734,11 @@ def test_a_lost_session_reopens_with_history_and_never_re_executes_a_tool(harnes
     second = h.engine()
     assert (STATE_RECONNECTING, "stream_ended") in h.hub.states and h.hub.states[-1] == (STATE_LIVE, "")
     assert h.ledger.abandoned == [("r2", "stream_ended")]
-    history = second.config.history
-    assert history[1] == {"role": "user", "content": "look it up"}
-    assert history[2]["role"] == "assistant" and history[2]["tool_calls"][0]["id"] == "c1"
-    assert history[3] == {"role": "tool", "content": "result of web_search", "tool_call_id": "c1", "name": "web_search"}
-    assert second.config.resume_handle == ""
+    # The call so far returns as text in the instruction: the tool call is a line, never an effect.
+    lines = second.config.instructions.split("\n")
+    assert lines.index("Owner: look it up") < lines.index("Ouroboros called web_search {}") < lines.index(
+        "Tool result (web_search): result of web_search")
+    assert second.config.history == () and second.config.resume_handle == ""
     second.push(ToolCall(call_id="c1", name="web_search", arguments="{}"))  # the provider asks again
     assert _wait_for(lambda: second.sent_of(ToolResult))
     assert second.sent_of(ToolResult)[0].output == "result of web_search" and h.batches == [["c1"]]
@@ -761,7 +762,7 @@ def test_go_away_at_a_completed_turn_renews_the_session_with_the_call_as_text(ha
     second = h.engine()
     # Nothing was open: the goodbye renews the session fresh, the owner's words return as text,
     # and the owner's surface is not told the call is reconnecting.
-    assert second.config.resume_handle == "" and any("73" in str(row["content"]) for row in second.config.history)
+    assert second.config.resume_handle == "" and "Owner: Remember the number 73" in second.config.instructions
     assert first.closed == ["go_away"] and (STATE_RECONNECTING, "go_away") not in h.hub.states
     h.stop()
     h.finish()
@@ -776,6 +777,7 @@ def test_go_away_mid_answer_resumes_with_the_providers_handle_by_its_deadline(ha
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
     second = h.engine()
     assert second.config.resume_handle == "resume-7" and second.config.history == ()
+    assert "## This call so far" not in second.config.instructions  # a resumed session already holds its call
     assert (STATE_RECONNECTING, "go_away") in h.hub.states
     h.stop()
     h.finish()

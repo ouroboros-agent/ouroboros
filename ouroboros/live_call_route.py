@@ -85,14 +85,21 @@ class RouteFact:
     # How many of the route's tokens one chars/4 estimate token costs until the route's own witness
     # exists (a first call, or a witness past its freshness): measured, conservative, never 1.0 by default.
     cold_density: float = 1.0
+    # The most audio a spoken session was seen to hold before the provider dropped its oldest turns
+    # (0 = never seen): the renewal's audio span starts here and a call's own drops lower it.
+    held_audio_tokens: int = 0
 
 
 REALTIME_ROUTE_FACTS: Dict[Tuple[str, str], RouteFact] = {
     # Window and output maximum from the model page (also models.list); the cold density from Gemini's
     # own TEXT counts of a Russian-and-English memory view: 1.19-1.22 per estimate token (2026-10-16).
+    # The held audio was measured 2026-10-18: four spoken sessions under an owner-scale call view
+    # (about 92k text tokens) dropped every turn but the last exchange once they held 2.5-2.9k audio
+    # tokens (two to three minutes of talk), with and without compression settings; a 7k view held 7k;
+    # text-only turns held 116k with nothing dropped. The system instruction was never dropped.
     (ENGINE_GOOGLE, "gemini-3.8-live"): RouteFact(
         131_072, 65_536, None, "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live", "2026-10-16",
-        cold_density=1.25),
+        cold_density=1.25, held_audio_tokens=2_500),
 }
 EVIDENCE_SOURCE_DOCUMENTED = "documented_route_fact"   # the evidence store's source label for these rows
 

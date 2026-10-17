@@ -18,7 +18,8 @@ from ouroboros.gateways.realtime_engine import (
 )
 from ouroboros.live_call_route import CALL_AUDIO_SPAN_TOKENS
 from ouroboros.live_session_view import (
-    SHORT_ROW_CHARS, _view_tokens, audio_reserve, history_rows, history_view, mark_spoken,
+    CALL_SO_FAR_HEADING, SHORT_ROW_CHARS, _view_tokens, audio_reserve, history_rows, history_view, mark_spoken,
+    with_call_so_far,
 )
 from tests import test_live_turn as base
 from tests.test_live_turn import _wait_for
@@ -28,8 +29,8 @@ harness = base.harness  # the same fixture, registered in this module
 SPAN_REACHED = {"text_input_tokens": 4_000, "audio_input_tokens": CALL_AUDIO_SPAN_TOKENS}
 
 
-def _fact(room: int) -> SimpleNamespace:
-    return SimpleNamespace(window_tokens=8_192 + room, reply_allowance_tokens=8_192)
+def _fact(room: int, held: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(window_tokens=8_192 + room, reply_allowance_tokens=8_192, held_audio_tokens=held)
 
 
 def _utterances(count: int, words: int = 90):
@@ -44,6 +45,34 @@ def test_a_fresh_session_leaves_one_audio_span_for_its_own_speech_and_at_most_ha
     small = _fact(10_000)
     assert audio_reserve(small, "v", []) == (10_000 - _view_tokens("v", [])) // 2  # a small room keeps half and half
     assert audio_reserve(None, "v", []) == 0
+
+
+def test_the_audio_a_route_holds_before_it_drops_turns_is_the_fresh_sessions_span():
+    assert audio_reserve(_fact(100_000, held=2_500), "v", []) == 2_500  # measured: renew before the drop
+    assert audio_reserve(_fact(100_000), "v", []) == CALL_AUDIO_SPAN_TOKENS  # never seen: the call's span
+    assert audio_reserve(_fact(100_000, held=90_000), "v", []) == CALL_AUDIO_SPAN_TOKENS  # the span stays the ceiling
+
+
+def test_the_call_so_far_rides_in_the_instruction_and_only_pixels_are_replayed_as_turns():
+    image = {"role": "user", "content": [{"type": "text", "text": "this slide"},
+                                         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}
+    rows = history_rows([{"role": "system", "content": "v"},
+                         {"role": "user", "content": "[Live call] A live voice call is open in this room."},
+                         {"role": "user", "content": "Remember 4721"},
+                         {"role": "assistant", "content": "Noted."},
+                         {"role": "assistant", "content": "", "tool_calls": [
+                             {"id": "c1", "type": "function", "function": {"name": "web_search", "arguments": '{"q": "x"}'}}]},
+                         {"role": "tool", "tool_call_id": "c1", "name": "web_search", "content": "found x"},
+                         {"role": "user", "content": "slide 3 is on screen", "_context_source": "peer:owner:screen"},
+                         image])
+    instructions, turns = with_call_so_far("You are Ouroboros.", rows)
+    head, block = instructions.split(f"\n\n{CALL_SO_FAR_HEADING}\n\n")
+    assert head == "You are Ouroboros." and block.split("\n\n", 1)[1].split("\n") == [
+        "[Live call] A live voice call is open in this room.", "Owner: Remember 4721", "Ouroboros: Noted.",
+        'Ouroboros called web_search {"q": "x"}', "Tool result (web_search): found x",
+        "[peer:owner:screen] slide 3 is on screen", "Owner: this slide [image shown here; replayed after this instruction]"]
+    assert turns == (rows[-1],) and turns[0]["content"][1]["type"] == "image_url"  # the pixels still reach the session
+    assert with_call_so_far("You are Ouroboros.", ()) == ("You are Ouroboros.", ())  # nothing yet: the view alone
 
 
 def test_a_long_call_replays_whole_where_half_the_room_would_have_cut_it():
@@ -117,6 +146,33 @@ def test_a_renewal_is_due_for_the_audio_span_the_window_or_the_providers_goodbye
     assert renewal.due() == "go_away"
 
 
+def test_the_audio_span_renews_a_turn_before_the_next_one_would_cross_it():
+    call, renewal = _renewal()
+    call.messages.append({"role": "user", "content": "hello"})
+    renewal.observe({"text_input_tokens": 30_000, "audio_input_tokens": 4_000})
+    renewal.observe({"text_input_tokens": 30_100, "audio_input_tokens": 7_000})  # 3k of audio in one turn
+    assert renewal.due() == ""  # 7k + 3k stays under the 12k span
+    renewal.observe({"text_input_tokens": 30_200, "audio_input_tokens": 9_500})
+    assert renewal.due() == "audio_span"  # 9.5k + 3k would cross it: renew now, at this completed turn
+
+
+def test_a_provider_that_drops_turns_renews_the_session_and_lowers_the_calls_span():
+    call, renewal = _renewal()
+    call.messages.append({"role": "user", "content": "the order is 4721"})
+    renewal.observe({"text_input_tokens": 30_000, "audio_input_tokens": 1_500})
+    renewal.observe({"text_input_tokens": 30_300, "audio_input_tokens": 2_700})
+    assert renewal.due() == "" and renewal.drops == 0  # held audio only grew: nothing was dropped
+    renewal.observe({"text_input_tokens": 29_850, "audio_input_tokens": 760})  # the provider forgot the call
+    assert renewal.due() == "dropped" and renewal.drops == 1 and renewal.held_at_drop == 2_700 and renewal.span == 2_700
+    renewal.reset((50_000, 12_000))  # the next session renews before it holds what this one held
+    assert renewal.span == 2_700 and not renewal.dropped and renewal.due() == ""
+    renewal.observe({"text_input_tokens": 30_000, "audio_input_tokens": 2_000})
+    renewal.observe({"text_input_tokens": 30_000, "audio_input_tokens": 1_000})  # a later drop lowers it further
+    assert renewal.held_at_drop == 2_000 and renewal.drops == 2
+    renewal.reset((50_000, 1_500))
+    assert renewal.span == 1_500  # a smaller span of the route's own still wins
+
+
 def test_a_session_with_nothing_new_since_it_opened_is_not_renewed():
     call, renewal = _renewal()
     renewal.observe({"text_input_tokens": 49_000, "audio_input_tokens": 12_000})
@@ -162,11 +218,29 @@ def test_a_session_is_renewed_at_a_completed_turn_once_its_audio_reaches_the_spa
     _answer(first, "a1")
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
     second = h.engine()
-    assert second.config.resume_handle == "" and any("73" in str(row["content"]) for row in second.config.history)
+    assert second.config.resume_handle == "" and "Owner: The number is 73" in second.config.instructions
     assert first.closed == ["handover"] and not any(state == STATE_RECONNECTING for state, _ in h.hub.states)
     h.stop()
     text, usage, _trace = h.finish()
     assert usage["live_call"]["reconnects"] == 1 and usage["live_call"]["ended"] == "owner_stop"
+
+
+def test_a_drop_in_the_providers_counts_renews_the_session_with_the_call_in_its_instruction(harness):
+    h = harness()
+    first = h.start()
+    first.push(Caption(speaker=SPEAKER_OWNER, text="The order is 4721", final=True, item_id="u1"))
+    _answer(first, "a1", usage={"text_input_tokens": 4_000, "audio_input_tokens": 900})
+    first.push(Caption(speaker=SPEAKER_OWNER, text="Tell me about GPS", final=True, item_id="u2"))
+    time.sleep(0.4)
+    assert len(h.llm.engines) == 1  # nothing dropped, nothing near a bound: the session goes on
+    _answer(first, "a2", usage={"text_input_tokens": 3_900, "audio_input_tokens": 300})  # the provider forgot u1
+    assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
+    second = h.engine()
+    assert "Owner: The order is 4721" in second.config.instructions and second.config.history == ()
+    assert first.closed == ["handover"] and not any(state == STATE_RECONNECTING for state, _ in h.hub.states)
+    h.stop()
+    _text, usage, _trace = h.finish()
+    assert usage["live_call"]["provider_drops"] == 1 and usage["live_call"]["reconnects"] == 1
 
 
 def test_no_renewal_while_ouroboros_is_still_heard_and_one_once_it_was(harness):
@@ -242,7 +316,7 @@ def test_a_fresh_session_forgets_its_predecessors_resume_handle(harness):
     h.llm.engines[1].end_stream()  # lost before the fresh session sent a checkpoint of its own
     assert _wait_for(lambda: len(h.llm.engines) == 3 and h.llm.engines[2].config is not None)
     third = h.llm.engines[2]
-    assert third.config.resume_handle == "" and third.config.history  # never the first session's handle
+    assert third.config.resume_handle == "" and "Owner: Hello" in third.config.instructions  # never the first handle
     h.stop()
     h.finish()
 

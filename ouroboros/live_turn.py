@@ -41,7 +41,7 @@ from ouroboros.live_call_route import (call_local_schemas, call_minutes_ceiling,
 from ouroboros.live_call_state import Acks, SessionRenewal, Spoken, narration_meta
 from ouroboros.live_session_view import (
     calibration_ratio, compression_watermarks, history_view, mark_spoken, record_density_witness, renewal_bounds,
-    text_estimate,
+    text_estimate, with_call_so_far,
 )
 from ouroboros.live_tool_batch import ToolBatchWorker, text_of
 from ouroboros.usage_accounting import BudgetExceeded
@@ -337,6 +337,7 @@ class _LiveCall:
             "terminal_origin": TERMINAL_ORIGIN_HOST_NOTICE,
             "live_call": {"call_id": self.spec.call_id, "engine": self.spec.engine, "model": self.spec.model,
                           "ended": reason, "minutes": minutes, "reconnects": self.reconnects,
+                          "provider_drops": self.renewal.drops,
                           "tool_calls": self.tools_lane.tool_calls, "batches": self.tools_lane.batches, **self.counts},
         })
         label = self.spec.label or self.spec.call_id
@@ -355,6 +356,7 @@ class _LiveCall:
 
     def _session_config(self, *, history: Tuple[Dict[str, Any], ...] = (), resume_handle: str = "") -> SessionConfig:
         instructions = text_of(self.messages[0].get("content")) if self.messages and self.messages[0].get("role") == "system" else ""
+        instructions, history = with_call_so_far(instructions, history)  # kept where the provider drops no turns
         compress_at, compress_to = compression_watermarks(self.route.fact, instructions, self.tool_schemas,
                                                           calibration_ratio(self.ctx))
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=(*self.tool_schemas, *call_local_schemas(self.spec)),

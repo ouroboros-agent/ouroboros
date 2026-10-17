@@ -4,11 +4,14 @@ The records are the driver's (``live_turn``): what Ouroboros said and how much o
 played, and the acknowledgements a delivery boundary owes. The renewal is the session's own
 lifecycle at completed turns. A Gemini Live session holds every spoken turn as audio, the
 densest and dearest part of its context, and each answer re-bills all of it (no prompt cache);
-its provider compression only slides the oldest turns out. So the host renews the session at a
-completed turn: the call's earlier speech returns as text (``live_session_view.history_view``)
-and the newest stretch stays audio, a sawtooth audio horizon. A renewal is due when the held
-audio reaches the call's audio span, when the measured prompt would reach the sliding window on
-the next turn, or when the provider says goodbye (``GoAway``); with no completed turn before the
+the provider also drops a spoken session's oldest turns minutes into a call, whatever its window
+and compression settings say (``live_call_route``: the route's held audio). So the host renews
+the session at a completed turn: the call so far returns as text in the session's system
+instruction, which the provider keeps (``live_session_view``), and the newest stretch stays
+audio, a sawtooth audio horizon. A renewal is due when the next turn would take the held audio
+past the call's audio span, when the measured prompt would reach the window on the next turn,
+when the provider's counts show it dropped turns (the audio it held then lowers this call's
+span), or when the provider says goodbye (``GoAway``); with no completed turn before the
 goodbye's own deadline the session resumes with the provider's handle, as a transport loss
 does. These are window and price physics, never judgment. The owner's audio heard while a
 session renews waits in a bounded backlog and reaches the next session.
@@ -17,10 +20,13 @@ session renews waits in a bounded backlog and reaches the next session.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 # Physical bounds: how long before a goodbye's deadline the renewal still waits for a completed
 # turn, and how much of the owner's audio one renewal's gap carries to the next session.
@@ -65,22 +71,36 @@ class SessionRenewal:
         self.call = call
         self.backlog: Deque[Tuple[Any, float]] = deque()
         self.backlog_ms = 0.0
+        self.held_at_drop = 0  # the least audio a session of this call held before the provider dropped turns
+        self.drops = 0         # how often the provider dropped a session's turns in this call
         self.reset((0, 0))
 
     def reset(self, bounds: Tuple[int, int]) -> None:
-        """A new session holds nothing yet; ``bounds`` is its ``(room, audio span)`` in provider tokens."""
-        self.room, self.span = bounds
+        """A new session holds nothing yet; ``bounds`` is its ``(room, audio span)`` in provider tokens,
+        the span no larger than what this call's sessions held before a drop."""
+        self.room, span = bounds
+        self.span = min(span, self.held_at_drop) if span and self.held_at_drop else (span or self.held_at_drop)
         self.rows_at_open = len(getattr(self.call, "messages", None) or ())  # what this session was opened with
-        self.held_audio = self.held_prompt = self.growth = 0
+        self.held_audio = self.held_prompt = self.growth = self.audio_growth = 0
+        self.dropped = False
         self.go_away_by: Optional[float] = None
         self.owner_speaking = False
 
     def observe(self, usage: Mapping[str, Any]) -> None:
-        """One answer's prompt counts what the session holds; its growth bounds the next turn's."""
+        """One answer's prompt counts what the session holds; its growth bounds the next turn's. Held
+        audio only grows while the provider keeps the session's turns, so a smaller count is a drop."""
         prompt = sum(int(usage.get(key) or 0) for key in HELD_INPUT_KEYS)
-        if self.held_prompt:
+        audio = int(usage.get("audio_input_tokens") or 0)
+        if self.held_audio and audio < self.held_audio:
+            self.dropped, self.drops = True, self.drops + 1
+            self.held_at_drop = min(self.held_at_drop, self.held_audio) if self.held_at_drop else self.held_audio
+            self.span = min(self.span, self.held_at_drop) if self.span else self.held_at_drop
+            log.info("live call %s: the provider dropped earlier turns after holding %s audio tokens",
+                     getattr(getattr(self.call, "spec", None), "call_id", ""), self.held_audio)
+        elif self.held_prompt:
             self.growth = max(self.growth, prompt - self.held_prompt)
-        self.held_prompt, self.held_audio = prompt, int(usage.get("audio_input_tokens") or 0)
+            self.audio_growth = max(self.audio_growth, audio - self.held_audio)
+        self.held_prompt, self.held_audio = prompt, audio
 
     def owner_caption(self, text: str, final: bool) -> None:
         self.owner_speaking = bool(str(text or "").strip()) and not final
@@ -93,7 +113,9 @@ class SessionRenewal:
             return "go_away"
         if len(self.call.messages) <= self.rows_at_open:
             return ""  # nothing was said since this session opened: a renewal would replay the same text
-        if self.span and self.held_audio >= self.span:
+        if self.dropped:
+            return "dropped"  # the provider forgot turns: the next session carries them as text
+        if self.span and self.held_audio and self.held_audio + self.audio_growth >= self.span:
             return "audio_span"
         if self.room and self.held_prompt and self.held_prompt + self.growth >= self.room:
             return "window"

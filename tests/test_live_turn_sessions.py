@@ -64,12 +64,14 @@ def test_pixels_a_tool_viewed_ride_on_that_calls_result(harness):
     engine.push(ToolCall("plain-2", "web_search", "{}"))
     assert _wait_for(lambda: len(engine.sent_of(ToolResult)) == 2)
     assert engine.sent_of(ToolResult)[1].images == ()
-    # A reopened session gets the image on the user row of its history view, never dropped.
+    # A reopened session gets the image on the user row of its history view, never dropped: the
+    # pixels as the one replayed turn, its words in the call so far with the rest of the call.
     engine.end_stream()
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.engine().config is not None)
     history = h.engine().config.history
     image_rows = [row for row in history if isinstance(row["content"], list)]
-    assert len(image_rows) == 1 and image_rows[0]["content"][1]["type"] == "image_url"
+    assert len(image_rows) == 1 and image_rows[0]["content"][1]["type"] == "image_url" and len(history) == 1
+    assert "[Image attached: pixel.png] [image shown here; replayed after this instruction]" in h.engine().config.instructions
     h.stop()
     h.finish()
 
@@ -173,9 +175,9 @@ def test_what_the_room_said_is_part_of_the_transcript_a_reopened_session_replays
     assert _wait_for(lambda: any(c.text == "slide 3 is on screen" for c in engine.sent_of(ContextItem)))
     engine.push(GoAway(time_left_s=30))
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.engine().config is not None)
-    history = h.engine().config.history
-    assert any(phrase in str(row["content"]) for row in history)
-    assert any(row["content"] == "slide 3 is on screen" for row in history)
+    instructions = h.engine().config.instructions
+    assert phrase in instructions and "Owner: The meeting" not in instructions  # the room's row, as the room wrote it
+    assert "[peer:owner:screen] slide 3 is on screen" in instructions  # context, named by its source
     # Replayed in history, delivered once: the second session is not sent them again as items.
     time.sleep(0.3)
     assert not any(phrase in c.text for c in h.engine().sent_of(ContextItem))
@@ -332,8 +334,8 @@ def test_joins_leaves_and_context_while_connecting_wait_for_the_live_session(har
     h.hub.control("context", text="seen before the session opened", source="screen")
     h.hub.feed(PeerAudio(peer_id="owner-1", role="owner", pcm=b"\x01" * 20))  # transient: not queued
     assert _wait_for(lambda: any(m.get("_context_source") == "peer:owner:screen" for m in h.messages))
-    assert engine.sent == [] and engine.config.history == (
-        {"role": "user", "content": "[Live call] A live voice call is open in this room."},)
+    assert engine.sent == [] and engine.config.history == ()
+    assert engine.config.instructions.endswith("\n[Live call] A live voice call is open in this room.")
     engine._loop.call_soon_threadsafe(engine.release_open.set)
     assert _wait_for(lambda: engine.sent_of(ContextItem))
     assert engine.sent_of(ContextItem) == [ContextItem(text="seen before the session opened", source="peer:owner:screen")]
