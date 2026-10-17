@@ -87,7 +87,7 @@ proof.
 `prompts/SYSTEM.md` is tier-0 for every Main and task profile in every context mode and
 competes with the task for context. It carries identity and tone, the decision loop,
 cross-tool policy, prohibitions and safety invariants stated once, and the memory
-contract's resident rule: active summaries stay in the index, archived sources remain
+contract's resident rule: active summaries stay in the whole index (people's in its outline too), archived sources remain
 addressable and explicitly listable (ARCHITECTURE §6 "Durable memory and project focus").
 A missing carrier stays a visible gap. Load-bearing floor rules stay in its preamble, the part
 overflow compaction keeps (ARCHITECTURE §6 "Context fitting, retry, and compaction").
