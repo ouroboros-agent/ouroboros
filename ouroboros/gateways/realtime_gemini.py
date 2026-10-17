@@ -19,11 +19,11 @@ from uuid import uuid4
 from ouroboros.gateways.realtime_engine import (
     AudioIn, AudioOut, Caption, ContextItem, EngineError, GoAway, Interrupt, Ready,
     ResponseDone, ResponseStarted, ResumeCheckpoint, SpeechStarted, ToolCall,
-    ToolCallCancelled, ToolResult, ToolsApplied, UpdateTools, USAGE_KEYS, register_engine,
+    ToolCallCancelled, ToolResult, ToolsApplied, UpdateTools, USAGE_KEYS, VideoIn, register_engine,
 )
 from ouroboros.gateways.realtime_engine import GOOGLE_INPUT_RATE as INPUT_RATE, GOOGLE_OUTPUT_RATE as OUTPUT_RATE
 from ouroboros.gateways.realtime_transport import (
-    EVENT_QUEUE_SIZE, LiveEngineRefusal, RealtimeTransport, check_audio,
+    EVENT_QUEUE_SIZE, LiveEngineRefusal, RealtimeTransport, check_audio, check_video,
     function_schemas, image_part, provider_sentence, transport_error,
 )
 
@@ -195,6 +195,10 @@ class GeminiLiveEngine(RealtimeTransport):
             check_audio(command, INPUT_RATE)
             await self._write({"realtimeInput": {"audio": {
                 "mimeType": f"audio/pcm;rate={INPUT_RATE}", "data": base64.b64encode(command.pcm).decode("ascii")}}})
+        elif isinstance(command, VideoIn):
+            check_video(command)
+            await self._write({"realtimeInput": {"video": {
+                "mimeType": command.mime, "data": base64.b64encode(command.data).decode("ascii")}}})
         elif isinstance(command, ContextItem):
             if self._item_id:
                 if len(self._context) >= EVENT_QUEUE_SIZE:

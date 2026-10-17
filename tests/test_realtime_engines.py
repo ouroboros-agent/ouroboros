@@ -4,6 +4,7 @@ import asyncio
 import base64
 import functools
 import json
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ from ouroboros.gateways.realtime_engine import (
     AudioIn, AudioOut, Caption, Close, Closed, ContextItem, EngineError, EngineRoute,
     GoAway, Interrupt, PlayedAudio, Ready, ResponseDone, ResponseStarted, ResumeCheckpoint,
     SessionConfig, ToolCallCancelled,
-    ToolResult, ToolsApplied, UpdateTools, USAGE_KEYS,
+    ToolResult, ToolsApplied, UpdateTools, USAGE_KEYS, VideoIn,
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal, transport_error
 
@@ -199,6 +200,26 @@ async def test_session_configuration_audio_limits_and_history(provider, rate):
     await engine.send(PlayedAudio("played-item", 100))
     assert len(socket.sent) == before
     assert connection.options[0][1]["logger"].disabled
+    await finished(engine, collector)
+
+
+@run_async
+async def test_gemini_vision_uses_documented_realtime_video_blob_and_checks_bytes():
+    image = b"\x89PNG\r\n\x1a\n" + b"pixels"
+    command = VideoIn("image/png", image)
+    with pytest.raises(FrozenInstanceError):
+        command.mime = "image/jpeg"
+    engine, connection, _, collector = await opened("google")
+    socket = connection.sockets[0]
+    await engine.send(command)
+    assert socket.sent[-1] == {"realtimeInput": {"video": {
+        "mimeType": "image/png", "data": base64.b64encode(image).decode("ascii")}}}
+    before = len(socket.sent)
+    for bad in (VideoIn("image/jpeg", image), VideoIn("image/png", b"not a png"),
+                VideoIn("image/png", image + bytes(2 * 1024 * 1024))):
+        with pytest.raises(LiveEngineRefusal):
+            await engine.send(bad)
+    assert len(socket.sent) == before
     await finished(engine, collector)
 
 

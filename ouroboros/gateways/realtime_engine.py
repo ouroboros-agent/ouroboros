@@ -93,6 +93,12 @@ class AudioIn:
 
 
 @dataclass(frozen=True)
+class VideoIn:
+    mime: str
+    data: bytes
+
+
+@dataclass(frozen=True)
 class ContextItem:
     """Text the session should know: typed owner words, another turn's reply,
     a task result, a peer-observed fact. ``source`` names its provenance in the
@@ -135,7 +141,7 @@ class Close:
     reason: str
 
 
-EngineCommand = Union[AudioIn, ContextItem, ToolResult, UpdateTools, PlayedAudio, Interrupt, Close]
+EngineCommand = Union[AudioIn, VideoIn, ContextItem, ToolResult, UpdateTools, PlayedAudio, Interrupt, Close]
 
 
 # ---- events: engine -> driver ---------------------------------------------------

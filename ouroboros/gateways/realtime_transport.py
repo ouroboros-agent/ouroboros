@@ -20,6 +20,7 @@ from ouroboros.net_transport import trust_ssl_context
 EVENT_QUEUE_SIZE = 128
 MAX_WIRE_BYTES = 4 * 1024 * 1024
 MAX_AUDIO_BYTES = 64 * 1024
+MAX_VIDEO_BYTES = 2 * 1024 * 1024  # base64 plus JSON stays below MAX_WIRE_BYTES
 
 
 class LiveEngineRefusal(ValueError):
@@ -78,6 +79,15 @@ def check_audio(command, rate: int) -> None:
         raise LiveEngineRefusal("audio_rate", f"This live route requires PCM16 mono at {rate} Hz.")
     if len(command.pcm) % 2 or len(command.pcm) > MAX_AUDIO_BYTES:
         raise LiveEngineRefusal("audio_size", "PCM16 audio must contain whole samples and fit 64 KiB.")
+
+
+def check_video(command) -> None:
+    from ouroboros.gateways.image_api import sniff_image_mime
+
+    if command.mime not in ("image/jpeg", "image/png") or sniff_image_mime(command.data) != command.mime:
+        raise LiveEngineRefusal("video_format", "Live vision requires JPEG or PNG bytes matching their MIME type.")
+    if not command.data or len(command.data) > MAX_VIDEO_BYTES:
+        raise LiveEngineRefusal("video_size", "Live vision frames must fit 2 MiB.")
 
 
 def function_schemas(tools):
