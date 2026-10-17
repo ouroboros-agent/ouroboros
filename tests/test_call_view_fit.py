@@ -100,6 +100,16 @@ def test_every_operative_section_enters_in_that_form_from_the_first_open(tmp_pat
     assert health.full_text in _system(turn) and runtime.full_text in _system(turn)
 
 
+def test_under_window_pressure_a_text_turn_relocates_service_blocks_and_keeps_its_stable_blocks(tmp_path):
+    health, runtime, world = _service("health_invariants"), _service("runtime"), _service("world")
+    core = _core(tmp_path, dynamic=[health, runtime], semi=[world])
+    window = 65_536 + 4_000  # Main's reserve plus less than any one block whole
+    turn = _text_turn(core, window=window)
+    assert set(_addressed(turn)) & {"health_invariants", "runtime"}  # the window asked the host floor
+    assert "world" not in _addressed(turn) and world.full_text in _system(turn)  # a text turn's stable block stays
+    assert "world" in _addressed(_call(core, window=window))  # a call addresses it from its first request
+
+
 def test_the_other_live_rooms_keep_names_and_state_and_their_notes_are_one_read_away(tmp_path):
     snapshot = _snapshot()
     call, turn = _call(_core(tmp_path, snapshot=snapshot)), _text_turn(_core(tmp_path, snapshot=snapshot))

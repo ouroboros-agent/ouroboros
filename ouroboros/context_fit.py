@@ -896,9 +896,12 @@ def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...
                 non_memory_tokens=original_fixed, kept=None if kept is None else kept.get(shown))
         from ouroboros.context_budget import context_mode_limits
 
-        governed = tuple(part for part in _parts_of(governance[form[mode]][0]) if isinstance(part, HostSection))
+        # A text turn's floor holds the host service blocks; a call also addresses its stable blocks (the
+        # book maps, WORLD, the subagent catalog), whose operative views its window needs from the start.
+        stable = (*core.semi_stable_sections, *(part for part in _parts_of(governance[form[mode]][0])
+                                                if isinstance(part, HostSection))) if call_view else ()
         addressed[mode], host_facts[mode] = fit_host_sections(
-            (*core.dynamic_sections, *core.dynamic_head_sections, *core.semi_stable_sections, *extra, *governed),
+            (*core.dynamic_sections, *core.dynamic_head_sections, *stable, *extra),
             root=core.section_root, task_id=core.section_task_id,
             measure=lambda overrides: measure(overrides, story, room), window_tokens=window_tokens,
             known_window=known_window, output_reserve=context_mode_limits(mode, preferred, output_reserve)[1],
