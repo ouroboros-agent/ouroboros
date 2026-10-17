@@ -315,18 +315,27 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             expect(state).to_have_text("Listening")
             page.wait_for_function("count => __callTest.frames.length > count", arg=count)
 
-            # Keyboard: the field returns with the visual docked; Send sends typed words as an ordinary turn.
-            expect(room.locator(".call-keyboard")).to_be_visible()
-            room.locator(".call-keyboard").click()
+            # Keyboard: the field returns between the docked visual and the call's controls; End and the
+            # way back to voice stay in the row (the owner lost both once); typed words go as an ordinary turn.
+            toggle = room.locator(".call-keyboard")
+            expect(toggle).to_be_visible()
+            expect(toggle).to_have_attribute("aria-label", "Type while talking")
+            toggle.click()
             expect(field).to_be_visible()
             expect(field).to_be_focused()
             expect(send).to_have_text("Send")
             assert room.locator(".call-wave").is_visible()
+            expect(room.locator(".call-end")).to_be_visible()
+            expect(room.locator(".call-mute")).to_be_visible()
+            expect(toggle).to_have_attribute("aria-label", "Back to voice")
+            expect(state).to_be_hidden()
             page.keyboard.press("Enter")  # empty: nothing
             assert admissions[-1]["client_message_id"] and len(admissions) == 1
             _shot(page, f"{engine}-dark-1280-keyboard")
-            room.locator(".call-visual-return").click()
+            toggle.click()
+            expect(state).to_have_text("Listening")
             expect(room.locator(".call-end")).to_be_visible()
+            expect(toggle).to_have_attribute("aria-label", "Type while talking")
 
             # Panic or Restart pressed and then cancelled keeps the call: only a confirmed stop ends it.
             for command in ("panic", "restart"):
@@ -387,6 +396,17 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 _no_sideways_scroll(page, f"phone {scheme}")
                 expect(room.locator(".call-keyboard")).to_be_visible()  # typing stays one press away on a phone
                 _shot(page, f"{engine}-{scheme}-390-listening")
+                # A phone's keyboard view keeps End and the way back; Mute waits in the voice view.
+                room.locator(".call-keyboard").click()
+                expect(room.locator(".call-end")).to_be_visible()
+                expect(room.locator(".call-mute")).to_be_hidden()
+                expect(field).to_be_visible()
+                field_width = page.evaluate(f"document.querySelector('{ROOM} #chat-input').getBoundingClientRect().width")
+                assert field_width >= 120, f"the phone's field keeps room to type: {field_width}px"
+                _no_sideways_scroll(page, f"phone keyboard {scheme}")
+                _shot(page, f"{engine}-{scheme}-390-keyboard")
+                room.locator(".call-keyboard").click()
+                expect(state).to_have_text("Listening")
                 page.evaluate("__callTest.speak(0.4)")
                 _caption(page, "owner", f"item_phone_{scheme}", "Hi again")
                 expect(room.locator(".call-sub")).to_have_text("You’re speaking")

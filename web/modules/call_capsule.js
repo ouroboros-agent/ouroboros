@@ -1,7 +1,8 @@
 /** The composer face of a call. With nothing to send, the Send capsule reads Talk; a press (never
  * Enter) starts the call. During a call the text row keeps its footprint and becomes the live
- * capsule: the visual and the state, Mute, Keyboard, End. Keyboard brings the field back with the
- * visual docked, and what is typed goes as an ordinary turn. When Talk cannot work, or a call
+ * capsule: the visual and the state, Mute, Keyboard, End. Keyboard brings the field back between
+ * the docked visual and the call's controls; End and the way back to voice never leave, and what is
+ * typed goes as an ordinary turn. When Talk cannot work, or a call
  * ends with something to say, a sheet takes the capsule's place with the words and one next step.
  * Every word the owner reads is chosen here from the session's facts (`callPresentation`). Calls
  * have one engine, Google's Gemini Live.
@@ -9,6 +10,12 @@
 import { fmt, tx } from './i18n.js';
 
 const KEYBOARD = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></svg>';
+// The same button in the keyboard view: back to the call's voice.
+const VOICE = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg>';
+const TOGGLE = {
+    keyboard: { icon: KEYBOARD, label: 'Type while talking' },
+    voice: { icon: VOICE, label: 'Back to voice' },
+};
 const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone'];
 
 // Why a call reconnects, beside "Reconnecting…".
@@ -174,13 +181,12 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     capsule.className = 'call-capsule';
     capsule.hidden = true;
     capsule.innerHTML = `<span class="call-visual"></span>
-        <button type="button" class="call-visual-return" aria-label="Show call controls" title="Show call controls"></button>
         <span class="call-words" role="status" aria-live="polite"><span class="call-state"></span><span class="call-sub"></span><span class="call-small"></span></span>
         <span class="call-buttons">
             <button type="button" class="call-btn call-action"></button>
             <button type="button" class="call-btn call-action"></button>
             <button type="button" class="call-btn call-mute" aria-pressed="false">Mute</button>
-            <button type="button" class="call-btn call-keyboard" aria-pressed="false" aria-label="Type while talking" title="Type while talking">${KEYBOARD}</button>
+            <button type="button" class="call-btn call-keyboard"></button>
             <button type="button" class="call-btn call-end">End</button>
             <button type="button" class="call-btn call-close">Close</button>
         </span>`;
@@ -257,8 +263,11 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     on('.call-mute', () => mute());
     on('.call-end', () => end());
     on('.call-close', () => { note = null; dismiss(); });
-    on('.call-keyboard', () => { keyboard = true; render(); field.focus({ preventScroll: true }); });
-    on('.call-visual-return', () => { keyboard = false; render(); $('.call-keyboard').focus({ preventScroll: true }); });
+    on('.call-keyboard', () => {
+        keyboard = !keyboard;
+        render();
+        if (keyboard) field.focus({ preventScroll: true });
+    });
     actions.forEach((button, index) => button.addEventListener('click', () => {
         const action = presented.actions?.[index];
         if (action) void act(action);
@@ -301,8 +310,15 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         setWords(words.small, presented.small || '', true);
         $('.call-mute').hidden = sheet;
         $('.call-mute').setAttribute('aria-pressed', String(Boolean(current.muted)));
-        $('.call-keyboard').hidden = sheet;
-        $('.call-keyboard').setAttribute('aria-pressed', String(keyboard));
+        const toggle = $('.call-keyboard');
+        toggle.hidden = sheet;
+        const face = keyboard ? 'voice' : 'keyboard';
+        if (toggle.dataset.face !== face) {
+            toggle.dataset.face = face;
+            toggle.innerHTML = TOGGLE[face].icon;
+            toggle.setAttribute('aria-label', TOGGLE[face].label);
+            toggle.title = TOGGLE[face].label;
+        }
         $('.call-end').hidden = sheet;
         $('.call-close').hidden = !sheet;
         actions.forEach((button, index) => {
