@@ -93,7 +93,7 @@ def test_a_provider_refusal_ends_the_call_with_its_own_words(harness):
     engine.push(EngineError(kind="invalid_request", message=words, retryable=False, provider_words=words))
     text, usage, _trace = h.finish()
     assert usage["live_call"]["ended"] == "invalid_request" and words in text
-    assert ("closed", words, "retry") in h.hub.words
+    assert ("closed", words, "") in h.hub.words  # no Try again: the same setup would be refused the same way
 
 
 def test_a_fresh_session_replays_the_newest_rows_that_fit_and_names_the_rest(harness):
@@ -285,6 +285,26 @@ def test_sessions_whose_connect_fails_silently_are_retried_with_a_wait_and_then_
     assert len(h.llm.engines) == 3 and usage["live_call"]["ended"] == "reconnect_failed"
     assert waits == [0.0371, 0.0742]  # each reopen after a session that proved nothing waits longer
     assert not any(state == STATE_LIVE for state, _ in h.hub.states)
+
+
+def test_a_working_session_clears_the_count_whatever_ends_it(harness, monkeypatch):
+    from ouroboros.gateways.realtime_engine import Caption, GoAway
+
+    monkeypatch.setattr(live_turn, "RECONNECT_ATTEMPTS", 3)
+    monkeypatch.setattr(live_turn, "RECONNECT_BACKOFF_S", 0.01)
+    h = harness()
+    h.start()
+    for lost in range(2):  # two sessions in a row end before proving themselves
+        h.llm.engines[-1].end_stream()
+        assert _wait_for(lambda: len(h.llm.engines) == lost + 2 and h.llm.engines[-1].config is not None)
+    h.llm.engines[-1].push(Caption(speaker="owner", text="Hello", final=True, item_id="o1"))  # this one works
+    h.llm.engines[-1].push(GoAway(time_left_s=5))
+    assert _wait_for(lambda: len(h.llm.engines) == 4 and h.llm.engines[-1].config is not None)
+    h.llm.engines[-1].end_stream()  # the first unproven loss after a working session is resumed
+    assert _wait_for(lambda: len(h.llm.engines) == 5 and h.llm.engines[-1].config is not None)
+    h.stop()
+    text, usage, _trace = h.finish()
+    assert usage["live_call"]["ended"] == "owner_stop"
 
 
 def test_a_planned_handover_neither_spends_nor_clears_the_unplanned_count(harness, monkeypatch):

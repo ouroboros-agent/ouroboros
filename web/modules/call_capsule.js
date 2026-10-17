@@ -45,7 +45,7 @@ const ENDINGS = {
     reconnect_failed: UNREACHABLE,
     preparation_failed: NOT_STARTED,
     call_not_started: NOT_STARTED,
-    invalid_request: REFUSED,
+    invalid_request: { words: REFUSED.words, bare: REFUSED.bare },  // a refused setup: the same call would repeat it
     protocol: REFUSED,
     provider_error: REFUSED,
     backpressure: { words: 'The call fell behind the voice stream', action: 'retry' },

@@ -72,7 +72,7 @@ PLANNED_HANDOVERS = ("go_away", "session_cap")  # the provider's or the host's o
 _ACTION_BY_REASON = {
     "missing_credential": ACTION_SETTINGS, "authentication": ACTION_SETTINGS, "engine_refused": ACTION_SETTINGS,
     "rate_limit": ACTION_RETRY, "provider_closed": ACTION_RETRY, "provider_error": ACTION_RETRY,
-    "invalid_request": ACTION_RETRY, "protocol": ACTION_RETRY, "backpressure": ACTION_RETRY,
+    "protocol": ACTION_RETRY, "backpressure": ACTION_RETRY,  # a refused request: the same call would repeat it
     "engine_unavailable": ACTION_RETRY, "reconnect_failed": ACTION_RETRY,
 }
 
@@ -434,15 +434,15 @@ class _LiveCall:
     async def _reconnect(self, reason: str, *, resume: bool) -> None:
         if self.closing or self.reconnecting:
             return
-        if reason not in PLANNED_HANDOVERS:  # a planned handover neither proves nor condemns a session
-            # A session that heard or said something, or stayed up a while after its setup, was working;
-            # sessions that keep ending before that are not a loss to resume: each reopen is paid.
-            lived = self.ready_at is not None and time.monotonic() - self.ready_at >= SESSION_PROVEN_S
-            self.unproven_reopens = 0 if self.session_proven or lived else self.unproven_reopens + 1
+        # A session that heard or said something, or stayed up after its setup, was working, whatever ends it;
+        lived = self.ready_at is not None and time.monotonic() - self.ready_at >= SESSION_PROVEN_S
+        if self.session_proven or lived:
+            self.unproven_reopens = 0
+        elif reason not in PLANNED_HANDOVERS:  # an unproven session's planned handover changes no count
+            self.unproven_reopens += 1
             if self.unproven_reopens >= RECONNECT_ATTEMPTS:
                 self.failure = ("live_engine_unavailable", f"reopened sessions kept ending ({reason})")
-                self._begin_close("reconnect_failed",
-                                  detail=f"the session kept ending right after it opened ({reason})")
+                self._begin_close("reconnect_failed", detail=f"the session kept ending right after it opened ({reason})")
                 return
         self.reconnecting, self.state = True, STATE_RECONNECTING
         self.hub.send_state(STATE_RECONNECTING, reason)

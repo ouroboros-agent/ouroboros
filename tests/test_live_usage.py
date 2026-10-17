@@ -20,6 +20,7 @@ def live_root(catalog_fixture, monkeypatch):  # noqa: F811
 
 
 def reserve(root, *, warm=True, **values):
+    # The ledger is engine-agnostic; this catalog row is the fixture's one tariff pricing every modality.
     args = dict(engine="openai", model="gpt-realtime-2.1", call_id="call-1", response_key="response-1",
                 task_id="call-task", rendered_mode="nano", drive_root=root)
     args.update(values)

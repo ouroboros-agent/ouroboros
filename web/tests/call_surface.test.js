@@ -60,8 +60,9 @@ test('each ending says what happened and offers its one next step', () => {
     assert.deepEqual(show(ended('preparation_failed')), ['The call could not start; the room has the details', ['Try again'], 'error']);
     assert.deepEqual(show(ended('call_not_started')), ['The call could not start; the room has the details', ['Try again'], 'error']);
     for (const code of ['invalid_request', 'protocol', 'provider_error']) {
-        assert.deepEqual(show(ended(code, { detail: 'Bad config.' })), ['Google refused the call: “Bad config.”', ['Try again'], 'error'], code);
-        assert.deepEqual(show(ended(code)), ['Google refused the call', ['Try again'], 'error'], code);
+        const again = code === 'invalid_request' ? [] : ['Try again'];  // a refused setup would only repeat
+        assert.deepEqual(show(ended(code, { detail: 'Bad config.' })), ['Google refused the call: “Bad config.”', again, 'error'], code);
+        assert.deepEqual(show(ended(code)), ['Google refused the call', again, 'error'], code);
     }
     // The host's own refusals are the host's words, never framed as Google's.
     assert.deepEqual(show(ended('engine_refused', { detail: 'A live route requires the provider’s model ID.' })),
