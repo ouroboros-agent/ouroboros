@@ -150,8 +150,10 @@ def test_macos_bundle_declares_microphone_and_signed_audio_entitlement():
     info = next(k.value for k in bundle.keywords if k.arg == "info_plist")
     fields = {ast.literal_eval(k): v for k, v in zip(info.keys, info.values)}
     assert "microphone" in ast.literal_eval(fields["NSMicrophoneUsageDescription"]).lower()
+    assert "camera" in ast.literal_eval(fields["NSCameraUsageDescription"]).lower()
     entitlements = plistlib.loads((ROOT / "entitlements.plist").read_bytes())
     assert entitlements["com.apple.security.device.audio-input"] is True
+    assert entitlements["com.apple.security.device.camera"] is True
 
 
 def test_launcher_keeps_display_probe_alias_and_origin_bound_hook():

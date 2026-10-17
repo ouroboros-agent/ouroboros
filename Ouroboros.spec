@@ -205,6 +205,7 @@ if _is_macos:
             'CFBundleVersion': open('VERSION').read().strip(),
             'NSHighResolutionCapable': True,
             'NSMicrophoneUsageDescription': 'Ouroboros uses your microphone when you start a live call.',
+            'NSCameraUsageDescription': 'Ouroboros uses your camera when you turn it on during a live call.',
             'LSMinimumSystemVersion': '12.0',
         },
     )
