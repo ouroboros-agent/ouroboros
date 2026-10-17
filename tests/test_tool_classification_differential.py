@@ -418,6 +418,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     # Same contract shape as the VLM family: rate limit is a soft window
     # (text lane unaffected), unknown outcome and provider failure are errors.
     "IMAGE_RATE_LIMITED": (True, "unavailable"),
+    # A live call's own notice when the realtime transport refuses a tool's result
+    # (live_turn._refused_tool_result): the realtime model hears it; the text loop's
+    # classifier never sees it and reads the bare marker as an ordinary warning.
+    "TOOL_RESULT_REFUSED": (False, "ok"),
     "IMAGE_OUTCOME_UNKNOWN": (True, "error"),
     "IMAGE_NOT_DISPATCHED": (True, "unavailable"),
     "IMAGE_PROVIDER_REJECTED": (True, "error"),

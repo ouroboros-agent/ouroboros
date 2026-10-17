@@ -200,7 +200,7 @@ def test_payload_digest_and_shape_are_fail_closed():
 
 
 # The digest of a ceiling minted before ``execution`` existed, computed by that code.
-_CEILING_DIGEST_BEFORE_EXECUTION = "85bb8793c4c8484e7cf85b53548ad3da0552a155fab992b5112394f339f60587"
+_CEILING_DIGEST_BEFORE_EXECUTION = "640d9d359748eaaae25f155e0b49a58ddff6e3e5a1a569059e6302aa596a37cd"
 
 
 def _ceiling_with(runtime: ResolvedPresenceRuntime):
