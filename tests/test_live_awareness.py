@@ -260,6 +260,8 @@ def test_handle_call_direct_admits_a_census_turn_of_kind_call(monkeypatch, tmp_p
     assert entered.wait(10)
     task = seen[0]
     assert task["_is_direct_chat"] is True and task["chat_id"] == 1 and task["text"].startswith("[Live call]")
+    # Gemini's own recognition took Russian for German and Polish in a real call: the call is told so.
+    assert "Speech recognition can take one language for another" in task["text"]
     assert CallSpec.from_metadata(task["metadata"]["live_call"]) == spec
     release.set()
     assert _wait_for(lambda: finished == [(receipt["task_id"], True)])

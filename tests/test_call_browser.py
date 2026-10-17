@@ -152,6 +152,9 @@ def _no_sideways_scroll(page, label: str) -> None:
         .map(el => [el.className, el.scrollWidth, el.clientWidth]).concat([['document', document.documentElement.scrollWidth, window.innerWidth]])""")
     for name, scroll, client in widths:
         assert scroll <= client, (label, name, scroll, client)
+    # The text field never scrolls sideways either: Safari drew a bar under it at a sub-pixel width.
+    overflow = page.evaluate(f"() => getComputedStyle(document.querySelector('{ROOM} #chat-input')).overflowX")
+    assert overflow == "hidden", (label, overflow)
 
 
 def _admissions(page, admissions, refusal=None):
@@ -258,6 +261,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.wait_for_function("parseFloat(getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
                                    ".getPropertyValue('--call-mic')) > 0.3")
             _shot(page, f"{engine}-dark-1280-owner")
+            assert page.evaluate(f"() => getComputedStyle(document.querySelector('{ROOM} .call-aura')).overflow") == "visible"
             _caption(page, "owner", "item_owner_1", " is six times seven?")
             _caption(page, "owner", "item_owner_1", "Hello, Ouroboros. How much is six times seven?", final=True)
             page.evaluate("__callTest.speak(0)")
@@ -349,6 +353,9 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.wait_for_function("parseFloat(getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
                                    ".getPropertyValue('--call-mic')) > 0.3")
             _shot(page, f"{engine}-light-1280-owner")
+            # On white the glow stays inside the capsule's outline; in the dark room it spills just around it.
+            aura = f"getComputedStyle(document.querySelector('{ROOM} .call-aura')).overflow"
+            assert page.evaluate(f"() => {aura}") == "hidden"
             page.evaluate("__callTest.speak(0)")
             _caption(page, "owner", "item_owner_2", "And eight times nine?", final=True)
             expect(state).to_have_text("Thinking")

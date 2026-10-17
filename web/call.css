@@ -552,6 +552,12 @@
     display: none;
 }
 
+/* On white, light spilling past the capsule reads as a stain on the room: there the glow stays
+   inside the capsule's own outline, seen through its glass. */
+:root[data-theme="light"] .call-aura {
+    overflow: hidden;
+}
+
 .call-aura i {
     position: absolute;
     inset: 2px 6px;
