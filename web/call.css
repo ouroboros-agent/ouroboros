@@ -52,6 +52,9 @@
     display: none;
 }
 
+/* The capsule keeps the row's footprint: as tall as the field's one line (style.css #chat-input: the
+   section size at line-height 1.45 with 5 px above and below), so a call starting or the keyboard
+   view opening never changes the composer's height. */
 .call-capsule {
     position: relative;
     display: flex;
@@ -59,7 +62,7 @@
     gap: var(--space-2);
     flex: 1 1 auto;
     min-width: 0;
-    min-height: var(--composer-control-height);
+    min-height: max(var(--composer-control-height), calc(var(--type-section) * 1.45 + 10px));
 }
 
 .call-capsule[hidden],

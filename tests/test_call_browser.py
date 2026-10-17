@@ -216,6 +216,8 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             expect(send).to_have_text("Talk")
             _no_sideways_scroll(page, "idle")
             _shot(page, f"{engine}-dark-1280-idle")
+            # The composer's one-line height, which a call keeps (DESIGN.md principle 6).
+            idle_row_height = page.evaluate(f"document.querySelector('{ROOM} .chat-text-row').getBoundingClientRect().height")
 
             # The phases a call reports, each in words; nothing claims a connection that is not happening.
             page.evaluate("__callTest.holdMedia = true")
@@ -400,6 +402,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 # and the composer keeps its height (the placeholder stays one line).
                 row_height = f"document.querySelector('{ROOM} .chat-text-row').getBoundingClientRect().height"
                 voice_height = page.evaluate(row_height)
+                assert abs(voice_height - idle_row_height) <= 1, ("a call keeps the composer's height", idle_row_height, voice_height)
                 room.locator(".call-keyboard").click()
                 expect(field).to_have_attribute("placeholder", "Message…")
                 assert abs(page.evaluate(row_height) - voice_height) <= 1, (voice_height, page.evaluate(row_height))
