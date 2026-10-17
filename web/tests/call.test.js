@@ -308,7 +308,7 @@ test('admission refusals keep the server code and words; a call asks for no engi
     } finally { refused.session.stop(); }
     const plain = fixture();
     try {
-        await plain.session.start({ engine: 'openai' });
+        await plain.session.start({ engine: 'a-removed-engine' });  // a stale caller cannot choose an engine
         assert.deepEqual(Object.keys(plain.requests[0]).sort(), ['chat_id', 'client_message_id']);
     } finally { plain.session.stop(); }
 });

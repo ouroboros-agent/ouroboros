@@ -138,8 +138,8 @@ function ending(view) {
 }
 
 /** Who is talking, from the captions and the light. Thinking runs from the owner's final words to
- * the first heard answer; an answer whose item is already named (an engine that transcribes the
- * owner only after answering) leaves no thinking behind it. */
+ * the first heard answer; an answer whose item is already named (Gemini can finish the owner's
+ * caption after its answer began) leaves no thinking behind it. */
 export function createTalkFacts() {
     const facts = { ownerSpeaking: false, thinking: false, answered: false };
     return {

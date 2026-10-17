@@ -135,17 +135,17 @@ test('thinking runs from the owner\'s final words to the first heard answer, on 
     assert.equal(gemini.facts.thinking, true);
     gemini.heard(true);
     assert.deepEqual(gemini.facts, { ownerSpeaking: false, thinking: false, answered: true });
-    // OpenAI: the owner is transcribed only after the answer began; no thinking after the answer.
-    const openai = createTalkFacts();
-    openai.voice();
-    openai.caption({ speaker: 'ouroboros', text: '', final: false });
-    openai.caption({ speaker: 'ouroboros', text: 'Forty-two.', final: true });
-    openai.caption({ speaker: 'owner', text: 'What is six times seven?', final: true });
-    assert.equal(openai.facts.thinking, false);
+    // The owner's final words can land after the answer began (Gemini's, observed live): no thinking after it.
+    const late = createTalkFacts();
+    late.voice();
+    late.caption({ speaker: 'ouroboros', text: '', final: false });
+    late.caption({ speaker: 'ouroboros', text: 'Forty-two.', final: true });
+    late.caption({ speaker: 'owner', text: 'What is six times seven?', final: true });
+    assert.equal(late.facts.thinking, false);
     // The next question starts a new answer.
-    openai.voice();
-    openai.caption({ speaker: 'owner', text: 'And eight times nine?', final: true });
-    assert.equal(openai.facts.thinking, true);
+    late.voice();
+    late.caption({ speaker: 'owner', text: 'And eight times nine?', final: true });
+    assert.equal(late.facts.thinking, true);
     // Words heard over the answer, or no words at all, are no question.
     const heardNow = createTalkFacts();
     heardNow.caption({ speaker: 'owner', text: 'mm', final: true }, true);
