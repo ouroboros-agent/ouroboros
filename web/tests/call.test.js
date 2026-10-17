@@ -90,6 +90,10 @@ test('vision controls expose browser capture and explain unsupported shells', ()
     const linux = { ...env, pywebview: { api: {} }, navigator: { ...env.navigator, userAgent: 'Linux' } };
     assert.equal(visionAvailability(linux).screen, false);
     assert.match(visionAvailability(linux).reason, /Linux desktop app/);
+    delete linux.pywebview;
+    assert.equal(visionAvailability(linux).screen, true);
+    linux.pywebview = { api: {} };  // the shell bridge arrives after the page loads
+    assert.equal(visionAvailability(linux).screen, false);
     assert.equal(visionAvailability({ ...env, navigator: { mediaDevices: { getUserMedia() {} } } }).screen, false);
 });
 

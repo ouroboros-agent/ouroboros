@@ -336,15 +336,17 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         setWords(words.small, presented.small || '', true);
         $('.call-mute').hidden = sheet;
         $('.call-mute').setAttribute('aria-pressed', String(Boolean(current.muted)));
+        const availableVision = typeof vision === 'function' ? vision() : vision;
         for (const [kind, selector, label] of [['screen', '.call-screen', 'Show screen'], ['camera', '.call-camera', 'Camera']]) {
             const button = $(selector), help = $(`${selector}-help`);
-            button.hidden = sheet || !vision[kind];
+            button.hidden = sheet || !availableVision[kind];
             button.disabled = current.state !== 'live' && current.sharing !== kind;
             button.setAttribute('aria-pressed', String(current.sharing === kind));
             button.title = current.sharing === kind ? `Stop ${kind === 'screen' ? 'screen sharing' : 'camera'}` : label;
-            help.hidden = sheet || Boolean(vision[kind]) || (kind === 'camera' && !vision.screen);
-            help.title = help.getAttribute('aria-label') || vision.reason || `${label} is unavailable here.`;
-            help.setAttribute('aria-label', vision.reason || `${label} is unavailable here.`);
+            help.hidden = sheet || Boolean(availableVision[kind]) || (kind === 'camera' && !availableVision.screen);
+            const why = availableVision[`${kind}Reason`] || availableVision.reason || `${label} is unavailable here.`;
+            help.title = why;
+            help.setAttribute('aria-label', why);
         }
         typingPlaceholder(keyboard && !sheet);
         const toggle = $('.call-keyboard');

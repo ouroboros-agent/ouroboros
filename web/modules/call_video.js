@@ -17,7 +17,8 @@ export function visionAvailability(env = globalThis) {
     if (shell) return { screen: false, camera: false, reason: 'Video sharing is unavailable in the Linux desktop app. Open this room in a browser.' };
     return { screen: typeof media?.getDisplayMedia === 'function',
         camera: typeof media?.getUserMedia === 'function',
-        reason: 'Screen sharing is unavailable in this browser. Open this room in a browser with screen capture.' };
+        reason: 'Screen sharing is unavailable in this browser. Open this room in a browser with screen capture.',
+        cameraReason: 'Camera sharing is unavailable in this browser.' };
 }
 
 function changedEnough(previous, next) {
@@ -53,7 +54,7 @@ export class CallVision {
         if (this.kind === kind) { this.stop(); return; }
         this.stop();
         const available = visionAvailability(this.env);
-        if (!available[kind]) { this.error = available.reason; this.notify(); return; }
+        if (!available[kind]) { this.error = available[`${kind}Reason`] || available.reason; this.notify(); return; }
         const token = this.token;
         let stream;
         try {

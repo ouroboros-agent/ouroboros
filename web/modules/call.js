@@ -344,7 +344,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         talk: () => session.start(),
         mute: () => session.setMuted(!session.muted),
         shareScreen: () => session.toggleVision('screen'), camera: () => session.toggleVision('camera'),
-        vision: visionAvailability(env),
+        vision: () => visionAvailability(env),
         end: () => session.end(),
         dismiss: () => session.dismiss(),
         act: action => act(action) });
@@ -379,6 +379,8 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     // reload leaves the page (pagehide). A press the owner then cancels keeps the call.
     const end = () => session.end();
     env.addEventListener?.('pagehide', end);
+    const bridgeReady = () => capsule.render();
+    env.addEventListener?.('pywebviewready', bridgeReady);
     return {
         session,
         leave: end,
@@ -388,6 +390,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
             end();
             destroyed = true;
             env.removeEventListener?.('pagehide', end);
+            env.removeEventListener?.('pywebviewready', bridgeReady);
             rooms.delete(entry);
             entry.destroy();
             light.destroy();
