@@ -250,12 +250,15 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.set_viewport_size({"width": 1280, "height": 900})
             _shot(page, f"{engine}-dark-1280-listening")
 
-            # The owner speaks: his blue light from the microphone, his words as a streaming room bubble.
+            # The owner speaks: his blue light from the microphone, his words streaming in the call's card.
             page.evaluate("__callTest.speak(0.4)")
             _caption(page, "owner", "item_owner_1", "Hello, Ouroboros. How much")
-            caption = room.locator(".chat-bubble.call-caption.user")
+            card = room.locator(".call-card")
+            caption = card.locator(".call-line.call-caption.owner")
             expect(caption).to_have_count(1)
-            expect(caption.locator(".message")).to_have_text("Hello, Ouroboros. How much")
+            expect(caption.locator(".call-line-text")).to_have_text("Hello, Ouroboros. How much")
+            expect(card).to_have_attribute("data-call-card", "live")
+            expect(card).to_have_attribute("data-call-open", "1")
             expect(caption).to_have_attribute("data-call-caption", "streaming")
             expect(room.locator(".call-sub")).to_have_text("You’re speaking")
             page.wait_for_function("parseFloat(getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
@@ -268,11 +271,12 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             expect(caption).to_have_attribute("data-call-caption", "final")
             expect(state).to_have_text("Thinking")
             _shot(page, f"{engine}-dark-1280-thinking")
-            # The room's own row replaces the caption: the words are there once.
+            # The room's own row replaces the caption: the words are there once, as a line of the one card.
             _room_row(page, {"role": "user", "content": "Hello, Ouroboros. How much is six times seven?", "source": "call",
-                             "chat_id": 1, "client_message_id": "call:test-1:item_owner_1"})
+                             "chat_id": 1, "client_message_id": "call:test-1:item_owner_1", "task_id": "call-task-1"})
             expect(caption).to_have_count(0)
-            expect(room.locator(".chat-bubble.user", has_text="How much is six times seven?")).to_have_count(1)
+            expect(card.locator(".call-line.owner", has_text="How much is six times seven?")).to_have_count(1)
+            expect(room.locator(".chat-bubble.user", has_text="How much is six times seven?")).to_be_hidden()
 
             # Ouroboros speaks: heard playback lights crimson; its caption streams, its spoken row replaces it.
             _socket(page, "socket.speech('item_ouro_1', 0, 3000);")
@@ -281,15 +285,16 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             expect(room.locator(".call-sub")).to_have_text("Speaking")
             page.wait_for_function("parseFloat(getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
                                    ".getPropertyValue('--call-out')) > 0.3")
-            spoken = room.locator(".chat-bubble.call-caption.assistant")
-            expect(spoken.locator(".message")).to_have_text("Forty-two.")
+            spoken = card.locator(".call-line.call-caption.ouroboros")
+            expect(spoken.locator(".call-line-text")).to_have_text("Forty-two.")
             _shot(page, f"{engine}-dark-1280-ouroboros")
             page.wait_for_function("__callTest.sockets.at(-1).sent.some(m => m.type === 'played' && m.item_id === 'item_ouro_1')")
             _room_row(page, {"role": "assistant", "content": "Forty-two.", "markdown": True, "is_progress": False,
-                             "system_type": "model_narration", "narration": True, "chat_id": 1,
+                             "system_type": "model_narration", "narration": True, "chat_id": 1, "task_id": "call-task-1",
                              "spoken": {"call_id": "test-1", "item_id": "item_ouro_1", "status": "played", "played_ms": 3000}})
             expect(spoken).to_have_count(0)
-            expect(room.locator(".chat-bubble.assistant", has_text="Forty-two.")).to_have_count(1)
+            expect(card.locator(".call-line.ouroboros", has_text="Forty-two.")).to_have_count(1)
+            expect(room.locator(".call-card")).to_have_count(1)  # one call, one card: no bubble per utterance
             _send(page, {"type": "flush", "epoch": 1})
             expect(state).to_have_text("Listening", timeout=10000)
 
@@ -405,7 +410,16 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             expect(room.locator(".call-capsule")).to_be_hidden()
             expect(send).to_have_text("Talk")
             # A caption whose row has not come yet stays, complete, until the room's row replaces it.
-            assert room.locator('.chat-bubble.call-caption[data-call-caption="streaming"]').count() == 0
+            assert room.locator('.call-line.call-caption[data-call-caption="streaming"]').count() == 0
+            # The ended call folds to one line that opens on a click.
+            expect(card).to_have_attribute("data-call-card", "ended")
+            expect(card).to_have_attribute("data-call-open", "0")
+            expect(card.locator(".call-card-facts")).to_contain_text("2 lines")
+            _shot(page, f"{engine}-dark-1280-card-folded")
+            card.locator(".call-card-head").click()
+            expect(card).to_have_attribute("data-call-open", "1")
+            expect(card.locator(".call-line.owner")).to_be_visible()
+            _shot(page, f"{engine}-dark-1280-card-open")
             assert not errors, errors
         finally:
             browser.close()

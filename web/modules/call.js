@@ -8,7 +8,7 @@ import { apiClient } from './api_client.js';
 import { openExternalViaHostBridge, shellBridgeApi } from './ui_helpers.js';
 import { decodeFrame, encodeFrame, levelFromRms, newerEpoch } from './call_worklet.js';
 import { createCallCapsule } from './call_capsule.js';
-import { createCallCaptions } from './call_captions.js';
+import { createCallCards } from './call_card.js';
 import { createCallLight } from './call_light.js';
 import { CALL_VISUAL } from './call_aura.js';
 import { trackCallMark } from './call_mark.js';
@@ -308,7 +308,7 @@ export class CallSession {
     }
 }
 
-/** The room call: Talk in the composer, the live capsule, its light, caption bubbles and the mark. */
+/** The room call: Talk in the composer, the live capsule, its light, the call's card in the room and the mark. */
 export function mountCall({ page, chatId, env = globalThis, ws = null, label = () => 'Main',
     onScreen = () => true, reveal = () => {}, openSettings = () => {}, onSettled = () => {} }) {
     const doc = page.ownerDocument;
@@ -322,13 +322,14 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     const visible = () => !destroyed && onScreen() && doc.visibilityState !== 'hidden';
     const light = createCallLight({ env, visible, heard: now => capsule.heard(now), voice: () => capsule.voice(),
         draw: state => capsule.draw(state) });
-    const captions = createCallCaptions({ feed: page.querySelector('#chat-messages, .chat-messages'), ws, doc });
     const session = new CallSession({ chatId, env,
         changed(view) { if (destroyed) return; light.setActive(view.active); capsule.render(); entry?.changed(); },
-        caption(msg) { captions.update(msg); capsule.caption(msg); },
+        caption(msg) { cards.update(msg); capsule.caption(msg); },
         level(levels) { light.level(levels); },
-        settled(view) { captions.finish(); onSettled(view); },
+        settled(view) { cards.finish(); onSettled(view); },
     });
+    const cards = createCallCards({ feed: page.querySelector('#chat-messages, .chat-messages'), ws, doc,
+        live: () => (session.active ? session.callId : '') });
     // Talk starts a call; a surface that cannot hold one answers the press with its sheet.
     const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, styled, view: () => session.view(),
         talk: () => session.start(),
@@ -379,7 +380,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
             rooms.delete(entry);
             entry.destroy();
             light.destroy();
-            captions.destroy();
+            cards.destroy();
             capsule.destroy();
         },
     };

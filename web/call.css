@@ -274,12 +274,107 @@
     background: linear-gradient(var(--tone-amber), var(--tone-amber)), var(--surface-float);
 }
 
-/* ---- Captions: ordinary bubbles of the room while they are spoken --------------------------- */
+/* ---- The call's card: one call is one card of the room, like a work's card ------------------ */
 
-.chat-bubble.call-caption[data-call-caption="streaming"] .message::after {
+/* The call's own rows stay mounted for the room (replies, history, Copy) and read in its card. */
+.call-folded {
+    display: none !important;
+}
+
+.call-card {
+    align-self: flex-start;
+    width: min(100%, 760px);
+    max-width: max(80%, min(100%, 620px));
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--accent-12);
+    background: var(--accent-04);
+    box-shadow: var(--live-card-shadow);
+    overflow: hidden;
+    container-type: inline-size;
+}
+
+.call-card-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    padding: var(--space-3) var(--space-4);
+    border: 0;
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.call-card-head:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: -2px;
+}
+
+.call-card-title {
+    font-weight: 600;
+}
+
+.call-card-facts {
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+}
+
+.call-card[data-call-card="live"] .call-entry-mark {
+    color: rgb(var(--call-ouro-rgb));
+}
+
+.call-card[data-call-open="0"] .call-card-lines {
+    display: none;
+}
+
+.call-card-lines {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: 0 var(--space-4) var(--space-3);
+    overflow-wrap: anywhere;
+}
+
+.call-line {
+    display: grid;
+    grid-template-columns: 6.5rem minmax(0, 1fr);
+    gap: var(--space-2);
+    line-height: 1.45;
+}
+
+.call-line-who {
+    font-size: var(--type-meta);
+    font-weight: 600;
+    line-height: 1.45rem;
+}
+
+.call-line.owner .call-line-who {
+    color: rgb(var(--call-owner-rgb));
+}
+
+.call-line.ouroboros .call-line-who {
+    color: rgb(var(--call-ouro-rgb));
+}
+
+.call-line.notice {
+    grid-template-columns: minmax(0, 1fr);
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+}
+
+.call-line.call-caption[data-call-caption="streaming"] .call-line-text::after {
     content: '▍';
     margin-left: 2px;
     opacity: 0.45;
+}
+
+@container (max-width: 420px) {
+    .call-line {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0;
+    }
 }
 
 /* ---- The shell's "In call" mark ---------------------------------------------------------------- */

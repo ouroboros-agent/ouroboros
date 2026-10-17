@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { callPresentation, createTalkFacts } from '../modules/call_capsule.js';
-import { createCallCaptions } from '../modules/call_captions.js';
+import { callMemberOf, callSpan, createCallCards } from '../modules/call_card.js';
 import { createCallLight } from '../modules/call_light.js';
 import { callClock, markedCall } from '../modules/call_mark.js';
 import { CALL_VISUAL, waveShape } from '../modules/call_aura.js';
@@ -162,16 +162,42 @@ test('thinking runs from the owner\'s final words to the first heard answer, on 
 });
 
 class FakeNode {
-    constructor(tag, doc) { this.tagName = tag.toUpperCase(); this.ownerDocument = doc; this.children = []; this.parentNode = null;
-        this.dataset = {}; this.className = ''; this.textContent = ''; }
-    get classList() { return { contains: name => this.className.split(/\s+/).includes(name) }; }
+    constructor(tag, doc) {
+        Object.assign(this, { tagName: tag.toUpperCase(), ownerDocument: doc, children: [], parentNode: null,
+            dataset: {}, className: '', ownText: '', attributes: {}, listeners: {}, offsetTop: 0, offsetHeight: 0 });
+    }
+    get classList() {
+        const names = () => this.className.split(/\s+/).filter(Boolean);
+        return {
+            contains: name => names().includes(name),
+            add: name => { if (!names().includes(name)) this.className = [...names(), name].join(' '); },
+            remove: name => { this.className = names().filter(other => other !== name).join(' '); },
+        };
+    }
+    get textContent() { return this.ownText + this.children.map(child => child.textContent).join(''); }
+    set textContent(value) { this.children = []; this.ownText = String(value); }
     get isConnected() { let node = this; while (node.parentNode) node = node.parentNode; return node === this.ownerDocument.feed; }
+    get lastChild() { return this.children.at(-1) || null; }
+    get previousElementSibling() { const kids = this.parentNode?.children || []; return kids[kids.indexOf(this) - 1] || null; }
     append(...nodes) { for (const node of nodes) { node.remove(); node.parentNode = this; this.children.push(node); } }
+    replaceChildren(...nodes) { for (const child of [...this.children]) child.remove(); this.append(...nodes); }
     insertBefore(node, before) { node.remove(); node.parentNode = this; this.children.splice(this.children.indexOf(before), 0, node); }
     remove() { if (!this.parentNode) return; this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; }
+    querySelector(selector) {
+        const name = selector.replace(/^\./, '');
+        for (const child of this.children) {
+            if (child.classList.contains(name)) return child;
+            const deeper = child.querySelector(selector);
+            if (deeper) return deeper;
+        }
+        return null;
+    }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    addEventListener(type, fn) { this.listeners[type] = fn; }
+    click() { this.listeners.click?.(); }
 }
 
-function feedFixture() {
+function feedFixture({ live = () => 'c1' } = {}) {
     const doc = { createElement: tag => new FakeNode(tag, doc) };
     const feed = new FakeNode('div', doc);
     doc.feed = feed;
@@ -179,70 +205,127 @@ function feedFixture() {
     const listeners = {};
     const ws = { on(type, fn) { (listeners[type] ||= new Set()).add(fn); return () => listeners[type].delete(fn); },
         emit(type, data) { for (const fn of listeners[type] || []) fn(data); }, listeners };
-    const captions = createCallCaptions({ feed, ws, doc });
-    const bubbles = () => feed.children.filter(node => node.className.includes('call-caption'));
-    const text = node => node.children[1].textContent;
-    return { doc, feed, ws, captions, bubbles, text };
+    let liveCall = live;
+    const cards = createCallCards({ feed, ws, doc, live: () => liveCall() });
+    const card = () => feed.children.find(node => node.className === 'call-card');
+    const lines = () => card()?.querySelector('.call-card-lines').children.map(node => [node.className, node.textContent]) || [];
+    // A room row as the chat mounts it: a bubble with its identity stamped.
+    const row = (role, text, data = {}, ts = 0) => {
+        const node = new FakeNode('div', doc);
+        node.className = `chat-bubble ${role}`;
+        const sender = new FakeNode('div', doc);
+        sender.className = 'sender';
+        sender.textContent = role === 'user' ? 'voice' : 'Ouroboros';
+        const message = new FakeNode('div', doc);
+        message.className = 'message';
+        message.textContent = text;
+        node.append(sender, message);
+        Object.assign(node.dataset, data, ts ? { ts: String(ts) } : {});
+        feed.append(node);
+        return node;
+    };
+    return { doc, feed, ws, cards, card, lines, row, setLive: fn => { liveCall = fn; } };
 }
 
-test('captions stream as ordinary room bubbles and the room\'s own row replaces each one, never twice', () => {
-    const { feed, ws, captions, bubbles, text } = feedFixture();
+test('a call is one card of the room: its rows fold into it, its captions stream at its end', () => {
+    const { feed, ws, cards, card, lines, row, setLive } = feedFixture();
+    const typed = row('user', 'Typed before the call', { clientMessageId: 'web-1', taskId: 't0' });
     const typing = new FakeNode('div', feed.ownerDocument);
     typing.className = 'chat-bubble assistant typing-bubble';
     feed.append(typing);
-    captions.update({ call_id: 'c1', speaker: 'owner', item_id: 'item_1', text: 'Hello', final: false });
-    captions.update({ call_id: 'c1', speaker: 'owner', item_id: 'item_1', text: ', Ouroboros', final: false });
-    assert.equal(bubbles().length, 1);
-    const [owner] = bubbles();
-    assert.equal(owner.className, 'chat-bubble user call-caption');
-    assert.deepEqual([owner.children[0].textContent, text(owner), owner.dataset.callCaption], ['You', 'Hello, Ouroboros', 'streaming']);
+    // The owner speaks before any row of the call exists: the card opens at the room's end, live and open.
+    cards.update({ call_id: 'c1', speaker: 'owner', item_id: 'o1', text: 'Hello', final: false });
+    cards.update({ call_id: 'c1', speaker: 'owner', item_id: 'o1', text: ', Ouroboros', final: false });
     assert.equal(feed.children.at(-1), typing);  // the typing indicator stays last
-    captions.update({ call_id: 'c1', speaker: 'owner', item_id: 'item_1', text: 'Hello, Ouroboros!', final: true });
-    assert.deepEqual([text(owner), owner.dataset.callCaption], ['Hello, Ouroboros!', 'final']);
-    // The chat painted the owner's row (it listens first); this caption leaves, a late copy stays out.
-    ws.emit('chat', { type: 'chat', role: 'user', content: 'Hello, Ouroboros!', client_message_id: 'call:c1:item_1' });
-    assert.equal(bubbles().length, 0);
-    captions.update({ call_id: 'c1', speaker: 'owner', item_id: 'item_1', text: 'Hello, Ouroboros!', final: true });
-    assert.equal(bubbles().length, 0);
-    // Ouroboros's spoken narration retires its caption; an item id may carry colons.
-    captions.update({ call_id: 'c1', speaker: 'ouroboros', item_id: 'local:turn:3', text: 'Forty', final: false });
-    captions.update({ call_id: 'c1', speaker: 'ouroboros', item_id: 'local:turn:3', text: '-two.', final: false });
-    assert.deepEqual([bubbles()[0].className, text(bubbles()[0])], ['chat-bubble assistant call-caption', 'Forty-two.']);
-    ws.emit('chat', { type: 'chat', role: 'assistant', content: '💬 Forty-two.', spoken: { call_id: 'c1', item_id: 'local:turn:3', status: 'played' } });
-    assert.equal(bubbles().length, 0);
-    // Rows of other calls and ordinary rows touch nothing.
-    captions.update({ call_id: 'c2', speaker: 'owner', item_id: 'a', text: 'One', final: false });
-    ws.emit('chat', { type: 'chat', role: 'user', content: 'One', client_message_id: 'call:c9:a' });
-    ws.emit('chat', { type: 'chat', role: 'user', content: 'typed', client_message_id: 'web-123' });
-    assert.equal(bubbles().length, 1);
-    // An utterance with no words leaves no bubble; a new utterance of the speaker ends the cut one.
-    captions.update({ call_id: 'c2', speaker: 'owner', item_id: 'a', text: '', final: true });
-    assert.equal(bubbles().length, 0);
-    captions.update({ call_id: 'c2', speaker: 'ouroboros', item_id: 'x', text: 'I was say', final: false });
-    captions.update({ call_id: 'c2', speaker: 'ouroboros', item_id: 'y', text: 'Sorry', final: false });
-    assert.deepEqual(bubbles().map(node => node.dataset.callCaption), ['final', 'streaming']);
-    // A reconnect's history read brings the rows this page missed: final captions leave, a live one stays.
-    ws.emit('open', { previouslyConnected: false });
-    assert.equal(bubbles().length, 2);
-    ws.emit('open', { previouslyConnected: true });
-    assert.deepEqual(bubbles().map(text), ['Sorry']);
-    captions.finish();
-    assert.equal(bubbles()[0].dataset.callCaption, 'final');
-    captions.destroy();
-    assert.equal(bubbles().length, 0);
+    assert.deepEqual([card().dataset.callCard, card().dataset.callOpen], ['live', '1']);
+    assert.deepEqual(lines(), [['call-line owner call-caption', 'YouHello, Ouroboros']]);
+    // The chat paints the owner's row (it listens first): the caption leaves, the row folds in as a line.
+    const owner = row('user', 'Hello, Ouroboros!', { clientMessageId: 'call:c1:o1', taskId: 'call-task' }, 1000);
+    ws.emit('chat', { type: 'chat', role: 'user', content: 'Hello, Ouroboros!', client_message_id: 'call:c1:o1' });
+    cards.scan();
+    assert.ok(owner.classList.contains('call-folded') && !typed.classList.contains('call-folded'));
+    assert.deepEqual(lines(), [['call-line owner', 'YouHello, Ouroboros!']]);
+    assert.equal(card().querySelector('.call-card-facts').textContent, 'Live · 1 line');
+    cards.update({ call_id: 'c1', speaker: 'owner', item_id: 'o1', text: 'Hello, Ouroboros!', final: true });
+    assert.equal(cards.count(), 0);  // a late caption of a settled item stays out
+    // Ouroboros's spoken narration of the same task folds in; a link it sent stays a room message.
+    cards.update({ call_id: 'c1', speaker: 'ouroboros', item_id: 'local:turn:3', text: 'Forty', final: false });
+    assert.equal(lines().at(-1)[1], 'OuroborosForty');
+    const narration = row('assistant', '💬 Forty-two.', { systemType: 'model_narration', taskId: 'call-task' }, 61000);
+    ws.emit('chat', { type: 'chat', role: 'assistant', spoken: { call_id: 'c1', item_id: 'local:turn:3' } });
+    const link = row('assistant', 'Here is the link: https://example.com', { taskId: 'call-task' }, 62000);
+    const work = new FakeNode('div', feed.ownerDocument);
+    work.className = 'chat-live-card';
+    work.dataset.taskId = 'call-task';
+    feed.append(work);
+    const elsewhere = row('assistant', '💬 A text turn narrates.', { systemType: 'model_narration', taskId: 'other' });
+    cards.scan();
+    assert.ok(narration.classList.contains('call-folded') && work.classList.contains('call-folded'));
+    assert.ok(!link.classList.contains('call-folded') && !elsewhere.classList.contains('call-folded'));
+    assert.deepEqual(lines(), [['call-line owner', 'YouHello, Ouroboros!'], ['call-line ouroboros', 'OuroborosForty-two.']]);
+    assert.equal(feed.children.indexOf(card()), feed.children.indexOf(owner) - 1);  // the card stands where the call began
+    // The call ends: its closing notice reads under the words, and the card folds to one line.
+    row('system', 'Live call c1 ended (owner_bye).', { taskId: 'call-task' }, 63000);
+    setLive(() => '');
+    cards.finish();
+    cards.scan();
+    assert.deepEqual(lines().at(-1), ['call-line notice', 'Live call c1 ended (owner_bye).']);
+    assert.deepEqual([card().dataset.callCard, card().dataset.callOpen], ['ended', '0']);
+    assert.equal(card().querySelector('.call-card-facts').textContent, '1 min · 2 lines');
+    card().querySelector('.call-card-head').click();
+    assert.equal(card().dataset.callOpen, '1');
+    cards.destroy();
+    assert.ok(!card() && !owner.classList.contains('call-folded'));
     assert.equal(ws.listeners.chat.size + ws.listeners.open.size, 0);
 });
 
+test('a call already in the room\'s history is one closed card, and an older page of it joins the same card', () => {
+    const { feed, card, lines, row, doc } = feedFixture({ live: () => '' });
+    row('user', 'Earlier typed words', { clientMessageId: 'web-2', taskId: 't1' });
+    const first = row('user', 'One', { clientMessageId: 'call:c7:a', taskId: 'call-7' }, 5000);
+    row('assistant', '💬 Two', { systemType: 'model_narration', taskId: 'call-7' }, 50000);
+    const cards = createCallCards({ feed, doc, live: () => '' });
+    assert.deepEqual([card().dataset.callCard, card().dataset.callOpen], ['ended', '0']);
+    assert.equal(feed.children.indexOf(card()), feed.children.indexOf(first) - 1);
+    // Paging up mounts an older row of the same call above: the card moves to stand before it.
+    const older = new FakeNode('div', doc);
+    older.className = 'chat-bubble user';
+    const message = new FakeNode('div', doc);
+    message.className = 'message';
+    message.textContent = 'Zero';
+    older.append(message);
+    Object.assign(older.dataset, { clientMessageId: 'call:c7:z', taskId: 'call-7', ts: '1000' });
+    feed.insertBefore(older, feed.children[0]);
+    cards.scan();
+    assert.equal(feed.children.indexOf(card()), 0);
+    assert.deepEqual(lines().map(([, text]) => text), ['YouZero', 'YouOne', 'OuroborosTwo']);
+    assert.equal(card().querySelector('.call-card-facts').textContent, '49 s · 3 lines');
+    cards.destroy();
+});
+
+test('what a room row is to a call, and how a call\'s span reads', () => {
+    const calls = new Map([['call-task', 'c1']]);
+    const node = (className, data) => ({ classList: { contains: name => className.split(' ').includes(name) }, dataset: data });
+    assert.deepEqual(callMemberOf(node('chat-bubble user', { clientMessageId: 'call:c1:x', taskId: 'call-task' }), new Map()),
+        { task: 'call-task', kind: 'owner', call: 'c1' });
+    assert.equal(callMemberOf(node('chat-bubble assistant', { systemType: 'model_narration', taskId: 'call-task' }), new Map()), null);
+    assert.deepEqual(callMemberOf(node('chat-bubble assistant', { systemType: 'model_narration', taskId: 'call-task' }), calls),
+        { task: 'call-task', kind: 'ouroboros' });
+    assert.equal(callMemberOf(node('chat-bubble user', { clientMessageId: 'web-1', taskId: 'call-task' }), calls), null);
+    assert.equal(callMemberOf(node('chat-bubble assistant', { taskId: 'call-task' }), calls), null);  // a link it sent
+    assert.deepEqual([callSpan(45_000), callSpan(60_000), callSpan(210_400)], ['45 s', '1 min', '3 min 30 s']);
+});
+
 test('a caption follows the newest message only for a reader who is there', () => {
-    const { feed, captions } = feedFixture();
+    const { feed, cards } = feedFixture();
     feed.scrollTop = 600;  // at the bottom (1000 - 600 - 400 = 0)
-    captions.update({ call_id: 'c', speaker: 'owner', item_id: '1', text: 'Hi', final: false });
+    cards.update({ call_id: 'c1', speaker: 'owner', item_id: '1', text: 'Hi', final: false });
     feed.scrollHeight = 1100;
-    captions.update({ call_id: 'c', speaker: 'owner', item_id: '1', text: ' there', final: false });
+    cards.update({ call_id: 'c1', speaker: 'owner', item_id: '1', text: ' there', final: false });
     assert.equal(feed.scrollTop, 1100);
     feed.scrollTop = 100;  // reading older messages
     feed.scrollHeight = 1200;
-    captions.update({ call_id: 'c', speaker: 'owner', item_id: '1', text: ' again', final: false });
+    cards.update({ call_id: 'c1', speaker: 'owner', item_id: '1', text: ' again', final: false });
     assert.equal(feed.scrollTop, 100);
 });
 
