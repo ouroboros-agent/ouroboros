@@ -77,6 +77,17 @@ def test_the_recorded_wire_labels_resume_handles_both_ways_and_keeps_no_audio_or
     assert parts[1] == {"text": "Привет"}  # a fresh run's words stay: they are the probe's own synthetic speech
 
 
+def test_a_data_copys_older_ledger_neither_counts_as_the_runs_money_nor_spends_its_budget(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+
+    rows = [{"attempt_id": "old", "ts_reserved": "2026-10-16T18:58:40.041002+00:00", "cost_usd": "legacy"},
+            {"attempt_id": "new", "ts_reserved": "2026-10-17T02:03:37.710432+00:00", "cost_usd": 0.01}]
+    assert [r["attempt_id"] for r in probe.attempts_since(rows, "2026-10-17T02:03:20.000000+00:00")] == ["new"]
+    assert len(probe.attempts_since(rows, "2026-10-01T00:00:00.000000+00:00")) == 2  # a fresh run keeps everything
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda data, **_: {"settled_usd": 1234.5})
+    assert probe.probe_budget(tmp_path) == "1244.5"  # ten dollars beyond what the copy has already spent
+
+
 def test_only_a_fresh_run_writes_a_replay_fixture():
     wire = [{"direction": "server", "message": {"setupComplete": {}}}]
     record = probe.recorded_exchange(wire, "gemini-3.8-live", data_copy=False)

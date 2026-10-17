@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 import uuid
 
@@ -359,6 +360,19 @@ def speech_fixture(root: Path, label: str, key: str, reuse: str | None) -> bytes
 GROUNDING_UNPRICED = {"groundingMetadata", "grounding_metadata"}
 
 
+def attempts_since(rows: list[dict], started_at: str) -> list[dict]:
+    """This run's ledger attempts: a data copy carries its install's whole ledger before them."""
+    return [row for row in rows if str(row.get("ts_reserved") or "") >= started_at]
+
+
+def probe_budget(data: Path) -> str:
+    """Ten dollars beyond what the run's data has already spent (a copy's ledger is its install's)."""
+    from ouroboros.usage_accounting import usage_projection
+
+    spent = float(usage_projection(data, global_limit_usd=1e9).get("settled_usd") or 0.0)
+    return str(round(spent + 10, 2))
+
+
 def money_evidence(rows: list[dict], events: list[dict]) -> tuple[bool, dict]:
     responses = [r for r in rows if r.get("source") == "live_response"]
     grounded = [r["attempt_id"] for r in responses if r.get("cost_usd") is None
@@ -401,6 +415,7 @@ class Probe:
             s: {"verdict": "NOT_RUN", "evidence": {"reason": "not selected" if s not in selected else "not reached"}}
             for s in SCENARIOS}, "total_cost_usd": None}
         self.agent = self.peer = self.thread = None
+        self.started_at = datetime.now(timezone.utc).isoformat()  # the ledger's own timestamp form
 
     def verdict(self, scenario, passed, **evidence):
         row = {"verdict": "PASS" if passed else "FAIL", "evidence": evidence}
@@ -620,7 +635,7 @@ class Probe:
             rows = txn.attempts()
             transitions = {r["attempt_id"]: dict(r) for r in txn.conn.execute(
                 "SELECT attempt_id, ts_reserved, ts_dispatched, ts_final FROM attempts")}
-        rows = [{**r, **transitions[r["attempt_id"]]} for r in rows]
+        rows = attempts_since([{**r, **transitions[r["attempt_id"]]} for r in rows], self.started_at)
         ok, facts = money_evidence(rows, self.evidence.rows)
         self.result.update(total_cost_usd=facts["total_cost_usd"], known_estimated_usd=facts["known_estimated_usd"])
         if "money" in self.selected:
@@ -652,7 +667,7 @@ def prepare_settings(root: Path, source: Path, google_key_file: str | None = Non
     settings.update(keys)
     settings.update(OUROBOROS_MODEL=OPENAI_DIRECT_DEFAULTS["main"],
                     OUROBOROS_MODEL_LIGHT=OPENAI_DIRECT_DEFAULTS["light"],
-                    OUROBOROS_MODEL_FALLBACKS=OPENAI_DIRECT_DEFAULTS["fallback"], TOTAL_BUDGET="10")
+                    OUROBOROS_MODEL_FALLBACKS=OPENAI_DIRECT_DEFAULTS["fallback"], TOTAL_BUDGET=probe_budget(root / "data"))
     path.touch(mode=0o600)
     write_json(path, settings)
     return settings, keys
