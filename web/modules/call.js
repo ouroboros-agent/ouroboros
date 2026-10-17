@@ -357,7 +357,8 @@ export class CallSession {
     }
 }
 
-/** The room call: Talk in the composer, the live capsule, its light, the call's card in the room and the mark. */
+/** The room call: Talk in the composer, the live capsule (the chip and its big view), its light, the
+ * call's card in the room and the mark. */
 export function mountCall({ page, chatId, env = globalThis, ws = null, label = () => 'Main',
     onScreen = () => true, reveal = () => {}, openSettings = () => {}, onSettled = () => {} }) {
     const doc = page.ownerDocument;

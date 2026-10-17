@@ -747,6 +747,15 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             page.wait_for_function(f"{row}.style.getPropertyValue('--call-tint-owner') === '0.500'")
             assert page.evaluate(f"{row}.style.getPropertyValue('--call-breath')") == "0.00"
             expect(room.locator(".call-state")).to_have_text("Listening")
+            # The big view is an instant switch, its words kept, and back.
+            room.locator(".call-size").click()
+            expect(room.locator(".chat-input-wrap")).to_have_attribute("data-call-view", "big")
+            assert room.locator(".chat-input-wrap").get_attribute("data-call-move") is None
+            expect(room.locator(".call-state")).to_have_text("Listening")
+            assert page.evaluate(f"{row}.getBoundingClientRect().height") > 300
+            room.locator(".call-size").click()
+            expect(room.locator(".chat-input-wrap")).to_have_attribute("data-call-view", "voice")
+            assert page.evaluate(f"{row}.classList.contains('call-lifted')") is False
             room.locator(".call-end").click()
             _ended(page)
             assert not errors, errors
@@ -764,3 +773,155 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
         finally:
             browser.close()
 
+
+@pytest.mark.serial
+@pytest.mark.ui_browser
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_the_big_view_grows_from_the_chip_and_minimises_back(direct_server_with_data, engine):
+    from playwright.sync_api import expect, sync_playwright
+
+    server = direct_server_with_data
+    lifted = f"document.querySelector('{ROOM} .chat-text-row').classList.contains('call-lifted')"
+    row_box = f"(() => {{ const r = document.querySelector('{ROOM} .chat-text-row').getBoundingClientRect(); " \
+              "return {left: r.left, top: r.top, width: r.width, height: r.height, bottom: r.bottom}; })()"
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch()
+        try:
+            for scheme in ("dark", "light"):
+                for width in (1280, 390):
+                    height = 900 if width > 400 else 844
+                    page, errors = _open(browser, server["url"], width=width, height=height, scheme=scheme, touch=width < 600)
+                    admissions = []
+                    _admissions(page, admissions)
+                    room = page.locator(ROOM)
+                    wrap = room.locator(".chat-input-wrap")
+                    send = _talk_ready(page)
+                    field = room.locator("#chat-input")
+                    state = room.locator(".call-state")
+                    tag = f"{engine}-{scheme}-{width}"
+                    idle = page.evaluate(row_box)
+                    send.click()
+                    page.wait_for_function("__callTest.sockets.length === 1 && __callTest.sockets[0].sent.length > 0")
+                    _state(page, state="live")
+                    expect(state).to_have_text("Listening")
+                    size = room.locator(".call-size")
+                    expect(size).to_be_visible()
+                    expect(size).to_have_attribute("aria-label", "Expand the call")
+                    _shot(page, f"{tag}-chip")
+
+                    # Expand: the same row grows into the panel; the composer keeps its place and height.
+                    size.click()
+                    expect(wrap).to_have_attribute("data-call-view", "big")
+                    page.wait_for_function(f"!document.querySelector('{ROOM} .chat-input-wrap').dataset.callMove")
+                    page.wait_for_timeout(500)  # the glass lands
+                    panel = page.evaluate(row_box)
+                    if width >= 980:
+                        # Docked where the composer lives; the room stays readable above it.
+                        assert abs(panel["left"] - idle["left"]) <= 1 and abs(panel["width"] - idle["width"]) <= 1, (panel, idle)
+                        assert abs(panel["bottom"] - idle["bottom"]) <= 1, (panel, idle)
+                        assert 300 <= panel["height"] <= 500 and panel["top"] > 200, panel
+                    else:
+                        assert panel["width"] >= width - 20 and panel["height"] >= height - 20, panel  # the whole screen
+                    spacer = page.evaluate(f"document.querySelector('{ROOM} .call-spacer').getBoundingClientRect().height")
+                    assert abs(spacer - idle["height"]) <= 1, (spacer, idle)
+                    expect(size).to_have_text("Minimise")
+                    expect(size).to_have_attribute("aria-label", "Minimise the call")
+                    for control in (".call-mute", ".call-show", ".call-keyboard", ".call-end"):
+                        button = room.locator(control)
+                        expect(button).to_be_visible()
+                        box = button.bounding_box()
+                        assert box["x"] >= 0 and box["x"] + box["width"] <= width and box["y"] + box["height"] <= height, (control, box)
+                        assert box["y"] > panel["top"] + panel["height"] / 2, (control, box)  # at the panel's foot
+                    _no_sideways_scroll(page, f"big {tag}")
+                    _shot(page, f"{tag}-big-listening", full=True)
+                    page.evaluate("__callTest.speak(0.4)")
+                    _caption(page, "owner", "item_big_1", "Hello")
+                    expect(room.locator(".call-sub")).to_have_text("You’re speaking")
+                    page.wait_for_timeout(300)
+                    _shot(page, f"{tag}-big-owner", full=True)
+                    page.evaluate("__callTest.speak(0)")
+                    _caption(page, "owner", "item_big_1", "Hello there", final=True)
+                    expect(state).to_have_text("Thinking")
+                    _socket(page, "socket.speech('item_big_ouro', 0, 3000);")
+                    expect(state).to_have_text("Ouroboros")
+                    page.wait_for_timeout(300)
+                    _shot(page, f"{tag}-big-ouroboros", full=True)
+                    _send(page, {"type": "flush", "epoch": 1})
+                    expect(state).to_have_text("Listening", timeout=10000)
+
+                    # Show is the product's own button: its menu opens over the panel; Escape closes only the menu.
+                    room.locator(".call-show").click()
+                    menu = page.locator(".call-show-menu")
+                    expect(menu).to_be_visible()
+                    expect(menu.locator('[data-source="screen"]')).to_be_enabled()
+                    page.keyboard.press("Escape")
+                    expect(menu).to_have_count(0)
+                    expect(wrap).to_have_attribute("data-call-view", "big")
+                    room.locator(".call-show").click()
+                    page.locator('.call-show-menu [data-source="camera"]').click()
+                    expect(room.locator(".call-show")).to_have_attribute("aria-pressed", "true")
+                    expect(room.locator(".call-sub")).to_contain_text("Camera on")
+                    _shot(page, f"{tag}-big-sharing", full=True)
+                    room.locator(".call-show").click()  # one press stops it
+                    expect(room.locator(".call-show")).not_to_have_attribute("aria-pressed", "true")
+                    room.locator(".call-mute").click()
+                    expect(state).to_have_text("Muted")
+                    _shot(page, f"{tag}-big-muted", full=True)
+                    room.locator(".call-mute").click()
+                    expect(state).to_have_text("Listening")
+
+                    # Minimise returns the composer's height and place; Escape minimises too.
+                    size.click()
+                    expect(wrap).to_have_attribute("data-call-view", "voice")
+                    page.wait_for_function(f"!{lifted}")
+                    back = page.evaluate(row_box)
+                    assert abs(back["height"] - idle["height"]) <= 1 and abs(back["top"] - idle["top"]) <= 1, (back, idle)
+                    assert room.locator(".call-spacer").count() == 0
+                    size.click()
+                    expect(wrap).to_have_attribute("data-call-view", "big")
+                    page.keyboard.press("Escape")
+                    expect(wrap).to_have_attribute("data-call-view", "voice")
+                    page.wait_for_function(f"!{lifted}")
+
+                    # Keyboard from the big view: the chip with the field, focused, at the composer's height.
+                    size.click()
+                    expect(wrap).to_have_attribute("data-call-view", "big")
+                    room.locator(".call-keyboard").click()
+                    expect(wrap).to_have_attribute("data-call-view", "keyboard")
+                    expect(field).to_be_visible()
+                    expect(field).to_be_focused()
+                    page.wait_for_function(f"!{lifted}")
+                    assert abs(page.evaluate(row_box)["height"] - idle["height"]) <= 1
+                    _shot(page, f"{tag}-keyboard-from-big")
+                    room.locator(".call-keyboard").click()
+                    expect(wrap).to_have_attribute("data-call-view", "voice")
+
+                    # An ending while big: the sheet stands in the composer at once, with its next step.
+                    size.click()
+                    expect(wrap).to_have_attribute("data-call-view", "big")
+                    _state(page, state="closed", reason="provider_closed", detail="", action="retry")
+                    expect(wrap).to_have_attribute("data-call-view", "sheet")
+                    expect(state).to_have_text("Google closed the call")
+                    expect(room.locator(".call-action").first).to_have_text("Try again")
+                    assert page.evaluate(lifted) is False and room.locator(".call-spacer").count() == 0
+                    _ended(page)
+                    _no_sideways_scroll(page, f"sheet from big {tag}")
+                    room.locator(".call-close").click()
+                    expect(send).to_have_text("Talk")
+
+                    # End from the big view: everything stops, Talk comes back in the composer.
+                    send.click()
+                    page.wait_for_function("__callTest.sockets.length === 2")
+                    _state(page, state="live")
+                    size.click()
+                    expect(wrap).to_have_attribute("data-call-view", "big")
+                    room.locator(".call-end").click()
+                    _ended(page)
+                    expect(room.locator(".call-capsule")).to_be_hidden()
+                    expect(send).to_have_text("Talk")
+                    assert page.evaluate(lifted) is False and room.locator(".call-spacer").count() == 0
+                    assert abs(page.evaluate(row_box)["height"] - idle["height"]) <= 1
+                    assert not errors, errors
+                    page.context.close()
+        finally:
+            browser.close()

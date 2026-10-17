@@ -1,14 +1,18 @@
 /** The composer face of a call. With nothing to send, the Send capsule reads Talk; a press (never
  * Enter) starts the call. During a call the text row keeps its footprint and becomes the live
- * capsule: the visual behind the state, Mute, Show (a screen or the camera, from a small menu), Keyboard, End. Keyboard brings the field back before
- * the call's controls, the visual dimmed behind it; End and the way back to voice never leave, and what is
- * typed goes as an ordinary turn. When Talk cannot work, or a call
- * ends with something to say, a sheet takes the capsule's place with the words and one next step.
+ * capsule (the chip): Expand, the visual behind the state and the call's time, Mute, Show (a screen
+ * or the camera, from a small menu), Keyboard, End. Expand grows the same capsule into the big view
+ * (`call_stage.js`): the state and the time in a corner, Minimise, and the same controls at the
+ * bottom. Keyboard brings the field back beside the call's controls (from the big view, in the chip);
+ * End and the way back to voice never leave, and what is typed goes as an ordinary turn. When Talk
+ * cannot work, or a call ends with something to say, a sheet takes the capsule's place with the
+ * words and one next step.
  * Every word the owner reads is chosen here from the session's facts (`callPresentation`). Calls
  * have one engine, Google's Gemini Live.
  */
 import { fmt, tx } from './i18n.js';
 import { bindMenu } from './ui_interactions.js';
+import { createCallStage } from './call_stage.js';
 
 const KEYBOARD = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></svg>';
 // The same button in the keyboard view: back to the call's voice.
@@ -29,6 +33,10 @@ const TOGGLE = {
 // The field's placeholder while the call's controls share its row: one line at a phone's width, so
 // opening the keyboard view never grows the composer.
 const KEYBOARD_PLACEHOLDER = 'Message…';
+// The way between the chip and the big view: one capsule, its icon and word follow the view.
+const GROW = '<svg class="call-size-grow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"/></svg>';
+const SHRINK = '<svg class="call-size-shrink" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 10h-6V4M4 14h6v6M14 10l7-7M3 21l7-7"/></svg>';
+const SIZE = { chip: 'Expand the call', big: 'Minimise the call' };
 const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone', 'callSharing', 'callWork'];
 
 // Why a call reconnects, beside "Reconnecting…".
@@ -194,8 +202,9 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     const capsule = doc.createElement('div');
     capsule.className = 'call-capsule';
     capsule.hidden = true;
-    capsule.innerHTML = `<span class="call-visual"></span>
-        <span class="call-words" role="status" aria-live="polite"><span class="call-state"></span><span class="call-sub"></span><span class="call-small"></span></span>
+    capsule.innerHTML = `<button type="button" class="call-btn call-size" aria-expanded="false">${GROW}${SHRINK}<span class="call-size-word">Minimise</span></button>
+        <span class="call-visual"></span>
+        <span class="call-words" role="status" aria-live="polite"><span class="call-state"></span><span class="call-time" aria-hidden="true" hidden></span><span class="call-sub"></span><span class="call-small"></span></span>
         <span class="call-buttons">
             <button type="button" class="call-btn call-action"></button>
             <button type="button" class="call-btn call-action"></button>
@@ -213,11 +222,13 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     const mark = visual.mark(doc);
     let showing = false;     // the capsule holds the row (a call, or a sheet)
     let keyboard = false;    // the owner asked to type during this call
+    let big = false;         // the owner grew the capsule into the big view
     let presented = { mode: 'idle' };
     let note = null;         // a sheet's follow-up line (a copied link)
     let dressed = false;     // Talk appears with its own look, never unstyled before call.css applies
     let gone = false;
     const talking = createTalkFacts();
+    const stage = createCallStage({ wrap, row, time: $('.call-time'), doc, env, escape: () => minimise() });
 
     // --- Talk in the Send capsule -------------------------------------------------------
     const empty = () => !field.value.trim() && !preview?.querySelector('.attach-badge');
@@ -317,10 +328,26 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     on('.call-end', () => end());
     on('.call-close', () => { note = null; dismiss(); });
     on('.call-keyboard', () => {
-        keyboard = !keyboard;
+        // From the big view Keyboard returns to the chip with the field: the big view carries none.
+        keyboard = big || !keyboard;
+        if (big) { big = false; stage.shrink(); }
         render();
         if (keyboard) field.focus({ preventScroll: true });
     });
+    on('.call-size', () => { if (big) minimise(); else expand(); });
+    function expand() {
+        if (big || presented.mode !== 'live') return;
+        keyboard = false;
+        big = true;
+        stage.grow();
+        render();
+    }
+    function minimise() {
+        if (!big) return;
+        big = false;
+        stage.shrink();
+        render();
+    }
     actions.forEach((button, index) => button.addEventListener('click', () => {
         const action = presented.actions?.[index];
         if (action) void act(action);
@@ -380,6 +407,9 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             note = null;
         }
         presented = callPresentation(current, { ...talking.facts, heard: light.heard() });
+        // A call that ends, or a room that leaves it, takes the big view back to the composer at once.
+        if (big && presented.mode !== 'live') { big = false; stage.shrink({ instant: true }); }
+        stage.clock(current);
         const nextShowing = presented.mode !== 'idle';
         if (nextShowing !== showing) {
             showing = nextShowing;
@@ -393,7 +423,8 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             return;
         }
         const sheet = presented.mode === 'sheet';
-        Object.assign(wrap.dataset, { call: presented.mode, callView: sheet ? 'sheet' : keyboard ? 'keyboard' : 'voice',
+        Object.assign(wrap.dataset, { call: presented.mode,
+            callView: sheet ? 'sheet' : big ? 'big' : keyboard ? 'keyboard' : 'voice',
             callLight: presented.light, callVoice: presented.voice || '', callTone: presented.tone || '',
             callSharing: current.sharing || '', callWork: presented.work ? '1' : '' });
         light.setMode(presented.light, presented.voice || '');
@@ -406,6 +437,13 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             ? `${sharing}${presented.sub ? ` · ${presented.sub}` : ''}` : presented.sub),
         followUp ? note?.kind === 'copy_failed' : Boolean(presented.subFormatted));
         setWords(words.small, presented.small || '', true);
+        const size = $('.call-size');
+        size.hidden = sheet;
+        size.setAttribute('aria-expanded', String(big));
+        if (size.title !== SIZE[big ? 'big' : 'chip']) {
+            size.title = SIZE[big ? 'big' : 'chip'];
+            size.setAttribute('aria-label', size.title);
+        }
         $('.call-mute').hidden = sheet;
         $('.call-mute').setAttribute('aria-pressed', String(Boolean(current.muted)));
         renderShow(sheet);
@@ -439,6 +477,9 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         row,
         render,
         draw: state => visualHandle.draw(state),
+        expand,
+        minimise,
+        get big() { return big; },
         caption(msg) { talking.caption(msg, light.heard()); render(); },
         voice() { talking.voice(); },
         heard(now) { talking.heard(now); render(); },
@@ -454,6 +495,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             field.removeEventListener('keydown', renderEntry);
             send.removeEventListener('click', renderEntry);
             showMenu?.close();
+            stage.destroy();
             visualHandle.destroy();
             typingPlaceholder(false);
             capsule.remove();

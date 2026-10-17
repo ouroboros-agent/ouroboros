@@ -1,4 +1,5 @@
-/* Live calls: Talk in the Send capsule, the live capsule in the text row's place (the chip), the sheet when Talk cannot work, the call's card, the shell's "In call" mark, and the
+/* Live calls: Talk in the Send capsule, the live capsule in the text row's place (the chip) and its
+   big view, the sheet when Talk cannot work, the call's card, the shell's "In call" mark, and the
    visual (the wave in the glass) last, as one block another visual replaces. Surfaces, shadows, tones, radii, type and motion are
    the design bible's tokens (DESIGN.md "Airy dopamine", ui.css "One control, three tones"); the
    call adds only what is its own: the two voices' light, the one light in the interface that
@@ -47,6 +48,7 @@
 }
 
 .chat-input-wrap[data-call-view="voice"] .chat-text-row > :not(.call-capsule):not(.call-glass),
+.chat-input-wrap[data-call-view="big"] .chat-text-row > :not(.call-capsule):not(.call-glass),
 .chat-input-wrap[data-call-view="sheet"] .chat-text-row > :not(.call-capsule):not(.call-glass) {
     display: none;
 }
@@ -83,7 +85,8 @@
     display: contents;
 }
 
-.chat-input-wrap[data-call-view="keyboard"] .call-words {
+.chat-input-wrap[data-call-view="keyboard"] .call-words,
+.chat-input-wrap[data-call-view="keyboard"] .call-size {
     display: none;
 }
 
@@ -104,8 +107,9 @@
     line-height: var(--call-words-leading);
 }
 
-/* A live call's words take only their own width, so the wave has the rest of the capsule. */
-.chat-input-wrap[data-call-view="voice"] .call-words {
+/* A live call's words: the state and its time on one line, what is happening under them. They take
+   only their own width, so the wave has the rest of the capsule. */
+.chat-input-wrap:is([data-call-view="voice"], [data-call-view="big"]) .call-words {
     display: grid;
     flex: 0 1 auto;
     grid-template-columns: minmax(0, max-content) auto minmax(0, 1fr);
@@ -113,8 +117,26 @@
 }
 
 .call-state { grid-area: 1 / 1; }
+.call-time { grid-area: 1 / 2; }
 .call-sub { grid-area: 2 / 1 / 3 / 4; }
 .call-small { grid-area: 3 / 1 / 4 / 4; }
+
+.call-time {
+    font-size: var(--type-body);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-meta);
+    white-space: nowrap;
+}
+
+.call-time::before {
+    content: '·';
+    margin: 0 0.4em;
+}
+
+.chat-input-wrap[data-call-view="sheet"] .call-time {
+    display: none;
+}
 
 .call-state {
     font-size: var(--type-body);
@@ -211,12 +233,22 @@
 }
 
 .call-keyboard,
-.call-show {
+.call-show,
+.call-size {
     width: var(--composer-control-height);
     padding: 0;
     color: var(--text-meta);
 }
 
+/* Expand and Minimise are one neutral capsule: an icon in the chip, the icon and "Minimise" in the big view. */
+.call-size {
+    gap: 6px;
+}
+
+.call-size .call-size-shrink,
+.call-size .call-size-word {
+    display: none;
+}
 
 .call-show[aria-expanded="true"] {
     background: var(--surface-capsule-hover);
@@ -288,11 +320,115 @@
     }
 }
 
+/* A phone's chip has room for the state word; the time waits in the big view. */
+@container call-row (max-width: 420px) {
+    .chat-input-wrap[data-call-view="voice"] .call-time {
+        display: none;
+    }
+}
+
 @container call-row (max-width: 520px) {
     .chat-input-wrap[data-call-view="keyboard"] .call-mute,
     .chat-input-wrap[data-call-view="keyboard"] .call-show {
         display: none;
     }
+}
+
+/* ---- The big view: the same capsule grown upward into a tall glass panel --------------------- */
+
+/* The row leaves the composer's flow for the passage and the big view; the spacer keeps the
+   composer's height, so the room never moves. On a wide window the panel stands where the composer
+   is and the room stays readable above it; on a phone it takes the screen. */
+.call-spacer {
+    order: 2;
+    flex: none;
+    width: 100%;
+}
+
+.chat-input-wrap[data-call] .chat-text-row.call-lifted {
+    position: fixed;
+    z-index: 60;
+    margin: 0;
+    padding: 0;
+    border-radius: var(--call-panel-radius, var(--pill-radius));
+    transition: left 0.64s var(--call-ease), top 0.64s var(--call-ease), width 0.64s var(--call-ease),
+        height 0.64s var(--call-ease), border-radius 0.64s var(--call-ease);
+}
+
+/* While the glass moves, its words and controls wait; the wave stretches with it. */
+.call-capsule > :not(.call-visual) {
+    transition: opacity 0.22s ease;
+}
+
+.chat-input-wrap[data-call-move="1"] .call-capsule > :not(.call-visual) {
+    opacity: 0;
+    transition-duration: 0.12s;
+}
+
+.chat-input-wrap[data-call-view="big"] .chat-text-row {
+    --composer-control-height: 40px;
+}
+
+.chat-input-wrap[data-call-view="big"] .call-capsule {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    gap: 0 var(--space-3);
+    align-items: start;
+    padding: var(--space-4);
+    min-height: 0;
+}
+
+.chat-input-wrap[data-call-view="big"] .call-words {
+    grid-area: 1 / 1;
+    padding: var(--space-2) 0 0 var(--space-2);
+    row-gap: 2px;
+}
+
+.chat-input-wrap[data-call-view="big"] .call-state {
+    font-size: var(--type-page);
+    font-weight: 600;
+    line-height: 1.15;
+}
+
+.chat-input-wrap[data-call-view="big"] .call-time {
+    align-self: end;
+    font-size: var(--type-section);
+    padding-bottom: 2px;
+}
+
+.chat-input-wrap[data-call-view="big"] .call-sub {
+    font-size: var(--type-body);
+}
+
+.chat-input-wrap[data-call-view="big"] .call-size {
+    grid-area: 1 / 2;
+    width: auto;
+    padding: 0 var(--space-4) 0 var(--space-3);
+    color: var(--text-primary);
+}
+
+.chat-input-wrap[data-call-view="big"] .call-size .call-size-grow {
+    display: none;
+}
+
+.chat-input-wrap[data-call-view="big"] .call-size .call-size-shrink,
+.chat-input-wrap[data-call-view="big"] .call-size .call-size-word {
+    display: inline;
+}
+
+/* Mute · Show · Keyboard · End at the foot of the panel, within a thumb's reach on a phone. */
+.chat-input-wrap[data-call-view="big"] .call-buttons {
+    grid-area: 3 / 1 / 4 / 3;
+    justify-content: center;
+    margin: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.chat-input-wrap[data-call-view="big"] .call-mute {
+    padding: 0 var(--space-4);
 }
 
 /* ---- The sheet: how a call ended, or why Talk cannot work here ------------------------------ */
@@ -706,6 +842,15 @@
     background: rgb(var(--call-ouro-rgb));
 }
 
+.chat-input-wrap[data-call-view="big"] .call-work {
+    gap: 7px;
+}
+
+.chat-input-wrap[data-call-view="big"] .call-work span {
+    width: 8px;
+    height: 8px;
+}
+
 /* Talk's sign, the card's and the shell mark's: the wave's three strands, still. */
 .call-entry-mark {
     display: inline-flex;
@@ -718,8 +863,14 @@
     display: block;
 }
 
-/* Reduced motion: the dots stand still; the visual draws a still wave whose colour and the words say the rest. */
+/* Reduced motion: the passage is an instant switch, the dots stand still; the visual draws a still
+   wave whose colour and the words say the rest. */
 @media (prefers-reduced-motion: reduce) {
+    .chat-input-wrap[data-call] .chat-text-row.call-lifted,
+    .call-capsule > :not(.call-visual) {
+        transition: none;
+    }
+
     .call-work span {
         animation: none;
     }
