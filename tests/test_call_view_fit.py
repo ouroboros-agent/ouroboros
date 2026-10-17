@@ -166,3 +166,17 @@ def test_a_calls_selected_schemas_count_in_its_fit_as_sent(tmp_path, monkeypatch
     # The driver sends every schema the call selected, so the Nano view is fitted beside all of them.
     assert "read_file" in with_schema["tools"]["nano"]
     assert with_schema["fixed"]["nano"] > seen["fixed"]["nano"]
+
+
+def test_a_first_call_counts_in_its_routes_cold_density_and_a_witness_replaces_it(tmp_path, monkeypatch):
+    route = {"provider": "google", "model": "gemini-3.8-live", "route_fp": "realtime-fp", "cold_density": 1.25}
+
+    def call():
+        return fit.build_context_fit_plan(SimpleNamespace(drive_root=tmp_path), _core(tmp_path), {"id": "call-task"},
+            preferred_mode="max", route_resolver=lambda *_a, **_kw: pytest.fail("never Main's route"),
+            known_window_tokens=WINDOW, known_output_reserve_tokens=RESERVE, known_route=route, call_view=True)
+
+    assert call().projection("nano").calibration_ratio == 1.25  # cold store: the route's documented density
+    monkeypatch.setattr("ouroboros.capability_evidence.resolve_main_token_density",
+                        lambda *_a: (1.12, "fresh_route_usage"))
+    assert call().projection("nano").calibration_ratio == 1.12  # the route's own witness wins

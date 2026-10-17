@@ -623,6 +623,16 @@ def _route_calibration_ratio(
         return 1.0
 
 
+def _route_density_is_cold(route_fp: str, model: str) -> bool:
+    """Whether the one observation store has no fresh witness for this route (the resolver's cold answer)."""
+    try:
+        from ouroboros.capability_evidence import canonical_evidence_root, resolve_main_token_density
+
+        return resolve_main_token_density(canonical_evidence_root(), route_fp, model)[1] == "cold_estimate"
+    except Exception:
+        return True
+
+
 def reclaim_low_water_margin(
     target_total_tokens: Optional[int], capacity_total_tokens: Optional[int],
 ) -> int:
@@ -986,6 +996,9 @@ def build_context_fit_plan(
         str(evidence.route_fp or ""),
         str(route["model"] or ""),
     )
+    cold = float((known_route or {}).get("cold_density") or 0)
+    if cold and _route_density_is_cold(str(evidence.route_fp or ""), str(route["model"] or "")):
+        ratio = cold  # the caller's route has no witness yet: its documented cold density, not 1.0
     known_window = is_known(evidence, require_fresh=True)
     input_source = None
     contents, initial_mode = _view_projections(

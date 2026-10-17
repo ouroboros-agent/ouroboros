@@ -56,11 +56,17 @@ class RouteFact:
     source_url: str
     read_on: str
     reply_allowance_tokens: int = CALL_REPLY_ALLOWANCE_TOKENS
+    # How many of the route's tokens one chars/4 estimate token costs until the route's own witness
+    # exists (a first call, or a witness past its freshness): measured, conservative, never 1.0 by default.
+    cold_density: float = 1.0
 
 
 REALTIME_ROUTE_FACTS: Dict[Tuple[str, str], RouteFact] = {
+    # Window and output maximum from the model page (also models.list); the cold density from Gemini's
+    # own TEXT counts of a Russian-and-English memory view: 1.19-1.22 per estimate token (2026-10-16).
     (ENGINE_GOOGLE, "gemini-3.8-live"): RouteFact(
-        131_072, 65_536, None, "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live", "2026-10-16"),
+        131_072, 65_536, None, "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live", "2026-10-16",
+        cold_density=1.25),
 }
 EVIDENCE_SOURCE_DOCUMENTED = "documented_route_fact"   # the evidence store's source label for these rows
 
@@ -161,7 +167,8 @@ def call_context_plan(task: Dict[str, Any], tools: Any, drive_root: Any) -> Opti
         return None
     route = resolve_call_route(spec, drive_root)
     fit_kwargs: Dict[str, Any] = {
-        "known_route": {"provider": spec.engine, "model": spec.model, "route_fp": route.evidence_fp},
+        "known_route": {"provider": spec.engine, "model": spec.model, "route_fp": route.evidence_fp,
+                        **({"cold_density": route.fact.cold_density} if route.fact else {})},
         "known_output_reserve_tokens": route.fact.reply_allowance_tokens if route.fact else CALL_REPLY_ALLOWANCE_TOKENS,
         "call_view": True,
     }

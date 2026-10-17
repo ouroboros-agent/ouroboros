@@ -57,8 +57,9 @@ def test_the_gemini_call_view_fits_its_route_with_room_for_the_conversation(owne
     assert plan.call_view and plan.model == "gemini-3.8-live"
     assert plan.projection("nano").memory_facts["floor"]["window_tokens"] == WINDOW  # never 65,536
     request = plan.projected_tokens_with_tools("nano", call.tool_schemas)
-    # The view, the user turn and the first tool view leave the reply allowance and at least one
-    # low-water level of the window (an eighth) for the conversation itself.
+    assert plan.projection("nano").calibration_ratio == 1.25  # no witness yet: the route's documented cold density
+    # In the route's own units, the view, the user turn and the first tool view leave the reply
+    # allowance and at least one low-water level of the window (an eighth) for the conversation itself.
     assert request + REPLY <= WINDOW - math.ceil(WINDOW / 8), request
     assert {"read_file", "promote_chat_to_task"} <= {s["function"]["name"] for s in call.tool_schemas}
 

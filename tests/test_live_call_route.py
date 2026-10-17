@@ -55,7 +55,7 @@ def test_call_context_plan_binds_the_fit_to_the_realtime_route_and_the_call_view
     # maximum (v1 passed that and fitted Gemini into half its window), and its own identity.
     assert plan.fit_kwargs == {"known_window_tokens": 131_072, "known_output_reserve_tokens": 8_192, "call_view": True,
                                "known_route": {"provider": ENGINE_GOOGLE, "model": "gemini-3.8-live",
-                                               "route_fp": fingerprint}}
+                                               "route_fp": fingerprint, "cold_density": 1.25}}
     assert [s["function"]["name"] for s in plan.tool_schemas] == ["web_search"]
     unknown = {"id": "t", "metadata": {"live_call": _spec(model="gemini-live-future").as_metadata()}}
     without = live_call_route.call_context_plan(unknown, None, tmp_path)
