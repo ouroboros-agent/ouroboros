@@ -228,12 +228,9 @@
     }
 }
 
-/* A phone-wide capsule folds Keyboard away and narrows End, so the state keeps its words. */
+/* A phone-wide capsule narrows End; Keyboard stays, the only way to type during a call. The state
+   line ellipsizes, so its words never push a control out. */
 @container call-row (max-width: 360px) {
-    .call-keyboard {
-        display: none;
-    }
-
     .call-end {
         padding: 0 var(--space-3);
     }
@@ -292,7 +289,7 @@
     position: fixed;
     top: calc(env(safe-area-inset-top, 0px) + var(--space-2));
     left: 50%;
-    z-index: 60;
+    z-index: 75; /* above the phone navigation drawer (70), so End stays reachable while it is open */
     display: flex;
     align-items: center;
     gap: var(--space-1);

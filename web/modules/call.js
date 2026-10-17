@@ -363,9 +363,9 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         return undefined;
     }
 
+    // Panic and Restart end the call only once confirmed: the server's own stop closes the hub, and a
+    // reload leaves the page (pagehide). A press the owner then cancels keeps the call.
     const end = () => session.end();
-    const panic = event => { if (event.target.closest?.('[data-chat-command="panic"], [data-chat-command="restart"]')) end(); };
-    doc.addEventListener('click', panic, true);
     env.addEventListener?.('pagehide', end);
     return {
         session,
@@ -375,7 +375,6 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
             if (destroyed) return;
             end();
             destroyed = true;
-            doc.removeEventListener('click', panic, true);
             env.removeEventListener?.('pagehide', end);
             rooms.delete(entry);
             entry.destroy();

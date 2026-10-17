@@ -307,17 +307,25 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.wait_for_function("count => __callTest.frames.length > count", arg=count)
 
             # Keyboard: the field returns with the visual docked; Send sends typed words as an ordinary turn.
-            if room.locator(".call-keyboard").is_visible():
-                room.locator(".call-keyboard").click()
-                expect(field).to_be_visible()
-                expect(field).to_be_focused()
-                expect(send).to_have_text("Send")
-                assert room.locator(".call-wave").is_visible()
-                page.keyboard.press("Enter")  # empty: nothing
-                assert admissions[-1]["client_message_id"] and len(admissions) == 1
-                _shot(page, f"{engine}-dark-1280-keyboard")
-                room.locator(".call-visual-return").click()
-                expect(room.locator(".call-end")).to_be_visible()
+            expect(room.locator(".call-keyboard")).to_be_visible()
+            room.locator(".call-keyboard").click()
+            expect(field).to_be_visible()
+            expect(field).to_be_focused()
+            expect(send).to_have_text("Send")
+            assert room.locator(".call-wave").is_visible()
+            page.keyboard.press("Enter")  # empty: nothing
+            assert admissions[-1]["client_message_id"] and len(admissions) == 1
+            _shot(page, f"{engine}-dark-1280-keyboard")
+            room.locator(".call-visual-return").click()
+            expect(room.locator(".call-end")).to_be_visible()
+
+            # Panic or Restart pressed and then cancelled keeps the call: only a confirmed stop ends it.
+            for command in ("panic", "restart"):
+                page.locator(f'#page-chat [data-chat-command="{command}"]').first.click()
+                page.locator("[data-confirm-cancel]").last.click()  # "Keep running" / "Cancel", not the corner ×
+                expect(page.locator("[data-confirm-cancel]")).to_have_count(0)
+                expect(state).to_have_text("Listening")
+                assert not page.evaluate("__callTest.sockets.at(-1).sent.some(message => message.type === 'bye')")
 
             _state(page, state="reconnecting", reason="session_cap")
             expect(state).to_have_text("Reconnecting…")
@@ -365,6 +373,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 _state(page, state="live")
                 expect(state).to_have_text("Listening")
                 _no_sideways_scroll(page, f"phone {scheme}")
+                expect(room.locator(".call-keyboard")).to_be_visible()  # typing stays one press away on a phone
                 _shot(page, f"{engine}-{scheme}-390-listening")
                 page.evaluate("__callTest.speak(0.4)")
                 _caption(page, "owner", f"item_phone_{scheme}", "Hi again")
