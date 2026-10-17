@@ -64,6 +64,11 @@ class _Hub:
         self.order.append("hub_close")
 
 
+# A guard against a call that never ends, not a speed claim: a run that admits the turn, opens the
+# hub and settles the lease takes several seconds on a loaded machine.
+CALL_WAIT_S = 60
+
+
 class _Driver:
     """A fake live driver: what the agent does once the task carries ``live_call``."""
 
@@ -81,7 +86,7 @@ class _Driver:
         self.hub.order.append("turn")
         self.started.set()
         if self.hold is not None:
-            assert self.hold.wait(10), "the fake call never got its end signal"
+            assert self.hold.wait(CALL_WAIT_S), "the fake call never got its end signal"
         if self.ending == "crash":
             raise RuntimeError("realtime socket died")
         if self.ending == "stop":
@@ -117,7 +122,7 @@ def _open(drive_root, repo, binding, hub, driver, **over):
 
 
 def _wait_ended(opened: PresenceCallOpened, run) -> None:
-    assert run is not None and run.ended.wait(10), f"call {opened.call_id} did not end"
+    assert run is not None and run.ended.wait(CALL_WAIT_S), f"call {opened.call_id} did not end"
 
 
 # --- opening -------------------------------------------------------------------------------------
@@ -258,7 +263,7 @@ def test_the_lease_spans_the_call_and_returns_on_end_stop_or_crash(tmp_path, mon
     driver = _Driver(drive_root, hub, hold=hold, ending=ending)
     opened = _open(drive_root, repo, binding, hub, driver)
     run = presence_call_run(opened.call_id)
-    assert driver.started.wait(10)
+    assert driver.started.wait(CALL_WAIT_S)
     gate = _configured_gate(drive_root)
 
     # Live: the conversation is held; a second call and a text turn both meet the lock.
@@ -314,7 +319,7 @@ def test_utterances_become_dialogue_rows_of_the_call(tmp_path, monkeypatch):
     hold = threading.Event()
     driver = _Driver(drive_root, hub, hold=hold)
     opened = _open(drive_root, repo, binding, hub, driver)
-    assert driver.started.wait(10)
+    assert driver.started.wait(CALL_WAIT_S)
     task = driver.task
     assert record_call_utterance(drive_root, task, direction="in", text="Can you summarize the agenda?")
     assert record_call_utterance(drive_root, task, direction="in", text="I agree with Alex.", speaker_label="Dana")
