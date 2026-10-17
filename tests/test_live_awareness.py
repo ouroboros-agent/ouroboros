@@ -207,14 +207,14 @@ class _Actor:
         self._current_task_started_at = time.time()
 
 
-def test_main_text_routing_does_not_steer_a_call_but_still_sees_a_text_turn(monkeypatch):
+def test_main_text_routing_does_not_steer_a_call_but_still_sees_a_text_turn(monkeypatch, tmp_path):
     from ouroboros.server_routing_context import _active_direct_roots
 
     registry = get_direct_activity_registry()
     registry.register("t-call", 1, kind="call", actor=_Actor("t-call", 1, "[Live call]"))
     registry.register("t-text", 1, kind="direct_chat", actor=_Actor("t-text", 1, "a text turn"))
     try:
-        roots = _active_direct_roots(SimpleNamespace(DRIVE_ROOT=None))
+        roots = _active_direct_roots(SimpleNamespace(DRIVE_ROOT=tmp_path))  # a text turn's reader reads its drive
         assert [root["task_id"] for root in roots] == ["t-text"]
         assert {entry.activity_id for entry in registry.actors()} >= {"t-call", "t-text"}   # Stop/Panic still see it
     finally:
