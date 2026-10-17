@@ -9,10 +9,12 @@ import { openExternalViaHostBridge, shellBridgeApi } from './ui_helpers.js';
 import { decodeFrame, encodeFrame, levelFromRms, newerEpoch } from './call_worklet.js';
 import { createCallCapsule } from './call_capsule.js';
 import { CallVision, visionAvailability } from './call_video.js';
+import { DEVICES_CHANGED, loadDevicePrefs, microphoneChanged, openMicrophone, routeSpeaker } from './call_devices.js';
 import { createCallCards } from './call_card.js';
 import { createCallLight } from './call_light.js';
 import { CALL_VISUAL } from './call_aura.js';
 import { trackCallMark } from './call_mark.js';
+import { showToast } from './toast.js';
 
 // Transport bound for a socket that delivers no message at all; every phase reports itself.
 const SOCKET_ANSWER_MS = 15000;
@@ -21,6 +23,8 @@ const ACTIVE = new Set(['permission', 'admission', 'preparing', 'connecting', 'l
 const SERVER_STATES = new Set(['preparing', 'connecting', 'live', 'reconnecting', 'closing', 'closed']);
 let microphoneOwner = null;
 const rooms = new Set();  // every mounted room call, for the shell mark and "Go to the call"
+const MIC_FELL_BACK = 'The chosen microphone is not connected; the call hears the system microphone.';
+const SPEAKER_FELL_BACK = 'The chosen speaker is not connected; the call plays through the system speaker.';
 
 export function callAvailability(env = globalThis) {
     let telegram = Boolean(env.Telegram?.WebApp)
@@ -56,7 +60,7 @@ function outputLatency(context) {
 export class CallSession {
     constructor({ chatId, env = globalThis, open = apiClient.openCall,
         socket = path => apiClient.callSocket(path), changed = () => {}, caption = () => {},
-        level = () => {}, settled = () => {} }) {
+        level = () => {}, settled = () => {}, notice = () => {} }) {
         this.chatId = chatId;
         this.env = env;
         this.open = open;
@@ -65,6 +69,7 @@ export class CallSession {
         this.caption = caption;
         this.level = level;
         this.settled = settled;
+        this.notice = notice;
         this.state = 'idle';
         this.generation = 0;
         this.captureGeneration = 0;
@@ -122,10 +127,13 @@ export class CallSession {
             // Resume during the gesture, before permission or admission can consume it on iOS.
             const resume = context.resume();
             resume.catch(() => {});
-            const media = await this.env.navigator.mediaDevices.getUserMedia({ audio: {
-                channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+            // This client's chosen microphone and cleaning (Settings → Live calls), else the system's own.
+            const prefs = loadDevicePrefs(this.env);
+            const { stream: media, fellBack } = await openMicrophone(this.env, prefs);
             if (!current()) { media.getTracks().forEach(track => track.stop()); return; }
+            if (fellBack) this.notice(MIC_FELL_BACK);
             this.media = media;
+            this.inputPrefs = prefs;
             for (const track of media.getAudioTracks()) track.onended = () => this.fail('microphone_lost');
             this.setState('admission');
             await resume;
@@ -140,6 +148,7 @@ export class CallSession {
             this.source = context.createMediaStreamSource(media);
             this.source.connect(node);
             node.connect(context.destination);
+            void routeSpeaker(context, prefs).then(route => { if (current() && route === 'fell_back') this.notice(SPEAKER_FELL_BACK); });
             const result = await this.open({ chat_id: this.chatId, client_message_id: this.env.crypto.randomUUID() });
             if (!result?.call_id || typeof result.ws_path !== 'string') throw new Error('The server did not return a call address.');
             if (!current()) { this.releaseAdmission(result.ws_path, context.sampleRate); return; }
@@ -197,6 +206,37 @@ export class CallSession {
         this.capture();
         this.send({ type: 'mute', muted: this.muted });
         this.changed(this.view());
+    }
+
+    /** A device choice made during the call: another microphone or cleaning replaces the track in
+     * place, the sound follows the chosen speaker where the engine allows, and a shown camera restarts
+     * on the chosen one. Before the microphone opens the next start reads the choice anyway. */
+    async applyDevices(prefs = loadDevicePrefs(this.env)) {
+        if (!this.active || !this.context || !this.node) return;
+        const generation = this.generation;
+        const current = () => generation === this.generation && Boolean(this.node);
+        if (await routeSpeaker(this.context, prefs) === 'fell_back' && current()) this.notice(SPEAKER_FELL_BACK);
+        if (current() && microphoneChanged(this.inputPrefs, prefs)) {
+            let opened;
+            try {
+                opened = await openMicrophone(this.env, prefs);
+            } catch {
+                if (current()) this.notice('The microphone could not change; the call keeps the one it had.');
+                return;
+            }
+            if (!current()) { opened.stream.getTracks().forEach(track => track.stop()); return; }
+            const [oldMedia, oldSource] = [this.media, this.source];
+            this.media = opened.stream;
+            for (const track of opened.stream.getAudioTracks()) track.onended = () => this.fail('microphone_lost');
+            this.source = this.context.createMediaStreamSource(opened.stream);
+            this.source.connect(this.node);
+            oldSource?.disconnect();
+            for (const track of oldMedia?.getTracks() || []) { track.onended = null; track.stop(); }
+            this.inputPrefs = prefs;
+            this.capture();
+            if (opened.fellBack) this.notice(MIC_FELL_BACK);
+        }
+        if (current() && this.vision.kind === 'camera' && prefs.camera !== this.vision.cameraId) void this.vision.restart();
     }
 
     toggleVision(kind) {
@@ -336,6 +376,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         caption(msg) { cards.update(msg); capsule.caption(msg); },
         level(levels) { light.level(levels); },
         settled(view) { cards.finish(); onSettled(view); },
+        notice(message) { if (!destroyed) showToast(message, 'warning'); },
     });
     const cards = createCallCards({ feed: page.querySelector('#chat-messages, .chat-messages'), ws, doc,
         live: () => (session.active ? session.callId : '') });
@@ -381,6 +422,8 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     env.addEventListener?.('pagehide', end);
     const bridgeReady = () => capsule.render();
     env.addEventListener?.('pywebviewready', bridgeReady);
+    const devicesChanged = () => { void session.applyDevices(); };
+    env.addEventListener?.(DEVICES_CHANGED, devicesChanged);
     return {
         session,
         leave: end,
@@ -391,6 +434,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
             destroyed = true;
             env.removeEventListener?.('pagehide', end);
             env.removeEventListener?.('pywebviewready', bridgeReady);
+            env.removeEventListener?.(DEVICES_CHANGED, devicesChanged);
             rooms.delete(entry);
             entry.destroy();
             light.destroy();

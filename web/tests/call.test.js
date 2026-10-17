@@ -4,6 +4,7 @@ import { apiClient } from '../modules/api_client.js';
 import { SETTINGS_INPUT_FIELDS, SECRET_KEYS, renderSettingsPage } from '../modules/settings_ui.js';
 import { CallSession, callAvailability, mediaFailure, mountRoomCall } from '../modules/call.js';
 import { visionAvailability } from '../modules/call_video.js';
+import { DEFAULT_DEVICE_PREFS } from '../modules/call_devices.js';
 import { decodeFrame, encodeFrame, encodeVideoFrame, followLevel, levelFromRms, LevelMeter, newerEpoch, pcm16, PlaybackBuffer,
     playedMilliseconds, LEVEL_CEILING_DB, LEVEL_FLOOR_DB, MAX_FRAME_PAYLOAD, MAX_VIDEO_FRAME_PAYLOAD, MAX_BUFFER_SECONDS } from '../modules/call_worklet.js';
 
@@ -53,6 +54,13 @@ test('Live calls in Settings: one engine (Gemini Live), its model and voice, and
     assert.doesNotMatch(live, /data-secret-setting/);
     assert.match(live, /Gemini Live with the Google AI key in Accounts → Google/);
     assert.doesNotMatch(live, /OpenAI/);
+    // This device's microphone, speaker and camera sit in the same section, outside the server draft.
+    const devices = html.slice(html.indexOf('data-call-devices'), html.indexOf('s-call-instructions'));
+    for (const key of ['mic', 'speaker', 'camera']) assert.match(devices, new RegExp(`id="s-call-device-${key}"[^>]*data-call-device="${key}"`));
+    for (const key of ['echoCancellation', 'noiseSuppression', 'autoGainControl']) assert.match(devices, new RegExp(`data-call-processing="${key}"`));
+    assert.match(devices, /data-call-mic-test/);
+    assert.match(devices, /never\s+sent to the server/);
+    assert.ok(SETTINGS_INPUT_FIELDS.every(([id]) => !id.startsWith('s-call-device-')));
 });
 
 test('framing rejects bad magic, version, kind, rate, lengths and oversized audio', () => {
@@ -194,7 +202,7 @@ test('the meter reports one window of captured and rendered RMS and stays quiet 
 function fixture({ open } = {}) {
     const tracks = [{ enabled: true, stopped: false, stop() { this.stopped = true; } }];
     const media = { getTracks: () => tracks, getAudioTracks: () => tracks };
-    const contexts = [], nodes = [], sockets = [], requests = [], views = [], captions = [], levels = [], settled = [];
+    const contexts = [], nodes = [], sockets = [], requests = [], views = [], captions = [], levels = [], settled = [], notices = [];
     const timers = new Map();
     let timerId = 0;
     class AudioContext {
@@ -227,10 +235,10 @@ function fixture({ open } = {}) {
     const session = new CallSession({ chatId: 71, env, socket, open: async body => {
         requests.push(body); return open ? open(body) : { call_id: 'c', ws_path: '/ws/call/c' };
     }, changed: view => views.push(view), caption: msg => captions.push(msg), level: data => levels.push(data),
-    settled: view => settled.push(view) });
+    settled: view => settled.push(view), notice: words => notices.push(words) });
     // Server messages arrive the way the page meets them: through the call socket.
     const state = msg => sockets.at(-1).onmessage({ data: JSON.stringify({ type: 'state', ...msg }) });
-    return { session, env, tracks, contexts, nodes, sockets, requests, views, captions, levels, settled, timers, state };
+    return { session, env, tracks, contexts, nodes, sockets, requests, views, captions, levels, settled, notices, timers, state };
 }
 
 test('feature detection names why a surface cannot call, and Telegram hides Talk', () => {
@@ -379,6 +387,55 @@ test('mic frames, mute, levels with output latency, and the owner End', async ()
         assert.equal(f.settled.length, 1);
         f.session.dismiss();
         assert.equal(f.session.state, 'idle');
+    } finally { f.session.stop(); }
+});
+
+test('a device change during a call replaces the microphone in place and keeps mute; a failed change keeps the call', async () => {
+    const f = fixture();
+    const next = [{ enabled: true, stop() { this.stopped = true; } }];
+    try {
+        await f.session.start();
+        f.sockets[0].connect();
+        f.state({ state: 'live' });
+        f.session.setMuted(true);
+        const asked = [];
+        f.env.navigator.mediaDevices.getUserMedia = async (constraints) => {
+            asked.push(constraints);
+            return { getTracks: () => next, getAudioTracks: () => next };
+        };
+        await f.session.applyDevices({ ...DEFAULT_DEVICE_PREFS, mic: 'usb-mic' });
+        assert.equal(asked[0].audio.deviceId.exact, 'usb-mic');
+        assert.equal(f.tracks[0].stopped, true);  // the old microphone is released
+        assert.equal(next[0].enabled, false);     // the new one is muted, as the call is
+        assert.equal(f.session.state, 'live');
+        // The same choice again reopens nothing; a speaker or camera choice is not a microphone change.
+        await f.session.applyDevices({ ...DEFAULT_DEVICE_PREFS, mic: 'usb-mic', speaker: 'headphones' });
+        assert.equal(asked.length, 1);
+        f.env.navigator.mediaDevices.getUserMedia = async () => { throw { name: 'NotReadableError' }; };
+        await f.session.applyDevices({ ...DEFAULT_DEVICE_PREFS, mic: 'other' });
+        assert.equal(f.session.state, 'live');
+        assert.equal(next[0].stopped, undefined);  // the working microphone stays
+        assert.match(f.notices.at(-1), /could not change/);
+    } finally { f.session.stop(); }
+});
+
+test('a chosen microphone that is gone opens the system one, and the owner is told', async () => {
+    const f = fixture();
+    const store = new Map([['ouroboros.call.devices', JSON.stringify({ mic: 'unplugged' })]]);
+    f.env.localStorage = { getItem: key => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) };
+    const asked = [];
+    const open = f.env.navigator.mediaDevices.getUserMedia;
+    f.env.navigator.mediaDevices.getUserMedia = async (constraints) => {
+        asked.push(constraints);
+        if (constraints.audio.deviceId) throw { name: 'OverconstrainedError' };
+        return open(constraints);
+    };
+    try {
+        await f.session.start();
+        assert.equal(asked.length, 2);
+        assert.equal(asked[1].audio.deviceId, undefined);
+        assert.match(f.notices[0], /chosen microphone is not connected/);
+        assert.equal(f.session.state, 'admission');
     } finally { f.session.stop(); }
 });
 

@@ -2,6 +2,7 @@
  * starts sharing; a small changed thumbnail and a slow keep-alive limit billed frames.
  */
 import { encodeVideoFrame, MAX_VIDEO_FRAME_PAYLOAD } from './call_worklet.js';
+import { loadDevicePrefs, openCamera } from './call_devices.js';
 
 const FRAME_MS = 1000;
 const KEEPALIVE_MS = 15000;
@@ -46,6 +47,7 @@ export class CallVision {
         this.lastSentAt = 0;
         this.sample = null;
         this.busy = false;
+        this.cameraId = '';
     }
 
     notify() { this.session.changed(this.session.view()); }
@@ -59,9 +61,11 @@ export class CallVision {
         let stream;
         try {
             const media = this.env.navigator.mediaDevices;
+            const prefs = loadDevicePrefs(this.env);
             stream = kind === 'screen'
                 ? await media.getDisplayMedia({ video: true, audio: false })
-                : await media.getUserMedia({ video: true, audio: false });
+                : (await openCamera(this.env, prefs)).stream;
+            if (kind === 'camera') this.cameraId = prefs.camera;
             if (token !== this.token || !this.session.active) { stream.getTracks().forEach(track => track.stop()); return; }
             const video = this.env.document.createElement('video');
             video.muted = true; video.playsInline = true; video.srcObject = stream;
@@ -83,6 +87,14 @@ export class CallVision {
                 : 'Video sharing could not start.';
             this.notify();
         }
+    }
+
+    /** A shown camera starts again on the device chosen now. */
+    restart() {
+        const kind = this.kind;
+        if (!kind) return Promise.resolve();
+        this.stop(false);
+        return this.toggle(kind);
     }
 
     stop(notify = true) {

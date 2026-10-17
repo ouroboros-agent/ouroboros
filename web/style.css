@@ -4394,6 +4394,32 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     transition: color 0.2s;
 }
 
+/* Settings → Live calls, this device: the microphone test's level, a capsule the owner's blue fills. */
+.call-devices {
+    display: grid;
+    gap: var(--space-2);
+    --call-device-level: 47, 107, 214;
+}
+:root[data-theme="dark"] .call-devices {
+    --call-device-level: 106, 166, 255;
+}
+.call-device-meter {
+    height: 8px;
+    max-width: 320px;
+    border-radius: var(--pill-radius);
+    background: var(--surface-tray);
+    overflow: hidden;
+}
+.call-device-meter > span {
+    display: block;
+    height: 100%;
+    width: 100%;
+    border-radius: inherit;
+    background: rgb(var(--call-device-level));
+    transform-origin: left center;
+    transform: scaleX(var(--level, 0));
+}
+
 .form-field input[type="range"] {
     -webkit-appearance: none;
     height: 4px;

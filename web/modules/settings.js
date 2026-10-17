@@ -1167,7 +1167,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // controls must not make the server draft dirty — otherwise toggling one would
     // ask the owner to discard "unsaved settings" that do not exist.
     const onServerSettingEdited = (event) => {
-        if (event?.target?.closest?.('[data-notify-settings], [data-autostart-settings]')) return;
+        if (event?.target?.closest?.('[data-notify-settings], [data-autostart-settings], [data-call-devices]')) return;
         if (event?.target?.closest?.('[data-response-limit]')) return;   // a maximum is an evidence acknowledgement, not a setting
         if (event?.target?.closest?.('[data-i18n-settings]')) return;   // the interface language saves through its own endpoint
         onSettingsEdited();
