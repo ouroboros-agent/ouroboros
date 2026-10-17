@@ -396,8 +396,13 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 _no_sideways_scroll(page, f"phone {scheme}")
                 expect(room.locator(".call-keyboard")).to_be_visible()  # typing stays one press away on a phone
                 _shot(page, f"{engine}-{scheme}-390-listening")
-                # A phone's keyboard view keeps End and the way back; Mute and the wave give the field their room.
+                # A phone's keyboard view keeps End and the way back; Mute and the wave give the field their room,
+                # and the composer keeps its height (the placeholder stays one line).
+                row_height = f"document.querySelector('{ROOM} .chat-text-row').getBoundingClientRect().height"
+                voice_height = page.evaluate(row_height)
                 room.locator(".call-keyboard").click()
+                expect(field).to_have_attribute("placeholder", "Message…")
+                assert abs(page.evaluate(row_height) - voice_height) <= 1, (voice_height, page.evaluate(row_height))
                 expect(room.locator(".call-end")).to_be_visible()
                 expect(room.locator(".call-mute")).to_be_hidden()
                 expect(room.locator(".call-wave")).to_be_hidden()
@@ -408,6 +413,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 _shot(page, f"{engine}-{scheme}-390-keyboard")
                 room.locator(".call-keyboard").click()
                 expect(state).to_have_text("Listening")
+                expect(field).to_have_attribute("placeholder", "Message Ouroboros...")
                 page.evaluate("__callTest.speak(0.4)")
                 _caption(page, "owner", f"item_phone_{scheme}", "Hi again")
                 expect(room.locator(".call-sub")).to_have_text("You’re speaking")

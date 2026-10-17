@@ -16,6 +16,9 @@ const TOGGLE = {
     keyboard: { icon: KEYBOARD, label: 'Type while talking' },
     voice: { icon: VOICE, label: 'Back to voice' },
 };
+// The field's placeholder while the call's controls share its row: one line at a phone's width, so
+// opening the keyboard view never grows the composer.
+const KEYBOARD_PLACEHOLDER = 'Message…';
 const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone'];
 
 // Why a call reconnects, beside "Reconnecting…".
@@ -273,6 +276,17 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         if (action) void act(action);
     }));
 
+    function typingPlaceholder(on) {
+        const kept = 'callPlaceholder' in field.dataset;
+        if (on && !kept) {
+            field.dataset.callPlaceholder = field.placeholder;
+            field.placeholder = KEYBOARD_PLACEHOLDER;
+        } else if (!on && kept) {
+            field.placeholder = field.dataset.callPlaceholder;
+            delete field.dataset.callPlaceholder;
+        }
+    }
+
     function setWords(element, text, formatted) {
         if (element.textContent !== text) element.textContent = text;
         if (formatted) element.dataset.i18nFmt = 'call'; else delete element.dataset.i18nFmt;
@@ -293,6 +307,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             capsule.hidden = !showing;
         }
         if (!showing) {
+            typingPlaceholder(false);
             for (const name of CALL_STATE) delete wrap.dataset[name];
             light.setMode('still', '');
             renderEntry();
@@ -310,6 +325,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         setWords(words.small, presented.small || '', true);
         $('.call-mute').hidden = sheet;
         $('.call-mute').setAttribute('aria-pressed', String(Boolean(current.muted)));
+        typingPlaceholder(keyboard && !sheet);
         const toggle = $('.call-keyboard');
         toggle.hidden = sheet;
         const face = keyboard ? 'voice' : 'keyboard';
@@ -354,6 +370,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             field.removeEventListener('keydown', renderEntry);
             send.removeEventListener('click', renderEntry);
             visualHandle.destroy();
+            typingPlaceholder(false);
             capsule.remove();
             for (const name of CALL_STATE) delete wrap.dataset[name];
             if (send.dataset.callEntry === 'talk' && group?.dataset.busy !== '1') { send.textContent = 'Send'; send.title = 'Send message'; }
