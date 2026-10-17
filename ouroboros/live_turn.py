@@ -4,24 +4,16 @@ A call is an ordinary turn whose model speaks and listens (ARCHITECTURE §6 "Liv
 calls"): the agent prepares the text turn's context, this driver opens the engine
 with that fitted system text and the room's Nano tool view (``live_call_route``)
 and pumps until the call ends: peer audio in, engine audio out through the hub,
-captions to the peers and the chat (owner speech as an owner row WITHOUT an owner
-turn, Ouroboros speech as the turn's narration with its played mark), tools on one
-serialized worker (``live_tool_batch``), the owner's mailbox (Stop, Hurry, typed
-words) on a short tick with deferred acknowledgement, and the room's new rows
-(``live_awareness``, from the instant the context was captured) as context. Session
-caps and transport losses reopen with a history view or the provider's resume
-handle; context the call heard is in its transcript and waits while no session is
-live. A Stop during the connection cancels the opening; a tool result the transport
-refuses is a typed failure the model hears; a session the provider refuses ends
-with its own words. The price quote warms on the ledger's thread, never holding the
-open. The phases (preparing, connecting, live) and each closing reason with its one
-next step come from here and the hub. Returns the loop's ``(text, usage, llm_trace)``
-with a host-notice terminal (``terminal_origin=host_notice``) naming the transcript.
+captions to peers and chat, runs tools on one serialized worker, drains owner mail
+and room rows, and reopens capped or lost sessions with a history view or resume
+handle. The price quote warms off the audio loop. Stop cancels opening. It returns
+the loop's triple with a host notice naming the transcript.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import logging
 import pathlib
@@ -40,7 +32,7 @@ from ouroboros.gateways.realtime_engine import (
     SPEAKER_OUROBOROS, SPEAKER_OWNER, USAGE_KEYS,
     AudioIn, AudioOut, Caption, Close, Closed, ContextItem, EngineError, GoAway, Interrupt, PlayedAudio, Ready,
     ResponseDone, ResponseStarted, ResumeCheckpoint, SessionConfig, SpeechStarted, ToolCall, ToolCallCancelled,
-    ToolResult, UpdateTools,
+    ToolResult, UpdateTools, VideoIn,
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
 from ouroboros.live_call_route import (call_local_schemas, call_minutes_ceiling, call_turn_taking, initial_call_schemas,
@@ -479,7 +471,7 @@ class _LiveCall:
     async def _send(self, command: Any) -> None:
         engine = self.engine
         if engine is None:
-            if isinstance(command, (ContextItem, ToolResult, UpdateTools)) and not self.closing:
+            if isinstance(command, (ContextItem, ToolResult, UpdateTools, VideoIn)) and not self.closing:
                 self._queued.append((len(self.messages), command))  # audio and playback marks are transient; context waits
             return
         if isinstance(command, (ContextItem, ToolResult, UpdateTools)):
@@ -567,6 +559,14 @@ class _LiveCall:
 
     async def _context(self, item: ContextItem) -> None:
         """Context the call heard is part of its transcript: a reopened session replays it."""
+        if isinstance(item, VideoIn):
+            row = self.messages[-1]
+            if isinstance(row["content"], str):
+                row["content"] = [{"type": "text", "text": row["content"]}]
+            row["content"].append({"type": "image_url", "image_url": {"url":
+                                   f"data:{item.mime};base64,{base64.b64encode(item.data).decode('ascii')}"}})
+            self._post(item)
+            return
         if not item.text.strip():
             return
         self.messages.append({"role": "user", "content": item.text, "_call_row": True, "_context_source": item.source})

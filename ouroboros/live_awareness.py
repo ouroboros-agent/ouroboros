@@ -22,9 +22,12 @@ from __future__ import annotations
 import logging
 import pathlib
 import threading
+import hashlib
+import io
 from typing import Any, Callable, Dict, List, Optional
 
-from ouroboros.gateways.realtime_engine import ContextItem
+from ouroboros.gateways.realtime_engine import ContextItem, VideoIn
+from ouroboros.gateways.realtime_transport import MAX_VIDEO_BYTES
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +114,7 @@ class RoomRows:
         self.chat_id, self.task_id, self.call_id, self.started_at = int(chat_id), str(task_id), str(call_id), started_at
         self._lock = threading.Lock()
         self._seen: set = set()
-        self._pending: List[ContextItem] = []
+        self._pending: List[ContextItem | VideoIn] = []
         self._member: Optional[Callable[[int, Dict[str, Any]], bool]] = None
         self._registered = False
 
@@ -135,7 +138,7 @@ class RoomRows:
             unregister_room_listener(self.chat_id, self._on_row)
             self._registered = False
 
-    def drain(self) -> List[ContextItem]:
+    def drain(self) -> List[ContextItem | VideoIn]:
         with self._lock:
             items, self._pending = self._pending, []
         return items
@@ -163,11 +166,49 @@ class RoomRows:
             key = row_key(row)
         except Exception:
             return
+        images = room_images(row, self.root)
         with self._lock:
             if key in self._seen:
                 return
             self._seen.add(key)
             self._pending.append(render_room_row(row, key))
+            self._pending.extend(images)
+
+
+def room_images(row: Dict[str, Any], root: pathlib.Path) -> List[VideoIn]:
+    """Read only an accepted owner's measured image uploads; bound what reaches Live."""
+    from ouroboros.chat_uploads import open_upload
+    from ouroboros.image_preparation import prepare_image_bytes
+
+    if row.get("direction") != "in":
+        return []
+    images = []
+    for ref in row.get("attachments") or ():
+        if not isinstance(ref, dict) or ref.get("kind") != "image" or ref.get("unavailable"):
+            continue
+        try:
+            handle, observed = open_upload(ref["upload"], root)
+            with handle:
+                data = handle.read(8 * 1024 * 1024 + 1)
+            if (observed.st_size != ref.get("size") or observed.st_mtime_ns != ref.get("mtime_ns")
+                    or len(data) != ref.get("size") or len(data) > 8 * 1024 * 1024
+                    or hashlib.sha256(data).hexdigest() != ref.get("sha256")):
+                continue
+            prepared = prepare_image_bytes(data, max_bytes=MAX_VIDEO_BYTES, max_side=1280,
+                                           reason="live call vision")
+            if prepared.mime in ("image/jpeg", "image/png"):
+                images.append(VideoIn(prepared.mime, prepared.data))
+            else:
+                from PIL import Image
+
+                with Image.open(io.BytesIO(prepared.data)) as source:
+                    converted = io.BytesIO()
+                    source.convert("RGB").save(converted, format="JPEG", quality=75)
+                if len(converted.getvalue()) <= MAX_VIDEO_BYTES:
+                    images.append(VideoIn("image/jpeg", converted.getvalue()))
+        except (OSError, ValueError, KeyError, ImportError):
+            log.debug("room image could not reach live call", exc_info=True)
+    return images
 
 
 def render_room_row(row: Dict[str, Any], key: str) -> ContextItem:

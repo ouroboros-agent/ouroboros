@@ -9,13 +9,19 @@ through their mailbox, a live call is admitted as a census turn of kind
 from __future__ import annotations
 
 import queue
+import asyncio
+import base64
+import io
 import threading
 import time
 from types import SimpleNamespace
 
+from PIL import Image
+
 from ouroboros import live_awareness
 from ouroboros.call_protocol import CallSpec
 from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE
+from ouroboros.gateways.realtime_engine import VideoIn
 from ouroboros.utils import utc_now_iso
 from supervisor import workers
 from supervisor.active_activity import get_direct_activity_registry
@@ -95,6 +101,37 @@ def test_room_rows_become_context_items_without_self_echo(tmp_path):
         rooms.stop()
     _log(tmp_path, "in", 1, "after the call")
     assert rooms.drain() == []
+
+
+def test_owner_image_row_reaches_live_video_and_replay_beside_its_text(tmp_path):
+    from ouroboros.chat_uploads import store_upload
+    from ouroboros.live_turn import _LiveCall
+    from ouroboros.gateways.realtime_gemini import history_turn
+
+    output = io.BytesIO()
+    Image.new("RGB", (40, 25), (30, 80, 120)).save(output, format="PNG")
+    _, ref = store_upload(output.getvalue(), "slide.png", data_dir=tmp_path)
+    rooms = live_awareness.RoomRows(tmp_path, 1, "t-call", "call-1", utc_now_iso())
+    rooms.start()
+    try:
+        _log(tmp_path, "in", 1, "Look at this slide", message_meta={"attachments": [ref]})
+        items = rooms.drain()
+        assert len(items) == 2 and isinstance(items[1], VideoIn)
+        assert items[1].mime == "image/png" and items[1].data == output.getvalue()
+        sent = []
+        call = SimpleNamespace(messages=[], _post=sent.append)
+        for item in items:
+            asyncio.run(_LiveCall._context(call, item))
+        assert sent == items
+        replay = history_turn(call.messages[0])
+        assert "Look at this slide" in replay["parts"][0]["text"]
+        assert base64.b64decode(replay["parts"][1]["inlineData"]["data"]) == output.getvalue()
+        # A changed upload cannot turn the accepted row into different pixels.
+        bad = dict(ref, sha256="0" * 64)
+        assert live_awareness.room_images({"direction": "in", "attachments": [bad]}, tmp_path) == []
+        assert live_awareness.room_images({"direction": "out", "attachments": [ref]}, tmp_path) == []
+    finally:
+        rooms.stop()
 
 
 def test_the_hidden_partition_is_a_room_and_a_row_without_a_chat_id_is_not_it(tmp_path):
