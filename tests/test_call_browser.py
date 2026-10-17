@@ -418,7 +418,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             _shot(page, f"{engine}-dark-1280-card-folded")
             card.locator(".call-card-head").click()
             expect(card).to_have_attribute("data-call-open", "1")
-            expect(card.locator(".call-line.owner")).to_be_visible()
+            expect(card.locator(".call-line.owner").first).to_be_visible()
             _shot(page, f"{engine}-dark-1280-card-open")
             assert not errors, errors
         finally:
