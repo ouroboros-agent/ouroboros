@@ -699,9 +699,11 @@ async def run_probe(args):
 
 # Never copied: the source's Claudexor home (its daemon's descriptor and token would let the copy reach
 # that daemon), the observability store (millions of request dumps a call never reads; copying it took
-# longer than everything else together on the owner's install), and the state's engine runtimes and
-# review checkouts (caches of whole trees no call reads).
-DATA_COPY_SKIPPED = ("claudexor", "observability", "state/cx", "state/review_checkouts")
+# longer than everything else together on the owner's install), the state's engine runtimes and review
+# checkouts, and the task workspaces (headless task files, forked drives and trees): whole trees no call
+# reads, which made the copy run past half an hour.
+DATA_COPY_SKIPPED = ("claudexor", "observability", "state/cx", "state/review_checkouts", "state/headless_tasks",
+                     "task_drives", "task_trees")
 
 
 def copy_data(source: Path, target: Path, *, skipped=DATA_COPY_SKIPPED, prefix: str = "") -> None:
