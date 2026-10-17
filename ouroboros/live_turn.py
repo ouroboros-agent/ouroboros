@@ -43,7 +43,7 @@ from ouroboros.gateways.realtime_engine import (
     ToolResult, UpdateTools,
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
-from ouroboros.live_call_route import call_minutes_ceiling, initial_call_schemas, native_search_enabled, resolve_call_route
+from ouroboros.live_call_route import call_minutes_ceiling, call_turn_taking, initial_call_schemas, native_search_enabled, resolve_call_route
 from ouroboros.live_session_view import (
     calibration_ratio, compression_watermarks, history_view, record_density_witness, text_estimate,
 )
@@ -390,7 +390,7 @@ class _LiveCall:
                                                           calibration_ratio(self.ctx))
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=tuple(self.tool_schemas),
                              history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle,
-                             compress_at_tokens=compress_at, compress_to_tokens=compress_to)
+                             compress_at_tokens=compress_at, compress_to_tokens=compress_to, **call_turn_taking(self.spec))
 
     async def _open_engine(self, *, resume_handle: str = "") -> None:
         if self.closing or self.hub.ended_by_owner:

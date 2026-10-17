@@ -41,6 +41,17 @@ def _spec(**overrides) -> CallSpec:
     return CallSpec(**fields)
 
 
+def test_the_owner_s_instructions_for_calls_open_his_calls_only():
+    from supervisor.worker_chat_lane import call_opening_text
+
+    plain = call_opening_text(_spec())
+    assert plain.startswith("[Live call]") and "instructions for calls" not in plain
+    told = call_opening_text(_spec(instructions="Говори коротко и по-русски."))
+    assert told.endswith("The owner's instructions for calls:\nГовори коротко и по-русски.")
+    # A Presence call speaks for its binding, whose own instructions it carries.
+    assert "instructions for calls" not in call_opening_text(_spec(instructions="x", presence_binding_id="b1"))
+
+
 # --- the room reaches the call -----------------------------------------------------
 
 
@@ -262,6 +273,7 @@ def test_handle_call_direct_admits_a_census_turn_of_kind_call(monkeypatch, tmp_p
     assert task["_is_direct_chat"] is True and task["chat_id"] == 1 and task["text"].startswith("[Live call]")
     # Gemini's own recognition took Russian for German and Polish in a real call: the call is told so.
     assert "Speech recognition can take one language for another" in task["text"]
+    assert "owner's instructions for calls" not in task["text"]  # none set: nothing added
     assert CallSpec.from_metadata(task["metadata"]["live_call"]) == spec
     release.set()
     assert _wait_for(lambda: finished == [(receipt["task_id"], True)])

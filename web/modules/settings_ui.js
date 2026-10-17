@@ -5,6 +5,7 @@ import { renderSubagentsSection } from './subagents_settings.js';
 import { languageBlockHtml } from './settings_language.js';
 import { modelRolesHost } from './model_roles.js';
 import { bindSecretReveal } from './settings_secrets.js';
+import { CALL_SETTINGS_FIELDS, callSettingsHtml } from './call_settings.js';
 
 // Reads as a sequence: keys → secrets → which API models → who among the agents
 // does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
@@ -28,10 +29,8 @@ export const SETTINGS_INPUT_FIELDS = [
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
     // Optional task bounds: a positive integer or "unlimited" (SSOT: ouroboros/settings_scales.py); a blank is refused by the server.
     ['s-max-rounds', 'OUROBOROS_MAX_ROUNDS', 'unlimited'], ['s-task-lifetime', 'OUROBOROS_TASK_ABS_CEILING_SEC', 'unlimited'],
-    // Live calls run on one engine, Google's Gemini Live: its model and voice are the call's only routes.
-    ['s-call-model-google', 'OUROBOROS_CALL_MODEL_GOOGLE'], ['s-call-voice-google', 'OUROBOROS_CALL_VOICE_GOOGLE'],
-    ['s-call-native-search', 'OUROBOROS_CALL_NATIVE_SEARCH', 'true'],
-    ['s-call-max-minutes', 'OUROBOROS_CALL_MAX_MINUTES'], ['s-presence-call-max-minutes', 'OUROBOROS_PRESENCE_CALL_MAX_MINUTES'],
+    // Live calls run on one engine, Google's Gemini Live (Models → Live calls, call_settings.js).
+    ...CALL_SETTINGS_FIELDS,
 ];
 
 const SETTINGS_TABS = [
@@ -107,7 +106,8 @@ const PROVIDER_CARDS = [
     {
         id: 'google', title: 'Google', hint: 'Gemini live calls',
         fields: [{ id: 's-google', settingKey: 'GOOGLE_API_KEY', label: 'Google API Key', placeholder: 'Google AI Studio key' }],
-        note: 'Live calls (Talk) use this key; their model, voice and limits are in Models → Live calls.',
+        note: 'Live calls (Talk) use this key; their model, voice and limits are in Models → Live calls. A call sends Google '
+            + 'your voice and the call\u2019s memory of you; with a free-tier key Google may use that content to improve its products, with a paid one it does not.',
     },
     {
         id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
@@ -391,33 +391,7 @@ export function renderSettingsPage() {
                         </div>
                         <div class="ui-field-help" id="s-websearch-preview" role="status"></div>
                     </div>
-                    <div class="form-section">
-                        <h3>Live calls</h3>
-                        <div class="settings-section-copy">Talk with Ouroboros by voice in any room: press Talk in an empty message field. Calls run on Google’s Gemini Live with the Google AI key in Accounts → Google. Changes apply to the next call.</div>
-                        <div class="form-grid two">
-                            <div class="form-field ui-field">
-                                <label for="s-call-native-search">Google native search</label>
-                                <select id="s-call-native-search" class="ui-control"><option value="false">Off</option><option value="true">On</option></select>
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-call-model-google">Gemini Live model</label>
-                                <input id="s-call-model-google" class="ui-control" type="text" placeholder="Use engine default">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-call-voice-google">Voice</label>
-                                <input id="s-call-voice-google" class="ui-control" type="text" placeholder="Use engine default">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-call-max-minutes">Call limit (minutes)</label>
-                                <input id="s-call-max-minutes" class="ui-control" type="number" min="1" step="1" placeholder="No limit" aria-describedby="s-call-duration-help">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-presence-call-max-minutes">Presence call limit (minutes)</label>
-                                <input id="s-presence-call-max-minutes" class="ui-control" type="number" min="1" step="1" placeholder="No limit" aria-describedby="s-call-duration-help">
-                            </div>
-                        </div>
-                        <div id="s-call-duration-help" class="settings-inline-note ui-field-help">Leave a duration empty for no time limit. The shared spending limit still applies.</div>
-                    </div>
+${callSettingsHtml()}
                 </section>
 
                 <section class="settings-panel" data-settings-panel="agents">

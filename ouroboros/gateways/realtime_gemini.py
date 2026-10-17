@@ -74,14 +74,23 @@ def setup_message(config):
     generation = {"responseModalities": ["AUDIO"]}
     if config.route.voice:
         generation["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": config.route.voice}}}
-    return {"setup": {
+    setup = {
         "model": config.route.model if config.route.model.startswith("models/") else f"models/{config.route.model}",
         "systemInstruction": {"parts": [{"text": config.instructions}]},
         "tools": tools, "generationConfig": generation,
         "inputAudioTranscription": {}, "outputAudioTranscription": {},
         "contextWindowCompression": compression(config),
         "sessionResumption": {"handle": config.resume_handle} if config.resume_handle else {},
-    }}
+    }
+    # The owner's turn-taking, sent only when it differs from the provider's defaults.
+    turn_taking = {}
+    if config.silence_ms > 0:
+        turn_taking["automaticActivityDetection"] = {"silenceDurationMs": config.silence_ms}
+    if not config.interruptions:
+        turn_taking["activityHandling"] = "NO_INTERRUPTION"
+    if turn_taking:
+        setup["realtimeInputConfig"] = turn_taking
+    return {"setup": setup}
 
 
 def history_turn(row):

@@ -21,6 +21,7 @@ test('Live calls in Settings: one engine (Gemini Live), its model and voice, and
     const html = renderSettingsPage();
     const fields = SETTINGS_INPUT_FIELDS.filter(([, key]) => key.includes('CALL_'));
     assert.deepEqual(fields.map(([, key]) => key), ['OUROBOROS_CALL_MODEL_GOOGLE', 'OUROBOROS_CALL_VOICE_GOOGLE',
+        'OUROBOROS_CALL_INSTRUCTIONS', 'OUROBOROS_CALL_PAUSE', 'OUROBOROS_CALL_INTERRUPTIONS',
         'OUROBOROS_CALL_NATIVE_SEARCH', 'OUROBOROS_CALL_MAX_MINUTES', 'OUROBOROS_PRESENCE_CALL_MAX_MINUTES']);
     for (const [id, key, fallback] of fields) {
         assert.equal(html.split(`id="${id}"`).length - 1, 1, key);
@@ -28,9 +29,19 @@ test('Live calls in Settings: one engine (Gemini Live), its model and voice, and
             assert.equal(fallback, undefined);
             assert.match(html, new RegExp(`id="${id}"[^>]*min="1"[^>]*step="1"`));
         }
+        // Model and voice are editable suggestions: a list to choose from, any id still typed.
         if (key.includes('_MODEL_') || key.includes('_VOICE_'))
-            assert.match(html, new RegExp(`<input id="${id}"[^>]*type="text"`));
+            assert.match(html, new RegExp(`type="text" id="${id}"[^>]*data-model-chooser`));
     }
+    const voices = html.slice(html.indexOf('id="s-call-voice-options"'), html.indexOf('</div></span>', html.indexOf('id="s-call-voice-options"')));
+    assert.equal(voices.split('data-model-value=').length - 1, 30);
+    assert.match(voices, /data-model-value="Kore"[^>]*>Kore — Firm</);
+    assert.match(html, /<textarea id="s-call-instructions"/);
+    assert.match(html, /id="s-call-pause"[^>]*>.*value="short".*value="normal".*value="long"/s);
+    assert.deepEqual(fields.filter(([, key]) => key.endsWith('PAUSE') || key.endsWith('INTERRUPTIONS')).map(([, , f]) => f),
+        ['normal', 'true']);
+    // The key's card says what a call sends Google and what a free-tier key lets Google do with it.
+    assert.match(html, /with a free-tier key Google may use that content to improve its products/);
     // No engine to choose and nothing about another engine: calls are Gemini Live.
     for (const gone of ['s-call-engine', 's-call-model-openai', 's-call-voice-openai']) assert.equal(html.includes(`id="${gone}"`), false, gone);
     // The Google AI key lives where every provider key lives (Accounts, and the Secrets list); Live calls

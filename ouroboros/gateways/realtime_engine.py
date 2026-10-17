@@ -78,6 +78,10 @@ class SessionConfig:
     # call view's size, the route's input limit and its reply allowance; 0 = provider default.
     compress_at_tokens: int = 0
     compress_to_tokens: int = 0
+    # Turn-taking the owner chose: how long a silence ends his turn (0 = provider default) and
+    # whether his speech interrupts the voice that is answering.
+    silence_ms: int = 0
+    interruptions: bool = True
 
 
 # ---- commands: driver -> engine -------------------------------------------------

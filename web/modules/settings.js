@@ -23,6 +23,7 @@ import { initHarnessAccounts } from './harness_accounts.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { confirmAndSendRestart } from './chat_activity.js';
 import { PROVIDER_TEST_INPUTS, SETTINGS_INPUT_FIELDS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
+import { bindCallSettings } from './call_settings.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
@@ -456,6 +457,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     };
     const disposeSettingsTabs = bindSettingsTabs(page, { state, onActivate: () => resetSecretReveals(page) });
     bindSecretInputs(page);
+    bindCallSettings(page);
     bindEffortSegments(page);
     // Appearance is client-local and injected after boot; never a server setting.
     globalThis.ouroTheme?.mount();

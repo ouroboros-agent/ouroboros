@@ -212,6 +212,7 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 | OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls |
 | OUROBOROS_CALL_VOICE_GOOGLE | "" | Gemini call voice (blank = provider default) |
 | OUROBOROS_CALL_NATIVE_SEARCH | true | Gemini's own Google Search in calls |
+| OUROBOROS_CALL_INSTRUCTIONS · _PAUSE · _INTERRUPTIONS | "" · normal · true | The owner's words a call opens with; how long a silence ends his turn (short 500 ms, long 1600 ms); whether his speech interrupts the answer |
 | OUROBOROS_CALL_MAX_MINUTES | "" | Optional call duration ceiling (blank = none) |
 | OUROBOROS_PRESENCE_CALL_MAX_MINUTES | "" | Optional ceiling for a Presence call, which holds a Presence slot (blank = none) |
 | LOCAL_MODEL_CHAT_FORMAT | "" | Local-model chat template override |

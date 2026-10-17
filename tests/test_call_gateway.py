@@ -100,7 +100,8 @@ def test_owner_open_captures_settings_and_closes_hub_on_finished(owner, monkeypa
     calls = []
     monkeypatch.setattr(config, "load_settings", lambda: {
         "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "live-model",
-        "OUROBOROS_CALL_VOICE_GOOGLE": "configured-voice", "OUROBOROS_CALL_MAX_MINUTES": "9"})
+        "OUROBOROS_CALL_VOICE_GOOGLE": "configured-voice", "OUROBOROS_CALL_MAX_MINUTES": "9",
+        "OUROBOROS_CALL_INSTRUCTIONS": " Be brief. ", "OUROBOROS_CALL_PAUSE": "Long", "OUROBOROS_CALL_INTERRUPTIONS": "false"})
 
     def admit(chat_id, spec, on_finished):
         assert get_hub(spec.call_id) is not None
@@ -114,6 +115,7 @@ def test_owner_open_captures_settings_and_closes_hub_on_finished(owner, monkeypa
     assert (chat_id, spec.engine, spec.model, spec.voice, spec.max_minutes, spec.client_message_id) == (
         1, "google", "live-model", "configured-voice", 9, "message")
     assert spec.opened_by == cp.OPENED_BY_OWNER
+    assert (spec.instructions, spec.pause, spec.interruptions) == ("Be brief.", "long", False)
     with owner.websocket_connect(response.json()["ws_path"]) as ws:
         hello(ws, "owner")
     finished("turn", True)
@@ -616,4 +618,6 @@ def test_an_emptied_model_field_opens_the_default_model(owner, monkeypatch):
     response = owner.post("/api/call/open", json={"chat_id": 1})
     assert response.status_code == 200, response.text
     assert admitted[-1].model == SETTINGS_DEFAULTS["OUROBOROS_CALL_MODEL_GOOGLE"] == "gemini-3.8-live"
+    # Unset turn-taking keeps the provider's defaults: speech interrupts, no pause chosen.
+    assert (admitted[-1].pause, admitted[-1].interruptions, admitted[-1].instructions) == ("", True, "")
     close_hub(admitted[-1].call_id)

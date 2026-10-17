@@ -520,6 +520,21 @@ def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
     assert denied.kind == "authentication" and "fixture-key" not in denied.message and denied.provider_words == ""
 
 
+def test_gemini_turn_taking_is_sent_only_when_the_owner_chose_it():
+    from ouroboros.call_protocol import CallSpec
+    from ouroboros.live_call_route import call_turn_taking
+
+    route = EngineRoute("google", "gemini-3.8-live")
+    assert "realtimeInputConfig" not in gemini.setup_message(SessionConfig(route, "core"))["setup"]
+    normal = call_turn_taking(CallSpec("c", 1, "google", "m", pause="normal"))
+    assert normal == {"silence_ms": 0, "interruptions": True}
+    assert "realtimeInputConfig" not in gemini.setup_message(SessionConfig(route, "core", **normal))["setup"]
+    chosen = call_turn_taking(CallSpec("c", 1, "google", "m", pause="long", interruptions=False))
+    assert gemini.setup_message(SessionConfig(route, "core", **chosen))["setup"]["realtimeInputConfig"] == {
+        "automaticActivityDetection": {"silenceDurationMs": 1600}, "activityHandling": "NO_INTERRUPTION"}
+    assert call_turn_taking(CallSpec("c", 1, "google", "m", pause="short"))["silence_ms"] == 500
+
+
 def test_gemini_compression_starts_at_the_drivers_watermarks():
     base = SessionConfig(EngineRoute("google", "gemini-3.8-live"), "core")
     assert gemini.setup_message(base)["setup"]["contextWindowCompression"] == {"slidingWindow": {}}

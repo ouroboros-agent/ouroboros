@@ -131,6 +131,9 @@ class CallSpec:
     ``presence_binding_id`` and runs under that binding's ceiling. ``max_minutes``
     is the owner's configured ceiling (``None`` = none); the provider's own
     session limits are handled as reconnects, not as the end of the call.
+    ``instructions`` are the owner's own words for calls; ``pause`` (short, normal,
+    long) is how long a silence ends the owner's turn and ``interruptions`` whether
+    speaking over Ouroboros interrupts it, all captured from Settings at admission.
     """
 
     call_id: str
@@ -143,6 +146,9 @@ class CallSpec:
     max_minutes: Optional[int] = None
     label: str = ""
     client_message_id: str = ""
+    instructions: str = ""
+    pause: str = ""
+    interruptions: bool = True
 
     def as_metadata(self) -> Dict[str, Any]:
         """The ``task["metadata"]["live_call"]`` form the driver selection reads."""
@@ -151,6 +157,7 @@ class CallSpec:
             "model": self.model, "voice": self.voice, "opened_by": self.opened_by,
             "presence_binding_id": self.presence_binding_id, "max_minutes": self.max_minutes,
             "label": self.label, "client_message_id": self.client_message_id,
+            "instructions": self.instructions, "pause": self.pause, "interruptions": self.interruptions,
         }
 
     @classmethod
@@ -163,6 +170,8 @@ class CallSpec:
             max_minutes=(int(data["max_minutes"]) if data.get("max_minutes") not in (None, "") else None),
             label=str(data.get("label") or ""),
             client_message_id=str(data.get("client_message_id") or ""),
+            instructions=str(data.get("instructions") or ""), pause=str(data.get("pause") or ""),
+            interruptions=data.get("interruptions") is not False,
         )
 
 

@@ -198,6 +198,17 @@ def call_minutes_ceiling(spec: CallSpec) -> Optional[int]:
     return int(raw) if raw.isdigit() and int(raw) > 0 else None
 
 
+# How long a silence ends the owner's turn, by his Settings choice: Google advises 500-800 ms and
+# defaults near 800, so Short is the low end of that advice and Long twice the default; Normal
+# leaves the provider's own default in place.
+PAUSE_SILENCE_MS = {"short": 500, "normal": 0, "long": 1600}
+
+
+def call_turn_taking(spec: CallSpec) -> Dict[str, Any]:
+    """The session's ``silence_ms`` and ``interruptions`` from what the owner chose for calls."""
+    return {"silence_ms": PAUSE_SILENCE_MS.get(str(spec.pause or "").lower(), 0), "interruptions": bool(spec.interruptions)}
+
+
 def native_search_enabled(spec: CallSpec) -> bool:
     """Gemini's own search grounding for this call, the owner's choice (on unless switched off)."""
     raw = (_call_setting("OUROBOROS_CALL_NATIVE_SEARCH") or "true").lower()

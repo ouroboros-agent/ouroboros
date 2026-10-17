@@ -78,8 +78,11 @@ def build_call_spec(payload: dict) -> cp.CallSpec:
             raise CallPeerError("invalid_call_max_minutes") from None
     else:
         limit = None
+    interruptions = str(settings.get("OUROBOROS_CALL_INTERRUPTIONS", True)).strip().lower() not in ("false", "0", "off", "no")
     return cp.CallSpec(uuid.uuid4().hex, payload["chat_id"], "google", model, voice,
-                       max_minutes=limit, client_message_id=payload.get("client_message_id", ""))
+                       max_minutes=limit, client_message_id=payload.get("client_message_id", ""),
+                       instructions=str(settings.get("OUROBOROS_CALL_INSTRUCTIONS") or "").strip(),
+                       pause=str(settings.get("OUROBOROS_CALL_PAUSE") or "").strip().lower(), interruptions=interruptions)
 
 
 def _admit_owner_call(payload: dict) -> dict:

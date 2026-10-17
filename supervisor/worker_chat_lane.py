@@ -730,15 +730,24 @@ def handle_call_direct(
             return {"admitted": False, "task_id": "", "reason": "project_room_unavailable"}
         if project_id:
             metadata["project_id"] = project_id
-    text = (f"[Live call] A live voice call is open in this room (engine {spec.engine}, model {spec.model}). "
-            "The conversation is spoken; its transcript is written to this chat. Speech recognition can take one "
-            "language for another: keep to the language this room is spoken and written in, and if the owner's "
-            "words suddenly read as another language, ask rather than switch.")
-    admitted = _admit_chat_task(None, int(chat_id), text, None, task_metadata=metadata, kind="call")
+    admitted = _admit_chat_task(None, int(chat_id), call_opening_text(spec), None, task_metadata=metadata, kind="call")
     if admitted is None:
         reason = "repo_writer_gate_closed" if not wake_gate_open() else "admission_failed"
         return {"admitted": False, "task_id": "", "reason": reason}
     return _start_direct_turn_thread(admitted, f"call-turn-{admitted['task']['id']}", on_finished)
+
+
+def call_opening_text(spec) -> str:
+    """The call turn's host text: what a call is, the language caveat, and the owner's own
+    instructions for calls (Settings), fitted with the call's context like any opening text; a
+    Presence call carries its binding's instructions instead."""
+    text = (f"[Live call] A live voice call is open in this room (engine {spec.engine}, model {spec.model}). "
+            "The conversation is spoken; its transcript is written to this chat. Speech recognition can take one "
+            "language for another: keep to the language this room is spoken and written in, and if the owner's "
+            "words suddenly read as another language, ask rather than switch.")
+    if spec.instructions and not spec.presence_binding_id:
+        text += f"\n\nThe owner's instructions for calls:\n{spec.instructions}"
+    return text
 
 
 def auto_resume_after_restart() -> None:
