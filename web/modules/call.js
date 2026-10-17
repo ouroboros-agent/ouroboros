@@ -343,7 +343,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, styled, view: () => session.view(),
         talk: () => session.start(),
         mute: () => session.setMuted(!session.muted),
-        shareScreen: () => session.toggleVision('screen'), camera: () => session.toggleVision('camera'),
+        show: kind => session.toggleVision(kind),
         vision: () => visionAvailability(env),
         end: () => session.end(),
         dismiss: () => session.dismiss(),

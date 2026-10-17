@@ -263,11 +263,20 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             _state(page, state="live")
             expect(state).to_have_text("Listening")
             expect(room.locator(".call-sub")).to_have_text("Speak whenever you’re ready")
-            # A browser-chosen screen sends a still as video; an unchanged view stays quiet.
-            screen = room.locator('.call-screen')
-            expect(screen).to_be_visible()
-            screen.click()
-            expect(screen).to_have_attribute('aria-pressed', 'true')
+            # Show opens a menu of sources; a browser-chosen screen sends a still as video and an
+            # unchanged view stays quiet.
+            show = room.locator('.call-show')
+            expect(show).to_be_visible()
+            expect(show).to_have_attribute('aria-haspopup', 'menu')
+            show.click()
+            menu = page.locator('.call-show-menu')
+            expect(menu).to_be_visible()
+            expect(menu.locator('[data-source="screen"]')).to_be_enabled()
+            expect(menu.locator('[data-source="camera"]')).to_be_enabled()
+            menu.locator('[data-source="screen"]').click()
+            expect(menu).to_have_count(0)
+            expect(show).to_have_attribute('aria-pressed', 'true')
+            expect(show).to_have_attribute('aria-label', 'Stop showing your screen')
             expect(room.locator('.call-sub')).to_contain_text('Screen on')
             page.wait_for_function("__callTest.frames.some(frame => frame.kind === 3)")
             assert page.evaluate("__callTest.displayCalls") == 1
@@ -279,15 +288,20 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.wait_for_function("__callTest.frames.filter(frame => frame.kind === 3).length > 1")
             video = page.evaluate("__callTest.frames.filter(frame => frame.kind === 3)")
             assert video[1]['at'] - video[0]['at'] >= 1000
+            # The browser's own stop ends the share; Show offers its menu again.
             page.evaluate("__callTest.displayStream.getVideoTracks()[0].onended()")
-            expect(screen).to_have_attribute('aria-pressed', 'false')
+            expect(show).not_to_have_attribute('aria-pressed', 'true')
+            expect(show).to_have_attribute('aria-haspopup', 'menu')
             assert page.evaluate("__callTest.displayStream.getVideoTracks()[0].readyState") == 'ended'
-            camera = room.locator('.call-camera')
-            camera.click()
-            expect(camera).to_have_attribute('aria-pressed', 'true')
+            show.click()
+            page.locator('.call-show-menu [data-source="camera"]').click()
+            expect(show).to_have_attribute('aria-pressed', 'true')
+            expect(room.locator('.call-sub')).to_contain_text('Camera on')
             page.wait_for_function("__callTest.frames.filter(frame => frame.kind === 3).length > 2")
-            camera.click()
-            expect(camera).to_have_attribute('aria-pressed', 'false')
+            # While a source is shown, Show is its stop: one press ends it without a menu.
+            show.click()
+            expect(page.locator('.call-show-menu')).to_have_count(0)
+            expect(show).not_to_have_attribute('aria-pressed', 'true')
             page.wait_for_function("__callTest.frames.length > 2")
             frames = page.evaluate("__callTest.frames.filter(frame => frame.kind === 1)")
             assert all(f["magic"] == [79, 67] and f["version"] == 1 and f["kind"] == 1

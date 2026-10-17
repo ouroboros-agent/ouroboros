@@ -1,6 +1,6 @@
 /** The composer face of a call. With nothing to send, the Send capsule reads Talk; a press (never
  * Enter) starts the call. During a call the text row keeps its footprint and becomes the live
- * capsule: the visual and the state, Mute, Keyboard, End. Keyboard brings the field back between
+ * capsule: the visual and the state, Mute, Show (a screen or the camera, from a small menu), Keyboard, End. Keyboard brings the field back between
  * the docked visual and the call's controls; End and the way back to voice never leave, and what is
  * typed goes as an ordinary turn. When Talk cannot work, or a call
  * ends with something to say, a sheet takes the capsule's place with the words and one next step.
@@ -8,10 +8,20 @@
  * have one engine, Google's Gemini Live.
  */
 import { fmt, tx } from './i18n.js';
+import { bindMenu } from './ui_interactions.js';
 
 const KEYBOARD = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></svg>';
 // The same button in the keyboard view: back to the call's voice.
 const VOICE = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg>';
+// Show: what Ouroboros may see. The menu offers each source this surface can capture; while one is
+// shown the button wears that source's icon and stops it.
+const SHOW = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><path d="M12 9.25a2.75 2.75 0 1 0 0 5.5 2.75 2.75 0 0 0 0-5.5z"/></svg>';
+const SCREEN = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="4" width="19" height="13" rx="2.5"/><path d="M8.5 20.5h7M12 17v3.5"/></svg>';
+const CAMERA = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="6.5" width="13.5" height="11" rx="2.5"/><path d="M16 10.5l5.5-3v9l-5.5-3"/></svg>';
+const SOURCES = {
+    screen: { icon: SCREEN, label: 'Screen', hint: 'A window or the whole screen', stop: 'Stop showing your screen', on: 'Screen on' },
+    camera: { icon: CAMERA, label: 'Camera', hint: '', stop: 'Stop the camera', on: 'Camera on' },
+};
 const TOGGLE = {
     keyboard: { icon: KEYBOARD, label: 'Type while talking' },
     voice: { icon: VOICE, label: 'Back to voice' },
@@ -173,7 +183,7 @@ export function createTalkFacts() {
 }
 
 export function createCallCapsule({ page, env = globalThis, visual, light, styled = Promise.resolve(), view, talk, mute,
-    shareScreen = () => {}, camera = () => {}, vision = {}, end, dismiss, act }) {
+    show = () => {}, vision = {}, end, dismiss, act }) {
     const doc = page.ownerDocument;
     const wrap = page.querySelector('.chat-input-wrap');
     const row = wrap.querySelector('.chat-text-row');
@@ -190,10 +200,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             <button type="button" class="call-btn call-action"></button>
             <button type="button" class="call-btn call-action"></button>
             <button type="button" class="call-btn call-mute" aria-pressed="false">Mute</button>
-            <button type="button" class="call-btn call-screen" aria-label="Show screen" title="Show screen" aria-pressed="false">▣</button>
-            <span class="call-vision-help call-screen-help" tabindex="0" role="note" hidden>ⓘ</span>
-            <button type="button" class="call-btn call-camera" aria-label="Camera" title="Camera" aria-pressed="false">◉</button>
-            <span class="call-vision-help call-camera-help" tabindex="0" role="note" hidden>ⓘ</span>
+            <button type="button" class="call-btn call-show"></button>
             <button type="button" class="call-btn call-keyboard"></button>
             <button type="button" class="call-btn call-end">End</button>
             <button type="button" class="call-btn call-close">Close</button>
@@ -269,8 +276,44 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     // --- the capsule ------------------------------------------------------------------
     const on = (selector, handler) => $(selector).addEventListener('click', handler);
     on('.call-mute', () => mute());
-    on('.call-screen', () => shareScreen());
-    on('.call-camera', () => camera());
+    let showMenu = null;     // the open Show menu's binding
+    on('.call-show', () => {
+        const shown = view().sharing;
+        if (shown) { show(shown); return; }
+        if (showMenu) { showMenu.close(); return; }
+        openShowMenu();
+    });
+    function openShowMenu() {
+        const button = $('.call-show');
+        const available = typeof vision === 'function' ? vision() : vision;
+        const menu = doc.createElement('div');
+        menu.className = 'ui-popup call-show-menu';
+        menu.setAttribute('role', 'menu');
+        menu.setAttribute('aria-label', 'Show Ouroboros');
+        let binding = null;
+        for (const [kind, source] of Object.entries(SOURCES)) {
+            const item = doc.createElement('button');
+            item.type = 'button';
+            item.setAttribute('role', 'menuitem');
+            item.dataset.source = kind;
+            item.innerHTML = `${source.icon}<span class="call-show-words"><span></span><small></small></span>`;
+            const why = available[kind] ? source.hint : available[`${kind}Reason`] || available.reason || 'Not available here';
+            item.querySelector('.call-show-words > span').textContent = source.label;
+            item.querySelector('small').textContent = why;
+            item.querySelector('small').hidden = !why;
+            item.disabled = !available[kind];
+            item.addEventListener('click', () => { binding?.close(); show(kind); });
+            menu.append(item);
+        }
+        doc.body.append(menu);
+        button.setAttribute('aria-expanded', 'true');
+        binding = bindMenu(menu, { anchor: button, onClose: () => {
+            menu.remove();
+            button.setAttribute('aria-expanded', 'false');
+            if (showMenu === binding) showMenu = null;
+        } });
+        showMenu = binding;
+    }
     on('.call-end', () => end());
     on('.call-close', () => { note = null; dismiss(); });
     on('.call-keyboard', () => {
@@ -282,6 +325,35 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         const action = presented.actions?.[index];
         if (action) void act(action);
     }));
+
+    // Show: hidden where nothing can be captured; a menu of sources, or the shown source's own stop.
+    function renderShow(sheet) {
+        const current = view();
+        const available = typeof vision === 'function' ? vision() : vision;
+        const button = $('.call-show');
+        const source = SOURCES[current.sharing];
+        button.hidden = sheet || !(available.screen || available.camera);
+        button.disabled = !source && current.state !== 'live';
+        const face = source ? current.sharing : 'show';
+        if (button.dataset.face !== face) {
+            button.dataset.face = face;
+            button.innerHTML = source ? source.icon : SHOW;
+        }
+        const label = source ? source.stop : 'Show Ouroboros your screen or camera';
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        if (source) {
+            button.setAttribute('aria-pressed', 'true');
+            button.removeAttribute('aria-haspopup');
+            button.removeAttribute('aria-expanded');
+            showMenu?.close();
+        } else {
+            button.removeAttribute('aria-pressed');
+            button.setAttribute('aria-haspopup', 'menu');
+            if (!showMenu) button.setAttribute('aria-expanded', 'false');
+        }
+        if ((button.hidden || button.disabled) && showMenu) showMenu.close();
+    }
 
     function typingPlaceholder(on) {
         const kept = 'callPlaceholder' in field.dataset;
@@ -329,25 +401,14 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         words.state.title = presented.title;
         const followUp = note?.kind === 'copied' ? 'Link copied — paste it into your browser'
             : note?.kind === 'copy_failed' ? fmt('Copy this address into your browser: {url}', { url: note.url }) : '';
-        const sharing = current.sharing ? `${current.sharing === 'screen' ? 'Screen' : 'Camera'} on` : '';
+        const sharing = SOURCES[current.sharing]?.on || '';
         setWords(words.sub, followUp || current.visionError || (sharing
             ? `${sharing}${presented.sub ? ` · ${presented.sub}` : ''}` : presented.sub),
         followUp ? note?.kind === 'copy_failed' : Boolean(presented.subFormatted));
         setWords(words.small, presented.small || '', true);
         $('.call-mute').hidden = sheet;
         $('.call-mute').setAttribute('aria-pressed', String(Boolean(current.muted)));
-        const availableVision = typeof vision === 'function' ? vision() : vision;
-        for (const [kind, selector, label] of [['screen', '.call-screen', 'Show screen'], ['camera', '.call-camera', 'Camera']]) {
-            const button = $(selector), help = $(`${selector}-help`);
-            button.hidden = sheet || !availableVision[kind];
-            button.disabled = current.state !== 'live' && current.sharing !== kind;
-            button.setAttribute('aria-pressed', String(current.sharing === kind));
-            button.title = current.sharing === kind ? `Stop ${kind === 'screen' ? 'screen sharing' : 'camera'}` : label;
-            help.hidden = sheet || Boolean(availableVision[kind]) || (kind === 'camera' && !availableVision.screen);
-            const why = availableVision[`${kind}Reason`] || availableVision.reason || `${label} is unavailable here.`;
-            help.title = why;
-            help.setAttribute('aria-label', why);
-        }
+        renderShow(sheet);
         typingPlaceholder(keyboard && !sheet);
         const toggle = $('.call-keyboard');
         toggle.hidden = sheet;
@@ -392,6 +453,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             field.removeEventListener('input', renderEntry);
             field.removeEventListener('keydown', renderEntry);
             send.removeEventListener('click', renderEntry);
+            showMenu?.close();
             visualHandle.destroy();
             typingPlaceholder(false);
             capsule.remove();

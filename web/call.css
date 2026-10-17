@@ -186,16 +186,14 @@
 }
 
 .call-mute[aria-pressed="true"],
-.call-screen[aria-pressed="true"],
-.call-camera[aria-pressed="true"],
+.call-show[aria-pressed="true"],
 .call-action {
     background: var(--tone-crimson);
     color: var(--tone-crimson-ink);
 }
 
 .call-mute[aria-pressed="true"]:hover,
-.call-screen[aria-pressed="true"]:hover,
-.call-camera[aria-pressed="true"]:hover,
+.call-show[aria-pressed="true"]:hover,
 .call-action:hover {
     background: var(--tone-crimson-hover);
 }
@@ -206,28 +204,35 @@
     color: var(--text-meta);
 }
 
-.call-screen,
-.call-camera {
+.call-show {
     width: var(--composer-control-height);
     padding: 0;
-    color: var(--text-secondary);
+    color: var(--text-meta);
 }
 
-.call-vision-help {
-    display: inline-flex;
+.call-show[aria-expanded="true"] {
+    background: var(--surface-capsule-hover);
+}
+
+/* Show's menu: each source with its icon; one that cannot work here says why in its own line. */
+.call-show-menu [role="menuitem"] {
+    display: flex;
     align-items: center;
-    justify-content: center;
-    width: var(--composer-control-height);
-    height: var(--composer-control-height);
-    border-radius: var(--pill-radius);
-    background: var(--surface-tray);
+    gap: var(--space-3);
+}
+
+.call-show-menu [role="menuitem"] > svg {
+    flex: none;
+    color: var(--text-meta);
+}
+
+.call-show-words {
+    display: grid;
+}
+
+.call-show-words small {
     color: var(--text-meta);
     font-size: var(--type-meta);
-}
-
-.call-vision-help:focus-visible {
-    outline: 2px solid var(--focus-accent-border);
-    outline-offset: 2px;
 }
 
 .chat-input-wrap[data-call-sharing="screen"] .call-sub::before,
@@ -273,9 +278,12 @@
     .chat-input-wrap[data-call-view="keyboard"] .chat-attach-btn {
         display: none;
     }
+}
 
-    .chat-input-wrap[data-call-view="voice"] .call-visual,
-    .chat-input-wrap[data-call-view="voice"] .call-mute {
+/* On a phone Show joins Mute, Keyboard and End: the small wave gives way so the state stays
+   legible, and the capsule's own light still answers both voices. */
+@container call-row (max-width: 400px) {
+    .chat-input-wrap[data-call-view="voice"]:has(.call-show:not([hidden])) .call-visual {
         display: none;
     }
 }
@@ -283,9 +291,7 @@
 @container call-row (max-width: 520px) {
     .chat-input-wrap[data-call-view="keyboard"] .call-mute,
     .chat-input-wrap[data-call-view="keyboard"] .call-visual,
-    .chat-input-wrap[data-call-view="keyboard"] .call-screen,
-    .chat-input-wrap[data-call-view="keyboard"] .call-camera,
-    .chat-input-wrap[data-call-view="keyboard"] .call-vision-help {
+    .chat-input-wrap[data-call-view="keyboard"] .call-show {
         display: none;
     }
 }
