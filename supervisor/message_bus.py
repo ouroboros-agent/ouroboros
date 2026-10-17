@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from ouroboros.artifacts import store_chat_media_bytes
-from ouroboros.chat_uploads import stored_refs
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_LINKS, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_QUIZ, CHAT_QUIZ_STATE, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
