@@ -31,9 +31,15 @@ log = logging.getLogger(__name__)
 # read_file, because every retained host section the call view points at is a
 # runtime_data read and a Gemini session reopens to gain a tool; and start_task,
 # because long work leaves the call as a task whose result reaches it through live
-# awareness. Everything else is one ``enable_tools`` away (growth reaches the engine as ``UpdateTools``).
+# awareness; and sight: view_image looks at an image a tool or the owner offers, browse_page
+# can look at a page, send_photo hands the owner an image. Everything else is one
+# ``enable_tools`` away (growth reaches the engine as ``UpdateTools``).
 CALL_INITIAL_TOOL_NAMES: Tuple[str, ...] = tuple(sorted(
-    COGNITIVE_MEMORY_TOOL_NAMES | {"web_search", "send_user_message", "read_file", "start_task"}))
+    COGNITIVE_MEMORY_TOOL_NAMES | {"web_search", "send_user_message", "read_file", "start_task",
+                                   "view_image", "browse_page", "send_photo"}))
+# The text loop's own request to compact its history: a call never applies it, so its schema
+# does not spend the call's window.
+CALL_INERT_TOOL_NAMES = frozenset({"compact_context"})
 REALTIME_EVIDENCE_KIND = "realtime_windows"   # capability_evidence.json namespace of the documented windows
 # A speech-sized reply: about five minutes of spoken answer, the physical allowance a call's
 # fit leaves for one response. A provider's output maximum is documentation, not this budget.
@@ -150,7 +156,8 @@ def initial_call_schemas(tools: Any, spec: Optional[CallSpec] = None) -> List[Di
 
     if spec is not None and spec.presence_binding_id:
         return initial_tool_schemas(tools, context_mode="max")
-    return initial_tool_schemas(tools, context_mode="nano", schema_names=CALL_INITIAL_TOOL_NAMES)
+    return [schema for schema in initial_tool_schemas(tools, context_mode="nano", schema_names=CALL_INITIAL_TOOL_NAMES)
+            if schema["function"]["name"] not in CALL_INERT_TOOL_NAMES]
 
 
 def call_context_plan(task: Dict[str, Any], tools: Any, drive_root: Any) -> Optional[CallContextPlan]:
