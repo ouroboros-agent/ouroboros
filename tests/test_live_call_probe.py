@@ -43,6 +43,48 @@ def test_a_data_copy_never_carries_the_source_daemon_home_or_its_request_dumps(t
     assert (copied / "state" / "queue_snapshot.json").exists() and not (copied / "state" / "cx").exists()
 
 
+def test_a_running_installs_own_data_is_refused_and_a_copy_of_it_is_taken(tmp_path):
+    live = tmp_path / "Ouroboros"
+    (live / "data" / "memory").mkdir(parents=True)
+    (live / "ouroboros.pid").write_text("123")
+    with pytest.raises(ValueError, match="refusing a live install"):
+        probe.data_copy_source(str(live / "data"))
+    versioned = tmp_path / "versioned"
+    (versioned / ".git").mkdir(parents=True)
+    with pytest.raises(ValueError, match="refusing a live install"):
+        probe.data_copy_source(str(versioned))
+    copy = tmp_path / "copy" / "data"
+    copy.mkdir(parents=True)
+    assert probe.data_copy_source(str(copy)) == copy.resolve()
+
+
+def test_the_recorded_wire_labels_resume_handles_both_ways_and_keeps_no_audio_or_instruction():
+    handles = {}
+    instruction = "The whole call view. " * 20
+    received = probe.redacted_wire({"sessionResumptionUpdate": {"newHandle": "token-1", "resumable": True}}, handles)
+    sent = probe.redacted_wire({"setup": {"systemInstruction": {"parts": [{"text": instruction}]},
+                                          "sessionResumption": {"handle": "token-1"}}}, handles)
+    audio = probe.redacted_wire({"serverContent": {"modelTurn": {"parts": [
+        {"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": base64.b64encode(b"\x01\x00" * 480).decode()}},
+        {"text": "Привет"}]}}}, handles)
+    # A reopen sends back the handle it received: one label in both directions, the token in neither.
+    assert sent["setup"]["sessionResumption"]["handle"] == received["sessionResumptionUpdate"]["newHandle"] == "recorded-handle-1"
+    assert "token-1" not in json.dumps([received, sent])
+    assert sent["setup"]["systemInstruction"] == {"recorded_chars": len(instruction),
+                                                  "sha256": probe.hashlib.sha256(instruction.encode()).hexdigest()}
+    parts = audio["serverContent"]["modelTurn"]["parts"]
+    assert parts[0]["inlineData"] == {"mimeType": "audio/pcm;rate=24000", "recorded_bytes": 960, "data": probe.TINY_PCM}
+    assert parts[1] == {"text": "Привет"}  # a fresh run's words stay: they are the probe's own synthetic speech
+
+
+def test_only_a_fresh_run_writes_a_replay_fixture():
+    wire = [{"direction": "server", "message": {"setupComplete": {}}}]
+    record = probe.recorded_exchange(wire, "gemini-3.8-live", data_copy=False)
+    assert record["header"]["provenance"] == "recorded_live" and record["events"] == wire
+    assert probe.recorded_exchange(wire, "gemini-3.8-live", data_copy=True) is None  # a copy's wire is its memory
+    assert probe.recorded_exchange([], "gemini-3.8-live", data_copy=False) is None
+
+
 def test_scenario_selection_rejects_typos():
     assert probe.select_scenarios("opening,money") == {"opening", "money"}
     assert probe.select_scenarios("all") == set(probe.SCENARIOS)

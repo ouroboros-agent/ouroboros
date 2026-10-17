@@ -4,10 +4,12 @@
 Run with the application's Python: ``python devtools/live_call_probe.py --scenarios
 all --output-dir /tmp/live-call-unique [--google-key-file F] [--data-copy DIR]``.
 Calls use Google Gemini Live (its key from ``--google-key-file`` or the settings
-source). ``--data-copy`` clones a data directory (APFS clone) into the run, so the
-call opens on a mature install's real memory instead of a fresh one; the source is
-never written. Each invocation owns a fresh external directory; it retains JSON
-evidence, PCM, instructions and logs. The in-process path deliberately avoids
+source). ``--data-copy`` clones a disposable copy of a data directory (APFS clone)
+into the run, so the call opens on a mature install's real memory instead of a fresh
+one; the copy is never written, and a running install's own data directory is refused.
+Each invocation owns a fresh external directory; it retains JSON evidence, PCM,
+instructions and logs. A fresh run also writes ``recorded_exchange.json``, the
+redacted wire a replay test can carry; a data-copy run does not (its wire is memory). The in-process path deliberately avoids
 server startup's update/daemon duties. Only the input fixture uses speech synthesis
 (OpenAI TTS, or saved fixtures with ``--fixture-dir``); Ouroboros speaks through Gemini.
 """
@@ -83,6 +85,7 @@ class Evidence:
     def __init__(self, root: Path):
         self.root, self.rows = root, []
         self.started = time.monotonic()
+        self.handles: dict = {}  # resume handle -> label, across every session of the recording
         self.lock = threading.Lock()
         self.stream = (root / "observations.jsonl").open("a", encoding="utf-8", buffering=1)
 
@@ -101,10 +104,23 @@ class Evidence:
 TINY_PCM = "AAABAA=="  # two PCM16 samples: a replayable stand-in for recorded audio
 
 
+def recorded_exchange(wire: list, model: str, *, data_copy: bool) -> dict | None:
+    """The replay fixture of a fresh run's wire; none for a data copy, whose speech, replayed rows
+    and tool results are that install's memory (a fixture is meant to be committed)."""
+    if not wire or data_copy:
+        return None
+    return {"header": {
+        "provenance": "recorded_live", "model": model, "recorded_on": time.strftime("%Y-%m-%d"),
+        "recorder": "devtools/live_call_probe.py",
+        "notes": "Audio is a two-sample stand-in beside its recorded length; resume handles are labels; "
+                 "the setup's instruction is its length and digest."}, "events": wire}
+
+
 def redacted_wire(message: dict, handles: dict) -> dict:
     """One Gemini wire message as a replayable fixture row: audio becomes ``TINY_PCM`` beside its
-    recorded length, resume handles become labels, the setup's instruction becomes its length and
-    digest, and grounding's rendered HTML becomes its length. Everything else stays as received."""
+    recorded length, resume handles become labels (the same label where the setup sends back a
+    handle it received), the setup's instruction becomes its length and digest, and grounding's
+    rendered HTML becomes its length. Everything else stays as received."""
     def walk(value, key=""):
         if isinstance(value, dict):
             if "inlineData" in value and isinstance(value["inlineData"], dict):
@@ -114,7 +130,7 @@ def redacted_wire(message: dict, handles: dict) -> dict:
                 return {**{k: walk(v, k) for k, v in value.items() if k != "inlineData"}, "inlineData": inline}
             out = {}
             for k, v in value.items():
-                if k == "newHandle" and v:
+                if v and isinstance(v, str) and (k == "newHandle" or (k == "handle" and key == "sessionResumption")):
                     out[k] = handles.setdefault(v, f"recorded-handle-{len(handles) + 1}")
                 elif k == "renderedContent" and isinstance(v, str):
                     out[k] = f"[{len(v)} characters of rendered search chips]"
@@ -138,8 +154,7 @@ class ObservedEngine:
     def __init__(self, engine, evidence: Evidence, ctx):
         self.engine, self.evidence, self.ctx = engine, evidence, ctx
         original_write, original_receive = engine._write, engine._handle_message
-
-        handles: dict = {}
+        handles = evidence.handles
 
         async def write(payload):
             await original_write(payload)
@@ -591,12 +606,10 @@ class Probe:
                              checkpoint=task_result.get("live_call"), terminal_events=terminals, hub_stats=self.hub.stats())
             close_hub(self.spec.call_id)
         wire = [{"direction": e["direction"], "message": e["message"]} for e in self.evidence.of("gemini_wire")]
-        if wire:  # a replayable fixture of what Gemini actually sent and received, redacted (``redacted_wire``)
-            write_json(self.root / "recorded_exchange.json", {"header": {
-                "provenance": "recorded_live", "model": getattr(getattr(self, "spec", None), "model", ""),
-                "recorded_on": time.strftime("%Y-%m-%d"), "recorder": "devtools/live_call_probe.py",
-                "notes": "Audio is a two-sample stand-in beside its recorded length; resume handles are labels; "
-                         "the setup's instruction is its length and digest."}, "events": wire})
+        record = recorded_exchange(wire, getattr(getattr(self, "spec", None), "model", ""),
+                                   data_copy=bool(self.result.get("data_copy")))
+        if record:  # a replayable fixture of what Gemini actually sent and received, redacted (``redacted_wire``)
+            write_json(self.root / "recorded_exchange.json", record)
         if getattr(self, "spec", None) is not None:  # how the route counted the call view's text (the fit's witness)
             from ouroboros.capability_evidence import canonical_evidence_root, resolve_main_token_density, route_fingerprint
 
@@ -699,15 +712,27 @@ async def run_probe(args):
 
 # Never copied: the source's Claudexor home (its daemon's descriptor and token would let the copy reach
 # that daemon), the observability store (millions of request dumps a call never reads; copying it took
-# longer than everything else together on the owner's install), the state's engine runtimes and review
+# longer than everything else together on a mature install), the state's engine runtimes and review
 # checkouts, and the task workspaces (headless task files, forked drives and trees): whole trees no call
 # reads, which made the copy run past half an hour.
 DATA_COPY_SKIPPED = ("claudexor", "observability", "state/cx", "state/review_checkouts", "state/headless_tasks",
                      "task_drives", "task_trees")
 
 
+def data_copy_source(value: str) -> Path:
+    """The disposable copy a run clones from; a running install's own data directory is refused.
+
+    A live install keeps writing while it is read (its locks, temporary files and settings with
+    every key it holds), so the probe takes a copy made beforehand, as ``call_context_measure`` does.
+    """
+    source = Path(value).expanduser().resolve()
+    if (source / ".git").exists() or (source.parent / "ouroboros.pid").exists() or (source.parent / "repo/.git").exists():
+        raise ValueError("refusing a live install's or a versioned data directory; pass a disposable copy of one")
+    return source
+
+
 def copy_data(source: Path, target: Path, *, skipped=DATA_COPY_SKIPPED, prefix: str = "") -> None:
-    """A mature install's data, cloned file by file (``cp -c``) into the run; the source is only read.
+    """A data copy, cloned file by file (``cp -c``) into the run; the source is only read.
 
     One entry at a time (descending into a folder only when something inside it is skipped), never
     ``skipped``, and never one whole-tree clonefile(2): that held APFS for minutes and froze the machine.
@@ -715,14 +740,11 @@ def copy_data(source: Path, target: Path, *, skipped=DATA_COPY_SKIPPED, prefix: 
     target.mkdir(mode=0o700)
     for entry in sorted(source.iterdir()):
         name = prefix + entry.name
-        if name in skipped or entry.name.endswith(".lock"):  # a held lock means nothing in a copy
+        if name in skipped or entry.name.endswith(".lock"):  # a lock file means nothing in a copy
             continue
         if entry.is_dir() and not entry.is_symlink() and any(s.startswith(name + "/") for s in skipped):
             copy_data(entry, target / entry.name, skipped=skipped, prefix=name + "/")
-        elif (subprocess.run(["cp", "-c", "-R", str(entry), str(target)]).returncode
-              and entry.exists() and not (target / entry.name).exists()):
-            # A live install keeps writing: files that vanished meanwhile (cp names them) are simply
-            # not copied; only an entry that still exists and was not copied at all stops the run.
+        elif subprocess.run(["cp", "-c", "-R", str(entry), str(target)]).returncode:
             raise RuntimeError(f"could not copy {entry}")
 
 
@@ -730,7 +752,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenarios", default="all", help=",".join(SCENARIOS))
     parser.add_argument("--google-key-file", help="a file holding the Google AI key for Gemini Live (read, never printed)")
-    parser.add_argument("--data-copy", help="a data directory cloned (APFS clone) into the run: a mature install's memory")
+    parser.add_argument("--data-copy", help="a disposable copy of a data directory, cloned into the run (never a "
+                        "running install's own): a mature install's memory")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--settings-source", default=_default_settings_source(),
                         help="the install whose provider keys the probe uses (read, never written)")
@@ -743,9 +766,10 @@ def main(argv=None) -> int:
         sys.path.insert(0, str(REPO))
         result = asyncio.run(run_probe(args))
         return int(bool(result.get("failure")) or any(r["verdict"] == "FAIL" for r in result["scenarios"].values()))
+    source = data_copy_source(args.data_copy) if args.data_copy else None  # refused before anything is made
     root = output_root(args.output_dir)
-    if args.data_copy:
-        copy_data(Path(args.data_copy).resolve(), root / "data")
+    if source:
+        copy_data(source, root / "data")
     before = daemon_list()
     write_json(root / "daemons-before.json", before)
     helper = runpy.run_path(str(REPO / "ouroboros/test_environment.py"))
