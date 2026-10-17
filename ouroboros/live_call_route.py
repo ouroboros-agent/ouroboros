@@ -40,6 +40,21 @@ CALL_INITIAL_TOOL_NAMES: Tuple[str, ...] = tuple(sorted(
 # The text loop's own request to compact its history: a call never applies it, so its schema
 # does not spend the call's window.
 CALL_INERT_TOOL_NAMES = frozenset({"compact_context"})
+# The call's own hang-up, declared to the session beside the registry's tools and answered by the
+# call itself (no tool runs): an owner call ends once the goodbye it asked to say has been heard.
+END_CALL_TOOL = "end_call"
+END_CALL_SCHEMA = {"type": "function", "function": {
+    "name": END_CALL_TOOL,
+    "description": ("Hang up this live call when the owner says goodbye or asks to end it. Say your goodbye "
+                    "first; the call ends once it has been heard."),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}
+END_CALL_RESULT = "The call ends once your goodbye has been heard."
+
+
+def call_local_schemas(spec: Optional[CallSpec]) -> Tuple[Dict[str, Any], ...]:
+    """The call's own tools beside the registry's: an owner call can hang up; a Presence call
+    belongs to its binding, which decides when it ends."""
+    return () if spec is None or spec.presence_binding_id else (END_CALL_SCHEMA,)
 REALTIME_EVIDENCE_KIND = "realtime_windows"   # capability_evidence.json namespace of the documented windows
 # A speech-sized reply: about five minutes of spoken answer, the physical allowance a call's
 # fit leaves for one response. A provider's output maximum is documentation, not this budget.

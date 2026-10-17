@@ -42,6 +42,7 @@ const NO_KEY = { words: 'Calls need a Google AI key — add it in Settings', act
 // that cannot hold a call (`sheet`), are words too. The server's own `action` wins over this table.
 const ENDINGS = {
     owner_bye: { words: 'Call ended', calm: true },
+    ouroboros_bye: { words: 'Ouroboros ended the call', calm: true },
     owner_stop: { words: 'Call ended', calm: true },
     max_minutes: { words: 'The call reached its time limit', calm: true },
     peers_left: { words: 'Everyone left the call', calm: true },

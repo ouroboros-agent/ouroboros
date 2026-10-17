@@ -121,6 +121,10 @@ class FakeHub:
         self.activity: list = []
         self.words: list = []  # (state, detail, action) of every state that carried words
         self.ended_by_owner = False
+        self.ended_by_ouroboros = False
+
+    def end_by_ouroboros(self) -> None:
+        self.ended_by_ouroboros = True
 
     def set_engine_rates(self, input_rate, output_rate) -> None:
         self.rates = (input_rate, output_rate)
@@ -342,7 +346,8 @@ def test_the_session_opens_with_the_fitted_instructions_and_the_nano_view(harnes
     engine = h.start()
     config = engine.config
     assert config.instructions == "You are Ouroboros, on a call."
-    assert [schema["function"]["name"] for schema in config.tools] == ["knowledge_read", "web_search", "enable_tools"]
+    # The registry's Nano view, then the call's own hang-up.
+    assert [schema["function"]["name"] for schema in config.tools] == ["knowledge_read", "web_search", "enable_tools", "end_call"]
     assert config.route.engine == ENGINE_GOOGLE and config.route.model == "gemini-3.8-live" and config.route.voice == "Kore"
     assert config.native_search is True and config.resume_handle == ""  # Gemini's own search: on by default
     assert config.history == ({"role": "user", "content": "[Live call] A live voice call is open in this room."},)
@@ -574,7 +579,7 @@ def test_tool_growth_reaches_the_session_as_an_update(harness, monkeypatch, tmp_
     engine.push(ToolCall(call_id="c-grow", name="enable_tools", arguments='{"names": ["read_file"]}'))
     assert _wait_for(lambda: engine.sent_of(UpdateTools))
     names = [s["function"]["name"] for s in engine.sent_of(UpdateTools)[0].tools]
-    assert names == ["knowledge_read", "web_search", "enable_tools", "read_file"]
+    assert names == ["knowledge_read", "web_search", "enable_tools", "read_file", "end_call"]  # the hang-up stays
     assert engine.sent_of(ToolResult)[0].call_id == "c-grow"
     h.stop()
     h.finish()

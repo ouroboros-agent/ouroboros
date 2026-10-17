@@ -152,6 +152,7 @@ class LiveCallHub(cp.CallHub):
         self._mix_at = 0.0
         self._closed = False
         self._owner_bye = False
+        self._ouroboros_bye = False
         # Born preparing: the call's turn is reading memory before any engine socket exists.
         self._state = {"type": "state", "state": cp.STATE_PREPARING, "reason": "", "engine": spec.engine,
                        "phase": "memory"}
@@ -173,6 +174,16 @@ class LiveCallHub(cp.CallHub):
         """The owner's surface said bye: a driver that has not opened its engine yet never opens it."""
         with self._condition:
             return self._owner_bye
+
+    @property
+    def ended_by_ouroboros(self) -> bool:
+        """Ouroboros hung up (its ``end_call``): the driver closes once its goodbye has been heard."""
+        with self._condition:
+            return self._ouroboros_bye
+
+    def end_by_ouroboros(self) -> None:
+        with self._condition:
+            self._ouroboros_bye = True
 
     def stats(self) -> dict[str, int]:
         with self._condition:

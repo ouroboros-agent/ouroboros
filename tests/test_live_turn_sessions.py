@@ -74,6 +74,25 @@ def test_pixels_a_tool_viewed_ride_on_that_calls_result(harness):
     h.finish()
 
 
+def test_ouroboros_hangs_up_once_its_goodbye_has_been_heard(harness):
+    from ouroboros.live_call_route import END_CALL_RESULT, END_CALL_TOOL
+
+    h = harness()
+    ran: list = []
+    h.tool_hook = lambda call, messages, schemas: ran.append(call["function"]["name"])
+    engine = h.start()
+    # The call's own hang-up is declared to the session beside the registry's tools.
+    assert END_CALL_TOOL in {t["function"]["name"] for t in engine.config.tools}
+    assert not h.hub.ended_by_ouroboros
+    engine.push(ToolCall("bye-1", END_CALL_TOOL, "{}"))
+    assert _wait_for(lambda: engine.sent_of(ToolResult))
+    result, = engine.sent_of(ToolResult)
+    assert (result.call_id, result.output) == ("bye-1", END_CALL_RESULT)
+    assert h.hub.ended_by_ouroboros and ran == []  # the call answered it; no registry tool ran
+    _text, usage, _trace = h.finish()
+    assert usage["live_call"]["ended"] == "ouroboros_bye"
+
+
 def test_pixels_with_no_result_to_carry_them_are_a_named_omission(harness):
     h = harness()
 

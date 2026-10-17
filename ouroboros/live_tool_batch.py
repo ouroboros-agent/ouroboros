@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.gateways.realtime_engine import ContextItem, ToolCall, ToolResult, UpdateTools
+from ouroboros.live_call_route import END_CALL_RESULT, END_CALL_TOOL, call_local_schemas
 from ouroboros.usage_accounting import BudgetExceeded
 
 log = logging.getLogger(__name__)
@@ -93,6 +94,11 @@ class ToolBatchWorker:
         self._pool.shutdown(wait=not self.running, cancel_futures=True)
 
     def enqueue(self, tool_call: ToolCall, epoch: int, origin: str = "") -> None:
+        if tool_call.name == END_CALL_TOOL and call_local_schemas(self.call.spec):
+            # The call's own hang-up: nothing runs; the call ends once the goodbye has been heard.
+            self.call.hub.end_by_ouroboros()
+            asyncio.create_task(self.call._send(ToolResult(tool_call.call_id, END_CALL_RESULT)))
+            return
         if tool_call.call_id in self.executed:
             # The provider asked again for a call already executed (a resent request
             # after a reconnect): the retained result answers, nothing runs twice.
@@ -169,7 +175,7 @@ class ToolBatchWorker:
             epochs = {tc.call_id: self.claimed.pop(tc.call_id, epoch) for epoch, tc in batch}
             await self._forward_changes(changes, epochs)
             if grown:
-                await call._send(UpdateTools(tuple(call.tool_schemas)))
+                await call._send(UpdateTools((*call.tool_schemas, *call_local_schemas(call.spec))))
             call._checkpoint()
 
     def _run_batch(self, calls: List[ToolCall]) -> Tuple[List[Dict[str, Any]], bool]:

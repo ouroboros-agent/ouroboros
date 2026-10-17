@@ -43,7 +43,8 @@ from ouroboros.gateways.realtime_engine import (
     ToolResult, UpdateTools,
 )
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
-from ouroboros.live_call_route import call_minutes_ceiling, call_turn_taking, initial_call_schemas, native_search_enabled, resolve_call_route
+from ouroboros.live_call_route import (call_local_schemas, call_minutes_ceiling, call_turn_taking, initial_call_schemas,
+                                       native_search_enabled, resolve_call_route)
 from ouroboros.live_session_view import (
     calibration_ratio, compression_watermarks, history_view, record_density_witness, text_estimate,
 )
@@ -388,7 +389,7 @@ class _LiveCall:
         instructions = text_of(self.messages[0].get("content")) if self.messages and self.messages[0].get("role") == "system" else ""
         compress_at, compress_to = compression_watermarks(self.route.fact, instructions, self.tool_schemas,
                                                           calibration_ratio(self.ctx))
-        return SessionConfig(route=self.route.engine, instructions=instructions, tools=tuple(self.tool_schemas),
+        return SessionConfig(route=self.route.engine, instructions=instructions, tools=(*self.tool_schemas, *call_local_schemas(self.spec)),
                              history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle,
                              compress_at_tokens=compress_at, compress_to_tokens=compress_to, **call_turn_taking(self.spec))
 
@@ -547,12 +548,12 @@ class _LiveCall:
             await asyncio.sleep(MAILBOX_TICK_S)
             await self._drain()
             now = time.monotonic()
-            ceiling = call_minutes_ceiling(self.spec)
-            if ceiling is not None and now - self.started >= ceiling * 60:
+            if (ceiling := call_minutes_ceiling(self.spec)) is not None and now - self.started >= ceiling * 60:
                 self._begin_close("max_minutes")
+            if getattr(self.hub, "ended_by_ouroboros", False) and not self.response_open and not self.spoken:
+                self._begin_close("ouroboros_bye")  # its goodbye has been heard to the end
             cap = self.route.fact.session_cap_minutes if self.route.fact else None
-            if (cap and not self.response_open and not self.reconnecting
-                    and now - self.session_started >= cap * 60 - SESSION_CAP_MARGIN_S):
+            if cap and not self.response_open and not self.reconnecting and now - self.session_started >= cap * 60 - SESSION_CAP_MARGIN_S:
                 asyncio.create_task(self._reconnect("session_cap", resume=False))
             for item_id, spoken in list(self.spoken.items()):
                 if spoken.final_at and now - max(spoken.final_at, spoken.ack_at) >= SPOKEN_ACK_GRACE_S:
@@ -855,8 +856,7 @@ class _LiveCall:
                      raw_usage: Optional[Dict[str, Any]] = None, status: str = "") -> Future:
         if key not in self.attempts:
             mode = str(getattr(self.ctx, "active_context_mode", "") or "nano")
-            self.attempts[key] = self._record(self._reserve, key, mode, dict(usage or {}),
-                                                     dict(raw_usage or {}), status)
+            self.attempts[key] = self._record(self._reserve, key, mode, dict(usage or {}), dict(raw_usage or {}), status)
             self.attempts[key].add_done_callback(self._on_reserved)
         return self.attempts[key]
 
