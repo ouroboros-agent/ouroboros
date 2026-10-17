@@ -381,6 +381,15 @@
     min-height: 0;
 }
 
+/* A phone's big view is the whole screen: its words and Minimise stay clear of the status bar and the notch. */
+@media (max-width: 979.98px) {
+    .chat-input-wrap[data-call-view="big"] .call-capsule {
+        padding-top: calc(var(--space-4) + env(safe-area-inset-top, 0px));
+        padding-left: calc(var(--space-4) + env(safe-area-inset-left, 0px));
+        padding-right: calc(var(--space-4) + env(safe-area-inset-right, 0px));
+    }
+}
+
 .chat-input-wrap[data-call-view="big"] .call-words {
     grid-area: 1 / 1;
     padding: var(--space-2) 0 0 var(--space-2);

@@ -59,7 +59,10 @@ test('the microphone and camera open on the chosen device, or the system one whe
 
 test('the speaker follows the choice where the engine allows it and falls back to the system one', async () => {
     assert.equal(speakerChoice({ AudioContext: class {} }), false);
-    class Routed { async setSinkId(id) { (this.ids ||= []).push(id); if (id === 'gone') throw missing('NotFoundError'); } }
+    class Routed {
+        sinkId = '';
+        async setSinkId(id) { (this.ids ||= []).push(id); if (id === 'gone') throw missing('NotFoundError'); this.sinkId = id; }
+    }
     assert.equal(speakerChoice({ AudioContext: Routed }), true);
     assert.equal(await routeSpeaker({}, { speaker: 'headphones' }), 'system');  // this engine plays where the system says
     const context = new Routed();
@@ -68,6 +71,14 @@ test('the speaker follows the choice where the engine allows it and falls back t
     assert.equal(await routeSpeaker(context, { speaker: 'headphones' }), 'routed');
     assert.equal(await routeSpeaker(context, { speaker: 'gone' }), 'fell_back');
     assert.deepEqual(context.ids, ['headphones', 'gone', '']);
+    // Back to the system's own speaker during a call: a routed context returns to it; one never routed is left alone.
+    assert.equal(await routeSpeaker(context, { speaker: 'headphones' }), 'routed');
+    assert.equal(await routeSpeaker(context, { speaker: 'default' }), 'system');
+    assert.deepEqual(context.ids.slice(-2), ['headphones', '']);
+    assert.equal(context.sinkId, '');
+    const untouched = new Routed();
+    assert.equal(await routeSpeaker(untouched, { speaker: 'default' }), 'system');
+    assert.equal(untouched.ids, undefined);
 });
 
 test('device lists leave out the browser aliases and say whether the devices are named yet', async () => {

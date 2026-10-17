@@ -81,7 +81,12 @@ export function speakerChoice(env = globalThis) {
 /** Send `context`'s sound to the chosen speaker where the engine can: 'routed', 'system' (no choice
  * here, or the system's own chosen) or 'fell_back' (the chosen speaker is gone; the system's plays). */
 export async function routeSpeaker(context, prefs) {
-    if (typeof context?.setSinkId !== 'function' || ALIASES.has(prefs.speaker)) return 'system';
+    if (typeof context?.setSinkId !== 'function') return 'system';
+    if (ALIASES.has(prefs.speaker)) {
+        // The system's own speaker: a context routed to a chosen one earlier in the call goes back to it.
+        if (context.sinkId) await Promise.resolve(context.setSinkId('')).catch(() => {});
+        return 'system';
+    }
     try {
         await context.setSinkId(prefs.speaker);
         return 'routed';

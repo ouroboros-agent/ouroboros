@@ -273,6 +273,28 @@ test('reduced motion switches sizes at once, with the same words', () => {
     } finally { h.done(); }
 });
 
+test('a phone\'s full-screen big view takes the rest of the page out of reach, and gives it back', () => {
+    for (const width of [390, 1280]) {
+        const h = harness({ width });
+        try {
+            const nav = h.doc.createElement('nav');
+            h.doc.body.prepend(nav);
+            h.set({ state: 'live', liveSince: 1 });
+            h.capsule.expand();
+            const preview = h.$('.chat-attachment-preview');
+            // Covered on a phone (the panel is the screen); a wide window keeps the room usable above it.
+            assert.equal(Boolean(nav.inert), width < 980, `nav ${width}`);
+            assert.equal(Boolean(preview.inert), width < 980, `preview ${width}`);
+            assert.ok(!h.row.inert && !h.page.inert && !h.wrap.inert, `the panel's own chain stays live ${width}`);
+            h.capsule.minimise();
+            assert.ok(!nav.inert && !preview.inert, `given back ${width}`);
+            h.capsule.expand();
+            h.set({ state: 'idle', liveSince: 0 });  // the call ended while big
+            assert.ok(!nav.inert, `given back when the call ends ${width}`);
+        } finally { h.done(); }
+    }
+});
+
 test('the call\'s time runs beside the state while the call is live, and only then', () => {
     const h = harness();
     try {

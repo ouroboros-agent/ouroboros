@@ -30,6 +30,7 @@ export function panelBox(chip, { width, height }) {
 export function createCallStage({ wrap, row, time, doc, env = globalThis, escape = () => {} }) {
     let big = false;
     let spacer = null;
+    let covered = [];  // what a full-screen panel took out of reach while it covers the page
     let origin = { x: 0, y: 0 };  // a transformed ancestor's offset of the fixed row, measured once per lift
     let timers = [];
     let since = 0;
@@ -66,6 +67,17 @@ export function createCallStage({ wrap, row, time, doc, env = globalThis, escape
         if (origin.x || origin.y) place(chip);
     }
 
+    /** A panel that covers the whole screen takes the rest of the page out of reach (focus, screen readers). */
+    function cover(on) {
+        for (const element of covered) element.inert = false;
+        covered = [];
+        for (let node = row; on && node?.parentElement && node !== doc.body; node = node.parentElement) {
+            for (const sibling of node.parentElement.children) {
+                if (sibling !== node && !sibling.inert) { sibling.inert = true; covered.push(sibling); }
+            }
+        }
+    }
+
     function land() {
         row.classList.remove('call-lifted');
         for (const name of ['left', 'top', 'width', 'height', 'transition', '--call-panel-radius']) row.style.removeProperty(name);
@@ -85,6 +97,7 @@ export function createCallStage({ wrap, row, time, doc, env = globalThis, escape
         void row.offsetWidth;  // the chip's rectangle is the passage's first frame
         row.style.transition = instant ? 'none' : '';
         place(panelBox(rect(spacer), viewport()));
+        cover(viewport().width < PHONE_BELOW);
         if (!instant) later(() => { delete wrap.dataset.callMove; }, MOVE_MS);
     }
 
@@ -93,6 +106,7 @@ export function createCallStage({ wrap, row, time, doc, env = globalThis, escape
         if (!big) return;
         clear();
         big = false;
+        cover(false);
         if (!spacer) return;
         if (instant || reduced()) { land(); return; }
         wrap.dataset.callMove = '1';
@@ -137,6 +151,7 @@ export function createCallStage({ wrap, row, time, doc, env = globalThis, escape
             if (ticking) env.clearInterval(ticking);
             ticking = 0;
             big = false;
+            cover(false);
             if (spacer) land();
             env.removeEventListener?.('resize', resized);
             doc.removeEventListener?.('keydown', key);
