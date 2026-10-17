@@ -1,6 +1,5 @@
-/* Live calls: Talk in the Send capsule, the live capsule in the text row's place, the sheet when
-   Talk cannot work, caption bubbles, the shell's "In call" mark, and visual B (the living capsule)
-   last, as one block another visual replaces. Surfaces, shadows, tones, radii, type and motion are
+/* Live calls: Talk in the Send capsule, the live capsule in the text row's place (the chip), the sheet when Talk cannot work, the call's card, the shell's "In call" mark, and the
+   visual (the wave in the glass) last, as one block another visual replaces. Surfaces, shadows, tones, radii, type and motion are
    the design bible's tokens (DESIGN.md "Airy dopamine", ui.css "One control, three tones"); the
    call adds only what is its own: the two voices' light, the one light in the interface that
    answers sound, on the capsule and never the room. The capsule writes its state on the composer
@@ -40,15 +39,15 @@
     container: call-row / inline-size;
 }
 
-/* Focus inside the capsule is a button's own ring, not the text field's: the composer keeps floating. */
-.chat-input-wrap[data-call]:not([data-call-view="keyboard"]) .chat-text-row:focus-within {
+/* Focus inside the sheet is a button's own ring, not the text field's: the composer keeps floating. */
+.chat-input-wrap[data-call="sheet"] .chat-text-row:focus-within {
     border-color: transparent;
     background: var(--surface-float);
     box-shadow: var(--elev-float);
 }
 
-.chat-input-wrap[data-call-view="voice"] .chat-text-row > :not(.call-capsule):not(.call-rim),
-.chat-input-wrap[data-call-view="sheet"] .chat-text-row > :not(.call-capsule):not(.call-rim) {
+.chat-input-wrap[data-call-view="voice"] .chat-text-row > :not(.call-capsule):not(.call-glass),
+.chat-input-wrap[data-call-view="sheet"] .chat-text-row > :not(.call-capsule):not(.call-glass) {
     display: none;
 }
 
@@ -76,9 +75,9 @@
     flex: none;
 }
 
-/* Keyboard: the field returns between the docked visual and the call's controls. End and the way
-   back to voice never leave the row. A narrow row gives the field Mute's and the wave's room (Mute is
-   one press away in the voice view, and the rim still shows the call is live), the narrowest also
+/* Keyboard: the field returns before the call's controls, the wave dimmed behind it. End and the
+   way back to voice never leave the row. A narrow row gives the field Mute's and Show's room (Mute is
+   one press away in the voice view, and the wave still shows the call is live), the narrowest also
    the attachment button's. */
 .chat-input-wrap[data-call-view="keyboard"] .call-capsule {
     display: contents;
@@ -104,6 +103,18 @@
     min-width: 0;
     line-height: var(--call-words-leading);
 }
+
+/* A live call's words take only their own width, so the wave has the rest of the capsule. */
+.chat-input-wrap[data-call-view="voice"] .call-words {
+    display: grid;
+    flex: 0 1 auto;
+    grid-template-columns: minmax(0, max-content) auto minmax(0, 1fr);
+    align-content: center;
+}
+
+.call-state { grid-area: 1 / 1; }
+.call-sub { grid-area: 2 / 1 / 3 / 4; }
+.call-small { grid-area: 3 / 1 / 4 / 4; }
 
 .call-state {
     font-size: var(--type-body);
@@ -137,6 +148,7 @@
     align-items: center;
     gap: var(--space-2);
     flex: none;
+    margin-left: auto;
 }
 
 /* The call's controls are the bible's capsules: standing on the rest shadow in one of three tones, a state
@@ -198,17 +210,13 @@
     background: var(--tone-crimson-hover);
 }
 
-.call-keyboard {
-    width: var(--composer-control-height);
-    padding: 0;
-    color: var(--text-meta);
-}
-
+.call-keyboard,
 .call-show {
     width: var(--composer-control-height);
     padding: 0;
     color: var(--text-meta);
 }
+
 
 .call-show[aria-expanded="true"] {
     background: var(--surface-capsule-hover);
@@ -280,17 +288,8 @@
     }
 }
 
-/* On a phone Show joins Mute, Keyboard and End: the small wave gives way so the state stays
-   legible, and the capsule's own light still answers both voices. */
-@container call-row (max-width: 400px) {
-    .chat-input-wrap[data-call-view="voice"]:has(.call-show:not([hidden])) .call-visual {
-        display: none;
-    }
-}
-
 @container call-row (max-width: 520px) {
     .chat-input-wrap[data-call-view="keyboard"] .call-mute,
-    .chat-input-wrap[data-call-view="keyboard"] .call-visual,
     .chat-input-wrap[data-call-view="keyboard"] .call-show {
         display: none;
     }
@@ -576,202 +575,152 @@
     }
 }
 
-/* ==== Visual B: the living capsule ============================================================== */
+
+/* ==== The visual: the wave in the glass ========================================================= */
 
 :root {
-    /* The two voices, luminous in the dark room: the owner's blue family and Ouroboros's crimson. */
+    /* The call's glass: the float surface made solid, so the panel never shows the room through it. */
+    --call-glass: rgb(38 31 46);
+    /* The two voices, luminous in the dark room: the owner's blue and Ouroboros's crimson. */
     --call-owner-rgb: 106, 166, 255;
-    --call-owner-2-rgb: 56, 189, 248;
     --call-ouro-rgb: 240, 86, 106;
-    --call-ouro-2-rgb: 255, 122, 154;
-    --call-ouro-hi-rgb: 255, 194, 201;
-    /* The light that travels round the capsule while Ouroboros prepares or thinks: white light in the
-       dark room; on white a neutral streak would read as a smudge, so there it is Ouroboros's crimson. */
-    --call-trace-rgb: var(--neutral-rgb);
-    /* How bright a voice may make the lit area: light is additive on dark, a stain on white. */
-    --call-glow: 1;
-    /* What the wave strokes with, read once per theme by the visual. */
-    --call-wave-owner: rgb(var(--call-owner-rgb));
-    --call-wave-ouroboros: rgb(var(--call-ouro-rgb));
-    --call-wave-idle: rgba(var(--neutral-rgb), 0.55);
-    --call-wave-error: rgb(var(--call-amber-rgb));
+    /* How strongly one voice tints the glass at full level; the wave's ink is always stronger. */
+    --call-tint-owner-max: 0.26;
+    --call-tint-ouroboros-max: 0.26;
+    /* The strands at rest (the room's ink) and the soft band a speaking strand carries, read once per theme. */
+    --call-wave-rest: 0.42;
+    --call-wave-band: 0.16;
+    --call-ease: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 :root[data-theme="light"] {
+    --call-glass: #ffffff;
     --call-owner-rgb: 47, 107, 214;
-    --call-owner-2-rgb: 14, 165, 233;
     --call-ouro-rgb: 201, 53, 69;
-    --call-ouro-2-rgb: 224, 68, 95;
-    --call-ouro-hi-rgb: 255, 154, 166;
-    --call-trace-rgb: 201, 53, 69;
-    --call-glow: 0.55;
-    --call-wave-idle: rgba(var(--neutral-rgb), 0.4);
+    --call-tint-owner-max: 0.11;
+    --call-tint-ouroboros-max: 0.09;
+    --call-wave-rest: 0.5;
+    --call-wave-band: 0.12;
+}
+
+/* The glass: while a call is live the row stops painting itself and this layer is its surface, so
+   the outline can breathe a few pixels with the voice (--call-breath) without moving the layout: the
+   breath is a spread of the glass's own colour (and of its tint), so it never widens a box or scrolls. */
+.chat-input-wrap[data-call="live"] .chat-text-row,
+.chat-input-wrap[data-call="live"] .chat-text-row:focus-within {
+    isolation: isolate;
+    border-color: transparent;
+    background: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    box-shadow: none;
+}
+
+.call-glass {
+    display: none;
+}
+
+.chat-input-wrap[data-call="live"] .call-glass {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: -2;
+    border-radius: inherit;
+    background: var(--call-glass);
+    box-shadow: 0 0 0 calc(var(--call-breath, 0) * 1px) var(--call-glass), var(--elev-float);
+    pointer-events: none;
+}
+
+.chat-input-wrap[data-call-view="keyboard"] .chat-text-row:focus-within .call-glass {
+    box-shadow: 0 0 0 calc(var(--call-breath, 0) * 1px) var(--call-glass), var(--elev-float),
+        0 0 0 3px var(--focus-accent-ring);
+}
+
+.call-glass-tint {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+}
+
+.call-glass-owner {
+    background: rgb(var(--call-owner-rgb));
+    box-shadow: 0 0 0 calc(var(--call-breath, 0) * 1px) rgb(var(--call-owner-rgb));
+    opacity: calc(var(--call-tint-owner, 0) * var(--call-tint-owner-max));
+}
+
+.call-glass-ouroboros {
+    background: rgb(var(--call-ouro-rgb));
+    box-shadow: 0 0 0 calc(var(--call-breath, 0) * 1px) rgb(var(--call-ouro-rgb));
+    opacity: calc(var(--call-tint-ouroboros, 0) * var(--call-tint-ouroboros-max));
+}
+
+/* The wave: one canvas across the glass, behind the words. */
+.chat-input-wrap[data-call="live"] .call-visual {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    display: block;
+    pointer-events: none;
 }
 
 .call-wave {
     display: block;
-    flex: none;
-    width: 64px;
-    height: 30px;
+    width: 100%;
+    height: 100%;
+}
+
+/* Under the words the strands step back, so the text keeps its reading contrast. */
+.chat-input-wrap[data-call-view="voice"] .call-wave {
+    -webkit-mask-image: linear-gradient(90deg, rgb(0 0 0 / 0.42) var(--call-words, 0px), #000 calc(var(--call-words, 0px) + 72px));
+    mask-image: linear-gradient(90deg, rgb(0 0 0 / 0.42) var(--call-words, 0px), #000 calc(var(--call-words, 0px) + 72px));
+}
+
+.chat-input-wrap[data-call-view="keyboard"] .call-wave {
+    opacity: 0.2;
+}
+
+/* A failed call's sheet keeps the wave's one still amber strand at its start. */
+.chat-input-wrap[data-call-view="sheet"] .call-visual {
+    width: 48px;
+    height: 24px;
     margin-left: var(--space-1);
 }
 
-/* The rim: a light running along the capsule's own edge, in the speaker's colour family; the
-   layers cross-fade by opacity, never through a third colour. It takes the edge's place inside
-   the row's box (the border steps aside), so the light never widens the composer. */
-.chat-input-wrap[data-call="live"] .chat-text-row {
-    border-color: transparent;
-}
-
-.call-rim {
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    border-radius: inherit;
-    pointer-events: none;
-}
-
-.chat-input-wrap:not([data-call="live"]) .call-rim {
+/* Live work: the room's three moving dots stand where the strands drew in. */
+.call-work {
     display: none;
 }
 
-.call-rim i {
+.chat-input-wrap[data-call="live"] .call-visual[data-work="1"] .call-work {
+    display: inline-flex;
     position: absolute;
-    inset: 0;
-    display: block;
-    border-radius: inherit;
-    padding: calc(1.4px + var(--call-rim-level, 0) * 2px);
-    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    -webkit-mask-composite: xor;
-    mask-composite: exclude;
+    left: var(--call-work-x, 50%);
+    top: var(--call-work-y, 50%);
+    gap: 4px;
+    transform: translate(-50%, -50%);
 }
 
-/* Each layer owns its opacity (a shared `i` rule would outrank the voices' own). */
-.call-rim-trace {
-    background: conic-gradient(from var(--call-spin, 0deg), rgba(var(--call-trace-rgb), 0.06) 0deg,
-        rgba(var(--call-trace-rgb), 0.06) 250deg, rgba(var(--call-trace-rgb), 0.95) 345deg, rgba(var(--call-trace-rgb), 0.06) 360deg);
-    opacity: 0;
-    transition: opacity 0.2s ease;
+.call-work span {
+    width: 5px;
+    height: 5px;
+    background: rgb(var(--call-ouro-rgb));
 }
 
-.call-rim-listen {
-    background: conic-gradient(from var(--call-spin, 0deg), rgba(var(--neutral-rgb), 0.12), rgba(var(--neutral-rgb), 0.45),
-        rgba(var(--neutral-rgb), 0.12), rgba(var(--neutral-rgb), 0.32), rgba(var(--neutral-rgb), 0.12));
-    opacity: 0;
-}
-
-.call-rim-owner {
-    background: conic-gradient(from var(--call-spin, 0deg), rgb(var(--call-owner-rgb)), rgb(var(--call-owner-2-rgb)),
-        rgba(var(--call-owner-rgb), 0.3), rgb(var(--call-owner-2-rgb)), rgb(var(--call-owner-rgb)));
-    opacity: min(1, calc(var(--call-mic, 0) * 1.1));
-}
-
-.call-rim-ouroboros {
-    background: conic-gradient(from var(--call-spin, 0deg), rgb(var(--call-ouro-rgb)), rgb(var(--call-ouro-2-rgb)),
-        rgba(var(--call-ouro-rgb), 0.3), rgb(var(--call-ouro-hi-rgb)), rgb(var(--call-ouro-rgb)));
-    opacity: min(1, calc(var(--call-out, 0) * 1.1));
-}
-
-.chat-input-wrap[data-call-light="trace"] .call-rim-trace {
-    opacity: 1;
-}
-
-.chat-input-wrap[data-call-light="listen"] .call-rim-listen {
-    opacity: calc((1 - var(--call-mic, 0)) * 0.9);
-}
-
-.chat-input-wrap[data-call-light="think"] .call-rim-ouroboros {
-    opacity: max(0.7, min(1, calc(var(--call-out, 0) * 1.1)));
-}
-
-/* Whose voice may light it: while Ouroboros is heard, the owner's light (or an echo) stays out. */
-.chat-input-wrap:not([data-call-voice="owner"]) .call-rim-owner,
-.chat-input-wrap:not([data-call-voice="owner"]) .call-aura-owner {
-    opacity: 0;
-}
-
-/* The glow behind the frosted glass: the capsule is lit from within and the light spills just
-   around it. Brightness stays in a narrow band; the voice mostly widens the light. */
-.call-aura {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: -1;
-    height: var(--call-row-height, 50px);
-    border-radius: var(--pill-radius);
-    pointer-events: none;
-}
-
-.chat-input-wrap:not([data-call="live"]) .call-aura {
-    display: none;
-}
-
-/* On white, light spilling past the capsule reads as a stain on the room: there the glow stays
-   inside the capsule's own outline, seen through its glass. */
-:root[data-theme="light"] .call-aura {
-    overflow: hidden;
-}
-
-.call-aura i {
-    position: absolute;
-    inset: 2px 6px;
-    display: block;
-    border-radius: inherit;
-    filter: blur(16px);
-}
-
-.call-aura-owner {
-    background: linear-gradient(90deg, rgb(var(--call-owner-rgb)), rgb(var(--call-owner-2-rgb)) 50%, rgb(var(--call-owner-rgb)));
-    opacity: calc(var(--call-mic, 0) * 0.75 * var(--call-glow));
-    transform: scaleY(calc(1 + var(--call-mic, 0) * 0.5));
-}
-
-.call-aura-ouroboros {
-    background: linear-gradient(90deg, rgb(var(--call-ouro-rgb)), rgb(var(--call-ouro-hi-rgb)) 50%, rgb(var(--call-ouro-rgb)));
-    opacity: calc(var(--call-out, 0) * 0.75 * var(--call-glow));
-    transform: scaleY(calc(1 + var(--call-out, 0) * 0.5));
-}
-
-.chat-input-wrap[data-call-light="think"] .call-aura-ouroboros {
-    opacity: calc(max(var(--call-out, 0) * 0.75, 0.3) * var(--call-glow));
-}
-
-/* Talk's sign, and the shell mark's: five still bars of a voice. */
+/* Talk's sign, the card's and the shell mark's: the wave's three strands, still. */
 .call-entry-mark {
     display: inline-flex;
     align-items: center;
-    gap: 2px;
     flex: none;
     height: 14px;
 }
 
-.call-entry-mark i {
+.call-entry-mark svg {
     display: block;
-    width: 2.5px;
-    height: 5px;
-    border-radius: 2px;
-    background: currentColor;
 }
 
-.call-entry-mark i:nth-child(2),
-.call-entry-mark i:nth-child(4) {
-    height: 9px;
-}
-
-.call-entry-mark i:nth-child(3) {
-    height: 13px;
-}
-
-/* Reduced motion: the light holds still and only changes whose colour it is, as fades of at most
-   200 ms; the visual draws a still wave and the words say the rest. */
+/* Reduced motion: the dots stand still; the visual draws a still wave whose colour and the words say the rest. */
 @media (prefers-reduced-motion: reduce) {
-    .call-aura i {
-        transform: none;
-    }
-
-    .call-rim i,
-    .call-aura i {
-        transition: opacity 0.2s ease;
+    .call-work span {
+        animation: none;
     }
 }

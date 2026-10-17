@@ -379,7 +379,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         notice(message) { if (!destroyed) showToast(message, 'warning'); },
     });
     const cards = createCallCards({ feed: page.querySelector('#chat-messages, .chat-messages'), ws, doc,
-        live: () => (session.active ? session.callId : '') });
+        live: () => (session.active ? session.callId : ''), sign: () => CALL_VISUAL.mark(doc) });
     // Talk starts a call; a surface that cannot hold one answers the press with its sheet.
     const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, styled, view: () => session.view(),
         talk: () => session.start(),

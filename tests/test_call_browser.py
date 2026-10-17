@@ -225,7 +225,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             field = room.locator("#chat-input")
             # Talk and Send are one capsule of one width; Enter on an empty field does nothing.
             talk_width = send.evaluate("el => el.getBoundingClientRect().width")
-            assert send.locator(".call-entry-mark i").count() == 5
+            assert send.locator(".call-entry-mark path").count() == 3  # the wave's three strands, still
             field.focus()
             page.keyboard.press("Enter")
             page.wait_for_timeout(300)
@@ -332,7 +332,10 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.wait_for_function("parseFloat(getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
                                    ".getPropertyValue('--call-mic')) > 0.3")
             _shot(page, f"{engine}-dark-1280-owner")
-            assert page.evaluate(f"() => getComputedStyle(document.querySelector('{ROOM} .call-aura')).overflow") == "visible"
+            # The light lives in the capsule's glass: its tint takes the owner's blue, nothing glows around it.
+            page.wait_for_function(f"parseFloat(document.querySelector('{ROOM} .chat-text-row').style.getPropertyValue('--call-tint-owner')) > 0.3")
+            assert page.evaluate(f"() => Number(document.querySelector('{ROOM} .chat-text-row').style.getPropertyValue('--call-tint-ouroboros'))") == 0
+            assert room.locator(".call-aura, .call-rim").count() == 0
             _caption(page, "owner", "item_owner_1", " is six times seven?")
             _caption(page, "owner", "item_owner_1", "Hello, Ouroboros. How much is six times seven?", final=True)
             page.evaluate("__callTest.speak(0)")
@@ -436,8 +439,9 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                                    ".getPropertyValue('--call-mic')) > 0.3")
             _shot(page, f"{engine}-light-1280-owner")
             # On white the glow stays inside the capsule's outline; in the dark room it spills just around it.
-            aura = f"getComputedStyle(document.querySelector('{ROOM} .call-aura')).overflow"
-            assert page.evaluate(f"() => {aura}") == "hidden"
+            # The glass breathes a few pixels with the voice; the composer's box never moves.
+            page.wait_for_function(f"parseFloat(document.querySelector('{ROOM} .chat-text-row').style.getPropertyValue('--call-breath')) > 0.5")
+            assert abs(page.evaluate(f"document.querySelector('{ROOM} .chat-text-row').getBoundingClientRect().height") - idle_row_height) <= 1
             page.evaluate("__callTest.speak(0)")
             _caption(page, "owner", "item_owner_2", "And eight times nine?", final=True)
             expect(state).to_have_text("Thinking")
@@ -474,7 +478,8 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 assert abs(page.evaluate(row_height) - voice_height) <= 1, (voice_height, page.evaluate(row_height))
                 expect(room.locator(".call-end")).to_be_visible()
                 expect(room.locator(".call-mute")).to_be_hidden()
-                expect(room.locator(".call-wave")).to_be_hidden()
+                # The wave stays behind the field, dimmed; it takes none of the field's room.
+                assert room.locator(".call-wave").evaluate("el => getComputedStyle(el).opacity") == "0.2"
                 expect(field).to_be_visible()
                 field_width = page.evaluate(f"document.querySelector('{ROOM} #chat-input').getBoundingClientRect().width")
                 assert field_width >= 100, f"the phone's field keeps room to type: {field_width}px"
@@ -733,14 +738,14 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             page.wait_for_function("__callTest.sockets.length === 1 && __callTest.sockets[0].sent.length > 0")
             _state(page, state="preparing", phase="memory")
             expect(room.locator(".call-state")).to_have_text("Preparing memory…")
-            spin = room.locator(".call-rim").evaluate("el => el.style.getPropertyValue('--call-spin')")
-            page.wait_for_timeout(400)
-            assert room.locator(".call-rim").evaluate("el => el.style.getPropertyValue('--call-spin')") == spin
             _state(page, state="live")
             page.evaluate("__callTest.speak(0.4)")
             page.wait_for_function("getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
                                    ".getPropertyValue('--call-mic').trim() === '0.600'")
-            assert room.locator(".call-rim").evaluate("el => el.style.getPropertyValue('--call-rim-level')") == "0.000"
+            # The colour still says who (the owner's tint), but the outline never breathes.
+            row = f"document.querySelector('{ROOM} .chat-text-row')"
+            page.wait_for_function(f"{row}.style.getPropertyValue('--call-tint-owner') === '0.500'")
+            assert page.evaluate(f"{row}.style.getPropertyValue('--call-breath')") == "0.00"
             expect(room.locator(".call-state")).to_have_text("Listening")
             room.locator(".call-end").click()
             _ended(page)
@@ -758,3 +763,4 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             assert telegram.locator(".call-capsule").count() == 0
         finally:
             browser.close()
+

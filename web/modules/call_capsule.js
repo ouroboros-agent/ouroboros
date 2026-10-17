@@ -1,7 +1,7 @@
 /** The composer face of a call. With nothing to send, the Send capsule reads Talk; a press (never
  * Enter) starts the call. During a call the text row keeps its footprint and becomes the live
- * capsule: the visual and the state, Mute, Show (a screen or the camera, from a small menu), Keyboard, End. Keyboard brings the field back between
- * the docked visual and the call's controls; End and the way back to voice never leave, and what is
+ * capsule: the visual behind the state, Mute, Show (a screen or the camera, from a small menu), Keyboard, End. Keyboard brings the field back before
+ * the call's controls, the visual dimmed behind it; End and the way back to voice never leave, and what is
  * typed goes as an ordinary turn. When Talk cannot work, or a call
  * ends with something to say, a sheet takes the capsule's place with the words and one next step.
  * Every word the owner reads is chosen here from the session's facts (`callPresentation`). Calls
@@ -29,7 +29,7 @@ const TOGGLE = {
 // The field's placeholder while the call's controls share its row: one line at a phone's width, so
 // opening the keyboard view never grows the composer.
 const KEYBOARD_PLACEHOLDER = 'Message…';
-const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone', 'callSharing'];
+const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone', 'callSharing', 'callWork'];
 
 // Why a call reconnects, beside "Reconnecting…".
 const RECONNECT_WORDS = {
@@ -133,7 +133,7 @@ export function callPresentation(view, live = {}) {
     if (heard) return { ...base, title: 'Ouroboros', sub: 'Speaking' };
     if (live.ownerSpeaking) return { ...base, title: 'Listening', sub: 'You’re speaking' };
     // The tool's own label is the host's sentence, shown as it is (or as the install translated it).
-    if (view.activity?.working) return { ...base, light: 'think', title: 'Working',
+    if (view.activity?.working) return { ...base, light: 'think', work: true, title: 'Working',
         sub: view.activity.label ? tx(view.activity.label) : 'Using a tool', subFormatted: Boolean(view.activity.label) };
     if (live.thinking) return { ...base, light: 'think', title: 'Thinking' };
     return { ...base, title: 'Listening', sub: 'Speak whenever you’re ready' };
@@ -395,7 +395,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         const sheet = presented.mode === 'sheet';
         Object.assign(wrap.dataset, { call: presented.mode, callView: sheet ? 'sheet' : keyboard ? 'keyboard' : 'voice',
             callLight: presented.light, callVoice: presented.voice || '', callTone: presented.tone || '',
-            callSharing: current.sharing || '' });
+            callSharing: current.sharing || '', callWork: presented.work ? '1' : '' });
         light.setMode(presented.light, presented.voice || '');
         setWords(words.state, presented.title, presented.formatted);
         words.state.title = presented.title;

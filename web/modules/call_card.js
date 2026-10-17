@@ -49,7 +49,7 @@ function spokenText(node) {
     return String((message || node).textContent || '').trim().replace(/^💬\s*/u, '');
 }
 
-export function createCallCards({ feed, ws = null, doc = feed?.ownerDocument, live = () => '' } = {}) {
+export function createCallCards({ feed, ws = null, doc = feed?.ownerDocument, live = () => '', sign = null } = {}) {
     const cards = new Map();        // task id, or `call:<id>` before its task is known → card
     const callTasks = new Map();    // task id → call id
     const captions = new Map();     // `call␀item` → caption line
@@ -78,10 +78,9 @@ export function createCallCards({ feed, ws = null, doc = feed?.ownerDocument, li
         const node = element('div', 'call-card');
         const head = element('button', 'call-card-head');
         head.type = 'button';
-        const sign = element('span', 'call-entry-mark');
-        for (let index = 0; index < 5; index += 1) sign.append(element('i'));
         const facts = element('span', 'call-card-facts');
-        head.append(sign, element('span', 'call-card-title', 'Call'), facts);
+        // The call's own small sign (the visual's, as on Talk) leads the card.
+        head.append(sign?.() || element('span', 'call-entry-mark'), element('span', 'call-card-title', 'Call'), facts);
         const lines = element('div', 'call-card-lines');
         node.append(head, lines);
         const card = { id, task: '', call: '', node, head, facts, lines, open: null, count: 0, span: 0 };

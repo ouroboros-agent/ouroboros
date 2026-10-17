@@ -448,49 +448,87 @@ test('the mark stands for the live call only while its room is off screen, with 
     assert.equal(callClock(0 + 1, 1 + 3_725_000), '1:02:05');
 });
 
-test('the visual is one swappable contract: a slot, its own row layers, the glow behind, a small sign', () => {
+test('the visual is one swappable contract: the wave in its slot, the glass behind the row, a small sign', () => {
     const made = [];
-    const node = (tag) => { const element = { tag, className: '', attrs: {}, innerHTML: '', removed: false, props: {},
-        style: { setProperty(name, value) { element.props[name] = value; } },
-        setAttribute(name, value) { this.attrs[name] = value; }, remove() { this.removed = true; } }; made.push(element); return element; };
-    const strokes = [];
+    const node = (tag) => {
+        const element = { tag, className: '', attrs: {}, innerHTML: '', removed: false, props: {}, dataset: {}, children: [],
+            clientWidth: 600, clientHeight: 50,
+            style: { setProperty(name, value) { element.props[name] = value; }, removeProperty(name) { delete element.props[name]; } },
+            setAttribute(name, value) { this.attrs[name] = value; }, remove() { this.removed = true; },
+            getBoundingClientRect: () => ({ left: 0, width: 600 }) };
+        made.push(element);
+        return element;
+    };
+    const fills = [];
+    const dashes = [];
     const doc = { createElement: tag => {
         const element = node(tag);
         if (tag === 'canvas') element.getContext = () => ({ setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {},
-            lineTo() {}, stroke() { strokes.push(this.strokeStyle); } });
+            lineTo() {}, closePath() {}, arc() {}, fill() { fills.push(this.fillStyle); }, stroke() { dashes.push(this.strokeStyle); },
+            setLineDash(pattern) { if (pattern.length) dashes.push('dash'); } });
         return element;
     } };
-    const slot = { children: [], replaceChildren(...nodes) { this.children = nodes; } };
-    const row = { offsetHeight: 50, appended: [], append(child) { this.appended.push(child); } };
-    const wrap = { appended: [], append(child) { this.appended.push(child); } };
-    const env = { devicePixelRatio: 3, getComputedStyle: () => ({ getPropertyValue: name => `colour(${name})` }),
-        addEventListener() {}, removeEventListener() {} };
+    const slot = { children: [], dataset: {}, clientWidth: 600, clientHeight: 50, getBoundingClientRect: () => ({ left: 0, width: 600 }),
+        replaceChildren(...nodes) { this.children = nodes; } };
+    const row = { appended: [], props: {}, append(child) { this.appended.push(child); }, querySelector: () => null,
+        style: { setProperty(name, value) { row.props[name] = value; }, removeProperty(name) { delete row.props[name]; } } };
+    const wrap = { dataset: { call: 'live', callView: 'voice' } };
+    let clock = 0;
+    const colours = { '--call-owner-rgb': '47, 107, 214', '--call-ouro-rgb': '201, 53, 69', '--call-amber-rgb': '180, 83, 9',
+        '--neutral-rgb': '28, 33, 51' };
+    const env = { devicePixelRatio: 3, getComputedStyle: () => ({ getPropertyValue: name => colours[name] || '' }),
+        performance: { now: () => clock }, addEventListener() {}, removeEventListener() {} };
     const handle = CALL_VISUAL.mount({ slot, row, wrap, doc, env });
-    const [canvas] = slot.children;
-    assert.deepEqual([canvas.className, canvas.attrs['aria-hidden'], canvas.width, canvas.height], ['call-wave', 'true', 128, 60]);
-    const [rim] = row.appended;
-    assert.equal(rim.className, 'call-rim');
-    for (const layer of ['trace', 'listen', 'owner', 'ouroboros']) assert.match(rim.innerHTML, new RegExp(`class="call-rim-${layer}"`), layer);
-    const [aura] = wrap.appended;  // behind the row, so the row's frosted glass is lit from behind
-    assert.equal(aura.className, 'call-aura');
-    assert.match(aura.innerHTML, /call-aura-owner.*call-aura-ouroboros/);
-    assert.equal(aura.props['--call-row-height'], '50px');
-    handle.draw({ mic: 0.8, out: 0, dt: 0.1, time: 1, mode: 'listen', voice: 'owner', owner: true });
-    assert.ok(parseFloat(rim.props['--call-spin']) > 0);
-    assert.equal(rim.props['--call-rim-level'], '0.800');
-    assert.deepEqual([...new Set(strokes)], ['colour(--call-wave-owner)']);
-    const spin = rim.props['--call-spin'];
-    handle.draw({ mic: 0.8, out: 0, dt: 0.1, time: 1.1, mode: 'muted', voice: 'owner' });
-    assert.equal(rim.props['--call-spin'], spin);  // muted is still
-    handle.draw({ mic: 0, out: 0.9, dt: 0.1, time: 1.2, mode: 'listen', voice: 'owner', reduced: true });
-    assert.equal(rim.props['--call-spin'], spin);  // reduced motion holds the rim
-    assert.equal(rim.props['--call-rim-level'], '0.000');
+    const [canvas, work] = slot.children;
+    assert.deepEqual([canvas.className, canvas.attrs['aria-hidden'], canvas.width, canvas.height], ['call-wave', 'true', 1200, 100]);
+    assert.equal(work.className, 'call-work chat-live-typing');
+    const [glass] = row.appended;  // the row's glass: its surface while live, tinted by one hue
+    assert.equal(glass.className, 'call-glass');
+    assert.match(glass.innerHTML, /call-glass-owner.*call-glass-ouroboros/);
+    const run = (state, seconds) => { for (let t = 0; t < seconds; t += 1 / 60) { clock += 1000 / 60; handle.draw(state); } };
+    const tints = () => [Number(row.props['--call-tint-owner']), Number(row.props['--call-tint-ouroboros'])];
+    // The owner speaks: blue ink, a blue tint, the outline breathing out a few pixels.
+    run({ mic: 0.8, out: 0, mode: 'listen', voice: 'owner', owner: true }, 1);
+    assert.ok(tints()[0] > 0.5 && tints()[1] === 0, String(tints()));
+    assert.ok(Number(row.props['--call-breath']) > 1 && Number(row.props['--call-breath']) < 8, row.props['--call-breath']);
+    const rgb = text => text.match(/[\d.]+/g).map(Number);
+    fills.length = 0;
+    run({ mic: 0.8, out: 0, mode: 'listen', voice: 'owner', owner: true }, 1 / 60);  // one settled frame
+    const strongest = fills.map(rgb).filter(([, , , alpha]) => alpha > 0.9);
+    assert.ok(strongest.length && strongest.every(([r, g, b]) => Math.abs(r - 47) <= 8 && Math.abs(g - 107) <= 8 && Math.abs(b - 214) <= 8),
+        'the main strand in the owner\'s blue');
+    // The turn passes: blue fades out before crimson comes in; never both lit at once.
+    let both = 0;
+    for (let t = 0; t < 1.5; t += 1 / 60) {
+        clock += 1000 / 60;
+        handle.draw({ mic: 0, out: 0.8, mode: 'listen', voice: 'ouroboros' });
+        const [owner, ouroboros] = tints();
+        if (owner > 0.1 && ouroboros > 0.1) both += 1;
+    }
+    assert.equal(both, 0);
+    assert.ok(tints()[1] > 0.5 && tints()[0] < 0.05, String(tints()));
+    // Muted: one dashed line; an error: one still amber strand; reduced motion holds the outline still.
+    fills.length = 0;
+    run({ mic: 0.9, out: 0, mode: 'muted', voice: 'owner' }, 0.5);
+    assert.ok(dashes.includes('dash'));
+    run({ mode: 'error' }, 0.3);
+    assert.ok(fills.at(-1).startsWith('rgba(180,83,9,'), fills.at(-1));
+    run({ mic: 0.9, out: 0, mode: 'listen', voice: 'owner', owner: true, reduced: true }, 0.3);
+    assert.equal(row.props['--call-breath'], '0.00');
+    // Live work draws the strands in to the room's three dots, and lets them go again.
+    wrap.dataset.callWork = '1';
+    run({ mode: 'think', voice: '' }, 1);
+    assert.equal(slot.dataset.work, '1');
+    wrap.dataset.callWork = '';
+    run({ mode: 'think', voice: '' }, 1);
+    assert.equal(slot.dataset.work, '');
     const mark = CALL_VISUAL.mark(doc);
     assert.equal(mark.className, 'call-entry-mark');
-    assert.equal((mark.innerHTML.match(/<i><\/i>/g) || []).length, 5);  // five bars of a voice, no lens
+    assert.equal((mark.innerHTML.match(/<path /g) || []).length, 3);  // the wave's three strands, still
     handle.destroy();
     assert.equal(slot.children.length, 0);
-    assert.deepEqual([rim.removed, aura.removed], [true, true]);
+    assert.equal(glass.removed, true);
+    assert.equal(row.props['--call-breath'], undefined);
     assert.throws(() => { CALL_VISUAL.name = 'lens'; }, TypeError);
 });
 
