@@ -65,6 +65,18 @@ test('history chrome shares one control and derives completeness from physical c
     assert.equal(controls.olderButton.hidden, true);
 });
 
+test('at its older end a grown room offers the way on, a chain a navigation began does not', () => {
+    const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc);
+    messages.isConnected = true;
+    const controls = createHistoryControls(messages);
+    const exhausted = { initialized: true, canOlder: false, canNewer: false, olderExhausted: true, loading: '', error: null };
+    controls.render(exhausted, { horizonGap: true });
+    assert.equal(controls.olderButton.hidden, false, 'a grown room re-anchors to the present from here');
+    controls.render({ ...exhausted, away: true }, { horizonGap: true });
+    assert.equal(controls.olderButton.hidden, true, 'a page around a task never sends Load more to the present');
+});
+
 test('the empty-Main greeting and the reconnect notice are chrome: a read over them still shows its loading and failure', () => {
     const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
     const messages = new ElementStub('div', doc);
@@ -97,19 +109,18 @@ test('the empty-Main greeting and the reconnect notice are chrome: a read over t
 test('sticky single-flight never swallows the post-completion resync', () => {
     // [GPT#12 + Fable#1] scheduleHistorySync (700ms debounce after task
     // completion) must do a REAL fetch — a lost task_done is healed only by
-    // refetching — so it calls syncHistory directly, never the sticky
-    // awaitInitialHydration shortcut.
+    // refetching — so it reads through the pager (what arrived since the newest
+    // read, else the newest page; chat_history_arrivals.test.js), never the
+    // sticky awaitInitialHydration shortcut.
     const fn = chatSource.slice(
         chatSource.indexOf('function scheduleHistorySync('),
         chatSource.indexOf('function applyLiveCardState('),
     );
-    assert.match(fn, /syncHistory\(\{ includeUser: false \}\)/);
+    assert.match(fn, /run: \(\) => historyPager\.read\(\)/);
     assert.doesNotMatch(fn, /awaitInitialHydration/);
-    // The reconnect branch of the open handler also always refetches.
-    assert.match(
-        chatSource,
-        /\? syncHistory\(\{ includeUser: !historyLoaded, fromReconnect: isReconnect \}\)/,
-    );
+    // The reconnect branch of the open handler reads the newest page whole (frames sent while away are lost),
+    // through the read that folds every reconnect arriving meanwhile into one more.
+    assert.match(chatSource, /\? syncHistory\(\{ fromReconnect: true \}\)/);
     // Every failed sync resets the sticky promise.
     assert.ok((chatSource.match(/initialHydrationPromise = null;/g) || []).length >= 3);
 });

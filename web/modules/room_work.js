@@ -10,11 +10,13 @@
  *   controls    task_control_menu.openTaskControls for the row's exact activity id, offered only while
  *               the current census confirms it; a loaded card stops through its own card path
  *   question    the instance's revealQuestion (chat_decision.js); it navigates and never answers
- *   reading     the instance's reading intent and timeline anchors (`Back to reading`)
+ *   reading     the instance's reading intent and timeline anchors (`Back to reading`); an unloaded row reads
+ *               the page around its task through the instance's pager (`around`), Back its own page (`revisit`)
  */
 import { fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
 import { bindContentButton, isForegroundLiveCard } from './chat_activity.js';
 import { compareHistoryPosition } from './chat_history_replay.js';
+import { createHistoryReveal } from './chat_history_reveal.js';
 import { fmt, tr } from './i18n.js';
 import { taskCancelPending } from './log_events.js';
 import {
@@ -91,6 +93,7 @@ export function createRoomWork({
     pendingSubmissions: pending = new Map(), pendingSuggestedNames: names = new Map(), modelWaits = null,
     stopEligible = () => false, cancelRunFromCard = null, refreshHeaderControlState = async () => {},
     captureVisibleTimelineAnchor = () => null, restoreVisibleTimelineAnchor = () => false, hostReady = () => true,
+    historyPager = null, showLatest = null,
 } = {}) {
     if (!page || !statusBadge || !messagesDiv) return null;
     const doc = page.ownerDocument;
@@ -179,6 +182,7 @@ export function createRoomWork({
     let frozen = null;          // key -> { row, slot } while open: order and slots hold until close
     let order = [];
     let backAnchor = null;
+    let backPlace = null;       // where Back returns when the passage was let go: its page, or the present
     let backTimer = 0;
     let focusTimer = 0;
     let outsideClickTimer = 0;
@@ -190,6 +194,9 @@ export function createRoomWork({
     let menuIntent = 0;
     let navigationIntent = 0;
     const expanded = new Set();  // keys whose details are open (cleared on close)
+    const lookups = new Map();   // id -> what a press found for an unloaded row, and for which census facts (cleared on close)
+    const history = historyPager && createHistoryReveal({ pager: historyPager, reading, feed: messagesDiv, records,
+        present: () => !destroyed && !page.hidden && page.isConnected });
     const views = new Map();     // key -> painted row
     const detailNames = new Map();
     const detailReads = new Set();
@@ -287,6 +294,15 @@ export function createRoomWork({
         };
     }
 
+    // A press's answer (loading|absent|moved|unknown) holds while the work's census facts stay as they were:
+    // work that changed may have a message now, so its row claims nothing again until a press asks.
+    const lookupFacts = (row) => `${row.view?.phase}|${row.attempt ?? ''}|${row.cmid || ''}`;
+    function lookupOf(row) {
+        const found = lookups.get(row.id);
+        if (found && found.state !== 'loading' && found.facts !== lookupFacts(row)) lookups.delete(row.id);
+        return lookups.get(row.id)?.state || '';
+    }
+
     // Work that left the census while the list is open: its row stays, settled, until close. Finish withdraws
     // the controls, never the way to its name, card or details; the word is its card's own final one, if known.
     function settled(row) {
@@ -344,6 +360,15 @@ export function createRoomWork({
         return out;
     }
 
+    // What a press on an unloaded row found out about where its message is (DESIGN "Room work status").
+    function whereText(row) {
+        const ended = row.settled || ['done', 'caution', 'failed'].includes(row.tone);
+        return { loading: tr('room_work.lookup.loading', 'Loading its message…'),
+            absent: ended ? tr('room_work.lookup.absent_ended', 'No message saved in this chat.') : tr('room_work.lookup.absent', 'No message yet.'),
+            moved: tr('room_work.lookup.moved', 'This work is in another room.'),
+            unknown: tr('room_work.lookup.unknown', 'Its message could not be checked.') }[row.lookup] || '';
+    }
+
     function describe(row) {
         const lines = [];
         if (row.settled && !row.latest) lines.push(row.outcomeKnown
@@ -351,8 +376,8 @@ export function createRoomWork({
                 tr('room_work.detail.finished_text', 'Its recorded outcome is shown above. This row stays until the list closes.')]
             : [tr('room_work.detail.activity', 'Activity'),
                 tr('room_work.detail.ended_text', 'No longer listed as active; its outcome is not known here. This row stays until the list closes.')]);
-        if (!row.loaded && row.kind !== 'pending') lines.push([tr('room_work.detail.where', 'Where'),
-            tr('room_work.detail.where_text', 'Its card is outside the messages loaded in this chat, so this row cannot take you to it. Older messages load from the chat itself.')]);
+        const where = whereText(row);
+        if (where) lines.push([tr('room_work.detail.where', 'Where'), where]);
         if (!row.confirmed && !row.settled && !row.latest) lines.push([tr('room_work.detail.why', 'Why no controls'),
             tr('room_work.detail.why_text', 'The latest update did not confirm this work, so nothing here can be paused or stopped.')]);
         const what = row.kind === 'pending' ? tr('room_work.what.pending', 'Your message, being sent')
@@ -409,7 +434,9 @@ export function createRoomWork({
     function activateRow(row) {
         if (!row) return;
         if (row.target?.isConnected) navigate(row);
-        else if (row.kind !== 'pending') toggleDetail(row.key);
+        else if (row.kind === 'pending') return;
+        else if (history && !['absent', 'moved', 'loading'].includes(row.lookup)) void reveal(row);
+        else toggleDetail(row.key);
     }
 
     function toggleDetail(key) {
@@ -423,23 +450,27 @@ export function createRoomWork({
         view.row = row;
         const { el, main } = view;
         const navigable = Boolean(row.target?.isConnected);
-        const detailable = !navigable && row.kind !== 'pending';
+        // An unloaded row asks the room's history on its press: until then it claims nothing about where its message is.
+        const lookable = !navigable && row.kind !== 'pending' && Boolean(history) && !['absent', 'moved'].includes(row.lookup);
+        // Opened details survive a census change; a press then asks again where its message is.
+        const detailable = !navigable && row.kind !== 'pending' && (!history || Boolean(row.lookup) || expanded.has(row.key));
         const isOpen = detailable && expanded.has(row.key);
         Object.assign(el.dataset, {
             id: row.id,
             slot: row.slot, kind: row.kind, tone: row.tone, settled: row.settled ? '1' : '0', open: isOpen ? '1' : '0',
         });
         const full = row.fullName || row.name;
-        // Every row says its state under its name (5A). A row whose message is not loaded says so in its name for
-        // assistive technology and in its details; it is not a visible line of its own.
-        const place = !row.loaded && row.kind !== 'pending' ? tr('room_work.place.unloaded', 'Not in loaded messages') : '';
-        const state = [row.view.text, row.view.secondary, place].filter(Boolean).join(' · ');
-        if (navigable || detailable) {
+        // Every row says its state under its name (5A); where an unloaded row's message is, its press finds out.
+        const state = [row.view.text, row.view.secondary].filter(Boolean).join(' · ');
+        if (navigable || lookable || detailable) {
             main.setAttribute('role', 'button');
             main.tabIndex = 0;
             main.setAttribute('aria-label', navigable
                 ? fmt(row.card ? 'Go to task: {name}, {state}' : 'Go to message: {name}, {state}', { name: full, state })
-                : fmt('Details: {name}, {state}', { name: full, state }));
+                : lookable ? fmt('Open: {name}, {state}', { name: full, state })
+                    : fmt('Details: {name}, {state}', { name: full, state }));
+            if (row.lookup === 'loading') main.setAttribute('aria-busy', 'true');
+            else main.removeAttribute('aria-busy');
             if (detailable) {
                 main.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
                 main.setAttribute('aria-controls', view.detail.id);
@@ -448,9 +479,9 @@ export function createRoomWork({
                 main.removeAttribute('aria-controls');
             }
         } else {
-            for (const name of ['role', 'tabindex', 'aria-label', 'aria-expanded', 'aria-controls']) main.removeAttribute(name);
+            for (const name of ['role', 'tabindex', 'aria-label', 'aria-expanded', 'aria-controls', 'aria-busy']) main.removeAttribute(name);
         }
-        main.dataset.target = navigable ? 'card' : detailable ? 'details' : 'none';
+        main.dataset.target = navigable ? 'card' : lookable ? 'history' : detailable ? 'details' : 'none';
         // The whole name is in the DOM; CSS clamps it to two lines, focus and open details show it whole.
         if (view.full !== full) { view.full = full; view.nameEl.textContent = full; }
         // Three dots are work (moving only for confirmed motion, still when queued); one dot is a single fact.
@@ -616,7 +647,7 @@ export function createRoomWork({
         const label = asPanel ? tr('room_work.scope.project', 'Work in this project')
             : tr('room_work.scope.main', 'Work in this chat');
         if (surface.getAttribute('aria-label') !== label) surface.setAttribute('aria-label', label);
-        rows = arrange(collect());
+        rows = arrange(collect()).map((row) => Object.assign(row, { lookup: lookupOf(row) }));
         paintTrigger();
         paintNote();
         if (!open) return;
@@ -707,6 +738,9 @@ export function createRoomWork({
         frozen = null;
         order = [];
         expanded.clear();
+        // A list dismissed while a row still looks drops that look: the reader left before it answered.
+        if ([...lookups.values()].some((found) => found.state === 'loading')) { navigationIntent += 1; live.textContent = ''; }
+        lookups.clear();
         // Reconcile against the closed-list policy before restoring focus. The final retained
         // Main row may just have ended; disabling its trigger on the next frame would strand focus.
         render();
@@ -739,14 +773,45 @@ export function createRoomWork({
         const target = row?.target;
         if (!target?.isConnected) return;
         navigationIntent += 1;
-        const anchor = captureVisibleTimelineAnchor();
+        arrive(row, target, departure());
+    }
+
+    const departure = () => (history ? history.departure(captureVisibleTimelineAnchor())
+        : { anchor: captureVisibleTimelineAnchor() });
+
+    function arrive(row, target, place) {
         close({ restoreFocus: false });
         scrollToNode(target);
-        showBack(anchor);
+        showBack(place.anchor, place);
         const summary = records.get(row.id)?.summaryButtonEl;
         const focus = summary?.isConnected ? summary : target;
         if (focus === target && !target.hasAttribute?.('tabindex')) target.setAttribute('tabindex', '-1');
         focus.focus?.({ preventScroll: true });
+    }
+
+    // An unloaded row: the chat reads the page around its task and lands there (DESIGN "Room work status"); the
+    // list stays open while it looks, and a history with no message of it here, or a read that cannot tell, says so.
+    async function reveal(row) {
+        const intent = ++navigationIntent;
+        const place = departure();
+        lookups.set(row.id, { state: 'loading', intent });
+        expanded.add(row.key);
+        live.textContent = tr('room_work.lookup.loading', 'Loading its message…');
+        schedule();
+        const found = await history.task(row.id, () => intent === navigationIntent);
+        if (!found) {
+            if (intent === navigationIntent) live.textContent = '';
+            if (lookups.get(row.id)?.intent === intent) { lookups.delete(row.id); expanded.delete(row.key); schedule(); }
+            return;
+        }
+        lookups.delete(row.id);
+        if (found.target) { arrive(row, found.target, place); return; }
+        if (found.left) showBack(place.anchor, place);  // its page was drawn yet shows nothing of it: Back undoes that
+        // The owner's own message is a message: a row that carries one is never told it has none.
+        const state = found.state === 'absent' && row.cmid ? 'unknown' : found.state;
+        lookups.set(row.id, { state, facts: lookupFacts(row) });
+        live.textContent = whereText({ ...row, lookup: state });
+        schedule();
     }
 
     // Goes to the exact waited question and focuses the question itself, never its answer field.
@@ -758,8 +823,9 @@ export function createRoomWork({
         if (shown && !destroyed && intent === navigationIntent && !page.hidden && page.isConnected) showBack(anchor);
     }
 
-    function showBack(anchor) {
+    function showBack(anchor, place = null) {
         backAnchor = anchor || null;
+        backPlace = backAnchor ? place : null;
         clearTimeout(backTimer);
         backLabel.textContent = 'Back to reading';
         back.hidden = !backAnchor;
@@ -775,22 +841,36 @@ export function createRoomWork({
         back.hidden = true;
     }
 
-    function goBack() {
+    async function goBack() {
         if (!backAnchor) return;
+        const anchor = backAnchor, place = backPlace;
+        const intent = ++navigationIntent;
+        clearTimeout(backTimer);
+        // The reader was following the present: Back is the return to it.
+        if (place?.present && showLatest) { backAnchor = null; hideBack(); await showLatest(); return; }
         reading.cancel();
-        const exact = restoreVisibleTimelineAnchor(backAnchor, { exact: true });
-        const near = exact || restoreVisibleTimelineAnchor(backAnchor, { cardOnly: true });
+        const restore = () => (restoreVisibleTimelineAnchor(anchor, { exact: true }) ? 'exact'
+            : restoreVisibleTimelineAnchor(anchor, { cardOnly: true }) ? 'near' : '');
+        let returned = restore();
+        if (!returned && place?.cursor && history) {  // the page the reader left was let go: read it again
+            const drawn = await history.revisit(place.cursor, () => intent === navigationIntent);
+            if (drawn === null) return;
+            if (drawn === false) {  // the read failed for now: Back stays for another try
+                live.textContent = 'The earlier reading place could not be read. Try again.';
+                return;
+            }
+            if (drawn === true) returned = restore();
+        }
         reading.stick = false;
         reading.scroll();
         backAnchor = null;
-        clearTimeout(backTimer);
-        if (!near) {
+        if (!returned) {
             backLabel.textContent = 'Earlier place is no longer loaded';
             live.textContent = 'The earlier reading place is no longer loaded.';
             backTimer = setTimeout(hideBack, 4000);
             return;
         }
-        live.textContent = exact ? 'Returned to where you were reading.' : 'Returned to the nearest loaded place.';
+        live.textContent = returned === 'exact' ? 'Returned to where you were reading.' : 'Returned to the nearest loaded place.';
         hideBack();
     }
 

@@ -324,9 +324,19 @@ def cold_blockers(ctx: Any, *, chosen: Dict[str, Any] | None = None,
     from ouroboros.budget_pause import observe_task_runs
     from ouroboros import delegate_custody as custody
 
+    from ouroboros.model_detach import is_detach
+
+    chosen = chosen if chosen is not None else (getattr(ctx, "_model_sleep", None) or {})
+    detach = is_detach(chosen)
+    allow_transfer = allow_transfer and not detach
+    if detach:
+        transferred = ()
     blockers: List[Dict[str, str]] = []
-    observed = observe_task_runs(custody.custody_root(ctx), str(ctx.task_id), reason="cold_sleep_check",
-                                 request_stop=False)
+    try:
+        observed = observe_task_runs(custody.custody_root(ctx), str(ctx.task_id), reason="cold_sleep_check",
+                                     request_stop=False)
+    except Exception as exc:
+        observed = {"custody_read": "failed", "error": str(exc), "runs": []}
     if observed.get("custody_read") != "ok":
         blockers.append({"kind": "custody_unreadable", "detail": str(observed.get("error") or "")})
     allowed = {tuple(pair) for pair in transferred}
@@ -356,7 +366,6 @@ def cold_blockers(ctx: Any, *, chosen: Dict[str, Any] | None = None,
 
     root = _canonical_root(ctx)
     tree_id = _member_coordinates(ctx)[1]
-    chosen = chosen if chosen is not None else (getattr(ctx, "_model_sleep", None) or {})
     dependencies = set(chosen.get("tasks", []) + chosen.get("senders", []))
     members = {str(ctx.task_id)}
     try:
@@ -370,7 +379,7 @@ def cold_blockers(ctx: Any, *, chosen: Dict[str, Any] | None = None,
                 # The root sleep fence would prevent this member from starting,
                 # including a child whose terminal/mail was selected as our wake.
                 blockers.append({"kind": "queued_member", "detail": task_id})
-            own_sleep = current_tool_operation(ctx, "await_messages") if own else ""
+            own_sleep = current_tool_operation(ctx, "continue_in_background" if detach else "await_messages") if own else ""
             from ouroboros.tool_custody import retained_tool_custody
             if retained_tool_custody(root, task_id, row, excluding=own_sleep):
                 blockers.append({"kind": "member_custody", "detail": task_id})
@@ -392,6 +401,15 @@ def cold_blockers(ctx: Any, *, chosen: Dict[str, Any] | None = None,
     return blockers
 
 
+class ColdSleepBlocked(ValueError):
+    def __init__(self, blockers):
+        self.blockers = blockers
+        super().__init__("a cold sleep would leave this task's own work unwatched: "
+                         + "; ".join(f"{b['kind']} {b.get('run_id') or b.get('name') or b.get('detail') or ''}"
+                                     for b in blockers)
+                         + " — sleep warm, wait for them, or stop them first")
+
+
 def request_sleep(ctx: Any, chosen: Dict[str, Any], mode: str) -> Dict[str, Any]:
     """Check, then arm the sleep: warm parks after this tool batch
     (``wait_after_tools``), cold at the next round boundary (``enter_cold_sleep``).
@@ -403,8 +421,10 @@ def request_sleep(ctx: Any, chosen: Dict[str, Any], mode: str) -> Dict[str, Any]
     """
     if mode == MODE_COLD and chosen.get("services"):
         raise ValueError("services wake only a warm sleep: a cold sleep ends the process that holds them")
+    from ouroboros.model_detach import is_detach
+
     ready = wake_reason(ctx, chosen)
-    if ready:
+    if ready and (not is_detach(chosen) or ready.startswith("control:")):
         questions = [] if ready.startswith("control:") else question_sources(ctx)
         return {"reason": "ready", "woke_by": ready, "slept": False, "mode": mode,
                 **({"questions": questions} if questions else {})}
@@ -431,10 +451,7 @@ def request_sleep(ctx: Any, chosen: Dict[str, Any], mode: str) -> Dict[str, Any]
     if mode == MODE_COLD:
         blockers = cold_blockers(ctx, chosen=chosen, allow_transfer=True)
         if blockers:
-            raise ValueError("a cold sleep would leave this task's own work unwatched: "
-                             + "; ".join(f"{b['kind']} {b.get('run_id') or b.get('name') or b.get('detail') or ''}"
-                                         for b in blockers)
-                             + " — sleep warm, wait for them, or stop them first")
+            raise ColdSleepBlocked(blockers)
     sleep_id = uuid.uuid4().hex
     ctx._owner_wait_requested = f"sleep:{sleep_id}"
     ctx._model_sleep = {"sleep_id": sleep_id, "mode": mode, **chosen}
@@ -504,3 +521,39 @@ def wake_notice(chosen: Dict[str, Any], outcome: str, slept: float | None) -> Di
         "The sleep did not count as execution time; an explicit deadline did not move."
         + (" A cold sleep ended your previous process: its browser and task-local services are gone; "
            "re-read files before building on them." if chosen.get("mode") == "cold" else ""))}
+
+
+def enter_cold_sleep(limit_ctx: Any) -> None:
+    """The round boundary after a COLD sleep was armed (``model_sleep``).
+
+    The loop's own continuation is saved and the process parks under the same
+    exact-pause carrier; nothing wakes it but its selected sources through the
+    supervisor's sleep-wake policy. Bound external work needs the body's exact
+    acceptance before release. Other writers and local services refuse the park:
+    the model is told the blockers and stays awake — never a killed helper.
+    """
+    from ouroboros.budget_pause import request_pause, RAIL_MODEL_SLEEP
+    from ouroboros.model_detach import is_detach, pool_available
+
+    ctx = getattr(getattr(limit_ctx, "tools", None), "_ctx", None)
+    sleep = getattr(ctx, "_model_sleep", None) if ctx is not None else None
+    if not isinstance(sleep, dict) or sleep.get("mode") != "cold":
+        return
+    blockers = cold_blockers(ctx, allow_transfer=True)
+    if is_detach(sleep) and not pool_available().get("available"):
+        blockers.append({"kind": "worker_pool_unavailable"})
+    if blockers:
+        if getattr(ctx, "_owner_wait_requested", "") == "sleep:" + str(sleep.get("sleep_id") or ""):
+            ctx._owner_wait_requested, ctx._owner_wait_deadline_at = "", ""
+        ctx._model_sleep = None
+        limit_ctx.messages.append({"role": "user", "content": (
+            "[SYSTEM NOTICE]\nYour cold sleep was not taken: this task still runs "
+            + "; ".join(f"{b['kind']} {b.get('run_id') or b.get('name') or b.get('detail') or ''}" for b in blockers)
+            + ". Sleep warm, wait for it, or stop it first.")})
+        return
+    request_pause(limit_ctx, rail=RAIL_MODEL_SLEEP, scope="task", reason_text="The model chose a cold sleep.")
+    if getattr(ctx, "_owner_wait_requested", "") == "sleep:" + str(sleep.get("sleep_id") or ""):
+        ctx._owner_wait_requested, ctx._owner_wait_deadline_at = "", ""
+    ctx._model_sleep = None  # no continuation owner: the ordinary loop continues awake
+
+

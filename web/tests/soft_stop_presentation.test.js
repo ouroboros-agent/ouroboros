@@ -22,17 +22,17 @@ import { appendProjectRow } from '../modules/project_answer.js';
 const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 
 test('Project row delegation preserves the actual producer metadata and terminal options', () => {
-    const delegation = chat.match(/if \(!projectEntry && PROJECT_ROW_TYPES.has\(systemType\)\) decorateProjectRow\(bubble, (\{[\s\S]*?\})\);/);
+    const delegation = chat.match(/\) decorateProjectRow\(bubble, (\{ \.\.\.meta[\s\S]*?\})\);/);
     assert.ok(delegation, 'the chat renderer delegates Project decoration');
     const forward = new Function('meta', 'opts', 'role', 'ts', 'fetchTaskDetailStrict', 'chatMedia', 'withStableViewport',
-        `return (${delegation[1]});`);
+        'projectRow', `return (${delegation[1]});`);
     const frame = { system_type: 'project_completion_summary', project_id: 'p', project_name: 'Project',
         task_id: 't', completion_answer: 'Result', completion_reason: 'Windows verification remains',
         terminal_time: '2026-10-09T10:00:00Z', ts: '2026-10-09T10:01:00Z', delivery_id: 'delivery' };
     appendProjectRow((_text, role, _markdown, ts, _progress, opts) => {
         const fetchDetail = () => {}, renderFile = () => {}, stableWrite = () => {};
         const forwarded = forward({ systemType: opts.systemType, projectName: 'stale' }, opts, role, ts,
-            fetchDetail, { buildDocumentBubble: renderFile }, stableWrite);
+            fetchDetail, { buildDocumentBubble: renderFile }, stableWrite, true);
         assert.equal(forwarded.systemType, frame.system_type);
         assert.equal(forwarded.projectId, frame.project_id);
         assert.equal(forwarded.projectName, frame.project_name);
@@ -45,6 +45,7 @@ test('Project row delegation preserves the actual producer metadata and terminal
         assert.equal(forwarded.fetchDetail, undefined, 'the Main mirror does not fetch a Files inventory');
         assert.equal(forwarded.renderFile, undefined);
         assert.equal(forwarded.onDomWrite, undefined, 'the fold has no in-place expansion');
+        assert.equal(forwarded.fold, true, 'a completion mirror in Ouroboros\'s voice folds');
     }, frame, '', {});
 });
 

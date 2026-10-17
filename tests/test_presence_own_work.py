@@ -211,7 +211,7 @@ def test_old_frozen_ceilings_keep_their_digest_and_gain_nothing(tmp_path):
     payload = presence_ceiling_payload(_ceiling())
     old = json.loads(json.dumps(payload))
     old["tools"] = [tool for tool in old["tools"]
-                    if tool["name"] not in {"get_task_result", "recent_tasks", "steer_task"}]
+                    if tool["name"] not in {"get_task_result", "recent_tasks", "tell_task"}]
     with pytest.raises(PresenceAuthorityError):
         presence_ceiling_from_payload(old)  # stripping the grants is not a valid frozen ceiling
     from ouroboros.presence_authority import _digest
@@ -223,8 +223,8 @@ def test_old_frozen_ceilings_keep_their_digest_and_gain_nothing(tmp_path):
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry.set_context(ctx)
     names = {schema["function"]["name"] for schema in registry.schemas()}
-    assert not names & {"get_task_result", "recent_tasks", "steer_task"}
-    assert "PRESENCE_CAPABILITY_BLOCKED" in registry.execute("steer_task", {"task_id": "x", "message": "y"})
+    assert not names & {"get_task_result", "recent_tasks", "tell_task"}
+    assert "PRESENCE_CAPABILITY_BLOCKED" in registry.execute("tell_task", {"task_id": "x", "message": "y"})
     assert "presence_cancel_work" in names  # the intrinsic control is unchanged
 
 
@@ -255,8 +255,8 @@ def _steering_turn(root, supervisor_ctx, emitted):
 
 def test_presence_steer_reaches_pending_and_running_own_work_as_task_authored_text(tmp_path, monkeypatch):
     import supervisor.queue as queue
-    from ouroboros.owner_mailbox import deliver_task_message, drain_owner_entries
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.tools.control import _tell_task
 
     monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
     queued = {"id": "queued-work", "delegation_role": "root", "chat_id": 77,
@@ -274,33 +274,29 @@ def test_presence_steer_reaches_pending_and_running_own_work_as_task_authored_te
 
     exact = "Alex says: use the March figures, not February."
     for target in ("queued-work", "running-work"):
-        out = _steer_task(turn, target, exact)
-        assert "written to its mailbox" in out and "not as owner text" in out
+        out = _tell_task(turn, target, exact)
+        assert "Message written to" in out
         [entry] = drain_owner_entries(tmp_path, target)
         assert entry["text"] == exact
-        assert (entry["provenance"], entry["source_task_id"]) == ("independent_task", "presence-turn-1")
+        assert (entry["kind"], entry["source_task_id"]) == ("relay_entry", "presence-turn-1")
         # The run's origin rides beside the words; it is never offered as their author.
         assert entry["sender_origin"] == {"provider": "slack", "account_id": "T1", "conversation_id": "D1",
                                           "source_event_id": "evt-D1-0"}
-        rendered = []
-        deliver_task_message(entry, target, None, rendered.append)
-        assert rendered[0].startswith("[Message from independent task presence-turn-1; that task's run started from ")
-        assert "does not make it the author of any words it quotes]" in rendered[0]
-        assert rendered[0].endswith("\n" + exact) and "[Message from my human]" not in rendered[0]
+        assert not entry["owner_rows"] and entry["relay"]["quotes"] == []
     assert fence["owner_message_generation"] == 3  # a task's words supersede no reviewed answer
     assert all(evt["presence_binding_id"] == BINDING for evt in emitted)
     assert all(evt["issuer"]["kind"] == "task" for evt in emitted)
 
     for target in ("foreign-work", "owner-work"):
-        refused = _steer_task(turn, target, "stop")
-        assert "STEER_REJECTED" in refused and "presence_work_not_related" in refused
+        refused = _tell_task(turn, target, "stop")
+        assert "TELL_REJECTED" in refused and "presence_work_not_related" in refused
         assert drain_owner_entries(tmp_path, target) == []
 
 
 def test_an_ordinary_task_still_messages_any_listed_root(tmp_path, monkeypatch):
     import supervisor.queue as queue
     from ouroboros.owner_mailbox import drain_owner_entries
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.tools.control import _tell_task
 
     monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
     owner = {"id": "owner-work", "delegation_role": "root", "chat_id": 1, "metadata": {}}
@@ -309,10 +305,10 @@ def test_an_ordinary_task_still_messages_any_listed_root(tmp_path, monkeypatch):
     turn.task_metadata = {}
     turn.task_id = "managed-root"
 
-    assert "written to its mailbox" in _steer_task(turn, "owner-work", "status please")
+    assert "Message written to" in _tell_task(turn, "owner-work", "status please")
     assert "presence_binding_id" not in emitted[0] and "sender_origin" not in emitted[0]
     [entry] = drain_owner_entries(tmp_path, "owner-work")
-    assert entry["provenance"] == "independent_task" and "sender_origin" not in entry
+    assert entry["kind"] == "relay_entry" and "sender_origin" not in entry
 
 
 # --- cancellation: request receipts, own binding only, before any intent -----------
@@ -537,7 +533,7 @@ def test_an_effective_redirect_is_judged_before_projection_and_own_retries_still
 
 def test_an_unconfirmed_presence_promote_is_readable_as_pending_by_its_own_binding(tmp_path, monkeypatch):
     from ouroboros.tools import control_events
-    from ouroboros.tools.control_routing import _promote_chat_to_task
+    from ouroboros.tools.control_routing import _start_task
     from ouroboros.tools.control_task_results import _get_task_result
 
     monkeypatch.setattr(control_events, "_PROMOTE_CONFIRM_TIMEOUT_SEC", 0.05)
@@ -552,9 +548,9 @@ def test_an_unconfirmed_presence_promote_is_readable_as_pending_by_its_own_bindi
         task_contract={"capability_ceiling": presence_ceiling_payload(_ceiling())},
     )
 
-    out = _promote_chat_to_task(ctx, "Compile the figures", title="Figure compilation", predecessor_task_id="")
+    out = _start_task(ctx, "Compile the figures", title="Figure compilation")
 
-    assert out.startswith("⚠️ PROMOTE_UNCONFIRMED")
+    assert out.startswith("Accepted, waiting to start:")
     task_id = emitted[0]["task_id"]
     stub = load_task_result(tmp_path, task_id)
     # Emitted, not scheduled: the supervisor alone grants that; the provenance is the event's own.
@@ -574,7 +570,7 @@ def test_an_unconfirmed_presence_promote_is_readable_as_pending_by_its_own_bindi
         pending_events=[], event_queue=types.SimpleNamespace(put_nowait=owner_emitted.append), current_chat_id=1,
         drive_root=tmp_path, budget_drive_root=str(tmp_path), project_id="", task_metadata={}, task_id="",
     )
-    _promote_chat_to_task(owner_ctx, "Owner work", title="Owner work", workspace="none", predecessor_task_id="")
+    _start_task(owner_ctx, "Owner work", title="Owner work", workspace="none")
     owner_stub = load_task_result(tmp_path, owner_emitted[0]["task_id"])
     assert "presence" not in (owner_stub.get("metadata") or {}) and "delegation_role" not in owner_stub
 
@@ -727,9 +723,9 @@ def _child_turn(root, row, supervisor_ctx, emitted):
 
 def test_a_presence_child_steers_only_its_bindings_work_through_the_supervisor(tmp_path, monkeypatch):
     import supervisor.queue as queue
-    from ouroboros.owner_mailbox import deliver_task_message, drain_owner_entries
+    from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.project_dialogue import AGENT_RECEIPT_ID_PREFIX
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.tools.control import _tell_task
     from supervisor.events import _handle_steer_task
 
     monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
@@ -747,17 +743,15 @@ def test_a_presence_child_steers_only_its_bindings_work_through_the_supervisor(t
     turn = _child_turn(tmp_path, child, supervisor_ctx, emitted)
 
     for target in ("queued-work", "running-work"):  # own binding, pending and live (owner Q2)
-        out = _steer_task(turn, target, "The March figures are confirmed.")
-        assert "written to its mailbox" in out and "not as owner text" in out
+        out = _tell_task(turn, target, "The March figures are confirmed.")
+        assert "Message written to" in out
         [entry] = drain_owner_entries(tmp_path, target)
-        assert (entry["provenance"], entry["source_task_id"]) == ("independent_task", child["id"])
+        assert (entry["kind"], entry["source_task_id"]) == ("relay_entry", child["id"])
         assert "sender_origin" not in entry  # the child's run started from its parent, not a room
-        rendered = []
-        deliver_task_message(entry, target, None, rendered.append)
-        assert rendered[0].startswith(f"[Message from independent task {child['id']}]")
+        assert not entry["owner_rows"] and entry["relay"]["quotes"] == []
     for target in ("foreign-work", "owner-work"):
-        refused = _steer_task(turn, target, "stop")
-        assert "STEER_REJECTED" in refused and "presence_work_not_related" in refused
+        refused = _tell_task(turn, target, "stop")
+        assert "TELL_REJECTED" in refused and "presence_work_not_related" in refused
         assert drain_owner_entries(tmp_path, target) == []
     assert all(evt["presence_binding_id"] == BINDING and evt["issuer"]["kind"] == "task" for evt in emitted)
 
@@ -780,7 +774,7 @@ def test_a_presence_child_steers_only_its_bindings_work_through_the_supervisor(t
     # An ordinary child still messages any listed root, with no Presence stamp at all.
     plain_emitted = []
     plain_turn = _child_turn(tmp_path, plain, supervisor_ctx, plain_emitted)
-    assert "written to its mailbox" in _steer_task(plain_turn, "owner-work", "status please")
+    assert "Message written to" in _tell_task(plain_turn, "owner-work", "status please")
     assert "presence_binding_id" not in plain_emitted[0]
 
 
@@ -814,7 +808,7 @@ def test_a_presence_child_reads_its_own_tree_and_bindings_work_and_nothing_else(
 def test_a_cyber_acting_presence_child_steers_and_answers_its_parent_through_the_real_loop(
         tmp_path, tmp_path_factory, monkeypatch):
     """Fake-model replay: under Cyber Pro an acting child holds the whole catalog, so the
-    inherited ceiling's steer_task reaches the real supervisor consumer through the registry;
+    inherited ceiling's tell_task reaches the real supervisor consumer through the registry;
     the child then finishes as an ordinary child. Nothing is sent to any transport."""
     import queue as stdlib_queue
 
@@ -852,7 +846,7 @@ def test_a_cyber_acting_presence_child_steers_and_answers_its_parent_through_the
 
     event_queue = types.SimpleNamespace(put_nowait=supervisor_consumer, put=supervisor_consumer)
     steer = [{"id": f"steer-{target}", "type": "function", "function": {
-        "name": "steer_task", "arguments": json.dumps({"task_id": target, "message": "Figures confirmed."})}}
+        "name": "tell_task", "arguments": json.dumps({"task_id": target, "note": "Figures confirmed."})}}
         for target in ("foreign-work", "running-work")]
     calls, replies = [], iter([{"role": "assistant", "content": None, "tool_calls": steer},
                                {"content": "Findings: the figures are confirmed."}])
@@ -877,7 +871,7 @@ def test_a_cyber_acting_presence_child_steers_and_answers_its_parent_through_the
 
     results = {row["tool_call_id"]: row["content"] for row in calls[-1] if row.get("role") == "tool"}
     assert "presence_work_not_related" in results["steer-foreign-work"]
-    assert "written to its mailbox" in results["steer-running-work"]
+    assert "Message written to" in results["steer-running-work"]
     assert drain_owner_entries(tmp_path, "foreign-work") == []
     assert [entry["source_task_id"] for entry in drain_owner_entries(tmp_path, "running-work")] == [child["id"]]
     assert text == "Findings: the figures are confirmed."

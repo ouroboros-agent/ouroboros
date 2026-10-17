@@ -167,7 +167,8 @@ test('own words answer from Main; a failed attempt stays answerable and a lost r
         { ok: false, status: 500, json: async () => ({}) },
         { ok: false, status: 409, json: async () => ({ state: 'answered', answered_index: 1, comment: 'Winner.' }) },
     ];
-    const fx = mainFixture({ fetchImpl: async (_url, init) => replies.shift()
+    const fx = mainFixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1', owner_quiz: { 'qz-1': { ...ROW, state: 'open' } } }),
+        fetchImpl: async (_url, init) => replies.shift()
         || { ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', comment: JSON.parse(init.body).comment }) } });
     try {
         fx.add(WAITING);
@@ -175,10 +176,10 @@ test('own words answer from Main; a failed attempt stays answerable and a lost r
         const [raced, own] = fx.cards();
         options(raced)[0].click();
         await turn();
-        assert.deepEqual([raced.dataset.state, fx.toasts[0].text], ['open', 'Could not record the answer (500).']);
+        assert.deepEqual([raced.dataset.state, fx.toasts[0].text], ['open', 'Answer not confirmed. Your original answer is kept.']);
         mock.timers.tick(SETTLE_MS);
         assert.equal(fx.column.children.length, 2, 'a refused attempt starts no countdown');
-        options(raced)[0].click();
+        raced.querySelector('.chat-quiz-retry').click();
         await turn();
         assert.deepEqual([raced.dataset.state, text(raced, 'chat-quiz-answer'), fx.toasts[1].text],
             ['answered', "Owner's answer: Winner.", 'Already answered.']);

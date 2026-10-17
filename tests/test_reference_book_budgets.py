@@ -5,13 +5,12 @@ listed chapter, ``reference_books.compose_book``) at this change's tip and at it
 The rule is pairwise: there is no stored number and no reserve, so text a change adds to a
 book is paid by shortening the same book in the same change.
 
-Official-CI ``size_ratchet`` lane only: local runs exclude the marker and every local surface
-reports the same balance as a fact (BIBLE P3 c5). The workflow sets ``OURO_BOOK_GROWTH_MODE``:
-``block`` for the official repository's owner/member/collaborator pull requests and pushes to
-``ouroboros``, ``warn`` for outside contributors and any fork's own CI. ``approved`` requires
-the owner's ``book-growth`` label; pushes bind it to the exact landed PR
-(``scripts/book_growth_mode.py``). Unset mode means ``block`` when
-``OURO_SIZE_RATCHET_BASE_REF`` resolves; without a base the book comparison skips.
+The opt-in ``size_ratchet`` lane is excluded from default local runs. Manual/tag CI
+has no per-change base, so this comparison skips there. Local qualification supplies
+``OURO_SIZE_RATCHET_BASE_REF``; unset ``OURO_BOOK_GROWTH_MODE`` then means ``block``.
+``scripts/book_growth_mode.py`` retains event-specific block/warn/approved semantics
+for explicit callers; an owner's ``book-growth`` label can approve an exception.
+Every local information surface reports the balance without blocking (BIBLE P3 c5).
 """
 from __future__ import annotations
 

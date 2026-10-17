@@ -368,78 +368,6 @@ def queued_admitted_dispatch(task: Any) -> bool:
                     "_terminalization_retry", "_continuation_prepared", *(() if intent else (BUDGET_HOLD_KEY,)))))
 
 
-def _resume_unstarted_owner_paused_root(q: Any, task: Dict[str, Any], fence: Dict[str, Any],
-                                         observation: Dict[str, Any]) -> Dict[str, Any]:
-    """The owner's Resume of a root the Pause caught while it was only queued.
-
-    A never-started root has no members. An admitted retry needs a fresh tree
-    census without unsettled effects (owner_pause_blockers); its attempt and
-    dispatch evidence stay, and children still need explicit selection (Q9).
-    Reopen both durable fence and queue latch or refuse: reopening only the
-    latch would fail every launch. The latch names the LOGICAL root; task may
-    be its current retry (#1730). Queue lock held.
-    """
-    from ouroboros.owner_pause import FENCE_RELEASED, launch_lock, read_fence, set_fence_state
-    from supervisor.events_budget import BUDGET_HOLD_KEY, OWNER_ROOT_RESUME_HOLDS, budget_hold_fact, hold_root_resume_descendants
-
-    task_id, root_id = str(task.get("id") or ""), str(fence.get("root_task_id") or task.get("id") or "")
-    admitted = "owner_pause_blockers" in observation
-    safe, error = observation["safe"], observation["unsafe_error"]
-    if not safe and not admitted:
-        return {"ok": False, "error": error, "action": "cancel_or_new_run"}
-    hold = budget_hold_fact(task)
-    # This explicit root Resume releases its Pause, its app-stop hold and its unsaved
-    # pause intent. A Continue's prior writer hold is rechecked below, never waived.
-    # All other holds, observed effects and durable write gates still bind.
-    if hold and hold.get("reason") not in OWNER_ROOT_RESUME_HOLDS:
-        return {"ok": False, "error": str(hold.get("reason") or "selection_owner_held")}
-    if observation.get("blockers"):
-        from supervisor.continuation_admission import writers_unsettled_refusal
-
-        return writers_unsettled_refusal(observation["blockers"])
-    if observation.get("owner_pause_blockers"):
-        return {"ok": False, "error": "owner_pause_effects_unsettled", "action": "wait_for_effect_settlement",
-                "blockers": observation["owner_pause_blockers"]}
-    root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
-    members = [row for row in q.PENDING if admitted and row is not task
-               and str(row.get("root_task_id") or "") == root_id]
-    prior = [(row, copy.deepcopy(row)) for row in [task, *members]]
-
-    def rollback() -> None:
-        for row, before in prior:
-            row.clear()
-            row.update(before)
-        q.BUDGET_ROOT_FENCES[root_id] = fence
-
-    with launch_lock(root, root_id):
-        if read_fence(root, root_id) != observation["authority"]["owner_fence"]:
-            return {"ok": False, "error": "selection_authority_changed"}
-        # Publish queue eligibility first, while durable launch authority is still
-        # closed. A crash or failed second write cannot start the unrun root.
-        q.BUDGET_ROOT_FENCES.pop(root_id, None)
-        task.pop("_budget_pause", None)
-        task.pop(BUDGET_HOLD_KEY, None)
-        if members:
-            # No root grant exists to bind: only the owner selects these members.
-            hold_root_resume_descendants(q, root_id, fence, {"grant_id": "", "generation": 0}, actor_id=task_id)
-        if not q.persist_queue_snapshot(reason="owner_pause_root_resumed"):
-            rollback()
-            return {"ok": False, "error": "snapshot_not_persisted"}
-        try:
-            set_fence_state(root, root_id, fence_id=str(fence.get("fence_id") or ""),
-                            state=FENCE_RELEASED, release_reason="owner_resume_unstarted_root")
-        except Exception as exc:
-            rollback()
-            q.persist_queue_snapshot(reason="owner_pause_root_resume_held")
-            return {"ok": False, "error": "owner_pause_fence_unwritable", "detail": str(exc)[:200]}
-    q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
-                   {"ts": utc_now_iso(), "type": "owner_pause_resumed", "task_id": task_id,
-                    "root_task_id": root_id, "fence_id": str(fence.get("fence_id") or ""),
-                    "same_generation": True, "never_started": not admitted})
-    return {"ok": True, "task_id": task_id, "root_task_id": root_id, "same_generation": True,
-            "owner_pause_released": True, "never_started": not admitted}
-
-
 def pending_member_replay_safe(q: Any, member: Dict[str, Any]) -> Tuple[bool, str]:
     """Whether one PENDING row genuinely never dispatched (zero physical calls)."""
     from supervisor.restart_retention import never_started
@@ -496,8 +424,11 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
     ``selected_by`` names the MODEL-issued request (owner Q9); an empty value is
     the owner's own act, which needs no root grant above itself.
     """
+    from ouroboros.control_actor import control_actor, mind_resume_refusal
     q = _queue_module()
     task_id = str(task_id or "").strip()
+    if refusal := mind_resume_refusal(q.DRIVE_ROOT):
+        return refusal
     if not task_id:
         return {"ok": False, "error": "missing_task_id"}
     from supervisor.events_budget import (
@@ -507,6 +438,8 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
     external = observation = None
     with q._queue_lock:
         located = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
+        if refusal := mind_resume_refusal(q.DRIVE_ROOT, located):
+            return refusal
     if located is None:
         # A member parked WARM under the owner's Pause (its stack retained while a
         # started critic finishes) wakes on the fence; the owner's own Resume and
@@ -593,6 +526,8 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
         task = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
         if task is None:
             return {"ok": False, "error": "task_not_pending"}
+        if refusal := mind_resume_refusal(q.DRIVE_ROOT, task):
+            return refusal
         pause = task.get("_budget_pause") if isinstance(task.get("_budget_pause"), dict) else None
         if pause and pause.get("exact_continuation"):
             if task is not located or task != located_state:
@@ -692,7 +627,7 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
             STATUS_SCHEDULED,
             reason_code="",
             resource_limit={
-                **prior_pause,
+                **prior_pause, **control_actor(),
                 "status": "resumed",
                 "resumed_at": resumed_at,
                 "auto_resume": False,
@@ -1598,3 +1533,5 @@ from supervisor.budget_resume import (  # noqa: E402, F401 -- intentional public
     grant_exact_budget_resume,
     revoke_exact_budget_resume,
 )
+
+from supervisor.budget_resume_unstarted import _resume_unstarted_owner_paused_root  # noqa: E402, F401

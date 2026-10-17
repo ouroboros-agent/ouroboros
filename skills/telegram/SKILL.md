@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.14
+version: 1.3.0
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -13,7 +13,7 @@ subscribe_events: [chat.outbound, chat.typing, chat.photo, chat.video, chat.docu
 conflicts: [telegram-bridge, telegram-miniapp-poc]
 when_to_use: The owner wants to communicate with and control Ouroboros through Telegram.
 model_experience:
-  what_model_sees: No new tools; the skill relays owner messages, photos and files (documents, video, audio, voice) from Telegram into the normal chat and mirrors replies back, so conversation turns may originate from Telegram without any visible difference. An owner's answer to a quiz card tapped or replied to in Telegram arrives through the same decision ingress as a web-card answer.
+  what_model_sees: No new tools; Telegram owner text, photos and files enter normal chat. Replies to mirrored messages carry host reply references for the mind to interpret, never routing instructions. Quiz answers use the web card's decision ingress. Answers to earlier owner messages use native Telegram replies.
   token_effect: Near-zero while idle — no per-round schema cost; incoming Telegram media arrive as ordinary attachments and cost what any chat attachment costs.
 timeout_sec: 60
 companion_processes:
@@ -40,13 +40,17 @@ memory, so the bot ships no dictionary and follows any language the owner choose
 keep their ordinary command-mode rules even in replies; quote a literal command
 as code or include it inside an explanation to send it as a quiz answer.
 
-Version 1.1 adds richer Telegram formatting, native MP3/M4A playback, and
-inline link keyboards. Version 1.1.1 fixes the task-done push, which read the
-lifecycle axis as a whole object and warned on every finished task. Version 1.2
-adds inbound files, answerable quiz cards, a truthful `degraded` bridge status
-while token validation is deferred by a dead network, and a task-done push whose
-word and icon follow the host's task phase (done, done with warnings, failed,
-cancelled).
+Version 1.3 remembers every mirrored part, including media and completion
+notices, in a bounded durable message map. Replying passes its host row or work
+reference through normal chat; Ouroboros decides what it means. Unknown or
+evicted ids add nothing. Answers to an earlier owner message from this Telegram
+chat use a native reply; answers to its latest owner message stay unquoted.
+Silent mode edits only within one task episode and reply origin; Continue
+episodes remain separate messages. Relay success stays silent; a host-reported
+failure arrives as one line. A relayed row quotes the owner's words verbatim as
+plain text, under where he wrote them and with the file names, above the note.
+Quiz buttons and replies keep their decision path; earlier parts of a long
+question carry ordinary references.
 
 Version 1.2.1 marks questions that wait for an owner answer and clears the
 waiting line after an answer submitted through Telegram.

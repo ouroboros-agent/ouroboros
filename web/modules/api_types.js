@@ -37,7 +37,7 @@
  * @property {boolean} skills_repo_configured
  * @property {boolean} github_token_configured
  * @property {Object} accounting  // physical-attempt ledger projection
- * @property {Array<Object>} projects  // active/deleting ProjectEntry sidebar projection
+ * @property {Array<ProjectEntry>} projects  // active/deleting sidebar projection
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
  * @property {Object<string, {project_id: string, chat_id: number, origin_bound?: boolean}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4). origin_bound marks a task the host included because its OWNER MESSAGE already has a project (#902), so one message cannot keep a second convertible card
  * @property {ActiveDirectTurn[]=} active_direct_turns  // active direct/ephemeral chat turns snapshot
@@ -213,6 +213,7 @@
  */
 /**
  * @typedef {Object} ChatInbound
+ * @property {string=} reply_to
  * @property {"chat"} type
  * @property {string} content
  * @property {string=} sender_session_id
@@ -456,6 +457,11 @@
  * @property {string=} delivered_at  // a `reminder` row: when the host showed it (later than due after downtime)
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
+ * @property {string=} row_address
+ * @property {Object=} reply_to
+ * @property {Object=} relay
+ * @property {string=} reply_to_relay
+ * @property {string=} kind
  */
 /**
  * @typedef {Object} TypingOutbound
@@ -487,6 +493,11 @@
  * @property {number=} chat_id
  * @property {string=} task_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
+ * @property {string=} row_address
+ * @property {Object=} reply_to
+ * @property {Object=} relay
+ * @property {string=} reply_to_relay
+ * @property {string=} kind
  */
 /**
  * @typedef {Object} VideoOutbound
@@ -507,6 +518,11 @@
  * @property {number=} chat_id
  * @property {string=} task_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
+ * @property {string=} row_address
+ * @property {Object=} reply_to
+ * @property {Object=} relay
+ * @property {string=} reply_to_relay
+ * @property {string=} kind
  */
 /**
  * @typedef {Object} LinkAction
@@ -525,6 +541,11 @@
  * @property {string=} task_id
  * @property {boolean=} project_thread
  * @property {Object=} transport
+ * @property {string=} row_address
+ * @property {Object=} reply_to
+ * @property {Object=} relay
+ * @property {string=} reply_to_relay
+ * @property {string=} kind
  */
 
 /**
@@ -560,6 +581,11 @@
  * @property {string=} task_id
  * @property {boolean=} project_thread
  * @property {Object=} transport
+ * @property {string=} row_address
+ * @property {Object=} reply_to
+ * @property {Object=} relay
+ * @property {string=} reply_to_relay
+ * @property {string=} kind
  */
 
 /**
@@ -611,6 +637,11 @@
  * @property {string=} task_id
  * @property {number=} size_bytes
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
+ * @property {string=} row_address
+ * @property {Object=} reply_to
+ * @property {Object=} relay
+ * @property {string=} reply_to_relay
+ * @property {string=} kind
  */
 
 /**
@@ -647,6 +678,9 @@
  * @property {string=} reasoning_effort  // the explicit start a New task picked from this picker card requests
  * @property {boolean} suppress_bubble
  * @property {string=} ts
+ * @property {string=} project_name
+ * @property {string[]=} target_task_ids
+ * @property {string[]=} target_titles
  */
 
 /** Additive history fact: a project-owned Main mirror cannot grant cancel authority.
@@ -701,6 +735,7 @@
  * @property {boolean=} thread_activity_seen
  * @property {string=} last_task_result_id
  * @property {boolean=} created
+ * @property {ProjectCognition} cognition
  */
 
 /**
@@ -816,10 +851,12 @@
  * @typedef {Object} OwnerContextModeResponse
  * @property {boolean} ok
  * @property {string} context_mode
+ * @property {string} project_id
+ * @property {ProjectCognition} cognition
  */
 
 /**
- * @typedef {Object} EffortRange  min ≤ recommended ≤ max, each an EFFORT_SCALE tier (the tolerant read)
+ * @typedef {Object} EffortRange  helper min ≤ max; primary recommended independent; each an EFFORT_SCALE tier
  * @property {string} min
  * @property {string} recommended
  * @property {string} max
@@ -828,6 +865,14 @@
 /**
  * @typedef {Object} OwnerEffortRangeResponse
  * @property {boolean} ok
+ * @property {EffortRange} effort_range
+ * @property {string} project_id
+ * @property {ProjectCognition} cognition
+ */
+
+/**
+ * @typedef {Object} ProjectCognition
+ * @property {string} context_mode
  * @property {EffortRange} effort_range
  */
 
@@ -1309,52 +1354,13 @@
  * @typedef {Object} TaskPauseRequest
  * @property {string} request_id
  */
-/**
- * @typedef {Object} TaskPauseResponse
- * @property {boolean=} ok
- * @property {string=} task_id
- * @property {string=} root_task_id
- * @property {string=} fence_id
- * @property {'requested'|'paused'|'released'=} state
- * @property {boolean=} duplicate
- * @property {Array<string>=} members
- * @property {boolean=} snapshot_persisted
- * @property {boolean=} latch_pending
- * @property {string=} error
- * @property {string=} reason_code
- */
+/** @typedef {import('./task_activity_types.js').TaskPauseResponse} TaskPauseResponse */
 /**
  * @typedef {Object} TaskContinueRequest
  * @property {string} action_nonce
  */
-/**
- * @typedef {Object} TaskContinueResponse
- * @property {boolean=} ok
- * @property {string=} task_id
- * @property {string=} predecessor_task_id
- * @property {string=} successor_task_id
- * @property {boolean=} replay
- * @property {boolean=} recovered
- * @property {boolean=} held
- * @property {string=} status
- * @property {Array<Object>=} blockers
- * @property {string=} error
- * @property {string=} reason_code
- * @property {string=} cause
- * @property {Array<string>=} gaps
- * @property {boolean=} unconfirmed
- * @property {'bound'|'admitted'=} state
- * @property {string=} action_nonce
- */
-/**
- * @typedef {Object} ContinuationOffer
- * @property {boolean=} eligible
- * @property {string=} refusal
- * @property {string=} cause
- * @property {string=} successor_task_id
- * @property {'bound'|'admitted'=} state
- * @property {string=} action_nonce
- */
+/** @typedef {import('./task_activity_types.js').TaskContinueResponse} TaskContinueResponse */
+/** @typedef {import('./task_activity_types.js').ContinuationOffer} ContinuationOffer */
 /**
  * Reuse stop_action_id (at most 200 characters) for this exact action; a later
  * Stop needs a new ID, distinct from server request_id. No ID means no exact retry.

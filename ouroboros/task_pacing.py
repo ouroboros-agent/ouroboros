@@ -1457,6 +1457,8 @@ def record_tool_activity(ctx: Any, result: Dict[str, Any]) -> None:
     })
     row["calls"] += 1
     row["error_calls"] += int(bool(result.get("is_error")))
+    from ouroboros.task_activity_facts import record_tool_count
+    record_tool_count(ctx, activity)
     duration = (result.get("result_meta") or {}).get("duration_ms")
     if (isinstance(duration, (int, float)) and not isinstance(duration, bool)
             and math.isfinite(duration) and duration >= 0):

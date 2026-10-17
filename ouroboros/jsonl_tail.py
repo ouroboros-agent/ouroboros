@@ -137,6 +137,7 @@ def read_jsonl_segment_with_gaps(
     *,
     tail_bytes: Optional[int] = None,
     iter_objects: Optional[Callable[..., Iterable[Any]]] = None,
+    stat: Optional[Callable[[pathlib.Path], Any]] = None,
 ) -> tuple[list, set[str]]:
     """Read one JSONL segment while retaining truthful parse/read-gap facts.
 
@@ -148,7 +149,7 @@ def read_jsonl_segment_with_gaps(
     path = pathlib.Path(path)
     parse = iter_objects or iter_jsonl_objects  # module name resolved at call time (test seam)
     try:
-        path.stat()
+        (stat or pathlib.Path.stat)(path)
     except FileNotFoundError:
         return [], set()
     except OSError:
@@ -174,13 +175,15 @@ def read_rotated_jsonl_entries(
     iter_objects: Optional[Callable[..., Iterable[Any]]] = None,
     coverage: Optional[dict] = None,
     list_archives: Optional[Callable[..., list]] = None,
+    stat: Optional[Callable[[pathlib.Path], Any]] = None,
 ) -> list | tuple[list, set[str]]:
     """Bounded, rotation-aware read of one JSONL log (module docstring).
 
     ``iter_objects`` is the parser seam (the gateway wrapper passes its own
     name so its tests keep governing it). ``list_archives`` is the listing seam
     with ``archive_segments``' signature: a request that reads many tasks lists
-    ``archive/`` once and replays its gap to each (``replay_evidence_for_tasks``).
+    ``archive/`` once and replays its gap to each (``replay_evidence_for_tasks``),
+    and ``stat`` the metadata seam through which it stats a segment once.
     ``coverage``, when given, is filled with ``live_size``, ``live_window``
     (bytes of the live file read; both absent when the live file could not be
     read), ``archives`` (consulted count), ``archives_available`` and
@@ -190,8 +193,9 @@ def read_rotated_jsonl_entries(
     parse = iter_objects or iter_jsonl_objects  # module name resolved at call time (test seam)
     gaps: set[str] = set()
     live_readable = True
+    stat = stat or pathlib.Path.stat
     try:
-        size = live.stat().st_size
+        size = stat(live).st_size
     except FileNotFoundError:
         size = 0  # not written yet: an empty window, not a gap
     except OSError:
@@ -202,7 +206,7 @@ def read_rotated_jsonl_entries(
     while True:
         if window >= size:
             if collect:
-                live_entries, live_gaps = read_jsonl_segment_with_gaps(live, iter_objects=parse)
+                live_entries, live_gaps = read_jsonl_segment_with_gaps(live, iter_objects=parse, stat=stat)
                 gaps.update(live_gaps)
             else:
                 live_entries = list(parse(live))
@@ -210,7 +214,7 @@ def read_rotated_jsonl_entries(
             break
         if collect:
             live_entries, live_gaps = read_jsonl_segment_with_gaps(
-                live, tail_bytes=window, iter_objects=parse)
+                live, tail_bytes=window, iter_objects=parse, stat=stat)
             gaps.update(live_gaps)
         else:
             live_entries = list(parse(live, tail_bytes=window))
@@ -227,7 +231,7 @@ def read_rotated_jsonl_entries(
         try:
             if collect:
                 archive_entries, archive_gaps = read_jsonl_segment_with_gaps(
-                    archive_path, iter_objects=parse)
+                    archive_path, iter_objects=parse, stat=stat)
                 gaps.update(archive_gaps)
             else:
                 archive_entries = list(parse(archive_path))

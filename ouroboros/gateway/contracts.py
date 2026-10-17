@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from ouroboros.cost_projection import CostPresentation
+from ouroboros.gateway.reference_contracts import ChatReferenceFields
 from ouroboros.storage import (  # noqa: F401 -- public re-exports
     StorageCategory, StorageError, StorageMeasurement, StorageResponse,
 )
@@ -48,9 +49,7 @@ class ChatInbound(TypedDict):
     # Multi-project chat routing: the owner stays user_id 1; chat_id selects the thread, project_id scopes memory.
     chat_id: NotRequired[int]
     project_id: NotRequired[str]
-    # Per-message sending-surface observables (additive-optional): raw facts the SPA measures at send
-    # time (pywebview bridge presence, ua, viewport, matchMedia booleans, captured_at), normalized by
-    # the closed-key `client_surface.normalize_client_surface`; absence is an honest gap, never defaulted.
+    reply_to: NotRequired[str]  # Host resolves the selected row/card at acceptance.
     client_surface: NotRequired[dict]
 
 
@@ -89,7 +88,7 @@ class TransportMetadata(TypedDict, total=False):
     sender_label: str
 
 
-class ChatOutbound(TypedDict):
+class ChatOutbound(ChatReferenceFields):
     """Outbound WS chat frame."""
 
     type: Literal["chat"]
@@ -117,7 +116,6 @@ class ChatOutbound(TypedDict):
     rounds: NotRequired[int]
     suggested_name: NotRequired[str]
     model_execution: NotRequired[Dict[str, Any]]
-    # Project question mirrored into Main as the Project's own form; the durable question stays in Project.
     quiz_id: NotRequired[str]
     quiz_state: NotRequired[str]
     project_chat_id: NotRequired[int]
@@ -266,7 +264,7 @@ class ChatOutbound(TypedDict):
     project_thread: NotRequired[bool]
 
 
-class PhotoOutbound(TypedDict):
+class PhotoOutbound(ChatReferenceFields):
     """Outbound WS photo frame."""
 
     type: Literal["photo"]
@@ -296,7 +294,7 @@ class PhotoOutbound(TypedDict):
     project_thread: NotRequired[bool]
 
 
-class VideoOutbound(TypedDict):
+class VideoOutbound(ChatReferenceFields):
     """Outbound WS video frame."""
 
     type: Literal["video"]
@@ -322,7 +320,7 @@ class VideoOutbound(TypedDict):
     project_thread: NotRequired[bool]
 
 
-class DocumentOutbound(TypedDict):
+class DocumentOutbound(ChatReferenceFields):
     """Outbound WS document/file frame."""
 
     type: Literal["document"]
@@ -356,7 +354,7 @@ class LinkAction(TypedDict):
     url: str
 
 
-class LinksOutbound(TypedDict):
+class LinksOutbound(ChatReferenceFields):
     """Outbound group of first-class external link buttons."""
 
     type: Literal["links"]
@@ -378,7 +376,7 @@ class QuizOption(TypedDict):
     recommended: NotRequired[bool]
 
 
-class QuizOutbound(TypedDict):
+class QuizOutbound(ChatReferenceFields):
     """Outbound owner quiz card: a typed question with option buttons.
 
     Optional questions continue under ``assumption``; ``wait_for_answer`` marks
@@ -509,6 +507,9 @@ class MessageAnnotationOutbound(TypedDict):
     suppress_bubble: bool
     chat_id: NotRequired[int]
     target: NotRequired[str]
+    project_name: NotRequired[str]
+    target_task_ids: NotRequired[list[str]]
+    target_titles: NotRequired[list[str]]
     target_label: NotRequired[str]
     project_id: NotRequired[str]
     project_chat_id: NotRequired[int]
@@ -627,6 +628,7 @@ class ProjectEntry(TypedDict, total=False):
     name: str
     chat_id: int
     working_dir: str
+    cognition: ProjectCognition
     provenance: str
     clone_url: str
     trusted_at: str
@@ -746,12 +748,12 @@ class ActiveDirectTurn(TypedDict):
     task_attempt: NotRequired[int]
 
 
-class ActiveChatActivity(ActiveDirectTurn):
-    """One live activity: direct turns and managed ROOT queue tasks share this shape.
-    budget_pausing includes a saved root whose tree still settles; budget_paused
-    awaits explicit Resume. Direct paused turns keep their ID/kind. Unreadable
-    live waits or Pause authority report unknown (incomplete census); unresolved owner-question detail reports
-    required_question_unavailable. Managed rows have empty client_message_id."""
+class ActiveChatActivity(ActiveDirectTurn):  # global root census; phase and control facts keep their own authority
+    last_line: NotRequired[str]  # visible model narration, never host notes
+    last_line_at: NotRequired[str]
+    tool_calls: NotRequired[int]
+    detached: NotRequired[bool]  # durable detached_at, independent of carrier/phase
+    project_name: NotRequired[str]
     status: NotRequired[str]
     outcome_axes: NotRequired[Dict[str, Any]]
     reason_code: NotRequired[str]
@@ -768,15 +770,22 @@ class ActiveChatActivity(ActiveDirectTurn):
     can_resume: NotRequired[bool]
     cancelable: NotRequired[bool]
 
-class EffortRange(TypedDict):  # min ≤ recommended ≤ max, each an EFFORT_SCALE tier (the tolerant read)
+class EffortRange(TypedDict):  # helper min ≤ max; primary recommended is independent
     min: str
     recommended: str
     max: str
 
 
+class ProjectCognition(TypedDict):
+    context_mode: str
+    effort_range: EffortRange
+
+
 class OwnerEffortRangeResponse(TypedDict):
     ok: bool
     effort_range: EffortRange
+    project_id: str
+    cognition: ProjectCognition
 
 
 class StateResponse(TypedDict):
@@ -916,6 +925,8 @@ class OwnerAutoGrantResponse(TypedDict):
 class OwnerContextModeResponse(TypedDict):
     ok: bool
     context_mode: str
+    project_id: str
+    cognition: ProjectCognition
 
 
 class OwnerSafetyModeResponse(TypedDict):
@@ -1526,25 +1537,17 @@ __all__ = [
     "UpdateApplySuccessResponse", "UpdateApplyErrorResponse",
     "UpdateStatusReadyOutbound",
     "UpdateProgressChangedOutbound",
-    "ProjectCreateRequest",
-    "ProjectEntry",
-    "ProjectDeleteResponse",
+    "ProjectCreateRequest", "ProjectEntry", "ProjectDeleteResponse", "ProjectCognition",
     "FsDirsEntry", "FsDirsResponse",
     "TaskNamedOutbound",
-    "ErrorResponse",
-    "StatusResponse",
-    "HealthResponse",
-    "StateResponse",
+    "ErrorResponse", "StatusResponse", "HealthResponse", "StateResponse",
     "ActiveDirectTurn", "ActiveChatActivity",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "AvailableSubagentsSettingsMeta",
     "SettingsPolicyAxis", "SettingsPolicyState", "SettingsMeta",
     "SettingsSaveResponse",
-    "OwnerRuntimeModeResponse",
-    "OwnerAutoGrantResponse",
-    "OwnerContextModeResponse",
-    "OwnerSafetyModeResponse",
+    "OwnerRuntimeModeResponse", "OwnerAutoGrantResponse", "OwnerContextModeResponse", "OwnerSafetyModeResponse",
     "OwnerSkillPresenceRuntimeRequest", "OwnerSkillPresenceRuntimeResponse",
     "OnboardingCompleteRequest", "OnboardingCompleteResponse",
     "OnboardingSubagentsPreviewResponse",
@@ -1557,9 +1560,7 @@ __all__ = [
     "EvolutionDataResponse",
     "ScheduledTasksResponse", "ScheduleUpsertResponse", "ScheduleDeleteResponse", "ScheduleActionResponse",
     "UploadResponse",
-    "ExtensionsIndexResponse",
-    "ExtensionLiveSnapshot",
-    "WidgetTab",
+    "ExtensionsIndexResponse", "ExtensionLiveSnapshot", "WidgetTab",
     "WidgetsResponse",
     "SkillPublishPreflightResponse",
     "SkillLifecycleQueueResponse",

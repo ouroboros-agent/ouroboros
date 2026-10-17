@@ -95,6 +95,8 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_worker_reports", "ouroboros/agent.py"),
     "budget_pause": _handled(
         "supervisor.events_budget", "ouroboros/agent.py", idle_input=True),
+    "mind_task_control": _handled(
+        "supervisor.events_mind_controls", "ouroboros/tools/control_mind.py", idle_input=True),
     "budget_resume_child": _handled(
         # #1196 (owner Q9): the resumed root's model selects one paused child.
         "supervisor.events_budget", "ouroboros/tools/join_ledger.py", idle_input=True),
@@ -138,8 +140,6 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_runtime_controls", "ouroboros/tools/control_runtime.py"),
     "review_late_result": _handled(
         "supervisor.cognitive_operations", "ouroboros/review_custody.py"),
-    "routing_manual_target": _handled(
-        "supervisor.events_project_routing", "ouroboros/tools/control_routing.py"),
     "schedule_subagent": _handled(
         "supervisor.events_schedule_task", "ouroboros/tools/control_scheduling.py",
         idle_input=True, note="the only producer of the schedule handler; the schedule_task key "
@@ -167,7 +167,7 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "skill_exec_finished": _handled(
         "supervisor.events_worker_reports", "ouroboros/tools/skill_exec.py"),
     "steer_task": _handled(
-        "supervisor.steering", "ouroboros/tools/control_routing.py",
+        "supervisor.steering", "ouroboros/tools/control_relay.py",
         "ouroboros/gateway/routing_decision.py"),
     "task_dispatch_resolved": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent_dispatch.py"),

@@ -497,11 +497,11 @@ def test_access_blocked_message_has_single_period(tmp_path):
     assert ".." not in error.replace("…", "")
 
 
-def test_promote_chat_description_carries_ground_truth_probe():
-    from ouroboros.tools.control import _PROMOTE_CHAT_DESCRIPTION
+def test_start_task_description_carries_ground_truth_probe():
+    from ouroboros.tools.control import _START_TASK_DESCRIPTION
 
-    assert "ground-truth its existence with one cheap probe" in _PROMOTE_CHAT_DESCRIPTION
-    assert "memory of past work is not evidence" in _PROMOTE_CHAT_DESCRIPTION
+    assert "ground-truth its existence with one cheap probe" in _START_TASK_DESCRIPTION
+    assert "memory of past work is not evidence" in _START_TASK_DESCRIPTION
 
 
 def test_degraded_owner_line_bounds_each_reason():

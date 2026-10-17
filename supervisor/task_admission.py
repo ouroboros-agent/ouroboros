@@ -642,6 +642,7 @@ def revalidate_project_holds() -> None:
     from supervisor.schedule_occurrence import first_dispatch_unsent, restore_allowed
     from supervisor.update_merge import assisted_resume_authorizes
     from ouroboros.projects_registry import _load_bindings, project_binding_for_task
+    from ouroboros.project_placement import pending_placement, refresh_pending_placement
     from ouroboros.owner_wait import restore_owner_wait_allowed
     from ouroboros.delegate_recovery import planned_handoff_resume_allowed
     from supervisor.events_budget import BUDGET_HOLD_KEY, HOLD_RESTORE_REFUSED_PREFIX, budget_hold_fact
@@ -721,9 +722,6 @@ def revalidate_project_holds() -> None:
                     continue
                 if _descends_from(task, lineage_unknown, pending_by_id):
                     raise ValueError("The parent task's state is unreadable; automatic recovery is not authorized.")
-            # Status and missing started_at alone cannot prove no handoff: the
-            # old RUNNING mirror was best-effort. Fresh queue admission supplies
-            # positive 'none'; canonical possible handoff always vetoes that row.
             stored = load_task_result(queue.DRIVE_ROOT, tid, strict=True) or {}
             governing = governing_continuation(task)  # the final dispatch's selection, no fallback
             granted = (owner_resume if governing == "owner_wait"
@@ -754,6 +752,19 @@ def revalidate_project_holds() -> None:
             fence = queue.ACCEPTANCE_FENCES.get(str(task.get("root_task_id") or ""))
             if isinstance(fence, dict) and fence.get("status") in {"active", "sealed"}:
                 raise ValueError("The task's root is in acceptance review; dispatch remains closed.")
+            if not host_unscoped(task) and read_error is not None:
+                raise ValueError("Project information is unreadable; recovery will be checked automatically when it is readable.") from read_error
+            if bindings is None and bindings_error is None:
+                try:
+                    bindings = _load_bindings(queue.DRIVE_ROOT, strict=True)["bindings"]
+                except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                    bindings_error = exc
+            if bindings_error is not None:
+                raise ValueError("Task scope information is unreadable; recovery will be checked automatically when it is readable.") from bindings_error
+            binding = project_binding_for_task(queue.DRIVE_ROOT, tid, strict=True, bindings_snapshot=bindings)
+            placement = pending_placement(queue.DRIVE_ROOT, task, bindings_snapshot=bindings)
+            if placement and not refresh_pending_placement(queue.DRIVE_ROOT, task, binding=placement):
+                raise ValueError("The committed placement cannot be readmitted yet.")
             basis = task.get("_project_admission")
             unscoped = host_unscoped(task)
             if not unscoped and (not isinstance(basis, dict) or basis.get("legacy_basis")
@@ -769,17 +780,6 @@ def revalidate_project_holds() -> None:
                     or unscoped and str(stored.get("workspace_root") or "") != str(task.get("workspace_root") or "")
                     or stored.get("workspace_root") and stored["workspace_root"] != task.get("workspace_root")):
                 raise ProjectAdmissionError("project_routing_fence_changed", "The saved task assignment changed.")
-            if not unscoped and read_error is not None:
-                raise ValueError("Project information is unreadable; recovery will be checked automatically when it is readable.") from read_error
-            if bindings is None and bindings_error is None:
-                try:
-                    bindings = _load_bindings(queue.DRIVE_ROOT, strict=True)["bindings"]
-                except (OSError, ValueError, TypeError, RuntimeError) as exc:
-                    bindings_error = exc
-            if bindings_error is not None:
-                raise ValueError("Task scope information is unreadable; recovery will be checked automatically when it is readable.") from bindings_error
-            binding = project_binding_for_task(queue.DRIVE_ROOT, tid, strict=True, bindings_snapshot=bindings)
-            # Conversion owns the durable binding; its older result is a projection.
             if (stored.get("project_id") and stored["project_id"] != task.get("project_id")
                     and not (binding and binding["project_id"] == task.get("project_id"))):
                 raise ProjectAdmissionError("project_routing_fence_changed", "The saved task assignment changed.")

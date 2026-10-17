@@ -70,7 +70,10 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
             const host = statusHost && noteText && (error || incomplete || approximate) ? statusHost : root;
             if (note.parentNode !== host) host.appendChild(note);
             note.classList.toggle('chat-history-status', host === statusHost);
-            const buttonHidden = migrating || (!error && !snapshot.canOlder && !(coverage.horizonGap && !snapshot.canNewer) && !hydrating);
+            // A grown room's exhausted chain offers the way on (it rebases to the present); a chain a navigation
+            // began ends at its older end: ↓ is the way to the present.
+            const buttonHidden = migrating || (!error && !snapshot.canOlder
+                && !(coverage.horizonGap && !snapshot.away) && !hydrating);
             const fields = [
                 [button, { textContent: hydrating ? 'Loading saved history…' : loading ? 'Loading…'
                     : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load more history',
@@ -293,7 +296,8 @@ export function syncLiveCardToggle(record) {
     const text = expanded ? 'Hide details' : 'Show details';
     const ariaExpanded = expanded ? 'true' : 'false';
     if (record.toggleEl.textContent !== text) record.toggleEl.textContent = text;
-    if (record.summaryButtonEl?.getAttribute('aria-expanded') !== ariaExpanded) {
+    // A Main portal's summary is content, not a disclosure (work_portal.js): it states no expanded state.
+    if (record.root.dataset.portal !== '1' && record.summaryButtonEl?.getAttribute('aria-expanded') !== ariaExpanded) {
         record.summaryButtonEl?.setAttribute('aria-expanded', ariaExpanded);
     }
 }

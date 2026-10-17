@@ -150,7 +150,7 @@ def _own_work_section(drive_root: Path, value: Mapping[str, Any], task_id: str) 
         "Independent work this Presence binding started, from this or another of its conversations, "
         "newest first (queued work without a result row leads). Being listed says nothing about whether "
         "its result reached anyone. Where your tools include them, get_task_result(task_id, "
-        "presence_scope=\"own_binding\") reads one exactly, steer_task gives it new facts as this "
+        "presence_scope=\"own_binding\") reads one exactly, tell_task gives it new facts as this "
         "task's own message, and presence_cancel_work requests its cancellation. Work of other "
         "bindings and the owner's own tasks are not addressable from here.\n\n"
         + "\n".join(lines)

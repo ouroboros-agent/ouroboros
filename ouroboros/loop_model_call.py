@@ -32,10 +32,7 @@ from ouroboros.usage_accounting import PhysicalAttemptContext, PhysicalAttemptPr
 
 
 log = logging.getLogger("ouroboros.loop")
-# The typed, temporary non-success of a round whose resource refusal no route recovered and
-# no owner wait follows (inline Presence, or a chain stopped by its own fence): nothing more is sent.
 RESOURCE_REFUSAL_KEY = "resource_refusal"
-# A round failure that owns a wait episode on its own route when no configured route answers.
 _ROUND_WAIT_KINDS = ("transport_unavailable", "provider_outcome_unknown")
 
 
@@ -1339,7 +1336,7 @@ def _append_routing_receipts(ctx: _RoundModelCallContext) -> bool:
     ctx.messages.append({"role": "user", "content": "\n".join([
         f"{ROUTING_RECEIPTS_HEADER} Routing acts recorded so far for the owner message(s) this turn answers "
         "and late outcomes of its own unconfirmed acts, oldest first — receipts from the routing rail; "
-        "facts, not a ban: another act stays your choice.",
+        "each row identifies the work and its recorded outcome.",
         *current,
         "Not listed: another turn's act under its own agent-steer id, or an act keyed only to a task id; "
         "neither links to this message."])})
@@ -1458,6 +1455,8 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         _loop()._append_or_merge_user_message(ctx.messages, facts)
     _fit_route_tool_ceiling(ctx)
     _append_routing_receipts(ctx)
+    from ouroboros.project_placement import append_placement_notice
+    append_placement_notice(ctx.tools._ctx, ctx.messages)
     _project_wake_input(ctx)
     disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
     if disposition is not None and _fit_key(disposition) in _loop()._context_reclaim_passes(ctx.tools._ctx):

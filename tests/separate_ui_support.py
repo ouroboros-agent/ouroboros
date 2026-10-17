@@ -423,8 +423,13 @@ def _python() -> str:
 
 
 @contextmanager
-def real_core(root: Path, *, provider: bool = True, password: str = PASSWORD, settings: dict | None = None):
-    """A started core with UI serving off; ``provider=False`` is a fresh install with no settings."""
+def real_core(root: Path, *, provider: bool = True, password: str = PASSWORD, settings: dict | None = None,
+              ui_dir: Path | str = "none"):
+    """A real core; main UI defaults off, and ``provider=False`` leaves settings absent.
+
+    ``ui_dir`` lets a client-entry test exercise selected files through this same core instead
+    of mistaking separately hosted files for the core's selected setup/sign-in pages.
+    """
     from ouroboros.test_environment import isolated_environment
     from tests.candidate_checkout import candidate_checkout, require_candidate_interpreter
 
@@ -452,8 +457,9 @@ def real_core(root: Path, *, provider: bool = True, password: str = PASSWORD, se
         env.update({
             "OUROBOROS_SERVER_HOST": "127.0.0.1", "OUROBOROS_SERVER_PORT": str(port),
             "OUROBOROS_HOST_SERVICE_PORT": str(free_port()), "OUROBOROS_NETWORK_PASSWORD": password,
-            # The operator's choice, never saved: the core serves no main interface.
-            "OUROBOROS_UI_DIR": "none",
+            "OUROBOROS_MAX_WORKERS": "1",  # fresh setup also keeps this fixture's pool bounded
+            # The fixture's explicit choice, never silently persisted by a read.
+            "OUROBOROS_UI_DIR": str(ui_dir),
             # A Restart must not reset this copy to a managed branch (no managed remote exists).
             "OUROBOROS_DISABLE_MANAGED_UPDATES": "1",
             # A visitor through the proxy is not loopback: Files needs the operator's root.

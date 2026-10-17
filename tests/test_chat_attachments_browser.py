@@ -588,7 +588,7 @@ def test_an_attachment_frame_lost_after_send_is_recoverable_exactly_once(direct_
     resends the same frame and id, landing ONE row. A frame the host did save, whose echo the
     drop cut off, is settled by history after the reconnect. One saved just before a host
     restart, which the page learns of only from the new process, says its delivery is not
-    confirmed and offers nothing to resend."""
+    confirmed and offers only Send as new, which puts his words back in the composer and sends nothing."""
     from playwright.sync_api import sync_playwright
 
     url, data = direct_server_with_data["url"], direct_server_with_data["data_dir"]
@@ -712,10 +712,16 @@ def test_an_attachment_frame_lost_after_send_is_recoverable_exactly_once(direct_
                 held.close()
             delivery = page.locator(f"{_BUBBLE} [data-ingress-saved='unconfirmed']")
             delivery.wait_for(timeout=60_000)
-            assert delivery.inner_text() == "Saved; delivery not confirmed."
-            assert page.locator(f"{_BUBBLE} [data-unconfirmed-action]").count() == 0, "no Send again: it could only rejoin"
+            assert delivery.inner_text().startswith("Saved; delivery not confirmed.")
+            actions = page.locator(f"{_BUBBLE} [data-unconfirmed-action]")
+            assert actions.all_inner_texts() == ["Send as new"], "no Send again: it could only rejoin"
             assert page.evaluate("() => Object.keys(sessionStorage).filter(k => k.startsWith('ouro_chat_unconfirmed'))") == []
             assert len(seen) == 4 and len(inbound(seen[-1])) == 1, "nothing was resent"
+            # Send as new only puts his words back in the composer, as a new message he may edit or send.
+            actions.first.click()
+            assert "third" in page.locator("#chat-input").input_value()
+            page.wait_for_timeout(500)
+            assert len(seen) == 4 and len(inbound(seen[-1])) == 1, "Send as new sent nothing by itself"
             _capture(page, page.locator(_BUBBLE).last, evidence / f"attachments-delivery-unconfirmed-{engine}.png")
         finally:
             browser.close()

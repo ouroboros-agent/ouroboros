@@ -329,14 +329,14 @@ test('#516 the card meta line separates its parts with real text, not a CSS gap'
     assert.equal(joinMetaParts(['a', '', 'b']), `a${META_PART_SEPARATOR}b`);
     assert.equal(META_PART_SEPARATOR, ' · ');
 
-    // The renderer joins the executor block with the rest through that same rule,
-    // instead of concatenating it onto the first fact.
+    // The renderer joins the executor block with the rest through the meta line's one joiner (each separator
+    // rides inside the part before it), instead of concatenating it onto the first fact.
     const activitySource = readFileSync(new URL('../modules/chat_activity.js', import.meta.url), 'utf8');
     const renderer = activitySource.slice(
         activitySource.indexOf('export function renderLiveCardMeta'),
         activitySource.indexOf('export function ownLiveActionsEl'),
     );
-    assert.match(renderer, /joinMetaParts\(\[\s*executorIdentityMarkup\(/);
+    assert.match(renderer, /metaLineHtml\(\[\s*executorIdentityMarkup\(/);
     assert.doesNotMatch(renderer, /\.join\(' · '\)/);
     // The visual-only spacing that stood in for the separator is gone.
     const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');

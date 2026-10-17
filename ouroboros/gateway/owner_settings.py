@@ -267,13 +267,13 @@ def _owner_read_settings_raw(document_out: Optional[Dict[str, Any]] = None) -> D
                 raw, settings_path=_config.SETTINGS_PATH, warn_ambiguous=True,
             )
             document = _config.normalize_settings_raw(raw)
-            merged.update(document)
     except SettingsIntegrityError:
         raise
     except Exception:
         log.debug("Failed to read raw owner settings; using defaults", exc_info=True)
     if document_out is not None:
         document_out.update(document)
+    merged.update(_config.normalize_effort_document(document))
     return merged
 
 

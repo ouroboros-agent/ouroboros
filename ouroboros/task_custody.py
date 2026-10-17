@@ -89,7 +89,7 @@ _MAILBOX_DIR = pathlib.Path(_OWNER_MAILBOX_DIR)
 _STAGING_DIR = pathlib.Path("state") / "custody_staging"
 _TRASH_DIR = pathlib.Path("state") / "custody_trash"
 # The addressed words a sender is owed; controls (hurry, finalize_now, ...) are not mail.
-UNREAD_MAIL_KINDS = frozenset({"owner_text", "task_message", "quiz_answer", "quiz_closed"})
+UNREAD_MAIL_KINDS = frozenset({"owner_text", "task_message", "quiz_answer", "quiz_closed", "relay_entry"})
 OWNER_MAIL_KINDS = frozenset({"owner_text", "quiz_answer", "quiz_closed"})  # what the owner authored
 # A store's own bookkeeping and non-deliverable subtrees (inputs, media, sources).
 _STORE_BOOKKEEPING = frozenset({".artifact_manifest.json", ".artifact_manifest.json.lock",
@@ -330,7 +330,7 @@ def owner_mail_rows(drive_root: Any, task_id: str) -> Tuple[List[str], bool]:
             continue
         if not isinstance(entry, dict):
             complete = False
-        elif str(entry.get("kind") or "owner_text") in OWNER_MAIL_KINDS:
+        elif str(entry.get("kind") or "owner_text") in OWNER_MAIL_KINDS | {"relay_entry"}:
             rows.append(line)
     return rows, complete
 

@@ -203,7 +203,10 @@ def test_reworded_host_rows_live_and_after_reload(subscription_ui, tmp_path, mon
         "helper": "Task kid12345 not scheduled: worker pool unavailable.",
     }
     for text in texts.values():
-        page.get_by_text(text, exact=False).first.wait_for(state="attached")
+        # A collapsed card's one line is cut on a word to fit (text_fit.js), so on a phone a long line ends
+        # `worker…`; its whole sentence stays in the card's timeline. The words before the cut must still be there.
+        shown = text if width >= 700 else text.split(":")[0]
+        page.get_by_text(shown, exact=False).first.wait_for(state="attached")
 
     # 5. A message saved into a running task's mailbox: a write, not a read receipt.
     page.locator("#chat-input").fill("Add the appendix too.")

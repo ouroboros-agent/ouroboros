@@ -197,7 +197,7 @@ HTTP_SHAPES: dict[str, Shape] = {
     "GET /api/health": Shape("200:HealthResponse"),
     "GET /api/contract": Shape("200:GatewayContractResponse"),
     "GET /api/state": Shape("200:StateResponse 500:ErrorResponse"),
-    "GET /onboarding": Shape("200:html", note="the builtin wizard page; its assets load from /onboarding/static"),
+    "GET /onboarding": Shape("200:html", query="builtin", note="selected setup or builtin wizard; builtin=1 forces builtin"),
     "GET /api/onboarding": Shape("200:html 204:empty", note="204: a ready provider exists, no setup needed"),
     "GET /api/onboarding/bootstrap": Shape("200:OnboardingBootstrapResponse", note="read-only; writes nothing"),
     "POST /api/onboarding/subagents/preview": Shape(
@@ -235,9 +235,9 @@ HTTP_SHAPES: dict[str, Shape] = {
     "POST /api/desktop/background": Shape(f"200:DesktopAutostartResponse {_SETTINGS_REFUSAL}", "OwnerEnabledRequest"),
     "POST /api/owner/runtime-mode": Shape(f"200:OwnerRuntimeModeResponse {_SETTINGS_REFUSAL}", "OwnerRuntimeModeRequest"),
     "POST /api/owner/auto-grant": Shape(f"200:OwnerAutoGrantResponse {_SETTINGS_REFUSAL}", "OwnerEnabledRequest"),
-    "POST /api/owner/context-mode": Shape(f"200:OwnerContextModeResponse {_SETTINGS_REFUSAL}", "OwnerContextModeRequest"),
-    "POST /api/owner/effort-range": Shape(f"200:OwnerEffortRangeResponse {_SETTINGS_REFUSAL}", "EffortRange",
-                                          note="min <= recommended <= max on the effort scale"),
+    "POST /api/owner/context-mode": Shape(f"200:OwnerContextModeResponse {_SETTINGS_REFUSAL} 404:SettingsWriteRefusal", "OwnerContextModeRequest"),
+    "POST /api/owner/effort-range": Shape(f"200:OwnerEffortRangeResponse {_SETTINGS_REFUSAL} 404:SettingsWriteRefusal", "OwnerEffortRangeRequest",
+                                          note="helper min <= max; primary independent; optional project_id, otherwise Main"),
     "POST /api/owner/safety-mode": Shape(f"200:OwnerSafetyModeResponse {_SETTINGS_REFUSAL}", "OwnerSafetyModeRequest"),
     "POST /api/owner/capability-ack": Shape(
         "200:ResponseLimitAckResponse|ContextWindowAckResponse 400:ErrorResponse", "CapabilityAckRequest",
@@ -282,7 +282,7 @@ HTTP_SHAPES: dict[str, Shape] = {
         "200,202:DecisionResponse 400,404:ErrorResponse 409:DecisionResponse|ErrorResponse 501,503:ErrorResponse",
         "DecisionRequest", note="request_id is the idempotency key; the first answer wins"),
     "GET /api/chat/history": Shape(
-        "200,400,409,503:ChatHistoryResponse", query="chat_id cursor n_human n_progress limit",
+        "200,400,409,503:ChatHistoryResponse", query="chat_id cursor around n_human n_progress limit",
         note="an error page echoes the cursor sent, so the same request can be repeated"),
     "POST /api/chat/upload": Shape("200:UploadResponse 400:ErrorResponse", "multipart", note="form field file"),
     "DELETE /api/chat/upload": Shape("200:ChatUploadDeleteResponse 400,404,409:ErrorResponse", "ChatUploadDeleteRequest",
@@ -439,7 +439,7 @@ HTTP_SHAPES: dict[str, Shape] = {
 # Middleware-owned routes: ``server_auth.NetworkAuthGate`` answers them itself, and only while it
 # enforces a configured network password for a non-loopback peer (otherwise they are not mounted).
 AUTH_ENDPOINTS: dict[str, Shape] = {
-    "GET /auth/login": Shape("200:html", query="next", note="the login form; next is a same-origin path"),
+    "GET /auth/login": Shape("200:html", query="next builtin", note="selected login or builtin form; builtin=1 forces builtin; next is a same-origin path"),
     "POST /auth/login": Shape(
         "200:AuthLoginResponse 303:empty 401:ErrorResponse|html", "AuthLoginRequest|form",
         note="JSON answers 200 with the session cookie; a form answers 303 to next"),

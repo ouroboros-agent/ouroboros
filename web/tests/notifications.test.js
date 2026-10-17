@@ -245,6 +245,18 @@ test('one turn ending is one notification, not a reply plus a terminal', () => {
     assert.equal(decideNotification(terminal, { ...ON, main_reply: true }, seen).reason, 'duplicate');
 });
 
+test('a Main turn left to run in the background rings as a finished task; an inline turn still does not', () => {
+    const ending = (owner) => classifyLiveFrame(
+        { type: 'task_done', status: 'completed', chat_id: 1, _is_direct_chat: true, ...(owner ? { execution_owner: owner } : {}) },
+        { kind: 'log', isMain: true, isRoot: true, taskId: 't-bg' },
+    );
+    const pooled = ending({ kind: 'pooled' });
+    assert.equal(pooled?.category, 'task_done', 'the pool ran its last attempt: the owner hears that the work ended');
+    assert.equal(pooled.key, 'conclusion:t-bg', 'the same key its final answer row would use, so one banner');
+    assert.equal(ending({ kind: 'direct' }), null, 'an inline conversation turn ends as a reply, not a task');
+    assert.equal(ending(null), null, 'without a carrier fact the historical origin still decides');
+});
+
 test('ordinary replies are Main-only, and progress/user frames are never events', () => {
     const main = classifyLiveFrame(
         { role: 'assistant', content: 'Here it is.', client_message_id: 'cm-1' },

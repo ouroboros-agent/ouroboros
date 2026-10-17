@@ -48,7 +48,7 @@ def test_unknown_values_take_their_key_default_and_minimal_round_trips(monkeypat
     _env(monkeypatch, OUROBOROS_EFFORT_MIN="bogus", OUROBOROS_EFFORT_TASK="", OUROBOROS_EFFORT_MAX="HIGH")
     assert effort_range() == {"min": "low", "recommended": "medium", "max": "high"}
     _env(monkeypatch, OUROBOROS_EFFORT_MIN="minimal", OUROBOROS_EFFORT_TASK="minimal", OUROBOROS_EFFORT_MAX="none")
-    assert effort_range() == {"min": "minimal", "recommended": "minimal", "max": "minimal"}
+    assert effort_range() == {"min": "none", "recommended": "minimal", "max": "minimal"}
     # A document read bypasses the environment; a live read opens the owner's current document.
     assert effort_range({"OUROBOROS_EFFORT_MAX": "ultra"}) == {"min": "low", "recommended": "medium", "max": "ultra"}
 
@@ -789,7 +789,10 @@ def test_the_owner_endpoint_writes_the_triple_atomically_projects_it_and_audits(
 
     ok = client.post("/api/owner/effort-range", json={"min": "none", "recommended": "medium", "max": "ultra"})
     assert ok.status_code == 200, ok.text
-    assert ok.json() == {"ok": True, "effort_range": {"min": "none", "recommended": "medium", "max": "ultra"}}
+    assert ok.json() == {"ok": True, "project_id": "",
+                        "effort_range": {"min": "none", "recommended": "medium", "max": "ultra"},
+                        "cognition": {"context_mode": "max", "effort_range": {
+                            "min": "none", "recommended": "medium", "max": "ultra"}}}
     stored = json.loads(settings_path.read_text(encoding="utf-8"))
     assert (stored["OUROBOROS_EFFORT_MIN"], stored["OUROBOROS_EFFORT_TASK"], stored["OUROBOROS_EFFORT_MAX"]) == ("none", "medium", "ultra")
     assert stored["OUROBOROS_MODEL"] == "openai/x"  # the rest of the document is untouched
@@ -807,8 +810,7 @@ def test_the_owner_endpoint_writes_the_triple_atomically_projects_it_and_audits(
 
 @pytest.mark.parametrize("body, fragment", [
     ({"min": "low", "recommended": "turbo", "max": "high"}, "'recommended' must be one of"),
-    ({"min": "high", "recommended": "medium", "max": "ultra"}, "ordered min"),
-    ({"min": "low", "recommended": "high", "max": "medium"}, "ordered min"),
+    ({"min": "high", "recommended": "medium", "max": "low"}, "ordered min"),
     ({"recommended": "medium"}, "'min' must be one of"),
     (["not", "an", "object"], "JSON body must be an object"),
 ])
@@ -861,12 +863,12 @@ def test_the_generic_save_accepts_a_tier_per_key_and_refuses_anything_else(monke
     refused = client.post("/api/settings", json={"OUROBOROS_EFFORT_TASK": "turbo"})
     assert refused.status_code == 400 and "OUROBOROS_EFFORT_TASK must be one of" in refused.json()["error"]
     assert not settings_path.exists()
-    # The order is not judged here (the read is tolerant): TASK above MAX saves, and reads as a widened top.
+    # The primary is independent: TASK above the helper MAX saves without moving either.
     saved = client.post("/api/settings", json={"OUROBOROS_EFFORT_TASK": " ULTRA ", "OUROBOROS_EFFORT_MAX": "high"})
     assert saved.status_code == 200, saved.text
     stored = json.loads(settings_path.read_text(encoding="utf-8"))
     assert (stored["OUROBOROS_EFFORT_TASK"], stored["OUROBOROS_EFFORT_MAX"]) == ("ultra", "high")
-    assert effort_range(stored) == {"min": "low", "recommended": "ultra", "max": "ultra"}
+    assert effort_range(stored) == {"min": "low", "recommended": "ultra", "max": "high"}
 
 
 def test_the_endpoint_is_indexed_mirrored_and_owner_only_for_the_browser():

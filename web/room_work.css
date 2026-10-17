@@ -174,7 +174,7 @@
     -webkit-user-select: text;
     user-select: text;
 }
-.rw-main:is([data-target="card"], [data-target="details"]) { cursor: pointer; }
+.rw-main:is([data-target="card"], [data-target="history"], [data-target="details"]) { cursor: pointer; }
 /* The one standard ring, flush inside; where :has() exists it frames the whole row. */
 .rw-main:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
 @supports selector(:has(*)) {
@@ -214,7 +214,7 @@
 /* An outcome's quieter second fact (Finalizing…, a wait beside Failed), one accessible status with it. */
 .rw-secondary { color: var(--text-meta); }
 .rw-secondary::before { content: '· '; }
-/* "Not in loaded messages" is said in the row's details and its name; only the chevron shows, beside the state. */
+/* Where a press found its message is said in the row's details; only the chevron shows, beside the state. */
 .rw-where { display: inline-flex; align-items: center; gap: 6px; }
 .rw-chev { color: var(--text-primary); }
 .rw-row[data-tone="live"] { --rw-dot: var(--accent); }

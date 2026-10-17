@@ -328,7 +328,8 @@ def bounded_receipt_history(world, monkeypatch):
     reads = []
 
     def read_result(data_dir, task_id, **kwargs):
-        assert kwargs == {"materialize_artifacts": False}
+        # A display read: no artifact materialization, through the page's batch reader.
+        assert kwargs.get("materialize_artifacts") is False and set(kwargs) <= {"materialize_artifacts", "reads"}
         reads.append(task_id)
         return load_result(data_dir, task_id, **kwargs)
 

@@ -172,6 +172,8 @@ def address_task_event(running: Any, drive_root: Any, payload: Dict[str, Any]) -
     for key in ("parent_task_id", "root_task_id"):
         if not payload.get(key) and task_row.get(key):
             payload[key] = str(task_row[key])
+    if task_row.get("_execution_owner"):
+        payload.setdefault("execution_owner", dict(task_row["_execution_owner"]))
     if task_row.get("_is_direct_chat"):
         # A direct turn resumed from its exact budget pause runs on a pooled
         # worker (#1196): its frames keep the lane fact the direct lane would

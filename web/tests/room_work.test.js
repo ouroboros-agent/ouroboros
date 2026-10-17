@@ -249,3 +249,198 @@ test('the one mark after the word turns amber for the owner\'s question beside a
         assert.deepEqual(paint('Paused', 'held', 'one'), ['held', true]);
     } finally { work?.destroy(); restoreDom(prior); }
 });
+
+// DESIGN "Room work status": a row goes to its message wherever it lies in the room's history.
+test('an unloaded row reads the page around its task and lands on its card; one with no message says so', async () => {
+    const { prior, mount } = installDom(async () => ({ ok: true, json: async () => ({}) }));
+    let work;
+    try {
+        const node = (tag, cls, parent) => {
+            const el = document.createElement(tag); el.className = cls; parent.appendChild(el); return el;
+        };
+        const page = node('div', 'page', mount);
+        const header = node('div', 'chat-page-header', page);
+        const titleRow = node('div', 'app-page-title-row', node('div', 'app-page-title-block', header));
+        const group = node('div', 'app-page-actions ui-chrome-group', header);
+        const badge = node('span', 'status-badge thinking', group);
+        const messages = node('div', 'chat-messages', page);
+        const records = new Map(), asked = [];
+        const activity = (id, extra = {}) => [id, { activity_id: id, kind: 'direct_chat', phase: 'working', chat_id: 1, ...extra }];
+        const activities = new Map([activity('t-old', { phase: 'budget_paused', pause_cause: 'owner' }), activity('t-wake'),
+            activity('t-own', { client_message_id: 'msg-1' })]);
+        const historyPager = {
+            pageOf: () => 'replay:recent', revisit: async () => ({ status: 'applied' }),
+            around: async (address, wanted) => {
+                asked.push([address, wanted()]);
+                if (address !== 'task:t-old') return { status: 'anchor', anchor: { state: 'absent', task_id: address.slice(5) } };
+                const card = node('div', 'chat-live-card', messages);  // the page around it mounts its card
+                records.set('t-old', { root: card, groupId: 't-old' });
+                return { status: 'applied', anchor: { state: 'found', task_id: 't-old', history_id: 'chat:100' } };
+            },
+        };
+        work = createRoomWork({ page, statusBadge: badge, messagesDiv: messages, ws: { isConnected: () => true },
+            reading: { stick: false, cancel() {}, scroll() {}, claim: () => () => true }, historyPager,
+            captureVisibleTimelineAnchor: () => ({ historyId: 'chat:900' }),
+            activeDirectActivities: activities, liveCardRecords: records, pendingSubmissions: new Map() });
+        const trigger = titleRow.children.find((el) => el.classList.contains('rw-trigger'));
+        const anchor = header.children.find((el) => el.classList.contains('rw-shade-anchor'));
+        const list = anchor.children.find((el) => el.classList.contains('rw-surface')).children[0];
+        const row = (id) => list.children.find((el) => el.dataset.id === id);
+        const main = (id) => row(id).querySelector('.rw-main');
+        const text = (el) => [el.textContent, ...el.children.map(text)].join(' ');
+        const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+        trigger.click();
+        // Before it asks, a row claims nothing about where its message is.
+        assert.match(main('t-old').getAttribute('aria-label'), /^Open: /);
+        assert.doesNotMatch(main('t-old').getAttribute('aria-label'), /loaded/);
+        assert.equal(main('t-old').dataset.target, 'history');
+        assert.doesNotMatch(text(list), /Not in loaded messages|cannot take you to it/);
+
+        main('t-old').click();
+        await settle();
+        assert.deepEqual(asked, [['task:t-old', true]]);
+        assert.equal(work.isOpen(), false, 'landed: the reader came to read it');
+        assert.equal(page.children.find((el) => el.classList.contains('rw-back')).hidden, false, 'Back returns to the passage left');
+
+        trigger.click();
+        assert.match(main('t-old').getAttribute('aria-label'), /^Go to task: /, 'its card is loaded now');
+        main('t-wake').click();
+        await settle();
+        assert.equal(work.isOpen(), true, 'nothing to land on: the list stays and says so');
+        assert.match(text(row('t-wake')), /No message yet\./);
+        assert.match(main('t-wake').getAttribute('aria-label'), /^Details: /);
+        main('t-wake').click();  // its details close; it does not ask again
+        await settle();
+        assert.equal(asked.length, 2);
+        // Work whose census facts change may have a message now: its row claims nothing again and a press asks.
+        activities.set('t-wake', { ...activities.get('t-wake'), phase: 'budget_paused', pause_cause: 'owner' });
+        work.update();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.match(main('t-wake').getAttribute('aria-label'), /^Open: /);
+        main('t-wake').click();
+        await settle();
+        assert.equal(asked.length, 3);
+        assert.match(text(row('t-wake')), /No message yet\./, 'the press answered again');
+        // Its details are open now: another census change keeps them open, without the stale answer.
+        activities.set('t-wake', { ...activities.get('t-wake'), phase: 'working', pause_cause: undefined });
+        work.update();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(main('t-wake').getAttribute('aria-expanded'), 'true', 'opened details survive');
+        assert.match(main('t-wake').getAttribute('aria-label'), /^Open: /, 'without the stale answer: a press asks again');
+        main('t-own').click();
+        await settle();
+        assert.match(text(row('t-own')), /Its message could not be checked\./, 'an owner’s message is never “no message”');
+        assert.doesNotMatch(text(list), /Not in loaded messages|cannot take you to it/);
+        trigger.click();
+        trigger.click();
+        assert.match(main('t-wake').getAttribute('aria-label'), /^Open: /, 'a later open asks again');
+        // A list dismissed while a row looks drops that look: nothing moves when it answers later.
+        let answer, wantedThen = null;
+        historyPager.around = (address, wanted) => new Promise((resolve) => {
+            answer = () => { wantedThen = wanted(); resolve({ status: 'superseded' }); };
+        });
+        main('t-wake').click();
+        await settle();
+        trigger.click();  // dismissed
+        answer();
+        await settle();
+        assert.equal(wantedThen, false, 'the dismissed list no longer wants that page');
+        // Pressed again after the list reopened, then dismissed again: the first look's late answer never undoes
+        // the second look's cancellation.
+        const answers = [], wanted = [];
+        historyPager.around = (address, isWanted) => new Promise((resolve) => {
+            answers.push(() => { wanted.push(isWanted()); resolve({ status: 'superseded' }); });
+        });
+        trigger.click();
+        main('t-wake').click();
+        await settle();
+        trigger.click();  // dismissed
+        trigger.click();
+        main('t-wake').click();  // the same row again
+        await settle();
+        answers[0]();
+        await settle();
+        trigger.click();  // dismissed again
+        answers[1]();
+        await settle();
+        assert.deepEqual(wanted, [false, false], 'neither look applies once its list closed');
+    } finally { work?.destroy(); restoreDom(prior); }
+});
+
+test('Back reads the page it left again, stays after a failed read and takes a follower back to the present', async () => {
+    const { prior, mount } = installDom(async () => ({ ok: true, json: async () => ({}) }));
+    let work;
+    try {
+        const node = (tag, cls, parent) => {
+            const el = document.createElement(tag); el.className = cls; parent.appendChild(el); return el;
+        };
+        const page = node('div', 'page', mount);
+        const header = node('div', 'chat-page-header', page);
+        const titleRow = node('div', 'app-page-title-row', node('div', 'app-page-title-block', header));
+        const badge = node('span', 'status-badge thinking', node('div', 'app-page-actions ui-chrome-group', header));
+        const messages = node('div', 'chat-messages', page);
+        const records = new Map(), revisits = [], presents = [];
+        let mounted = false, fails = 1, gone = false;
+        const historyPager = {
+            pageOf: () => 'replay:left',
+            revisit: async (cursor, wanted) => {
+                revisits.push([cursor, wanted()]);
+                if (gone) return { status: 'error', error: { status: 409 } };
+                if (fails-- > 0) return { status: 'error' };
+                mounted = true;  // the page the reader left is drawn again
+                return { status: 'applied' };
+            },
+            around: async () => {
+                records.set('t-old', { root: node('div', 'chat-live-card', messages), groupId: 't-old' });
+                return { status: 'applied', anchor: { state: 'found', task_id: 't-old', history_id: 'chat:100' } };
+            },
+        };
+        const reading = { stick: false, nearBottom: () => false, cancel() {}, scroll() {}, claim: () => () => true };
+        work = createRoomWork({ page, statusBadge: badge, messagesDiv: messages, ws: { isConnected: () => true }, reading,
+            historyPager, showLatest: async () => presents.push('newest'),
+            captureVisibleTimelineAnchor: () => ({ historyId: 'chat:900' }),
+            restoreVisibleTimelineAnchor: (_anchor, { exact } = {}) => Boolean(exact && mounted),
+            activeDirectActivities: new Map([['t-old', { activity_id: 't-old', kind: 'direct_chat', phase: 'working', chat_id: 1 }]]),
+            liveCardRecords: records, pendingSubmissions: new Map() });
+        const trigger = titleRow.children.find((el) => el.classList.contains('rw-trigger'));
+        const list = header.children.find((el) => el.classList.contains('rw-shade-anchor')).children[0].children[0];
+        const main = () => list.children.find((el) => el.dataset.id === 't-old').querySelector('.rw-main');
+        const back = page.children.find((el) => el.classList.contains('rw-back'));
+        const live = page.children.find((el) => el.getAttribute('role') === 'status');
+        const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+        trigger.click();
+        main().click();
+        await settle();
+        back.click();
+        await settle();
+        assert.deepEqual(revisits, [['replay:left', true]], 'the passage was let go: its page is read again, once');
+        assert.equal(back.hidden, false, 'a failed read keeps Back for another try');
+        assert.match(live.textContent, /could not be read/);
+        back.click();
+        await settle();
+        assert.equal(revisits.length, 2);
+        assert.equal(back.hidden, true);
+        assert.equal(live.textContent, 'Returned to where you were reading.');
+        assert.deepEqual(presents, []);
+        // A page that cannot be read again (the room's view changed) ends Back instead of asking for a retry.
+        mounted = false;
+        gone = true;
+        trigger.click();
+        main().click();
+        await settle();
+        back.click();
+        await settle();
+        assert.equal(revisits.length, 3);
+        assert.equal(live.textContent, 'The earlier reading place is no longer loaded.');
+        gone = false;
+        // A reader following the present goes back to it and reads no left page.
+        Object.assign(reading, { stick: true, nearBottom: () => true });
+        trigger.click();
+        main().click();
+        await settle();
+        back.click();
+        await settle();
+        assert.deepEqual(presents, ['newest']);
+        assert.equal(revisits.length, 3);
+    } finally { work?.destroy(); restoreDom(prior); }
+});

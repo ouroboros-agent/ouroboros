@@ -30,7 +30,7 @@ from ouroboros.gateway._helpers import coerce_int, read_rotated_jsonl_entries
 from ouroboros.gateway.cost_breakdown import make_cost_breakdown_endpoint  # noqa: F401 — historical import path (router)
 from ouroboros.gateway.history_paging import (
     HistoryCursorError, deferred_before, history_page_coverage, history_page_tokens, progress_quota_predicate,
-    replay_evidence_rows, room_view_fingerprint, select_history_page, latest_arrival, PROJECTION_FAILED,
+    replay_evidence_rows, room_view_fingerprint, select_history_page, latest_arrival, notes_stamp, PROJECTION_FAILED,
 )
 from ouroboros.gateway.history_segments import room_segment_lens
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
@@ -196,6 +196,7 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
     copy with recorded attachments renders as its row does (views, source, mark).
     """
     from ouroboros.project_dialogue import project_origin_rows
+    from ouroboros.chat_references import origin_projection
 
     origin_rows = project_origin_rows(data_dir, thread_id)
     if not origin_rows:
@@ -225,7 +226,7 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
             "client_message_id": cmid,
             "task_id": "",
             "origin_projected": True,
-            "origin_id": row["origin_id"],
+            "origin_id": row["origin_id"], **origin_projection(data_dir, ref),
             **({"attachments": attachment_views(row["attachments"], data_dir)} if row.get("attachments") else {}),
             **({"text_placeholder": True} if row.get("text_placeholder") is True else {}),
         })
@@ -302,7 +303,9 @@ def _chat_quota_predicate(row_matches_thread):
 
 
 def _history_identity(entry):
-    return {key: entry[key] for key in ("history_id", "history_position") if key in entry}
+    from ouroboros.chat_references import projection_fields
+    return {**({"row_address": entry["row_address"]} if entry.get("row_address") else projection_fields(entry)),
+            **{key: entry[key] for key in ("history_id", "history_position", "reply_to", "relay", "reply_to_relay") if key in entry}}
 
 
 def _read_progress_history_entries(live, adir, want, counts_toward_quota, *, include_gaps=False):
@@ -354,38 +357,24 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     rec.update({key: entry[key] for key in ("outcome_phase", "outcome_final", "initiator") if key in entry})
 
 
-def _load_terminal_result(
-    data_dir: pathlib.Path,
-    task_id: str,
-    cache: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Read effective facts once for lineage/annotation, without artifact materialization.
-    Migration must reach the HTTP boundary, never become an absent terminal fact.
-    """
-    if task_id in cache:
-        return cache[task_id]
-    try:
-        from ouroboros.task_status import load_effective_task_result
+_READS = ("task_reads",)  # the request's batch reader inside its result cache (never a task id)
 
-        result = load_effective_task_result(data_dir, task_id, materialize_artifacts=False)
-    except StoreMigrating:
-        raise
-    except Exception:
-        result = None
-    if result:
-        cache[task_id] = result
-    else:
-        # Empty effective read is not proof of absence: an unavailable store retains
-        # uncertainty; only a store that answers "no row" proves the result absent.
-        from ouroboros.task_store import exists
-        cache[task_id] = {}
+
+def _load_terminal_result(data_dir: pathlib.Path, task_id: str, cache: Dict[Any, Any]) -> Dict[str, Any]:
+    """Effective facts once per request for lineage/annotation, without artifact materialization,
+    through the request's ``TaskReads`` (prefetched by ``_assemble_history_response``). Migration
+    reaches the HTTP boundary; an unavailable read keeps uncertainty ({}), and only the store's own
+    answer of "no row" proves the result absent."""
+    if task_id not in cache:
+        from ouroboros.task_reads import TaskReads
+
+        reads = cache.setdefault(_READS, TaskReads(data_dir))
         try:
-            if not exists(data_dir, task_id):
-                cache[task_id] = {"_history_result_absent": True}
+            cache[task_id] = reads.effective(task_id) or ({"_history_result_absent": True} if reads.absent(task_id) else {})
         except StoreMigrating:
             raise
         except Exception:
-            pass
+            cache[task_id] = {}
     return cache[task_id]
 
 
@@ -442,6 +431,8 @@ def _annotate_terminal_task_truth(
         # A parent anchored by its child's row carries that row's ts; a census anchor has none.
         for task_id, ts in (evidence_anchors or {}).items():
             represented.setdefault(task_id, ts)
+        if _READS in cache:  # anchored parents and current work were not in the page's first batch
+            cache[_READS].prefetch([*represented, *result_task_ids])
         tool_evidence_by_task = replay_evidence_for_tasks(data_dir, represented)
         for task_id, evidence in tool_evidence_by_task.items():
             result = _load_terminal_result(data_dir, task_id, cache)
@@ -712,8 +703,10 @@ def _collect_chat_rows(
     selected_entries: Optional[list] = None,
     entry_gaps: Optional[set] = None,
     replay_evidence: Optional[list] = None,
+    reads: Any = None,
 ) -> tuple[list, int] | tuple[list, int, set[str]]:
-    """Project selected chat entries (or the legacy recent read), with quota/gaps."""
+    """Project selected chat entries (or the legacy recent read), with quota/gaps; ``reads``: the
+    request's ``TaskReads``, which reads every asking task's questions in one batch."""
     from supervisor.message_ingress import delivery_facts
 
     # Quiz lifecycle merge (#Q-2b): the chat row froze the card at ask time ("open"); the durable
@@ -726,7 +719,10 @@ def _collect_chat_rows(
         if task_id not in quiz_projection_cache:
             from ouroboros.task_results import load_task_result
 
-            data = load_task_result(chat_path.parent.parent, task_id) or {}
+            if reads is not None:
+                reads.prefetch(row.get("task_id") for row in _chat_entries if row.get("type") == "quiz")
+            data = (reads.load(chat_path.parent.parent, task_id) if reads is not None
+                    else load_task_result(chat_path.parent.parent, task_id)) or {}
             quiz_projection_cache[task_id] = {
                 "quizzes": data.get("owner_quiz") if isinstance(data.get("owner_quiz"), dict) else {},
                 "wait": data.get("owner_wait") if isinstance(data.get("owner_wait"), dict) else {},
@@ -835,10 +831,9 @@ def _collect_chat_rows(
                 # before the producer stripped markdown; a no-op on new rows.
                 # The durable chat.jsonl is never rewritten.
                 rec["text"] = strip_markdown(rec["text"])
-                if isinstance(entry.get("terminal_time"), dict):
-                    rec["terminal_time"] = dict(entry["terminal_time"])
-                if isinstance(entry.get("completion_notice"), dict):
-                    rec["completion_notice"] = dict(entry["completion_notice"])
+                for key in ("terminal_time", "completion_notice", "outcome_axes"):
+                    if isinstance(entry.get(key), dict):
+                        rec[key] = dict(entry[key])
                 for key in ("project_id", "project_name", "task_name", "target_label", "status", "completion_answer",
                             "completion_reason", "delivery_id", "handoff_id"):
                     if key in entry:
@@ -1423,13 +1418,14 @@ def _assemble_history_response(
     thread_id: int,
     n_human: int,
     n_progress: int,
-    cursor: Optional[str] = None,
+    cursor: Optional[str] = None, around: Optional[str] = None,
 ) -> bytes:
     """Select and project recent/archive history in the endpoint's one worker.
 
     Room lenses, source reads, projection, terminal truth and JSON encoding all
     stay off the event loop. Both selectors use the same row transformers.
     """
+    notes = notes_stamp(data_dir)  # before the annotations are read: a later change refuses ``after``
     project_chat_ids, project_source_refs, chat_annotations, bindings_by_task, rooms, classified = (
         _project_history_context(data_dir, thread_id)
     )
@@ -1445,16 +1441,20 @@ def _assemble_history_response(
                                {"chat": _chat_quota_predicate(row_matches_thread),
                                 "progress": progress_quota_predicate(row_matches_thread, _stored_chat_id)},
                                {"human": _MAX_N_HUMAN, "progress": _MAX_N_PROGRESS},
-                               room_segment_lens(thread_id, project_chat_ids, project_source_refs, rooms))
+                               room_segment_lens(thread_id, project_chat_ids, project_source_refs, rooms),
+                               notes, rooms.warm, around, (row_matches_thread, _stored_chat_id))
     selections, before, recent = page["selections"], page["before"], page["recent"]
     n_human, n_progress = page["quotas"]["human"], page["quotas"]["progress"]
     historical_terminals: Dict[str, dict] = {}
     replay_evidence: list = []
+    from ouroboros.task_reads import TaskReads
+
+    result_cache: Dict[Any, Any] = {_READS: TaskReads(data_dir)}  # every task result is read once, in batches
     combined, chat_quota_rows, chat_gaps = _collect_chat_rows(
         chat_path, archive_dir, n_human, row_matches_thread, chat_annotations,
         include_gaps=True, historical_terminals=historical_terminals,
         selected_entries=selections["chat"][0], entry_gaps=selections["chat"][2],
-        replay_evidence=replay_evidence,
+        replay_evidence=replay_evidence, reads=result_cache[_READS],
     )
     progress_rows, progress_quota_rows, progress_gaps = _collect_progress_rows(
         progress_path, archive_dir, n_progress, row_matches_thread,
@@ -1464,10 +1464,10 @@ def _assemble_history_response(
     combined.extend(progress_rows)
     candidates = list(combined)
     combined = _fold_task_bound_skill_reviews(combined)
-    lifecycle_row = _active_lifecycle_row(row_matches_thread) if not cursor else None
+    lifecycle_row = _active_lifecycle_row(row_matches_thread) if not (cursor or around) or page["after"] else None
     if lifecycle_row is not None:
         combined.append(lifecycle_row)
-    result_cache: Dict[str, Dict[str, Any]] = {}  # every task result below is read once per request
+    result_cache[_READS].prefetch(row.get("task_id") for row in combined)
     arrival = latest_arrival(combined, page, data_dir, row_matches_thread, _stored_chat_id, chat_gaps, lambda task_id: (
         _load_terminal_result(data_dir, task_id, result_cache))) if thread_id in project_chat_ids else (
         {} if classified or thread_id == 1 else {"latest_message": None})  # an unclassified room may be a Project
@@ -1488,7 +1488,7 @@ def _assemble_history_response(
     # Annotate only emitted rows; an absent summary must not strand a card.
     deferred_lineage: set = set()
     evidence_anchors = {}
-    if recent:  # current work has no history position: its evidence lands at the page end
+    if recent or page["after"]:  # current work has no history position: its evidence lands at the page end
         from ouroboros.gateway.state import current_work_in_room
         evidence_anchors = dict.fromkeys(current_work_in_room(
             data_dir, bindings_by_task, row_matches_thread.evidence_matches), "")
@@ -1518,7 +1518,6 @@ def _assemble_history_response(
         before[source] = max([before[source], *(entry["_history_end"] for entry in selections[source][0] or ()
                                                if entry.get("history_id") in deferred_lineage)])
 
-    # Wake-ups have their own task/result and need no replay special case.
     # Retired "bg-consciousness" progress has no task_result: replay treats it
     # like any missing-result row; the client's durable task-detail read shows
     # "Outcome unavailable". Never stamp it terminal here: no result is not Done.
@@ -1526,8 +1525,10 @@ def _assemble_history_response(
     # Hidden source evidence shares ordinary keyed replay. It carries no new
     # review/cost authority and never consumes the conversation quota.
     messages.extend(replay_evidence_rows(messages, replay_evidence))
-    tokens = history_page_tokens(page)
+    tokens = history_page_tokens(page, messages, result_cache[_READS])
     stream_gaps = {"chat": chat_gaps | selections["chat"][2], "progress": progress_gaps | selections["progress"][2]}
+    if result_cache[_READS].failed or {PROJECTION_FAILED, "unreadable_source"} & (stream_gaps["chat"] | stream_gaps["progress"]):
+        tokens.pop("after_cursor", None)  # a read that failed part-way is read whole again, never continued
     window = _window_metadata(
             chat_quota_rows, progress_quota_rows, n_human, n_progress,
             {source: selections[source][1] == 0 for source in ("chat", "progress")},
@@ -1579,9 +1580,10 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
         thread_id = _int_param("chat_id", 1, 2**31 - 1) or 1
         # ONE thread hop for the whole assembly (perf2 P3): reads, transforms,
         # slicing, annotation, and the JSON encode all run off the event loop.
-        cursor = request.query_params.get("cursor")
+        cursor, around = (request.query_params.get(name) for name in ("cursor", "around"))
         try:
-            body = await asyncio.to_thread(_assemble_history_response, data_dir, thread_id, n_human, n_progress, cursor)
+            body = await asyncio.to_thread(_assemble_history_response, data_dir, thread_id, n_human, n_progress,
+                                           cursor, around)
         except (HistoryCursorError, JsonlChainUnreadable, OSError, StoreMigrating) as exc:
             reason = (exc.reason if isinstance(exc, HistoryCursorError) else
                       "migrating" if isinstance(exc, StoreMigrating) else "history_source_unavailable")

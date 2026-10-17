@@ -142,7 +142,7 @@ def test_a_routing_notice_borrows_nothing_from_the_task_it_refused(room, target,
     page = room.read()
     unknown, notice = [row for row in page["messages"] if row.get("system_type") == "steer_not_delivered"]
     assert (unknown["task_id"], notice["task_id"]) == ("gone-1", target)
-    identity = {"text", "ts", "task_id", "history_id", "history_position"}
+    identity = {"text", "ts", "task_id", "history_id", "history_position", "row_address"}
     assert {k: v for k, v in notice.items() if k not in identity} == \
         {k: v for k, v in unknown.items() if k not in identity}
     assert page["window"]["latest_message"] == {"history_id": notice["history_id"], "out_of_order": False}

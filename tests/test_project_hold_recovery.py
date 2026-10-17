@@ -385,7 +385,7 @@ def test_held_deadline_keeps_custody_without_replay(host, tmp_path, monkeypatch,
 
 def test_unchanged_hold_does_not_rewrite_snapshot_but_changed_reason_does(host, tmp_path, monkeypatch):  # noqa: F811
     accepted(host, tmp_path)
-    restore_unreadable(host)
+    path, original = restore_unreadable(host)
     sent = worker(host, monkeypatch)
     workers.assign_tasks()  # First failure projects its current cause.
     writes = []
@@ -398,6 +398,9 @@ def test_unchanged_hold_does_not_rewrite_snapshot_but_changed_reason_does(host, 
     workers.assign_tasks()
     assert not writes and not sent
     host.pending[0]["_project_admission"] = None
+    workers.assign_tasks()
+    assert not writes  # Unreadable placement authority still owns the refusal.
+    path.write_bytes(original)
     workers.assign_tasks()
     assert len(writes) == 1
     assert "original" in host.pending[0]["_project_admission_restore_hold"]["detail"].lower()

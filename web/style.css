@@ -263,9 +263,18 @@ body.resizing-panels { user-select: none; }
 
 .chat-live-actions {
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: flex-end;
     gap: var(--space-2);
-    padding: 0 14px var(--space-2);
+    padding: 0 var(--space-4) var(--space-3);
+}
+
+/* In the card's foot the controls are the action row's right end: [Reply] [Resume] [Stop…]. */
+.chat-live-foot-end > .chat-live-actions {
+    flex: 0 1 auto;
+    margin-inline-start: auto;
+    padding: 0;
 }
 
 /* S3 (Q2/HQ1): the three-action task stop/hurry dropdown (Chat + Activity). */
@@ -280,7 +289,8 @@ body.resizing-panels { user-select: none; }
     padding: var(--space-2);
     border: 1px solid var(--surface-border);
     border-radius: var(--radius-md);
-    background: rgba(var(--shell-rgb), 0.94);
+    /* An opaque modal surface: a menu over a card's footer must not let its text read through. */
+    background: rgb(var(--modal-rgb));
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
     box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
@@ -293,9 +303,11 @@ body.resizing-panels { user-select: none; }
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-secondary);
+    /* Each item is an action the owner can take: legible at rest, on the body size. */
+    color: var(--text-primary);
     font: inherit;
-    font-size: 13px;
+    font-size: var(--type-body);
+    line-height: var(--line-body);
     text-align: left;
     padding: var(--space-2) var(--space-3);
     cursor: pointer;
@@ -335,7 +347,8 @@ body.resizing-panels { user-select: none; }
 .chat-quiz-project.chat-live-project-card-btn {
     flex: 0 1 auto; width: auto; min-width: 0; max-width: min(100%, 32ch);
     margin-inline-end: auto;
-    padding: 1px 8px;
+    /* A reference is a control: at least a 24px target (it measured 20px). */
+    padding: var(--space-1) var(--space-3);
     gap: var(--space-1);
     border: 1px solid var(--project-18);
     border-radius: var(--pill-radius);
@@ -363,7 +376,9 @@ body.resizing-panels { user-select: none; }
     mask-image: linear-gradient(180deg, black 60%, transparent 100%);
 }
 .chat-bubble.project-answer > .message > :first-child { margin-top: 0; }
-.chat-bubble.project-answer > .system-message-actions { align-items: center; padding-block: var(--space-2) var(--space-1); }
+.chat-bubble.project-answer > .system-message-actions,
+.chat-bubble.assistant > .system-message-actions { align-items: center; padding-block: var(--space-2) var(--space-1); }
+.chat-bubble.assistant > .system-message-actions .chat-quiz-project { min-height: var(--space-5); max-width: min(100%, 64ch); }
 .project-answer-limitation { color: var(--text-meta); white-space: normal; overflow-wrap: anywhere; }
 /* Main's questions and owner actions (docs/DESIGN.md "Project question mirror"). The waiting
    pill is one of the composer's pills (Swarm / Context / Effort): their row, height and type, at
@@ -495,9 +510,9 @@ body.resizing-panels { user-select: none; }
 /* A Project door that is a row or a capsule carries the glyph on a light tile of
    the Project tint, the glyph in project ink: a mark, never a second button
    (docs/DESIGN.md "Visual intent"); the question head keeps its compact pill. */
-.project-handoff .chat-live-project-icon,
 .chat-live-bound-pointer .chat-live-project-icon,
-.system-message-actions .chat-quiz-project .chat-live-project-icon {
+.system-message-actions .chat-quiz-project .chat-live-project-icon,
+.msg-routing-annotation .chat-quiz-project .chat-live-project-icon {
     flex: none;
     align-items: center;
     justify-content: center;
@@ -509,24 +524,35 @@ body.resizing-panels { user-select: none; }
     font-size: var(--type-body);
 }
 
-/* Under a message the reference is a capsule with the reading size and a full target. */
-.system-message-actions .chat-quiz-project.chat-live-project-card-btn {
+/* Under a message the reference is a capsule with the reading size and a full target; the one-line receipt
+   that names a room (`Passed on to the work in`) carries the same capsule after its words. */
+.system-message-actions .chat-quiz-project.chat-live-project-card-btn,
+.msg-routing-annotation .chat-quiz-project.chat-live-project-card-btn {
     min-height: var(--touch-target-min);
     padding: var(--space-1) var(--space-3) var(--space-1) var(--space-1);
     gap: var(--space-2);
     font-size: var(--type-body);
 }
-.system-message-actions .chat-quiz-project :is(.chat-live-project-name, .chat-live-project-status) {
+.system-message-actions .chat-quiz-project :is(.chat-live-project-name, .chat-live-project-status),
+.msg-routing-annotation .chat-quiz-project :is(.chat-live-project-name, .chat-live-project-status) {
     font-size: var(--type-body);
 }
 
-/* F4 — a bound (project-chat) card keeps its live timeline above and gets the
-   project pointer as a wide fuchsia footer, so a divider sets it apart. The
-   task title stays the one primary thing in text ink; the destination speaks
-   in the Project hue, its arrow on a round mark at the row's end. */
+/* The card of a work that lives in a Project ends with that Project's reference (A's bound footer): a wide
+   fuchsia strip across the card's full width with the Project mark, the name in the Project hue and the arrow
+   on a round mark at the row's end. The task title stays the one primary thing in text ink. Same insets as the
+   card body, so the mark lines up with the chip and the title. */
 .chat-live-bound-pointer {
+    /* The card's footer, not a pill inside it: square corners (the card clips its own bottom corners) and a
+       hairline that runs edge to edge. */
+    border-radius: 0;
+    gap: var(--space-2);
+    min-height: var(--touch-target-min);
+    padding: var(--space-2) var(--space-4);
     border-top: 1px solid var(--project-18);
     background: var(--project-08);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
 }
 
 .chat-live-bound-pointer .chat-live-project-name {
@@ -549,6 +575,7 @@ body.resizing-panels { user-select: none; }
     border-radius: var(--pill-radius);
     font-size: var(--type-body);
 }
+
 
 .nav-section {
     display: flex;
@@ -1403,13 +1430,28 @@ body.resizing-panels { user-select: none; }
     backdrop-filter: blur(10px);
 }
 
-.onboarding-frame {
+.onboarding-surface {
     position: relative;
     z-index: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
     width: 100%;
-    height: 100%;
+}
+
+.onboarding-frame {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
     border: 0;
     background: transparent;
+}
+
+.onboarding-recovery {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px;
+    background: var(--bg-primary);
 }
 
 .onboarding-restart-card {
@@ -1546,7 +1588,9 @@ body.resizing-panels { user-select: none; }
 .chat-scroll-activity-dot[hidden] { display: none; }
 
 .chat-bubble {
-    padding: 10px 14px;
+    /* The same inset as a task card's body (--space-4 at the sides), so a bubble's words and the card
+       under it start on one edge. */
+    padding: var(--space-3) var(--space-4);
     border-radius: var(--radius-lg);
     max-width: 80%;
     word-wrap: break-word;
@@ -1777,10 +1821,22 @@ body.resizing-panels { user-select: none; }
     border-style: dashed;
 }
 
+/* The delivery sentence under an owner message. When it carries actions (Send again, Discard, Send as a new
+   message) the sentence and its actions are ONE flex row: the same gap everywhere, wrapping on a phone, never a
+   stack of full-width buttons (docs/DESIGN.md "Chat attachments"). */
 .msg-pending {
-    margin-top: 6px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
     font-size: var(--type-meta);
+    line-height: var(--line-meta);
     color: var(--text-muted);
+}
+/* A doubt the owner may act on is a load-bearing caveat: meta ink, not the disabled step (docs/DESIGN.md section 3). */
+.msg-pending:is([data-ingress-unconfirmed], [data-ingress-saved="unconfirmed"], [data-ingress-saved="undispatched"]) {
+    color: var(--text-meta);
 }
 
 .msg-routing-annotation {
@@ -1792,6 +1848,17 @@ body.resizing-panels { user-select: none; }
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+/* The receipt that names a room carries the Project reference on its own line, not in a second padded row. */
+.msg-routing-annotation.has-reference {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    margin-top: var(--space-2);
+    overflow: visible;
+    white-space: normal;
+}
+.msg-routing-annotation .chat-quiz-project { margin-inline-end: 0; max-width: min(100%, 64ch); min-height: var(--space-5); }
 
 .msg-routing-annotation[data-annotation-status="pending"] {
     color: var(--text-disabled);
@@ -1869,10 +1936,10 @@ body.resizing-panels { user-select: none; }
     max-width: max(80%, min(100%, 620px));
     padding: 0;
     border-radius: var(--radius-lg);
-    border: 1px solid var(--accent-dim);
+    border: 1px solid var(--accent-12);
     background: var(--accent-04);
     backdrop-filter: blur(12px);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(var(--neutral-rgb), 0.03);
+    box-shadow: var(--live-card-shadow);
     overflow: hidden;
     container-type: inline-size;
     container-name: livecard;
@@ -1889,17 +1956,51 @@ body.resizing-panels { user-select: none; }
     display: none;
 }
 
+/* The portal (work_portal.js): the same card in Main, collapsed for good, while its work lives in a
+   Project room. Chip + quiet fact, title, one narration line (two at most), the foot (meta + its
+   controls) and the Project reference footer. The room holds the timeline, reviews and children,
+   so they never render here, and the summary is reading content, not a disclosure. */
+.chat-live-card[data-portal="1"] > .chat-live-timeline,
+.chat-live-card[data-portal="1"] > [data-live-reviews-host],
+.chat-live-card[data-portal="1"] > .chat-subagents,
+.chat-live-card[data-portal="1"] > .chat-live-summary-button .chat-live-summary-side,
+.chat-live-card[data-portal="1"] > .chat-live-foot > .chat-live-foot-end > .chat-live-review-summary {
+    display: none;
+}
+
+.chat-live-card[data-portal="1"] > .chat-live-summary-button {
+    cursor: auto;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+.chat-live-card[data-portal="1"] > .chat-live-summary-button:hover {
+    background: transparent;
+}
+
+.chat-live-card[data-portal="1"]:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity {
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+}
+
+/* A binding whose Main receipt is not durable keeps its visible gap mark. */
+.chat-live-card[data-receipt] {
+    border-style: dashed;
+}
+
 .chat-live-summary-button {
+    box-sizing: border-box;
     width: 100%;
     border: 0;
     background: transparent;
     color: inherit;
     font: inherit;
     cursor: pointer;
-    padding: 11px 14px;
+    /* The card's inset: --space-4 at the sides, --space-3 on top; the foot below closes it. */
+    padding: var(--space-3) var(--space-4) 0;
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    flex-direction: column;
+    gap: var(--space-2);
     user-select: none;
     text-align: left;
 }
@@ -1915,8 +2016,9 @@ body.resizing-panels { user-select: none; }
    is a div[role=button] (keyboard-activated in chat.js) because WebKit never
    lets text inside a real <button> be selected. */
 .chat-live-summary-button .chat-live-title,
+.chat-live-summary-button .chat-live-episodes,
 .chat-live-summary-button .chat-live-activity,
-.chat-live-summary-button .chat-live-meta {
+.chat-live-foot .chat-live-meta {
     -webkit-user-select: text;
     user-select: text;
 }
@@ -1933,8 +2035,27 @@ body.resizing-panels { user-select: none; }
        controls past the card edge. */
     min-width: 0;
     justify-content: space-between;
-    gap: 10px;
+    gap: var(--space-3);
+}
+
+/* A root card reads top to bottom: status (chip + quiet fact) with its disclosure on the right,
+   then the work's name on a line of its own, at the card-title size and title weight 500. */
+.chat-live-card:not(.subagent) > .chat-live-summary-button > .chat-live-summary {
+    flex-wrap: wrap;
+    align-items: center;
+    row-gap: var(--space-2);
+}
+
+.chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-title {
+    order: 3;
     flex: 1 1 100%;
+    font-size: var(--type-section);
+    line-height: var(--line-title);
+}
+
+.chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-summary-side {
+    order: 2;
+    margin-inline-start: auto;
 }
 
 /* Chip + typing dots only; the title is their sibling so a narrow container can
@@ -1942,8 +2063,9 @@ body.resizing-panels { user-select: none; }
 .chat-live-summary-main {
     display: flex;
     align-items: center;
-    gap: 8px;
-    flex: 0 0 auto;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-2);
+    flex: 0 1 auto;
     max-width: 100%;
     min-width: 0;
 }
@@ -1951,7 +2073,7 @@ body.resizing-panels { user-select: none; }
 .chat-live-summary-side {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
     flex-shrink: 0;
     /* One title line (title type size, not the inherited body size). */
     min-height: calc(1.45 * var(--type-body));
@@ -1971,6 +2093,26 @@ body.resizing-panels { user-select: none; }
     text-transform: none;
 }
 
+/* The task status chip (DESIGN "Status and chips"): a semi-transparent pill, dot + the chip's words,
+   in its explicit pair. The dot carries the state at a glance; while the work is computing it
+   breathes (the one motion; the card draws no second typing indicator). */
+.chat-live-phase {
+    gap: calc(var(--space-1) * 1.5);
+    padding: calc(var(--space-1) / 2) var(--space-3) calc(var(--space-1) / 2) var(--space-2);
+    line-height: var(--line-meta);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.chat-live-phase::before {
+    content: "";
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
 .chat-live-phase:is(.start, .calling, .context, .progress, .working, .thought, .thinking, .boot),
 .chat-live-line-phase:is(.start, .calling, .context, .progress, .working, .thought, .thinking, .boot) {
     color: var(--accent-light);
@@ -1978,12 +2120,23 @@ body.resizing-panels { user-select: none; }
     background: var(--accent-10);
 }
 
-.chat-live-phase[data-motion="1"], .chat-live-phase-secondary[data-motion="1"] {
+/* Motion: the chip's dot breathes while the work computes (the chip itself stays still and readable);
+   a moving fact beside an outcome chip (a running finalization) keeps today's gentle pulse. */
+.chat-live-phase[data-motion="1"]::before {
+    animation: live-dot-breathe 1.4s ease-in-out infinite;
+}
+
+.chat-live-phase-secondary[data-motion="1"] {
     animation: thinking-pulse 1.5s ease-in-out infinite;
 }
 
+@keyframes live-dot-breathe {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.35; transform: scale(0.7); }
+}
+
 @media (prefers-reduced-motion: reduce) {
-    .chat-live-phase[data-motion="1"], .chat-live-phase-secondary[data-motion="1"] { animation: none; }
+    .chat-live-phase[data-motion="1"]::before, .chat-live-phase-secondary[data-motion="1"] { animation: none; }
 }
 
 /* Phase pills are status chips with class-named tones; the triple is the
@@ -2037,6 +2190,11 @@ body.resizing-panels { user-select: none; }
 .chat-live-typing span:nth-child(3) { animation-delay: 0.4s; }
 
 .chat-live-card[data-finished="1"] > .chat-live-summary-button .chat-live-typing {
+    display: none;
+}
+
+/* A card's chip dot is its activity indicator; the three dots stay for the sidebar and typing rows. */
+.chat-live-card .chat-live-typing {
     display: none;
 }
 
@@ -2119,7 +2277,8 @@ body.resizing-panels { user-select: none; }
 .chat-live-meta {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
+    /* One space's width after a separator (the space before it is real text inside the part). */
+    gap: 0 var(--space-1);
     flex: 1 1 auto;
     min-width: 0;
     color: var(--text-disabled);
@@ -2127,9 +2286,97 @@ body.resizing-panels { user-select: none; }
     line-height: var(--line-meta);
 }
 
-.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-meta {
+.chat-live-card:not([data-expanded="1"]) > .chat-live-foot > .chat-live-meta {
     min-height: 1.35em;
 }
+
+/* The card's foot: the meta line (tool calls · cost · updated) at full width, then ONE action row. Controls
+   never sit on the meta/timestamp band. The row leads with the quiet Reviews count (under the metadata, DESIGN
+   "Reviews inside task cards") and ends right-aligned with the controls: [Reply] [Resume] [Stop…]. Same
+   structure at every width; the Project reference footer stays below. */
+.chat-live-foot {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4) var(--space-3);
+}
+
+.chat-live-foot-end {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2) var(--space-3);
+    min-width: 0;
+}
+
+.chat-live-foot-end > .chat-live-review-summary {
+    margin-inline-end: auto;
+}
+
+/* A root card's action row always holds Reply, so it keeps the controls' height whether the work runs or
+   has settled: running and settled cards breathe alike. */
+.chat-live-card:not(.subagent) > .chat-live-foot > .chat-live-foot-end {
+    min-height: calc(var(--space-5) + var(--space-1));
+}
+
+.chat-live-foot-end:not(:has(> :not([hidden]):not(:empty))) {
+    display: none;
+}
+
+/* A settled card (Done, Done with warnings, Failed, Cancelled) whose only action is Reply has no action row:
+   Reply stands at the right end of the meta line (its last line when the meta wraps), the same small neutral
+   button, vertically centred on that line. A card with a lifecycle control keeps its row [Reply] [Resume] [Stop…],
+   and a Reviews count keeps its row with Reply. */
+.chat-live-card[data-finished="1"]:not(.subagent) > .chat-live-foot:has(> .chat-live-foot-end > .chat-live-actions > [data-card-reply]:only-child):not(:has(> .chat-live-foot-end > .chat-live-review-summary:not([hidden]))) {
+    flex-direction: row;
+    align-items: center;
+    align-items: last baseline;
+    gap: var(--space-3);
+}
+
+.chat-live-card[data-finished="1"]:not(.subagent) > .chat-live-foot:has(> .chat-live-foot-end > .chat-live-actions > [data-card-reply]:only-child):not(:has(> .chat-live-foot-end > .chat-live-review-summary:not([hidden]))) > .chat-live-meta {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.chat-live-card[data-finished="1"]:not(.subagent) > .chat-live-foot:has(> .chat-live-foot-end > .chat-live-actions > [data-card-reply]:only-child):not(:has(> .chat-live-foot-end > .chat-live-review-summary:not([hidden]))) > .chat-live-foot-end {
+    flex: none;
+    min-height: 0;
+}
+
+/* Episodes of one work (Continue): one meta line each under the title, never a chip column. */
+.chat-live-episodes {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--space-1) / 2);
+    min-width: 0;
+}
+
+.chat-live-episodes[hidden] {
+    display: none;
+}
+
+.chat-live-episode {
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    overflow-wrap: anywhere;
+}
+
+.chat-live-episode-label {
+    font-weight: 500;
+}
+
+.chat-live-episode-outcome {
+    font-weight: 500;
+}
+
+.chat-live-episode-outcome[data-tone="ok"] { color: var(--status-ok-fg); }
+.chat-live-episode-outcome[data-tone="warn"] { color: var(--status-warn-fg); }
+.chat-live-episode-outcome[data-tone="error"] { color: var(--status-error-fg); }
+.chat-live-episode-outcome[data-tone="neutral"] { color: var(--status-neutral-fg); }
 
 /* Why a chip word or an amount reads as it does: part of the expanded card, which the
    summary button opens by pointer, touch and keyboard (never a hover-only title); selectable. */
@@ -2149,10 +2396,14 @@ body.resizing-panels { user-select: none; }
    Neutral by rule: the outcome owns the status colour, this only says the task
    has not let go yet, so it stays a quiet sentence rather than a second chip. */
 .chat-live-phase-secondary {
+    min-width: 0;
     color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
-    white-space: nowrap;
+}
+
+.chat-live-phase-secondary[hidden] {
+    display: none;
 }
 
 /* HQ1: an applied owner hurry, never a chat bubble — the house fast-forward vector
@@ -2170,13 +2421,23 @@ body.resizing-panels { user-select: none; }
     font-size: var(--type-meta);
 }
 
+.chat-live-meta-part {
+    min-width: 0;
+}
+
+/* The ` · ` separator rides inside the fact before it (chat_activity.metaLineHtml). A plain-text fact is an
+   inline block: it moves to the next line whole, and when it is longer than a line its separator follows its last
+   word in the text flow (an inline-flex box would park the dot at the far right of the wrapped fact). */
+.chat-live-meta-part > .chat-live-meta-text:not(.chat-live-effort) {
+    display: inline-block;
+}
+
+
 .chat-live-review-summary {
     color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
     flex: 0 0 auto;
-    margin-inline-start: auto;
-    align-self: baseline;
     white-space: nowrap;
 }
 
@@ -2193,7 +2454,7 @@ body.resizing-panels { user-select: none; }
 
 .chat-live-card[data-expanded="1"] > [data-live-reviews-host] > .chat-live-reviews {
     display: block;
-    margin: 0 14px 12px;
+    margin: 0 var(--space-4) var(--space-3);
     border-top: 1px solid var(--divider);
 }
 
@@ -2344,10 +2605,10 @@ body.resizing-panels { user-select: none; }
 }
 
 .chat-live-timeline {
-    padding: 0 14px 12px;
+    padding: var(--space-3) var(--space-4);
     display: none;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--space-2);
 }
 
 .chat-live-card[data-expanded="1"] > .chat-live-timeline {
@@ -2360,11 +2621,11 @@ body.resizing-panels { user-select: none; }
 .chat-subagents {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-block: 2px 12px;
-    margin-inline: 24px 14px;
-    padding-inline-start: 14px;
-    border-inline-start: 1px solid var(--accent-25);
+    gap: var(--space-2);
+    margin-block: 0 var(--space-3);
+    margin-inline: var(--space-5) var(--space-4);
+    padding-inline-start: var(--space-3);
+    border-inline-start: 1px solid var(--accent-18);
 }
 
 .chat-subagents:empty {
@@ -2392,6 +2653,12 @@ body.resizing-panels { user-select: none; }
     .chat-live-card {
         width: 100%;
         max-width: 100%;
+    }
+
+    /* The question card takes the narrow column's full width like every other bubble, so a column of
+       bubbles shares one right edge (DESIGN §5). Two classes: the base 560px rule comes later in the file. */
+    .chat-bubble > .chat-quiz-card {
+        max-width: none;
     }
 }
 
@@ -2425,6 +2692,12 @@ body.resizing-panels { user-select: none; }
         justify-content: flex-end;
     }
 
+    /* A narrow card keeps its counts and chevron beside the chip (the chevron already says it opens);
+       the words would push them onto a row of their own. */
+    .chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-toggle {
+        display: none;
+    }
+
     .chat-live-line-toggle {
         flex-wrap: wrap;
     }
@@ -2452,9 +2725,11 @@ body.resizing-panels { user-select: none; }
         margin-inline-start: 0;
     }
 
+    /* Equal inline inset on both sides: a child sits --space-3 + --space-2 from its root card's border on
+       the left (where the thread line runs) and on the right; no child border meets the root's border. */
     .chat-subagents {
-        margin-inline: 0;
-        padding-inline-start: 8px;
+        margin-inline: var(--space-3);
+        padding-inline: var(--space-2);
     }
 
     .chat-subagents .chat-subagents {
@@ -2474,6 +2749,21 @@ body.resizing-panels { user-select: none; }
         flex: 1 1 160px;
         min-width: 0;
     }
+
+    /* On a phone the collapsed child's identity row stays one row: the role name ellipsizes before its
+       `N notes` count would drop to a row of its own. */
+    .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button > .chat-live-summary {
+        flex-wrap: nowrap;
+    }
+
+    .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-title {
+        flex: 1 1 0;
+    }
+
+    .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-summary-side {
+        flex: none;
+        flex-wrap: nowrap;
+    }
 }
 
 .chat-live-card.subagent {
@@ -2487,7 +2777,20 @@ body.resizing-panels { user-select: none; }
 /* An opaque secondary surface prevents translucent tints accumulating at depth.
    Nested frames and parent-child rails remain the hierarchy cue. */
 .chat-live-card.subagent .chat-live-summary-button {
-    padding: 9px 12px;
+    padding: var(--space-2) var(--space-3) 0;
+}
+
+.chat-live-card.subagent > .chat-live-foot {
+    padding: var(--space-1) var(--space-3) var(--space-2);
+}
+
+/* A child with nothing for its foot (no meta, no count, no control) closes on its summary. */
+.chat-live-card.subagent > .chat-live-foot:not(:has(> .chat-live-meta:not(:empty), > .chat-live-foot-end > .chat-live-review-summary:not([hidden]), > .chat-live-foot-end > .chat-live-actions:not(:empty))) {
+    display: none;
+}
+
+.chat-live-card.subagent:not(:has(> .chat-live-foot > .chat-live-meta:not(:empty), > .chat-live-foot > .chat-live-foot-end > .chat-live-review-summary:not([hidden]), > .chat-live-foot > .chat-live-foot-end > .chat-live-actions:not(:empty))) > .chat-live-summary-button {
+    padding-bottom: var(--space-2);
 }
 
 /* A nested child is subordinate to its root: quieter ink, and collapsed it is
@@ -2523,7 +2826,7 @@ body.resizing-panels { user-select: none; }
     display: none;
 }
 
-.chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-meta {
+.chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-foot > .chat-live-meta {
     min-height: 0;
 }
 
@@ -7747,12 +8050,14 @@ textarea.chat-input {
 .chat-live-effort {
     display: inline-flex;
     align-items: center;
-    gap: 3px;
 }
+/* The pin keeps its own space (a margin, not a flex gap), so the meta separator that rides inside this fact
+   sits as close as after any other fact. */
 .chat-live-effort-pin {
     flex: 0 0 auto;
     width: 11px;
     height: 11px;
+    margin-inline-end: calc(var(--space-1) * 0.75);
 }
 
 /* Phase 6: per-bubble/subagent executor chip (owner directive: a small chip
@@ -7770,7 +8075,7 @@ textarea.chat-input {
 /* The chip's detail sentence is card text only while the card is expanded;
    `contents` makes its separator and text ordinary parts of the meta line. */
 .chat-live-executor-detail { display: none; }
-.chat-live-card[data-expanded="1"] > .chat-live-summary-button .chat-live-executor-detail { display: contents; }
+.chat-live-card[data-expanded="1"] > :is(.chat-live-summary-button, .chat-live-foot) .chat-live-executor-detail { display: contents; }
 
 /* Structured chat delivery surfaces. All controls inherit the dark application
    palette so media stays legible in both Main and Project chat instances. */
@@ -8434,6 +8739,30 @@ textarea.chat-input {
 .chat-quiz-option:active:not(:disabled) { filter: var(--press); }
 .chat-quiz-option:disabled { color: var(--text-disabled); cursor: default; background: var(--surface-tray); box-shadow: none; }
 .chat-quiz-option.chosen { color: var(--status-ok-fg); background: var(--tone-green); }
+.chat-quiz-option.pending-choice {
+    transition: none;
+    box-shadow: var(--elev-rest), inset 0 0 0 1px var(--focus-accent-border);
+    background: var(--accent-08);
+    color: var(--text-primary);
+}
+.chat-quiz-card [aria-disabled="true"] { cursor: default; }
+.chat-quiz-card [aria-disabled="true"]:not(.pending-choice) { opacity: .75; }
+.chat-quiz-card [aria-disabled="true"]:hover:not(.pending-choice) {
+    background: var(--surface-tray);
+}
+.chat-quiz-card[data-submission="sending"] .chat-quiz-dot,
+.chat-quiz-card[data-submission="unknown"] .chat-quiz-dot,
+.chat-quiz-card[data-submission="checking"] .chat-quiz-dot { background: var(--text-meta); }
+.chat-quiz-feedback {
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2);
+    color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta);
+}
+.chat-quiz-feedback[hidden], .chat-quiz-feedback [hidden] { display: none; }
+.chat-quiz-submission-note, .chat-quiz-storage-note { flex-basis: 100%; white-space: pre-wrap; }
+.chat-quiz-storage-note { color: var(--status-warn-fg); }
+.chat-quiz-feedback button:focus-visible {
+    outline: 2px solid var(--focus-accent-border); outline-offset: 2px;
+}
 .chat-quiz-option-detail {
     font-weight: 400;
     font-size: var(--type-meta);
@@ -8516,128 +8845,239 @@ textarea.chat-input {
     color: var(--text-meta);
 }
 
-/* D12: always-visible compact copy icon in the bubble's bottom-right corner. */
-.chat-message-copy {
-    position: absolute;
-    right: 8px;
-    bottom: 6px;
+/* D12: always-visible compact copy icon in the bubble's bottom-right corner. The Reply control joins it in
+   one control row (docs/DESIGN.md "Replies"): the same 24px square, ink and rhythm, one --space-2 gap. */
+.chat-message-copy,
+.chat-message-reply {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 22px;
+    width: var(--space-5);
+    height: var(--space-5);
     padding: 0;
     border: 1px solid transparent;
-    border-radius: var(--radius-xs);
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: 1;
     cursor: pointer;
-    opacity: 0.45;
+    opacity: 0.7;
     transition: opacity 0.15s ease, background 0.15s ease;
 }
+/* On the time's line: the bubble's bottom inset is --space-3, the 24px controls stand --space-2 above its edge. */
+.chat-message-copy { position: absolute; right: var(--space-2); bottom: var(--space-2); }
+.chat-message-actions {
+    position: absolute;
+    right: var(--space-2);
+    bottom: var(--space-2);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+.chat-message-actions > .chat-message-copy { position: static; }
 
 .chat-message-copy:hover,
-.chat-message-copy:focus-visible { opacity: 1; }
-.chat-message-copy:hover { background: var(--surface-control); }
-.chat-message-copy:focus-visible {
+.chat-message-copy:focus-visible,
+.chat-message-reply:hover,
+.chat-message-reply:focus-visible { opacity: 1; }
+.chat-message-copy:hover,
+.chat-message-reply:hover { background: var(--surface-control); }
+.chat-message-copy:focus-visible,
+.chat-message-reply:focus-visible {
     outline: 2px solid var(--focus-accent-border);
     outline-offset: 2px;
 }
 
-/* Reserve a gutter so the timestamp never sits under the always-visible icon
-   (the button spans ~30px from the bubble's right edge). */
-.chat-bubble.has-copy .msg-time { margin-right: 28px; }
+/* Reserve a gutter so the timestamp never sits under the always-visible controls (Copy ends 32px from the
+   bubble's edge, Reply and Copy 64px; the bubble's own inset is --space-4, the gap to the time --space-2). */
+.chat-bubble.has-copy .msg-time { margin-right: var(--space-5); }
+.chat-bubble.has-reply .msg-time { margin-right: calc(var(--space-5) * 2 + var(--space-2)); }
 
-/* One Project entry surface, independent of the task or history shell it
-   replaced (docs/DESIGN.md "Project work entries"): a light title over one
-   destination row, the Project reference filling it beside time and Copy. Its
-   free area forwards a press to that reference (project_handoff.js), so it shows
-   the pointer; text keeps the reading cursor and its selection. */
-.chat-live-card.project-handoff,
-.chat-bubble.project-handoff {
+/* The message a quote points at: a calm ring for a moment, a keyboard ring while it holds focus. */
+@keyframes chat-quote-target {
+    from { box-shadow: 0 0 0 3px var(--accent-25); }
+    to { box-shadow: 0 0 0 3px transparent; }
+}
+:is(.chat-bubble, .chat-live-card).is-quote-target { animation: chat-quote-target 1.4s ease-out; }
+/* A row that takes focus only to be returned to (a quote's target, a closed row menu) shows the one keyboard ring. */
+:is(.chat-bubble, .chat-live-card)[tabindex="-1"]:focus { outline: none; }
+:is(.chat-bubble, .chat-live-card)[tabindex="-1"]:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+    :is(.chat-bubble, .chat-live-card).is-quote-target { animation: none; box-shadow: 0 0 0 3px var(--accent-25); }
+}
+
+/* === The quote panel (docs/DESIGN.md "Replies"): one component (chat_reply_quote.js) inside a bubble and
+   above the composer. The bar and the author name wear the QUOTED author's ink, the panel one tint of that same
+   ink on the quote glass; no literal colours. A reply shows one ellipsized line and is a button that jumps to
+   the quoted message; a relay shows the owner's complete words, clamped to six lines, `Show all` in its head. */
+.chat-quote {
+    --quote-ink: var(--text-meta);
+    --quote-tint: var(--ui-card-bg-soft);
+    position: relative;
+    display: block;
+    margin: 0 0 var(--space-2);
+    border-radius: var(--radius-sm);
+    background: linear-gradient(var(--quote-tint), var(--quote-tint)), var(--quote-glass);
+    overflow: hidden;
+}
+.chat-quote[data-author="user"] { --quote-ink: var(--user-sender); --quote-tint: var(--user-bubble-from); }
+.chat-quote[data-author="assistant"] { --quote-ink: var(--assistant-sender); --quote-tint: var(--accent-10); }
+.chat-quote[data-author="system"] { --quote-ink: var(--system-sender); --quote-tint: var(--system-bubble-bg); }
+.chat-quote::before {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    inline-size: 2px;
+    background: var(--quote-ink);
+}
+.chat-quote-main {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
-    align-self: flex-start;
-    width: min(100%, 760px);
-    max-width: max(80%, min(100%, 620px));
+    gap: 0;
+    box-sizing: border-box;
+    width: 100%;
     min-width: 0;
     margin: 0;
-    padding: var(--space-3) var(--space-4);
-    border: 1px solid var(--project-18);
-    border-radius: var(--radius-lg);
-    background: var(--project-08);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 var(--project-08);
-    backdrop-filter: blur(12px);
-    overflow: hidden;
-    container-type: inline-size;
-    container-name: projectcard;
+    padding: var(--space-2) var(--space-3);
+    border: 0;
+    background: transparent;
+    color: var(--text-meta);
+    font: inherit;
+    text-align: start;
     cursor: pointer;
-    transition: border-color 250ms ease, background-color 250ms ease, box-shadow 250ms ease;
 }
-
-.project-handoff-heading {
+.chat-quote-main:hover { background: var(--menu-item-hover); }
+/* A quoted photo leads the panel with its thumbnail (the head and the line stand to its right). */
+.chat-quote-main.has-thumb {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: var(--space-2);
+    align-items: center;
+}
+.chat-quote-main.has-thumb > .chat-quote-thumb { grid-row: 1 / span 2; }
+.chat-quote-thumb {
+    display: block;
+    width: var(--chat-attach-thumb-size);
+    height: var(--chat-attach-thumb-size);
+    border-radius: var(--radius-xs);
+    object-fit: cover;
+    background: var(--surface-control);
+}
+.chat-quote-main:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
+.chat-quote-head {
     display: flex;
     align-items: baseline;
-    gap: var(--space-3);
-    white-space: normal;
-}
-.project-handoff-title {
-    flex: 0 1 auto;
+    gap: var(--space-1);
     min-width: 0;
-    overflow-wrap: anywhere;
-    font-size: var(--type-section);
-    line-height: var(--line-title);
-    font-weight: 500;
-    color: var(--text-primary);
-}
-.project-handoff-phase {
-    display: flex;
-    flex-shrink: 0;
-    align-items: baseline;
-    justify-content: flex-end;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    max-width: 100%;
-    margin-inline-start: auto;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
     line-height: var(--line-meta);
+    white-space: nowrap;
 }
-.project-handoff :is(.project-handoff-title, .project-handoff-phase > *, .msg-time) { cursor: auto; }
-.project-handoff-footer { display: flex; align-items: center; gap: var(--space-2); min-height: var(--touch-target-min); }
-.project-handoff .chat-quiz-project.chat-live-project-card-btn {
-    flex: 1 1 auto; align-self: stretch; max-width: none; min-height: var(--touch-target-min);
-    margin: 0; padding: 0; gap: var(--space-2);
-    border: 0; border-radius: var(--radius-sm); background: transparent;
-    font-size: var(--type-body); line-height: var(--line-meta);
+.chat-quote-lead,
+.chat-quote-when { flex: none; color: var(--text-meta); }
+.chat-quote-author {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--quote-ink);
+    font-weight: 600;
+    text-overflow: ellipsis;
 }
-.project-handoff .chat-quiz-project .chat-live-project-name {
-    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
-    white-space: normal; overflow-wrap: anywhere;
-    font-size: var(--type-body); color: var(--project);
+.chat-quote-text {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-meta);
+    font-size: var(--type-body);
+    line-height: var(--line-meta);
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
-.project-handoff .chat-quiz-project .chat-live-project-status { font-size: var(--type-body); color: var(--project); }
-.project-handoff .project-handoff-footer .msg-time { flex: none; margin: 0; opacity: 1; white-space: nowrap; color: var(--text-meta); }
-.project-handoff .chat-message-copy { position: static; margin-inline-start: auto; flex: 0 0 auto; }
-@media (hover: hover) {
-    .project-handoff:hover .chat-live-project-name { text-decoration: underline; text-underline-offset: 3px; }
+
+/* A relay: the owner's words are the instruction, so they read in primary ink, wrapped, up to six lines. */
+.chat-quote[data-mode="relay"] { padding: var(--space-2) var(--space-3); }
+.chat-quote[data-mode="relay"] > .chat-quote-head { align-items: center; min-height: var(--space-5); }
+.chat-quote[data-mode="relay"] > .chat-quote-text {
+    margin-top: var(--space-1);
+    color: var(--text-primary);
+    line-height: var(--line-body);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
 }
+
+/* The clamp of a long quotation (a relay panel's text); its toggle lives in the panel's head, a row that already
+   exists, so no control floats on a row of its own. */
+.chat-clamp {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 6;
+    line-clamp: 6;
+    overflow: hidden;
+}
+.chat-clamp[data-expanded="1"] { display: block; -webkit-line-clamp: unset; line-clamp: unset; overflow: visible; }
+.chat-clamp-toggle { flex: none; margin-inline-start: auto; min-height: var(--space-5); padding-block: 0; }
+/* The files that came with the owner's relayed words: named, not served again. */
+.chat-quote-files {
+    margin-top: var(--space-1);
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    overflow-wrap: anywhere;
+}
+.chat-clamp-toggle[hidden] { display: none; }
+
+/* Above the composer: the same panel on the glass of the field below it, with its cancel control. */
+.chat-input-wrap > .chat-quote--composer {
+    order: 1;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    padding-inline-end: var(--space-2);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-lg);
+    background: linear-gradient(var(--quote-tint), var(--quote-tint)), var(--quote-glass);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    animation: chat-quote-in 0.16s ease-out;
+}
+.chat-quote--composer .chat-quote-main { flex: 1 1 auto; width: auto; padding-block: var(--space-2); padding-inline-start: var(--space-5); }
+/* In the rounded strip the author bar stands inside the curve, straight from end to end (the bubble quote's
+   bar meets square-ish corners; here the pill would bend it into a crescent). */
+.chat-quote--composer::before {
+    inset-block: var(--space-2);
+    inset-inline-start: var(--space-3);
+    border-radius: var(--radius-xs);
+}
+.chat-quote-cancel {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: var(--composer-control-height, 32px);
+    height: var(--composer-control-height, 32px);
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-meta);
+    cursor: pointer;
+}
+.chat-quote-cancel:hover { background: var(--menu-item-hover); color: var(--text-primary); }
+.chat-quote-cancel:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
+@keyframes chat-quote-in {
+    from { opacity: 0; transform: translateY(var(--space-1)); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .chat-input-wrap > .chat-quote--composer { animation: none; }
+}
+/* A finger needs the shared touch target on the controls these blocks add (the clamp toggle, the doubt's actions);
+   the time under the doubt's actions then keeps clear of the Reply / Copy targets that sit on its line. */
 @media (pointer: coarse) {
-    .project-handoff .chat-message-copy { min-width: var(--touch-target-min); min-height: var(--touch-target-min); }
-}
-
-/* A saved binding with no durable Main receipt retains its visible gap mark. */
-.project-handoff.project-handoff--unsaved { border-style: dashed; }
-
-@container projectcard (max-width: 560px) {
-    .project-handoff-heading { flex-direction: column; align-items: flex-start; }
-    .project-handoff-phase { order: -1; justify-content: flex-start; margin-inline-start: 0; }
-    /* The name takes the whole row; time and Copy follow on the right. */
-    .project-handoff-footer { flex-wrap: wrap; }
-    .project-handoff .project-handoff-footer > [data-intent] { flex-basis: 100%; }
-    .project-handoff .project-handoff-footer .msg-time { margin-inline-start: auto; }
-    .project-handoff .project-handoff-footer .msg-time:not([hidden]) + .chat-message-copy { margin-inline-start: 0; }
+    .chat-clamp-toggle, .msg-pending .btn { min-height: var(--touch-target-min); }
+    .chat-bubble:is(.has-reply, .has-copy) > .msg-pending:has(.btn) + .msg-time { margin-top: var(--space-3); }
 }
 
 .chat-copy-fallback {
@@ -8897,6 +9337,9 @@ textarea.chat-input {
 }
 :root[data-theme] .chat-live-summary-button { padding: 16px 20px 12px; }
 :root[data-theme] .chat-live-actions { padding: 0 20px 16px; gap: var(--space-2); }
+/* The work card's foot (meta line, its one action row) and its Project footer share the card's insets. */
+:root[data-theme] :is(.chat-live-foot, .chat-live-bound-pointer) { padding-inline: 20px; }
+:root[data-theme] .chat-live-foot-end > .chat-live-actions { padding: 0; }
 :root[data-theme] :is(.chat-live-phase, .chat-live-line-phase) { border-color: transparent; }
 /* A Project entry is the Project's voice: its tint, one resting object in every shell it replaces (a task card, a
    history row); an unsaved entry keeps its dashed edge, which is a state, not an outline. */

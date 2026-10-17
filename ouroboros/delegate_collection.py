@@ -341,6 +341,7 @@ class BodyRuntime:
         self.retry_requested: set[str] = set()
         self.collection_attempts: dict[str, tuple] = {}
         self.collection_failures: dict[str, dict] = {}
+        self._observing = None
         self.thread = threading.Thread(target=self._drive, name="delegated-body", daemon=True)
         try:
             self.thread.start()
@@ -389,15 +390,32 @@ class BodyRuntime:
         from ouroboros.claudexor_daemon import read_owned_gateway
         return read_owned_gateway()
 
+    def _observer_gateway(self):
+        """The generation's one observation client: a handshake and an HTTP client per poll of
+        every held run kept the server's interpreter busy (N4). A failed read drops it."""
+        with self.lock:
+            if self._observing is None:
+                self._observing = self._gateway()
+            return self._observing
+
+    def _drop_observer_gateway(self, gateway=None):
+        with self.lock:
+            if gateway is not None and self._observing is not gateway:
+                return
+            gateway, self._observing = self._observing, None
+        if gateway is not None:
+            gateway.close()
+
     def _observe(self, entry):
         from ouroboros.gateways.claudexor import SHORT_POLL_TIMEOUT_SEC
-        gateway = self._gateway()
+        gateway = self._observer_gateway()
         try:
             detail = gateway.get_run(entry.run_id, timeout_sec=SHORT_POLL_TIMEOUT_SEC)
-            # A late valid source fact remains evidence; it grants no wait.
-            observe_run(self.root, entry, detail)
-        finally:
-            gateway.close()
+        except BaseException:
+            self._drop_observer_gateway(gateway)  # a moved or restarted daemon gets a fresh handshake
+            raise
+        # A late valid source fact remains evidence; it grants no wait.
+        observe_run(self.root, entry, detail)
 
     def _collect(self, run_id):
         try:
@@ -477,6 +495,7 @@ class BodyRuntime:
             # close(wait=False) neither joins on the control loop nor forgets them.
             self.observers.shutdown(wait=True, cancel_futures=True)
             self.collectors.shutdown(wait=True, cancel_futures=True)
+            self._drop_observer_gateway()
             with _RUNTIME_LOCK:
                 if _RUNTIMES.get(str(self.root)) is self:
                     del _RUNTIMES[str(self.root)]

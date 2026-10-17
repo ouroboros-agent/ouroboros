@@ -8,6 +8,7 @@ starts first and this module only opens a window onto its ``/onboarding`` page.
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable
 
 from ouroboros.config import (
@@ -20,6 +21,34 @@ from ouroboros.server_runtime import apply_runtime_provider_defaults, has_startu
 # The launcher's own logger: these lines belong in launcher.log next to the
 # startup sequence they are part of.
 log = logging.getLogger("launcher")
+
+
+def setup_recovery_menu(window, read_port: Callable[[], int | None]) -> list:
+    """macOS recovery outside the selected page; other hosts keep their existing chrome.
+
+    pywebview 5.4 retains its application menu across GUI loops. Each normal
+    window gets a fresh binding; a retained action cannot navigate a successor
+    (including Startup Failed) or use an endpoint the launcher no longer owns.
+    """
+    if sys.platform != "darwin":
+        return []
+    import webview
+
+    if window not in webview.windows:
+        return []
+    from webview.menu import Menu, MenuAction
+
+    def open_builtin_setup() -> None:
+        try:
+            if window not in webview.windows or webview.active_window() is not window:
+                return
+            port = read_port()
+            if port:
+                window.load_url(f"http://127.0.0.1:{port}/onboarding?builtin=1")
+        except Exception:
+            log.warning("Could not open built-in setup in this window.", exc_info=True)
+
+    return [Menu("Help", [MenuAction("Open built-in setup", open_builtin_setup)])]
 
 
 def prepare_first_run_settings() -> tuple[dict, bool]:
@@ -44,7 +73,7 @@ def prepare_first_run_settings() -> tuple[dict, bool]:
 
 def present_first_run_onboarding(
     settings: dict, port: int, *, open_external_url: Callable[[str], dict],
-    headless: bool = False,
+    headless: bool = False, read_port: Callable[[], int | None] | None = None,
 ) -> dict:
     """Show first-run onboarding served by the ALREADY-RUNNING managed gateway.
 
@@ -121,18 +150,19 @@ def present_first_run_onboarding(
                 window.destroy()
             return "ok"
 
-    appearance.attach(webview.create_window(
+    window = webview.create_window(
         "Ouroboros — Setup",
         url=f"http://127.0.0.1:{port}/onboarding",
         js_api=OnboardingHostApi(),
         width=980,
         height=780,
         min_size=(840, 640),
-    ))
+    )
+    appearance.attach(window)
     # Share persistent local UI storage with the same-origin main window.
     # This includes cookies and website data, not only the appearance choice.
-    webview.start(private_mode=False)
+    webview.start(private_mode=False, menu=setup_recovery_menu(window, read_port or (lambda: port)))
     return outcome
 
 
-__all__ = ["prepare_first_run_settings", "present_first_run_onboarding"]
+__all__ = ["prepare_first_run_settings", "present_first_run_onboarding", "setup_recovery_menu"]

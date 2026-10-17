@@ -39,7 +39,7 @@ def prepare(runtime):
 
 def test_history_failure_recovers_without_client_retry_or_history_scan(runtime, monkeypatch):
     from ouroboros.memory import Memory
-    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.owner_mailbox import drain_owner_entries, acknowledge_transcript_entry
 
     prepare(runtime)
     real_log = message_bus.log_chat
@@ -59,15 +59,16 @@ def test_history_failure_recovers_without_client_retry_or_history_scan(runtime, 
     monkeypatch.setattr(message_bus, "log_chat", real_log)
     monkeypatch.setattr(Memory, "read_chat_generations", lambda *a, **kw: pytest.fail("maintenance scanned chat generations"))
     due(runtime)
-    assert recover(runtime) == {"attempted": 1, "delivered": 1, "pending": 0}
+    assert recover(runtime) == {"attempted": 1, "delivered": 0, "pending": 1}
     repaired = block(runtime)
-    assert repaired["discharged_at"] and repaired["delivery"]["attempts"] == 2
+    assert not repaired.get("discharged_at") and repaired["delivery"]["attempts"] == 2
     assert repaired["request_id"] == original["request_id"] == "stable-owner-request"
     assert repaired["answered_at"] == original["answered_at"]
     assert repaired["answered_index"] == 1 and repaired["comment"] == " exact choice "
     [entry] = drain_owner_entries(runtime.root, runtime.task["id"], set())
     assert entry["kind"] == "quiz_answer" and "option 2: Second" in entry["text"]
-    assert runtime.frames[-1]["question_delivery"] == {"kind": "answer", "state": "delivered"}
+    assert acknowledge_transcript_entry(runtime.root, runtime.task["id"], entry)
+    assert block(runtime)["delivery"]["state"] == "delivered"
     assert recover(runtime)["attempted"] == 0
 
 
@@ -185,7 +186,7 @@ def migrated_without_address(runtime):
     assert members(runtime.root, "unknowns")["question:task-quiz:q"]["reason"] == "publication_address_ambiguous"
 
 
-@pytest.mark.parametrize("author", ["running", "paused_pending"])
+@pytest.mark.parametrize("author", ["running"])
 def test_live_author_receives_an_answer_whose_card_address_is_unknown_once(runtime, monkeypatch, author):
     """A task alive across the upgrade asked under the older body; its migration found no
     unique publication witness. Its mailbox needs no chat address: the winning answer reaches
@@ -205,7 +206,7 @@ def test_live_author_receives_an_answer_whose_card_address_is_unknown_once(runti
         "kind": "answer", "state": "owed", "reason_code": "publication_address_unknown"}
     def mailbox():
         return [entry for entry in drain_owner_entries(runtime.root, runtime.task["id"], set())
-                if entry["msg_id"] == "quiz_answer:q"]
+                if entry["msg_id"] == "quiz_answer:task-quiz:q"]
     [entry] = mailbox()
     assert entry["kind"] == "quiz_answer" and "option 2: Second" in entry["text"] and " exact words " in entry["text"]
     debt = block(runtime)["delivery"]
@@ -218,6 +219,8 @@ def test_live_author_receives_an_answer_whose_card_address_is_unknown_once(runti
     loser = _answer(runtime, "q", request_id="competing", index=0)
     assert loser[0] == 409 and loser[1]["answered_index"] == 1
     assert len(mailbox()) == 1 and block(runtime)["answered_index"] == 1
+    from ouroboros.owner_mailbox import acknowledge_transcript_entry
+    assert acknowledge_transcript_entry(runtime.root, runtime.task["id"], entry)
     # The author settles; an explicit import later binds the address from exact history: the
     # row is written once, and the answer the author already holds never becomes an owner turn.
     monkeypatch.setattr(queue, "RUNNING", {})
@@ -232,7 +235,7 @@ def test_live_author_receives_an_answer_whose_card_address_is_unknown_once(runti
     [row] = [row for row in rows if row.get("type") == "quiz_answer"]
     assert row["chat_id"] == 1 and row["quiz"]["comment"] == " exact words "
     assert not [row for row in rows if row.get("client_message_id") == "quiz_late_answer:task-quiz:q"]
-    assert runtime.bridge._inbox.empty() and len(mailbox()) == 1
+    assert runtime.bridge._inbox.empty() and mailbox() == []  # saved ACK excludes read mail
 
 
 def test_owner_closure_reaches_a_live_author_while_its_row_waits_for_an_address(runtime):
@@ -469,6 +472,9 @@ def test_removal_refuses_anything_but_an_unknown_late_answer(runtime):
     status, reply = _decide(runtime, request_id="rm-open", action="dismiss")
     assert status == 409 and reply["error"] == "delivery_not_unknown" and reply["state"] == "open"
     assert _answer(runtime, "q", request_id="live", index=0)[0] == 200
+    from ouroboros.owner_mailbox import drain_owner_entries, acknowledge_transcript_entry
+    [entry] = drain_owner_entries(runtime.root, runtime.task["id"], set())
+    assert acknowledge_transcript_entry(runtime.root, runtime.task["id"], entry)
     status, reply = _decide(runtime, request_id="rm-delivered", action="dismiss")
     assert status == 409 and reply["error"] == "delivery_not_unknown"
     assert reply["question_delivery"] == {"kind": "answer", "state": "delivered"} and "dismissed_at" not in block(runtime)["delivery"]

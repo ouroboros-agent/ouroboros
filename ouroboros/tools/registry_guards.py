@@ -326,6 +326,9 @@ def _disabled_tools(ctx: Any) -> frozenset:
     # too (harmless: nothing registers it), so old contracts round-trip as-is.
     if "claude_code_edit" in names:
         names.add("delegate_start")
+    from ouroboros.contracts.task_contract import expand_disabled_tool_names
+
+    names.update(expand_disabled_tool_names(names))
     # Rename compatibility: contracts that withheld `advisory_review` keep
     # withholding the SAME organ under its new name, and vice versa (a new
     # contract naming only the new spelling must also silence the alias).

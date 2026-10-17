@@ -14,6 +14,7 @@ from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterator, List, Optional
 
 from ouroboros.contracts.chat_id_policy import project_chat_id
+from ouroboros.composer_cognition import ensure_project_cognition, main_cognition, project_cognition
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.project_facts import sanitize_project_id
 from ouroboros.store import open_store
@@ -45,10 +46,7 @@ PROJECT_LIFECYCLES = frozenset({PROJECT_ACTIVE, PROJECT_DELETING, PROJECT_TOMBST
 def _file_write_lock(target_path: pathlib.Path, *, timeout_sec: float = 4.0) -> Iterator[None]:
     """Server create/bind and worker journal share a sidecar flock for load→modify→atomic-write;
     nested _LOCK serializes threads. A process-local lock alone permits lost updates."""
-    from ouroboros.platform_layer import (
-        acquire_exclusive_file_lock,
-        release_exclusive_file_lock,
-    )
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target_path.with_name(target_path.name + ".lock")
@@ -246,6 +244,7 @@ def bind_task_to_project(
     *,
     origin: Dict[str, Any],
     admission_basis: Optional[dict] = None,
+    execution_readmission: bool = False,
 ) -> Dict[str, Any]:
     """Durably bind an existing task/live card to a project thread.
 
@@ -268,9 +267,7 @@ def bind_task_to_project(
     if admission_basis is None and get_reserved_project(drive_root, pid) is None:
         create_project(drive_root, pid)
     media = _origin_media(drive_root, origin)  # a chat read: never under the registry's cross-process lock
-    # Linearize admission with the lifecycle fence. Holding the registry lock
-    # through the short bindings append means begin_project_deletion either lands
-    # before this bind (which is refused) or after it (which cancellation sees).
+    # Registry lock linearizes binding with destination deletion.
     with _file_write_lock(_registry_path(drive_root)), \
             project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
         project = next(
@@ -292,6 +289,7 @@ def bind_task_to_project(
             "project_id": pid,
             "project_chat_id": resolved_chat,
             "bound_at": utc_now_iso(),
+            **({"placement_admission": admission_basis} if execution_readmission else {}),
             **origin_fields,
         }
         with _file_write_lock(_bindings_path(drive_root)):
@@ -300,8 +298,6 @@ def bind_task_to_project(
             if isinstance(existing, dict):
                 existing_pid = str(existing.get("project_id") or "")
                 if existing_pid == pid:
-                    # One-way enrichment: fill a ref-less row when a valid ref
-                    # arrives; a stored valid ref is immutable (never replaced).
                     if not isinstance(existing.get("source_ref"), dict) and "source_ref" in origin_fields:
                         enriched = {
                             key: value for key, value in existing.items() if key != "origin_absent"
@@ -322,12 +318,8 @@ def bind_task_to_project(
 
 
 def project_task_bindings(drive_root: Any) -> Dict[str, Dict[str, Any]]:
-    """Copy of the immutable task-to-Project bindings for read models."""
-    return {
-        str(task_id): dict(row)
-        for task_id, row in _load_bindings(drive_root).get("bindings", {}).items()
-        if isinstance(row, dict)
-    }
+    """Copy of the immutable task-to-Project bindings for read models (the cached lens)."""
+    return {str(task_id): dict(row) for task_id, row in _bindings_lens(drive_root).items() if isinstance(row, dict)}
 
 
 def all_task_bindings(drive_root: Any) -> Dict[str, int]:
@@ -344,8 +336,10 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
     (F4), not merely to suppress the stray convert button (P2). Strict snapshot
     readers propagate source failures so absence never impersonates completeness."""
     out: Dict[str, Dict[str, Any]] = {}
-    try:
-        for tid, row in _load_bindings(drive_root, strict=strict).get("bindings", {}).items():
+    try:  # a strict reader rereads the file; the others share the mtime-keyed lens
+        names = {row["id"]: row.get("name") or row["id"] for row in _load(drive_root)["projects"]}
+        bindings = _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
+        for tid, row in bindings.items():
             if not isinstance(row, dict):
                 continue
             pid = str(row.get("project_id") or "").strip()
@@ -354,7 +348,7 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
             except (TypeError, ValueError):
                 cid = 0
             if pid and cid:
-                out[str(tid)] = {"project_id": pid, "chat_id": cid}
+                out[str(tid)] = {"project_id": pid, "chat_id": cid, "project_name": str(names.get(pid) or pid)}
     except Exception:
         if strict:
             raise
@@ -433,16 +427,11 @@ _ORIGIN_CLAIM_LOCK = threading.RLock()
 
 
 def origin_claim_lock() -> Any:
-    """The one lock every IMPLICIT project claim holds from its origin read through
-    its durable bind: the UI conversion, the promote handler and the in-task
-    ``ensure_project_scope`` handler. All three run in the SERVER process (the
-    gateway is in-process with the supervisor, and workers reach both through
-    events), so a process-local RLock serializes them; a model call that names the
-    project stays OUTSIDE it, because it may await for seconds.
+    """Serialize mind/button placement from the task binding read through commit.
 
-    Without it two cards of the SAME owner message, clicked in two tabs (or the
-    desktop shell and the mini app) inside one naming window, both read "no project
-    for this origin" and both create one."""
+    Naming stays outside the lock. Shared message origin is provenance only;
+    independent works never acquire each other's room through this serializer.
+    """
     return _ORIGIN_CLAIM_LOCK
 
 
@@ -470,46 +459,6 @@ def _live_task_ids() -> set:
         log.debug("_live_task_ids: direct activity read failed", exc_info=True)
     live.discard("")
     return live
-
-
-def live_origin_lanes() -> list:
-    """``(task_id, origin_message_ref)`` for every LIVE owner ROOT and in-flight
-    direct turn — the task ids one owner message's work can still be spread across.
-
-    Subagents are excluded: a delegated child is never bound itself, it inherits
-    its root's project by lineage. ONE scan with TWO readers that must agree — the
-    freshly created project's sibling claim (which binds them durably) and the
-    /api/state binding projection (which only closes their convert gate). While
-    each kept its own scan, a task the claim skipped could still be offered as a
-    second convertible unit for work that already has a project. Never raises: an
-    unreadable supervisor answers "no lanes", which degrades to today's
-    task-keyed behaviour rather than blocking the owner.
-    """
-    lanes: list = []
-    try:
-        from supervisor.queue import _queue_lock
-        from supervisor.workers import PENDING, RUNNING
-
-        with _queue_lock:
-            rows = [meta.get("task") for meta in list(RUNNING.values()) if isinstance(meta, dict)]
-            rows += list(PENDING or ())
-        for row in rows:
-            if not isinstance(row, dict) or str(row.get("delegation_role") or "") == "subagent":
-                continue
-            lanes.append((str(row.get("id") or ""), row.get("origin_message_ref")))
-    except Exception:
-        log.debug("live_origin_lanes: queue scan failed", exc_info=True)
-    try:
-        from supervisor.active_activity import get_direct_activity_registry
-
-        for entry in get_direct_activity_registry().actors():
-            lanes.append((
-                str(getattr(entry, "activity_id", "") or ""),
-                getattr(entry, "origin_message_ref", None),
-            ))
-    except Exception:
-        log.debug("live_origin_lanes: direct activity scan failed", exc_info=True)
-    return [(tid, ref) for tid, ref in lanes if tid]
 
 
 def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = False,
@@ -762,11 +711,15 @@ class RoomResolver:
         return chat
 
     def warm(self, task_ids: Any) -> None:
-        """Read every unseen id's lineage in ONE transaction (an archive summary names hundreds)."""
-        unseen = {tid for tid in map(str, task_ids) if tid and (str(self.root), tid) not in _TASK_LINEAGE}
-        read = _read_lineage(self.root, unseen - self.misses) if unseen - self.misses else {}
-        if read is not None:
+        """Read the lineage of every unseen id and of its unseen ancestors, ONE transaction per
+        generation, before the rule walks them one id at a time (a page names dozens)."""
+        wanted = {str(tid) for tid in task_ids if tid}
+        while unseen := {tid for tid in wanted if (str(self.root), tid) not in _TASK_LINEAGE} - self.misses:
+            read = _read_lineage(self.root, unseen)
+            if read is None:
+                return
             self.misses.update(unseen - read.keys())
+            wanted = {row[key] for row in read.values() for key in ("parent_task_id", "root_task_id") if row[key]}
 
 
 def project_chat_for_task_tree(
@@ -999,15 +952,13 @@ def create_project(
     origin: str = "owner",
     admission_basis: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Register or return an active room; its optional folder may stay empty.
-
-    Chat identity derives deterministically from the id. The returned, unpersisted
-    ``created`` flag is true only for THIS registration, so announcements can
-    distinguish a newly created room from an idempotent replay.
-    """
+    """Register an active room with deterministic chat id and an optional folder.
+    The unpersisted ``created`` flag distinguishes this registration from replay."""
     pid = sanitize_project_id(project_id)
     if not pid:
         raise ValueError(f"unusable project id: {project_id!r}")
+    cognition = main_cognition()
+    ensure_project_cognition(drive_root, baseline=cognition)
     with _file_write_lock(_registry_path(drive_root)), \
             project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
         data = _load(drive_root, strict=True, project_id=pid)
@@ -1024,6 +975,7 @@ def create_project(
             "name": _validated_name(name, pid),
             "chat_id": project_chat_id(pid),
             "working_dir": str(working_dir or "").strip(),
+            "cognition": cognition,
             "origin": str(origin or "owner"),
             "created_at": utc_now_iso(),
             "last_active_at": utc_now_iso(),
@@ -1236,6 +1188,8 @@ def reconcile_projects(drive_root: Any) -> int:
     """
     added = 0
     try:
+        ensure_project_cognition(drive_root)
+        cognition = main_cognition()
         if _registry_path(drive_root).is_file():
             _mark_registry_committed(drive_root)  # a registry saved before its witness existed
         projects_root = pathlib.Path(drive_root) / "projects"
@@ -1276,13 +1230,14 @@ def reconcile_projects(drive_root: Any) -> int:
                     if not store.is_dir():
                         continue
                     marker = _read_store_marker(store)
-                    if marker.get("id") != row.get("id") or marker.get("name") != row.get("name"):
+                    if any(marker.get(key) != row.get(key) for key in ("id", "name", "cognition")):
                         try:
                             atomic_write_json(store / _PROJECT_MARKER_NAME, {
                                 "id": row.get("id"),
                                 "name": row.get("name"),
                                 "origin": row.get("origin"),
                                 "created_at": row.get("created_at"),
+                                "cognition": row.get("cognition"),
                             })
                         except OSError:
                             # One unwritable store must not abort the whole reconcile:
@@ -1317,8 +1272,8 @@ def reconcile_projects(drive_root: Any) -> int:
                     # proj_*-named project passed through create_project and is
                     # already in ``known``, so it never reaches this guard.
                     row_name, row_origin, row_created = pid, "reconcile", ""
+                    marker = _read_store_marker(entry)
                     if pid.startswith("proj_") and pid not in bound:
-                        marker = _read_store_marker(entry)
                         if marker.get("id") != pid:
                             continue  # unbound, unmarked: a workspace facts store
                         # Recovery with the room's REAL identity: the pre-guard
@@ -1332,6 +1287,7 @@ def reconcile_projects(drive_root: Any) -> int:
                         "name": row_name,
                         "chat_id": project_chat_id(pid),
                         "working_dir": "",
+                        "cognition": project_cognition(marker, cognition),
                         "origin": row_origin,
                         "created_at": row_created or utc_now_iso(),
                         "last_active_at": utc_now_iso(),
@@ -1478,6 +1434,7 @@ def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -
     """Sidebar list or strict addressed room, independent of sidebar caps/activity.
     Missing/inactive yields no room; unreadable/ambiguous authority raises."""
     out: List[Dict[str, Any]] = []
+    cognition = main_cognition()
     bindings = _load_bindings(drive_root).get("bindings", {})
     if chat_id is not None:
         address = int(chat_id)
@@ -1489,15 +1446,10 @@ def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -
         projects = list_sidebar_projects(drive_root)[: max(1, int(limit))]
 
     def _has_thread_activity(project: Dict[str, Any]) -> bool:
-        # Registry-facts derivation ONLY — the GET path never scans logs and
-        # never writes. Micro-delta vs the retired per-request log scan
-        # (disclosed): a project whose thread carries ONLY telemetry rows (no
-        # owner-visible canonical row, no binding) reads inactive until its
-        # first visible row — exactly the junk-row shape this filter exists
-        # to hide. Legacy projects whose activity predates the
-        # visible_revision counter are covered by the write-once
-        # `thread_activity_seen` flag seeded at boot reconcile
-        # (_backfill_thread_activity).
+        # Registry facts only: GET never scans logs or writes. Telemetry-only
+        # rooms (no visible canonical row or binding) remain inactive until a
+        # visible row arrives, hiding junk rooms. Boot reconcile's write-once
+        # thread_activity_seen covers activity predating visible_revision.
         pid = str(project.get("id") or "")
         # v6.59.0: a project the OWNER explicitly created in the UI is always shown —
         # the activity filter exists to hide junk reconcile rows, not a fresh project
@@ -1516,6 +1468,7 @@ def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -
             "name": project.get("name"),
             "chat_id": project.get("chat_id"),
             "working_dir": project.get("working_dir") or "",
+            "cognition": project_cognition(project, cognition),
             "provenance": project.get("provenance") or "",
             "last_active_at": project.get("last_active_at") or "",
             "lifecycle": project.get("lifecycle") or PROJECT_ACTIVE,
@@ -1546,7 +1499,6 @@ __all__ = [
     "list_projects",
     "list_reserved_projects",
     "list_sidebar_projects",
-    "live_origin_lanes",
     "origin_claim_lock",
     "origin_key",
     "project_binding_for_task",

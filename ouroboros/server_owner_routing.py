@@ -87,20 +87,11 @@ def _route_project_chat_to_running_task(
     task_metadata: Any = None,
     image_data: Any = None,
 ) -> str:
-    """Deliver a Project follow-up to the sole RUNNING/PENDING root mailbox.
+    """Deliver ordinary room input to its sole live reader, under admission locks.
 
-    Multi-project (v6.32.0): a focused project room with exactly ONE active pooled
-    task IS that task's context, so a follow-up is delivered to it as a TRANSPORT
-    invariant (the loop drains the mailbox every round) — there is no routing CHOICE
-    to make. But when the room has ZERO or MORE THAN ONE steerable task, picking a
-    target is a JUDGMENT, and code must never make it mechanically (BIBLE P5 LLM-first,
-    v6.34.0 WS1): this returns "" so the message flows to the decision turn, where the
-    agent sees `current_chat.running_tasks` and chooses `steer_task` / `promote_chat_to_task`.
-    Returns the delivered task id, or "" (no delivery — fall through to the decision lane).
-
-    A chat is a project thread by REGISTRY membership, not a bare numeric range —
-    large external-transport (Telegram-style) chat ids must not be misclassified and
-    have their owner messages swallowed.
+    Queued or paused roots remain explicit tell_task targets, never implicit
+    readers. Zero or several readers starts a fresh head in this room; the
+    model chooses whether to relay, move, detach, answer or start work.
     """
     try:
         if not _project_id_for_registered_chat(ctx, chat_id):
@@ -108,7 +99,7 @@ def _route_project_chat_to_running_task(
     except Exception:
         return ""
     try:
-        steerable = _addressable_root_tasks(ctx, chat_id)
+        steerable = [row for row in _addressable_root_tasks(ctx, chat_id) if row.get("room_reader")]
         # Exactly one candidate => unambiguous transport. Zero or many => a routing
         # decision the AGENT must make (P5/WS1), so do not deliver here.
         if len(steerable) != 1:
@@ -205,6 +196,10 @@ def _route_project_chat_to_running_task(
                 ctx, task_drive, tid, task_metadata, image_data,
             )
             if direct_lock_held:
+                from ouroboros.room_reader import is_reading
+                if not is_reading(task_drive, tid, task_obj or candidate, running=True):
+                    _drop_staged_inputs()
+                    return ""
                 # AR2-6 (fable): the direct-agent lane used to skip the
                 # cancel-pending admission check the queue lane makes below — a
                 # direct turn whose cancellation is pending must not accept a
@@ -218,11 +213,11 @@ def _route_project_chat_to_running_task(
                 _queue_lock.acquire()
                 queue_lock_held = True
                 live_meta = getattr(ctx, "RUNNING", {}).get(tid)
-                still_pending = any(
-                    isinstance(row, dict) and str(row.get("id") or "") == tid
-                    for row in list(getattr(ctx, "PENDING", []) or [])
-                )
-                if live_meta is None and not still_pending:
+                if isinstance(live_meta, dict):
+                    task_obj = live_meta.get("task") if isinstance(live_meta.get("task"), dict) else live_meta
+                from ouroboros.room_reader import is_reading
+                if not is_reading(task_drive, tid, task_obj, running=live_meta is not None,
+                                  fences=getattr(ctx, "BUDGET_ROOT_FENCES", None)):
                     return ""
                 # A worker may remain RUNNING to finish paid post-work after its
                 # answer/result settled. Its solve loop no longer drains this
@@ -624,7 +619,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             event["origin_suppressed"] = True
         _handle_promote_chat_to_task(event, ctx)
         return
-    if project_id:
+    if project_id and not task_metadata.get("late_answer"):
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,

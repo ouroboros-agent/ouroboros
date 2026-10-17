@@ -350,18 +350,18 @@ test('a bodyless 409 no longer invents an expiry the card would obey', async () 
         card.querySelectorAll('.chat-quiz-option')[0].click();
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(card.dataset.state, 'open');
-        assert.match(fx.toasts[0].text, /Could not record the answer \(409\)/);
-        // The pending latch is released: the owner can try again.
+        assert.match(fx.toasts[0].text, /Answer not confirmed/);
+        // An unknown outcome forbids a different/automatic second answer.
         card.querySelectorAll('.chat-quiz-option')[0].click();
         await new Promise((resolve) => setTimeout(resolve, 0));
-        assert.equal(fx.calls.length, 2);
+        assert.equal(fx.calls.length, 1);
     } finally { fx.restore(); }
 });
 
 test('a retry reuses the SAME request_id (stable idempotency key)', async () => {
     const seen = [];
     let failFirst = true;
-    const fx = fixture({ fetchImpl: async (url, init) => {
+    const fx = fixture({ isMain: true, fetchDetail: async () => ({ task_id: 't-1', chat_id: 1, owner_quiz: { 'qz-1': WS_MSG } }), fetchImpl: async (url, init) => {
         seen.push(JSON.parse(init.body).request_id);
         if (failFirst) { failFirst = false; return { ok: false, status: 503, json: async () => ({}) }; }
         return { ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', answered_index: 0 }) };
@@ -372,7 +372,7 @@ test('a retry reuses the SAME request_id (stable idempotency key)', async () => 
         btn.click();
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(card.dataset.state, 'open'); // 503 leaves the card open for retry
-        btn.click();
+        card.querySelector('.chat-quiz-retry').click();
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(card.dataset.state, 'answered');
         assert.equal(seen.length, 2);
@@ -560,24 +560,25 @@ test('Enter sends an optionless answer through Send; Shift+Enter, composition an
 
 test('held Enter and an Enter/click race record one answer; a refusal keeps the draft for the same retry', async () => {
     const replies = [];
-    const fx = fixture({ fetchImpl: () => new Promise((resolve) => replies.push(resolve)) });
+    const fx = fixture({ isMain: true, fetchDetail: async () => ({ task_id: 't-1', chat_id: 1, owner_quiz: { 'qz-1': WS_MSG } }),
+        fetchImpl: () => new Promise((resolve) => replies.push(resolve)) });
     try {
         const card = fx.decision.buildQuizCard(WS_MSG);
         const { field, send } = commentParts(card);
         field.value = 'wait for CI, then merge';
         field.listeners.get('input')();
         pressEnter(field);
-        assert.equal(pressEnter(field, { repeat: true }).defaultPrevented, true);
+        assert.equal(pressEnter(field, { repeat: true }).defaultPrevented, undefined, 'the submitted field is read-only while confirmation is unknown');
         pressEnter(field);
         send.click();
         await turn();
         assert.equal(fx.calls.length, 1, "the card's pending answer is the one gate");
         replies.shift()({ ok: false, status: 503, json: async () => ({}) });
         await turn();
-        assert.deepEqual([card.dataset.state, fx.toasts.at(-1).text], ['open', 'Could not record the answer (503).']);
+        assert.deepEqual([card.dataset.state, fx.toasts.at(-1).text], ['open', 'Answer not confirmed. Your original answer is kept.']);
         assert.equal(card.querySelector('.chat-quiz-comment'), field);
         assert.equal(field.value, 'wait for CI, then merge', 'the draft survives the refusal');
-        pressEnter(field);
+        card.querySelector('.chat-quiz-retry').click();
         await turn();
         const [first, retry] = fx.calls.map((call) => JSON.parse(call.init.body));
         assert.deepEqual([fx.calls.length, retry.request_id], [2, first.request_id], 'the retry replays the same request');

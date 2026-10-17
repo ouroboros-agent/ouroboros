@@ -352,8 +352,8 @@ def _initial_effort_for(task: Dict[str, Any], task_type: str) -> str:
     """The effort a task starts on.
 
     For a delegated child this is what ``resolve_subagent_dispatch`` derived and
-    wrote onto the record moments ago, which is ``resolve_effort(task_type)`` — read
-    back rather than recomputed so the loop runs the effort the record states. For
+    wrote onto the record moments ago — read back rather than recomputed so the
+    loop runs the effort the record states. For
     everything else, and for an unrecognized STORED value (durable data outlives the
     schema that wrote it), it is the task-type default directly — or, when the task
     names a model ROLE in its metadata (a consciousness wake-up), that role's effort

@@ -10,9 +10,9 @@ import {
     chatStatusCounts,
     createStateSnapshotSequencer,
     isForegroundLiveCard,
-    routingAnnotationText,
     unkeyedFrameEndsTurn,
 } from '../modules/chat_activity.js';
+import { routingAnnotationText } from '../modules/routing_receipt.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 

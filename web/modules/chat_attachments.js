@@ -333,7 +333,7 @@ export function createComposerAttachments({ preview, attachBtn, fileInput, input
 
 // What a reload keeps of a sent frame: its words, identity, routing and the refs of uploads the
 // host already stores — never bytes, never the send-time client_surface (an honest gap on resend).
-const KEPT_FRAME_KEYS = ['type', 'content', 'client_message_id', 'sender_session_id', 'force_plan', 'chat_id', 'project_id'];
+const KEPT_FRAME_KEYS = ['type', 'content', 'client_message_id', 'sender_session_id', 'force_plan', 'chat_id', 'project_id', 'reply_to'];
 
 function keptFrame(frame) {
     if (frame?.type !== 'chat' || typeof frame.content !== 'string' || !frame.client_message_id) return null;
@@ -343,11 +343,12 @@ function keptFrame(frame) {
 }
 
 /**
- * Attachment messages the socket took but the host has not yet confirmed saving. A
- * local `send()` is not acceptance; the echo or history row marked `ingress_accepted`
- * is (`settle`, beside `markIngressSaved`). Until then the sent frame is kept under its
- * own client_message_id, with no count bound: each one is an unsaved message of the
- * owner's. This tab's `storage` (sessionStorage) keeps its words, id, routing and
+ * Owner messages the host has not yet confirmed saving: every send, words or attachments (a bare slash
+ * command is a command, not a message). A local `send()` is not acceptance; the echo or history row
+ * marked `ingress_accepted` is (`settle`, beside `markIngressSaved`). Until then the sent frame (its
+ * `reply_to` included) is kept under its own client_message_id, with no count bound: each one is an
+ * unsaved message of the owner's. A frame still in the socket's offline queue (`queued`) is that
+ * queue's until it is written (`flushed`); a close offers nothing for it meanwhile. This tab's `storage` (sessionStorage) keeps its words, id, routing and
  * upload refs (`keptFrame`, with the bubble's views and time) across a reload and a
  * room's teardown; a storage refusal is shown and the in-memory copy still retries, and
  * a kept copy the next instance cannot read is shown too, never silently dropped. A
@@ -363,14 +364,15 @@ function keptFrame(frame) {
  * (or echoed before a deferred dispatch): the frame waits for the next fact. A saved row
  * with none of the three came from a host process that has since ended (a restart came
  * between): whether it reached the agent is unknown and Send again would only rejoin
- * it, so its bubble says "Saved; delivery not confirmed" and the frame is dropped. Bubble
+ * it, so its bubble says "Saved; delivery not confirmed" and the frame is dropped; the one action it keeps is "Send as a
+ * new message", which only prepares the composer with the owner's words (`compose`) and sends nothing. Bubble
  * labels (markIngressSaved): `Input saved` on `ingress_dispatched` and `ingress_pending`,
  * `Saved, not delivered.` (frame kept) on `ingress_undispatched`. `count` feeds the chat
  * instance's `hasPendingWork`, which keeps a Project room holding one hidden instead of
  * destroying it. Nothing here resends by itself or deletes an upload: those stay on the host.
  */
-export function createUnconfirmedSends({ send, root, onDomWrite, showToast, storage = null, storageKey = '' }) {
-    const frames = new Map();  // id -> { frame, views, ts, restored }
+export function createUnconfirmedSends({ send, root, onDomWrite, showToast, compose = null, storage = null, storageKey = '' }) {
+    const frames = new Map();  // id -> { frame, views, ts, restored, queued }
     const bubbleOf = (id) => [...(root()?.querySelectorAll('.chat-bubble.user[data-client-message-id]') || [])]
         .find((node) => node.dataset.clientMessageId === id) || null;
     let unreadable = false;  // a kept copy this tab cannot read restores nothing, and says so
@@ -445,6 +447,8 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, stor
     }
 
     // Saved by a host process that has since ended: what it did with the row is unknown, and nothing replays it.
+    // The one honest next step is a NEW message: its action prepares the composer with the owner's own words and sends
+    // nothing; the saved row stays as it is, and the owner reads, edits and sends (or does not) from the composer.
     function doubtDelivery(bubble) {
         let note = bubble.querySelector('[data-ingress-saved]');
         if (!note) {
@@ -455,6 +459,13 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, stor
         clearActions(note);
         note.dataset.ingressSaved = 'unconfirmed';
         note.textContent = tr('chat.saved_delivery_unconfirmed', 'Saved; delivery not confirmed.');
+        if (compose) {
+            const words = () => bubble.querySelector('.message')?.textContent || '';
+            // Short visible words so the sentence and its action share one row on a phone; the name stays whole.
+            const asNew = action(tr('chat.send_as_new_short', 'Send as new'), 'send_as_new', () => compose(words()));
+            asNew.setAttribute('aria-label', tr('chat.send_as_new', 'Send as a new message'));
+            note.append(asNew);
+        }
         return true;
     }
 
@@ -464,16 +475,21 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, stor
             const bubble = bubbleOf(id);
             if (!bubble) continue;  // not in the feed now: still unsaved, the frame stays
             if (bubble.querySelector('[data-ingress-saved]')?.dataset.ingressSaved === '') forget(id);
-            else onDomWrite(() => mark(id, bubble));
+            else if (!frames.get(id).queued) onDomWrite(() => mark(id, bubble));  // the socket's own queue still holds a queued one
         }
     }
 
     return {
-        track(frame, { views = [], ts = '' } = {}) {
+        track(frame, { views = [], ts = '', queued = false } = {}) {
             const id = String(frame?.client_message_id || '');
             if (!id) return;
-            frames.set(id, { frame, views: attachmentViews(views), ts });
+            frames.set(id, { frame, views: attachmentViews(views), ts, queued });
             persist();
+        },
+        /** The socket's offline queue wrote (or dropped) a queued frame: from now on it is this tab's to offer again. */
+        flushed(id) {
+            const entry = frames.get(String(id || ''));
+            if (entry) entry.queued = false;
         },
         /** The host's saved row for an id (its echo or history): the only thing that ends a doubt — unless
          *  the host proved that row never reached dispatch, which keeps the frame for its one handover, or

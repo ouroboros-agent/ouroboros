@@ -29,7 +29,7 @@ from ouroboros.contracts.task_contract import (
     normalize_allowed_resources,  # noqa: F401
 )
 from ouroboros.tools.control_delegation import (
-    _ensure_project_scope,
+    _move_to_project,
     admitted_depth_cap,  # noqa: F401
     child_budget_for_schedule,  # noqa: F401
     normalize_required_capabilities,  # noqa: F401
@@ -99,42 +99,20 @@ log = logging.getLogger(__name__)
 # the parent for the whole requested window on ids that exist nowhere.
 
 
-# promote_chat_to_task tool description (hoisted from get_tools for the
-# 300-line function gate; v6.70.0 added the ground-truth-probe contract).
-_PROMOTE_CHAT_DESCRIPTION = (
-    "Start a supervised pooled task while this conversation remains available. Use for "
-    "independent work needing its own queue slot, admission and reviews, or an owner's "
-    "explicit request for a separate task; tools/files/multiple steps alone can stay here. "
+_START_TASK_DESCRIPTION = (
+    "Start a NEW, separate independent work with its own task id and card. "
+    "The work reading the current request already exists and can do that request itself. "
+    "move_to_project places THIS work in a room with the same id. "
     "For an EXISTING artifact, ground-truth its existence with one cheap probe "
     "(list_skills/list_files): memory of past work is not evidence it still exists. "
-    "Give a short human-readable title. project_name creates a named Project and a NEW "
-    "task there; project_id uses an existing Project. Interpret the owner's intended name, "
-    "not keywords. To move THIS task instead, use ensure_project_scope. An unmet Swarm "
-    "force_plan obligation moves to the new task; further work here is unplanned. "
-    "Use predecessor_task_id for one settled result (see argument); steer_task for a live root. "
-    "workspace_root selects the working folder; by default a Project task's file/shell/git "
-    "tools use its registered folder, not the Ouroboros repo. workspace='none' opts out. "
-    "Owner follow-ups can steer the task. Claim creation only on OK, never PROMOTE_REJECTED "
-    "or PROMOTE_UNCONFIRMED; do not retry UNCONFIRMED automatically."
+    "Give the separate work a short title and objective. project_name creates a named room; "
+    "project_id selects an existing room. workspace_root selects its folder; "
+    "workspace='none' opts out of the room's default folder. "
+    "A durable pending intent means accepted, waiting to start; inspect its recorded "
+    "outcome before explicitly retrying an uncertain admission."
 )
 
-# route_to_project tool description, hoisted from get_tools for the same function gate.
-_ROUTE_TO_PROJECT_DESCRIPTION = (
-    "Route a main-chat message to an EXISTING project so the work continues in that "
-    "project's own context (memory/journal/thread), keeping the main chat free. Use "
-    "when a message clearly belongs to a known project (call list_projects first if "
-    "unsure of the id). If confidence is low or several projects/tasks could match, "
-    "CALL THIS TOOL with project_id='' and the owner's message: it emits the typed "
-    "needs_manual_target acknowledgement with host-validated task options and New task "
-    "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
-    "use promote_chat_to_task instead. When continuing one settled result (any project; "
-    "the host list is a hint), pass its internal `predecessor_task_id`; pass an empty "
-    "string for fresh work. Returns a visible routing receipt."
-)
 
-# The new root's starting effort: one optional choice shared by both verbs that mint a
-# root from a conversation; applied in Cyber Pro only (a root starts at the owner's
-# recommended level otherwise). Child actors decide theirs in schedule_subagent(effort=…).
 _ROOT_EFFORT_PARAM = {"type": "string", "enum": list(EFFORT_SCALE), "description": (
     "Optional: the reasoning effort the NEW task starts on; applied in Cyber Pro only — otherwise the "
     "task starts at my human's recommended level and the result says so. Omit for that level.")}
@@ -181,9 +159,11 @@ _SCHEDULE_SUBAGENT_DESCRIPTION = (
 
 def get_tools() -> List[ToolEntry]:
     from ouroboros.tools.control_maintenance import maintenance_tool_entries
+    from ouroboros.tools.control_mind import mind_tool_entries
 
     return [
         *maintenance_tool_entries(),
+        *mind_tool_entries(),
         ToolEntry("finish_task", {"name": "finish_task",
             "description": "Select the complete answer and request completion of your current task. "
                 "Use finish after considering the observed work, or stop with a rationale naming unfinished work. "
@@ -209,41 +189,37 @@ def get_tools() -> List[ToolEntry]:
             "description": "Promote ouroboros -> ouroboros-stable. Call when you consider the code stable.",
             "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
         }, _promote_to_stable),
-        ToolEntry("promote_chat_to_task", {
-            "name": "promote_chat_to_task",
-            "description": _PROMOTE_CHAT_DESCRIPTION,
+        ToolEntry("start_task", {
+            "name": "start_task",
+            "description": _START_TASK_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "objective": {"type": "string", "description": "What the task must accomplish."},
                     "title": {"type": "string", "description": "Short task name the owner sees on its card and on the Main receipt, <=80 chars; also the Project name if the owner converts the task. The objective is not shown in its place."},
-                    "project_name": {"type": "string", "description": "Display name of a NEW Project for the NEW task; its filesystem id is derived. Use ensure_project_scope to move THIS task instead.", "default": ""},
+                    "project_name": {"type": "string", "description": "Display name of a NEW Project for the NEW task; its filesystem id is derived. Use move_to_project to move THIS task instead.", "default": ""},
                     "expected_output": {"type": "string", "description": "What done looks like.", "default": ""},
                     "project_id": {"type": "string", "description": "Optional EXISTING project scope (filesystem-clean id).", "default": ""},
                     "workspace_root": {"type": "string", "description": "Absolute ordinary folder or Git worktree root outside Ouroboros repo/data, validated at admission. File/process work supports ordinary folders; Git operations need a worktree. Omit for the Project's registered working_dir or, in Main, Ouroboros's own repo.", "default": ""},
                     "workspace": {"type": "string", "description": "'none' opts out of the Project's default folder; empty otherwise.", "default": ""},
                     "context_requires_self_body_docs": {"type": "boolean", "description": "True for work on Ouroboros code, including copies elsewhere: this task gets the full development handbook in Max. Low/Nano and helpers keep their usual book maps.", "default": False},
                     "source": {"type": "string", "description": "Attach an existing folder or clone a git URL (https://... or git@host:path) server-side into the projects root; private auth failures are typed auth_required. Registers the folder with provenance + trusted_at as the Project/task workspace. Use for work on a supplied repo/folder.", "default": ""},
-                    "predecessor_task_id": {"type": "string", "description": "Required: empty for fresh work, or one settled result id from the host manifest/recent_tasks/get_task_result. Any settled status/project; lists are hints. Name the root for a helper's result. Live roots and pending promotes refuse."},
                     "reasoning_effort": _ROOT_EFFORT_PARAM,
                 },
-                "required": ["objective", "title", "predecessor_task_id"],
+                "required": ["objective", "title"],
             },
-        }, _promote_chat_to_task),
-        ToolEntry("ensure_project_scope", {
-            "name": "ensure_project_scope",
+        }, _start_task),
+        ToolEntry("move_to_project", {
+            "name": "move_to_project",
             "description": (
-                "Create (or attach to) a named Ouroboros PROJECT and bind THE CURRENT running "
-                "task to it DURABLY. Use this when you are ALREADY working a task and realize it "
-                "should be a named project (the owner asked to 'create a project called X', or the "
-                "work has grown into a real deliverable) — instead of a bare filesystem mkdir. "
-                "Unlike promote_chat_to_task (which starts a NEW independent task in a project), "
-                "this binds the task you are in: its journal_write and per-project knowledge start "
-                "working, and its live progress routes to the project thread. The result states "
-                "the REAL outcome the host recorded — the durable binding, a typed refusal, or "
-                "unconfirmed — never a promise. Idempotent for the same project; a task already "
-                "bound to a different project stays there (a requested name is carried to that "
-                "project as a rename). A planning obligation stays with this task."
+                "Place this work in a named Project room, keeping its task id and card. "
+                "Use it when the current request belongs in a project; only this work moves. "
+                "Its journal, knowledge tools and progress routing use the room immediately. "
+                "The current execution keeps its folder and writer lease until readmission "
+                "at the next execution boundary; knowledge is not automatically reloaded. "
+                "The result reports the recorded durable binding, refusal or unconfirmed outcome. "
+                "A task already bound to a room stays there; a requested name renames that room. "
+                "A planning obligation stays with this task."
             ),
             "parameters": {
                 "type": "object",
@@ -253,50 +229,32 @@ def get_tools() -> List[ToolEntry]:
                 },
                 "required": [],
             },
-        }, _ensure_project_scope),
+        }, _move_to_project),
         ToolEntry("list_projects", {
             "name": "list_projects",
             "description": (
                 "List the owner's projects (id, name, recency, running flag) — read-only. "
                 "Use it in a main-chat turn to decide whether a message belongs to an existing "
-                "project, then route it there with route_to_project."
+                "project, then place this work there with move_to_project."
             ),
             "parameters": {"type": "object", "properties": {
                 "limit": {"type": "integer", "default": 50, "description": "Max projects to list."},
             }},
         }, _list_projects),
-        ToolEntry("route_to_project", {
-            "name": "route_to_project",
-            "description": _ROUTE_TO_PROJECT_DESCRIPTION,
+        ToolEntry("tell_task", {
+            "name": "tell_task",
+            "description": "Send a note to another work, with optional exact owner quotes selected from "
+                           "your held owner_quote_handles. The note is yours; quoted words remain the owner's. "
+                           "The work reads it at its next checkpoint. Paused work keeps the mail without resuming. "
+                           "Use forward_to_worker for messages inside your task tree. "
+                           "Presence can address work of its own binding only.",
             "parameters": {"type": "object", "properties": {
-                "project_id": {"type": "string", "default": "", "description": "Target project id (filesystem-clean; see list_projects), or empty to emit typed needs_manual_target."},
-                "message": {"type": "string", "description": "The owner message / work to route into the project."},
-                "title": {"type": "string", "description": "Short task name the owner sees on the new root's card, <=80 chars. Required when an existing project is targeted; no title is needed for the manual picker (blank or invalid target), which starts no task."},
-                "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
-                "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a settled result (any settled status; any project, the host list is a hint; a helper's result is continued with its root named) to continue it. A live root or a pending promote is refused."},
-                "candidates": {"type": "array", "items": {"type": "string"}, "description": "Optional, ONLY with project_id='': the task/project ids you consider plausible, in preference order. The typed picker shows them first; ids not in the host-built option list are ignored."},
-                "reasoning_effort": _ROOT_EFFORT_PARAM,
-            }, "required": ["message", "predecessor_task_id"]},
-        }, _route_to_project),
-        ToolEntry("steer_task", {
-            "name": "steer_task",
-            "description": (
-                "Deliver a message to any host-listed active independent root (a running or pending "
-                "root task; hidden/headless roots included) — YOU pick from current_chat.addressable_root_tasks, "
-                "main_routing_manifest.root_tasks, or the [INDEPENDENT_ROOTS] note. Use it when a message "
-                "continues or redirects a task already in flight, instead of spawning a duplicate. Who "
-                "you are decides how it lands: in an owner conversation turn it is delivered as the "
-                "owner's steering text; from a task it is written as a message from THIS task (never "
-                "owner text, no file attachments), and the result says written, not read. The task picks "
-                "it up at its next step. If no running task clearly fits, use promote_chat_to_task "
-                "(new work) or answer inline — never steer a task you are unsure about. "
-                "A Presence-bound turn can steer only work in its own binding; the host checks it."
-            ),
-            "parameters": {"type": "object", "properties": {
-                "task_id": {"type": "string", "description": "Id of the running task to steer (from current_chat.running_tasks)."},
-                "message": {"type": "string", "description": "The follow-up / steering message to deliver to that task."},
-            }, "required": ["task_id", "message"]},
-        }, _steer_task),
+                "task_id": {"type": "string", "description": "Work to receive the message."},
+                "note": {"type": "string", "default": "", "description": "Your own words and context."},
+                "quote": {"type": "array", "items": {"type": "string"}, "default": [],
+                          "description": "Owner row addresses held by this turn; exact words and attachments travel together."},
+            }, "required": ["task_id"]},
+        }, _tell_task),
         ToolEntry("schedule_subagent", {
             "name": "schedule_subagent",
             "description": _SCHEDULE_SUBAGENT_DESCRIPTION,
@@ -358,6 +316,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "text": {"type": "string", "description": "Message text"},
                 "reason": {"type": "string", "description": "Why you're reaching out (logged, not sent)"},
+                "reply_to_relay": {"type": "string", "description": "Reply to a drained relay in its source room. Empty selects the single open relay; omit for an ordinary room message."},
                 "destination": {"type": "string", "enum": ["current", "main"], "default": "current",
                                 "description": "'current' (default): this conversation's room. 'main': the "
                                                "owner's main chat, for a brief plain-text notice that belongs "
@@ -471,16 +430,11 @@ from ouroboros.tools.control_events import (  # noqa: E402, F401 -- intentional 
     _wait_for_routing_annotation,
 )
 from ouroboros.tools.control_routing import (  # noqa: E402, F401 -- intentional public re-exports
-    _MISSING_PREDECESSOR_SELECTOR,
     _attach_client_surface,
     _attach_origin_from_metadata,
-    _attach_predecessor_authority_from_metadata,
     _finish_swarm_handoff,
     _list_projects,
-    _predecessor_selector_error,
-    _promote_chat_to_task,
-    _route_to_project,
-    _steer_task,
+    _start_task,
 )
 from ouroboros.tools.control_runtime import (  # noqa: E402, F401 -- intentional public re-exports
     _chat_history,
@@ -556,3 +510,5 @@ from ouroboros.tools.control_task_results import (  # noqa: E402, F401 -- intent
 # _schedule_task and HIDDEN_LEGACY_SCHEDULE_PARAMS above (the moved spans own
 # the definitions; the attribute consumer reads it off the registered handler).
 setattr(_schedule_task, "_hidden_legacy_params", HIDDEN_LEGACY_SCHEDULE_PARAMS)
+
+from ouroboros.tools.control_relay import _tell_task

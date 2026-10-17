@@ -40,7 +40,7 @@ from ouroboros.settings_defaults import (
     settings_env_keys,  # noqa: F401
 )
 from ouroboros.settings_scales import (
-    EFFORT_SCALE, OPTIONAL_BOUND_LEGACY, UNLIMITED,  # noqa: F401
+    EFFORT_SCALE, EFFORT_RANGE_KEYS, EFFORT_FORMAT_KEY, normalize_effort_document, OPTIONAL_BOUND_LEGACY, UNLIMITED,  # noqa: F401
     PROMPT_CACHE_TTL_SCALE, defaults_for_settings_document, optional_bound_value,  # noqa: F401
     REVIEW_POOL_DEFAULT_EFFORT,  # noqa: F401
     VALID_RUNTIME_MODES,  # noqa: F401
@@ -502,6 +502,8 @@ def prepare_settings_for_persist(settings: dict, *, authored_keys: Sequence[str]
     for key in (MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY, MODEL_PROCESSING_PREFERENCES_KEY):
         if key in prepared:
             prepared[key] = normalize_model_role_options(key, prepared[key])[1]
+    from ouroboros.composer_cognition import preserve_project_cognition
+    preserve_project_cognition(prepared, SETTINGS_PATH)
     return strip_masked_secrets(prepared, known_setting_keys=SETTINGS_DEFAULTS)
 
 
@@ -700,9 +702,7 @@ def verify_settings_integrity() -> str | None:
 
 log = logging.getLogger(__name__)
 
-# Dropped-retired-key sets this process has already reported (the notice in
-# ``normalize_settings_raw``). Keyed by the exact set so a document carrying a
-# second ghost still gets its own line.
+# Retired-key combinations reported by normalize_settings_raw each get one notice.
 _RETIREMENT_NOTICE_SEEN: set[tuple[str, ...]] = set()
 
 
@@ -852,7 +852,9 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
             continue
         settings[key] = _coerce_setting_value(key, raw_env)
         env_authored.add(key)
-    # Unauthored model slots follow the configured access; a never-configured install (§1.5) mints its factory catalog here.
+    settings.update(normalize_effort_document({EFFORT_FORMAT_KEY: loaded.get(EFFORT_FORMAT_KEY),
+        **{key: settings[key] for key in EFFORT_RANGE_KEYS if key in loaded or key in env_authored}}))
+    # Unauthored slots and the never-configured catalog follow the configured access.
     propose_unauthored_model_slots(settings, authored_model_slots(loaded) | env_authored)
     apply_at_read_seam(settings, merged=True)
     return settings

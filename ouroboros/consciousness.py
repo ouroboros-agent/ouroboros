@@ -208,7 +208,7 @@ class BackgroundConsciousness:
         except OSError:
             log.warning("consciousness: legacy observation inbox could not be archived", exc_info=True)
 
-    def live_turns(self) -> Tuple[str, bool]:
+    def live_turns(self, *, queue_blocking: bool = True) -> Tuple[str, bool]:
         """``(live wake task id or "", owner turn live?)`` read off the direct-activity census."""
         from supervisor.active_activity import get_direct_activity_registry
         from supervisor.workers import direct_chat_turn
@@ -221,11 +221,14 @@ class BackgroundConsciousness:
                 wake = activity_id
             else:
                 owner = True
-        return wake, owner
+        from supervisor.consciousness_carriers import queued_wakes
+        pooled = queued_wakes(blocking=queue_blocking)
+        return wake or (pooled[0] if pooled else ""), owner
 
     def tick(self, now: Optional[float] = None) -> str:
         """One supervisor pass; never blocks on a wake. Returns the typed decision."""
         now = time.time() if now is None else float(now)
+        wake, owner_live = self.live_turns()  # never wait for Q while holding the clock lock
         with self._lock:
             from supervisor.state import control_is
 
@@ -235,7 +238,6 @@ class BackgroundConsciousness:
             self._enabled = not self._stopped and control_is(self._read_state(), "bg_consciousness_enabled", True)
             if not self._enabled:
                 return "disabled"
-            wake, owner_live = self.live_turns()
             if wake or owner_live:
                 return "wake_live" if wake else "owner_turn_live"
             if now < self._next_wake_at:
@@ -302,7 +304,11 @@ class BackgroundConsciousness:
 
         # Check-and-register under the lane's own re-entrant gate lock: atomic with the census.
         with workers._repo_writer_gate_lock:
-            wake, owner_live = self.live_turns()
+            from supervisor.consciousness_carriers import WakeCensusBusy
+            try:
+                wake, owner_live = self.live_turns(queue_blocking=False)
+            except WakeCensusBusy:
+                return "activity_census_busy"
             if wake or owner_live:
                 return "wake_live" if wake else "owner_turn_live"
             receipt = workers.handle_wake_direct(
@@ -377,8 +383,11 @@ class BackgroundConsciousness:
             self._stopped = True
             was_enabled, self._enabled = self._enabled, False
         wake, _owner = self.live_turns()
-        if wake:
-            threading.Thread(target=self._stop_live_wake, args=(wake,), name="wake-stop", daemon=True).start()
+        from supervisor.consciousness_carriers import queued_wakes
+        wakes = list(dict.fromkeys(([wake] if wake else []) + queued_wakes()))
+        if wakes:
+            for task_id in wakes:
+                threading.Thread(target=self._stop_live_wake, args=(task_id,), name="wake-stop", daemon=True).start()
             return f"Background consciousness disabled; wake-up {wake} ends at its next step."
         return "Background consciousness disabled." if was_enabled else "Background consciousness is already disabled."
 
@@ -388,7 +397,12 @@ class BackgroundConsciousness:
 
         try:
             turn = workers.direct_chat_turn(task_id)
-            turn is None or worker_chat_lane.stop_direct_chat_turn(task_id, turn)
+            from supervisor.consciousness_carriers import stop_pooled_wake
+            if turn is not None:
+                worker_chat_lane.stop_direct_chat_turn(task_id, turn)
+            # A handoff can race this read. An intent survives it and the ordinary
+            # sweep routes the stop to whichever carrier owns the id now.
+            stop_pooled_wake(task_id)
         except Exception:
             log.debug("consciousness: graceful stop of wake %s failed", task_id, exc_info=True)
 

@@ -267,7 +267,7 @@ test('live structured delivery frames keep additive grouping and size fields', (
     const types = moduleFile('api_types.js');
 
     for (const className of ['PhotoOutbound', 'VideoOutbound', 'DocumentOutbound', 'LinksOutbound', 'QuizOutbound']) {
-        assert.ok(contracts.includes(`class ${className}(TypedDict):`));
+        assert.ok(contracts.includes(`class ${className}(ChatReferenceFields):`));
         assert.ok(types.includes(`@typedef {Object} ${className}`));
     }
     assert.match(bus, /"type": "photo",[\s\S]*?"task_id": str\(task_id or ""\)/);

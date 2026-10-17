@@ -707,18 +707,19 @@ def test_right_to_left_strips_that_scroll_keep_the_moved_mode_and_bracket_in_vie
             assert at_end["maxWhole"] and at_end["ultraWhole"] and at_end["scroll"] == "end" and "to left" in at_end["fade"], seen
             assert at_end["max"][0] - at_end["shellLeft"] >= at_end["inset"] - 0.5, seen
             # A press lands on the level under it: back at the start, a press on None (outside the
-            # range, on the min side) carries the min bracket there.
+            # helper range) sets primary there without moving the min bracket.
             page.evaluate(f"() => {{ document.querySelector('{EFFORT} .chat-effort-strip').scrollLeft = 0; }}")
             page.wait_for_function(f"() => document.querySelector('{EFFORT} .chat-effort-strip').dataset.scroll === 'start'")
             none = page.evaluate(MARKS)["none"]
             box = page.locator(f'{EFFORT} [data-effort-seg="none"]').bounding_box()
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range"), timeout=30_000) as saved:
                 page.mouse.click(none[0] + (none[1] - none[0]) * 0.75, box["y"] + box["height"] / 2)
-            assert json.loads(saved.value.request.post_data)["min"] == "none", saved.value.request.post_data
+            assert json.loads(saved.value.request.post_data)["recommended"] == "none", saved.value.request.post_data
+            assert json.loads(saved.value.request.post_data)["min"] == "low", saved.value.request.post_data
             page.wait_for_timeout(300)
             seen["effort-press"] = pressed = page.evaluate(MARKS)
             # The scale's outer edge is two whole-pixel offsets (as Ultra's is left to right): within a pixel.
-            assert abs(pressed["band"][1] - pressed["none"][1]) <= 1 and abs(pressed["min"][1] - pressed["band"][1]) <= 0.6, seen
+            assert abs(pressed["pill"][1] - pressed["none"][1]) <= 1 and abs(pressed["min"][1] - pressed["band"][1]) <= 0.6, seen
             _shot(page, tmp_path, f"capsules-rtl-effort-press-{engine}-320")
         finally:
             _record(tmp_path, f"capsules-rtl-{engine}-320", seen)

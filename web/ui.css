@@ -113,6 +113,9 @@
     --ui-card-bg-soft: var(--surface-card-soft);
     --ui-card-border: var(--surface-border);
     --ui-modal-bg: rgba(var(--modal-rgb), 0.98);
+    /* A live task card's lift off the transcript: soft in light (a near-black shadow that suits the
+       dark shell reads as grime on white), unchanged in dark. */
+    --live-card-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(var(--neutral-rgb), 0.03);
     /* Status triples: fg/bg/border named together, never derived
        (docs/DESIGN.md "Status and chips"). The fg tints are readable at 12px on
        near-black; the saturated --green/--amber/--red stay for dots, tracks and
@@ -230,6 +233,8 @@
     /* The smallest comfortable touch target for a coarse pointer (a phone). */
     --touch-target-min: 36px;
     --vvh: 100dvh;
+    /* Quote panel glass (DESIGN "Replies"): the shell colour at one alpha, so a quote reads lighter than the bubble it sits in. */
+    --quote-glass: rgba(var(--shell-rgb), 0.7);
 }
 
 :root[data-theme="light"] {
@@ -273,6 +278,7 @@
     --diagram-line: #66606e;
     --diagram-secondary: #edf0f5;
     --diagram-tertiary: #f5f6f8;
+    --live-card-shadow: 0 6px 20px rgba(var(--neutral-rgb), 0.06), 0 1px 3px rgba(var(--neutral-rgb), 0.05);
     /* Airy dopamine seed, light values (the dark ones are in :root): white objects and capsules on two soft shadows. */
     --elev-rest: 0 1px 2px rgba(28, 33, 51, 0.05), 0 6px 18px rgba(28, 33, 51, 0.06);
     --elev-float: 0 2px 6px rgba(28, 33, 51, 0.06), 0 18px 44px rgba(28, 33, 51, 0.11);

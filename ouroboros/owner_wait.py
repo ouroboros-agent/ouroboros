@@ -60,8 +60,10 @@ def classify_wake(entries: list[dict], quiz_id: str) -> str:
         return "control:finalize_now"
     if KIND_OWNER_PAUSE in kinds:
         return "control:owner_pause"
-    if any(kind == KIND_QUIZ_ANSWER and row.get("msg_id") == f"quiz_answer:{quiz_id}"
-           for kind, row in zip(kinds, entries)):
+    # This card's answer: ``quiz_answer:{asker}:{quiz}``, or saved ``quiz_answer:{quiz}`` mail.
+    answers = [str(row.get("msg_id") or "") for kind, row in zip(kinds, entries) if kind == KIND_QUIZ_ANSWER]
+    if quiz_id and any(msg_id.startswith("quiz_answer:") and msg_id.rsplit(":", 1)[-1] == quiz_id
+                       for msg_id in answers):
         return "answer"
     if any(kind == KIND_QUIZ_CLOSED and row.get("msg_id") == f"quiz_closed:{quiz_id}"
            for kind, row in zip(kinds, entries)):
@@ -164,6 +166,8 @@ def continuation_state(ctx: Any, messages: list, trace: dict, usage: dict,
     cost_ceiling = getattr(ctx, "_cost_ceiling", None)
     model_wait = getattr(ctx, "model_wait_context", None)
     model_state = model_wait.continuation_state() if model_wait is not None else {}
+    from ouroboros.settings_integrity import captured_cognition
+
     return {
         "task_id": ctx.task_id, "task_attempt": int(getattr(ctx, "task_attempt", None) or 1),
         "started_at": getattr(ctx, "task_started_at", None),
@@ -175,6 +179,7 @@ def continuation_state(ctx: Any, messages: list, trace: dict, usage: dict,
         "usage": without_finalization_timing(usage),
         "cost_ceiling": asdict(cost_ceiling) if cost_ceiling is not None else None,
         "model_wait": model_state,
+        "cognition": captured_cognition(),
         "nanny_activity": {key: getattr(ctx, key, None) for key in (
             "_nanny_metered_progress", "_nanny_delegate_baseline",
         )},
@@ -187,6 +192,8 @@ def continuation_state(ctx: Any, messages: list, trace: dict, usage: dict,
         "round_idx": round_idx, "tool_schemas": tool_schemas,
         "seen": sorted(seen), "owner_directives": getattr(ctx, "_owner_directives", []),
         "sleep_interaction_seen": dict(getattr(ctx, "_sleep_interaction_seen", None) or {}),
+        "held_owner_messages": dict(getattr(ctx, "_held_owner_messages", None) or {}),
+        "open_relays": dict(getattr(ctx, "_open_relays", None) or {}),
         # Own routing acts still unconfirmed: a resumed turn reports their outcomes too.
         "unconfirmed_routing_acts": list(getattr(ctx, "unconfirmed_routing_acts", None) or []),
         "route": {key: getattr(ctx, key, None) for key in (
@@ -859,6 +866,8 @@ def wait_after_tools(ctx: Any, messages: list, trace: dict, usage: dict,
     """Yield only after complete tool results; no model polling or terminal path."""
     if not getattr(ctx, "_owner_wait_requested", "") and not review_binding:
         return
+    from ouroboros.model_detach import preserve_owner_question
+    preserve_owner_question(ctx, messages)
     sleep = getattr(ctx, "_model_sleep", None)
     if isinstance(sleep, dict) and sleep.get("mode") == "cold" and not review_binding:
         # A cold sleep ends this process at the next round boundary
@@ -942,8 +951,10 @@ def restore_continuation_state(tools: Any, state: dict, messages: list, trace: d
     from ouroboros.loop_delivery import DeliveryCandidate
 
     from ouroboros.model_wait import adopt_handoff_clock, budget_paused_seconds
+    from ouroboros.settings_integrity import restore_cognition
 
     ctx = tools._ctx
+    restore_cognition(state.get("cognition"))
     # Missing old observations are unknown, not this new process's startup seed.
     # None is the known fresh state; an empty mark has no historical anchor.
     for key in ("_nanny_metered_progress", "_nanny_delegate_baseline"):
@@ -958,6 +969,8 @@ def restore_continuation_state(tools: Any, state: dict, messages: list, trace: d
     ctx._loop_mailbox_seen_ids = seen
     ctx._sleep_interaction_seen = dict(state.get("sleep_interaction_seen") or {})
     ctx._owner_directives = state["owner_directives"]
+    ctx._held_owner_messages = dict(state.get("held_owner_messages") or {})
+    ctx._open_relays = dict(state.get("open_relays") or {})
     ctx.unconfirmed_routing_acts = [dict(act) for act in state.get("unconfirmed_routing_acts") or [] if isinstance(act, dict)]
     # Match the agent's native handoff clock; a budget grant overrides it separately.
     ctx._budget_paused_sec = budget_paused_seconds(adopt_handoff_clock(
@@ -977,8 +990,8 @@ def restore_continuation_state(tools: Any, state: dict, messages: list, trace: d
 def rebind_restored_route(tools: Any, state: dict, messages: list) -> tuple:
     """Rebind the restored route's context-fit plan; returns ``(plan, mode)``.
 
-    The new capture starts in the mode the task ran in (restored onto ``ctx``), never above the
-    owner's current one: a restore, like any route, never raises a mode."""
+    The actor's captured owner choice survives restart, separately from the physically
+    achieved mode. Legacy sources without that choice keep the previous fallback."""
     from ouroboros.loop import _rebind_context_fit_plan, get_context_mode
     from ouroboros.memory_floor import MODES
     from ouroboros.model_slots import task_model_binding

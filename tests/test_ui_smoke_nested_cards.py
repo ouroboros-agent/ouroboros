@@ -30,7 +30,8 @@ CHILD = '#page-chat .chat-live-card.subagent[data-task-id="%s"]'
 FACTS = """sel => {
     const card = document.querySelector(sel);
     const button = card.querySelector(':scope > .chat-live-summary-button');
-    const q = (s) => button.querySelector(s);
+    // The summary holds chip, title and line; the meta line and the Reviews count lead the card's own foot.
+    const q = (s) => button.querySelector(s) || card.querySelector(`:scope > [data-live-foot] ${s}`);
     const style = (el) => getComputedStyle(el);
     const rect = (el) => el.getBoundingClientRect();
     const title = q('[data-live-title]');
@@ -229,7 +230,8 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                 assert second_planner["text"] == "planner (33334444)"
                 assert "Agent model: gpt-5.6-sol" in first_planner["metaText"]
                 assert "Agent model: gemini-3.6-flash" in second_planner["metaText"]
-                # A child's review count docks on its metadata row while collapsed, like the root's.
+                # A child's review count stays in its own foot while collapsed, like the root's (the action row under
+                # its metadata line), never a band of the summary.
                 _emit_ws_frame(page, {**child_frame, "task_id": "nest-review", "subagent_task_id": "nest-review",
                                       "subagent_role": "reviewer", "subagent_event": "completed",
                                       "content": "reviewer re-read the candidate and filed a long note " + "word " * 40,
@@ -241,7 +243,7 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                 )
                 reviewed = page.evaluate(FACTS, CHILD % "nest-review")
                 assert reviewed["expanded"] == "0" and not reviewed["reviewsHidden"] and reviewed["reviewsDisplay"] != "none", reviewed
-                assert abs(reviewed["reviewsTop"] - reviewed["metaTop"]) <= 2, reviewed
+                assert reviewed["reviewsTop"] >= reviewed["metaTop"] - 2, reviewed
                 # Expanding a child reveals its narration line (metadata was already there).
                 page.locator(CHILD % "nest-review").locator(":scope > [data-live-summary-button]").click()
                 page.wait_for_timeout(200)

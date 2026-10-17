@@ -3,6 +3,7 @@
 import asyncio
 from copy import deepcopy
 import json
+import os
 import pathlib
 import queue
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 from ouroboros import cancel_intents, loop, model_wait, owner_mailbox, usage_accounting as ua
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
+from ouroboros.settings_integrity import task_settings_snapshot
 from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
 from tests.test_llm_claudexor import MODEL, result, setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
@@ -476,7 +478,8 @@ def test_hard_cancel_returns_empty_events_to_real_worker_loop_and_keeps_queue_ow
 
     monkeypatch.setattr(actual, "_prepare_task_context", prepare)
     monkeypatch.setattr(actual, "_start_task_heartbeat_loop", lambda *_args: None)
-    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose", lambda *_args: None)
+    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose",
+                        lambda *_args: task_settings_snapshot({}, os.environ))
     monkeypatch.setattr(agent_module, "make_agent", lambda **_kwargs: actual)
     monkeypatch.setattr(worker_process, "_bind_worker_repo_root", lambda *_args: None)
     monkeypatch.setattr(worker_process, "_prepare_worker_task_runtime", lambda: None)

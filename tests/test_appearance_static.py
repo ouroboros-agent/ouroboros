@@ -20,8 +20,11 @@ the structural fact, no browser needed.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
+
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WEB = REPO_ROOT / "web"
@@ -34,19 +37,45 @@ def _read(rel: str) -> str:
     return (REPO_ROOT / rel).read_text(encoding="utf-8")
 
 
+def _assert_persistent_webview_starts(source: str, rel: str) -> int:
+    calls = [node for node in ast.walk(ast.parse(source))
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and isinstance(node.func.value, ast.Name)
+             and node.func.value.id == "webview" and node.func.attr == "start"]
+    for call in calls:
+        assert any(keyword.arg == "private_mode" and isinstance(keyword.value, ast.Constant)
+                   and keyword.value.value is False for keyword in call.keywords), (
+            f"{rel}:{call.lineno}: webview.start() must explicitly pass private_mode=False; "
+            "a private WebView discards the appearance choice when the window closes"
+        )
+    return len(calls)
+
+
 def test_every_first_party_window_uses_a_persistent_profile():
-    calls = 0
-    for rel in WEBVIEW_HOSTS:
-        source = _read(rel)
-        for match in re.finditer(r"^\s*webview\.start\((.*)\)\s*$", source, re.M):
-            calls += 1
-            assert "private_mode=False" in match.group(1), (
-                f"{rel}: {match.group(0).strip()} starts a private WebView, so the "
-                "appearance choice is discarded when the window closes"
-            )
+    calls = sum(_assert_persistent_webview_starts(_read(rel), rel) for rel in WEBVIEW_HOSTS)
     # The count is asserted so that a NEW window added without the flag fails
     # here rather than silently using the library default.
     assert calls == 5, f"expected 5 first-party webview.start() calls, found {calls}"
+
+
+def test_persistent_profile_guard_reads_multiline_calls_and_ignores_non_calls():
+    source = '''
+# webview.start()
+example = "webview.start(private_mode=True)"
+other.start(private_mode=True)
+webview.start(
+    debug=False,
+    private_mode=False,
+    menu=build_menu(),
+)
+'''
+    assert _assert_persistent_webview_starts(source, "fixture.py") == 1
+
+
+@pytest.mark.parametrize("argument", ["", "private_mode=True", "private_mode=0"])
+def test_persistent_profile_guard_rejects_missing_or_non_false_argument(argument):
+    with pytest.raises(AssertionError, match="must explicitly pass private_mode=False"):
+        _assert_persistent_webview_starts(f"webview.start(\n    {argument}\n)", "fixture.py")
 
 
 def test_the_select_arrow_is_a_theme_token_not_a_baked_colour():

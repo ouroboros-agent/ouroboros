@@ -80,12 +80,12 @@ UNNAMED = [{}, {"title": ""}, {"title": "   \n\t"}, {"title": "**"}, {"title": '
 
 @pytest.mark.parametrize("named", UNNAMED, ids=["omitted", "empty", "whitespace", "markup-only", "quotes-only"])
 def test_a_model_promote_without_a_name_is_refused_before_any_effect(tmp_path, monkeypatch, named):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _no_effects(monkeypatch)
     ctx = SimpleNamespace(pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path)
-    out = _promote_chat_to_task(ctx, "Work order: audit chat rows.", predecessor_task_id="", **named)
-    assert out.startswith("⚠️ TOOL_ARG_ERROR (promote_chat_to_task): title is required"), out
+    out = _start_task(ctx, "Work order: audit chat rows.",  **named)
+    assert out.startswith("⚠️ TOOL_ARG_ERROR (start_task): title is required"), out
     assert "Nothing was scheduled" in out
     assert ctx.pending_events == [] and list(tmp_path.iterdir()) == []
 
@@ -102,17 +102,17 @@ def test_the_registered_tool_requires_a_name_and_refuses_an_unnamed_call(tmp_pat
     write_task_result(tmp_path, "root", "running", root_task_id="root")
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = registry._ctx.root_task_id = "root"
-    parameters = registry.get_schema_by_name("promote_chat_to_task")["function"]["parameters"]
-    assert parameters["required"] == ["objective", "title", "predecessor_task_id"]
+    parameters = registry.get_schema_by_name("start_task")["function"]["parameters"]
+    assert parameters["required"] == ["objective", "title"]
     title = parameters["properties"]["title"]
     assert "default" not in title and "If omitted" not in title["description"]
     assert "owner sees on its card" in title["description"]
-    args = {"objective": "Work order: audit chat rows.", "predecessor_task_id": ""}
+    args = {"objective": "Work order: audit chat rows."}
     assert list(Draft7Validator(parameters).iter_errors(args))
 
     _no_effects(monkeypatch)
     for unnamed in ({}, {"title": "  "}):
-        result = registry.execute_result("promote_chat_to_task", {**args, **unnamed})
+        result = registry.execute_result("start_task", {**args, **unnamed})
         assert (result.status, result.code) == ("error", "TOOL_ARG_ERROR"), result
         assert "title is required" in result.text
 
@@ -120,14 +120,13 @@ def test_the_registered_tool_requires_a_name_and_refuses_an_unnamed_call(tmp_pat
 def test_a_named_promote_is_admitted_under_its_name_and_a_queued_untitled_event_still_is(tmp_path, monkeypatch):
     """The refusal lives in the model-facing tool, not in admission: replay keeps working."""
     import supervisor.workers as workers
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     monkeypatch.setattr("ouroboros.tools.control_events._wait_for_promotion_admission",
                         lambda *_a, **_k: {"status": "scheduled", "effective_project_id": ""})
     ctx = SimpleNamespace(pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path)
     objective = "Work order: audit chat rows.\nRead every producer first."
-    assert _promote_chat_to_task(ctx, objective, title="Chat row audit", workspace="none",
-                                 predecessor_task_id="").startswith("OK: task")
+    assert _start_task(ctx, objective, title="Chat row audit", workspace="none").startswith("OK: task")
     [event] = ctx.pending_events
     assert event["title"] == "Chat row audit" and event["objective"] == objective
 
@@ -154,41 +153,3 @@ def test_the_descriptions_name_the_reader_without_changing_the_shapes():
     finish = _tool_schema(control, "finish_task")["parameters"]
     assert finish["required"] == ["action"]
     assert "owner reads it as the stop's cause on the task row" in finish["properties"]["rationale"]["description"]
-
-
-@pytest.mark.parametrize("named", UNNAMED, ids=["omitted", "empty", "whitespace", "markup-only", "quotes-only"])
-def test_a_model_route_without_a_name_refuses_before_creating_a_root(tmp_path, monkeypatch, named):
-    from ouroboros.projects_registry import create_project
-    from ouroboros.tools.control import _route_to_project
-
-    create_project(tmp_path, "audit", name="Audit")
-    before = {str(p.relative_to(tmp_path)): p.read_bytes() if p.is_file() else None for p in tmp_path.rglob("*")}
-    _no_effects(monkeypatch)
-    ctx = SimpleNamespace(pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path)
-    out = _route_to_project(ctx, "audit", "Internal work order", predecessor_task_id="", **named)
-    assert out.startswith("⚠️ TOOL_ARG_ERROR (route_to_project): title is required"), out
-    assert "Nothing was scheduled" in out
-    assert ctx.pending_events == []
-    assert before == {str(p.relative_to(tmp_path)): p.read_bytes() if p.is_file() else None for p in tmp_path.rglob("*")}
-
-
-def test_registered_route_title_is_conditional_and_its_refusal_is_typed(tmp_path, monkeypatch):
-    from jsonschema import Draft7Validator
-
-    import ouroboros.safety as safety
-    from ouroboros.projects_registry import create_project
-    from ouroboros.tools.registry import ToolRegistry
-
-    monkeypatch.setattr(safety, "check_safety", lambda *_a, **_k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
-    create_project(tmp_path, "audit", name="Audit")
-    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    parameters = registry.get_schema_by_name("route_to_project")["function"]["parameters"]
-    assert parameters["properties"]["title"]["type"] == "string"
-    assert "title" not in parameters["required"], "the manual picker launches nothing"
-    args = {"message": "Internal work order", "predecessor_task_id": ""}
-    assert not list(Draft7Validator(parameters).iter_errors(args))
-    _no_effects(monkeypatch)
-    result = registry.execute_result("route_to_project", {**args, "project_id": "audit"})
-    assert (result.status, result.code) == ("error", "TOOL_ARG_ERROR"), result
-    assert "title is required" in result.text

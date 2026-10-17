@@ -54,7 +54,9 @@ def test_continue_admits_a_new_root_with_exact_owner_sources_and_replays_it_fore
     from supervisor.continuation_admission import admit_continuation
 
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
-    _interrupted(tmp_path)
+    returns = {"relay-1": {"relay_id": "relay-1", "source": {"chat_id": 1, "address": "held-row"}}}
+    held = {"held-row": {"direction": "in", "chat_id": 1, "text": "quoted words"}}
+    _interrupted(tmp_path, open_relays=returns, held_owner_messages=held)
     _owner_mail(tmp_path)
 
     first = admit_continuation("pred-1", action_nonce=NONCE)
@@ -66,6 +68,8 @@ def test_continue_admits_a_new_root_with_exact_owner_sources_and_replays_it_fore
     assert row["chat_id"] == 7 and row["root_task_id"] == successor and row["deadline_at"].startswith("2099")
     assert row["predecessor_task_id"] == "pred-1"
     meta = row["metadata"]
+    assert meta["continuation"]["owner_sources"]["open_relays"] == returns
+    assert meta["continuation"]["owner_sources"]["held_owner_messages"] == held
     assert meta["objective_author"]["kind"] == "continuation"
     corpus = [(r["source"], r["content"]) for r in meta["owner_corpus"]]
     assert corpus == [("origin_message", "Write the Friday report"),

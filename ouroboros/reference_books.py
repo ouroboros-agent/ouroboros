@@ -294,13 +294,13 @@ def read_book_section(book: ReferenceBook, title: str) -> BookView:
 
 
 # --------------------------------------------------------------------------- book balance
-# A measurement, never a gate (BIBLE P3 c5): the official CI `size_ratchet` lane is the
-# only surface that refuses a grown book; every local surface states the same fact.
+# A measurement, never a gate (BIBLE P3 c5). The size lane needs an explicit
+# contribution base; ordinary manual/tag CI cannot certify per-change book growth.
 
 BOOK_GROWTH_RULE = (
-    "Official CI requires each touched book to end no larger than at its base; text a change "
-    "adds is paid by shortening the same book. The repository owner's book-growth label can "
-    "approve an exception. Local commits are not blocked."
+    "Each touched book must end no larger than at its contribution base; added text is paid "
+    "by shortening the same book. Manual/tag CI without that base does not verify this rule. "
+    "The owner's book-growth label can approve an exception; local commits are not blocked."
 )
 
 

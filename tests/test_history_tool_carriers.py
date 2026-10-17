@@ -39,7 +39,7 @@ def _room_read(root, chat_id):
 
 @pytest.fixture(autouse=True)
 def _no_live_activity(monkeypatch):
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [])
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [])
 
 
 @pytest.mark.parametrize("role", ["in", "out"])
@@ -79,7 +79,7 @@ def test_speechless_current_root_is_addressed_without_importing_other_rooms(tmp_
     project = create_project(tmp_path, "other", name="Other room")
     rows = [{"activity_id": task, "chat_id": chat, "kind": "direct_chat", "phase": "thinking"}
             for task, chat in (("root", 1), ("foreign", project["chat_id"]), ("hidden", 0))]
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: rows)
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: rows)
     _write(tmp_path / "logs/tools.jsonl", [_tool(row["activity_id"]) for row in rows])
     assert [row["task_id"] for row in _read(tmp_path)["messages"]] == ["root"]
 
@@ -89,7 +89,7 @@ def test_current_root_with_original_zero_address_follows_its_project_binding(tmp
 
     project = create_project(tmp_path, "bound", name="Bound room")
     bind_task_to_project(tmp_path, "root", project["id"], origin={"absent": "system"})
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [
         {"activity_id": "root", "chat_id": 0, "kind": "direct_chat", "phase": "thinking"}])
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     [carrier] = _room_read(tmp_path, project["chat_id"])["messages"]
@@ -138,7 +138,7 @@ def test_child_cannot_address_parent_tool_evidence_to_its_own_room(tmp_path, mon
 
 
 def test_current_root_narration_outside_page_keeps_evidence_without_fake_cursor(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [
         {"activity_id": "root", "chat_id": 1, "phase": "working", "kind": "managed_task"}])
     _write(tmp_path / "logs/chat.jsonl", [
         {"direction": "out", "task_id": "root", "text": "Earlier speech", "ts": TS, "chat_id": 1},
@@ -210,15 +210,16 @@ def test_shared_noisy_log_windows_are_decoded_once_per_request(tmp_path, monkeyp
     parser = utils.iter_jsonl_objects
     decoded = []
 
-    def observed(source, *, tail_bytes=None, gap_reasons=None):
-        decoded.append((source, tail_bytes))
-        yield from parser(source, tail_bytes=tail_bytes, gap_reasons=gap_reasons)
+    def observed(source, **kwargs):
+        # The replay hands each window over as one read (no buffered 4 KiB line walk).
+        decoded.append((source, kwargs["_handle"].getbuffer().nbytes))
+        yield from parser(source, **kwargs)
 
     monkeypatch.setattr(utils, "iter_jsonl_objects", observed)
     result = replay_evidence_for_tasks(tmp_path, ["root", "second"])
     assert all(len(evidence["observations"]) == 1 for evidence in result.values())
     assert len(decoded) == len(set(decoded)), "selected tasks share the same physical parse"
-    assert sum(min(path.stat().st_size, window or path.stat().st_size) for _, window in decoded) < 3 * path.stat().st_size
+    assert sum(window for _, window in decoded) < 3 * path.stat().st_size
     before = len(decoded)
     replay_evidence_for_tasks(tmp_path, ["root"])
     assert len(decoded) > before, "no cross-request memo can hide new settlements"
@@ -445,7 +446,7 @@ def test_an_empty_ts_census_anchor_with_zero_tools_gets_no_carrier(tmp_path, mon
     from ouroboros.task_results import write_task_result
 
     write_task_result(tmp_path, "live", "running", root_task_id="live", chat_id=1)
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [
         {"activity_id": "live", "chat_id": 1, "kind": "managed_task", "phase": "working"}])
     _write(tmp_path / "logs/chat.jsonl", [{"direction": "in", "text": "Latest question", "ts": TS, "chat_id": 1}])
     assert [row["text"] for row in _read(tmp_path)["messages"]] == ["Latest question"]
@@ -519,12 +520,15 @@ def test_answered_root_with_a_paused_late_phase_is_not_readdressed_at_the_page_e
     paused = {"activity_id": "root", "chat_id": 1, "kind": "direct_chat", "phase": "budget_paused", "pause_cause": "owner",
               "status": status, "root_phase_checkpoint": {"post_task_synthesis": "paused"}}
     census = [paused]
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: census)
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: census)
     assert [row["text"] for row in _read(tmp_path)["messages"]] == ["Latest question"]
     # Positive control: unanswered current work of the room keeps its evidence at the page end,
     # including a turn whose checkpoint holds only the pre-answer cost "refresh" pseudo-status.
-    census[:] = [{"activity_id": "root", "chat_id": 1, "kind": "direct_chat", "phase": "working",
-                  "root_phase_checkpoint": {"post_task_synthesis": "refresh"}}]
+    # The answered test reads the task's own stored checkpoint, never a census display copy.
+    from ouroboros.store import update_task
+
+    update_task(tmp_path, "root", lambda doc: {**doc, "root_phase_checkpoint": {"post_task_synthesis": "refresh"}})
+    census[:] = [{"activity_id": "root", "chat_id": 1, "kind": "direct_chat", "phase": "working"}]
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     carrier = _read(tmp_path)["messages"][-1]
     assert carrier["system_type"] == "task_evidence" and carrier["task_id"] == "root" and carrier["ts"] == ""

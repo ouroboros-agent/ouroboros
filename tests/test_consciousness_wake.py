@@ -40,7 +40,7 @@ def test_wake_task_metadata_carries_origin_level_and_tree_cap(monkeypatch):
     assert meta["consciousness_autonomy"] == "observe" and meta["runtime_mode_cap"] == "light"
     assert meta["model_role"] == "consciousness" and meta["wake_reason"] == "heartbeat"
     # P3e: the cap the wake's own root scope binds, never the non-root member ceiling.
-    assert "promote_chat_to_task" in meta["disabled_tools"] and meta["root_cost_ceiling_usd"] == 3.5
+    assert "start_task" in meta["disabled_tools"] and meta["root_cost_ceiling_usd"] == 3.5
     assert "root_limit_usd" not in meta
     full = wake.wake_task_metadata("full", "event:x")
     assert full["disabled_tools"] == [] and full["runtime_mode_cap"] == "" and "root_cost_ceiling_usd" not in full

@@ -796,17 +796,6 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         )
 
     current_task_id = str(getattr(ctx, "task_id", "") or "")
-    if getattr(ctx, 'is_direct_chat', False):
-        try:
-            append_jsonl(ctx.drive_logs() / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "schedule_task_from_direct_chat",
-                "task_id": current_task_id,
-                "description": objective[:200],
-                "warning": "schedule_subagent called from direct chat context — potential duplicate work",
-            })
-        except Exception:
-            pass
     parent_task_id = str(current_task_id or metadata.get("parent_task_id") or "").strip()
     root_task_id_seed = str(metadata.get("root_task_id") or current_task_id or "").strip()
     session_id = str(metadata.get("session_id") or "")

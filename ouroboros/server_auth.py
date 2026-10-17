@@ -12,17 +12,22 @@ import pathlib
 import secrets
 import time
 from http.cookies import SimpleCookie
-from urllib.parse import parse_qs
+from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlencode
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ouroboros.config import load_settings
 
+if TYPE_CHECKING:
+    from ouroboros.server_web import ServedUI
+
 NETWORK_PASSWORD_KEY = "OUROBOROS_NETWORK_PASSWORD"
 AUTH_COOKIE_NAME = "ouroboros_auth"
 _PUBLIC_HTTP_PATHS = {"/api/health", "/auth/login", "/auth/logout"}
+_NO_STORE = {"Cache-Control": "no-store"}
 
 
 def resolve_network_password(env_value: str | None, settings_loader) -> str:
@@ -245,10 +250,14 @@ def _login_page(next_url: str, error: str = "") -> str:
 </html>"""
 
 
-async def _handle_login(scope: Scope, receive: Receive, send: Send, password: str) -> None:
+async def _handle_login(scope: Scope, receive: Receive, send: Send, password: str,
+                        served_ui: ServedUI | None = None) -> None:
     request = Request(scope, receive)
     if request.method == "GET":
-        response = HTMLResponse(_login_page(request.query_params.get("next", "/")), status_code=200)
+        page = (served_ui.custom_page("auth/index.html")
+                if served_ui is not None and request.query_params.get("builtin") != "1" else None)
+        response = HTMLResponse(page if page is not None else _login_page(request.query_params.get("next", "/")),
+                                headers=_NO_STORE)
         await response(scope, receive, send)
         return
     if request.method != "POST":
@@ -273,7 +282,7 @@ async def _handle_login(scope: Scope, receive: Receive, send: Send, password: st
         if is_json:
             response = JSONResponse({"error": "Invalid password."}, status_code=401)
         else:
-            response = HTMLResponse(_login_page(next_url, "Invalid password."), status_code=401)
+            response = HTMLResponse(_login_page(next_url, "Invalid password."), status_code=401, headers=_NO_STORE)
         await response(scope, receive, send)
         return
 
@@ -317,8 +326,9 @@ async def _handle_logout(scope: Scope, receive: Receive, send: Send) -> None:
 class NetworkAuthGate:
     """Require a password for non-localhost access only when configured."""
 
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app: ASGIApp, *, served_ui: ServedUI | None = None):
         self.app = app
+        self.served_ui = served_ui
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -326,23 +336,25 @@ class NetworkAuthGate:
             return
 
         password = get_configured_network_password()
-        if not password:
-            await self.app(scope, receive, send)
-            return
-
-        if is_loopback_host(_scope_client_host(scope)):
-            await self.app(scope, receive, send)
-            return
-
+        active = bool(password) and not is_loopback_host(_scope_client_host(scope))
         path = scope.get("path", "") or "/"
-        if scope["type"] == "http" and path == "/auth/login":
-            await _handle_login(scope, receive, send, password)
-            return
-        if scope["type"] == "http" and path == "/auth/logout":
-            await _handle_logout(scope, receive, send)
+        if scope["type"] == "http" and path in {"/auth/login", "/auth/logout"}:
+            # These names belong to the gate even when it is inactive: a selected
+            # asset named login/logout must not become a different operation.
+            if not active:
+                await PlainTextResponse("Not Found", status_code=404)(scope, receive, send)
+            elif path == "/auth/login":
+                await _handle_login(scope, receive, send, password, self.served_ui)
+            else:
+                await _handle_logout(scope, receive, send)
             return
 
-        if scope["type"] == "http" and path in _PUBLIC_HTTP_PATHS:
+        if not active:
+            await self.app(scope, receive, send)
+            return
+
+        if scope["type"] == "http" and (path in _PUBLIC_HTTP_PATHS or (
+                (path == "/auth" or path.startswith("/auth/")) and scope.get("method") in {"GET", "HEAD"})):
             await self.app(scope, receive, send)
             return
 
@@ -355,7 +367,15 @@ class NetworkAuthGate:
             return
 
         if _request_wants_html(scope):
-            response = HTMLResponse(_login_page(_build_next_url(scope)), status_code=401)
+            builtin_setup = path == "/onboarding" and Request(scope).query_params.get("builtin") == "1"
+            custom = (self.served_ui.custom_page("auth/index.html")
+                      if self.served_ui is not None and not builtin_setup else None)
+            next_url = _sanitize_next_url(_build_next_url(scope))
+            if custom is not None:
+                response = RedirectResponse("/auth/login?" + urlencode({"next": next_url}), status_code=303,
+                                            headers=_NO_STORE)
+            else:
+                response = HTMLResponse(_login_page(next_url), status_code=401, headers=_NO_STORE)
         else:
             response = JSONResponse({"error": "Authentication required."}, status_code=401)
         await response(scope, receive, send)

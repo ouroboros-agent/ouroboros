@@ -22,7 +22,7 @@ const searched = (window) => window?.latest_message === null && Number.isSafeInt
 
 /**
  * @param {{
- *   read: (fresh: boolean) => Promise<boolean>,  // true when the recent read succeeded
+ *   read: (fresh: boolean, whole: boolean) => Promise<boolean>,  // true when the read succeeded; `whole`: the newest page
  *   isShown: () => boolean,
  *   isReadingLatest: (latest: undefined|null|object) => boolean,  // the reader is at `latest`
  *   onReadingLatest?: () => void,
@@ -135,10 +135,12 @@ export function createProjectReadReceipt({ read, isShown, isReadingLatest, onRea
         // is read again: a repaired source can name it without a new revision.
         // The current opening read consumes its landing even on a gap: a later
         // arrival must not inherit that navigation. Unknown/hidden content never lands.
+        // A fresh read takes only what arrived since the newest read, except while the
+        // newest message is unknown and unsearched: only the newest page can name it.
         async refresh({ revision = 0 } = {}) {
             const own = ++generation;
             const target = Math.max(0, Number(revision) || 0);
-            const readable = await read(target > coveredRevision);
+            const readable = await read(target > coveredRevision, newest() === null && !searched(recentRead.window));
             const covered = readable && newest() !== null;
             if (covered && target > coveredRevision) coveredRevision = target;
             if (own !== generation) return { painted: false, revision: target };
@@ -159,6 +161,15 @@ export function createProjectReadReceipt({ read, isShown, isReadingLatest, onRea
         recent({ window, coverage, recentVersion }) {
             recentRead = { window, coverage, recentVersion };
             if (newest() === null) coveredRevision = 0;
+        },
+        // Rows an `after_cursor` read added, once drawn: the newest message among them
+        // (`history_paging.latest_arrival` names it) is the room's newest, on the same
+        // recent read's bytes; none named leaves the newest as it was. A read that
+        // cannot name it never comes here (the newest page is read instead).
+        arrived(window) {
+            const named = window?.latest_message;
+            if (named) recentRead = { ...recentRead, window: { ...recentRead.window, latest_message: named } };
+            settle();
         },
         // An older page, once drawn, can show the newest message or, on a quiet
         // chain, name it, prove there is none or end the search unknown. The recent

@@ -794,23 +794,20 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
 
 def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
     from ouroboros import config as _config
-    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+    from ouroboros.composer_cognition import main_cognition, request_project_id, update_project_cognition
 
+    if not isinstance(body, dict):
+        return unsaved_error("JSON body must be an object.", 400)
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     from ouroboros.context_mode_compat import VALID_CONTEXT_MODES
 
     if raw_mode not in set(VALID_CONTEXT_MODES):
         return unsaved_error("'mode' must be one of: " + ", ".join(VALID_CONTEXT_MODES), 400)
     next_mode = _config.normalize_context_mode(raw_mode)
-    digest = settings_document_digest()
-    previous_mode = _config.get_owner_context_mode()
-    cyber = runtime_mode_at_least(_config.get_runtime_mode(), "cyber_pro")
-    if not cyber and VALID_CONTEXT_MODES.index(next_mode) < VALID_CONTEXT_MODES.index(previous_mode) and _has_running_agent_tasks():
-        return unsaved_error(
-            "Context mode can only be lowered while Ouroboros is idle. "
-            "Wait until no queued or running work remains, then choose the working context.",
-            409,
-        )
+    try:
+        project_id = request_project_id(body)
+    except ValueError as exc:
+        return unsaved_error(str(exc), 400)
 
     def _set_context_mode(current: Dict[str, Any]) -> Dict[str, Any]:
         current["OUROBOROS_CONTEXT_MODE"] = next_mode
@@ -821,30 +818,26 @@ def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
         return current
 
     with settings_document_mutation():
-        # Re-prove the ordinary-mode idle policy under the lock: either the queue
-        # or the previous mode may have changed while this writer waited. The
-        # digest alone cannot attest idleness. Cyber can choose the next mode
-        # during work; existing task snapshots retain their original settings.
-        previous_mode = _config.get_owner_context_mode()
-        if not cyber and VALID_CONTEXT_MODES.index(next_mode) < VALID_CONTEXT_MODES.index(previous_mode) and _has_running_agent_tasks():
-            return unsaved_error(
-                "Context mode can only be lowered while Ouroboros is idle. "
-                "Wait until no queued or running work remains, then choose the working context.",
-                409,
-            )
-        # This endpoint IS the author of both keys, so they persist even at the shipped default.
-        # The digest binds the idle refusal above to the document this write replaces.
-        _owner_update_settings(_set_context_mode, digest,
-                               authored_keys=_CONTEXT_MODE_KEYS, allow_context_lowering=True)
-        # Same-lock projection: see api_owner_auto_grant.
-        os.environ["OUROBOROS_CONTEXT_MODE"] = next_mode
-        os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+        if project_id:
+            try:
+                old, cognition = update_project_cognition(request_drive_root(request), project_id, context_mode=next_mode)
+            except ValueError as exc:
+                return unsaved_error(str(exc), 404, code="project_unavailable")
+            previous_mode = old["context_mode"]
+        else:
+            previous_mode = main_cognition()["context_mode"]
+            digest = settings_document_digest()
+            _owner_update_settings(_set_context_mode, digest,
+                                   authored_keys=_CONTEXT_MODE_KEYS, allow_context_lowering=True)
+            os.environ["OUROBOROS_CONTEXT_MODE"] = next_mode
+            os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+            cognition = main_cognition()
     _owner_audit(
         request,
         "context_mode",
-        {"context_mode": next_mode, "previous_context_mode": previous_mode},
+        {"project_id": project_id, "context_mode": next_mode, "previous_context_mode": previous_mode},
     )
-    return JSONResponse({"ok": True, "context_mode": next_mode})
+    return JSONResponse({"ok": True, "project_id": project_id, "context_mode": next_mode, "cognition": cognition})
 
 
 @owner_write_guard

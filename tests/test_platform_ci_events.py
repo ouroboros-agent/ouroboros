@@ -1,9 +1,10 @@
-"""Ordinary desktop PR coverage at the existing CI matrix/event seam."""
+"""Manual/release CI admission and the retained job/secret boundaries."""
 
 from __future__ import annotations
 
 import json
 import re
+from fnmatch import fnmatchcase
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,22 +38,60 @@ def _value(expression, *, event, ref, base="", schedule="", cancelled=False, att
     })
 
 
+def _triggered(workflow, event, ref):
+    """Positive push filters used here, per GitHub workflow-syntax on.push docs.
+
+    Tags-only excludes the undefined branch ref type; check this BEFORE jobs.
+    This is not a general GitHub event/path/expression emulator.
+    """
+    triggers = workflow.get("on", workflow.get(True))
+    if event not in triggers:
+        return False
+    if event != "push":
+        return True
+    filters = triggers[event] or {}
+    for prefix, kind, other in (("refs/heads/", "branches", "tags"),
+                                 ("refs/tags/", "tags", "branches")):
+        if ref.startswith(prefix):
+            if kind not in filters:
+                return other not in filters
+            return any(fnmatchcase(ref[len(prefix):], pattern) for pattern in filters[kind])
+    return False
+
+
+@pytest.mark.parametrize("name", ["ci.yml", "ui-browser-push.yml", "provider-canary-push.yml"])
+@pytest.mark.parametrize("event,ref", [
+    ("push", "refs/heads/main"), ("push", "refs/heads/ouroboros"),
+    ("push", "refs/heads/ouroboros-stable"), ("push", "refs/heads/v7.7.0"),
+    ("pull_request", "refs/pull/42/merge"), ("pull_request_target", "refs/heads/ouroboros"),
+    ("schedule", "refs/heads/main"), ("push", "refs/tags/other"),
+    ("push", "refs/tags/v7.7.0"), ("push", "refs/tags/v8.0.0-rc.1"),
+    ("workflow_dispatch", "refs/heads/candidate"), ("workflow_dispatch", "refs/tags/v7.7.0"),
+])
+def test_ordinary_ci_triggers_only_on_request_or_release(name, event, ref):
+    workflow = yaml.safe_load((ROOT / ".github/workflows" / name).read_text(encoding="utf-8"))
+    expected = event == "workflow_dispatch" or (
+        name == "ci.yml" and event == "push" and ref.startswith("refs/tags/v"))
+    assert _triggered(workflow, event, ref) is expected
+
+
 @pytest.mark.parametrize("event,ref,base,quick,platforms", [
-    ("pull_request", "refs/pull/42/merge", "ouroboros", True, []),
+    ("pull_request", "refs/pull/42/merge", "ouroboros", False, []),
     ("pull_request", "refs/pull/42/merge", "main", False, []),
-    # Landed commits retain both desktop systems; Ubuntu is quick-test.
-    ("push", "refs/heads/ouroboros", "", True, ["windows-latest", "macos-latest"]),
+    # Retained job predicates cannot bypass the removed workflow triggers.
+    ("push", "refs/heads/ouroboros", "", False, []),
     ("push", "refs/heads/main", "", False, []),
-    ("push", "refs/heads/ouroboros-stable", "", False, ["ubuntu-latest", "windows-latest", "macos-latest"]),
+    ("push", "refs/heads/ouroboros-stable", "", False, []),
     ("push", "refs/tags/v7.0.0", "", False, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("workflow_dispatch", "refs/heads/candidate", "", True, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("schedule", "refs/heads/main", "", False, []),
 ])
-def test_ordinary_matrix_covers_prs_and_landed_pushes_and_keeps_other_events(event, ref, base, quick, platforms):
+def test_ordinary_matrix_requires_admitted_manual_or_tag_event(event, ref, base, quick, platforms):
     facts = {"event": event, "ref": ref, "base": base}
-    assert bool(_value(WORKFLOW["jobs"]["quick-test"]["if"], **facts)) is quick
+    triggered = _triggered(WORKFLOW, event, ref)
+    assert (triggered and bool(_value(WORKFLOW["jobs"]["quick-test"]["if"], **facts))) is quick
     job = WORKFLOW["jobs"]["full-test-runs"]
-    admitted = _value(job["if"], **facts)
+    admitted = triggered and _value(job["if"], **facts)
     actual = _value(job["strategy"]["matrix"]["os"], **facts) if admitted else []
     if admitted:
         actual += [row["os"] for row in job["strategy"]["matrix"]["include"]]
@@ -63,9 +102,22 @@ def test_ordinary_matrix_covers_prs_and_landed_pushes_and_keeps_other_events(eve
     assert job["runs-on"] == "$" + "{{ matrix.os }}"
 
 
-def test_selected_pr_job_keeps_merge_checkout_and_pr_base_evidence_secret_free():
+@pytest.mark.parametrize("name", ["quick-test", "sqlite-floor", "betterleaks-platform-smoke"])
+@pytest.mark.parametrize("event,ref,expected", [
+    ("workflow_dispatch", "refs/heads/candidate", True),
+    ("push", "refs/tags/v7.7.0", False),
+    ("push", "refs/heads/ouroboros", False),
+    ("pull_request", "refs/pull/42/merge", False),
+])
+def test_additional_pre_tag_checks_require_manual_dispatch(name, event, ref, expected):
+    admitted = _triggered(WORKFLOW, event, ref) and bool(_value(
+        WORKFLOW["jobs"][name]["if"], event=event, ref=ref, base="ouroboros"))
+    assert admitted is expected
+
+
+def test_dormant_pr_predicates_keep_checkout_and_base_evidence_secret_free():
     triggers = WORKFLOW.get("on") or WORKFLOW[True]  # PyYAML's YAML 1.1 spelling of "on".
-    assert triggers["pull_request"]["branches"] == ["ouroboros"]
+    assert "pull_request" not in triggers
     assert "pull_request_target" not in triggers
     assert WORKFLOW["permissions"] == {"contents": "read"}
     job = WORKFLOW["jobs"]["quick-test"]
@@ -130,8 +182,7 @@ def test_desktop_pr_coverage_does_not_admit_provider_or_release_jobs(name):
     ("schedule", "refs/heads/main", "17 3 * * *", False),
 ])
 def test_provider_canaries_join_this_workflow_only_for_manual_runs_and_tags(event, ref, schedule, called):
-    """Branch pushes reach the canaries through provider-canary-push.yml, so a
-    provider outage on a landed commit leaves this workflow's result to the code."""
+    """Provider jobs retain their required/optional manual/tag qualification split."""
     for name, scope in (("integration-test", "required"), ("integration-optional", "optional")):
         job = WORKFLOW["jobs"][name]
         assert job["uses"] == "./.github/workflows/provider-canary.yml"
@@ -167,18 +218,13 @@ def test_only_a_new_pull_request_head_cancels_a_run(event, attempt, group, cance
     assert bool(_value(concurrency["cancel-in-progress"], **facts)) is cancels
 
 
-def test_landed_push_desktop_matrix_runs_in_this_repository_only():
-    """A private copy that pushes its own commits keeps the Ubuntu quick job and pays no desktop minutes."""
+def test_manual_and_tag_desktop_matrix_remains_available_to_forks():
+    """No automatic branch tests; explicit qualification still covers three OSes."""
     job = WORKFLOW["jobs"]["full-test-runs"]
-    push = {"event": "push", "ref": "refs/heads/ouroboros"}
-    assert _value(job["if"], **push)
-    assert not _value(job["if"], **push, repository="someone/private-copy")
-    assert not _value(job["if"], event="pull_request", ref="refs/pull/42/merge", base="ouroboros")
-    assert _value(WORKFLOW["jobs"]["quick-test"]["if"], **push, repository="someone/private-copy")
-    # Stable pushes, manual runs and tags keep their matrix in every repository.
-    for event, ref, base in (("push", "refs/heads/ouroboros-stable", ""),
-                             ("workflow_dispatch", "refs/heads/candidate", ""), ("push", "refs/tags/v7.0.0", "")):
-        assert _value(job["if"], event=event, ref=ref, base=base, repository="someone/private-copy")
+    assert not _triggered(WORKFLOW, "push", "refs/heads/ouroboros")
+    for event, ref in (("workflow_dispatch", "refs/heads/candidate"), ("push", "refs/tags/v7.7.0")):
+        assert _triggered(WORKFLOW, event, ref)
+        assert _value(job["if"], event=event, ref=ref, repository="someone/private-copy")
 
 
 @pytest.mark.parametrize("run_id,module", [

@@ -1,6 +1,6 @@
 """The reference-book balance: a fact on every local surface, never a gate (BIBLE P3 c5).
 
-The official CI lane (tests/test_reference_book_budgets.py) is what refuses a grown book;
+The opt-in lane (tests/test_reference_book_budgets.py) compares a supplied contribution base;
 here the same measurement reaches Ouroboros when it writes book text,
 runs the commit gate's free checks before a paid reviewer and asks for codebase health.
 """

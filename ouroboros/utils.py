@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import hashlib
+import io
 import json
 import logging
 import math
@@ -651,6 +652,15 @@ def append_jsonl(
     return _written
 
 
+def jsonl_window(handle: Any, size: int, tail_bytes: Optional[int] = None) -> bytes:
+    """The whole lines of the last ``tail_bytes`` of a ``size``-byte file in ONE read (no per-block GIL hand-off)."""
+    if tail_bytes is None or size <= tail_bytes:
+        return handle.read(size)
+    handle.seek(size - tail_bytes - 1)
+    data = handle.read(tail_bytes + 1)
+    return data[data.find(b"\n") + 1:] if b"\n" in data else b""
+
+
 def iter_jsonl_objects(
     path: pathlib.Path,
     max_entries: Optional[int] = None,
@@ -659,19 +669,15 @@ def iter_jsonl_objects(
     gap_reasons: Optional[set[str]] = None,
     _handle: Any = None,  # Internal borrowed stream; its caller owns closing.
 ) -> Iterator[Any]:
-    """Yield parseable JSONL entries; max_entries applies to raw tail lines."""
+    """Yield parseable JSONL entries; max_entries applies to raw tail lines; a tail is one read."""
     path = pathlib.Path(path)
     if (max_entries is not None and max_entries <= 0) or (tail_bytes is not None and tail_bytes <= 0):
         return
     try:
         with (contextlib.nullcontext(_handle) if _handle is not None else path.open("rb")) as handle:
             if tail_bytes is not None:
-                file_size = path.stat().st_size
-                if file_size > tail_bytes:
-                    start = file_size - tail_bytes
-                    handle.seek(start - 1)
-                    if handle.read(1) != b"\n":
-                        handle.readline()
+                handle = io.BytesIO(jsonl_window(handle, os.fstat(handle.fileno()).st_size
+                                                 if _handle is None else path.stat().st_size, tail_bytes))
             if max_entries:
                 # Keep one raw sentinel so callers can distinguish an exact
                 # bounded tail from a suffix. Parsed-object counts cannot prove
@@ -764,6 +770,40 @@ def jsonl_archive_segments(
     return sorted(found)
 
 
+_CLOSED_SEGMENTS: Dict[str, tuple] = {}  # chain path -> (live identity, archive/ mtime, closed segments)
+
+
+def _closed_segments(path: pathlib.Path, live_stat: Any, *, strict: bool) -> List[Tuple[pathlib.Path, Any]]:
+    """A chain's rotated segments with their stats, oldest first, without the live file's alias; a complete
+    listing is reused while the live inode and ``archive/``'s mtime hold, the newest archive re-stat'ed."""
+    try:
+        key = (live_stat.st_dev, live_stat.st_ino, os.stat(path.parent.parent / "archive").st_mtime_ns)
+    except (AttributeError, OSError):
+        key = None
+    if key is not None and (cached := _CLOSED_SEGMENTS.get(str(path))) is not None and cached[0] == key:
+        with contextlib.suppress(OSError):
+            return [*cached[1][:-1], *((segment, segment.stat()) for segment, _stat in cached[1][-1:])]
+    try:  # a listing that skipped anything is never reused
+        segments, complete, closed = jsonl_archive_segments(path, strict=True), True, []
+    except JsonlChainUnreadable:
+        if strict:
+            raise
+        segments, complete, closed = [], False, []
+    for segment in segments:
+        try:
+            stat = segment.stat()
+        except OSError as exc:
+            if strict and not isinstance(exc, FileNotFoundError):
+                raise JsonlChainUnreadable(f"cannot stat {segment}: {exc}") from exc
+            complete = False
+            continue
+        if key is None or (stat.st_dev, stat.st_ino) != key[:2]:
+            closed.append((segment, stat))
+    if key is not None and complete:
+        _CLOSED_SEGMENTS[str(path)] = (key, tuple(closed))
+    return closed
+
+
 @contextlib.contextmanager
 def jsonl_chain_handles(
     path: pathlib.Path, *, strict: bool = False,
@@ -821,15 +861,8 @@ def jsonl_chain_handles(
                     raise JsonlChainUnreadable(f"cannot open or stat {path}: {exc}") from exc
                 live_stat = None
             entries, ends, total = [], [], 0
-            for segment in [*jsonl_archive_segments(path, strict=strict), path]:
-                try:
-                    stat = live_stat if segment == path else segment.stat()
-                except OSError as exc:
-                    if strict and not isinstance(exc, FileNotFoundError):
-                        raise JsonlChainUnreadable(f"cannot stat {segment}: {exc}") from exc
-                    continue
-                if stat is None or (segment != path and live_stat is not None
-                        and (stat.st_dev, stat.st_ino) == (live_stat.st_dev, live_stat.st_ino)):
+            for segment, stat in [*_closed_segments(path, live_stat, strict=strict), (path, live_stat)]:
+                if stat is None:
                     continue
                 total += stat.st_size
                 entries.append([segment, stat, segment == path])

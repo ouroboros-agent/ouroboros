@@ -524,49 +524,45 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
     )
     assert "import { appendProjectRow, decorateProjectRow, PROJECT_ROW_TYPES, refreshProjectAnswerFold, syncSavedProjectContext } from './project_answer.js';" in chat
     assert "const PROJECT_ROW_TYPES" not in chat
-    # Compact Main entries own their shell; the remaining lifecycle rows only delegate:
-    # the lifecycle-row module puts the one Project reference (web/modules/project_reference.js)
-    # into the shared action composition.
-    assert "if (projectEntry) handoffs.mount(bubble, {" in chat
-    assert "if (!projectEntry && PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { ...meta, ...opts, role," in chat
+    # One work, one card: a Main start/transfer row binds the work's own card (work_portal.js), never a
+    # second entry; the remaining lifecycle rows only delegate: the lifecycle-row module puts the one Project
+    # reference (web/modules/project_reference.js) into the shared action composition.
+    portal = (root / "web" / "modules" / "work_portal.js").read_text(encoding="utf-8")
+    assert "createProjectHandoffs" not in chat and "handoffs" not in chat
+    assert "if (isMain && ['project_started', 'project_handoff'].includes(msg.system_type) && msg.task_id && msg.project_id) {" in portal
+    assert ") decorateProjectRow(bubble, { ...meta, ...opts, role," in chat
     assert "completion = systemType === 'project_completion_summary'" in render
     assert "terminalTime: msg.terminal_time || null" in render
     assert "createSystemMessageActions(projectReference(" in render
     assert "row.className = 'system-message-actions'" in helpers
-    # The Main mirror of a Project question carries no system action: its Project chip is the way there.
-    assert "createSystemMessageActions(" in (root / "web/modules/chat_activity.js").read_text(encoding="utf-8")
+    # The owner's routed message names its room on its one receipt line, through the same door.
+    receipt = (root / "web" / "modules" / "routing_receipt.js").read_text(encoding="utf-8")
+    assert "projectReference({ id: annotation.project_id," in receipt
+    assert "createSystemMessageActions(" not in receipt
     assert "document.createElement('br')" not in render
 
-    # The custom pill is gone everywhere; the conversion-flow buttons moved to
-    # the shared design-system role beside their `btn btn-xs btn-danger` sibling.
+    # The custom pill is gone everywhere; the conversion-flow buttons use the shared
+    # design-system role beside their neutral Stop… sibling.
     assert "chat-live-project-btn" not in chat
     assert "chat-live-project-btn" not in style
-    # The conversion button is now built by the chrome sync from the record's
-    # facts (an HTML template could not be re-derived when a turn is direct),
-    # so the design-system role and the marker app.js queries are set on the
-    # node itself.
-    chrome = chat[chat.index("function syncBlockChrome(record) {"):chat.index("function syncCancelRunButton(record) {")]
-    assert "btn.className = 'btn btn-xs btn-default';" in chrome
+    # The conversion button is built by the card's chrome sync from the record's facts (an HTML template
+    # could not be re-derived when a turn is direct); the portal module owns it with the move it makes.
+    chrome = portal[portal.index("function syncConvert(record, wanted) {"):portal.index("function row(msg, text, opts) {")]
+    assert "btn.className = 'btn btn-sm btn-default';" in chrome
     assert "btn.dataset.turnIntoProject = '1';" in chrome
     assert "btn.textContent = liveCardLabel.turnIntoProject();" in chrome
+    assert "portals.syncConvert(record," in chat
     # The words sit with the other live-card labels and are read through the interface-language seam.
     chip = (root / "web" / "modules" / "task_phase_chip.js").read_text(encoding="utf-8")
     assert "turnIntoProject: () => tr('task.card.turn_into_project', 'Turn into project')," in chip
-    # One owner intent, one control: the converted card (chat.js), the bound-task
-    # footer (app.js) and every row that points at a Project get it from the door,
-    # which alone knows its classes and words.
+    # One owner intent, one control: the portal's footer and every row that points at a Project get it
+    # from the door, which alone knows its classes and words.
     door = (root / "web" / "modules" / "project_reference.js").read_text(encoding="utf-8")
     assert "chat-live-project-card-btn" in door and "chat-live-project-card-btn" not in helpers
-    handoff = (root / "web" / "modules" / "project_handoff.js").read_text(encoding="utf-8")
-    # Main alone owns a handoff controller; the converted card mounts through it.
-    assert "handoffs?.mount(record.root" in chat and "isMain ? createProjectHandoffs(" in chat
-    assert "projectReference({ id: projectId, name: projectName }, { layout: 'inline', taskId })" in handoff
-    assert "state: 'background'" not in handoff
-    assert "projectReference(project, { layout: 'footer' })" in app
-    # The project pointer is a Main-root affordance: applyTaskBindings walks
-    # only Main root cards, never the Project panel's copy or nested subagents
-    # (D15; the browser flow is pinned by the marker-gated continuity smoke).
-    assert "'#page-chat .chat-live-card[data-task-id]:not(.subagent)'" in app
+    assert "projectReference(target, { layout: 'footer', taskId: record.groupId })" in portal
+    # The portal is a Main-root affordance: the controller binds nothing outside Main or on a nested child.
+    assert "if (!isMain || !record || record.isSubagent || !project?.id) return false;" in portal
+    assert "projectReference(" not in app and "window.__ouroTaskBindings = bindings || {};" in app
 
     # Layout-only container CSS; the page-local `Open Project` button and its rule are gone.
     assert ".system-message-actions {" in style

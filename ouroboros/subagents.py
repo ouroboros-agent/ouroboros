@@ -11,7 +11,7 @@ the applied one comes back on the engine receipt.
 Effort follows ONE rule (``settings_scales.choose_effort``): a level encoded in
 the row's model name, else the owner's pin (the row's ``effort``), else the
 parent's request clamped into the owner's effort range (Cyber Pro: unclamped,
-and a request beats a pin), else the range's recommended level. The decision is
+and a request beats a pin), else this room's primary clamped into its helper bounds. The decision is
 taken at dispatch, recorded as ``{requested, applied, source}`` on the child
 record (``SubagentDispatch.effort_fact``) and disclosed to the child, the parent
 and the chat; for a session row it is the delegated LEAF's level, while the
@@ -1021,7 +1021,7 @@ def resolve_subagent_dispatch(
     from ouroboros.runtime_mode_policy import effort_range_binds
     from ouroboros.settings_scales import choose_effort, effort_fact
 
-    # A legacy (row-less) child: the parent's request inside the owner's range, else recommended.
+    # A row-less child: request or primary, clamped into this room's helper bounds.
     derived_effort, effort_source = choose_effort(
         task.get("requested_effort"), binds=effort_range_binds(task.get("metadata")))
 

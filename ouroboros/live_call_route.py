@@ -29,11 +29,11 @@ log = logging.getLogger(__name__)
 # The call's initial Nano view: memory of the mind, the web, and the room's chat (what
 # reads better than it sounds — links, code, lists — the voice writes there itself);
 # read_file, because every retained host section the call view points at is a
-# runtime_data read and a Gemini session reopens to gain a tool; and promote_chat_to_task,
+# runtime_data read and a Gemini session reopens to gain a tool; and start_task,
 # because long work leaves the call as a task whose result reaches it through live
 # awareness. Everything else is one ``enable_tools`` away (growth reaches the engine as ``UpdateTools``).
 CALL_INITIAL_TOOL_NAMES: Tuple[str, ...] = tuple(sorted(
-    COGNITIVE_MEMORY_TOOL_NAMES | {"web_search", "send_user_message", "read_file", "promote_chat_to_task"}))
+    COGNITIVE_MEMORY_TOOL_NAMES | {"web_search", "send_user_message", "read_file", "start_task"}))
 REALTIME_EVIDENCE_KIND = "realtime_windows"   # capability_evidence.json namespace of the documented windows
 # A speech-sized reply: about five minutes of spoken answer, the physical allowance a call's
 # fit leaves for one response. A provider's output maximum is documentation, not this budget.

@@ -75,13 +75,15 @@ def test_shapes_bind_only_indexed_routes_with_valid_bodies_that_resolve():
             assert contract_typed_dict(name), (token, name)
 
 
-def test_auth_endpoints_are_the_gate_owned_public_paths():
+def test_auth_endpoints_are_the_gate_owned_public_paths(gated_client):
     from ouroboros import server_auth
 
     paths = {token.split(" ", 1)[1] for token in endpoint_index.AUTH_ENDPOINTS}
     assert paths == {"/auth/login", "/auth/logout"} and paths <= server_auth._PUBLIC_HTTP_PATHS
-    source = inspect.getsource(server_auth.NetworkAuthGate.__call__)
-    assert 'path == "/auth/login"' in source and 'path == "/auth/logout"' in source
+    # The inner fixture has no auth routes: these responses prove gate ownership.
+    assert gated_client.get("/auth/login").status_code == 200
+    logout = gated_client.get("/auth/logout", follow_redirects=False)
+    assert logout.status_code == 303 and "Max-Age=0" in logout.headers["set-cookie"]
 
 
 def test_ws_shapes_cover_the_frozen_ws_index_and_name_the_right_frames():
@@ -219,6 +221,9 @@ def test_the_contract_is_served_derived_and_self_consistent(tmp_path):
         assert schema["type"] == "object" and "properties" in schema, name
     # Published facts the journeys rely on.
     by_token = {f"{e['method']} {e['path']}": e for e in document["http"]}
+    assert by_token["GET /onboarding"]["query"] == ["builtin"]
+    assert by_token["GET /auth/login"]["query"] == ["next", "builtin"]
+    assert set(by_token["GET /auth/login"]["responses"]) == {"200"}
     assert by_token["GET /api/onboarding/bootstrap"]["responses"]["200"]["schemas"] == ["OnboardingBootstrapResponse"]
     assert by_token["GET /api/tasks/{task_id}/events"]["responses"]["200"] == {
         "content_type": "text/event-stream", "schemas": ["TaskEvent"]}

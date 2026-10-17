@@ -478,7 +478,9 @@ def set_budget_pause(root: Any, task_id: str, row: Dict[str, Any],
         notice = (notice_fields(current, root, task_id, str(row.get("pause_id") or ""), str(row.get("reason")))
                   if row.get("state") == STATE_PAUSED and row.get("reason") in {"budget", REASON_AUTHORITY}
                   and (old.get("state") != STATE_PAUSED or old.get("pause_id") != row.get("pause_id")) else {})
-        return stamp_task_result_schema({**current, **retained_wait, **notice, "budget_pause": dict(row)})
+        from ouroboros.model_detach import detached_fields
+        return stamp_task_result_schema({**current, **retained_wait, **notice,
+                                         **detached_fields(current, row), "budget_pause": dict(row)})
 
     from ouroboros.task_store import patch_document
     patch_document(root, task_id, update)
@@ -626,7 +628,9 @@ def _exact_continuation_row(limit_ctx: Any, ctx: Any, *, pause_id: str, rail: st
         from ouroboros.model_sleep import cold_blockers
 
         blockers = cold_blockers(ctx, allow_transfer=True)
-        if any(blocker.get("kind") == "queued_member" for blocker in blockers):
+        from ouroboros.model_detach import is_detach
+        if blockers and (is_detach(getattr(ctx, "_model_sleep", None))
+                         or any(blocker.get("kind") == "queued_member" for blocker in blockers)):
             raise ColdSleepDependencyBlocked(f"selected queued dependency: {blockers}")
         if blockers:
             raise ColdSleepWritersUnsettled(f"{HOLD_COLD_WRITERS_UNSETTLED}: {blockers}")
@@ -1026,31 +1030,7 @@ def _hold_until(ctx: Any, usage: Dict[str, Any], reason: str, attempt: Callable[
             time.sleep(_HOLD_POLL_SEC)
 
 
-def enter_cold_sleep(limit_ctx: Any) -> None:
-    """The round boundary after a COLD sleep was armed (``model_sleep``).
-
-    The loop's own continuation is saved and the process parks under the same
-    exact-pause carrier; nothing wakes it but its selected sources through the
-    supervisor's sleep-wake policy. Bound external work needs the body's exact
-    acceptance before release. Other writers and local services refuse the park:
-    the model is told the blockers and stays awake — never a killed helper.
-    """
-    ctx = getattr(getattr(limit_ctx, "tools", None), "_ctx", None)
-    sleep = getattr(ctx, "_model_sleep", None) if ctx is not None else None
-    if not isinstance(sleep, dict) or sleep.get("mode") != "cold":
-        return
-    from ouroboros.model_sleep import cold_blockers
-
-    blockers = cold_blockers(ctx, allow_transfer=True)
-    if blockers:
-        ctx._model_sleep = None
-        limit_ctx.messages.append({"role": "user", "content": (
-            "[SYSTEM NOTICE]\nYour cold sleep was not taken: this task still runs "
-            + "; ".join(f"{b['kind']} {b.get('run_id') or b.get('name') or ''}" for b in blockers)
-            + ". Sleep warm, wait for it, or stop it first.")})
-        return
-    request_pause(limit_ctx, rail=RAIL_MODEL_SLEEP, scope="task", reason_text="The model chose a cold sleep.")
-    ctx._model_sleep = None  # no continuation owner: the ordinary loop continues awake
+from ouroboros.model_sleep import enter_cold_sleep  # noqa: E402, F401 -- existing public seam
 
 
 # Fields of a direct turn's task record that never travel in its pause event:
@@ -1084,6 +1064,8 @@ def pause_event(task: Dict[str, Any], pause: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.utils import utc_now_iso
 
     task_id = str(task.get("id") or "")
+    from ouroboros.model_detach import detached_fields
+    task = {**task, **detached_fields(task, pause)}
     direct = bool(task.get("_is_direct_chat"))
     return {
         "type": "budget_pause",

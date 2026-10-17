@@ -10,6 +10,7 @@ only on positive contention. No provider, engine or live data is reached.
 
 from __future__ import annotations
 
+import os
 import queue as queue_mod
 import time
 from contextlib import contextmanager, nullcontext
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import usage_accounting as ua
+from ouroboros.settings_integrity import task_settings_snapshot
 from tests._store_shared import unreadable_result
 from tests._usage_store_testing import ledger_rows
 from tests.test_billing_group import _scope, _spend
@@ -69,7 +71,8 @@ def test_a_startup_read_failure_binds_no_stand_in_and_every_send_rereads(data_ro
         return real_read(*args, **kwargs)
 
     monkeypatch.setattr(task_results, "load_task_result", reader)
-    monkeypatch.setattr("ouroboros.subagent_runtime.apply_task_start_settings_or_disclose", lambda *_a, **_k: None)
+    monkeypatch.setattr("ouroboros.subagent_runtime.apply_task_start_settings_or_disclose",
+                        lambda *_a, **_k: task_settings_snapshot({}, os.environ))
     monkeypatch.setattr("ouroboros.model_wait.task_model_wait_scope", lambda **_k: nullcontext())
     outcomes = []
 

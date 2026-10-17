@@ -422,22 +422,6 @@ def test_exception_overflow_text_survives_a_generic_response_body():
     assert result.retry_same_request is False
 
 
-def test_router_selector_is_explicit_and_schema_requires_it(tmp_path):
-    from ouroboros.tools.control import _promote_chat_to_task, _route_to_project, get_tools
-
-    ctx = type("Ctx", (), {"pending_events": [], "event_queue": None, "drive_root": tmp_path})()
-    assert "predecessor_task_id is required" in _promote_chat_to_task(ctx, "work")
-    assert "predecessor_task_id is required" in _promote_chat_to_task(ctx, "work", predecessor_task_id=None)
-    assert ctx.pending_events == []
-    assert "predecessor_task_id is required" in _route_to_project(ctx, "missing", "work")
-    assert "predecessor_task_id is required" in _route_to_project(
-        ctx, "missing", "work", predecessor_task_id=None,
-    )
-    entries = {entry.name: entry for entry in get_tools()}
-    assert "predecessor_task_id" in entries["promote_chat_to_task"].schema["parameters"]["required"]
-    assert "predecessor_task_id" in entries["route_to_project"].schema["parameters"]["required"]
-
-
 def test_context_overflow_skips_cross_model_and_forced_provider_calls(tmp_path, monkeypatch):
     import queue
 

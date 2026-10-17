@@ -78,6 +78,8 @@ def _stamp_owner_delivery(
     """
     if owner_ctx is None:
         return
+    from ouroboros.owner_relay import retain_owner_message
+    retain_owner_message(owner_ctx, client_message_id=client_message_id)
     owner_ctx.last_owner_delivery = {
         "msg_id": msg_id, "client_message_id": client_message_id, "text": text, "ts": ts,
     }
@@ -116,13 +118,20 @@ def _drain_incoming_messages(
     """
     controls: Dict[str, Any] = {}
 
+    def ack_saved(entry: Dict[str, Any]) -> None:
+        if not acknowledge_transcript_entry(drive_root, task_id, entry) or event_queue is None:
+            return
+        if entry.get("relay") or entry.get("quiz_delivery"):
+            event_queue.put_nowait({"type": "owner_message_injected", "task_id": task_id,
+                                   "relay_ack": entry.get("relay"), "quiz_ack": entry.get("quiz_delivery")})
+
     def ack_content(entry: Dict[str, Any]) -> None:
         if defer_content_ack and owner_ctx is not None:
             from ouroboros.working_checkpoint import defer_content_ack as defer
 
-            defer(owner_ctx, lambda: acknowledge_transcript_entry(drive_root, task_id, entry))
+            defer(owner_ctx, lambda: ack_saved(entry))
         else:
-            acknowledge_transcript_entry(drive_root, task_id, entry)
+            ack_saved(entry)
     if owner_ctx is not None and getattr(owner_ctx, "last_owner_delivery", None) is not None:
         owner_ctx.last_owner_delivery = None
     while not incoming_messages.empty():
@@ -171,6 +180,11 @@ def _drain_incoming_messages(
         attempt = getattr(owner_ctx, "task_attempt", None) or (1 if owner_ctx is not None else None)
         for entry in drain_owner_entries(drive_root, task_id, _owner_msg_seen, attempt):
             kind = entry.get("kind") or KIND_OWNER_TEXT
+            if kind == "relay_entry":
+                from ouroboros.owner_relay import inject_relay
+                inject_relay(owner_ctx, entry, messages)
+                ack_content(entry)
+                continue
             if kind == KIND_FINALIZE_NOW:
                 handle_finalize_now_entry(entry, owner_ctx, drive_root, task_id, controls)
                 continue
@@ -227,8 +241,14 @@ def _drain_incoming_messages(
                 ack_content(entry)
                 continue
             if kind == KIND_QUIZ_ANSWER:
+                from ouroboros.owner_quiz import late_answer_owner_text
+                answer = (entry.get("quiz_delivery") or {}).get("answer_snapshot")
+                owner_words = late_answer_owner_text(answer) if isinstance(answer, dict) else dmsg
+                if isinstance(answer, dict):
+                    from ouroboros.owner_relay import retain_owner_message
+                    retain_owner_message(owner_ctx, (answer.get("delivery") or {}).get("answer_row"))
                 _loop()._record_owner_directive(
-                    owner_ctx, source="owner_quiz_answer", content=dmsg,
+                    owner_ctx, source="owner_quiz_answer", content=owner_words,
                     msg_id=str(entry.get("msg_id") or ""),
                 )
                 deliver_quiz_answer(
@@ -252,7 +272,7 @@ def _drain_incoming_messages(
             _loop()._record_owner_directive(
                 owner_ctx,
                 source="owner_mailbox",
-                content=owner_content,
+                content=_owner_content(entry, drive_root, task_id),
                 msg_id=str(entry.get("msg_id") or ""),
             )
             _stamp_owner_delivery(
@@ -283,6 +303,12 @@ def _drain_incoming_messages(
                     })
                 except Exception:
                     pass
+    if owner_ctx is not None and getattr(owner_ctx, "_held_owner_messages", None):
+        handles = list(owner_ctx._held_owner_messages)
+        if handles != getattr(owner_ctx, "_quote_handles_shown", None):
+            _loop()._append_or_merge_user_message(messages,
+                "[Host fact: owner_quote_handles held by this turn]\n" + json.dumps(handles), slot=owner_ctx)
+            owner_ctx._quote_handles_shown = handles
     return controls
 
 

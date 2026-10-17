@@ -45,7 +45,7 @@ REFUSAL_REASONS = (
     "routing_annotation_persist_failed", "source_continuation_publish_failed",
     "confirmation_timeout",
     # steer (supervisor/steering.py)
-    "target_unknown", "direct_chat_turn", "subagent_target", "chat_mismatch",
+    "target_unknown", "direct_chat_turn", "subagent_target",
     "cancel_pending", "target_closed", "target_finished", "acceptance_fence_sealed",
     "mailbox_write_failed",
     # ensure_project_scope (worker_promotion, events_project_routing)
@@ -165,7 +165,7 @@ def test_producer_literals_are_all_covered_or_exempt():
 
 def test_origin_addressed_notice_types_cover_admission_and_steering():
     assert ORIGIN_ADDRESSED_NOTICE_TYPES == frozenset({
-        "task_not_started", "task_start_unconfirmed", "steer_not_delivered",
+        "task_not_started", "task_start_unconfirmed", "steer_not_delivered", "relay_reply",
     })
 
 

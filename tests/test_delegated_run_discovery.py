@@ -388,7 +388,8 @@ def test_a_retry_reader_stages_into_its_own_store_and_the_starter_receipt_names_
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
 
-    ctx = retry_context(tmp_path, monkeypatch, split=True)  # retry-b on a forked drive
+    ctx = retry_context(tmp_path, monkeypatch, split=True,
+                        fixed_ownership_clock=True)  # retry-b on a forked drive
     held = durable_run(ctx, owner="retry-a")
     bind_gateway(monkeypatch, TerminalGateway(output="V" * 120_000))
     wait = call(ctx, "delegate_wait", run_id=held.run_id)

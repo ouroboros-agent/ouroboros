@@ -198,11 +198,16 @@ def handle_routing_decision(
     if isinstance(origin.get("client_surface"), dict) and origin.get("client_surface"):
         provenance["client_surface"] = dict(origin["client_surface"])
     if action == "steer_task":
+        from ouroboros.owner_relay import owner_quote
+
         evt: Dict[str, Any] = {
             "type": "steer_task",
             "routing_token": dispatch_token,
             "target_task_id": str(chosen.get("task_id") or ""),
-            "message": origin_text,
+            # His click names this live work for his own retained message: the words
+            # travel as a verified quote with his force (D7); the note is only his comment.
+            "message": f"[Owner picker comment] {comment}" if comment else "",
+            "quotes": [owner_quote(drive_root, origin)],
             "chat_id": chat_id,
             "client_message_id": client_message_id,
             # The owner clicked: an owner turn by construction. The option list
@@ -280,6 +285,10 @@ def handle_routing_decision(
         ForkingPickler.dumps(dict(evt))
         from supervisor.workers import get_event_q
 
+        if action == "new_task_in_project":
+            from ouroboros.promotion_intent import prepare_promotion_intent
+
+            prepare_promotion_intent(drive_root, evt)
         get_event_q().put_nowait(dict(evt))
     except Exception as exc:
         log.warning("routing decision dispatch failed", exc_info=True)

@@ -110,7 +110,7 @@ open LAN or public port.
 
 ## The Main Interface and a Separately Hosted One
 
-`OUROBOROS_UI_DIR` chooses only what the core serves at `/` and `/static/*`:
+`OUROBOROS_UI_DIR` chooses what the core serves at `/` and `/static/*`:
 empty for the builtin interface, `none` for no main page, or an absolute (or `~`)
 directory with its own `index.html`, laid out like `web/`. It applies when the
 server starts, so a saved change waits for a restart. A saved value, an empty one
@@ -127,6 +127,12 @@ return to the builtin interface, clear the setting (in Settings → Advanced, or
 - A directory that is relative, missing, has no `index.html` or contains the
   core's data, source or settings tree is not applied: the builtin interface
   serves and `served_ui.error` says why.
+- A selected directory may also supply complete `onboarding.html` and
+  `auth/index.html` pages. The login's `auth/` assets are public before sign-in;
+  publish only that page's public build files there. Missing optional pages
+  fall back whole to builtin. `/onboarding?builtin=1` and
+  `/auth/login?builtin=1` keep builtin recovery without changing the setting.
+  API writers and password checks remain the core's (§2–4 of CLIENT_CONTRACT).
 - With `none`, `/` answers a 404 page and `/static/*` 404; windows that open the
   core's own address (desktop, Android, Telegram) show that page too. The API,
   the WebSocket, sign-in, the setup wizard (`/onboarding`, with its own assets

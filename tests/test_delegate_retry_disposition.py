@@ -153,7 +153,8 @@ def captured_result(tmp_path, monkeypatch, kind):
     from tests.test_delegated_run_isolation import _seed_target
     from tests.test_delegated_skill_payload import _seed_skill
 
-    ctx = retry_context(tmp_path, monkeypatch, chain=("retry-a", "retry-b", "retry-c"), split=True)
+    ctx = retry_context(tmp_path, monkeypatch, chain=("retry-a", "retry-b", "retry-c"), split=True,
+                        fixed_ownership_clock=True)
     data = custody.custody_root(ctx)
     if kind == "git":
         seed = tmp_path / "git-project"

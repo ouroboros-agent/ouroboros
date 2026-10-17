@@ -23,16 +23,6 @@ PROVIDER_SECRETS = (
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "GIGACHAT_CREDENTIALS",
 )
-SHARED_BRANCHES = ["main", "ouroboros", "ouroboros-stable"]
-# What starts a PAID canary run on a branch push. The code workflow has no path list, so this
-# one is spelled out here: a prompts- or skills-only push runs the code workflow and no canary.
-CANARY_PUSH_PATHS = [
-    "ouroboros/**", "supervisor/**", "server.py", "tests/**", "web/**", "site/**", "docs/**", "assets/**",
-    "requirements-runtime.lock", "uv.lock", "pyproject.toml", ".github/workflows/**", ".github/actions/**",
-    "build.sh", "build_linux.sh", "build_windows.ps1", "Dockerfile", "scripts/**", "devtools/**",
-    "packaging/**", "android/**", "VERSION", "README.md", "CONTRIBUTING.md", "LICENSE",
-    ".github/PULL_REQUEST_TEMPLATE.md", "launcher.py",
-]
 DOWNLOAD_ACTION = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 UI_JOBS = ["scope", "ui-shard", "ui-manifest", "ui-smoke"]
 # The complete lane takes no selection: its jobs run whenever browsers are needed.
@@ -112,7 +102,7 @@ def _triggers(workflow):
 
 
 def _canary_wiring_faults(ci, shared, push):
-    """One body, two disjoint release groups and the unchanged all-canary push."""
+    """One body, two disjoint release groups and an explicit all-canary dispatch."""
     faults = []
     passed = {name: f"${{{{ secrets.{name} }}}}" for name in PROVIDER_SECRETS}
     for label, caller, scope in (("ci.yml", ci["jobs"]["integration-test"], {"scope": "required"}),
@@ -140,12 +130,11 @@ def _canary_wiring_faults(ci, shared, push):
                         "type": "string", "default": "all"}}
     if _triggers(shared) != {"workflow_call": {"secrets": declared, "inputs": inputs}}:
         faults.append("the shared job is not call-only with scoped input and eight optional secrets")
-    # One paid run per push that touches the canary path list, on the three shared branches only.
-    if _triggers(push) != {"push": {"branches": SHARED_BRANCHES, "paths": CANARY_PUSH_PATHS}}:
-        faults.append("the push wrapper's trigger is not the three shared branches with the canary path list")
-    # The code workflow sees EVERY push to those branches: a path list here leaves a landed commit untested.
-    if _triggers(ci)["push"] != {"branches": SHARED_BRANCHES, "tags": ["v*"]}:
-        faults.append("ci.yml's push trigger is not the three shared branches plus v* tags with no path filter")
+    if _triggers(push) != {"workflow_dispatch": None}:
+        faults.append("the standalone provider wrapper must be manual-only")
+    # Tags-only is not an unfiltered push: GitHub excludes the undefined branch ref type.
+    if set(_triggers(ci)) != {"push", "workflow_dispatch"} or _triggers(ci).get("push") != {"tags": ["v*"]}:
+        faults.append("ci.yml must admit only manual dispatch and v* tags without a path filter")
     for label, workflow in ((CANARY, shared), (CANARY_PUSH, push)):
         if list(workflow["jobs"]) != ["integration-test"]:
             faults.append(f"{label} holds more than the canary job")
@@ -157,7 +146,7 @@ def _canary_wiring_faults(ci, shared, push):
     return faults
 
 
-def test_provider_canaries_share_one_body_between_the_code_workflow_and_the_push_wrapper():
+def test_provider_canaries_share_one_body_between_release_and_manual_callers():
     assert _canary_wiring_faults(*map(_workflow, ("ci.yml", CANARY, CANARY_PUSH))) == []
     callers = []
     for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
@@ -173,7 +162,7 @@ def test_provider_canaries_share_one_body_between_the_code_workflow_and_the_push
 def test_provider_canary_workflows_are_editable_while_ci_yml_stays_protected():
     """`release-preflight` requires the provider-canary job, but ci.yml, which
     wires that job into the release chain, is the protected release invariant;
-    the canary body and its branch-push wrapper reach no install, so Advanced
+    the canary body and its manual wrapper reach no install, so Advanced
     may edit them. The contributor review label still follows the body."""
     from ouroboros.runtime_mode_policy import RELEASE_INVARIANT_PATHS, protected_path_category
     from scripts.run_external_review import _RELEASE_MACHINERY_PATHS
@@ -193,14 +182,16 @@ CANARY_DRIFTS = {
     "optional repeats required": lambda w: w.ci["jobs"]["integration-optional"]["with"].update(scope="required"),
     "required repeats all": lambda w: w.ci["jobs"]["integration-test"]["with"].update(scope="all"),
     "optional admission diverges": lambda w: w.ci["jobs"]["integration-optional"].update({"if": "true"}),
-    "wrapper also fires on tags": lambda w: _triggers(w.push)["push"].update(tags=["v*"]),
-    "wrapper gains a second trigger": lambda w: _triggers(w.push).update(workflow_dispatch=None),
-    "wrapper drops a branch": lambda w: _triggers(w.push)["push"]["branches"].remove("main"),
-    "wrapper drops a path": lambda w: _triggers(w.push)["push"]["paths"].pop(),
-    "wrapper gains a path": lambda w: _triggers(w.push)["push"]["paths"].append("prompts/**"),
+    "wrapper also fires on tags": lambda w: _triggers(w.push).update(push={"tags": ["v*"]}),
+    "wrapper restores branch pushes": lambda w: _triggers(w.push).update(push={"branches": ["ouroboros"]}),
+    "wrapper restores PRs": lambda w: _triggers(w.push).update(pull_request=None),
+    "wrapper loses dispatch": lambda w: _triggers(w.push).pop("workflow_dispatch"),
     "ci.yml regains a path filter": lambda w: _triggers(w.ci)["push"].update(paths=["ouroboros/**"]),
     "ci.yml ignores a path": lambda w: _triggers(w.ci)["push"].update({"paths-ignore": ["prompts/**"]}),
-    "ci.yml drops a branch": lambda w: _triggers(w.ci)["push"]["branches"].remove("main"),
+    "ci.yml restores branches": lambda w: _triggers(w.ci)["push"].update(branches=["ouroboros"]),
+    "ci.yml restores PRs": lambda w: _triggers(w.ci).update(pull_request={"branches": ["ouroboros"]}),
+    "ci.yml drops tags": lambda w: _triggers(w.ci)["push"].pop("tags"),
+    "ci.yml drops dispatch": lambda w: _triggers(w.ci).pop("workflow_dispatch"),
     "wrapper concurrency": lambda w: w.push.update(concurrency="canary"),
     "shared job concurrency": lambda w: w.shared["jobs"]["integration-test"].update(concurrency="canary"),
     "inherited secrets": lambda w: w.ci["jobs"]["integration-test"].update(secrets="inherit"),
@@ -239,17 +230,15 @@ def _selected(job, event, selection):
 def test_manual_ui_selection_is_fixed_partial_and_never_a_paid_or_full_check():
     caller = _workflow("ui-browser-push.yml")
     triggers = caller.get("on", caller.get(True))
-    assert set(triggers) == {"push", "workflow_dispatch"}
-    assert triggers["push"] == {"branches": ["ouroboros"]}
+    assert set(triggers) == {"workflow_dispatch"}
     selection = triggers["workflow_dispatch"]["inputs"]["diagnostic"]
     assert selection["type"] == "choice" and selection["default"] == "full"
     assert selection["options"] == ["full", "viewport", "inflight"]
     assert "PARTIAL DIAGNOSTIC" in caller["run-name"]
     assert list(caller["jobs"]) == ["ui-smoke", "ui-diagnostic"] and "secrets" not in str(caller)
     lane, partial_job = caller["jobs"]["ui-smoke"], caller["jobs"]["ui-diagnostic"]
-    # Exactly one job runs: the complete lane for a push (no selection exists there) and
-    # a manual `full`, the scenario for every other manual selection, a foreign one included.
-    for event, choice, runs_lane in (("push", "", True), ("workflow_dispatch", "full", True),
+    # Exactly one job runs for a dispatch: full or a clearly partial diagnostic.
+    for event, choice, runs_lane in (("workflow_dispatch", "full", True),
                                      ("workflow_dispatch", "viewport", False),
                                      ("workflow_dispatch", "inflight", False),
                                      ("workflow_dispatch", "", False), ("workflow_dispatch", "tests", False)):

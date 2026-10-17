@@ -220,7 +220,6 @@ from supervisor.events_project_routing import (  # noqa: E402, F401 -- intention
     _handle_ensure_project_scope,
     _handle_project_digest,
     _handle_promote_chat_to_task,
-    _handle_routing_manual_target,
     _notify_host_initiated_refusal,
     _persist_promote_rejection,
     _prepare_promote_source_off_loop,
@@ -285,6 +284,8 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
 from supervisor.worker_owner_wait import handle_owner_wait  # noqa: E402
 from supervisor.worker_pool_lifecycle import handle_worker_quiescent  # noqa: E402
 
+from supervisor.events_mind_controls import handle_mind_task_control
+
 EVENT_HANDLERS = {
     "llm_usage": _handle_llm_usage,
     "external_wait_lease": _handle_external_wait_lease,
@@ -297,6 +298,7 @@ EVENT_HANDLERS = {
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
     "budget_resume_child": _handle_budget_resume_child,
+    "mind_task_control": handle_mind_task_control,
     "task_heartbeat": _handle_task_heartbeat,
     "task_dispatch_resolved": _handle_task_dispatch_resolved,
     "task_focus_updated": _handle_task_focus_updated,
@@ -315,7 +317,6 @@ EVENT_HANDLERS = {
     "schedule_subagent": _handle_schedule_task,
     "promote_chat_to_task": _handle_promote_chat_to_task,
     "ensure_project_scope": _handle_ensure_project_scope,
-    "routing_manual_target": _handle_routing_manual_target,
     "steer_task": _handle_steer_task,
     "project_digest": _handle_project_digest,
     "cancel_task": _handle_cancel_task,

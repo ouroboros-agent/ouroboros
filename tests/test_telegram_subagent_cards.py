@@ -22,11 +22,15 @@ class _Api:
 
 class _Rec:
     sent = []; edited = []; _id = [1000]
-    def __init__(self, token, **_kwargs): pass
+    def __init__(self, token, **kwargs): self.on_message = kwargs.get("on_message")
     async def send_message(self, chat_id, text, parse_mode="HTML"):
-        _Rec._id[0] += 1; _Rec.sent.append((chat_id, text, parse_mode, _Rec._id[0])); return _Rec._id[0]
+        _Rec._id[0] += 1; _Rec.sent.append((chat_id, text, parse_mode, _Rec._id[0]))
+        if self.on_message: self.on_message(chat_id, _Rec._id[0])
+        return _Rec._id[0]
     async def edit_message_text(self, chat_id, message_id, text, parse_mode="HTML"):
-        _Rec.edited.append((chat_id, message_id, text, parse_mode)); return True
+        _Rec.edited.append((chat_id, message_id, text, parse_mode))
+        if self.on_message: self.on_message(chat_id, message_id)
+        return True
     async def send_chat_action(self, chat_id, action="typing"): pass
 
 

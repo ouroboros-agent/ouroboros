@@ -154,7 +154,7 @@ def _tool_ctx(tmp_path, events, metadata):
 
 
 def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_events._wait_for_promotion_admission",
@@ -166,12 +166,12 @@ def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_pat
         "origin_message_ref": _ref(),
         "origin_message_text": OWNER_TEXT,
     })
-    out = _promote_chat_to_task(
+    out = _start_task(
         ctx,
         objective="Create a standalone 3D browser game about a robot (LLM-rewritten)",
         title="Robot browser game",
         project_name="Robot City Adventure",
-        predecessor_task_id="",
+
     )
     assert out.startswith("OK: task")
     evt = events[0]
@@ -180,7 +180,7 @@ def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_pat
 
 
 def test_ensure_scope_tool_attaches_task_origin(tmp_path):
-    from ouroboros.tools.control_delegation import _ensure_project_scope
+    from ouroboros.tools.control_delegation import _move_to_project
 
     events = []
     ctx = _tool_ctx(tmp_path, events, {
@@ -190,8 +190,8 @@ def test_ensure_scope_tool_attaches_task_origin(tmp_path):
     ctx.project_id = ""
     ctx.task_id = "t-run"
     ctx.task_contract = {}
-    out = _ensure_project_scope(ctx, project_name="Robot City")
-    assert out.startswith("⚠️ SCOPE_UNCONFIRMED")  # deferred transport: no bind landed yet
+    out = _move_to_project(ctx, project_name="Robot City")
+    assert out.startswith("SCOPE_UNCONFIRMED")  # deferred transport: no bind landed yet
     evt = [e for e in events if e.get("type") == "ensure_project_scope"][0]
     assert evt["source_ref"] == _ref()
     assert evt["source_text"] == OWNER_TEXT

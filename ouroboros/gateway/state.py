@@ -324,6 +324,7 @@ _FINALIZING_MEMO_MAX = 1024
 def _task_activity_facts(drive_root: Any, task_id: str) -> dict:
     """One signature-keyed read serves outcome, finalizing, retry and question facts."""
     from ouroboros.task_store import read_document, signature
+    from ouroboros.task_activity_facts import card_facts
 
     memo_id = (str(pathlib.Path(drive_root).resolve()), task_id)
     try:
@@ -368,7 +369,7 @@ def _task_activity_facts(drive_root: Any, task_id: str) -> dict:
         # The executor's own terminal fact or nothing: generic ts is never an answer time.
         display["late_work"] = {"title": task_presentation_name(data),
                                 "answered_at": terminal_time_fact(data).get("occurred_at") or ""}
-    facts = {"finalizing": post_task_synthesis_is_open(synthesis), "late_phase": synthesis,
+    facts = {"finalizing": post_task_synthesis_is_open(synthesis), "late_phase": synthesis, "card": card_facts(data),
              "display": display,
              # An answered root's census row (D10) carries only its own routing identity.
              "row": {key: data[key] for key in ("chat_id", "project_id", "_is_direct_chat", "queued_at")
@@ -502,7 +503,7 @@ def _direct_activity_pause_projection(drive_root: Any, row: dict, availability: 
 
 
 def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *, direct_turns=None, availability=None,
-                                  decision_owners=None) -> list:
+                                  decision_owners=None, owners_only: bool = False) -> list:
     """Direct turns plus ROOT managed queue tasks as ONE activity list.
 
     Additive beside ``active_direct_turns`` (kept unchanged for compatibility):
@@ -515,10 +516,14 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
     ``origin_bound`` row is a convert-gate fact only and re-homes nothing. A
     post-task wait keeps the task row's own ``_is_direct_chat`` fact as its
     ``kind``, so a direct turn waiting for a model after its answer is never
-    relabelled a managed task. Never raises.
+    relabelled a managed task. ``owners_only`` keeps the same owners and rooms
+    but skips every per-row phase, pause and question projection (each a store
+    read): a reader that needs only which work is current (one room's history)
+    must not pay for the whole census. Never raises.
     """
     direct_rows = direct_turns if direct_turns is not None else _direct_turns_snapshot_safe()
-    activities = [_direct_activity_pause_projection(drive_root, row, availability) for row in direct_rows]
+    activities = [dict(row) if owners_only else _direct_activity_pause_projection(drive_root, row, availability)
+                  for row in direct_rows]
     census_ids = {row.get("activity_id") for row in activities}
     bindings = task_bindings if isinstance(task_bindings, dict) else {}
     try:
@@ -562,11 +567,13 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
         def _activity(task_id: str, row: Dict[str, Any], phase: str, started_at: float, *, root: bool = True,
                       can_resume: bool = False, owner_resumed: bool = False) -> Dict[str, Any]:
             from ouroboros.project_admission import project_hold_fact
+            from ouroboros.task_activity_facts import card_facts
 
             if phase == "unknown" and availability is not None:
                 availability["complete"] = False
             return {
                 "activity_id": task_id,
+                "detached": card_facts(row)["detached"],
                 "chat_id": int(row.get("chat_id") or 0),
                 "project_id": str(row.get("project_id") or ""),
                 "client_message_id": "",
@@ -609,6 +616,9 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 if root:
                     census_ids.add(task_id)
                     active_roots.add(str(row.get("root_task_id") or task_id))
+                if owners_only:
+                    activities.append(_activity(task_id, row, "queued", _epoch_or_zero(row.get("queued_at")), root=root))
+                    continue
                 # #322 (P1): a budget-paused member must not masquerade as
                 # "queued" — nothing will dispatch it until an explicit resume.
                 pausing = _managed_task_budget_pausing(drive_root, row, task_id)
@@ -629,6 +639,9 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 if root:
                     census_ids.add(task_id)
                     active_roots.add(str(row.get("root_task_id") or task_id))
+                if owners_only:
+                    activities.append(_activity(task_id, row, "working", started_at, root=root))
+                    continue
                 # #1196: a RUNNING root whose durable budget_pause row says
                 # "pausing" is neither working nor paused yet — additive phase.
                 pausing = _managed_task_budget_pausing(drive_root, row, task_id)
@@ -703,9 +716,11 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
             binding = next((owners_by_id[key] for key in (activity.get("parent_task_id"), activity.get("root_task_id"))
                 if key in owners_by_id and owners_by_id[key].get("project_id")), None)
         if isinstance(binding, dict) and not binding.get("origin_bound"):
-            for key in ("chat_id", "project_id"):
+            for key in ("chat_id", "project_id", "project_name"):
                 if binding.get(key):
                     activity[key] = binding[key]
+    if owners_only:
+        return [row for row in activities if row.get("activity_id") in census_ids]
     try:
         from ouroboros.project_dialogue import owner_wait_projection, project_question_pointer
         from ouroboros.projects_registry import list_reserved_projects
@@ -720,7 +735,9 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
         projects = {}  # Known wait state survives missing optional Project detail.
     for activity in activities:
         try:
+            from ouroboros.task_activity_facts import enrich_activity
             facts = _task_activity_facts(drive_root, str(activity.get("activity_id") or ""))
+            enrich_activity(activity, facts, projects)
             display = dict(facts.get("display") or {})
             recorded_waits = display.pop("model_waits", {})
             attempt = int(activity.get("task_attempt") or 1)
@@ -778,11 +795,12 @@ def current_work_in_room(drive_root: Any, task_bindings: Any, matches: Callable[
     An answered root whose late phase alone remains (D10: the answer stays, the owner
     paused only its post-task work) is not current conversation: its card stays beside
     its delivered answer and Activity offers the saved remainder, so it is never
-    re-addressed at the end of a page that no longer holds its own rows."""
-    return [str(row["activity_id"]) for row in _chat_activities_snapshot_safe(drive_root, task_bindings)
-            if row.get("activity_id") and row.get("chat_id") is not None
-            and not _answer_stored((row.get("root_phase_checkpoint") or {}).get("post_task_synthesis"))
-            and matches(row["chat_id"], {**row, "task_id": row["activity_id"]})]
+    re-addressed at the end of a page that no longer holds its own rows. Only this room's
+    owners pay for their facts: the census of every room's work stays with ``/api/state``."""
+    in_room = [str(row["activity_id"]) for row in _chat_activities_snapshot_safe(drive_root, task_bindings, owners_only=True)
+               if row.get("activity_id") and row.get("chat_id") is not None
+               and matches(row["chat_id"], {**row, "task_id": row["activity_id"]})]
+    return [task_id for task_id in in_room if not _answer_stored(_task_activity_facts(drive_root, task_id).get("late_phase"))]
 
 
 async def api_state(request: Request) -> JSONResponse:
@@ -922,46 +940,20 @@ def _task_bindings_safe(request: Request, *, availability=None) -> dict:
     no button gate either — such a run is addressed to its project thread at
     admission, so it never mints a card in Main. Never raises.
 
-    ORIGIN-bound tasks are included too (#902). One owner message spawns several
-    task ids, and an ADOPTING conversion (#900) binds only the card that was
-    clicked: the message's other live cards stayed task-unbound and went on
-    offering "Turn into project" for work that already has one. The project an
-    origin already has is resolved by ``project_id_for_origin`` — the one owner of
-    that fact, including its legacy several-projects-per-origin tie-break — over
-    the SAME live lanes the sibling claim walks; the room id comes from the
-    binding that names the chosen project, so no second source can disagree.
-    Such a row carries ``origin_bound``: it closes the convert gate and points at
-    the project, and deliberately does NOT re-home the task's live card, whose
-    chat rows are still in the chat the task was started from."""
+    """
     try:
         from ouroboros.projects_registry import all_task_project_bindings
 
         drive_root = request_drive_root(request)
         bindings = {
-            str(k): {"project_id": str(v.get("project_id") or ""), "chat_id": int(v.get("chat_id") or 0)}
+            str(k): {"project_id": str(v.get("project_id") or ""), "chat_id": int(v.get("chat_id") or 0),
+                     "project_name": str(v.get("project_name") or "")}
             for k, v in (all_task_project_bindings(drive_root, strict=True) or {}).items()
         }
     except Exception:
         if availability is not None:
             availability["complete"] = False
         return {}
-    try:
-        from ouroboros.projects_registry import live_origin_lanes, project_id_for_origin
-
-        rooms = {row["project_id"]: row["chat_id"] for row in bindings.values()}
-        for task_id, origin_ref in live_origin_lanes():
-            if task_id in bindings:
-                continue
-            project_id = str(project_id_for_origin(drive_root, origin_ref) or "")
-            room = rooms.get(project_id)
-            if room:
-                bindings[task_id] = {
-                    "project_id": project_id, "chat_id": room, "origin_bound": True,
-                }
-    except Exception:
-        # Fail OPEN on the enrichment only: the durable task-keyed answer above is
-        # complete on its own, and the residual is the stray button, not a wrong one.
-        log.debug("origin-bound task projection unavailable", exc_info=True)
     return bindings
 
 

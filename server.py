@@ -1263,7 +1263,7 @@ routes = [
             "api_settings_post": api_settings_post,
         },
     ),
-    *served_ui.mounts(),  # builtin /onboarding/static, then the selected /static (kept last)
+    *served_ui.mounts(),  # public selected /auth, builtin /onboarding/static, selected /static last
 ]
 
 from contextlib import ExitStack, asynccontextmanager, suppress
@@ -1571,7 +1571,7 @@ async def lifespan(app):
         _shutdown_supervisor_event_bus()
 
 
-app = NetworkAuthGate(Starlette(routes=routes, lifespan=lifespan))
+app = NetworkAuthGate(Starlette(routes=routes, lifespan=lifespan), served_ui=served_ui)
 app.app.state.drive_root = pathlib.Path(DATA_DIR)  # type: ignore[attr-defined]
 app.app.state.repo_dir = pathlib.Path(REPO_DIR)  # type: ignore[attr-defined]
 app.app.state.broadcast_ws_sync = broadcast_ws_sync  # type: ignore[attr-defined]

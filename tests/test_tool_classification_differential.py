@@ -95,10 +95,9 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "CHILD_RESULT_LINEAGE_FORBIDDEN": Delta(False, "ok", True, "blocked", "A.4", "a refused child-result lineage is a denial"),
     "COGNITIVE_TOOL_REQUIRED": Delta(True, "cognitive_tool_required", False, "ok", "A.11", "owner batch #4: the cognitive redirect is a hint, the error flag is removed"),
     "EXECUTOR_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
-    # This tree's post-cutoff producers emit five more *_UNAVAILABLE identifiers
+    # This tree's post-cutoff producers emit four more *_UNAVAILABLE identifiers
     # the reference corpus never saw; each is the same A.18 move (the generic
     # `_UNAVAILABLE` marker keeps its own status instead of the coarse error).
-    "AUTHORITY_SOURCE_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "REVIEW_BINDING_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "REVIEW_STATE_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "SAFETY_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
@@ -246,14 +245,6 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "shape:promote_unconfirmed": Delta(False, "ok", True, "tool_reported_failure", "A.21", "an unconfirmed admission must not be reported as a created task"),
     "shape:route_rejected": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a project route the supervisor refused scheduled nothing"),
     "shape:route_unconfirmed": Delta(False, "ok", True, "tool_reported_failure", "A.21", "an unconfirmed project route must not be reported as routed"),
-    # The same family through its IDENTIFIERS: `ROUTE_*`/`ROUTING_UNCONFIRMED`/
-    # `NEEDS_MANUAL_TARGET` end in none of the suffixes the generic marker chain
-    # reads, so a route that dispatched nothing and a picker card that replaced the
-    # route both reported an ordinary warning on a successful call.
-    "ROUTE_REJECTED": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a route the supervisor refused is a refusal the agent must see, not a routed task"),
-    "ROUTE_UNCONFIRMED": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a route with no confirmed receipt did not provably schedule anything"),
-    "ROUTING_UNCONFIRMED": Delta(False, "ok", True, "tool_reported_failure", "A.21", "an unconfirmed manual-target delivery dispatched no route and offered no options"),
-    "NEEDS_MANUAL_TARGET": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a routing act that ended in a picker card dispatched no route"),
     # A.21 across the remaining control leaves. Same blindness as above: a
     # markerless sentence, or one that reaches its result through a helper the
     # publication wraps, has no (code, first line) pair to harvest.
@@ -331,9 +322,13 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     # SEES the refusal (is_error, and the policy-denial bucket tool_reported_failure
     # already routes to), while the execution health axis stays undegraded because
     # the refusal is not the agent's failure. Nothing new is declared: that status
-    # has been a non-failure for the ledger since v6.83.0.
-    "STEER_REJECTED": Delta(False, "ok", True, "tool_reported_failure", "A.I23", "a steer the host refused is a refusal the agent must see, not a delivered message"),
-    "STEER_UNCONFIRMED": Delta(False, "ok", True, "tool_reported_failure", "A.I23", "a steer with no confirmed receipt did not provably arrive, so it is not a success"),
+    # has been a non-failure for the ledger since v6.83.0. The one-bubble change
+    # deleted the text producers behind STEER_*, ROUTE_*, ROUTING_UNCONFIRMED,
+    # NEEDS_MANUAL_TARGET and the routing AUTHORITY_SOURCE_UNAVAILABLE (route_to_project,
+    # the manual-target picker, predecessor selection); their rows went with them per
+    # the unfired-rows rule. tell_task publishes its refusals natively
+    # (tests/test_control_native_results.py), and tool_result.py keeps the identifier
+    # register for stored traces.
     "native:TOOL_ARG_ERROR:ERROR": Delta(False, "ok", True, "argument_error", "A.B7", "both commit entry points reject an empty commit message before attempting a commit"),
     "native:TOOL_ARG_ERROR:REJECTED": Delta(False, "ok", True, "argument_error", "A.B7", "scratchpad and identity writers reject empty or malformed content before writing"),
     "native:TOOL_ERROR:TASK_MESSAGE_UNWRITTEN": Delta(False, "ok", True, "error", "A.B7", "forward_to_worker failed to persist the requested message"),

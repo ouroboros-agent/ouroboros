@@ -123,6 +123,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "utc_now_iso",
         # The bounded residual forecast and a disabled pool's frozen membership.
         "MAX_WORKERS", "_WORKER_POOL_DISABLED_REASON",
+        # A moved work's placement readmission validates its new room folder at launch.
+        "REPO_DIR",
     })),
     "supervisor/worker_health.py": ("supervisor/workers.py", "_pool", frozenset({
         # Runtime707: health hands off recovery; the reaper owns storm/respawn.

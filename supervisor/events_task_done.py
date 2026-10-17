@@ -800,7 +800,8 @@ def _resolve_lifecycle_fault(
         "reason_code": str(stored.get("reason_code") or ""),
         "outcome_axes": normalize_outcome_axes(stored),
     }
-    for key in ("review_projection", "review_status", "artifact_status", "artifact_bundle", "root_phase_checkpoint"):
+    for key in ("review_projection", "review_status", "artifact_status", "artifact_bundle", "root_phase_checkpoint",
+                "execution_owner", "_is_direct_chat"):
         if key in stored:
             task_done_event[key] = stored[key]
     try:
@@ -978,7 +979,8 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             _events()._resolve_lifecycle_fault(evt, ctx, _evt_status)
             return
     recovery = meta.get("_terminal_file_recovery") or {}
-    if task and not (task.get("_is_direct_chat") or _evt_status == STATUS_INTERRUPTED):
+    from ouroboros.task_carrier import inline_execution
+    if task and not (inline_execution(task) or _evt_status == STATUS_INTERRUPTED):
         if prepared_attempt is None or (recovery and not recovery.get("event_sent")):
             from supervisor.task_reaper import enqueue_terminal_file_recovery
 
@@ -1067,12 +1069,15 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         # result carries it, and a reaper-delivered terminal reads the result.
         "_is_direct_chat": bool(evt.get("_is_direct_chat") or (
             isinstance(final_task_result, dict) and final_task_result.get("_is_direct_chat"))),
+        "execution_owner": final_task_result.get("execution_owner") or evt.get("execution_owner") or {},
         "root_phase_checkpoint": final_task_result.get("root_phase_checkpoint") or {},
         "outcome_axes": outcome_axes,
         "reason_code": reason_code,
         "artifact_status": artifact_status,
         **terminal_cost,
     }
+    from supervisor.consciousness_carriers import finish_pooled_wake
+    finish_pooled_wake(ctx, task_id, final_task_result)
     if str(evt.get("typed_routing_action") or "").strip():
         task_done_event["typed_routing_action"] = str(evt.get("typed_routing_action") or "").strip()
     if isinstance(artifact_bundle, dict):

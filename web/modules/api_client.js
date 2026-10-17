@@ -292,8 +292,8 @@ export async function fetchTaskDetail(taskId) {
  * @param {string} taskId
  * @returns {Promise<import('./api_types.js').TaskDetailResponse|null>}
  */
-export async function fetchTaskDetailStrict(taskId) {
-    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+export async function fetchTaskDetailStrict(taskId, { signal } = {}) {
+    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`, signal ? { signal } : {});
     if (resp && typeof resp.json === 'function') {
         if (resp.ok !== false) return resp.json();
         if (resp.status === 404) return null;
@@ -347,11 +347,12 @@ export const apiClient = {
     startHarnessMaintenance,
     harnessMaintenanceOperation,
     cancelHarnessMaintenance,
-    /** Read a recent window or replay one opaque, room-bound history page. */
-    chatHistory: ({ chatId = 1, cursor = null, signal } = {}) => {
+    /** Read a recent window, replay one opaque, room-bound history page, or read the page around one task. */
+    chatHistory: ({ chatId = 1, cursor = null, around = null, signal } = {}) => {
         const params = new URLSearchParams();
         if (chatId !== 1) params.set('chat_id', String(chatId));
         if (cursor) params.set('cursor', cursor);
+        if (around) params.set('around', around);  // `task:<id>`: the page around that task
         const query = params.toString();
         return fetchJson(`/api/chat/history${query ? `?${query}` : ''}`, { cache: 'no-store', signal });
     },
@@ -419,7 +420,7 @@ export const apiClient = {
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),
-    /** The owner's effort range, saved as one ordered triple. @param {{min: string, recommended: string, max: string}} range */
+    /** Save room primary effort and ordered helper bounds. @param {import('./client_contract_types.js').OwnerEffortRangeRequest} range */
     ownerEffortRange: (range) => jsonPost('/api/owner/effort-range', range),
     /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
     ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),

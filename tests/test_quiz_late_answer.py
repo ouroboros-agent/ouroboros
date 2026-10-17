@@ -136,7 +136,10 @@ def test_an_answer_the_live_task_received_is_not_forwarded_when_retried_after_it
     assert first.status_code == 200, first.text
     assert first.json()["duplicate"] is False and not first.json().get("forwarded")
     assert "answered_after_terminal" not in quiz_states(tmp_path, "task-2")["q1"]
-    reconcile_terminal(tmp_path, "task-2")  # the task ended with the answer in its mailbox
+    from ouroboros.owner_mailbox import drain_owner_entries, acknowledge_transcript_entry
+    [entry] = drain_owner_entries(tmp_path, "task-2", set())
+    assert acknowledge_transcript_entry(tmp_path, "task-2", entry)
+    reconcile_terminal(tmp_path, "task-2")  # the task ended after reading the answer
     gone = _decision_app(tmp_path, monkeypatch, live_task=None)
     again = _post(gone, {"request_id": "r2", "decision_id": "quiz:task-2:q1", "option_index": 0})
     assert again.status_code == 200 and again.json()["duplicate"] is True
@@ -394,8 +397,7 @@ def test_the_drained_late_answer_gives_the_model_the_rebuilt_frame_while_the_row
     assert ("The owner answered in their own words without choosing an offered option. "
             "Verbatim: neither -- use duckdb") in delivered
     [directive] = [row for row in ctx._owner_directives if row["source"] == "owner_mailbox"]
-    assert directive["content"].startswith(LATE_HEAD.format("task-1") + "\n[Owner quiz answer] quiz q1")
-    assert "Verbatim: neither -- use duckdb" in directive["content"]
+    assert directive["content"] == "neither -- use duckdb"
     # The steer relay's delivery fact stays the owner's own message.
     assert ctx.last_owner_delivery["text"] == "neither -- use duckdb"
 
@@ -437,7 +439,7 @@ def test_an_unreadable_card_is_disclosed_with_the_owners_words(tmp_path):
     _drain_incoming_messages(messages, queue_mod.Queue(), tmp_path, "live-root", None, set(),
                              owner_ctx=ctx)
     delivered = str(messages[-1]["content"])
-    assert f"{LATE_HEAD.format('task-gone')}\n2. postgres\n" in delivered
+    assert "[Late answer to a question asked by task task-gone, which is not reading]\n2. postgres\n" in delivered
     assert "answers quiz q9; that card could not be read" in delivered
     assert "[Owner quiz answer]" not in delivered
 
@@ -480,16 +482,14 @@ def test_a_late_answer_direct_turn_starts_with_the_rebuilt_frame(tmp_path, monke
     assert plain.task["text"] == "prod parity"
 
 
-def test_a_late_answer_routed_into_a_project_rooms_live_root_carries_its_provenance(tmp_path, monkeypatch):
+def test_a_late_answer_bypasses_an_unrelated_project_reader(tmp_path, monkeypatch):
     """End to end through the real bridge intake: a late answer in a Project room
     with exactly one live root lands in THAT root's mailbox as the owner's words
     with its typed late_answer provenance, so the drain can rebuild the frame."""
-    import queue as queue_mod
     from types import SimpleNamespace
 
     import server
     import supervisor.message_bus as mb
-    from ouroboros.loop_round_limits import _drain_incoming_messages
     from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.projects_registry import create_project
 
@@ -505,30 +505,25 @@ def test_a_late_answer_routed_into_a_project_rooms_live_root_carries_its_provena
                        "option_index": 1, "comment": "prod parity"})
     assert resp.status_code == 200 and resp.json()["forwarded"] is True
 
+    heads = []
     pending = [{"id": "pending-root", "chat_id": chat_id, "root_task_id": "pending-root",
                 "delegation_role": "root", "drive_root": str(tmp_path)}]
     ctx = SimpleNamespace(
-        DRIVE_ROOT=tmp_path, PENDING=pending, RUNNING={},
+        DRIVE_ROOT=tmp_path, PENDING=[], RUNNING={"pending-root": {"task": pending[0]}},
         load_state=lambda: {"owner_id": 1, "owner_chat_id": 1, "session_id": "s-1"},
         update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
         consciousness=SimpleNamespace(inject_observation=lambda _text: None),
         get_chat_agent=lambda: SimpleNamespace(_busy=False),
-        handle_chat_direct=lambda *a, **k: pytest.fail("mailbox delivery must not run a turn"),
+        handle_chat_direct=lambda *a, **k: heads.append((a, k)),
         send_with_budget=lambda *a, **k: None,
     )
     monkeypatch.setattr(bridge, "send_routing_ack", lambda *a, **k: None, raising=False)
     server._process_bridge_updates(bridge, 0, ctx)
 
-    [entry] = drain_owner_entries(tmp_path, "pending-root", set(), include_acknowledged=True)
-    assert entry["text"] == "prod parity"
-    _assert_host_snapshot(entry["late_answer"], "task-1", "q1")
-    owner_ctx = SimpleNamespace()
-    messages = [{"role": "user", "content": "Initial requirement"}]
-    _drain_incoming_messages(messages, queue_mod.Queue(), tmp_path, "pending-root", None, set(),
-                             owner_ctx=owner_ctx)
-    delivered = str(messages[-1]["content"])
-    assert "The owner chose option 2: postgres" in delivered
-    assert "Owner comment (verbatim): prod parity" in delivered
+    assert drain_owner_entries(tmp_path, "pending-root", set()) == []
+    assert len(heads) == 1
+    metadata = heads[0][1]["task_metadata"]
+    _assert_host_snapshot(metadata["late_answer"], "task-1", "q1")
 
 
 def test_a_late_web_answer_passes_the_supervisor_consumer_seam(tmp_path, monkeypatch):

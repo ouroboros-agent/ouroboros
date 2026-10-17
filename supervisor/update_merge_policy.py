@@ -41,6 +41,7 @@ HOT_CODE_PATHS = frozenset({
     # monoliths keeps the label (same parity rule as the D04 block above).
     "ouroboros/tools/control_events.py",
     "ouroboros/tools/control_routing.py",
+    "ouroboros/tools/control_relay.py",
     "ouroboros/tools/control_runtime.py",
     # v7 D07 split leaves: the rest of the hot control monolith moved out with
     # the D07 lane and keeps the label (same parity rule as the D04 block).

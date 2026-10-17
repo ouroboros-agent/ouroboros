@@ -393,7 +393,8 @@ def _main_notice_refusal(ctx: ToolContext, chat_id: object) -> str:
     return ""
 
 
-def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destination: str = "current") -> str:
+def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destination: str = "current",
+                       reply_to_relay: str | None = None) -> str:
     """Send a separate owner reply without completing the ongoing task.
 
     ``destination="main"`` addresses the owner's main chat from an owner-visible
@@ -432,6 +433,21 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
         # via log_chat(record_type=...) exactly like media rows.
         system_type = "proactive_message"
 
+    relay = {}
+    reply_meta = {}
+    if reply_to_relay is not None:
+        from ouroboros.owner_relay import select_return
+        from ouroboros.chat_references import resolve_reply
+        from ouroboros.tool_access import canonical_data_root
+        relay, error = select_return(ctx, reply_to_relay)
+        error = error or owner_contact_refusal(ctx, chat_id)
+        if relay and relay["source"]["chat_id"] != chat_id:
+            error = error or _main_notice_refusal(ctx, chat_id)
+        if error:
+            return publish_no_effect(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=error, meta={"reason_code": "RELAY_RETURN_UNRESOLVED"}))
+        chat_id, system_type = relay["source"]["chat_id"], "relay_reply"
+        reply_meta = {"reply_to": resolve_reply(canonical_data_root(ctx), relay["source"]["address"]),
+                      "reply_to_relay": relay["relay_id"]}
     from ouroboros.tools.owner_delivery import deliver_owner_event
     from ouroboros.utils import append_jsonl
     mode = deliver_owner_event(ctx, {
@@ -441,6 +457,7 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
         "format": "markdown",
         "is_progress": False,
         "system_type": system_type,
+        "progress_meta": reply_meta,
         "ts": utc_now_iso(),
     })
     append_jsonl(ctx.drive_logs() / "events.jsonl", {
@@ -452,6 +469,10 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
         "transport_mode": mode,
         "text_preview": text[:200],
     })
+    if relay:
+        ctx._open_relays.pop(relay["relay_id"], None)
+        from ouroboros.owner_relay import persist_held_state
+        persist_held_state(ctx)
     if target == "main":
         return "OK: notice sent to the main chat." if mode == "live" else "OK: notice queued for delivery to the main chat."
     if mode == "live":

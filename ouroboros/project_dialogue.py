@@ -494,6 +494,7 @@ def append_chat_annotation(
     require_latest_status: Any = None,
     require_latest_token: Any = None,
     reasoning_effort: str = "",
+    project_name: str = "", target_task_ids: Any = None, target_titles: Any = None,
 ) -> bool:
     """Append one compact UI annotation.
 
@@ -509,9 +510,6 @@ def append_chat_annotation(
     while the message's CURRENT latest status is in the set — the first-wins
     claim seam of the routing picker (#198). Absent/None keeps plain append.
 
-    ``reasoning_effort`` rides a picker row whose producer chose the explicit
-    start of a New task picked from it (#1539), and a closing row naming the
-    start that root was admitted with; a steered task never wears one.
     """
     message_id = str(client_message_id or "").strip()
     if not message_id:
@@ -524,6 +522,8 @@ def append_chat_annotation(
         "target": str(target or "")[:200],
         "status": str(status or "")[:80],
     }
+    if target_task_ids is not None:
+        row.update(project_name=project_name, target_task_ids=list(target_task_ids), target_titles=list(target_titles or []))
     if str(target_label or ""):
         row["target_label"] = str(target_label)[:200]
     if project_id and project_chat_id:
@@ -650,7 +650,6 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "target_unknown": "that task is no longer running",
     "direct_chat_turn": "that reply has already been given",
     "subagent_target": "that task is a helper of another task",
-    "chat_mismatch": "that task belongs to another chat",
     "cancel_pending": "that task is being stopped",
     "target_closed": "that task has already finished",
     "target_finished": "that task has already finished",
@@ -659,7 +658,7 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "project_scope_conflict": "the task already belongs to another project",
     "missing_task_or_project": "no task or project was named",
     "project_unavailable": "the project is no longer available",
-    # route_to_project's typed abstention codes (control_routing._route_to_project)
+    # Historical routing-card refusal codes, retained for receipt replay.
     "target_unspecified": "no destination was chosen",
     "invalid_project_id": "that project id is not valid",
     "target_not_found": "that project does not exist",
@@ -667,7 +666,7 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
 
 # Host routing refusals stay in the issuing chat regardless of the target's
 # Project binding (room_membership); they are never terminal task facts.
-ORIGIN_ADDRESSED_NOTICE_TYPES = frozenset({"task_not_started", "task_start_unconfirmed", "steer_not_delivered"})
+ORIGIN_ADDRESSED_NOTICE_TYPES = frozenset({"task_not_started", "task_start_unconfirmed", "steer_not_delivered", "relay_reply"})
 
 # A root's deliberate plain-text notice to Main (send_user_message
 # destination="main"); never a task's final answer.
@@ -681,10 +680,10 @@ MAIN_PINNED_ROW_TYPES = frozenset({"project_started", "project_handoff", "projec
 # (``message_bus.send_with_budget``) reads this one set; the readers above keep
 # each component's own reading.
 ROOM_FIXED_ROW_TYPES = MAIN_PINNED_ROW_TYPES | ORIGIN_ADDRESSED_NOTICE_TYPES | frozenset({
-    "acceptance_late_settlement", "project_question_pointer"})
+    "acceptance_late_settlement", "project_question_pointer", "relay_reply"})
 
 # Statuses of an act that LANDED (or is still in flight): no cause sentence.
-_LANDED_ROUTING_STATUSES = frozenset({"scheduled", "delivered", "pending", "dispatch_pending", "accepted"})
+_LANDED_ROUTING_STATUSES = frozenset({"scheduled", "delivered", "read", "pending", "dispatch_pending", "accepted"})
 
 
 def routing_refusal_cause(action: str, status: str, reason: str, options: Any = None) -> str:
@@ -1506,7 +1505,7 @@ def project_completion_delivery_outcome(
             excerpt = f"{excerpt} Open the Project for details."
         from ouroboros.terminal_time import terminal_time_fact
         from ouroboros.terminal_projection import completion_notice
-
+        from ouroboros.project_completion_facts import completion_facts
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
             "text": (f"{snapshot['target_label']} · "
@@ -1515,6 +1514,7 @@ def project_completion_delivery_outcome(
             "role": "system", "system_type": "project_completion_summary",
             "delivery_id": f"project-completion:{tid}",
             "progress_meta": {
+                **completion_facts(drive_root, tid, task, result, task_done_event),
                 "project_id": snapshot["project_id"],
                 "project_name": snapshot["project_name"],
                 "target_label": snapshot["target_label"], "status": status,
@@ -1536,9 +1536,7 @@ def enqueue_project_completion_summary(
     drive_root: Any, evt: Dict[str, Any], task_id: str, task: Dict[str, Any],
     result: Dict[str, Any], task_done_event: Dict[str, Any],
 ) -> bool:
-    """Whether THIS call queued a live Main copy — the long-standing answer;
-    durability is the typed pair's other half, for callers that must tell a
-    duplicate from a lost one."""
+    """Whether this call queued a live Main copy; the typed pair also reports durability."""
     return project_completion_delivery_outcome(
         drive_root, evt, task_id, task, result, task_done_event,
     )[1]

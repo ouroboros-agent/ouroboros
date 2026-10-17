@@ -58,7 +58,7 @@ def test_chat_resyncs_history_after_reconnect():
     assert not any(quota in history for quota in ("n_human", "n_progress", "limit"))
     assert "limit=1000" not in source
     assert "cache: 'no-store'" in history
-    assert "syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })" in source
+    assert "isReconnect ? syncHistory({ fromReconnect: true })" in source
     assert "const expectedDisconnect = socketState !== WebSocket.OPEN" in source
     assert "if (expectedDisconnect && err instanceof TypeError)" in source
 

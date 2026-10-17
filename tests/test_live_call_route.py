@@ -75,7 +75,7 @@ def test_the_first_tool_view_reads_its_pointers_and_hands_long_work_to_a_task():
     # Every retained host section in the call view is a runtime_data read, and a Gemini session
     # reopens to gain a tool: read_file must be there from the first open.
     assert set(live_call_route.CALL_INITIAL_TOOL_NAMES) == set(COGNITIVE_MEMORY_TOOL_NAMES) | {
-        "web_search", "send_user_message", "read_file", "promote_chat_to_task"}
+        "web_search", "send_user_message", "read_file", "start_task"}
 
 
 def test_the_first_tool_view_names_exist_in_the_registry(tmp_path):
@@ -86,7 +86,7 @@ def test_the_first_tool_view_names_exist_in_the_registry(tmp_path):
     registry = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "data")
     registry.set_context(ToolContext(repo_dir=repo, drive_root=tmp_path / "data", task_id="t"))
     names = {schema["function"]["name"] for schema in live_call_route.initial_call_schemas(registry, _spec())}
-    assert {"read_file", "promote_chat_to_task", "knowledge_read", "memory_read"} <= names
+    assert {"read_file", "start_task", "knowledge_read", "memory_read"} <= names
 
 
 def test_a_presence_call_opens_with_its_whole_ceiling_and_an_owner_call_with_the_nano_view():

@@ -240,6 +240,93 @@ def documents_by_ids(root: Any, task_ids: Iterable[str]) -> Dict[str, Dict[str, 
     return {str(document.get("task_id")): document for document in _decode(*fetched)}
 
 
+# A display read (``task_reads``: history cards; ``effective_task_result`` with
+# ``materialize_artifacts=False``, retry successors and child replicas included) takes every
+# stored key except the bulky evidence no such reader uses — 94 MB of heads for 1.46 GB of
+# bodies on a long-lived install. A DROPPED key goes; a KEPT key keeps only the named sub-keys
+# it is read through; every other key, a new fact included, arrives as stored. The evidence
+# goes to task detail, Continue and writers (cost planes, verification, plan/review state,
+# traces, artifacts — whose materialized view is the ``materialize_artifacts=True`` read).
+# A display reader that needs a dropped path names it here; ``tests/test_task_reads.py``
+# builds a page from display views and from full documents and requires the same page.
+DISPLAY_DROPPED: Tuple[str, ...] = (
+    "loop_outcome", "trace_refs", "review_evidence", "artifacts", "result", "trace_summary",
+    "governing_owner_words", "verification_ledger", "plan_review_state", "acceptance_debt",
+    "mutation_evidence", "configured_subagent", "context", "continuation_narrative", "origin_message_text",
+    "owner_mailbox", "subagent_availability", "plan_record", "review_status", "schedule_admission",
+    "task_acceptance_review_accounting",
+    *(f"metadata.{key}" for key in (
+        "task_contract", "main_routing_manifest", "governing_owner_words", "routing_contract",
+        "configured_subagent", "continuation", "project_routing_manifest", "subagent_envelope", "owner_corpus",
+        "origin_message_text", "wake_observation", "project_last_task_result", "current_chat",
+        "workspace_preflight", "workspace_copy", "late_answer")),
+)
+DISPLAY_KEPT: Dict[str, Tuple[str, ...]] = {"artifact_bundle": ("status",), "task_contract": ("deadline_at",)}
+_KEEP = "__keep__"  # a path no kept object holds: the no-op target of a conditional edit
+
+
+def _display_sql(column: str = "b.body") -> str:
+    """One stored body's display view in SQLite JSON1 functions of the store's SQLite floor (no
+    ``->``): presence, booleans and nulls are kept exactly, a non-object KEPT value as stored."""
+    def path(*parts: str) -> str:
+        return "'$." + ".".join(parts) + "'"
+
+    view = (f"json_remove({column}, {', '.join(path(*key.split('.')) for key in DISPLAY_DROPPED)})"
+            if DISPLAY_DROPPED else f"json({column})")
+    for key, kept in DISPLAY_KEPT.items():
+        is_object = f"json_type({column}, {path(key)}) = 'object'"
+        values = [f"CASE json_type({column}, {path(key, sub)}) WHEN 'true' THEN json('true') WHEN 'false' "
+                  f"THEN json('false') WHEN 'null' THEN json('null') ELSE json_extract({column}, {path(key, sub)}) END"
+                  for sub in kept]
+        built = "json_object(" + ", ".join(f"'{sub}', {value}" for sub, value in zip(kept, values)) + ")"
+        absent = ", ".join(f"CASE WHEN json_type({column}, {path(key, sub)}) IS NULL THEN {path(sub)} "
+                           f"ELSE {path(_KEEP)} END" for sub in kept)
+        view = (f"json_replace({view}, CASE WHEN {is_object} THEN {path(key)} ELSE {path(key, _KEEP)} END, "
+                f"CASE WHEN {is_object} THEN json_remove({built}, {absent}) END)")
+    return view
+
+
+def display_documents(root: Any, task_ids: Iterable[str],
+                      versions: Optional[Dict[str, int]] = None) -> Dict[str, str]:
+    """The display views (``DISPLAY_DROPPED``) of several documents as JSON text, row-backed
+    fields projected: ONE aggregated row in ONE short read, everything else after it closes.
+    A page of tasks costs a few interpreter hand-offs and kilobytes, not a row step per task and
+    the megabytes of evidence; each caller decodes its own private copy of a text. ``versions``
+    receives each view's ``write_seq`` from the same read."""
+    ids = sorted({str(task_id) for task_id in task_ids if str(task_id or "").strip()})
+    if not ids:
+        return {}
+    with open_store(root, write=False) as txn:
+        record = txn.conn.execute(  # '' || ...: the view travels as a string, decoded per use
+            f"SELECT json_group_array(json_array(t.task_id, '' || {_display_sql()}, t.write_seq)) FROM tasks AS t "
+            "JOIN task_bodies AS b ON b.task_id = t.task_id WHERE t.task_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(ids),)).fetchone()
+        handoff_rows = txn.handoff_records(ids)
+    handoffs = store.decode_handoffs(ids, handoff_rows)
+    held = {record["task_id"] for record in handoff_rows}
+    found = json.loads(record[0] or "[]")
+    if versions is not None:
+        versions.update((task_id, int(seq or 0)) for task_id, _text, seq in found)
+    return {task_id: (text if task_id not in held else
+                      store.document_text(store.project_handoffs(json.loads(text), handoffs[task_id])))
+            for task_id, text, _seq in found}
+
+
+def task_versions(root: Any, task_ids: Iterable[str]) -> Dict[str, Tuple[int, str, bool]]:
+    """Each stored task's ``(write_seq, status, owes_synthesis)``, typed columns only, in ONE
+    aggregated row: whether documents a window shows changed since it read them, and which of them
+    are settled now. An id the store does not hold is absent from the answer."""
+    ids = sorted({str(task_id) for task_id in task_ids if str(task_id or "").strip()})
+    if not ids:
+        return {}
+    with open_store(root, write=False) as txn:
+        record = txn.conn.execute(
+            "SELECT json_group_array(json_array(task_id, write_seq, status, owes_synthesis)) FROM tasks "
+            "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(ids),)).fetchone()
+    return {task_id: (int(seq or 0), str(status or ""), bool(owes))
+            for task_id, seq, status, owes in json.loads(record[0] or "[]")}
+
+
 def task_ids(root: Any) -> List[str]:
     with open_store(root, write=False) as txn:
         return txn.task_ids()

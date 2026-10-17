@@ -266,6 +266,10 @@
  * task-progress and outcome fields of a live `chat` frame (`ChatOutbound`). Replay-evidence rows
  * (`quiz_answer`, `quiz_closed`, `task_evidence`, or `summary_kind` + `historical_terminal`) are never shown.
  * @typedef {Object} ChatHistoryMessage
+ * @property {string=} row_address
+ * @property {Object=} reply_to
+ * @property {Object=} relay
+ * @property {string=} reply_to_relay
  * @property {string} text
  * @property {'user'|'assistant'|'system'} role
  * @property {string} ts  // the stored row's time: the same string its live frame carried
@@ -398,6 +402,15 @@
  */
 
 /**
+ * What an `around=task:<id>` read found: `found` (its page lands on `history_id`), `absent` (the
+ * thread's saved history holds no row of the task a client could show) or `moved` (another thread's).
+ * @typedef {Object} ChatHistoryAnchor
+ * @property {'found'|'absent'|'moved'} state
+ * @property {string} task_id
+ * @property {string=} history_id
+ */
+
+/**
  * `GET /api/chat/history`: conversation rows oldest first; replay evidence may follow them
  * regardless of timestamp and recur across pages. An error answer keeps this shape: no rows,
  * `has_more` true and the cursor that was sent as `next_cursor`.
@@ -407,8 +420,10 @@
  * @property {string=} next_before_ts  // legacy, no longer sent
  * @property {?string} next_cursor
  * @property {?string=} page_cursor
+ * @property {string=} after_cursor  // the newest page and every `after` read: the rows stored since
  * @property {ChatHistoryWindow} window
  * @property {ChatHistoryCoverage=} coverage
+ * @property {ChatHistoryAnchor=} anchor  // an `around` read only
  * @property {string=} error
  * @property {string=} reason_code
  */
@@ -425,6 +440,15 @@
  * `POST /api/owner/context-mode`.
  * @typedef {Object} OwnerContextModeRequest
  * @property {'nano'|'low'|'max'} mode
+ * @property {string=} project_id
+ */
+
+/**
+ * @typedef {Object} OwnerEffortRangeRequest
+ * @property {string} min
+ * @property {string} recommended
+ * @property {string} max
+ * @property {string=} project_id
  */
 
 /**

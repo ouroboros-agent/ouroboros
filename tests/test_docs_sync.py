@@ -384,6 +384,7 @@ def test_architecture_endpoint_table_mirrors_route_registries(tmp_path):
     row in ARCHITECTURE §4, and no row names a route that is not mounted."""
     from ouroboros.gateway.endpoint_index import HTTP_ENDPOINTS
     from ouroboros.gateway import files as gateway_files
+    from ouroboros.server_web import ServedUI
 
     section = _architecture_section("4. Server API Endpoints")
     rows = re.findall(r"^\| (GET|POST|PUT|PATCH|DELETE|ANY|WS|STATIC) \| `([^`]+)` \|", section, re.M)
@@ -397,9 +398,12 @@ def test_architecture_endpoint_table_mirrors_route_registries(tmp_path):
             if method in ("HEAD", "OPTIONS"):
                 continue
             expected_public.add(f"{method} {route.path}")
-    # server-level surfaces that are not gateway routes but belong in the map (server_web.ServedUI:
-    # the selected interface at / and /static, the core's own builtin tree at /onboarding/static)
-    expected_public |= {"GET /", "WS /ws", "STATIC /static/*", "STATIC /onboarding/static/*"}
+    # Server-level surfaces include every static mount of the existing serving owner.
+    # Use a disposable source tree, without importing or starting the real server.
+    fixture_repo = tmp_path / "public-repo"
+    (fixture_repo / "web").mkdir(parents=True)
+    expected_public |= {"GET /", "WS /ws"}
+    expected_public.update(f"STATIC {mount.path}/*" for mount in ServedUI(fixture_repo).mounts())
     # /api/extensions/{skill}/{rest:path} is mounted for every verb and documented once as ANY
     expected_public = {e for e in expected_public if not e.endswith("/api/extensions/{skill}/{rest:path}")}
     expected_public.add("ANY /api/extensions/{skill}/{rest:path}")

@@ -74,6 +74,9 @@ def _emit_routing_receipt(
     routing_token = str(evt.get("routing_token") or "").strip()
     annotation_status = "not_applicable"
     project_address = _routing_project_address(ctx, target, status)
+    if evt.get("relay_id"):
+        from ouroboros.owner_relay import relay_target_facts
+        project_address.update(relay_target_facts(ctx.DRIVE_ROOT, target, evt.get("relay_target")))
     # Q3=A: the owner-facing sentence for a REFUSED act (host table; "" for a
     # landed row or the picker), computed once for the durable row and the ack.
     cause = routing_refusal_cause(action, status, reason, options)
@@ -180,6 +183,9 @@ def _publish_routing_ack(
                 "status": status,
                 **_routing_project_address(ctx, target, status),
             }
+            if evt.get("relay_id"):
+                from ouroboros.owner_relay import relay_target_facts
+                ack_kwargs.update(relay_target_facts(ctx.DRIVE_ROOT, target, evt.get("relay_target")))
             if options is not None:
                 ack_kwargs["options"] = options
             if attachment_manifest is not None:
@@ -460,6 +466,9 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                 },
             )
             return blocked
+        from ouroboros.promotion_intent import claim_promotion_intent
+
+        claim_promotion_intent(ctx.DRIVE_ROOT, evt)
         evt = {**evt, "_admission_reserved": True}
         if str(evt.get("source") or "").strip() and not evt.get("_source_prepared"):
             threading.Thread(
@@ -540,8 +549,6 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                     "routing_receipt_required": bool(str(evt.get("client_message_id") or "")),
                     "routing_receipt_status": str(receipt.get("annotation_status") or ""),
                     "source_note": str(outcome.get("source_note") or ""),
-                    # Owner 3=A: the promoter's unmet planning obligation moved onto
-                    # this root; the tool reads it back with the admission receipt.
                     **({"force_plan_transfer": dict(transfer)} if isinstance(transfer, dict) and transfer else {}),
                 },
                 result=(
@@ -744,15 +751,7 @@ def _record_obligation_transfer(ctx: Any, transfer: Dict[str, Any]) -> None:
 
 
 def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
-    """Create/attach the registry project for an in-task ensure_project_scope call,
-    bind the CURRENT task to it, and answer on the receipt rail.
-
-    The worker already scoped itself in memory; what it waits for is the DURABLE
-    outcome: a landed bind (``delivered``) or a typed refusal (``rejected`` with
-    the reason -- bound elsewhere, a refused bind, a registration failure) under
-    the act's own synthetic receipt id. Before this the tool said "OK: created"
-    before any bind existed and the handler's receipt writer reported an unwritten
-    row as persisted."""
+    """Frozen receipt adapter for placement of the current work."""
     from supervisor.workers import ensure_project_scope
 
     try:
@@ -764,10 +763,6 @@ def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
     if not isinstance(outcome, dict):
         outcome = {"status": "unconfirmed", "reason": "handler_returned_no_outcome"}
     target = str(outcome.get("project_id") or evt.get("project_id") or "")
-    if outcome.get("status") == "delivered":
-        from ouroboros.project_handoff import enqueue_project_handoff
-
-        enqueue_project_handoff(ctx.DRIVE_ROOT, str(evt.get("task_id") or ""))
     label = ""
     try:
         from ouroboros.projects_registry import get_project
@@ -790,32 +785,3 @@ def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
         })
     except Exception:
         log.debug("ensure_project_scope settle row failed", exc_info=True)
-
-
-def _handle_routing_manual_target(evt: Dict[str, Any], ctx: Any) -> None:
-    """Publish the decision actor's typed abstention without routing work."""
-    from ouroboros.project_dialogue import routing_options_with_labels
-    from ouroboros.settings_scales import EFFORT_SCALE
-
-    options = routing_options_with_labels(ctx.DRIVE_ROOT, evt.get("options"))
-    effort = str(evt.get("reasoning_effort") or "")
-    _emit_routing_receipt(
-        ctx,
-        evt,
-        action="route_decision",
-        # An unnamed target stays "": the typed reason is a code, never a task
-        # id to label.
-        target=str(evt.get("requested_target") or "")[:200],
-        status="needs_manual_target",
-        reason=str(evt.get("reason") or "target_unspecified"),
-        # The model's own words about the abstention, kept beside the typed
-        # code on the durable row (replay-only; no owner surface reads it).
-        detail=str(evt.get("detail") or ""),
-        options=options,
-        # Durable carrier: the picker click re-forwards these staged specs to
-        # the chosen destination long after the routing turn's metadata died.
-        attachment_manifest=_events()._routing_attachments(evt.get("attachment_uploads")),
-        # The turn's explicit start for a New task picked here: the card is its only
-        # carrier once the turn ends (routing_decision reads it back on the click).
-        reasoning_effort=effort if effort in EFFORT_SCALE else "",
-    )

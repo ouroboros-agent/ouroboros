@@ -170,8 +170,10 @@ def test_api_conversion_binding_overrides_old_result_scope_on_restore(host, tmp_
     workers.assign_tasks()
     workers.assign_tasks()
     assert [row["id"] for row in sent] == ["converted"]
-    for key in ("project_id", "_project_admission", "workspace_root", "drive_root", "text"):
+    for key in ("project_id", "drive_root", "text"):
         assert sent[0].get(key) == prepared.get(key)
+    assert sent[0]["workspace_root"] == ""  # The destination room has no execution folder.
+    assert sent[0]["_project_admission"] == registry.project_admission_basis("chosen", answer["project"], frozen=True)
     assert load_task_result(host.root, "converted")["status"] == "running"
     assert not host.attempts
 
@@ -182,45 +184,46 @@ def test_in_task_conversion_uses_chosen_row_for_retry(host, tmp_path, scoped):  
     from supervisor.worker_promotion import ensure_project_scope
 
     prepared = admit(host, tmp_path, scoped=scoped)
+    original = copy.deepcopy(prepared)
     host.pending.clear()
     host.running[prepared["id"]] = {"task": prepared}
-    # The adopted-origin case is the legitimate derived-scope conversion path.
+    # A sibling's origin is provenance only; the explicit target still names the room.
     if scoped:
         from ouroboros.project_dialogue import build_owner_message_ref
         ref = build_owner_message_ref(chat_id=1, client_message_id="origin", ts="2026-01-01T00:00:00Z", text="Work")
         prepared.update(origin_message_ref=ref, origin_message_text="Work")
+        original = copy.deepcopy(prepared)
         registry.create_project(host.root, "chosen")
         registry.bind_task_to_project(host.root, "sibling", "chosen", origin={"ref": ref, "text": "Work"})
     result = ensure_project_scope({"task_id": "converted", "project_id": "chosen"}, host.ctx)
     assert result["status"] == "delivered"
     chosen = registry.get_reserved_project(host.root, "chosen")
-    assert prepared["_project_admission"] == registry.project_admission_basis("chosen", chosen, frozen=True)
+    assert prepared == original  # RUNNING execution resources do not move.
     host.running.clear()
     retried = queue.enqueue_task(prepared)
     assert not retried.get("_admission_blocked") and retried["workspace_root"] == prepared["workspace_root"]
+    assert retried["_project_admission"] == registry.project_admission_basis("chosen", chosen, frozen=True)
 
 
 @pytest.mark.parametrize("carrier", ["absent", "main", "derived"])
-def test_conversion_rollback_restores_scope_and_exact_carrier(host, tmp_path, monkeypatch, carrier):  # noqa: F811
+def test_conversion_bind_failure_preserves_scope_and_exact_carrier(host, tmp_path, monkeypatch, carrier):  # noqa: F811
     from supervisor import queue
 
     prepared = admit(host, tmp_path, scoped=carrier == "derived")
     if carrier == "absent":
         prepared.pop("_project_admission")
     before = copy.deepcopy(prepared)
+    assert queue.persist_queue_snapshot()
+    saved = queue.QUEUE_SNAPSHOT_PATH.read_bytes()
     marked = []
     def refuse(*args, **kwargs):
         marked.append(copy.deepcopy(prepared))
         raise ValueError("synthetic refused bind")
     monkeypatch.setattr(registry, "bind_task_to_project", refuse)
     response, _ = convert(host)
-    assert marked[0]["project_id"] == "chosen"
-    assert marked[0]["_project_admission"]["project"]["id"] == "chosen"
+    assert marked == [before]  # Binding commits before any pending mark, so no rollback is needed.
     assert response.status_code >= 400 and prepared == before
-    saved = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))["pending"][0]["task"]
-    assert saved["project_id"] == before["project_id"]
-    assert ("_project_admission" in saved) == ("_project_admission" in before)
-    assert saved.get("_project_admission") == before.get("_project_admission")
+    assert queue.QUEUE_SNAPSHOT_PATH.read_bytes() == saved
 
 
 @pytest.mark.parametrize("timestamp", ["old", "invalid", "absent"])

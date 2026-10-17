@@ -71,8 +71,20 @@ def unreadable_result(monkeypatch, task_id: str, *, root=None) -> dict:
             raise store.StoreError(f"simulated unreadable row: {tid}")
         return real_row(self, tid, *columns)
 
+    from ouroboros import task_store
+
+    real_views = task_store.display_documents
+
+    def display_documents(root, task_ids, versions=None):  # a batch holding the row fails like a single read of it
+        ids = [str(tid) for tid in task_ids]
+        if switch["on"] and str(task_id) in ids and (
+                wanted_root is None or pathlib.Path(root).resolve() == wanted_root):
+            raise store.StoreError(f"simulated unreadable row: {task_id}")
+        return real_views(root, ids, versions)
+
     monkeypatch.setattr(store.Txn, "body_text", body_text)
     monkeypatch.setattr(store.Txn, "row", row)
+    monkeypatch.setattr(task_store, "display_documents", display_documents)
     return switch
 
 

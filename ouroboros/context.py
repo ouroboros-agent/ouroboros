@@ -547,6 +547,9 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             scheduled_tasks_digest_out.update(schedule_digest)
     # Surface running tasks so a busy-chat turn can steer instead of duplicating it.
     _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if ctx is not None:
+        from ouroboros.owner_relay import held_owner_messages
+        runtime_data["owner_quote_handles"] = list(held_owner_messages(ctx))
     # Owner Surface Fact: the surface that SENT the message this task/turn came
     # from. A web message carries raw observables (pywebview/ua/viewport/...);
     # a non-web ingress carries {"channel": <source>} STAMPED AT ITS PRODUCER
@@ -558,25 +561,25 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
     # internal producers: scheduler, skill schedules); absence stays honest.
     from ouroboros.client_surface import owner_client_fact
 
+    if _meta.get("reply_reference"):
+        runtime_data["reply_to"] = _meta["reply_reference"]
     _owner_client = owner_client_fact(_meta)
     if _owner_client:
         runtime_data["owner_client"] = dict(_owner_client)
         runtime_data["owner_client_note"] = _OWNER_CLIENT_NOTE
     _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
+    if not declared:
+        from ouroboros.live_works import context_present
+        runtime_data["live_works_present"] = context_present(env, task)
     if not declared and _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):
         runtime_data["current_chat"] = _current_chat
         runtime_data["current_chat_rule"] = (
             "addressable_root_tasks are RUNNING/PENDING roots in THIS chat. If a new message continues or "
-            "redirects one of them, steer_task(task_id, message) it rather than spawning a duplicate; "
-            "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
+            "redirects one of them, tell_task(task_id, note, quote) can carry your note and held owner words; "
+            "your judgment picks the target; otherwise do this request here. start_task begins separate work. A "
             "message in a project room defaults to that project unless it clearly says otherwise."
         )
-    # Host-built ground truth about what THIS lane may continue: Main's bounded
-    # manifest, a project room's own hint (its recent ROOT results and the roots
-    # still live in it) and the thread's most recent result (id/status/workspace
-    # facts/artifact refs). Read these before framing a "continue" promotion;
-    # never reconstruct prior work from chat memory. What promote ACCEPTS is the
-    # predicate in ARCHITECTURE ch. 10 - these rows are the hint, not the door.
+    # Host facts identify live work and recorded results independently of the spawn tool.
     for _routing_key in (
         "main_routing_manifest", "project_routing_manifest", "project_last_task_result",
     ):

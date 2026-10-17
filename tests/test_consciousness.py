@@ -423,7 +423,7 @@ def test_launch_starts_an_ordinary_main_turn_with_the_wake_envelope(clock):
     assert meta["initiator"] == "consciousness" and meta["usage_category"] == "consciousness"
     assert meta["wake_reason"] == "heartbeat" and meta["consciousness_autonomy"] == "act"
     assert meta["model_role"] == "consciousness" and meta["runtime_mode_cap"] == "light"
-    assert "toggle_evolution" in meta["disabled_tools"] and "steer_task" not in meta["disabled_tools"]
+    assert "toggle_evolution" in meta["disabled_tools"] and "tell_task" not in meta["disabled_tools"]
     # В26=A: the wake tree's GRACEFUL ceiling = min(per-task cap 50, remaining 17.5); the
     # ledger fence keeps the per-task cap (a fence narrowed below one Main attempt's
     # reservation refused every wake of a nearly spent day before its first call).
@@ -561,11 +561,11 @@ def test_a_turn_admitted_in_the_same_instant_keeps_the_wake_due(clock, monkeypat
     calls = {"n": 0}
     real = clock.clock.live_turns
 
-    def live_turns():
+    def live_turns(**kwargs):
         calls["n"] += 1
         if calls["n"] == 2:  # the re-check under the gate lock sees a just-admitted owner turn
             _register("owner002")
-        return real()
+        return real(**kwargs)
 
     monkeypatch.setattr(clock.clock, "live_turns", live_turns)
     due = clock.clock.next_wake_at

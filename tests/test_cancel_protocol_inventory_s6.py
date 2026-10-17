@@ -101,6 +101,14 @@ TERMINAL_WRITERS = {
     # Same terminal status under the locked projector; this records only the
     # deterministic successor link after a positive first-round no-effect proof.
     ('ouroboros/presence_runner.py::_retry_target', 'STATUS_FAILED'): 'terminal',
+    # D12 durable new-work intent (start_task): prepare creates the "requested" row
+    # before emission; claim moves its locked projector to "admitting" and keeps
+    # "requested". Boot reconciliation (prior workers proved gone) settles ONLY a
+    # proven-unadmitted intent "failed"/promotion_not_started (explicit retry, nothing
+    # restarts); an uncertain one stays "requested" and held.
+    ('ouroboros/promotion_intent.py::prepare_promotion_intent', '"requested"'): 'dynamic',
+    ('ouroboros/promotion_intent.py::claim_promotion_intent', '"requested"'): 'dynamic',
+    ('ouroboros/promotion_intent.py::reconcile_promotion_intents', '"requested"'): 'dynamic',
     # #1154: the compare-and-clear of a settled terminal-projection obligation.
     # It preserves the record's CURRENT status inside the projector and publishes
     # no lifecycle transition of its own; the status argument is only the
@@ -200,6 +208,8 @@ NO_DELIVERABLE_LANES = {
         'a refused schedule never became a task with an answer',
     'supervisor/events_project_routing.py::_persist_promote_rejection':
         'a refused promotion never became a task with an answer',
+    'ouroboros/promotion_intent.py::reconcile_promotion_intents':
+        'a new-work intent proven never admitted is settled not_started: no attempt ran, no answer exists',
     # upstream retry/depth lanes (bea08137 class), absent at the reference cut:
     'supervisor/task_admission.py::persist_never_admitted_refusal':
         'positively never admitted: the origin refusal receipt exists, no model answer exists',

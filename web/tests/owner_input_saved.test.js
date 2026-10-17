@@ -53,14 +53,17 @@ test('the typed flag on my own echo says Input saved once, and Sending... stays'
     try {
         await f.send('please look at the logs');
         assert.equal(f.status(), 'Sending');
-        f.echo({ content: 'please look at the logs', sender_session_id: ME, client_message_id: 'cm-1', ingress_accepted: true });
+        // A live echo of the running host always says what it did with the row (here: dispatched).
+        f.echo({ content: 'please look at the logs', sender_session_id: ME, client_message_id: 'cm-1', ingress_accepted: true,
+            ingress_dispatched: true });
         const [note] = f.notes('cm-1');
         assert.equal(note?.textContent, 'Input saved');
         assert.equal(note.className, 'msg-pending', 'the quiet delivery-note style, no new chrome');
         const kids = f.bubble('cm-1').children;
         assert.equal(kids.indexOf(note), kids.findIndex((node) => node.classList.contains('msg-time')) - 1, 'above the time');
         assert.equal(f.status(), 'Sending', 'a saved row is not a started turn');
-        f.echo({ content: 'please look at the logs', sender_session_id: ME, client_message_id: 'cm-1', ingress_accepted: true });
+        f.echo({ content: 'please look at the logs', sender_session_id: ME, client_message_id: 'cm-1', ingress_accepted: true,
+            ingress_dispatched: true });
         assert.equal(f.notes('cm-1').length, 1, 'a repeated echo keeps one note');
         assert.equal(f.messages.children.filter((node) => node.classList.contains('user')).length, 1);
     } finally { f.close(); }
@@ -326,6 +329,10 @@ function keptTab() {
             fire: (type, payload) => [...(handlers.get(type) || [])].forEach((fn) => fn(payload)),
             notes: (cmid) => (bubble(cmid)?.children || []).filter((node) => node.className === 'msg-pending'),
             actions: (cmid) => room.notes(cmid).flatMap((note) => note.children.filter((node) => node.tagName === 'BUTTON')),
+            // Send again and Discard rejoin or forget the kept frame; `Send as a new message` is the doubt's own action (it only
+            // prepares the composer). Tests of the first kind must not read the second as a retry.
+            retries: (cmid) => room.actions(cmid).filter((node) => node.dataset.unconfirmedAction !== 'send_as_new'),
+            asNew: (cmid) => room.actions(cmid).filter((node) => node.dataset.unconfirmedAction === 'send_as_new'),
             press: (cmid, label) => room.actions(cmid).find((node) => node.textContent === label).click(),
             async send(text) {
                 const fileInput = document.byId.get('chat-file-input');
@@ -598,7 +605,10 @@ test('after a host restart a kept send meets its saved row: delivery not confirm
 
         const reloaded = tab.open();
         await until(() => reloaded.notes('cm-1')[0]?.textContent === DOUBT, 'the first read meets a row of the ended process');
-        assert.deepEqual(reloaded.actions('cm-1'), [], 'no Send again: it could only rejoin');
+        assert.deepEqual(reloaded.retries('cm-1'), [], 'no Send again: it could only rejoin');
+        assert.deepEqual(reloaded.asNew('cm-1').map((node) => node.textContent), ['Send as new'], 'the one honest next step is a new message');
+        assert.deepEqual(reloaded.asNew('cm-1').map((node) => node.getAttribute('aria-label')), ['Send as a new message'],
+            'short words on a phone row, the whole name for a screen reader');
         assert.equal(reloaded.notes('cm-1').length, 1, 'one note: the doubt replaced Input saved');
         assert.deepEqual(reloaded.notes('cm-3')[0].textContent, 'Saved, not delivered.');
         assert.equal(reloaded.actions('cm-2').length, 2, 'the one the host never saw is still in doubt with its actions');
@@ -608,18 +618,23 @@ test('after a host restart a kept send meets its saved row: delivery not confirm
         tab.host.history = [tab.row('cm-1', reloadWords, { restarted: true }), tab.row('cm-3', provenWords, { restarted: true })];
         await reloaded.instance.refreshHistory({ revision: 2 });
         assert.deepEqual(reloaded.notes('cm-3').map((node) => node.textContent), [DOUBT]);
-        assert.deepEqual(reloaded.actions('cm-3'), []);
+        assert.deepEqual(reloaded.retries('cm-3'), []);
+        assert.equal(reloaded.asNew('cm-3').length, 1, 'the doubt keeps its one action');
         assert.deepEqual(reloaded.notes('cm-1').map((node) => node.textContent), [DOUBT], 'the doubt is final for that read');
 
         // Live: Send again reaches the restarted host, which rejoins the row an ended process saved.
         reloaded.press('cm-2', 'Send again');
         reloaded.echo('cm-2', liveWords, { restarted: true });
         assert.deepEqual(reloaded.notes('cm-2').map((node) => node.textContent), [DOUBT]);
-        assert.deepEqual(reloaded.actions('cm-2'), []);
+        assert.deepEqual(reloaded.retries('cm-2'), []);
         reloaded.fire('close');
-        assert.deepEqual([reloaded.actions('cm-1'), reloaded.actions('cm-2'), reloaded.actions('cm-3')], [[], [], []],
+        assert.deepEqual([reloaded.retries('cm-1'), reloaded.retries('cm-2'), reloaded.retries('cm-3')], [[], [], []],
             'a socket close offers none of them again');
         assert.deepEqual(reloaded.sent.map((item) => item.frame.client_message_id), ['cm-2'], 'only the one manual Send again');
+        // The doubt's own action prepares the composer and sends nothing: the owner reads, edits and sends it, or does not.
+        reloaded.press('cm-1', 'Send as new');
+        assert.equal(document.activeElement, document.byId.get('chat-input'), 'the composer is focused');
+        assert.deepEqual(reloaded.sent.map((item) => item.frame.client_message_id), ['cm-2'], 'preparing the composer sends nothing');
         assert.deepEqual(tab.kept(), []);
         assert.equal(reloaded.instance.hasPendingWork(), false);
         reloaded.instance.destroy();
@@ -727,7 +742,8 @@ test('an echo sent before a deferred dispatch waits; a close offers Send again, 
         tab.host.history = [tab.row('cm-1', first), tab.row('cm-2', second, { restarted: true })];
         await room.instance.refreshHistory({ revision: 1 });
         assert.deepEqual(room.notes('cm-2').map((node) => node.textContent), [DOUBT]);
-        assert.deepEqual(room.actions('cm-2'), []);
+        assert.deepEqual(room.retries('cm-2'), []);
+        assert.equal(room.asNew('cm-2').length, 1, 'the doubt keeps its one action');
         assert.deepEqual(tab.kept(), []);
         assert.equal(room.instance.hasPendingWork(), false);
     } finally { tab.close(); }

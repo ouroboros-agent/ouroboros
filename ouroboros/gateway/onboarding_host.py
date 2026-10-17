@@ -1,7 +1,7 @@
 """The onboarding page route: one wizard host for every shell.
 
-``GET /onboarding`` serves the first-run wizard as an ordinary page so it can
-load ``web/modules/*`` as real ES modules. Three consumers share it:
+``GET /onboarding`` serves the selected complete setup page, else the builtin
+wizard. ``?builtin=1`` explicitly opens recovery. Three consumers share it:
 
 * the desktop launcher, which opens this URL in its setup window AFTER the
   managed gateway is healthy (there is no pre-server wizard any more);
@@ -44,6 +44,11 @@ def _live_setup() -> tuple[dict, dict]:
 
 
 async def onboarding_page(_request: Request) -> HTMLResponse:
+    served_ui = getattr(_request.app.state, "served_ui", None)
+    if served_ui is not None and _request.query_params.get("builtin") != "1":
+        page = served_ui.custom_page("onboarding.html")
+        if page is not None:
+            return HTMLResponse(page, headers=_NO_STORE)
     _settings, bootstrap = _live_setup()
     return HTMLResponse(render_onboarding_html(bootstrap), headers=_NO_STORE)
 

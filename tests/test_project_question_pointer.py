@@ -70,7 +70,13 @@ def test_real_escalation_bridge_history_detail_and_answer(tmp_path, monkeypatch)
     main = json.loads(_assemble_history_response(tmp_path, 1, 10, 0))["messages"]
     assert main[0]["quiz_state"] == "answered" and main[0]["answered_index"] == 1
     assert main[0]["question"] == "Which storage?" and main[0]["options"] == ["Local", "Shared"]
-    assert main[0]["text"] == "You answered in Question Project"
+    # Owed to the live asker until its saved read; that read settles it.
+    assert main[0]["text"] == "Answer recorded · delivery pending in Question Project"
+    from ouroboros.owner_mailbox import acknowledge_transcript_entry, drain_owner_entries
+    [entry] = drain_owner_entries(tmp_path, "task-1")
+    assert entry["kind"] == "quiz_answer" and acknowledge_transcript_entry(tmp_path, "task-1", entry)
+    main = json.loads(_assemble_history_response(tmp_path, 1, 10, 0))["messages"]
+    assert main[0]["quiz_state"] == "answered" and main[0]["text"] == "You answered in Question Project"
     assert reconcile_terminal(tmp_path, "task-1") == []
     assert quiz_states(tmp_path, "task-1")[qid]["option_details"][1] == "Multiple writers over network"
 

@@ -305,8 +305,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # writes at the documented 2x-vs-1.25x ratio). Non-Anthropic wire formats are a NO-OP by construction
     # (Gemini documents no ttl field — the v5.30.0 outage class).
     "OUROBOROS_PROMPT_CACHE_TTL": "1h",
-    # The owner's effort range (settings_scales.effort_range): EFFORT_SCALE tiers, read tolerantly as
-    # MIN <= TASK (the recommended level: Main's) <= MAX; a reviewer row's effort is the row's own.
+    # Main's primary TASK is independent of the helper corridor MIN <= MAX.
+    # Projects copy these once; explicit reviewer-row pins retain their precedence.
     "OUROBOROS_EFFORT_MIN": "low",
     "OUROBOROS_EFFORT_TASK": "medium",
     "OUROBOROS_EFFORT_MAX": "high",

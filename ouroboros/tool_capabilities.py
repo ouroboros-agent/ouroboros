@@ -45,8 +45,8 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "wait_task", "wait_tasks", "get_task_result",
     # Serial addressed turns: wait for an unread mailbox entry without spending
     # model rounds (slot held, clamped to the per-call ceiling, delivers nothing).
-    "await_messages",
-    # D#7 soft-join child controls (siblings of steer_task): inspect/decide a child's fate
+    "await_messages", "continue_in_background", "pause_task", "resume_task", "continue_task",
+    # D#7 soft-join child controls (siblings of tell_task): inspect/decide a child's fate
     # before finalizing (peek = pure read, discard = explicit abandon, cancel = real stop).
     "cancel_task", "peek_task", "discard_child_result", "override_delegation_constraint",
     # The same family (#1196, owner Q9): a resumed parent selects each of its OWN
@@ -61,8 +61,8 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     # (kept in the core envelope so the anti-freeze ephemeral turn never needs an
     # enable_tools detour to route — though initial_tool_schemas exposes the full
     # set today, this makes the coupling explicit).
-    "list_projects", "route_to_project", "promote_chat_to_task", "steer_task",
-    "ensure_project_scope",
+    "list_projects", "start_task", "tell_task",
+    "move_to_project",
     *COGNITIVE_MEMORY_TOOL_NAMES,
     "chronicle_write",
     "recent_tasks", "live_roots", "update_focus",
@@ -414,10 +414,9 @@ FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset({
 # verb rides the same receipt rail (``ensure_project_scope`` moves THIS task;
 # its receipt is the Started annotation and the project pointer).
 ROUTING_VERBS: dict[str, frozenset[str]] = {
-    "promote_chat_to_task": frozenset({"promote_chat_to_task"}),
-    "route_to_project": frozenset({"promote_chat_to_task", "routing_manual_target"}),
-    "steer_task": frozenset({"steer_task"}),
-    "ensure_project_scope": frozenset({"ensure_project_scope"}),
+    "start_task": frozenset({"promote_chat_to_task"}),
+    "tell_task": frozenset({"steer_task"}),
+    "move_to_project": frozenset({"ensure_project_scope"}),
 }
 
 
@@ -439,10 +438,11 @@ def routing_action_for_tool(name: object) -> str:
 # set (``FOREGROUND_MUTATIVE_TOOLS``: publication and the file editors) joins it
 # at the authority module.
 OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
+    "pause_task", "resume_task", "continue_task",
     "maintain_harness",
-    # starting or steering work (steer_task stays: the nanny of a running campaign)
-    "promote_chat_to_task", "schedule_subagent", "schedule_followup", "plan_task",
-    "route_to_project", "ensure_project_scope", "delegate_start", "initiate_presence",
+    # starting or steering work (tell_task stays: the nanny of a running campaign)
+    "start_task", "schedule_subagent", "schedule_followup", "plan_task",
+    "move_to_project", "delegate_start", "initiate_presence",
     "cancel_task", "resume_child_task", "override_delegation_constraint", "request_deep_self_review",
     # writing files, running processes, integrating patches
     "write_file", "edit_text", "apply_patch", "edit_batch",

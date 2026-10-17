@@ -24,7 +24,7 @@ def _lane(monkeypatch, tmp_path):
 
 def test_two_native_turns_are_independently_addressable_and_drainable(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.server_routing_context import _addressable_root_tasks
     from supervisor.steering import _handle_steer_task
 
@@ -69,12 +69,14 @@ def test_two_native_turns_are_independently_addressable_and_drainable(monkeypatc
         armed = workers.arm_direct_chat_turn(second.task["id"], lambda turn: "control-second")
         assert armed["stop_control_msg_id"] == "control-second"
         assert "stop_control_msg_id" not in workers.direct_chat_turn(first.task["id"])
+        from tests.test_steer_relay import held_quote
         _handle_steer_task({
+            "quotes": held_quote(tmp_path, "Use the blue variant", second.task["chat_id"]),
             "target_task_id": second.task["id"], "chat_id": second.task["chat_id"],
             "message": "Use the blue variant", "client_message_id": "owner-blue",
         }, ctx)
-        assert drain_owner_messages(tmp_path, second.task["id"]) == ["Use the blue variant"]
-        assert drain_owner_messages(tmp_path, first.task["id"]) == []
+        assert [e["text"] for e in drain_owner_entries(tmp_path, second.task["id"])] == ["Use the blue variant"]
+        assert drain_owner_entries(tmp_path, first.task["id"]) == []
         assert second._owner_message_generation == 1
         workers.close_repo_writer_admission("test-update")
         assert set(workers.drain_repo_writers(timeout=0.01)) == ids

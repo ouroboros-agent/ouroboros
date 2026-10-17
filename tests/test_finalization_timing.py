@@ -1,6 +1,7 @@
 """Finalization observations must preserve the answer's existing delivery path."""
 
 import json
+import os
 import queue
 import threading
 from collections import deque
@@ -609,6 +610,7 @@ def test_late_phase_checkpoint_omits_clocks_but_live_delivery_keeps_them(
 
 def test_agent_scope_keeps_post_loop_child_lookups_and_resets_reused_workers(tmp_path, monkeypatch):
     from ouroboros import agent as agent_module, observability as obs
+    from ouroboros.settings_integrity import task_settings_snapshot
     from ouroboros.task_status import find_child_tasks
 
     class LLM:
@@ -634,7 +636,7 @@ def test_agent_scope_keeps_post_loop_child_lookups_and_resets_reused_workers(tmp
 
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setattr(agent_module.subagent_runtime, "apply_task_start_settings_or_disclose",
-                        lambda *args: None)
+                        lambda *args: task_settings_snapshot({}, os.environ))
     host = SimpleNamespace(env=SimpleNamespace(drive_root=tmp_path), _event_queue=None,
                            _emit_live_log=lambda *args, **kwargs: None, _handle_task_scoped=task_body)
     first = agent_module.OuroborosAgent.handle_task(host, {"id": "one", "type": "task"})

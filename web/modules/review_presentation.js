@@ -1116,6 +1116,35 @@ function reviewRevision(value) {
     return /^[0-9a-f]{64}$/.test(revision) ? revision : null;
 }
 
+// One queue for every card's review detail on the page (issue #1771): a room with
+// many review owners otherwise opened one GET per owner at once and starved the
+// browser's few connections per host (WebKit: 6), videos included. Newest request
+// first: a room opens at its newest cards, and an expansion is the latest ask. A
+// read keeps its slot until it settles; one whose response never comes is aborted
+// at the slot's bound and fails like any lost read (its card offers Retry), so a dead
+// connection neither stalls every card's details nor stays open beside the next
+// reads. A closed owner's queued reads never start.
+export const REVIEW_DETAIL_READS = 2;
+export const REVIEW_DETAIL_SLOT_MS = 30000;
+const detailQueue = [];
+let detailReads = 0;
+function drainDetailReads() {
+    while (detailReads < REVIEW_DETAIL_READS && detailQueue.length) {
+        const job = detailQueue.pop();
+        detailReads += 1;
+        const abort = new AbortController();
+        const lost = new Promise((_resolve, reject) => abort.signal.addEventListener('abort',
+            () => reject(new Error('review detail read lost its connection')), { once: true }));
+        const timer = setTimeout(() => abort.abort(), REVIEW_DETAIL_SLOT_MS);
+        Promise.race([new Promise(resolve => resolve(job.read(abort.signal))), lost]).then(job.resolve, job.reject)
+            .finally(() => { clearTimeout(timer); detailReads -= 1; drainDetailReads(); });
+    }
+}
+const queueDetailRead = (owner, read) => new Promise((resolve, reject) => {
+    detailQueue.push({ owner, read, resolve, reject });
+    drainDetailReads();
+});
+
 // Revisions are opaque SHA-256 tokens; one distinct token may trail a live GET.
 export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {}, onSettled = () => {} } = {}) {
     const states = new Map();
@@ -1132,7 +1161,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
         const request = Promise.resolve()
             .then(() => {
                 if (!state.everApplied || state.lastStatus === 'error') notify('loading');
-                return fetchDetail(taskId);
+                return queueDetailRead(states, (signal) => fetchDetail(taskId, { signal }));
             })
             .then((detail) => {
                 // The strict seam rejects failures; null means genuinely absent (404).
@@ -1221,6 +1250,9 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
         clear() {
             for (const state of states.values()) clearTimeout(state.migrationTimer);
             states.clear();
+            for (const [index, job] of [...detailQueue.entries()].reverse()) {
+                if (job.owner === states) detailQueue.splice(index, 1)[0].reject(new Error('review detail read cancelled'));
+            }
         },
     };
 }

@@ -386,15 +386,18 @@ test('copy control is an always-visible icon button that marks the bubble (D12)'
 test('stylesheet pins the always-visible copy icon and the timestamp reserve (D12)', () => {
     // (a) The copy control is anchored bottom-right and PERMANENTLY visible:
     // a non-zero base opacity, never the old hover-reveal opacity 0.
+    // Offsets are a pixel length or a spacing token (Copy shares its recipe with Reply: `.chat-message-copy,
+    // .chat-message-reply { ... }`, so the visible-at-rest opacity may live in that shared rule).
+    const length = String.raw`(?:\d+px|var\(--space-\d\))`;
     assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*position:\s*absolute/);
-    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*right:\s*\d+px/);
-    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*bottom:\s*\d+px/);
+    assert.match(styleCss, new RegExp(String.raw`\.chat-message-copy\s*\{[^}]*right:\s*${length}`));
+    assert.match(styleCss, new RegExp(String.raw`\.chat-message-copy\s*\{[^}]*bottom:\s*${length}`));
     // The fractional part must carry a non-zero digit: 0.0 / .0 are invisible.
-    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0?\.\d*[1-9]/);
-    assert.doesNotMatch(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0\s*;/);
+    assert.match(styleCss, /\.chat-message-copy(?:,\s*\.chat-message-reply)?\s*\{[^}]*opacity:\s*0?\.\d*[1-9]/);
+    assert.doesNotMatch(styleCss, /\.chat-message-copy(?:,\s*\.chat-message-reply)?\s*\{[^}]*opacity:\s*0\s*;/);
     // (b) has-copy bubbles reserve a right gutter so the timestamp can never
     // sit under the icon (the structural overlap fix); 0px is no reserve.
-    assert.match(styleCss, /\.chat-bubble\.has-copy\s+\.msg-time\s*\{[^}]*margin-right:\s*[1-9]\d*px/);
+    assert.match(styleCss, new RegExp(String.raw`\.chat-bubble\.has-copy\s+\.msg-time\s*\{[^}]*margin-right:\s*(?:[1-9]\d*px|var\(--space-[1-9]\))`));
 });
 
 test('reset disposes listeners, stops players, clears groups, and destroy is final', () => {

@@ -21,8 +21,8 @@ goes out first as ordered plain messages through the client's existing chunker,
 and a compact message with the project line, the numbered option labels, the
 hint and the keyboard follows last. Only that last message is remembered, so a
 tap, a reply to it and the answered-edit keep working exactly as for a short
-card; a reply to one of the earlier explanation parts is an ordinary owner
-message, deliberately without per-part bookkeeping. An open question (no
+card; a reply to an earlier explanation part is an ordinary owner message
+carrying the bridge's host-row reference. An open question (no
 options) is the same card without a keyboard; its hint asks for a reply.
 """
 

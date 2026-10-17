@@ -1,13 +1,11 @@
-"""Static web serving: the selected main interface and the core's own web resources.
+"""One generation's selected interface and optional complete setup/login views.
 
-The builtin ``web/`` tree always belongs to the core: the onboarding wizard loads its
-whole module graph from ``/onboarding/static`` and the author kit reads its controls
-from it. ``OUROBOROS_UI_DIR`` selects only what ``/`` and ``/static`` serve: empty is
-the builtin interface, ``none`` serves no main interface (API, WebSocket, onboarding,
-extensions and files stay), and an absolute or ``~`` directory with the ``web/`` layout
-is a trusted alternative published as-is. The choice is applied once per server
-generation (``ServedUI.apply`` in the lifespan), so serving, ``/api/state`` and the
-builtin page marker always describe the same applied selection.
+``OUROBOROS_UI_DIR`` selects ``/`` and ``/static``; a directory may also provide
+``onboarding.html`` and ``auth/index.html``. Its ``auth/`` is a public login asset
+bundle. Missing optional pages fall back whole-page: the builtin wizard's graph
+under ``/onboarding/static`` and the optional author kit always remain builtin.
+Empty selects builtin, ``none`` serves no main interface, and a trusted directory
+is published as-is. ``ServedUI.apply`` pins the choice once per server generation.
 """
 
 from __future__ import annotations
@@ -177,6 +175,7 @@ def select_ui(value: Any, builtin_dir: pathlib.Path, *, protected: tuple[pathlib
 class _Generation(NamedTuple):
     selection: UiSelection
     static: Any  # the ASGI app serving /static, None without a main interface
+    auth_static: Any = None  # the selected directory's intentionally public auth/ bundle
 
 
 class ServedUI:
@@ -200,8 +199,9 @@ class ServedUI:
         return self._current.selection
 
     def mounts(self) -> list[Mount]:
-        """The core's own resources (always builtin), then the selected ``/static``."""
+        """Public selected login assets, builtin recovery resources, then selected main assets."""
         return [
+            Mount("/auth", app=self.auth_assets, name="auth_assets"),
             Mount("/onboarding/static", app=self._builtin_static, name="onboarding_static"),
             Mount("/static", app=self.static, name="static"),
         ]
@@ -218,15 +218,18 @@ class ServedUI:
             protected = tuple(pathlib.Path(p).resolve() for p in owned if p)
             selection = select_ui(requested, self.builtin_dir, protected=protected)
             static = None
+            auth_static = None
             if selection.source == "builtin":
                 static = self._builtin_static
             elif selection.source == "directory":
                 static = NoCacheStaticFiles(directory=str(selection.root))
+                auth_static = NoCacheStaticFiles(directory=str(selection.root / "auth"), check_dir=False)
         except Exception as exc:  # the core, its API and its controls start whatever the selection
             selection = UiSelection("builtin", self.builtin_dir,
                                     f"{UI_DIR_SETTING} {requested!r} was not applied: {type(exc).__name__}: {exc}")
             static = self._builtin_static
-        self._current = _Generation(selection, static)
+            auth_static = None
+        self._current = _Generation(selection, static, auth_static)
         app.state.served_ui = self
         record_applied_restart_settings({UI_DIR_SETTING: requested})
         if selection.error:
@@ -235,6 +238,33 @@ class ServedUI:
             log.info("Main interface: %s%s", selection.source,
                      f" ({selection.root})" if selection.source == "directory" else "")
         return selection
+
+    def custom_page(self, relative_path: str) -> str | None:
+        """Read an optional whole page from the applied directory, never from saved intent.
+
+        The two callers name onboarding.html or auth/index.html. Read before sending
+        headers so a known read failure can still choose a complete builtin page.
+        Missing is ordinary; unreadable or invalid UTF-8 is a diagnosed fallback.
+        """
+        selection = self._current.selection
+        if selection.source != "directory":
+            return None
+        path = selection.root / relative_path
+        try:
+            return path.read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError) as exc:
+            log.warning("Could not read selected interface page %s; using builtin: %s", path, exc)
+            return None
+
+    async def auth_assets(self, scope, receive, send):
+        """Serve only the selected login bundle; login/logout are reserved for the auth gate."""
+        current = self._current
+        app = current.auth_static
+        if app is None or not (current.selection.root / "auth").is_dir():
+            app = PlainTextResponse("Not Found", status_code=404)
+        await app(scope, receive, send)
 
     async def index_page(self, request):
         current = self._current

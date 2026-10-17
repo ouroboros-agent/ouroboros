@@ -338,6 +338,33 @@ def test_one_unanswered_reader_does_not_hide_another_selected_run(tmp_path, monk
         runtime.close(wait=True)
 
 
+def test_observation_reuses_one_client_and_rebuilds_it_after_a_failed_read(tmp_path):
+    """A handshake and an HTTP client per poll of every held run kept the server busy: the
+    generation keeps one client, drops it on a failed read and closes it when it ends."""
+    a, b = started(tmp_path, "run-a"), started(tmp_path, "run-b")
+    made, closed, fail = [], [], {"once": True}
+    class Gateway:
+        def __init__(self):
+            made.append(self)
+        def get_run(self, rid, **kwargs):
+            if rid == a.run_id and fail.pop("once", False):
+                raise ConnectionError("the daemon moved")
+            return {"summary": {"runId": rid, "state": "running"}, "lastSeq": 1, "pendingInteractions": []}
+        def close(self):
+            closed.append(self)
+    stop = threading.Event()
+    stop.set()  # no background ticks: the observations below are the only ones
+    runtime = body.BodyRuntime(tmp_path, stop_event=stop, gateway_factory=Gateway, max_workers=2)
+    runtime.thread.join(10)
+    with pytest.raises(ConnectionError):
+        runtime._observe(a)
+    for entry in (a, b, b, a):
+        runtime._observe(entry)
+    assert len(made) == 2 and closed == [made[0]]
+    runtime._drop_observer_gateway()
+    assert closed == made
+
+
 def test_automatic_availability_is_not_an_owner_omission(tmp_path, money):
     from ouroboros.context_health import _unread_output_line
     entry = started(tmp_path)

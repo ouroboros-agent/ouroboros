@@ -53,12 +53,14 @@ def _active_direct_roots(ctx: Any) -> list:
         with lock:
             turn = direct_chat_turn(entry.activity_id)
             if turn is not None:
+                from ouroboros.room_reader import is_reading
+                reader = is_reading(ctx.DRIVE_ROOT, turn["id"], turn, running=True)
                 roots.append({
                     "task_id": turn["id"], "status": "running",
                     "title": _clip_marked(turn.get("title"), 120),
                     "objective": _clip_marked(turn.get("text"), 600),
                     "project_id": turn["project_id"], "chat_id": turn["chat_id"],
-                    "started_at": turn["_started_at"], "steerable": True, "direct_chat": True,
+                    "started_at": turn["_started_at"], "steerable": True, "direct_chat": True, "room_reader": reader,
                 })
     return roots
 
@@ -72,7 +74,7 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
         tid = str(task_id or "").strip()
         if not tid or tid in seen or not isinstance(task_obj, dict):
             return
-        if task_obj.get("_is_direct_chat") or str(task_obj.get("delegation_role") or "") == "subagent":
+        if str(task_obj.get("delegation_role") or "") == "subagent":
             return
         if chat_id is not None and not _task_belongs_to_chat(ctx, tid, task_obj, int(chat_id or 0)):
             return
@@ -84,6 +86,9 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
 
         if (load_task_result(_task_drive_for_task(task_obj, tid), tid) or {}).get("status") in SETTLED_STATUSES:
             return
+        from ouroboros.room_reader import is_reading
+        reader = is_reading(_task_drive_for_task(task_obj, tid), tid, task_obj, running=status == "running",
+                            fences=getattr(ctx, "BUDGET_ROOT_FENCES", None))
         objective = str(
             task_obj.get("objective") or task_obj.get("description") or task_obj.get("text") or ""
         ).strip()
@@ -94,7 +99,7 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
             "objective": _clip_marked(objective, 600),
             "project_id": str(task_obj.get("project_id") or ""),
             "started_at": started_at,
-            "steerable": True,
+            "steerable": True, "room_reader": reader,
         })
         seen.add(tid)
 
@@ -107,6 +112,9 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
         if isinstance(pending, dict):
             _add(pending.get("id"), pending, "pending", pending.get("queued_at"))
     for direct in _active_direct_roots(ctx):
+        if direct["task_id"] in seen and direct.get("room_reader"):
+            out[:] = [row for row in out if row["task_id"] != direct["task_id"]]
+            seen.discard(direct["task_id"])
         if direct["task_id"] not in seen and (
             chat_id is None or _task_belongs_to_chat(ctx, direct["task_id"], direct, chat_id)
         ):
@@ -128,7 +136,7 @@ def _clip_marked(value: str, limit: int) -> str:
 def _chat_running_tasks(ctx: Any, chat_id: int) -> list:
     """Structural snapshot of the owner's RUNNING root tasks in THIS chat (id +
     objective + recency). The decision turn reads this from runtime context to
-    pick a steer_task target by its own judgment — code only exposes the state,
+    pick a tell_task target by its own judgment — code only exposes the state,
     it never auto-chooses (BIBLE P5). Direct native roots are included;
     delegated subagents are not owner roots."""
     return [row for row in _addressable_root_tasks(ctx, chat_id) if row.get("status") == "running"]
@@ -171,6 +179,11 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
             "arguments": {"task_id": task_id, "include_authority": True},
         },
     }
+    if isinstance(row.get("promotion_admission"), dict):
+        from ouroboros.promotion_intent import promotion_intent_notice
+        out.update(promotion_admission=dict(row["promotion_admission"]),
+                   promotion_intent_available=bool(row.get("promotion_intent")),
+                   admission_notice=promotion_intent_notice(task_id, row))
     if git:
         out["workspace_git_at_start"] = {
             "head": str(git.get("head") or ""),
@@ -267,7 +280,7 @@ def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
     """The room's bounded HINT for a "continue this work" decision: the project's
     recent ROOT results and the roots still live in it, each with the small typed
     facts that separate the two choices - a settled root is promote's predecessor,
-    a live one is ``steer_task``.
+    a live one is ``tell_task``.
 
     A hint, never the door: promote's predicate admits any settled result, listed
     or not, of any project (ch. 10), so this window may be bounded without
@@ -410,11 +423,17 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
 
 def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task_metadata: Any) -> Any:
     """Enrich a chat turn's metadata with the structural facts the decision turn
-    needs: the RUNNING tasks in THIS chat (so it can steer_task the right one
+    needs: the RUNNING tasks in THIS chat (so it can tell_task the right one
     instead of spawning a duplicate) and the originating message id (for idempotent
     steer delivery). P5-clean: surfaces state only; the agent picks the target by
-    judgment among answer / steer_task / promote_chat_to_task / route_to_project."""
+    judgment among answer / tell_task / start_task / move_to_project."""
     md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
+    try:  # a fact like the manifests below: its failure never holds back the owner's message
+        from ouroboros.live_works import live_works_present
+        md["live_works_present"] = live_works_present(ctx.DRIVE_ROOT)
+    except Exception:
+        log.warning("Unable to build the live-works present", exc_info=True)
+        md["live_works_present"] = {"error": "live_works_present_unavailable"}
     addressable_here = _addressable_root_tasks(ctx, chat_id)
     running_here = [row for row in addressable_here if row.get("status") == "running"]
     project_id = str(md.get("project_id") or "").strip() or _project_id_for_registered_chat(
@@ -435,7 +454,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         log.warning("Unable to build Main routing manifest", exc_info=True)
         main_manifest = {"error": "routing_manifest_unavailable"} if is_main_lane else {}
     if not addressable_here and not client_message_id and not main_manifest:
-        return task_metadata
+        return md
     if addressable_here:
         md["current_chat"] = {
             "chat_id": int(chat_id or 0),
@@ -460,46 +479,13 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
             log.warning("Unable to build the project routing manifest", exc_info=True)
     if client_message_id:
         md["client_message_id"] = client_message_id
-    option_roots = (
-        list(main_manifest.get("root_tasks") or [])
-        if is_main_lane and isinstance(main_manifest, dict)
-        else addressable_here
-    )
-    manual_options = [
-        {
-            "action": "steer_task",
-            "task_id": row["task_id"],
-            "status": row["status"],
-            "title": row.get("title") or row.get("objective"),
-            "project_id": str(row.get("project_id") or ""),
-        }
-        for row in option_roots
-        if isinstance(row, dict) and row.get("task_id")
-    ]
-    if is_main_lane and isinstance(main_manifest, dict):
-        manual_options.extend({
-            "action": "new_task_in_project",
-            "project_id": str(row.get("project_id") or ""),
-            "project_name": str(row.get("name") or row.get("project_id") or "Project"),
-            "label": f"New task in {str(row.get('name') or 'Project')}",
-        } for row in list(main_manifest.get("projects") or []) if isinstance(row, dict))
-    elif project_id:
-        manual_options.append({
-            "action": "new_task_in_project",
-            "project_id": project_id,
-            "label": "New task in Project",
-        })
     routing_contract = {
         "llm_first": True,
         "source_lane": "main" if is_main_lane else "project",
         "valid_actions": [
-            "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
-            "needs_manual_target",
+            "answer_inline", "tell_task", "start_task", "move_to_project",
         ],
-        "on_uncertain_or_invalid_target": "needs_manual_target",
-        "manual_options": manual_options,
     }
-    routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
     receipt = _message_routing_receipt(ctx, client_message_id)
     if receipt:
         # DISCLOSURE, not a gate (owner decision B5=A): one owner message became a
@@ -514,7 +500,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
             routing_contract["message_routing_acts"] = acts
             routing_contract["message_routing_acts_note"] = (
                 "Recorded routing acts already taken for THIS owner message, oldest first. "
-                "Facts, not a ban: another act stays your choice.")
+                "Each receipt identifies the work and its recorded outcome.")
     md["routing_contract"] = routing_contract
     return md
 
@@ -579,8 +565,8 @@ def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
     """Bind a chat frame's task_metadata to the thread's project via chat_id (the
     SSOT). A registered project chat scopes to its OWN project, overriding any
     client-supplied project_id; a non-project chat DROPS an untrusted client
-    project_id (work is scoped to a project only via the promote_chat_to_task tool,
-    never a raw ws frame). Prevents a stale/malformed frame (chat_id A + project_id
+    project_id (work placement uses durable binding, never a raw ws frame).
+    Prevents a stale/malformed frame (chat_id A + project_id
     B) from rendering in A while loading/writing project B's memory."""
     if project_id:
         return {**(task_metadata or {}), "project_id": project_id}

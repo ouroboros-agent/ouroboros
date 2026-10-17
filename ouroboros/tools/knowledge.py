@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List
 
 from ouroboros import knowledge as knowledge_store
+from ouroboros.project_facts import placed_project_id
 from ouroboros.knowledge import INDEX_FILE as INDEX_FILE, OVERVIEW_TOPIC as OVERVIEW_TOPIC
 from ouroboros.knowledge import sanitize_topic as _sanitize_topic
 from ouroboros.tools.arg_feedback import ignored_argument_note
@@ -36,7 +37,7 @@ def _address(ctx: ToolContext, topic: str, scope: str = "") -> knowledge_store.K
     sanitized = _sanitize_topic(topic)
     if sanitized in GLOBAL_ONLY_TOPICS:
         return knowledge_store.resolve_knowledge_address(_backlog_root(ctx), sanitized, "global")
-    project = str(getattr(ctx, "project_id", "") or "")
+    project = str(placed_project_id(ctx) or "")
     root = _backlog_root(ctx)
     if not getattr(ctx, "budget_drive_root", "") and (project or scope.startswith("project:")):
         from ouroboros.config import DATA_DIR

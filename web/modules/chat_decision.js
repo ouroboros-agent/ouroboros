@@ -1,8 +1,9 @@
 // Typed quiz and routing picker (#198): one family, POST /api/decisions contract.
 // Optional questions let work continue under an assumption; required questions
 // wait. Both become records after settlement; confirmed routing becomes an ack.
+import { createQuizSubmission } from './quiz_submission.js';
 import { MAX_DECISION_COMMENT, MAX_QUIZ_OPTIONS } from './api_types.js';
-import { renderRoutingAnnotation, routingOptionLabel } from './chat_activity.js';
+import { renderRoutingAnnotation, routingOptionLabel } from './routing_receipt.js';
 import { paintAttachmentOutcome } from './chat_attachments.js';
 import { nameProjectReference, projectReference } from './project_reference.js';
 import { ANSWERABLE_QUIZ_STATES, QUIZ_LIFECYCLE, questionPresentation, waitFacts, WAIT_FIELDS,
@@ -46,6 +47,7 @@ export function createChatDecision({
     onDomWrite = (mutate) => mutate(),
     isMain = false,
     chatId = 1,
+    projectId = '',
     insertMessageNode = null,
     // Main's own node retirement (viewport-stable; media, decision views and markdown released).
     removeMessageNode = null,
@@ -264,6 +266,7 @@ export function createChatDecision({
                 const focused = card.contains?.(document.activeElement);
                 view.disposeMarkdown?.();
                 releaseMaterials(bubble);
+                submissions.release(card);
                 if (quizViews.get(view.key) === card) quizViews.delete(view.key);
                 const next = mountMirror(view);
                 if (!next) return false;
@@ -290,6 +293,7 @@ export function createChatDecision({
         clearTimeout(view.timer);
         view.timer = null;
         view.disposeMarkdown?.();
+        if (view.card) submissions.release(view.card);
         view.disposeMarkdown = null;
         if (mirrors.get(view.key) === view) mirrors.delete(view.key);
         if (quizViews.get(view.key) === view.card) quizViews.delete(view.key);
@@ -461,7 +465,26 @@ export function createChatDecision({
         });
     }
 
-    async function submitAnswer(card, quiz, index, comment, settle = setCardState, action = 'answer') {
+    const submissions = createQuizSubmission({ apiFetch, onDomWrite, showToast,
+        canUse: card => !disposed && (!isMain || (connected && card.dataset.authorityStale !== '1')),
+        readQuestion: quiz => readQuestion(quiz.taskId, quiz.quizId, quiz.projectId, { fresh: true }),
+        accept(card, body) {
+            if (body) {
+                const current = observe({ ...body, task_id: card.dataset.taskId, quiz_id: card.dataset.quizId });
+                if (Object.hasOwn(current, 'comment')) card.dataset.ownerComment = current.comment || '';
+                setCardState(card, current.state, current.answered_index);
+            } else setCardState(card, card.dataset.state, null);
+        },
+    });
+    function submitAnswer(card, quiz, index, comment, _settle = setCardState, action = 'answer') {
+        if (action !== 'answer') {
+            if (card.dataset.submission) return;
+            return submitOtherQuizAction(card, quiz, index, comment, _settle, action);
+        }
+        submissions.submit(card, quiz, index, String(comment || ''));
+    }
+
+    async function submitOtherQuizAction(card, quiz, index, comment, settle = setCardState, action = 'answer') {
         if (card.dataset.pending === '1' || (isMain && (!connected || card.dataset.authorityStale === '1'))) return;
         card.dataset.pending = '1';
         const text = String(comment || '');
@@ -503,33 +526,6 @@ export function createChatDecision({
                     observe({ ...body, task_id: quiz.taskId, quiz_id: quiz.quizId });
                     settle(card, 'closed', null); return;
                 }
-                // The confirmation is the display truth: a same-request_id
-                // retry may have carried a different payload, and the server
-                // answers with what was actually RECORDED — index absent for a
-                // free answer, comment as stored. Never render this attempt's
-                // own click over it.
-                const answered = Number.isInteger(body?.answered_index) ? body.answered_index : null;
-                const recorded = typeof body?.comment === 'string' ? body.comment : '';
-                if (body?.ok !== true || body.state !== 'answered'
-                    || (answered !== null && (answered < 0 || answered >= quiz.options.length))
-                    || (answered === null && !recorded.trim())) {
-                    showToast('Answer confirmation unavailable. Check the question before retrying.', 'error');
-                    return;
-                }
-                if (recorded) card.dataset.ownerComment = recorded;
-                else delete card.dataset.ownerComment;
-                observe({ ...body, task_id: quiz.taskId, quiz_id: quiz.quizId });
-                settle(card, 'answered', answered);
-                // A late answer is recorded like any other; where it went is the
-                // host's fact (`forwarded`), so the card says so instead of implying
-                // the finished task will act on it.
-                if (body.answered_after_terminal === true) {
-                    showToast(body.forwarded === true
-                        ? 'Answer recorded. The task had finished, so it was delivered to its chat as your message.'
-                        : questionDeliveryPending(body) ? 'Answer recorded; delivery to the chat is pending.'
-                        : 'Answer recorded. The task had finished; nothing is waiting on it.', 'info');
-                }
-                return;
             }
             const status = res ? res.status : 0;
             if (status === 409 && body && body.state) {
@@ -646,6 +642,7 @@ export function createChatDecision({
             });
             return changed;
         });
+        submissions.settled(card);
         // Settling disables or removes the control the owner used (an option, the ×): focus stays in
         // this card, on its question, rather than falling to the page.
         const active = document.activeElement;
@@ -657,6 +654,7 @@ export function createChatDecision({
 
     function buildQuizCard(msg, mirror = null) {
         const quiz = normalizeQuiz(msg);
+        quiz.projectId = String(msg.project_id || mirror?.row.project_id || projectId || '');
         // A Main mirror keeps its way to the Project even while its row cannot carry the whole
         // form yet: then it shows what is known and takes no answer (never a guessed one).
         const complete = Boolean(quiz.question) && quiz.optionsKnown;
@@ -818,6 +816,7 @@ export function createChatDecision({
 
         if (quiz.comment) card.dataset.ownerComment = quiz.comment;
         setCardState(card, quiz.state, quiz.answeredIndex);
+        if (complete) submissions.attach(card, quiz);
         const framed = frameNode(msg, card);
         const disposeMarkdown = enhanceMarkdown && mountMarkdown ? enhanceMarkdown(card) : null;
         if (mirror) mirror.disposeMarkdown = disposeMarkdown;
@@ -1030,7 +1029,7 @@ export function createChatDecision({
 
     // A released node takes its views with it: a mirror's countdown and rendered markdown go too.
     function releaseViews(root) {
-        for (const [key, card] of quizViews) if (root.contains(card)) quizViews.delete(key);
+        for (const [key, card] of quizViews) if (root.contains(card)) { submissions.release(card); quizViews.delete(key); }
         for (const view of [...mirrors.values()]) if (root.contains(view.bubble)) releaseMirror(view);
     }
 
@@ -1051,6 +1050,7 @@ export function createChatDecision({
         },
         destroy() {
             disposed = true;
+            submissions.destroy();
             for (const view of [...mirrors.values()]) releaseMirror(view);
             observations.clear(); quizViews.clear(); detailReads.clear();
         },

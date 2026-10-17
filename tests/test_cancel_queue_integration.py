@@ -387,7 +387,7 @@ def test_preserve_pending_shutdown_keeps_cancel_authority_hold_nonterminal(
 def test_steering_is_refused_while_a_cancel_intent_is_active(tmp_path, monkeypatch):
     """A1.8: no NEW steering writes into a task whose cancellation is pending."""
     import supervisor.events as events_mod
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
     from supervisor.events import _handle_steer_task
 
     ci.request_cancel(tmp_path, "steerme", reason="tearing down")
@@ -410,10 +410,11 @@ def test_steering_is_refused_while_a_cancel_intent_is_active(tmp_path, monkeypat
     )
     assert receipts and receipts[0]["status"] == "rejected"
     assert receipts[0]["reason"] == "cancel_pending"
-    assert drain_owner_messages(tmp_path, "steerme") == []
+    assert drain_owner_entries(tmp_path, "steerme") == []
     assert sent == [((1, "Task · Not delivered: that task is being stopped"), {
         "role": "system", "system_type": "steer_not_delivered", "task_id": "steerme",
     })]
+
 
 def test_drop_cancelled_pending_stamps_the_decision_and_honors_the_stored_status(
     qenv, monkeypatch,
@@ -639,7 +640,7 @@ def test_drop_cancelled_pending_leaves_the_intent_open_when_the_write_fails(
 def test_steering_refusal_covers_the_legacy_latch_too(tmp_path, monkeypatch):
     """A-F19: a pre-migration wedged task must not accept new owner messages."""
     import supervisor.events as events_mod
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
     from supervisor.events import _handle_steer_task
 
     write_task_result(tmp_path, "legacy-steer", STATUS_CANCEL_REQUESTED, result="wedged")
@@ -659,7 +660,8 @@ def test_steering_refusal_covers_the_legacy_latch_too(tmp_path, monkeypatch):
         {"target_task_id": "legacy-steer", "message": "new orders", "chat_id": 1}, ctx,
     )
     assert receipts and receipts[0]["reason"] == "cancel_pending"
-    assert drain_owner_messages(tmp_path, "legacy-steer") == []
+    assert drain_owner_entries(tmp_path, "legacy-steer") == []
+
 
 def test_drop_cancelled_pending_yields_to_a_live_claim_owner(qenv, monkeypatch):
     """AR2-2: the pre-assignment drop CLAIMS before it settles. A live custody's
@@ -829,9 +831,10 @@ def test_steer_refusal_removes_the_just_staged_attachments(tmp_path, monkeypatch
     attach_dir = task_artifact_dir_path(tmp_path, "steer-stage") / "attachments"
     staged = list(attach_dir.glob("*")) if attach_dir.exists() else []
     assert staged == [], f"staged inputs must be removed on refusal: {staged}"
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
 
-    assert drain_owner_messages(tmp_path, "steer-stage") == []
+    assert drain_owner_entries(tmp_path, "steer-stage") == []
+
 
 
 def _restart_snapshot(qenv, monkeypatch, *, running: list, pending: list = (), ts: str = ""):

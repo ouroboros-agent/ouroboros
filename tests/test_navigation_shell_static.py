@@ -154,9 +154,11 @@ def test_project_panel_composer_and_welcome_contracts():
     assert ".project-panel.open" in css
     assert "left: var(--sidebar-width);" in css  # sidebar stays clickable under backdrop
     assert ".chat-header-actions {\n        display: none;" not in css
-    # Gateway Boundary: chat.js consumes the endpoint via the api_client wrapper,
-    # and the raw route lives in api_client.js (not a raw fetch in chat.js).
-    assert "projectFromTask" in chat_js
+    # Gateway Boundary: Turn into project (work_portal.js, the card's move) consumes the endpoint via
+    # the api_client wrapper, and the raw route lives in api_client.js (no raw fetch in a chat module).
+    portal_js = _read("web/modules/work_portal.js")
+    assert "apiClient.projectFromTask(" in portal_js
+    assert "/api/projects/from-task" not in portal_js and "/api/projects/from-task" not in chat_js
     assert "/api/projects/from-task" in _read("web/modules/api_client.js")
 
 

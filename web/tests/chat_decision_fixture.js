@@ -62,7 +62,10 @@ export class NodeStub {
     matches(selector) {
         return selector === ':focus-visible' && globalThis.document.activeElement === this && !globalThis.document.pointerModality;
     }
-    addEventListener(type, handler) { this.listeners.set(type, handler); }
+    addEventListener(type, handler) {
+        const previous = this.listeners.get(type);
+        this.listeners.set(type, previous ? event => { previous(event); handler(event); } : handler);
+    }
     click(event = {}) {
         const handler = this.listeners.get('click');
         if (handler) handler({ target: this, detail: 0, stopPropagation() {}, preventDefault() {}, ...event });
@@ -100,11 +103,14 @@ export function countPropertyWrites(target, key) {
 
 export function fixture({ fetchImpl, renderMarkdown, enhanceMarkdown, onDomWrite, fetchDetail, isMain = false,
     frameNode = (_msg, node) => node, insertMessageNode = null, removeMessageNode = null, focusAfterRemoval = null,
-    onQuestionsChanged, rawDetail = false } = {}) {
-    const prior = { document: globalThis.document, crypto: globalThis.crypto, window: globalThis.window };
+    onQuestionsChanged, rawDetail = false, storage = null, events = null, projectId = '', chatId = 1 } = {}) {
+    const prior = { document: globalThis.document, crypto: globalThis.crypto, window: globalThis.window, localStorage: globalThis.localStorage };
+    const saved = new Map();
+    globalThis.localStorage = storage || { getItem: key => saved.get(key) || null,
+        setItem: (key, value) => saved.set(key, value), removeItem: key => saved.delete(key) };
     globalThis.document = { createElement: (tag) => new NodeStub(tag) };
     const opened = [];
-    globalThis.window = { dispatchEvent: (event) => opened.push(event.detail) };
+    globalThis.window = events || { dispatchEvent: (event) => opened.push(event.detail) };
     if (!globalThis.crypto?.randomUUID) Object.defineProperty(globalThis, 'crypto', {
         configurable: true, value: { randomUUID: () => 'fixed-request-id' },
     });
@@ -134,13 +140,15 @@ export function fixture({ fetchImpl, renderMarkdown, enhanceMarkdown, onDomWrite
                     : { state: 'unknown' };
             return { ...detail, question_rooms: Object.fromEntries(Object.keys(detail.owner_quiz || {}).map(id => [id, room])) };
         },
-        isMain,
+        isMain, projectId, chatId,
         insertMessageNode,
         removeMessageNode,
         focusAfterRemoval,
         onQuestionsChanged,
     });
     return { decision, toasts, calls, opened, restore: () => {
+        decision.destroy();
+        globalThis.localStorage = prior.localStorage;
         globalThis.document = prior.document;
         globalThis.window = prior.window;
         Object.defineProperty(globalThis, 'crypto', { configurable: true, value: prior.crypto });

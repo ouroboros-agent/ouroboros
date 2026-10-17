@@ -1248,8 +1248,6 @@ def _run_startup_task_recovery(
         log.warning("Startup file/task recovery deferred: prior worker ownership is unconfirmed")
         return report
     try:
-        # Reattach logical receipts before any orphan or cleanup decision. On a
-        # providerless boot the queue has not restored its saved carriers yet.
         from ouroboros.task_status import _load_queue_snapshot
         snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
         saved = [row["task"] for row in snapshot.get("pending", [])
@@ -1262,9 +1260,17 @@ def _run_startup_task_recovery(
         report["errors"].append(f"startup_ownership_unconfirmed: {type(exc).__name__}")
         log.warning("Startup task recovery deferred: live/pending ownership is unreadable", exc_info=True)
         return report
+    intent_errors = []
+    try:  # its own step: an unsettled new-work intent is no reason to skip the file recovery below
+        from ouroboros.promotion_intent import reconcile_promotion_intents
+        reconcile_promotion_intents(drive_root, protected=protected)
+    except Exception:
+        intent_errors.append("promotion_intent_reconcile_failed")
+        log.warning("Startup new-work intent reconciliation deferred", exc_info=True)
     report = _recover_terminal_task_files(drive_root, protected)
     report["unresolved"].extend(preparations["retained"] + preparations["uncertain"])
     report["errors"].extend(f"preparation:{item}" for item in preparations["errors"])
+    report["errors"].extend(intent_errors)
     excluded = protected | set(report["unresolved"])
     if report["errors"]:
         log.warning("Startup task file recovery has gaps: %s", report)

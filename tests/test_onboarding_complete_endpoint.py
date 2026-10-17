@@ -135,8 +135,14 @@ def onboarding(monkeypatch, tmp_path):
         return payload
 
     monkeypatch.setattr(gw_onboarding, "_read_harness_snapshot", _snapshot)
-    monkeypatch.setattr(config, "apply_settings_to_env",
-                        lambda settings: calls["env"].append(dict(settings)))
+    original_apply_settings = config.apply_settings_to_env
+
+    def apply_settings(settings, *, environ=None):
+        if environ is not None:
+            return original_apply_settings(settings, environ=environ)
+        calls["env"].append(dict(settings))
+
+    monkeypatch.setattr(config, "apply_settings_to_env", apply_settings)
 
     def _supervisor(_request, _settings):
         calls["supervisor"] += 1

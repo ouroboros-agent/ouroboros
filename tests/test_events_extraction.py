@@ -70,7 +70,6 @@ _MOVED_OWNERS = {
     "_handle_ensure_project_scope": events_project_routing,
     "_handle_project_digest": events_project_routing,
     "_handle_promote_chat_to_task": events_project_routing,
-    "_handle_routing_manual_target": events_project_routing,
     "_persist_promote_rejection": events_project_routing,
     "_prepare_promote_source_off_loop": events_project_routing,
     "_publish_routing_ack": events_project_routing,

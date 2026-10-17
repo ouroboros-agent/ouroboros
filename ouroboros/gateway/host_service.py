@@ -459,6 +459,8 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
     try:
         from ouroboros.task_status import SETTLED_STATUSES
 
+        if not isinstance(payload.get("reply_to", ""), str):
+            return _json_error("reply_to must be an address string", 400)
         text = str(payload.get("text") or "")
         image_caption = str(payload.get("image_caption") or "")
         client_message_id = str(payload.get("client_message_id") or "").strip()[:128]
@@ -492,7 +494,8 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 # Reuse the accepted byte-proven kinds; same_message still checks every incoming digest/name.
                 logged = text.strip() or image_caption.strip() or chat_uploads.attachment_placeholder(
                     inline_image, {"chat_attachments": inbound.get("attachments"), "chat_attachment_uploads": incoming})
-                if not chat_uploads.same_message(inbound, logged, incoming):
+                if (not chat_uploads.same_message(inbound, logged, incoming)
+                        or (inbound.get("reply_to") or {}).get("address", "") != payload.get("reply_to", "")):
                     return _json_error("client_message_id was already used for a different message", 409)
                 state = _operation_state(ctx, rows, inbound)
                 if state["status"] in SETTLED_STATUSES:
@@ -516,6 +519,8 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
             inline = str(payload.get("image_base64") or "") if image_mime else ""
             metadata = {**({"chat_attachment_uploads": uploads} if uploads else {}),
                         **({"chat_attachments": refs} if refs else {})}
+        if payload.get("reply_to"):  # no reference adds nothing to a plain inject's kwargs
+            metadata["reply_to"] = payload["reply_to"]
         bridge = ctx.bridge_getter()
         response_event: asyncio.Event = asyncio.Event()
         response_holder: dict[str, str] = {}

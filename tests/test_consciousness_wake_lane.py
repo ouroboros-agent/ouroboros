@@ -411,7 +411,10 @@ def test_handle_task_ledger_category_comes_from_usage_category(monkeypatch, tmp_
 
     monkeypatch.setattr(usage_accounting, "usage_scope", fake_scope)
     monkeypatch.setattr(model_wait, "task_model_wait_scope", lambda **kw: contextlib.nullcontext())
-    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose", lambda *a, **k: None)
+    from ouroboros.settings_integrity import task_settings_snapshot
+
+    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose",
+                        lambda *a, **k: task_settings_snapshot({}, os.environ))
     monkeypatch.setattr(config, "task_settings_scope", lambda snapshot: contextlib.nullcontext())
     monkeypatch.setattr(agent_module.OuroborosAgent, "_handle_task_scoped", lambda self, task: [])
     agent = object.__new__(agent_module.OuroborosAgent)

@@ -21,11 +21,11 @@ Methods over 150 lines or eight parameters are decomposition signals, not gates
 (CHECKLISTS item 11(c); BIBLE P7). Runtime function totals are descriptive, with no
 aggregate ceiling, because a repository-wide count penalizes useful decomposition.
 
-Enforcement: official-repository CI runs the blocking `size_ratchet` lane (ARCHITECTURE
-§8 "CI topology"). Locally nothing blocks on size (BIBLE P3): default lanes exclude the
-marker, `check_worktree_readiness` and `codebase_health` report `validate_size_ratchet`
-findings as "official CI will enforce" warnings, and the diff pulse shows growth since
-the contribution base while a change is made (ARCHITECTURE §6 "Commit preflight").
+Enforcement: manual/tag CI runs `size_ratchet` (ARCHITECTURE §8). Without an event
+base its transition check compares only HEAD's parent, not all intervening commits;
+local qualification must name the contribution base. Local default lanes exclude
+this marker; readiness/health warn and the diff pulse reports growth (BIBLE P3;
+ARCHITECTURE §6 "Commit preflight").
 
 ### Paying down a size cap
 
@@ -160,13 +160,11 @@ here, and enroll it in `hot_store_growth_notes` in the same change.
 
 ### Invariant: Continuation authority and bounded role projections
 
-Continuation is an explicit relation, not an inferred chat-memory feature: the router
-contract requires `predecessor_task_id` (`""` = fresh; omission or `null` is a typed
-refusal before any lookup, enqueue or provider spend), and Main receives only a
-defensive projection of the predecessor authority, never a raw head/tail slice, an
-invented summary or a mutation of the canonical result (ARCHITECTURE §1 "CLI /
-Headless Boundary"); the optional exact read, never a forced reread, is
-`get_task_result(include_authority=True)`.
+Continuation is an explicit relation, not inferred chat memory: only the Continue CAS
+(`continued_by`) links a successor, and new work names no predecessor. Main gets only a
+defensive projection of a predecessor's authority, never a raw head/tail slice, an invented
+summary or a canonical-result mutation (ARCHITECTURE §1 "CLI / Headless Boundary"); the
+optional exact read is `get_task_result(include_authority=True)`.
 
 The root startup injection is a bounded envelope, not a body copy, from the one producer
 `contracts.task_contract.bounded_continuation_envelope`: each field is whole-or-pointer

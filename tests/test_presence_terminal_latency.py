@@ -1,5 +1,6 @@
 """Native Presence returns durable replies while existing synthesis retains custody."""
 
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -10,6 +11,7 @@ import pytest
 from ouroboros import agent as agent_module, agent_task_pipeline as pipeline, loop
 from ouroboros.model_wait import current_model_wait
 from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
+from ouroboros.settings_integrity import task_settings_snapshot
 from ouroboros.task_results import load_task_result
 from tests.test_presence_completion import _call
 from tests.test_presence_runner import _admission, _event
@@ -32,7 +34,8 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setattr(agent_module, "validate_task_authority_sources", lambda *_a: None)
     monkeypatch.setattr(agent_module.OuroborosAgent, "_start_task_heartbeat_loop", lambda *_a: None)
-    monkeypatch.setattr(agent_module.subagent_runtime, "apply_task_start_settings_or_disclose", lambda *_a: None)
+    monkeypatch.setattr(agent_module.subagent_runtime, "apply_task_start_settings_or_disclose",
+                        lambda *_a: task_settings_snapshot({}, os.environ))
     started, release = threading.Event(), threading.Event()
     stages, owners, agents = [], [], []
     threads_before = set(threading.enumerate())

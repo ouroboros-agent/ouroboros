@@ -1,13 +1,12 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
-import { executorIdentityMarkup, joinMetaParts } from './harness_presentation.js';
+import { META_PART_SEPARATOR, executorIdentityMarkup } from './harness_presentation.js';
 import { effortChipMarkup } from './effort_chip.js';
 import { resultFilesItemHtml } from './result_files.js';
 import { taskSourceDownloadUrl, apiFetch } from './api_client.js';
 import { compactModel, formatLogDuration, modelExecutionLabel } from './log_events.js';
-import { createSystemMessageActions } from './ui_helpers.js';
-import { projectReference } from './project_reference.js';
+import { fitText, fullText } from './text_fit.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import { activityWaitPhase, pausePhaseLabel, modelActivityPresentation, paintLiveDetail, taskActivityPresentation } from './task_phase_chip.js';
@@ -822,8 +821,10 @@ export function clearStickyCardState(record) {
     // The activity clock is cycle state too: a recycled slot ('active') would
     // otherwise open showing the previous cycle's "updated" time.
     record.latestActivityTs = '';
+    record.latestActivityRaw = '';
+    record.startedAt = 0;
     if (record.activityEl) {
-        record.activityEl.textContent = '';
+        fitText(record.activityEl, '', 0);  // also drops a portal line's word-cut fit
         record.activityEl.removeAttribute('title');
     }
     record.modelExecution = null;
@@ -1250,58 +1251,6 @@ export function formatMsgTime(isoStr) {
     }
 }
 
-/** Human label for ONE manual-routing option row (shared with the picker card). */
-export function routingOptionLabel(option) {
-    if (!option || typeof option !== 'object') return '';
-    if (option.label) return String(option.label);
-    if (option.action === 'new_task_in_project') {
-        return fmt('New task in {name}', { name: String(option.project_name || tr('routing.generic_project', 'Project')) });
-    }
-    if (option.title || option.project_name) {
-        return String(option.title || option.project_name);
-    }
-    return option.project_id && !option.task_id ? tr('routing.generic_project', 'Project') : tr('routing.generic_task', 'Task');
-}
-
-/** Human text for a typed routing annotation ('' hides the line). */
-export function routingAnnotationText(annotation) {
-    if (!annotation || typeof annotation !== 'object') return '';
-    // A refused act carries the host's own owner-facing sentence (`cause`);
-    // it outranks the status matrix below. Absent on scheduled/delivered/
-    // pending rows and on the picker frame, so those labels are unchanged.
-    const cause = String(annotation.cause || '').trim();
-    if (cause) return tx(cause);
-    const action = String(annotation.action || '');
-    const status = String(annotation.status || '');
-    const target = String(annotation.target || '');
-    const targetLabel = String(annotation.target_label || '')
-        || (target ? (action === 'project_route' ? tr('routing.generic_project', 'Project') : tr('routing.generic_task', 'Task')) : '');
-    if (status === 'pending') return tr('routing.pending', 'Choosing the right destination…');
-    if (status === 'needs_manual_target') {
-        const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
-            .map(routingOptionLabel)
-            .filter(Boolean);
-        if (optionLabels.length) return `${tr('routing.choose_target', 'Choose a target')} · ${optionLabels.join(' / ')}`;
-        // No options and (by the guard above) no cause: a receipt written
-        // before the host sentence existed, or by a producer that bypasses
-        // `_emit_routing_receipt`. Nothing can be chosen on such a row, so it
-        // must not invite a choice.
-        const notRouted = tr('routing.not_routed', 'Not routed');
-        return targetLabel ? `${notRouted} · ${targetLabel}` : notRouted;
-    }
-    if (status === 'project_unavailable') return tr('routing.project_unavailable', 'Project is unavailable');
-    const labels = {
-        mailbox_delivery: 'Message saved for task',  // a recorded mailbox write, never a read receipt
-        steer_task: 'Steered task',
-        promote_chat_to_task: 'Started task',
-        route_to_project: 'Routed to project',
-        project_route: 'Project routing',
-    };
-    const label = labels[action] ? tr(`routing.action.${action}`, labels[action])
-        : (status.replaceAll('_', ' ') || action.replaceAll('_', ' '));
-    return targetLabel && label ? `${label} · ${targetLabel}` : label;
-}
-
 /**
  * Project one /api/state activity census onto the client's active-activity map.
  *
@@ -1434,22 +1383,6 @@ export function unconfirmedForegroundCardIds(cards, activeIds) {
     return out;
 }
 
-// Extracted from chat.js (byte-ratchet payment): the DOM half of the routing
-// acknowledgement, kept beside its text builder above.
-export function clearTransientRoutingAnnotations(messagesDiv = globalThis.document?.querySelector?.('#chat-messages')) {
-    if (!messagesDiv) return false;
-    let changed = false;
-    for (const note of messagesDiv.querySelectorAll(
-        '.msg-routing-annotation[data-annotation-status="pending"]',
-    )) {
-        const bubble = note.closest('.chat-bubble');
-        if (bubble) delete bubble.dataset.chatAnnotationStatus;
-        note.remove();
-        changed = true;
-    }
-    return changed;
-}
-
 // В9: the host stamps a typed `ingress_accepted: true` on an owner echo only after the durable chat write, so that
 // client_message_id's bubble says `Input saved` — never that work began; `ingress_undispatched` (proven never dispatched) says
 // `Saved, not delivered.` and `ingress_pending` (the running host has not said yet) `Input saved`, each until the next fact.
@@ -1466,61 +1399,33 @@ export function markIngressSaved(root, row) {
     return true;
 }
 
-export function renderRoutingAnnotation(bubble, annotation, chatId = 1) {
-    if (!bubble) return false;
-    const text = routingAnnotationText(annotation);
-    let note = bubble.querySelector('.msg-routing-annotation');
-    if (!text) {
-        const hasStatus = bubble.dataset.chatAnnotationStatus !== undefined;
-        if (!note && !hasStatus) return false;
-        note?.remove();
-        bubble.querySelector('.msg-routing-actions')?.remove();
-        if (hasStatus) delete bubble.dataset.chatAnnotationStatus;
-        return true;
-    }
-    const status = String(annotation.status || '');
-    const destinationKey = `${annotation.project_id || ''}|${annotation.project_chat_id || ''}|${annotation.target || ''}`;
-    const changed = !note || note.dataset.annotationText !== text
-        || note.dataset.destinationKey !== destinationKey
-        || note.dataset.annotationStatus !== status
-        || bubble.dataset.chatAnnotationStatus !== status;
-    if (!note) {
-        note = document.createElement('div');
-        note.className = 'msg-routing-annotation';
-        const time = bubble.querySelector('.msg-time');
-        if (time) time.before(note);
-        else bubble.append(note);
-    }
-    if (!changed) return false;
-    bubble.querySelector('.msg-routing-actions')?.remove();
-    note.textContent = text;
-    note.dataset.annotationText = text;
-    note.dataset.destinationKey = destinationKey;
-    if (note.dataset.annotationStatus !== status) note.dataset.annotationStatus = status;
-    if (bubble.dataset.chatAnnotationStatus !== status) bubble.dataset.chatAnnotationStatus = status;
-    const destination = annotation.project_id && Number(annotation.project_chat_id) > 0
-        && Number(annotation.project_chat_id) !== Number(chatId)
-        && ['scheduled', 'delivered'].includes(status);
-    if (destination) {
-        const actions = createSystemMessageActions(projectReference(
-            { id: annotation.project_id, chat_id: Number(annotation.project_chat_id) }, { taskId: annotation.target || '' },
-        ));
-        actions.classList.add('msg-routing-actions');
-        const time = bubble.querySelector('.msg-time');
-        if (time) time.before(actions);
-        else bubble.append(actions);
-    }
-    return changed;
+// Full narration stays in the timeline, not a mouse-only title.
+// How many lines a COLLAPSED card's activity line shows (the CSS clamps say the same: a child 1, a Main portal
+// 2, a root card 3); an expanded card shows the whole line.
+export function collapsedActivityLines(record) {
+    const root = record?.root;
+    if (!root || root.dataset?.expanded === '1') return 0;
+    if (record.isSubagent || root.dataset?.subagent === '1') return 1;
+    return root.dataset?.portal === '1' ? 2 : 3;
 }
 
-// Full narration stays in the timeline, not a mouse-only title.
+/** Re-fit the activity line after the card's form changed (expanded, collapsed, bound as a portal). */
+export function refitCollapsedActivity(record) {
+    const el = record?.activityEl;
+    if (!el) return false;
+    fitText(el, fullText(el), collapsedActivityLines(record));
+    return true;
+}
+
 export function renderCollapsedActivity(record, text) {
     if (!record?.activityEl) return false;
-    const changed = record.activityEl.textContent !== text
-        || Boolean(record.activityEl.hasAttribute?.('title'));
-    if (record.activityEl.textContent !== text) record.activityEl.textContent = text;
-    if (record.activityEl.hasAttribute?.('title')) record.activityEl.removeAttribute('title');
-    return Boolean(changed && record.activityEl.isConnected);
+    const el = record.activityEl;
+    // A collapsed card's line is cut on a word with a clean ending (never `.…`; text_fit.js).
+    const shown = fullText(el);
+    const changed = shown !== text || Boolean(el.hasAttribute?.('title'));
+    if (shown !== text) fitText(el, text, collapsedActivityLines(record));
+    if (el.hasAttribute?.('title')) el.removeAttribute('title');
+    return Boolean(changed && el.isConnected);
 }
 
 // The 13 cost-meta keys shared by both subagent whitelists (the delegation
@@ -1546,13 +1451,64 @@ export function cardMetaKeys(src) {
 
 // the ONE meta-line renderer, fed entirely from record state,
 // so a replay batch renders it exactly once per card.
+// "updated" names the turn's own last narration in the chat's one time format (formatMsgTime: the
+// same words as a bubble's clock), never the host locale's long date.
+function updatedLabel(record) {
+    const time = record.latestActivityRaw ? formatMsgTime(record.latestActivityRaw) : null;
+    const text = time?.short || record.latestActivityTs || '';
+    return text ? `updated ${text}` : '';
+}
+
+// An unfinished card always carries a time on its meta line: its last narration's, else when the work
+// started (the census start, else the card's first row). The line is never empty beside a control.
+function clockLabel(record) {
+    const updated = updatedLabel(record);
+    if (updated || record.finished) return updated;
+    const started = Number(record.startedAt) || Number(record.root?.dataset?.ts) || 0;
+    const time = started > 0 ? formatMsgTime(new Date(started).toISOString()) : null;
+    return time?.short ? `started ${time.short}` : '';
+}
+
+// The meta line keeps its real ` · ` text separators (a copied line reads as it looks), but each
+// separator rides inside the part before it and holds on to that part's last word (a no-break space
+// before the dot): a wrapped line may end with a dot, never start with one or keep a dot alone.
+const META_SEP_HTML = `<span class="chat-live-meta-sep">${META_PART_SEPARATOR.replace(/^ /, '&nbsp;')}</span>`;
+// The dot goes inside the part's last fact when that fact is a plain meta span, so the fact (kept
+// whole, as today) carries its dot with it; otherwise it follows the part.
+function withTrailingSeparator(part) {
+    const lastFact = part.lastIndexOf('<span class="chat-live-meta-text');
+    const tail = lastFact >= 0 ? part.slice(lastFact + 1) : '';
+    if (lastFact >= 0 && /<\/span>\s*$/.test(part) && !tail.includes('<span') && (tail.match(/<\/span>/g) || []).length === 1) {
+        return part.replace(/<\/span>\s*$/, `${META_SEP_HTML}</span>`);
+    }
+    return part + META_SEP_HTML;
+}
+
+function metaLineHtml(parts) {
+    const kept = parts.filter(Boolean);
+    return kept.map((part, index) => `<span class="chat-live-meta-part">${index < kept.length - 1
+        ? withTrailingSeparator(part) : part}</span>`).join('');
+}
+
 export function renderLiveCardMeta(record, { agentModel = record?.agentModel || '' } = {}) {
     if (!record?.metaEl) return false;
+    const toolCalls = Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '';
+    const cost = (record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : [];
+    // A Main portal is the collapsed form of a work that lives in its Project room: tool calls ·
+    // cost · updated, plus the facts that change what the owner may trust. Executor, model and
+    // effort details stay on the room's card.
+    const portal = record.root?.dataset?.portal === '1';
     // The executor block is ONE part of this line, joined by the same text
     // separator as the rest: concatenating it left the chip and the first fact
     // touching in a copied line and running together for a screen reader,
     // because only the flex gap separated them.
-    const html = joinMetaParts([
+    const html = portal ? metaLineHtml([
+        record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
+        !record.finished && record.projectHoldDetail || '',
+        // A settled portal needs no activity clock: its chip states how the work ended and the author's
+        // final (with its own end time) arrives as a message.
+        toolCalls, ...cost, record.finished ? '' : clockLabel(record),
+    ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`)) : metaLineHtml([
         executorIdentityMarkup(record.executorChip, { agentModel: compactModel(agentModel) }),
         effortChipMarkup(record.effort),
         ...[
@@ -1561,12 +1517,12 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
             !record.finished && record.projectHoldDetail || '',
             record.historyRetentionProblem || '',
             modelExecutionLabel(record.modelExecution),
-            Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '',
+            toolCalls,
             record.toolErrors > 0 ? `${record.toolErrors} error${record.toolErrors === 1 ? '' : 's'}` : '',
             Number.isFinite(record.durationSec) ? formatLogDuration(record.durationSec) : '',
             ...(Array.isArray(record._lastFrameMeta) ? record._lastFrameMeta : []),
-            ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),
-            record.latestActivityTs ? `updated ${record.latestActivityTs}` : '',
+            ...cost,
+            clockLabel(record),
         ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`),
     ]);
     const detailChanged = paintLiveDetail(record, 'liveCostDetail', String(record.costMeta?.detail || ''));
@@ -1578,8 +1534,18 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
 // Only host-attested cancelable queue roots receive this control.
 // A card's OWN actions row: a nested child card carries a row of its own, and a
 // descendant lookup would hand a root without one its child's.
+// The row lives at the end of the card's own foot, beside its meta line (right-docked, after the quiet
+// Reviews count): a single control never floats on an empty row of its own, and the summary above it
+// keeps its own inset. A nested child's foot is its own, so a descendant lookup is never used.
+function ownFootEnd(record) {
+    const foot = record?.footEl;
+    const end = record?.footEndEl;
+    return foot && end && foot.parentElement === record.root && end.parentElement === foot ? end : null;
+}
+
 export function ownLiveActionsEl(record) {
-    return [...(record?.root?.children || [])]
+    const holder = ownFootEnd(record) || record?.root;
+    return [...(holder?.children || [])]
         .find((node) => node.classList?.contains('chat-live-actions')) || null;
 }
 
@@ -1591,10 +1557,15 @@ export function ensureLiveActionsEl(record) {
     if (!actions) {
         actions = document.createElement('div');
         actions.className = 'chat-live-actions';
-        const timeline = record.timelineEl && record.timelineEl.parentElement === record.root
-            ? record.timelineEl
-            : null;
-        record.root.insertBefore(actions, timeline);
+        const end = ownFootEnd(record);
+        if (end) {
+            end.appendChild(actions);
+        } else {
+            const timeline = record.timelineEl && record.timelineEl.parentElement === record.root
+                ? record.timelineEl
+                : null;
+            record.root.insertBefore(actions, timeline);
+        }
     }
     return actions;
 }

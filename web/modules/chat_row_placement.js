@@ -5,7 +5,7 @@ import { isNonTerminalMediaHistoryRow, positiveTaskTerminalFact } from './chat_a
 
 // project_dialogue.ORIGIN_ADDRESSED_NOTICE_TYPES: a routing refusal names the task it
 // refused, never its speaker; it stays the issuing chat's own row.
-export const ORIGIN_ADDRESSED_NOTICE_TYPES = new Set(['task_not_started', 'task_start_unconfirmed', 'steer_not_delivered']);
+export const ORIGIN_ADDRESSED_NOTICE_TYPES = new Set(['task_not_started', 'task_start_unconfirmed', 'steer_not_delivered', 'relay_reply']);
 
 /**
  * Where a known child's non-progress, unplaced row goes: a routing notice stays a row

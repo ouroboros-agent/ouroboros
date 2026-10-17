@@ -1,9 +1,6 @@
-// The composer's controls that write GLOBAL owner settings (docs/DESIGN.md "Composer
-// owner controls"): the Nano/Low/Max context mode and the effort range, two labelled
-// capsules (ring · name · value) that each open inline into their strip. Both save
-// through their audited owner endpoint, show the server's refusal as a toast, and
-// resync every open composer from the next `/api/state` snapshot. Swarm is not one of
-// them: it is a per-message flag that never leaves the frame it rides.
+// Each composer's saved room settings: Context and Effort, two inline capsules.
+// Main and Projects read their own authoritative values and save through the owner
+// endpoints. Swarm stays a per-message flag. (DESIGN: Composer owner controls.)
 import { fmt } from './i18n.js';
 import {
     EFFORT_OPTIONS, EFFORT_RANGE_DEFAULT, OWNER_TIERS, effortText, normalizeEffortRange, ownerLevelIndex,
@@ -13,7 +10,7 @@ const N = OWNER_TIERS.length - 1;
 const HANDLES = ['min', 'rec', 'max'];
 const CONTEXT_MODES = ['nano', 'low', 'max'];
 const CONTEXT_LABELS = Object.freeze({ nano: 'Nano', low: 'Low', max: 'Max' });
-const CONTEXT_TITLE = 'Context mode (owner setting). Nano is the compact owner window, Low fits ~250K / local models, Max is full. Saves immediately; lowering requires Ouroboros to be idle.';
+const CONTEXT_TITLE = 'Context mode (owner setting). Nano is the compact owner window, Low fits ~250K / local models, Max is full. Saves for new participants in this room; running work keeps its context.';
 const contextModeOf = (mode) => (['nano', 'low', 'max'].includes(mode) ? mode : 'max');
 const HOVER_OPEN_MS = 160;
 // After the mouse leaves, the open strip waits this long before it closes, and a margin
@@ -55,27 +52,20 @@ function observeLayout(win, nodes, layout) {
     };
 }
 
-/** Each handle pushes the ones it meets: min and max carry the recommended level along, and
- *  the recommended level carries a bracket past which it moves; min and max never cross. */
+/** The primary level is independent; the helper brackets cannot cross each other. */
 export function applyHandle(base, which, value) {
     const s = { ...base };
     const v = clamp(value, 0, N);
-    if (which === 'min') { s.min = Math.min(v, s.max); s.rec = Math.max(s.rec, s.min); }
-    else if (which === 'max') { s.max = Math.max(v, s.min); s.rec = Math.min(s.rec, s.max); }
-    else { s.rec = v; s.min = Math.min(s.min, v); s.max = Math.max(s.max, v); }
+    if (which === 'min') s.min = Math.min(v, s.max);
+    else if (which === 'max') s.max = Math.max(v, s.min);
+    else s.rec = v;
     return s;
 }
 
 export function snapRange(v) {
     const s = { min: Math.round(v.min), rec: Math.round(v.rec), max: Math.round(v.max) };
-    s.rec = clamp(s.rec, s.min, s.max);
+    s.rec = clamp(s.rec, 0, N);
     return s;
-}
-
-/** A tap off the handles: inside the range it sets the recommended level, outside it the bracket on that side moves. */
-export function nearestHandle(committed, segment) {
-    if (segment >= committed.min && segment <= committed.max) return 'rec';
-    return segment < committed.min ? 'min' : 'max';
 }
 
 const indicesOf = (range) => ({
@@ -112,10 +102,10 @@ function effortRangeMarkup() {
     return capsuleHead(ring, 'Effort', 'chat-effort-head', ' data-i18n-skip')
         + '<div class="chat-capsule-body">'
         + '<div class="chat-effort-strip" data-effort-strip data-scroll="none"><div class="chat-effort-band" data-effort-band aria-hidden="true"></div>'
-        + '<div class="chat-effort-handle chat-effort-rec" data-handle="rec" role="slider" tabindex="-1" aria-label="Recommended effort"></div>'
+        + '<div class="chat-effort-handle chat-effort-rec" data-handle="rec" role="slider" tabindex="-1" aria-label="Primary effort"></div>'
         + segments
-        + '<div class="chat-effort-handle chat-effort-cap chat-effort-min" data-handle="min" role="slider" tabindex="-1" aria-label="Minimum effort"></div>'
-        + '<div class="chat-effort-handle chat-effort-cap chat-effort-max" data-handle="max" role="slider" tabindex="-1" aria-label="Maximum effort"></div></div>'
+        + '<div class="chat-effort-handle chat-effort-cap chat-effort-min" data-handle="min" role="slider" tabindex="-1" aria-label="Minimum helper effort"></div>'
+        + '<div class="chat-effort-handle chat-effort-cap chat-effort-max" data-handle="max" role="slider" tabindex="-1" aria-label="Maximum helper effort"></div></div>'
         + '</div>';
 }
 
@@ -509,16 +499,8 @@ function createCapsule({
     });
 }
 
-/**
- * The effort range: the capsule `Effort X-High` (closed, only the recommended level; the ring
- * still draws the range and the button's name says it) that opens inline into the seven-level
- * strip with min/max brackets and the recommended pill.
- *
- * Saves happen on gesture end through the owner endpoint, serialized (last wins); a failed save
- * shows the server's sentence and returns the control to the server's value. A stored tier
- * outside the seven owner tiers (`minimal`) is shown at the nearest owner tier and is rewritten
- * only when the owner moves that handle.
- */
+/** Inline primary/helper effort controls. Gesture-end saves serialize; refusal restores
+ * the last server value. A stored `minimal` renders at Low until that handle moves. */
 export function createEffortRangeControl({
     row, saveEffortRange, showToast, refreshState = () => {}, onLayout = () => {}, onSettled = () => {},
     win = globalThis.window, doc = globalThis.document,
@@ -581,11 +563,11 @@ export function createEffortRangeControl({
     function pick(event) {
         const b = boundaryAt(event);
         const segment = b === null ? state.shown.rec : Math.min(N, Math.floor(b));
-        return { which: nearestHandle(state.shown, segment), start: segment };
+        return { which: 'rec', start: segment };  // helper bounds have their own handles
     }
 
     /* --- rendering: every mark sits on whole levels, a drag included (the pill always covers
-       the word it names, and a pushed bracket moves with it, never behind it) --- */
+       the word it names independently of the helper brackets) --- */
     function render() {
         const s = snapRange(state.view || state.shown);
         const dir = scaleDir();
@@ -607,7 +589,7 @@ export function createEffortRangeControl({
         const dot = ringPoint(ringAngle(s.rec));
         ring.rec.setAttribute('cx', dot.x.toFixed(2));
         ring.rec.setAttribute('cy', dot.y.toFixed(2));
-        // The recommended level may go anywhere (it pushes the brackets); a bracket stops at the other one.
+        // Primary may go anywhere; each helper bracket stops at the other one.
         const bounds = { min: [0, s.max], rec: [0, N], max: [s.min, N] };
         const open = Boolean(capsule?.isOpen());
         for (const which of HANDLES) {
@@ -622,7 +604,7 @@ export function createEffortRangeControl({
         const word = effortText(state.draft.recommended);
         if (value.textContent !== word) value.textContent = word;
         const stored = state.stored;
-        head.title = fmt('Effort: {level}, range {min}–{max}. Applies to new work.', {
+        head.title = fmt('Primary effort: {level}; helpers {min}–{max}. Applies to new participants in this room.', {
             level: effortText(stored.recommended), min: effortText(stored.min), max: effortText(stored.max),
         });
         head.setAttribute('aria-label', head.title);
@@ -630,8 +612,7 @@ export function createEffortRangeControl({
 
     /* --- the model: drag preview, commit on gesture end, serialized saves --- */
     function beginDrag(which) { state.drag = { which }; state.view = { ...state.shown }; render(); }
-    // A drag builds on its own preview: a bracket the pill pushed stays pushed when the pointer
-    // comes back; cancel restores the committed range.
+    // A drag builds on its preview; cancel restores the committed values.
     function dragTo(which, value) { if (!state.drag) return; state.view = applyHandle(state.view || state.shown, which, value); render(); }
     function cancelDrag() { state.drag = null; state.view = null; render(); }
     function endDrag() {
@@ -779,7 +760,7 @@ export function createEffortRangeControl({
         isPinned: () => capsule.isPinned(),
         shown: () => ({ ...state.shown }),
         stored: () => ({ ...state.stored }),
-        /** Every composer shows the one global value: the `/api/state` snapshot's `effort_range`. */
+        /** The containing composer supplies only its room's authoritative value. */
         syncState(data) {
             const range = data?.effort_range;
             if (!range || typeof range !== 'object' || typeof range.recommended !== 'string') return;
@@ -799,14 +780,8 @@ export function createEffortRangeControl({
     };
 }
 
-/**
- * The context mode: the capsule `Context Max` that opens inline into exactly three modes, the
- * chosen one under a glass thumb. A choice (a press, a tap, Enter/Space, an arrow) posts the
- * owner endpoint at once, which hot-applies it without a restart; outside Cyber Pro a lower mode
- * is accepted only while Ouroboros is idle. The strip waits for the answer; a refusal leaves the
- * saved mode and says why, and every answer re-reads /api/state.
- */
-function createContextModeControl({ el, row, apiFetch, showToast, refreshState, onLayout, onSettled, win, doc }) {
+/** Context saves apply to future room participants; a refusal retains the saved mode. */
+function createContextModeControl({ el, row, saveContextMode, showToast, refreshState, onLayout, onSettled, win, doc }) {
     el.classList.add('chat-capsule');
     el.setAttribute('role', 'group');
     el.setAttribute('aria-label', 'Context size mode');
@@ -836,32 +811,32 @@ function createContextModeControl({ el, row, apiFetch, showToast, refreshState, 
             thumb.style.width = `${seg.offsetWidth}px`;
         }
     }
-    const postMode = (mode) => apiFetch('/api/owner/context-mode', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode }),
-    });
-    async function choose(mode) {
-        const next = ['nano', 'low', 'max'].includes(mode) ? mode : 'max';
-        if (el.dataset.disabled === 'true' || next === current()) return;
+    let saving = null, lastOk = true, destroyed = false;
+    function choose(mode) {
+        const next = contextModeOf(mode);
+        if (saving || destroyed || next === current()) return;
         el.dataset.disabled = 'true';
-        try {
-            const resp = await postMode(next);
-            if (resp.ok) {
-                el.dataset.contextMode = next;
-            } else {
-                let message = 'Could not change context mode.';
-                try { const p = await resp.json(); if (p?.error) message = p.error; } catch {}
-                showToast(message, 'error');
+        saving = (async () => {
+            try {
+                const saved = await saveContextMode(next);
+                if (destroyed) return false;
+                el.dataset.contextMode = contextModeOf(saved.context_mode);
+                lastOk = true;
+            } catch (e) {
+                if (destroyed) return false;
+                lastOk = false;
+                showToast(e.message || 'Could not change context mode.', 'error');
+            } finally {
+                saving = null;
+                if (!destroyed) {
+                    el.dataset.disabled = 'false';
+                    render();
+                    refreshState(true);
+                }
             }
-        } catch (e) {
-            showToast(`Could not change context mode: ${e.message || e}`, 'error');
-            /* leave the current value; /api/state refresh will resync */
-        } finally {
-            el.dataset.disabled = 'false';
-            render();
-            refreshState(true);
-        }
+            return lastOk;
+        })();
+        return saving;
     }
     const onChoose = (event) => {
         const seg = event.target?.closest?.('.chat-seg');
@@ -896,13 +871,16 @@ function createContextModeControl({ el, row, apiFetch, showToast, refreshState, 
     return {
         el,
         capsule,
-        /** The one global value: the `/api/state` snapshot's `context_mode`; a save in flight answers for itself. */
+        /** A save in flight answers for itself; the composer supplies this room's value. */
         syncState(data) {
             if (typeof data?.context_mode !== 'string' || el.dataset.disabled === 'true') return;
             el.dataset.contextMode = contextModeOf(data.context_mode);
             render();
         },
+        hasPendingSave: () => Boolean(saving),
+        pendingSave: () => saving || Promise.resolve(lastOk),
         destroy() {
+            destroyed = true;
             capsule.destroy();
             el.removeEventListener('click', onChoose);
             strip.removeEventListener('keydown', onKey);
@@ -921,8 +899,22 @@ function createContextModeControl({ el, row, apiFetch, showToast, refreshState, 
  * @param {() => void} [deps.onLayout]  a strip opened or closed on its own line
  * @param {HTMLElement} [deps.box]  independently sized page the composer docks inside
  */
-export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRange, showToast, refreshState, onLayout, box = null, win = globalThis.window, doc = globalThis.document }) {
+export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRange, showToast, refreshState, onLayout, projectId = '', box = null, win = globalThis.window, doc = globalThis.document }) {
     let destroyed = false;
+    const scoped = body => projectId ? { ...body, project_id: projectId } : body;
+    const readback = reply => {
+        if ((reply?.project_id || '') !== projectId) throw new Error('Settings response belongs to another room.');
+        return reply?.cognition || reply;
+    };
+    const saveContextMode = async mode => {
+        const response = await apiFetch('/api/owner/context-mode', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(scoped({ mode })),
+        });
+        const reply = await response.json();
+        if (!response.ok) throw new Error(reply?.error || 'Could not change context mode.');
+        return readback(reply);
+    };
+    const saveRoomEffort = async range => readback(await saveEffortRange(scoped(range)));
     const capsules = [];
     // Measure the settled, closed row synchronously: keep names while it fits, else rings and
     // values. If long translated values still wrap, cap the widest with an ellipsis; accessible
@@ -958,8 +950,8 @@ export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRan
     }
     const shared = { showToast, refreshState, onLayout, onSettled: fitNames, win, doc };
     const contextEl = byId('context-mode');
-    const context = contextEl ? createContextModeControl({ el: contextEl, row: row || contextEl.parentElement, apiFetch, ...shared }) : null;
-    const effort = row ? createEffortRangeControl({ row, saveEffortRange, ...shared }) : null;
+    const context = contextEl ? createContextModeControl({ el: contextEl, row: row || contextEl.parentElement, saveContextMode, ...shared }) : null;
+    const effort = row ? createEffortRangeControl({ row, saveEffortRange: saveRoomEffort, ...shared }) : null;
     for (const control of [context, effort]) if (control) capsules.push(control.capsule);
     // One capsule is open at a time.
     if (context && effort) { context.capsule.peer = effort.capsule; effort.capsule.peer = context.capsule; }
@@ -982,9 +974,14 @@ export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRan
     return {
         context,
         effort,
-        syncState(data) { context?.syncState(data); effort?.syncState(data); fitNames(); },
-        hasPendingSave: () => Boolean(effort?.hasPendingSave()),
-        pendingSave: () => (effort ? effort.pendingSave() : Promise.resolve(true)),
+        syncState(data) {
+            const values = projectId ? data?.projects?.find(project => project.id === projectId)?.cognition : data;
+            if (destroyed || !values) return;
+            context?.syncState(values); effort?.syncState(values); fitNames();
+        },
+        hasPendingSave: () => Boolean(context?.hasPendingSave() || effort?.hasPendingSave()),
+        pendingSave: async () => (await Promise.all([context, effort]
+            .filter(control => control?.hasPendingSave()).map(control => control.pendingSave()))).every(ok => ok !== false),
         destroy() {
             destroyed = true;
             stopObserving();

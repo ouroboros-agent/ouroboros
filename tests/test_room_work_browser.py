@@ -172,6 +172,7 @@ class Transport:
         self.state_reads = 0
         self.requests: list = []
         self.posts: list = []
+        self.around_reads: list = []  # presses on rows whose card is not loaded (``around=task:<id>``)
         self.console: list = []
         page.on("request", lambda request: self.requests.append((request.method, urlparse(request.url).path))
                 if "/api/" in request.url else None)
@@ -197,7 +198,14 @@ class Transport:
                             "project_chat_ids": [p["chat_id"] for p in self.projects]})
 
     def _history(self, route):
-        chat_id = int(parse_qs(urlparse(route.request.url).query).get("chat_id", ["1"])[0])
+        query = parse_qs(urlparse(route.request.url).query)
+        chat_id, around = int(query.get("chat_id", ["1"])[0]), query.get("around", [""])[0]
+        if around:  # these rooms' saved history holds no message of the census-only work (gateway: ``absent``)
+            self.around_reads.append(around)
+            route.fulfill(json={"messages": [], "has_more": False, "next_cursor": None, "page_cursor": None,
+                                "window": {"complete": False, "truncated_by": ["page"]},
+                                "anchor": {"state": "absent", "task_id": around.partition(":")[2]}})
+            return
         route.fulfill(json={"messages": self.history.get(chat_id, []), "progress": []})
 
     def _tasks(self, route):
@@ -413,10 +421,11 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
     # Names: the card's coined name whole in the DOM; census-only work reads its detail; else a neutral name.
     assert by["rw-live"]["name"] == LONGER_NAME and by["rw-live"]["target"] == "card"
     assert by["rw-live"]["label"].startswith(f"Go to task: {LONGER_NAME}, Working")
-    # Work outside the loaded messages says so in its name for assistive technology and in its details (5A),
-    # never as a visible line of its own: every row's second line is its state.
-    assert "Not in loaded messages" in by["rw-unknown"]["label"] and by["rw-unknown"]["target"] == "details"
-    assert by["rw-unknown"]["state"].startswith("Activity unconfirmed") and "loaded" not in by["rw-unknown"]["state"]
+    # A row whose card is not loaded claims nothing about where its message is until a press asks the room's
+    # history (DESIGN "Room work status"); every row's second line is its state (5A).
+    assert by["rw-unknown"]["target"] == "history" and by["rw-unknown"]["label"].startswith("Open: "), by["rw-unknown"]
+    assert "loaded" not in by["rw-unknown"]["label"] and "loaded" not in by["rw-unknown"]["state"]
+    assert by["rw-unknown"]["state"].startswith("Activity unconfirmed")
     assert page.locator("#page-chat .rw-place").count() == 0
     assert by["rw-queued"]["name"].startswith("Task"), by["rw-queued"]
     # Three dots are work (moving only for confirmed motion); one dot is a single fact.
@@ -437,11 +446,15 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
         assert row(focused, "rw-live")["reading"] == "1" and grown > heights["rest"] + 1, (focused, grown, heights)
     capture(page, "main-states-long-name-focus")
 
-    # A card-less row opens its details (an explicit press), never a hover; finished work included later.
+    # A card-less row asks the room's history on an explicit press, never a hover, and says what it found:
+    # here the saved history holds no message of it, so it opens its details (finished work included later).
     row_main(page, "rw-unknown").click()
-    detail = wait_facts(page, "main", lambda f: row(f, "rw-unknown")["open"], "details of an unloaded row")
-    assert row(detail, "rw-unknown")["expanded"] == "true"
-    assert row(detail, "rw-unknown")["detail"].startswith("WhereIts card is outside the messages loaded")
+    detail = wait_facts(page, "main", lambda f: "No message" in row(f, "rw-unknown")["detail"], "an unloaded row's lookup")
+    assert transport.around_reads == ["task:rw-unknown"]
+    assert row(detail, "rw-unknown")["expanded"] == "true" and row(detail, "rw-unknown")["open"]
+    assert row(detail, "rw-unknown")["detail"].startswith("WhereNo message yet.")
+    assert row(detail, "rw-unknown")["label"].startswith("Details: ")
+    assert "Not in loaded messages" not in json.dumps(detail) and "cannot take you to it" not in json.dumps(detail)
     assert row(detail, "rw-unknown")["detail"].endswith("WhatA task"), "label and words (textContent joins them)"
     assert not detail["surfaceHidden"]
     assert transport.decision_posts() == [] and transport.posts == []

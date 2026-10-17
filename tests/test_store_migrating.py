@@ -19,7 +19,7 @@ def test_history_migrating_reaches_http_and_never_imports(tmp_path, monkeypatch,
                                            "text": "Saved words", "chat_id": 1}])
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     _write(tmp_path / "task_results/root.json", [{"_schema_version": 1, "task_id": "root", "status": "completed"}])
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [])
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [])
     endpoint = history.make_chat_history_endpoint(tmp_path)
     request = SimpleNamespace(query_params={"chat_id": "1"})
     with monkeypatch.context() as patch:

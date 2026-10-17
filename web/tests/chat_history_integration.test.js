@@ -284,7 +284,9 @@ test('a refresh while the reader reads older history leaves the next press readi
     for (let n = 0; n < 20; n += 1) await new Promise(resolve => setTimeout(resolve, 0));
     await f.refresh(page([row('chat:700', 'Newest again')], 'page:recent', 'before:700'));
     for (let n = 0; n < 20; n += 1) await new Promise(resolve => setTimeout(resolve, 0));
-    assert.deepEqual(f.calls.slice(4), [null, null], 'a reader following the newest message gets the re-anchored chain');
+    assert.deepEqual(f.calls.slice(4), [null], 'a reader following the newest message re-anchors at that read, read once');
+    await f.clickOlder();
+    assert.equal(f.calls.at(-1), 'before:700', 'the re-anchored chain goes on straight below the read it started from');
 });
 
 test('the return to the present lets go of the windows kept while reading, leaving no unnoted hole', async (t) => {

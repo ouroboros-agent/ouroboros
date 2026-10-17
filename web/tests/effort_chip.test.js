@@ -62,28 +62,32 @@ function fixture() {
     };
 }
 
+// A meta fact ends with its separator when another fact follows (the dot rides with the fact before it).
+const tail = String.raw`(?:<span class="chat-live-meta-sep">&nbsp;· <\/span>)?<\/span>`;
+
 test('a child card paints the chip from its frames and keeps it across frames without one', () => {
     const f = fixture();
     try {
         f.emit({ role: 'assistant', task_id: ROOT, content: 'Child queued', subagent_event: 'scheduled', ...lineage('kid-a'),
             effort_level: 'high', effort_requested: 'ultra', effort_source: 'auto', model: 'openai/gpt-5.6-terra' });
-        assert.match(f.meta('kid-a'), /<span class="chat-live-meta-text chat-live-effort" data-effort-source="auto">Effort High \(asked Ultra\)<\/span>/);
-        assert.match(f.meta('kid-a'), /Agent model: gpt-5.6-terra<\/span> · <span class="chat-live-meta-text chat-live-effort"/, 'after the executor block, separated by text');
+        assert.match(f.meta('kid-a'), new RegExp(String.raw`<span class="chat-live-meta-text chat-live-effort" data-effort-source="auto">Effort High \(asked Ultra\)${tail}`));
+        assert.match(f.meta('kid-a'), /Agent model: gpt-5.6-terra<span class="chat-live-meta-sep">&nbsp;· <\/span><\/span><\/span><span class="chat-live-meta-part"><span class="chat-live-meta-text chat-live-effort"/,
+            'after the executor block, separated by text');
         f.emit({ role: 'assistant', task_id: 'kid-a', content: 'Reading the tests.', narration: true, subagent_event: 'progress', ...lineage('kid-a') }, 1);
         assert.match(f.meta('kid-a'), /Effort High \(asked Ultra\)/, 'a progress frame without the fact keeps the chip');
         f.emit({ role: 'assistant', task_id: ROOT, content: 'Child done', subagent_event: 'completed', status: 'completed', result: 'ok',
             ...lineage('kid-a'), effort_level: 'high', effort_requested: 'high', effort_source: 'auto' }, 2);
-        assert.match(f.meta('kid-a'), /data-effort-source="auto">Effort High<\/span>/, 'the terminal frame restates the fact');
+        assert.match(f.meta('kid-a'), new RegExp(String.raw`data-effort-source="auto">Effort High${tail}`), 'the terminal frame restates the fact');
         // Pinned, model-named and Cyber children, each with its own words.
         f.emit({ role: 'assistant', task_id: ROOT, content: 'Child queued', subagent_event: 'scheduled', ...lineage('kid-b', 'reviewer'),
             effort_level: 'high', effort_requested: 'ultra', effort_source: 'pin' }, 3);
-        assert.match(f.meta('kid-b'), /data-effort-source="pin" aria-label="Pinned effort High \(asked Ultra\)"><svg class="chat-live-effort-pin"[^>]*>.*<\/svg>High \(asked Ultra\)<\/span>/);
+        assert.match(f.meta('kid-b'), new RegExp(String.raw`data-effort-source="pin" aria-label="Pinned effort High \(asked Ultra\)"><svg class="chat-live-effort-pin"[^>]*>.*<\/svg>High \(asked Ultra\)${tail}`));
         f.emit({ role: 'assistant', task_id: ROOT, content: 'Child queued', subagent_event: 'scheduled', ...lineage('kid-c', 'second-opinion'),
             effort_level: 'xhigh', effort_requested: 'xhigh', effort_source: 'model_name' }, 4);
-        assert.match(f.meta('kid-c'), /data-effort-source="model_name">X-High · model name<\/span>/);
+        assert.match(f.meta('kid-c'), new RegExp(String.raw`data-effort-source="model_name">X-High · model name${tail}`));
         f.emit({ role: 'assistant', task_id: ROOT, content: 'Child queued', subagent_event: 'scheduled', ...lineage('kid-d', 'deep'),
             effort_level: 'ultra', effort_requested: 'ultra', effort_source: 'cyber' }, 5);
-        assert.match(f.meta('kid-d'), /data-effort-source="cyber">Effort Ultra \(Cyber Pro\)<\/span>/);
+        assert.match(f.meta('kid-d'), new RegExp(String.raw`data-effort-source="cyber">Effort Ultra \(Cyber Pro\)${tail}`));
         // An old frame: no level, no chip — never back-filled from the owner's range.
         f.emit({ role: 'assistant', task_id: ROOT, content: 'Child queued', subagent_event: 'scheduled', ...lineage('kid-e', 'scout') }, 6);
         assert.doesNotMatch(f.meta('kid-e'), /chat-live-effort/);

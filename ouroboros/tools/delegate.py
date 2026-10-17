@@ -1364,8 +1364,8 @@ def get_tools() -> List[ToolEntry]:
                     "Lower native access to readonly or workspace_write; omit to inherit the captured profile "
                     "(new mutating sessions default full). Explicit readonly authority wins. Omit on retry_of."},
                 "effort": {"type": "string", "enum": ["auto", *EFFORT_SCALE], "default": "auto", "description":
-                    "The run's reasoning effort inside my human's effort range: auto/omitted = the recommended "
-                    "level; outside the range it runs at the nearest bound. A row my human pinned or a level in "
+                    "The run's reasoning effort: auto/omitted = this room's primary clamped into its helper "
+                    "bounds; outside those bounds it runs at the nearest bound. A row my human pinned or a level in "
                     "its model name keeps that level outside Cyber Pro; the receipt says so. Omit on retry_of."},
                 "root": {"type": "string", "enum": ["active_workspace", "skill_payload"],
                     "default": "active_workspace", "description":

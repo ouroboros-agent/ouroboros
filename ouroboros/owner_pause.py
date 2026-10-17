@@ -239,6 +239,8 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
     from ouroboros.task_store import patch_document
     from ouroboros.utils import utc_now_iso
 
+    from ouroboros.control_actor import control_actor
+    attribution = control_actor()
     outcome: Dict[str, Any] = {}
 
     def update(current: dict) -> Optional[dict]:
@@ -262,12 +264,12 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
         if current.get("status") in _TRULY_TERMINAL_STATUSES and not (late_work or late_open):
             raise OwnerPauseRefused("task_terminal")
         if fence_closed(old) and not _resume_outstanding(actor_current if actor_current is not None else current, old):
-            requests[request_id] = {"fence_id": old["fence_id"], "generation": old.get("generation")}
+            requests[request_id] = {**attribution, "fence_id": old["fence_id"], "generation": old.get("generation")}
             fence = {**old, "requests": requests}
             outcome.update(fence=fence, created=False)
             return stamp_task_result_schema({**current, "owner_pause": fence})
         fence = {
-            "fence_id": uuid.uuid4().hex, "request_id": str(request_id or ""),
+            **attribution, "fence_id": uuid.uuid4().hex, "request_id": str(request_id or ""),
             # ``owner`` for the owner's own press; a stop door names itself
             # (``server_shutdown``, ``owner_restart``): the next start reads it.
             "state": FENCE_REQUESTED, "requested_by": str(requested_by or "owner"), "requested_at": utc_now_iso(),
@@ -276,7 +278,7 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
             # Still closed here only under outstanding Resume authority: name it.
             **({"supersedes_fence_id": old["fence_id"]} if fence_closed(old) else {}),
         }
-        requests[request_id] = {"fence_id": fence["fence_id"], "generation": fence["generation"]}
+        requests[request_id] = {**attribution, "fence_id": fence["fence_id"], "generation": fence["generation"]}
         fence["requests"] = requests
         outcome.update(fence=fence, created=True)
         return stamp_task_result_schema({**current, "owner_pause": fence})

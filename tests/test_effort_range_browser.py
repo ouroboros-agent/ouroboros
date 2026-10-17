@@ -8,8 +8,8 @@ and returns focus, an outside press closes. The open strip never takes a second 
 inside its row: beside the others on a wide screen, alone while they step aside on a 390 px phone
 and in a ~440 px Project pane, scrolling inside itself on a 320 px phone; the pill covers its word
 and the band meets the brackets. A drag and the keyboard save the full triple through
-the owner endpoint, the pill pushes a bracket and the bracket stays pushed, and every composer
-reads the one value back from /api/state; a change made just before Send lands before the
+the owner endpoint, with primary independent from helper bounds. Each composer
+reads only its room; a change made just before Send lands before the
 message; Settings → Behavior has no effort section and ends with Startup & background, whose
 host fact reads as one plain note; Settings → Agents says Auto or the level in the model name.
 """
@@ -154,7 +154,7 @@ def test_desktop_hover_opens_press_pins_escape_and_outside_close(direct_server_w
             assert (closed["name"], closed["value"], closed["headText"]) == ("Effort", "Medium", "EffortMedium"), closed
             assert abs(closed["top"] - closed["pillsTop"]) <= 2, closed
             assert closed["recTabIndex"] == -1, "closed handles are out of the tab order"
-            assert closed["title"] == "Effort: Medium, range Low–High. Applies to new work.", closed
+            assert closed["title"] == "Primary effort: Medium; helpers Low–High. Applies to new participants in this room.", closed
             assert closed["extras"] == 0, "no title word of the strip's own, no separator element, no reset"
             _shot(page, tmp_path, f"composer-closed-{engine}-dark")
             # Hover opens after ~160 ms; at this width the strip stays beside the pills.
@@ -306,7 +306,7 @@ def test_phone_press_opens_alone_on_the_line_while_the_pills_step_aside(direct_s
             browser.close()
 
 
-def test_project_pane_strip_stands_alone_and_shows_the_same_value(direct_server_with_data, tmp_path):  # noqa: F811
+def test_project_pane_strip_stands_alone_and_keeps_its_own_value(direct_server_with_data, tmp_path):  # noqa: F811
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import sync_playwright
 
@@ -347,13 +347,17 @@ def test_project_pane_strip_stands_alone_and_shows_the_same_value(direct_server_
             assert opened["top"] < opened["inputTop"], opened
             _assert_strip_geometry(opened)
             _shot(page, tmp_path, "composer-project-pane-open-chromium")
-            # A change in the pane reaches Main through /api/state.
+            # A change in the pane remains there after authoritative readback.
             page.focus(f"{panel} .chat-effort-max")
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range") and r.status == 200, timeout=30_000):
                 page.keyboard.press("ArrowRight")
             _wait(page, "el.getAttribute('aria-valuetext') !== 'High'", f"{panel} .chat-effort-max")
-            page.wait_for_function(f"() => document.querySelector('{CONTROL} .chat-effort-max').getAttribute('aria-valuetext') === 'X-High'",
-                                   timeout=30_000)
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_function(f"() => document.querySelector('{CONTROL}')?.dataset.known === 'true'")
+            assert _facts(page)["max"] == "High"
+            page.click('.nav-project-row[data-project-id="pane"]')
+            page.wait_for_function(f"() => document.querySelector('{panel}')?.dataset.known === 'true'")
+            assert _facts(page, panel)["max"] == "X-High"
         finally:
             browser.close()
 
@@ -387,7 +391,7 @@ def test_drag_and_keyboard_save_the_full_triple_and_reload_reads_it_back(direct_
             _wait(page, "(el.dataset.saving || 'false') === 'false'")
             after = _facts(page)
             assert (after["min"], after["rec"], after["max"]) == ("Low", "Medium", "Ultra"), after
-            # A tap inside the range moves the recommended level; outside, the nearest bracket.
+            # A level tap sets primary both inside and outside the helper range.
             x, y = _segment_center(page, "xhigh")
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range"), timeout=30_000) as waited:
                 page.mouse.click(x, y)
@@ -395,45 +399,43 @@ def test_drag_and_keyboard_save_the_full_triple_and_reload_reads_it_back(direct_
             x, y = _segment_center(page, "none")
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range"), timeout=30_000) as waited:
                 page.mouse.click(x, y)
-            assert json.loads(waited.value.request.post_data) == {"min": "none", "recommended": "xhigh", "max": "ultra"}
-            # Keyboard: the recommended handle steps, min and max push it.
+            assert json.loads(waited.value.request.post_data) == {"min": "low", "recommended": "none", "max": "ultra"}
+            # Keyboard: primary and helper bounds move independently.
             page.focus(f"{CONTROL} .chat-effort-rec")
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range"), timeout=30_000) as waited:
-                page.keyboard.press("ArrowLeft")
-            assert json.loads(waited.value.request.post_data) == {"min": "none", "recommended": "high", "max": "ultra"}
+                page.keyboard.press("ArrowRight")
+            assert json.loads(waited.value.request.post_data) == {"min": "low", "recommended": "low", "max": "ultra"}
             page.focus(f"{CONTROL} .chat-effort-min")
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range"), timeout=30_000) as waited:
                 page.keyboard.press("End")
-            assert json.loads(waited.value.request.post_data) == {"min": "ultra", "recommended": "ultra", "max": "ultra"}
+            assert json.loads(waited.value.request.post_data) == {"min": "ultra", "recommended": "low", "max": "ultra"}
             _shot(page, tmp_path, "composer-open-changed-chromium")
-            # The pill pushes the bracket in its way, and a pushed bracket stays when the pointer
-            # comes back within the same drag: Ultra · Ultra · Ultra → drag the pill to None and
-            # back to Medium → None · Medium · Ultra.
+            # Moving primary below the helper interval leaves both brackets at Ultra.
             pill = page.locator(f"{CONTROL} .chat-effort-rec").bounding_box()
             page.mouse.move(pill["x"] + pill["width"] / 2, pill["y"] + pill["height"] / 2)
             page.mouse.down()
             x, y = _segment_center(page, "none")
             page.mouse.move(x, y, steps=10)
-            _wait(page, "el.querySelector('.chat-effort-min').getAttribute('aria-valuetext') === 'None'")
+            _wait(page, "el.querySelector('.chat-effort-min').getAttribute('aria-valuetext') === 'Ultra'")
             x, y = _segment_center(page, "medium")
             page.mouse.move(x, y, steps=6)
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range"), timeout=30_000) as waited:
                 page.mouse.up()
-            assert json.loads(waited.value.request.post_data) == {"min": "none", "recommended": "medium", "max": "ultra"}
+            assert json.loads(waited.value.request.post_data) == {"min": "ultra", "recommended": "medium", "max": "ultra"}
             _wait(page, "(el.dataset.saving || 'false') === 'false'")
             _assert_strip_geometry(_facts(page))
             # A reload reads the saved value back from /api/state.
             page.reload(wait_until="domcontentloaded")
             page.wait_for_function(f"() => document.querySelector('{CONTROL}')?.dataset.known === 'true'", timeout=30_000)
             reloaded = _facts(page)
-            assert (reloaded["min"], reloaded["rec"], reloaded["max"]) == ("None", "Medium", "Ultra"), reloaded
+            assert (reloaded["min"], reloaded["rec"], reloaded["max"]) == ("Ultra", "Medium", "Ultra"), reloaded
             page.click(HEAD)
             _wait(page, "el.dataset.open === 'true'")
             # A refused save: the server's sentence, the control back at the server's value.
             page.route("**/api/owner/effort-range", lambda route: route.fulfill(
                 status=400, content_type="application/json",
                 body=json.dumps({"error": "Effort range refused by the test.", "saved": False, "code": "effort_range_invalid"})))
-            page.focus(f"{CONTROL} .chat-effort-max")
+            page.focus(f"{CONTROL} .chat-effort-min")
             page.keyboard.press("ArrowLeft")
             page.wait_for_selector(".toast", timeout=10_000)
             assert "Effort range refused by the test." in page.locator(".toast").first.inner_text()
@@ -465,13 +467,14 @@ def test_a_320_px_phone_scrolls_the_strip_inside_the_control(direct_server_with_
             assert opened["headWidth"] > 20, "the ring stays"
             _assert_strip_geometry(opened)
             _shot(page, tmp_path, f"composer-phone-320-open-{engine}")
-            # The hidden end is reached by scrolling the strip; a tap there moves the bracket.
+            # The hidden end is reached by scrolling; a tap sets primary without moving bounds.
             page.evaluate(f"() => {{ const s = document.querySelector('{CONTROL} .chat-effort-strip'); s.scrollLeft = s.scrollWidth; }}")
             _wait(page, "el.querySelector('.chat-effort-strip').dataset.scroll === 'end'")
             x, y = _segment_center(page, "ultra")
             with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range"), timeout=30_000) as waited:
                 page.touchscreen.tap(x, y)
-            assert json.loads(waited.value.request.post_data)["max"] == "ultra"
+            assert json.loads(waited.value.request.post_data)["recommended"] == "ultra"
+            assert json.loads(waited.value.request.post_data)["max"] == "high"
         finally:
             browser.close()
 
@@ -607,3 +610,72 @@ def test_agents_rows_say_auto_or_the_level_in_the_model_name(role_ui, tmp_path, 
     _shot(page, tmp_path, f"settings-agents-effort-{width}")
     session_named.locator("[data-subagent-effort-named]").scroll_into_view_if_needed()
     _shot(page, tmp_path, f"settings-agents-effort-named-{width}")
+
+
+@pytest.mark.parametrize("engine,touch", [("chromium", False), ("webkit", True)])
+def test_room_cognition_is_independent_and_survives_project_switch(direct_server_with_data, tmp_path, engine, touch):  # noqa: F811 - fixture import
+    """Main and two Projects keep their own values; primary can sit below both helper bounds."""
+    import urllib.request
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+
+    def request(path, body=None):
+        req = urllib.request.Request(url + path, data=None if body is None else json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read())
+
+    original = {"min": "high", "recommended": "max", "max": "ultra"}
+    request("/api/owner/effort-range", original)
+    alpha = request("/api/projects", {"id": "cognition-alpha", "name": "Cognition Alpha"})["project"]
+    beta = request("/api/projects", {"id": "cognition-beta", "name": "Cognition Beta"})["project"]
+    request("/api/owner/effort-range", {"min": "low", "recommended": "medium", "max": "high"})
+    # Hide these rooms from the bounded state projection: the addressed read remains authoritative.
+    with sync_playwright() as pw:
+        browser, page = _launch(pw, engine, viewport={"width": 1440, "height": 900}, has_touch=touch)
+        try:
+            page.route("**/api/state", lambda route: route.fulfill(json={
+                **route.fetch().json(), "projects": [],
+            }))
+            _open_chat(page, url, width=1440)
+
+            def open_room(project):
+                page.evaluate("project => window.dispatchEvent(new CustomEvent('ouro:open-project', {detail: {project}}))", project)
+                selector = f"#panel-pchat-{project['id']}"
+                page.wait_for_function("sel => document.querySelector(sel + ' .chat-effort-range')?.dataset.known === 'true'", arg=selector)
+                return selector
+
+            panel = open_room(alpha)
+            if touch:
+                page.set_viewport_size({"width": 390, "height": 844})
+            context = f"{panel} .chat-context-mode"
+            page.locator(f"{context} .chat-capsule-head").tap() if touch else page.click(f"{context} .chat-capsule-head")
+            with page.expect_response(lambda r: r.url.endswith("/api/owner/context-mode")) as changed:
+                page.locator(f'{context} [data-mode="low"]').tap() if touch else page.click(f'{context} [data-mode="low"]')
+            assert changed.value.status == 200, changed.value.text()
+            assert json.loads(changed.value.request.post_data) == {"mode": "low", "project_id": alpha["id"]}
+            page.keyboard.press("Escape")
+            effort = f"{panel} .chat-effort-range"
+            page.focus(f"{effort} .chat-effort-head")
+            page.keyboard.press("Enter")
+            page.focus(f"{effort} .chat-effort-rec")
+            with page.expect_response(lambda r: r.url.endswith("/api/owner/effort-range")) as changed:
+                page.keyboard.press("Home")
+            assert changed.value.status == 200, changed.value.text()
+            body = json.loads(changed.value.request.post_data)
+            assert body == {**original, "recommended": "none", "project_id": alpha["id"]}
+            _wait(page, "el.dataset.saving === 'false'", effort)
+            assert (_facts(page, effort)["min"], _facts(page, effort)["rec"], _facts(page, effort)["max"]) == ("High", "None", "Ultra")
+            _shot(page, tmp_path, f"cognition-primary-outside-range-{engine}")
+            second = open_room(beta)
+            assert _facts(page, f"{second} .chat-effort-range")["rec"] == "Max"
+            assert page.locator(f"{second} .chat-context-mode").get_attribute("data-context-mode") == "max"
+            panel = open_room(alpha)
+            assert _facts(page, f"{panel} .chat-effort-range")["rec"] == "None"
+            assert page.locator(f"{panel} .chat-context-mode").get_attribute("data-context-mode") == "low"
+            main = request("/api/state")
+            assert main["context_mode"] == "max" and main["effort_range"]["recommended"] == "medium"
+            assert request(f"/api/projects?chat_id={beta['chat_id']}")["projects"][0]["cognition"]["effort_range"] == original
+        finally:
+            browser.close()

@@ -14,6 +14,11 @@
 /** Shared census facts from the gateway; phase and outcome are independent. */
 /**
  * @typedef {Object} ActiveChatActivity
+ * @property {string=} last_line Visible model narration; empty when not recorded.
+ * @property {string=} last_line_at
+ * @property {number=} tool_calls
+ * @property {boolean=} detached Durable detached_at; independent of carrier/phase.
+ * @property {string=} project_name
  * @property {string=} status  // recorded lifecycle outcome; phase still owns current activity
  * @property {Object=} outcome_axes
  * @property {string=} reason_code
@@ -56,4 +61,46 @@
  * @property {string} criterion_source  // task_stated | agent_defined
  * @property {string} receipt_ts  // the receipt's own timestamp; no separate receipt id exists
  * @property {string=} detail  // the producer's sentence for a timeout or a bytes_equal comparison
+ */
+/**
+ * @typedef {Object} TaskPauseResponse
+ * @property {boolean=} ok
+ * @property {string=} task_id
+ * @property {string=} root_task_id
+ * @property {string=} fence_id
+ * @property {'requested'|'paused'|'released'=} state
+ * @property {boolean=} duplicate
+ * @property {Array<string>=} members
+ * @property {boolean=} snapshot_persisted
+ * @property {boolean=} latch_pending
+ * @property {string=} error
+ * @property {string=} reason_code
+ */
+/**
+ * @typedef {Object} TaskContinueResponse
+ * @property {boolean=} ok
+ * @property {string=} task_id
+ * @property {string=} predecessor_task_id
+ * @property {string=} successor_task_id
+ * @property {boolean=} replay
+ * @property {boolean=} recovered
+ * @property {boolean=} held
+ * @property {string=} status
+ * @property {Array<Object>=} blockers
+ * @property {string=} error
+ * @property {string=} reason_code
+ * @property {string=} cause
+ * @property {Array<string>=} gaps
+ * @property {boolean=} unconfirmed
+ * @property {'bound'|'admitted'=} state
+ * @property {string=} action_nonce
+ */
+/**
+ * @typedef {Object} ContinuationOffer
+ * @property {boolean=} eligible
+ * @property {string=} refusal
+ * @property {string=} cause
+ * @property {string=} successor_task_id
+ * @property {'bound'|'admitted'=} state
+ * @property {string=} action_nonce
  */

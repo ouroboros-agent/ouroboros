@@ -1,10 +1,10 @@
 # Ouroboros CI — Five-tier cross-platform testing and release pipeline
 #
-# Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests
-# Tier 2 (Full):        Every ouroboros push → Windows/macOS (PRs: selected scope, pr-selected-os); stable / manual / tag → full 3-OS matrix
-# Tier 1.5 (SQLite floor): Push to ouroboros or PR targeting ouroboros             → store modules on ubuntu-22.04's system SQLite 3.37.2
-# Tier 2.5 (Integration): Manual / tag (branch pushes: provider-canary-push.yml)       → Real-provider tests, reusable provider-canary.yml (~2 min)
-# Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
+# Tier 1 (Quick):       Manual                                                        → Ubuntu-only tests
+# Tier 2 (Full):        Manual / tag                                                   → Full 3-OS matrix
+# Tier 1.5 (SQLite floor): Manual                                                      → store modules on ubuntu-22.04's system SQLite 3.37.2
+# Tier 2.5 (Integration): Manual / tag                                                 → Real-provider tests, reusable provider-canary.yml
+# Tier 2.6 (Skill smoke): Manual / tag                                                 → LIVE OuroborosHub install smoke + review/grant/enable checks (paid)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
 # Opt-in (System E2E):    Manual / tag (no schedule)                                     → KEYLESS tests/system_e2e/ scenario lane (Ubuntu, ≤60 min)
 # Manual (Live E2E):      Dispatch input e2e_live=true only (no schedule)                → PAID devtools/e2e_live stand, $30 cap, OUROBOROS_E2E_LIVE_OPENROUTER_KEY (skipped honestly without it)
@@ -16,23 +16,17 @@
 
 name: CI
 
-# The code workflow runs on every push to the three shared branches and on
-# every `v*` tag, with no path filter: tests and builds read prompts, skills,
-# the Makefile, the spec and the requirements too, and a path list silently
-# leaves a new top-level path untested. The paid provider canaries keep their
-# own path list in `provider-canary-push.yml`, and the browser lane's push
-# entry stays `ui-browser-push.yml`, which calls the SAME reusable
-# `ui-browser.yml` lane this workflow calls for pull requests, manual runs and
-# tags.
+# Ordinary cloud tests run by request and on every `v*` release tag, not on
+# branch pushes or PRs (owner choice, 2026-10-16). Local tests and independent
+# review remain; cross-platform failures may surface only at qualification.
+# Tags-only push filtering intentionally excludes ALL branches. Manual/tag
+# runs retain the complete release graph, with no path filter. The UI/provider
+# wrappers remain available for focused manual runs; Claudexor integration
+# and non-test publishing workflows keep their own triggers.
 on:
   push:
-    branches: [main, ouroboros, ouroboros-stable]
     tags:
       - 'v*'
-  # Fork-safe PR validation: no provider secrets and no pull_request_target.
-  # Only fork-safe jobs match pull_request refs, including full host UI proof.
-  pull_request:
-    branches: [ouroboros]
   # Plain dispatch retains the provider and skill-review jobs and can spend
   # money. The separate paid e2e-live stand additionally requires its opt-in
   # input (`-f e2e_live=true`); all other dispatch gates stay unchanged.
@@ -47,22 +41,21 @@ on:
   # scheduled run would report the DEFAULT BRANCH in github.ref, which is why
   # the paid lanes below keep their `!= 'schedule'` guards.
 
-# Read-only is sufficient for tests and fork PRs. The release job overrides
+# Read-only is sufficient for the test jobs. The release job overrides
 # this narrowly with contents: write when publishing a tag.
 permissions:
   contents: read
 
-# A new push to a pull request cancels the run for its previous head. Every other
-# event, and every re-run, gets a group of its own: GitHub keeps one pending run per
-# group, so a shared group would let a re-run of an old head displace the new one,
-# and a release, a scheduled or a landed-commit run must never be cancelled.
+# Each manual/tag run and re-run has its own group, so it cannot displace another
+# qualification. The dormant PR branch is retained alongside the job predicates;
+# it does not enable a PR trigger.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 jobs:
   # ──────────────────────────────────────────────────────────────────
-  # Tier 1: Quick tests on Ubuntu (push to ouroboros or PR targeting it)
+  # Tier 1: Quick tests on Ubuntu (manual dispatch)
   # ──────────────────────────────────────────────────────────────────
   quick-test:
     if: |
@@ -317,11 +310,8 @@ jobs:
         run: /usr/bin/python3 -I -S scripts/safe_test.py --temp-parent "${{ runner.temp }}" -- .venv/bin/python -m pytest tests/test_store.py tests/test_store_import.py tests/test_store_switch.py tests/test_custody_store_rows.py tests/test_store_cutover.py tests/test_store_activation.py -q --tb=short --timeout=300 --timeout-method=thread
 
   # ──────────────────────────────────────────────────────────────────
-  # Tier 2: Full Windows/macOS for every landed `ouroboros` push (Ubuntu is
-  # quick-test there); full 3-OS matrix for stable, manual runs and tags. The landed
-  # push is what tells a later PR that a Windows/macOS failure is inherited. It runs
-  # in this repository only: an install that pushes its own commits to a private copy
-  # would pay Windows and macOS minutes for every self-modification.
+  # Tier 2: Full 3-OS matrix on manual runs and release tags. Branch/PR cases
+  # in the predicates below remain dormant without a corresponding trigger.
   # ──────────────────────────────────────────────────────────────────
   full-test-runs:
     if: |
@@ -603,7 +593,7 @@ jobs:
           --count 4 --sha "${{ github.sha }}" --run-id "${{ github.run_id }}"
           --summary "$GITHUB_STEP_SUMMARY"
 
-  # Fork-safe PR proof for the one native secret-scanner dependency. This job
+  # Manual proof for the one native secret-scanner dependency. This job
   # carries no provider or repository secret: it exercises the explicit pinned
   # installer, managed resolver, license/version checks, and redaction-safe real
   # scanner smoke on each supported desktop OS family.
@@ -645,9 +635,8 @@ jobs:
   # Tier 2.5: Integration tests against real provider APIs
   # The job body is the reusable `provider-canary.yml`. This workflow calls it
   # for manual runs and `v*` tags, where `release-preflight` requires its
-  # result. Branch pushes are deliberately NOT matched here:
-  # `provider-canary-push.yml` owns that trigger and shares the job, so a
-  # provider outage on a landed commit never reddens this workflow.
+  # result. `provider-canary-push.yml` is a standalone manual all-canary
+  # entry; it does not start a second paid run when a tag is pushed.
   # Required failures block release-preflight; optional qualification is a separate
   # strict job outside that dependency graph, never a forgiven mixed producer exit.
   # Required inconclusive skips fail the official tag floor. Before tagging a branch
@@ -840,9 +829,8 @@ jobs:
           grep -q "tests/test_smoke.py" /tmp/size-ratchet-collect.txt
           grep -q "tests/test_repo_health_smoke.py" /tmp/size-ratchet-collect.txt
 
-  # Pushes are deliberately NOT matched here: `.github/workflows/ui-browser-push.yml`
-  # owns that trigger and shares this job, so a landed push gets one browser
-  # lane under its own result.
+  # The complete reusable lane serves manual/tag qualification. The separate
+  # manual wrapper offers diagnostics without narrowing this release dependency.
   ui-smoke:
     if: |
       github.event_name == 'pull_request'
@@ -1859,6 +1847,9 @@ jobs:
           test -x "$MOUNT/Install CLI.command"
           APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$MOUNT/Ouroboros.app/Contents/Info.plist")"
           lipo -archs "$MOUNT/Ouroboros.app/Contents/MacOS/$APP_EXECUTABLE" | tr ' ' '\n' | grep -qx arm64
+          # Source handoff uses this interpreter, not the launcher's frozen imports.
+          HOME="$HOME_DIR" "$MOUNT/Ouroboros.app/Contents/Frameworks/python-standalone/bin/python3" -I -B -c \
+            'import webview, objc, AppKit, WebKit, PyObjCTools.AppHelper'
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             "$MOUNT/Ouroboros.app/Contents/Resources/bin/ouroboros" --help >/dev/null
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
@@ -1897,6 +1888,9 @@ jobs:
           test -f "$SMOKE_ROOT/Ouroboros/_internal/repo_bundle_manifest.json"
           python scripts/fetch_claudexor_runtime.py --verify-only \
             --output-dir "$SMOKE_ROOT/Ouroboros/_internal/claudexor-runtime"
+          # Source handoff uses this interpreter, not the launcher's frozen imports.
+          HOME="$HOME_DIR" "$SMOKE_ROOT/Ouroboros/_internal/python-standalone/bin/python3" -I -B -c \
+            'import webview'
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             "$SMOKE_ROOT/Ouroboros/bin/ouroboros" --help >/dev/null
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
@@ -2405,6 +2399,9 @@ jobs:
           $env:HOMEDRIVE = Split-Path -Qualifier $HomeDir
           $env:HOMEPATH = $HomeDir.Substring($env:HOMEDRIVE.Length)
           New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA, $env:APPDATA | Out-Null
+          # Source handoff uses this interpreter, not the launcher's frozen imports.
+          & "$SmokeRoot\Ouroboros\_internal\python-standalone\python.exe" -I -B -c "import clr_loader, pythonnet, webview"
+          if ($LASTEXITCODE -ne 0) { throw "packaged source-handoff desktop imports failed: $LASTEXITCODE" }
           & "$SmokeRoot\Ouroboros\bin\ouroboros.cmd" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "packaged CLI smoke failed: $LASTEXITCODE" }
           $env:OUROBOROS_DATA_DIR = Join-Path $env:RUNNER_TEMP "ouroboros-claudexor-smoke"

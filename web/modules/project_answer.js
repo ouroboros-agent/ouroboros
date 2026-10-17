@@ -75,9 +75,9 @@ function watchFolds() {
 
 export function decorateProjectRow(bubble, { role = 'system', projectId = '', projectName = '', terminalTime, addedAt,
     systemType = '', completion = systemType === 'project_completion_summary',
-    completionLimitation = '', limitation = completionLimitation } = {}) {
+    completionLimitation = '', limitation = completionLimitation, fold = role === 'assistant' } = {}) {
     if (!bubble || !projectId) return null;
-    if (role === 'assistant') {
+    if (fold) {
         bubble.classList.add('project-answer');
         watchFolds();
         afterLayout(() => refreshProjectAnswerFold(bubble));

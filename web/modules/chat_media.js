@@ -259,6 +259,8 @@ export function createChatMedia({
             ${timeHtml}
         `;
         stampNodeTimestamp(bubble, rawTs);
+        // The row's address makes a delivered photo, file, link card or question a reply target (CONTRACTS K6).
+        if (msg.row_address) bubble.dataset.rowAddress = String(msg.row_address);
         if (msg.history_id) bubble.dataset.historyId = msg.history_id;
         if (msg.history_position) {
             bubble.dataset.historySource = msg.history_position.source;

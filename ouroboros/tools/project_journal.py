@@ -6,7 +6,7 @@ live in the per-project store (``data/projects/<id>/``), which generic data
 tools cannot reach (``project_store_access_block``) — these scoped tools are
 the only write path, exactly like project knowledge.
 
-Tools resolve the project from the CURRENT task (``ctx.project_id``); an
+Tools resolve the project from the CURRENT task's durable placement; an
 explicit ``project_id`` argument lets the main-chat agent annotate a specific
 project (e.g. when curating from the штаб).
 """
@@ -21,6 +21,7 @@ from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.project_facts import (
+    placed_project_id,
     project_journal_path,
     project_reflections_path,
     project_workpad_path,
@@ -73,7 +74,7 @@ def _scope_authority(ctx: ToolContext) -> tuple[str, Dict[str, Any]]:
 
 
 def _resolve_project_id(ctx: ToolContext, explicit: Any, *, write: bool = False) -> tuple[str, str]:
-    own_value = getattr(ctx, "project_id", "")
+    own_value = placed_project_id(ctx)
     if own_value not in (None, "") and not isinstance(own_value, str):
         return "", "⚠️ TOOL_ARG_ERROR: current project scope is malformed"
     if explicit not in (None, "") and not isinstance(explicit, str):
@@ -638,7 +639,7 @@ def _update_focus(ctx: ToolContext, text: str, source_ref: Any) -> str:
     # what the provider was allowed to omit).
     if isinstance(source_ref, dict) and str(source_ref.get("reader") or "") in ("journal_read", "workpad_read") \
             and not str(source_ref.get("project_id") or "").strip():
-        own_project = str(getattr(ctx, "project_id", "") or "").strip()
+        own_project = str(placed_project_id(ctx) or "").strip()
         if own_project:
             source_ref = {**source_ref, "project_id": own_project}
     from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result

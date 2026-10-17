@@ -23,6 +23,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ouroboros.control_actor import control_actor, mind_resume_refusal
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -167,6 +168,8 @@ def resume_warm_owner_pause_root(task_id: str, *, selected_by: str = "") -> Opti
     if not task:
         return None
     result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    if refusal := mind_resume_refusal(result_root, task):
+        return refusal
     root_task_id = str(task.get("root_task_id") or task_id)
     try:
         fence = read_fence(result_root, root_task_id)
@@ -215,10 +218,9 @@ def resume_warm_owner_pause_root(task_id: str, *, selected_by: str = "") -> Opti
                                            actor_id=task_id if actor else None)
     except Exception:
         return {'ok': False, 'error': 'owner_pause_custody_unreadable'}
-    grant = {"grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "granted_at_ts": time.time(),
+    grant = {**control_actor(), "grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "granted_at_ts": time.time(),
              "single_use": True, "selected_by": str(selected_by or "owner"), "authority": "explicit_resume",
-             'root_resume_basis': root_state['basis'],
-             "generation": int(fence.get("generation") or 0), "warm": True}
+             'root_resume_basis': root_state['basis'], "generation": int(fence.get("generation") or 0), "warm": True}
     projected = None
     if actor:
         # The census above passed never-started members on the durable fence alone when the
@@ -368,6 +370,8 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     if not pause_id.strip():
         return {"ok": False, "error": "malformed_pause_identity"}
     result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    if refusal := mind_resume_refusal(result_root, task):
+        return refusal
     if any((pathlib.Path(q.DRIVE_ROOT) / "state" / name).exists()
            for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
         return {"ok": False, "error": "restart_no_resume", "action": "wait_or_cancel"}
@@ -505,7 +509,7 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     generation = int(row.get("resume_generation") or 0) + 1
     pause_generation = int(row.get("pause_generation") or 0)
     grant = {
-        **({"owner_pause_fence_id": owner_fence_id} if owner_fence_id else {}),
+        **control_actor(), **({"owner_pause_fence_id": owner_fence_id} if owner_fence_id else {}),
         "grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "granted_at_ts": now,
         "single_use": True, "paused_duration_sec": prior_paused + max(0.0, now - paused_at),
         "executed_sec_before_pause": round(executed_sec, 3),
@@ -958,7 +962,7 @@ def resume_late_phase(task_id: str) -> Optional[Dict[str, Any]]:
         refusal = _late_phase_refusal(q, root, task_id, row, record, fence)
         if refusal:
             return refusal
-        grant = {"grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "single_use": True,
+        grant = {**control_actor(), "grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "single_use": True,
                  "selected_by": "owner", "authority": "explicit_resume",
                  "fence_id": str(fence.get("fence_id") or "") if fence_closed(fence) else ""}
 

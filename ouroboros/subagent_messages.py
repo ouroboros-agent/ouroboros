@@ -167,7 +167,7 @@ def subagent_message_meta(
     return meta
 
 
-def apply_chat_row_metadata(record, message_meta):
+def apply_chat_row_metadata(record, message_meta, *, direction="", task_id="", root=None):
     """Attach supported producer metadata without storing arbitrary transport fields."""
     from ouroboros.chat_uploads import stored_refs
 
@@ -175,6 +175,14 @@ def apply_chat_row_metadata(record, message_meta):
     # child final after progress retention/rotation has removed its cards.
     meta = dict(message_meta or {})
     text, record_type = record.get("text", ""), record.get("type", "")
+    if direction == "out" and task_id and record_type != "relay_entry" and "reply_to" not in meta:
+        from ouroboros.chat_references import origin_reply
+        meta["reply_to"] = origin_reply(root, task_id)
+    for key in ("reply_to", "relay"):
+        if isinstance(meta.get(key), dict) and meta[key]:
+            record[key] = dict(meta[key])
+    if meta.get("reply_to_relay"):
+        record["reply_to_relay"] = str(meta["reply_to_relay"])
     if meta.get("late_answer"):
         from ouroboros.owner_quiz import late_answer_ref
         accepted_answer = late_answer_ref(meta["late_answer"])
@@ -192,7 +200,7 @@ def apply_chat_row_metadata(record, message_meta):
     if isinstance(meta.get("spoken"), dict):
         record["spoken"] = dict(meta["spoken"])
     if record_type in ("project_started", "project_handoff", "project_completion_summary"):
-        for key in ("project_id", "project_name", "task_name", "target_label", "status", "completion_answer", "completion_reason", "completion_notice", "handoff_id", "terminal_time"):
+        for key in ("project_id", "project_name", "task_name", "target_label", "status", "completion_answer", "completion_reason", "completion_notice", "handoff_id", "terminal_time", "outcome_axes"):
             if key in meta:
                 record[key] = meta[key]
     if meta.get("delivery_id"):

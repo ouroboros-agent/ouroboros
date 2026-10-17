@@ -118,8 +118,8 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "type": "string", "enum": ["auto", *EFFORT_SCALE], "default": "auto",
             # `auto` is the provider-safe spelling of omission (a strict schema may fill it).
             "description": (
-                "This child's reasoning effort, inside my human's effort range: auto/omitted = the "
-                "recommended level; a request outside the range runs at its nearest bound. A row my "
+                "This child's reasoning effort: auto/omitted = this room's primary clamped into its "
+                "helper bounds; a request outside those bounds runs at the nearest bound. A row my "
                 "human pinned or a level in its model name keeps that level outside Cyber Pro; the "
                 "result says so. For a session row this is the delegated run's level."
             ),

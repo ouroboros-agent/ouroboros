@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Optional
 from ouroboros.config import (
     SETTINGS_DEFAULTS, defaults_for_settings_document, normalize_settings_raw, serialize_settings,
 )
+from ouroboros.settings_scales import EFFORT_FORMAT_KEY, normalize_effort_document
 from ouroboros.update_channels import get_managed_update_fetch_timeout_sec, normalize_update_channel
 from ouroboros.utils import atomic_write_json, write_text_atomic
 
@@ -165,8 +166,8 @@ def build_colab_settings(
     # renamed key is already present as its default and the customization under the
     # former key is lost, then written back to Drive as the owner's choice. Private
     # sentinel keys stay out of the document.
-    loaded = {k: v for k, v in normalize_settings_raw(document).items() if not str(k).startswith("_")} if document else {}
-    settings.update(loaded)
+    loaded = {k: v for k, v in normalize_settings_raw(document).items() if not str(k).startswith("_") or k == EFFORT_FORMAT_KEY} if document else {}
+    settings.update(normalize_effort_document(loaded))
     if github_repo:
         settings["GITHUB_REPO"] = github_repo
     settings["TOTAL_BUDGET"] = float(total_budget)

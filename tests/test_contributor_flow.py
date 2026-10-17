@@ -52,7 +52,7 @@ def test_missing_session_model_is_labelled_absent_in_evidence():
     assert receipt["model_verification"] == "absent"
 
 
-def test_pull_request_ci_is_fork_safe_and_does_not_enable_provider_jobs():
+def test_manual_ci_keeps_readonly_test_jobs_and_explicit_release_permissions():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
@@ -60,12 +60,11 @@ def test_pull_request_ci_is_fork_safe_and_does_not_enable_provider_jobs():
         "\n  # ──────────────────────────────────────────────────────────────────"
     )[0]
 
-    assert "pull_request:\n    branches: [ouroboros]" in workflow
+    assert "\n  pull_request:" not in workflow
+    assert "\n  workflow_dispatch:" in workflow
     assert "\n  pull_request_target:" not in workflow
-    # A schedule IS admitted (owner 9A: the keyless system-e2e-mock lane), so
-    # the unattended run must not reach the paid provider job. A cron run
-    # carries the default branch ref, hence the explicit event guard, which has
-    # to come FIRST to gate the whole `||` whatever ref conditions follow it.
+    # Dormant job predicates retain their secret boundaries even with PR/schedule
+    # triggers disabled; a ref alone must never enable the paid provider job.
     assert "github.event_name != 'schedule'" in workflow.partition(
         "\n  integration-test:\n")[2].partition("\n    uses:")[0]
     assert "permissions:\n  contents: read" in workflow
@@ -79,7 +78,7 @@ def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
     workflows = ROOT / ".github" / "workflows"
     workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
     # The canary steps live in one reusable file; ci.yml calls it for manual
-    # runs and tags, the push workflow for the three shared branches.
+    # runs and tags, the standalone wrapper only on explicit dispatch.
     shared = (workflows / "provider-canary.yml").read_text(encoding="utf-8")
     push = (workflows / "provider-canary-push.yml").read_text(encoding="utf-8")
     integration_job = workflow.partition("\n  integration-test:\n")[2].partition(
@@ -95,7 +94,8 @@ def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
     assert "github.event_name == 'workflow_dispatch'" in integration_job
     assert "refs/tags/v" in integration_job
     assert "refs/heads/" not in integration_job
-    assert "\n  push:\n    branches: [main, ouroboros, ouroboros-stable]\n" in push
+    assert "\n  push:" not in push
+    assert "\n  workflow_dispatch:" in push
     assert "uses: ./.github/workflows/provider-canary.yml" in push
     assert "pull_request" not in push
 

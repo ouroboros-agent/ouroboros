@@ -30,8 +30,8 @@ A client and the core must share one browser origin, served from the root path. 
 | Path prefix | Owner | What it serves |
 |---|---|---|
 | `/api` | core | HTTP API, including extension routes under `/api/extensions/{skill}/…` |
-| `/auth` | core | login and logout, only while the network auth gate is active (§3) |
-| `/onboarding` | core | the builtin setup wizard; its assets under `/onboarding/static/*` are always the core's own files |
+| `/auth` | core | login/logout operations while the network gate is active; optional public login assets (§3) |
+| `/onboarding` | core | the selected setup page or builtin wizard; `/onboarding/static/*` always serves builtin assets |
 | `/ws` | core | the WebSocket |
 | `/` and `/static` | the interface | the main page and its assets |
 
@@ -65,6 +65,31 @@ The rules for the setting itself:
 
 `GET /api/state` reports what this core actually serves as `served_ui: {source: "builtin"|"directory"|"none", error?}`. This is the applied choice, not the requested one, and it is not a fingerprint of anyone's asset files.
 
+### Complete setup and sign-in pages
+
+A valid selected directory may also contain these optional files:
+
+```text
+index.html          main client
+onboarding.html     complete setup page
+auth/index.html     complete sign-in page
+auth/...            public sign-in assets
+```
+
+`GET /onboarding` serves `onboarding.html`; under the active network gate, `GET /auth/login` serves `auth/index.html`. Each is returned unchanged. If its optional file is absent or cannot be read, that whole page uses the builtin implementation. The rules apply only to `source: "directory"`; builtin, `none` and rejected directory selections keep builtin setup/login.
+
+Setup resources use the selected `/static/` tree. Login resources use `/auth/`, which publishes **only the selected `auth/` directory**, including before sign-in, on loopback and without a password. Relative resources in the login document resolve there. `login` and `logout` are reserved names for the gate's operations. Publish only public build assets in `auth/`, never settings or credentials. Missing custom assets answer 404; they never borrow builtin files. The applied directory remains fixed until restart, just like the main page.
+
+`/onboarding?builtin=1` and `/auth/login?builtin=1&next=<path>` explicitly open the builtin pages without changing settings. The builtin wizard loads its own complete `/onboarding/static/` graph; the login form is self-contained. A builtin setup request keeps builtin sign-in when authentication is needed, so it remains recoverable even if both custom pages have broken JavaScript. The server cannot detect a script that fails after the HTML loads: recovery is an explicit action, not an automatic fallback timer.
+
+On macOS launchers containing this change, **Help → Open built-in setup** works independently of page JavaScript in the setup and main windows. A directory or separately hosted copy of the builtin client offers recovery outside its setup iframe. The core-owned builtin main page omits that extra control: it already opens builtin setup. Other clients own their recovery controls. This change adds no native recovery control to Windows/Linux, Android or Telegram shells; their builtin HTTP URLs remain available, but a shell without an address bar needs its own host action or a browser to open them. Old installed launchers do not acquire a new menu until their launcher code is updated.
+
+In a separately hosted deployment with `OUROBOROS_UI_DIR=none`, the core's setup/login pages stay builtin. That interface host can supply its own pages at its own interface addresses and call the same APIs (§3–4); these optional files are specifically for a directory served by the core. See the [minimal client example](examples/client_views/README.md).
+
+### Personal source changes and updates
+
+For a personal version of the builtin application, change its ordinary source through the existing body development and review workflow. A normal merge update brings official changes into those local commits; disjoint edits merge automatically, while textual conflicts and incompatible behavior need the agent or author to resolve and test them. This includes UI code: no separate UI updater or release-note checklist is required. A replacement/reset has different semantics (§15). A separately maintained client owns its releases; updating the core cannot invent that client's new screens. Using the published setup vocabulary (§4) can expose new fields in a data-driven form, but does not automatically implement a new interaction.
+
 ### When a page served by the core should reload
 
 The builtin page served by the core carries `<meta name="ouroboros-ui-owner" content="core">`. It is added to the response and is never part of `web/index.html`. Pages without it are owned by someone else. Apply these rules after reconnecting to a restarted core:
@@ -86,13 +111,15 @@ Nobody tells an unmarked page to reload. A new choice reaches it when someone ne
 - a per-request `X-Ouroboros-Password: <password>` header;
 - `Authorization: Bearer <password>` or Basic.
 
-**Refusals.** A refused HTTP request answers `401` with `{"error": "Authentication required."}`. A `GET` that asks for `text/html` gets the login page instead. The open routes are `GET /api/health`, `/auth/login` and `/auth/logout`.
+**Refusals.** A refused HTTP request answers `401` with `{"error": "Authentication required."}`. A `GET` that asks for `text/html` gets the builtin login form with 401, or redirects to `/auth/login?next=…` when a selected login page exists. Explicit builtin setup recovery keeps the builtin form. Health, login/logout and GET/HEAD of the selected `/auth/` assets are public; the main `/static/` tree, APIs, setup bootstrap and extension resources retain the gate.
 
 **Signing in from a browser interface:**
 
 1. **On 401, go to the login form.** When a core route (for example `GET /api/state` or `GET /api/onboarding`) answers 401, navigate the top-level page to `/auth/login?next=<path>`. Use the page's own path, query and fragment, URL-encoded.
 2. **Return to `next`.** After a correct password the form answers `303` to `next`. A JSON client posts `{"password", "next"?}` to `/auth/login` and receives `200 {ok: true, next}` with the cookie. A wrong password answers `401` and sets no session.
 3. **What `next` accepts.** It must be a same-origin path: it starts with one `/`, and contains no backslash, no control characters (tab and newline included) and no quotes or angle brackets. Anything else becomes `/`.
+
+**A custom login page** submits JSON to the same `POST /auth/login`, displays its 401 error in its own UI and navigates using the successful response's sanitized `next`. No HTML placeholders or private bootstrap are required. HTML form POST keeps the builtin behavior: a wrong password returns the builtin form with 401, a correct one redirects with 303. Use JSON to retain custom error presentation. `GET /auth/login?builtin=1` always opens the builtin form while the gate is active.
 
 **The session.** It is an HttpOnly, SameSite=Lax cookie named `ouroboros_auth`. It is `Secure` when the core sees TLS. It lasts 30 days, and a core that loses its key file signs everyone out.
 
@@ -102,13 +129,13 @@ Nobody tells an unmarked page to reload. A new choice reaches it when someone ne
 
 **The WebSocket.** An unauthenticated `/ws` is refused before the connection is accepted (HTTP 403 during the handshake). Browsers report it as close code 1006, never a custom code. Recognise sign-in problems through an HTTP probe, not through WebSocket close codes.
 
-**Signing out.** `GET` or `POST /auth/logout` deletes the cookie and answers `303` to `next`. While the gate is inactive, `/auth/*` is not mounted (404).
+**Signing out.** `GET` or `POST /auth/logout` deletes the cookie and answers `303` to `next`. Login/logout answer 404 when the gate is inactive; those names never serve selected files. Other `/auth/` paths serve the optional public bundle even without the gate: missing files answer 404, unsupported methods 405. With no bundle those paths answer 404.
 
 ## 4. First contact and setup
 
 1. **Check the core.** `GET /api/health` checks the core and returns `abi_version`. `GET /api/contract` lists the routes this core offers.
 2. **Check whether setup is needed.** `GET /api/onboarding` answers `204` when a usable model provider is configured (nothing to set up), otherwise `200` with the builtin wizard page.
-3. **Load or show setup.** Either frame or open `/onboarding`, the builtin wizard (all its files come from the core), or render your own setup from `GET /api/onboarding/bootstrap`.
+3. **Load or show setup.** Frame or open `/onboarding` (the selected complete page when present, otherwise builtin), or render your own setup from `GET /api/onboarding/bootstrap`. Force the builtin wizard with `/onboarding?builtin=1`. The readiness probe's 200 HTML body remains builtin for existing clients.
 
 `GET /api/onboarding/bootstrap` returns `{ready, bootstrap}` and writes nothing. `bootstrap` is exactly what the builtin wizard renders. It contains:
 
@@ -173,90 +200,97 @@ Replace `<model-id>` with the endpoint's model id. An empty review pool is an ex
 
 `POST /api/onboarding/subagents/preview` takes the same body and returns, without saving, the agent roster and the model settings setup would produce.
 
+### Completing setup in a host window
+
+The HTTP completion receipt is the save result. Closing a window or receiving a bridge return value does not prove a save. After a confirmed successful receipt, use the host that actually exists:
+
+- **Separate desktop setup window:** if present, call `window.pywebview.api.onboarding_finished({ok: true, restart_required, runtime_mode})` with the receipt's values. The existing host closes setup and owns a required server restart before opening the main client. The bridge appears asynchronously (`pywebviewready`); detect the actual method rather than infer it from the core version. The main window does not expose this setup-only method. If it is unavailable, keep the saved/restart state visible and offer the host's normal close/restart path.
+- **A setup iframe inside the builtin or copied builtin client:** send `parent.postMessage({type: 'ouroboros:onboarding-complete', restart_required, runtime_mode}, location.origin)`. That parent's overlay owns its transition and restart display. This is a client convention; another parent can define its own handoff. Do not call the parent's setup-window bridge or close the main window.
+- **A plain top-level page:** navigate to `/` only when no restart is needed. Otherwise show that setup was saved but the new access mode is pending, and use the ordinary restart workflow (§15). A navigation alone does not apply a boot-pinned setting.
+
+On a failed or unknown save, retain the form and follow the existing readback rules; do not send a successful completion message or blindly save again. The native `onboarding_finished` method only reports the HTTP result, and introduces no second settings writer.
+
 ## 5. Conversation: live events and history
 
 ### State
 
 `GET /api/state` (`StateResponse`) contains:
 - **Readiness:** `supervisor_ready` and `supervisor_error`.
-- **Activity:** `active_chat_activities`. The older `active_direct_turns` is kept for compatibility.
+- **Activity:** global root census `active_chat_activities`: `last_line`/`last_line_at`, `tool_calls`, `detached`, `project_id`/`project_name`; legacy `active_direct_turns` retained.
 - **Projects:** `projects` (a compact feed that may be capped) and `project_chat_ids` (the complete set).
-- **Current decisions:** `current_questions` exposes outstanding questions independently of the recent history page (Main's own as `native` identity rows without form fields); `main_attention` exposes human-required task actions. Their `*_complete` flags and `*_gaps` distinguish a complete empty set from unavailable evidence. Retain earlier content on incomplete reads, without granting stale controls.
-- **Modes and budget:** the access and context modes, and money figures in which `null` means unknown.
-- **Checkout:** `sha` is the first 8 characters of the checkout's commit; `branch` is `null` for a detached HEAD or unknown branch.
+- **Current decisions:** `current_questions` (outstanding questions independent of the recent history page; Main's own as `native` identity rows without form fields) and `main_attention` (human-required task actions); `*_complete` flags and `*_gaps` tell a complete empty set from unavailable evidence. On incomplete reads keep earlier content without granting stale controls.
+- **Modes and budget:** the access and context modes, and money figures (`null` means unknown).
+- **Checkout:** `sha`, the first 8 characters of the commit on disk (the running core's start commit is `running_sha` in `GET /api/update/status`); `branch`, `null` for a detached HEAD or unknown branch.
 - **`served_ui`.**
 
-`sha` identifies the files on disk. The commit the running core actually started from is `running_sha` in `GET /api/update/status`.
-
 A quiz-bound activity may carry `owner_wait.quiz_id`, the exact question its wait
-names, in Main as well as a Project. Absence supplies no question identity.
-To open it, read `GET /api/tasks/{activity_id}` and match the exact task and quiz in
-`owner_quiz`. Its `question_rooms[quiz_id]` proves current display membership:
-`state:known` supplies `chat_id` and `project_id` (empty for Main); `unknown` or
-absent proof permits no form. Match Main's chat or the named Project (including
-its Main mirror). This is the shared room resolver's projection, not the task's
-contextual `project_id` or immutable publication/reply address. Hidden chat 0
-proves Main only through that exact quiz's recorded Main publication (§7).
-Opening is a read, never a decision submission; stale socket epochs authorize nothing.
-Wait state and quiz state remain separate: a resumed task does not mean the
-question was answered. Use §7's decision contract to answer it.
+names, in Main as in a Project; absence supplies no question identity. To open it,
+match the exact task and quiz in `owner_quiz` of `GET /api/tasks/{activity_id}`.
+Its `question_rooms[quiz_id]`, the shared room resolver's projection (not the
+task's contextual `project_id` or immutable publication/reply address), proves
+current display membership: `state:known` supplies `chat_id` and `project_id`
+(empty for Main) to match Main's chat or the named Project (its Main mirror
+included); `unknown` or absent proof permits no form, and hidden chat 0 proves
+Main only through that exact quiz's recorded Main publication (§7). Opening is a
+read, never a decision submission; stale socket epochs authorize nothing. Wait
+and quiz state stay separate (resuming the task does not answer the question);
+answer through §7.
 
 ### The WebSocket `/ws`
 
-**Format and liveness.** Open one socket per client. Every frame is a JSON text message with a `type`. The core sends `heartbeat` about every 15 seconds while clients are connected. If nothing arrives for about 45 seconds, treat the socket as dead and reconnect. A heartbeat proves the connection is alive, not that work is progressing. Before restarting, the core closes sockets with code 1012. The socket has no resume cursor: frames sent while it is down are not sent again.
+**Format and liveness.** Open one socket per client; every frame is a JSON text message with a `type`. While clients are connected the core sends `heartbeat` about every 15 seconds (proof the connection is alive, not that work is progressing); after about 45 silent seconds, treat the socket as dead and reconnect. Before restarting, the core closes sockets with code 1012.
 
-**Message types.** `ws.messages` in the contract lists every built-in type, with the shape of each direction:
+**Message types.** `ws.messages` in the contract lists every built-in type with each direction's shape:
 - **Client to core:** `chat` and `command`.
 - **Core to client, stored as history rows:** `chat` (a message or a progress line), `photo`, `video`, `document`, `links` and `quiz`.
 - **Core to client, signals only:**
   - `quiz_state` updates a question card; history shows the merged state.
-  - `typing` is transient.
-  - `log` carries one runtime event row in `data` (`data.type` names the event). It drives live activity displays; the task's durable facts come from §6.
-  - `message_annotation` is the routing outcome shown on an owner message; history carries it as that row's `chat_annotation`.
+  - `log` carries one runtime event row in `data` (`data.type` names the event) for live activity displays; the task's durable facts come from §6.
+  - `message_annotation`, the routing outcome shown on an owner message, is that row's `chat_annotation` in history.
   - `task_named` gives a card its title; history rows carry `suggested_name`.
   - `projects_changed`, `extension_lifecycle`, `update_status_ready`, `update_progress_changed`, `ui_language_changed` and `ui_i18n_updated` mean "read the named state again".
-  - `heartbeat`.
+  - `typing` (transient) and `heartbeat`.
 
-A few `chat` frames are transient notices that history never shows, for example `system_type: "initialization_notice"` (a message could not be accepted yet) and a repair receipt with `task_id_pending: true`.
+Some `chat` frames are transient notices history never shows, for example `system_type: "initialization_notice"` (a message could not be accepted yet) and a repair/admission receipt with `task_id_pending: true` (no proof a durable task is readable yet).
 
-**Extension messages** are namespaced per skill (`ext_<n>_<token>_<message>`; use `ws_prefix` from `GET /api/widgets`, including its trailing separator). Send an object with `type: ws_prefix + <handler-name>` and the fields that handler defines. The core passes the whole object; it does not require a `data` wrapper. A non-null handler result returns `{type: "<request-type>.reply", data: <result>}` to the requesting socket; a handler returning no result sends no reply. There is no core-provided request correlation id: concurrent correlation belongs to the skill's format. Refusals/failures are `log` frames with `data.level` and `data.message`, without guaranteed request id or refusal code.
+**Extension messages** are namespaced per skill (`ext_<n>_<token>_<message>`; use `ws_prefix` from `GET /api/widgets`, trailing separator included). Send an object with `type: ws_prefix + <handler-name>` and that handler's fields; the core passes the whole object (no `data` wrapper required). A non-null handler result returns `{type: "<request-type>.reply", data: <result>}` to the requesting socket; no result, no reply. The core adds no request correlation id (the skill's format correlates concurrent requests); refusals/failures are `log` frames with `data.level` and `data.message`, without guaranteed request id or refusal code.
 
 ### Sending a message
 
 Send `{"type": "chat", "content": "...", "client_message_id": "<unique id>", "chat_id": <thread>}`:
-- **Threads.** `chat_id` 1 is Main. A project's thread is its `chat_id` from `GET /api/projects`. Add `project_id` for a project thread.
-- **Attachments.** First upload each file with `POST /api/chat/upload` (multipart field `file`). Then reference it in `attachments` as `{filename: <stored id from the upload>, display_name, mime}`. The core measures size and checksum itself.
-- **What "sent" means.** A successful socket send only means the socket took the frame. The message is accepted when the core echoes it back as a `chat` frame from `role: "user"` with your `client_message_id` and `ingress_accepted: true`.
-  - `ingress_pending` and `ingress_dispatched` describe what this core process knows of it.
-  - Those flags are lost if the core restarts.
-- **Retrying.** Sending the same `client_message_id` with the same words and attachments joins the already accepted message. The same id with different content is refused.
-- **What is lost.** A frame sent while the socket is down is lost unless your client keeps it. The core keeps no outbox for clients.
+- **Threads.** `chat_id` 1 is Main; a project's thread is its `chat_id` from `GET /api/projects`, sent with its `project_id`.
+- **Attachments.** Upload each file with `POST /api/chat/upload` (multipart field `file`), then list it in `attachments` as `{filename: <stored id from the upload>, display_name, mime}`; the core measures size and checksum itself.
+- **Replies.** `reply_to: "<row_address>"` (a work card: `task:<task_id>` of its current episode) names the row meant; the core stores its resolved reference on the owner row as a fact for Ouroboros, routing nothing.
+- **What "sent" means.** A socket send only means the socket took the frame; the message is accepted when the core echoes it as a `chat` frame from `role: "user"` with your `client_message_id` and `ingress_accepted: true`. `ingress_pending` and `ingress_dispatched` say what this core process knows of it and are lost on a restart.
+- **Retrying.** The same `client_message_id` with the same words and attachments joins the already accepted message; with different content it is refused.
+- **What is lost.** A frame sent while the socket is down is lost unless your client keeps it: the core keeps no client outbox.
 - **Commands.** Slash commands go as `{"type": "command", "cmd": "/restart"}` and so on, or through `POST /api/command` (§15).
 
-**Refusals and submission correlation.** Schema rejection sends `{type:"log", data:{level:"warning", message:…}}`, without guaranteed correlation. Acceptance failures, including reusing an accepted id for different content, can send transient `chat` notices with `role:"system"`, `system_type:"initialization_notice"`, the submitting `chat_id` and, when supplied, its `client_message_id`. Command, admission, update and review System replies can also name the submission they answer. Settle only that submission's Sending indicator, in that room; a System row alone establishes neither acceptance nor task completion. If the id is absent, do not guess which submission was answered. Without an accepted echo, keep the operation unresolved and read history.
+**Refusals and submission correlation.** Schema rejection sends `{type:"log", data:{level:"warning", message:…}}`, without guaranteed correlation. Acceptance failures (reusing an accepted id for different content among them) can send transient `chat` notices with `role:"system"`, `system_type:"initialization_notice"`, the submitting `chat_id` and any supplied `client_message_id`, and command, admission, update and review System replies can name the submission they answer: settle only that submission's Sending indicator, in that room, never a guessed one. A System row alone establishes neither acceptance nor task completion; without an accepted echo, keep the operation unresolved and read history.
 
-**Origin correlation.** Optional `origin_message_ref` is `{chat_id, client_message_id, ts, text_sha256}` and names the accepted owner row. Its hash checks that row's text, not reply text. Match its thread and owner-message id, then track `task_id`; an absent reference establishes no causation. `task_id_pending:true` is a transient repair/admission receipt, not proof a durable task is already readable.
+**Origin correlation.** Optional `origin_message_ref` (`{chat_id, client_message_id, ts, text_sha256}`) names the accepted owner row; its hash checks that row's text, not reply text. Match its thread and owner-message id, then track `task_id`; an absent reference establishes no causation.
 
-**Thread filtering.** The socket broadcasts multiple destinations. Apply the merge rules below only to stored-row deliveries belonging to the history view being read. Do not compare every socket frame with Main history, infer Main from a missing `chat_id`, or treat transient notices as missing stored rows.
+**Thread filtering.** The socket broadcasts several destinations: apply the merge rules below only to stored-row deliveries of the history view being read, never comparing every frame with Main history, inferring Main from a missing `chat_id` or taking transient notices for missing stored rows.
 
 ### History rows
 
-In a Project response, `window.latest_message` names the latest eligible non-owner standalone message by stored arrival, excluding card content; it need not be the last timestamp-sorted row, and null means unknown. Its `out_of_order` flag says it sorts above earlier arrivals or lies before the recent read. With a null message, `window.latest_before` is the chat offset before which older pages continue the bounded search. `window.latest_absent` means that search reached the chat's start without a gap and found no eligible message below the frozen upper bound, not that the chat has no stored rows. These are search observations, not a client's read acknowledgement.
+In a Project response, `window.latest_message` names the latest eligible non-owner standalone message by stored arrival (card content excluded), not necessarily the last row by timestamp; null means unknown, and its `out_of_order` flag says it sorts above earlier arrivals or lies before the recent read. With a null message, older pages continue the bounded search below the chat offset `window.latest_before`; `window.latest_absent` means the search reached the chat's start without a gap and found no eligible message below the frozen upper bound, not that the chat has no stored rows. These are search observations, not a client's read acknowledgement.
 
-`GET /api/chat/history?chat_id=<thread>` returns `ChatHistoryResponse`. The selected conversation rows are oldest first; replay evidence can follow them regardless of its timestamp and recur on other pages. Apply that evidence to the keyed card or question rather than counting it as another conversation message. Each row of `messages` is a `ChatHistoryMessage`:
+`GET /api/chat/history?chat_id=<thread>` returns `ChatHistoryResponse`. The selected conversation rows are oldest first; replay evidence can follow them regardless of its timestamp and recur on other pages: apply it to the keyed card or question, never count it as another conversation message. Each row of `messages` is a `ChatHistoryMessage`:
 - **Always present:** `text` (live frames call it `content`), `role` (`user`, `assistant` or `system`), `ts`, `is_progress`, `system_type` (the row's kind; `""` for an ordinary message) and `task_id`.
-- **Identity:** a row read from storage has `history_id` (`"<chat|progress>:<offset>"`) and `history_position` (`{source, offset}`). Re-reading the same stored row returns the same `history_id`. `client_message_id` correlates owner messages and some quiz publications; use `role: "user"`, not this field's presence, to identify an owner row.
+- **Identity:** stored rows carry `history_id` (`"<chat|progress>:<offset>"`, the same on every re-read), `history_position` (`{source, offset}`) and a stable `row_address` computed before projection (none without a persisted source). `client_message_id` correlates owner messages and some quiz publications; owner authorship follows `role`.
+- **References:** `reply_to` (an owner row's: the row he replied to; an Ouroboros answer's: the owner message its turn answers) is `{address, chat_id, role, author_label, kind, snippet, ts, task_id}` (`snippet`: at most 160 whitespace-collapsed characters) or `{address, unresolved: true}`. A `relay_entry` row's `relay` holds the owner's words passed into the room: `quotes`, every message passed on, each with `text`, `attachments` and `source` (where and when he wrote it), the singular fields repeating the first. A reply to a relay, in its source room, carries `reply_to_relay`.
 - **Deliveries:** `msg_type` is `document`, `photo`, `video`, `links` or `quiz`, with `filename`, `mime`, `download_url`, `caption` and `size_bytes`; `actions` and `title` for links; `quiz` for a question (`quiz.quiz_id`, `quiz.state`, the recorded answer).
-- **Progress rows** (`is_progress: true`) carry the same task-progress facts live `chat` progress frames carry (`ChatOutbound`).
+- **Progress rows** (`is_progress: true`) carry the task-progress facts of live `chat` progress frames (`ChatOutbound`).
 - **Rows that are not messages.** Do not show these as bubbles:
-  - replay evidence: `system_type` `quiz_answer`, `quiz_closed` or `task_evidence`, or a row with `summary_kind` and `historical_terminal`. They carry facts for cards whose rows lie on other pages. A `task_evidence` carrier may be an in-room parent's only evidence (zero tool calls included; `task_terminal_status` only when the parent is terminal): a client mints a parent card only from the parent's own rows, carrier or live state, never from a child's `parent_task_id`; a child whose parent has no such evidence here renders as its own card and re-nests when that evidence arrives.
+  - replay evidence (`system_type` `quiz_answer`, `quiz_closed` or `task_evidence`, or a row with `summary_kind` and `historical_terminal`), facts for cards whose rows lie on other pages. A `task_evidence` carrier may be an in-room parent's only evidence (zero tool calls included; `task_terminal_status` only when the parent is terminal): mint a parent card only from the parent's own rows, carrier or live state, never from a child's `parent_task_id`; a child whose parent has no such evidence here renders as its own card and re-nests when that evidence arrives.
   - `system_type: "task_model_wait"`: a model wait's latest state, in `model_waits`, for the task's card.
-- **A rebuilt row:** `lifecycle_virtual: true` describes the skill operation running now. It is rebuilt with a fresh `ts` on every read and has no `history_id`, so replace it rather than merge it.
-- **Derived and synthesized rows:** in Main a Project question appears as `system_type: "project_question_pointer"` (with `quiz_id`), carrying the question row's `history_id`. A Project's start message rebuilt from its binding (`origin_projected: true`) has no `history_id`. A synthesized `origin_omission` System notice says further archived origins were not rendered; it also has no stored `history_id`.
+- **A rebuilt row:** `lifecycle_virtual: true` describes the skill operation running now, rebuilt with a fresh `ts` on every read and without `history_id`: replace it rather than merge it.
+- **Derived and synthesized rows:** in Main a Project question appears as `system_type: "project_question_pointer"` (with `quiz_id`), carrying the question row's `history_id`. A Project's start message rebuilt from its binding (`origin_projected: true`) and a synthesized `origin_omission` System notice (further archived origins were not rendered) have no stored `history_id`.
 
 ### Merging live frames and history
 
-The core writes each stored row and sends its live frame with an identical `ts` string, the same `task_id`, `role`, `system_type`, `is_progress` and `source` (when provided), and for a text row the same words. So a live frame and a history row are the same row when:
+The core writes each stored row and its live frame with an identical `ts` string, the same `task_id`, `role`, `system_type`, `is_progress`, `source` (when provided) and, for a text row, words, so a live frame and a history row are the same row when:
 
 | Live frame | History row | Same row when |
 |---|---|---|
@@ -266,23 +300,26 @@ The core writes each stored row and sends its live frame with an identical `ts` 
 | `photo`, `video`, `document` or `links` | `msg_type` equal to the frame's `type` | `task_id` and `ts` are equal |
 | any other `chat` | a row with the same `is_progress`, `role` and `system_type` | `task_id`, `ts` and `content` = `text` are all equal |
 
-Only `role:"user"` rows merge by `client_message_id`. On a System frame that field correlates the answered submission, not the System row's identity; it is not persisted on that row. Use the other-chat rule for stored System replies. Never match on `ts` or `task_id` alone: one task writes many rows with close timestamps, and the same words can come from different tasks.
+Only `role:"user"` rows merge by `client_message_id`: on a System frame it only correlates the answered submission and is not persisted, so stored System replies use the other-chat rule. Never match on `ts` or `task_id` alone: one task writes many rows with close timestamps, and the same words can come from different tasks.
 
 **On every connect and reconnect:**
 1. Open the socket and keep the frames it delivers.
 2. Read `GET /api/state` and the history of the threads on screen.
-3. Show the history rows. Then apply the kept frames and the later ones, skipping a frame that matches a row you already have.
-4. Use `history_id` to recognise a stored row you already have when you read history again or page through it.
+3. Show the history rows, then apply the kept and later frames, skipping a frame that matches a row you already have.
+4. Recognise a stored row you already have by its `history_id` when you read history again or page through it.
 
-Frames sent while you were disconnected are not resent: history and the task reads (§6) are the record.
+The socket has no resume cursor: frames sent while you were disconnected are not resent; history and the task reads (§6) are the record.
 
 ### Reading history
 
 - **How much.** `n_human` (default 150, at most 1500) bounds conversation rows and `n_progress` (default 60, at most 600) progress rows.
 - **Paging.** While `has_more` is true, pass `next_cursor` back as `cursor` to read older rows. `page_cursor` re-reads the same page. Cursors are opaque.
+- **New arrivals.** The newest page carries `after_cursor` (absent when a read failed part-way or the window holds more tasks than a cursor can name); passed back as `cursor`, it returns the rows stored since that read with the room's current work (never paging older, ordered by time) and the next `after_cursor`, so a client that keeps a window open reads its new rows instead of the whole window again. In a project thread `window.latest_message` names the newest message among them when one arrived (absent: none did); `out_of_order` also counts the window it continues.
+- **Around one task.** `around=task:<task_id>` (never together with `cursor`) reads the page around that task's earliest row of the thread, wherever it lies: about a quarter of each quota before it and the rest after it. `anchor` says what was found: `{"state": "found", "task_id", "history_id"}` with an ordinary page (`page_cursor` re-reads it, `next_cursor` continues older; it is not the newest page, so it has no `after_cursor`), or `absent` (the thread's saved history holds no row of it a client could show) or `moved` (its rows belong to another thread), both with no rows and no cursors. A source that cannot be read answers `503 history_source_unavailable`: unknown, never absent. A stream holding none of the task's rows carries none of its context: the page names it in `window.truncated_by` (`chat_around_unpositioned` or `progress_around_unpositioned`), and on that page and the older pages it continues to, that stream's `coverage` span is null.
 - **Errors.** An error answer keeps the same shape, with no rows and `has_more` true, and echoes the cursor you sent as `next_cursor`, so the same request can be repeated:
-  - `400 history_cursor_invalid`;
+  - `400 history_cursor_invalid`, or `history_around_invalid` for an `around` that is not `task:<id>` or comes with a cursor;
   - `409 history_view_changed`: which rows belong to the thread changed (its projects or task bindings); start again without a cursor;
+  - `409 history_delta_reset`: since an `after_cursor`, more arrived than one read replays, a stored row could not be read, owner-message annotations changed, a task the window shows settled or changed after it settled, or a shown skill operation ended; read the newest page again (in a busy room this is a common answer, not a rare one);
   - `503 history_source_unavailable` or `migrating`.
 - **Incomplete windows.** `window.complete` is true only when nothing bounded the read; `window.truncated_by` names each cause (`quota`, `page`, `lineage_cap`, or a stream gap such as `chat_source_unavailable`). Never treat an incomplete window as an empty conversation. `coverage` reports which stored bytes were delivered, for clients that page; it says nothing about chronology.
 
@@ -303,20 +340,20 @@ A room holds at most one owner call; its audio travels on its own socket, never 
 
 **Projects:**
 - **List:** `GET /api/projects` (`ProjectListResponse`): active and deleting projects, at most 200, most recently active first.
-- **Create:** `POST /api/projects` (`ProjectCreateRequest` → `ProjectCreateResponse`). One source at most: `path` (attach a folder), `git_url` (clone) or `with_workspace`. Creating an existing `id` with no source changes nothing and answers the existing row with `created: false`. The flag is optional on other responses: absence proves neither new creation nor failure. An existing `id` with a source answers 409. A clone that needs credentials answers 401 with `error_code: "auth_required"` (not the network gate).
-- **Turn a task into a project:** `POST /api/projects/from-task` (`ProjectFromTaskRequest`). The caller supplies no idempotency key. The server derives `handoff_id` from the project, the task and its origin message, so repeating the call for the same task returns the same `handoff_id`. With the default project id (`task-<task_id>`), a repeat also adopts the project the task's work already has (`adopted: true`). A task bound to another project answers 409. Without `name`, naming may wait for one model call.
-- **Rename and delete:** `POST /api/projects/{id}/update` renames (`{name}`, at most 80 characters). `POST /api/projects/{id}/delete` starts the deletion, and repeating it is harmless.
-- **Changes from elsewhere:** the `projects_changed` message announces new projects. Add their `chat_id` to the threads you listen to before reading the list again.
+- **Create:** `POST /api/projects` (`ProjectCreateRequest` → `ProjectCreateResponse`). One source at most: `path` (attach a folder), `git_url` (clone) or `with_workspace`. Creating an existing `id` with no source changes nothing and answers the existing row with `created: false` (a flag optional on other responses, whose absence proves neither new creation nor failure); with a source it answers 409. A clone that needs credentials answers 401 with `error_code: "auth_required"` (not the network gate).
+- **Turn a task into a project:** `POST /api/projects/from-task` (`ProjectFromTaskRequest`) takes no idempotency key: the server derives `handoff_id` from the project, the task and its origin message, so repeating the call for the same task returns the same `handoff_id`, and with the default project id (`task-<task_id>`) a repeat also adopts the project the task's work already has (`adopted: true`). A task bound to another project answers 409. Without `name`, naming may wait for one model call.
+- **Rename and delete:** `POST /api/projects/{id}/update` renames (`{name}`, at most 80 characters). `POST /api/projects/{id}/delete` starts the deletion (a repeat is harmless).
+- **Changes from elsewhere:** `projects_changed` announces new projects: add their `chat_id` to the threads you listen to before reading the list again.
 - **Choosing a folder to attach:** `GET /api/fs/dirs?path=` lists directories under the home folder only (at most 500, `truncated` beyond that).
 
 **Starting a task.** `POST /api/tasks` (`TaskCreateRequest`). The `task_id` you choose, or the one returned, is the task's identity.
-- **Duplicate id:** an id that already exists answers 409, so a retry with the same id cannot start the task twice.
-- **Outcome unknown:** `503` with `status: "unconfirmed"` means the task may or may not be queued. `GET /api/tasks/{task_id}` can answer 404 while it is still queued, so a 404 is not proof it will not run. Sending the same `task_id` again answers 409 and never starts a second copy. Never resend under a new id; watch the task and let the person decide.
+- **Duplicate id:** an existing id answers 409, so a retry with the same id cannot start the task twice.
+- **Outcome unknown:** `503` with `status: "unconfirmed"` means the task may or may not be queued; `GET /api/tasks/{task_id}` can answer 404 while it is still queued, so a 404 is no proof it will not run. The same `task_id` sent again answers 409 and never starts a second copy. Never resend under a new id; watch the task and let the person decide.
 - **Other 503s:** they come before the task is scheduled, and the attempt is cleaned up: nothing runs, `GET /api/tasks/{task_id}` answers 404, and the same `task_id` can be sent again.
 
 **Reading tasks:** `GET /api/tasks` (filters `status`, `limit`, `queue_only`) and `GET /api/tasks/{task_id}`. Records identify `task_id`, `status`, `ts` and `updated_at`; `result`, artifacts and evidence appear when available. List rows omit bulky evidence; read the detail for the result. `status` accepts a comma-separated filter; `limit` defaults to 50, positive values cap at 500, and `0` requests all rows. `queue_only=1` returns `{tasks:[], queue}` without history.
 
-A Project completion frame/history row may carry `completion_notice`: `{neutral: bool, detail: string, phase: string, salvage?: string}`. This compact transport view is not a verdict: neutral means technical caveats stay in task details, never independently approved success. Full outcome/answer fields remain authoritative; `salvage` preserves the existing intermediate excerpt. Older rows may omit it; replay can derive the missing metadata from the canonical result without rewriting retained text. With no recoverable source, transports retain the legacy text rather than assuming it is status-only.
+A Project completion frame/history row may carry `completion_notice`: `{neutral: bool, detail: string, phase: string, salvage?: string}`, a compact transport view, not a verdict: neutral means technical caveats stay in task details, never independently approved success. Full outcome/answer fields remain authoritative; `salvage` preserves the existing intermediate excerpt. Older rows may omit it; replay can derive the missing metadata from the canonical result without rewriting retained text, and with no recoverable source transports retain the legacy text rather than assuming it is status-only.
 
 The terminal lifecycle set is exactly `completed`, `failed`, `cancelled`, `rejected_duplicate`. Other values, including `requested`, `scheduled`, `running`, `interrupted` and a pause or pending cancellation, do not prove completion. Terminal lifecycle alone does not mean objective success.
 
@@ -342,26 +379,26 @@ data: {"seq":12,"type":"task_result","task_id":"…","data":{…}}
 
 **Downloading a result file:**
 - **Where:** `GET /api/tasks/{id}/artifacts/{name}` (optionally `relpath`, `archive` or `source`).
-- **Partial downloads:** byte ranges are supported. A `206` response is a byte slice, potentially an incomplete JSON document even when the original file was JSON; do not parse it as a complete document.
+- **Partial downloads:** byte ranges are supported. A `206` response is a byte slice, possibly an incomplete JSON document even when the original file was JSON, so do not parse it as a complete one.
 - **Checking the bytes:** the `x-ouroboros-artifact-sha256` header gives the checksum when the core verified the bytes.
 - **Changed after recording:** `409 artifact_identity_changed` means the file changed after it was recorded.
 
 ## 7. Questions and decisions
 
-**How a question arrives.** A task asks the owner through a `quiz` frame (`QuizOutbound`). It also appears in history as a `msg_type: "quiz"` row. `quiz_state` frames update it. Its state is `open`, `answered`, `closed` (explicitly closed without answering), `expired_terminal` (the task finished; an answer can still be recorded) or `superseded`.
+**How a question arrives.** A task asks the owner through a `quiz` frame (`QuizOutbound`), in history a `msg_type: "quiz"` row, updated by `quiz_state` frames. Its state is `open`, `answered`, `closed` (explicitly closed without answering), `expired_terminal` (the task finished; an answer can still be recorded) or `superseded`.
 
 **Answering.** Send `POST /api/decisions` with `DecisionRequest` and a `decision_id` of `quiz:<task_id>:<quiz_id>`:
-- **What to send:** `option_index`, `comment`, or both. A comment alone must be nonempty. `option_index`, `answered_index` and `recommended_index` are zero-based positions in `options`. Negative/non-integer indices answer `400 option_index_invalid`; an index beyond an open card's options answers `400` with `error:"option_out_of_range"`. No index and no comment answers `400 option_index_required`. An already closed card can instead return its recorded 409 state; an absent quiz is `404 quiz_not_found`.
-- **Safe retries:** the same `request_id` returns the already recorded answer with `duplicate: true`, even if the retry's payload differs. Display that returned recorded answer, not the retry's input: a successful replay does not accept a changed answer. This also lets the existing delivery-recovery path finish after a partial failure.
+- **What to send:** `option_index`, `comment` (nonempty when alone), or both; `option_index`, `answered_index` and `recommended_index` are zero-based positions in `options`. A negative/non-integer index answers `400 option_index_invalid`, one beyond an open card's options `400` with `error:"option_out_of_range"`, and neither index nor comment `400 option_index_required`. An already closed card can instead return its recorded 409 state; an absent quiz is `404 quiz_not_found`.
+- **Safe retries:** the same `request_id` returns the already recorded answer with `duplicate: true`, even if the retry's payload differs: display that answer, not the retry's input (a successful replay accepts no changed answer). It also lets the existing delivery-recovery path finish after a partial failure.
 - **First answer wins.** A different answer to an already answered question answers `409` with the recorded state.
-- **Late answers.** An answer that arrives after the task ended is still recorded (`answered_after_terminal`) and goes to the card's recorded publication chat, not its ask-time chat. The core records that `publication_chat_id` before first showing the card and never changes it: a question asked in the hidden partition (0) and shown in Main is answered in Main (1), and a converted task keeps that delivery address while history displays its card in the current resolved room. `forwarded:true` confirms the answer entered the ordinary owner-message path there. `forwarded:false` is not delivery: `hidden_chat` and `a2a_chat` have no owner turn; `publication_address_unknown` (an older card without a proven address) stays recorded and owed, and the core never guesses a room; `late_answer_delivery_unknown` means proof of dispatch was lost, and the core never sends it again. Show this returned outcome rather than infer delivery from the room the card appears in.
-- **Recorded but not delivered.** `503 quiz_history_write_failed`, `mailbox_write_failed` or `late_answer_not_delivered` mean the answer is recorded but not yet delivered. Retry with the same `request_id`.
+- **Late answers.** An answer after the task ended is still recorded (`answered_after_terminal`) and goes to the card's `publication_chat_id`, recorded before the card was first shown and never changed, not to its ask-time chat: a question asked in the hidden partition (0) and shown in Main is answered in Main (1), and a converted task keeps that address while history shows its card in the current resolved room. `forwarded:true` confirms the answer entered the ordinary owner-message path there; `forwarded:false` is not delivery: `hidden_chat` and `a2a_chat` have no owner turn, `publication_address_unknown` (an older card without a proven address) stays recorded and owed with no guessed room, and `late_answer_delivery_unknown` means proof of dispatch was lost and nothing is resent. Show this returned outcome; never infer delivery from the room the card appears in.
+- **Recorded but not delivered.** `503 quiz_history_write_failed`, `mailbox_write_failed` or `late_answer_not_delivered` mean the answer is recorded but not yet delivered: retry with the same `request_id`.
 
-**Closing without answering.** For a root task's quiz, use the same endpoint and `decision_id`, with a `request_id`, `action: "close"` and an optional `reason` of at most 2000 characters; a blank or omitted owner reason records `Closed by the owner without an answer.`, and a non-string or longer one answers `400 close_reason_invalid`. Omit `option_index` and `comment`. Closure shares the first-winner rule with answers; show the returned `state`, `closed_reason` and `question_delivery` rather than treating a recorded closure as proof its author received it.
+**Closing without answering.** For a root task's quiz, send the same endpoint and `decision_id` with a `request_id`, `action: "close"` and an optional `reason` of at most 2000 characters, without `option_index` or `comment`; a blank or omitted owner reason records `Closed by the owner without an answer.`, and a non-string or longer one answers `400 close_reason_invalid`. Closure shares the first-winner rule with answers; show the returned `state`, `closed_reason` and `question_delivery`: a recorded closure is no proof its author received it.
 
-**Removing unknown late delivery from current decisions.** For an answered quiz with unknown late-answer delivery, send `action: "dismiss"` with `decision_id` and `request_id`, and no answer, comment or reason. This removes only the outstanding delivery item; the recorded answer and unknown outcome stay in history. It neither resends the answer nor marks it delivered. A different, ineligible state is refused; read the returned facts.
+**Removing unknown late delivery from current decisions.** For an answered quiz with unknown late-answer delivery, send `action: "dismiss"` with `decision_id` and `request_id` only (no answer, comment or reason). It removes only the outstanding delivery item, neither resending the answer nor marking it delivered; the recorded answer and unknown outcome stay in history. Another, ineligible state is refused; read the returned facts.
 
-**Other decisions.** Routing choices (`routing:<client_message_id>:<token>`) and model-wait choices (`model_wait:<task_id>:<wait_id>`) use the same endpoint and the same idempotency rule.
+**Other decisions.** Model-wait choices (`model_wait:<task_id>:<wait_id>`) and persisted routing choices (`routing:<client_message_id>:<token>`; no new routing pickers are produced) use the same endpoint and idempotency rule.
 
 ## 8. Stop, pause, continue, resume
 
@@ -412,10 +449,10 @@ Every settings writer (Settings, setup, owner controls, language, desktop backgr
 
 **Owner controls.** Each saves one setting through the same writer:
 - `POST /api/owner/runtime-mode` `{mode}`: `light`, `advanced`, `pro` or `cyber_pro`; applies when the core next starts.
-- `POST /api/owner/context-mode` `{mode}`: `nano`, `low` or `max`. Lowering it while work is queued or running answers 409, except in `cyber_pro`.
+- `POST /api/owner/context-mode` `{mode, project_id?}`: `nano`, `low` or `max`; applies to new participants in that room, including while others run. Omitted `project_id` means Main.
 - `POST /api/owner/safety-mode` `{mode}`: `full`, `light` or `off`.
 - `POST /api/owner/auto-grant` `{enabled}`.
-- `POST /api/owner/effort-range` `{min, recommended, max}`, each a level of the effort scale (`none` to `ultra`) with min ≤ recommended ≤ max.
+- `POST /api/owner/effort-range` `{min, recommended, max, project_id?}`: effort tiers (`none` to `ultra`), min ≤ max; primary `recommended` is independent. Omitted `project_id` means Main. Both endpoints return `project_id` and the saved `cognition` (`context_mode`, `effort_range`); project summaries carry the same object. Main state fields remain Main's.
 
 `POST /api/owner/capability-ack` (`CapabilityAckRequest`) vouches for one exact route's maximum response or context window. It writes acknowledgement evidence, never settings, and a repeat overwrites it.
 

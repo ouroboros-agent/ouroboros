@@ -41,6 +41,9 @@ _ADDED_OWNERS = {
     # The owner's effort range: its keys, the owner-facing tiers, the tolerant read, the Cyber
     # Pro predicate, the clamp, the one effort decision and its recorded fact.
     "EFFORT_RANGE_KEYS": settings_scales,
+    "EFFORT_FORMAT_KEY": settings_scales,
+    "normalize_effort_document": settings_scales,
+    "normalize_legacy_effort_settings": settings_scales,
     "OWNER_EFFORT_TIERS": settings_scales,
     "EFFORT_SOURCES": settings_scales,
     "_tier": settings_scales,

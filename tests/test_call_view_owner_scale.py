@@ -61,7 +61,7 @@ def test_the_gemini_call_view_fits_its_route_with_room_for_the_conversation(owne
     # In the route's own units, the view, the user turn and the first tool view leave the reply
     # allowance and at least one low-water level of the window (an eighth) for the conversation itself.
     assert request + REPLY <= WINDOW - math.ceil(WINDOW / 8), request
-    assert {"read_file", "promote_chat_to_task"} <= {s["function"]["name"] for s in call.tool_schemas}
+    assert {"read_file", "start_task"} <= {s["function"]["name"] for s in call.tool_schemas}
 
 
 def test_tier_zero_stays_byte_whole_and_every_service_block_is_operative(owner_scale):

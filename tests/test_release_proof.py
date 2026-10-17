@@ -525,6 +525,30 @@ def test_vendor_distro_smoke_is_informational_and_never_gates_a_release():
     assert "vendor-package-smoke" not in release_needs
 
 
+def test_macos_final_dmg_checks_its_own_desktop_imports_without_user_site():
+    workflow = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    smoke = workflow.split("- name: Smoke final macOS DMG", 1)[1].split("- name: Smoke final Linux archive", 1)[0]
+    assert 'hdiutil attach "${{ steps.release_asset.outputs.path }}"' in smoke
+    assert '"$MOUNT/Ouroboros.app/Contents/Frameworks/python-standalone/bin/python3" -I -B -c' in smoke
+    assert "import webview, objc, AppKit, WebKit, PyObjCTools.AppHelper" in smoke
+    assert "webview.create_window" not in smoke and "webview.start" not in smoke
+
+
+def test_linux_archive_and_windows_zip_check_their_own_desktop_imports_without_user_site():
+    workflow = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    linux = workflow.split("- name: Smoke final Linux archive", 1)[1].split("- name: Smoke final Linux AppImage", 1)[0]
+    assert 'tar -xzf "${{ steps.release_asset.outputs.path }}"' in linux
+    assert '"$SMOKE_ROOT/Ouroboros/_internal/python-standalone/bin/python3" -I -B -c' in linux
+    assert "'import webview'" in linux
+    windows = workflow.split("- name: Smoke final Windows archive", 1)[1].split("- name: Record packaged artifact smoke", 1)[0]
+    assert 'Expand-Archive -Path "${{ steps.release_asset.outputs.path }}"' in windows
+    assert '& "$SmokeRoot\\Ouroboros\\_internal\\python-standalone\\python.exe" -I -B -c' in windows
+    assert '"import clr_loader, pythonnet, webview"' in windows
+    assert "packaged source-handoff desktop imports failed" in windows
+    for smoke in (linux, windows):
+        assert "webview.create_window" not in smoke and "webview.start" not in smoke
+
+
 def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification():
     workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     markers = [

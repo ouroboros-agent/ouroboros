@@ -127,7 +127,7 @@ def test_top_level_workspace_focus_has_tool_and_schema_parity(tmp_path, monkeypa
         "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
         "delegate_message",
         "switch_model", "send_photo", "send_video", "send_file", "send_links",
-        "commit_reviewed", "promote_chat_to_task", "vcs_restore",
+        "commit_reviewed", "start_task", "vcs_restore",
     } <= names
 
     # Successor of the retired _WORKSPACE_ALLOWED_TOOLS subset invariant: the

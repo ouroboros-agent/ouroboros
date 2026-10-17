@@ -421,6 +421,18 @@ def persist_consciousness_choice(enabled: bool) -> str:
 
 def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
     """Log owner injections so health checks can detect duplicate processing."""
+    if evt.get("quiz_ack"):
+        from ouroboros.owner_quiz import quiz_states, question_delivery_projection
+        from ouroboros.gateway.task_decision import _send_quiz_state
+        ack = evt["quiz_ack"]
+        block = quiz_states(ctx.DRIVE_ROOT, ack["task_id"]).get(ack["quiz_id"]) or {}
+        _send_quiz_state(ack["quiz_id"], ack["task_id"], str(block.get("state") or "answered"),
+                         question_delivery=question_delivery_projection(block))
+        return
+    if evt.get("relay_ack"):
+        from ouroboros.owner_relay import publish_relay_ack
+        publish_relay_ack(ctx.DRIVE_ROOT, str(evt["task_id"]), evt["relay_ack"], getattr(ctx, "bridge", None))
+        return
     try:
         ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
             "ts": evt.get("ts", utc_now_iso()),

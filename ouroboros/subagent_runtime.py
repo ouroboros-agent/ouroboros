@@ -143,8 +143,8 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
             continue
         session = row.route.is_session
         handle = handles[row.subagent_id]
-        # The row's effort as the mind may act on it: ``auto`` (the range decides, recommended by
-        # default), the owner's pin, or the level its model name carries (``effort_source``).
+        # The row's effort: ``auto`` (primary clamped into room helper bounds), the owner's pin,
+        # or the level its model name carries (``effort_source``).
         named = model_named_effort(row.route)
         projected: dict[str, Any] = {
             "subagent_id": handle,

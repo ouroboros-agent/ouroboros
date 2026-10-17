@@ -968,6 +968,7 @@ def emit_task_results(
         # a stamped status makes the event self-describing.
         "status": str(stored_result.get("status") or ""),
         "_is_direct_chat": bool(task.get("_is_direct_chat")),
+        "execution_owner": stored_result.get("execution_owner") or task.get("_execution_owner") or {},
         **({"typed_routing_action": _typed_routing_action} if _typed_routing_action else {}),
         **({"model_execution": send_event["progress_meta"]["model_execution"]}
            if "model_execution" in send_event.get("progress_meta", {}) else {}),

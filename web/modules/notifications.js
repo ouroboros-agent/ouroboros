@@ -221,8 +221,10 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
         // consciousness wake-up, any conversation turn. Calling that "a task
         // finished" would ring on every answer while the owner's ordinary-reply
         // toggle is off, which is the opposite of what the toggle promises. A
-        // conversation's ending belongs to `main_reply` and nowhere else.
-        if (frame._is_direct_chat === true) return null;
+        // conversation's ending belongs to `main_reply` and nowhere else. The flag is the work's historical
+        // origin; the attempt's carrier says what ran it: a turn handed to the worker pool
+        // (`continue_in_background`) ended as background work and rings like one.
+        if (frame._is_direct_chat === true && text(frame.execution_owner?.kind) !== 'pooled') return null;
         return {
             category: 'task_done',
             key: `conclusion:${taskId}`,

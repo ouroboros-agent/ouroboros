@@ -294,6 +294,9 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
         if kind in OWNER_SOURCE_KINDS | {"task_message"} and not isinstance(entry.get("text") or "", str):
             gaps.append("owner_mailbox_row_malformed")  # the writer stores text; never str() a body
             continue
+        if kind == "quiz_answer" and (entry.get("quiz_delivery") or {}).get("answer_snapshot"):
+            from ouroboros.owner_quiz import late_answer_owner_text
+            entry = {**entry, "text": late_answer_owner_text(entry["quiz_delivery"]["answer_snapshot"])}
         if msg_id and msg_id in seen:
             if seen[msg_id] != (str(entry.get("text") or ""), kind in OWNER_SOURCE_KINDS):
                 gaps.append("owner_message_identity_conflict")
@@ -307,6 +310,17 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
             later.append({"source": "owner_quiz_answer" if kind == "quiz_answer" else "owner_mailbox",
                           "content": str(entry.get("text") or ""), "msg_id": msg_id,
                           "ts": str(entry.get("ts") or ""), "exact_row": entry["_exact_row"]})
+        elif kind == "relay_entry":
+            for row in entry.get("owner_rows") or []:
+                from ouroboros.chat_chain import format_address, row_address
+                from ouroboros.owner_relay import owner_text
+                address = format_address(row_address(row))
+                if address not in seen:
+                    later.append({"source": "owner_mailbox", "content": owner_text(row), "msg_id": address})
+                    seen[address] = (owner_text(row), True)
+            peers.append({"msg_id": msg_id, "ts": str(entry.get("ts") or ""),
+                          "source_task_id": str(entry.get("source_task_id") or ""),
+                          "provenance": "independent_task", "text": str(entry.get("text") or "")})
         elif kind == "task_message":
             peers.append({"msg_id": msg_id, "ts": str(entry.get("ts") or ""),
                           "source_task_id": str(entry.get("source_task_id") or ""),
@@ -359,6 +373,8 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
         else:
             gaps.append("owner_source_provenance_unknown")  # never promoted to owner text
     return {"original": original, "later": later, "peer_context": peers, "gaps": list(dict.fromkeys(gaps)),
+            "open_relays": result.get("open_relays", chained.get("open_relays", {})),
+            "held_owner_messages": {**chained.get("held_owner_messages", {}), **result.get("held_owner_messages", {})},
             "predecessor_note": {"task_id": task_id, "reader": "get_task_result",
                                  "kind": "predecessor_authored_note"}}
 
@@ -518,7 +534,8 @@ def claim_on_predecessor(drive_root: Any, predecessor_task_id: str, nonce: str,
         verdict = continuation_eligibility(current, predecessor_task_id)
         if not verdict["eligible"]:
             raise ValueError(verdict["refusal"])
-        claim = {"successor_task_id": binding["successor_task_id"], "action_nonce": nonce,
+        from ouroboros.control_actor import control_actor
+        claim = {**control_actor(), "successor_task_id": binding["successor_task_id"], "action_nonce": nonce,
                  "binding": dict(binding), "binding_sha256": binding_sha(binding),
                  "bound_at": utc_now_iso(), "state": "bound"}
         outcome.update(claim=claim, created=True)

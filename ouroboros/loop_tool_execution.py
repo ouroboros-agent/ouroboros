@@ -129,7 +129,9 @@ def _settle_host_error(tools, drive_logs, live, invocation, outcome):
 def _settling_tool_worker(function, tools, drive_logs, live, invocation, *args):
     """All producer effects, including exceptional settlement, precede Future completion."""
     try:
-        return function(*args)
+        from ouroboros.tool_call_log import invocation_scope
+        with invocation_scope(invocation):
+            return function(*args)
     except BaseException as exc:
         _settle_host_error(tools, drive_logs, live, invocation, exc)
         raise

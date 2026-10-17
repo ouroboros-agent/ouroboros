@@ -814,8 +814,8 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
             data = json.loads(resp.read().decode("utf-8"))
         runs = [r for r in (data.get("workflow_runs") or []) if r.get("head_sha") == local_sha]
         if not runs:
-            return "\n\n⏳ CI: Run not yet registered — check GitHub Actions in ~30s."
-        # One push starts several workflows (code, browser lane, provider canaries): each is
+            return "\n\nCI: No push workflow run is registered for this commit."
+        # A push may start zero or several workflows, depending on the repository: each is
         # reported under its own name and none stands for the others. The API lists newest
         # first, so the first row per workflow belongs to the latest push of this commit.
         latest: Dict[str, dict] = {}

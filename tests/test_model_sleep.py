@@ -158,6 +158,7 @@ def test_the_pooled_park_excludes_the_sleep_live_and_the_grant_folds_it(tmp_path
     workers.RUNNING["sleeper"] = meta
     ctx = SimpleNamespace(RUNNING=workers.RUNNING, WORKERS=workers.WORKERS, DRIVE_ROOT=tmp_path)
     checkpoint = {"wait_id": "w1", "task_attempt": 1, "source_ref": {"x": 1}, "reason": "sleep",
+                  "budget_paused_sec": 0.0, "sleep_started_at": time.time(),
                   "sleep": {"senders": ["peer-a"], "any_mail": False}}
     handle_owner_wait({"task_id": "sleeper", "wait_id": "w1", "task_attempt": 1, "worker_id": 0, "pid": 77,
                        "phase": "park", "checkpoint": checkpoint}, ctx)
@@ -266,6 +267,23 @@ def test_a_panic_boot_holds_a_cold_sleeper_before_its_marker_is_consumed(tmp_pat
     (tmp_path / "state" / "panic_stop.flag").write_text("panic", encoding="utf-8")
     assert queue.restore_pending_from_snapshot() == 1
     assert budget_hold_fact(workers.PENDING[0])["reason"] == HOLD_PANIC
+
+
+def test_an_ordinary_restart_restores_a_cold_sleep_that_wakes_itself(tmp_path, monkeypatch):
+    from supervisor.events_budget import budget_hold_fact
+    from supervisor.sleep_wake import wake_ready_sleepers
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    _cold_park(tmp_path, monkeypatch, workers, wake_after_sec=1)
+    # An update or crash recovery: neither the owner's Restart flag nor a Panic flag.
+    assert queue.persist_queue_snapshot(reason="before_update")
+    workers.PENDING[:] = []
+    assert queue.restore_pending_from_snapshot() == 1
+    assert budget_hold_fact(workers.PENDING[0]) is None
+    time.sleep(1.2)
+    outcome = wake_ready_sleepers(queue)
+    assert outcome[0]["ok"] is True and outcome[0]["ready"]["reason"] == "timeout"
 
 
 @pytest.mark.parametrize("source", ["mail", "task", "runs"])

@@ -190,7 +190,8 @@ def record_quiz_delivery_failure(drive_root: Any, task_id: str, quiz_id: str, re
     _mutate_projection(drive_root, task_id, mutate)
 
 
-def mark_quiz_history_written(drive_root: Any, task_id: str, quiz_id: str, receipt: str = "history_at") -> None:
+def mark_quiz_history_written(drive_root: Any, task_id: str, quiz_id: str, receipt: str = "history_at",
+                              source_row: Optional[dict] = None) -> None:
     """Strict history append receipt; retries no longer fold history to find this fact.
     ``mailbox_at``: the live author's mailbox holds the answer or closure, which neither a
     retry nor the late path repeats while the history row alone stays owed."""
@@ -202,6 +203,8 @@ def mark_quiz_history_written(drive_root: Any, task_id: str, quiz_id: str, recei
         if delivery.get(receipt):
             return _KEEP
         delivery[receipt] = utc_now_iso()
+        if source_row is not None:
+            delivery["answer_row"] = dict(source_row)
         block["delivery"] = delivery
         return True
 
@@ -762,7 +765,8 @@ def late_answer_ref(value: Any) -> Optional[Dict[str, Any]]:
     block = snapshot.get("quiz") if isinstance(snapshot, dict) else None
     if (isinstance(block, dict) and snapshot.get("task_id") == task_id
             and block.get("quiz_id") == quiz_id and block.get("state") == STATE_ANSWERED
-            and (block.get("answered_after_terminal") is True or block.get("delivery_after_terminal") is True)):
+            and (block.get("answered_after_terminal") is True or block.get("delivery_after_terminal") is True
+                 or (block.get("delivery") or {}).get("route") == "fresh_head")):
         ref["answer_snapshot"] = {"task_id": task_id, "quiz": dict(block)}
     return ref
 
@@ -791,7 +795,8 @@ def late_answer_model_text(drive_root: Any, late_answer: Any, owner_text: str) -
     if not block:
         snapshot = ref.get("answer_snapshot")
         block = dict(snapshot["quiz"]) if isinstance(snapshot, dict) else {}
-    head = f"[Late answer to a question asked by task {ref['task_id']}, which had finished]\n"
+    state = "which had finished" if block.get("answered_after_terminal") or block.get("delivery_after_terminal") else "which is not reading"
+    head = f"[Late answer to a question asked by task {ref['task_id']}, {state}]\n"
     if isinstance(block, dict) and str(block.get("state") or "") == STATE_ANSWERED:
         return head + recorded_answer_frame(block)
     return (

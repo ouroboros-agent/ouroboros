@@ -117,6 +117,7 @@ def _replay(q: Any, predecessor: str, nonce: str, successor: str) -> Optional[Di
 # writer census: the owner's Continue. Every other consumer (Pause, Resume,
 # money, sleep, restart) keeps the whole observation.
 CONTINUE_PURPOSE = "owner_continue"
+CONTINUE_TITLE_PREFIX = "Continue: "
 
 
 def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
@@ -331,7 +332,10 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
     deadline_at = str(binding.get("deadline_at") or "")
     text = work_order_text(predecessor, verdict["cause"], sources, deadline_at=deadline_at,
                            authority_source=authority_source, checkout=recorded_system_checkout(result))
-    title = str(result.get("title") or result.get("suggested_name") or result.get("objective") or predecessor)[:80]
+    title = str(result.get("title") or result.get("suggested_name") or result.get("objective") or predecessor)
+    while title.startswith(CONTINUE_TITLE_PREFIX):
+        title = title[len(CONTINUE_TITLE_PREFIX):]
+    title = (title or predecessor)[:80]
     original = sources.get("original") or {}
     origin_ref = original.get("origin_message_ref")
     from ouroboros.settings_scales import EFFORT_SCALE
@@ -353,7 +357,7 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
         **({"context_requires_self_body_docs": self_body_docs} if isinstance(self_body_docs, bool) else {}),
         "id": binding["successor_task_id"], "type": "task", "chat_id": binding.get("chat_id"),
         "project_id": str(binding.get("project_id") or ""), "text": text, "objective": text,
-        "title": f"Continue: {title}", "suggested_name": f"Continue: {title}",
+        "title": f"{CONTINUE_TITLE_PREFIX}{title}", "suggested_name": f"{CONTINUE_TITLE_PREFIX}{title}",
         "root_task_id": binding["successor_task_id"], "depth": 0, "delegation_role": "root",
         **({"deadline_at": deadline_at} if deadline_at else {}),
         **{key: binding[key] for key in ("workspace_root", "workspace_mode") if binding.get(key)},
@@ -369,7 +373,9 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
             "owner_corpus": owner_corpus_rows(sources),
             "continuation": {
                 "predecessor_task_id": predecessor, "cause": verdict["cause"],
-                "owner_sources": {"original": sources.get("original"), "later": sources.get("later") or []},
+                "owner_sources": {"original": sources.get("original"), "later": sources.get("later") or [],
+                                  "held_owner_messages": sources.get("held_owner_messages") or {},
+                                  "open_relays": sources.get("open_relays") or {}},
                 "peer_context": sources.get("peer_context") or [],
                 "billing_group_id": binding.get("billing_group_id"),
                 "billing_group_limit_usd": binding.get("billing_group_limit_usd"),
@@ -529,7 +535,8 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
             return {"ok": False, "error": "continuation_claim_unwritable", "detail": str(exc)[:200]}
         binding = dict(claim["binding"])
     blockers = action_writers(q, predecessor, purpose=CONTINUE_PURPOSE)
-    admission = {"binding": binding, "binding_sha256": binding_sha(binding), "admitted_at": utc_now_iso(),
+    admission = {**{key: claim[key] for key in ("actor", "actor_task_id", "reason") if key in claim},
+                 "binding": binding, "binding_sha256": binding_sha(binding), "admitted_at": utc_now_iso(),
                  "held": bool(blockers)}
     task = _successor_task(q, predecessor, result, binding, verdict, sources, admission)
     if blockers:

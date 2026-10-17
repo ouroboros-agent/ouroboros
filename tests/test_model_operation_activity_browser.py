@@ -34,7 +34,7 @@ def test_model_phase_card_header_reconnect_and_terminal(project_chat, chat_id, t
     summary = card.locator(":scope > [data-live-summary-button]")
     phase_detail = card.locator(":scope > .chat-live-details > [data-live-phase-detail]")
     cost_detail = card.locator(":scope > .chat-live-details > [data-live-cost-detail]")
-    meta = card.locator(":scope > [data-live-summary-button] [data-live-meta]")
+    meta = card.locator(":scope > [data-live-foot] [data-live-meta]")  # the meta line leads the card's foot
     suffix = f"{ui['engine']}-{ui['theme']}-{ui['width']}-{chat_id}"
     # The title is primary and the amount keeps its honest word; the reason is not a caption.
     expect(title).to_have_text("Новый этап восстановления проектов")

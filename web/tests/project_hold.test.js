@@ -2,32 +2,26 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { computeHydratedDirectActivities, chatStatusCounts, computeDerivedChatStatus } from '../modules/chat_activity.js';
 import { summarizeProjectActivities } from '../modules/project_activity.js';
-import { handoffPhase } from '../modules/project_handoff.js';
-import { desiredLiveCardPhase, setHistoricalUnavailable, setLiveCardPhase, setLiveCardTypingVisible, syncParkedPhase } from '../modules/task_phase_chip.js';
+import { censusTaskPhase, desiredLiveCardPhase, setHistoricalUnavailable, setLiveCardPhase, setLiveCardTypingVisible, syncParkedPhase } from '../modules/task_phase_chip.js';
 import { readFileSync } from 'node:fs';
 
 const hold = { label: 'Waiting for Project verification', reason: 'project_routing_fence_lookup_failed', detail: 'Authority is unreadable.' };
 const held = { activity_id: 'same-id', chat_id: 7, kind: 'managed_task', phase: 'queued', project_admission_hold: hold };
 
-test('known non-Project wait keeps the scope label in Chat and Main handoff', () => {
+test('known non-Project wait keeps the scope label in Chat', () => {
     const scopeHold = { ...hold, label: 'Waiting for task scope verification' };
     const row = { ...held, chat_id: 1, project_admission_hold: scopeHold };
     const activities = computeHydratedDirectActivities(new Map(), [row], 1);
     assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [])).text, scopeHold.label);
-    assert.equal(handoffPhase(row, null).text, scopeHold.label);
 });
 
-test('held task is stationary across hydrated Chat, Project and Main receipt', () => {
+test('held task is stationary across hydrated Chat and Project', () => {
     const activities = computeHydratedDirectActivities(new Map(), [held], 7);
     const card = { root: { isConnected: true }, groupId: 'same-id', finished: false };
     const status = computeDerivedChatStatus(chatStatusCounts(activities, [card]));
     assert.deepEqual(status, { kind: 'online', text: hold.label, tone: 'held', showDots: false, dots: 'one' });
     assert.equal(summarizeProjectActivities([{ ...held, required_question_unavailable: true }]).label, hold.label);
     assert.equal(summarizeProjectActivities([held]).motion, false);
-    assert.equal(handoffPhase(held, null).text, hold.label);
-    assert.equal(handoffPhase(held, null).motion, false);
-    assert.equal(handoffPhase(held, { status: 'failed' }).text, 'Failed');
-    assert.equal(handoffPhase(held, null, false).text, 'Activity unconfirmed');
 });
 
 for (const [phase, text, kind, showDots, tone] of [
@@ -64,15 +58,15 @@ test('same-ID recovery clears the hold; independent work and budget remain truth
     assert.equal(computeDerivedChatStatus(chatStatusCounts(paused, [])).text, 'Paused');
 });
 
-test('Main handoff keeps a budget pause beside the Project wait, as the sidebar does', () => {
+test('the census phase (a Main portal\'s chip source) keeps a budget pause beside the Project wait, as the sidebar does', () => {
     const paused = { ...held, phase: 'budget_paused' };
-    assert.equal(handoffPhase(paused, null).text, `Paused · ${hold.label}`);
-    assert.equal(handoffPhase(paused, null).motion, false);
-    assert.equal(handoffPhase(paused, null).text, summarizeProjectActivities([paused]).label);
-    assert.equal(handoffPhase({ ...held, phase: 'budget_pausing' }, null).text, `Pausing… · ${hold.label}`);
-    assert.equal(handoffPhase({ ...held, phase: 'budget_pausing' }, null).motion, false);
-    assert.equal(handoffPhase(held, null).text, hold.label);
-    assert.equal(handoffPhase(paused, { status: 'cancelled' }).text, 'Cancelled');
+    assert.equal(censusTaskPhase(paused, null).text, `Paused · ${hold.label}`);
+    assert.equal(censusTaskPhase(paused, null).motion, false);
+    assert.equal(censusTaskPhase(paused, null).text, summarizeProjectActivities([paused]).label);
+    assert.equal(censusTaskPhase({ ...held, phase: 'budget_pausing' }, null).text, `Pausing… · ${hold.label}`);
+    assert.equal(censusTaskPhase({ ...held, phase: 'budget_pausing' }, null).motion, false);
+    assert.equal(censusTaskPhase(held, null).text, hold.label);
+    assert.equal(censusTaskPhase(paused, { status: 'cancelled' }).text, 'Cancelled');
 });
 
 test('a held card with retained progress waits statically; Stop, terminal and same-ID recovery outrank it', () => {

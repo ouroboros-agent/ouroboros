@@ -66,7 +66,9 @@ def _live_root_task(task_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
     ``task_not_live`` is NOT a hard refusal for a quiz answer — the caller
     consults the durable projection for the honest late-answer state; nor is
     ``task_settled``, a RUNNING worker whose result already settled (its
-    mailbox is no longer drained, TZ-2 D15)."""
+    mailbox is no longer drained, TZ-2 D15). ``task_not_reading`` is alive
+    (queued, held, owner- or money-paused) but reads no question mail now; an
+    unheld cold sleep still reads it here, never in room intake (D6)."""
     from supervisor import queue as q
 
     with q._queue_lock:
@@ -110,6 +112,12 @@ def _live_root_task(task_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
         # drains the mailbox any more — the same fact that refuses owner mail
         # sends the answer down the late path instead of into a dead mailbox.
         return None, "task_settled"
+    from ouroboros.room_reader import is_reading, unheld_cold_sleep
+    from supervisor.workers import direct_chat_turn
+    drive = _task_drive_for_task(task, task_id)
+    running = task_id in q.RUNNING or direct_chat_turn(task_id) is not None
+    if not (is_reading(drive, task_id, task, running=running) or unheld_cold_sleep(drive, task_id, task)):
+        return None, "task_not_reading"
     return task, ""
 
 
@@ -184,14 +192,14 @@ def _record_quiz_answer_history(
         raise ValueError(_reason or "publication_address_unknown")
     address["chat_id"] = published_chat
     index = block.get("answered_index")
-    log_chat(
+    stored = log_chat(
         "system", address.get("chat_id"), 0,
         _quiz_answer_frame(block, index if isinstance(index, int) else None, str(block.get("comment") or "")),
         ts=str(block["answered_at"]), source="owner_quiz_answer", task_id=task_id,
         client_message_id=source_id, record_type="quiz_answer", quiz=dict(block),
         message_meta=address, drive_root=drive_root, require_write=True,
     )
-    mark_quiz_history_written(drive_root, task_id, str(block["quiz_id"]))
+    mark_quiz_history_written(drive_root, task_id, str(block["quiz_id"]), source_row=stored)
 
 
 def _late_answer_destination(
@@ -240,10 +248,8 @@ def _forward_late_quiz_answer(
     rebuilds the FULL frame from the stored block for the model
     (``owner_quiz.late_answer_model_text``), so the model still reads the card.
 
-    Disclosed property: in a PROJECT room that currently has exactly one live
-    steerable root task, the ordinary routing delivers this message into THAT
-    task's mailbox — the answer can therefore reach a different, live task in
-    the same room. In Main it always starts the ordinary owner turn.
+    The typed late_answer metadata bypasses the room's ordinary-reader route.
+    A fresh head receives the complete frame and the asker keeps its holds.
     """
     from supervisor import message_bus
 
@@ -289,6 +295,7 @@ def _forward_late_quiz_answer(
         # owner the SAME user bubble their own typing produces (a rejoin
         # already echoed when it was first accepted).
         from ouroboros.projects_registry import stamp_project_thread
+        from ouroboros.chat_references import projection_fields
 
         echo = {
             # The accepted canonical row is the echo's text authority, exactly
@@ -296,6 +303,7 @@ def _forward_late_quiz_answer(
             "type": "chat", "role": "user", "content": str(row.get("text") or text),
             "ts": str(row.get("ts") or ""), "source": str(source or "web"), "chat_id": chat_id,
             "sender_session_id": "", "client_message_id": client_message_id,
+            **projection_fields(row),
         }
         if row.get("ingress_accepted") is True:
             echo["ingress_accepted"] = True  # the row's own fact: live matches history replay
@@ -517,12 +525,12 @@ async def answer_decision(drive_root: pathlib.Path, body: Any, *, source: str = 
                 task_id=task_id, reason_code=refusal,
             )
         from ouroboros.owner_quiz import (
-            CLOSURE_FIELDS, claim_quiz_delivery, mark_discharged, mark_quiz_history_written,
-            question_delivery_projection, quiz_states, record_answered, record_answer_delivery_after_terminal,
-            question_delivery_settled, record_quiz_delivery_failure, reconcile_terminal,
+            CLOSURE_FIELDS, claim_quiz_delivery, question_delivery_projection, quiz_states, record_answered,
+            record_answer_delivery_after_terminal, question_delivery_settled, record_quiz_delivery_failure,
+            reconcile_terminal,
         )
 
-        if task is None:
+        if task is None and refusal != "task_not_reading":
             # The author is gone, or settled into post-work. Normally the
             # task-done seam expires its open quizzes; a crash window or the
             # post-work window leaves one open — heal it here so the card's
@@ -544,109 +552,39 @@ async def answer_decision(drive_root: pathlib.Path, body: Any, *, source: str = 
         block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
         attempt_delivery = False
         pending_reason = ""
-        handed = False  # the live author's mailbox already holds this answer (``mailbox_at``)
+        forwarded = None
+        forward_reason = ""
+        late_delivery = bool(block.get("answered_after_terminal") or block.get("delivery_after_terminal"))
         if block.get("state") == "answered" and not question_delivery_settled(block):
             claimed = claim_quiz_delivery(drive_root, task_id, quiz_id, force=not _recovery)
             attempt_delivery = bool(claimed)
             block = claimed or quiz_states(drive_root, task_id).get(quiz_id) or block
-            handed = bool((block.get("delivery") or {}).get("mailbox_at"))
-            if attempt_delivery and task is None and not handed:
+            if (attempt_delivery and task is None and refusal != "task_not_reading"
+                    and not (block.get("delivery") or {}).get("read_at")):
                 block = record_answer_delivery_after_terminal(drive_root, task_id, quiz_id)
-            if attempt_delivery:
-                destination, pending_reason = _late_answer_destination(drive_root, task_id, block)
-                if destination is None:
-                    # The history row needs the published card's chat; a live author's
-                    # mailbox does not, so only the row stays owed with its typed reason.
-                    record_quiz_delivery_failure(drive_root, task_id, quiz_id, pending_reason)
-                    attempt_delivery = task is not None and not handed
-        try:
-            if attempt_delivery and not pending_reason:
-                _record_quiz_answer_history(
-                    drive_root, task_id, task, block,
-                    duplicate=bool(outcome.get("duplicate") or not outcome.get("ok")),
-                )
-        except Exception:
-            log.warning("Quiz answer history write failed for %s", quiz_id, exc_info=True)
-            record_quiz_delivery_failure(drive_root, task_id, quiz_id, "quiz_history_write_failed")
-            return _answer_pending(
-                drive_root, task_id, quiz_id, "quiz_history_write_failed",
-                "The answer was recorded. Delivery is pending and will retry automatically.",
-            )
-        if task is not None and attempt_delivery and not handed:
-            from supervisor.queue import _task_drive_for_task
-
-            from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, write_owner_message
-
-            # Every proven winning answer can heal its delivery, including a
-            # competing new request after a partial write. The loser still
-            # receives 409 below; the msg_id is stable per quiz, so the drain
-            # dedupes a doubled line while a LOST control is healed by any
-            # retry instead of being unrecoverable (the drain reads only the
-            # mailbox, never the projection).
-            # TOCTOU residual (disclosed): the task can settle between the
-            # liveness read and this append — the control then waits for a
-            # same-id retry attempt (reset_attempt_controls_for_retry revokes
-            # only hurry/finalize kinds), and the model judges freshness from
-            # the frame's stamps (30=A). No lock spans both writes on purpose.
-            # The recorded block is the ONLY answer truth: a same-request_id
-            # retry may legally carry a different payload (a 503 retry pressed
-            # as an option after a free answer), and echoing that payload would
-            # hand the task a choice the projection never recorded.
-            answered_index = (int(block["answered_index"])
-                              if isinstance(block.get("answered_index"), int)
-                              else None)  # None: the owner's own free answer
-            frame = _quiz_answer_frame(block, answered_index, str(block.get("comment") or ""))
-            drive = _task_drive_for_task(task, task_id)
-            if not write_owner_message(
-                drive, frame, task_id,
-                msg_id=f"quiz_answer:{quiz_id}", kind=KIND_QUIZ_ANSWER,
-            ):
-                # The projection already recorded the answer (the card is
-                # truthful); the injection control failed — say so. A retry
-                # of this request re-attempts the append.
-                record_quiz_delivery_failure(drive_root, task_id, quiz_id, "mailbox_write_failed")
-                return _answer_pending(
-                    drive_root, task_id, quiz_id, "mailbox_write_failed",
-                    "The answer was recorded. Delivery is pending and will retry automatically.",
-                )
-            mark_quiz_history_written(drive_root, task_id, quiz_id, receipt="mailbox_at")
-            handed = True
-        if handed and attempt_delivery and not pending_reason:
-            block = mark_discharged(drive_root, task_id, quiz_id) or block
-        forwarded: Optional[bool] = None
-        forward_reason = pending_reason
-        late_delivery = bool(block.get("answered_after_terminal") or block.get("delivery_after_terminal"))
-        if late_delivery and question_delivery_settled(block):
+                late_delivery = True
+        if attempt_delivery:
+            destination, pending_reason = _late_answer_destination(drive_root, task_id, block)
+            if destination is not None:
+                try:
+                    _record_quiz_answer_history(drive_root, task_id, task, block,
+                                               duplicate=bool(outcome.get("duplicate") or not outcome.get("ok")))
+                except Exception:
+                    record_quiz_delivery_failure(drive_root, task_id, quiz_id, "quiz_history_write_failed")
+                    return _answer_pending(drive_root, task_id, quiz_id, "quiz_history_write_failed",
+                                           "The answer was recorded. Its history and delivery remain pending.")
+            from ouroboros.question_answers import deliver_answer
+            forwarded, forward_reason = await run_sync_to_completion(
+                deliver_answer, drive_root, task_id, quiz_id, block, _live_root_task, _forward_late_quiz_answer)
+            late_delivery = late_delivery or bool(forwarded)
+            forward_reason = pending_reason or forward_reason
+            if forward_reason:
+                record_quiz_delivery_failure(drive_root, task_id, quiz_id, forward_reason)
+            if forward_reason == "mailbox_write_failed":
+                return _answer_pending(drive_root, task_id, quiz_id, forward_reason,
+                                       "The answer was recorded. Delivery remains pending.")
+        elif late_delivery and question_delivery_settled(block):
             forwarded = True
-        if task is None and attempt_delivery and late_delivery and not handed and not pending_reason:
-            # The persisted acceptance route decides delivery, never the task's
-            # liveness NOW: an answer accepted LATE (no mailbox will ever drain)
-            # is delivered as an ordinary owner message, and a duplicate request
-            # re-enters this path on purpose — the named ingress deduplicates it,
-            # so a retry after a failed delivery still delivers. An answer the
-            # live task already received is never forwarded when its lost HTTP
-            # response is retried after the task ended (that would be a second
-            # owner turn).
-            # The named ingress waits for the single host's ingress lock, which
-            # an off-loop socket acceptance or skill delivery may hold across a
-            # slow state read or chat scan: wait for it off the ASGI loop too. A
-            # cancelled waiter still lets row → queue → echo settle first.
-            try:
-                forwarded, forward_reason = await run_sync_to_completion(
-                    _forward_late_quiz_answer, drive_root, task_id, quiz_id, block,
-                    source=str(block.get("answer_source") or source),
-                )
-            except Exception:
-                log.warning("Late quiz answer delivery failed for %s", quiz_id, exc_info=True)
-                record_quiz_delivery_failure(drive_root, task_id, quiz_id, "late_answer_not_delivered")
-                return _answer_pending(
-                    drive_root, task_id, quiz_id, "late_answer_not_delivered",
-                    "The answer was recorded. Delivery is pending and will retry automatically.",
-                )
-            if forwarded:
-                block = mark_discharged(drive_root, task_id, quiz_id) or block
-            else:
-                record_quiz_delivery_failure(drive_root, task_id, quiz_id, forward_reason or "late_answer_not_delivered")
         settled_block = quiz_states(drive_root, task_id).get(quiz_id)
         if settled_block:
             block = settled_block
@@ -683,13 +621,14 @@ async def answer_decision(drive_root: pathlib.Path, body: Any, *, source: str = 
             comment=str(block.get("comment") or ""),
             question_delivery=delivery_view,
         )
-    except Exception as exc:
+    except Exception:
         try:
             from ouroboros.owner_quiz import record_quiz_delivery_failure
             record_quiz_delivery_failure(drive_root, task_id, quiz_id, "quiz_delivery_failed")
         except Exception:
             log.warning("Could not record quiz delivery failure for %s", quiz_id, exc_info=True)
-        return 503, {"error": str(exc)}
+        return _answer_pending(drive_root, task_id, quiz_id, "quiz_delivery_failed",
+                               "The answer was recorded. Delivery remains pending.")
     payload_ok = _quiz_decision_receipt(decision_id, outcome, block)
     if late_delivery:
         # The card outlived its author: say so, and say whether the answer

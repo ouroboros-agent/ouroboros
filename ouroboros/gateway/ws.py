@@ -395,6 +395,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                         task_metadata: dict[str, Any] = {
                             "force_plan": force_plan,
                             "force_plan_source": "swarm" if force_plan else "",
+                            "reply_to": msg.get("reply_to", ""),
                         }
                         # Attachment inspection belongs to the ordered acceptance
                         # worker, so this socket can receive Panic during disk I/O.

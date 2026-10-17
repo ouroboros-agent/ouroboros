@@ -64,6 +64,24 @@ def paused_env(env, monkeypatch):  # noqa: F811 - the imported fixture
     return env
 
 
+@pytest.fixture
+def pause_refusal(monkeypatch):
+    """Observe the drain's real refusal decision, before return-evidence I/O."""
+    from ouroboros import review_custody
+
+    observed = threading.Event()
+    original = review_custody.author_detaches
+
+    def observe(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if result:
+            observed.set()
+        return result
+
+    monkeypatch.setattr(review_custody, "author_detaches", observe)
+    return observed
+
+
 def _author(f, model, request, outcome):
     def run():
         with _parent(f):
@@ -121,7 +139,7 @@ def test_a_launched_reviewer_finishes_its_episode_while_the_synchronous_author_d
 
 @pytest.mark.parametrize("preparation_boundary", ["model_preparation", "before_episode_binding"])
 def test_a_reviewer_that_had_not_launched_when_the_pause_landed_never_starts(
-        paused_env, monkeypatch, preparation_boundary):
+        paused_env, monkeypatch, preparation_boundary, pause_refusal):
     from contextlib import contextmanager
 
     gate = threading.Event()
@@ -142,7 +160,8 @@ def test_a_reviewer_that_had_not_launched_when_the_pause_landed_never_starts(
     try:
         assert model.preparing.wait(10)
         owner_pause.install_fence(f.root, TASK, request_id="pause")
-        until(lambda: "returned_at" in outcome, timeout=1.5)
+        assert pause_refusal.wait(1.5), "the drain did not observe Pause promptly"
+        until(lambda: "returned_at" in outcome)
         actor = outcome["result"].actors[0]
         assert actor["operation_state"] == "pending_dispatch" and actor["late_result_pending"]
         assert actor["usage"]["owner_pause_preparing"] is True
@@ -167,7 +186,7 @@ def test_a_reviewer_that_had_not_launched_when_the_pause_landed_never_starts(
     assert all(row["state"] == "released" for row in attempt_rows_in_start_order(f.root))
 
 
-def test_pause_detaches_a_mixed_panel_and_resume_cannot_launch_its_unsent_preparation(paused_env):
+def test_pause_detaches_a_mixed_panel_and_resume_cannot_launch_its_unsent_preparation(paused_env, pause_refusal):
     from dataclasses import replace
     from ouroboros.review_substrate import run_review_request
 
@@ -191,7 +210,9 @@ def test_pause_detaches_a_mixed_panel_and_resume_cannot_launch_its_unsent_prepar
     try:
         assert armed.first_sent.wait(10) and preparing.preparing.wait(10)
         owner_pause.install_fence(f.root, TASK, request_id="mixed")
-        until(lambda: "result" in outcome, timeout=1.5)
+        # Bound the drain's refusal decision separately from persisted return evidence.
+        assert pause_refusal.wait(1.5), "the drain did not observe Pause promptly"
+        until(lambda: "result" in outcome)
         rows = {row["slot_id"]: row for row in outcome["result"].actors}
         assert rows["armed"]["operation_state"] == "in_flight"
         assert rows["preparing"]["operation_state"] == "pending_dispatch"
@@ -228,7 +249,7 @@ def test_a_new_panel_under_an_accepted_pause_is_refused_before_any_send(paused_e
 
 
 @pytest.mark.parametrize("capture_state", ["settled", "unresolved"])
-def test_preparation_refusal_preserves_independent_positive_or_unknown_capture(paused_env, capture_state):
+def test_preparation_refusal_preserves_independent_positive_or_unknown_capture(paused_env, capture_state, pause_refusal):
     from types import SimpleNamespace
     from ouroboros.review_custody import _ACTIVE
 
@@ -249,7 +270,8 @@ def test_preparation_refusal_preserves_independent_positive_or_unknown_capture(p
     try:
         assert preparing.wait(10)
         owner_pause.install_fence(f.root, TASK, request_id="before-capture-delivery")
-        until(lambda: "result" in outcome, timeout=1.5)
+        assert pause_refusal.wait(1.5), "the drain did not observe Pause promptly"
+        until(lambda: "result" in outcome)
         row = outcome["result"].actors[0]
         entry = next(entry for entry in _ACTIVE.values() if entry.operation_id == row["operation_id"])
         assert entry.pause_before_launch
