@@ -271,7 +271,7 @@ test('a call is one card of the room: its rows fold into it, its captions stream
     cards.scan();
     assert.deepEqual(lines().at(-1), ['call-line notice', 'Live call c1 ended (owner_bye).']);
     assert.deepEqual([card().dataset.callCard, card().dataset.callOpen], ['ended', '0']);
-    assert.equal(card().querySelector('.call-card-facts').textContent, '1 min · 2 lines');
+    assert.equal(card().querySelector('.call-card-facts').textContent, '1 min 2 s · 2 lines');  // to the closing notice
     card().querySelector('.call-card-head').click();
     assert.equal(card().dataset.callOpen, '1');
     cards.destroy();

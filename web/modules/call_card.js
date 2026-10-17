@@ -179,11 +179,13 @@ export function createCallCards({ feed, ws = null, doc = feed?.ownerDocument, li
             if (member.kind === 'work') continue;
             const text = spokenText(member.node);
             if (!text) continue;
+            // The span runs from the first words to the call's end, its closing notice.
+            const ts = Number(member.node.dataset.ts);
+            if (Number.isFinite(ts)) last = Math.max(Number.isFinite(last) ? last : ts, ts);
             // The closing notice says how the call ended; it reads under the words, not as one of them.
             if (member.kind === 'notice') { notices.push(line('notice', text)); continue; }
             spoken.push(line(member.kind, text));
-            const ts = Number(member.node.dataset.ts);
-            if (Number.isFinite(ts)) { first = Number.isFinite(first) ? Math.min(first, ts) : ts; last = Math.max(Number.isFinite(last) ? last : ts, ts); }
+            if (Number.isFinite(ts)) first = Number.isFinite(first) ? Math.min(first, ts) : ts;
         }
         const streaming = [...captions.values()].filter(entry => entry.call === card.call).map(entry => entry.node);
         card.lines.replaceChildren(...spoken, ...streaming, ...notices);
