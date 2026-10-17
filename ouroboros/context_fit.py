@@ -992,13 +992,15 @@ def build_context_fit_plan(
         core, {form: _governance_blocks(env, core, mode=form) for form in ("max", "low")}, core.user_content_json,
         preferred=preferred, tool_schemas=tool_schemas, window_tokens=int(evidence.window_tokens or 0),
         known_window=known_window, output_reserve=output_reserve, ratio=ratio,
-        start="nano" if call_view else None, call_view=call_view)
+        # A call's schemas are already its selection (the driver sends them all): resident in every mode.
+        start="nano" if call_view else None, call_view=call_view, resident=call_view)
 
     from ouroboros.context_budget import context_mode_limits
     from ouroboros.tool_policy import select_tool_schemas
 
     # The task-input pointer is decided on the calibrated Nano request: the schemas it sends and its reply floor.
-    nano_sent_tokens = tool_schema_tokens(list(select_tool_schemas(tool_schemas or [], context_mode="nano").schemas))
+    nano_sent_tokens = tool_schema_tokens(list(tool_schemas or []) if call_view else list(
+        select_tool_schemas(tool_schemas or [], context_mode="nano").schemas))
     nano_reserve = context_mode_limits("nano", preferred, output_reserve)[1]
     window = int(evidence.window_tokens or 0) if known_window else 0
 

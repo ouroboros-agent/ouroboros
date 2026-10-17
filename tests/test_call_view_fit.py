@@ -145,3 +145,24 @@ def test_parts_render_byte_identical_to_the_joined_texts_when_nothing_is_relocat
             _text_turn(legacy, window=2_000_000, preferred=preferred)
         for mode in ("max", "low", "nano"):
             assert selected.projection(mode).system_content_json == baseline.projection(mode).system_content_json
+
+
+def test_a_calls_selected_schemas_count_in_its_fit_as_sent(tmp_path, monkeypatch):
+    from ouroboros import memory_floor
+
+    seen = {}
+    original = memory_floor.mode_views
+
+    def spy(snapshot, **kwargs):
+        seen.update(fixed=dict(kwargs["fixed_tokens_by_mode"]), tools=kwargs["tool_names"])
+        return original(snapshot, **kwargs)
+
+    monkeypatch.setattr(memory_floor, "mode_views", spy)
+    read_file = {"type": "function", "function": {"name": "read_file", "description": "Read a retained file. " * 20,
+                                                  "parameters": {"type": "object", "properties": {}}}}
+    _call(_core(tmp_path, snapshot=_snapshot()), tool_schemas=[read_file])
+    with_schema = dict(seen)
+    _call(_core(tmp_path, snapshot=_snapshot()), tool_schemas=[])
+    # The driver sends every schema the call selected, so the Nano view is fitted beside all of them.
+    assert "read_file" in with_schema["tools"]["nano"]
+    assert with_schema["fixed"]["nano"] > seen["fixed"]["nano"]
