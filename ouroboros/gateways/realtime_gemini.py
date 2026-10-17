@@ -1,9 +1,9 @@
 """Gemini Live I/O with checkpoint-bound tool activation and turn accounting.
 
 The wire is documented at https://ai.google.dev/api/live and
-https://ai.google.dev/gemini-api/docs/live-api/tools. The fixtures are synthetic
-from those documents; the adapter itself was run against gemini-3.8-live through
-``devtools/live_call_probe.py``. Gemini has no
+https://ai.google.dev/gemini-api/docs/live-api/tools. One fixture is synthetic from
+those documents; the other is gemini-3.8-live's own wire from a probed call
+(``devtools/live_call_probe.py``, redacted), replayed in the tests. Gemini has no
 response/audio item IDs: local playback IDs are labeled, while function IDs and
 resume handles remain provider-owned. Context waits for idle because clientContent
 interrupts generation even when turnComplete is false.

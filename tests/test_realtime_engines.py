@@ -12,7 +12,7 @@ import pytest
 from ouroboros.gateways import realtime_gemini as gemini
 from ouroboros.gateways.realtime_engine import (
     AudioIn, AudioOut, Caption, Close, Closed, ContextItem, EngineError, EngineRoute,
-    GoAway, Interrupt, PlayedAudio, Ready, ResponseDone, ResponseStarted,
+    GoAway, Interrupt, PlayedAudio, Ready, ResponseDone, ResponseStarted, ResumeCheckpoint,
     SessionConfig, ToolCallCancelled,
     ToolResult, ToolsApplied, UpdateTools, USAGE_KEYS,
 )
@@ -139,6 +139,34 @@ async def test_documented_gemini_exchange_both_directions():
     assert selected(events, GoAway) == [GoAway(12.5)]
     assert [e.text for e in selected(events, Caption) if e.final] == ["Look up fixture.", "I will check."]
     assert not selected(events, EngineError)
+
+
+@run_async
+async def test_a_recorded_gemini_exchange_replays_into_the_events_the_driver_reads():
+    """What gemini-3.8-live sent in one probed call on a fresh install (redacted by devtools/live_call_probe.py):
+    a greeting, a web search, a link sent to the chat, an interruption and a typed message."""
+    from ouroboros.gateways.realtime_engine import ToolCall
+
+    fixture = json.loads((WIRE / "gemini" / "recorded_exchange.json").read_text(encoding="utf-8"))
+    assert fixture["header"]["provenance"] == "recorded_live"
+    setup = next(row["message"]["setup"] for row in fixture["events"] if "setup" in row["message"])
+    declarations = setup["tools"][0]["functionDeclarations"]
+    assert declarations and all("parametersJsonSchema" in d and "parameters" not in d for d in declarations)
+    engine, connection, events, collector = await opened("google")
+    socket = connection.sockets[0]
+    for row in fixture["events"]:
+        if row["direction"] == "server" and "setupComplete" not in row["message"]:
+            await feed(engine, socket, row["message"])
+    await finished(engine, collector)
+    assert not selected(events, EngineError)
+    done = selected(events, ResponseDone)
+    # Gemini counts each prompt's text apart from its audio: the density witness and the price read these.
+    assert done and all(d.usage["text_input_tokens"] > 0 for d in done)
+    assert any(d.usage["audio_input_tokens"] > 0 for d in done) and any(d.usage["audio_output_tokens"] > 0 for d in done)
+    assert [call.name for call in selected(events, ToolCall)] == ["web_search", "send_user_message"]
+    finals = [c for c in selected(events, Caption) if c.final]
+    assert any(c.speaker == "owner" for c in finals) and any(c.speaker == "ouroboros" for c in finals)
+    assert selected(events, AudioOut) and selected(events, ResumeCheckpoint)
 
 
 @pytest.mark.parametrize("provider,rate", [("google", 16000)])
