@@ -552,7 +552,7 @@ def test_peer_against_the_real_call_hub_when_it_is_present():
 
     from ouroboros import call_protocol as cp
 
-    spec = cp.CallSpec("call-real", 1, "openai", "gpt-realtime")
+    spec = cp.CallSpec("call-real", 1, "google", "gemini-3.8-live")
     hub = call_peers.open_hub(spec)
 
     async def open_call(request):
