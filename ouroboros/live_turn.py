@@ -5,9 +5,12 @@ the agent prepares the text turn's context; this driver opens the engine with th
 system text and the room's Nano tool view (``live_call_route``) and pumps until the call
 ends: peer audio and frames in, engine audio out through the hub, captions to the peers and
 the chat, tools on one serialized worker (``live_tool_batch``), the owner's mailbox on a
-short tick, and the room's new rows (``live_awareness``) as context. Session caps and
-transport losses reopen with a history view or the resume handle; the price quote warms off
-the audio loop. Returns the loop's ``(text, usage, llm_trace)`` with a host-notice terminal.
+short tick, and the room's new rows (``live_awareness``) as context. At a completed turn the
+session is renewed with the call so far as text when its held audio or window needs it, or
+the provider says goodbye (``live_call_state``), the owner's audio across the gap kept;
+transport losses resume with the provider's handle and session caps reopen with the history
+view; the price quote warms off the audio loop. Returns the loop's ``(text, usage, llm_trace)``
+with a host-notice terminal.
 """
 
 from __future__ import annotations
@@ -20,7 +23,6 @@ import queue
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import (
@@ -36,8 +38,10 @@ from ouroboros.gateways.realtime_engine import (
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
 from ouroboros.live_call_route import (call_local_schemas, call_minutes_ceiling, call_turn_taking, initial_call_schemas,
                                        native_search_enabled, resolve_call_route)
+from ouroboros.live_call_state import Acks, SessionRenewal, Spoken, narration_meta
 from ouroboros.live_session_view import (
-    calibration_ratio, compression_watermarks, history_view, record_density_witness, text_estimate,
+    calibration_ratio, compression_watermarks, history_view, mark_spoken, record_density_witness, renewal_bounds,
+    text_estimate,
 )
 from ouroboros.live_tool_batch import ToolBatchWorker, text_of
 from ouroboros.usage_accounting import BudgetExceeded
@@ -58,7 +62,7 @@ RECONNECT_BACKOFF_S = 0.5
 SESSION_PROVEN_S = 10.0
 SESSION_CAP_MARGIN_S = 60.0
 BATCH_SETTLE_WAIT_S = 5.0
-PLANNED_HANDOVERS = ("go_away", "session_cap")  # the provider's or the host's own renewals, not losses
+PLANNED_HANDOVERS = ("go_away", "session_cap", "handover")  # the provider's or the host's own renewals, not losses
 
 # The one next step the owner's surface offers beside a closed call's reason.
 _ACTION_BY_REASON = {
@@ -70,13 +74,6 @@ _ACTION_BY_REASON = {
 
 
 # ---- seams the lanes meet at (tests replace these) --------------------------------
-
-@dataclass(frozen=True)
-class _Acks:
-    """A delivery boundary: the content acknowledgements owed for what was posted before it."""
-
-    callbacks: Tuple[Callable[[], Any], ...]
-
 
 def _hub_for(call_id: str):
     from ouroboros.call_peers import get_hub
@@ -95,27 +92,6 @@ def _loop():
     from ouroboros import loop
 
     return loop
-
-
-def _narration_meta(emit_progress: Callable[..., None]) -> Dict[str, Any]:
-    owner = getattr(emit_progress, "__self__", None)
-    build = getattr(owner, "_subagent_progress_meta", None)
-    try:
-        return dict(build("progress")) if callable(build) else {}
-    except Exception:
-        return {}
-
-
-@dataclass
-class _Spoken:
-    text: str = ""
-    final_at: float = 0.0
-    played_ms: int = 0
-    played: bool = False
-    interrupted: bool = False
-    audio_ms: float = 0
-    ack_at: float = 0
-    started_at: float = 0.0  # when its first audio went to the peers
 
 
 class _LiveCall:
@@ -171,7 +147,7 @@ class _LiveCall:
         self.cancelled_items: set = set()
         self.played_ms: Dict[str, int] = {}
         self.playback_acked = False  # whether any peer reports what it played
-        self.spoken: Dict[str, _Spoken] = {}
+        self.spoken: Dict[str, Spoken] = {}
         self.counts = {"owner": 0, "ouroboros": 0, "heard": 0}
         self.muted_peers: set = set()
         # Meeting peers whose microphone feeds the session. While one is present the
@@ -204,6 +180,7 @@ class _LiveCall:
         self._reader_stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
         self.tools_lane = ToolBatchWorker(self)
+        self.renewal = SessionRenewal(self)
         self.stateful_executor = None
         self.rooms = None
         self.fanout = None
@@ -390,6 +367,8 @@ class _LiveCall:
         if not self.reconnecting:
             self.hub.send_state(STATE_CONNECTING)
         engine = self.llm.open_live(self.route.engine)
+        if not resume_handle:
+            self.resume_handle = ""  # a fresh session's predecessor can no longer be resumed into
         # The history view holds every transcript row up to this count; context recorded
         # after it, while the connection was pending, is delivered once the session is live.
         history, cut = ((), -1) if resume_handle else (self._history_view(), len(self.messages))
@@ -404,6 +383,8 @@ class _LiveCall:
             raise
         self.engine, self.epoch, self.session_started = engine, self.epoch + 1, time.monotonic()
         self.session_proven, self.ready_at = False, None
+        self.renewal.reset(renewal_bounds(self.route.fact, config.instructions, self.tool_schemas,
+                                          calibration_ratio(self.ctx)))
         self.witness = None if resume_handle else (self.epoch, config)
         self.input_ms = 0.0  # a new session counts its input audio from zero
         self.hub.set_engine_rates(self.input_rate, self.output_rate)
@@ -423,7 +404,7 @@ class _LiveCall:
         """The newest call rows a fresh session replays (``live_session_view.history_view``)."""
         return history_view(self.route.fact, self.messages, self.tool_schemas, calibration_ratio(self.ctx))
 
-    async def _reconnect(self, reason: str, *, resume: bool) -> None:
+    async def _reconnect(self, reason: str, *, resume: bool, announce: bool = True) -> None:
         if self.closing or self.reconnecting:
             return
         # A session that heard or said something, or stayed up after its setup, was working, whatever ends it;
@@ -437,7 +418,8 @@ class _LiveCall:
                 self._begin_close("reconnect_failed", detail=f"the session kept ending right after it opened ({reason})")
                 return
         self.reconnecting, self.state = True, STATE_RECONNECTING
-        self.hub.send_state(STATE_RECONNECTING, reason)
+        if announce:  # a renewal at a completed turn keeps the owner's surface as it is
+            self.hub.send_state(STATE_RECONNECTING, reason)
         old, self.engine = self.engine, None
         self.epoch += 1  # events of the lost session are stale from here
         if old is not None:
@@ -459,6 +441,8 @@ class _LiveCall:
                 await self._open_engine(resume_handle=handle)
                 self.reconnects += 1
                 self.reconnecting = False
+                for event in self.renewal.take_backlog():  # the owner's words across the gap, in order
+                    await self._on_hub_event(event)
                 return
             except Exception:
                 log.warning("live call %s reopen attempt %s failed", self.spec.call_id, attempt_no + 1, exc_info=True)
@@ -546,6 +530,7 @@ class _LiveCall:
             cap = self.route.fact.session_cap_minutes if self.route.fact else None
             if cap and not self.response_open and not self.reconnecting and now - self.session_started >= cap * 60 - SESSION_CAP_MARGIN_S:
                 asyncio.create_task(self._reconnect("session_cap", resume=False))
+            self.renewal.tick(now)
             for item_id, spoken in list(self.spoken.items()):
                 if spoken.final_at and now - max(spoken.final_at, spoken.ack_at) >= SPOKEN_ACK_GRACE_S:
                     self._write_spoken_row(item_id)
@@ -575,7 +560,7 @@ class _LiveCall:
     async def _deliver_forever(self) -> None:
         while True:
             item = await self._outbox.get()
-            if isinstance(item, _Acks):
+            if isinstance(item, Acks):
                 # Content is acknowledged only once a live session holds it and the checkpoint
                 # is written; otherwise its acknowledgements wait for a later boundary (and
                 # unacknowledged entries are redelivered).
@@ -606,6 +591,8 @@ class _LiveCall:
                     self._note_meeting_audio(self.input_ms, self.input_ms + duration)
                 self.input_ms += duration
                 await self._send(AudioIn(pcm=event.pcm, rate=rate))
+            elif self.reconnecting and not self.closing and event.peer_id not in self.muted_peers:
+                self.renewal.hold(event, len(event.pcm) * 500 / self.input_rate)
         elif isinstance(event, PeerControl):
             kind = str(event.message.get("type") or "")
             if kind == "played":
@@ -653,12 +640,14 @@ class _LiveCall:
                     # before its first frame, so played acknowledgements bind to it.
                     self.hub.send_caption(SPEAKER_OUROBOROS, "", False, event.item_id)
                 self.speaking_item = event.item_id
-                spoken = self.spoken.setdefault(event.item_id, _Spoken())
+                spoken = self.spoken.setdefault(event.item_id, Spoken())
                 spoken.started_at = spoken.started_at or time.monotonic()
                 spoken.audio_ms += len(event.pcm) * 500 / event.rate
                 self.hub.play(event.pcm, event.item_id)
         elif isinstance(event, Caption):
             self.hub.send_caption(event.speaker, event.text, event.final, event.item_id)
+            if event.speaker == SPEAKER_OWNER:
+                self.renewal.owner_caption(event.text, event.final)
             if event.final:
                 self._on_final_caption(event)
         elif isinstance(event, SpeechStarted):
@@ -674,6 +663,7 @@ class _LiveCall:
             self._attempt_for(event.response_id or event.item_id)
         elif isinstance(event, ResponseDone):
             self.response_open, self.current_response = False, ""
+            self.renewal.observe(event.usage)
             self._settle(event)
             await self._drain()
             if self.fanout.pending:
@@ -681,7 +671,7 @@ class _LiveCall:
         elif isinstance(event, ResumeCheckpoint):
             self.resume_handle = event.handle if event.resumable else ""
         elif isinstance(event, GoAway):
-            asyncio.create_task(self._reconnect("go_away", resume=True))
+            self.renewal.go_away(event.time_left_s)  # renewed at the next completed turn, or resumed by its deadline
         elif isinstance(event, EngineError):
             if event.retryable:
                 asyncio.create_task(self._reconnect(f"engine_error:{event.kind}", resume=True))
@@ -746,8 +736,8 @@ class _LiveCall:
             self.fanout.note(SPEAKER_OWNER, text)
         elif event.speaker == SPEAKER_OUROBOROS:
             self.counts["ouroboros"] += 1
-            self.messages.append({"role": "assistant", "content": text, "_call_row": True})
-            spoken = self.spoken.setdefault(event.item_id, _Spoken())
+            self.messages.append({"role": "assistant", "content": text, "_call_row": True, "_item_id": event.item_id})
+            spoken = self.spoken.setdefault(event.item_id, Spoken())
             spoken.text, spoken.final_at = text, time.monotonic()
             spoken.played_ms = max(spoken.played_ms, self.played_ms.get(event.item_id, 0))
             if spoken.interrupted or (spoken.played and spoken.played_ms >= spoken.audio_ms):
@@ -840,9 +830,10 @@ class _LiveCall:
         if spoken is None or not spoken.text:
             return
         status = "interrupted" if spoken.interrupted else ("played" if spoken.played else "generated")
+        mark_spoken(self.messages, item_id, status)  # a later replay says what was heard
         if self.spec.presence_binding_id:
             self._record_presence_utterance("out", spoken.text)
-        meta = _narration_meta(self.emit_progress)
+        meta = narration_meta(self.emit_progress)
         meta["spoken"] = {"call_id": self.spec.call_id, "item_id": item_id, "status": status, "played_ms": spoken.played_ms}
         try:
             self.emit_progress(spoken.text, narration=True, _progress_meta_override=meta)
@@ -953,7 +944,7 @@ class _LiveCall:
         pending = list(getattr(self.ctx, "_pending_content_acks", None) or [])
         if (scratch or controls or pending) and self.engine is not None and not self.closing:
             self.ctx._pending_content_acks = []
-            self._post(_Acks(tuple(pending)))
+            self._post(Acks(tuple(pending)))
 
     def _checkpoint(self) -> bool:
         """The call's durable state on its task row; content ACKs wait for this write."""

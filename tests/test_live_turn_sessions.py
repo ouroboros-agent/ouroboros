@@ -377,7 +377,7 @@ def test_a_repeated_request_for_a_running_call_joins_it_and_runs_the_effect_once
     first = h.start()
     first.push(ToolCall("one-physical-effect", "web_search", "{}"))
     assert entered.wait(3)
-    first.push(GoAway(time_left_s=30))
+    first.end_stream()  # the connection drops while the tool runs
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.engine().config is not None)
     second = h.engine()
     second.push(ToolCall("one-physical-effect", "web_search", "{}"))  # the new session asks again

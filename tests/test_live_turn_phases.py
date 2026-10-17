@@ -134,7 +134,7 @@ def test_the_routes_density_scales_the_replay_and_the_kept_view():
 def test_a_replayed_row_weighs_its_tool_call_arguments_too():
     from types import SimpleNamespace
 
-    from ouroboros.live_session_view import history_view
+    from ouroboros.live_session_view import SHORT_ROW_CHARS, history_view
 
     fact = SimpleNamespace(window_tokens=8_192 + 4_000, reply_allowance_tokens=8_192)
     call = {"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": "x" * 40_000}}
@@ -143,11 +143,14 @@ def test_a_replayed_row_weighs_its_tool_call_arguments_too():
                 {"role": "assistant", "content": "", "tool_calls": [call]},  # empty words, 10k tokens of arguments
                 {"role": "tool", "tool_call_id": "c1", "content": "written"}]
     view = history_view(fact, messages, [])
-    assert not any(item.get("tool_calls") for item in view)  # the arguments do not ride in for free
-    assert view[0]["content"].startswith("[Earlier in this call:") and view[-1]["content"] == "written"
+    # The arguments do not ride in for free: they are cut to a line, so every row still replays.
+    replayed = [item for item in view if item.get("tool_calls")]
+    assert len(view) == 3 and replayed and view[-1]["content"] == "written"
+    assert len(replayed[0]["tool_calls"][0]["function"]["arguments"]) < SHORT_ROW_CHARS + 200
     small = dict(call, function={"name": "write_file", "arguments": "{}"})
     messages[2] = {"role": "assistant", "content": "", "tool_calls": [small]}
-    assert any(item.get("tool_calls") for item in history_view(fact, messages, []))  # a small call still replays
+    whole = [item for item in history_view(fact, messages, []) if item.get("tool_calls")]
+    assert whole[0]["tool_calls"][0]["function"]["arguments"] == "{}"  # a small call replays as it was
 
 
 def _replayed_text(view):

@@ -749,17 +749,34 @@ def test_a_lost_session_reopens_with_history_and_never_re_executes_a_tool(harnes
     assert usage["live_call"]["reconnects"] == 1 and h.task_row()["live_call"]["reconnects"] == 1
 
 
-def test_go_away_resumes_with_the_providers_handle(harness, monkeypatch, tmp_path):
+def test_go_away_at_a_completed_turn_renews_the_session_with_the_call_as_text(harness, monkeypatch, tmp_path):
     monkeypatch.delenv("OUROBOROS_CALL_NATIVE_SEARCH", raising=False)
     h = harness(spec=_spec(engine=ENGINE_GOOGLE, model="gemini-3.8-live", voice="Kore"))
     first = h.start()
     assert first.config.native_search is True
+    first.push(Caption(speaker=SPEAKER_OWNER, text="Remember the number 73", final=True, item_id="u1"))
     first.push(ResumeCheckpoint(handle="resume-7", resumable=True))
     first.push(GoAway(time_left_s=5))
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
     second = h.engine()
+    # Nothing was open: the goodbye renews the session fresh, the owner's words return as text,
+    # and the owner's surface is not told the call is reconnecting.
+    assert second.config.resume_handle == "" and any("73" in str(row["content"]) for row in second.config.history)
+    assert first.closed == ["go_away"] and (STATE_RECONNECTING, "go_away") not in h.hub.states
+    h.stop()
+    h.finish()
+
+
+def test_go_away_mid_answer_resumes_with_the_providers_handle_by_its_deadline(harness):
+    h = harness()
+    first = h.start()
+    first.push(ResumeCheckpoint(handle="resume-7", resumable=True))
+    first.push(ResponseStarted(item_id="a1", response_id="r1"))  # Ouroboros is answering: no completed turn
+    first.push(GoAway(time_left_s=0.5))
+    assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
+    second = h.engine()
     assert second.config.resume_handle == "resume-7" and second.config.history == ()
-    assert first.closed == ["go_away"]
+    assert (STATE_RECONNECTING, "go_away") in h.hub.states
     h.stop()
     h.finish()
 

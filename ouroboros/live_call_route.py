@@ -59,6 +59,11 @@ REALTIME_EVIDENCE_KIND = "realtime_windows"   # capability_evidence.json namespa
 # A speech-sized reply: about five minutes of spoken answer, the physical allowance a call's
 # fit leaves for one response. A provider's output maximum is documentation, not this budget.
 CALL_REPLY_ALLOWANCE_TOKENS = 8_192
+# The newest stretch of a call one session holds as audio before it is renewed with that stretch
+# as text (``live_call_state``): a price and window bound in the route's tokens, since every answer
+# re-bills what the session holds and audio counts several times its own words as text. About ten
+# minutes of speech at the design's rate; the real rate is in each response's AUDIO count.
+CALL_AUDIO_SPAN_TOKENS = 12_000
 
 
 @dataclass(frozen=True)

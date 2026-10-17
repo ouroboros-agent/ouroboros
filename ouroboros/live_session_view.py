@@ -4,18 +4,26 @@ Pure functions over the call's route fact, its fitted messages and tool schemas,
 driver (``live_turn``) stays the lifecycle and these physical numbers are testable alone.
 The numbers are window physics, never judgment: the route's input limit less one spoken
 reply is the room a session has; the call view takes its share and the conversation the rest.
+A fresh session leaves its own speech one audio span (``CALL_AUDIO_SPAN_TOKENS``, at most half
+of the room) and replays the call so far as text in the rest: every row whole while it fits,
+then the oldest tool results, tool arguments and images shortened to a line, and only then the
+oldest rows named by count (``live_call_state`` renews the session before its audio outgrows it).
 """
 
 from __future__ import annotations
 
 import json
 import math
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ouroboros.context_fit import estimate_context_prompt_tokens
-from ouroboros.live_call_route import CALL_REPLY_ALLOWANCE_TOKENS
+from ouroboros.live_call_route import CALL_AUDIO_SPAN_TOKENS, CALL_REPLY_ALLOWANCE_TOKENS
 from ouroboros.live_tool_batch import images_of, text_of
 from ouroboros.utils import estimate_tokens
+
+
+# What a shortened row keeps of a tool result or tool arguments: a line, not the body.
+SHORT_ROW_CHARS = 400
 
 
 def _room(fact: Any) -> int:
@@ -44,14 +52,40 @@ def compression_watermarks(fact: Any, instructions: str, tool_schemas: Sequence[
     return start, view + (start - view) // 2
 
 
+def audio_reserve(fact: Any, instructions: str, tool_schemas: Sequence[Mapping], ratio: float = 1.0) -> int:
+    """What a fresh session leaves for its own speech: the call's audio span, at most half of the room."""
+    if fact is None:
+        return 0
+    return min(CALL_AUDIO_SPAN_TOKENS, max(0, _room(fact) - _view_tokens(instructions, tool_schemas, ratio)) // 2)
+
+
+def renewal_bounds(fact: Any, instructions: str, tool_schemas: Sequence[Mapping],
+                   ratio: float = 1.0) -> Tuple[int, int]:
+    """A session's ``(room, audio span)`` for its renewal (``live_call_state``); ``(0, 0)`` = unbounded."""
+    if fact is None:
+        return 0, 0
+    return _room(fact), audio_reserve(fact, instructions, tool_schemas, ratio)
+
+
+def mark_spoken(messages: Sequence[Mapping], item_id: str, status: str) -> None:
+    """How Ouroboros's spoken row ended (played, interrupted, generated), for a later replay."""
+    for msg in reversed(messages):
+        if item_id and msg.get("_item_id") == item_id:
+            msg["_spoken"] = status  # type: ignore[index]
+            return
+
+
 def history_rows(messages: Sequence[Mapping]) -> List[Dict[str, Any]]:
-    """The call's dialogue after the system message as history items (text, a user row's images)."""
+    """The call's dialogue after the system message as history items (text, a user row's images);
+    a spoken row the owner cut off says so, since only its start was heard."""
     rows: List[Dict[str, Any]] = []
     for msg in messages[1:] if messages and messages[0].get("role") == "system" else messages:
         role = str(msg.get("role") or "")
         if role not in ("user", "assistant", "tool"):
             continue
         content, text = msg.get("content"), text_of(msg.get("content"))
+        if role == "assistant" and msg.get("_spoken") == "interrupted" and text:
+            content = text = f"[The owner interrupted this; only its start was heard] {text}"
         images = images_of(content)
         if images and role == "user":
             parts = [part for part in content if isinstance(part, dict) and part.get("type") in ("text", "image_url")]
@@ -73,6 +107,29 @@ def _replayed_tokens(item: Mapping) -> int:
     return int(estimate_context_prompt_tokens([dict(item)]))
 
 
+def _shortened(item: Mapping) -> Optional[Dict[str, Any]]:
+    """The row with its tool body, tool arguments or images cut to a line; ``None`` if nothing is heavy."""
+    note = " … [shortened in this session; the whole row is in this room's transcript]"
+    short, changed = dict(item), False
+    content = item.get("content")
+    if isinstance(content, list):  # a row's images: their words stay, the pixels are named
+        images = len([part for part in content if isinstance(part, dict) and part.get("type") == "image_url"])
+        short["content"] = f"{text_of(content)} [{images} image(s) shown here earlier in this call]".strip()
+        changed = True
+    elif item.get("role") == "tool" and isinstance(content, str) and len(content) > SHORT_ROW_CHARS:
+        short["content"], changed = content[:SHORT_ROW_CHARS] + note, True
+    calls = []
+    for call in item.get("tool_calls") or ():
+        function = dict((call or {}).get("function") or {})
+        arguments = str(function.get("arguments") or "")
+        if len(arguments) > SHORT_ROW_CHARS:
+            function["arguments"], changed = arguments[:SHORT_ROW_CHARS] + note, True
+        calls.append({**call, "function": function})
+    if calls:
+        short["tool_calls"] = calls
+    return short if changed else None
+
+
 def _omission_notice(count: int) -> Dict[str, Any]:
     return {"role": "user", "content": (
         f"[Earlier in this call: {count} rows (speech, typed words, tool results) are not "
@@ -81,19 +138,29 @@ def _omission_notice(count: int) -> Dict[str, Any]:
 
 def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[Mapping],
                  ratio: float = 1.0) -> Tuple[Dict[str, Any], ...]:
-    """The newest rows a fresh session can replay within half the room beside the call view.
+    """The call so far that a fresh session replays beside the call view and its audio span.
 
-    A long call's own words would otherwise fill a reopened window before anyone speaks;
-    the rows left out are named by count, since they stay in the room's transcript.
-    Without a route fact nothing bounds the replay. ``ratio`` is the route's density, as
-    for the watermarks: the room is the provider's count, the estimates are chars/4.
+    Every row while they fit; then the oldest heavy rows shortened to a line (tool results,
+    tool arguments, images), so dialogue outlasts tool weight; only then the newest rows
+    that fit, the rest named by count, since they stay in the room's transcript. A long
+    call's own words would otherwise fill a reopened window before anyone speaks. Without
+    a route fact nothing bounds the replay. ``ratio`` is the route's density, as for the
+    watermarks: the room is the provider's count, the estimates are chars/4.
     """
     rows = history_rows(messages)
     if fact is None:
         return tuple(rows)
     system = messages[0] if messages and messages[0].get("role") == "system" else {}
-    budget = max(0, (_room(fact) - _view_tokens(text_of(system.get("content")), tool_schemas, ratio)) // 2)
+    instructions = text_of(system.get("content"))
+    room = max(0, _room(fact) - _view_tokens(instructions, tool_schemas, ratio))
+    budget = room - audio_reserve(fact, instructions, tool_schemas, ratio)
     costs = [math.ceil(_replayed_tokens(item) * ratio) for item in rows]
+    for index, item in enumerate(rows):  # the oldest tool weight goes first
+        if sum(costs) <= budget:
+            break
+        short = _shortened(item)
+        if short is not None:
+            rows[index], costs[index] = short, math.ceil(_replayed_tokens(short) * ratio)
     if sum(costs) > budget:  # rows stay out, so the notice naming them is replayed too and weighs its share
         budget -= math.ceil(_replayed_tokens(_omission_notice(len(rows))) * ratio)
     kept: List[Dict[str, Any]] = []
