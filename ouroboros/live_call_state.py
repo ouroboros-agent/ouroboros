@@ -32,6 +32,9 @@ log = logging.getLogger(__name__)
 # turn, and how much of the owner's audio one renewal's gap carries to the next session.
 GO_AWAY_MARGIN_S = 2.0
 GAP_AUDIO_MS = 30_000.0
+# A shared screen or camera sends an unchanged view again this often (call_video.js KEEPALIVE_MS), so a
+# frame this fresh is still on show: a session that opens after it is shown it at once.
+FRAME_KEEPALIVE_S = 15.0
 # The usage keys that count what a session holds as input (``realtime_engine.USAGE_KEYS``).
 HELD_INPUT_KEYS = ("text_input_tokens", "audio_input_tokens", "image_input_tokens", "video_input_tokens")
 
@@ -71,6 +74,7 @@ class SessionRenewal:
         self.call = call
         self.backlog: Deque[Tuple[Any, float]] = deque()
         self.backlog_ms = 0.0
+        self.frame: Optional[Tuple[float, Any]] = None  # (when, the newest frame a peer showed)
         self.held_at_drop = 0  # the least audio a session of this call held before the provider dropped turns
         self.drops = 0         # how often the provider dropped a session's turns in this call
         self.reset((0, 0))
@@ -97,9 +101,10 @@ class SessionRenewal:
             self.span = min(self.span, self.held_at_drop) if self.span else self.held_at_drop
             log.info("live call %s: the provider dropped earlier turns after holding %s audio tokens",
                      getattr(getattr(self.call, "spec", None), "call_id", ""), self.held_audio)
-        elif self.held_prompt:
-            self.growth = max(self.growth, prompt - self.held_prompt)
-            self.audio_growth = max(self.audio_growth, audio - self.held_audio)
+        else:
+            self.audio_growth = max(self.audio_growth, audio - self.held_audio)  # a session opens holding no audio
+            if self.held_prompt:
+                self.growth = max(self.growth, prompt - self.held_prompt)
         self.held_prompt, self.held_audio = prompt, audio
 
     def owner_caption(self, text: str, final: bool) -> None:
@@ -138,6 +143,13 @@ class SessionRenewal:
                                                 resume=False, announce=False))
         elif reason == "go_away" and now >= self.go_away_by:
             asyncio.create_task(call._reconnect("go_away", resume=True))
+
+    def saw(self, frame: Any) -> None:
+        self.frame = (time.monotonic(), frame)
+
+    def on_show(self, now: float) -> Any:
+        """The newest frame while its view is still shared, for a session that opened after it."""
+        return self.frame[1] if self.frame and now - self.frame[0] <= FRAME_KEEPALIVE_S else None
 
     def hold(self, event: Any, duration_ms: float) -> None:
         """The owner's audio while a session renews; past the gap's bound later audio is dropped."""

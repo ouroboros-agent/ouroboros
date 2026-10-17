@@ -41,8 +41,9 @@ def test_peer_video_reaches_engine_only_during_live_state():
     async def send(command):
         sent.append(command)
 
+    seen = []
     call = SimpleNamespace(state=STATE_CONNECTING, engine=object(), closing=False,
-                           reconnecting=False, _send=send)
+                           reconnecting=False, _send=send, renewal=SimpleNamespace(saw=seen.append))
     frame = PeerVideo("owner-1", "owner", "image/jpeg", b"\xff\xd8\xff")
     asyncio.run(live_turn._LiveCall._on_hub_event(call, frame))
     assert sent == []
@@ -52,6 +53,7 @@ def test_peer_video_reaches_engine_only_during_live_state():
     call.reconnecting = True
     asyncio.run(live_turn._LiveCall._on_hub_event(call, frame))
     assert len(sent) == 1
+    assert seen == [frame] * 3  # every frame is kept as the newest, sent or not
 
 
 def _wait_for(predicate, timeout=10.0):
@@ -777,7 +779,8 @@ def test_go_away_mid_answer_resumes_with_the_providers_handle_by_its_deadline(ha
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
     second = h.engine()
     assert second.config.resume_handle == "resume-7" and second.config.history == ()
-    assert "## This call so far" not in second.config.instructions  # a resumed session already holds its call
+    # A resumed session keeps its own turns and is sent the instruction it was opened with again.
+    assert second.config.instructions == first.config.instructions and "## This call so far" in first.config.instructions
     assert (STATE_RECONNECTING, "go_away") in h.hub.states
     h.stop()
     h.finish()

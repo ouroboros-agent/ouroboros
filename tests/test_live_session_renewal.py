@@ -12,14 +12,15 @@ import time
 from types import SimpleNamespace
 
 from ouroboros import live_call_state
-from ouroboros.call_protocol import STATE_RECONNECTING, PeerAudio
+from ouroboros.call_protocol import STATE_LIVE, STATE_RECONNECTING, PeerAudio, PeerVideo
 from ouroboros.gateways.realtime_engine import (
     SPEAKER_OUROBOROS, SPEAKER_OWNER, AudioIn, AudioOut, Caption, ResponseDone, ResponseStarted, ResumeCheckpoint,
+    VideoIn,
 )
 from ouroboros.live_call_route import CALL_AUDIO_SPAN_TOKENS
 from ouroboros.live_session_view import (
-    CALL_SO_FAR_HEADING, SHORT_ROW_CHARS, _view_tokens, audio_reserve, history_rows, history_view, mark_spoken,
-    with_call_so_far,
+    CALL_SO_FAR_HEADING, IMAGE_REPLAY_LABEL, SHORT_ROW_CHARS, _view_tokens, audio_reserve, history_rows, history_view,
+    mark_spoken, with_call_so_far,
 )
 from tests import test_live_turn as base
 from tests.test_live_turn import _wait_for
@@ -71,7 +72,10 @@ def test_the_call_so_far_rides_in_the_instruction_and_only_pixels_are_replayed_a
         "[Live call] A live voice call is open in this room.", "Owner: Remember 4721", "Ouroboros: Noted.",
         'Ouroboros called web_search {"q": "x"}', "Tool result (web_search): found x",
         "[peer:owner:screen] slide 3 is on screen", "Owner: this slide [image shown here; replayed after this instruction]"]
-    assert turns == (rows[-1],) and turns[0]["content"][1]["type"] == "image_url"  # the pixels still reach the session
+    # The pixels still reach the session, under a label; their row's words are not sent twice.
+    assert len(turns) == 1 and turns[0]["content"][0] == {"type": "text", "text": IMAGE_REPLAY_LABEL}
+    assert turns[0]["content"][1:] == [part for part in rows[-1]["content"] if part["type"] == "image_url"]
+    assert "this slide" not in str(turns)
     assert with_call_so_far("You are Ouroboros.", ()) == ("You are Ouroboros.", ())  # nothing yet: the view alone
 
 
@@ -150,10 +154,23 @@ def test_the_audio_span_renews_a_turn_before_the_next_one_would_cross_it():
     call, renewal = _renewal()
     call.messages.append({"role": "user", "content": "hello"})
     renewal.observe({"text_input_tokens": 30_000, "audio_input_tokens": 4_000})
-    renewal.observe({"text_input_tokens": 30_100, "audio_input_tokens": 7_000})  # 3k of audio in one turn
-    assert renewal.due() == ""  # 7k + 3k stays under the 12k span
+    renewal.observe({"text_input_tokens": 30_100, "audio_input_tokens": 7_000})  # the largest turn so far: the first 4k
+    assert renewal.due() == ""  # 7k + 4k stays under the 12k span
     renewal.observe({"text_input_tokens": 30_200, "audio_input_tokens": 9_500})
-    assert renewal.due() == "audio_span"  # 9.5k + 3k would cross it: renew now, at this completed turn
+    assert renewal.due() == "audio_span"  # 9.5k + 4k would cross it: renew now, at this completed turn
+
+
+def test_a_sessions_first_answer_already_forecasts_the_next_turns_audio():
+    call, renewal = _renewal()
+    renewal.reset((50_000, 2_500))
+    call.messages.append({"role": "user", "content": "hello"})
+    renewal.observe({"text_input_tokens": 30_000, "audio_input_tokens": 1_500})  # a fresh session opened with none
+    assert renewal.due() == "audio_span"  # another turn like it would cross the 2.5k the route holds
+    renewal.reset((50_000, 2_500))
+    call.messages.append({"role": "user", "content": "and"})
+    renewal.observe({"text_input_tokens": 30_000, "audio_input_tokens": 500})
+    assert renewal.due() == ""  # a short first turn leaves the room for another
+    assert renewal.growth == 0  # the instruction it was opened with is no turn's growth
 
 
 def test_a_provider_that_drops_turns_renews_the_session_and_lowers_the_calls_span():
@@ -195,6 +212,21 @@ def test_a_renewal_waits_for_a_completed_turn():
     assert renewal.at_turn_boundary()
     call.tools_lane.claimed = {"c1": 1}
     assert not renewal.at_turn_boundary()  # a tool call is still unanswered
+
+
+def test_the_newest_frame_is_on_show_for_the_clients_keep_alive_and_then_not():
+    import pathlib
+    import re
+
+    call, renewal = _renewal()
+    assert renewal.on_show(time.monotonic()) is None  # nothing shown yet
+    renewal.saw("frame-1")
+    renewal.saw("frame-2")
+    now = time.monotonic()
+    assert renewal.on_show(now) == "frame-2"
+    assert renewal.on_show(now + live_call_state.FRAME_KEEPALIVE_S + 1) is None  # sharing stopped: no stale view
+    source = (pathlib.Path(__file__).resolve().parents[1] / "web/modules/call_video.js").read_text(encoding="utf-8")
+    assert int(re.search(r"KEEPALIVE_MS = (\d+)", source).group(1)) == live_call_state.FRAME_KEEPALIVE_S * 1000
 
 
 def test_the_gap_backlog_keeps_the_first_words_within_its_bound():
@@ -241,6 +273,38 @@ def test_a_drop_in_the_providers_counts_renews_the_session_with_the_call_in_its_
     h.stop()
     _text, usage, _trace = h.finish()
     assert usage["live_call"]["provider_drops"] == 1 and usage["live_call"]["reconnects"] == 1
+
+
+def _renewed_with_a_frame(h):
+    first = h.start()
+    assert _wait_for(lambda: (STATE_LIVE, "") in h.hub.states)
+    frame = PeerVideo("owner-1", "owner", "image/jpeg", b"\xff\xd8\xff-the-screen")
+    h.hub.feed(frame)
+    assert _wait_for(lambda: first.sent_of(VideoIn))
+    first.push(Caption(speaker=SPEAKER_OWNER, text="What is on my screen?", final=True, item_id="u1"))
+    _answer(first, "a1")
+    assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
+    assert _wait_for(lambda: [state for state, _ in h.hub.states].count(STATE_LIVE) >= 2)
+    return frame, h.llm.engines[1]
+
+
+def test_a_renewed_session_is_shown_the_view_still_shared(harness):
+    h = harness()
+    frame, second = _renewed_with_a_frame(h)
+    assert _wait_for(lambda: second.sent_of(VideoIn))
+    assert second.sent_of(VideoIn)[0] == VideoIn("image/jpeg", frame.data)
+    h.stop()
+    h.finish()
+
+
+def test_a_view_no_longer_shared_is_not_shown_to_a_renewed_session(harness, monkeypatch):
+    monkeypatch.setattr(live_call_state, "FRAME_KEEPALIVE_S", -1.0)  # every frame is older than the keep-alive
+    h = harness()
+    _frame, second = _renewed_with_a_frame(h)
+    time.sleep(0.3)
+    assert second.sent_of(VideoIn) == []
+    h.stop()
+    h.finish()
 
 
 def test_no_renewal_while_ouroboros_is_still_heard_and_one_once_it_was(harness):

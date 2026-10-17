@@ -181,8 +181,9 @@ def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[
     return tuple(kept)
 
 
-# The heading of the call so far in a session's system instruction.
+# The heading of the call so far in a session's system instruction, and the label its replayed pixels carry.
 CALL_SO_FAR_HEADING = "## This call so far"
+IMAGE_REPLAY_LABEL = "[An image shown earlier in this call; its words are in the call so far]"
 
 
 def _transcript_line(row: Mapping) -> str:
@@ -213,7 +214,10 @@ def with_call_so_far(instructions: str, history: Sequence[Mapping]) -> Tuple[str
         return instructions, ()
     block = (f"{CALL_SO_FAR_HEADING}\n\nWhat was said and done in this call before this session, oldest first; "
              "this session's own turns continue it.\n\n" + "\n".join(lines))
-    images = tuple(row for row in history if row.get("role") == "user" and images_of(row.get("content")))
+    # The pixels alone, under a short label: their row's words are already in the instruction.
+    images = tuple({"role": "user", "content": [{"type": "text", "text": IMAGE_REPLAY_LABEL}, *(
+        part for part in row["content"] if isinstance(part, dict) and part.get("type") == "image_url")]}
+        for row in history if row.get("role") == "user" and images_of(row.get("content")))
     return (f"{instructions}\n\n{block}" if instructions else block), images
 
 

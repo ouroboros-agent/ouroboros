@@ -132,6 +132,7 @@ class _LiveCall:
         self.session_proven = False  # this session heard or said something
         self.ready_at: Optional[float] = None  # when this session's setup was answered
         self.resume_handle = ""
+        self.opened_rows: Tuple[Dict[str, Any], ...] = ()  # the call so far the open session was given
         # (session epoch, its opening config): the first response's text count becomes the route's
         # density witness unless other text reached the session before it.
         self.witness: Optional[Tuple[int, SessionConfig]] = None
@@ -356,7 +357,10 @@ class _LiveCall:
 
     def _session_config(self, *, history: Tuple[Dict[str, Any], ...] = (), resume_handle: str = "") -> SessionConfig:
         instructions = text_of(self.messages[0].get("content")) if self.messages and self.messages[0].get("role") == "system" else ""
-        instructions, history = with_call_so_far(instructions, history)  # kept where the provider drops no turns
+        # The call so far rides in the instruction, where the provider drops no turns; a resumed session
+        # is sent the instruction it was opened with again and keeps its own turns.
+        instructions, history = with_call_so_far(instructions, history)
+        history = () if resume_handle else history
         compress_at, compress_to = compression_watermarks(self.route.fact, instructions, self.tool_schemas,
                                                           calibration_ratio(self.ctx))
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=(*self.tool_schemas, *call_local_schemas(self.spec)),
@@ -373,7 +377,7 @@ class _LiveCall:
             self.resume_handle = ""  # a fresh session's predecessor can no longer be resumed into
         # The history view holds every transcript row up to this count; context recorded
         # after it, while the connection was pending, is delivered once the session is live.
-        history, cut = ((), -1) if resume_handle else (self._history_view(), len(self.messages))
+        history, cut = (self.opened_rows, -1) if resume_handle else (self._history_view(), len(self.messages))
         config = self._session_config(history=history, resume_handle=resume_handle)
         try:
             await engine.open(config)
@@ -388,6 +392,7 @@ class _LiveCall:
         self.renewal.reset(renewal_bounds(self.route.fact, config.instructions, self.tool_schemas,
                                           calibration_ratio(self.ctx)))
         self.witness = None if resume_handle else (self.epoch, config)
+        self.opened_rows = self.opened_rows if resume_handle else history
         self.input_ms = 0.0  # a new session counts its input audio from zero
         self.hub.set_engine_rates(self.input_rate, self.output_rate)
         if self.empty_since is None and not self.hub.peers():
@@ -581,6 +586,7 @@ class _LiveCall:
 
     async def _on_hub_event(self, event: Any) -> None:
         if isinstance(event, PeerVideo):
+            self.renewal.saw(event)
             if self.state == STATE_LIVE and self.engine is not None and not self.closing and not self.reconnecting:
                 await self._send(VideoIn(event.mime, event.data))
         elif isinstance(event, PeerAudio):
@@ -686,6 +692,8 @@ class _LiveCall:
         elif isinstance(event, Ready):
             self.state, self.ready_at = STATE_LIVE, time.monotonic()
             self.hub.send_state(STATE_LIVE)
+            if (frame := self.renewal.on_show(self.ready_at)) is not None:  # a renewed session sees what is shown
+                await self._send(VideoIn(frame.mime, frame.data))
             effective = dict(event.effective or {})
             if effective.get("input_rate") or effective.get("output_rate"):
                 self.input_rate = int(effective.get("input_rate") or self.input_rate)
