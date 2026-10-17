@@ -99,10 +99,11 @@ def _retain(root: pathlib.Path, path: str, text: str) -> None:
         os.unlink(temporary)
 
 
-def relocated_text(section: HostSection, reader: str) -> str:
-    """What a request shows of a relocated section: its operative view and the read of its retained bytes."""
+def relocated_text(section: HostSection, reader: str, *, call: bool = False) -> str:
+    """What a request shows of a relocated section: its operative view, why, and the read of its retained bytes."""
+    cause = "from this call's view" if call else "for the physical window"
     return (section.operative_view + "\n\n"
-            + f"[Host section details omitted for the physical window; retained full text: {reader}.]")
+            + f"[Host section details omitted {cause}; retained full text: {reader}.]")
 
 
 def _tokens(text: str) -> int:
@@ -140,7 +141,7 @@ def fit_host_sections(
             continue
         path = section_address(task_id, section)
         reader = f"read_file(root='runtime_data', path={path!r})"
-        short = relocated_text(section, reader)
+        short = relocated_text(section, reader, call=operative)
         saved = _tokens(section.full_text) - _tokens(short)
         if len(short) >= len(section.full_text) or saved <= 0:
             continue

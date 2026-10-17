@@ -90,6 +90,8 @@ def test_every_operative_section_enters_in_that_form_from_the_first_open(tmp_pat
         row = _addressed(call)[section.section_id]
         assert (tmp_path / row["path"]).read_text(encoding="utf-8") == section.full_text  # the pointer reads back
         assert row["reader"] in text
+    # The marker names the call's view as the cause, never a physical window that did not ask for it.
+    assert "omitted from this call's view" in text and "omitted for the physical window" not in text
     # Tier zero and unviewed parts stay whole; the window alone would not have asked for any of this.
     for whole in ("SYSTEM WHOLE", "BIBLE WHOLE", "WHOLE IDENTITY " * 50, "WHOLE INDEX", "protected dynamic text"):
         assert whole in text
