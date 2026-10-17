@@ -49,7 +49,7 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 | OPENAI_BASE_URL | "" | OpenAI base-URL override; legacy compatible endpoint (only with `OPENAI_API_KEY`) |
 | OPENAI_COMPATIBLE_API_KEY | "" | OpenAI-compatible endpoint credential |
 | OPENAI_COMPATIBLE_BASE_URL | "" | OpenAI-compatible endpoint base URL; only with its own key (blank = no auth) |
-| GOOGLE_API_KEY | "" | Google AI (Gemini API) credential; calls need it |
+| GOOGLE_API_KEY | "" | Google AI (Gemini API) key; calls need it |
 | CLOUDRU_FOUNDATION_MODELS_API_KEY | "" | Cloud.ru credential |
 | CLOUDRU_FOUNDATION_MODELS_BASE_URL | `https://foundation-models.api.cloud.ru/v1` | Cloud.ru base URL |
 | GIGACHAT_CREDENTIALS | "" | GigaChat auth key |
@@ -210,10 +210,10 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 | OUROBOROS_DESKTOP_KEEP_RUNNING | false | Closing the desktop window keeps Ouroboros running (Windows, macOS; `launcher_background.py`); disk-authored consent, absent until the owner chooses |
 | OUROBOROS_PRESENCE_MAX_ACTIVE | 2 | Cross-process Presence turn cap (UI-bounded 1-20) |
 | OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls |
-| OUROBOROS_CALL_VOICE_GOOGLE | "" | Gemini voice for calls (blank = provider default) |
+| OUROBOROS_CALL_VOICE_GOOGLE | "" | Gemini call voice (blank = provider default) |
 | OUROBOROS_CALL_NATIVE_SEARCH | true | Gemini's own Google Search in calls |
-| OUROBOROS_CALL_MAX_MINUTES | "" | Optional duration ceiling for a call (blank = none) |
-| OUROBOROS_PRESENCE_CALL_MAX_MINUTES | "" | Optional duration ceiling for a Presence call, which holds a Presence slot (blank = none) |
+| OUROBOROS_CALL_MAX_MINUTES | "" | Optional call duration ceiling (blank = none) |
+| OUROBOROS_PRESENCE_CALL_MAX_MINUTES | "" | Optional ceiling for a Presence call, which holds a Presence slot (blank = none) |
 | LOCAL_MODEL_CHAT_FORMAT | "" | Local-model chat template override |
 | GITHUB_TOKEN | "" | GitHub token (push/PR/issues) |
 | GITHUB_REPO | "" | Personal `origin` repository |

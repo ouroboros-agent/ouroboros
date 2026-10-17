@@ -850,10 +850,8 @@ class OuroborosAgent:
         from ouroboros.tool_policy import initial_tool_schemas  # the schemas count in the memory view's floor
         from ouroboros.live_call_route import call_context_plan
 
-        # A live call resolves its engine route BEFORE the context is fitted (the realtime window and
-        # initial tool view); its room feed catches up from the instant before the chat is read.
-        live_plan = call_context_plan(task, self.tools, self.env.drive_root)
-        context_captured_at = utc_now_iso()
+        # A live call's route (window, first tool view) precedes the fit; its room feed starts before the read.
+        live_plan, context_captured_at = call_context_plan(task, self.tools, self.env.drive_root), utc_now_iso()
         messages, cap_info = build_llm_messages(
             env=self.env,
             memory=self.memory,

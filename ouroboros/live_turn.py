@@ -1,31 +1,22 @@
 """Live voice-call driver: one realtime engine session is the turn's model round.
 
 A call is an ordinary turn whose model speaks and listens (ARCHITECTURE §6 "Live
-calls"). The agent prepares the same context as for a text turn; this driver opens
-the engine with that fitted system text and the room's Nano tool view
-(``live_call_route``), then pumps until the call ends: peer audio in, engine audio
-out through the hub, captions to the peers and to the chat (owner speech as an
-owner row written WITHOUT opening an owner turn, Ouroboros speech as the turn's
-own narration with its played mark), tool calls on one serialized batch worker
-(``live_tool_batch``), the owner's mailbox (Stop, Hurry, typed words) drained on a
-short tick with deferred acknowledgement, and the room's new rows
-(``live_awareness``, caught up from the instant the agent captured the context)
-fed in as context. Provider session caps and transport losses are reconnects
-with a host-built history view (or the provider's resume handle), never the end
-of the call. Context the call heard (room rows, peer observations, Hurry) is part
-of its transcript, so a reopened session replays it; while no session is live,
-context waits in a queue and no mail is acknowledged. The mailbox, the peers and
-the tool lane run from the first moment, so a Stop during the connection cancels
-the opening and closes whatever the provider opened. A tool result the transport
-refuses becomes a typed failure the model hears. The route's documented limits
-(window, reply allowance) shape the first open and Gemini's compression watermarks;
-a session the provider still refuses ends with the provider's own words. The price
-quote is warmed first on the ledger's thread, so no catalog fetch ever holds the
-open or runs on the call's loop. The phases the owner's surface shows (preparing,
-connecting, live) and every closing reason with its one next step come from here
-and the hub. The driver returns the
-loop's ordinary ``(text, usage, llm_trace)`` triple with a host-authored
-terminal (``terminal_origin=host_notice``) that points at the transcript.
+calls"): the agent prepares the text turn's context, this driver opens the engine
+with that fitted system text and the room's Nano tool view (``live_call_route``)
+and pumps until the call ends: peer audio in, engine audio out through the hub,
+captions to the peers and the chat (owner speech as an owner row WITHOUT an owner
+turn, Ouroboros speech as the turn's narration with its played mark), tools on one
+serialized worker (``live_tool_batch``), the owner's mailbox (Stop, Hurry, typed
+words) on a short tick with deferred acknowledgement, and the room's new rows
+(``live_awareness``, from the instant the context was captured) as context. Session
+caps and transport losses reopen with a history view or the provider's resume
+handle; context the call heard is in its transcript and waits while no session is
+live. A Stop during the connection cancels the opening; a tool result the transport
+refuses is a typed failure the model hears; a session the provider refuses ends
+with its own words. The price quote warms on the ledger's thread, never holding the
+open. The phases (preparing, connecting, live) and each closing reason with its one
+next step come from here and the hub. Returns the loop's ``(text, usage, llm_trace)``
+with a host-notice terminal (``terminal_origin=host_notice``) naming the transcript.
 """
 
 from __future__ import annotations
@@ -63,12 +54,10 @@ log = logging.getLogger(__name__)
 
 SOURCE_CALL = "call"   # the owner-speech row source (live_awareness skips it)
 
-# Physical/transport bounds, not behaviour: the Stop tick, the ack wait before a
-# spoken row is written as generated, the rejoin grace of an empty room, the
-# reopen attempts per loss, the first wait before reopening after a session that
-# proved nothing (doubling each time), how long a session stays up after its setup
-# to count as a working connection, the margin before a provider's session cap and
-# the wait for a running tool batch at close.
+# Physical/transport bounds, not behaviour: the Stop tick, the ack wait before a spoken row is
+# written as generated, the rejoin grace of an empty room, unproven sessions in a row, the first
+# (doubling) wait before reopening after one, how long a session stays up after its setup to count
+# as working, the margin before a provider's session cap and the wait for a tool batch at close.
 MAILBOX_TICK_S = 0.25
 SPOKEN_ACK_GRACE_S = 10.0
 PEER_GRACE_S = 20.0
@@ -446,9 +435,8 @@ class _LiveCall:
         if self.closing or self.reconnecting:
             return
         if reason not in PLANNED_HANDOVERS:  # a planned handover neither proves nor condemns a session
-            # A session that heard or said something, or stayed up a while after its setup, was a
-            # working connection and its loss is resumed. Sessions that keep ending before that are
-            # not a lost connection to resume again: each reopen is paid, so the call ends instead.
+            # A session that heard or said something, or stayed up a while after its setup, was working;
+            # sessions that keep ending before that are not a loss to resume: each reopen is paid.
             lived = self.ready_at is not None and time.monotonic() - self.ready_at >= SESSION_PROVEN_S
             self.unproven_reopens = 0 if self.session_proven or lived else self.unproven_reopens + 1
             if self.unproven_reopens >= RECONNECT_ATTEMPTS:
@@ -468,9 +456,7 @@ class _LiveCall:
         for key in list(self.attempts):
             self._abandon(self.attempts.pop(key), reason)
         self.response_open = False
-        if self.unproven_reopens and reason not in PLANNED_HANDOVERS:
-            # A session that failed at once (a connect refused, a network gone) is retried after a wait,
-            # so a short outage does not use every attempt in the same second.
+        if self.unproven_reopens and reason not in PLANNED_HANDOVERS:  # a brief outage keeps its attempts
             await asyncio.sleep(RECONNECT_BACKOFF_S * 2 ** (self.unproven_reopens - 1))
             if self.closing:
                 self.reconnecting = False

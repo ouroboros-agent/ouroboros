@@ -141,7 +141,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | GET | `/api/logs/{name}` | |
 | POST | `/api/chat/upload` | |
 | DELETE | `/api/chat/upload` | pending uploads only, else 409 |
-| POST | `/api/call/open` | admits a live call in the room (§6), else a typed refusal |
+| POST | `/api/call/open` | admits a room's live call (§6) or refuses, typed |
 | POST | `/api/local-model/start` | |
 | POST | `/api/local-model/stop` | |
 | GET | `/api/local-model/status` | |
@@ -152,7 +152,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/mcp/test` | |
 | POST | `/api/mcp/import/preview` | |
 | WS | `/ws` | |
-| WS | `/ws/call/{call_id}` | the owner surface's call: PCM frames and `call_protocol` control |
+| WS | `/ws/call/{call_id}` | the owner surface's call socket: PCM frames, `call_protocol` control |
 | STATIC | `/static/*` | |
 | STATIC | `/onboarding/static/*` | |
 | STATIC | `/auth/*` | selected public login assets |
@@ -169,7 +169,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | retains transport queue observations |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/ui/ws-message` | |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/call/open` | `call_peer` grant: a companion joins an admitted call, or with `presence` opens a Presence call |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/call/open` | `call_peer` grant: join an admitted call, or with `presence` open a Presence call |
 | WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/call/{call_id}/peer` | that companion's call audio |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/notify` | `notify_owner` grant: one signed `skill_notice` System row, no model turn |
 | WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/events` | |
