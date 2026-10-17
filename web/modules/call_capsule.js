@@ -19,7 +19,7 @@ const TOGGLE = {
 // The field's placeholder while the call's controls share its row: one line at a phone's width, so
 // opening the keyboard view never grows the composer.
 const KEYBOARD_PLACEHOLDER = 'Message…';
-const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone'];
+const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone', 'callSharing'];
 
 // Why a call reconnects, beside "Reconnecting…".
 const RECONNECT_WORDS = {
@@ -173,7 +173,7 @@ export function createTalkFacts() {
 }
 
 export function createCallCapsule({ page, env = globalThis, visual, light, styled = Promise.resolve(), view, talk, mute,
-    end, dismiss, act }) {
+    shareScreen = () => {}, camera = () => {}, vision = {}, end, dismiss, act }) {
     const doc = page.ownerDocument;
     const wrap = page.querySelector('.chat-input-wrap');
     const row = wrap.querySelector('.chat-text-row');
@@ -190,6 +190,10 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             <button type="button" class="call-btn call-action"></button>
             <button type="button" class="call-btn call-action"></button>
             <button type="button" class="call-btn call-mute" aria-pressed="false">Mute</button>
+            <button type="button" class="call-btn call-screen" aria-label="Show screen" title="Show screen" aria-pressed="false">▣</button>
+            <span class="call-vision-help call-screen-help" tabindex="0" role="note" hidden>ⓘ</span>
+            <button type="button" class="call-btn call-camera" aria-label="Camera" title="Camera" aria-pressed="false">◉</button>
+            <span class="call-vision-help call-camera-help" tabindex="0" role="note" hidden>ⓘ</span>
             <button type="button" class="call-btn call-keyboard"></button>
             <button type="button" class="call-btn call-end">End</button>
             <button type="button" class="call-btn call-close">Close</button>
@@ -265,6 +269,8 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     // --- the capsule ------------------------------------------------------------------
     const on = (selector, handler) => $(selector).addEventListener('click', handler);
     on('.call-mute', () => mute());
+    on('.call-screen', () => shareScreen());
+    on('.call-camera', () => camera());
     on('.call-end', () => end());
     on('.call-close', () => { note = null; dismiss(); });
     on('.call-keyboard', () => {
@@ -316,16 +322,30 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         }
         const sheet = presented.mode === 'sheet';
         Object.assign(wrap.dataset, { call: presented.mode, callView: sheet ? 'sheet' : keyboard ? 'keyboard' : 'voice',
-            callLight: presented.light, callVoice: presented.voice || '', callTone: presented.tone || '' });
+            callLight: presented.light, callVoice: presented.voice || '', callTone: presented.tone || '',
+            callSharing: current.sharing || '' });
         light.setMode(presented.light, presented.voice || '');
         setWords(words.state, presented.title, presented.formatted);
         words.state.title = presented.title;
         const followUp = note?.kind === 'copied' ? 'Link copied — paste it into your browser'
             : note?.kind === 'copy_failed' ? fmt('Copy this address into your browser: {url}', { url: note.url }) : '';
-        setWords(words.sub, followUp || presented.sub, followUp ? note?.kind === 'copy_failed' : Boolean(presented.subFormatted));
+        const sharing = current.sharing ? `${current.sharing === 'screen' ? 'Screen' : 'Camera'} on` : '';
+        setWords(words.sub, followUp || current.visionError || (sharing
+            ? `${sharing}${presented.sub ? ` · ${presented.sub}` : ''}` : presented.sub),
+        followUp ? note?.kind === 'copy_failed' : Boolean(presented.subFormatted));
         setWords(words.small, presented.small || '', true);
         $('.call-mute').hidden = sheet;
         $('.call-mute').setAttribute('aria-pressed', String(Boolean(current.muted)));
+        for (const [kind, selector, label] of [['screen', '.call-screen', 'Show screen'], ['camera', '.call-camera', 'Camera']]) {
+            const button = $(selector), help = $(`${selector}-help`);
+            button.hidden = sheet || !vision[kind];
+            button.disabled = current.state !== 'live' && current.sharing !== kind;
+            button.setAttribute('aria-pressed', String(current.sharing === kind));
+            button.title = current.sharing === kind ? `Stop ${kind === 'screen' ? 'screen sharing' : 'camera'}` : label;
+            help.hidden = sheet || Boolean(vision[kind]) || (kind === 'camera' && !vision.screen);
+            help.title = help.getAttribute('aria-label') || vision.reason || `${label} is unavailable here.`;
+            help.setAttribute('aria-label', vision.reason || `${label} is unavailable here.`);
+        }
         typingPlaceholder(keyboard && !sheet);
         const toggle = $('.call-keyboard');
         toggle.hidden = sheet;

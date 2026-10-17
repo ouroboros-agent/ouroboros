@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { apiClient } from '../modules/api_client.js';
 import { SETTINGS_INPUT_FIELDS, SECRET_KEYS, renderSettingsPage } from '../modules/settings_ui.js';
 import { CallSession, callAvailability, mediaFailure, mountRoomCall } from '../modules/call.js';
+import { visionAvailability } from '../modules/call_video.js';
 import { decodeFrame, encodeFrame, encodeVideoFrame, followLevel, levelFromRms, LevelMeter, newerEpoch, pcm16, PlaybackBuffer,
     playedMilliseconds, LEVEL_CEILING_DB, LEVEL_FLOOR_DB, MAX_FRAME_PAYLOAD, MAX_VIDEO_FRAME_PAYLOAD, MAX_BUFFER_SECONDS } from '../modules/call_worklet.js';
 
@@ -81,6 +82,15 @@ test('JPEG video uses its own bounded binary frame and format code', () => {
     const bad = encodeVideoFrame({ mime: 'image/jpeg', data });
     new DataView(bad).setUint32(10, 9, true);
     assert.throws(() => decodeFrame(bad));
+});
+
+test('vision controls expose browser capture and explain unsupported shells', () => {
+    const env = { navigator: { userAgent: 'Mac', mediaDevices: { getUserMedia() {}, getDisplayMedia() {} } } };
+    assert.deepEqual([visionAvailability(env).screen, visionAvailability(env).camera], [true, true]);
+    const linux = { ...env, pywebview: { api: {} }, navigator: { ...env.navigator, userAgent: 'Linux' } };
+    assert.equal(visionAvailability(linux).screen, false);
+    assert.match(visionAvailability(linux).reason, /Linux desktop app/);
+    assert.equal(visionAvailability({ ...env, navigator: { mediaDevices: { getUserMedia() {} } } }).screen, false);
 });
 
 test('float capture saturates correctly and played time never rounds up unheard samples', () => {
@@ -244,7 +254,8 @@ test('a call shows its own phases: permission, admission, then every server phas
         assert.deepEqual(f.views.map(view => view.state), ['permission', 'admission']);
         assert.deepEqual(f.requests, [{ chat_id: 71, client_message_id: 'call-request' }]);  // no per-call fields
         const socket = f.sockets[0]; socket.connect();
-        assert.deepEqual(socket.sent[0], { type: 'hello', protocol: 1, role: 'owner', mic: true, speaker: true, rate: 48000, label: 'Owner' });
+        assert.deepEqual(socket.sent[0], { type: 'hello', protocol: 1, role: 'owner', mic: true, speaker: true,
+            video: true, rate: 48000, label: 'Owner' });
         f.state({ state: 'preparing', reason: '', phase: 'memory', engine: 'google', detail: '', action: '' });
         assert.deepEqual([f.session.state, f.views.at(-1).phase], ['preparing', 'memory']);
         assert.equal(f.tracks[0].enabled, false);  // nothing leaves the microphone before the call is live

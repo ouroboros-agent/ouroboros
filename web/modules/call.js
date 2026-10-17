@@ -8,6 +8,7 @@ import { apiClient } from './api_client.js';
 import { openExternalViaHostBridge, shellBridgeApi } from './ui_helpers.js';
 import { decodeFrame, encodeFrame, levelFromRms, newerEpoch } from './call_worklet.js';
 import { createCallCapsule } from './call_capsule.js';
+import { CallVision, visionAvailability } from './call_video.js';
 import { createCallCards } from './call_card.js';
 import { createCallLight } from './call_light.js';
 import { CALL_VISUAL } from './call_aura.js';
@@ -72,6 +73,7 @@ export class CallSession {
         this.seq = 0;
         this.epoch = 0;
         this.muted = false;
+        this.vision = new CallVision(this, env);
         this.clear();
     }
 
@@ -86,6 +88,7 @@ export class CallSession {
     view() {
         const { state, code, detail, action, words, phase, muted, callId, liveSince } = this;
         return { state, code, detail, action, words, phase, muted, callId, liveSince,
+            sharing: this.vision.kind, visionError: this.vision.error,
             activity: { ...this.activity }, active: this.active };
     }
 
@@ -147,8 +150,9 @@ export class CallSession {
             this.timer = this.env.setTimeout(() => this.fail('socket_silent'), SOCKET_ANSWER_MS);
             socket.onopen = () => {
                 if (!current()) return;
+                const vision = visionAvailability(this.env);
                 this.send({ type: 'hello', protocol: 1, role: 'owner', mic: true, speaker: true,
-                    rate: context.sampleRate, label: 'Owner' });
+                    video: vision.screen || vision.camera, rate: context.sampleRate, label: 'Owner' });
                 this.capture();
             };
             socket.onmessage = ({ data }) => {
@@ -193,6 +197,10 @@ export class CallSession {
         this.capture();
         this.send({ type: 'mute', muted: this.muted });
         this.changed(this.view());
+    }
+
+    toggleVision(kind) {
+        if (this.active && ['screen', 'camera'].includes(kind)) void this.vision.toggle(kind);
     }
 
     onAudio(data) {
@@ -285,6 +293,7 @@ export class CallSession {
 
     stop(state = 'closed', facts = {}) {
         const wasActive = this.active;
+        this.vision.stop(false);
         this.generation++;
         this.env.clearTimeout(this.timer);
         for (const track of this.media?.getTracks() || []) { track.onended = null; track.enabled = false; track.stop(); }
@@ -334,6 +343,8 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, styled, view: () => session.view(),
         talk: () => session.start(),
         mute: () => session.setMuted(!session.muted),
+        shareScreen: () => session.toggleVision('screen'), camera: () => session.toggleVision('camera'),
+        vision: visionAvailability(env),
         end: () => session.end(),
         dismiss: () => session.dismiss(),
         act: action => act(action) });

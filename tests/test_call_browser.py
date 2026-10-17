@@ -20,9 +20,29 @@ FAKE_CALL = r"""(() => {
     const NativeSocket = window.WebSocket;
     // A real microphone is never digitally silent; a quiet one sits below the light's floor (-66 dBFS).
     const QUIET = 0.0005;
-    const probe = window.__callTest = { sockets: [], frames: [], streams: [], micContexts: [], gains: [], micGain: QUIET };
+    const probe = window.__callTest = { sockets: [], frames: [], streams: [], videoStreams: [],
+        micContexts: [], gains: [], micGain: QUIET, displayCalls: 0 };
     probe.speak = (gain) => { probe.micGain = gain || QUIET; for (const node of probe.gains) node.gain.value = probe.micGain; };
-    const mediaDevices = { getUserMedia: async () => {
+    probe.video = (kind) => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 320; canvas.height = 180;
+        const paint = () => {
+            const context = canvas.getContext('2d');
+            context.fillStyle = probe.screenColour || '#2878bd'; context.fillRect(0, 0, 320, 180);
+            context.fillStyle = '#fff'; context.fillRect(20, 20, 120, 40);
+        };
+        paint(); probe.paintScreen = paint;
+        const stream = canvas.captureStream(5);
+        probe.videoStreams.push(stream);
+        if (kind === 'screen') probe.displayStream = stream;
+        return stream;
+    };
+    const mediaDevices = { getDisplayMedia: async () => {
+        probe.displayCalls++;
+        if (probe.denyDisplay) throw new DOMException('Test screen permission denied', 'NotAllowedError');
+        return probe.video('screen');
+    }, getUserMedia: async (options) => {
+        if (options?.video) return probe.video('camera');
         if (probe.deny) throw new DOMException('Test permission denied', 'NotAllowedError');
         if (probe.holdMedia) await new Promise(resolve => { probe.releaseMedia = resolve; });
         const context = new AudioContext();
@@ -54,7 +74,7 @@ FAKE_CALL = r"""(() => {
                 const view = new DataView(data);
                 probe.frames.push({ magic: [view.getUint8(0), view.getUint8(1)], version: view.getUint8(2),
                     kind: view.getUint8(3), epoch: view.getUint16(4, true), seq: view.getUint32(6, true),
-                    rate: view.getUint32(10, true), bytes: data.byteLength - 16 });
+                    rate: view.getUint32(10, true), bytes: data.byteLength - 16, at: Date.now() });
                 return;
             }
             const msg = JSON.parse(data); this.sent.push(msg);
@@ -144,6 +164,7 @@ def _room_row(page, frame: dict) -> None:
 
 def _ended(page):
     page.wait_for_function("__callTest.streams.every(stream => stream.getTracks().every(track => track.readyState === 'ended'))")
+    page.wait_for_function("__callTest.videoStreams.every(stream => stream.getTracks().every(track => track.readyState === 'ended'))")
     page.wait_for_function("__callTest.micContexts.every(context => context.state === 'closed')")
 
 
@@ -231,7 +252,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             assert admissions[-1]["chat_id"] == 1 and admissions[-1]["client_message_id"]
             assert set(admissions[-1]) == {"chat_id", "client_message_id"}
             hello = _socket(page, "return socket.sent[0];")
-            assert hello["protocol"] == 1 and hello["role"] == "owner" and hello["mic"] and hello["speaker"]
+            assert hello["protocol"] == 1 and hello["role"] == "owner" and hello["mic"] and hello["speaker"] and hello["video"]
             _state(page, state="preparing", phase="memory", engine="google")
             expect(state).to_have_text("Preparing memory…")
             expect(room.locator(".call-sub")).to_have_text("Reading this room and my notes")
@@ -242,8 +263,33 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             _state(page, state="live")
             expect(state).to_have_text("Listening")
             expect(room.locator(".call-sub")).to_have_text("Speak whenever you’re ready")
+            # A browser-chosen screen sends a still as video; an unchanged view stays quiet.
+            screen = room.locator('.call-screen')
+            expect(screen).to_be_visible()
+            screen.click()
+            expect(screen).to_have_attribute('aria-pressed', 'true')
+            expect(room.locator('.call-sub')).to_contain_text('Screen on')
+            page.wait_for_function("__callTest.frames.some(frame => frame.kind === 3)")
+            assert page.evaluate("__callTest.displayCalls") == 1
+            first = page.evaluate("__callTest.frames.filter(frame => frame.kind === 3)")
+            assert first[0]['rate'] == 1 and 0 < first[0]['bytes'] <= 512 * 1024
+            page.wait_for_timeout(1200)
+            assert len(page.evaluate("__callTest.frames.filter(frame => frame.kind === 3)")) == len(first)
+            page.evaluate("__callTest.screenColour = '#e03065'; __callTest.paintScreen()")
+            page.wait_for_function("__callTest.frames.filter(frame => frame.kind === 3).length > 1")
+            video = page.evaluate("__callTest.frames.filter(frame => frame.kind === 3)")
+            assert video[1]['at'] - video[0]['at'] >= 1000
+            page.evaluate("__callTest.displayStream.getVideoTracks()[0].onended()")
+            expect(screen).to_have_attribute('aria-pressed', 'false')
+            assert page.evaluate("__callTest.displayStream.getVideoTracks()[0].readyState") == 'ended'
+            camera = room.locator('.call-camera')
+            camera.click()
+            expect(camera).to_have_attribute('aria-pressed', 'true')
+            page.wait_for_function("__callTest.frames.filter(frame => frame.kind === 3).length > 2")
+            camera.click()
+            expect(camera).to_have_attribute('aria-pressed', 'false')
             page.wait_for_function("__callTest.frames.length > 2")
-            frames = page.evaluate("__callTest.frames")
+            frames = page.evaluate("__callTest.frames.filter(frame => frame.kind === 1)")
             assert all(f["magic"] == [79, 67] and f["version"] == 1 and f["kind"] == 1
                        and f["rate"] == hello["rate"] and f["bytes"] > 0 for f in frames)
             for width in WIDTHS:

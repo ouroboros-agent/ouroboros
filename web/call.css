@@ -168,6 +168,11 @@
     background: var(--surface-capsule-hover);
 }
 
+.call-btn:disabled {
+    box-shadow: none;
+    cursor: default;
+}
+
 .call-btn:active,
 .call-mark-end:active {
     filter: var(--press);
@@ -181,12 +186,16 @@
 }
 
 .call-mute[aria-pressed="true"],
+.call-screen[aria-pressed="true"],
+.call-camera[aria-pressed="true"],
 .call-action {
     background: var(--tone-crimson);
     color: var(--tone-crimson-ink);
 }
 
 .call-mute[aria-pressed="true"]:hover,
+.call-screen[aria-pressed="true"]:hover,
+.call-camera[aria-pressed="true"]:hover,
 .call-action:hover {
     background: var(--tone-crimson-hover);
 }
@@ -195,6 +204,37 @@
     width: var(--composer-control-height);
     padding: 0;
     color: var(--text-meta);
+}
+
+.call-screen,
+.call-camera {
+    width: var(--composer-control-height);
+    padding: 0;
+    color: var(--text-secondary);
+}
+
+.call-vision-help {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--composer-control-height);
+    height: var(--composer-control-height);
+    border-radius: var(--pill-radius);
+    background: var(--surface-tray);
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+}
+
+.call-vision-help:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+
+.chat-input-wrap[data-call-sharing="screen"] .call-sub::before,
+.chat-input-wrap[data-call-sharing="camera"] .call-sub::before {
+    content: '●';
+    color: var(--tone-crimson-ink);
+    margin-right: var(--space-1);
 }
 
 .call-end {
@@ -233,11 +273,19 @@
     .chat-input-wrap[data-call-view="keyboard"] .chat-attach-btn {
         display: none;
     }
+
+    .chat-input-wrap[data-call-view="voice"] .call-visual,
+    .chat-input-wrap[data-call-view="voice"] .call-mute {
+        display: none;
+    }
 }
 
 @container call-row (max-width: 520px) {
     .chat-input-wrap[data-call-view="keyboard"] .call-mute,
-    .chat-input-wrap[data-call-view="keyboard"] .call-visual {
+    .chat-input-wrap[data-call-view="keyboard"] .call-visual,
+    .chat-input-wrap[data-call-view="keyboard"] .call-screen,
+    .chat-input-wrap[data-call-view="keyboard"] .call-camera,
+    .chat-input-wrap[data-call-view="keyboard"] .call-vision-help {
         display: none;
     }
 }
