@@ -52,7 +52,7 @@ def seed_skill(root, *, name="meeting", token="skill-token", granted=True, revie
 
 @pytest.fixture
 def hub():
-    spec = cp.CallSpec(uuid.uuid4().hex, 1, "openai", "test-model")
+    spec = cp.CallSpec(uuid.uuid4().hex, 1, "google", "test-model")
     result = open_hub(spec)
     yield result
     close_hub(spec.call_id)
@@ -84,13 +84,13 @@ def door(request, hub, owner, tmp_path):
 
 def hello(ws, role, **extra):
     ws.send_json({"type": "hello", "protocol": 1, "role": role, "mic": True,
-                  "speaker": True, "rate": 24000, "label": "test", **extra})
+                  "speaker": True, "rate": 16000, "label": "test", **extra})  # Gemini's input rate: no resampling
     assert ws.receive_json()["type"] == "state"
     assert ws.receive_json()["type"] == "flush"
 
 
-def audio(epoch=0, seq=0, kind=cp.FRAME_AUDIO_IN, rate=24000):
-    return cp.encode_frame(cp.AudioFrame(kind, epoch, seq, rate, 0, b"\x64\x00" * 480))
+def audio(epoch=0, seq=0, kind=cp.FRAME_AUDIO_IN, rate=16000):
+    return cp.encode_frame(cp.AudioFrame(kind, epoch, seq, rate, 0, b"\x64\x00" * (rate // 50)))  # one 20 ms frame
 
 
 def test_owner_open_captures_settings_and_closes_hub_on_finished(owner, monkeypatch):
@@ -228,7 +228,7 @@ def test_both_doors_audio_controls_output_flush_and_leave(door):
         event = hub.next_event(EVENT_WAIT_S)
         assert isinstance(event, cp.PeerJoined) and event.peer.role == role
         ws.send_bytes(audio())
-        assert hub.next_event(EVENT_WAIT_S) == cp.PeerAudio(event.peer.peer_id, role, b"\x64\x00" * 480)
+        assert hub.next_event(EVENT_WAIT_S) == cp.PeerAudio(event.peer.peer_id, role, b"\x64\x00" * 320)
         for control in [{"type": "played", "item_id": "item", "played_ms": 20},
                         {"type": "mute", "muted": True},
                         {"type": "context", "text": "A slide is visible", "source": "screen"},
@@ -264,7 +264,7 @@ def test_both_doors_reject_invalid_control(door, message):
     assert hub.peers() == ()
 
 
-@pytest.mark.parametrize("frame", [b"bad", audio(kind=cp.FRAME_AUDIO_OUT), audio(rate=16000),
+@pytest.mark.parametrize("frame", [b"bad", audio(kind=cp.FRAME_AUDIO_OUT), audio(rate=24000),  # not the hello's rate
                                     audio()[:cp.HEADER_SIZE] + b"\0" * (cp.MAX_FRAME_PAYLOAD + 2)])
 def test_both_doors_refuse_bad_binary_frames(door, frame):
     client, path, role, hub = door
@@ -325,7 +325,7 @@ def test_host_requires_current_review_token_and_explicit_call_peer_grant(tmp_pat
 
 def test_host_grant_is_bound_to_call_token_and_directions(tmp_path, hub):
     seed_skill(tmp_path)
-    other = open_hub(cp.CallSpec(uuid.uuid4().hex, 1, "openai", "test"))
+    other = open_hub(cp.CallSpec(uuid.uuid4().hex, 1, "google", "test"))
     try:
         with TestClient(create_host_service_app(tmp_path), headers={"x-skill-token": "skill-token"}) as client:
             path = f"/call/{hub.call_id}/peer"
@@ -479,7 +479,7 @@ def test_both_doors_close_after_terminal_state(door):
         hello(ws, role)
         hub.close("finished")
         assert ws.receive_json() == {"type": "flush", "epoch": hub.epoch}
-        assert ws.receive_json() == {"type": "state", "state": "closed", "reason": "finished", "engine": "openai"}
+        assert ws.receive_json() == {"type": "state", "state": "closed", "reason": "finished", "engine": "google"}
         with pytest.raises(WebSocketDisconnect):
             ws.receive_text()
     assert not hub.peers()

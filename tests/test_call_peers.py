@@ -22,7 +22,12 @@ def samples(data):
 
 
 def spec(call_id="test-call"):
-    return cp.CallSpec(call_id, 1, "openai", "test-model")
+    return cp.CallSpec(call_id, 1, "google", "test-model")
+
+
+def hub_at_24k(value=None, **kwargs):
+    """A hub whose engine runs at 24 kHz both ways, so the 24 kHz peers below mix and play without resampling."""
+    return LiveCallHub(value or spec(), rates=(24000, 24000), **kwargs)
 
 
 def join(hub, peer_id="owner", *, role="owner", mic=True, speaker=True, rate=24000):
@@ -53,7 +58,7 @@ def test_stateful_resampling_chunk_identity_and_round_trip_error(rates):
 
 
 def test_mixing_clips_once_and_keeps_conservative_provenance():
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     join(hub)
     join(hub, "meeting", role="meeting")
     send(hub, [30000, -30000, 100], "owner")
@@ -67,7 +72,7 @@ def test_mixing_clips_once_and_keeps_conservative_provenance():
 
 
 def test_tracks_and_different_device_rates_share_one_engine_timeline():
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     hub.set_engine_rates(16000, 24000)
     join(hub, rate=48000)
     join(hub, "meeting", role="meeting", rate=16000)
@@ -83,7 +88,7 @@ def test_tracks_and_different_device_rates_share_one_engine_timeline():
 
 
 def test_flush_discards_queued_audio_and_resampler_tail_but_keeps_captions():
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     join(hub, rate=48000)
     hub.send_caption("ouroboros", "Hello", True, "item")
     hub.play(pcm([1234] * 480), "item")
@@ -101,7 +106,7 @@ def test_flush_discards_queued_audio_and_resampler_tail_but_keeps_captions():
 
 
 def test_audio_queue_bounds_drop_oldest_with_counters_and_sequence_wrap():
-    hub = LiveCallHub(spec(), audio_queue_frames=2, output_queue_frames=2)
+    hub = hub_at_24k(None, audio_queue_frames=2, output_queue_frames=2)
     join(hub)
     send(hub, [1] * 480, seq=0xFFFFFFFF)
     send(hub, [2] * 480, seq=0)
@@ -118,7 +123,7 @@ def test_audio_queue_bounds_drop_oldest_with_counters_and_sequence_wrap():
 
 
 def test_output_absorbs_a_recorded_realtime_burst_without_changing_input_bound():
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     join(hub)
     # The real provider emitted 4.15 seconds in 112 ms: the input capture's
     # one-second bound must not cut this normal outbound burst to one second.
@@ -133,11 +138,11 @@ def test_output_absorbs_a_recorded_realtime_burst_without_changing_input_bound()
     assert hub.stats()["output_dropped_frames"] == 0
     assert hub._audio_limit == 50
     with pytest.raises(ValueError, match="positive"):
-        LiveCallHub(spec(), output_queue_frames=0)
+        hub_at_24k(None, output_queue_frames=0)
 
 
 def test_mute_direction_checks_and_peer_lifecycle():
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     join(hub)
     send(hub, [100])
     hub.receive_control("owner", {"type": "mute", "muted": True})
@@ -158,7 +163,7 @@ def test_mute_direction_checks_and_peer_lifecycle():
 
 
 def test_control_pressure_refuses_instead_of_dropping_unread_facts():
-    hub = LiveCallHub(spec(), control_queue_messages=2)
+    hub = hub_at_24k(None, control_queue_messages=2)
     join(hub)
     for value in (True, False):
         hub.receive_control("owner", {"type": "mute", "muted": value})
@@ -200,7 +205,7 @@ def test_mixer_waits_one_audio_tick_for_asynchronous_microphones(monkeypatch):
 
     clock = [100.0]
     monkeypatch.setattr(call_peers.time, "monotonic", lambda: clock[0])
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     join(hub)
     join(hub, "meeting", role="meeting")
     send(hub, [1000] * 480)
@@ -214,7 +219,7 @@ def test_mixer_waits_one_audio_tick_for_asynchronous_microphones(monkeypatch):
 
 
 def test_engine_rate_change_resets_buffers_and_notifies_peers():
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     join(hub, rate=48000)
     send(hub, [100] * 960, rate=48000)
     hub.play(pcm([100] * 480), "item")
@@ -233,7 +238,7 @@ def test_peer_and_stream_capacity_have_accept_and_refusal_paths(monkeypatch):
 
     monkeypatch.setattr(call_peers, "MAX_PEERS", 2)
     monkeypatch.setattr(call_peers, "MAX_STREAMS", 2)
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     join(hub)
     join(hub, "second")
     with pytest.raises(CallPeerError, match="peer_capacity_full"):
@@ -253,14 +258,14 @@ def test_peer_and_stream_capacity_have_accept_and_refusal_paths(monkeypatch):
 
 @pytest.mark.parametrize("rate", [0, -1, 7999, 192001, True, 16000.5])
 def test_unsupported_rates_refuse_before_join(rate):
-    hub = LiveCallHub(spec())
+    hub = hub_at_24k()
     with pytest.raises(CallPeerError, match="unsupported_audio_rate"):
         hub.join(cp.PeerInfo("owner", "owner", True, True), rate)
     assert hub.peers() == ()
 
 
 def test_speaker_direction_and_slow_control_consumer():
-    hub = LiveCallHub(spec(), control_queue_messages=2)
+    hub = hub_at_24k(None, control_queue_messages=2)
     join(hub, speaker=False)
     hub.play(pcm([12] * 480), "item")
     assert hub.next_outgoing("owner") is None
@@ -305,7 +310,7 @@ def test_a_hub_is_born_preparing_and_remembers_an_owner_bye():
 
 
 def test_a_closed_state_keeps_the_drivers_words_and_close_adds_them_only_when_missing():
-    hub = LiveCallHub(cp.CallSpec("words", 1, "openai", "m"))
+    hub = LiveCallHub(cp.CallSpec("words", 1, "google", "m"))
     hub.join(cp.PeerInfo("p1", cp.PEER_OWNER, True, True), 24000)
     hub.next_outgoing("p1"), hub.next_outgoing("p1")
     hub.send_activity("working", "web_search")
@@ -316,12 +321,12 @@ def test_a_closed_state_keeps_the_drivers_words_and_close_adds_them_only_when_mi
     while (message := hub.next_outgoing("p1")) is not None:
         if isinstance(message, str) and json.loads(message)["type"] == "state":
             states.append(json.loads(message))
-    assert states == [{"type": "state", "state": "closed", "reason": "provider_closed", "engine": "openai",
+    assert states == [{"type": "state", "state": "closed", "reason": "provider_closed", "engine": "google",
                        "detail": "You exceeded your current quota.", "action": "retry"}]
-    other = LiveCallHub(cp.CallSpec("bare", 1, "openai", "m"))
+    other = LiveCallHub(cp.CallSpec("bare", 1, "google", "m"))
     other.join(cp.PeerInfo("p2", cp.PEER_OWNER, True, True), 24000)
     other.next_outgoing("p2"), other.next_outgoing("p2")
     other.close("call_not_started", action="retry")
     tail = [json.loads(m) for m in iter(lambda: other.next_outgoing("p2"), None) if isinstance(m, str)]
-    assert tail[-1] == {"type": "state", "state": "closed", "reason": "call_not_started", "engine": "openai",
+    assert tail[-1] == {"type": "state", "state": "closed", "reason": "call_not_started", "engine": "google",
                         "action": "retry"}

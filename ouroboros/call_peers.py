@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ouroboros import call_protocol as cp
+from ouroboros.gateways.realtime_engine import GOOGLE_INPUT_RATE, GOOGLE_OUTPUT_RATE
 
 # Physical transport bounds: one second of capture per track; ten minutes of
 # outbound PCM, because a provider sends a whole answer many times faster than it
@@ -134,7 +135,8 @@ class PeerGrant:
 
 class LiveCallHub(cp.CallHub):
     def __init__(self, spec: cp.CallSpec, *, audio_queue_frames: int = AUDIO_QUEUE_FRAMES,
-                 control_queue_messages: int = CONTROL_QUEUE_MESSAGES, output_queue_frames: int = OUTPUT_QUEUE_FRAMES):
+                 control_queue_messages: int = CONTROL_QUEUE_MESSAGES, output_queue_frames: int = OUTPUT_QUEUE_FRAMES,
+                 rates: tuple[int, int] = (GOOGLE_INPUT_RATE, GOOGLE_OUTPUT_RATE)):
         if audio_queue_frames < 1 or control_queue_messages < 1 or output_queue_frames < 1:
             raise ValueError("queue bounds must be positive")
         self.spec, self.call_id = spec, spec.call_id
@@ -144,8 +146,8 @@ class LiveCallHub(cp.CallHub):
         self._events: deque = deque()
         self._audio_limit, self._control_limit = audio_queue_frames, control_queue_messages
         self._output_limit = output_queue_frames
-        self._input_rate = 16000 if spec.engine == "google" else 24000
-        self._output_rate = 24000
+        # The engine's wire rates (Gemini Live's by default) until the driver's engine confirms its own.
+        self._input_rate, self._output_rate = _rate(rates[0]), _rate(rates[1])
         self._epoch = 0
         self._mix_at = 0.0
         self._closed = False
