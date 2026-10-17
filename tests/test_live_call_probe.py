@@ -9,7 +9,7 @@ import pytest
 from devtools import live_call_probe as probe
 from ouroboros.call_peers import LiveCallHub
 from ouroboros.call_protocol import CallSpec, PeerAudio
-from ouroboros.gateways.realtime_engine import AudioIn, EngineError, EngineRoute, SessionConfig, ToolResult
+from ouroboros.gateways.realtime_engine import AudioIn, EngineError, EngineRoute, SessionConfig, ToolResult, VideoIn
 
 
 def test_output_requires_new_external_temp_directory(tmp_path, monkeypatch):
@@ -189,6 +189,31 @@ def test_observer_forwards_real_commands_and_records_only_audio_lengths(tmp_path
         assert evidence.of("EngineError")[0]["error_kind"] == "invalid_request"
 
     asyncio.run(run())
+
+
+def test_a_shown_frame_reaches_the_engine_whole_and_the_evidence_keeps_only_its_length(tmp_path):
+    frame = probe.sight_frame()
+    assert frame[:2] == b"\xff\xd8" and len(frame) < 512 * 1024  # a JPEG the call protocol carries
+
+    class Engine:
+        _write = AsyncMock()
+        _handle_message = AsyncMock()
+        send = AsyncMock()
+
+    async def run():
+        engine, evidence = Engine(), probe.Evidence(tmp_path)
+        observed = probe.ObservedEngine(engine, evidence, object())
+        command = VideoIn("image/jpeg", frame)
+        await observed.send(command)
+        assert engine.send.call_args.args == (command,)
+        assert evidence.of("command")[0]["data"] == {"omitted_binary_bytes": len(frame)}
+
+    asyncio.run(run())
+    wire = probe.redacted_wire({"realtimeInput": {"video": {"mimeType": "image/jpeg",
+                                                            "data": base64.b64encode(frame).decode()}}}, {})
+    assert wire["realtimeInput"]["video"] == {"mimeType": "image/jpeg", "data": probe.TINY_PCM}
+    text = probe.redacted_wire({"realtimeInput": {"text": "kept"}}, {})
+    assert text == {"realtimeInput": {"text": "kept"}}  # only binary media is replaced
 
 
 def test_owner_audio_uses_real_codec_and_engine_rate(tmp_path):

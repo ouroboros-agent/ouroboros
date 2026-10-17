@@ -36,14 +36,16 @@ from types import SimpleNamespace
 import uuid
 
 REPO = Path(__file__).resolve().parents[1]
-SCENARIOS = ("opening", "russian_reply", "tool", "chat", "interruption", "typed", "hangup", "money")
+SCENARIOS = ("opening", "russian_reply", "tool", "chat", "interruption", "typed", "vision", "hangup", "money")
 SPEECH = {
     "russian_reply": "Привет! Ты меня слышишь? Ответь одним коротким предложением.",
     "tool": "Найди в интернете, какая сейчас погода в Москве, и скажи коротко.",
     "chat": "Пришли мне в чат ссылку на прогноз погоды.",
     "long": "Расскажи подробно, минуту или дольше, как образуются облака и дождь.",
     "interrupt": "Стоп, достаточно! Скажи только: хорошо, остановился.",
+    "vision": "Что сейчас на моём экране? Назови число, которое там написано.",
 }
+SIGHT_NUMBER = "73"  # the vision scenario's screen shows it; no conversation guesses it unseen
 RATE, FRAME_BYTES = 24000, 960  # PCM16 mono, 20 ms at the peer boundary.
 
 
@@ -138,7 +140,7 @@ def redacted_wire(message: dict, handles: dict) -> dict:
                 elif k == "systemInstruction":
                     text = "".join(part.get("text", "") for part in v.get("parts", []))
                     out[k] = {"recorded_chars": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest()}
-                elif k == "data" and key == "audio":
+                elif k == "data" and key in ("audio", "video"):
                     out[k] = TINY_PCM
                 else:
                     out[k] = walk(v, k)
@@ -198,6 +200,8 @@ class ObservedEngine:
             fields = asdict(command)
             if "images" in fields:
                 fields["images"] = {"omitted_binary_bytes": sum(map(len, fields["images"]))}
+            if isinstance(fields.get("data"), bytes):  # a video frame
+                fields["data"] = {"omitted_binary_bytes": len(fields["data"])}
             self.evidence.note("command", type=type(command).__name__, **fields)
 
     async def events(self):
@@ -228,7 +232,7 @@ class OwnerPeer:
         self.pending, self.played = deque(), {}
         self.next_play = time.monotonic()
         self.speaking, self.next_capture = False, time.monotonic()
-        hub.join(PeerInfo(self.peer_id, "owner", True, True, "Synthetic owner"), RATE)
+        hub.join(PeerInfo(self.peer_id, "owner", True, True, "Synthetic owner", video=True), RATE)
 
     def control(self, **message):
         self.hub.receive_control(self.peer_id, message)
@@ -358,6 +362,19 @@ def speech_fixture(root: Path, label: str, key: str, reuse: str | None) -> bytes
 # A grounded response carries Gemini's search charge, which the public catalog prices nowhere; the
 # ledger keeps such a response unknown-priced by design (``live_usage``), a disclosure, not a gap.
 GROUNDING_UNPRICED = {"groundingMetadata", "grounding_metadata"}
+
+
+def sight_frame() -> bytes:
+    """The vision scenario's shared screen: a white 1280x720 JPEG with one large number on it."""
+    import io
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (1280, 720), "white")
+    ImageDraw.Draw(image).text((640, 360), SIGHT_NUMBER, fill=(201, 53, 69), anchor="mm",
+                               font=ImageFont.load_default(size=360))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=80)
+    return out.getvalue()
 
 
 def attempts_since(rows: list[dict], started_at: str) -> list[dict]:
@@ -566,6 +583,25 @@ class Probe:
             except Exception as exc:
                 self.verdict(name, False, error=str(exc), captions=self.evidence.of("Caption"),
                              tool_calls=self.evidence.of("ToolCall"), commands=self.evidence.of("command"))
+        if "vision" in self.selected:
+            from ouroboros.call_protocol import VideoFrame
+
+            try:
+                frame = sight_frame()
+                self.hub.receive_video(self.peer.peer_id, VideoFrame(self.hub.epoch, 0, "image/jpeg", frame))
+                self.evidence.note("peer_video", bytes=len(frame))
+                await self.wait(lambda: any(e["type"] == "VideoIn" for e in self.evidence.of("command")))
+                facts = await self.speech_case("vision", fixtures["vision"])
+                spoken = [c["text"] for c in facts["captions"] if c["speaker"] == "ouroboros"]
+                said = " ".join(spoken).lower()
+                # Gemini reports each modality's prompt tokens: the frame's own count is the image/video row.
+                details = [(e.get("raw_usage") or {}).get("promptTokensDetails")
+                           for e in self.evidence.of("ResponseDone", facts["since"])]
+                self.verdict("vision", SIGHT_NUMBER in said or "семьдесят три" in said, spoken=spoken,
+                             frame_bytes=len(frame), prompt_tokens_details=details,
+                             latency_seconds=facts["latency_seconds"])
+            except Exception as exc:
+                self.verdict("vision", False, error=str(exc), captions=self.evidence.of("Caption"))
         if "interruption" in self.selected:
             try:
                 since = self.evidence.note("scenario_start", scenario="interruption")["at"]
@@ -697,7 +733,7 @@ async def run_probe(args):
             for name in probe.selected:
                 probe.result["scenarios"][name]["evidence"] = {"reason": "selected engine or speech fixture credential absent"}
             return probe.result
-        labels = [s for s in ("russian_reply", "tool", "chat") if s in probe.selected]
+        labels = [s for s in ("russian_reply", "tool", "chat", "vision") if s in probe.selected]
         if "interruption" in probe.selected:
             labels += ["long", "interrupt"]
         fixtures = {name: await asyncio.to_thread(speech_fixture, root, name, keys["OPENAI_API_KEY"], args.fixture_dir)
