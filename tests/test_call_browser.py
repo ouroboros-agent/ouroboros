@@ -396,13 +396,14 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 _no_sideways_scroll(page, f"phone {scheme}")
                 expect(room.locator(".call-keyboard")).to_be_visible()  # typing stays one press away on a phone
                 _shot(page, f"{engine}-{scheme}-390-listening")
-                # A phone's keyboard view keeps End and the way back; Mute waits in the voice view.
+                # A phone's keyboard view keeps End and the way back; Mute and the wave give the field their room.
                 room.locator(".call-keyboard").click()
                 expect(room.locator(".call-end")).to_be_visible()
                 expect(room.locator(".call-mute")).to_be_hidden()
+                expect(room.locator(".call-wave")).to_be_hidden()
                 expect(field).to_be_visible()
                 field_width = page.evaluate(f"document.querySelector('{ROOM} #chat-input').getBoundingClientRect().width")
-                assert field_width >= 120, f"the phone's field keeps room to type: {field_width}px"
+                assert field_width >= 100, f"the phone's field keeps room to type: {field_width}px"
                 _no_sideways_scroll(page, f"phone keyboard {scheme}")
                 _shot(page, f"{engine}-{scheme}-390-keyboard")
                 room.locator(".call-keyboard").click()

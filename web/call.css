@@ -74,7 +74,9 @@
 }
 
 /* Keyboard: the field returns between the docked visual and the call's controls. End and the way
-   back to voice never leave the row; Mute leaves a narrow one, one press away in the voice view. */
+   back to voice never leave the row. A narrow row gives the field Mute's and the wave's room (Mute is
+   one press away in the voice view, and the rim still shows the call is live), the narrowest also
+   the attachment button's. */
 .chat-input-wrap[data-call-view="keyboard"] .call-capsule {
     display: contents;
 }
@@ -224,10 +226,15 @@
     .call-end {
         padding: 0 var(--space-3);
     }
+
+    .chat-input-wrap[data-call-view="keyboard"] .chat-attach-btn {
+        display: none;
+    }
 }
 
 @container call-row (max-width: 520px) {
-    .chat-input-wrap[data-call-view="keyboard"] .call-mute {
+    .chat-input-wrap[data-call-view="keyboard"] .call-mute,
+    .chat-input-wrap[data-call-view="keyboard"] .call-visual {
         display: none;
     }
 }
