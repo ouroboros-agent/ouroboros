@@ -36,7 +36,7 @@ SCHEDULE_SILENT = "silent"
 # (missing = 0); the provider's own fields stay beside it in ``raw_usage``. Audio
 # counts never fold into text counts: they are priced separately.
 USAGE_KEYS = (
-    "text_input_tokens", "audio_input_tokens", "image_input_tokens", "cached_input_tokens",
+    "text_input_tokens", "audio_input_tokens", "image_input_tokens", "video_input_tokens", "cached_input_tokens",
     "text_output_tokens", "audio_output_tokens",
 )
 

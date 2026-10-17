@@ -54,7 +54,7 @@ def _raw_body(raw: Mapping) -> Mapping:
 def _cached_split(counts: dict, raw: Mapping) -> dict:
     """The aggregate cache count needs a modality witness when inputs are mixed."""
     total = counts["cached_input_tokens"]
-    modalities = ("text", "audio", "image")
+    modalities = ("text", "audio", "image", "video")
     split = None
     details = raw.get("input_token_details", raw.get("input_tokens_details", {}))
     if isinstance(details, Mapping) and "cached_tokens_details" in details:
@@ -95,9 +95,9 @@ def _unpriced_raw(raw: Mapping) -> list[str]:
                 "groundingMetadata", "grounding_metadata", "server_tool_use"):
         if raw.get(key):
             missing.append(key)
-    for key, supported in (("promptTokensDetails", {"TEXT", "AUDIO", "IMAGE"}),
+    for key, supported in (("promptTokensDetails", {"TEXT", "AUDIO", "IMAGE", "VIDEO"}),
                            ("responseTokensDetails", {"TEXT", "AUDIO"}),
-                           ("prompt_tokens_details", {"TEXT", "AUDIO", "IMAGE"}),
+                           ("prompt_tokens_details", {"TEXT", "AUDIO", "IMAGE", "VIDEO"}),
                            ("response_tokens_details", {"TEXT", "AUDIO"})):
         if key not in raw:
             continue
@@ -165,7 +165,7 @@ def _price(quote: dict | None, usage: Mapping, raw_usage: Mapping) -> tuple[floa
         missing.extend(_raw_count_gaps(counts, body))
         missing.extend(str(key) for key, value in usage.items() if key not in USAGE_KEYS and value != 0)
         split = _cached_split(counts, body)
-        total_input = sum(counts[f"{m}_input_tokens"] for m in ("text", "audio", "image"))
+        total_input = sum(counts[f"{m}_input_tokens"] for m in ("text", "audio", "image", "video"))
         for key in RATE_FIELDS:
             if key.startswith("cached_"):
                 number = split[key.split("_")[1]]
@@ -174,10 +174,16 @@ def _price(quote: dict | None, usage: Mapping, raw_usage: Mapping) -> tuple[floa
                 if key.endswith("_input_tokens"):
                     number -= split[key.split("_")[0]]
             if number:
-                price = rate(quote, RATE_FIELDS[key], input_tokens=total_input)
+                field = RATE_FIELDS[key]
+                if key in ("video_input_tokens", "cached_video_input_tokens"):
+                    dedicated = ("input_cost_per_video_token" if key == "video_input_tokens"
+                                 else "cache_read_input_video_token_cost")
+                    if rate(quote, dedicated, input_tokens=total_input) is not None:
+                        field = dedicated
+                price = rate(quote, field, input_tokens=total_input)
                 priced[key] = {"tokens": number, "usd_per_token": price}
                 if price is None:
-                    missing.append(RATE_FIELDS[key])
+                    missing.append(field)
         thoughts = _thoughts_tokens(body)
         if thoughts:
             price = rate(quote, RATE_FIELDS["text_output_tokens"], input_tokens=total_input)

@@ -134,7 +134,7 @@ async def test_documented_gemini_exchange_both_directions():
     assert len(selected(events, ResponseStarted)) == len(selected(events, ResponseDone)) == 1
     done = selected(events, ResponseDone)[0]
     assert done.item_id.startswith("local:gemini:") and done.response_id == ""
-    assert done.usage == dict(zip(USAGE_KEYS, (10, 6, 3, 5, 2, 6)))
+    assert done.usage == dict(zip(USAGE_KEYS, (10, 6, 3, 0, 5, 2, 6)))
     assert done.raw_usage["cacheTokensDetails"][1]["tokenCount"] == 2
     assert selected(events, ToolCallCancelled) == [ToolCallCancelled(("synthetic-call-2",))]
     assert selected(events, GoAway) == [GoAway(12.5)]
@@ -221,6 +221,12 @@ async def test_gemini_vision_uses_documented_realtime_video_blob_and_checks_byte
             await engine.send(bad)
     assert len(socket.sent) == before
     await finished(engine, collector)
+
+
+def test_gemini_normalizes_reported_video_modality_as_input_tokens():
+    raw = {"promptTokensDetails": [{"modality": "VIDEO", "tokenCount": 70}]}
+    assert gemini.normalize_usage(raw)["video_input_tokens"] == 70
+    assert gemini.normalize_usage({})["video_input_tokens"] == 0
 
 
 @run_async
@@ -321,7 +327,7 @@ def test_usage_normalization_never_maps_undifferentiated_totals_to_text():
     raw = {"promptTokensDetails": [{"modality": "TEXT", "tokenCount": 10}, {"modality": "AUDIO", "tokenCount": 20},
                                    {"modality": "IMAGE", "tokenCount": 3}], "cachedContentTokenCount": 7,
            "responseTokensDetails": [{"modality": "TEXT", "tokenCount": 4}, {"modality": "AUDIO", "tokenCount": 6}]}
-    assert gemini.normalize_usage(raw) == dict(zip(USAGE_KEYS, (10, 20, 3, 7, 4, 6)))
+    assert gemini.normalize_usage(raw) == dict(zip(USAGE_KEYS, (10, 20, 3, 0, 7, 4, 6)))
 
 
 @pytest.mark.parametrize("provider", ["google"])

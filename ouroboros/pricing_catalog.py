@@ -32,9 +32,11 @@ RATE_FIELDS = {
     "audio_input_tokens": "input_cost_per_audio_token",
     "audio_output_tokens": "output_cost_per_audio_token",
     "image_input_tokens": "input_cost_per_image_token",
+    "video_input_tokens": "input_cost_per_image_token",
     "cached_text_input_tokens": "cache_read_input_token_cost",
     "cached_audio_input_tokens": "cache_read_input_audio_token_cost",
     "cached_image_input_tokens": "cache_read_input_image_token_cost",
+    "cached_video_input_tokens": "cache_read_input_image_token_cost",
 }
 log = logging.getLogger(__name__)
 _lock = threading.Lock()

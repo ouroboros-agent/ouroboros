@@ -40,7 +40,7 @@ def test_reserved_response_has_explicit_modality_estimate_and_mode(live_root, ca
     row, = ledger_rows(root)
     assert ids == [row["attempt_id"]]
     assert row["kind"] == "attempt" and row["state"] == "dispatched"
-    assert row["reservation_upper_bound_usd"] == pytest.approx(1024 * (2 + 8 + 10 + 20 + 5) / 1e6)
+    assert row["reservation_upper_bound_usd"] == pytest.approx(1024 * (2 + 8 + 10 + 20 + 5 + 5) / 1e6)
     assert row["rendered_mode"] == "nano"
     assert row["cost_evidence"]["call_id"] == "call-1"
     assert row["cost_evidence"]["response_key"] == "response-1"
@@ -93,7 +93,6 @@ def test_gemini_cached_modality_details(live_root, catalog_fixture):  # noqa: F8
     ({"audio_input_tokens": 10, "cached_input_tokens": 5}, {"input_token_details": {"cached_tokens_details": {"audio_tokens": 4}}}),
     ({"audio_input_tokens": -1}, {}), ({"audio_input_tokens": True}, {}),
     ({"audio_input_tokens": None}, {}), ({"audio_input_tokens": 1.2}, {}),
-    ({"text_input_tokens": 10, "video_input_tokens": 1}, {}),
     ({"text_input_tokens": 10}, {"promptTokensDetails": [{"modality": "VIDEO", "tokenCount": 1}]}),
     ({"text_input_tokens": 10}, {"unpriced_components": ["google_search"]}),
     ({"text_input_tokens": 10}, {"toolUsePromptTokenCount": 5}),
@@ -111,6 +110,27 @@ def test_unknown_or_inconsistent_modality_keeps_whole_cost_unknown(live_root, us
     assert row["cost_usd"] is None and row["cost_final"] is False
     assert row["cost_estimated"] is False and row["cost_coverage"] == "partial"
     assert row["cost_evidence"]["unpriced"]
+
+
+def test_video_uses_catalog_image_tariff_and_missing_tariff_is_unknown(live_root, catalog_fixture):  # noqa: F811
+    import json
+
+    _, rows, response, _ = catalog_fixture
+    attempt = reserve(live_root)
+    raw = {"promptTokensDetails": [{"modality": "VIDEO", "tokenCount": 70}]}
+    live.settle_live_response(attempt, usage={"video_input_tokens": 70}, raw_usage=raw, status="completed")
+    row, = ledger_rows(live_root)
+    assert row["cost_usd"] == pytest.approx(70 * 5e-6)
+    assert row["cost_evidence"]["priced_usage"]["video_input_tokens"]["usd_per_token"] == 5e-6
+
+    del rows["gpt-realtime-2.1"]["input_cost_per_image_token"]
+    response.content = json.dumps(rows).encode()
+    other = live_root / "without-video-tariff"
+    other.mkdir()
+    live.settle_live_response(reserve(other), usage={"video_input_tokens": 70}, raw_usage=raw, status="completed")
+    missing, = ledger_rows(other)
+    assert missing["cost_usd"] is None and missing["cost_coverage"] == "partial"
+    assert "input_cost_per_image_token" in missing["cost_evidence"]["unpriced"]
 
 
 @pytest.mark.parametrize("field,usage", [("input_cost_per_audio_token", {"audio_input_tokens": 10}),
