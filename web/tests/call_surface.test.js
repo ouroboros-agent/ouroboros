@@ -233,11 +233,16 @@ test('a call is one card of the room: its rows fold into it, its captions stream
     const typing = new FakeNode('div', feed.ownerDocument);
     typing.className = 'chat-bubble assistant typing-bubble';
     feed.append(typing);
-    // The owner speaks before any row of the call exists: the card opens at the room's end, live and open.
+    // The owner speaks before any row of the call exists: the card appears at the room's end, live and
+    // folded (the transcript is kept, never the call's focus); a click opens it.
     cards.update({ call_id: 'c1', speaker: 'owner', item_id: 'o1', text: 'Hello', final: false });
     cards.update({ call_id: 'c1', speaker: 'owner', item_id: 'o1', text: ', Ouroboros', final: false });
     assert.equal(feed.children.at(-1), typing);  // the typing indicator stays last
-    assert.deepEqual([card().dataset.callCard, card().dataset.callOpen], ['live', '1']);
+    assert.deepEqual([card().dataset.callCard, card().dataset.callOpen], ['live', '0']);
+    card().querySelector('.call-card-head').click();
+    assert.equal(card().dataset.callOpen, '1');
+    card().querySelector('.call-card-head').click();
+    assert.equal(card().dataset.callOpen, '0');
     assert.deepEqual(lines(), [['call-line owner call-caption', 'YouHello, Ouroboros']]);
     // The chat paints the owner's row (it listens first): the caption leaves, the row folds in as a line.
     const owner = row('user', 'Hello, Ouroboros!', { clientMessageId: 'call:c1:o1', taskId: 'call-task' }, 1000);

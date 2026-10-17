@@ -1,9 +1,11 @@
 /** One call is one card in the room (the owner's choice for how a call reads in the chat): the call's
  * own rows fold into it as lines — the owner's spoken words (`client_message_id` `call:<call>:<item>`),
  * Ouroboros's spoken narration of the same task, the call's work card and its closing notice — and
- * the live captions stream at its end. An ended call folds to one line that opens on a click. The
- * rows stay the room's and stay mounted, only hidden (memory, replies, history and Copy keep reading
- * them); a link Ouroboros sends during the call stays an ordinary message.
+ * the live captions stream at its end. The transcript is kept, never the call's focus: one's own
+ * words running past while one speaks pull attention from the conversation, so a card is one folded
+ * line, live or ended, until the owner opens it. The rows stay the room's and stay mounted, only
+ * hidden (memory, replies, history and Copy keep reading them); a link Ouroboros sends during the
+ * call stays an ordinary message.
  *
  * A row names its call's task: the owner's row carries the call id, every row the task id, so a
  * task is a call once one owner row of it is seen. A caption that arrives before that row opens the
@@ -94,7 +96,7 @@ export function createCallCards({ feed, ws = null, doc = feed?.ownerDocument, li
     }
 
     const isLive = card => Boolean(card.call) && live() === card.call;
-    const isOpen = card => (card.open == null ? isLive(card) : card.open);
+    const isOpen = card => card.open === true;
 
     function paint(card) {
         const liveNow = isLive(card);

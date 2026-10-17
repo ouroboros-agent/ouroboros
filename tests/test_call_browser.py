@@ -252,16 +252,22 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.set_viewport_size({"width": 1280, "height": 900})
             _shot(page, f"{engine}-dark-1280-listening")
 
-            # The owner speaks: his blue light from the microphone, his words streaming in the call's card.
+            # The owner speaks: his blue light from the microphone, his words streaming into the call's card,
+            # which stays one folded line (the transcript is kept, never the call's focus) until opened.
             page.evaluate("__callTest.speak(0.4)")
             _caption(page, "owner", "item_owner_1", "Hello, Ouroboros. How much")
             card = room.locator(".call-card")
             caption = card.locator(".call-line.call-caption.owner")
             expect(caption).to_have_count(1)
-            expect(caption.locator(".call-line-text")).to_have_text("Hello, Ouroboros. How much")
             expect(card).to_have_attribute("data-call-card", "live")
+            expect(card).to_have_attribute("data-call-open", "0")
+            expect(caption).to_be_hidden()
+            card.locator(".call-card-head").click()
             expect(card).to_have_attribute("data-call-open", "1")
+            expect(caption.locator(".call-line-text")).to_have_text("Hello, Ouroboros. How much")
             expect(caption).to_have_attribute("data-call-caption", "streaming")
+            card.locator(".call-card-head").click()  # folded again: the call goes on without its words in view
+            expect(card).to_have_attribute("data-call-open", "0")
             expect(room.locator(".call-sub")).to_have_text("You’re speaking")
             page.wait_for_function("parseFloat(getComputedStyle(document.querySelector('#page-chat .chat-input-wrap'))"
                                    ".getPropertyValue('--call-mic')) > 0.3")
