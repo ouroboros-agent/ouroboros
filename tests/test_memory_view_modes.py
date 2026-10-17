@@ -273,10 +273,14 @@ def test_a_built_max_keeps_books_before_refusal_while_memory_still_fits(tmp_path
 @pytest.mark.parametrize("preferred", ["low", "nano"])
 def test_owner_lower_mode_startup_still_selects_its_existing_sized_mode(tmp_path, monkeypatch, preferred):
     core, plan = _built(tmp_path, monkeypatch)
-    need = _needs(core, plan)
-    for window in (10_000_000, need["low"] + 50, need["low"] - 50, 1):
+    # The host floor addresses its sections (the knowledge index's outline among them) before Low gives
+    # way to Nano: Low's own minimum is its need less everything that floor can address.
+    saved = sum(int(row["tokens_saved"]) for row in
+                plan(1).projection("low").memory_facts.get("host_sections_addressed", []))
+    low_floor = _needs(core, plan)["low"] - saved
+    for window in (10_000_000, low_floor + 50, low_floor - 50, 1):
         built = plan(window, preferred=preferred)
-        expected = "nano" if preferred == "nano" or window < need["low"] else "low"
+        expected = "nano" if preferred == "nano" or window < low_floor else "low"
         assert built.initial_mode == expected
         assert built.preferred_mode == preferred
         assert built.projection(expected).memory_facts["floor"]["target_tokens"] == (

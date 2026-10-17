@@ -223,22 +223,22 @@ def test_shared_understanding_view_is_its_outline_its_summary_place_and_its_size
         f"## 2026-10-{day:02d} — dated block", f"### A finer point of day {day}")]
     assert "\n".join(headings) in view  # its own headings, verbatim and in order
     assert "We intend" not in view and "We commit" not in view and "Details that" not in view
-    assert "It has no authored summary yet (no summary field); full text: " \
+    assert "It has no authored summary yet (no summary field)\n\nFull text: " \
            "knowledge_read(topic='overview', scope='global')." in view
     source_heading = "## Shared understanding\n\nSource: knowledge_read(topic='overview', scope='global').\n\n"
     assert section.full_text.startswith(source_heading)
     assert f"Its body is {len(section.full_text) - len(source_heading)} characters under 21 headings." in view
-    # Ouroboros's own summary field is named where it already renders: the knowledge index.
+    # Ouroboros's own summary field rides in the view itself: the index's outline shows titles.
     from ouroboros.knowledge import read_knowledge_note
 
     assert write_knowledge_note(address, "", mode="edit", expected_revision=read_knowledge_note(address).revision,
                                 summary="Where we stand and what we hold to.").ok
     summarized = context.build_knowledge_sections(env)
-    assert "Its authored summary is the overview entry of the knowledge index in this context" \
-        in summarized[0].operative_view
+    assert "Its authored summary:\nWhere we stand and what we hold to." in summarized[0].operative_view
     index = summarized[1]
-    assert index.section_id == "knowledge_index" and index.operative_view is None
-    assert "Where we stand and what we hold to." in index.full_text
+    assert index.section_id == "knowledge_index" and "Where we stand and what we hold to." in index.full_text
+    assert index.operative_view.startswith("## Knowledge base") and "- overview — Our orientation" in index.operative_view
+    assert "Where we stand and what we hold to." not in index.operative_view  # an outline: titles, not summaries
     # Under physical window pressure the floor addresses it like any host service block.
     addressed, receipts = section_floor.fit_host_sections(
         [section, _service("runtime", 20_000)], root=str(tmp_path), task_id="task-1",

@@ -73,11 +73,15 @@ def test_tier_zero_stays_byte_whole_and_every_service_block_is_operative(owner_s
     assert (root / "memory" / "identity.md").read_text(encoding="utf-8") in text
     assert (root / "memory" / "scratchpad.md").read_text(encoding="utf-8") in text
     index = next(part for part in plan.core.dynamic_head_sections if part.section_id == "knowledge_index")
-    assert index.full_text in text and "Where we stand: " in index.full_text  # the overview's own summary
+    assert index.operative_view in text and index.full_text not in text  # the index's outline in a call
+    assert all(f"- topic-{i:03d}" in index.operative_view for i in range(120))  # every active note keeps its line
+    overview = next(part for part in plan.core.dynamic_head_sections if part.section_id == "shared_understanding")
+    assert "Where we stand: " in overview.operative_view  # the overview's own summary rides in its view
     addressed = {row["section_id"]: row for row in plan.projection("nano").memory_facts["host_sections_addressed"]}
     assert set(addressed) >= {"health_invariants", "shared_understanding", "pattern_register", "world", "subagents",
-                              "execution_reflections", "architecture_map", "development_map", "live_rooms"}
-    assert not {"system", "bible", "identity", "scratchpad", "knowledge_index"} & set(addressed)
+                              "execution_reflections", "architecture_map", "development_map", "live_rooms",
+                              "knowledge_index"}
+    assert not {"system", "bible", "identity", "scratchpad"} & set(addressed)
     sections = {part.section_id: part for part in (*plan.core.dynamic_sections, *plan.core.dynamic_head_sections,
                                                    *plan.core.semi_stable_sections)}
     for section_id, row in addressed.items():

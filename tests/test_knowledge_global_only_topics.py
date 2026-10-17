@@ -122,7 +122,7 @@ def test_write_schema_states_the_rules_the_code_actually_enforces(tmp_path):
     assert "Reserved topics (improvement-backlog, overview, patterns) always resolve to global." in props["scope"]["description"]
     assert "people and relationships" in props["scope"]["description"]
     assert "no scope prefixes" in props["topic"]["description"]
-    assert "stays resident in the index" in schemas["knowledge_write"]["description"]
+    assert "stays resident in the whole index" in schemas["knowledge_write"]["description"]
 
     # …and the retained-frontmatter claim is true: a body-only overwrite keeps
     # the authored summary that the index renders.

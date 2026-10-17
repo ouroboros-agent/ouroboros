@@ -25,8 +25,9 @@ from ouroboros.utils import estimate_tokens
 
 log = logging.getLogger(__name__)
 PROTECTED = TIER0_ALWAYS_FULL | {"task_contract_discipline", "task_input", "task_authority"}
+# Producer order of the steps: host facts first, the durable knowledge index (whole -> its outline) last.
 LADDER = ("health_invariants", "runtime", "review_records", "registry", "installed_skills",
-          "drive_state", "shared_understanding")
+          "drive_state", "shared_understanding", "project_knowledge_index", "knowledge_index")
 
 
 @dataclass(frozen=True, eq=False, repr=False)

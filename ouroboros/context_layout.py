@@ -23,12 +23,14 @@ from ouroboros.reference_books import ReferenceBook, compose_book, load_referenc
 # data so a drift-guard test can assert no future change demotes it. The marks I
 # keep in view never become addresses (``memory_floor`` has no step for them);
 # conversations are the memory view's, whose physical floor alone degrades them.
+# The durable knowledge index is resident in every view but steps to its outline
+# (every active note by address and title) where the window needs it and in a call
+# (``section_floor``); BIBLE P1 records that resolution step.
 TIER0_ALWAYS_FULL = frozenset({
     "system",
     "bible",
     "identity",
     "scratchpad",
-    "knowledge_index",
     "memory_marks",
 })
 

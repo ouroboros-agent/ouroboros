@@ -42,7 +42,7 @@ def build_knowledge_sections(
     # One mind keeps its authored common orientation across rooms. The generated
     # inventory is navigation, not a substitute for that understanding; a
     # project's shelf adds focus without hiding the common corpus.
-    from ouroboros.knowledge import (OVERVIEW_TOPIC, knowledge_index_view,
+    from ouroboros.knowledge import (OVERVIEW_TOPIC, knowledge_index_views,
                                      read_knowledge_note, resolve_knowledge_address)
 
     pid = str(project_id or "").strip()
@@ -76,15 +76,17 @@ def build_knowledge_sections(
     for address, header, label in knowledge_indexes:
         # Every shelf and overview branch projects the current source state, even
         # when a previous writer could not publish its generated index.
+        reader = f"knowledge_list(scope={address.scope!r})"
         try:
-            text = knowledge_index_view(address, overview=overview)
+            text, outline = knowledge_index_views(address, overview=overview)
         except (OSError, UnicodeDecodeError) as exc:
-            text = f"Knowledge navigation unavailable: {type(exc).__name__}; knowledge_list(scope={address.scope!r})."
+            text = outline = f"Knowledge navigation unavailable: {type(exc).__name__}; {reader}."
         if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
             log.warning("context: %s is large (%d chars)", label, len(text))
-        # The durable knowledge index is tier zero: an id, never an operative view.
+        # The durable index's operative view is its outline: every active note by address and
+        # title, people's summaries kept (``knowledge.render_knowledge_outline``).
         sections.append(HostSection("knowledge_index" if address is global_address else "project_knowledge_index",
-                                    f"{header}\n\n{text}"))
+                                    f"{header}\n\n{text}", f"{header}\n\n{outline}", reader=reader))
     patterns_reader = "knowledge_read(topic='patterns', scope='global')"
     pointer = f"Pattern Register details: {patterns_reader}."
     if include_pattern_body:
@@ -123,18 +125,18 @@ def build_knowledge_sections(
 
 
 def _shared_understanding_view(overview: Any, text: str, reader: str) -> str:
-    """The overview's own headings verbatim, where its authored summary is, and its size.
+    """The overview's own headings verbatim, its authored summary, and its size.
 
-    The summary is the note's own ``summary`` field, rendered with the overview's entry in
-    the knowledge index; a note without one is a named gap, never prose taken from the body.
+    The summary is the note's own ``summary`` field, carried here because the index's outline
+    view shows titles; a note without one is a named gap, never prose taken from the body.
     """
     source = overview.source
     headings = [source.text_at(item.span).strip() for item in source.headings] if source is not None else []
-    summary = ("Its authored summary is the overview entry of the knowledge index in this context"
-               if overview.summary.strip() else "It has no authored summary yet (no summary field)")
+    summary = (f"Its authored summary:\n{overview.summary.strip()}" if overview.summary.strip()
+               else "It has no authored summary yet (no summary field)")
     outline = "\n".join(headings) if headings else (
         f"(its headings are unavailable: {overview.parse_error or 'the source did not parse'})")
-    return (f"## Shared understanding\n\nIts own headings, verbatim:\n{outline}\n\n{summary}; full text: {reader}. "
+    return (f"## Shared understanding\n\nIts own headings, verbatim:\n{outline}\n\n{summary}\n\nFull text: {reader}. "
             f"Its body is {len(text)} characters under {len(headings)} headings.")
 
 
