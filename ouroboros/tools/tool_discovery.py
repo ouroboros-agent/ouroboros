@@ -187,15 +187,41 @@ def enable_tools(
     if hidden:
         parts.append("🚫 Hidden by policy (the tool exists but this task cannot use it): " + "; ".join(hidden))
     if not_found:
-        pointer = (" list_available_tools shows the current callable names."
-                   if registry.get_schema_by_name("list_available_tools") is not None else "")
+        discovery = registry.get_schema_by_name("list_available_tools") is not None
+        pointer = " list_available_tools shows the current callable names." if discovery else ""
         parts.append(f"❌ Not found: {', '.join(not_found)}.{pointer}")
+        parts.extend(_named_namespace_guidance(registry, not_found, discovery=discovery))
     text = "\n".join(parts)
     if not enabled:
         return _publish_tool_result(ctx, ToolResult(
             status="blocked" if hidden else "error",
             code="ACCESS_BLOCKED" if hidden else "UNKNOWN_TOOL", text=text))
     return text
+
+
+def _named_namespace_guidance(registry: "ToolRegistry", names: List[str], *, discovery: bool) -> List[str]:
+    """A missed name that is a namespace, or the skill an extension namespace is named by, answers
+    with that namespace's callable tools (the exact naming rule, never a likeness): the overview
+    shows an extension as its namespace, and a caller that asks for the skill gets its tools."""
+    from ouroboros.extension_surface_names import extension_name_prefix
+    from ouroboros.tool_policy import name_miss_guidance
+
+    callable_rows = getattr(registry, "callable_rows", None)
+    if callable_rows is None:  # a catalog without dispatch rows answers the plain miss only
+        return []
+    rows = callable_rows() or []
+    namespaces = {tool_namespace(str(row["name"])) for row in rows} - {BUILTIN_NAMESPACE}
+    lines: List[str] = []
+    for name in names:
+        try:
+            namespace = name if name in namespaces else extension_name_prefix(name)[:-1]
+        except Exception:
+            continue
+        if namespace not in namespaces:
+            continue
+        lines.append(f"{name} names the namespace {namespace}, not one tool; enable its tools by their names.")
+        lines.extend(name_miss_guidance(name, namespace, callable_rows(namespace), discovery=discovery))
+    return lines
 
 
 def bind_resident_schemas(registry: "ToolRegistry", resident: List[Dict[str, Any]]) -> set:
