@@ -65,13 +65,15 @@ SOURCE_CALL = "call"   # the owner-speech row source (live_awareness skips it)
 
 # Physical/transport bounds, not behaviour: the Stop tick, the ack wait before a
 # spoken row is written as generated, the rejoin grace of an empty room, the
-# reopen attempts per loss, how long a session stays up after its setup to count
-# as a working connection, the margin before a provider's session cap and the
-# wait for a running tool batch at close.
+# reopen attempts per loss, the first wait before reopening after a session that
+# proved nothing (doubling each time), how long a session stays up after its setup
+# to count as a working connection, the margin before a provider's session cap and
+# the wait for a running tool batch at close.
 MAILBOX_TICK_S = 0.25
 SPOKEN_ACK_GRACE_S = 10.0
 PEER_GRACE_S = 20.0
 RECONNECT_ATTEMPTS = 3
+RECONNECT_BACKOFF_S = 0.5
 SESSION_PROVEN_S = 10.0
 SESSION_CAP_MARGIN_S = 60.0
 BATCH_SETTLE_WAIT_S = 5.0
@@ -466,6 +468,13 @@ class _LiveCall:
         for key in list(self.attempts):
             self._abandon(self.attempts.pop(key), reason)
         self.response_open = False
+        if self.unproven_reopens and reason not in PLANNED_HANDOVERS:
+            # A session that failed at once (a connect refused, a network gone) is retried after a wait,
+            # so a short outage does not use every attempt in the same second.
+            await asyncio.sleep(RECONNECT_BACKOFF_S * 2 ** (self.unproven_reopens - 1))
+            if self.closing:
+                self.reconnecting = False
+                return
         handle = self.resume_handle if resume else ""
         for attempt_no in range(RECONNECT_ATTEMPTS):
             try:

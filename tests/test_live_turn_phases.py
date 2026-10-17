@@ -250,6 +250,43 @@ def test_a_quiet_session_that_stayed_up_is_resumed_on_every_drop(harness, monkey
     assert len(h.llm.engines) == engines and usage["live_call"]["ended"] == ended
 
 
+def test_sessions_whose_connect_fails_silently_are_retried_with_a_wait_and_then_end_the_call(harness, monkeypatch):
+    # The real adapter reports a failed connect as an event, never by raising from open().
+    from ouroboros.gateways.realtime_engine import EngineError
+
+    class Unreachable(base.FakeEngine):
+        auto_ready = False
+
+        async def open(self, config):
+            await super().open(config)
+            self._queue.put_nowait(EngineError("transport", "connect failed", retryable=True))
+
+    monkeypatch.setattr(live_turn, "RECONNECT_ATTEMPTS", 3)
+    monkeypatch.setattr(live_turn, "RECONNECT_BACKOFF_S", 0.0371)  # distinct from the driver's other waits
+    waits = []
+    real_sleep = live_turn.asyncio.sleep
+
+    async def sleep(delay, *args, **kwargs):
+        if delay in (0.0371, 0.0742, 0.1484):
+            waits.append(delay)
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(live_turn.asyncio, "sleep", sleep)
+    h = harness()
+
+    def open_live(route):
+        h.llm.routes.append(route)
+        h.llm.engines.append(Unreachable())
+        return h.llm.engines[-1]
+
+    h.llm.open_live = open_live
+    h.start()
+    text, usage, _trace = h.finish()
+    assert len(h.llm.engines) == 3 and usage["live_call"]["ended"] == "reconnect_failed"
+    assert waits == [0.0371, 0.0742]  # each reopen after a session that proved nothing waits longer
+    assert not any(state == STATE_LIVE for state, _ in h.hub.states)
+
+
 def test_a_planned_handover_neither_spends_nor_clears_the_unplanned_count(harness, monkeypatch):
     from ouroboros.gateways.realtime_engine import GoAway
 
