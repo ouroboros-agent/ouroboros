@@ -744,7 +744,8 @@ def call_opening_text(spec) -> str:
     text = (f"[Live call] A live voice call is open in this room (engine {spec.engine}, model {spec.model}). "
             "The conversation is spoken; its transcript is written to this chat. Speech recognition can take one "
             "language for another: keep to the language this room is spoken and written in, and if the owner's "
-            "words suddenly read as another language, ask rather than switch.")
+            "words suddenly read as another language, ask rather than switch. "
+            "The owner can show a screen or camera during the call, and its frames arrive as images.")
     if spec.instructions and not spec.presence_binding_id:
         text += f"\n\nThe owner's instructions for calls:\n{spec.instructions}"
     return text

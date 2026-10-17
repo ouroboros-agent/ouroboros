@@ -52,6 +52,7 @@ def test_the_owner_s_instructions_for_calls_open_his_calls_only():
 
     plain = call_opening_text(_spec())
     assert plain.startswith("[Live call]") and "instructions for calls" not in plain
+    assert "show a screen or camera" in plain and "frames arrive as images" in plain
     told = call_opening_text(_spec(instructions="Говори коротко и по-русски."))
     assert told.endswith("The owner's instructions for calls:\nГовори коротко и по-русски.")
     # A Presence call speaks for its binding, whose own instructions it carries.
