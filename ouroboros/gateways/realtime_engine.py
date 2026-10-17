@@ -222,6 +222,9 @@ class EngineError:
     kind: str
     message: str
     retryable: bool = False
+    # The provider's own sentence, when it gave one (the owner may read it quoted as the
+    # provider's); ``message`` alone is the host's description and is never quoted as theirs.
+    provider_words: str = ""
 
 
 @dataclass(frozen=True)

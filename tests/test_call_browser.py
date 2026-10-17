@@ -467,7 +467,7 @@ def test_call_failures_say_what_happened_and_the_unavailable_sheet(direct_server
                     _shot(page, f"{tag}-no-key")
                     if width > 400:
                         room.locator(".call-action").first.click()
-                        expect(page.locator("#s-call-google-key")).to_be_focused(timeout=10000)
+                        expect(page.locator("#s-google")).to_be_focused(timeout=10000)
                         page.click('[data-nav-page="chat"]')
                         expect(send).to_have_text("Talk")
                     else:

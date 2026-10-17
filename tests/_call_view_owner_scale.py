@@ -1,7 +1,7 @@
-"""A data root at the sizes measured on the owner's data, with synthetic Russian and English text only.
+"""A data root at the sizes measured on a mature install, with synthetic Russian and English text only.
 
-The composition follows ``rework/consilium/PACKET_R2.md`` §0 (the 184k-token call context of
-16.10): an identity of ~41 KB, a ten-block scratchpad, a knowledge index of ~74k characters over
+The composition follows a mature install whose whole call context measured about 184k tokens:
+an identity of ~41 KB, a ten-block scratchpad, a knowledge index of ~74k characters over
 ~120 notes with authored summaries, a ~120k-character shared understanding in dated sections, a
 ~50k-character Pattern Register, 207 delegated-run obligations in Health Invariants, a subagent
 catalog, execution reflections, fifteen other live rooms with a note each, a long Main room and

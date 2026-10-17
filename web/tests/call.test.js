@@ -33,13 +33,13 @@ test('Live calls in Settings: one engine (Gemini Live), its model and voice, and
     }
     // No engine to choose and nothing about another engine: calls are Gemini Live.
     for (const gone of ['s-call-engine', 's-call-model-openai', 's-call-voice-openai']) assert.equal(html.includes(`id="${gone}"`), false, gone);
-    // The Google AI key: Accounts, Secrets and now Live calls, all one secret.
+    // The Google AI key lives where every provider key lives (Accounts, and the Secrets list); Live calls
+    // names it there instead of a third field for the same secret.
     assert.ok(SECRET_KEYS.some(([key]) => key === 'GOOGLE_API_KEY'));
-    assert.equal(html.split('data-secret-setting="GOOGLE_API_KEY"').length - 1, 3);
+    assert.equal(html.split('data-secret-setting="GOOGLE_API_KEY"').length - 1, 2);
     const live = html.slice(html.indexOf('<h3>Live calls</h3>'), html.indexOf('s-call-duration-help'));
-    assert.match(live, /id="s-call-google-key" name="GOOGLE_API_KEY" data-secret-setting="GOOGLE_API_KEY"[^>]*type="password"/);
-    assert.match(live, /secret-toggle" data-target="s-call-google-key">Show/);
-    assert.match(live, /Gemini Live with the Google AI key below, the same key as Accounts → Google/);
+    assert.doesNotMatch(live, /data-secret-setting/);
+    assert.match(live, /Gemini Live with the Google AI key in Accounts → Google/);
     assert.doesNotMatch(live, /OpenAI/);
 });
 

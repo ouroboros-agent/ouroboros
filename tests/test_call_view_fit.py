@@ -1,9 +1,8 @@
 """A live call's view: the ordinary fit against the realtime route, with every host section in its operative form.
 
 A live session's window always fills, so in a call every host section that has an operative
-view enters in that form from the first open (CONSENSUS «What the call holds», owner decision
-1A); tier zero stays whole, the call starts in Nano, and the other live rooms are one more such
-section. A text turn with the same capture and window keeps every section whole.
+view enters in that form from the first open; tier zero stays whole, the call starts in Nano,
+and the other live rooms are one more such section. A text turn with the same capture and window keeps every section whole.
 """
 from __future__ import annotations
 

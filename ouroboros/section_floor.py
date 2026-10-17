@@ -3,7 +3,9 @@
 Producers supply the operative view; the floor never interprets authored prose or
 decides which authority matters. Unknown sections stay whole. Captured bytes are
 retained before a pointer is published, under an immutable content address in the
-actor's runtime data root. No owner target or working margin runs this ladder.
+actor's runtime data root. No owner target or working margin runs this ladder; a live
+call, whose session window always fills, addresses every section that has an operative
+view from its first request (``fit_host_sections(operative=True)``).
 """
 from __future__ import annotations
 

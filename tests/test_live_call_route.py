@@ -1,8 +1,8 @@
 """The realtime route of a live call (Gemini Live): its documented facts, the plan the fit receives, the first tools.
 
-Calls run on Gemini only (owner decision 17.10, «1. B»). The fit measures against the
-realtime route itself: its input limit (131,072) and a speech-sized reply allowance
-(8,192), never the provider's 65,536 output maximum, which v1 subtracted from the window.
+Calls run on Gemini Live only. The fit measures against the realtime route itself: its
+input limit (131,072) and a speech-sized reply allowance (8,192), never the provider's
+65,536 output maximum, which the first release subtracted from the window.
 """
 from __future__ import annotations
 
@@ -96,3 +96,12 @@ def test_a_presence_call_opens_with_its_whole_ceiling_and_an_owner_call_with_the
         registry, _spec(presence_binding_id="b" * 32))]
     assert "notes_read" not in owner and {"web_search", "enable_tools"} <= set(owner)
     assert presence == ["notes_read", "web_search", "enable_tools"]
+
+
+def test_the_first_releases_call_keys_are_retired_where_settings_are_read():
+    from ouroboros.config import normalize_settings_raw
+
+    gone = {"OUROBOROS_CALL_ENGINE": "openai", "OUROBOROS_CALL_MODEL_OPENAI": "gpt-realtime-2.1",
+            "OUROBOROS_CALL_VOICE_OPENAI": "marin"}
+    read = normalize_settings_raw({**gone, "OUROBOROS_CALL_MODEL_GOOGLE": "gemini-3.8-live"})
+    assert not set(gone) & set(read) and read["OUROBOROS_CALL_MODEL_GOOGLE"] == "gemini-3.8-live"

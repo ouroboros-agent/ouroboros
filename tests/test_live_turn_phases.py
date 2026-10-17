@@ -88,7 +88,7 @@ def test_a_provider_refusal_ends_the_call_with_its_own_words(harness):
     h = harness()
     engine = h.start()
     words = "user system instruction has 140000 tokens and the sum is above the 131072 limit"
-    engine.push(EngineError(kind="invalid_request", message=words, retryable=False))
+    engine.push(EngineError(kind="invalid_request", message=words, retryable=False, provider_words=words))
     text, usage, _trace = h.finish()
     assert usage["live_call"]["ended"] == "invalid_request" and words in text
     assert ("closed", words, "retry") in h.hub.words

@@ -683,7 +683,7 @@ class _LiveCall:
                 asyncio.create_task(self._reconnect(f"engine_error:{event.kind}", resume=True))
             else:
                 self.failure = ("live_engine_error", f"{event.kind}: {event.message}")
-                self._begin_close(event.kind, detail=event.message)
+                self._begin_close(event.kind, detail=event.provider_words)  # only the provider's words are quoted
         elif isinstance(event, Closed):
             if not self.closing:
                 asyncio.create_task(self._reconnect(f"transport_lost:{event.reason}", resume=True))

@@ -12,14 +12,13 @@ import json
 import math
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
+from ouroboros.live_call_route import CALL_REPLY_ALLOWANCE_TOKENS
 from ouroboros.live_tool_batch import images_of, text_of
 from ouroboros.utils import estimate_tokens
 
-REPLY_ALLOWANCE_FALLBACK = 8_192  # a ~5-minute spoken answer, when the route fact names none
-
 
 def _room(fact: Any) -> int:
-    reply = int(getattr(fact, "reply_allowance_tokens", 0) or REPLY_ALLOWANCE_FALLBACK)
+    reply = int(getattr(fact, "reply_allowance_tokens", 0) or CALL_REPLY_ALLOWANCE_TOKENS)
     return int(fact.window_tokens) - reply
 
 

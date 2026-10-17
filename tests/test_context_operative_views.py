@@ -1,9 +1,9 @@
 """Host producers' operative views: the actionable facts that stay inline when a window is physically small.
 
-Owner decision 1A (16.10): host service blocks shrink to actionable facts inline plus a pointer
-to the retained full text; tier zero stays whole. Each producer builds its own view from the
-facts it holds, never by parsing its rendered prose. The sizes here follow the composition
-measured on the owner's data (``rework/consilium/PACKET_R2.md`` §0).
+When the window is physically small, host service blocks shrink to their actionable facts inline
+plus a pointer to the retained full text; tier zero stays whole. Each producer builds its own view
+from the facts it holds, never by parsing its rendered prose. The sizes here follow the composition
+of a mature install whose whole call context measured about 184k tokens.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _env(tmp_path):
 
 
 def _obligations(monkeypatch, *, available=119, unread=53, patches=35, faults=2):
-    """Delegated-run obligations in the owner's measured composition (PACKET_R2 §0: ~111 KB of lines)."""
+    """Delegated-run obligations in a mature install's measured composition (~111 KB of lines)."""
     import ouroboros.delegate_custody as custody
 
     runs = []

@@ -107,7 +107,7 @@ const PROVIDER_CARDS = [
     {
         id: 'google', title: 'Google', hint: 'Gemini live calls',
         fields: [{ id: 's-google', settingKey: 'GOOGLE_API_KEY', label: 'Google API Key', placeholder: 'Google AI Studio key' }],
-        note: 'Live calls (Talk) use this key; the same key is in Models → Live calls.',
+        note: 'Live calls (Talk) use this key; their model, voice and limits are in Models → Live calls.',
     },
     {
         id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
@@ -393,9 +393,8 @@ export function renderSettingsPage() {
                     </div>
                     <div class="form-section">
                         <h3>Live calls</h3>
-                        <div class="settings-section-copy">Talk with Ouroboros by voice in any room: press Talk in an empty message field. Calls run on Google’s Gemini Live with the Google AI key below, the same key as Accounts → Google. Changes apply to the next call.</div>
+                        <div class="settings-section-copy">Talk with Ouroboros by voice in any room: press Talk in an empty message field. Calls run on Google’s Gemini Live with the Google AI key in Accounts → Google. Changes apply to the next call.</div>
                         <div class="form-grid two">
-                            ${secretField({ id: 's-call-google-key', settingKey: 'GOOGLE_API_KEY', label: 'Google AI key', placeholder: 'Google AI Studio key' })}
                             <div class="form-field ui-field">
                                 <label for="s-call-native-search">Google native search</label>
                                 <select id="s-call-native-search" class="ui-control"><option value="false">Off</option><option value="true">On</option></select>

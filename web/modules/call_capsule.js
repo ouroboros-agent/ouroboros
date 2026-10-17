@@ -15,21 +15,21 @@ const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone'];
 const RECONNECT_WORDS = {
     session_cap: 'Starting a fresh voice session',
     go_away: 'The voice service is moving the session',
-    context_length: 'Fitting the conversation to the voice model',
     transport_lost: 'The voice connection dropped',
 };
-// Where Settings opens for a step: the Live calls rows (key, model) or another tab.
-const KEY = { tab: 'models', focus: 's-call-google-key' };
+// Where Settings opens for a step: the Google key in Accounts, the Live calls rows, or another tab.
+const KEY = { tab: 'providers', focus: 's-google' };
 const MODEL = { tab: 'models', focus: 's-call-model-google' };
 const BUDGET = { tab: 'behavior', focus: '' };
 const REFUSED = { words: 'Google refused the call: “{detail}”', bare: 'Google refused the call', action: 'retry' };
 const UNREACHABLE = { words: 'Can’t reach Google’s voice service', action: 'retry' };
 const NOT_STARTED = { words: 'The call could not start; the room has the details', action: 'retry' };
 const NO_KEY = { words: 'Calls need a Google AI key — add it in Settings', action: 'settings', settings: KEY };
-// How a call ends, in the owner's words: `{detail}` quotes the engine, and `bare` is the sentence
-// when there is nothing to quote. `action` is the one next step; `calm` endings are facts, not
-// problems. Codes this page meets itself, and surfaces that cannot hold a call (`sheet`), are
-// words too. The server's own `action` wins over this table.
+// How a call ends, in the owner's words. For Google's own closes and errors the server's `detail`
+// is Google's sentence, quoted as Google's; for the host's own refusals it is the host's sentence,
+// never framed as Google's. `bare` is the sentence when there is nothing to say, `action` the one
+// next step; `calm` endings are facts, not problems. Codes this page meets itself, and surfaces
+// that cannot hold a call (`sheet`), are words too. The server's own `action` wins over this table.
 const ENDINGS = {
     owner_bye: { words: 'Call ended', calm: true },
     owner_stop: { words: 'Call ended', calm: true },
@@ -40,19 +40,17 @@ const ENDINGS = {
     missing_credential_google: NO_KEY,
     authentication: { words: 'Google refused the key', action: 'settings', settings: KEY },
     rate_limit: { words: 'Google says: “{detail}”', bare: 'Google asked to slow down', action: 'retry' },
-    quota: { words: 'Google says: “{detail}”', bare: 'Google says its quota is used up', action: 'retry' },
     provider_closed: { words: 'Google closed the call: “{detail}”', bare: 'Google closed the call', action: 'retry' },
-    context_too_large: { words: 'My core memory is larger than this engine holds ({detail})',
-        bare: 'My core memory is larger than this engine holds', action: 'settings', settings: MODEL },
     engine_unavailable: UNREACHABLE,
     reconnect_failed: UNREACHABLE,
     preparation_failed: NOT_STARTED,
     call_not_started: NOT_STARTED,
     invalid_request: REFUSED,
     protocol: REFUSED,
-    backpressure: REFUSED,
     provider_error: REFUSED,
-    engine_refused: REFUSED,
+    backpressure: { words: 'The call fell behind the voice stream', action: 'retry' },
+    engine_refused: { words: 'The call could not start: {detail}', bare: 'The call could not start',
+        action: 'settings', settings: MODEL },
     // Admission refusals the server words itself; the table adds only the next step.
     call_model_missing: { action: 'settings', settings: MODEL },
     invalid_call_max_minutes: { action: 'settings', settings: MODEL },
@@ -76,22 +74,15 @@ const ENDINGS = {
     no_live_audio: { sheet: true, words: 'This browser can’t play live audio. Open Ouroboros in a current browser.' },
     no_call_socket: { sheet: true, words: 'This browser can’t open call connections.' },
 };
-// Codes of the first version's server, read as today's reasons.
-const ALIASES = { 'engine_error:authentication': 'authentication', 'engine_error:invalid_request': 'invalid_request',
-    'engine_error:rate_limit': 'rate_limit', 'engine_error:context_length': 'context_too_large',
-    'engine_error:transport': 'engine_unavailable', 'engine_error:protocol': 'protocol',
-    'engine_error:backpressure': 'backpressure', 'engine_error:provider': 'provider_error',
-    admission_failed: 'preparation_failed', engine_error: 'provider_error', transport_lost: 'reconnect_failed' };
 const ACTION_LABELS = { retry: 'Try again', settings: 'Open Settings', reveal: 'Go to the call',
     open_browser: 'Open in browser', get_app: 'Get the new app' };
 
-/** A reason code as `{ kind, base, detail }`: `base` is the code before any `:detail`, `kind` the
- * same after reading a first-version code as today's. */
+/** A reason code as `{ kind, base, detail }`: `kind` and `base` are the code before any `:detail`. */
 function reason(code) {
     const raw = String(code || '');
     const colon = raw.indexOf(':');
     const base = colon < 0 ? raw : raw.slice(0, colon);
-    return { kind: ALIASES[raw] || ALIASES[base] || base, base, detail: colon < 0 ? '' : raw.slice(colon + 1) };
+    return { kind: base, base, detail: colon < 0 ? '' : raw.slice(colon + 1) };
 }
 
 function actionFor(kind, entry) {

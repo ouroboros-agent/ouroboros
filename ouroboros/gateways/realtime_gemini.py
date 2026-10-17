@@ -1,8 +1,9 @@
 """Gemini Live I/O with checkpoint-bound tool activation and turn accounting.
 
 The wire is documented at https://ai.google.dev/api/live and
-https://ai.google.dev/gemini-api/docs/live-api/tools. Fixtures are explicitly
-synthetic_from_docs until live Google credentials are available. Gemini has no
+https://ai.google.dev/gemini-api/docs/live-api/tools. The fixtures are synthetic
+from those documents; the adapter itself was run against gemini-3.8-live through
+``devtools/live_call_probe.py``. Gemini has no
 response/audio item IDs: local playback IDs are labeled, while function IDs and
 resume handles remain provider-owned. Context waits for idle because clientContent
 interrupts generation even when turnComplete is false.
@@ -328,7 +329,8 @@ class GeminiLiveEngine(RealtimeTransport):
             kind = "authentication" if code in (401, 403) else "provider_error"
             # An access refusal keeps the host's words: its provider text can echo credentials.
             words = "" if kind == "authentication" else provider_sentence(message["error"].get("message"))
-            await self._fail(EngineError(kind, words or "Gemini rejected a live event.", code in (408, 429, 500, 503)))
+            await self._fail(EngineError(kind, words or "Gemini rejected a live event.", code in (408, 429, 500, 503),
+                                         provider_words=words))
 
 
 register_engine("google", GeminiLiveEngine)

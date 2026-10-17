@@ -51,31 +51,30 @@ test('each ending says what happened and offers its one next step', () => {
     assert.deepEqual(show(ended('authentication')), ['Google refused the key', ['Open Settings'], 'error']);
     assert.deepEqual(show(ended('rate_limit', { detail: 'Slow down, please.' })), ['Google says: “Slow down, please.”', ['Try again'], 'error']);
     assert.deepEqual(show(ended('rate_limit')), ['Google asked to slow down', ['Try again'], 'error']);
-    assert.deepEqual(show(ended('quota', { detail: 'Quota exceeded for this project.' })),
-        ['Google says: “Quota exceeded for this project.”', ['Try again'], 'error']);
-    assert.deepEqual(show(ended('provider_closed', { detail: 'Session ended.' })), ['Google closed the call: “Session ended.”', ['Try again'], 'error']);
-    // There is no other engine to offer: the model choice is in Settings.
-    assert.deepEqual(show(ended('context_too_large', { detail: '140,112 > 131,072 tokens' })),
-        ['My core memory is larger than this engine holds (140,112 > 131,072 tokens)', ['Open Settings'], 'error']);
+    // Google's own sentence is quoted as Google's (a quota close is one of them); without one, plain words.
+    assert.deepEqual(show(ended('provider_closed', { detail: 'You exceeded your current quota.' })),
+        ['Google closed the call: “You exceeded your current quota.”', ['Try again'], 'error']);
+    assert.deepEqual(show(ended('provider_closed')), ['Google closed the call', ['Try again'], 'error']);
     assert.deepEqual(show(ended('engine_unavailable')), ['Can’t reach Google’s voice service', ['Try again'], 'error']);
     assert.deepEqual(show(ended('reconnect_failed')), ['Can’t reach Google’s voice service', ['Try again'], 'error']);
     assert.deepEqual(show(ended('preparation_failed')), ['The call could not start; the room has the details', ['Try again'], 'error']);
     assert.deepEqual(show(ended('call_not_started')), ['The call could not start; the room has the details', ['Try again'], 'error']);
-    for (const code of ['invalid_request', 'protocol', 'backpressure', 'provider_error', 'engine_refused']) {
+    for (const code of ['invalid_request', 'protocol', 'provider_error']) {
         assert.deepEqual(show(ended(code, { detail: 'Bad config.' })), ['Google refused the call: “Bad config.”', ['Try again'], 'error'], code);
         assert.deepEqual(show(ended(code)), ['Google refused the call', ['Try again'], 'error'], code);
     }
+    // The host's own refusals are the host's words, never framed as Google's.
+    assert.deepEqual(show(ended('engine_refused', { detail: 'A live route requires the provider’s model ID.' })),
+        ['The call could not start: A live route requires the provider’s model ID.', ['Open Settings'], 'error']);
+    assert.deepEqual(show(ended('backpressure')), ['The call fell behind the voice stream', ['Try again'], 'error']);
     // The server's own action wins over the page's table; an action this page does not know offers nothing.
     assert.deepEqual(show(ended('engine_unavailable', { action: 'settings' })), ['Can’t reach Google’s voice service', ['Open Settings'], 'error']);
-    assert.deepEqual(show(ended('context_too_large', { action: 'other_engine' })), ['My core memory is larger than this engine holds', [], 'error']);
-    // The first version's codes read the same.
-    assert.deepEqual(show(ended('engine_error:authentication')), ['Google refused the key', ['Open Settings'], 'error']);
-    assert.deepEqual(show(ended('admission_failed')), ['The call could not start; the room has the details', ['Try again'], 'error']);
-    // Settings opens where the step is: the key and the model are in Models → Live calls.
+    assert.deepEqual(show(ended('provider_closed', { action: 'other_engine' })), ['Google closed the call', [], 'error']);
+    // Settings opens where the step is: the key in Accounts → Google, the model in Models → Live calls.
     const target = (code) => callPresentation(ended(code)).actions.map(a => [a.tab, a.focus]);
-    assert.deepEqual(target('missing_credential'), [['models', 's-call-google-key']]);
-    assert.deepEqual(target('authentication'), [['models', 's-call-google-key']]);
-    assert.deepEqual(target('context_too_large'), [['models', 's-call-model-google']]);
+    assert.deepEqual(target('missing_credential'), [['providers', 's-google']]);
+    assert.deepEqual(target('authentication'), [['providers', 's-google']]);
+    assert.deepEqual(target('engine_refused'), [['models', 's-call-model-google']]);
     assert.deepEqual(target('budget_exceeded'), [['behavior', '']]);
     // Nothing about another engine is left in the words.
     for (const code of Object.keys({ missing_credential: 1, authentication: 1, rate_limit: 1, engine_unavailable: 1, invalid_request: 1 }))
@@ -91,7 +90,7 @@ test('a reasonless or unknown ending still shows the capsule: the call ended, an
     assert.deepEqual([unknown.mode, unknown.title, unknown.small], ['sheet', 'The call ended', 'a_code_from_the_future']);
     // Only an unknown code reaches the owner raw, in small print; known codes are words.
     for (const code of ['owner_bye', 'max_minutes', 'peers_left', 'budget_exceeded', 'missing_credential', 'authentication',
-        'rate_limit', 'quota', 'provider_closed', 'context_too_large', 'engine_unavailable', 'reconnect_failed',
+        'rate_limit', 'provider_closed', 'engine_unavailable', 'reconnect_failed',
         'preparation_failed', 'call_not_started', 'invalid_request', 'protocol', 'backpressure', 'provider_error',
         'engine_refused', 'socket_closed', 'socket_silent', 'microphone_busy', 'permission_denied', 'old_app']) {
         const p = callPresentation(ended(code));
@@ -120,7 +119,7 @@ test('what this page finds itself, and surfaces that cannot hold a call, get wor
         ['No live model is set for this engine in Settings (Models, Live calls).', [['settings', 'models', 's-call-model-google']]]);
     const noKey = failed('missing_credential_google', { words: 'Calls need a Google AI key — add it in Settings' });
     assert.deepEqual([noKey.title, noKey.actions.map(a => [a.kind, a.focus])],
-        ['Calls need a Google AI key — add it in Settings', [['settings', 's-call-google-key']]]);
+        ['Calls need a Google AI key — add it in Settings', [['settings', 's-google']]]);
     assert.deepEqual(failed('repo_writer_gate_closed', { words: 'Ouroboros is applying an update; try the call again in a moment.' })
         .actions.map(a => a.kind), ['retry']);
 });

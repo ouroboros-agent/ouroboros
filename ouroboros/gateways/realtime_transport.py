@@ -1,4 +1,4 @@
-"""Bounded websocket lifetime shared by the two live provider projections.
+"""Bounded websocket lifetime of the Gemini Live projection.
 
 The LLM layer supplies credentials; this leaf owns I/O and cleanup only. A full
 consumer queue closes explicitly instead of losing speech or blocking Stop behind
@@ -63,11 +63,11 @@ def transport_error(exc: Exception) -> EngineError:
     if code == 1007 and sentence:
         # Gemini refuses a setup it cannot hold (e.g. an instruction above the window) this way,
         # in its own words; reopening the same session cannot change them.
-        return EngineError("invalid_request", sentence)
+        return EngineError("invalid_request", sentence, provider_words=sentence)
     if code in (1002, 1003, 1007, 1009):
         return EngineError("protocol", "Live provider rejected the websocket payload.")
     if code is not None and code not in (1000, 1001, 1006) and sentence:
-        return EngineError("provider_closed", sentence)
+        return EngineError("provider_closed", sentence, provider_words=sentence)
     if code == 1011:
         return EngineError("provider_closed", "The live provider ended the session with an internal error.")
     return EngineError("transport", "Live provider connection lost; delivery may be incomplete.", True)

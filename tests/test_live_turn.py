@@ -167,7 +167,6 @@ class FakeLedger:
         self.reserved: list = []
         self.settled: list = []
         self.abandoned: list = []
-        self.transcriptions: list = []
         self.refused: list = []
         self.warmed: list = []
         self.refuse = False
@@ -188,9 +187,6 @@ class FakeLedger:
 
     def settle_live_response(self, attempt, *, usage, raw_usage, status) -> None:
         self.settled.append((attempt["key"], status, dict(usage)))
-
-    def record_transcription(self, **fields) -> None:
-        self.transcriptions.append(fields)
 
     def abandon_live_response(self, attempt, *, reason) -> None:
         self.abandoned.append((attempt["key"], reason))
@@ -635,7 +631,7 @@ def test_a_withdrawn_tool_call_does_not_run(harness, monkeypatch, tmp_path):
 # --- the ledger and the budget ----------------------------------------------------------
 
 
-def test_responses_are_reserved_and_settled_and_transcription_is_recorded(harness, monkeypatch, tmp_path):
+def test_responses_are_reserved_and_settled(harness, monkeypatch, tmp_path):
     h = harness()
     engine = h.start()
     engine.push(ResponseStarted(item_id="a1", response_id="r1"))
@@ -750,12 +746,20 @@ def test_a_retryable_engine_error_reconnects_and_a_fatal_one_ends_the_call(harne
     first.push(EngineError(kind="rate_limited", message="slow down", retryable=True))
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
     second = h.engine()
-    second.push(EngineError(kind="authentication", message="bad key", retryable=False))
+    second.push(EngineError(kind="authentication", message="Live provider refused access.", retryable=False))
     text, usage, _trace = h.finish()
     assert usage["reason_code"] == "live_engine_error" and usage["live_call"]["ended"] == "authentication"
-    assert "authentication: bad key" in text
-    # The owner's surface gets the provider's sentence and the one next step beside the reason.
-    assert ("closed", "bad key", "settings") in h.hub.words
+    assert "authentication: Live provider refused access." in text
+    # The surface gets the one next step; the host's own description is never quoted as the provider's words.
+    assert ("closed", "", "settings") in h.hub.words
+
+
+def test_a_providers_own_sentence_reaches_the_surface_as_its_words(harness):
+    h = harness()
+    h.start().push(EngineError(kind="provider_closed", message="You exceeded your current quota.",
+                               provider_words="You exceeded your current quota."))
+    h.finish()
+    assert ("closed", "You exceeded your current quota.", "retry") in h.hub.words
 
 
 def test_a_session_that_cannot_be_reopened_ends_the_call(harness, monkeypatch, tmp_path):

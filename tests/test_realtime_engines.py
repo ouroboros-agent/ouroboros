@@ -474,9 +474,11 @@ def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
     error = transport_error(quota)
     assert error.kind == "provider_closed" and not error.retryable
     assert error.message.startswith("You exceeded your current quota") and "AIza" not in error.message
+    assert error.provider_words == error.message  # Google's own sentence, which the owner may read as Google's
     assert "https://" not in error.message
     failed = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1011, reason="")))
     assert failed.kind == "provider_closed" and not failed.retryable  # a server error without words: Try again
+    assert failed.provider_words == ""  # the host's description is never quoted as Google's
     lost = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1006, reason="")))
     assert lost.kind == "transport" and lost.retryable  # a connection lost without a close frame resumes
     normal = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1000, reason="bye")))
@@ -487,7 +489,7 @@ def test_a_named_server_close_keeps_its_sentence_and_is_not_retried():
     bare = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1007, reason="")))
     assert bare.kind == "protocol"
     denied = transport_error(SimpleNamespace(rcvd=SimpleNamespace(code=1008, reason="key fixture-key is invalid")))
-    assert denied.kind == "authentication" and "fixture-key" not in denied.message
+    assert denied.kind == "authentication" and "fixture-key" not in denied.message and denied.provider_words == ""
 
 
 def test_gemini_compression_starts_at_the_drivers_watermarks():
