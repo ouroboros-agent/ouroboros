@@ -19,11 +19,12 @@ echoed back into the session.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import logging
 import pathlib
 import threading
-import hashlib
-import io
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.gateways.realtime_engine import ContextItem, VideoIn
@@ -209,6 +210,14 @@ def room_images(row: Dict[str, Any], root: pathlib.Path) -> List[VideoIn]:
         except (OSError, ValueError, KeyError, ImportError):
             log.debug("room image could not reach live call", exc_info=True)
     return images
+
+
+def attach_image(row: Dict[str, Any], item: VideoIn) -> None:
+    """A room image joins its own text row in the call's transcript, so a reopened session replays it."""
+    if isinstance(row["content"], str):
+        row["content"] = [{"type": "text", "text": row["content"]}]
+    url = f"data:{item.mime};base64,{base64.b64encode(item.data).decode('ascii')}"
+    row["content"].append({"type": "image_url", "image_url": {"url": url}})
 
 
 def render_room_row(row: Dict[str, Any], key: str) -> ContextItem:

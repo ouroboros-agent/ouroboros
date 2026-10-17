@@ -1,16 +1,18 @@
 """Live voice-call driver: one realtime engine session is the turn's model round.
 
-A call is an ordinary turn whose model speaks and listens (ARCHITECTURE §6).
-This driver opens the fitted Nano view, pumps peer input and engine output,
-runs tools on one worker, drains mail and room rows, and reopens lost sessions.
-The price quote warms off the audio loop. Stop cancels opening. It returns
-the loop's triple with a host notice naming the transcript.
+A call is an ordinary turn whose model speaks and listens (ARCHITECTURE §6 "Live calls"):
+the agent prepares the text turn's context; this driver opens the engine with that fitted
+system text and the room's Nano tool view (``live_call_route``) and pumps until the call
+ends: peer audio and frames in, engine audio out through the hub, captions to the peers and
+the chat, tools on one serialized worker (``live_tool_batch``), the owner's mailbox on a
+short tick, and the room's new rows (``live_awareness``) as context. Session caps and
+transport losses reopen with a history view or the resume handle; the price quote warms off
+the audio loop. Returns the loop's ``(text, usage, llm_trace)`` with a host-notice terminal.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextvars
 import logging
 import pathlib
@@ -557,11 +559,8 @@ class _LiveCall:
     async def _context(self, item: ContextItem) -> None:
         """Context the call heard is part of its transcript: a reopened session replays it."""
         if isinstance(item, VideoIn):
-            row = self.messages[-1]
-            if isinstance(row["content"], str):
-                row["content"] = [{"type": "text", "text": row["content"]}]
-            row["content"].append({"type": "image_url", "image_url": {"url":
-                                   f"data:{item.mime};base64,{base64.b64encode(item.data).decode('ascii')}"}})
+            from ouroboros.live_awareness import attach_image
+            attach_image(self.messages[-1], item)  # a room image follows its own text row
             self._post(item)
             return
         if not item.text.strip():
