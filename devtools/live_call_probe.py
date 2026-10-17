@@ -98,6 +98,40 @@ class Evidence:
             return [r for r in self.rows if r["kind"] == kind and r["at"] >= since]
 
 
+TINY_PCM = "AAABAA=="  # two PCM16 samples: a replayable stand-in for recorded audio
+
+
+def redacted_wire(message: dict, handles: dict) -> dict:
+    """One Gemini wire message as a replayable fixture row: audio becomes ``TINY_PCM`` beside its
+    recorded length, resume handles become labels, the setup's instruction becomes its length and
+    digest, and grounding's rendered HTML becomes its length. Everything else stays as received."""
+    def walk(value, key=""):
+        if isinstance(value, dict):
+            if "inlineData" in value and isinstance(value["inlineData"], dict):
+                inline = dict(value["inlineData"])
+                inline["recorded_bytes"] = len(base64.b64decode(inline.get("data") or ""))
+                inline["data"] = TINY_PCM
+                return {**{k: walk(v, k) for k, v in value.items() if k != "inlineData"}, "inlineData": inline}
+            out = {}
+            for k, v in value.items():
+                if k == "newHandle" and v:
+                    out[k] = handles.setdefault(v, f"recorded-handle-{len(handles) + 1}")
+                elif k == "renderedContent" and isinstance(v, str):
+                    out[k] = f"[{len(v)} characters of rendered search chips]"
+                elif k == "systemInstruction":
+                    text = "".join(part.get("text", "") for part in v.get("parts", []))
+                    out[k] = {"recorded_chars": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+                elif k == "data" and key == "audio":
+                    out[k] = TINY_PCM
+                else:
+                    out[k] = walk(v, k)
+            return out
+        if isinstance(value, list):
+            return [walk(item, key) for item in value]
+        return value
+    return walk(message)
+
+
 class ObservedEngine:
     """Delegate every operation unchanged and retain evidence at the actual wire."""
 
@@ -105,8 +139,12 @@ class ObservedEngine:
         self.engine, self.evidence, self.ctx = engine, evidence, ctx
         original_write, original_receive = engine._write, engine._handle_message
 
+        handles: dict = {}
+
         async def write(payload):
             await original_write(payload)
+            if "realtimeInput" not in payload or "audio" not in payload.get("realtimeInput", {}):
+                evidence.note("gemini_wire", direction="client", message=redacted_wire(payload, handles))
             if payload.get("type") != "input_audio_buffer.append" and "realtimeInput" not in payload:
                 if payload.get("type") == "session.update" or "setup" in payload:
                     evidence.note("wire_sent", type=payload.get("type", "setup"),
@@ -115,9 +153,7 @@ class ObservedEngine:
                     evidence.note("wire_sent", payload=payload)
 
         async def receive(payload):
-            if payload.get("type") in {"error", "conversation.item.truncated", "response.done",
-                                       "conversation.item.input_audio_transcription.completed"}:
-                evidence.note("wire_received", payload=payload)
+            evidence.note("gemini_wire", direction="server", message=redacted_wire(payload, handles))
             await original_receive(payload)
 
         engine._write, engine._handle_message = write, receive
@@ -352,9 +388,14 @@ class Probe:
         self.agent = self.peer = self.thread = None
 
     def verdict(self, scenario, passed, **evidence):
-        self.result["scenarios"][scenario] = {"verdict": "PASS" if passed else "FAIL", "evidence": evidence}
+        row = {"verdict": "PASS" if passed else "FAIL", "evidence": evidence}
+        if evidence.get("route") == "native_search":
+            # Gemini's own Google Search answered: the function-tool path did not run in this scenario.
+            row.update(route="native_search", function_path="NOT_RUN")
+        self.result["scenarios"][scenario] = row
         write_json(self.root / "result.json", self.result)
-        print(scenario + ": " + self.result["scenarios"][scenario]["verdict"], flush=True)
+        print(scenario + ": " + row["verdict"] + (" (native search; function path NOT_RUN)"
+                                                  if row.get("route") else ""), flush=True)
 
     async def wait(self, predicate, *, timeout=None):
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
@@ -506,12 +547,10 @@ class Probe:
                 rows = json_rows(self.root / "data/logs/chat.jsonl")
                 interrupted = [r for r in rows if (r.get("spoken") or {}).get("status") == "interrupted"]
                 continued = [e for e in self.evidence.of("peer_audio", cut) if e["item_id"] in continued_items()]
-                truncated = [e for e in self.evidence.of("wire_received", cut)
-                             if e["payload"].get("type") == "conversation.item.truncated"]
                 # Gemini truncates server-side: the host's flush, cut and continued speech are the proof.
                 self.verdict("interruption", bool(commands and flushes and interrupted and continued
                              and not self.hub.closed),
-                             commands=commands, flushes=flushes, truncated=truncated, rows=interrupted,
+                             commands=commands, flushes=flushes, rows=interrupted,
                              continued_audio_bytes=sum(e["bytes"] for e in continued))
             except Exception as exc:
                 self.verdict("interruption", False, error=str(exc))
@@ -551,6 +590,13 @@ class Probe:
                              thread_alive=self.thread.is_alive(), hub_closed=self.hub.closed,
                              checkpoint=task_result.get("live_call"), terminal_events=terminals, hub_stats=self.hub.stats())
             close_hub(self.spec.call_id)
+        wire = [{"direction": e["direction"], "message": e["message"]} for e in self.evidence.of("gemini_wire")]
+        if wire:  # a replayable fixture of what Gemini actually sent and received, redacted (``redacted_wire``)
+            write_json(self.root / "recorded_exchange.json", {"header": {
+                "provenance": "recorded_live", "model": getattr(getattr(self, "spec", None), "model", ""),
+                "recorded_on": time.strftime("%Y-%m-%d"), "recorder": "devtools/live_call_probe.py",
+                "notes": "Audio is a two-sample stand-in beside its recorded length; resume handles are labels; "
+                         "the setup's instruction is its length and digest."}, "events": wire})
         if getattr(self, "spec", None) is not None:  # how the route counted the call view's text (the fit's witness)
             from ouroboros.capability_evidence import canonical_evidence_root, resolve_main_token_density, route_fingerprint
 
@@ -671,8 +717,10 @@ def copy_data(source: Path, target: Path, *, skipped=DATA_COPY_SKIPPED, prefix: 
             continue
         if entry.is_dir() and not entry.is_symlink() and any(s.startswith(name + "/") for s in skipped):
             copy_data(entry, target / entry.name, skipped=skipped, prefix=name + "/")
-        elif subprocess.run(["cp", "-c", "-R", str(entry), str(target)]).returncode and entry.exists():
-            # A live install keeps writing: an entry that vanished meanwhile is simply not copied.
+        elif (subprocess.run(["cp", "-c", "-R", str(entry), str(target)]).returncode
+              and entry.exists() and not (target / entry.name).exists()):
+            # A live install keeps writing: files that vanished meanwhile (cp names them) are simply
+            # not copied; only an entry that still exists and was not copied at all stops the run.
             raise RuntimeError(f"could not copy {entry}")
 
 
