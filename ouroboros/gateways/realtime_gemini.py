@@ -107,7 +107,8 @@ def history_turn(row):
             else:
                 raise LiveEngineRefusal("history_content", "Gemini live history requires text or inline images.")
     if row.get("tool_calls"):
-        parts.append({"text": "[Earlier tool calls] " + json.dumps(row["tool_calls"])})
+        # As the replay bound weighs them (``live_session_view``): words unescaped, Cyrillic as itself.
+        parts.append({"text": "[Earlier tool calls] " + json.dumps(row["tool_calls"], ensure_ascii=False)})
     return {"role": "model" if role in ("assistant", "model") else "user", "parts": parts}
 
 

@@ -12,6 +12,7 @@ import json
 import math
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
+from ouroboros.context_fit import estimate_context_prompt_tokens
 from ouroboros.live_call_route import CALL_REPLY_ALLOWANCE_TOKENS
 from ouroboros.live_tool_batch import images_of, text_of
 from ouroboros.utils import estimate_tokens
@@ -69,9 +70,13 @@ def history_rows(messages: Sequence[Mapping]) -> List[Dict[str, Any]]:
 def _replayed_tokens(item: Mapping) -> int:
     """What one replayed row weighs: its text, its images (the bounded proxy) and the earlier tool
     calls it carries as text, whose arguments can dwarf an assistant row's words."""
-    from ouroboros.context_fit import estimate_context_prompt_tokens
-
     return int(estimate_context_prompt_tokens([dict(item)]))
+
+
+def _omission_notice(count: int) -> Dict[str, Any]:
+    return {"role": "user", "content": (
+        f"[Earlier in this call: {count} rows (speech, typed words, tool results) are not "
+        "replayed into this session; they are in this room's transcript.]")}
 
 
 def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[Mapping],
@@ -88,26 +93,24 @@ def history_view(fact: Any, messages: Sequence[Mapping], tool_schemas: Sequence[
         return tuple(rows)
     system = messages[0] if messages and messages[0].get("role") == "system" else {}
     budget = max(0, (_room(fact) - _view_tokens(text_of(system.get("content")), tool_schemas, ratio)) // 2)
+    costs = [math.ceil(_replayed_tokens(item) * ratio) for item in rows]
+    if sum(costs) > budget:  # rows stay out, so the notice naming them is replayed too and weighs its share
+        budget -= math.ceil(_replayed_tokens(_omission_notice(len(rows))) * ratio)
     kept: List[Dict[str, Any]] = []
     spent = 0
-    for item in reversed(rows):
-        cost = math.ceil(_replayed_tokens(item) * ratio)
+    for item, cost in zip(reversed(rows), reversed(costs)):
         if spent + cost > budget:
             break
         kept.append(item)
         spent += cost
     kept.reverse()
     if len(kept) < len(rows):
-        kept.insert(0, {"role": "user", "content": (
-            f"[Earlier in this call: {len(rows) - len(kept)} rows (speech, typed words, tool results) are not "
-            "replayed into this session; they are in this room's transcript.]")})
+        kept.insert(0, _omission_notice(len(rows) - len(kept)))
     return tuple(kept)
 
 
 def text_estimate(instructions: str, history: Sequence[Mapping], tool_schemas: Sequence[Mapping]) -> int:
     """The fit estimator's own count of the text a fresh session is opened with (the density basis)."""
-    from ouroboros.context_fit import estimate_context_prompt_tokens
-
     return int(estimate_context_prompt_tokens([{"role": "system", "content": instructions}, *history],
                                               list(tool_schemas) or None))
 

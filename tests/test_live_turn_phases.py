@@ -150,6 +150,49 @@ def test_a_replayed_row_weighs_its_tool_call_arguments_too():
     assert any(item.get("tool_calls") for item in history_view(fact, messages, []))  # a small call still replays
 
 
+def _replayed_text(view):
+    from ouroboros.gateways.realtime_gemini import history_turn
+
+    return "".join(part.get("text", "") for row in view for part in history_turn(row)["parts"])
+
+
+def test_a_replayed_tool_call_weighs_what_gemini_replays_in_any_script():
+    import json
+    import math
+    from types import SimpleNamespace
+
+    from ouroboros.live_session_view import _view_tokens, history_view
+    from ouroboros.utils import estimate_tokens
+
+    fact, ratio = SimpleNamespace(window_tokens=131_072, reply_allowance_tokens=8_192), 1.2
+    view = "x" * 360_000  # a large call view, as on a mature install
+    arguments = json.dumps({"path": "notes.md", "content": "я" * 15_000}, ensure_ascii=False)
+    messages = [{"role": "system", "content": view},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "w1", "type": "function", "function": {"name": "write_file", "arguments": arguments}}]},
+                {"role": "tool", "tool_call_id": "w1", "content": "Written"}]
+    kept = history_view(fact, messages, [], ratio)
+    budget = (131_072 - 8_192 - _view_tokens(view, [], ratio)) // 2
+    assert math.ceil(estimate_tokens(_replayed_text(kept)) * ratio) <= budget  # Cyrillic replays as itself
+    assert any(item.get("tool_calls") for item in kept)  # and a call that fits at its real weight still replays
+
+
+def test_the_replay_notice_is_budgeted_with_the_rows_it_names():
+    from types import SimpleNamespace
+
+    from ouroboros.live_session_view import _view_tokens, history_view
+    from ouroboros.utils import estimate_tokens
+
+    messages = [{"role": "system", "content": "x"}, {"role": "user", "content": "old " * 1_000},
+                {"role": "user", "content": "x" * 100}]
+    for room in (100, 200):
+        fact = SimpleNamespace(window_tokens=8_192 + room, reply_allowance_tokens=8_192)
+        kept = history_view(fact, messages, [])
+        assert estimate_tokens(_replayed_text(kept)) <= (room - _view_tokens("x", [])) // 2
+        assert kept[0]["content"].startswith("[Earlier in this call:")
+    assert kept[-1]["content"] == "x" * 100  # with room for both, the newest row replays beside its notice
+
+
 def test_sessions_that_die_before_answering_end_the_call_instead_of_reopening_forever(harness, monkeypatch):
     from ouroboros.gateways.realtime_engine import ResponseDone
 
