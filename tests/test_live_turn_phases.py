@@ -1,6 +1,6 @@
 """What the owner's surface is told during a call: phases, closing words, activity, and session windows.
 
-Uses the driver harness of ``tests/test_live_turn.py`` (fake hub, engine, LLM and ledger).
+Uses the driver harness of ``tests/_live_call_shared.py`` (fake hub, engine, LLM and ledger).
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ import pytest
 from ouroboros import live_turn
 from ouroboros.call_protocol import STATE_CLOSED, STATE_CONNECTING, STATE_LIVE, PeerAudio
 from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, AudioIn, EngineError, ToolCall
-from tests import test_live_turn as base
-from tests.test_live_turn import _spec, _wait_for
+from tests import _live_call_shared as base
+from tests._live_call_shared import _spec, _wait_for
 
 harness = base.harness  # the same fixture, registered in this module
 

@@ -1,7 +1,7 @@
 """A long call's session renewals: the call so far returns as text, the newest stretch stays audio.
 
 Pure parts (``live_session_view``, ``live_call_state``) run alone; the driver parts use the
-harness of ``tests/test_live_turn.py`` (fake hub, engine, LLM and ledger).
+harness of ``tests/_live_call_shared.py`` (fake hub, engine, LLM and ledger).
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ from ouroboros.live_session_view import (
     CALL_SO_FAR_HEADING, IMAGE_REPLAY_LABEL, SHORT_ROW_CHARS, _view_tokens, audio_reserve, history_rows, history_view,
     mark_spoken, with_call_so_far,
 )
-from tests import test_live_turn as base
-from tests.test_live_turn import _wait_for
+from tests import _live_call_shared as base
+from tests._live_call_shared import _wait_for
 
 harness = base.harness  # the same fixture, registered in this module
 

@@ -1,9 +1,9 @@
 """The live voice-call driver across sessions: what a call heard, saw and was asked.
 
-The round-trip cases of ``test_live_turn``'s harness that span a reconnect, a
+The round-trip cases of the driver harness that span a reconnect, a
 connection still opening, a repeated provider request, a Presence call's rounds
 and the route's instruction ceiling. The fakes and the ``harness`` fixture are
-``test_live_turn``'s own.
+``tests/_live_call_shared.py``'s.
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from ouroboros.gateways.realtime_engine import (
     ResponseDone, ResponseStarted, SpeechStarted, ToolCall, ToolResult,
 )
 from ouroboros.usage_accounting import BudgetExceeded
-from tests import test_live_turn as base
-from tests.test_live_turn import OWNER, FakeEngine, _spec, _wait_for
+from tests import _live_call_shared as base
+from tests._live_call_shared import OWNER, FakeEngine, _spec, _wait_for
 
 harness = base.harness  # the same fixture, registered in this module
 
