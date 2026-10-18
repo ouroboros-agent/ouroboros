@@ -190,20 +190,23 @@ from ouroboros.nanny_pacing import (
 )
 
 
-def _setup_dynamic_tools(tools_registry, tool_schemas, messages, context_mode="max"):
-    """Bind the one discovery implementation to this loop's resident schema list."""
-    from ouroboros.tools.tool_discovery import bind_resident_schemas
+def _setup_dynamic_tools(tools_registry, tool_schemas, messages, context_mode="max", call=False):
+    """Bind the one discovery implementation to this loop's resident schema list. A live ``call``
+    is told what else exists by namespace and skill, since each catalog look costs it a spoken pause."""
+    from ouroboros.tools.tool_discovery import bind_resident_schemas, call_catalog_facts
 
     enabled_extra = bind_resident_schemas(tools_registry, tool_schemas)
     tools_registry._ctx._actor_loaded_tool_names = enabled_extra  # a route's schema ceiling keeps these
-    non_core_count = len(list_non_core_tools(tools_registry, context_mode=context_mode))
-    if non_core_count > 0:
+    non_core = list_non_core_tools(tools_registry, context_mode=context_mode)
+    if non_core and call:
+        _append_or_merge_user_message(messages, "[SYSTEM NOTICE]\n" + call_catalog_facts(len(tool_schemas), non_core))
+    elif non_core:
         _append_or_merge_user_message(
             messages,
             (
                 "[SYSTEM NOTICE]\n"
                 f"You have {len(tool_schemas)} core tools loaded. "
-                f"There are {non_core_count} additional tools available "
+                f"There are {len(non_core)} additional tools available "
                 f"(use `list_available_tools` to see them, `enable_tools` to activate). "
                 f"Core tools cover most tasks. Enable extras only when needed."
             ),

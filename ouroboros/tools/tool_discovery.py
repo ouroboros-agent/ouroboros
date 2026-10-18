@@ -106,9 +106,12 @@ def list_available_tools(
     that namespace, an MCP row as ``raw MCP name → callable name``. It describes
     the catalog observed now, not what an earlier request carried.
     """
-    schemas = registry.schemas()
-    omissions = registry.capability_omissions()
-    callable_rows = {row["name"]: row for row in registry.callable_rows() or []}
+    from ouroboros.extension_liveness import liveness_observation
+
+    with liveness_observation():  # one look at the catalog: both passes share the skill inventory
+        schemas = registry.schemas()
+        omissions = registry.capability_omissions()
+        callable_rows = {row["name"]: row for row in registry.callable_rows() or []}
     rows = [
         {**callable_rows[row["name"]], "loaded": row["residency"] == "loaded",
          "description": (" ".join(callable_rows[row["name"]]["raw_description"].split())[:120]
@@ -122,6 +125,8 @@ def list_available_tools(
     for row in rows:
         groups.setdefault(tool_namespace(row["name"]), []).append(row)
     selected = str(namespace or "").strip()
+    if selected and selected not in groups and selected != BUILTIN_NAMESPACE:
+        selected = _skill_namespace(selected, groups) or selected  # a skill names its extension namespace
     header = ("Current callable catalog (observed now); [loaded] = the schema is already in "
               "your tool list, enable_tools loads a not-loaded one.")
     if selected:
@@ -135,8 +140,9 @@ def list_available_tools(
                      " Use list_available_tools() for the namespace overview."]
     else:
         lines = [header, f"{len(rows)} callable tools. Namespaces — list_available_tools(namespace=...) lists one completely:"]
-        lines += [f"- {name}: {len(items)} tools, {sum(item['loaded'] for item in items)} loaded"
-                  for name, items in sorted(groups.items())]
+        skills = _namespace_skills()
+        lines += [f"- {name}{f' (skill {skills[name]})' if name in skills else ''}: {len(items)} tools, "
+                  f"{sum(item['loaded'] for item in items)} loaded" for name, items in sorted(groups.items())]
         # Names only here, so the overview stays bounded; namespace="builtin" adds purposes.
         for state, loaded_flag in (("loaded", True), ("not loaded", False)):
             names = [row["name"] for row in groups.get(BUILTIN_NAMESPACE, []) if row["loaded"] is loaded_flag]
@@ -197,6 +203,40 @@ def enable_tools(
             status="blocked" if hidden else "error",
             code="ACCESS_BLOCKED" if hidden else "UNKNOWN_TOOL", text=text))
     return text
+
+
+def call_catalog_facts(loaded: int, not_loaded: List[Dict[str, Any]]) -> str:
+    """What a live call can load beyond its view, by namespace (an extension's skill named), so the
+    voice can enable a tool by name without a catalog look first."""
+    skills, counts = _namespace_skills(), {}
+    for row in not_loaded:
+        namespace = tool_namespace(str(row.get("name") or ""))
+        counts[namespace] = counts.get(namespace, 0) + 1
+    parts = [f"{name}{f' (skill {skills[name]})' if name in skills else ''}: {count}"
+             for name, count in sorted(counts.items())]
+    return (f"Your tool list holds {loaded} tools. {len(not_loaded)} more are callable, by namespace — "
+            + "; ".join(parts) + ". enable_tools loads tools by their names (a namespace or a skill's name answers "
+            "with its tools' names); list_available_tools(namespace=...) describes one namespace.")
+
+
+def _namespace_skills() -> Dict[str, str]:
+    """Each loaded extension namespace and the skill it belongs to, so the overview can name the skill."""
+    from ouroboros.extension_loader import _lock as ext_lock, _tools as ext_tools
+
+    with ext_lock:
+        return {tool_namespace(str(tool.get("name") or "")): str(tool.get("skill") or "")
+                for tool in ext_tools.values() if tool.get("skill")}
+
+
+def _skill_namespace(name: str, groups: Dict[str, Any]) -> str:
+    """The extension namespace a skill's name produces (the loader's exact naming rule), when it is listed."""
+    from ouroboros.extension_surface_names import extension_name_prefix
+
+    try:
+        namespace = extension_name_prefix(name)[:-1]
+    except Exception:
+        return ""
+    return namespace if namespace in groups else ""
 
 
 def _named_namespace_guidance(registry: "ToolRegistry", names: List[str], *, discovery: bool) -> List[str]:
@@ -271,7 +311,7 @@ def get_tools() -> List[ToolEntry]:
                     "properties": {
                         "namespace": {
                             "type": "string",
-                            "description": "Optional namespace to list completely, e.g. builtin or mcp_<server>.",
+                            "description": "Optional namespace to list completely, e.g. builtin, mcp_<server> or an extension's skill name.",
                         },
                     },
                     "required": [],
@@ -284,9 +324,10 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "enable_tools",
                 "description": (
-                    "Compatibility check for named tools (comma-separated). Tasks start "
-                    "with the selected envelope active, so this confirms registration instead "
-                    "of granting delayed core tools."
+                    "Load permitted tools that are not in your tool list yet, by their exact names "
+                    "(comma-separated); a tool already loaded is confirmed. A namespace or a skill's "
+                    "name answers with its tools' names. In a live call the voice session reopens "
+                    "once to take the new tools."
                 ),
                 "parameters": {
                     "type": "object",

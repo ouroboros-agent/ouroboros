@@ -243,7 +243,7 @@ class Harness:
         monkeypatch.setattr(live_turn, "_ledger", lambda: self.ledger)
         monkeypatch.setattr(live_turn, "initial_call_schemas", lambda tools, spec=None: list(self.schemas))
         monkeypatch.setattr(loop, "_setup_dynamic_tools",
-                            lambda tools, schemas, messages, context_mode="max": (list(schemas), None))
+                            lambda tools, schemas, messages, context_mode="max", call=False: (list(schemas), None))
         monkeypatch.setattr(loop, "handle_tool_calls", self._handle_tool_calls)
         monkeypatch.setattr(loop, "_measure_tool_result_batch", lambda ctx, messages, schemas, *, round_id: None)
         monkeypatch.setattr(loop_budget, "_cleanup_loop_resources", lambda executor, exit_ctx: None)
@@ -368,7 +368,7 @@ def test_the_session_opens_with_the_fitted_instructions_and_the_nano_view(harnes
     # The call so far rides in the instruction, which the provider keeps; no history turns.
     assert config.instructions.startswith("You are Ouroboros, on a call.\n\n## This call so far")
     # The registry's Nano view, then the call's own hang-up.
-    assert [schema["function"]["name"] for schema in config.tools] == ["knowledge_read", "web_search", "enable_tools", "end_call"]
+    assert [schema["function"]["name"] for schema in config.tools] == ["knowledge_read", "web_search", "enable_tools", "end_call", "set_call_languages"]
     assert config.route.engine == ENGINE_GOOGLE and config.route.model == "gemini-3.8-live" and config.route.voice == "Kore"
     assert config.native_search is True and config.resume_handle == ""  # Gemini's own search: on by default
     assert config.instructions.endswith("\n[Live call] A live voice call is open in this room.") and config.history == ()
@@ -458,7 +458,9 @@ def test_final_captions_become_rows_of_the_room_without_an_owner_turn(harness, m
     assert text == "Sunny." and kwargs["narration"] is True
     assert kwargs["_progress_meta_override"]["spoken"] == {"call_id": "call-1", "item_id": "a1", "status": "played", "played_ms": 800}
     assert engine.sent_of(PlayedAudio) == [PlayedAudio(item_id="a1", played_ms=800)]
-    assert [m["role"] for m in h.messages[2:]] == ["user", "assistant"] and all(m["_call_row"] for m in h.messages[2:])
+    # The call became audible (a fact the voice may greet on), then the owner's words, then the answer.
+    assert [(m["role"], m.get("_context_source")) for m in h.messages[2:]] == [
+        ("user", "call_live"), ("user", None), ("assistant", None)] and all(m["_call_row"] for m in h.messages[2:])
     h.stop()
     h.finish()
 
@@ -600,7 +602,7 @@ def test_tool_growth_reaches_the_session_as_an_update(harness, monkeypatch, tmp_
     engine.push(ToolCall(call_id="c-grow", name="enable_tools", arguments='{"names": ["read_file"]}'))
     assert _wait_for(lambda: engine.sent_of(UpdateTools))
     names = [s["function"]["name"] for s in engine.sent_of(UpdateTools)[0].tools]
-    assert names == ["knowledge_read", "web_search", "enable_tools", "read_file", "end_call"]  # the hang-up stays
+    assert names == ["knowledge_read", "web_search", "enable_tools", "read_file", "end_call", "set_call_languages"]  # the hang-up stays
     assert engine.sent_of(ToolResult)[0].call_id == "c-grow"
     h.stop()
     h.finish()
@@ -934,7 +936,7 @@ def test_the_call_view_opens_with_memory_the_web_and_the_room_chat():
     # Pointers in the call view are read_file addresses, and long work becomes a task, from the first open.
     assert set(CALL_INITIAL_TOOL_NAMES) == set(COGNITIVE_MEMORY_TOOL_NAMES) | {
         "web_search", "send_user_message", "read_file", "start_task",
-        "view_image", "browse_page", "send_photo"}
+        "view_image", "browse_page", "send_photo", "peek_task", "get_task_result", "tell_task"}
 
 
 def test_a_call_nobody_attaches_to_ends_after_the_rejoin_grace(harness, monkeypatch, tmp_path):

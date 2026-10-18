@@ -9,9 +9,11 @@ this module never loads or unloads anything.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import pathlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from ouroboros.extension_registry_state import _extensions, _load_failures, _lock
 from ouroboros.skill_loader import (
@@ -24,6 +26,35 @@ from ouroboros.skill_loader import (
 from ouroboros.skill_peer_inventory import discover_skill_peers
 
 log = logging.getLogger(__name__)
+
+# One catalog observation (a listing, a call's first tool view): the skill inventory read once.
+_OBSERVATION: contextvars.ContextVar[Optional[Dict[Any, Any]]] = contextvars.ContextVar(
+    "extension_liveness_observation", default=None)
+
+
+@contextlib.contextmanager
+def liveness_observation() -> Iterator[None]:
+    """Inside the block every liveness check shares one discovery of the installed skills' peers and of
+    each skill's identity, per data root and skills repository, as one look at the catalog reads them;
+    outside it each check discovers afresh. Nothing outlives the block, so the next observation sees a
+    skill disabled, reviewed or edited in between. A nested block joins the outer one."""
+    if _OBSERVATION.get() is not None:
+        yield
+        return
+    token = _OBSERVATION.set({})
+    try:
+        yield
+    finally:
+        _OBSERVATION.reset(token)
+
+
+def _observed(key: Any, compute: Any) -> Any:
+    seen = _OBSERVATION.get()
+    if seen is None:
+        return compute()
+    if key not in seen:
+        seen[key] = compute()
+    return seen[key]
 
 
 def _extension_runtime_state(
@@ -186,15 +217,17 @@ def runtime_state_for_skill_name(
     from ouroboros.config import get_skills_repo_path
 
     resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
+    root_key = str(pathlib.Path(drive_root))
     if selected_skill is not None:
         selected = [selected_skill]
     elif skills is not None:
         selected = list(skills)
     else:
-        selected = discover_skill_identity(drive_root, skill_name, repo_path=resolved_repo_path)
-    peer_projection = list(skills) if skills is not None else list(
-        discover_skill_peers(drive_root, repo_path=resolved_repo_path)
-    )
+        selected = _observed(("identity", root_key, resolved_repo_path, skill_name),
+                             lambda: discover_skill_identity(drive_root, skill_name, repo_path=resolved_repo_path))
+    peer_projection = list(skills) if skills is not None else list(_observed(
+        ("peers", root_key, resolved_repo_path),
+        lambda: tuple(discover_skill_peers(drive_root, repo_path=resolved_repo_path))))
     safe_name = _sanitize_skill_name(skill_name)
     skill = next((item for item in selected if item.name == safe_name), None)
     if skill is None:

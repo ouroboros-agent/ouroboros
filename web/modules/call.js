@@ -364,11 +364,14 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     const doc = page.ownerDocument;
     const composer = page.querySelector('.chat-input-wrap');
     const available = callAvailability(env);
-    const noop = { destroy() {}, leave() {}, retains: () => false };
+    const noop = { destroy() {}, leave() {}, retains: () => false, state() {} };
     if (!composer || available.hidden) return noop;
     const styled = ensureStylesheet(doc);
     let destroyed = false;
     let entry = null;
+    // Talk appears once the server says this install has the Google AI key calls need: unknown until
+    // the first state snapshot every room receives (`state`), so no press can lead to a missing key.
+    let keyed = false;
     const visible = () => !destroyed && onScreen() && doc.visibilityState !== 'hidden';
     const light = createCallLight({ env, visible, heard: now => capsule.heard(now), voice: () => capsule.voice(),
         draw: state => capsule.draw(state) });
@@ -389,7 +392,8 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         vision: () => visionAvailability(env),
         end: () => session.end(),
         dismiss: () => session.dismiss(),
-        act: action => act(action) });
+        act: action => act(action),
+        offered: () => keyed });
     light.attach(capsule.wrap);
     entry = trackCallMark({ session, label, onScreen, reveal, page, env, sign: () => CALL_VISUAL.mark(doc),
         wake: () => light.wake() });
@@ -429,6 +433,11 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         session,
         leave: end,
         retains: () => session.active,
+        state(data) {
+            if (destroyed || typeof data?.calls_key_configured !== 'boolean' || data.calls_key_configured === keyed) return;
+            keyed = data.calls_key_configured;
+            capsule.entry();
+        },
         destroy() {
             if (destroyed) return;
             end();
@@ -467,8 +476,10 @@ function ensureStylesheet(doc) {
  * non-terminal lifetime. When the call ends, `release` lets go of a hidden room nothing else holds. */
 export function mountRoomCall({ room, mount = mountCall, release = () => {}, ...options }) {
     const call = mount({ ...options, onSettled: () => queueMicrotask(release) });
-    const { destroy, hasPendingWork } = room;
+    const { destroy, hasPendingWork, hydrateStateSnapshot } = room;
     room.destroy = () => { call.destroy(); destroy(); };
     room.hasPendingWork = () => call.retains() || Boolean(hasPendingWork?.());
+    // The state snapshot every open room already receives tells its call whether Talk can work.
+    room.hydrateStateSnapshot = (data, ...rest) => { call.state?.(data); return hydrateStateSnapshot?.(data, ...rest); };
     return call;
 }

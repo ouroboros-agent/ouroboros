@@ -607,3 +607,13 @@ test('a room call holds its room for the whole call and lets go when it ends; de
     mountRoomCall({ room: busy, mount: () => ({ retains: () => false, destroy() {} }) });
     assert.equal(busy.hasPendingWork(), true);
 });
+
+test('the state every room receives tells its call whether Talk can work, then reaches the room', () => {
+    const seen = [];
+    const room = { hydrateStateSnapshot: (data, at) => seen.push(['room', data?.calls_key_configured, at]), destroy() {} };
+    mountRoomCall({ room, mount: () => ({ retains: () => false, destroy() {},
+        state: data => seen.push(['call', data?.calls_key_configured]) }) });
+    room.hydrateStateSnapshot({ calls_key_configured: true }, 7);
+    room.hydrateStateSnapshot(null, 8);  // an unavailable read: the call keeps what it knew
+    assert.deepEqual(seen, [['call', true], ['room', true, 7], ['call', undefined], ['room', undefined, 8]]);
+});

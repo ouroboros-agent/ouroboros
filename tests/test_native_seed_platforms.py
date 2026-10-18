@@ -48,6 +48,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 SEEDS = REPO / "skills"
 UNIX = "unix_computer_use"
 WINDOWS = "windows_computer_use"
+OTHER_SEEDS = tuple(sorted(path.name for path in SEEDS.iterdir()
+                           if (path / "SKILL.md").is_file() and path.name not in (UNIX, WINDOWS)))
 BASE = "e4ab6cabbb579cfb62b9547ad039cf10e86bfad3"  # official history, available in upstream checkouts
 UNIX_043 = "1e237c1bc89f0600a7362f69eddafdff4ddd1f2d"
 log = logging.getLogger(__name__)
@@ -100,13 +102,14 @@ def earlier_install(data_root, *, unix_marker=True) -> pathlib.Path:
     native = data_root / "skills" / "native"
     native.mkdir(parents=True, exist_ok=True)
     (native / ".bootstrap-seed-complete").write_text("earlier release\n", encoding="utf-8")
-    for name in ("telegram", UNIX):
+    for name in (*OTHER_SEEDS, UNIX):
         (native / f".post-bootstrap-seed-{name}").write_text("offered\n", encoding="utf-8")
-    # Telegram has its own release cadence; its current payload keeps the
-    # resync counts below about the computer-use skills only.
-    shutil.copytree(SEEDS / "telegram", native / "telegram",
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    (native / "telegram" / ".seed-origin").write_text(f"seeded_from={BASE}\n", encoding="utf-8")
+    # Every other bundled skill (Telegram, the meeting skills) has its own release
+    # cadence; its current payload keeps the resync counts below about the
+    # computer-use skills only.
+    for name in OTHER_SEEDS:
+        shutil.copytree(SEEDS / name, native / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (native / name / ".seed-origin").write_text(f"seeded_from={BASE}\n", encoding="utf-8")
     git_payload(UNIX_043, f"skills/{UNIX}", native / UNIX)
     if unix_marker:
         (native / UNIX / ".seed-origin").write_text(f"seeded_from={UNIX_043}\n", encoding="utf-8")
@@ -183,7 +186,7 @@ def test_an_existing_windows_install_receives_the_windows_skill_on_update(data, 
     assert load_enabled(data, WINDOWS) is True
     # The upgraded Unix copy now says where it applies: hidden here, never switched
     # on, its connections kept for an install that moves back to macOS/Linux.
-    assert _read_skill_manifest(native / UNIX).version == "0.5.0"
+    assert _read_skill_manifest(native / UNIX).version == "0.5.1"
     assert not (data / "state" / "skills" / UNIX / "enabled.json").exists()
     assert (data / "state" / "skills" / UNIX / "connections.json").read_bytes() == connections
     assert WINDOWS in names(data) and UNIX not in names(data)
@@ -269,7 +272,7 @@ def test_a_legacy_unix_remote_choice_on_windows_survives_off_boot_and_on(data, m
         assert UNIX not in extension_loader.snapshot()["extensions"]
         # A subsequent version resync must preserve eligibility AND the newer OFF.
         installed = native / UNIX / "SKILL.md"
-        installed.write_text(installed.read_text(encoding="utf-8").replace("version: 0.5.0", "version: 0.0.1", 1), encoding="utf-8")
+        installed.write_text(installed.read_text(encoding="utf-8").replace("version: 0.5.1", "version: 0.0.1", 1), encoding="utf-8")
         assert resync(data) == 1
         assert (state / "enabled.json").read_bytes() == off and not load_enabled(data, UNIX)
         assert find_skill(data, UNIX) is not None
@@ -335,7 +338,7 @@ def test_update_turns_the_unix_skill_on_where_its_owner_never_chose(data, monkey
     assert (copied, upgraded) == (0, 1)
     assert not (native / WINDOWS).exists() and not (native / f".post-bootstrap-seed-{WINDOWS}").exists()
     manifest = _read_skill_manifest(native / UNIX)
-    assert manifest.version == "0.5.0" and "net" in manifest.permissions
+    assert manifest.version == "0.5.1" and "net" in manifest.permissions
     assert load_enabled(data, UNIX) is True
     assert (data / "state" / "skills" / UNIX / "connections.json").read_bytes() == connections
 

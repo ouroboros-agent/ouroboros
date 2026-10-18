@@ -121,6 +121,7 @@ D20 = "Presence"
 "ouroboros/acceptance_material.py" = "D06"
 "ouroboros/agent.py" = "D01"
 "ouroboros/call_protocol.py" = "D01"  # live-call wire vocabulary shared by peers, the driver and the gateway
+"ouroboros/call_languages.py" = "D01"  # the recognition languages a call's voice recorded (owner, Presence bindings)
 "ouroboros/call_peers.py" = "D01"  # per-call audio hub: peer set, mixing, resampling, output epochs
 "ouroboros/live_awareness.py" = "D01"  # live call <-> room: room rows as context items, utterances to running text turns
 "ouroboros/live_call_route.py" = "D01"  # live-call route, documented-window evidence, initial Nano view, minutes ceiling

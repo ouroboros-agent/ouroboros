@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.call_languages import SET_CALL_LANGUAGES_SCHEMA
 from ouroboros.call_protocol import CallSpec
 from ouroboros.gateways.realtime_engine import ENGINE_GOOGLE, GOOGLE_INPUT_RATE, GOOGLE_OUTPUT_RATE, EngineRoute
 from ouroboros.tool_capabilities import COGNITIVE_MEMORY_TOOL_NAMES
@@ -32,11 +33,14 @@ log = logging.getLogger(__name__)
 # runtime_data read and a Gemini session reopens to gain a tool; and start_task,
 # because long work leaves the call as a task whose result reaches it through live
 # awareness; and sight: view_image looks at an image a tool or the owner offers, browse_page
-# can look at a page, send_photo hands the owner an image. Everything else is one
+# can look at a page, send_photo hands the owner an image; and the started task's progress,
+# result and a word to it (peek_task, get_task_result, tell_task), never a wait: the call has
+# one tool lane, and a task's result reaches the call by itself. Everything else is one
 # ``enable_tools`` away (growth reaches the engine as ``UpdateTools``).
 CALL_INITIAL_TOOL_NAMES: Tuple[str, ...] = tuple(sorted(
     COGNITIVE_MEMORY_TOOL_NAMES | {"web_search", "send_user_message", "read_file", "start_task",
-                                   "view_image", "browse_page", "send_photo"}))
+                                   "view_image", "browse_page", "send_photo",
+                                   "peek_task", "get_task_result", "tell_task"}))
 # The text loop's own request to compact its history: a call never applies it, so its schema
 # does not spend the call's window.
 CALL_INERT_TOOL_NAMES = frozenset({"compact_context"})
@@ -52,9 +56,16 @@ END_CALL_RESULT = "The call ends once your goodbye has been heard."
 
 
 def call_local_schemas(spec: Optional[CallSpec]) -> Tuple[Dict[str, Any], ...]:
-    """The call's own tools beside the registry's: an owner call can hang up; a Presence call
-    belongs to its binding, which decides when it ends."""
-    return () if spec is None or spec.presence_binding_id else (END_CALL_SCHEMA,)
+    """The call's own tools beside the registry's: every call records the languages its recognition
+    expects (``call_languages``); an owner call can hang up, while a Presence call belongs to its
+    binding, which decides when it ends."""
+    if spec is None:
+        return ()
+    return (SET_CALL_LANGUAGES_SCHEMA,) if spec.presence_binding_id else (END_CALL_SCHEMA, SET_CALL_LANGUAGES_SCHEMA)
+
+
+def call_local_tool_names(spec: Optional[CallSpec]) -> frozenset:
+    return frozenset(schema["function"]["name"] for schema in call_local_schemas(spec))
 REALTIME_EVIDENCE_KIND = "realtime_windows"   # capability_evidence.json namespace of the documented windows
 # A speech-sized reply: about five minutes of spoken answer, the physical allowance a call's
 # fit leaves for one response. A provider's output maximum is documentation, not this budget.
@@ -172,18 +183,48 @@ def window_evidence(drive_root: Any, spec: CallSpec) -> Optional[Dict[str, Any]]
     return dict(record) if isinstance(record, dict) else None
 
 
+# A skill manifest's declaration that its tools open every owner call (``live_call: first_view``, an
+# extra frontmatter key): the desktop skills declare it, so a call can look at the screen and press a
+# key the moment it is asked, without reopening its session to load them.
+CALL_VIEW_MANIFEST_KEY, CALL_VIEW_FIRST = "live_call", "first_view"
+
+
+def call_view_extension_names(drive_root: Any) -> frozenset:
+    """The loaded extension tools whose skill declares ``live_call: first_view``. Which of them a call
+    sees is still the registry's answer (live, granted, permitted), like any other schema."""
+    from ouroboros.extension_loader import _lock, _tools
+    from ouroboros.skill_loader import find_skill
+
+    with _lock:
+        rows = [(name, str(tool.get("skill") or ""), str(tool.get("skills_repo_path") or "") or None)
+                for name, tool in _tools.items()]
+    declared: Dict[Tuple[str, Optional[str]], bool] = {}
+    for key in {(skill, repo) for _name, skill, repo in rows if skill}:
+        try:
+            loaded = find_skill(drive_root, key[0], repo_path=key[1]) if drive_root else None
+        except Exception:
+            log.debug("call view: skill %s unreadable", key[0], exc_info=True)
+            loaded = None
+        extras = getattr(getattr(loaded, "manifest", None), "raw_extra", None) or {}
+        declared[key] = isinstance(extras, dict) and extras.get(CALL_VIEW_MANIFEST_KEY) == CALL_VIEW_FIRST
+    return frozenset(name for name, skill, repo in rows if declared.get((skill, repo)))
+
+
 def initial_call_schemas(tools: Any, spec: Optional[CallSpec] = None) -> List[Dict[str, Any]]:
     """The call's initial view of the room's permitted schemas.
 
-    An owner call opens with the Nano path and the call's initial names. A
-    Presence call opens with every schema its binding's ceiling permits: the
-    binding author chose that set, and the registry already narrowed it.
+    An owner call opens with the Nano path, the call's initial names and the tools of
+    skills that declare themselves part of a call (``call_view_extension_names``). A
+    Presence call opens with every schema its binding's ceiling permits: the binding
+    author chose that set, and the registry already narrowed it.
     """
     from ouroboros.tool_policy import initial_tool_schemas
 
     if spec is not None and spec.presence_binding_id:
         return initial_tool_schemas(tools, context_mode="max")
-    return [schema for schema in initial_tool_schemas(tools, context_mode="nano", schema_names=CALL_INITIAL_TOOL_NAMES)
+    ctx = getattr(tools, "_ctx", None)
+    names = (*CALL_INITIAL_TOOL_NAMES, *sorted(call_view_extension_names(getattr(ctx, "drive_root", None))))
+    return [schema for schema in initial_tool_schemas(tools, context_mode="nano", schema_names=names)
             if schema["function"]["name"] not in CALL_INERT_TOOL_NAMES]
 
 
@@ -231,9 +272,11 @@ def call_minutes_ceiling(spec: CallSpec) -> Optional[int]:
 PAUSE_SILENCE_MS = {"short": 500, "normal": 0, "long": 1600}
 
 
-def call_turn_taking(spec: CallSpec) -> Dict[str, Any]:
-    """The session's ``silence_ms`` and ``interruptions`` from what the owner chose for calls."""
-    return {"silence_ms": PAUSE_SILENCE_MS.get(str(spec.pause or "").lower(), 0), "interruptions": bool(spec.interruptions)}
+def call_turn_taking(spec: CallSpec, languages: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """The session's ``silence_ms`` and ``interruptions`` from what the owner chose for calls, and the
+    recognition ``language_hints`` the voice recorded (``call_languages``)."""
+    return {"silence_ms": PAUSE_SILENCE_MS.get(str(spec.pause or "").lower(), 0), "interruptions": bool(spec.interruptions),
+            "language_hints": tuple(languages)}
 
 
 def native_search_enabled(spec: CallSpec) -> bool:

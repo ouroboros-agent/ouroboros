@@ -191,7 +191,7 @@ export function createTalkFacts() {
 }
 
 export function createCallCapsule({ page, env = globalThis, visual, light, styled = Promise.resolve(), view, talk, mute,
-    show = () => {}, vision = {}, end, dismiss, act }) {
+    show = () => {}, vision = {}, end, dismiss, act, offered = () => true }) {
     const doc = page.ownerDocument;
     const wrap = page.querySelector('.chat-input-wrap');
     const row = wrap.querySelector('.chat-text-row');
@@ -232,7 +232,8 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
 
     // --- Talk in the Send capsule -------------------------------------------------------
     const empty = () => !field.value.trim() && !preview?.querySelector('.attach-badge');
-    const entryMode = () => (showing ? 'call' : group?.dataset.busy === '1' ? 'busy' : empty() ? 'talk' : 'send');
+    // Talk is offered only where a call can open: the install has the Google AI key calls need (`offered`).
+    const entryMode = () => (showing ? 'call' : group?.dataset.busy === '1' ? 'busy' : empty() && offered() ? 'talk' : 'send');
     function renderEntry() {
         if (!dressed) return;
         const mode = entryMode();
@@ -476,6 +477,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         wrap,
         row,
         render,
+        entry: () => renderEntry(),
         draw: state => visualHandle.draw(state),
         expand,
         minimise,

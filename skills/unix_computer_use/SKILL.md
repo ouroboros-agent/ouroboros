@@ -1,7 +1,7 @@
 ---
 name: unix_computer_use
 description: Local and remote desktop observation/input tools with coordinate normalization (local macOS/Linux by default; optional OSWorld HTTP and SSH Mac backends).
-version: 0.5.0
+version: 0.5.1
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -10,9 +10,10 @@ os: [darwin, linux]
 permissions: [tool, subprocess, net]
 env_from_settings: []
 when_to_use: The user asks Ouroboros to inspect a desktop, take a screenshot, click/type/press keys, drag, or operate a local/explicitly configured remote GUI under human or benchmark supervision.
+live_call: first_view
 model_experience:
   what_model_sees: Roughly two dozen desktop tools (screenshot, click/type/key/scroll input, connection registry) join the tool list, and each screenshot auto-attaches a WXGA-bounded image to the conversation in the same round.
-  token_effect: The tool schemas add a moderate fixed cost to every round while the skill is enabled; each screenshot adds one image attachment (the dominant per-use cost), so prefer batching actions per capture.
+  token_effect: The tool schemas add a moderate fixed cost to every round while the skill is enabled, a live call's answers included, since its tools open every owner call; each screenshot adds one image attachment (the dominant per-use cost), so prefer batching actions per capture.
 ---
 
 # Unix Computer Use

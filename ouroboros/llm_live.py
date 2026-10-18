@@ -21,6 +21,19 @@ def live_key_present(settings) -> bool:
     return bool(str(settings.get(PROVIDER_ENV_KEYS["google"]) or "").strip())
 
 
+def live_key_configured() -> bool:
+    """Whether this install can open a call: the Google AI key is in the server's environment or its
+    settings. The page offers Talk only then (``/api/state`` ``calls_key_configured``)."""
+    if str(runtime_setting(PROVIDER_ENV_KEYS["google"], "") or "").strip():
+        return True
+    from ouroboros.config import load_settings
+
+    try:
+        return live_key_present(load_settings())
+    except Exception:
+        return False
+
+
 def make_live_engine(client, route: EngineRoute) -> LiveEngine:
     from ouroboros.gateways.realtime_gemini import GeminiLiveEngine
 

@@ -188,11 +188,26 @@ def _admissions(page, admissions, refusal=None):
     page.route("**/api/call/open", admit)
 
 
-def _open(browser, url, *, width=1280, height=900, scheme="dark", touch=False, motion="no-preference", init=FAKE_CALL):
+def _calls_key(page, configured: bool) -> None:
+    """The isolated server has no Google AI key: the state it reports says the install has one (or not)."""
+    def state(route):
+        response = route.fetch()
+        try:
+            body = response.json()
+        except Exception:
+            route.fulfill(response=response)
+            return
+        route.fulfill(response=response, json={**body, "calls_key_configured": configured})
+    page.route("**/api/state", state)
+
+
+def _open(browser, url, *, width=1280, height=900, scheme="dark", touch=False, motion="no-preference", init=FAKE_CALL,
+          key=True):
     context = browser.new_context(viewport={"width": width, "height": height}, color_scheme=scheme,
                                   reduced_motion=motion, has_touch=touch)
     page = context.new_page()
     page.add_init_script(init)
+    _calls_key(page, key)
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto(url, wait_until="domcontentloaded")
@@ -770,6 +785,17 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             assert telegram.locator("#chat-send").get_attribute("data-call-entry") is None
             expect(telegram.locator("#chat-send")).to_have_text("Send")
             assert telegram.locator(".call-capsule").count() == 0
+            telegram.close()
+
+            # No Google AI key on this install: no Talk to press (owner decision 3A), Send stays Send.
+            keyless, keyless_errors = _open(browser, server["url"], key=False)
+            keyless.locator("#chat-attach").wait_for()
+            keyless.wait_for_function("() => !!document.querySelector('#page-chat .call-capsule')")
+            keyless.wait_for_timeout(500)
+            assert keyless.locator("#chat-send").get_attribute("data-call-entry") != "talk"
+            expect(keyless.locator("#chat-send")).to_have_text("Send")
+            assert not keyless_errors, keyless_errors
+            keyless.context.close()
         finally:
             browser.close()
 

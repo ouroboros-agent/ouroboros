@@ -809,6 +809,7 @@ class StateResponse(TypedDict):
     safety_mode: str
     skills_repo_configured: bool
     github_token_configured: bool
+    calls_key_configured: bool  # the Google AI key calls need is set: the page offers Talk
     accounting: Dict[str, Any]
     # Multi-project sidebar feed: compact registered projects [{id, name, chat_id, working_dir, last_active_at, ...}].
     projects: list

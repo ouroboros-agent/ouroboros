@@ -110,9 +110,11 @@ class RoomRows:
     both paths). ``drain`` returns what accumulated since the last drain.
     """
 
-    def __init__(self, drive_root: Any, chat_id: int, task_id: str, call_id: str, started_at: str) -> None:
+    def __init__(self, drive_root: Any, chat_id: int, task_id: str, call_id: str, started_at: str,
+                 started: Callable[[], Any] = tuple) -> None:
         self.root = pathlib.Path(drive_root)
         self.chat_id, self.task_id, self.call_id, self.started_at = int(chat_id), str(task_id), str(call_id), started_at
+        self.started = started  # the tasks this call started: their rows report to it
         self._lock = threading.Lock()
         self._seen: set = set()
         self._pending: List[ContextItem | VideoIn] = []
@@ -172,7 +174,10 @@ class RoomRows:
             if key in self._seen:
                 return
             self._seen.add(key)
-            self._pending.append(render_room_row(row, key))
+            # Addressed to the call, so it may answer at once: the owner's words in its room, and what a task
+            # it started reports. Other turns' replies and system rows are context for its next turn.
+            addressed = row.get("direction") == "in" or str(row.get("task_id") or "") in set(self.started() or ())
+            self._pending.append(render_room_row(row, key, opens_response=addressed))
             self._pending.extend(images)
 
 
@@ -220,7 +225,7 @@ def attach_image(row: Dict[str, Any], item: VideoIn) -> None:
     row["content"].append({"type": "image_url", "image_url": {"url": url}})
 
 
-def render_room_row(row: Dict[str, Any], key: str) -> ContextItem:
+def render_room_row(row: Dict[str, Any], key: str, *, opens_response: bool = False) -> ContextItem:
     """One room row as the mind reads it: who wrote it, then the words (bounded, disclosed)."""
     from ouroboros.owner_mailbox import TASK_MESSAGE_MAX_CHARS
     from ouroboros.utils import truncate_within_limit
@@ -234,7 +239,48 @@ def render_room_row(row: Dict[str, Any], key: str) -> ContextItem:
     else:
         who = f"Ouroboros wrote in this room{' (turn ' + task_id + ')' if task_id else ''}"
     text = truncate_within_limit(str(row.get("text") or ""), TASK_MESSAGE_MAX_CHARS)
-    return ContextItem(text=f"{who} [{key}]:\n{text}", source=f"{ROOM_ITEM_SOURCE}:{direction or 'out'}")
+    return ContextItem(text=f"{who} [{key}]:\n{text}", source=f"{ROOM_ITEM_SOURCE}:{direction or 'out'}",
+                       opens_response=opens_response)
+
+
+HURRY_FACT = "The owner pressed Hurry: finish what you are saying and wrap up."
+
+
+async def drain_into_call(call: Any) -> None:
+    """The owner's mailbox and the room's new rows into a live call (``call`` is the driver).
+
+    A Stop never waits behind the context sends. What is addressed to the call opens a response at
+    the next completed turn (``Openings``): the owner's own words and a principal's message to this
+    task (rows typed ``owner_words`` at delivery), the room rows ``RoomRows`` marks, and Hurry; every
+    other row is context for the call's next turn. Content acknowledgements wait for a boundary
+    after everything posted so far, held content included.
+    """
+    from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY, OWNER_WORDS_KIND
+    from ouroboros.live_call_state import Acks
+    from ouroboros.live_tool_batch import text_of
+    from ouroboros.loop_round_limits import _drain_incoming_messages
+
+    scratch: List[Dict[str, Any]] = []
+    controls = _drain_incoming_messages(scratch, call.incoming, call.drive_root, call.task_id, call.event_queue,
+                                        call.owner_msg_seen, owner_ctx=call.ctx, defer_content_ack=True)
+    if controls.get("finalize_now"):
+        call._begin_close("owner_stop")
+    for msg in scratch:
+        call.messages.append({**msg, "_call_row": True})
+        item = ContextItem(text=text_of(msg.get("content")), source="mailbox",
+                           opens_response=msg.get(HOST_CONTEXT_KIND_KEY) == OWNER_WORDS_KIND)
+        if item.text.strip() and not call.closing:
+            call.openings.hold(item) if item.opens_response else call._post(item)
+    if not call.closing:
+        for item in call.rooms.drain():
+            await call._context(item)
+        if controls.get("hurry"):
+            await call._context(ContextItem(text=HURRY_FACT, source="owner_control", opens_response=True))
+    pending = list(getattr(call.ctx, "_pending_content_acks", None) or [])
+    if (scratch or controls or pending) and call.engine is not None and not call.closing:
+        call.ctx._pending_content_acks = []
+        # Behind held content its acknowledgements wait too: an entry is acknowledged once a session holds it.
+        (call.openings.hold if call.openings.held else call._post)(Acks(tuple(pending)))
 
 
 def running_room_turns(chat_id: int, exclude_task_id: str) -> List[str]:

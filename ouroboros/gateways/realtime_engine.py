@@ -82,6 +82,9 @@ class SessionConfig:
     # whether his speech interrupts the voice that is answering.
     silence_ms: int = 0
     interruptions: bool = True
+    # BCP-47 hints for the provider's speech recognition (the owner's languages first); a hint, never a
+    # pin on the spoken reply, which follows each speaker.
+    language_hints: Tuple[str, ...] = ()
 
 
 # ---- commands: driver -> engine -------------------------------------------------
@@ -103,10 +106,14 @@ class ContextItem:
     """Text the session should know: typed owner words, another turn's reply,
     a task result, a peer-observed fact. ``source`` names its provenance in the
     prefix the mind reads. It never cuts the current speech; the mind decides
-    whether and when to speak about it."""
+    whether and when to speak about it. ``opens_response`` marks a dialogue act
+    addressed to the call (it became audible, the owner typed in its room, a task
+    it started reported, Hurry): it completes the client turn, so the mind may
+    answer at once, or stay silent; everything else waits for the next turn."""
 
     text: str
     source: str
+    opens_response: bool = False
 
 
 @dataclass(frozen=True)

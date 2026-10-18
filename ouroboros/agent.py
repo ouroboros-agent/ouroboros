@@ -863,7 +863,7 @@ class OuroborosAgent:
             **(live_plan.fit_kwargs if live_plan is not None else {}),
         )
         if live_plan is not None:
-            cap_info.update(live_call_spec=live_plan.spec, live_call_context_captured_at=context_captured_at)
+            cap_info.update(live_call_spec=live_plan.spec, live_call_context_captured_at=context_captured_at, live_call_tool_schemas=live_plan.tool_schemas)
         # The second of the three places a reduction must reach (the durable record
         # above is the first, `[SUBTASK_OUTCOME]` the third). It is appended HERE,
         # after the context is built, because it is a fact about THIS dispatch —
@@ -1106,7 +1106,7 @@ class OuroborosAgent:
                         task_id=str(task.get("id") or ""), task_type=task_type_str,
                         budget_remaining_usd=budget_remaining, event_queue=self._event_queue,
                         drive_root=self.env.drive_root, spec=live_spec, task=task,
-                        context_captured_at=str(cap_info.get("live_call_context_captured_at") or ""),
+                        context_captured_at=str(cap_info.get("live_call_context_captured_at") or ""), tool_schemas=cap_info.get("live_call_tool_schemas"),
                     )
                 except (BudgetExceeded, BudgetPauseRequested):
                     raise

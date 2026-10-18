@@ -76,7 +76,7 @@ def test_the_first_tool_view_reads_its_pointers_and_hands_long_work_to_a_task():
     # reopens to gain a tool: read_file must be there from the first open.
     assert set(live_call_route.CALL_INITIAL_TOOL_NAMES) == set(COGNITIVE_MEMORY_TOOL_NAMES) | {
         "web_search", "send_user_message", "read_file", "start_task",
-        "view_image", "browse_page", "send_photo"}
+        "view_image", "browse_page", "send_photo", "peek_task", "get_task_result", "tell_task"}
 
 
 def test_the_first_tool_view_names_exist_in_the_registry(tmp_path):

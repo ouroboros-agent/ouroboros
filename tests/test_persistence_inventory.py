@@ -789,7 +789,9 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # 387 -> 389 (live calls): the direct-route price catalog cache ``state/pricing/litellm.json``
 # (``ouroboros/pricing_catalog.py``; a section-2 row) and the small-window section captures
 # ``state/context_views/*/*/*.md`` (``ouroboros/section_floor.py``; a section-4 row).
-EXPECTED_SCAN_PATHS = 389
+# 389 -> 390 (live calls): the recognition languages a call's voice recorded,
+# ``state/call_languages.json`` (``ouroboros/call_languages.py``; a section-2 row).
+EXPECTED_SCAN_PATHS = 390
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts

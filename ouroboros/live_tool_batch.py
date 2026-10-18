@@ -24,12 +24,14 @@ import base64
 import contextvars
 import copy
 import functools
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.gateways.realtime_engine import ContextItem, ToolCall, ToolResult, UpdateTools
-from ouroboros.live_call_route import END_CALL_RESULT, END_CALL_TOOL, call_local_schemas
+from ouroboros.call_languages import SET_CALL_LANGUAGES_TOOL, languages_recorded_text, record_call_languages
+from ouroboros.gateways.realtime_engine import SCHEDULE_SILENT, ContextItem, ToolCall, ToolResult, UpdateTools
+from ouroboros.live_call_route import END_CALL_RESULT, END_CALL_TOOL, call_local_schemas, call_local_tool_names
 from ouroboros.usage_accounting import BudgetExceeded
 
 log = logging.getLogger(__name__)
@@ -94,10 +96,15 @@ class ToolBatchWorker:
         self._pool.shutdown(wait=not self.running, cancel_futures=True)
 
     def enqueue(self, tool_call: ToolCall, epoch: int, origin: str = "") -> None:
-        if tool_call.name == END_CALL_TOOL and call_local_schemas(self.call.spec):
+        local = call_local_tool_names(self.call.spec)
+        if tool_call.name == END_CALL_TOOL and END_CALL_TOOL in local:
             # The call's own hang-up: nothing runs; the call ends once the goodbye has been heard.
             self.call.hub.end_by_ouroboros()
-            asyncio.create_task(self.call._send(ToolResult(tool_call.call_id, END_CALL_RESULT)))
+            # Silent: the goodbye was already said; a result Gemini answers aloud would add a line.
+            asyncio.create_task(self.call._send(ToolResult(tool_call.call_id, END_CALL_RESULT, scheduling=SCHEDULE_SILENT)))
+            return
+        if tool_call.name == SET_CALL_LANGUAGES_TOOL and SET_CALL_LANGUAGES_TOOL in local:
+            asyncio.create_task(self._record_languages(tool_call))
             return
         if tool_call.call_id in self.executed:
             # The provider asked again for a call already executed (a resent request
@@ -110,6 +117,26 @@ class ToolBatchWorker:
             return
         self.claimed[tool_call.call_id] = epoch
         self.pending.append((epoch, tool_call, origin))
+
+    async def _record_languages(self, tool_call: ToolCall) -> None:
+        """The call's own record of its recognition languages (``call_languages``), written beside the
+        audio loop: the next completed turn reopens the session with them (``SessionRenewal.due``), and
+        the transcript keeps the line, so a reopened session knows what it recorded. A recorded list is
+        answered silently; a refusal when idle, so the voice can correct it."""
+        call = self.call
+        try:
+            languages = json.loads(tool_call.arguments or "{}").get("languages")
+            kept = await asyncio.get_running_loop().run_in_executor(None, functools.partial(
+                record_call_languages, call.drive_root, languages,
+                binding_id=call.spec.presence_binding_id, task_id=call.task_id))
+        except Exception as exc:  # a malformed argument, a refused tag or an unwritable record
+            await call._send(ToolResult(tool_call.call_id, f"Not recorded: {exc}"))
+            return
+        call.renewal.languages = kept
+        text = languages_recorded_text(kept)
+        call.messages.append({"role": "user", "content": f"[{text}]", "_call_row": True,
+                              "_context_source": SET_CALL_LANGUAGES_TOOL})
+        await call._send(ToolResult(tool_call.call_id, text, scheduling=SCHEDULE_SILENT))
 
     def cancel(self, call_ids: Tuple[str, ...]) -> None:
         self.cancelled.update(call_ids)

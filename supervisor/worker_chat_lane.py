@@ -722,33 +722,48 @@ def handle_call_direct(
     if remaining <= 0:
         return {"admitted": False, "task_id": "", "reason": "budget_exhausted"}
     metadata: Dict[str, Any] = {"live_call": spec.as_metadata(), "client_message_id": str(spec.client_message_id or "")}
+    if not spec.presence_binding_id:
+        # The owner opened this call on his own surface: the owner door's stamp for a root with no logged
+        # message, so the call speaks as his turn (Main notices, routing) as his typed turn would.
+        metadata["origin_suppressed"] = True
     from ouroboros.contracts.chat_id_policy import is_project_chat_id
 
+    room = "the main chat"
     if is_project_chat_id(chat_id):
         from ouroboros.project_admission import reserved_project_for_chat
 
         try:
-            project_id = str(reserved_project_for_chat(_pool().DRIVE_ROOT, int(chat_id)).get("id") or "")
+            project = reserved_project_for_chat(_pool().DRIVE_ROOT, int(chat_id)) or {}
         except Exception:
             return {"admitted": False, "task_id": "", "reason": "project_room_unavailable"}
-        if project_id:
-            metadata["project_id"] = project_id
-    admitted = _admit_chat_task(None, int(chat_id), call_opening_text(spec), None, task_metadata=metadata, kind="call")
+        if project.get("id"):
+            metadata["project_id"] = str(project["id"])
+        room = f'the project room "{project.get("name") or project.get("id") or chat_id}"'
+    from ouroboros.call_languages import recorded_call_languages
+
+    languages = recorded_call_languages(_pool().DRIVE_ROOT, spec.presence_binding_id)
+    admitted = _admit_chat_task(None, int(chat_id), call_opening_text(spec, room, languages), None,
+                                task_metadata=metadata, kind="call")
     if admitted is None:
         reason = "repo_writer_gate_closed" if not wake_gate_open() else "admission_failed"
         return {"admitted": False, "task_id": "", "reason": reason}
     return _start_direct_turn_thread(admitted, f"call-turn-{admitted['task']['id']}", on_finished)
 
 
-def call_opening_text(spec) -> str:
-    """The call turn's host text: what a call is, the language caveat, and the owner's own
+def call_opening_text(spec, room: str = "this room", languages: Any = ()) -> str:
+    """The call turn's host text: what a call is and where, its recognition languages and the language
+    caveat, what the owner can show, how tools and tasks behave in a call, and the owner's own
     instructions for calls (Settings), fitted with the call's context like any opening text; a
     Presence call carries its binding's instructions instead."""
-    text = (f"[Live call] A live voice call is open in this room (engine {spec.engine}, model {spec.model}). "
-            "The conversation is spoken; its transcript is written to this chat. Speech recognition can take one "
-            "language for another: keep to the language this room is spoken and written in, and if the owner's "
-            "words suddenly read as another language, ask rather than switch. "
-            "The owner can show a screen or camera during the call, and its frames arrive as images.")
+    from ouroboros.call_languages import languages_opening_sentence
+
+    text = (f"[Live call] A live voice call is open in {room} (engine {spec.engine}, model {spec.model}). "
+            "The conversation is spoken; its transcript is written to this chat. "
+            f"{languages_opening_sentence(languages)} Speech recognition can still take one language for another: "
+            "if the owner's words suddenly read as another language, ask rather than switch; another speaker may "
+            "speak their own. The owner can show a screen or camera (Show) and its frames arrive as images; you "
+            "may ask for it. Tools run while you can keep talking: when one will take a moment, first say in a "
+            "few words what you are doing, then call it. Tasks you start report back into this call.")
     if spec.instructions and not spec.presence_binding_id:
         text += f"\n\nThe owner's instructions for calls:\n{spec.instructions}"
     return text

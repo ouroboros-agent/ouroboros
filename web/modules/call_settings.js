@@ -43,7 +43,7 @@ export function callSettingsHtml() {
     return `
                     <div class="form-section">
                         <h3>Live calls</h3>
-                        <div class="settings-section-copy">Talk with Ouroboros by voice in any room: press Talk in an empty message field. Calls run on Google’s Gemini Live with the Google AI key in Accounts → Google. Changes apply to the next call.</div>
+                        <div class="settings-section-copy">Talk with Ouroboros by voice in any room: press Talk in an empty message field. Calls run on Google’s Gemini Live with the Google AI key in Accounts → Google; Talk appears once that key is set. Changes apply to the next call.</div>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
                                 <label for="s-call-model-google">Gemini Live model</label>

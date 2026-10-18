@@ -38,7 +38,8 @@ from ouroboros.gateways.realtime_engine import (
 from ouroboros.gateways.realtime_transport import LiveEngineRefusal
 from ouroboros.live_call_route import (call_local_schemas, call_minutes_ceiling, call_turn_taking, initial_call_schemas,
                                        native_search_enabled, resolve_call_route)
-from ouroboros.live_call_state import Acks, SessionRenewal, Spoken, narration_meta
+from ouroboros.live_awareness import drain_into_call
+from ouroboros.live_call_state import Acks, Openings, SessionRenewal, Spoken, narration_meta
 from ouroboros.live_session_view import (
     calibration_ratio, compression_watermarks, history_view, mark_spoken, record_density_witness, renewal_bounds,
     text_estimate, with_call_so_far,
@@ -99,14 +100,14 @@ class _LiveCall:
 
     def __init__(self, *, messages, tools, llm, drive_logs, emit_progress, incoming_messages, task_id, task_type,
                  event_queue, drive_root, spec: CallSpec, task: Optional[Dict[str, Any]] = None,
-                 context_captured_at: str = "") -> None:
+                 context_captured_at: str = "", tool_schemas: Optional[List[Dict[str, Any]]] = None) -> None:
         self.messages, self.tools, self.llm, self.drive_logs = messages, tools, llm, drive_logs
         self.task = task if isinstance(task, dict) else {}
         self.emit_progress, self.incoming, self.task_id = emit_progress, incoming_messages, task_id
         self.task_type, self.event_queue, self.drive_root, self.spec = task_type, event_queue, drive_root, spec
         # The instant the turn's context was captured: the room feed catches up from
         # there, so a row accepted while the context was being prepared is not lost.
-        self.context_captured_at = context_captured_at
+        self.context_captured_at, self.first_tools = context_captured_at, list(tool_schemas or ())
         self.ctx = tools._ctx
         self.route = resolve_call_route(spec, drive_root)
         # The PCM rates the engine wire takes and returns (Gemini Live: 16 kHz in, 24 kHz out);
@@ -182,6 +183,7 @@ class _LiveCall:
         self._reader: Optional[threading.Thread] = None
         self.tools_lane = ToolBatchWorker(self)
         self.renewal = SessionRenewal(self)
+        self.openings = Openings(self.renewal)  # what is addressed to the call waits for a completed turn
         self.stateful_executor = None
         self.rooms = None
         self.fanout = None
@@ -225,8 +227,8 @@ class _LiveCall:
         self._hub_events, self._outbox = asyncio.Queue(), asyncio.Queue()
         loop_mod._reset_turn_state(self.ctx)
         loop_mod._initialize_owner_directives(self.ctx, self.messages)
-        self.tool_schemas, _extra = loop_mod._setup_dynamic_tools(
-            self.tools, list(initial_call_schemas(self.tools, self.spec)), self.messages, context_mode="nano")
+        self.tool_schemas, _extra = loop_mod._setup_dynamic_tools(  # the plan's first view, else one fresh look
+            self.tools, self.first_tools or list(initial_call_schemas(self.tools, self.spec)), self.messages, context_mode="nano", call=True)
         self.ctx.event_queue, self.ctx.task_id, self.ctx.messages = self.event_queue, self.task_id, self.messages
         self.ctx._accumulated_usage = self.usage
         self.ctx.active_context_mode = getattr(getattr(self.ctx, "context_fit_plan", None), "initial_mode", "nano")
@@ -235,7 +237,8 @@ class _LiveCall:
                                     self.usage, self.llm_trace, self.ctx, getattr(self.ctx, "_execution_trace", None))
         self.ctx._execution_trace = self.llm_trace
         self.rooms = RoomRows(self.drive_root, self.spec.chat_id, self.task_id, self.spec.call_id,
-                              self.context_captured_at or self.started_at_iso)
+                              self.context_captured_at or self.started_at_iso,
+                              started=lambda: getattr(self.ctx, "_call_started_task_ids", ()))
         self.fanout = UtteranceFanout(self.drive_root, self.spec.chat_id, self.task_id, self.spec.call_id)
         self.rooms.start()
         self._reader = threading.Thread(target=self._read_hub, name=f"call-hub-{self.task_id}", daemon=True)
@@ -360,12 +363,12 @@ class _LiveCall:
         # The call so far rides in the instruction, where the provider drops no turns; a resumed session
         # is sent the instruction it was opened with again and keeps its own turns.
         instructions, history = with_call_so_far(instructions, history)
-        history = () if resume_handle else history
         compress_at, compress_to = compression_watermarks(self.route.fact, instructions, self.tool_schemas,
                                                           calibration_ratio(self.ctx))
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=(*self.tool_schemas, *call_local_schemas(self.spec)),
-                             history=history, native_search=native_search_enabled(self.spec), resume_handle=resume_handle,
-                             compress_at_tokens=compress_at, compress_to_tokens=compress_to, **call_turn_taking(self.spec))
+                             history=() if resume_handle else history, native_search=native_search_enabled(self.spec),
+                             resume_handle=resume_handle, compress_at_tokens=compress_at, compress_to_tokens=compress_to,
+                             **call_turn_taking(self.spec, self.renewal.languages))
 
     async def _open_engine(self, *, resume_handle: str = "") -> None:
         if self.closing or self.hub.ended_by_owner:
@@ -390,7 +393,7 @@ class _LiveCall:
         self.engine, self.epoch, self.session_started = engine, self.epoch + 1, time.monotonic()
         self.session_proven, self.ready_at = False, None
         self.renewal.reset(renewal_bounds(self.route.fact, config.instructions, self.tool_schemas,
-                                          calibration_ratio(self.ctx)))
+                                          calibration_ratio(self.ctx)), config.language_hints)
         self.witness = None if resume_handle else (self.epoch, config)
         self.opened_rows = self.opened_rows if resume_handle else history
         self.input_ms = 0.0  # a new session counts its input audio from zero
@@ -538,6 +541,8 @@ class _LiveCall:
             if cap and not self.response_open and not self.reconnecting and now - self.session_started >= cap * 60 - SESSION_CAP_MARGIN_S:
                 asyncio.create_task(self._reconnect("session_cap", resume=False))
             self.renewal.tick(now)
+            for item in self.openings.take():
+                self._post(item)
             for item_id, spoken in list(self.spoken.items()):
                 if spoken.final_at and now - max(spoken.final_at, spoken.ack_at) >= SPOKEN_ACK_GRACE_S:
                     self._write_spoken_row(item_id)
@@ -552,13 +557,13 @@ class _LiveCall:
         """Context the call heard is part of its transcript: a reopened session replays it."""
         if isinstance(item, VideoIn):
             from ouroboros.live_awareness import attach_image
-            attach_image(self.messages[-1], item)  # a room image follows its own text row
-            self._post(item)
+            attach_image(self.messages[-1], item)  # a room image follows its own text row, held with it
+            self.openings.hold(item) if self.openings.held else self._post(item)
             return
         if not item.text.strip():
             return
         self.messages.append({"role": "user", "content": item.text, "_call_row": True, "_context_source": item.source})
-        self._post(item)
+        self.openings.hold(item) if item.opens_response else self._post(item)
 
     def _post(self, item: Any) -> None:
         if self._outbox is not None:
@@ -692,6 +697,8 @@ class _LiveCall:
         elif isinstance(event, Ready):
             self.state, self.ready_at = STATE_LIVE, time.monotonic()
             self.hub.send_state(STATE_LIVE)
+            if (fact := self.openings.live(bool(self.spec.presence_binding_id))) is not None:
+                await self._context(fact)  # the voice may greet, in its own words
             if (frame := self.renewal.on_show(self.ready_at)) is not None:  # a renewed session sees what is shown
                 await self._send(VideoIn(frame.mime, frame.data))
             effective = dict(event.effective or {})
@@ -931,30 +938,7 @@ class _LiveCall:
     # ---- the owner's mailbox and the room -------------------------------------------
 
     async def _drain(self) -> None:
-        from ouroboros.loop_round_limits import _drain_incoming_messages
-
-        scratch: List[Dict[str, Any]] = []
-        controls = _drain_incoming_messages(scratch, self.incoming, self.drive_root, self.task_id, self.event_queue,
-                                            self.owner_msg_seen, owner_ctx=self.ctx, defer_content_ack=True)
-        if controls.get("finalize_now"):
-            self._begin_close("owner_stop")  # a Stop never waits behind the context sends below
-        for msg in scratch:
-            self.messages.append({**msg, "_call_row": True})
-            item = ContextItem(text=text_of(msg.get("content")), source="mailbox")
-            if item.text.strip() and not self.closing:
-                self._post(item)
-        if not self.closing:
-            for item in self.rooms.drain():
-                await self._context(item)
-            if controls.get("hurry"):
-                await self._context(ContextItem(text="The owner pressed Hurry: finish what you are saying and wrap up.",
-                                                source="owner_control"))
-        # A boundary after everything posted so far owes exactly the acknowledgements taken
-        # now; later mail waits for its own boundary.
-        pending = list(getattr(self.ctx, "_pending_content_acks", None) or [])
-        if (scratch or controls or pending) and self.engine is not None and not self.closing:
-            self.ctx._pending_content_acks = []
-            self._post(Acks(tuple(pending)))
+        await drain_into_call(self)  # the owner's mailbox, the room's rows and Hurry (``live_awareness``)
 
     def _checkpoint(self) -> bool:
         """The call's durable state on its task row; content ACKs wait for this write."""
@@ -984,7 +968,7 @@ def run_live_turn(
     messages: List[Dict[str, Any]], tools: Any, llm: Any, drive_logs: pathlib.Path,
     emit_progress: Callable[..., None], incoming_messages: queue.Queue, task_id: str, task_type: str,
     budget_remaining_usd: Optional[float], event_queue: Optional[queue.Queue], drive_root: Optional[pathlib.Path],
-    spec: CallSpec, task: Optional[Dict[str, Any]] = None, context_captured_at: str = "",
+    spec: CallSpec, task: Optional[Dict[str, Any]] = None, context_captured_at: str = "", tool_schemas: Any = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Run one live call to its end; the loop's ordinary triple with a host-authored terminal.
 
@@ -996,5 +980,5 @@ def run_live_turn(
     call = _LiveCall(messages=messages, tools=tools, llm=llm, drive_logs=drive_logs, emit_progress=emit_progress,
                      incoming_messages=incoming_messages, task_id=task_id, task_type=task_type,
                      event_queue=event_queue, drive_root=drive_root, spec=spec, task=task,
-                     context_captured_at=context_captured_at)
+                     context_captured_at=context_captured_at, tool_schemas=tool_schemas)
     return call.run()

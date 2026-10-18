@@ -6,7 +6,9 @@ those documents; the other is gemini-3.8-live's own wire from a probed call
 (``devtools/live_call_probe.py``, redacted), replayed in the tests. Gemini has no
 response/audio item IDs: local playback IDs are labeled, while function IDs and
 resume handles remain provider-owned. Context waits for idle because clientContent
-interrupts generation even when turnComplete is false.
+interrupts generation even when turnComplete is false; an item that opens a response
+completes the client turn (``turnComplete: true``), and items held through one answer
+go out together after it, completing the turn once if any of them opens one.
 """
 from __future__ import annotations
 
@@ -78,7 +80,10 @@ def setup_message(config):
         "model": config.route.model if config.route.model.startswith("models/") else f"models/{config.route.model}",
         "systemInstruction": {"parts": [{"text": config.instructions}]},
         "tools": tools, "generationConfig": generation,
-        "inputAudioTranscription": {}, "outputAudioTranscription": {},
+        # Recognition hints only: measured 18.10, they keep noisy Russian Russian and leave an English
+        # speaker English; speechConfig.languageCode changed nothing for this native-audio model, so none.
+        **{key: ({"languageCodes": list(config.language_hints)} if config.language_hints else {})
+           for key in ("inputAudioTranscription", "outputAudioTranscription")},
         "contextWindowCompression": compression(config),
         "sessionResumption": {"handle": config.resume_handle} if config.resume_handle else {},
     }
@@ -242,7 +247,7 @@ class GeminiLiveEngine(RealtimeTransport):
                     raise LiveEngineRefusal("context_backpressure", "Live context queue is full; retain this item for redelivery.")
                 self._context.append(command)
             else:
-                await self._send_context(command)
+                await self._send_context(command, complete=command.opens_response)
         elif isinstance(command, ToolResult):
             schedules = {"when_idle": "WHEN_IDLE", "silent": "SILENT"}
             if command.scheduling not in schedules:
@@ -269,9 +274,13 @@ class GeminiLiveEngine(RealtimeTransport):
         else:
             raise LiveEngineRefusal("command", "Unsupported live engine command.")
 
-    async def _send_context(self, command):
+    async def _send_context(self, command, *, complete=False):
+        if not command.text:  # a bare completion: the response opens over the context already sent
+            if complete:
+                await self._write({"clientContent": {"turnComplete": True}})
+            return
         await self._write({"clientContent": {"turns": [{"role": "user", "parts": [
-            {"text": f"[{command.source}] {command.text}"}]}], "turnComplete": False}})
+            {"text": f"[{command.source}] {command.text}"}]}], "turnComplete": bool(complete)}})
 
     def _start_response(self, message):
         if self._item_id:
@@ -361,9 +370,10 @@ class GeminiLiveEngine(RealtimeTransport):
                 self._response_id = ""
                 self._usage = {}
             self._interrupted = self._discard_audio = False
-            for command in self._context:
-                await self._send_context(command)
-            self._context.clear()
+            held, self._context = list(self._context), []
+            opens = any(command.opens_response for command in held)
+            for index, command in enumerate(held):
+                await self._send_context(command, complete=opens and index == len(held) - 1)
         if "sessionResumptionUpdate" in message:
             checkpoint = message["sessionResumptionUpdate"]
             resumable = checkpoint.get("resumable", False)

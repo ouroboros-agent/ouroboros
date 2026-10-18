@@ -155,6 +155,10 @@ def _finish_swarm_handoff(
     """Preserve the first Presence admission receipt for its terminal consumers."""
 
     metadata = getattr(ctx, "task_metadata", {})
+    if isinstance(metadata, dict) and metadata.get("live_call") and status == "scheduled" and evt.get("task_id"):
+        # A live call hears what the tasks it started report as addressed to it (``live_awareness.RoomRows``).
+        started = getattr(ctx, "_call_started_task_ids", None)
+        ctx._call_started_task_ids = {*(started or ()), str(evt["task_id"])}
     presence_turn = isinstance(metadata, dict) and bool(metadata.get("presence"))
     if presence_turn and not isinstance(
         getattr(ctx, "_swarm_handoff_attempt", None), dict
@@ -372,8 +376,9 @@ def _start_task(
             f"OK: task {tid}{scope_note} accepted and durably scheduled ({mode}){repo_root_note}."
             f"{source_confirmation} "
             "The task now runs independently, and follow-up chat can steer it. "
-            "Use wait_task/get_task_result if its result "
-            "is needed in this conversation."
+            + ("Its result arrives in this call by itself; peek_task shows its progress meanwhile."
+               if isinstance(getattr(ctx, "task_metadata", None), dict) and ctx.task_metadata.get("live_call")
+               else "Use wait_task/get_task_result if its result is needed in this conversation.")
             + (f"\n{effort_note}" if effort_note else "")
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")

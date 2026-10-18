@@ -391,9 +391,11 @@ def test_telegram_owner_wait_upgrade_reseeds_current_version(tmp_path, fake_log)
     ("telegram", "8fc237123292", "1.3.0", "1.3.3"),
     ("telegram", "7f71fe8d29c975e25b35a235e1c821e1b547674f", "1.3.1", "1.3.3"),
     ("telegram", "6014e8896dabe371f5c06cf8adc5dc9902f53c2d", "1.3.2", "1.3.3"),
-    ("unix_computer_use", "162ad3fe6791fcaf6cf625e6b0c50d3a2a27e7f8", "0.4.1", "0.5.0"),
-    ("unix_computer_use", "ec3fc6e5b5ae5ee99a746b5e1a0f6343a41926d4", "0.4.2", "0.5.0"),
-    ("unix_computer_use", "1e237c1bc89f0600a7362f69eddafdff4ddd1f2d", "0.4.3", "0.5.0"),
+    ("unix_computer_use", "162ad3fe6791fcaf6cf625e6b0c50d3a2a27e7f8", "0.4.1", "0.5.1"),
+    ("unix_computer_use", "ec3fc6e5b5ae5ee99a746b5e1a0f6343a41926d4", "0.4.2", "0.5.1"),
+    ("unix_computer_use", "1e237c1bc89f0600a7362f69eddafdff4ddd1f2d", "0.4.3", "0.5.1"),
+    # The Windows-split seed (0.5.0): an install on it receives the call-view declaration.
+    ("unix_computer_use", "9e2bd962903044a6516917bcb10a933b2d1acafd", "0.5.0", "0.5.1"),
 ])
 def test_resync_delivers_payload_from_real_previous_seed(
     tmp_path, fake_log, monkeypatch, name, source, old_version, new_version,

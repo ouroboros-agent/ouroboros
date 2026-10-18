@@ -226,8 +226,10 @@ hydrateNavIcons();
 // While a Project panel paints, Main defers first hydration (bounded in chat.js).
 let projectPanelOpeningSince = 0;
 let mainChat;
+let lastStateSnapshot = null;  // the newest /api/state body: a room's call that mounts later reads it at once
 const stateSnapshots = createStateSnapshotSequencer((data, requestedAt, generation) => {
     data = data && typeof data === 'object' ? data : {};
+    lastStateSnapshot = data;
     // A complete REST body cannot prove absence while the socket is in a
     // disconnect episode. Keep the previous rows and render them unknown until
     // a post-reconnect snapshot is sequenced.
@@ -305,7 +307,7 @@ function withRoomCall(room) {
     const project = () => lastProjectRows.find((row) => row.id === room.projectId) || null;
     import('./modules/call.js').then(({ mountRoomCall }) => {
         if (!room.page.isConnected) return;
-        mountRoomCall({
+        const call = mountRoomCall({
             room, page: room.page, chatId: room.chatId, ws,
             label: () => (room.projectId ? project()?.name || room.projectId : 'Main'),
             onScreen: () => (room.projectId
@@ -320,6 +322,7 @@ function withRoomCall(room) {
                     && projectInstances.get(room.projectId) === room) destroyProjectInstance(room.projectId);
             },
         });
+        call.state?.(lastStateSnapshot);
     });
     return room;
 }

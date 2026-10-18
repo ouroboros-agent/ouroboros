@@ -91,6 +91,7 @@ permissions: [net, tool, route, widget, read_settings, companion_process, superv
 conflicts: [legacy-weather]            # optional incompatible installed skill names
 env_from_settings: [OPENROUTER_API_KEY]                  # core keys require an owner grant
 when_to_use: User asks for the weather forecast.
+live_call: first_view               # optional; this extension's tools open every owner voice call
 model_experience:                   # optional prose (CPL-7); a bare string is also accepted
   what_model_sees: One weather tool joins the tool list; results come back as compact JSON.
   token_effect: Small fixed schema cost per round while enabled.
@@ -171,6 +172,15 @@ the `list_skills` index and the "Installed Skills" context section, whole in
 `list_skills(name=...)`, which also returns the `read_file` call for this
 manifest — so write it for the model, not for the human reviewer. Unknown keys or
 non-string values are refused at parse time.
+
+`live_call: first_view` (extensions only) puts the skill's permitted tools in the
+first tool view of every owner voice call, beside the call's own memory, web and
+task tools. A call's session takes a new tool only by reopening, so a skill whose
+tools a call should be able to use at once (the bundled desktop skills: look at the
+screen, press a key) declares it; every answer of the call then carries those
+schemas. Without it a call still loads the tools with `enable_tools` when needed.
+The registry decides as for any schema: a skill that is off, unreviewed or not
+granted adds nothing.
 
 ### Passive context snapshots (extensions only)
 

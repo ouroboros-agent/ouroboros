@@ -161,6 +161,7 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     concurrent request.
     """
     from ouroboros.tools.github import github_token_from_env_or_settings
+    from ouroboros.llm_live import live_key_configured
     from ouroboros.usage_accounting import usage_projection, usage_writer_snapshot
     from supervisor.queue import get_evolution_status_snapshot
     from supervisor.state import TOTAL_BUDGET_LIMIT, control_value, load_state
@@ -284,6 +285,7 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         # on the worker thread with the rest of the snapshot, never on the event loop.
         "bg_state": (_describe_bg(request)(bg_enabled) if _describe_bg(request) else {}),
         "github_token_configured": bool(github_token_from_env_or_settings()),
+        "calls_key_configured": live_key_configured(),  # Talk is offered only with the Google AI key
         "projects": projects,
         "project_chat_ids": project_chat_ids,
         "task_bindings": task_bindings,
@@ -937,6 +939,7 @@ async def api_state(request: Request) -> JSONResponse:
             "safety_mode": get_safety_mode(),
             "skills_repo_configured": bool(get_skills_repo_path()),
             "github_token_configured": snap["github_token_configured"],
+            "calls_key_configured": snap["calls_key_configured"],
             "accounting": {
                 "available": accounting_available,
                 "authority": "physical_attempt_ledger",

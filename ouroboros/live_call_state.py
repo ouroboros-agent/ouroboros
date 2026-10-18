@@ -13,8 +13,10 @@ past the call's audio span, when the measured prompt would reach the window on t
 when the provider's counts show it dropped turns (the audio it held then lowers this call's
 span), or when the provider says goodbye (``GoAway``); with no completed turn before the
 goodbye's own deadline the session resumes with the provider's handle, as a transport loss
-does. These are window and price physics, never judgment. The owner's audio heard while a
-session renews waits in a bounded backlog and reaches the next session.
+does. These are window and price physics, never judgment. A session also renews when the voice
+recorded other recognition languages than it opened with (``call_languages``): the provider takes
+them only at a session's setup. The owner's audio heard while a session renews waits in a
+bounded backlog and reaches the next session.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Tuple
+
+from ouroboros.call_languages import recorded_call_languages
 
 log = logging.getLogger(__name__)
 
@@ -77,12 +81,19 @@ class SessionRenewal:
         self.frame: Optional[Tuple[float, Any]] = None  # (when, the newest frame a peer showed)
         self.held_at_drop = 0  # the least audio a session of this call held before the provider dropped turns
         self.drops = 0         # how often the provider dropped a session's turns in this call
-        self.reset((0, 0))
+        # The languages the next session's recognition expects: the record when the call starts, then
+        # what the voice records during it (``live_tool_batch``).
+        spec = getattr(call, "spec", None)
+        self.languages: Tuple[str, ...] = recorded_call_languages(
+            getattr(call, "drive_root", None), getattr(spec, "presence_binding_id", "") or "")
+        self.reset((0, 0), self.languages)
 
-    def reset(self, bounds: Tuple[int, int]) -> None:
+    def reset(self, bounds: Tuple[int, int], languages: Tuple[str, ...] = ()) -> None:
         """A new session holds nothing yet; ``bounds`` is its ``(room, audio span)`` in provider tokens,
-        the span no larger than what this call's sessions held before a drop."""
+        the span no larger than what this call's sessions held before a drop; ``languages`` are the
+        recognition languages it opened with."""
         self.room, span = bounds
+        self.opened_languages = tuple(languages)
         self.span = min(span, self.held_at_drop) if span and self.held_at_drop else (span or self.held_at_drop)
         self.rows_at_open = len(getattr(self.call, "messages", None) or ())  # what this session was opened with
         self.held_audio = self.held_prompt = self.growth = self.audio_growth = 0
@@ -116,6 +127,8 @@ class SessionRenewal:
     def due(self) -> str:
         if self.go_away_by is not None:
             return "go_away"
+        if self.languages != self.opened_languages:
+            return "languages"  # the provider takes recognition languages only when a session opens
         if len(self.call.messages) <= self.rows_at_open:
             return ""  # nothing was said since this session opened: a renewal would replay the same text
         if self.dropped:
@@ -162,3 +175,47 @@ class SessionRenewal:
         self.backlog.clear()
         self.backlog_ms = 0.0
         return events
+
+
+class Openings:
+    """Dialogue acts addressed to the call, held for a completed turn: completing the client turn
+    interrupts whatever is under way, so they go out only at ``SessionRenewal.at_turn_boundary``,
+    in order with the images and acknowledgements held behind them, and then one bare completion
+    opens one response for all of them (measured 18.10: gemini-3.8-live answers a bare
+    ``turnComplete`` over the context it holds). The first is the call becoming audible, once per
+    call (a renewal or a resumption continues the conversation): a fact, never a scripted greeting;
+    the voice chooses its words from the room, in the correspondence's language."""
+
+    def __init__(self, renewal: "SessionRenewal") -> None:
+        self.renewal = renewal
+        self.held: List[Any] = []
+        self.live_told = False
+
+    def live(self, presence: bool) -> Optional[Any]:
+        """The fact that the call can be heard now, the first time a session of this call is live."""
+        from ouroboros.gateways.realtime_engine import ContextItem
+
+        if self.live_told:
+            return None
+        self.live_told = True
+        text = ("This call is now live: the other side can hear you." if presence
+                else "The owner has just opened this call and can hear you now.")
+        return ContextItem(text=text, source="call_live", opens_response=True)
+
+    def hold(self, item: Any) -> None:
+        self.held.append(item)
+
+    def take(self) -> List[Any]:
+        """Everything held, in order, then the one completion that opens the response; content
+        acknowledgements last, since they may be taken only once a session holds the content."""
+        if not self.held or not self.renewal.at_turn_boundary():
+            return []
+        from dataclasses import replace
+
+        from ouroboros.gateways.realtime_engine import ContextItem
+
+        items, self.held = self.held, []
+        content = [replace(item, opens_response=False) if isinstance(item, ContextItem) else item
+                   for item in items if not isinstance(item, Acks)]
+        return [*content, ContextItem(text="", source="", opens_response=True),
+                *(item for item in items if isinstance(item, Acks))]

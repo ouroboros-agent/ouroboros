@@ -574,12 +574,25 @@ def test_gemini_turn_taking_is_sent_only_when_the_owner_chose_it():
     route = EngineRoute("google", "gemini-3.8-live")
     assert "realtimeInputConfig" not in gemini.setup_message(SessionConfig(route, "core"))["setup"]
     normal = call_turn_taking(CallSpec("c", 1, "google", "m", pause="normal"))
-    assert normal == {"silence_ms": 0, "interruptions": True}
+    assert normal == {"silence_ms": 0, "interruptions": True, "language_hints": ()}
     assert "realtimeInputConfig" not in gemini.setup_message(SessionConfig(route, "core", **normal))["setup"]
     chosen = call_turn_taking(CallSpec("c", 1, "google", "m", pause="long", interruptions=False))
     assert gemini.setup_message(SessionConfig(route, "core", **chosen))["setup"]["realtimeInputConfig"] == {
         "automaticActivityDetection": {"silenceDurationMs": 1600}, "activityHandling": "NO_INTERRUPTION"}
     assert call_turn_taking(CallSpec("c", 1, "google", "m", pause="short"))["silence_ms"] == 500
+
+
+def test_gemini_recognition_is_hinted_with_the_recorded_languages_and_the_reply_never_pinned():
+    from ouroboros.call_protocol import CallSpec
+    from ouroboros.live_call_route import call_turn_taking
+
+    route = EngineRoute("google", "gemini-3.8-live")
+    hinted = call_turn_taking(CallSpec("c", 1, "google", "m"), ("ru-RU", "en-US"))
+    setup = gemini.setup_message(SessionConfig(route, "core", **hinted))["setup"]
+    assert setup["inputAudioTranscription"] == setup["outputAudioTranscription"] == {"languageCodes": ["ru-RU", "en-US"]}
+    assert "languageCode" not in setup["generationConfig"].get("speechConfig", {})  # measured: no effect on the reply
+    bare = gemini.setup_message(SessionConfig(route, "core", **call_turn_taking(CallSpec("c", 1, "google", "m"))))["setup"]
+    assert bare["inputAudioTranscription"] == bare["outputAudioTranscription"] == {}  # nothing recorded: the provider guesses
 
 
 def test_gemini_compression_starts_at_the_drivers_watermarks():
@@ -589,3 +602,30 @@ def test_gemini_compression_starts_at_the_drivers_watermarks():
                            compress_at_tokens=122_880, compress_to_tokens=106_000)
     assert gemini.setup_message(marked)["setup"]["contextWindowCompression"] == {
         "triggerTokens": 122_880, "slidingWindow": {"targetTokens": 106_000}}
+
+
+@run_async
+async def test_gemini_completes_the_client_turn_only_for_what_opens_a_response():
+    engine, connection, events, collector = await opened("google")
+    socket = connection.sockets[0]
+    await engine.send(ContextItem("A system row", "room_row:system"))
+    assert socket.sent[-1]["clientContent"]["turnComplete"] is False  # context waits for the next turn
+    await engine.send(ContextItem("The owner has just opened this call", "call_live", opens_response=True))
+    assert socket.sent[-1]["clientContent"]["turnComplete"] is True  # measured 18.10: the model speaks at once
+    audio = {"serverContent": {"modelTurn": {"parts": [{"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": "AAABAA=="}}]}}}
+    await feed(engine, socket, audio)
+    before = len(socket.sent)
+    await engine.send(ContextItem("The task you started reports", "room_row:out", opens_response=True))
+    await engine.send(ContextItem("Another turn's reply", "room_row:out"))
+    assert len(socket.sent) == before  # held through the answer: completing a turn now would cut it
+    await feed(engine, socket, {"serverContent": {"turnComplete": True}})
+    held = [sent["clientContent"] for sent in socket.sent[before:]]
+    assert [turn["turnComplete"] for turn in held] == [False, True]  # together, one response for both
+    await feed(engine, socket, audio)
+    later = len(socket.sent)
+    await engine.send(ContextItem("Only context", "room_row:system"))
+    await feed(engine, socket, {"serverContent": {"turnComplete": True}})
+    assert [sent["clientContent"]["turnComplete"] for sent in socket.sent[later:]] == [False]
+    await engine.send(ContextItem("", "", opens_response=True))  # a bare completion: measured to open a response
+    assert socket.sent[-1] == {"clientContent": {"turnComplete": True}}
+    await finished(engine, collector)

@@ -119,11 +119,11 @@ def test_owner_image_row_reaches_live_video_and_replay_beside_its_text(tmp_path)
         items = rooms.drain()
         assert len(items) == 2 and isinstance(items[1], VideoIn)
         assert items[1].mime == "image/png" and items[1].data == output.getvalue()
-        sent = []
-        call = SimpleNamespace(messages=[], _post=sent.append)
+        sent, held = [], []
+        call = SimpleNamespace(messages=[], _post=sent.append, openings=SimpleNamespace(held=held, hold=held.append))
         for item in items:
             asyncio.run(_LiveCall._context(call, item))
-        assert sent == items
+        assert items[0].opens_response and held == items and sent == []  # the owner's words wait with their image
         replay = history_turn(call.messages[0])
         assert "Look at this slide" in replay["parts"][0]["text"]
         assert base64.b64decode(replay["parts"][1]["inlineData"]["data"]) == output.getvalue()
@@ -310,7 +310,7 @@ def test_handle_call_direct_admits_a_census_turn_of_kind_call(monkeypatch, tmp_p
     task = seen[0]
     assert task["_is_direct_chat"] is True and task["chat_id"] == 1 and task["text"].startswith("[Live call]")
     # Gemini's own recognition took Russian for German and Polish in a real call: the call is told so.
-    assert "Speech recognition can take one language for another" in task["text"]
+    assert "Speech recognition can still take one language for another" in task["text"]
     assert "owner's instructions for calls" not in task["text"]  # none set: nothing added
     assert CallSpec.from_metadata(task["metadata"]["live_call"]) == spec
     release.set()

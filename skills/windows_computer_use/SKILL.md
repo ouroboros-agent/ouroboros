@@ -1,7 +1,7 @@
 ---
 name: windows_computer_use
 description: Windows desktop reading and element actions through the UI Automation text tree (roles, labels, states, coordinates) - no screenshots, no coordinate clicks.
-version: 0.1.0
+version: 0.1.1
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -12,6 +12,7 @@ install:
   - kind: pip
     package: comtypes==1.4.17
 when_to_use: The agent needs to read what a Windows window says (as text with roles and states), find an element by name/role/automation_id, or act on a named element (press a button, set a field, toggle, expand, select) so that the action survives window movement and DPI. It reads what the application exposes through UI Automation, not pixels.
+live_call: first_view
 model_experience:
   what_model_sees: Four tools - window_list (visible windows), window_read (a window as a text tree with roles/labels/states/rects), element_find (search the tree by selector), element_act (invoke/set_value/toggle/expand/collapse/select/scroll_into_view/focus on the element a selector names). No images; answers are compact JSON trees.
   token_effect: The tool schemas add a small fixed cost to every round while the skill is enabled; each window_read returns a bounded tree (default 400 nodes, ceiling 5000) that costs tokens proportional to the tree size actually read.
