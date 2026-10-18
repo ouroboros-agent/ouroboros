@@ -180,7 +180,8 @@ def test_the_toggle_never_enters_the_settings_draft():
     for attribute in ('id="s-', 'name="s-'):
         assert attribute not in block
     settings = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
-    assert "closest?.('[data-notify-settings], [data-autostart-settings]')" in settings
+    # The client-local blocks never enter the draft: notifications, autostart and this device's call devices.
+    assert "closest?.('[data-notify-settings], [data-autostart-settings], [data-call-devices]')" in settings
 
 
 @pytest.fixture

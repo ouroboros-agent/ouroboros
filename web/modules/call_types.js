@@ -29,6 +29,7 @@
  * @property {string=} label
  * @property {boolean=} mic
  * @property {boolean=} speaker
+ * @property {boolean=} video
  */
 /**
  * @typedef {Object} HostCallOpenResponse
@@ -42,6 +43,7 @@
  * @property {'owner'|'meeting'} role
  * @property {boolean} mic
  * @property {boolean} speaker
+ * @property {boolean=} video
  * @property {number} rate
  * @property {string=} label
  */
@@ -116,6 +118,7 @@
  * @property {string} audio_header
  * @property {number} audio_header_bytes
  * @property {number} max_audio_payload_bytes
+ * @property {number} max_video_payload_bytes
  * @property {number} max_control_bytes
  * @property {Object<string, string>} peer_messages
  * @property {Object<string, string>} server_messages
