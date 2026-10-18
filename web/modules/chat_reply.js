@@ -5,9 +5,11 @@
 // host resolves: this module sends only the quoted row's address and never decides who reads the words.
 import { tr } from './i18n.js';
 import { showToast } from './toast.js';
+import { isStoreMigrating } from './api_client.js';
 import { ensureLiveActionsEl } from './chat_activity.js';
 import { authorOf, createRelayQuote, createReplyQuote, normalizeReplyRef, replySnippet } from './chat_reply_quote.js';
 import { fullText } from './text_fit.js';
+import { revealTimelineNode } from './chat_render_batch.js';
 
 const REPLY_ICON = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"'
     + ' stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -25,12 +27,31 @@ function rowAbove(node) {
     return row;
 }
 
+/** Why a quote did not land, as `[code, words]` from the answer or the host's typed reason. Answers and a moved
+ * work card (its task names no room) stay so; an unreadable source may stay so too. Only a read that may answer
+ * differently asks to try again. */
+function failureText({ state, task_id: taskId, error }) {
+    if (state === 'absent') return ['absent', 'The quoted message was not found in saved history.'];
+    if (state === 'ambiguous') return ['ambiguous', 'This reference matches more than one saved message.'];
+    if (state === 'unavailable') return ['unavailable', 'The quoted message cannot be shown in an available room.'];
+    if (state === 'moved' && taskId) return ['moved', 'This work is in another room.'];
+    if (isStoreMigrating(error)) return ['migrating', 'Saved history is being upgraded. Try again shortly.'];
+    if (error?.body?.reason_code === 'history_source_unavailable') {
+        return ['source_unavailable', 'Saved history that may hold the quoted message could not be read.'];
+    }
+    return ['unknown', 'Could not load the quoted message. Try again.'];
+}
+
 /**
  * `feed` holds the bubbles (each stamped `data-row-address`), `input` is the composer field (the strip goes before its
  * row), `key` names the sessionStorage slot of a staged reply. `reading()` is the room's reading-position owner,
  * resolved when a quote is pressed; `onDomWrite` is the instance's stable-viewport seam for a clamp's toggle.
+ * `history()` supplies exact-node revelation through this room's pager; `navigate(address, chatId, current)`
+ * lets app switch to the host's destination only while this claim remains current. It returns a state or null
+ * for cancellation. Neither the quote's stored chat label nor its task chooses the destination.
  */
-export function createChatReplies({ chatId, feed, input, key = '', reading, onDomWrite = (write) => write() }) {
+export function createChatReplies({ chatId, feed, input, key = '', reading, history = () => null,
+    navigate = null, present = () => true, onDomWrite = (write) => write() }) {
     // The strip stands right before the field's row (below the pills); a bare field (a test fixture) takes it itself.
     const textRow = input.closest('.chat-text-row') || input;
     let storage = null;
@@ -39,6 +60,9 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
     let staged = null;
     let strip = null;
     let targetTimer = 0;
+    let destroyed = false;
+    // `held`: the reader's own live-edge intent while a reveal is pending (a reveal sets stick false itself).
+    let revealGeneration = 0, revealing = 0, held = null;
 
     const remember = () => {
         if (!storage || !storageKey) return;
@@ -61,20 +85,58 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         targetTimer = setTimeout(() => target.classList.remove('is-quote-target'), TARGET_MS);
     }
 
-    /** Scrolls to the quoted message when this room has it loaded; says so when it does not. */
-    function jump(ref) {
-        const target = rowOf(ref.address);
-        if (!target) {
-            showToast(tr('chat.reply.not_loaded', 'That message is not loaded here'), 'info');
-            return false;
-        }
+    /** One claim covers the loaded fastpath, bounded read and app-owned room switch. Never sends a message.
+     * A reveal that moved nothing (an answer, a failed read, a room it could not open) gives a reader who followed
+     * the live edge that edge back, with what arrived meanwhile, while the claim is still theirs: a gesture, a
+     * newer reveal or leaving the room decided instead. A landing or a page drawn around it (`left`) keeps its view. */
+    async function reveal(address, isCurrent = () => true, prepared = null) {
         const position = reading();
-        position.cancel();
-        feed.scrollTop += target.getBoundingClientRect().top - feed.getBoundingClientRect().top - HEADER_CLEARANCE;
+        const following = held?.claimed() ? held.following : position.stick;
+        const claimed = position.claim ? position.claim() : (position.cancel(), () => true);
+        const wanted = () => !destroyed && present() && claimed() && isCurrent();
+        const generation = revealing = ++revealGeneration;
+        const own = held = { following, claimed };
         position.stick = false;
+        const result = await seek(address, position, wanted, prepared)
+            .catch(error => (wanted() ? { state: 'unknown', error } : null));
+        if (generation === revealing) revealing = 0;
+        if (held === own) held = null;
+        if (following && generation === revealGeneration && wanted() && result?.state !== 'found' && !result?.left) {
+            position.stick = true;
+            position.followAfterLayout?.();
+        }
+        return result;
+    }
+
+    async function seek(address, position, wanted, prepared) {
+        let target = !prepared && (history()?.exact(address) || (!history() && rowOf(address)));
+        if (!target) {
+            const result = await history()?.reference(address, wanted, prepared);
+            if (!wanted() || !result) return null;
+            if (result.state === 'moved' && Number.isInteger(result.chat_id) && navigate) {
+                return navigate(address, result.chat_id, wanted);
+            }
+            if (!result.target) return result;
+            target = result.target;
+        }
+        if (!wanted()) return null;
+        const header = feed.closest('.page, .chat-instance-panel')?.querySelector('.chat-page-header, .chat-panel-statusbar');
+        const clearance = Math.max(HEADER_CLEARANCE,
+            (header?.getBoundingClientRect().bottom || 0) - feed.getBoundingClientRect().top + 12);
+        revealTimelineNode(target, feed, clearance);
         position.scroll();
+        // This explicit placement measured the current column. An ordinary scroll
+        // keeps the old-width anchor until reflow; a newly opened room must replace it.
+        position.remember(true);
         markTarget(target);
-        return true;
+        return { state: 'found' };
+    }
+
+    async function jump(ref) {
+        const result = await reveal(ref.address);
+        if (!result || result.state === 'found') return;
+        const [code, words] = failureText(result);
+        showToast(tr(`chat.reply.${code}`, words), 'info');
     }
 
     function paint() {
@@ -281,6 +343,8 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         start,
         syncCard,
         syncDerivedQuotes,
+        reveal,
+        get revealing() { return revealing !== 0; },
         /**
          * "Send as a new message" under a delivery doubt: the owner's words join this composer's draft (sent, they are
          * a new message with a fresh id); nothing is sent here.
@@ -297,6 +361,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         echoRow: () => (staged ? { reply_to: staged } : null),
         clear,
         destroy() {
+            destroyed = true;
             clearTimeout(targetTimer);
             keyHost?.removeEventListener('keydown', onKeydown);
             strip?.remove();

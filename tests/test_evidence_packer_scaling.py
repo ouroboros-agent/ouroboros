@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 import pytest
 
-from ouroboros import evidence_packer as packer, evidence_packs as packs, observability, store, usage_store
+from ouroboros import evidence_packer as packer, evidence_packs as packs, maintenance, observability, store, usage_store
 from supervisor import terminal_delivery
-from tests.test_evidence_packs import REPO, _result, _task
+from tests.test_evidence_packs import _result, _task
 from tests.test_evidence_packs import root as root
 
 
@@ -29,9 +29,9 @@ def test_unrelated_changes_do_not_wake_swept_task(root, monkeypatch, change):
     _task(root, "packed", blobs=1)
     assert packer.run_pass(root)["unlinked"] == 2
     packer.run_pass(root)  # record the directory revision after our own unlink
+    maintenance.run_job(root, "evidence_packing")  # the job's quiet fact for this state
+    assert "evidence_packing" not in maintenance.due(root)
     before = packer.task_stamps(root, "packed")
-    unit = packer.EvidencePacker()
-    assert not unit.tick(root, REPO)
     if change == "money":
         _reserve(root, "unrelated")
     elif change == "delivery":
@@ -42,12 +42,13 @@ def test_unrelated_changes_do_not_wake_swept_task(root, monkeypatch, change):
     else:
         _task(root, "unrelated", status="running", blobs=1)
         packer.record_swept(root, "unrelated", packer.task_stamps(root, "unrelated"))
-    monkeypatch.setattr(packer, "spawn_maintenance_job", lambda *a: pytest.fail("unrelated change spawned a packer"))
     assert packer.task_stamps(root, "packed") == before
     assert packer.changed_tasks(root) == []
-    assert unit.tick(root, REPO)
-    unit._thread.join(10)
-    assert not unit._thread.is_alive()
+    # The change may make a look worthwhile; the child's discovery then finds no changed stamp,
+    # starts no packing pass, and records the new quiet facts.
+    monkeypatch.setattr(packer, "run_pass", lambda *a, **k: pytest.fail("unrelated change started a packing pass"))
+    assert maintenance.run_job(root, "evidence_packing")["state"] == "done"
+    assert "evidence_packing" not in maintenance.due(root)
 
 
 @pytest.mark.parametrize("blocker", ["money", "delivery"])
@@ -68,7 +69,7 @@ def test_own_settlement_change_wakes_a_swept_task(root, blocker):
     assert packer.run_pass(root)["unlinked"] == 2
 
 
-@pytest.mark.parametrize("operation", ["changed_tasks", "run_pass", "tick"])
+@pytest.mark.parametrize("operation", ["changed_tasks", "run_pass", "job"])
 @pytest.mark.parametrize("status", ["running", "completed"])
 def test_money_and_deliveries_read_once_for_all_tasks(root, monkeypatch, operation, status):
     for number in range(12):
@@ -91,17 +92,14 @@ def test_money_and_deliveries_read_once_for_all_tasks(root, monkeypatch, operati
 
     assert terminal_delivery.register_pending_delivery(
         root, {"delivery_id": "owed-live", "task_id": "live-0", "chat_id": 1})
-    unit = packer.EvidencePacker()
-    unit.tick(root, REPO)
-    if operation == "tick":
+    if operation == "job":
         packer.run_pass(root)
         packer.run_pass(root)
+    store.close_connections(root / usage_store.STORE_REL)  # the next lease opens a traced, persistent connection
     monkeypatch.setattr(usage_store, "_connect", connect)
     monkeypatch.setattr(utils, "read_json_dict", read)
-    if operation == "tick":
-        assert unit.tick(root, REPO)
-        unit._thread.join(10)
-        assert not unit._thread.is_alive()
+    if operation == "job":  # the child's discovery: nothing changed, so no pass follows it
+        assert maintenance.run_job(root, "evidence_packing")["state"] == "done"
     else:
         getattr(packer, operation)(root)
     queries = [sql for sql in statements if "FROM attempts" in sql and sql.startswith("SELECT")]

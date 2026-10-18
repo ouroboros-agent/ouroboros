@@ -1,5 +1,7 @@
 """Finalization observations must preserve the answer's existing delivery path."""
 
+from tests import _dialogue as dialogue_test
+
 import json
 import os
 import queue
@@ -231,7 +233,7 @@ def test_answer_reaches_the_chat_while_the_store_is_blocked_and_the_card_follows
         assert answer["text"] == "Hello." and answer["delivery_id"].startswith("final:barrier:")
         assert td.terminal_answer_receipts(root, "barrier")["state"] == "owed"
         delivery._handle_send_message(answer, host)
-        rows = [json.loads(line) for line in chat_path.read_text(encoding="utf-8").splitlines()]
+        rows = dialogue_test.log_rows(chat_path)
         assert [row["text"] for row in rows] == ["Hello."], "the answer is in the chat before the store"
         assert td.terminal_answer_receipts(root, "barrier")["state"] == "delivered"
         assert not any(row.get("type") == "task_summary" for row in rows), "no Done card before the row"
@@ -258,7 +260,7 @@ def test_answer_reaches_the_chat_while_the_store_is_blocked_and_the_card_follows
         stored = pipeline.write_task_result(root, "barrier", "completed",
                                             root_phase_checkpoint={"post_task_synthesis": "completed"})
     assert append_terminal_task_projection(root, "barrier", task, stored, {**done, "chat_id": 1})
-    rows = [json.loads(line) for line in chat_path.read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.log_rows(chat_path)
     assert [row.get("text") for row in rows][0] == "Hello."
     card = rows[-1]
     assert card["summary_kind"] == "terminal_root_projection" and card["outcome_phase"] == "done"

@@ -26,6 +26,7 @@ from ouroboros.presence_gate import _configured_gate, admit_configured_gate
 from ouroboros.presence_runner import _read_previous_turn, presence_chat_id
 from ouroboros.presence_runtime import PresenceRuntimeOverrides
 from ouroboros.task_results import load_task_result, write_task_result
+from tests._dialogue import chat_rows
 from tests.test_presence_admission import _binding, _install_behavior, _select_history
 
 KEY = "telegram:public-bot:room-42:thread-7"
@@ -179,7 +180,7 @@ def test_an_enabled_binding_opens_one_live_turn_under_its_ceiling(tmp_path, monk
     assert presence_call_run(opened.call_id) is None
     pointer = _read_previous_turn(drive_root, KEY)
     assert pointer["task_id"] == opened.task_id and pointer["outcome"] == "silent"
-    rows = [json.loads(line) for line in (drive_root / "logs" / "chat.jsonl").read_text().splitlines()]
+    rows = chat_rows(drive_root)
     assert [row["direction"] for row in rows] == ["in"]
     assert rows[0]["text"] == "Ouroboros joined the meeting" and rows[0]["task_id"] == opened.task_id
 
@@ -322,14 +323,16 @@ def test_utterances_become_dialogue_rows_of_the_call(tmp_path, monkeypatch):
     assert driver.started.wait(CALL_WAIT_S)
     task = driver.task
     assert record_call_utterance(drive_root, task, direction="in", text="Can you summarize the agenda?")
-    assert record_call_utterance(drive_root, task, direction="in", text="I agree with Alex.", speaker_label="Dana")
+    for _ in range(2):  # the same item recorded twice is one row
+        assert record_call_utterance(drive_root, task, direction="in", text="I agree with Alex.", speaker_label="Dana",
+                                     utterance_id="item-7")
     assert record_call_utterance(drive_root, task, direction="out", text="Sure: three items today.")
     assert not record_call_utterance(drive_root, task, direction="in", text="   ")
     assert not record_call_utterance(drive_root, task, direction="sideways", text="x")
     hold.set()
     _wait_ended(opened, presence_call_run(opened.call_id))
 
-    rows = [json.loads(line) for line in (drive_root / "logs" / "chat.jsonl").read_text().splitlines()]
+    rows = chat_rows(drive_root)
     assert [(row["direction"], row["text"]) for row in rows] == [
         ("in", "Ouroboros joined the meeting"),
         ("in", "Can you summarize the agenda?"),
@@ -341,8 +344,13 @@ def test_utterances_become_dialogue_rows_of_the_call(tmp_path, monkeypatch):
     assert rows[1]["user_id"] != rows[2]["user_id"] and rows[3]["user_id"] == 0
     assert {row["task_id"] for row in rows} == {opened.task_id}
     assert {row["chat_id"] for row in rows} == {presence_chat_id(KEY)}
-    # Every row keeps the call event's identity, so a replay of that event recognizes them.
+    # Every row keeps the call event's identity, so a replay of that event recognizes them; each
+    # utterance is its own named row (the store keeps one inbound row per name), the opening row
+    # keeps the event's own name.
     assert len({row["presence_event_identity"] for row in rows}) == 1
+    event_id = rows[0]["client_message_id"]
+    assert rows[2]["client_message_id"] == f"{event_id}:heard:item-7"
+    assert rows[1]["client_message_id"].startswith(f"{event_id}:heard:") and rows[3]["client_message_id"] == event_id
     assert rows[3]["transport"]["delivery"] == {"state": "authored"}
 
 

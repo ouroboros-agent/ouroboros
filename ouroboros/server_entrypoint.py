@@ -81,6 +81,16 @@ def admit_data_root(data_dir: pathlib.Path, *, wait_sec: float | None = None) ->
         os.close(previous)
 
 
+def admission_held(data_dir: pathlib.Path) -> bool:
+    """Whether THIS process holds ``data_dir``'s admission (the same actual root).
+
+    While it does, no other process holds or serves that root, and one that held it
+    earlier has exited: a server keeps its admission until it exits.
+    """
+    with _admission_lock:
+        return _admission.get("fd") is not None and _admission.get("root") == os.path.realpath(data_dir)
+
+
 def release_admission_for_tests() -> None:
     """Test isolation only: end this process's admission between tests."""
     with _admission_lock:

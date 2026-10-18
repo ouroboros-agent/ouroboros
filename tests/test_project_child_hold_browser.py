@@ -7,13 +7,13 @@ No provider is called. Live scheduled/terminal frames use the normal WS consumer
 """
 import copy
 import json
-import os
 import time
-from pathlib import Path
 
 import pytest
 
+from ouroboros import dialogue_store
 from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401
+from tests._shared import producer_evidence_dir
 from tests.test_project_admission_refusal_browser import _producers
 from tests.test_project_authority_outages import _uncertain_child
 from tests.test_project_hold_recovery import worker
@@ -33,7 +33,6 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
     from ouroboros.gateway.tasks import _tasks_list_payload
     from ouroboros.store import StoreError
     from ouroboros.task_results import load_task_result, write_task_result
-    from ouroboros.utils import append_jsonl
     from supervisor import queue, workers
 
     server = direct_server_with_data
@@ -49,7 +48,8 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
     sent = worker(host, monkeypatch)
     assert queue.persist_queue_snapshot()
     snapshots, request_count, errors = [], [], []
-    evidence = Path(os.environ.get("OUROBOROS_TEST_TEMP_ROOT") or tmp_path) / "child-hold" / f"{engine}-{ending}"
+    evidence = producer_evidence_dir(tmp_path / "child-hold" / f"{engine}-{ending}",
+                                     f"child-hold-{engine}-{ending}")
     evidence.mkdir(parents=True, exist_ok=True)
     print(f"CHILD_HOLD_EVIDENCE={evidence}")
 
@@ -78,7 +78,7 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
     def frame(page, tid, **fields):
         row = {"type": "chat", "role": "assistant", "is_progress": True,
                "chat_id": 1, "task_id": tid, "ts": "2026-09-30T10:00:00Z", **fields}
-        append_jsonl(server["data_dir"] / "logs" / "progress.jsonl", row)
+        dialogue_store.append(server["data_dir"], "progress", row)
         _emit_ws_frame(page, row)
 
     def shot(page, name):
@@ -192,7 +192,6 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
     from ouroboros.gateway.tasks import _tasks_list_payload
     from ouroboros.store import StoreError
     from ouroboros.task_results import load_task_result, write_task_result
-    from ouroboros.utils import append_jsonl
     from supervisor import queue, workers
 
     server = direct_server_with_data
@@ -219,7 +218,8 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
     show_child_hold = freeze_next_child_reply = block_state = False
     completed_states, deferred_states = [], []
     state_count_at_child_reply = None
-    evidence = Path(os.environ.get("OUROBOROS_TEST_TEMP_ROOT") or tmp_path) / "child-hold" / f"{engine}-{ending}"
+    evidence = producer_evidence_dir(tmp_path / "child-hold" / f"{engine}-{ending}",
+                                     f"child-hold-{engine}-{ending}")
     evidence.mkdir(parents=True, exist_ok=True)
     print(f"CHILD_HOLD_EVIDENCE={evidence}")
 
@@ -256,7 +256,7 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
     def frame(page, tid, **fields):
         row = {"type": "chat", "role": "assistant", "is_progress": True,
                "chat_id": 1, "task_id": tid, "ts": "2026-09-30T10:00:00Z", **fields}
-        append_jsonl(server["data_dir"] / "logs" / "progress.jsonl", row)
+        dialogue_store.append(server["data_dir"], "progress", row)
         _emit_ws_frame(page, row)
 
     def shot(page, name):

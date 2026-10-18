@@ -75,10 +75,10 @@ def test_skill_review_first_line_and_lazy_critic_quotes(direct_server_with_data,
     rows = [{"type": "chat", "role": "system", "system_type": "skill_review", "content": text, "chat_id": 1,
              "ts": f"2026-10-10T16:00:0{index}+00:00", **({"skill": "emoji-review", "job_id": "emoji-job"} if index else {})}
             for index, text in enumerate((legacy, compact))]
-    from supervisor.message_bus import append_jsonl
+    from ouroboros import dialogue_store
 
     for row in rows:
-        append_jsonl(server["data_dir"] / "logs/chat.jsonl", {
+        dialogue_store.append(server["data_dir"], "chat", {
             **{key: value for key, value in row.items() if key not in {"role", "type", "content", "system_type"}},
             "direction": "system", "type": "skill_review", "text": row["content"],
         })

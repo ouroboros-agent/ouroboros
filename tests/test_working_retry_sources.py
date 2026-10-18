@@ -29,7 +29,6 @@ def restored(tmp_path, monkeypatch, request):
     monkeypatch.setenv("MCP_ENABLED", "false")
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
     monkeypatch.setattr("ouroboros.llm.LLMClient.chat", lambda *a, **k: pytest.fail("No model call"))
-    monkeypatch.setattr(cc, "_call_summarizer", lambda *a, **k: pytest.fail("No helper call"))
     monkeypatch.setattr(context, "_context_fit_route", lambda task, **kw: (
         {"model": task["model"], "provider": "openai", "use_local": False},
         SimpleNamespace(status="confirmed", stale=False, window_tokens=500_000, route_fp="test-route")))

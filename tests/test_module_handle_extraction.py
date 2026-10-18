@@ -224,7 +224,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "rescue_git_capture", "utc_now_iso",
     })),
     "supervisor/git_ops_reset.py": ("supervisor/git_ops.py", "_go", frozenset({
-        "BRANCH_DEV", "BRANCH_STABLE", "DRIVE_ROOT", "REPO_DIR",
+        "BOOTSTRAP_PIN_MARKER_NAME", "BRANCH_DEV", "BRANCH_STABLE", "DRIVE_ROOT", "REPO_DIR",
+        "UPDATE_INTENT_MARKER_NAME", "_bootstrap_pin_marker_path", "_update_intent_marker_path",
         "_git_network_bounded",
         "_admission_gate_for_unsynced_tree",
         "_clear_bootstrap_pin_marker", "_clear_update_intent",
@@ -362,7 +363,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     "ouroboros/loop_forced_finalization.py": ("ouroboros/loop.py", "_loop", frozenset({
         'DeliveryCandidate', '_LoopExitContext', '_append_or_merge_user_message',
         '_call_forced_model_once', '_child_disposition_state', '_claimed_child_dispositions',
-        '_context_reclaim_materializations', '_current_delivery_candidate', '_degrade_retained_delivery_candidate', '_delivery_evidence_state',
+        '_current_delivery_candidate', '_degrade_retained_delivery_candidate', '_delivery_evidence_state',
         '_delivery_replace_required', '_direct_child_results', '_disclose_service_finalization', '_drain_forced_owner_directives',
         '_drain_incoming_messages', '_emit_checkpoint_event', '_finalize_forced_services',
         '_finalize_task_services', '_force_plan_decision', '_force_plan_disclosure',
@@ -383,14 +384,13 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_TREE_ACCOUNTING_MAX_STALE_SEC", "_loop_tree_accounting", "_resolve_loop_max_rounds",
     })),
     "ouroboros/loop_model_call.py": ("ouroboros/loop.py", "_loop", frozenset({
-        "_RoundModelCallContext", "_account_compaction_usage", "_append_or_merge_user_message",
+        "_RoundModelCallContext", "_append_or_merge_user_message",
         "_apply_runtime_overrides", "_call_round_model", "_fallback_chain_allowed",
         "_reconcile_transport_wait", "_run_cross_model_fallback_chain",
-        "_context_overflow_retries", "_context_reclaim_materializations",
-        "_context_reclaim_passes", "_dispatch_round_model", "_emit_checkpoint_event",
-        "_measure_round_main_fit", "_output_exhausted_notice", "_rebind_context_fit_plan", "_run_main_reclaim",
+        "_context_overflow_retries", "_dispatch_round_model", "_emit_checkpoint_event",
+        "_measure_round_main_fit", "_output_exhausted_notice", "_rebind_context_fit_plan",
         "_server_web_allowed_by_task", "_task_deadline_epoch", "call_llm_with_retry",
-        "compact_tool_history_llm", "last_physical_attempt_capture", "seal_task_transcript",
+        "last_physical_attempt_capture", "seal_task_transcript",
     })),
     "ouroboros/loop_nudges.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_TREE_ACCOUNTING_MAX_STALE_SEC", "_append_or_merge_user_message",
@@ -454,7 +454,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_handle_forced_finalization", "_last_assistant_text", "_owner_marked_content",
         "_measure_main_context_view", "_measure_round_main_fit",
         "_provider_unavailable_result", "_record_owner_directive",
-        "_soft_land_exhausted_ceiling", "_task_deadline_epoch", "compact_tool_history_llm",
+        "_soft_land_exhausted_ceiling", "_task_deadline_epoch",
         "provider_no_call_source", "utc_now",
         # #1196: a budget-pause HOLD ended by control rejoins the model-wait rails and
         # merges its forced trace like every other controlled exit.

@@ -2,7 +2,6 @@
 
 import contextvars
 import json
-import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -11,6 +10,7 @@ import pytest
 
 from ouroboros import config, model_wait, subagent_runtime
 from ouroboros.settings_integrity import task_settings_snapshot
+from tests._socket_seal import block_network_except_socketpair
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +43,7 @@ def isolated_runtime(tmp_path, monkeypatch):
     def no_network(*args, **kwargs):
         raise AssertionError("Snapshot regressions must never contact a provider")
 
-    monkeypatch.setattr(socket.socket, "connect", no_network)
+    block_network_except_socketpair(monkeypatch, no_network)
     yield data
 
 

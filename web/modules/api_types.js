@@ -29,6 +29,7 @@
  * @property {?number} spent_calls
  * @property {boolean} supervisor_ready
  * @property {?string} supervisor_error
+ * @property {BootDocument=} boot  // the boot phases (same object as /api/health.boot); the Starting… header paints them
  * @property {string} runtime_mode
  * @property {string} context_mode
  * @property {boolean} context_mode_auto_low  // frozen compatibility field; always false
@@ -51,6 +52,17 @@
  * @property {Array<Object>=} main_attention_gaps Typed gaps in current action evidence.
  * @property {import('./client_contract_types.js').ServedUiState=} served_ui  // this generation's main interface; absent on older cores
  */
+/**
+ * @typedef {Object} BootDocument  // GET /api/health.boot and GET /api/state.boot: the serving generation's phases
+ * @property {'starting'|'serving'|'ready'|'failed'} phase
+ * @property {string} since
+ * @property {boolean} dialogue_ready  // an owner message is accepted durably
+ * @property {boolean} tasks_ready  // pooled task starts are admitted
+ * @property {Array<{name: string, state: 'running'|'done'|'failed', started_at: string, ended_at: ?string, error: ?string}>} steps
+ * @property {Object<string, {state: ?string, done: ?number, total: ?number}>} jobs  // the store's named background jobs
+ * @property {?string} error
+ */
+
 /**
  * Background Consciousness alarm clock (server._describe_bg_consciousness_state over consciousness.status_snapshot). A wake-up is an ordinary Main turn; the direct-activity census owns its liveness.
  * @typedef {Object} BgConsciousnessState
@@ -89,6 +101,7 @@
  * @property {string} runtime_version
  * @property {string} app_version
  * @property {string=} abi_version  // gateway ABI carrier; absent on cores older than GET /api/contract
+ * @property {BootDocument=} boot  // the serving generation's phases; answered while the boot runs
  */
 /**
  * @typedef {Object} OpenAICompatibleModelsResponse
@@ -262,7 +275,6 @@
  * @property {boolean=} ingress_accepted Canonical inbound row saved; not proof of task start or model delivery.
  * @property {boolean=} ingress_dispatched This live host process accepted the row and entered its dispatch; absent after a host restart (unknown).
  * @property {boolean=} ingress_pending This live host process accepted the row and has entered or refused neither yet: a later echo or history read says which.
- * @property {boolean=} ingress_undispatched History only: this live host process proved the row's write raised before dispatch; one Send again hands it over.
  * @property {Array<NonNullable<UploadResponse['view']>>=} attachments The owner message's ChatAttachmentView list: the same views history replays.
  * @property {boolean=} text_placeholder The owner row's text is the host's placeholder (no words were sent): no caption is shown.
  * @property {boolean=} markdown
@@ -1260,6 +1272,7 @@
  * @property {Array<Object>=} quota
  * @property {Array<Object>=} quota_absences
  * @property {Array<Object>=} resources Engine resource facets retain decimal strings, units and independent observation times.
+ * @property {Object=} availability_scope Engine binding: model (string|null), requestKind (text|image), basis quota_block.
  * @property {Object<string, boolean>=} resource_capabilities Catalog-negotiated read, refresh, reset and inspect_reset operations.
  * @property {ClaudexorReadState=} resource_capabilities_read Operations-catalog evidence, independent of reads.catalog (agent capabilities).
  * @property {ClaudexorStatusReads=} reads
@@ -1279,6 +1292,9 @@
  * @property {Object} profiles
  * @property {Array<Object>} quota
  * @property {Array<Object>} quota_absences
+ * @property {Array<Object>=} resources
+ * @property {Object=} availability_scope
+ * Engine echo: model (string|null), requestKind (text|image), basis quota_block.
  * @property {boolean} unified_accounts
  * @property {ClaudexorStatusReads} reads
  * @property {Object<'discovery'|'accounts'|'quota', ClaudexorPassiveReadError>} read_errors

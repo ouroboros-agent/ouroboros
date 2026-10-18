@@ -26,7 +26,8 @@ def test_native_memory_reports_reclaimable_bytes_without_double_counting(monkeyp
     monkeypatch.setattr(budget.sys, "platform", platform)
     if platform == "darwin":
         outputs = iter(["65536\n", 'Mach Virtual Memory Statistics: (page size of 4096 bytes)\n'
-                        'Pages free: 2.\nPages inactive: 3.\nPages speculative: 1.\nPages purgeable: 2.\n'])
+                        'Pages free: 2.\nPages inactive: 3.\nPages speculative: 1.\nPages purgeable: 2.\n',
+                        "1\n"])  # kern.memorystatus_vm_pressure_level: normal
         monkeypatch.setattr(budget, "_native_output", lambda argv: next(outputs))
     elif platform == "linux":
         monkeypatch.setattr(budget.Path, "read_text", lambda self, **kwargs: "MemTotal: 64 kB\nMemAvailable: 24 kB\n")
@@ -35,6 +36,26 @@ def test_native_memory_reports_reclaimable_bytes_without_double_counting(monkeyp
         monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(
             virtual_memory=lambda: SimpleNamespace(total=65536, available=24576)))
     assert budget.physical_memory() == budget.MemorySnapshot(65536, 24576)
+
+
+@pytest.mark.parametrize("level, pressure", [("1\n", False), ("2\n", False), ("4\n", True), (None, False)])
+def test_macos_kernel_pressure_counts_although_inactive_pages_look_free(monkeypatch, level, pressure):
+    """XNU keeps refilling the inactive queue with anonymous pages it then compresses, so free +
+    inactive + speculative barely moves under pressure: the kernel's critical level is read too.
+    Warn is routine on a busy small Mac running a healthy battery. An unreadable level leaves the
+    free-memory reading alone."""
+    vm = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 2.\nPages inactive: 3.\nPages speculative: 1.\n"
+
+    def native(argv):
+        if argv[-1] == "kern.memorystatus_vm_pressure_level":
+            if level is None:
+                raise subprocess.CalledProcessError(1, argv)
+            return level
+        return "65536\n" if argv[-1] == "hw.memsize" else vm
+
+    monkeypatch.setattr(budget.sys, "platform", "darwin")
+    monkeypatch.setattr(budget, "_native_output", native)
+    assert budget.physical_memory() == budget.MemorySnapshot(65536, 24576, pressure)
 
 
 def test_native_probe_failure_admits_one_worker(monkeypatch):
@@ -50,6 +71,21 @@ def test_physical_headroom_and_parent_slots_cap_the_same_budget(monkeypatch, req
     monkeypatch.setattr(budget, "physical_memory", lambda: budget.MemorySnapshot(10 * peak, 4 * peak))
     env = {} if inherited is None else {budget.NESTED_WORKERS_ENV: str(inherited)}
     assert budget.worker_budget(requested, env=env) == expected
+
+
+@pytest.mark.parametrize("capacity", [2, 3])
+def test_the_gate_pins_the_worker_count_it_verified(tmp_path, monkeypatch, capacity):
+    """The requested three slots still obey measured memory, not a hostile pytest override."""
+    total = 20 * config.TEST_WORKER_PEAK_RSS_BYTES
+    memory = budget.MemorySnapshot(total, int(total * config.TEST_MEMORY_RESERVE_FRACTION)
+                                   + capacity * config.TEST_WORKER_PEAK_RSS_BYTES)
+    monkeypatch.setattr(budget, "physical_memory", lambda: memory)
+    monkeypatch.setenv(budget.WORKERS_ENV, "3")
+    monkeypatch.setenv(budget.NESTED_WORKERS_ENV, "3")
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "1")
+    env = preflight_runner._preflight_env(tmp_path / "root", tmp_path / "root" / "repo")
+    assert env["PYTEST_XDIST_AUTO_NUM_WORKERS"] == str(capacity)
+    assert budget.WORKERS_ENV not in env  # the candidate cannot re-lower the admission seam
 
 
 def test_preflight_keeps_the_admission_it_measured_before_the_run(tmp_path, monkeypatch):
@@ -95,7 +131,7 @@ def test_local_node_lane_uses_the_same_cpu_and_memory_budget(tmp_path, monkeypat
 ])
 def test_shared_child_spawn_keeps_containment_and_bounds_nested_runners(monkeypatch, argv, slots, expected):
     seen = {}
-    token = "OURO_PROC_CONTAINER_1234567890abcdef"
+    token = "OURO_PROC_CONTAINER_1234567890ABCDEF"  # Windows upper-cases os.environ keys
     monkeypatch.setenv(token, "1")
     monkeypatch.setattr(conftest, "_ORIGINAL_POPEN_INIT", lambda self, args, **kwargs: seen.update(args=args, **kwargs))
     env = {} if slots is None else {budget.NESTED_WORKERS_ENV: slots}
@@ -120,9 +156,11 @@ def _run_pytest(tmp_path, files, *, workers, extra=(), owned=True):
                      f"raise SystemExit(pytest.main({args!r}))\n", encoding="utf-8")
     started = time.monotonic()
     if not owned:  # A bare run: the caller removed every inherited membership token.
+        # No launcher root either: its own evidence in tmp_path would otherwise retain the outer one.
+        env = {key: value for key, value in os.environ.items() if key != "OUROBOROS_TEST_TEMP_ROOT"}
         with log.open("w", encoding="utf-8") as output:
             proc = subprocess.Popen([sys.executable, str(entry)], cwd=ROOT,
-                                    env={**os.environ, budget.NESTED_WORKERS_ENV: str(workers)},
+                                    env={**env, budget.NESTED_WORKERS_ENV: str(workers)},
                                     stdout=output, stderr=subprocess.STDOUT)
         try:
             code = proc.wait(timeout=60)
@@ -153,11 +191,21 @@ def test_a_cgroup_limit_bounds_physical_memory_and_credits_reclaimable_cache(mon
              "/sys/fs/cgroup/memory.max": f"{4 * gib}\n",  # a 4 GiB container
              "/sys/fs/cgroup/memory.current": f"{3 * gib}\n",  # 3 GiB charged, 1 GiB of it file cache
              "/sys/fs/cgroup/memory.stat": f"anon {2 * gib}\ninactive_file {gib}\n"}
-    read_text, is_file = Path.read_text, Path.is_file
+    real_read, real_is_file = Path.read_text, Path.is_file
+
+    def faked(path):  # POSIX spelling: a Windows host renders these paths with backslashes
+        return path.as_posix().startswith(("/proc/", "/sys/fs/cgroup/"))
+
+    def read_text(self, *args, **kwargs):
+        if not faked(self):
+            return real_read(self, *args, **kwargs)
+        if self.as_posix() not in files:  # absent here, never this host's real cgroup file
+            raise FileNotFoundError(self.as_posix())
+        return files[self.as_posix()]
+
     monkeypatch.setattr(budget, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: files[str(self)] if str(self) in files
-                        else read_text(self, *a, **k))
-    monkeypatch.setattr(Path, "is_file", lambda self: str(self) in files or is_file(self))
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "is_file", lambda self: self.as_posix() in files if faked(self) else real_is_file(self))
     memory = budget.physical_memory()
     assert (memory.total_bytes, memory.available_bytes) == (4 * gib, 2 * gib)  # the cap, minus anon only
     del files["/sys/fs/cgroup/memory.stat"]  # without the stat file the cache is not credited
@@ -223,7 +271,12 @@ def test_worker_death_ends_pass_with_crash_and_unfinished_evidence(tmp_path, fau
     assert data["worker_crash"]["unfinished"] == [
         "test_1_running.py::test_running", "test_2_pending.py::test_pending"]
     pid, born = json.loads(child_identity.read_text(encoding="utf-8"))
-    assert pl.process_start_time(pid) != born or pid_is_zombie(pid), output
+    # Gone or an unreaped corpse. Windows keeps an exited process (and its birth) readable
+    # while a handle is open and ends Job members asynchronously, so its exit state decides.
+    deadline = time.monotonic() + 15
+    while pl.process_start_time(pid) == born and not pl.pid_provably_gone(pid) and not pid_is_zombie(pid):
+        assert time.monotonic() < deadline, output
+        time.sleep(0.05)
 
 
 def test_unowned_worker_death_lets_running_tests_finish(tmp_path, monkeypatch):

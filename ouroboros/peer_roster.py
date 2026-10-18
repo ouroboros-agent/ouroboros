@@ -35,7 +35,7 @@ import logging
 import pathlib
 from typing import Any, Dict, List, Optional
 
-from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
+from ouroboros.context_budget import bound_host_row
 from ouroboros.dialogue_provenance import is_presence_task, presence_caller_binding
 from ouroboros.focus import compact_focus, focus_fingerprint
 from ouroboros.task_status import SETTLED_STATUSES, _load_queue_snapshot, queue_snapshot_observation
@@ -618,8 +618,7 @@ def maybe_append_roster_note(ctx: Any, messages: List[Dict[str, Any]], drive_roo
     # merge it with unsent owner text: that loses its representation boundary.
     # The head's present is an earlier observation; exact current-note presence
     # deduplicates subsequent changes for every root alike.
-    messages.append({"role": "user", "content": current_note,
-                     HOST_CONTEXT_KIND_KEY: ROSTER_UPDATE_NAME if prior is not None else ROSTER_SNAPSHOT_NAME})
+    messages.append(bound_host_row(ROSTER_UPDATE_NAME if prior is not None else ROSTER_SNAPSHOT_NAME, current_note))
     base = prior["base"] if prior is not None else current_note
     ctx._peer_roster_display = {"value": current, "last": current_note,
                                "base": base, "chain": _visible_roster_chain(messages, base)}

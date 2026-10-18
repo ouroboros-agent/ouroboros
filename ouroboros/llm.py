@@ -73,13 +73,9 @@ from ouroboros.llm_fallback import (
 from ouroboros.llm_gigachat import (
     _GigaChatLaneMixin,  # noqa: F401
 )
+from ouroboros.context_budget import estimate_message_chars as _estimate_message_chars  # noqa: F401 -- the historical private name
 from ouroboros.llm_local import (
-    _compact_local_text,  # noqa: F401
-    _compact_markdown_sections,  # noqa: F401
-    _estimate_message_chars,  # noqa: F401
-    _LOCAL_COMPACTION_MODES,  # noqa: F401
     _LocalLaneMixin,  # noqa: F401
-    _split_markdown_sections,  # noqa: F401
     LocalContextTooLargeError,  # noqa: F401
 )
 from ouroboros.llm_messages import (

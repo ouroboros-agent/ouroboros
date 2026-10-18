@@ -31,6 +31,8 @@ Full egress interception (socket-level deny + evidence) is Ф4 scope, not Ф0.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import hashlib
 import json
 import os
@@ -1260,7 +1262,9 @@ def clone_repo(destination: pathlib.Path) -> pathlib.Path:
     depend on the operator's global git config.
     """
     clone = pathlib.Path(destination) / "clone"
-    subprocess.run(["git", "clone", "--no-hardlinks", "-q", str(REPO_ROOT), str(clone)],
+    # Full-history transport clone: omit unreachable source objects, not history
+    # or refs. No alternates; source deletion cannot invalidate this checkout.
+    subprocess.run(["git", "clone", "--no-local", "-q", str(REPO_ROOT), str(clone)],
                    check=True, capture_output=True)
     subprocess.run(["git", "checkout", "-B", "ouroboros"], cwd=str(clone),
                    check=True, capture_output=True)
@@ -1379,6 +1383,9 @@ class ArtifactOracle:
 
     def _jsonl(self, relpath: str, *, type_filter: str = "") -> list:
         path = self.data_root / relpath
+        if relpath in {"logs/chat.jsonl", "logs/progress.jsonl"}:
+            return [row for row in dialogue_test.log_rows(path)
+                    if not type_filter or str(row.get("type") or "") == type_filter]
         if not path.exists():
             return []
         rows = []
@@ -1409,7 +1416,7 @@ class ArtifactOracle:
 
     def chat_bytes(self) -> bytes:
         path = self.data_root / "logs" / "chat.jsonl"
-        return path.read_bytes() if path.exists() else b""
+        return dialogue_test.log_bytes(path)
 
     def running_ids(self) -> set:
         return {

@@ -263,21 +263,13 @@ def test_stamp_helper_ignores_broken_skill(tmp_path, monkeypatch):
     assert review.status != "clean"
 
 
-def test_bundled_unix_computer_use_net_permission_needs_no_grants_but_owner_enable():
-    """The shipped skill declares `net` for its remote backends. `net` needs no
-    owner grant (grants only gate inject_chat/subscribe_event), but it DOES remove
-    the skill from the launcher's native auto-enable class — the owner (or a bench
-    runner via save_enabled) must enable it explicitly. This is deliberate."""
-    from ouroboros.launcher_bootstrap import _NATIVE_AUTO_ENABLE_EXEMPT_PERMISSIONS
-    from ouroboros.skill_loader import requested_skill_permissions
+def test_net_alone_still_keeps_an_unnamed_seed_disabled(seed_env):
+    """`net` stays outside the auto-enable class for every seed the owner did not
+    name: only the bundled computer-use seeds start enabled despite it."""
+    seed_dir, target_root, data_root = seed_env
+    _write_skill(seed_dir, "remote_probe", permissions="[tool, subprocess, net]")
 
-    manifest = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "skills" / "unix_computer_use" / "SKILL.md"
-    ).read_text(encoding="utf-8")
-    assert "permissions: [tool, subprocess, net]" in manifest
-    assert "env_from_settings: []" in manifest
-    # net requires no owner grant...
-    assert requested_skill_permissions(["tool", "subprocess", "net"], []) == []
-    # ...but is NOT in the auto-enable-exempt set (so the skill needs owner enable).
-    assert "net" not in _NATIVE_AUTO_ENABLE_EXEMPT_PERMISSIONS
+    assert _seed_skills_into(seed_dir, target_root, log) == 1
+
+    assert load_review_state(data_root, "remote_probe", skill_dir=target_root / "native" / "remote_probe").status == "clean"
+    assert load_enabled(data_root, "remote_probe") is False

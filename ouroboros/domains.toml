@@ -77,6 +77,7 @@ D20 = "Presence"
 "ouroboros/startup_task_files.py" = "D11"
 "ouroboros/notice_receipts.py" = "D11"
 "ouroboros/delegate_custody_current.py" = "D07"
+"ouroboros/delegate_invocation.py" = "D07"
 "ouroboros/swarm_rollup.py" = "D07"
 "launcher.py" = "D18"
 "ouroboros/budget_pause.py" = "D01"
@@ -98,6 +99,8 @@ D20 = "Presence"
 "ouroboros/launcher_tray_macos.py" = "D18"
 "ouroboros/launcher_background.py" = "D18"
 "ouroboros/launcher_appearance.py" = "D18"
+"ouroboros/launcher_readiness.py" = "D18"
+"ouroboros/launcher_window_chrome.py" = "D18"
 "ouroboros/desktop_notifications.py" = "D18"
 "ouroboros/desktop_media.py" = "D18"
 "ouroboros/desktop_autostart.py" = "D18"
@@ -185,6 +188,8 @@ D20 = "Presence"
 "ouroboros/context_compaction.py" = "D03"
 "ouroboros/context_source_view.py" = "D03"
 "ouroboros/context_fit.py" = "D03"
+"ouroboros/context_anchor.py" = "D03"  # this conversation's own size anchor and accepted-input floor
+"ouroboros/context_renewal.py" = "D03"  # the refusal path's floor: the same task in a fresh view of its record
 "ouroboros/context_health.py" = "D03"
 "ouroboros/context_layout.py" = "D03"
 "ouroboros/context_mode_compat.py" = "D03"
@@ -276,7 +281,6 @@ D20 = "Presence"
 "ouroboros/gateway/files.py" = "D11"
 "ouroboros/gateway/history.py" = "D11"
 "ouroboros/gateway/history_paging.py" = "D11"
-"ouroboros/gateway/history_segments.py" = "D11"
 "ouroboros/gateway/history_contracts.py" = "D11"
 "ouroboros/gateway/host_service.py" = "D11"
 "ouroboros/gateway/call_ws.py" = "D11"
@@ -303,6 +307,7 @@ D20 = "Presence"
 "ouroboros/gateway/settings_secrets.py" = "D11"
 "ouroboros/gateway/skill_publish.py" = "D11"
 "ouroboros/gateway/state.py" = "D11"
+"ouroboros/gateway/reply_preparation.py" = "D11"
 "ouroboros/gateway/storage.py" = "D11"
 "ouroboros/gateway/main_decisions.py" = "D11"  # addressed canonical Main questions and human recovery controls
 "ouroboros/gateway/task_events.py" = "D11"
@@ -433,6 +438,8 @@ D20 = "Presence"
 "ouroboros/preflight_runner.py" = "D06"
 "ouroboros/test_environment.py" = "D06"
 "ouroboros/test_selection.py" = "D06"  # commit-gate test scope: floor, changed tests, direct importers, widening
+"ouroboros/test_evidence.py" = "D06"
+"ouroboros/safe_test_supervisor.py" = "D06"
 "ouroboros/presence_admission.py" = "D20"
 "ouroboros/presence_authority.py" = "D20"
 "ouroboros/presence_bindings.py" = "D20"
@@ -495,6 +502,7 @@ D20 = "Presence"
 "ouroboros/review_evidence_sections.py" = "D06"
 "ouroboros/review_evidence_refs.py" = "D06"
 "ouroboros/review_checking.py" = "D06"
+"ouroboros/review_checking_prune.py" = "D06"
 "ouroboros/review_execution.py" = "D06"
 "ouroboros/review_session_reads.py" = "D06"
 "ouroboros/review_execution_projection.py" = "D06"
@@ -544,6 +552,7 @@ D20 = "Presence"
 "ouroboros/skill_conflicts.py" = "D14"
 "ouroboros/skill_lifecycle_queue.py" = "D14"
 "ouroboros/skill_loader.py" = "D14"
+"ouroboros/skill_context_snapshot.py" = "D14"
 "ouroboros/skill_catalogue.py" = "D14"
 "ouroboros/skill_peer_inventory.py" = "D14"
 "ouroboros/skill_uninstall_state.py" = "D14"
@@ -583,6 +592,8 @@ D20 = "Presence"
 "ouroboros/delegate_directory.py" = "D07"
 "ouroboros/subagents.py" = "D07"
 "ouroboros/subagent_route_health.py" = "D07"
+"ouroboros/subagent_inspection.py" = "D07"
+"ouroboros/claudexor_observations.py" = "D07"
 "ouroboros/subscription_install_presets.py" = "D12"
 "ouroboros/synthesis_cost_text.py" = "D01"
 "ouroboros/task_continuation.py" = "D06"
@@ -590,7 +601,12 @@ D20 = "Presence"
 "ouroboros/task_pacing.py" = "D01"
 "ouroboros/task_activity_facts.py" = "D01"
 "ouroboros/store.py" = "D17"
+"ouroboros/store_hot_facts.py" = "D17"
 "ouroboros/store_import.py" = "D17"
+"ouroboros/maintenance_jobs.py" = "D17"
+"ouroboros/dialogue_store.py" = "D17"
+"ouroboros/dialogue_import.py" = "D17"
+"ouroboros/dialogue_positions.py" = "D17"
 "ouroboros/store_switch.py" = "D10"
 "ouroboros/task_results.py" = "D17"
 "ouroboros/task_result_schema.py" = "D17"
@@ -741,6 +757,7 @@ D20 = "Presence"
 "ouroboros/usage_store.py" = "D16"
 "ouroboros/storage.py" = "D16"  # Dashboard Storage: the bounded data-folder measurement behind gateway/storage.py
 "ouroboros/jsonl_tail.py" = "D18"
+"ouroboros/temp_sweep.py" = "D18"
 "ouroboros/utils.py" = "D18"
 "ouroboros/verified_download.py" = "D18"
 "ouroboros/version.py" = "D10"
@@ -755,7 +772,9 @@ D20 = "Presence"
 "ouroboros/world_profiler.py" = "D15"
 "server.py" = "D11"
 "ouroboros/server_liveness.py" = "D11"
+"ouroboros/server_boot.py" = "D11"
 "ouroboros/server_maintenance.py" = "D11"
+"ouroboros/maintenance.py" = "D11"
 "ouroboros/terminal_cost_reconciliation.py" = "D11"
 "ouroboros/server_owner_routing.py" = "D11"
 "ouroboros/server_process.py" = "D11"
@@ -851,6 +870,7 @@ D20 = "Presence"
 "ouroboros/gateway/task_model_wait.py" = "D11"
 "ouroboros/gateway/decision_contracts.py" = "D11"
 "ouroboros/gateway/schedule_contracts.py" = "D11"
+"ouroboros/gateway/health_contracts.py" = "D11"
 "ouroboros/node_runtime.py" = "D18"
 "ouroboros/routing_wait.py" = "D17"
 "ouroboros/tools/owner_delivery.py" = "D05"
@@ -1008,6 +1028,7 @@ allowed = [
   "D13->D17",
   "D13->D18",
   "D14->D02",
+  "D14->D03",
   "D14->D04",
   "D14->D05",
   "D14->D06",
@@ -1017,6 +1038,7 @@ allowed = [
   "D14->D12",
   "D14->D13",
   "D14->D16",
+  "D14->D17",
   "D14->D18",
   "D14->D19",
   "D15->D01",
@@ -1024,11 +1046,11 @@ allowed = [
   "D15->D04",
   "D15->D12",
   "D15->D16",
+  "D15->D17",
   "D15->D18",
   "D15->D19",
   "D16->D02",
   "D16->D06",
-  "D16->D11",
   "D16->D12",
   "D16->D14",
   "D16->D17",
@@ -1139,7 +1161,7 @@ lazy_only = [
   "D14->D01",
   "D14->D07",
   "D14->D08",
-  "D14->D17",
+  "D14->D15",
   "D14->D20",
   "D15->D02",
   "D15->D05",
@@ -1149,7 +1171,6 @@ lazy_only = [
   "D15->D09",
   "D15->D10",
   "D15->D13",
-  "D15->D17",
   "D15->D20",
   "D16->D01",
   "D16->D03",
@@ -1157,8 +1178,8 @@ lazy_only = [
   "D16->D07",
   "D16->D08",
   "D16->D09",
+  "D16->D11",
   "D17->D02",
-  "D17->D03",
   "D17->D05",
   "D17->D07",
   "D17->D09",

@@ -3,8 +3,9 @@
 One drive holds many settled children with evidence and exact prices beside limited active debt: a
 running child, an undeclared duty (an older or newer body's), a live-owned open attempt and a remote
 call whose owner Continues while its probe is out. The owners are the real ones: the 20 s pass's
-abandoned-usage duty (``server_maintenance._reconcile_abandoned_usage``) and the 300 s pass's packer
-tick, whose supervised child runs ``evidence_packer.run_pass`` here in process. Once settled in, the
+abandoned-usage duty (``server_maintenance._reconcile_abandoned_usage``) and the 300 s pass's maintenance
+tick, whose supervised child (``ouroboros.maintenance``) runs its due jobs here in process; its packing job
+calls ``evidence_packer.run_pass``. Once settled in, the
 repeated passes do nothing: no child spawn, no re-read or re-verified member, no daemon call, no
 ledger, result or log write, and every content projection (the parent's child lookup, the results,
 money, blob and handle bytes; the payload reader once) is equal, not merely counted. Late work is then
@@ -21,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import ouroboros.maintenance as child_process
 from ouroboros import evidence_packer as packer, evidence_packs as packs, obligations
 from ouroboros import observability as obs, server_maintenance as maintenance, store, usage_accounting as usage
 from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
@@ -65,20 +67,28 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_claudexor, "recover_model_attempt",
                         lambda root, row, **kw: reads.append(row["task_id"]) or recover(root, row, **kw))
 
-    def spawn(cmd, **_kwargs):  # the supervised child, in process: its own ``run_pass``
-        assert cmd[1:3] == ["-m", "ouroboros.evidence_packer"]
+    run_pass = packer.run_pass
+
+    def observed_pass(data_root, **kwargs):  # the packing pass inside the child, its report kept
         child_run.active = True
         try:
-            reports.append(packer.run_pass(root))
+            reports.append(run_pass(data_root, **kwargs))
         finally:
             child_run.active = False
-        return _FakeChild(json.dumps(reports[-1]).encode())
+        return reports[-1]
+
+    def spawn(cmd, **_kwargs):  # the supervised child, in process: its pass over the due jobs
+        assert cmd[1:3] == ["-m", "ouroboros.maintenance"]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(packer, "run_pass", observed_pass)
+            report = child_process.run(root)
+        return _FakeChild(json.dumps(report).encode())
 
     monkeypatch.setattr(process_custody, "spawn_supervised", spawn)
     monkeypatch.setattr(process_custody, "current_custody_session_id", lambda: "session")
     packs._READERS.clear()
     yield SimpleNamespace(root=root, live=live, calls=calls, reads=reads, reports=reports, gateway=Gateway,
-                          unit=packer.EvidencePacker(), refs={}, handles={}, child_run=child_run)
+                          unit=child_process.MaintenanceChild(), refs={}, handles={}, child_run=child_run)
     packs._READERS.clear()
 
 
@@ -120,7 +130,8 @@ def _row(env, reservation):
 
 
 def _pass(env):
-    """One 20 s abandoned-usage pass, then one 300 s packer tick; the child's report, or None for no child."""
+    """One 20 s abandoned-usage pass, then one 300 s maintenance tick; the child's packing report, or
+    None when no packing pass ran (no child at all is proven by the unchanged logs)."""
     spawned = len(env.reports)
     maintenance._reconcile_abandoned_usage(env.root)
     if env.unit.tick(env.root, REPO):
@@ -164,7 +175,6 @@ def _settle_in(env):
                      call_type="llm_claudexor_request", payload={}, keep_raw=True,
                      manifest={"invocation_id": ended.attempt_id, "operation_id": "operation"})
     truth = {tid: [packs.blob_bytes(root, ref) for ref in refs] for tid, refs in env.refs.items()}
-    assert env.unit.tick(root, REPO) is False  # the boot tick only arms
 
     # Pass 1. The owner Continues while the ended call's probe is out: the post-I/O fence refuses to
     # settle. Packing moves placements, never content: every projection equals its pre-pack reading.

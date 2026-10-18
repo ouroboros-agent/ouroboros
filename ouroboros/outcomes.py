@@ -1101,7 +1101,9 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_DEGRADED
         reason_code = usage_reason or REASON_AUTHORING_HANDOVER_INCOMPLETE
         failure = {"kind": "authoring_handover", "reason_code": reason_code}
-    elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"}:
+    elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"} \
+            and not usage.get("wake_silent"):
+        # A typed wake-silent finish is intentional, unlike an ordinary empty final.
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}

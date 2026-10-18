@@ -847,6 +847,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # COPY . . keeps .git (the image needs its history); a persisted
+          # token would ride .git/config into an image layer.
+          persist-credentials: false
       - name: Build Docker image
         id: docker_build
         run: docker build -t ouroboros-web:test .
@@ -877,6 +881,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false  # same image build as docker-ui-smoke
       - name: Build Docker image
         run: docker build -t ouroboros-web:test .
       - name: Run portable detail tests in Docker
@@ -1568,18 +1574,28 @@ jobs:
               fh.write(f"is_prerelease={'true' if is_prerelease else 'false'}\n")
               fh.write("tag_valid=true\n")
           PY
+      # Owner decision 2026-10-17: only the official v7.7.0 tag may continue after
+      # full-test or system E2E concluded red (failed or timed out); integration
+      # stays required. The release proof records every actual result.
       - name: Require test prerequisites for publication
         if: ${{ !cancelled() }}
         env:
           FULL_TEST_RESULT: ${{ needs.full-test.result }}
           INTEGRATION_RESULT: ${{ needs.integration-test.result }}
           SYSTEM_E2E_RESULT: ${{ needs.system-e2e-mock.result }}
+          V7_7_0_OWNER_EXCEPTION: ${{ github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros' }}
         shell: bash
         run: |
           set -euo pipefail
+          RESULTS="full-test=$FULL_TEST_RESULT integration-test=$INTEGRATION_RESULT system-e2e-mock=$SYSTEM_E2E_RESULT"
           if [[ "$FULL_TEST_RESULT" != success || "$INTEGRATION_RESULT" != success || "$SYSTEM_E2E_RESULT" != success ]]; then
-            echo "Required release prerequisites did not all succeed: full-test=$FULL_TEST_RESULT integration-test=$INTEGRATION_RESULT system-e2e-mock=$SYSTEM_E2E_RESULT" >&2
-            exit 1
+            if [[ "${V7_7_0_OWNER_EXCEPTION:-}" == true && "$INTEGRATION_RESULT" == success &&
+                  "$FULL_TEST_RESULT" =~ ^(success|failure|cancelled)$ && "$SYSTEM_E2E_RESULT" =~ ^(success|failure|cancelled)$ ]]; then
+              echo "::warning::v7.7.0 owner exception: continuing with $RESULTS; the release proof discloses them."
+            else
+              echo "Required release prerequisites did not all succeed: $RESULTS" >&2
+              exit 1
+            fi
           fi
 
 
@@ -2535,13 +2551,19 @@ jobs:
   # Release: Create GitHub Release with all artifacts
   # ──────────────────────────────────────────────────────────────────
   release:
+    # Owner decision 2026-10-17: only the official v7.7.0 tag may continue after
+    # full-test, system E2E or the UI lane concluded (not skipped) red; every
+    # other job and tag stays strict. That tag stops at a verified draft.
     if: >-
       ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
           needs.build.result == 'success' && needs.windows-proof.result == 'success' && needs.release-preflight.result == 'success' &&
-          needs.marker-guards.result == 'success' && needs.ui-smoke.result == 'success' &&
+          needs.integration-test.result == 'success' && needs.marker-guards.result == 'success' &&
           needs.docker-ui-smoke.result == 'success' && needs.docker-portable-test.result == 'success' &&
-          needs.skill-smoke.result == 'success' }}
-    needs: [build, windows-proof, android-build, release-preflight, marker-guards, ui-smoke, docker-ui-smoke, docker-portable-test, skill-smoke]
+          needs.skill-smoke.result == 'success' &&
+          ((needs.full-test.result == 'success' && needs.system-e2e-mock.result == 'success' && needs.ui-smoke.result == 'success') ||
+           (github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros' &&
+            needs.full-test.result != 'skipped' && needs.system-e2e-mock.result != 'skipped' && needs.ui-smoke.result != 'skipped')) }}
+    needs: [build, windows-proof, android-build, release-preflight, full-test, integration-test, system-e2e-mock, marker-guards, ui-smoke, docker-ui-smoke, docker-portable-test, skill-smoke]
     runs-on: ubuntu-latest
     concurrency:
       group: release-${{ github.ref }}
@@ -2616,11 +2638,25 @@ jobs:
           # Empty selects the explicitly unsigned Windows ZIP; set, the proof
           # receipt must name exactly this verified signer.
           WINDOWS_SIGNER_THUMBPRINT: ${{ vars.ESIGNER_CERT_SHA1 }}
+          # Every consumed job's actual result; the proof refuses a missing one.
+          RELEASE_GATE_RESULTS: >-
+            full-test=${{ needs.full-test.result }}
+            integration-test=${{ needs.integration-test.result }}
+            system-e2e-mock=${{ needs.system-e2e-mock.result }}
+            release-preflight=${{ needs.release-preflight.result }}
+            build=${{ needs.build.result }}
+            windows-proof=${{ needs.windows-proof.result }}
+            marker-guards=${{ needs.marker-guards.result }}
+            ui-smoke=${{ needs.ui-smoke.result }}
+            docker-ui-smoke=${{ needs.docker-ui-smoke.result }}
+            docker-portable-test=${{ needs.docker-portable-test.result }}
+            skill-smoke=${{ needs.skill-smoke.result }}
         shell: bash
         run: |
           set -euo pipefail
           PREVIOUS_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
           ARGS=()
+          for GATE in $RELEASE_GATE_RESULTS; do ARGS+=(--gate-result "$GATE"); done
           if [ -n "$PREVIOUS_TAG" ]; then ARGS+=(--previous-tag "$PREVIOUS_TAG"); fi
           python scripts/release_proof.py assemble \
             --directory release-artifacts \
@@ -2733,7 +2769,13 @@ jobs:
             exit 1
           fi
 
+      - name: Hold the v7.7.0 owner-exception release at its verified draft
+        if: ${{ github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros' }}
+        shell: bash
+        run: echo "v7.7.0 remains a verified draft; the owner publishes it explicitly." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish verified GitHub Release
+        if: ${{ !(github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros') }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash

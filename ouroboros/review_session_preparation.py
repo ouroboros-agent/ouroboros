@@ -22,7 +22,7 @@ def render_review_session_prompt(request: Any, slot: Any, task: str) -> str:
         ("You are an independent Ouroboros reviewer slot running as a read-only agent session."
          if access == "readonly" else
          f"You are an independent Ouroboros reviewer slot running as an agent session with {access} "
-         "technical access in a private checking copy.")
+         "technical access in a private checking folder.")
         + HOST_FACTS_INSTRUCTION,  # an agent session has a shell HOME; the raw API reviewer prompt does not
         f"Surface: {request.surface}", f"Role hint: {slot.role_hint or 'general reviewer'}", "", task, "",
         "OUTPUT CONTRACT (your host parses this structurally):",

@@ -5,6 +5,8 @@ it never enumerates results and never reads chat history (invariant 10).
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 from types import SimpleNamespace
 
@@ -28,7 +30,6 @@ def notices(tmp_path, monkeypatch):
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 1})
     bridge = SimpleNamespace(send_message=lambda chat, text, **kw: sent.append((chat, text, kw)))
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda *_: None)
     prepare_startup_state(root)  # the lifecycle import creates the sets, as boot does
     write_task_result(root, "task", "running", chat_id=1)
     return root, sent
@@ -40,7 +41,7 @@ def _pause(root, episode="one", reason="budget", state="paused"):
 
 def _rows(root):
     path = root / "logs" / "chat.jsonl"
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+    return dialogue_test.log_rows(path)
 
 
 def _owing(root):

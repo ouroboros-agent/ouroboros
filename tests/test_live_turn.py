@@ -10,7 +10,6 @@ chat and the task row.
 from __future__ import annotations
 
 import asyncio
-import json
 import queue
 import threading
 import time
@@ -249,7 +248,8 @@ class Harness:
         monkeypatch.setattr(loop, "_measure_tool_result_batch", lambda ctx, messages, schemas, *, round_id: None)
         monkeypatch.setattr(loop_budget, "_cleanup_loop_resources", lambda executor, exit_ctx: None)
         monkeypatch.setattr(message_bus, "get_bridge", lambda: SimpleNamespace(
-            broadcast=self.broadcasts.append, send_chat_action=lambda *a, **k: None))
+            broadcast=self.broadcasts.append, send_chat_action=lambda *a, **k: None,
+            send_message=lambda *a, **k: (True, "")))
         self.ctx = SimpleNamespace(task_attempt=1, active_context_mode="nano", drive_root=tmp_path, task_id="t-call")
         self.tools = SimpleNamespace(_ctx=self.ctx)
         self.messages = [{"role": "system", "content": "You are Ouroboros, on a call."},
@@ -308,10 +308,9 @@ class Harness:
         return sum(str(m.get("content")).startswith("[Heard in the call]") for m in self.messages)
 
     def chat_rows(self) -> list:
-        path = self.root / "logs" / "chat.jsonl"
-        if not path.exists():
-            return []
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        from tests._dialogue import chat_rows
+
+        return chat_rows(self.root)
 
     def task_row(self) -> dict:
         from ouroboros.task_results import load_task_result
@@ -855,16 +854,19 @@ def test_a_presence_call_records_both_sides_in_its_conversation_never_as_owner_r
     time.sleep(0.05)
     engine.push(Caption(speaker=SPEAKER_OWNER, text="hello Aika", final=True, item_id="u1"))
     assert _wait_for(lambda: recorded)
-    assert recorded[0] == ("t-call", {"direction": "in", "text": "hello Aika", "speaker_label": "Elena"})
+    assert recorded[0] == ("t-call", {"direction": "in", "text": "hello Aika", "speaker_label": "Elena",
+                                      "utterance_id": "u1"})
     for label in ("Elena", "Pavel"):  # two voices during one utterance: it stays unnamed
         h.hub.feed(PeerControl(peer_id="zoom-1", role="meeting", message={"type": "participant", "label": label, "speaking": True}))
     time.sleep(0.05)
     engine.push(Caption(speaker=SPEAKER_OWNER, text="and the budget", final=True, item_id="u2"))
     assert _wait_for(lambda: len(recorded) == 2) and recorded[1][1]["speaker_label"] == ""
+    assert recorded[1][1]["utterance_id"] == "u2"  # each utterance is its own row of the conversation
     engine.push(Caption(speaker=SPEAKER_OUROBOROS, text="Happy to help.", final=True, item_id="a1"))
     h.hub.control("played", item_id="a1", played_ms=900)
     assert _wait_for(lambda: len(recorded) == 3)
-    assert recorded[2] == ("t-call", {"direction": "out", "text": "Happy to help.", "speaker_label": ""})
+    assert recorded[2] == ("t-call", {"direction": "out", "text": "Happy to help.", "speaker_label": "",
+                                      "utterance_id": ""})
     assert h.chat_rows() == []
     h.stop()
     h.finish()

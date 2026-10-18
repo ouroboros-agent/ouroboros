@@ -347,12 +347,12 @@ export const apiClient = {
     startHarnessMaintenance,
     harnessMaintenanceOperation,
     cancelHarnessMaintenance,
-    /** Read a recent window, replay one opaque, room-bound history page, or read the page around one task. */
+    /** Read a recent window, replay a room-bound page, or read around a task or exact row address. */
     chatHistory: ({ chatId = 1, cursor = null, around = null, signal } = {}) => {
         const params = new URLSearchParams();
         if (chatId !== 1) params.set('chat_id', String(chatId));
         if (cursor) params.set('cursor', cursor);
-        if (around) params.set('around', around);  // `task:<id>`: the page around that task
+        if (around) params.set('around', around);  // `task:<id>` or canonical `row:…`
         const query = params.toString();
         return fetchJson(`/api/chat/history${query ? `?${query}` : ''}`, { cache: 'no-store', signal });
     },

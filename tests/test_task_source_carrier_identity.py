@@ -62,7 +62,7 @@ def _capsule_request(child: pathlib.Path, task_id: str, handles: list) -> dict:
     checkpoint = cc._persist_reclaim_checkpoint(messages, request, SimpleNamespace(fingerprint="c" * 64, units=[]),
                                                 drive_root=child, task_id=task_id)
     unit = dataclasses.replace(unit, source_refs=(*unit.source_refs, *({"source_ref": ref} for ref in handles)))
-    capsule, _ = cc._capsule_message(cc._SelectedUnit(unit, 0, ""), "summary",
+    capsule, _ = cc._capsule_message(unit, "summary",
                                      [cc._part(unit.unit_id, unit.source_text)], checkpoint, request)
     assert cc._capsule_metadata(capsule)[1] is not None  # the walk follows a valid capsule's sources
     return observability.persist_call(child, task_id=task_id, call_id="capsule-request", call_type="llm_request",
@@ -255,7 +255,7 @@ def test_a_pending_legacy_row_heals_on_one_retry_and_leaves_the_ledger(tmp_path)
     with pytest.raises(PlanReviewSourceUnavailable):
         load_plan_review_state(parent, task_id)  # the strict decider sees the damage
 
-    report = observability.retry_pending_child_ref_promotions(parent, generation=object())
+    report = observability.retry_pending_child_ref_promotions(parent)
 
     assert (report["scanned"], report["completed"], report["errors"]) == (1, [task_id], [])
     row = load_task_result(parent, task_id)
@@ -265,7 +265,7 @@ def test_a_pending_legacy_row_heals_on_one_retry_and_leaves_the_ledger(tmp_path)
     assert (row["child_ref_promotion"]["status"], row["child_ref_promotion"]["unavailable_refs"]) == ("complete", [])
     shutil.rmtree(child)
     assert load_plan_review_state(parent, task_id)["waves"][-1]["spec"] == spec  # verified canonical bytes
-    assert observability.retry_pending_child_ref_promotions(parent, generation=object())["scanned"] == 0
+    assert observability.retry_pending_child_ref_promotions(parent)["scanned"] == 0
 
 
 def test_a_complete_legacy_row_is_readable_in_memory_and_never_rewritten(tmp_path):

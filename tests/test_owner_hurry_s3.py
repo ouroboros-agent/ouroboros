@@ -16,6 +16,8 @@ safety never consult it; retry attempts start with no executable latch.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import pathlib
 import queue as _q
@@ -76,7 +78,7 @@ def _hurry_rows(drive_root, task_id):
 
 def _chat_log_snapshot(drive_root):
     path = pathlib.Path(drive_root) / "logs" / "chat.jsonl"
-    return path.read_text(encoding="utf-8") if path.exists() else None
+    return dialogue_test.log_text(path) if bool(dialogue_test.log_rows(path)) else None
 
 
 # ---------------------------------------------------------------------------

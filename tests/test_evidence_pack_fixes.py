@@ -416,22 +416,21 @@ def test_compression_is_outside_result_and_publication_locks(root, monkeypatch):
     assert packer.run_pass(root)["faults"] == 0
 
 
-def test_stop_latches_and_signals_without_waiting_for_candidate_walk(root, monkeypatch):
+def test_stop_latches_and_signals_without_waiting_for_the_job_facts_read(root, monkeypatch):
     import threading
     from tests.test_evidence_packs import REPO, _FakeChild
-    from ouroboros import process_custody
+    from ouroboros import maintenance, process_custody
 
     entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
-    unit, child = packer.EvidencePacker(), _FakeChild(b"")
+    unit, child = maintenance.MaintenanceChild(), _FakeChild(b"")
     unit._process = child
-    unit.tick(root, REPO)
 
-    def walk(_, _stop):
+    def facts(_root):
         entered.set()
         assert release.wait(5)
-        return ["candidate"]
+        return ["evidence_packing"]
 
-    monkeypatch.setattr(packer, "packing_pending", walk)
+    monkeypatch.setattr(maintenance, "due", facts)
     spawns = []
     monkeypatch.setattr(process_custody, "spawn_supervised", lambda *a, **k: spawns.append(a) or _FakeChild(b""))
     tick = threading.Thread(target=unit.tick, args=(root, REPO))
@@ -440,7 +439,7 @@ def test_stop_latches_and_signals_without_waiting_for_candidate_walk(root, monke
     try:
         assert entered.wait(2)
         stop.start()
-        assert stopped.wait(0.3), "Stop waited for the mutex held by the disk walk"
+        assert stopped.wait(0.3), "Stop waited for the mutex held by the facts read"
         assert child.killed.is_set() and unit._stopped.is_set()
     finally:
         release.set()
@@ -597,10 +596,10 @@ def test_switch_preflight_refuses_corrupt_sidecar_before_export_or_owner(root, m
 
 
 @pytest.mark.parametrize("leader", [True, False])
-def test_packer_child_is_custody_blocker_until_exit_is_confirmed(root, monkeypatch, leader):
+def test_maintenance_child_is_custody_blocker_until_exit_is_confirmed(root, monkeypatch, leader):
     from ouroboros import process_custody
 
-    entry = {"pid": 4242, "pgid": 4242, "purpose": "evidence_packer", "scope": "session"}
+    entry = {"pid": 4242, "pgid": 4242, "purpose": "maintenance", "scope": "session"}
     alive, signals = [True], []
     monkeypatch.setattr(process_custody, "_read_ledger_records", lambda *a, **k: (True, [entry], b""))
     monkeypatch.setattr(process_custody, "_fingerprint_matches", lambda e: alive[0] and leader)

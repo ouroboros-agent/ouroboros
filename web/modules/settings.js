@@ -179,9 +179,14 @@ function customSecretRow(key = '', value = '') {
         row.querySelector(`label[for="${id}"]`).textContent = `Value for ${event.target.value.trim() || `custom key ${ordinal}`}`;
     });
     row.querySelector('[data-custom-secret-remove]')?.addEventListener('click', () => {
+        // The caret moves to the key now in this place, else to Add (DESIGN "List editors").
+        const shown = [...row.parentElement.querySelectorAll('[data-custom-secret-row]:not([hidden])')];
+        const next = shown[shown.indexOf(row) + 1] || shown[shown.indexOf(row) - 1];
         resetSecretReveals(row);
         if (row.dataset.originalKey) { row.dataset.removeCustomSecret = '1'; row.hidden = true; }
         else row.remove();
+        if (next) revealNewRow(next, next.querySelector('[data-custom-secret-key]'));
+        else document.getElementById('btn-add-custom-secret')?.focus();
         markSettingsDirty();
     });
     return row;

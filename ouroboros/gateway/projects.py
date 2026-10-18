@@ -205,6 +205,7 @@ _SKILL_LIFECYCLE_KINDS = {
     "disable": "Disable skill",
     "remove": "Remove skill",
     "update": "Update skill",
+    "deps": "Skill dependencies",
     "dependency": "Skill dependencies",
     "dependencies": "Skill dependencies",
 }

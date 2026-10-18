@@ -249,11 +249,31 @@ def _force_rmtree(path: Path) -> None:
     On Windows git pack/object files under ``.git`` are read-only, and
     ``shutil.rmtree(ignore_errors=True)`` silently FAILS to delete them, leaving
     the directory behind. The onerror hook clears the read-only bit and retries
-    so genesis-project / worktree teardown actually removes the tree."""
+    so genesis-project / worktree teardown actually removes the tree. It only adds
+    owner bits, only inside the tree and never through a link (a target may live
+    outside it): a removal its folder refuses makes that folder writable, and a
+    folder that could not be listed is made listable and removed in turn."""
+    root = os.path.abspath(path)
+
+    def _linked(info):  # a link, or a Windows junction (reparse point)
+        return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+
+    def _grant(target, bits):
+        info = os.lstat(target)  # one look: the mode written is this entry's own
+        if os.path.commonpath([root, target]) == root and not _linked(info):
+            os.chmod(target, stat.S_IMODE(info.st_mode) | bits)
+
     def _on_error(func, p, _exc):
+        p = os.path.abspath(p)  # a relative tree reports relative paths
         try:
-            os.chmod(p, stat.S_IWRITE)
-            func(p)
+            if func in (os.unlink, os.remove, os.rmdir):
+                if os.path.dirname(p) != os.path.dirname(root):
+                    _grant(os.path.dirname(p), stat.S_IRWXU)
+                _grant(p, stat.S_IRWXU if os.path.isdir(p) else stat.S_IWRITE | stat.S_IREAD)
+                func(p)
+            elif not _linked(os.lstat(p)) and os.path.isdir(p):
+                _grant(p, stat.S_IRWXU)
+                shutil.rmtree(p, onerror=_on_error)
         except Exception:
             pass
 
@@ -555,6 +575,60 @@ def _git_env(repo_dir: Path, *args: str, env: Dict[str, str],
     )
 
 
+class _InPlaceFill:
+    """A ``stream_artifact_file`` sink that rewrites an open file from its first differing byte."""
+
+    def __init__(self, handle: Any):
+        self.handle, self.size, self.differs = handle, 0, False
+
+    def write(self, chunk: bytes) -> None:
+        if not self.differs:
+            if self.handle.read(len(chunk)) == chunk:
+                self.size += len(chunk)
+                return
+            self.differs = True
+            self.handle.seek(self.size)
+        self.handle.write(chunk)
+        self.size += len(chunk)
+
+
+def _fill_private_copy(source: Path, checkout: Path, copy_root: Path) -> None:
+    """Give one file Git checked out into a not-yet-returned copy the source's exact bytes.
+
+    Nothing reads or runs in the copy before provisioning returns, and the
+    whole-tree diff after population binds every byte to the baseline, so the
+    per-file temporary file and rename of ``copy_artifact_file`` (the measured
+    cost) buys nothing here. The same stable source read rewrites the file in
+    place from its first differing byte, an equal file is not written, and
+    ``copystat`` applies the source's mode, times and flags as before. An entry
+    checkout did not write (outside an inherited sparse-checkout cone) is created
+    by ``copy_artifact_file`` as before while the copy still has its ``.git``, so
+    a removal that has reached ``.git`` re-creates nothing; entries a removal
+    still walking the tree already deleted can be re-created until it gets
+    there, and the failed start's discard removes them. A path checkout left as
+    something other than a regular file is refused, never written through. No retention flow
+    provisions copies, so skipping that helper's publication fence loses nothing.
+    """
+    from ouroboros.artifacts import copy_artifact_file, stream_artifact_file
+
+    try:
+        info = os.lstat(checkout)
+    except FileNotFoundError:
+        if not os.path.lexists(copy_root / ".git"):
+            raise
+        copy_artifact_file(source, checkout)
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"snapshot checkout is not a regular file: {checkout}")
+    if info.st_mode & 0o600 != 0o600:  # an owner-unwritable umask; copystat restores the mode
+        os.chmod(checkout, stat.S_IMODE(info.st_mode) | 0o600)
+    with open(checkout, "r+b") as handle:
+        sink = _InPlaceFill(handle)
+        stream_artifact_file(source, sink)
+        handle.truncate(sink.size)
+    shutil.copystat(source, checkout)
+
+
 def provision_execution_snapshot(
     *, target_root: Any, task_id: Any, snapshot_id: str,
     worktree_root: Optional[Any] = None, data_dir: Optional[Any] = None, independent: bool = False,
@@ -781,8 +855,6 @@ def _provision_git_copy(
         # Populate outside the lock: the same reset git's own `worktree add` runs
         # (no submodule recursion) — minus the target's post-checkout hook.
         _git(wt_path, "reset", "--hard", "--quiet", "--no-recurse-submodules")
-        from ouroboros.artifacts import copy_artifact_file
-
         # Git owns the baseline representation, but the child must see the
         # source's actual working bytes, not checkout's CRLF/smudge rewrite.
         # Read the existing tree inventory so deletions, links and gitlinks
@@ -795,7 +867,7 @@ def _provision_git_copy(
                 original = target / relative
                 if original.is_symlink():
                     raise OSError(f"snapshot input changed from a regular file: {relative}")
-                copy_artifact_file(original, wt_path / relative)
+                _fill_private_copy(original, wt_path / relative, wt_path)
                 copied.append(raw_path)
         # The checkout recorded each entry's stat for the bytes IT wrote; a
         # CRLF/smudge rewrite (core.autocrlf=true is Git for Windows' default)

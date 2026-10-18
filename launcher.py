@@ -65,6 +65,7 @@ from ouroboros.desktop_media import attach_media_permissions, display_ready as _
 from ouroboros.launcher_server_reaper import (
     reap_same_install_strays as _reap_same_install_strays_impl,
 )
+from ouroboros.launcher_readiness import wait_for_server as _wait_for_server
 from ouroboros.launcher_windows_runtime import (  # noqa: F401  (re-exported: same objects, prior launcher surface)
     _prepare_windows_webview_runtime,
     _show_windows_message,
@@ -223,6 +224,7 @@ _shutdown_event = threading.Event()
 # (first-run configuration adopted), not a crash — same shape as the exit-code-42
 # branch, for the case where the launcher, not the agent, decided the restart.
 _agent_restart_requested = threading.Event()
+_agent_exit_before_ready = threading.Event()  # the child exited before it served: the UI wait ends now
 _webview_window = None
 # Linux-only browser-fallback flag (#56): set by _detect_headless() when no
 # pywebview GUI backend can initialize. Stays False on macOS/Windows — the
@@ -617,14 +619,15 @@ def _clear_port_file() -> bool:
     return not PORT_FILE.exists()
 
 
-def _await_generation_endpoint(proc, *, port_file_cleared: bool, timeout: float, abort_event=None) -> Optional[int]:
-    """The port THIS child published, or None when it exited, stopped or never published. The main
-    binding counts only with the child's PID and measured birth identity (a stale row of an earlier
-    server that held the same PID fails); the plain port file only after its pre-start removal was confirmed."""
+def _await_generation_endpoint(proc, *, port_file_cleared: bool, abort_event=None) -> Optional[int]:
+    """The port THIS child published, or None when it exited or the launcher stopped. The wait lasts
+    as long as the child lives: no clock decides that a live server failed (its boot is long on a
+    cold disk; the server answers ``/api/health`` as soon as its socket serves). The main binding
+    counts only with the child's PID and measured birth identity (a stale row of an earlier server
+    that held the same PID fails); the plain port file only after its pre-start removal was confirmed."""
     from ouroboros.server_process import read_service_bindings, service_binding_is_live
 
-    deadline = time.time() + timeout
-    while time.time() < deadline and not (abort_event is not None and abort_event.is_set()):
+    while not (abort_event is not None and abort_event.is_set()):
         if proc.poll() is not None:
             return None
         try:
@@ -637,29 +640,6 @@ def _await_generation_endpoint(proc, *, port_file_cleared: bool, timeout: float,
             return published
         time.sleep(0.25)
     return None
-
-
-def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None, proc=None) -> bool:
-    """Wait for the agent HTTP server to respond.
-
-    ``abort_event`` (headless mode) lets a shutdown signal cut the wait short:
-    the handlers only set the event, so without this check a SIGTERM during
-    startup would still sit out the full readiness timeout. ``proc``'s exit ends it too."""
-    url = f"http://127.0.0.1:{port}/api/health"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if abort_event is not None and abort_event.is_set():
-            return False
-        if proc is not None and proc.poll() is not None:
-            return False
-        try:
-            with urllib.request.urlopen(url, timeout=2) as response:
-                if response.status == 200:
-                    return True
-        except Exception:
-            pass
-        time.sleep(0.5)
-    return False
 
 
 def _kill_orphaned_children(reason: str = "window_close") -> None:
@@ -718,6 +698,7 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             _shutdown_event.set()
             break
         port_file_cleared = _clear_port_file()
+        _agent_exit_before_ready.clear()  # this generation proves itself
 
         _external_host_result = update_external_host(_external_host_update, EMBEDDED_PYTHON, log, _shutdown_event)
         if _shutdown_event.is_set():
@@ -728,21 +709,23 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             stop_agent()
             break
 
-        actual_port = _await_generation_endpoint(proc, port_file_cleared=port_file_cleared, timeout=45,
-                                                  abort_event=_shutdown_event)
+        actual_port = _await_generation_endpoint(proc, port_file_cleared=port_file_cleared, abort_event=_shutdown_event)
         if actual_port is None:
-            log.warning("Agent server published no endpoint of its own within 45s")
+            log.warning("Agent server exited (or the launcher stopped) before it published an endpoint")
         else:
             _update_server_process_record_port(proc.pid, actual_port)
-            if _wait_for_server(actual_port, timeout=45, abort_event=_shutdown_event, proc=proc):
+            if _wait_for_server(actual_port, abort_event=_shutdown_event, proc=proc):
                 _generation_port = actual_port
             else:
-                log.warning("Agent server did not become responsive within 45s (port %d)", actual_port)
+                log.warning("Agent server exited before it answered /api/health on port %d", actual_port)
 
         proc.wait()
+        proved = _generation_port is not None
         _generation_port = None
         exit_code = proc.returncode
         log.info("Agent exited with code %d", exit_code)
+        if not proved and exit_code not in (RESTART_EXIT_CODE, PANIC_EXIT_CODE) and not _agent_restart_requested.is_set():
+            _agent_exit_before_ready.set()  # a child that died before serving: the UI wait fails now, not at a deadline
         if exit_code == RESTART_EXIT_CODE:
             try:
                 from ouroboros.delegate_recovery import acknowledge_observed_restart_exit
@@ -853,10 +836,13 @@ def _request_agent_restart() -> None:
 
 
 def _await_server_ready(port: int, abort_event=None, lifecycle_thread=None) -> tuple[bool, int]:
-    """Wait until the lifecycle thread proves the current generation healthy; its port.
+    """Wait until the lifecycle thread proves the current generation serving; its port.
 
-    The server may rebind on conflict; every later consumer (UI URL, onboarding window)
-    uses the endpoint that generation published, never the requested port or a stale file.
+    No clock: the wait lasts while the generation lives and the lifecycle thread runs. It ends
+    False at once when the child exits before it served (``_agent_exit_before_ready``), when the
+    lifecycle thread ended (the crash fuse) or on abort. The server may rebind on conflict; every
+    later consumer (UI URL, onboarding window) uses the endpoint that generation published, never
+    the requested port or a stale file.
     """
     if _external_host_update is not None and lifecycle_thread is not None:
         # Native preparation has its own bounded operation before server.py exists.
@@ -869,11 +855,12 @@ def _await_server_ready(port: int, abort_event=None, lifecycle_thread=None) -> t
             lifecycle_thread.join(timeout=0.1)
         else:
             return False, port
-    deadline = time.time() + 60
-    while time.time() < deadline and not (abort_event is not None and abort_event.is_set()):
+    while not (abort_event is not None and abort_event.is_set()):
         if _generation_port:
             return True, _generation_port
         if lifecycle_thread is not None and not lifecycle_thread.is_alive():
+            break
+        if _agent_exit_before_ready.is_set():
             break
         time.sleep(0.1)
     return False, _generation_port or port
@@ -1323,7 +1310,7 @@ def main(argv=()):
     port = _requested_server_port()  # the lifecycle loop clears the previous generation first
 
     # Headless: handlers BEFORE the lifecycle thread spawns server.py — a
-    # SIGTERM in the ~60s readiness window must reach our teardown.
+    # SIGTERM while the server still boots must reach our teardown.
     _abort = None
     if _headless:
         install_shutdown_signal_handlers(_headless_signal_handler)

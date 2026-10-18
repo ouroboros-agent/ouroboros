@@ -84,12 +84,12 @@ def room(tmp_path, monkeypatch):
         return json.loads(response.body)
 
     def row_id(text: str) -> str:
-        offset = 0
-        for line in (tmp_path / "logs" / "chat.jsonl").read_bytes().splitlines(keepends=True):
-            row = json.loads(line)
+        from ouroboros import dialogue_store as ds
+
+        for entry in ds.iter_rows(tmp_path, "chat"):
+            row = entry.row
             if text in str(row.get("text") or row.get("caption") or ""):
-                return f"chat:{offset}"
-            offset += len(line)
+                return entry.history_id
         raise AssertionError(f"no stored row {text!r}")
 
     return SimpleNamespace(chat_id=chat_id, host=host, frames=frames, root=tmp_path, read=read, row_id=row_id,

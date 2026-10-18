@@ -256,18 +256,6 @@ def test_the_roster_note_rides_the_real_loop_as_an_append(full_loop, monkeypatch
     assert "prompt_prefix_breaks" not in usage
 
 
-def _fake_compaction(messages, *_args, **_kwargs):
-    """Stand in for the summarizer behind both compaction seams: rewrite the
-    first tool result in place and report the pass as applied."""
-    rebuilt = list(messages)
-    for index, message in enumerate(rebuilt):
-        if message.get("role") == "tool":
-            rebuilt[index] = {**message, "content": "[compacted tool result]"}
-            break
-    receipt = SimpleNamespace(status="applied", checkpoint_ref="ckpt-1", reclaimed_tokens=10, goal_reached=True, fit=None)
-    return rebuilt, receipt, {"prompt_tokens": 1, "completion_tokens": 1}
-
-
 def _after_step(f, step, hook):
     """Run ``hook`` once the scripted model has answered round ``step``."""
     inner = _four_tool_rounds(f)
@@ -290,12 +278,13 @@ def _assert_one_sanctioned_rewrite_at_round_three(f, usage):
     _assert_prefix_chain(f.model_inputs[2:])
 
 
-def test_manual_compaction_is_recorded_as_a_sanctioned_break_on_its_round(full_loop, monkeypatch):  # noqa: F811 -- imported pytest fixture
+def test_authored_compaction_is_recorded_as_a_sanctioned_break_on_its_round(full_loop, monkeypatch):  # noqa: F811 -- imported pytest fixture
+    from ouroboros.tools.compact_context import _compact_context
+
     f = full_loop
-    monkeypatch.setattr(loop, "compact_tool_history_llm", _fake_compaction)
-    # The owner-requested reclaim is picked up by _run_round_compaction at the top of round 3.
+    # The mind's own view, bound to its last observed send, is applied by _run_round_compaction at the top of round 3.
     monkeypatch.setattr(loop, "call_llm_with_retry", _after_step(
-        f, 2, lambda: setattr(f.ctx, "_pending_compaction", 1)))
+        f, 2, lambda: _compact_context(f.ctx, working_note="The first reads are folded.", keep_unit_ids=[])))
 
     result, usage, _trace = f.run()
 

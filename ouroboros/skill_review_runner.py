@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
-from ouroboros import skill_review_history
+from ouroboros import dialogue_store, skill_review_history
 from ouroboros.config import get_skills_repo_path, load_settings
 from ouroboros.skill_lifecycle_queue import (
     DuplicateLifecycleJobError,
@@ -187,14 +187,6 @@ def _present_dead_running_job(projection: Dict[str, Any], current: Dict[str, Any
 
 def _events_path(drive_root: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(drive_root) / "logs" / "events.jsonl"
-
-
-def _chat_jsonl_path(drive_root: pathlib.Path) -> pathlib.Path:
-    return pathlib.Path(drive_root) / "logs" / "chat.jsonl"
-
-
-def _progress_jsonl_path(drive_root: pathlib.Path) -> pathlib.Path:
-    return pathlib.Path(drive_root) / "logs" / "progress.jsonl"
 
 
 def _read_review_job(path: pathlib.Path) -> Dict[str, Any]:
@@ -414,8 +406,8 @@ def _append_review_chat_summary(
     task_id = str(payload.get("task_id") or "")
     task_suffix = f", task={task_id}" if task_id else ""
     text = f"{title}: `{skill_name}` — status={status}, source={provenance}{task_suffix}"
-    append_jsonl(
-        _chat_jsonl_path(drive_root),
+    dialogue_store.append_quietly(
+        drive_root, "chat",
         {
             "ts": ts,
             "direction": "system",
@@ -508,8 +500,8 @@ def _append_interrupted_review_progress(
         if key in payload:
             lifecycle[key] = payload[key]
     text = f"Skill review: `{skill_name}` — interrupted — {reason}"
-    append_jsonl(
-        _progress_jsonl_path(drive_root),
+    dialogue_store.append_quietly(
+        drive_root, "progress",
         {
             "ts": ts,
             "type": "send_message",

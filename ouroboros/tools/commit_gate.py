@@ -444,11 +444,27 @@ def count_paid_review_cycles(ctx: ToolContext, *, root_task_id: str) -> int:
         return 0
     from ouroboros.review_state import load_state, make_repo_key
 
-    state = load_state(pathlib.Path(ctx.drive_root))
-    attempts = state.filter_attempts(
-        repo_key=make_repo_key(pathlib.Path(ctx.repo_dir)),
-        tool_name=_current_review_tool_name(ctx),
-    )
+    tool = _current_review_tool_name(ctx)
+    if tool == "review_change":
+        from ouroboros.tools.review_change_custody import paid_repo_key, review_state_root
+
+        state = load_state(review_state_root(ctx))
+        owner = paid_repo_key(ctx, ctx.repo_dir)
+        # Filter unrelated history before filesystem provenance reads; equal
+        # physical keys share one resolution within this observation only.
+        owners = {str(pathlib.Path(ctx.repo_dir).resolve()): owner}
+        paid = 0
+        for item in state.filter_attempts(tool_name=tool):
+            if not item.paid or item.root_task_id != root:
+                continue
+            key = item.review_budget_repo_key or owners.get(item.repo_key)
+            if key is None:
+                key = owners[item.repo_key] = paid_repo_key(ctx, item.repo_key)
+            paid += key == owner
+        return paid
+    else:
+        state = load_state(pathlib.Path(ctx.drive_root))
+        attempts = state.filter_attempts(repo_key=make_repo_key(pathlib.Path(ctx.repo_dir)), tool_name=tool)
     return sum(
         1
         for item in attempts

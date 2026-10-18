@@ -287,7 +287,6 @@
  * @property {boolean=} ingress_accepted
  * @property {boolean=} ingress_dispatched
  * @property {boolean=} ingress_pending
- * @property {boolean=} ingress_undispatched
  * @property {Object[]=} attachments  // ChatAttachmentView
  * @property {boolean=} text_placeholder
  * @property {Object=} chat_annotation
@@ -402,11 +401,13 @@
  */
 
 /**
- * What an `around=task:<id>` read found: `found` (its page lands on `history_id`), `absent` (the
- * thread's saved history holds no row of the task a client could show) or `moved` (another thread's).
+ * `around`: a task card or an exact stored row. `found` binds `history_id`; a moved row names its
+ * current `chat_id`. Only complete source misses prove absent; failures/imports answer 503.
  * @typedef {Object} ChatHistoryAnchor
- * @property {'found'|'absent'|'moved'} state
- * @property {string} task_id
+ * @property {'found'|'absent'|'moved'|'ambiguous'|'unavailable'} state
+ * @property {string=} task_id
+ * @property {string=} row_address
+ * @property {number=} chat_id
  * @property {string=} history_id
  */
 

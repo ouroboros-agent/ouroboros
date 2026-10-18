@@ -473,6 +473,16 @@ const CARD_HEADER = [
 // full output, a Review attempt detail. Each clips what it holds.
 const BOUNDED_BOX = '[data-live-timeline], .chat-live-line-body-full, [data-review-attempt-detail]';
 
+/** An explicit exact-line landing scrolls every clipping owner before the feed. */
+export function revealTimelineNode(node, feed, clearance) {
+    for (let box = node.parentElement; box && box !== feed; box = box.parentElement) {
+        if (box.matches?.(BOUNDED_BOX)) {
+            box.scrollTop += node.getBoundingClientRect().top - box.getBoundingClientRect().top;
+        }
+    }
+    feed.scrollTop += node.getBoundingClientRect().top - feed.getBoundingClientRect().top - clearance;
+}
+
 // A node's own bounded reading box: an expanded line's fetched full output or
 // a Review attempt detail. The owner card timeline is found from the node.
 function innerBox(node) {

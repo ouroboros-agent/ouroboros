@@ -743,11 +743,11 @@ class OuroborosAgent:
         # to the PROJECT FOLDER (project_room_lens_dir keys on this metadata; the
         # robot-room incident: "." resolved to the system repo and the agent
         # narrated the wrong tree). A set-but-broken working_dir rides as a LOUD
-        # note instead (never a silent repo fallback).
-        if bool(task.get("_is_direct_chat")) and _resolved_project_id and not str(task.get("workspace_root") or "").strip():
-            try:
-                from ouroboros.workspace_admission import room_chat_lens_dir
+        # note instead (never a silent repo fallback). Kept resources win (room_lens_applies).
+        from ouroboros.workspace_admission import room_chat_lens_dir, room_lens_applies
 
+        if _resolved_project_id and room_lens_applies(task):
+            try:
                 _room_dir, _room_note = room_chat_lens_dir(self.env.drive_root, _resolved_project_id)
                 if _room_dir:
                     task_metadata["_project_room_dir"] = _room_dir
@@ -1158,17 +1158,10 @@ class OuroborosAgent:
                     except Exception:
                         log.debug("Failed to persist review continuation after task exception", exc_info=True)
 
-            intentional_empty = (
-                getattr(ctx, "_presence_completion_accepted", False)
-                and (getattr(ctx, "_presence_completion", None) or {}).get("outcome") in {"silent", "tool_delivered"}
-                and str(usage.get("execution_status") or usage.get("result_status") or "") not in {"failed", "infra_failed"}
-            )
-            if not isinstance(text, str) or (not text.strip() and not intentional_empty):
-                text = "⚠️ Model returned an empty response. Try rephrasing your request."
+            replaced, _, text = _resolve_intentional_empty(ctx, usage, text)
+            if replaced:
                 usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_NOTICE
                 usage.pop("presence_completion_outcome", None)
-                if ctx is not None:
-                    ctx._presence_completion_accepted = False
 
             # A task that scoped ITSELF mid-run (ensure_project_scope) set the scope on
             # ctx, but persistence/finalization read the task dict — sync it back so the
@@ -1468,6 +1461,25 @@ class OuroborosAgent:
 
         threading.Thread(target=_loop, daemon=True).start()
         return stop
+
+
+def _resolve_intentional_empty(ctx: Any, usage: Dict[str, Any], text: Any) -> tuple[bool, bool, Any]:
+    """Resolve empty finals before outcome derivation; ``(replaced, intentional, text)``.
+
+    The loop's accepting exit stamps ``usage["wake_silent"]`` (loop_delivery): the wake's
+    words, even empty, are internal, and the pipeline decides what its outcome publishes.
+    """
+    ok_status = str(usage.get("execution_status") or usage.get("result_status") or "") not in {"failed", "infra_failed"}
+    presence = (getattr(ctx, "_presence_completion_accepted", False)
+                and (getattr(ctx, "_presence_completion", None) or {}).get("outcome") in {"silent", "tool_delivered"}
+                and ok_status)
+    intentional_empty = presence or usage.get("wake_silent") is True
+    if not isinstance(text, str) or (not text.strip() and not intentional_empty):
+        if ctx is not None:
+            ctx._presence_completion_accepted = False
+        usage.pop("wake_silent", None)
+        return True, False, "⚠️ Model returned an empty response. Try rephrasing your request."
+    return False, intentional_empty, text
 
 
 def make_agent(

@@ -7,6 +7,8 @@ own gate, execution registry, admission, in-flight budget and endpoints decide.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import functools
 import json
 import time
@@ -328,7 +330,7 @@ def test_reporting_v1_release_is_receipt_owned_and_reaches_the_resuming_author(h
     first = turn(h, 42, reporting=1).json()
     assert (first["status"], first["outcome"], first["text"]) == ("continuing", "message", ANSWER)
     assert first["delivery_reporting_version"] == 1 and first["output_ref"]
-    rows = [json.loads(line) for line in (h.data / "logs" / "chat.jsonl").read_text().splitlines()]
+    rows = dialogue_test.log_rows(h.data / "logs" / "chat.jsonl")
     assert not [row for row in rows if row.get("direction") == "out"]  # mode 1: receipts own outgoing history
     receipt = {"schema_version": 1, "delivery_id": f"auto:{first['output_ref']}", "part_id": "0",
                "state": "delivered", "provider": "telegram", "account_id": "bot-1", "conversation_id": "room-1",

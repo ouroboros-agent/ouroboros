@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,7 @@ VALID_SKILL_PERMISSIONS = frozenset(
         # sentence shown in the owner's chat as a System row signed with the
         # skill's name; never a model turn. Narrower than inject_chat, granted separately.
         "notify_owner",
+        "context_snapshot",
     }
 )
 _EVENT_TOPIC_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
@@ -55,6 +57,15 @@ _EVENT_TOPIC_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 # to the model's context and what that costs in tokens. Prose by design — the
 # section is rendered verbatim (bounded) on model-visible surfaces, not parsed.
 MODEL_EXPERIENCE_KEYS = ("what_model_sees", "token_effect")
+
+# ``os`` names platforms by ``sys.platform`` (the vocabulary install specs use);
+# the marketplace adapter and authors also write these spellings.
+_OS_ALIASES = {"macos": "darwin", "mac": "darwin", "osx": "darwin", "windows": "win32", "win": "win32"}
+
+
+def host_platform() -> str:
+    """The platform a manifest's ``os`` is matched against (``sys.platform``)."""
+    return sys.platform
 
 
 class SkillManifestError(ValueError):
@@ -121,6 +132,8 @@ class SkillManifest:
     # keys from MODEL_EXPERIENCE_KEYS (at least one non-empty). Absent (None)
     # keeps the pre-section behavior everywhere.
     model_experience: Optional[Dict[str, str]] = None
+    # Reviewed local-file declaration; never an executable prompt callback.
+    context_snapshot: Optional[Dict[str, str]] = None
     # Human-readable body after SKILL.md frontmatter.
     body: str = ""
     # Unknown fields preserved for forward compatibility.
@@ -135,6 +148,16 @@ class SkillManifest:
 
     def is_extension(self) -> bool:
         return self.type == "extension"
+
+    def applies_to_platform(self, platform: str = "") -> bool:
+        """Whether the declared ``os`` (``any`` or a comma list) covers ``platform``.
+
+        Defaults to ``host_platform()``. This governs new bundled offerings;
+        discovery separately retains legacy remote choices. Other sources keep
+        ``os`` descriptive.
+        """
+        wanted = {_OS_ALIASES.get(item, item) for item in _string_list(self.os.lower())}
+        return not wanted or "any" in wanted or (platform or host_platform()) in wanted
 
     def validate(self) -> List[str]:
         """Return soft warnings; parse errors already raised on structural damage."""
@@ -176,6 +199,8 @@ class SkillManifest:
             warnings.append("timeout_sec must be positive")
         if self.scheduled_tasks and "supervised_task" not in self.permissions:
             warnings.append("scheduled_tasks require the supervised_task permission")
+        if self.context_snapshot and "context_snapshot" not in self.permissions:
+            warnings.append("context_snapshot requires its hash-bound owner permission")
         if self.plugin_api is not None:
             # Semantic validation is owned by the negotiation contract; a
             # function-level import keeps the contracts package acyclic.
@@ -455,6 +480,7 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         "ui_tab",
         "plugin_api",
         "model_experience",
+        "context_snapshot",
         "schema_version",
     }
     extras: Dict[str, Any] = {
@@ -526,6 +552,18 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
             )
 
     model_experience = _parse_model_experience(data.get("model_experience"))
+    context_snapshot = data.get("context_snapshot")
+    if context_snapshot is not None:
+        if (str(data.get("type") or "instruction").lower() != "extension"
+                or not isinstance(context_snapshot, dict) or set(context_snapshot) != {"path"}
+                or "context_snapshot" not in _string_list(data.get("permissions"))):
+            raise SkillManifestError("context_snapshot requires an extension and exactly one relative 'path'")
+        path = context_snapshot["path"]
+        if (not isinstance(path, str) or not path or "\\" in path
+                or pathlib.PurePosixPath(path).is_absolute() or ".." in pathlib.PurePosixPath(path).parts
+                or ":" in path or path.endswith("/")):
+            raise SkillManifestError("context_snapshot.path must name a file beneath the skill state directory")
+        context_snapshot = {"path": path}
 
     companion_processes = _parse_companion_processes(data.get("companion_processes", []))
 
@@ -575,7 +613,7 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         type=str(data.get("type") or "instruction").strip().lower(),
         when_to_use=str(data.get("when_to_use") or "").strip(),
         requires=_string_list(data.get("requires")),
-        os=str(data.get("os") or "any").strip().lower() or "any",
+        os=",".join(item.lower() for item in _string_list(data.get("os"))) or "any",
         runtime=str(data.get("runtime") or "").strip().lower(),
         timeout_sec=timeout_sec,
         env_from_settings=_string_list(data.get("env_from_settings")),
@@ -589,6 +627,7 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         ui_tab=ui_tab,
         plugin_api=plugin_api,
         model_experience=model_experience,
+        context_snapshot=context_snapshot,
         body=body,
         raw_extra=extras,
         schema_version=schema_version_int,

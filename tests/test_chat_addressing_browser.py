@@ -7,9 +7,7 @@ card cannot pass by disappearing before the final assertion.
 """
 
 import json
-import os
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -18,6 +16,7 @@ from tests.system_e2e.harness import (
     start_server, wait_durable_result, wait_until,
 )
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
+from tests._shared import producer_evidence_dir
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
 
 wait_clone = clone_fixture
@@ -110,7 +109,8 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
         **original_env(server), "HOME": str(home), "USERPROFILE": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
     })
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "evidence") / f"addressing-{case}-{width}"
+    evidence = producer_evidence_dir(tmp_path / "evidence", "chat-addressing",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT") / f"addressing-{case}-{width}"
     evidence.mkdir(parents=True, exist_ok=True)
     with ToolCallOnlyModel([response] * 16) as stub:
         server = start_server(wait_clone, tmp_path / "instance", keyless_settings(stub, OUROBOROS_MAX_WORKERS=1))

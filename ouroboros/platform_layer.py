@@ -261,13 +261,13 @@ _KERNEL_LOCK_TIER: dict = {}  # lock directory -> (kernel locks enforced there, 
 _KERNEL_LOCK_TIER_LOCK = threading.Lock()  # one probe per directory, one verdict for every thread
 
 
-def kernel_file_locks_enforced(lock_path: pathlib.Path) -> bool:
-    """Probe and cache kernel-lock capability per directory, never on a live refusal.
-
-    Unprobeable directories stay enforced and retry later; unsupported/ENOLCK
-    select the recorded name-only tier. See ARCHITECTURE §1 "Platform substrate"."""
+def kernel_file_locks_enforced(lock_path: pathlib.Path, *, known: Optional[tuple] = None) -> bool:
+    """Probe/cache per directory; restore ``known=(tier, errno)`` after mount validation,
+    or ``(None, None)`` to recheck. Unprobeable paths retry; unsupported/ENOLCK use name locking."""
     directory = os.path.realpath(str(pathlib.Path(lock_path).parent))
     with _KERNEL_LOCK_TIER_LOCK:
+        if known is not None:
+            _KERNEL_LOCK_TIER[directory] = known
         tier, refused = _KERNEL_LOCK_TIER.get(directory, (None, None))
         if tier is None:
             probe = os.path.join(directory, f".kernel-lock-probe.{os.getpid()}.{time.time_ns()}")
@@ -289,7 +289,7 @@ def kernel_file_locks_enforced(lock_path: pathlib.Path) -> bool:
                 except OSError:
                     log.debug("Kernel-lock probe %s left behind", probe, exc_info=True)
             if not tier:
-                log.warning("No kernel file locks under %s (errno %s): locks there use the name protocol only", directory, refused)
+                log.warning("Name-only locks under %s (errno %s)", directory, refused)
             _KERNEL_LOCK_TIER[directory] = (tier, refused)
     return tier
 

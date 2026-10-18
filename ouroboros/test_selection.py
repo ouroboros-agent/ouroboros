@@ -103,7 +103,9 @@ def _release_versions(repo: Path, base: str) -> set[str]:
 
 def _version_only_change(repo: Path, base: str, path: str, versions: set[str]) -> bool:
     try:
-        old = _git(repo, "show", f"{base}:{path}").decode("utf-8")
+        # Both sides with universal newlines, as read_text gives the checkout: a blob a
+        # Windows checkout stored with CRLF bytes must not turn a version bump into apparatus.
+        old = _git(repo, "show", f"{base}:{path}").decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         new = (repo / path).read_text(encoding="utf-8")
     except (OSError, UnicodeError, subprocess.SubprocessError):
         return False

@@ -1,5 +1,7 @@
 """Synthesis sees task observations without mistaking tool success for receipt."""
 
+from tests import _dialogue as dialogue_test
+
 import hashlib
 import json
 import shutil
@@ -143,7 +145,7 @@ def test_facts_row_buys_no_packet_and_persists_no_narrative(tmp_path, monkeypatc
     env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
     pipeline._store_task_result(env, task, "Photo sent.", {"rounds": 4, "cost": 0}, _trace())
     pipeline._record_task_facts(env, task, {"rounds": 4, "cost": 0}, _trace(), tmp_path / "logs")
-    [row] = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    [row] = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert row["summary_kind"] == "host_task_facts" and row["text"] == ""
     assert row["tool_calls"] == 41 and row["tool_errors"] == 0 and row["routing_tool_calls"] == 0
     assert row["tool_call_counts"] == {"send_photo": 1, "send_user_message": 40}

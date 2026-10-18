@@ -231,7 +231,7 @@ function assertFollowed(f, node) {
     assert.deepEqual(controls(f, 'w-1-c1'), ['Reply', 'Stop…'], 'its own controls: Stop… while the room runs it');
     const episodes = f.part('w-1-c1', 'live-episodes');
     assert.equal(episodes.hidden, false);
-    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/,
+    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-name">Audit the projects<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/,
         'the ended episode is one meta line on the same card');
     assert.match(episodes.innerHTML, /data-episode="2" data-current="1"/);
 }
@@ -400,7 +400,7 @@ function assertRoomFollowed(f, node) {
     assert.ok(!controls(f, 'w-1-c1').includes('Continued'));
     const episodes = f.part('w-1-c1', 'live-episodes');
     assert.equal(episodes.hidden, false);
-    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/,
+    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-name">Audit the projects<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/,
         'the ended episode is one meta line on the same card');
     assert.match(episodes.innerHTML, /data-episode="2" data-current="1"/);
 }
@@ -505,8 +505,8 @@ function assertSettledFollow(f, folded, { id = 'w-1-c1', episodes = 2 } = {}) {
     assert.ok(!controls(f, id).includes('Stop…') && !controls(f, id).includes('Continued'), 'a settled work offers no Stop');
     const lines = f.part(id, 'live-episodes').innerHTML;
     assert.equal((lines.match(/data-episode="/g) || []).length, episodes);
-    assert.match(lines, /Episode 1<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/);
-    assert.match(lines, new RegExp(`data-episode="${episodes}" data-current="1"><span class="chat-live-episode-label">Episode ${episodes}</span> · <span class="chat-live-episode-span">[^<]+–[^<]+</span></div>`),
+    assert.match(lines, /Episode 1<\/span> · <span class="chat-live-episode-name">Audit the projects<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/);
+    assert.match(lines, new RegExp(`data-episode="${episodes}" data-current="1"><span class="chat-live-episode-label">Episode ${episodes}</span> · (?:<span class="chat-live-episode-name">[^<]+</span> · )?<span class="chat-live-episode-span">[^<]+–[^<]+</span></div>`),
         'the finished current episode carries its own span; the chip is its outcome');
 }
 

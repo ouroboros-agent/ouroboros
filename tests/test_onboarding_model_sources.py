@@ -231,15 +231,19 @@ def test_codex_only_preview_and_finish_share_models_agents_and_atomic_settings(o
     assert not saved.get("OUROBOROS_REVIEWER_SLOTS")
 
 
-def test_codex_only_finish_computes_omitted_quick_path_models(onboarding):
+@pytest.mark.parametrize("modalities, vision", [
+    (["text", "image"], "claudexor::codex=default"), (["text"], ""), (["text", 42], ""), (["image", ""], "")])
+def test_codex_only_finish_computes_omitted_quick_path_models(onboarding, modalities, vision):
     onboarding.calls["snapshot_payload"] = {
         **LIVE_SNAPSHOT,
         "model_catalog": [{"value": "claudexor::codex=default", "is_default": True,
-                           "input_modalities": ["text", "image"]}],
+                           "input_modalities": modalities}],
     }
     response = onboarding.client.post("/api/onboarding/complete", json={"subscriptionsConnected": True})
     assert response.status_code == 200, response.text
     assert onboarding.saved()["OUROBOROS_MODEL"] == "claudexor::codex=default"
+    # Vision is saved only from a stated image row; otherwise it stays blank (Auto).
+    assert onboarding.saved()["OUROBOROS_MODEL_VISION"] == vision
 
 
 def test_finish_preserves_visible_empty_inheritance_and_shipped_value(onboarding):

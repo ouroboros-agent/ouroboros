@@ -7,6 +7,8 @@ import time
 
 import pytest
 
+from ouroboros.test_evidence import diagnostic_directory
+
 from tests.ui_failure_evidence import FailureEvidence
 
 _CAPTURE_TEST_SOCKET = """() => {
@@ -1161,7 +1163,7 @@ def run_chat_viewport_smoke(
                 page.evaluate(_SETTLE_TWO_FRAMES)
                 assert_noop_read(page, noop_top)
                 page.screenshot(
-                    path=str(data_dir.parent / f"live-card-viewport-{browser_engine}.png"),
+                    path=str(diagnostic_directory(data_dir.parent, "chat-viewport") / f"live-card-viewport-{browser_engine}.png"),
                     full_page=True,
                 )
 

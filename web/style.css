@@ -50,6 +50,48 @@ body {
     position: relative;  /* positioning context for the resize handle */
 }
 
+/* macOS desktop window (launcher_window_chrome.py): while its transparent title bar covers the page,
+   the shell writes the band's height and the traffic lights' far edge here, measured, in CSS px.
+   The sidebar starts below the band; content reaching the left edge (drawer layout, a project panel
+   as wide as the window) starts past the lights. Without the shell's attribute nothing moves. */
+:root[data-window-chrome="integrated"] {
+    --window-chrome-top: 0px;
+    --window-chrome-start: 0px;
+    --window-chrome-clearance: calc(var(--window-chrome-start) + var(--space-3));
+}
+:root[data-window-chrome="integrated"] #primary-sidebar {
+    padding-top: calc(var(--space-4) + var(--window-chrome-top));
+}
+:root[data-window-chrome="integrated"] .onboarding-overlay {
+    box-sizing: border-box;
+    padding-top: var(--window-chrome-top);
+}
+/* Main's header floats over its transcript and lets a press between its groups through to the row beneath, a
+   link or button the owner cannot see: inside the band this strip takes such a press for the title bar. The
+   header's groups stay above it; the feed keeps its scrollbar (the global 6px ::-webkit-scrollbar). */
+:root[data-window-chrome="integrated"] .chat-page-header::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 6px;
+    height: var(--window-chrome-top);
+    z-index: -1;
+    pointer-events: auto;
+}
+:root[data-window-chrome="integrated"] .project-panel-bar {
+    padding-left: max(14px, calc(var(--window-chrome-clearance) + var(--project-panel-width) - 100vw));
+}
+@media (max-width: 900px) {
+    :root[data-window-chrome="integrated"] .project-panel-bar { padding-left: max(14px, var(--window-chrome-clearance)); }
+}
+@media (max-width: 640px) {
+    :root[data-window-chrome="integrated"] #primary-sidebar {
+        padding-top: max(64px, calc(var(--space-4) + var(--window-chrome-top)));
+    }
+    :root[data-window-chrome="integrated"] .app-page-header { padding-left: max(12px, var(--window-chrome-clearance)); }
+}
+
 /* Resizable side-section drag handles (v6.33.0). Thin edge strips that set
    --sidebar-width / --project-panel-width; hidden under the mobile drawer. */
 /* CW10 (v6.34.0): suppress text selection while dragging via a class, not a JS
@@ -2046,6 +2088,12 @@ body.resizing-panels { user-select: none; }
     row-gap: var(--space-2);
 }
 
+/* The status box spans its row and centres its own chip, so an empty status (a terminal projection) starts at
+   the row's top with the disclosure instead of floating to the row's middle. */
+.chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-summary-main {
+    align-self: stretch;
+}
+
 .chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-title {
     order: 3;
     flex: 1 1 100%;
@@ -2378,6 +2426,21 @@ body.resizing-panels { user-select: none; }
 .chat-live-episode-outcome[data-tone="error"] { color: var(--status-error-fg); }
 .chat-live-episode-outcome[data-tone="neutral"] { color: var(--status-neutral-fg); }
 
+/* Earlier physical episodes disclose their existing content, never another work/control card. */
+.chat-live-episode-history { margin: var(--space-2) var(--space-4) var(--space-3); }
+.chat-live-episode-history[hidden],
+.chat-live-card:not([data-expanded="1"]) > .chat-live-episode-history { display: none; }
+.chat-episode-history { border-top: 1px solid var(--divider); min-width: 0; }
+.chat-episode-history > summary {
+    cursor: pointer;
+    padding-block: var(--space-2);
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    overflow-wrap: anywhere;
+}
+.chat-episode-history > summary:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.chat-episode-history[open] > [data-live-reviews-host] > .chat-live-reviews { display: block; }
+
 /* Why a chip word or an amount reads as it does: part of the expanded card, which the
    summary button opens by pointer, touch and keyboard (never a hover-only title); selectable. */
 .chat-live-details {
@@ -2611,7 +2674,8 @@ body.resizing-panels { user-select: none; }
     gap: var(--space-2);
 }
 
-.chat-live-card[data-expanded="1"] > .chat-live-timeline {
+.chat-live-card[data-expanded="1"] > .chat-live-timeline,
+.chat-episode-history[open] > .chat-live-timeline {
     display: flex;
     border-top: 1px solid rgba(var(--neutral-rgb), 0.05);
     max-height: 420px;
@@ -2725,39 +2789,34 @@ body.resizing-panels { user-select: none; }
         margin-inline-start: 0;
     }
 
-    /* Equal inline inset on both sides: a child sits --space-3 + --space-2 from its root card's border on
-       the left (where the thread line runs) and on the right; no child border meets the root's border. */
+    /* Equal inline inset on both sides, paid once: a child sits --space-1 inside the thread line on the left
+       and inside its root card's border on the right, so no child border meets the root's border. Deeper
+       levels keep only their rail and frame; any wider per-level inset collapses a depth-10 child on a phone. */
     .chat-subagents {
-        margin-inline: var(--space-3);
-        padding-inline: var(--space-2);
+        margin-inline: 0;
+        padding-inline: var(--space-1);
     }
 
     .chat-subagents .chat-subagents {
-        padding-inline-start: 0;
+        padding-inline: 0;
     }
 
     /* A COLLAPSED nested child keeps its one-line identity row — status chip ·
        role · `N notes` · chevron — over its model/executor metadata (DESIGN.md
        §5) instead of dropping the title to a third band once its own inline
-       width crosses this threshold (#623). The title is already nowrap/ellipsis
-       here; it keeps the same 160px demand the mobile readability floor uses,
-       and only when even that cannot share the row do the side controls wrap
-       under it. Higher specificity than the .chat-live-title rule above, so the
-       cascade decides, not source order. */
-    .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-title {
-        order: 0;
-        flex: 1 1 160px;
-        min-width: 0;
-    }
-
-    /* On a phone the collapsed child's identity row stays one row: the role name ellipsizes before its
-       `N notes` count would drop to a row of its own. */
+       width crosses this threshold (#623). The row never wraps: the side
+       controls keep their size and the role (nowrap/ellipsis, below) takes the
+       rest, so a long role ellipsizes before its `N notes` count would drop to
+       a row of its own. Higher specificity than the .chat-live-title rule
+       above, so the cascade decides, not source order. */
     .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button > .chat-live-summary {
         flex-wrap: nowrap;
     }
 
     .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-title {
+        order: 0;
         flex: 1 1 0;
+        min-width: 0;
     }
 
     .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-summary-side {
@@ -2798,8 +2857,8 @@ body.resizing-panels { user-select: none; }
    label is the root's) over its metadata row (model, harness chip with the run count,
    cost, last update, docked Reviews count). Only its narration line waits for
    expansion. The title stays on one line and stays IN the identity row at every
-   width (the narrow-regime rule above gives it a 160px demand and lets the side
-   controls wrap under it instead). Activity now stays visible beneath it. */
+   width (in the narrow regime above it ellipsizes before the side controls
+   would leave the row). Activity now stays visible beneath it. */
 .chat-live-card.subagent .chat-live-title {
     font-weight: 400;
     color: var(--text-secondary);
@@ -4792,6 +4851,13 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     color: var(--text-primary);
 }
 
+/* A fact too long for a narrow card moves its value under its label instead of overflowing. */
+.evo-runtime-chip {
+    flex-wrap: wrap;
+    max-width: 100%;
+    white-space: normal;
+}
+
 .evo-chart-wrap {
     position: relative;
     width: 100%;
@@ -6117,6 +6183,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     justify-content: space-between;
     gap: 10px;
 }
+
+/* A long unbroken title (a skill name) wraps; Close never leaves the dialog. */
+.marketplace-modal-head > h3 { min-width: 0; overflow-wrap: anywhere; }
+.marketplace-modal-head > button { flex: 0 0 auto; }
 
 .marketplace-modal-head, .marketplace-modal-actions { flex-shrink: 0; }
 .marketplace-modal-body > * { flex-shrink: 0; }
@@ -8430,7 +8500,9 @@ textarea.chat-input {
     border-bottom: 1px solid var(--surface-border);
 }
 
-.document-reader-identity { grid-area: identity; min-width: 0; }
+/* Name, type and size are selectable text like the document: declared, so the macOS window's
+   title bar band (launcher_window_chrome.py) leaves a press on them to selection. */
+.document-reader-identity { grid-area: identity; min-width: 0; cursor: text; }
 .document-reader-actions { grid-area: actions; }
 .document-reader-close { grid-area: close; }
 
@@ -8706,6 +8778,7 @@ textarea.chat-input {
     color: var(--text-meta);
 }
 .chat-quiz-dot {
+    flex: 0 0 auto;
     width: 8px;
     height: 8px;
     border-radius: 50%;
@@ -8927,12 +9000,12 @@ textarea.chat-input {
     from { box-shadow: 0 0 0 3px var(--accent-25); }
     to { box-shadow: 0 0 0 3px transparent; }
 }
-:is(.chat-bubble, .chat-live-card).is-quote-target { animation: chat-quote-target 1.4s ease-out; }
+:is(.chat-bubble, .chat-live-card, .chat-live-line).is-quote-target { animation: chat-quote-target 1.4s ease-out; }
 /* A row that takes focus only to be returned to (a quote's target, a closed row menu) shows the one keyboard ring. */
-:is(.chat-bubble, .chat-live-card)[tabindex="-1"]:focus { outline: none; }
-:is(.chat-bubble, .chat-live-card)[tabindex="-1"]:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+:is(.chat-bubble, .chat-live-card, .chat-live-line)[tabindex="-1"]:focus { outline: none; }
+:is(.chat-bubble, .chat-live-card, .chat-live-line)[tabindex="-1"]:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
-    :is(.chat-bubble, .chat-live-card).is-quote-target { animation: none; box-shadow: 0 0 0 3px var(--accent-25); }
+    :is(.chat-bubble, .chat-live-card, .chat-live-line).is-quote-target { animation: none; box-shadow: 0 0 0 3px var(--accent-25); }
 }
 
 /* === The quote panel (docs/DESIGN.md "Replies"): one component (chat_reply_quote.js) inside a bubble and

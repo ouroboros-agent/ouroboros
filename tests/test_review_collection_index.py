@@ -337,10 +337,14 @@ def test_classification_is_off_read_lock_batched_and_cas_preserves_current_write
         with monkeypatch.context() as patch:
             patch.setattr(obligations, "review_collection_pending", original)
             return classify(row)
-    real_commit = store.commit
+    real_commit, totals = store.commit, {}
     def commit(conn):
-        commits.append(conn.total_changes)
+        # total_changes is cumulative on a cached connection: this transaction's rows are the step.
+        total = conn.total_changes
+        commits.append(total - totals.get(id(conn), (conn, 0))[1])
+        totals[id(conn)] = (conn, total)
         return real_commit(conn)
+    store.close_connections()  # fresh connections count from zero
     monkeypatch.setattr(obligations, "review_collection_pending", classify_once)
     monkeypatch.setattr(store, "commit", commit)
     assert list(task_store.review_collection_candidates(tmp_path)) == []
@@ -460,6 +464,8 @@ def test_storeless_export_import_and_changed_legacy_files_derive_membership(tmp_
     changed["review_operations"]["op"]["state"] = "collected"
     (restored / "task_results" / "task.json").write_text(json.dumps(changed), encoding="utf-8")
     store_import.ensure_current_store(restored, with_children=False)
+    assert task_store.read_document(restored, "task") == row  # boot leaves frozen files to maintenance
+    store_import.run_legacy_reconcile(restored)
     assert task_store.read_document(restored, "task") == changed and _flag(restored, "task")[0] == 0
 
 

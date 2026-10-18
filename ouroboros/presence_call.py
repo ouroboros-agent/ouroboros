@@ -302,15 +302,19 @@ def _event_from_task(task: Mapping[str, Any]) -> PresenceTurnEvent:
 
 
 def record_call_utterance(drive_root: Path, task: Mapping[str, Any], *, direction: str, text: str,
-                          speaker_label: str = "") -> bool:
+                          speaker_label: str = "", utterance_id: str = "") -> bool:
     """Retain one finalized utterance of a live call as a Presence dialogue row.
 
     The driver calls this for every finalized correspondent utterance (``direction="in"``,
     attributed to the participant label the platform reported, else to "meeting audio")
     and for every utterance Ouroboros spoke (``direction="out"``). The row carries the
     call's task and conversation exactly like a text turn's rows, so history, memory and
-    the previous-turn pointer read the call as one conversation. False means the row
-    could not be written; the driver discloses that, the call is not ended for it.
+    the previous-turn pointer read the call as one conversation. An inbound row is named
+    by the event and its ``utterance_id`` (the engine's item id; a fresh name without
+    one): the store keeps one inbound row per name, so the event's own name would keep
+    only the call's opening row, while the same item recorded twice stays one row. False
+    means the row could not be written; the driver discloses that, the call is not ended
+    for it.
     """
     text = str(text or "").strip()
     if direction not in {"in", "out"} or not text:
@@ -323,9 +327,10 @@ def record_call_utterance(drive_root: Path, task: Mapping[str, Any], *, directio
         label = str(speaker_label or "").strip() or MEETING_AUDIO_LABEL
         speaker = {"display_name": label, "platform_actor_id": f"meeting-audio:{label}"}
         user_id = _stable_numeric_id("presence-actor-log", speaker["platform_actor_id"])
+    name = f"{event.source_event_id}:heard:{utterance_id or secrets.token_hex(8)}" if direction == "in" else ""
     try:
         _log_dialogue(Path(drive_root), direction=direction, chat_id=chat_id, user_id=user_id, text=text,
-                      event=event, task=task, task_id=str(task["id"]), speaker=speaker)
+                      event=event, task=task, task_id=str(task["id"]), speaker=speaker, client_message_id=name)
     except PresenceTurnError:
         log.warning("Presence call %s: a %s utterance could not be retained", task.get("id"), direction)
         return False

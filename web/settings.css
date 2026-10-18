@@ -464,7 +464,6 @@
     min-width: 0;
 }
 
-.settings-secret-value,
 .settings-secret-source,
 .settings-secret-status {
     grid-column: 1 / -1;
@@ -472,11 +471,19 @@
     overflow-wrap: anywhere;
 }
 
+/* Show puts the value in the masked input's own cell (the input steps aside);
+   the buttons keep to its first line rather than stretching with a long value. */
 .settings-secret-value {
+    min-width: 0;
+    overflow-wrap: anywhere;
     white-space: pre-wrap;
     -webkit-user-select: text;
     user-select: text;
     cursor: text;
+}
+
+.settings-secret-value:not([hidden]) ~ .btn {
+    align-self: start;
 }
 
 .available-subagents-editor {
@@ -1004,7 +1011,8 @@
     .secret-input-row {
         grid-template-columns: minmax(0, 1fr) auto auto;
     }
-    .secret-input-row > input { grid-column: 1 / -1; }
+    .secret-input-row > input,
+    .secret-input-row > .settings-secret-value { grid-column: 1 / -1; }
     .secret-input-row > button:first-of-type { grid-column: 2; }
 
     .settings-card-head,

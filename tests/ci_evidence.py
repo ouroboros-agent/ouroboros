@@ -585,6 +585,8 @@ class _Results:
         except Exception as close_error:
             error = error or close_error
         if error is not None:  # One line, then silence: the session outcome is untouched.
+            from ouroboros.test_evidence import diagnostics_incomplete
+            diagnostics_incomplete(type(error).__name__)
             print(f"CI_DIAGNOSTICS_INCOMPLETE: incremental journal disabled ({type(error).__name__})")
 
     def _event(self, event, nodeid, **facts):
@@ -675,6 +677,8 @@ class _Results:
             write_json(output_dir(self.config) / "results.json", _redact(facts, self.secrets))
         except Exception as error:
             # Diagnostics alone never alter session.exitstatus or expose a body.
+            from ouroboros.test_evidence import diagnostics_incomplete
+            diagnostics_incomplete(type(error).__name__)
             print(f"CI_DIAGNOSTICS_INCOMPLETE: safe result export failed ({type(error).__name__})")
         finally:
             self._journal_off()

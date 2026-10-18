@@ -348,17 +348,18 @@ def adopt_registered_answer(root: Any, task: Dict[str, Any], task_id: str, *, at
                             registry_root: Any = None) -> Optional[Dict[str, Any]]:
     """Finalize a dead attempt whose answer the host already holds, instead of running its prompt again.
 
-    Both recovery owners (timeout reaping, dead-worker recovery) consult this before
-    admitting a fresh model attempt. With the answer out before the result store
-    (owner 1A(1)) a death inside the store is an ordinary window; the authored answer
-    must not be generated a second time. A registered answer — owed, exhausted,
+    Timeout reaping and dead-worker recovery consult this before admitting a fresh
+    model attempt, cancellation custody before settling a direct boot fence. With
+    the answer out before the result store (owner 1A(1)) a death inside the store is
+    an ordinary window; the authored answer must not be generated a second time.
+    A registered answer — owed, exhausted,
     delivered, or merely unreadable evidence — terminalizes the attempt in the
     lifecycle-fault vocabulary: lifecycle ``failed``, execution ``infra_failed``,
     reason ``finalization_incomplete``, the outbox's own text as the result and a
     host notice naming what stayed incomplete. An owed row keeps replaying through
     the outbox; an exhausted one is named as given up. Returns the stored terminal row, or None when no answer is
-    registered (the ordinary retry proceeds). A refused write raises: the caller's
-    existing no-retry fallback owns the attempt, never a second model run.
+    registered (the ordinary retry proceeds). Storage errors propagate; the
+    monotonic writer may instead return an already-settled row. Neither permits a new model run.
     """
     answer = registered_answer(registry_root if registry_root is not None else root, task_id)
     if not answer:
@@ -367,7 +368,8 @@ def adopt_registered_answer(root: Any, task: Dict[str, Any], task_id: str, *, at
     from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
     from ouroboros.task_results import STATUS_FAILED, write_task_result
 
-    ended = _CAUSES.get("worker_crash") if str(cause or "") == "worker_crash" else f"its attempt was stopped ({cause or 'unknown cause'})"
+    # Only causes whose phrase claims no retry name themselves; the rest stay typed.
+    ended = _CAUSES[cause] if cause in {"worker_crash", "app_stop"} else f"its attempt was stopped ({cause or 'unknown cause'})"
     copy = f"; its copy is kept at {answer['preserved_path']}" if answer.get("preserved_path") else ""
     held = {"owed": "was authored and is owed to the chat (the outbox delivers it)",
             "exhausted": f"was authored, but sending it to the chat was given up{copy}",

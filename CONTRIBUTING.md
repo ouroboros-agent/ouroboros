@@ -114,6 +114,9 @@ the change — then the full local battery when practical:
 python scripts/run_tests.py            # or: make test
 ```
 
+This uses `safe_test`: isolated HOME/data, scrubbed owner/provider environment,
+durable logs/source/diagnostics in `<checkout>/../.test-evidence` by default.
+
 That is the one fast recipe (node lane, then every default-lane test in a single
 xdist run); a bare `pytest tests/` runs the same tests in one process and takes
 many times longer. Like CI's default lanes it leaves out the opt-in marker

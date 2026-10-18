@@ -69,9 +69,6 @@ class Producer:
 
     def __init__(self, data, monkeypatch):
         self.data, self.live = data, []
-        (data / "logs").mkdir(parents=True, exist_ok=True)
-        (data / "logs" / "chat.jsonl").touch()
-        (data / "logs" / "progress.jsonl").touch()
         bridge = message_bus.LocalChatBridge()
         bridge._broadcast_fn = self.live.append
         monkeypatch.setattr(message_bus, "DATA_DIR", data)

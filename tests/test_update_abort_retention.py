@@ -481,6 +481,9 @@ def test_unreadable_money_after_abort_still_refuses_assignment(tmp_path, monkeyp
         if str(database).split("?")[0] == ledger.as_uri():
             raise usage_store.sqlite3.OperationalError("injected money-store open failure")
         return original_connect(database, *args, **kwargs)
+    from ouroboros import store
+
+    store.close_connections()  # a thread keeps its open handle; the next money read opens the file again
     monkeypatch.setattr(usage_store.sqlite3, "connect", denied)
     system.control._respawn_workers_after_failed_update()
     _assert_returned(system, tmp_path)

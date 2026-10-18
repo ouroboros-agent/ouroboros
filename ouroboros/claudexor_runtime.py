@@ -10,7 +10,8 @@ selection.  Installing a newer pin while an older daemon is alive therefore
 stages the immutable directory without hot-swapping the process; the next
 daemon start selects it, and a planned restart whose landed checkout changed the
 pin ends the old daemon so that start follows (``server_restart``).  Rolling
-Ouroboros back selects the older pin and its preserved directory again.
+Ouroboros back selects the older executable, not older engine data; a migrated
+home may refuse it. Forward-only recovery is documented in docs/PERSISTENCE.md.
 """
 
 from __future__ import annotations

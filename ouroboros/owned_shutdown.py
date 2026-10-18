@@ -204,13 +204,15 @@ def _put(document: Dict[str, Any], entry: Dict[str, Any]) -> bool:
     return True
 
 
-def _forget(root: Any, record_ids: Iterable[str], *, drive_root: str = "") -> bool:
+def _forget(root: Any, record_ids: Iterable[str], *, drive_root: str = "",
+            expected_ledger: Optional[dict] = None) -> bool:
     ids = set(record_ids)
 
     def change(document: Dict[str, Any]) -> bool:
         records = document.get("records", {})
         gone = [rid for rid in ids if rid in records
-                and (not drive_root or records[rid].get("drive_root") == drive_root)]
+                and (not drive_root or records[rid].get("drive_root") == drive_root)
+                and (expected_ledger is None or records[rid].get("ledger_entry") == expected_ledger)]
         for rid in gone:
             records.pop(rid)
         return bool(gone)
@@ -366,6 +368,17 @@ def _stop_executor_record(root: Any, entry: Dict[str, Any], deadline: float) -> 
         pid = _int(record.get("host_pid"))
         if not _exit_proven(pid):
             if not executor._host_pid_matches_record(record):
+                expected = str(record.get("host_command_sha256") or "")
+                measured = executor._process_command_sha256(pid)
+                if expected and measured and expected != measured:
+                    from ouroboros.process_custody import record_not_ours
+
+                    if record_not_ours(root, {"pid": pid, "record_id": entry["record_id"]}, {
+                        "recorded": {"cmd_sha256": expected}, "measured": {"cmd_sha256": measured},
+                        "mismatches": ["cmd_sha256"],
+                    }, lock_timeout_sec=max(0.0, min(2.0, deadline - time.monotonic()))):
+                        executor._forget_process(path)
+                        return not path.exists()
                 return False  # alive under an identity the record cannot prove: no right to signal
             executor._kill_host_pid(pid)
             while not _exit_proven(pid):
@@ -380,13 +393,28 @@ def _stop_executor_record(root: Any, entry: Dict[str, Any], deadline: float) -> 
 
 def _stop_ledgered(root: Any, entry: Dict[str, Any], deadline: float, retained: set) -> bool:
     from ouroboros.platform_layer import kill_pid_tree, kill_process_group_id, pid_is_alive
-    from ouroboros.process_custody import _fingerprint_matches, _service_group_survives_leader
+    from ouroboros.process_custody import (
+        _fingerprint_matches, _service_group_survives_leader, measured_identity_mismatch, record_not_ours,
+    )
 
     row = entry.get("ledger_entry") if isinstance(entry.get("ledger_entry"), dict) else {}
 
     def alive() -> bool:
         return _fingerprint_matches(row) or _service_group_survives_leader(row)
 
+    def retire_mismatch() -> Optional[bool]:
+        evidence = measured_identity_mismatch(row)
+        # A reused non-leader PID does not refute surviving group members.
+        if not evidence or _service_group_survives_leader(row):
+            return None
+        if not record_not_ours(root, {**row, "record_id": entry["record_id"]}, evidence,
+                               lock_timeout_sec=max(0.0, min(2.0, deadline - time.monotonic()))):
+            return False
+        return _forget(root, [entry["record_id"]], expected_ledger=row)
+
+    retired = retire_mismatch()
+    if retired is not None:
+        return retired
     if alive():
         # Liveness may tolerate an unmeasurable start time (retention); a signal needs the
         # explicit stop's measured identity, or a recorded group that still has members.
@@ -405,8 +433,12 @@ def _stop_ledgered(root: Any, entry: Dict[str, Any], deadline: float, retained: 
             if time.monotonic() >= deadline:
                 return False
             time.sleep(_POLL_SEC)
-    _forget(root, [entry["record_id"]])
-    return True
+    retired = retire_mismatch()
+    if retired is not None:
+        return retired
+    if not _exit_proven(_int(row.get("pid"))):
+        return False  # a failed identity read is neither a mismatch nor an exit
+    return _forget(root, [entry["record_id"]], expected_ledger=row)
 
 
 def _stop_entry(root: Any, entry: Dict[str, Any], deadline: float, retained: set,

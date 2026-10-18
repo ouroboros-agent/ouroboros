@@ -252,6 +252,7 @@ const ctx = {
     openDashboardTab,
     isProjectOpening: () => projectPanelOpeningSince > 0,
     stateSnapshots,
+    revealQuotedSource,
     setBeforePageLeave: (handler) => {
         if (typeof handler !== 'function') return () => {};
         beforePageLeaveHandlers.push(handler);
@@ -373,7 +374,7 @@ function destroyProjectInstance(pid) {
 }
 
 let projectNavigationGeneration = 0;
-function closeProjectPanel({ sync = true } = {}) {
+function closeProjectPanel({ sync = true, reveal = false } = {}) {
     projectNavigationGeneration += 1;
     projectReveals.clear();
     const activeId = navState.activeProjectId;
@@ -388,10 +389,11 @@ function closeProjectPanel({ sync = true } = {}) {
     if (sync) syncNavigationState();
     // Leaving a Project for Main is a return to Main: its newest message (owner
     // decision 2026-10-05). Another page shows Main later through `ouro:page-shown`.
-    if (activeId && state.activePage === 'chat') void mainChat?.showLatest?.();
+    if (activeId && state.activePage === 'chat' && !reveal) void mainChat?.showLatest?.();
 }
 
-async function openProjectPanel(project, { closeDrawer = true, openOnly = false, taskId = '', quizId = '' } = {}) {
+async function openProjectPanel(project, { closeDrawer = true, openOnly = false, taskId = '', quizId = '', sourceReveal = null } = {}) {
+    if (sourceReveal && !sourceReveal.current()) return null;
     if (!project?.id || String(project.lifecycle || 'active') !== 'active') return;
     const navigation = ++projectNavigationGeneration;
     if (navState.activeProjectId === project.id) {
@@ -405,7 +407,7 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
     projectPanelOpeningSince = Date.now();
     try {
         const movedToChat = await showPage('chat', { closeProject: false, closeDrawer: false });
-        if (movedToChat === false || navigation !== projectNavigationGeneration) return;
+        if (movedToChat === false || navigation !== projectNavigationGeneration || sourceReveal && !sourceReveal.current()) return;
         // The room covers Main: a document Main had open closes rather than sit over it.
         mainChat?.closeTransient?.();
         navState.activeProjectId = project.id;
@@ -444,6 +446,17 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         }
         if (closeDrawer) navState.mobileDrawerOpen = false;
         syncNavigationState();
+        if (sourceReveal) {
+            const reveal = {};
+            projectReveals.set(project.id, reveal);
+            cancelProjectPaint(project.id, inst);
+            try {
+                return await inst.revealSource(sourceReveal.address,
+                    () => navigation === projectNavigationGeneration, sourceReveal.page);
+            } finally {
+                if (projectReveals.get(project.id) === reveal) projectReveals.delete(project.id);
+            }
+        }
         // Reopened at the newest message; after the panel is shown, so the column
         // has real geometry. An unread room lands on the message that arrived last
         // (DESIGN "Project unread dot"). A question opened from Main is revealed below instead.
@@ -463,6 +476,29 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
     } finally {
         projectPanelOpeningSince = 0;
     }
+}
+
+// The host names the destination. Resolve it in the full registry and read its exact page BEFORE
+// switching: errors and cancelled lookups keep the current room and all composer state. The page
+// then enters the destination's own pager; ordinary close/reopen still goes to the newest message.
+async function revealQuotedSource(address, chatId, isCurrent) {
+    const navigation = projectNavigationGeneration;
+    const current = () => navigation === projectNavigationGeneration && isCurrent();
+    let project = null;
+    if (chatId !== 1) {
+        const data = await fetchJson(`/api/projects?chat_id=${encodeURIComponent(chatId)}`);
+        if (!current()) return null;
+        project = data?.projects?.length === 1 ? data.projects[0] : null;
+        if (!project || project.lifecycle !== 'active' || Number(project.chat_id) !== chatId) return { state: 'unavailable' };
+    }
+    const page = await apiClient.chatHistory({ chatId, around: address });
+    if (!current()) return null;
+    if (page?.anchor?.state !== 'found') return page?.anchor || { state: 'unknown' };
+    if (page.anchor.row_address !== address || page.anchor.chat_id !== chatId) return { state: 'unknown' };
+    if (project) return openProjectPanel(project, { openOnly: true, sourceReveal: { address, page, current: isCurrent } });
+    closeProjectPanel({ reveal: true });
+    const showing = projectNavigationGeneration;
+    return mainChat.revealSource(address, () => showing === projectNavigationGeneration, page);
 }
 
 function freshProjectRow(project) {

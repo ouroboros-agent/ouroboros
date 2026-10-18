@@ -17,8 +17,10 @@ import json
 
 import pytest
 
+from ouroboros import dialogue_store
 from ouroboros.context import build_health_invariants, build_runtime_section
 
+from tests import _dialogue as dialogue_test
 from tests._context_shared import _make_health_env
 
 
@@ -356,22 +358,18 @@ def _grow_ledger(path, size: int) -> None:
 
 
 class TestHotStoreGrowthInvariant:
-    def test_progress_growth_warns_above_threshold(self, tmp_path):
-        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
-
+    def test_frozen_progress_export_is_not_a_hot_store(self, tmp_path):
         env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES + 1)
+        _grow_file(tmp_path / "logs" / "progress.jsonl", 8_000_001)
 
         result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" in result
-        assert "logs/progress.jsonl" in result
-        assert "rotation" in result  # remediation pointer
+        assert "HOT STORE GROWTH" not in result
 
     def test_exactly_at_threshold_stays_silent(self, tmp_path):
-        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
+        from ouroboros.context_budget import TOOLS_LOG_WARN_BYTES
 
         env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES)
+        _grow_file(tmp_path / "logs" / "tools.jsonl", TOOLS_LOG_WARN_BYTES)
 
         result = build_health_invariants(env)
         assert "HOT STORE GROWTH" not in result
@@ -425,10 +423,10 @@ class TestHotStoreGrowthInvariant:
 
     def test_isolated_benchmark_sentinel_suppresses_warnings(self, tmp_path):
         from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
-        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
+        from ouroboros.context_budget import TOOLS_LOG_WARN_BYTES
 
         env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES + 1)
+        _grow_file(tmp_path / "logs" / "tools.jsonl", TOOLS_LOG_WARN_BYTES + 1)
         (tmp_path / ISOLATED_BENCHMARK_SENTINEL).write_text("isolated\n", encoding="utf-8")
 
         result = build_health_invariants(env)
@@ -588,14 +586,12 @@ def test_project_room_keeps_an_older_own_directive_beside_sibling_traffic(tmp_pa
     sibling = create_project(root, "sibling", name="Sibling")
     own_chat, sibling_chat = int(own["chat_id"]), int(sibling["chat_id"])
     decisive = "CLAUDEXOR_ONLY_AND_THREE_LEVEL_NESTING"
-    (root / "archive").mkdir(parents=True, exist_ok=True)
-    (root / "archive" / "chat_20260820T010000.jsonl").write_text(
-        json.dumps({"chat_id": own_chat, "direction": "in", "ts": "2026-08-20T01:00:00+00:00", "text": decisive}) + "\n",
-        encoding="utf-8",
-    )
-    (root / "logs" / "chat.jsonl").write_text("".join(
-        json.dumps({"chat_id": sibling_chat, "direction": "in", "ts": "2026-08-21T00:00:00+00:00",
-                    "text": f"noise-{i}"}) + "\n" for i in range(4500)), encoding="utf-8")
+    # The directive is old history (an archived chain segment); the sibling noise is the newer live chain.
+    dialogue_test.seed(root, archives={"chat_20260820T010000.jsonl": [
+        {"chat_id": own_chat, "direction": "in", "ts": "2026-08-20T01:00:00+00:00", "text": decisive}]},
+        live={"chat": [{"chat_id": sibling_chat, "direction": "in", "ts": "2026-08-21T00:00:00+00:00",
+                        "text": f"noise-{i}"} for i in range(4500)]})
+    dialogue_test.import_all(root)
 
     _a, _b, changing, _cap = blocks(env, memory, {"id": "own-task", "chat_id": own_chat})
     room = section(changing, f"## This room (Project Own [chat_id={own_chat}])")
@@ -622,21 +618,22 @@ def test_project_room_keeps_the_retention_proof_cross_room_directive_once(tmp_pa
     bind_task_to_project(root, "cat-root", "cat-tower", project_chat, origin={"ref": ref, "text": directive})
     source_row = {**ref, "direction": "in", "text": directive}
     follow = {"chat_id": project_chat, "direction": "in", "ts": "2026-08-21T00:01:00Z", "text": "continue"}
-    (root / "logs" / "chat.jsonl").write_text(json.dumps(source_row) + "\n" + json.dumps(follow) + "\n",
-                                              encoding="utf-8")
+    # The chain does not hold the owner's row (an older install never stored it): the binding kept the words.
+    dialogue_store.append(root, "chat", follow)
     label = f"## This room (Project Cat tower [chat_id={project_chat}])"
+    _a, _b, absent, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
+    room = section(absent, label)
+    assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # retention-proof: the binding kept it
+    assert "### Words that started this work (retention-proof)" in room
+
+    origin = root / "memory" / "chronicle"
+    assert origin.is_dir()  # the first capture activated the chronicle
+    # Once the owner's row itself is an open row of this room, it is read there, once, and not under the heading.
+    dialogue_store.append(root, "chat", source_row)
     _a, _b, present, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
     room = section(present, label)
     assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # an open row of this room
     assert "### Words that started this work" not in room
-
-    origin = root / "memory" / "chronicle"
-    assert origin.is_dir()  # the first capture activated the chronicle
-    (root / "logs" / "chat.jsonl").write_text(json.dumps(follow) + "\n", encoding="utf-8")
-    _a, _b, later, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
-    room = section(later, label)
-    assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # retention-proof: the binding kept it
-    assert "### Words that started this work (retention-proof)" in room
 
 
 def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tmp_path):
@@ -658,12 +655,8 @@ def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tm
 def test_archive_only_chat_chain_is_complete_while_live_file_is_absent(tmp_path):
     from ouroboros.memory import Memory
 
-    archive = tmp_path / "archive"
-    archive.mkdir(parents=True)
-    (archive / "chat_20260820T010000.jsonl").write_text(
-        json.dumps({"direction": "in", "text": "archive-only"}) + "\n",
-        encoding="utf-8",
-    )
+    dialogue_test.seed(tmp_path, archives={"chat_20260820T010000.jsonl": [{"direction": "in", "text": "archive-only"}]})
+    dialogue_test.import_all(tmp_path)
 
     entries, coverage = Memory(drive_root=tmp_path).read_chat_generations()
 

@@ -97,7 +97,7 @@ def test_protected_sections_never_shrink_even_with_an_operative_view(tmp_path, s
     assert "forbidden replacement" not in _text(plan)
     assert plan.messages_for("max")[1]["content"] == "WORDS THAT STARTED THE WORK"
     assert section_id not in {row["section_id"] for row in _host_facts(plan)}
-    disposition = fit.measure_main_fit(plan, plan.messages_for("max"), [], drive_root=tmp_path,
+    disposition = fit.measure_main_fit(plan, plan.messages_for("max"), [],
         profile="owner_max", rendered_mode="max", round_id="r1", automatic_pass_used=True)
     assert disposition.predicted_capacity_miss
     assert disposition.action == "send"  # an estimator miss never hard-refuses

@@ -589,11 +589,27 @@ def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str
 
     status = (receipt.get("outcome") or {}).get("status", "unknown")
     lines = [card_row_text(receipt), f"receipt_id={receipt['receipt_id']} (task result: merge_receipts)"]
-    if receipt.get("readback_only"):
+    prior = receipt.get("prior_status", "unknown") if receipt.get("readback_only") else None
+    if prior == "merged":
+        lines.append("This PR's merge is already recorded in this receipt, so this call only read GitHub back "
+                     "and sent no new merge request.")
+    elif prior == "":
+        lines.append("An earlier or concurrent request for this PR holds its merge intent with no recorded outcome "
+                     "yet, so this call only read GitHub back and sent no new merge request.")
+    elif prior is not None:
         lines.append("An earlier request for this PR had no confirmed outcome, so this call only read GitHub back "
                      "and sent no new merge request. Unknown and queued requests remain observation-only.")
-    if receipt.get("republished"):
-        lines.append("Receipt publication retried; the merge was not repeated.")
+    # The receipt's retained, already bounded and redacted gh facts belong in this local
+    # response (#1555); the public PR-body block never carries them.
+    effect = receipt.get("effect") or {}
+    if effect and not effect.get("ok"):
+        facts = ", ".join([f"failure={effect.get('failure') or 'unknown'}"] + [
+            f"{key}={effect[key]}" for key in ("exit_code", "http_status") if effect.get(key) is not None])
+        output = str(effect.get("output") or "").strip()
+        lines.append(("Earlier merge request: " if receipt.get("readback_only") else "Merge request: ")
+                     + facts + (f": {output}" if output else ""))
+    if (receipt.get("outcome") or {}).get("reason"):
+        lines.append(f"GitHub readback: {receipt['outcome']['reason']}.")
     publication = receipt.get("publication") or {}
     if receipt.get("receipt_write_gap"):
         lines.append("⚠️ Merge receipt persistence is unknown after the external effect: "

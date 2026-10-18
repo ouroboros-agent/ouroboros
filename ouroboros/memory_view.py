@@ -433,30 +433,13 @@ Entry = Tuple[Dict[str, Any], Dict[str, Any], int]
 
 
 def _row_texts(root: pathlib.Path, entries: List[Entry]) -> Dict[str, Dict[str, Any]]:
-    """``row_sha256 -> row`` read by address: each hinted generation once, a missed hint by search."""
-    wanted: Dict[str, Dict[int, str]] = {}
-    for address, _meta, _pos in entries:
-        hint = _mapping(address.get("hint"))
-        if type(hint.get("line")) is int:
-            wanted.setdefault(str(hint.get("gen") or ""), {})[hint["line"]] = address["row_sha256"]
-    paths = {sig: path for path, sig in chat_chain.generation_signatures(root)}
-    rows: Dict[str, Dict[str, Any]] = {}
-    for gen, lines, last in ((gen, lines, max(lines)) for gen, lines in wanted.items()):  # max once, not per line
-        if gen not in paths:
-            continue
-        with paths[gen].open("rb") as handle:
-            for number, raw in enumerate(handle, 1):
-                sha = lines.get(number)
-                row = chat_chain._decoded(raw) if sha else None
-                if row is not None and chat_chain.source_row_id(row) == sha:
-                    rows[sha] = row
-                if number >= last:
-                    break
+    """Read exactly the selected row identities from the dialogue store."""
+    rows = {}
     for address, _meta, _pos in entries:
         if address["row_sha256"] not in rows:
-            found, _status = chat_chain.resolve_row(root, address)
-            if found is not None:
-                rows[address["row_sha256"]] = found
+            row, _status = chat_chain.resolve_row(root, address)
+            if row is not None:
+                rows[address["row_sha256"]] = row
     return rows
 
 

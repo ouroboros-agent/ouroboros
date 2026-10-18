@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 from ouroboros import context_compaction as compaction
@@ -211,9 +212,7 @@ def _unit(call_id: str) -> list[dict]:
     ]
 
 
-def test_context_capsule_checkpoint_is_actor_readable_and_dangling_is_explicit(
-    monkeypatch, tmp_path,
-):
+def test_context_capsule_checkpoint_is_actor_readable_and_dangling_is_explicit(tmp_path):
     messages = _unit("checkpointed")
     request = ContextReclaimRequest(
         route_fp="main-route",
@@ -224,30 +223,11 @@ def test_context_capsule_checkpoint_is_actor_readable_and_dangling_is_explicit(
         reclaim_goal_tokens=100,
         allow_partial_shrink=True,
     )
-    monkeypatch.setattr(compaction, "_summarizer_spec", lambda: {
-        "model": "summary-model",
-        "resolved_model": "summary-model",
-        "provider": "test",
-        "route_fp": "summary-route",
-        "effort": "low",
-        "output_budget": 32_768,
-        "use_local": False,
-    })
-    monkeypatch.setattr(
-        compaction,
-        "_call_summarizer",
-        lambda parts, **_kwargs: {
-            part.source_id: f"summary {part.sha256}" for part in parts
-        },
-    )
-
-    rebuilt, receipt, _usage = compaction.compact_tool_history_llm(
-        messages,
-        request=request,
-        drive_root=tmp_path,
-        task_id="checkpoint-task",
-        keep_recent=0,
-        negative_memo=set(),
+    request = replace(request, working_note="The command ran once.", keep_unit_ids=(),
+                      expected_view_revision=request.transcript_sha256)
+    rebuilt, receipt = compaction.compact_tool_history_llm(
+        messages, request=request, observed_messages=messages, tool_schemas=[],
+        fit_candidate=lambda *_: {"accepted": True}, drive_root=tmp_path, task_id="checkpoint-task",
     )
     assert receipt.status == "applied"
     capsule = rebuilt[0]["content"][0]["_context_capsule"]

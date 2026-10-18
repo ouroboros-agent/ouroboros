@@ -738,30 +738,31 @@ textarea.ui-control { resize: vertical; }
    body and no shadow. A state changes colour, never height: hover deepens the fill a step, a press deepens it again
    (--press), a chosen one takes its tone; what cannot be pressed now loses its shadow. `.ui-chrome-control` stays
    geometry only (a floating control's own tone is its page's): page styles map their controls onto these tones and
-   add no fourth recipe and no outline. */
-:root[data-theme] .btn { border-color: transparent; border-radius: var(--pill-radius); font-weight: 600; transition: var(--motion-tone); }
-:root[data-theme] :is(.btn-default, .btn-secondary) {
+   add no fourth recipe and no outline. These recipes are the product documents' own (their root is `.ouro-ui`);
+   `:where` keeps the specificity, and an author frame that sets `data-theme` keeps the overridable base recipe. */
+:root[data-theme]:where(.ouro-ui) .btn { border-color: transparent; border-radius: var(--pill-radius); font-weight: 600; transition: var(--motion-tone); }
+:root[data-theme]:where(.ouro-ui) :is(.btn-default, .btn-secondary) {
     border-color: transparent; background: var(--surface-capsule); color: var(--text-primary); box-shadow: var(--elev-rest);
 }
-:root[data-theme] :is(.btn-default, .btn-secondary):not(:disabled):hover { border-color: transparent; background: var(--surface-capsule-hover); }
-:root[data-theme] .btn-ghost { border-color: transparent; background: transparent; box-shadow: none; }
-:root[data-theme] .btn-ghost:not(:disabled):hover { background: var(--tone-quiet-hover); }
-:root[data-theme] .btn-primary { background: var(--tone-crimson); color: var(--tone-crimson-ink); box-shadow: var(--elev-rest); }
-:root[data-theme] .btn-primary:not(:disabled):hover { background: var(--tone-crimson-hover); }
-:root[data-theme] .btn-save { background: var(--tone-green); color: var(--status-ok-fg); box-shadow: var(--elev-rest); }
-:root[data-theme] .btn-save:not(:disabled):hover { background: var(--tone-green-hover); }
-:root[data-theme] .btn-danger { border-color: transparent; background: var(--tone-red); color: var(--status-error-fg); box-shadow: var(--elev-rest); }
-:root[data-theme] .btn-danger:not(:disabled):hover { border-color: transparent; background: var(--tone-red-hover); }
-:root[data-theme] .btn:hover { transform: none; }
-:root[data-theme] :is(.btn, .theme-choice):not(:disabled):active { transform: none; filter: var(--press); }
-:root[data-theme] .btn-ghost:not(:disabled):active { box-shadow: none; }
-:root[data-theme] .btn:disabled { box-shadow: none; }
+:root[data-theme]:where(.ouro-ui) :is(.btn-default, .btn-secondary):not(:disabled):hover { border-color: transparent; background: var(--surface-capsule-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-ghost { border-color: transparent; background: transparent; box-shadow: none; }
+:root[data-theme]:where(.ouro-ui) .btn-ghost:not(:disabled):hover { background: var(--tone-quiet-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-primary { background: var(--tone-crimson); color: var(--tone-crimson-ink); box-shadow: var(--elev-rest); }
+:root[data-theme]:where(.ouro-ui) .btn-primary:not(:disabled):hover { background: var(--tone-crimson-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-save { background: var(--tone-green); color: var(--status-ok-fg); box-shadow: var(--elev-rest); }
+:root[data-theme]:where(.ouro-ui) .btn-save:not(:disabled):hover { background: var(--tone-green-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-danger { border-color: transparent; background: var(--tone-red); color: var(--status-error-fg); box-shadow: var(--elev-rest); }
+:root[data-theme]:where(.ouro-ui) .btn-danger:not(:disabled):hover { border-color: transparent; background: var(--tone-red-hover); }
+:root[data-theme]:where(.ouro-ui) .btn:hover { transform: none; }
+:root[data-theme]:where(.ouro-ui) :is(.btn, .theme-choice):not(:disabled):active { transform: none; filter: var(--press); }
+:root[data-theme]:where(.ouro-ui) .btn-ghost:not(:disabled):active { box-shadow: none; }
+:root[data-theme]:where(.ouro-ui) .btn:disabled { box-shadow: none; }
 /* The Appearance choice is one control in both documents (the SPA and the served setup page load only this sheet
    in common): neutral capsules, the chosen one in the crimson tone, all standing. */
-:root[data-theme] .theme-choice {
+:root[data-theme]:where(.ouro-ui) .theme-choice {
     border-color: transparent; border-radius: var(--pill-radius); background: var(--surface-capsule); box-shadow: var(--elev-rest);
     transition: var(--motion-tone);
 }
-:root[data-theme] .theme-choice:hover { border-color: transparent; background: var(--surface-capsule-hover); }
-:root[data-theme] .theme-choice[aria-checked="true"] { border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); }
-:root[data-theme] :is(.ui-chip, .status-badge) { border-color: transparent; }
+:root[data-theme]:where(.ouro-ui) .theme-choice:hover { border-color: transparent; background: var(--surface-capsule-hover); }
+:root[data-theme]:where(.ouro-ui) .theme-choice[aria-checked="true"] { border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); }
+:root[data-theme]:where(.ouro-ui) :is(.ui-chip, .status-badge) { border-color: transparent; }

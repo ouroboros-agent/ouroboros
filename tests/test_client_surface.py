@@ -13,6 +13,8 @@ import json
 import pathlib
 from types import SimpleNamespace
 
+from tests._dialogue import chat_rows
+
 from ouroboros.client_surface import (
     CLIENT_SURFACE_UA_LIMIT,
     client_surface_identity,
@@ -126,7 +128,7 @@ def test_log_chat_persists_client_surface_column(tmp_path, monkeypatch):
     fact = {"pywebview": True, "ua": "TestShell/1.0"}
     mb.log_chat("in", 1, 1, "hello", source="web", client_surface=fact)
     mb.log_chat("in", 1, 1, "bare", source="web")
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines()]
+    rows = chat_rows(tmp_path)
     assert rows[0]["client_surface"] == fact
     assert "client_surface" not in rows[1]
 
@@ -448,7 +450,7 @@ def test_inbound_message_owner_persists_the_original_client_surface(tmp_path, mo
         SimpleNamespace(), message, chat_id=1, user_id=1,
         client_message_id="surface-message", text="owner input", ts="2026-09-07T00:00:00Z",
     )
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8"))
+    (row,) = chat_rows(tmp_path)
     assert row["client_surface"] == surface
     assert row["client_message_id"] == ref["client_message_id"] == "surface-message"
     assert row["text"] == "owner input" and row["direction"] == "in"
@@ -543,7 +545,7 @@ def test_the_common_enqueue_stamps_one_host_receipt_for_every_transport(tmp_path
     monkeypatch.setattr(message_bus, "load_state", lambda: {})
     message_bus.record_inbound_message(bridge, command, chat_id=1, user_id=1, client_message_id="c1",
                                        text="via /api/command", ts="2026-09-26T09:00:00+00:00")
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8"))
+    (row,) = chat_rows(tmp_path)
     assert row["client_surface"]["received_at"] == command["received_at"] and "logged_at" not in row
 
 

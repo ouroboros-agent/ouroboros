@@ -410,8 +410,8 @@
   {
     "id": "test_styles_cover_chat_header_controls_and_grouped_cards",
     "path": "web/style.css",
-    "kind": "contains",
-    "value": ".chat-live-card[data-expanded=\"1\"] > .chat-live-timeline {"
+    "kind": "regex",
+    "value": "\\.chat-live-card\\[data-expanded=\"1\"\\] > \\.chat-live-timeline(?:,[^{,]+)*\\s*\\{\\s*display: flex;"
   },
   {
     "id": "test_styles_cover_chat_header_controls_and_grouped_cards",
@@ -489,7 +489,13 @@
     "id": "test_live_card_has_inline_typing_dots_and_pulsing_phase_badge",
     "path": "web/style.css",
     "kind": "contains",
-    "value": ".chat-live-phase[data-motion=\"1\"], .chat-live-phase-secondary[data-motion=\"1\"]"
+    "value": ".chat-live-phase[data-motion=\"1\"]::before, .chat-live-phase-secondary[data-motion=\"1\"] { animation: none; }"
+  },
+  {
+    "id": "test_live_card_has_inline_typing_dots_and_pulsing_phase_badge",
+    "path": "web/style.css",
+    "kind": "contains",
+    "value": ".chat-live-phase[data-motion=\"1\"]::before {\n    animation: live-dot-breathe"
   },
   {
     "id": "test_live_card_has_inline_typing_dots_and_pulsing_phase_badge",
@@ -903,7 +909,7 @@
     "id": "test_history_replay_resyncs_after_reconnect",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "fromReconnect: isReconnect"
+    "value": "isReconnect ? syncHistory({ fromReconnect: true })"
   },
   {
     "id": "test_history_replay_resyncs_after_reconnect",
@@ -1227,7 +1233,7 @@
     "id": "test_chat_block_chrome_follows_work",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "        const wanted = isMain && work && record.root.dataset.projectBound !== '1'"
+    "value": "portals.syncConvert(record, isMain && work && !isPortal(record) && !(window.__ouroTaskBindings || {})[record.groupId]);"
   },
   {
     "id": "test_chat_block_chrome_follows_work",

@@ -216,11 +216,16 @@ def test_real_late_collector_revisits_only_pending_plan_after_legacy_history(cou
             txn.store_task(document(f"old-{i:03}", plan_record=_record([_participant("done", status="answered")]),
                                     result="retained answer" * 500))
         txn.conn.execute("UPDATE tasks SET plan_collection_pending=NULL WHERE task_id LIKE 'old-%'")
-    commits, original_commit = [], store.commit
+    commits, original_commit, totals = [], store.commit, {}
 
     def committed(conn):
-        commits.append(conn.total_changes)
+        # total_changes is cumulative on a cached connection: this transaction's rows are the step.
+        total = conn.total_changes
+        commits.append(total - totals.get(id(conn), (conn, 0))[1])
+        totals[id(conn)] = (conn, total)
         return original_commit(conn)
+
+    store.close_connections()  # fresh connections count from zero
 
     with monkeypatch.context() as patch:
         patch.setattr(store, "commit", committed)
@@ -307,4 +312,6 @@ def test_storeless_roundtrip_and_reimport_preserve_plan_and_derive_selector(tmp_
     closed["plan_record"]["asks"][0]["participants"][0]["status"] = "answered"
     copied.write_text(json.dumps(closed), encoding="utf-8")
     store_import.ensure_current_store(restored, with_children=False)
+    assert task_store.read_document(restored, "task") == original  # boot only opens the store
+    store_import.run_legacy_reconcile(restored)
     assert task_store.read_document(restored, "task") == closed and _flags(restored, "task")[1] == 0

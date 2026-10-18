@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from ouroboros import artifacts, subagent_worktrees as wt, workspace_patch_capture as capture
+from ouroboros import subagent_worktrees as wt, workspace_patch_capture as capture
 from ouroboros.platform_layer import _lock_identity, pid_is_alive
 from tests._delegated_transport_shared import _owned_gateway_uses_each_test_transport  # noqa: F401
 from tests.test_delegated_full_access import full_run  # noqa: F401
@@ -43,7 +43,7 @@ def _phase_spies(monkeypatch, snaps):
     """Record whether the lock was held when each phase ran."""
     seen: dict = {}
     real_verdicts, real_copy, real_git, real_git_env, real_save = (
-        capture.untracked_binary_verdicts, artifacts.copy_artifact_file, wt._git, wt._git_env, wt._save_registry)
+        capture.untracked_binary_verdicts, wt._fill_private_copy, wt._git, wt._git_env, wt._save_registry)
 
     def spy_git_env(repo_dir, *args, **kw):  # baseline staging goes through _git_env, not _git
         for marker in ("update-index", "write-tree", "commit-tree"):
@@ -55,9 +55,9 @@ def _phase_spies(monkeypatch, snaps):
         seen["classify"] = _lock_held(snaps)
         return real_verdicts(root, rels, **kw)
 
-    def spy_copy(source, destination, **kw):
+    def spy_copy(source, destination, copy_root):
         seen["copy"] = _lock_held(snaps)
-        return real_copy(source, destination, **kw)
+        return real_copy(source, destination, copy_root)
 
     def spy_git(repo_dir, *args, **kw):
         for marker in ("update-index", "commit-tree", "reset", "update-ref", "worktree"):
@@ -70,7 +70,7 @@ def _phase_spies(monkeypatch, snaps):
         return real_save(entries, data_dir)
 
     monkeypatch.setattr(capture, "untracked_binary_verdicts", spy_verdicts)
-    monkeypatch.setattr(artifacts, "copy_artifact_file", spy_copy)
+    monkeypatch.setattr(wt, "_fill_private_copy", spy_copy)
     monkeypatch.setattr(wt, "_git", spy_git)
     monkeypatch.setattr(wt, "_git_env", spy_git_env)
     monkeypatch.setattr(wt, "_save_registry", spy_save)
@@ -418,7 +418,7 @@ def test_a_failure_after_the_provisional_row_leaves_nothing_and_a_crash_is_gc_re
     def boom(*_a, **_k):
         raise OSError("copy failed")
 
-    monkeypatch.setattr(artifacts, "copy_artifact_file", boom)
+    monkeypatch.setattr(wt, "_fill_private_copy", boom)
     with pytest.raises(OSError, match="copy failed"):
         _provision(target, snaps, data, snapshot_id="snapFail")
     assert wt.find_execution_snapshot("snapFail", data_dir=data) is None

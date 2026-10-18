@@ -545,6 +545,46 @@ class TestBuildWindowsPs1:
         assert all(match.start() < _find_pyinstaller_cmd_pos(src) for match in installs)
 
 
+def test_python_standalone_pin_is_the_fixed_sqlite_release():
+    """Desktop packages take CPython 3.10.22 from python-build-standalone 20261009.
+
+    That release is the last one that still ships Python 3.10, and its SQLite
+    is 3.53.1 (the WAL-reset fix). The two download scripts are the pin.
+    """
+    shell = _read("scripts/download_python_standalone.sh")
+    windows = _read("scripts/download_python_standalone.ps1")
+    assert 'RELEASE="20261009"' in shell
+    assert 'PY_VERSION="3.10.22"' in shell
+    assert '$Release = "20261009"' in windows
+    assert '$PyVersion = "3.10.22"' in windows
+    assert "20260211" not in shell and "20260211" not in windows
+    assert "3.10.19" not in shell and "3.10.19" not in windows
+    for platform in (
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+    ):
+        assert platform in shell
+    assert "x86_64-pc-windows-msvc" in windows
+    pinned = dict(re.findall(r'PLATFORM="([^"]+)"\n\s+SHA256="([0-9a-f]{64})"', shell))
+    assert set(pinned) == {
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+    }
+    windows_sha = re.search(r'\$Sha256 = "([0-9a-f]{64})"', windows)
+    assert windows_sha is not None
+    docker = _read("Dockerfile")
+    docker_sha = dict(re.findall(r'PLATFORM="([^"]+)"; SHA256="([0-9a-f]{64})"', docker))
+    assert docker_sha == {
+        "x86_64-unknown-linux-gnu": pinned["x86_64-unknown-linux-gnu"],
+        "aarch64-unknown-linux-gnu": pinned["aarch64-unknown-linux-gnu"],
+    }
+    assert windows_sha.group(1) not in docker_sha.values()
+
+
 # ---------------------------------------------------------------------------
 # Dockerfile  (Docker / web runtime)
 # ---------------------------------------------------------------------------
@@ -592,10 +632,30 @@ class TestDockerfile:
     """
 
     def test_build_is_self_contained(self):
-        """``docker build -t ouroboros-web .`` must not depend on a locally built base tag."""
+        """``docker build -t ouroboros-web .`` must not depend on a locally built base tag.
+
+        The interpreter is the pinned python-build-standalone build, checked in
+        the image build for Python 3.10.22 and SQLite >= 3.51.3.
+        """
         src = _read("Dockerfile")
-        assert "FROM python:3.10-slim" in src
+        assert "FROM python:3.10-slim" not in src
+        assert "FROM debian:trixie-slim" in src
+        assert "ghcr.io/astral-sh/uv:" in src
         assert "FROM ${" not in src, "the image must not start from an unpublished local tag"
+        assert "sha256sum -c -" in src
+        assert "assert sqlite>=(3, 51, 3)" in src
+        assert "--python /opt/python-standalone/bin/python3" in src
+
+    def test_runtime_stage_keeps_the_python_base_packages(self):
+        """debian:trixie-slim lacks what python:3.10-slim installed: without CA
+        certificates git and OpenSSL cannot verify HTTPS (Update fetches), and
+        tzdata/netbase back zoneinfo and service lookups."""
+        src = _read("Dockerfile")
+        runtime = src[src.index("FROM debian:trixie-slim AS runtime"):]
+        install = re.search(r"apt-get install -y --no-install-recommends ([^\\\n]+)", runtime)
+        assert install is not None
+        assert {"ca-certificates", "git", "netbase", "tzdata"} <= set(install.group(1).split())
+        assert "LANG=C.UTF-8" in runtime
 
     def test_playwright_pin_matches_lock(self):
         src = _read("Dockerfile")
@@ -636,6 +696,21 @@ class TestDockerfile:
             "a PLAYWRIGHT_BROWSERS_PATH=0 prefix hides /ms-playwright and makes the lane download at test time"
         )
         assert "playwright install --only-shell" not in ci, "the portable lane measures the shipped image"
+
+    def test_ci_docker_builds_never_bake_the_checkout_token(self):
+        """`COPY . .` keeps `.git`, so a job building the image from its checkout must not
+        persist GITHUB_TOKEN as `.git/config`'s extraheader into a layer (#1263)."""
+        import yaml
+
+        jobs = yaml.safe_load(_read(".github/workflows/ci.yml"))["jobs"]
+        building = sorted(name for name, job in jobs.items()
+                          if any("docker build" in str(step.get("run", "")) for step in job.get("steps", [])))
+        assert {"docker-portable-test", "docker-ui-smoke"} <= set(building), building
+        for name in building:
+            checkouts = [step for step in jobs[name]["steps"]
+                         if str(step.get("uses", "")).startswith("actions/checkout@")]
+            assert checkouts, name
+            assert all((step.get("with") or {}).get("persist-credentials") is False for step in checkouts), name
 
 
 @pytest.mark.parametrize(

@@ -36,7 +36,7 @@ def test_closed_segments_are_stat_once_until_the_chain_rotates(tmp_path, monkeyp
     real = pathlib.Path.stat
 
     def counted(self, *args, **kwargs):
-        stats.append(str(self))
+        stats.append(self.as_posix())  # one separator, so a native Windows path is counted too
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(pathlib.Path, "stat", counted)

@@ -1462,8 +1462,3 @@ def rotate_jsonl_log_if_needed(
         path.touch()
     finally:
         release_exclusive_file_lock(lock_path, lock_fd)
-
-
-def rotate_chat_log_if_needed(drive_root: pathlib.Path, max_bytes: int = 800_000) -> None:
-    """Compatibility wrapper: chat.jsonl rotation via the generalized rotator."""
-    rotate_jsonl_log_if_needed(drive_root, "chat.jsonl", "chat", max_bytes)

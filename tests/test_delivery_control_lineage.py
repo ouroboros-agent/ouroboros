@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import copy
 import hashlib
 import json
@@ -901,10 +903,7 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
 
     assert transported == [(7, decoded)]
     assert pending_deliveries(tmp_path) == []
-    chat_rows = [
-        json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    chat_rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     delivered_rows = [row for row in chat_rows if row.get("task_id") == "issue-449"]
     assert [row["text"] for row in delivered_rows] == [decoded]
     assert delivered_rows[0]["format"] == "markdown"

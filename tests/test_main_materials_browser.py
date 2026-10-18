@@ -1,21 +1,21 @@
 """Main question materials and Project result navigation through the real SPA.
 
 Readers, explicit downloads, keyboard navigation and reloads use the production
-server. Evidence is retained via OUROBOROS_BROWSER_EVIDENCE_OUT, including RED.
+server. Evidence goes to the shared diagnostic channel, or an explicit
+OUROBOROS_BROWSER_EVIDENCE_OUT, including RED.
 """
 
 import hashlib
 import struct
 import zlib
 import json
-import os
 import re
-from pathlib import Path
 
 import pytest
 
 from devtools.benchmarks.common.server_runner import _api
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
+from tests._shared import producer_evidence_dir
 from tests.system_e2e.harness import KeylessIsolatedServer, ScriptedStubModel, keyless_settings, write_settings_file
 
 wait_clone = clone_fixture
@@ -77,7 +77,8 @@ def _m1660_material_question(root):
 
 
 def _m1660_material_evidence(tmp_path, stem):
-    evidence = Path(os.environ.get('OUROBOROS_BROWSER_EVIDENCE_OUT') or tmp_path / 'screenshots') / stem
+    evidence = producer_evidence_dir(tmp_path / 'screenshots', "main-materials",
+                                     env='OUROBOROS_BROWSER_EVIDENCE_OUT') / stem
     evidence.mkdir(parents=True, exist_ok=True)
     return evidence
 
@@ -375,17 +376,21 @@ def test_main_final_released_with_its_history_page_mounts_again_with_project_doo
     import time
     from datetime import datetime, timedelta, timezone
     from playwright.sync_api import expect, sync_playwright
-    from tests.test_chat_history_paging_browser import MAIN, _idle, _open, _step, _write
+    from ouroboros import dialogue_store
+    from tests import _dialogue as dialogue_test
+    from tests.test_chat_history_paging_browser import MAIN, _idle, _open, _step
     from tests.ui_chat_viewport_smoke import _emit_ws_frame
 
     root = tmp_path / 'instance' / 'data'
     root.mkdir(parents=True)
     repo = tmp_path / 'artifact-producer-repo'
     repo.mkdir()
-    # Four Main pages older than the final: one history read holds 150 conversation rows.
-    _write(root / 'archive' / 'chat_20260901T000000.jsonl', [
+    # Four Main pages older than the final: one history read holds 150 conversation rows, an older
+    # install's archive that the upgrade imports before the final is written.
+    dialogue_test.seed(root, archives={'chat_20260901T000000.jsonl': [
         {'ts': '2026-09-01T10:00:00Z', 'chat_id': 1, 'direction': 'in', 'text': f'Older Main message {index:04d}'}
-        for index in range(620)])
+        for index in range(620)]})
+    dialogue_test.import_all(root)
     answer = '\n\n'.join(f'Paragraph {index}: the retained reports are ready to read.' for index in range(1, 31))
     receipt, payloads = _m1660_seed_readable_inventory(root, repo, answer=answer)
     receipt.update(engine=engine)
@@ -408,10 +413,9 @@ def test_main_final_released_with_its_history_page_mounts_again_with_project_doo
             server.stop()
             # Newer Main conversation puts the final one page back from the newest read.
             start = datetime.now(timezone.utc)
-            with (root / 'logs' / 'chat.jsonl').open('a', encoding='utf-8') as stream:
-                for index in range(160):
-                    stream.write(json.dumps({'ts': (start + timedelta(seconds=index)).isoformat(), 'chat_id': 1,
-                                             'direction': 'in', 'text': f'Newer Main message {index:04d}'}) + '\n')
+            for index in range(160):
+                dialogue_store.append(root, 'chat', {'ts': (start + timedelta(seconds=index)).isoformat(), 'chat_id': 1,
+                                                     'direction': 'in', 'text': f'Newer Main message {index:04d}'})
             server.start(ready_timeout=120)
             with sync_playwright() as pw:
                 browser = getattr(pw, engine).launch()

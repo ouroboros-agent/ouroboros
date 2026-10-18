@@ -249,6 +249,8 @@ def collect_terminal(root, run_id: str, *, gateway=None, detail: dict | None = N
                 and not disposition_refusal(root, entry)):
             try:
                 capture = capture_terminal_patch_for_drive(root, entry, gateway=gateway, retain_investigation=False)
+                if isinstance(capture, dict) and capture.get("status") == "failed":  # a typed failure stays owed
+                    raise RuntimeError(str(capture.get("note") or "patch capture failed"))
             except Exception as exc:
                 errors.append(f"capture:{type(exc).__name__}")
                 _collection_failure(entry, "capture", exc, failures)
@@ -294,13 +296,20 @@ def capture_projection(root, entry, *, reader_task_id="") -> dict | None:
     try:
         manifest = json.loads((cap_dir / "workspace_patch.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"status": "pending", "note": "Body capture is still owed; no patch was applied.",
+        from ouroboros.delegate_registration_policy import evidence_only
+
+        if evidence_only(entry):  # no author decision is owed
+            return {"status": "pending", "note": "Body capture is still owed; evidence only, never applied.",
+                    "patch_disposition": entry.patch_disposed or "not_applicable"}
+        return {"status": "pending", "note": "Body capture is still owed; no patch was applied. integrate_delegated_patch "
+                "prepares a finished run's capture itself and returns it for inspection first.",
                 "patch_disposition": entry.patch_disposed or "pending"}
     if directory:
         from ouroboros.delegate_directory import directory_capture_block
-        return directory_capture_block(root, entry, manifest)
-    from ouroboros.tools.delegate_integration import _capture_block
-    block = _capture_block(entry, cap_dir, manifest, manifest.get("authority_drift") or {})
+        block = directory_capture_block(root, entry, manifest)
+    else:
+        from ouroboros.tools.delegate_integration import _capture_block
+        block = _capture_block(entry, cap_dir, manifest, manifest.get("authority_drift") or {})
     if reader_task_id and reader_task_id != entry.task_id:
         for kind in ("patch", "manifest"):
             if block.get(f"{kind}_read") and block.get(f"{kind}_artifact"):
@@ -341,6 +350,8 @@ class BodyRuntime:
         self.retry_requested: set[str] = set()
         self.collection_attempts: dict[str, tuple] = {}
         self.collection_failures: dict[str, dict] = {}
+        # Each held run's latest dated execution fact, as the last observation read it.
+        self.observed: dict[str, dict] = {}
         self._observing = None
         self.thread = threading.Thread(target=self._drive, name="delegated-body", daemon=True)
         try:
@@ -412,10 +423,31 @@ class BodyRuntime:
         try:
             detail = gateway.get_run(entry.run_id, timeout_sec=SHORT_POLL_TIMEOUT_SEC)
         except BaseException:
+            self._remember(entry, None)
             self._drop_observer_gateway(gateway)  # a moved or restarted daemon gets a fresh handshake
             raise
         # A late valid source fact remains evidence; it grants no wait.
         observe_run(self.root, entry, detail)
+        self._remember(entry, detail)
+
+    def _remember(self, entry, detail):
+        """Keep this read's execution fact for readers that must not poll the engine themselves
+        (``gateway/reply_preparation.py``); ``detail`` None is a read nothing answered."""
+        from ouroboros.delegate_supervision import run_activity
+
+        summary = c.summary_of(detail) if detail is not None else {}
+        fact = {"run_id": entry.run_id, "task_id": entry.task_id, "invocation_id": entry.invocation_id,
+                "answered": detail is not None, "run_state": str(summary.get("state") or ""),
+                "waiting_on_user": bool(summary.get("waitingOnUser") or (detail or {}).get("pendingInteractions")),
+                "at": time.monotonic()}  # dated on this process's clock, like every in-process reader
+        with self.lock:
+            previous, self.observed[entry.run_id] = self.observed.get(entry.run_id), fact
+        if run_activity(fact) is True and (previous is None or run_activity(previous) is not True):
+            _announce_working(entry)  # first seen working too: a restarted host's idle cue learns of it
+
+    def observation(self, run_id) -> dict:
+        with self.lock:
+            return dict(self.observed.get(str(run_id)) or {})
 
     def _collect(self, run_id):
         try:
@@ -451,6 +483,9 @@ class BodyRuntime:
             entry = current.run(self.root, rid)
             if entry is not None:
                 entries[rid] = entry
+        with self.lock:
+            for rid in set(self.observed) - set(entries):
+                del self.observed[rid]  # a run no longer held has no current execution fact
         with self.lock:
             self.retry_requested.intersection_update(
                 rid for rid in self.retry_requested
@@ -505,6 +540,47 @@ class BodyRuntime:
         self.changed.set()
         if wait and threading.current_thread() is not self.thread:
             self.thread.join()
+
+
+def _announce_working(entry) -> None:
+    """A held run works now and did not at its last read (or had none): say so the way a
+    resumed attempt does, since its task may be a sleeper whose Telegram typing had stopped
+    (DESIGN §9). Best effort: a lost frame costs one missed cue."""
+    from types import SimpleNamespace
+
+    try:
+        from ouroboros.model_sleep import announce_resumed
+        from supervisor import queue as q
+        from supervisor.active_activity import get_direct_activity_registry
+        from supervisor.workers import get_event_q
+
+        with q._queue_lock:
+            rows = [meta.get("task") for meta in q.RUNNING.values() if isinstance(meta, dict)] + list(q.PENDING)
+        task = next((row for row in rows if isinstance(row, dict) and str(row.get("id") or "") == entry.task_id), None)
+        turn = get_direct_activity_registry().get(entry.task_id) if task is None else None
+        if task is None and turn is None:
+            return
+        announce_resumed(SimpleNamespace(event_queue=get_event_q(create=False), task_id=entry.task_id,
+                                         current_chat_id=task.get("chat_id") if task is not None else turn.chat_id))
+    except Exception:
+        log.debug("Working-again announce unavailable for %s", entry.run_id, exc_info=True)
+
+
+def current_activity(root, task_id: str, run_id: str, invocation_id: str = ""):
+    """Whether a held run works now by this observer's latest read: the same run, task and
+    (when given) invocation, read within a few ticks; anything else is None (unknown)."""
+    from ouroboros.delegate_supervision import _OBSERVATION_CURRENT_SEC, run_activity
+
+    runtime = body_runtime(root)
+    fact = runtime.observation(run_id) if runtime is not None else {}
+    try:
+        current = "at" in fact and time.monotonic() - float(fact["at"]) <= _OBSERVATION_CURRENT_SEC
+    except (TypeError, ValueError):
+        current = False
+    if (not current or fact.get("task_id") != str(task_id)
+            or (invocation_id and fact.get("invocation_id") != str(invocation_id))):
+        return None
+    return run_activity(fact)
 
 
 def start_body_runtime(root, *, stop_event=None, gateway_factory=None, max_workers=None) -> BodyRuntime:

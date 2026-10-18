@@ -60,8 +60,8 @@ def _governance_text(system_root: pathlib.Path, rel_path: str) -> str:
 def _session_task_text(system_prompt: str, user_content: str, session_root: str) -> str:
     return (
         "RETRIEVING REVIEWER (agent session): you review "
-        f"{session_root or 'the active workspace'} (read-only, or in a private checking copy of it "
-        "when your seat holds write access). The evidence below is the host's REDACTED "
+        f"{session_root or 'the active workspace'} (read-only, or from your own private checking folder "
+        "when your seat holds write access; its checking instructions say what it holds). The evidence below is the host's REDACTED "
         "snapshot — the same bytes every reviewer sees — so do NOT re-read the raw evidence "
         "locators (a session reading originals would leak what the api route redacts, 4e133c8a); "
         "the ONE exception is the governance pack — its named sources are public "

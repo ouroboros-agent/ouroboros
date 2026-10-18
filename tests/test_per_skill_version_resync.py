@@ -374,21 +374,26 @@ def test_telegram_owner_wait_upgrade_reseeds_current_version(tmp_path, fake_log)
     )
 
     assert upgraded == 1
-    assert "version: 1.3.0" in (installed / "SKILL.md").read_text(encoding="utf-8")
+    assert "version: 1.3.3" in (installed / "SKILL.md").read_text(encoding="utf-8")
     for path in ("plugin.py", "lib/telegram_quiz.py", "lib/telegram_state.py"):
         assert (installed / path).read_bytes() == (seed_dir / "telegram" / path).read_bytes()
 
 
 @pytest.mark.serial
 @pytest.mark.parametrize("name,source,old_version,new_version", [
-    ("telegram", "d918b6973235013e5d7b9d78fe98701979396d4f", "1.2.6", "1.3.0"),
-    ("telegram", "5133c379dbde841c53f6a9ddbea2dbd8225da737", "1.2.11", "1.3.0"),
+    ("telegram", "d918b6973235013e5d7b9d78fe98701979396d4f", "1.2.6", "1.3.3"),
+    ("telegram", "5133c379dbde841c53f6a9ddbea2dbd8225da737", "1.2.11", "1.3.3"),
     # The published PID1 seed (#1780): an install already on 1.2.12 receives the closed-state payload.
-    ("telegram", "28dbbd4b4b029752f11bfd08d00ea5a05da9e89a", "1.2.12", "1.3.0"),
-    ("telegram", "4bb7526b2644ed5a0cbdfd845066ef7a86ea261c", "1.2.13", "1.3.0"),
-    ("telegram", "0b96e0964ecf", "1.2.14", "1.3.0"),
-    ("unix_computer_use", "162ad3fe6791fcaf6cf625e6b0c50d3a2a27e7f8", "0.4.1", "0.4.3"),
-    ("unix_computer_use", "ec3fc6e5b5ae5ee99a746b5e1a0f6343a41926d4", "0.4.2", "0.4.3"),
+    ("telegram", "28dbbd4b4b029752f11bfd08d00ea5a05da9e89a", "1.2.12", "1.3.3"),
+    ("telegram", "4bb7526b2644ed5a0cbdfd845066ef7a86ea261c", "1.2.13", "1.3.3"),
+    ("telegram", "0b96e0964ecf", "1.2.14", "1.3.3"),
+    ("telegram", "181b7ff4029a89c33b7060150b8dda91cc568090", "1.3.0", "1.3.3"),
+    ("telegram", "8fc237123292", "1.3.0", "1.3.3"),
+    ("telegram", "7f71fe8d29c975e25b35a235e1c821e1b547674f", "1.3.1", "1.3.3"),
+    ("telegram", "6014e8896dabe371f5c06cf8adc5dc9902f53c2d", "1.3.2", "1.3.3"),
+    ("unix_computer_use", "162ad3fe6791fcaf6cf625e6b0c50d3a2a27e7f8", "0.4.1", "0.5.0"),
+    ("unix_computer_use", "ec3fc6e5b5ae5ee99a746b5e1a0f6343a41926d4", "0.4.2", "0.5.0"),
+    ("unix_computer_use", "1e237c1bc89f0600a7362f69eddafdff4ddd1f2d", "0.4.3", "0.5.0"),
 ])
 def test_resync_delivers_payload_from_real_previous_seed(
     tmp_path, fake_log, monkeypatch, name, source, old_version, new_version,
@@ -409,6 +414,8 @@ def test_resync_delivers_payload_from_real_previous_seed(
     drive = tmp_path / "data"
     monkeypatch.setenv("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS", "true")
     monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", drive / "settings.json")
+    # The Unix seed applies on macOS/Linux only; pin a host it applies to.
+    monkeypatch.setattr("ouroboros.contracts.skill_manifest.host_platform", lambda: "linux")
     native = drive / "skills" / "native"
     installed = native / name
     installed.mkdir(parents=True)
@@ -438,6 +445,14 @@ def test_resync_delivers_payload_from_real_previous_seed(
         changed_payload = ("lib/telegram_notifier.py", "plugin.py")
     if name == "telegram" and old_version == "1.2.14":
         changed_payload = ("lib/telegram_api.py", "lib/telegram_state.py", "lib/telegram_notifier.py", "plugin.py")
+    if name == "telegram" and old_version == "1.3.0":
+        changed_payload = ("plugin.py", "lib/telegram_state.py")
+        assert not (installed / "lib/telegram_typing.py").exists()
+    if name == "telegram" and old_version == "1.3.1":
+        changed_payload = ("lib/telegram_state.py",)
+        assert (installed / "lib/telegram_typing.py").read_bytes() == (repo / "skills/telegram/lib/telegram_typing.py").read_bytes()
+    if name == "telegram" and old_version == "1.3.2":
+        changed_payload = ("lib/telegram_notifier.py",)
     for path in changed_payload:
         assert (installed / path).read_bytes() != (repo / "skills" / name / path).read_bytes()
     save_enabled(drive, name, False)

@@ -1,14 +1,12 @@
-"""Response maxima reach planning, complete compaction, and native/API consumers."""
+"""Response maxima reach planning and native/API consumers."""
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import capability_evidence as ce, context_compaction as cc, usage_accounting as ua
+from ouroboros import capability_evidence as ce, usage_accounting as ua
 from ouroboros.response_limits import record_response_ack, resolve_response_limit
 from tests import test_llm_claudexor as claudexor_fixtures, test_processing_transport as transport_fixtures
-from tests.test_context_reclaim_materializer import _unit, _request, _SPEC, _install_pure_dependencies
 from tests.test_llm_claudexor import MODEL
 
 transport = transport_fixtures.transport
@@ -50,56 +48,6 @@ def test_real_reviewer_repair_and_forced_candidate_share_the_physical_ceiling(tr
         model=model, reasoning_effort="high")
     assert prospective.max_completion_tokens == 4096
     assert len(ledger_rows(root)) == 2  # Preparing a forced send reserves nothing.
-
-
-def test_light_map_batches_and_json_fallback_share_cap_and_keep_incomplete_source_raw(tmp_path, monkeypatch):
-    from ouroboros import llm_observability
-    _install_pure_dependencies(monkeypatch)
-    monkeypatch.setattr(cc, "_summarizer_spec", lambda: {**_SPEC, "output_budget": 512})
-    calls = []
-    def complete(_client, **kwargs):
-        source = kwargs["messages"][0]["content"]
-        rows = json.loads(source.rsplit('\n', 1)[-1])
-        calls.append((kwargs, rows))
-        assert kwargs["max_tokens"] == 512
-        assert len(rows) == 1 and rows[0]["summary_budget_tokens"] == 384
-        assert "-result-tail-" in rows[0]["content"]
-        if kwargs.get("tools"):
-            return {"content": "no structured summary"}, {}
-        entries = [{"source_id": row["source_id"], "summary": "kept complete source"} for row in rows]
-        message = {"content": json.dumps({"summaries": entries})}
-        # A partial generation must never replace the raw source, even if it parses.
-        return message, {"response_finish_reason": "length"} if "-result-tail-incomplete" in source else {}
-    monkeypatch.setattr(llm_observability, "chat_observed", complete)
-    messages = [*_unit("complete", "a"), *_unit("incomplete", "b"), *_unit("neighbor", "c")]
-    rebuilt, receipt, _ = cc.compact_tool_history_llm(messages, request=_request(messages, 99999),
-        drive_root=tmp_path, task_id="compaction", negative_memo=set())
-    assert len(calls) == 6
-    assert all("tools" in calls[i][0] and "tools" not in calls[i + 1][0] for i in (0, 2, 4))
-    assert receipt.status == "applied"
-    assert messages[2] in rebuilt and messages[3] in rebuilt
-    assert messages[0] not in rebuilt and messages[4] not in rebuilt
-
-
-def test_fold_and_structured_continuation_keep_the_same_output_budget(tmp_path, monkeypatch):
-    from ouroboros import llm_observability
-    parts = [cc._part("unit", "begin", 0), cc._part("unit", "tail", 5)]
-    calls = []
-    def complete(_client, **kwargs):
-        calls.append(kwargs)
-        source = kwargs["messages"][0]["content"]
-        rows = json.loads(source.rsplit('\n', 1)[-1])
-        assert rows[0]["summary_budget_tokens"] == 128
-        if kwargs.get("tools"):
-            return {"content": "unstructured"}, {}
-        return {"content": json.dumps({"summaries": [{"source_id": rows[0]["source_id"], "summary": "folded"}]})}, {}
-    monkeypatch.setattr(llm_observability, "chat_observed", complete)
-    answer = cc._fold_summaries(parts, {part.source_id: "complete summary " + part.text for part in parts},
-        drive_root=tmp_path, task_id="fold", spec={**_SPEC, "output_budget": 256}, summary_budget_tokens=128, usage_total={})
-    assert answer == "folded" and len(calls) == 2
-    assert all(call["max_tokens"] == 256 and call["call_type"] == "context_compaction_fold" for call in calls)
-    assert "complete summary begin" in calls[0]["messages"][0]["content"]
-    assert "complete summary tail" in calls[0]["messages"][0]["content"]
 
 
 @pytest.mark.parametrize("role", ["main", "light", "reviewer:triad_1", "consciousness"])

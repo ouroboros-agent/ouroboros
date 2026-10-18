@@ -796,6 +796,9 @@ def run_delegated_review_session(
     start_attempted, start_refused = False, False  # only submit witnesses POST entry
     try:
         record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
+        if record is not None and record["state"] == "legacy_gap":
+            raise ReviewRouteUnavailable(f"legacy_gap: {record['reason']}; delegated invocation needs repair",
+                                         code="review_custody_legacy_gap")
         if record is not None and record["state"] == "started" and record["run_id"]:
             run_id, started_custody = owned_started_review_custody(custody, custody_drive, record, task_id)
         if record is not None and (run_id or record["state"] == "pending"):

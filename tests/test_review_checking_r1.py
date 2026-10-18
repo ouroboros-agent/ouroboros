@@ -82,7 +82,7 @@ def test_large_binary_delta_streams_to_file_and_is_retained_whole(author, tmp_pa
 
     monkeypatch.setattr(subprocess, "run", observe)
     monkeypatch.setattr(rc, "EVIDENCE_RETAIN_BYTES", 16 * 1024)  # investigations' bound; never a reviewer's
-    result = rc.capture_seat_evidence(data, "task", "large", release=True)
+    result = rc.capture_seat_evidence(data, "task", "large")
     assert streamed and result["status"] == "retained" and result["patch_retained"] and not result["gaps"]
     assert result["patch_bytes"] > rc.EVIDENCE_RETAIN_BYTES
     assert pathlib.Path(result["evidence_dir"], "delta.patch").stat().st_size == result["patch_bytes"]
@@ -100,7 +100,7 @@ def test_capture_disables_reviewer_configured_host_hooks(author, tmp_path):  # n
     _git(area, "config", "core.fsmonitor", str(hook))
     _git(area, "config", "core.hooksPath", str(tmp_path))
     (area / "test.txt").write_text("reviewer change", encoding="utf8")
-    evidence = rc.capture_seat_evidence(data, "task", "hooks", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "hooks")
     assert evidence["status"] == "retained" and "A\ttest.txt" in evidence["changed"]
     assert not marker.exists()
 
@@ -128,17 +128,15 @@ def test_release_receipt_retries_residual_cleanup_without_recapturing(author, tm
     real_remove = sw._force_rmtree
     monkeypatch.setattr(sw, "_force_rmtree", lambda _path: None)
 
-    receipt = rc.capture_seat_evidence(data, "task", "residual", release=True)
+    receipt = rc.capture_seat_evidence(data, "task", "residual")
     durable = json.loads(pathlib.Path(receipt["evidence_dir"], "summary.json").read_text(encoding="utf8"))
-    assert receipt == durable
-    assert receipt["status"] == "retained" and not receipt["refresh_safe"]
-    assert receipt["retention_reason"] == "cleanup_failed" and area.is_dir()
-    evidence_dir = receipt["evidence_dir"]
+    assert receipt["status"] == "retained" and "residual" in receipt["cleanup_error"] and area.is_dir()
+    assert receipt["area"] == str(area)
+    assert {key: value for key, value in receipt.items() if key not in ("area", "cleanup_error")} == durable
     monkeypatch.setattr(rc, "_git_delta", lambda *_args, **_kwargs: pytest.fail("recaptured evidence"))
     monkeypatch.setattr(sw, "_force_rmtree", real_remove)
-    # A later release retries the residual cleanup while keeping the immutable evidence directory.
-    retained = rc.capture_seat_evidence(data, "task", "residual", release=True)
-    assert retained["refresh_safe"] and retained["evidence_dir"] == evidence_dir and not area.exists()
+    # A later call retries only the deletion; the durable receipt stays as written.
+    assert rc.capture_seat_evidence(data, "task", "residual") == durable and not area.exists()
 
 
 def test_interrupted_materialization_refuses_unproven_cleanup(author, tmp_path, monkeypatch):  # noqa: F811
@@ -158,7 +156,7 @@ def test_sticky_refresh_keeps_previous_copy_when_cleanup_is_unproven(author, tmp
     data = tmp_path / "data"
     first = rc.freeze_checking_source(author, data_root=data, subject=rc.SUBJECT_INDEX)
     area = pathlib.Path(rc.thread_seat_area(data, "task", "plan_review:t1", first, operation_id="turn-1"))
-    rc.capture_seat_evidence(data, "task", "turn-1", release=True)
+    rc.capture_seat_evidence(data, "task", "turn-1")
     (author / "f.txt").write_text("round two\n", encoding="utf8")
     _git(author, "add", "f.txt")
     second = rc.freeze_checking_source(author, data_root=data, subject=rc.SUBJECT_INDEX)
@@ -219,7 +217,7 @@ def test_real_git_copy_with_readonly_objects_releases_after_verified_cleanup(
     events = _windows_readonly_unlink(monkeypatch, target) if simulate_windows else []
     receipt = rc.terminal_seat_evidence(data, "task", "readonly-objects", {"summary": {"state": "succeeded"}})
     durable = json.loads(pathlib.Path(receipt["evidence_dir"], "summary.json").read_text(encoding="utf8"))
-    assert receipt == durable and receipt["status"] == "retained" and receipt["refresh_safe"]
+    assert receipt == durable and receipt["status"] == "retained"
     assert not area.exists()
     assert _author_state(author) == before
     assert b"readonly-probe.txt" in pathlib.Path(receipt["evidence_dir"], "delta.patch").read_bytes()
@@ -244,7 +242,7 @@ def test_sticky_consumer_refresh_recovers_readonly_objects_in_same_thread(
     assert events == ["denied", "chmod", "retried"]
     assert first["thread_id"] == second["thread_id"] == "thread-1"
     assert len(thread_gateway.thread_requests) == 1 and len(thread_gateway.turn_requests) == 2
-    assert second["checking_evidence"]["refresh_safe"] and area.is_dir()
+    assert second["checking_evidence"]["status"] == "retained" and area.is_dir()
     assert _git(area, "write-tree") == source["tree"] and not (area / "readonly-probe.txt").exists()
     assert _author_state(author) == before
     assert {str(p.relative_to(saved)): p.read_bytes() for p in saved.rglob("*") if p.is_file()} == saved_bytes
@@ -266,57 +264,13 @@ def test_interrupted_materialization_retries_after_readonly_cleanup(author, tmp_
     monkeypatch.setattr(rc, "_materialize_git", interrupted)
     with pytest.raises(rc.CheckingAreaUnavailable, match="interrupted after materialization"):
         rc.prepare_seat_area(data, "task", "interrupted-readonly", source)
-    assert not (home / "checking.json").exists()
+    # The marker is written first and names the copy as unfinished, so it is never adopted.
+    assert json.loads((home / "checking.json").read_text(encoding="utf8"))["materializing"] is True
     monkeypatch.setattr(rc, "_materialize_git", materialize)
     events = _windows_readonly_unlink(monkeypatch, targets[0])
     area = pathlib.Path(rc.prepare_seat_area(data, "task", "interrupted-readonly", source))
     assert events == ["denied", "chmod", "retried"]
-    assert area == home / "area" and (home / "checking.json").is_file()
+    assert area == home / "area"
+    assert "materializing" not in json.loads((home / "checking.json").read_text(encoding="utf8"))
     assert _git(area, "write-tree") == source["tree"] and not (area / "readonly-probe.txt").exists()
     assert _author_state(author) == before
-
-
-@pytest.mark.parametrize("failure", ["pending", "released_outcome", "residual_outcome"])
-def test_capture_retry_write_failure_returns_last_durable_receipt(tmp_path, monkeypatch, failure):
-    data, subject = tmp_path / "data", tmp_path / "subject"
-    subject.mkdir()
-    (subject / "original.txt").write_text("original", encoding="utf8")
-    source = rc.freeze_checking_source(subject, data_root=data)
-    area = pathlib.Path(rc.prepare_seat_area(data, "task", "write-failure", source))
-    (area / "result.txt").write_bytes(b"retained result\n")
-    with monkeypatch.context() as patch:
-        patch.setattr(sw, "_force_rmtree", lambda _path: None)
-        prior = rc.capture_seat_evidence(data, "task", "write-failure", release=True)
-    summary_path = pathlib.Path(prior["evidence_dir"], "summary.json")
-    summary_bytes = summary_path.read_bytes()
-    real_write, real_remove = rc.atomic_write_json, sw._force_rmtree
-    attempted, pending_written, removals = [], [], []
-
-    def write(path, receipt, **kwargs):
-        assert path == summary_path
-        attempted.append(receipt.copy())
-        pending = receipt.get("retention_reason") == "cleanup_pending"
-        if (failure == "pending") == pending:
-            raise OSError("injected receipt write failure")
-        real_write(path, receipt, **kwargs)
-        pending_written.append(receipt.copy())
-
-    def remove(path):
-        assert pending_written and json.loads(summary_path.read_text(encoding="utf8")) == pending_written[-1]
-        removals.append(path)
-        if failure != "residual_outcome":
-            real_remove(path)
-
-    monkeypatch.setattr(rc, "atomic_write_json", write)
-    monkeypatch.setattr(sw, "_force_rmtree", remove)
-    monkeypatch.setattr(rc, "_directory_delta", lambda *_args: pytest.fail("recaptured residual"))
-    receipt = rc.capture_seat_evidence(data, "task", "write-failure", release=True)
-    assert receipt == json.loads(summary_path.read_text(encoding="utf8"))
-    assert receipt["status"] == "retained" and not receipt["refresh_safe"]
-    if failure == "pending":
-        assert receipt == prior and summary_path.read_bytes() == summary_bytes and not removals
-    else:
-        assert len(attempted) == 2 and removals == [area]
-        assert receipt == pending_written[-1] and receipt["retention_reason"] == "cleanup_pending"
-    assert area.exists() == (failure != "released_outcome")
-    assert pathlib.Path(receipt["evidence_dir"], "files", "result.txt").read_bytes() == b"retained result\n"

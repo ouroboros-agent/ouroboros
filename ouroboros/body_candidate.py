@@ -112,9 +112,9 @@ def list_candidates(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
     return _rows(data_dir)
 
 
-def find(owner: str, data_dir: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+def find(owner: str, data_dir: Optional[Any] = None, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     owner = str(owner or "").strip()
-    for row in _rows(data_dir) if owner else []:
+    for row in _rows(data_dir, strict=strict) if owner else []:
         if row.get("task_id") == owner:
             return row
     return None
@@ -315,10 +315,13 @@ def live_lineage_processes(results_root: Any, task_id: str) -> List[int]:
         return [-1]
 
 
-def _continuation_predecessor(ctx: Any) -> str:
-    contract = getattr(ctx, "task_contract", None)
+def continuation_predecessor(carrier: Any) -> str:
+    """The host-validated predecessor whose candidate ``prepare`` inherits: the contract's
+    source, or a queued row's admitted pointer before its worker projects it there."""
+    row = carrier if isinstance(carrier, dict) else {}
+    contract = row.get("task_contract") if row else getattr(carrier, "task_contract", None)
     authority = contract.get("predecessor_authority") if isinstance(contract, dict) else None
-    source = authority.get("source") if isinstance(authority, dict) else None
+    source = authority.get("source") if isinstance(authority, dict) else row.get("predecessor_authority_source")
     return str(source.get("task_id") or "").strip() if isinstance(source, dict) else ""
 
 
@@ -492,7 +495,7 @@ def _prepare_locked(ctx: Any, resume: str) -> Dict[str, Any]:
         row = _transfer(ctx, row, owner, via="explicit_resume")
     else:
         row = find(owner)
-        predecessor = _continuation_predecessor(ctx)
+        predecessor = continuation_predecessor(ctx)
         if row is None and predecessor and (inherited := find(predecessor)) is not None \
                 and pathlib.Path(str(inherited.get("path") or "")).is_dir():
             row = _transfer(ctx, inherited, owner, via="continuation")

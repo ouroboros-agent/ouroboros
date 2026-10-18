@@ -183,7 +183,7 @@ def test_prunes_wait_off_ready_path_and_tree_debt_clears_after_recovery(tmp_path
     migrations.prepare_startup_state(tmp_path)
     monkeypatch.setattr(maintenance, "DATA_DIR", tmp_path)
     for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_SOURCE_PRUNES_OWED", "_STARTUP_TREES_OWED",
-                 "_STARTUP_RECOVERY_GAPS", "_STARTUP_TEMP_SWEEP_OWED"):
+                 "_STARTUP_RECOVERY_GAPS"):
         monkeypatch.setattr(maintenance, name, [False])
     calls = []
     monkeypatch.setattr(headless, "prune_task_trees", lambda *a, **kw: calls.append("trees"))
@@ -206,7 +206,7 @@ def test_deferred_prunes_keep_live_tree_and_retry_recovery_gaps(tmp_path, monkey
     migrations.prepare_startup_state(tmp_path)
     monkeypatch.setattr(maintenance, "DATA_DIR", tmp_path)
     for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_SOURCE_PRUNES_OWED", "_STARTUP_TREES_OWED",
-                 "_STARTUP_RECOVERY_GAPS", "_STARTUP_TEMP_SWEEP_OWED"):
+                 "_STARTUP_RECOVERY_GAPS"):
         monkeypatch.setattr(maintenance, name, [False])
     monkeypatch.setattr(maintenance, "_startup_worktree_prune", lambda: None)
     monkeypatch.setattr(maintenance, "_prune_delegated_snapshots", lambda: None)
@@ -246,7 +246,7 @@ def test_periodic_sweep_retries_source_only_debt_until_success(tmp_path, monkeyp
     migrations.prepare_startup_state(tmp_path)
     monkeypatch.setattr(maintenance, "DATA_DIR", tmp_path)
     for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_TREES_OWED", "_STARTUP_SOURCE_PRUNES_OWED",
-                 "_STARTUP_RECOVERY_GAPS", "_STARTUP_TEMP_SWEEP_OWED"):
+                 "_STARTUP_RECOVERY_GAPS"):
         monkeypatch.setattr(maintenance, name, [name == "_STARTUP_SOURCE_PRUNES_OWED"])
     monkeypatch.setattr(maintenance, "_periodic_zombie_reconcile", lambda **kw: None)
     monkeypatch.setattr(maintenance, "_run_drive_custody_pass", lambda *a: None)

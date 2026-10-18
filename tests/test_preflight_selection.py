@@ -7,12 +7,14 @@ import pytest
 from ouroboros import commit_admission as admission, preflight_runner as pr, test_selection as selection
 from ouroboros.preflight_qualification import adoption_test_evidence, full_proof_error
 from tests.test_preflight_runner import _make_repo, _commit_all
+from tests.test_preflight_receipts import receipt_python  # noqa: F401 -- dependency-only lane fixture
 
 pytestmark = pytest.mark.serial  # finite nested pytest controllers; one at a time
 
 
 @pytest.fixture
-def candidate(tmp_path, monkeypatch):
+def candidate(tmp_path, monkeypatch, receipt_python):  # noqa: F811 -- pytest fixture injection
+    monkeypatch.setenv("OUROBOROS_AGENT_PYTHON", receipt_python)
     monkeypatch.setenv("OUROBOROS_PREFLIGHT_TEST_WORKERS", "2")
     monkeypatch.setenv("OURO_TEST_WORKER_BUDGET", "2")  # nested slots: the selected gate must really run two workers
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_SERIAL", raising=False)

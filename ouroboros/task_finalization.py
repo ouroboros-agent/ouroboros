@@ -252,6 +252,8 @@ def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
     path = str(usage.get("terminal_salvage_path") or "")
     if path:
         fields["terminal_salvage_path"] = path
+    if usage.get("wake_silent") is True:
+        fields["wake_silent"] = True
     if usage.get("terminal_plan_review_open") is True:
         fields["terminal_plan_review_open"] = True
     for key in ("terminal_provider_notice", "terminal_host_notice"):
@@ -637,6 +639,8 @@ def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, An
         "completion_observations": row.get("completion_observations") or {"status": "unavailable"},
         **({"terminal_host_notice": terminal_host_notice_text(row)} if terminal_host_notice_text(row) else {}),
     }
+    if row.get("wake_silent") is True:  # no model words were submitted; the retained ones are not speech
+        package.update(final_result_text="", wake_silent=True, internal_terminal_text=str(row.get("result") or ""))
     if is_presence_task(row):
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         # Remember the event-time body, not today's replay policy: a historical
@@ -687,6 +691,11 @@ def sealed_final_prompt_section(sealed_final: Dict[str, Any] | None) -> str:
     )
     heading, presence_facts, internal_text = "Final result text (submitted for delivery):\n", "", ""
     presence = sealed_final.get("presence_delivery")
+    if sealed_final.get("wake_silent") is True:
+        heading, final_text = "Final result text:\n", "(none: the wake finished silently; no model words were submitted)"
+        if raw := str(sealed_final.get("internal_terminal_text") or ""):
+            internal_text = "Internal wake result (retained, never sent to the owner):\n" + truncate_review_artifact(
+                raw, limit=_SEALED_FINAL_TEXT_PROMPT_CHARS) + "\n"
     if isinstance(presence, dict):
         introduction = (
             "The recorded automatic-reply body was prepared for the Presence adapter;\n"

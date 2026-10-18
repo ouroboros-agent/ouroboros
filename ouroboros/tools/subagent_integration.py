@@ -1205,7 +1205,10 @@ def get_tools() -> List[ToolEntry]:
                     "results stay retained. Direct ordinary-folder work has already changed the "
                     "source: apply acknowledges those effects, reject cannot undo them, and no full "
                     "rollback is promised. Unapplied copies can be explicitly rejected; conflicts "
-                    "retain their snapshot and results. Read the captured result before deciding. "
+                    "retain their snapshot and results. Read the captured result before deciding. A finished "
+                    "run's capture still owed when you call is prepared by this call and returned for "
+                    "inspection, never applied in the same call; one already ready is applied as before, "
+                    "with no proof that you read it. "
                     "Undisposed snapshots or directory-copy results remain custody debt; direct runs "
                     "do not create that debt."
                 ),

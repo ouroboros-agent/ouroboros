@@ -45,6 +45,7 @@ DEFAULT_POLICY = POLICY_CHECK
 TOOL_POLICY: Dict[str, str] = {
     # Typed host maintenance enforces existing actor/resource/Pause authority.
     "inspect_harness": POLICY_SKIP,
+    "inspect_subagent": POLICY_SKIP,
     "maintain_harness": POLICY_SKIP,
     # Read-only / trivially safe.
     "read_file": POLICY_SKIP,

@@ -3,6 +3,7 @@ import { apiFetch } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { applyChartTheme, chartChrome, onThemeChange } from './theme_palette.js';
 import { tr } from './i18n.js';
+import { showToast } from './toast.js';
 
 /**
  * Ask for the evolution-campaign objective (pure decision helper, node-tested
@@ -69,6 +70,8 @@ export function initEvolution({ ws, state, mount }) {
     let loadSequence = 0;
     let chartLoaded = false;
     let disposed = false;
+    let lightMode = false;
+    let commandPending = false;
     const refreshBtn = document.getElementById('evo-refresh');
     const startBtn = document.getElementById('evo-start');
     const stopBtn = document.getElementById('evo-stop');
@@ -192,13 +195,18 @@ export function initEvolution({ ws, state, mount }) {
             campaignDetail.textContent = [objective ? `Objective: ${objective}` : '', progress ? `Progress: ${progress}` : ''].filter(Boolean).join(' ');
         }
         // Evolution is self-modification work, so it is hard-blocked in light mode.
-        const isLightMode = String(runtime.runtime_mode || '') === 'light';
+        lightMode = String(runtime.runtime_mode || '') === 'light';
+        paintCommandControls();
         if (startBtn) {
-            startBtn.disabled = isLightMode;
-            startBtn.title = isLightMode
+            startBtn.title = lightMode
                 ? "Evolution campaigns need runtime mode 'advanced' or 'pro' (currently 'light')."
                 : '';
         }
+    }
+
+    function paintCommandControls() {
+        if (startBtn) startBtn.disabled = lightMode || commandPending;
+        if (stopBtn) stopBtn.disabled = commandPending;
     }
 
     function renderEmptyState(message) {
@@ -406,25 +414,42 @@ export function initEvolution({ ws, state, mount }) {
     refreshBtn.addEventListener('click', () => {
         loadEvolution(true);
     });
+    // One command at a time: Start and Pause stay disabled until the gateway answers
+    // (the objective dialog is modal, so it needs no extra gate). The command's own
+    // outcome arrives in chat: a refusal here means only that it was never sent.
+    async function sendCommand(cmd, button) {
+        commandPending = true;
+        paintCommandControls();
+        try {
+            const resp = await apiFetch('/api/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cmd }),
+            });
+            if (!resp.ok) {
+                const body = await resp.json().catch(() => ({}));
+                throw new Error(body?.error || `HTTP ${resp.status}`);
+            }
+        } catch (error) {
+            showToast(`Could not send ${cmd.split(' ', 2).join(' ')}: ${error?.message || error}`, 'error');
+        } finally {
+            commandPending = false;
+            paintCommandControls();
+            // Disabling the pressed button dropped keyboard focus to the page; give it back.
+            if (document.activeElement === document.body && !button.disabled) button.focus({ preventScroll: true });
+        }
+        loadEvolution(true);
+    }
     startBtn?.addEventListener('click', async () => {
+        if (commandPending) return;
         const asked = await promptCampaignObjective();
         // Cancel = no campaign start (semantic fix, owner-approved Б1-8: the
         // old `prompt() || ''` started a paid campaign even on Cancel/null).
-        if (!asked.confirmed) return;
-        await apiFetch('/api/command', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cmd: `/evolve on${asked.objective ? ` ${asked.objective}` : ''}` }),
-        });
-        loadEvolution(true);
+        if (!asked.confirmed || commandPending) return;
+        await sendCommand(`/evolve on${asked.objective ? ` ${asked.objective}` : ''}`, startBtn);
     });
-    stopBtn?.addEventListener('click', async () => {
-        await apiFetch('/api/command', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cmd: '/evolve off' }),
-        });
-        loadEvolution(true);
+    stopBtn?.addEventListener('click', () => {
+        if (!commandPending) sendCommand('/evolve off', stopBtn);
     });
 
     const unsubscribeOpen = ws.on('open', () => {

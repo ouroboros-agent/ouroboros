@@ -48,6 +48,11 @@ def paused_retry(host, monkeypatch, clock, reaper, door):
 
             slot = workers.WORKERS[0]
             slot.proc = SimpleNamespace(pid=12345)
+            from ouroboros.model_wait import TaskModelWait
+
+            waiter = TaskModelWait(task={**task, "budget_drive_root": str(host.root)},
+                                   drive_root=host.root, event_queue=None, worker_slot_held=False)
+            waiter.tool_context, ctx.model_wait_context = ctx, waiter
             def park(_ctx, checkpoint):
                 handle_owner_wait({"phase": "park", "task_id": task["id"], "worker_id": 0,
                     "pid": 12345, "task_attempt": task["_attempt"], "wait_id": checkpoint["wait_id"],

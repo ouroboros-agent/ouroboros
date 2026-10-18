@@ -12,6 +12,8 @@ carry dated pointers, and late review settlements stay whole.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import os
 import threading
@@ -284,7 +286,7 @@ def test_no_task_shape_buys_a_lesson_or_writes_a_note(tmp_path, monkeypatch, sha
     assert not (tmp_path / "memory" / "knowledge").exists()
     assert not (tmp_path / "logs" / "task_reflections.jsonl").exists()
     assert memory.load_scratchpad_blocks()[0]["content"] == "Compressed working notes."
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert [row.get("summary_kind") for row in rows if row.get("task_id") == task["id"]].count("host_task_facts") == 1
     checkpoint = pipeline.load_task_result(tmp_path, task["id"])["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "completed" and "post_task_stop_reason" not in checkpoint
@@ -614,9 +616,13 @@ def test_the_chooser_reads_the_sealed_outcome_bounded_with_its_cut_named(tmp_pat
 def test_a_missing_backlog_is_named_and_an_unreadable_one_stays_unknown(tmp_path, monkeypatch):
     prompt = _chooser_prompt(tmp_path, monkeypatch, {"id": "t", "text": "x"})
     assert "No improvement-backlog note has been written yet" in prompt
-    _address(tmp_path, BACKLOG).path.mkdir(parents=True)  # unreadable as a file
+    path = _address(tmp_path, BACKLOG).path
+    path.mkdir(parents=True)  # unreadable as a file; Windows reports PermissionError
+    with pytest.raises(OSError) as failure:
+        path.read_text(encoding="utf-8")
     prompt = _chooser_prompt(tmp_path, monkeypatch, {"id": "t", "text": "x"})
-    assert "Improvement-backlog source unavailable (IsADirectoryError); it is unknown, not empty" in prompt
+    assert (f"Improvement-backlog source unavailable ({type(failure.value).__name__}); "
+            "it is unknown, not empty") in prompt
 
 
 # --- contexts: the full register where it lived, dated pointers, whole late criticism -------------

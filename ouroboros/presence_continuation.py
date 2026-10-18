@@ -34,7 +34,6 @@ import functools
 import hashlib
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -49,7 +48,7 @@ CONTINUATION_VERSION = 1
 # finalize request reacquires: its bounded wrap-up still speaks under the conversation.
 HARD_STOPS = frozenset({"cancelled", "task_ended", "deadline", "execution_deadline",
                         "absolute_ceiling", "accounting_wait_expired"})
-# The reentry scan reads at most this much of the chat chain (live generations rotate near 800 KB).
+# Reentry carries at most this many matching dialogue bytes; foreign rooms consume no budget.
 _REENTRY_SCAN_BYTES = 8_000_000
 # Whole facts up to this size travel in the note; the exact snapshot stays actor-readable.
 _REENTRY_NOTE_CHARS = 24_000
@@ -368,107 +367,88 @@ def _log_released(binding: ReviewWaitBinding, ctx: Any, text: str) -> None:
 
 
 def _chat_cursor(drive_root: Path) -> dict:
-    """Where this author's reentry facts begin: the live chat generation's identity and size.
+    """The next SQL byte coordinate; legacy generation/byte cursors remain resolvable."""
+    from ouroboros import dialogue_store as ds
 
-    A generation is named by its first line (``jsonl_generation_signature``, the SSOT the
-    consolidator and chat readers share), so a rotation into ``archive/`` is followed.
-    """
-    from ouroboros.chat_chain import chat_chain_paths
-    from ouroboros.utils import jsonl_generation_signature
-
-    paths = chat_chain_paths(drive_root)
-    signature = jsonl_generation_signature(paths[-1])
-    return {"gen": str(signature.get("first_line_sha256") or ""), "offset": int(signature.get("size") or 0),
-            "after_archive": paths[-2].name if len(paths) > 1 else "", "at": utc_now_iso()}
+    return {"gen": "dialogue:chat", "offset": ds.stream_end(drive_root, "chat"),
+            "after_archive": "", "at": utc_now_iso()}
 
 
-def _relative(drive_root: Path, path: Path) -> str:
-    try:
-        return path.relative_to(drive_root).as_posix()
-    except ValueError:
-        return str(path)
+def _cursor_position(root: Path, cursor: Mapping[str, Any]) -> int:
+    from ouroboros import dialogue_store as ds
+
+    if not cursor:
+        raise ValueError("cursor_unavailable")
+    gen, offset = str(cursor.get("gen") or ""), int(cursor.get("offset") or 0)
+    if gen == "dialogue:chat":
+        return offset
+    ds.require_imported(root, "chat")
+    if offset:
+        unit = ds.last_legacy_generation(root, gen=gen)
+        if unit is None:
+            raise ValueError("cursor_generation_missing")
+        if offset > unit["size"]:
+            raise ValueError("generation_truncated_below_cursor")
+        return unit["base"] + offset
+    after = str(cursor.get("after_archive") or "")
+    if not after:
+        return 0
+    unit = ds.last_legacy_generation(root, name=after)
+    if unit is None:
+        raise ValueError("cursor_generation_missing")
+    return unit["base"] + unit["size"]
+
+
+def _conversation_entries(root: Path, key: str, lower: int, upper: int):
+    """The producer's stable conversation chat id narrows the SQL probe before validation."""
+    from ouroboros import dialogue_store as ds
+    from ouroboros.presence_runner import _stable_numeric_id
+
+    chat = _stable_numeric_id("presence-conversation", key)
+    for entry in ds.iter_probes(root, "chat", [("chat_id", chat)], lower=lower, upper=upper, newest_first=False):
+        transport = entry.row.get("transport")
+        if isinstance(transport, dict) and str(transport.get("conversation_key") or "") == key:
+            yield entry
+
+
+def _interval_gaps(root: Path, lower: int, upper: int) -> list[dict]:
+    from ouroboros import dialogue_positions as dp, dialogue_store as ds
+
+    ds.require_imported(root, "chat", lower=lower, upper=upper)
+    return [{"kind": "jsonl_non_object" if gap.kind == "non_object" else "jsonl_malformed",
+             "path": "state/dialog.sqlite", "offset": gap.seq, "length": gap.length}
+            for gap in dp.skipped_between(root, "chat", lower, upper)]
 
 
 def _conversation_rows_since(drive_root: Path, cursor: Mapping[str, Any], key: str) -> tuple[list[dict], list[dict]]:
-    """This conversation's canonical rows after ``cursor`` and every gap of that read.
+    """Matching rows after the persisted cursor; missing import and invalid intervals stay gaps."""
+    from ouroboros import dialogue_store as ds
+    from ouroboros.store import StoreError
 
-    The yielded generation is found in the chat chain by its identity and read from the
-    cursor's byte; every later generation is read whole. Unreadable lines, a rewritten or
-    truncated generation and an exhausted scan budget are reported as gaps, never skipped
-    silently, and no row is guessed for a range that cannot be told apart.
-    """
-    from ouroboros.chat_chain import chat_chain_paths
-    from ouroboros.utils import jsonl_generation_signature
-
-    root = Path(drive_root)
-    if not cursor:
-        return [], [{"kind": "cursor_unavailable"}]
-    paths = chat_chain_paths(root)
-    gen, offset = str(cursor.get("gen") or ""), int(cursor.get("offset") or 0)
-    if not offset:  # empty or absent at the yield: every generation begun since is new
-        after = str(cursor.get("after_archive") or "")
-        plan = [(path, 0) for path in paths[:-1] if path.name > after] + [(paths[-1], 0)]
-    else:
-        index = next((i for i in range(len(paths) - 1, -1, -1)
-                      if str(jsonl_generation_signature(paths[i]).get("first_line_sha256") or "") == gen), None)
-        if index is None:
-            return [], [{"kind": "cursor_generation_missing"}]
-        plan = [(paths[index], offset), *((path, 0) for path in paths[index + 1:])]
-    needles = {key.encode("utf-8"), json.dumps(key)[1:-1].encode("utf-8")}
-    rows: list[dict] = []
-    gaps: list[dict] = []
-    budget = _REENTRY_SCAN_BYTES
-    for number, (path, start) in enumerate(plan):
-        where = _relative(root, path)
-        live = number == len(plan) - 1
-        try:
-            handle = open(path, "rb")
-        except FileNotFoundError:
-            if not live:  # the live file is briefly absent right after a rotation
-                gaps.append({"kind": "generation_unreadable", "path": where, "error": "FileNotFoundError"})
-            continue
-        except OSError as exc:
-            gaps.append({"kind": "generation_unreadable", "path": where, "error": type(exc).__name__})
-            continue
-        with handle:
-            size = os.fstat(handle.fileno()).st_size
-            if size < start:
-                gaps.append({"kind": "generation_truncated_below_cursor", "path": where, "offset": start,
-                             "size": size})
-                continue
-            if start:
-                handle.seek(start - 1)
-                if handle.read(1) != b"\n":
-                    gaps.append({"kind": "generation_rewritten_at_cursor", "path": where, "offset": start})
-                    continue
-            position = start
-            for raw in handle:
-                if budget <= 0:
-                    gaps.append({"kind": "scan_budget_exhausted", "path": where, "offset": position,
-                                 "unread_generations": len(plan) - number - 1})
-                    return rows, gaps
-                here, position, budget = position, position + len(raw), budget - len(raw)
-                if not raw.strip():
-                    continue
-                mentions = any(needle in raw for needle in needles)
-                try:
-                    value = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError) as exc:
-                    kind = ("trailing_row_incomplete" if live and not raw.endswith(b"\n")
-                            else "jsonl_decode_error" if isinstance(exc, UnicodeDecodeError) else "jsonl_malformed")
-                    gaps.append({"kind": kind, "path": where, "offset": here, "mentions_conversation": mentions})
-                    continue
-                if not isinstance(value, dict):
-                    gaps.append({"kind": "jsonl_non_object", "path": where, "offset": here,
-                                 "mentions_conversation": mentions})
-                    continue
-                transport = value.get("transport") if isinstance(value.get("transport"), dict) else {}
-                if str(transport.get("conversation_key") or "") == key:
-                    rows.append(value)
-    return rows, gaps
+    root, rows = Path(drive_root), []
+    try:
+        lower, upper = _cursor_position(root, cursor), ds.stream_end(root, "chat")
+        if lower > upper:
+            return [], [{"kind": "history_source_changed"}]
+        gaps = _interval_gaps(root, lower, upper)
+        remaining = _REENTRY_SCAN_BYTES
+        for entry in _conversation_entries(root, key, lower, upper):
+            if remaining <= 0:
+                gaps.append({"kind": "scan_budget_exhausted", "path": "state/dialog.sqlite",
+                             "offset": entry.seq, "unread_generations": 0})
+                break
+            rows.append(entry.row)
+            remaining -= entry.length
+        return rows, gaps
+    except StoreError as exc:
+        return rows, [{"kind": "history_importing" if isinstance(exc, ds.StoreMigrating) else "history_import_failed"}]
+    except (OSError, ValueError, TypeError) as exc:
+        return rows, [{"kind": str(exc) or "history_source_unavailable"}]
 
 
 _GAP_WORDS = {
+    "history_importing": "dialogue history is still importing",
+    "history_import_failed": "a dialogue segment could not be imported",
     "cursor_unavailable": "no log position was recorded when you yielded",
     "cursor_generation_missing": ("the log generation you yielded in is no longer in the chat chain (removed or "
                                   "rewritten), so later rows cannot be told apart from earlier ones"),
@@ -488,7 +468,7 @@ def _gap_line(gap: Mapping[str, Any]) -> str:
     words = _GAP_WORDS.get(str(gap.get("kind")), str(gap.get("kind")))
     try:
         # History pages carry offsets in the captured chain, not a physical file.
-        words = words.format(**{"path": "the captured chat.jsonl chain", **gap})
+        words = words.format(**{"path": "state/dialog.sqlite", **gap})
     except (KeyError, IndexError):
         pass
     return f"- {words}" + ("; it names this conversation" if gap.get("mentions_conversation") else "")
@@ -651,106 +631,74 @@ _REENTRY_PAGE_BYTES = 64 * 1024
 
 
 def capture_reentry_history(root: Path, cursor: Mapping[str, Any]) -> dict:
-    """Freeze the yielded-to-observed byte interval using the existing chat-chain reader.
+    """Freeze SQL byte bounds and the last row's identity, with the existing wire shape."""
+    from ouroboros import dialogue_store as ds
+    from ouroboros.chat_chain import source_row_id
+    from ouroboros.store import StoreError
 
-    Only physical metadata is retained, not a second history. Prefix identities bind
-    offsets across append/rotation; replacement, truncation and closed-file mutation
-    become unavailable source, never an empty page. Concurrent in-place edits during
-    append are outside the shared reader's non-atomic capture contract.
-    """
-    from ouroboros.jsonl_tail import JsonlChainSnapshot
-    from ouroboros.utils import jsonl_generation_signature
-
-    unavailable = {"status": "unavailable", "reason": "history_source_unavailable"}
-    if not cursor:
-        return {**unavailable, "reason": "cursor_unavailable"}
     try:
-        reader = JsonlChainSnapshot(Path(root) / "logs" / "chat.jsonl")
-        offset = int(cursor.get("offset") or 0)
-        if offset:
-            index = next((i for i in reversed(range(len(reader.entries)))
-                          if jsonl_generation_signature(reader.entries[i][0]).get("first_line_sha256")
-                          == cursor.get("gen")), None)
-            if index is None or offset > reader.entries[index][1].st_size:
-                return {**unavailable, "reason": "cursor_generation_missing"}
-            lower = reader.segment(index)[0] + offset
-            if reader._read(lower - 1, lower) != b"\n":
-                return {**unavailable, "reason": "generation_rewritten_at_cursor"}
-        else:
-            after = str(cursor.get("after_archive") or "")
-            lower = next((reader.segment(i)[0] for i, (path, _stat, live) in enumerate(reader.entries)
-                          if live or path.name > after), reader.upper)
-        segments = [{"device": stat.st_dev, "inode": stat.st_ino, "size": stat.st_size,
-                     "mtime_ns": stat.st_mtime_ns, "live": live}
-                    for _path, stat, live in reader.entries if stat.st_size]
-        return {"status": "available", "start": lower, "end": reader.upper, "segments": segments}
-    except (OSError, ValueError, TypeError):
-        return unavailable
+        lower, upper = _cursor_position(root, cursor), ds.stream_end(root, "chat")
+        if not 0 <= lower <= upper:
+            raise ValueError("cursor_generation_missing")
+        ds.require_imported(root, "chat", lower=lower, upper=upper)
+        last = ds.newest(root, "chat", limit=1, before=upper)
+        witness = {"store": "dialogue", "seq": last[0].seq, "sha256": source_row_id(last[0].row)} if last else {
+            "store": "dialogue", "seq": None}
+        return {"status": "available", "start": lower, "end": upper, "segments": [witness]}
+    except StoreError as exc:
+        return {"status": "unavailable", "reason": "history_importing" if isinstance(exc, ds.StoreMigrating)
+                else "history_import_failed"}
+    except (OSError, ValueError, TypeError) as exc:
+        return {"status": "unavailable", "reason": str(exc) or "history_source_unavailable"}
 
 
 def reentry_history_page(root: Path, history: Mapping[str, Any], key: str, offset: Any) -> dict:
-    """One bounded page of a checkpoint's own conversation, with exact rows and next offset.
+    """One page of this conversation in its frozen interval, budgeted by matching bytes.
 
-    A long row is returned whole; foreign/malformed rows consume scan bytes too.
-    The caller supplies only a position, never a path, room or an enlarged horizon.
+    The offset remains an absolute byte coordinate. A complete oversized row travels
+    whole. Old physical witnesses without an imported identity mapping are explicitly
+    unavailable; the checkpoint's already retained observation remains readable.
     """
-    from ouroboros.jsonl_tail import JsonlChainSnapshot
+    from ouroboros import dialogue_store as ds
+    from ouroboros.chat_chain import source_row_id
+    from ouroboros.store import StoreError
 
     unavailable = {"kind": "presence_reentry_history", "status": "unavailable", "rows": []}
     if history.get("status") != "available":
         return {**unavailable, "reason": history.get("reason") or "history_source_unavailable"}
     lower, upper = history["start"], history["end"]
+    invalid = {**unavailable, "reason": "source_range_invalid", "history_start": lower, "history_end": upper}
     if type(offset) is not int or not lower <= offset <= upper:
-        return {**unavailable, "reason": "source_range_invalid", "history_start": lower, "history_end": upper}
-
-    def reader_at_horizon():
-        reader = JsonlChainSnapshot(Path(root) / "logs" / "chat.jsonl", upper=upper)
-        actual = [(stat, live) for _path, stat, live in reader.entries if stat.st_size]
-        for index, expected in enumerate(history["segments"]):
-            stat, _live = actual[index]
-            if ((stat.st_dev, stat.st_ino) != (expected["device"], expected["inode"])
-                    or stat.st_size < expected["size"]
-                    or (stat.st_size != expected["size"] and not expected["live"])
-                    or (stat.st_size == expected["size"] and stat.st_mtime_ns != expected["mtime_ns"])):
-                raise ValueError("history_source_changed")
-        return reader
-
+        return invalid
     try:
-        reader = reader_at_horizon()
-        if lower < offset < upper and reader._read(offset - 1, offset) != b"\n":
-            return {**unavailable, "reason": "source_range_invalid", "history_start": lower, "history_end": upper}
-        end = min(upper, offset + _REENTRY_PAGE_BYTES)
-        raw = reader._read(offset, end)
-        while b"\n" not in raw and end < upper:
-            next_end = min(upper, end + _REENTRY_PAGE_BYTES)
-            raw += reader._read(end, next_end)
-            end = next_end
-        if end < upper and b"\n" in raw:
-            raw = raw[:raw.rfind(b"\n") + 1]
-        end = offset + len(raw)
-        reader_at_horizon()  # refuse a replaced/truncated source observed during the physical read
-        rows, gaps, position = [], [], offset
-        for line in raw.splitlines(keepends=True):
-            here, position = position, position + len(line)
-            if not line.strip():
-                continue
-            try:
-                if not line.endswith(b"\n"):
-                    gaps.append({"kind": "trailing_row_incomplete", "offset": here})
-                    continue
-                value = json.loads(line.decode("utf-8"))
-            except (UnicodeError, ValueError):
-                gaps.append({"kind": "jsonl_malformed", "offset": here})
-                continue
-            if not isinstance(value, dict):
-                gaps.append({"kind": "jsonl_non_object", "offset": here})
-                continue
-            transport = value.get("transport") if isinstance(value.get("transport"), dict) else {}
-            if str(transport.get("conversation_key") or "") == key:
-                rows.append(value)
+        for witness in history.get("segments", []):
+            if witness.get("store") != "dialogue":
+                return {**unavailable, "reason": "legacy_source_identity_unavailable"}
+            if witness.get("seq") is not None:
+                entry = ds.row_at(root, "chat", witness["seq"])
+                if entry is None or source_row_id(entry.row) != witness["sha256"]:
+                    raise ValueError("history_source_changed")
+        if upper > ds.stream_end(root, "chat"):
+            raise ValueError("history_source_changed")
+        if offset not in (lower, upper) and ds.row_at(root, "chat", offset) is None:
+            previous = ds.newest(root, "chat", before=offset, limit=1)
+            if not previous or previous[0].end != offset:
+                return invalid
+        ds.require_imported(root, "chat", lower=offset, upper=upper)
+        rows, used, end = [], 0, upper
+        for entry in _conversation_entries(root, key, offset, upper):
+            if rows and used >= _REENTRY_PAGE_BYTES:
+                end = entry.seq
+                break
+            rows.append(entry.row)
+            used += entry.length
+        gaps = _interval_gaps(root, offset, end)
         return {"kind": "presence_reentry_history", "status": "ok", "rows": rows, "gaps": gaps,
                 "history_start": lower, "history_end": upper, "start_offset": offset, "end_offset": end,
                 "next_offset": end if end < upper else None, "interval_exhausted": end == upper}
+    except StoreError as exc:
+        return {**unavailable, "reason": "history_importing" if isinstance(exc, ds.StoreMigrating)
+                else "history_import_failed", "history_start": lower, "history_end": upper}
     except (OSError, ValueError, IndexError, KeyError, TypeError):
         return {**unavailable, "reason": "history_source_changed", "history_start": lower, "history_end": upper}
 

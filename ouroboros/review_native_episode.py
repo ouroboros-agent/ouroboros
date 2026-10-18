@@ -491,7 +491,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
             return {"accepted": True, "input_chars": _wire_size(candidate, selected_tools),
                     "output_reserve_tokens": int(self.assignment.request.max_tokens or self.assignment.slot.max_tokens),
                     "measurement_basis": "canonical_serialized_characters", "strict_bound_proven": False}
-        candidate, receipt, _ = compact_tool_history_llm(
+        candidate, receipt = compact_tool_history_llm(
             messages, request=request, observed_messages=observed["messages"],
             observed_tool_schemas=observed["tool_schemas"], tool_schemas=schemas,
             fit_candidate=fit, drive_root=root, task_id=self.assignment.request.task_id or "review")

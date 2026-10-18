@@ -12,6 +12,8 @@ paid stage these tests paused; the scratchpad stage now is.)
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import pathlib
 import threading
@@ -150,7 +152,7 @@ def _scratch(f) -> list:
 
 
 def _facts_rows(f) -> list:
-    rows = [json.loads(line) for line in (f.root / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = dialogue_test.log_rows(f.root / "logs" / "chat.jsonl")
     return [row for row in rows if row.get("summary_kind") == "host_task_facts"]
 
 

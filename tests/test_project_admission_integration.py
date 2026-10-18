@@ -129,7 +129,12 @@ def test_ui_conversion_keeps_prepared_resource_through_recovery(host, tmp_path, 
         assert registry.project_id_for_task(host.root, "retry") == "chosen"
     [recovered] = host.pending
     assert recovered["project_id"] == "chosen" and recovered["workspace_root"] == folder
-    assert recovered["_project_admission"] == basis and not recovered.get("_project_admission_restore_hold")
+    current = registry.project_admission_basis(
+        "chosen", registry.get_reserved_project(host.root, "chosen"), frozen=True)
+    assert current["project"]["routing_incarnation"] == basis["project"]["routing_incarnation"]
+    assert current != basis  # placement refreshes the room, never the prepared working folder
+    assert recovered["_project_admission"] == (current if consumer == "restore" else basis)
+    assert not recovered.get("_project_admission_restore_hold")
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -172,7 +177,7 @@ def test_api_conversion_binding_overrides_old_result_scope_on_restore(host, tmp_
     assert [row["id"] for row in sent] == ["converted"]
     for key in ("project_id", "drive_root", "text"):
         assert sent[0].get(key) == prepared.get(key)
-    assert sent[0]["workspace_root"] == ""  # The destination room has no execution folder.
+    assert sent[0]["workspace_root"] == str(folder)  # Placement keeps the explicit API folder, not the room's none.
     assert sent[0]["_project_admission"] == registry.project_admission_basis("chosen", answer["project"], frozen=True)
     assert load_task_result(host.root, "converted")["status"] == "running"
     assert not host.attempts

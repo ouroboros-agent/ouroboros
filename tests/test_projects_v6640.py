@@ -1,6 +1,7 @@
 """Focused v6.64 Project lifecycle, canonical-dialogue, and sidebar guards."""
 
 from __future__ import annotations
+from tests._dialogue import advance_room_revision
 
 import asyncio
 import json
@@ -10,19 +11,7 @@ import pytest
 
 
 def test_project_lifecycle_revision_binding_and_no_resurrection(tmp_path):
-    from ouroboros.projects_registry import (
-        begin_project_deletion,
-        bind_task_to_project,
-        complete_project_deletion,
-        create_project,
-        get_project,
-        get_reserved_project,
-        increment_project_visible_revision,
-        list_projects,
-        project_binding_for_task,
-        reconcile_projects,
-        reserved_project_chat_ids,
-    )
+    from ouroboros.projects_registry import begin_project_deletion, bind_task_to_project, complete_project_deletion, create_project, get_project, get_reserved_project, list_projects, project_binding_for_task, reconcile_projects, reserved_project_chat_ids
 
     project = create_project(tmp_path, "alpha", name="Alpha")
     memory_dir = tmp_path / "projects" / "alpha"
@@ -50,13 +39,13 @@ def test_project_lifecycle_revision_binding_and_no_resurrection(tmp_path):
     assert binding["source_ref"] == first_ref
     assert binding["source_text"] == owner_text
 
-    assert increment_project_visible_revision(tmp_path, project_id="alpha")["visible_revision"] == 1
-    assert increment_project_visible_revision(tmp_path, chat_id=project["chat_id"])["visible_revision"] == 2
+    assert advance_room_revision(tmp_path, project_id="alpha")["visible_revision"] == 1
+    assert advance_room_revision(tmp_path, chat_id=project["chat_id"])["visible_revision"] == 2
     deleting = begin_project_deletion(tmp_path, "alpha")
     assert deleting["lifecycle"] == "deleting"
     assert deleting["routing_generation"] == 1
     assert get_project(tmp_path, "alpha") is None  # admission is already closed
-    assert increment_project_visible_revision(tmp_path, project_id="alpha") is None
+    assert advance_room_revision(tmp_path, project_id="alpha") is None
     with pytest.raises(ValueError, match="cannot accept bindings"):
         bind_task_to_project(tmp_path, "task-after-fence", "alpha", origin={"absent": "system"})
 

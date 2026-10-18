@@ -670,26 +670,30 @@ through the review, toggle, launcher-grant, self-authored finalize,
 native launcher-seed trust, and marketplace paths, not through generic
 agent/browser file writes.
 
-Native launcher-seed trust (v6.31.0) is a named, hash-pinned, audited
-exception to manual first review: when the LAUNCHER itself writes a
-bundled native skill payload (bootstrap seed, post-bootstrap new seed,
-or version resync — all marked by `.seed-origin`), it stamps
+Native launcher-seed trust (v6.31.0) is a hash-pinned, audited first-review
+exception: the LAUNCHER writes bundled payloads (bootstrap, new seed or
+version resync, marked by `.seed-origin`) and stamps
 `review.json` with `status=clean`, `reviewer_models=["repo_commit_gate"]`,
-and `review_profile="native_seed"`, because those exact payload bytes
-already passed the repo commit gate's review wave. The verdict is bound to
-the post-seed content hash (lifecycle control files excluded), so ANY
-later edit flips it stale and non-executable exactly like an ordinary
-review; removing `.seed-origin` reclassifies the skill as user-managed.
-Zero-grant native seeds (no secret keys, no privileged permissions, only
-tool/subprocess surface) also auto-enable — but only when no explicit
-owner enable/disable choice exists yet; a version resync never overrides
-an owner's disable. The verdict is additionally bound to the marker at
-LOAD time: a `native_seed` review whose `.seed-origin` is gone reads back
-as pending (non-executable). The owner opt-out is
+and `review_profile="native_seed"`: those bytes passed the repo review wave.
+The verdict pins the post-seed hash (control files excluded); edits stale
+it as with ordinary reviews. Removing the marker reclassifies ownership
+as user-managed and makes this verdict pending at LOAD, not executable.
+Zero-grant seeds (no secret keys or privileged permissions, only
+tool/subprocess, or the default-on bundled computer-use seeds) auto-enable
+only where their manifest `os` applies and no owner choice exists;
+resync never overrides OFF. Foreign seeds
+are resynced but not newly offered or auto-enabled. Discovery hides them
+except a Windows Unix-remote choice: resync records `legacy_remote_platform=win32`
+in `.seed-origin` for an enabled, formerly unrestricted Unix seed (not recorded
+`native_seed` auto-ON). Actor-less ON, including inherited early auto-ON,
+cannot be distinguished from manual ON and is retained. Eligibility survives
+OFF/resync for intentional ON; it grants no trust or local Windows backend.
+Declared isolated dependencies use the post-PASS step at boot for enabled
+seeds or at enable, without model review. Owner opt-out:
 `OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS=false`; the trust never extends to
 clawhub/external/self-authored skills. Packaged installs bind native-seed
-trust to the SHA-pinned `repo.bundle`; source-mode installs copy current
-worktree bytes and therefore lack that packaged-byte provenance.
+trust to SHA-pinned `repo.bundle`; source mode copies worktree bytes,
+without that packaged-byte provenance.
 `skip_advisory_review` records only the commit's skipped preflight: the repo
 review wave, both parts, still runs.
 
@@ -770,7 +774,7 @@ buckets, nested manifests, and path escapes remain refused.
 
 ### Output contract
 
-Reviewers return a JSON array covering every item below (16 items total).
+Reviewers return a JSON array covering every item below.
 Each entry carries `item`, `verdict` (`PASS`/`FAIL`), `severity`
 (`critical`/`advisory`), and `reason`. If one item has multiple distinct
 concrete problems, reviewers may return multiple `FAIL` entries for that
@@ -799,6 +803,7 @@ and do not return `PASS` for an item that also has a `FAIL` — the concrete
 | 14 | integration_preflight | Does the skill include cheap local preflight checks for the APIs/files/runtimes it depends on before spending provider budget or starting long work? Missing preflight for fragile external integrations is an advisory FAIL. | advisory |
 | 15 | bug_hunting | Are there obvious runtime bugs in reviewed code: wrong filenames, mismatched manifest script names, missing imports, impossible arguments, JSON/schema mismatches, blocking calls in async handlers, or untested happy-path assumptions? For every FAIL, cite the concrete runtime bug and state how you propose to fix it (file/symbol/change), so the author can apply the correction instead of guessing. Concrete likely runtime breakage should use `severity=critical`; latent issues, provider fragility, minor cleanup, or dead-code concerns should use `severity=advisory`. | severity-driven |
 | 16 | completion_notification | For long-running or user-visible work, does the skill emit or document a completion/failure notification path (for example a host event, `events.jsonl` append, or clear stdout marker consumed by Ouroboros)? A skill that must reach the owner directly (a reminder, a finished external job) declares `notify_owner` and hands the host one bounded sentence through `POST /notify`, shown as a signed System row in the owner's chat — judged as under item 9: attributable, bounded, user-facing, and never a way to inject conversation. Mark PASS with reason "Not applicable" for tiny synchronous utilities. | advisory |
+| 17 | context_snapshot_discipline | For `context_snapshot`: are the declared local snapshots compact deterministic facts, with honest dates/units/unknowns, no instructions, secrets or relative-age counters? Check atomic publication, the complete UTF-8 file bound and withdrawal on expiry/revocation (CREATING_SKILLS “Passive context snapshots”); no network, model or refresh belongs on prompt preparation. Mark other skills Not applicable. | severity-driven when applicable |
 
 ### Severity rules
 
@@ -829,7 +834,7 @@ and do not return `PASS` for an item that also has a `FAIL` — the concrete
   `permissions_honesty`, `no_repo_mutation`, `path_confinement`,
   `env_allowlist`, `inject_chat_minimization`,
   `event_subscription_minimization`, and `host_token_handling`.
-- Items 7, 8, 11, and 15 are severity-driven. A `FAIL` with
+- Items 7, 8, 11, 15 and 17 are severity-driven. A `FAIL` with
   `severity=critical` produces `blockers`; a `FAIL` with
   `severity=advisory` produces `warnings`. Reviewers MUST reserve
   critical severity for concrete dangerous or runtime-breaking cases

@@ -698,11 +698,25 @@ def compute_direct_review_seats(
     return [seats.get(role, seats["main"]) for role in roles]
 
 
+def image_input_from_modalities(value: Any) -> bool | None:
+    """Image input stated by one input-modality list: True/False, or None when it says nothing.
+
+    Only a non-empty list of non-blank strings is a statement. A missing, null or empty
+    list, another shape, or one item that is not a non-blank string leaves it unknown:
+    the valid remainder of ``["text", 42]`` or ``["text", ""]`` is not a complete list
+    that omits images.
+    """
+    if isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value):
+        return "image" in {item.strip().lower() for item in value}
+    return None
+
+
 def supports_vision(model_id: str, *, model_role: str = "",
                     model_account_override: str | None = None) -> bool | None:
     """Image input of the exact route: True, False, or None when nothing sourced says.
 
-    A Claudexor route answers from the catalog of this call's role/account, never
+    A Claudexor route answers from the input modalities in the catalog of this
+    call's role/account (``image_input_from_modalities``), never
     a global overlay; an API route answers from the fresh route-scoped catalog
     record (``vision_routing.route_image_input``). A model's name is not
     evidence, so every other case is None: image senders preserve input when the
@@ -731,8 +745,7 @@ def supports_vision(model_id: str, *, model_role: str = "",
         if catalog.get("source") != source or (account and catalog.get("credentialProfileId") != account):
             return None
         item = next((row for row in catalog.get("models", []) if row.get("id") == native_model), {})
-        modalities = item.get("inputModalities")
-        return "image" in modalities if isinstance(modalities, list) and modalities else None
+        return image_input_from_modalities(item.get("inputModalities"))
     from ouroboros.vision_routing import route_image_input
 
     return route_image_input(model_id).verdict

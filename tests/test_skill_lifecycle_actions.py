@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros import dialogue_store
 from ouroboros.contracts.task_constraint import TaskConstraint
 from ouroboros.owner_mailbox import acknowledge_task_messages, revoke_owner_control, write_owner_message
 from ouroboros.owner_quiz import record_answered, record_asked
@@ -14,7 +15,6 @@ from ouroboros.project_dialogue import build_owner_message_ref
 from ouroboros.skill_lifecycle_actions import run_skill_action
 from ouroboros.skill_loader import SkillReviewState, load_skill, load_skill_grants, save_review_state
 from ouroboros.tools.registry import ToolContext
-from ouroboros.utils import append_jsonl
 from tests._extension_loader_shared import _write_ext_skill
 from tests._extension_loader_shared import _clear_loader_state  # noqa: F401
 
@@ -40,7 +40,7 @@ def skill_actor(tmp_path, monkeypatch):
 
 def _owner_chat(ctx, *, chat_id=42, text="Grant demo the inject_chat permission."):
     ref = build_owner_message_ref(chat_id=chat_id, client_message_id="owner-command", ts="2026-09-06T10:00:00Z", text=text)
-    append_jsonl(ctx.drive_root / "logs" / "chat.jsonl", {**ref, "direction": "in", "text": text})
+    dialogue_store.append(ctx.drive_root, "chat", {**ref, "direction": "in", "text": text})
     return {"kind": "chat", "ref": ref}
 
 
@@ -162,7 +162,7 @@ def test_only_proven_later_owner_disable_supersedes_repair_intent(skill_actor, m
         text = "Run demo again now."
         ref = build_owner_message_ref(chat_id=42, client_message_id="new-owner-request",
                                      ts="2026-09-06T12:00:00Z", text=text)
-        append_jsonl(ctx.drive_root / "logs" / "chat.jsonl", {**ref, "direction": "in", "text": text})
+        dialogue_store.append(ctx.drive_root, "chat", {**ref, "direction": "in", "text": text})
         result = run_skill_action(ctx, "demo", "enable", owner_source={"kind": "chat", "ref": ref})
     assert result["ok"] and load_enabled(ctx.drive_root, "demo"), result
 

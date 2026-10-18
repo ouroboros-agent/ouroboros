@@ -598,7 +598,24 @@ def run_pr_merge(ctx: Any, gh: Gh, gh_api: Gh, *, drive_root: Any, task_id: str,
                               "returned, or omit it and declare the review instead; nothing was merged"}
     pr = _read_pr(gh, number)
     if pr is None:
-        return {"refused": "pr_unreadable", "detail": "the pull request could not be read; nothing was merged"}
+        # This call's no-effect fact never reads as the end of an earlier request: name each
+        # still-observed receipt for this number by its own recorded URL and real status
+        # (which repository this call meant needs the read that failed).
+        earlier = [r for r in task_receipts(drive_root, task_id)
+                   if r.get("number") == int(number) and _must_observe(r)]
+        if not earlier:
+            return {"refused": "pr_unreadable", "detail": "the pull request could not be read; nothing was merged"}
+        facts = []
+        for r in earlier:
+            status = (r.get("outcome") or {}).get("status") or "unknown"
+            target = (r.get("repo") or {}).get("url") or f"PR #{int(number)}"
+            facts.append(f"a merge of {target} was already confirmed (receipt_id={r['receipt_id']})"
+                         if status == "merged" else
+                         f"the earlier merge request for {target} is still unresolved "
+                         f"(receipt_id={r['receipt_id']}, outcome {status})")
+        return {"refused": "pr_unreadable", "detail": (
+            "the pull request could not be read, so this call sent no new merge request; " + "; ".join(facts)
+            + "; call pr_merge again once GitHub answers to observe it")}
     repo = {"url": str(pr.get("url") or "")}
     mine = [r for r in task_receipts(drive_root, task_id) if r.get("repo") == repo]
     prior = next((r for r in reversed(mine) if _must_observe(r)), None)
@@ -638,7 +655,8 @@ def run_pr_merge(ctx: Any, gh: Gh, gh_api: Gh, *, drive_root: Any, task_id: str,
         recovered = dict(prior, outcome=outcome, observed_after=observed, state="settled")
         recovered["launch_operation_ids"] = list(dict.fromkeys(
             [*(prior.get("launch_operation_ids") or []), *([operation_id] if operation_id else [])]))
-        return {**_finish(ctx, gh, gh_api, drive_root, task_id, recovered), "readback_only": True}
+        return {**_finish(ctx, gh, gh_api, drive_root, task_id, recovered), "readback_only": True,
+                "prior_status": str((prior.get("outcome") or {}).get("status") or "")}
     res = gh(["pr", "merge", str(number), f"--{method}", "--match-head-commit", expected], timeout=120)
     receipt.update(state="effect_attempted", effect={
         "ok": bool(getattr(res, "ok", False)), "exit_code": getattr(res, "exit_code", None),

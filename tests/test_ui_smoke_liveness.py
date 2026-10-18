@@ -10,7 +10,6 @@ its truthful Working with no flicker and no durable-detail polling.
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 
 import pytest
@@ -23,13 +22,8 @@ from tests.test_ui_smoke_project_continuity import (
     _wait_status,
 )
 
-import tempfile
+from tests._shared import producer_evidence_dir
 from tests._store_shared import seed_result
-
-_SCREENSHOT_DIR = pathlib.Path(
-    os.environ.get("OUROBOROS_UI_SMOKE_SHOT_DIR", "")
-    or (pathlib.Path(tempfile.gettempdir()) / "ouroboros-ui-shots")
-)
 
 
 def _seed_orphan_swarm(data_dir: pathlib.Path) -> None:
@@ -105,8 +99,9 @@ def test_ui_smoke_orphan_swarm_card_converges_to_online(direct_server_with_data)
                 timeout=30_000,
             )
             _wait_status(page, "Online", timeout=15_000)
-            _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-            page.screenshot(path=str(_SCREENSHOT_DIR / "liveness_L1_online.png"))
+            shots = producer_evidence_dir(direct_server_with_data["data_dir"].parent, "liveness",
+                                          env="OUROBOROS_UI_SMOKE_SHOT_DIR")
+            page.screenshot(path=str(shots / "liveness_L1_online.png"))
             # The child's answer text survives as an ordinary bubble.
             assert page.get_by_text("child final answer").count() >= 1
         finally:

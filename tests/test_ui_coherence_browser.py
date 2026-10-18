@@ -898,3 +898,83 @@ def test_short_question_and_routing_cards_keep_their_width_floor(subscription_ui
     assert metrics['overflow'] <= 1, metrics
     assert all(card['width'] >= card['minimum'] - 1 and card['inside'] for card in metrics['cards']), metrics
     setup_browser.capture(page, f'question-routing-width-{width}')
+
+
+@pytest.mark.parametrize('width', [1440, 390])
+def test_shared_dialog_head_wraps_a_long_title_and_keeps_close_inside(subscription_ui, width):
+    """A long unbroken skill name wraps in the shared modal head; Close keeps its size inside the dialog."""
+    page = subscription_ui['page']
+    page.set_viewport_size({'width': width, 'height': 844})
+    open_app(subscription_ui)
+    for title in ('Grant access to weather', 'Grant access to publication_grant_access_with_a_very_long_skill_name'):
+        page.evaluate("""async title => { (await import('/static/modules/confirm_dialog.js'))
+            .openConfirmDialog({ title, body: 'Grant access?', confirmLabel: 'Grant access' }); }""", title)
+        box = page.locator('.confirm-dialog').evaluate("""dialog => {
+            const d = dialog.getBoundingClientRect(), h = dialog.querySelector('h3').getBoundingClientRect();
+            const c = dialog.querySelector('.marketplace-modal-head [data-confirm-cancel]').getBoundingClientRect();
+            return {inside: h.left >= d.left && h.right <= c.left && c.right <= d.right + 0.5,
+                close: c.width, overflow: document.documentElement.scrollWidth - innerWidth};
+        }""")
+        assert box['inside'] and box['close'] > 50 and box['overflow'] <= 0, (title, box)
+        setup_browser.capture(page, f'dialog-head-{width}-{len(title)}')
+        page.keyboard.press('Escape')
+        page.wait_for_selector('.confirm-dialog', state='detached')
+
+
+def test_quiz_dot_and_evolution_facts_keep_their_shape_in_narrow_columns(subscription_ui):
+    """The quiz status dot stays round in a 320px column; a long Evolution fact wraps inside its card."""
+    page = subscription_ui['page']
+    page.set_viewport_size({'width': 390, 'height': 844})
+    page.route('**/api/state', lambda route: route.fulfill(json={
+        'supervisor_ready': True, 'active_chat_activities': [], 'projects': [], 'runtime_mode': 'advanced',
+        'bg_consciousness_enabled': True, 'bg_consciousness_state': {'status': 'sleeping', 'spent_24h_usd': 1.25,
+                                                                     'daily_usd': 10, 'unknown_unmetered': 1, 'integrity_degraded': True}}))
+    open_app(subscription_ui)
+    page.evaluate("""async () => {
+        const { createChatDecision } = await import('/static/modules/chat_decision.js');
+        const { createChatMedia } = await import('/static/modules/chat_media.js');
+        const { mountChatMarkdown } = await import('/static/modules/chat_markdown.js');
+        const media = createChatMedia({ chatSessionId: 'dot', formatMsgTime: () => null,
+            stampNodeTimestamp: () => {}, senderLabel: () => 'You' });
+        const decision = createChatDecision({ apiFetch: () => {}, showToast: () => {},
+            frameNode: media.bubbleFrameNode, mountMarkdown: mountChatMarkdown });
+        const column = document.querySelector('#chat-messages');
+        column.style.maxWidth = '320px';
+        column.append(decision.buildQuizCard({ type: 'quiz', task_id: 'dot', quiz_id: 'expired', state: 'expired_terminal',
+            question: 'How broadly should the next step change the interface?', options: ['Keep scope', 'Broaden scope'] }));
+    }""")
+    dot = page.locator('.chat-quiz-dot').bounding_box()
+    assert dot['width'] == pytest.approx(8, abs=0.5) and dot['height'] == pytest.approx(8, abs=0.5), dot
+    page.locator('#page-chat [data-mobile-nav-toggle]').click()  # a phone keeps navigation behind its menu
+    page.click('[data-nav-page="dashboard"]')
+    page.locator('[data-dashboard-tab="evolution"]').click()
+    chip = page.locator('.evo-runtime-chip', has_text='ledger integrity degraded')
+    chip.wait_for()
+    metrics = page.locator('#evo-chart-content').evaluate("""box => {
+        const card = box.querySelector('.evo-runtime-card').getBoundingClientRect();
+        return {scroll: box.scrollWidth - box.clientWidth,
+            outside: [...box.querySelectorAll('.evo-runtime-chip')].filter(c => c.getBoundingClientRect().right > card.right + 0.5).length};
+    }""")
+    assert metrics == {'scroll': 0, 'outside': 0}, metrics
+    chip.scroll_into_view_if_needed()
+    setup_browser.capture(page, 'evolution-facts-390')
+
+
+def test_evolution_start_says_a_refused_send_and_returns_focus(subscription_ui):
+    """Start campaign through its objective dialog: a gateway refusal is a visible error, the
+    button waits for the answer and keyboard focus comes back to it."""
+    page, held = subscription_ui['page'], []
+    page.route('**/api/command', lambda route: held.append(route))
+    open_app(subscription_ui, '/#dashboard')
+    page.locator('[data-dashboard-tab="evolution"]').click()
+    page.locator('#evo-start').focus()
+    page.keyboard.press('Enter')
+    page.locator('.confirm-dialog [data-confirm-ok]').click()
+    page.wait_for_function('() => document.getElementById("evo-start").disabled')
+    assert page.evaluate('() => document.getElementById("evo-stop").disabled') and len(held) == 1
+    held[0].fulfill(status=409, json={'error': 'Complete provider setup before sending this command.'})
+    toast = page.locator('.toast', has_text='Could not send /evolve on: Complete provider setup')
+    toast.wait_for()
+    page.wait_for_function('() => document.activeElement === document.getElementById("evo-start")')
+    assert held[0].request.post_data_json == {'cmd': '/evolve on'}
+    setup_browser.capture(page, 'evolution-start-refused')

@@ -20,6 +20,7 @@ import types
 import pytest
 
 from ouroboros import launcher_appearance as la
+from ouroboros import launcher_window_chrome
 
 FULL_WIDTH_HWND = 0x7FFF_0000_1234  # above 32 bits: a ToInt32 handle would not survive
 # Each page names itself by when it became the window's page (theme.js: performance.timeOrigin).
@@ -68,8 +69,9 @@ class Window:
 
 @pytest.fixture
 def windows(monkeypatch):
-    """The Windows path with its native seams replaced by recorders."""
+    """The Windows path with its native seams replaced by recorders (the macOS title bar: test_launcher_window_chrome)."""
     monkeypatch.setattr(la, "_WINDOWS", True)
+    monkeypatch.setattr(launcher_window_chrome, "_MACOS", False)
     state = types.SimpleNamespace(writes=[], refreshes=[], high_contrast=False, hresult=0)
 
     def write(hwnd, dark):

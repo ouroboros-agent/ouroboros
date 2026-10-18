@@ -263,6 +263,34 @@ def is_extension_live(
     return bool(state.get("desired_live")) and bool(state.get("live_loaded"))
 
 
+def live_context_publishers(drive_root: pathlib.Path) -> Dict[str, Dict[str, Any]]:
+    """Published declarations using the existing readiness authority.
+
+    Publication froze manifest/hash identity. Only enable/review/grant controls
+    are reread; no payload hashing or filesystem peer discovery on a prompt
+    path. A worker observes its loaded generation, not an atomic cross-process
+    view. Standard unload removes the declaration.
+    """
+    from dataclasses import replace
+    from ouroboros.skill_loader import load_enabled, load_review_state
+
+    with _lock:
+        published = [(name, bundle.loaded_skill, dict(bundle.context_snapshot), bundle.content_hash)
+                     for name, bundle in _extensions.items()
+                     if bundle.loaded_skill is not None and bundle.context_snapshot]
+        peers = [bundle.loaded_skill for bundle in _extensions.values() if bundle.loaded_skill is not None]
+    result = {}
+    for name, skill, descriptor, revision in published:
+        current = replace(skill, enabled=load_enabled(drive_root, name), review=load_review_state(
+            drive_root, name, skill_type="extension", skill_dir=skill.skill_dir))
+        state = _apply_durable_extension_health(_apply_deps_block(_extension_runtime_state(
+            current, drive_root=drive_root, skills=peers), drive_root, current), drive_root, current)
+        result[name] = {**descriptor, "revision": str(revision or ""),
+                        "eligible": bool(state["desired_live"] and state["live_loaded"]),
+                        "reason": state["reason"]}
+    return result
+
+
 def _revert_enabled_after_load_error(
     revert: bool, drive_root: pathlib.Path, skill_name: str, state: Dict[str, Any]
 ) -> None:

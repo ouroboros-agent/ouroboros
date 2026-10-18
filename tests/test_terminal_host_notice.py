@@ -1,5 +1,7 @@
 """Model answer identity and host disclosures through the real terminal consumers."""
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 from collections import deque
 import hashlib
@@ -11,6 +13,7 @@ import pytest
 
 from ouroboros import agent_task_pipeline as pipeline, loop
 from ouroboros.task_results import load_task_result, write_task_result
+from ouroboros.test_evidence import diagnostic_directory
 from tests._delivery_candidate_shared import write_child, write_confirmed_disposition_fixture
 from tests.test_delivery_forced_finalization import _bind_host_pass, _forced_test_context
 from tests.test_ui_smoke_playwright import direct_server_with_data as _direct_server_with_data
@@ -458,7 +461,6 @@ def test_a_host_notice_never_becomes_a_second_chat_row(tmp_path, monkeypatch, di
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_kw: None)
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
@@ -512,14 +514,13 @@ def test_the_notice_field_survives_every_machine_reader_without_a_chat_row(tmp_p
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_kw: None)
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     delivery._handle_send_message(event, SimpleNamespace(
         DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl, send_with_budget=message_bus.send_with_budget))
     chats = [row for row in frames if row.get("type") == "chat"]
     assert [(row["role"], row["content"]) for row in chats] == [("assistant", ANSWER)]
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert [row["text"] for row in rows if not row.get("type")] == [ANSWER]
 
 
@@ -590,7 +591,6 @@ def test_open_custody_is_its_own_card_row_live_and_on_history_replay(tmp_path, m
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_kw: None)
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     owed_while_sending = []
@@ -744,7 +744,7 @@ def test_browser_renders_the_model_answer_without_a_host_bubble(direct_server_wi
             answer.wait_for(state="visible", timeout=15000)
             assert "Plan review remained open" not in answer.inner_text()
             assert page.locator(".chat-bubble.system").count() == 0
-            page.screenshot(path=str(data.parent / "terminal-host-notice.png"), full_page=True)
+            page.screenshot(path=str(diagnostic_directory(data.parent, "terminal-host-notice") / "terminal-host-notice.png"), full_page=True)
             page.reload(wait_until="domcontentloaded")
             answer.wait_for(state="visible", timeout=15000)
             assert answer.count() == 1 and page.locator(".chat-bubble.system").count() == 0

@@ -15,6 +15,8 @@ render arm is pinned in ``web/tests/chat_plain_system_rows.test.js``.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import types
@@ -248,8 +250,11 @@ def test_history_normalizes_old_project_rows_on_read_without_rewriting_log(tmp_p
     assert assistant["text"] == "## Assistant heading stays markdown"
     assert assistant["markdown"] is True
 
-    # The durable log was read, never rewritten.
-    assert chat_path.read_bytes() == before
+    # The durable rows were read, never rewritten: the cutover moved the chain file's exact bytes into
+    # the frozen archive, and the store holds every line as written.
+    from tests._dialogue import lines
+    assert b"".join(path.read_bytes() for path in sorted((tmp_path / "archive").glob("chat_*.jsonl"))) == before
+    assert lines(tmp_path) == [json.dumps(row, ensure_ascii=False) for row in rows]
 
 
 def test_strip_markdown_is_the_single_shared_stripper():
@@ -286,9 +291,6 @@ def test_cancel_receipt_rides_verbatim_live_durable_and_on_replay(
     monkeypatch.setattr(
         message_bus, "load_state", lambda: {"session_id": "s-1", "owner_id": 7},
     )
-    monkeypatch.setattr(
-        message_bus, "_advance_project_visible_revision", lambda _chat_id: None,
-    )
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
 
     verbatim = (
@@ -306,11 +308,7 @@ def test_cancel_receipt_rides_verbatim_live_durable_and_on_replay(
     assert live["role"] == "system"
     assert live["system_type"] == "cancel_receipt"
 
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     durable = next(row for row in rows if row.get("type") == "cancel_receipt")
     assert durable["text"] == verbatim
 
@@ -403,8 +401,7 @@ def test_the_task_summary_row_carries_reason_detail_only_when_there_is_a_cause(t
     assert _completion_verdict(clean, {}) == ""
     assert append_terminal_task_projection(tmp_path, "root-project", root, clean,
                                            {"status": "completed", "outcome_axes": clean["outcome_axes"]})
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     (projection,) = [row for row in rows if row.get("summary_kind") == "terminal_root_projection"]
     assert projection["outcome"] == "Done" and "reason_detail" not in projection
     # The other direction: a non-clean result writes the renderer's own clause, byte-identical.
@@ -412,8 +409,7 @@ def test_the_task_summary_row_carries_reason_detail_only_when_there_is_a_cause(t
     root_warn = {**root, "id": "root-project-warn"}
     assert append_terminal_task_projection(tmp_path, "root-project-warn", root_warn, warn,
                                            {"status": "completed", "outcome_axes": warn["outcome_axes"]})
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     warned = [row for row in rows if row.get("summary_kind") == "terminal_root_projection"][-1]
     assert warned["reason_detail"] == _completion_verdict(warn, {}) != ""
 
@@ -550,11 +546,7 @@ def test_host_verdict_leads_both_lifecycle_rows(tmp_path, monkeypatch):
     )
 
     assert append_terminal_task_projection(tmp_path, "root-project", root, result, done)
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     projection = next(row for row in rows if row.get("summary_kind") == "terminal_root_projection")
     assert projection["text"] == (
         "Done with warnings. Root task root-project. "
@@ -611,7 +603,7 @@ def test_terminal_row_reports_the_depth_request_only_when_one_exists(tmp_path):
 
     rows = {
         json.loads(line)["task_id"]: json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines()
         if line.strip()
     }
     # The depth facts stay on the task result, where a reader can compare them;
@@ -648,7 +640,7 @@ def test_a_host_salvage_row_is_never_a_bare_headline_and_reason(tmp_path):
 
     row = next(
         json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines()
         if line.strip()
     )
     assert row["outcome"] == "Failed"

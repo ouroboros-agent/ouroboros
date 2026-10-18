@@ -496,7 +496,7 @@ def test_vlm_child_reads_credential_named_runtime_content(tmp_path, monkeypatch)
 
 def test_vlm_project_store_guard_applies(tmp_path):
     """SC-6 read_file parity: the per-project facts store (projects/<id>/) is
-    reachable only via the project-scoped knowledge tools — read_file denies it
+    reachable only via the project-scoped tools — read_file denies it
     for EVERY profile, so the matrix-derived runtime_data admission must too."""
     from ouroboros.tools import vision
 

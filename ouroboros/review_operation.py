@@ -533,7 +533,9 @@ def review_operation_scope(*, request: Any, slots: List[Any], usage_ctx: Any,
     try:
         token = _BOUND.set(operation)
         try:
-            with operation_wait_scope(operation.wait):
+            from ouroboros.review_pause import author_drain
+
+            with author_drain(parent, operation), operation_wait_scope(operation.wait):
                 yield binding
         finally:
             _BOUND.reset(token)
@@ -1053,17 +1055,13 @@ def _row_actor(slot: Any, operation_id: str, row: Optional[dict], *, state: str,
 
 def _invocation_for_operation(root: Any, slot: Any, operation_id: str, row: dict) -> Optional[Dict[str, Any]]:
     """The durable delegated invocation this operation requested, if one is on record."""
-    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_invocation
 
     token = str(row.get("pending_invocation_id") or (row.get("usage") or {}).get("pending_invocation_id")
                 or (row.get("recovery_binding") or {}).get("pending_invocation_id") or "")
-    rows = list(custody.custody_rows(root))
     if not token:
-        token = next((str(item.get("invocation_id") or "") for item in rows
-                      if item.get("type") == custody.START_REQUESTED
-                      and str(item.get("operation_id") or "") == operation_id
-                      and str(item.get("slot_id") or "") == str(slot.slot_id)), "")
-    record = custody.invocation_record(root, token, rows=rows) if token else None
+        return delegate_invocation.operation_record(root, operation_id, str(slot.slot_id))
+    record = delegate_invocation.invocation_record(root, token)
     return {**record, "invocation_id": token} if record is not None else None
 
 
@@ -1084,6 +1082,15 @@ def _observe_delegated_review(root: Any, request: Any, slot: Any, row: dict, ope
         return _row_actor(slot, operation_id, row, state="custody_lost",
                           reason="The recorded review assignment binding is inconsistent."), UNAVAILABLE
     record = _invocation_for_operation(root, slot, operation_id, row)
+    if record is not None and record.get("state") == "legacy_gap":
+        actor = _row_actor(slot, operation_id, row, state="custody_lost", reason=(
+            f"Legacy invocation custody is incomplete (legacy_gap: {record['reason']}); "
+            "it cannot prove nothing was sent, so the reviewer is never re-sent."))
+        if not controller_known:
+            actor = _frozen_actor(row, slot)
+        actor.failure_code = "review_custody_legacy_gap"
+        actor.usage["custody_state"] = "legacy_gap"
+        return actor, UNAVAILABLE if controller_known else DEFERRED
     if record is not None:
         expected = {"task_id": request.task_id, "surface": request.surface, "slot_id": slot.slot_id,
                     "operation_id": operation_id,
@@ -1152,9 +1159,7 @@ def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_
     try:
         from ouroboros.review_checking import terminal_seat_evidence
 
-        # The exact-detail policy retains unknown writers; failed runs need the
-        # engine's literal settled scope. Windows copy-use compatibility is success-only,
-        # not proof about arbitrary detached OS descendants.
+        # The receipt is written before the seat's one-shot copy is deleted.
         evidence = terminal_seat_evidence(root, request.task_id, operation_id, detail)
     except Exception as exc:
         # The paid verdict remains collectible even if retaining its checking

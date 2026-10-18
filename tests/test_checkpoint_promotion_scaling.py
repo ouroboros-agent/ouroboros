@@ -29,7 +29,7 @@ def test_shared_checkpoint_history_has_bounded_parsing_and_survives_gc(tmp_path,
             drive_root=child, task_id=task_id,
         )
         capsule, _ = cc._capsule_message(
-            cc._SelectedUnit(unit, 0, ""), f"summary {index}",
+            unit, f"summary {index}",
             [cc._part(unit.unit_id, unit.source_text)], ref, request,
         )
         refs.append(ref)
@@ -81,7 +81,7 @@ def test_exact_checkpoint_keeps_old_manifest_identity_beside_derived_version(tmp
     first = cc._persist_reclaim_checkpoint(messages, request,
         SimpleNamespace(fingerprint="first", units=[]), drive_root=child, task_id=task)
     unit = cc._atomic_units(messages, trace_refs_by_tool_call_id={"read": call})[-1]
-    capsule, _ = cc._capsule_message(cc._SelectedUnit(unit, 0, ""), "summary",
+    capsule, _ = cc._capsule_message(unit, "summary",
                                     [cc._part(unit.unit_id, unit.source_text)], first, request)
     later_messages = [capsule, *_unit("next", "y")]
     later = cc._persist_reclaim_checkpoint(later_messages, _request(later_messages, 10),
@@ -172,7 +172,7 @@ def test_deep_producer_checkpoint_chain_has_no_graph_recursion(tmp_path):
         unit = cc._atomic_units(messages)[-1]
         ref = cc._persist_reclaim_checkpoint(messages, request,
             SimpleNamespace(fingerprint=f"deep-{index}", units=[]), drive_root=child, task_id=task)
-        capsule, _ = cc._capsule_message(cc._SelectedUnit(unit, 0, ""), "summary",
+        capsule, _ = cc._capsule_message(unit, "summary",
                                         [cc._part(unit.unit_id, unit.source_text)], ref, request)
         refs.append(ref)
     _, state = observability.promote_child_task_refs(parent, child, task,

@@ -40,7 +40,6 @@ from ouroboros.consciousness_authority import (
 )
 from ouroboros.context_health import safe_read
 from ouroboros.dialogue_provenance import is_presence_task
-from ouroboros.jsonl_tail import JsonlChainSnapshot
 
 PROMPT_REL = pathlib.Path("prompts") / "CONSCIOUSNESS.md"
 WAKE_OBSERVATION_KEY = "wake_observation"  # task metadata: the bound observation's source and projection
@@ -167,99 +166,55 @@ def _closed_card_line(task_id, quiz_id, block, *, now):
             f"question: {_clip_preview(block.get('question') or 'question text unavailable')}")
 
 
-class _ChatChain(JsonlChainSnapshot):
-    """One captured pass over ``logs/chat.jsonl`` + its rotated archives (``jsonl_chain_handles``).
-
-    Offsets count bytes across the chain; archives are never pruned, so an
-    accepted boundary stays a valid position across rotations. Only complete
-    rows are returned (``JsonlChainSnapshot.rows``): an unfinished live line
-    belongs to the next wake.
-    """
-
-    def first_line_sha256(self, index: int) -> str:
-        """Hash only a committed first nonempty line within this captured segment."""
-        from ouroboros.utils import jsonl_chain_handles
-
-        base, end = self.segment(index)
-        if base < end:
-            with jsonl_chain_handles(self.path, strict=True, start_offset=base, snapshot=self.snapshot) as handles:
-                remaining = end - base
-                while remaining:
-                    raw = handles[0][1].readline(remaining)
-                    if not raw.endswith(b"\n"):
-                        return ""
-                    remaining -= len(raw)
-                    first = raw.decode("utf-8", errors="replace").strip()
-                    if first:
-                        return hashlib.sha256(first.encode("utf-8", errors="replace")).hexdigest()
-        return ""
-
-
-def _boundary_segment(chain: _ChatChain, boundary: Any) -> Optional[int]:
-    """The segment an accepted boundary still denotes, or None when the chain changed."""
-    if not isinstance(boundary, dict) or boundary.get("version") != OBSERVATION_BOUNDARY_VERSION:
-        return None
-    try:
-        upper, seg_start = int(boundary["upper"]), int(boundary["segment_start"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    for index in range(len(chain.entries)):
-        base, end = chain.segment(index)
-        if base == seg_start and upper <= end:
-            expected = str(boundary.get("segment_sha256") or "")
-            actual = chain.first_line_sha256(index)
-            # A zero-byte boundary never committed that segment's first line;
-            # legacy cursors may have fingerprinted its then-unfinished bytes.
-            return index if upper == base or not expected or expected == actual else None
-    return None
-
-
 def _chat_window(drive_root: pathlib.Path, boundary: Any, since: float,
                  gaps: set) -> Tuple[List[Tuple[int, Dict[str, Any]]], Dict[str, Any]]:
-    """Every complete chat-chain row appended after the accepted boundary.
+    """Every row after the accepted SQL/legacy byte boundary, including late old timestamps.
 
-    Position, not the row's own ``ts``, defines the window: a row written late
-    with an older stamp is still new to this wake. Without a usable boundary
-    (first wake after upgrade, or a replaced chain) the window starts at the
-    first row stamped at/after ``since``, and says so.
+    A wake requests all rooms. Only the initial time bootstrap surveys their retained
+    rows; subsequent wakes query the accepted interval. Imports must cover the interval
+    before its boundary can advance, and skipped intervals remain visible gaps.
     """
-    chain = _ChatChain(drive_root / "logs" / "chat.jsonl")
-    if not isinstance(boundary, dict) or "upper" not in boundary:
-        boundary = None  # no accepted chat position (only transitions were ever accepted)
-    if not chain.entries:
-        return [], {"lower": 0, "upper": 0, "basis": "empty_chain", "boundary": None}
-    start_index = _boundary_segment(chain, boundary)
-    basis = "accepted_boundary"
-    if start_index is not None:
+    from ouroboros import dialogue_store as ds, dialogue_positions as dp
+    from ouroboros.chat_chain import source_row_id
+
+    upper = ds.stream_end(drive_root, "chat")
+    if not upper:
+        ds.require_imported(drive_root, "chat")
+        return [], {"lower": 0, "upper": 0, "basis": "empty_chain", "boundary": {
+            "version": OBSERVATION_BOUNDARY_VERSION, "upper": 0, "segment_start": 0,
+            "segment_sha256": "dialogue:empty"}}
+    boundary = boundary if isinstance(boundary, dict) and "upper" in boundary else None
+    lower, valid = 0, False
+    if boundary and boundary.get("version") == OBSERVATION_BOUNDARY_VERSION:
         lower = int(boundary["upper"])
-    else:
+        start, signature = int(boundary.get("segment_start", 0)), str(boundary.get("segment_sha256") or "")
+        if signature == "dialogue:empty":
+            valid = lower <= upper and not ds.newest(drive_root, "chat", before=lower, limit=1)
+        elif signature.startswith("dialogue:"):
+            entry = ds.row_at(drive_root, "chat", start)
+            valid = entry is not None and signature == "dialogue:" + source_row_id(entry.row) and entry.end <= lower <= upper
+        else:
+            ds.require_imported(drive_root, "chat", upper=lower)
+            valid = any(unit["base"] == start and lower <= unit["base"] + unit["size"]
+                        and (lower == start or not signature or unit["gen"] == signature)
+                        for unit in ds.generation_metadata(drive_root, "chat"))
+    basis = "accepted_boundary"
+    if not valid:
         basis = "time_bootstrap" if boundary is None else "time_bootstrap_boundary_mismatch"
-        if boundary is not None:
+        if boundary:
             gaps.add("accepted_boundary_no_longer_matches_chat_chain")
-        # Newest segment first; without a fresh row the window starts at the end
-        # of the last COMPLETE line, so an unfinished live line is read later.
-        since_iso, index = _iso(since), len(chain.entries) - 1
-        rows, lower = chain.rows(index, chain.segment(index)[0], set())
-        start_index = index
-        while index >= 0:
-            fresh = [offset for offset, row in rows if str(row.get("ts") or "") >= since_iso]
-            if fresh:
-                lower, start_index = fresh[0], index
-            if rows and str(rows[0][1].get("ts") or "") < since_iso:
-                break
-            index -= 1
-            rows = chain.rows(index, chain.segment(index)[0], set())[0] if index >= 0 else []
-    collected: List[Tuple[int, Dict[str, Any]]] = []
-    upper = lower
-    for index in range(start_index, len(chain.entries)):
-        rows, upper = chain.rows(index, max(lower, chain.segment(index)[0]), gaps)
-        collected.extend(rows)
-    # The boundary names the segment it sits in by start and first line: a later
-    # pass proves the chain still holds that position before trusting it.
-    seg_index = max(i for i in range(len(chain.entries)) if chain.segment(i)[0] <= upper)
-    seg_start = chain.segment(seg_index)[0]
-    accepted = {"version": OBSERVATION_BOUNDARY_VERSION, "upper": upper, "segment_start": seg_start,
-                "segment_sha256": chain.first_line_sha256(seg_index)}
+        ds.require_imported(drive_root, "chat", upper=upper)
+        lower = next((entry.seq for entry in ds.iter_rows(drive_root, "chat", upper=upper)
+                      if str(entry.row.get("ts") or "") >= _iso(since)), upper)
+    ds.require_imported(drive_root, "chat", lower=lower, upper=upper)
+    for gap in dp.skipped_between(drive_root, "chat", lower if valid else 0, upper):
+        gaps.add(f"{'jsonl_non_object' if gap.kind == 'non_object' else 'jsonl_malformed'}:state/dialog.sqlite:{gap.seq}")
+    collected = [(entry.seq, entry.row) for entry in ds.iter_rows(drive_root, "chat", lower=lower, upper=upper)]
+    last = ds.newest(drive_root, "chat", before=upper, limit=1)
+    accepted = ({"version": OBSERVATION_BOUNDARY_VERSION, "upper": upper, "segment_start": last[0].seq,
+                 "segment_sha256": "dialogue:" + source_row_id(last[0].row)} if last else {
+                     "version": OBSERVATION_BOUNDARY_VERSION, "upper": upper, "segment_start": 0,
+                     "segment_sha256": "dialogue:empty"})
     return collected, {"lower": lower, "upper": upper, "basis": basis, "boundary": accepted}
 
 
@@ -667,6 +622,9 @@ def observe_wake(drive_root: Any, *, boundary: Any, since: float, now: float, re
     except Exception as exc:
         chat_rows, window = [], {"lower": None, "upper": None, "basis": "chat_chain_unreadable", "boundary": None}
         gaps.add(f"chat log unreadable: {type(exc).__name__}")
+        from ouroboros.store import StoreError
+        if isinstance(exc, StoreError):
+            gaps.add(str(exc))
     window["transitions_basis"] = basis
     try:
         registry = list_reserved_projects(root)

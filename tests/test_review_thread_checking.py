@@ -30,7 +30,7 @@ from tests._review_session_route_shared import (  # noqa: F401
     fake_route,
 )
 from tests.test_review_checking import _author_state, _git, author  # noqa: F401
-from tests.test_review_checking_scope import ABSENT, NO_CENSUS, SETTLED, UNSETTLED
+from tests.test_review_checkout_lifecycle import ABSENT, NO_CENSUS, SETTLED, UNSETTLED, directory_source
 
 
 class ThreadGateway(FakeGateway):
@@ -155,7 +155,6 @@ def test_successful_turns_refresh_subject_in_same_thread_and_retain_each_output(
     area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
     assert area.is_dir()
     _assert_coverage(first["checking_evidence"], ThreadGateway.coverage(1))
-    assert first["checking_evidence"]["refresh_safe"]
     first_summary = (Path(first["checking_evidence"]["evidence_dir"]) / "summary.json").read_bytes()
     assert _author_state(author) == before_a
 
@@ -185,7 +184,6 @@ def test_successful_turns_refresh_subject_in_same_thread_and_retain_each_output(
                   thread_id=first["thread_id"])
     assert seen_roots == [area]
     _assert_coverage(second["checking_evidence"], ThreadGateway.coverage(2))
-    assert second["checking_evidence"]["refresh_safe"]
     _assert_coverage(first["checking_evidence"], ThreadGateway.coverage(1))
     assert (Path(first["checking_evidence"]["evidence_dir"]) / "summary.json").read_bytes() == first_summary
     assert first["checking_evidence"]["evidence_dir"] != second["checking_evidence"]["evidence_dir"]
@@ -215,7 +213,7 @@ def test_directory_turns_keep_geometry_same_thread_and_frozen_evidence(tmp_path,
     source_dir, drive = tmp_path / "ordinary folder", tmp_path / "drive"
     source_dir.mkdir()
     (source_dir / "f.txt").write_bytes(b"A staged\n")
-    source = rc.freeze_checking_source(source_dir, data_root=drive)
+    source = directory_source(source_dir, drive)
     first = _run(source_dir, drive, source, access=access)
     area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
     receipt = Path(first["checking_evidence"]["evidence_dir"]) / "summary.json"
@@ -226,7 +224,7 @@ def test_directory_turns_keep_geometry_same_thread_and_frozen_evidence(tmp_path,
 
     (source_dir / "f.txt").write_bytes(b"B revised\n")
     thread_gateway.expected_subject = b"B revised\n"
-    second_source = rc.freeze_checking_source(source_dir, data_root=drive)
+    second_source = directory_source(source_dir, drive)
     thread_gateway.before_turn = lambda current: (
         current == area and not (current / "reviewer-test.txt").exists()
         and not (current / ".git").exists()) or pytest.fail("directory turn did not refresh its bound copy")
@@ -247,12 +245,12 @@ def test_directory_turns_keep_geometry_same_thread_and_frozen_evidence(tmp_path,
     assert (source_dir / "f.txt").read_bytes() == b"B revised\n"
 
 
-@pytest.mark.parametrize("settled", [False, True], ids=["unsettled", "settled"])
-def test_failed_directory_copy_residue_refreshes_only_after_permitted_capture(tmp_path, thread_gateway, settled):
+@pytest.mark.parametrize("scope", [SETTLED, UNSETTLED], ids=["settled", "unsettled"])
+def test_failed_directory_turn_refreshes_after_its_capture_whatever_the_scope(tmp_path, thread_gateway, scope):
     source_dir, drive = tmp_path / "folder", tmp_path / "drive"
     source_dir.mkdir()
     (source_dir / "f.txt").write_bytes(b"A staged\n")
-    source = rc.freeze_checking_source(source_dir, data_root=drive)
+    source = directory_source(source_dir, drive)
 
     def failed_preparation(area):
         (area / ".git").mkdir()
@@ -261,30 +259,24 @@ def test_failed_directory_copy_residue_refreshes_only_after_permitted_capture(tm
     thread_gateway.before_turn = failed_preparation
     thread_gateway.terminal_state = "failed"
     thread_gateway.failure_code = "workspace_unavailable"
-    thread_gateway.process_scope = SETTLED if settled else UNSETTLED
+    thread_gateway.process_scope = scope
     with pytest.raises(ClaudexorUnavailable) as caught:
         _run(source_dir, drive, source)
     assert caught.value.code == "workspace_unavailable"
     evidence = caught.value.checking_evidence
-    assert evidence["status"] == "retained" and evidence["refresh_safe"] is settled
+    assert evidence["status"] == "retained" and "refresh_safe" not in evidence
     captured = Path(evidence["evidence_dir"]) / "summary.json"
     preserved = captured.read_bytes()
     area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
-    assert (area / ".git" / "index.lock").is_file()
+    assert (area / ".git" / "index.lock").is_file()  # a thread keeps its copy between turns
     thread_gateway.terminal_state = "succeeded"
     thread_gateway.before_turn = lambda current: (
         current == area and not (current / ".git").exists()
     ) or pytest.fail("refresh carried the failed preparation's synthetic Git directory")
-    if settled:
-        second = _run(source_dir, drive, source, operation="op-2", thread_id="thread-1")
-        assert second["thread_id"] == "thread-1" and second["turn_id"] == "turn-2"
-        assert thread_gateway.turn_requests[-1][1]["execution"]["workspaceKind"] == "directory"
-    else:
-        with pytest.raises(ReviewRouteUnavailable) as blocked:
-            _run(source_dir, drive, source, operation="op-2", thread_id="thread-1")
-        assert blocked.value.code == "review_checking_copy_unavailable"
-        assert (area / ".git" / "index.lock").read_bytes() == b""
-    assert len(thread_gateway.turn_requests) == (2 if settled else 1)
+    second = _run(source_dir, drive, source, operation="op-2", thread_id="thread-1")
+    assert second["thread_id"] == "thread-1" and second["turn_id"] == "turn-2"
+    assert thread_gateway.turn_requests[-1][1]["execution"]["workspaceKind"] == "directory"
+    assert len(thread_gateway.turn_requests) == 2
     assert captured.read_bytes() == preserved
     assert sorted(path.name for path in source_dir.iterdir()) == ["f.txt"]
 
@@ -307,32 +299,23 @@ def test_failed_terminal_turn_keeps_named_output_and_original_error(author, tmp_
     assert caught.value.delegated_run_id == "run-1"
     evidence = caught.value.checking_evidence
     _assert_coverage(evidence, ThreadGateway.coverage(1))
-    assert not evidence["refresh_safe"]
-    assert evidence["retention_reason"] == "writer_quiescence_unverified"
-    area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
-    assert area.is_dir()
-    with pytest.raises(ReviewRouteUnavailable) as blocked:
-        _run(author, drive, source, operation="op-2", thread_id="thread-1")
-    assert blocked.value.code == "review_checking_copy_unavailable"
-    assert len(thread_gateway.turn_requests) == 1
-    assert (area / rc.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == ThreadGateway.coverage(1)
+    assert not {"refresh_safe", "retention_reason"} & set(evidence)
+    thread_gateway.terminal_state = "succeeded"
+    second = _run(author, drive, source, operation="op-2", thread_id="thread-1")
+    assert second["turn_id"] == "turn-2" and len(thread_gateway.turn_requests) == 2
     _assert_coverage(evidence, ThreadGateway.coverage(1))
+    _assert_coverage(second["checking_evidence"], ThreadGateway.coverage(2))
     assert _author_state(author) == before
 
 
-@pytest.mark.parametrize("scope,refreshes", [
-    (ABSENT, True), (SETTLED, True), (NO_CENSUS, True), (None, False), (UNSETTLED, False),
-    ({**NO_CENSUS, "survivors": 1}, False), ({**NO_CENSUS, "unreadable": 1}, False),
-    ({**NO_CENSUS, "coverage": "marker"}, False),
+@pytest.mark.parametrize("scope", [
+    ABSENT, SETTLED, NO_CENSUS, None, UNSETTLED, {**NO_CENSUS, "survivors": 1}, {**NO_CENSUS, "unreadable": 1},
+    {**NO_CENSUS, "coverage": "marker"},
 ], ids=["absent", "settled", "no-census", "null", "unsettled", "no-census-survivor", "no-census-unreadable",
         "mixed-coverage"])
-def test_process_scope_decides_whether_the_next_turn_refreshes_the_copy(author, tmp_path, thread_gateway, scope, refreshes):  # noqa: F811
-    """A succeeded turn whose scope is unknown (``null``: the engine holds no readable
-    record, e.g. a run that succeeded before an engine upgrade and is first captured after
-    it) or unsettled delivers its answer and evidence, keeps the copy as left and refuses
-    the next turn typed before any send; an absent key (an older engine) or a settled
-    scope refreshes the copy, and so does the engine's census-less answer (Windows) under
-    the owner's weaker permission, which each receipt names beside the engine's facts."""
+def test_any_process_scope_lets_the_next_turn_refresh_the_copy(author, tmp_path, thread_gateway, scope):  # noqa: F811
+    """The answer and evidence of a succeeded turn are delivered whatever process census
+    the engine reports, and the next turn starts on a fresh copy (owner 1A, 2026-10-12)."""
     drive = tmp_path / "drive"
     source = rc.freeze_checking_source(author, data_root=drive, subject=rc.SUBJECT_INDEX)
     before = _author_state(author)
@@ -342,25 +325,11 @@ def test_process_scope_decides_whether_the_next_turn_refreshes_the_copy(author, 
     first = _run(author, drive, source)
     assert first["text"] == '{"findings": []}' and first["run_id"] == "run-1"
     _assert_coverage(first["checking_evidence"], ThreadGateway.coverage(1))
-    assert first["checking_evidence"]["refresh_safe"] is refreshes
-    compatible = scope == NO_CENSUS
-    assert first["checking_evidence"].get("release_basis") == (rc.RELEASE_WITHOUT_CENSUS if compatible else None)
-    assert first["checking_evidence"].get("process_scope") == (NO_CENSUS if compatible else None)
-    area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
-    if refreshes:
-        second = _run(author, drive, source, operation="op-2", thread_id=first["thread_id"])
-        assert second["turn_id"] == "turn-2" and left_over == [False, False], "turn 2 starts on a fresh copy"
-        _assert_coverage(second["checking_evidence"], ThreadGateway.coverage(2))
-        assert second["checking_evidence"]["refresh_safe"] is True
-        assert second["checking_evidence"].get("release_basis") == first["checking_evidence"].get("release_basis")
-        assert second["checking_evidence"].get("process_scope") == first["checking_evidence"].get("process_scope")
-    else:
-        assert first["checking_evidence"]["retention_reason"] == "writer_quiescence_unverified"
-        with pytest.raises(ReviewRouteUnavailable) as blocked:
-            _run(author, drive, source, operation="op-2", thread_id=first["thread_id"])
-        assert blocked.value.code == "review_checking_copy_unavailable"
-        assert (area / "reviewer-test.txt").read_bytes() == b"reviewer turn 1\n" and left_over == [False]
-    assert len(thread_gateway.turn_requests) == (2 if refreshes else 1)
+    assert not {"refresh_safe", "release_basis", "process_scope"} & set(first["checking_evidence"])
+    second = _run(author, drive, source, operation="op-2", thread_id=first["thread_id"])
+    assert second["turn_id"] == "turn-2" and left_over == [False, False], "turn 2 starts on a fresh copy"
+    _assert_coverage(second["checking_evidence"], ThreadGateway.coverage(2))
+    assert len(thread_gateway.turn_requests) == 2
     assert len(thread_gateway.thread_requests) == 1 and not thread_gateway.start_requests
     assert not thread_gateway.cancels and _author_state(author) == before
 
@@ -368,46 +337,46 @@ def test_process_scope_decides_whether_the_next_turn_refreshes_the_copy(author, 
 def test_engine_upgrade_between_turns_reuses_the_stored_receipt(author, tmp_path, thread_gateway):  # noqa: F811
     drive = tmp_path / "drive"
     source = rc.freeze_checking_source(author, data_root=drive, subject=rc.SUBJECT_INDEX)
-    first = _run(author, drive, source)  # an older engine: no projection, refresh-safe capture
+    first = _run(author, drive, source)  # an older engine: no projection
     stored = Path(first["checking_evidence"]["evidence_dir"]) / "summary.json"
     stored_bytes = stored.read_bytes()
     thread_gateway.process_scope = None  # upgraded engine: no readable scope record of run-1 or run-2
     assert rc.terminal_seat_evidence(drive, "task-1", "op-1", thread_gateway.get_run("run-1")) == first["checking_evidence"]
     assert stored.read_bytes() == stored_bytes
     second = _run(author, drive, source, operation="op-2", thread_id=first["thread_id"])
-    assert second["turn_id"] == "turn-2", "the stored receipt still opens the next turn"
-    assert not second["checking_evidence"]["refresh_safe"]  # the new turn's own scope is unknown
-    with pytest.raises(ReviewRouteUnavailable) as blocked:
-        _run(author, drive, source, operation="op-3", thread_id=first["thread_id"])
-    assert blocked.value.code == "review_checking_copy_unavailable"
-    assert len(thread_gateway.turn_requests) == 2 and stored.read_bytes() == stored_bytes
+    third = _run(author, drive, source, operation="op-3", thread_id=first["thread_id"])
+    assert (second["turn_id"], third["turn_id"]) == ("turn-2", "turn-3")
+    assert len(thread_gateway.turn_requests) == 3 and stored.read_bytes() == stored_bytes
 
 
-def test_unobserved_terminal_keeps_copy_and_blocks_next_subject(author, tmp_path, thread_gateway, monkeypatch):  # noqa: F811
+def test_unobserved_terminal_is_captured_by_the_next_turn(author, tmp_path, thread_gateway, monkeypatch):  # noqa: F811
     from ouroboros import review_execution as rx
 
     drive = tmp_path / "drive"
     source = rc.freeze_checking_source(author, data_root=drive, subject=rc.SUBJECT_INDEX)
     original_error = OSError("daemon connection lost before terminal receipt")
+    real_poll, failed = rx._poll_session_terminal, []
 
-    def unavailable(*args, **kwargs):
-        raise original_error
+    def lost_once(*args, **kwargs):
+        if not failed:
+            failed.append(True)
+            raise original_error
+        return real_poll(*args, **kwargs)
 
-    monkeypatch.setattr(rx, "_poll_session_terminal", unavailable)
+    monkeypatch.setattr(rx, "_poll_session_terminal", lost_once)
     with pytest.raises(OSError) as caught:
         _run(author, drive, source)
     assert caught.value is original_error
     assert not getattr(caught.value, "checking_evidence", None)
     area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
     assert (area / rc.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == ThreadGateway.coverage(1)
-    with pytest.raises(ReviewRouteUnavailable) as blocked:
-        _run(author, drive, source, operation="op-2", thread_id="thread-1")
-    assert blocked.value.code == "review_checking_copy_unavailable"
-    assert len(thread_gateway.turn_requests) == 1
-    assert (area / rc.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == ThreadGateway.coverage(1)
+    second = _run(author, drive, source, operation="op-2", thread_id="thread-1")
+    assert second["turn_id"] == "turn-2" and len(thread_gateway.turn_requests) == 2
+    _assert_coverage(rc._receipt(drive, "task-1", "op-1"), ThreadGateway.coverage(1))
+    _assert_coverage(second["checking_evidence"], ThreadGateway.coverage(2))
 
 
-def test_capture_failure_preserves_copy_and_successful_response(author, tmp_path, thread_gateway, monkeypatch):  # noqa: F811
+def test_capture_failure_keeps_the_answer_and_does_not_block_the_thread(author, tmp_path, thread_gateway, monkeypatch):  # noqa: F811
     drive = tmp_path / "drive"
     source = rc.freeze_checking_source(author, data_root=drive, subject=rc.SUBJECT_INDEX)
 
@@ -418,12 +387,10 @@ def test_capture_failure_preserves_copy_and_successful_response(author, tmp_path
     first = _run(author, drive, source)
     assert first["text"] == '{"findings": []}'
     assert first["checking_evidence"]["status"] == "capture_failed"
-    area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
-    assert (area / rc.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == ThreadGateway.coverage(1)
-    with pytest.raises(ReviewRouteUnavailable):
-        _run(author, drive, source, operation="op-2", thread_id=first["thread_id"])
-    assert len(thread_gateway.turn_requests) == 1 and not thread_gateway.start_requests
-    assert (area / rc.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == ThreadGateway.coverage(1)
+    assert "evidence volume unavailable" in first["checking_evidence"]["error"]
+    second = _run(author, drive, source, operation="op-2", thread_id=first["thread_id"])
+    assert second["turn_id"] == "turn-2" and not thread_gateway.start_requests
+    assert rc._receipt(drive, "task-1", "op-1")["status"] == "capture_failed"
 
 
 @pytest.mark.parametrize("ordinary_directory", [False, True], ids=["git", "directory"])
@@ -435,7 +402,8 @@ def test_lost_turn_response_rejoins_original_copy_and_invocation(author, tmp_pat
     if ordinary_directory:
         root.mkdir()
         (root / "f.txt").write_bytes(b"A staged\n")
-    source = rc.freeze_checking_source(root, data_root=drive, subject=rc.SUBJECT_INDEX)
+    source = (directory_source(root, drive) if ordinary_directory
+              else rc.freeze_checking_source(root, data_root=drive, subject=rc.SUBJECT_INDEX))
     before, retry_state = _author_state(author), {}
     thread_gateway.lose_start_response = True
     with pytest.raises(TimeoutError):
@@ -447,7 +415,6 @@ def test_lost_turn_response_rejoins_original_copy_and_invocation(author, tmp_pat
     facts = _run(root, drive, None, retry_state=retry_state, reconcile_only=True)
     _assert_coverage(facts["checking_evidence"], ThreadGateway.coverage(1))
     assert facts["idempotent_recovery"] and facts["run_id"] == "run-1"
-    assert facts["checking_evidence"]["refresh_safe"]
     assert len(thread_gateway.thread_requests) == len(thread_gateway.turns) == 1
     assert len(thread_gateway.turn_requests) == 2
     assert [row[2] for row in thread_gateway.turn_requests] == [pending, pending]
@@ -522,7 +489,7 @@ def test_directory_capture_retains_named_coverage_bytes_and_digest(tmp_path):
     source_folder, drive = tmp_path / "payload", tmp_path / "drive"
     source_folder.mkdir()
     (source_folder / "SKILL.md").write_bytes(b"original skill\n")
-    source = rc.freeze_checking_source(source_folder, data_root=drive)
+    source = directory_source(source_folder, drive)
     assert source["kind"] == "directory"
     area = Path(rc.prepare_seat_area(drive, "task-1", "directory-op", source))
     declared = area / rc.EVIDENCE_DIRNAME
@@ -530,7 +497,7 @@ def test_directory_capture_retains_named_coverage_bytes_and_digest(tmp_path):
     expected = b'<coverage branch-rate="0.7"/>\r\n\x00\xff'
     (declared / "coverage.xml").write_bytes(expected)
     # This test itself completed the only synchronous writer before capture.
-    evidence = rc.capture_seat_evidence(drive, "task-1", "directory-op", release=True)
+    evidence = rc.capture_seat_evidence(drive, "task-1", "directory-op")
     _assert_coverage(evidence, expected)
     assert not area.exists()
     assert (source_folder / "SKILL.md").read_bytes() == b"original skill\n"
@@ -539,20 +506,20 @@ def test_directory_capture_retains_named_coverage_bytes_and_digest(tmp_path):
     assert saved["named_evidence"] == evidence["named_evidence"]
 
 
-def test_capture_without_writer_quiescence_keeps_thread_copy_and_blocks_refresh(author, tmp_path):  # noqa: F811
+def test_a_captured_thread_turn_keeps_its_copy_until_the_next_turn(author, tmp_path):  # noqa: F811
     drive = tmp_path / "drive"
     source = rc.freeze_checking_source(author, data_root=drive, subject=rc.SUBJECT_INDEX)
     area = Path(rc.thread_seat_area(drive, "task-1", "plan_review:t1", source, operation_id="op-1"))
     declared = area / rc.EVIDENCE_DIRNAME
     declared.mkdir()
     (declared / "coverage.xml").write_bytes(ThreadGateway.coverage(1))
-    evidence = rc.capture_seat_evidence(drive, "task-1", "op-1", release=False)
+    evidence = rc.capture_seat_evidence(drive, "task-1", "op-1")
     _assert_coverage(evidence, ThreadGateway.coverage(1))
-    assert not evidence["refresh_safe"]
-    with pytest.raises(rc.CheckingAreaUnavailable):
-        rc.thread_seat_area(drive, "task-1", "plan_review:t1", source, operation_id="op-2")
     assert (declared / "coverage.xml").read_bytes() == ThreadGateway.coverage(1)
-    assert (Path(evidence["evidence_dir"]) / "files" / rc.EVIDENCE_DIRNAME / "coverage.xml").exists()
+    assert rc.thread_seat_area(drive, "task-1", "plan_review:t1", source, operation_id="op-2") == str(area)
+    assert not declared.exists()
+    saved = Path(evidence["evidence_dir"]) / "files" / rc.EVIDENCE_DIRNAME / "coverage.xml"
+    assert saved.read_bytes() == ThreadGateway.coverage(1)
 
 
 def test_saved_host_thread_id_resumes_when_caller_supplies_none(author, tmp_path, thread_gateway):  # noqa: F811
@@ -564,7 +531,6 @@ def test_saved_host_thread_id_resumes_when_caller_supplies_none(author, tmp_path
     home = rc.seat_dir(drive, "task-1", "thread:plan_review:t1")
     marker = json.loads((home / "checking.json").read_text())
     assert marker["thread_id"] == first["thread_id"] == "thread-1"
-    assert first["checking_evidence"]["refresh_safe"]
     second = _run(author, drive, source, operation="op-2")
     assert second["thread_id"] == first["thread_id"]
     assert second["turn_id"] == "turn-2"
@@ -584,9 +550,8 @@ def test_mismatched_supplied_thread_id_refuses_before_refresh_or_send(author, tm
     first = _run(author, drive, source)
     home = rc.seat_dir(drive, "task-1", "thread:plan_review:t1")
     area = home / "area"
-    # Successful terminal capture is complete; identity mismatch must prevent
-    # refresh even when the ordinary refresh gate is open.
-    assert first["checking_evidence"]["refresh_safe"]
+    # The turn's receipt exists; an identity mismatch still prevents the refresh.
+    assert first["checking_evidence"]["status"] == "retained"
     marker_before = (home / "checking.json").read_bytes()
     marker_inode = area.stat().st_ino
     paid = []
@@ -645,7 +610,6 @@ def test_cancelled_terminal_carries_evidence_on_original_poller_timeout(author, 
     assert caught.value.checking_terminal_detail["summary"]["state"] == "cancelled"
     assert thread_gateway.cancels == [("run-1", "review_slot_timeout")]
     _assert_coverage(caught.value.checking_evidence, ThreadGateway.coverage(1))
-    assert not caught.value.checking_evidence["refresh_safe"]
     area = rc.seat_dir(drive, "task-1", "thread:plan_review:t1") / "area"
     assert (area / rc.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == ThreadGateway.coverage(1)
     assert _author_state(author) == before
@@ -660,7 +624,7 @@ def test_completed_turn_evidence_remains_readable_when_later_area_is_replaced(au
     declared = area / rc.EVIDENCE_DIRNAME
     declared.mkdir()
     (declared / "coverage.xml").write_bytes(b"original-turn\x00")
-    original = rc.capture_seat_evidence(drive, "task-1", "op-1", release=True)
+    original = rc.capture_seat_evidence(drive, "task-1", "op-1")
     area.rename(area.with_name("retained-away"))
     area.symlink_to(author, target_is_directory=True)
     assert rc.capture_seat_evidence(drive, "task-1", "op-1") == original

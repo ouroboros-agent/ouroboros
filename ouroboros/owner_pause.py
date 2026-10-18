@@ -38,7 +38,6 @@ from __future__ import annotations
 import logging
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar, copy_context
-import copy
 import pathlib
 import threading
 import time
@@ -89,7 +88,7 @@ class LaunchBusy(OwnerPauseRefused):
 # --- the durable fence --------------------------------------------------------------
 
 _CACHE_LOCK = threading.Lock()
-_CACHE: Dict[str, Tuple[tuple, Dict[str, Any]]] = {}
+_CACHE: Dict[str, bool] = {}  # observed authority only, never cached control values
 
 
 def _lock_path(root_drive: Any, root_task_id: str) -> pathlib.Path:
@@ -99,25 +98,20 @@ def _lock_path(root_drive: Any, root_task_id: str) -> pathlib.Path:
 
 
 def _control_projection(root_drive: Any, root_task_id: str) -> Dict[str, Any]:
-    """The root's current ``owner_pause`` projection (``{}`` when none).
-
-    Cached on the row's write signature: an unchanged signature is an unchanged
-    projection and the launch gate costs one indexed read on the hot path. An
-    unreadable root result raises: an unknown fence is never read as an open one.
-    """
-    from ouroboros.task_store import signature
+    """One addressed control read; an unknown fence is never an open one."""
+    from ouroboros.store_hot_facts import controls
 
     root_task_id = str(root_task_id or "").strip()
     if not root_task_id or root_drive in (None, ""):
         return {}
     key = f"{root_drive}:{root_task_id}"
     try:
-        stamp = signature(root_drive, root_task_id)
+        projection = controls(root_drive, root_task_id)
     except StoreBusy:
         raise
     except StoreError as exc:
         raise ValueError("owner_pause_authority_unreadable") from exc  # the store could not answer: unknown, never open
-    if stamp is None:
+    if not projection:
         from ouroboros.task_result_schema import TASK_RESULT_QUARANTINE_DIR
         from ouroboros.task_results import task_results_dir
 
@@ -127,26 +121,10 @@ def _control_projection(root_drive: Any, root_task_id: str) -> Dict[str, Any]:
         if prior or (quarantine / f"{root_task_id}.json").exists() or any(quarantine.glob(f"{root_task_id}.*.json")):
             raise ValueError("owner_pause_authority_missing")  # a row that was, or was refused: never an open fence
         return {}
+    # Remember only that this process saw authority, preserving the missing-row
+    # refusal. Current controls always come from the store or the request snapshot.
     with _CACHE_LOCK:
-        cached = _CACHE.get(key)
-        if cached is not None and cached[0] == stamp:
-            return copy.deepcopy(cached[1])
-    from ouroboros.task_results import load_task_result
-
-    try:
-        row = load_task_result(pathlib.Path(root_drive), root_task_id, strict=True) or {}
-    except StoreBusy:
-        raise
-    except StoreError as exc:
-        raise ValueError("owner_pause_authority_unreadable") from exc
-    projection = {"owner_pause": row.get("owner_pause") or {},
-                  "budget_pause": row.get("budget_pause") if isinstance(row.get("budget_pause"), dict) else {},
-                  "status": row.get("status"), "present": bool(row)}
-    # A concurrent body change may make this read newer than the first stamp.
-    # Cache only a stable pair, never tag older data with a later signature.
-    if signature(root_drive, root_task_id) == stamp:
-        with _CACHE_LOCK:
-            _CACHE[key] = (stamp, copy.deepcopy(projection))
+        _CACHE[key] = True
     return projection
 
 
@@ -184,8 +162,12 @@ def root_actor(root_drive: Any, root_task_id: str, task_id: str, *, strict: bool
     if not task_id or not root_task_id or task_id == root_task_id:
         return bool(task_id) and task_id == root_task_id
     from ouroboros.cancel_intents import _validated_single_cancel_target
+    from ouroboros.store_hot_facts import read
 
     try:
+        row = read(root_drive, root_task_id) or {}
+        if not row.get("superseded_by") and not row.get("retry_task_id"):
+            return False
         return _validated_single_cancel_target(root_drive, root_task_id) == task_id
     except Exception:
         if strict:
@@ -515,7 +497,7 @@ def interrupted_member_resume(root_drive: Any, root_task_id: str, task_id: str, 
     The Resume itself rechecks all of it.
     """
     from ouroboros.budget_pause import STATE_RESUMED, budget_pause_row
-    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES
 
     try:
         if root_actor(root_drive, root_task_id, task_id, strict=True):
@@ -531,7 +513,7 @@ def interrupted_member_resume(root_drive: Any, root_task_id: str, task_id: str, 
         return False
     try:
         fence = read_fence(root_drive, root_task_id)
-        root = load_task_result(root_drive, root_task_id, strict=True) or {}
+        root = _control_projection(root_drive, root_task_id)
     except Exception:
         return None
     selected = (fence.get("selected_members") or {}).get(task_id)
@@ -906,10 +888,10 @@ def tree_member_results(root_drive: Any, root_task_id: str) -> Dict[str, Dict[st
     store refuses the census. Selection never supplies live status or custody.
     """
     from ouroboros.task_results import load_task_result
-    from ouroboros.task_store import task_facts
+    from ouroboros.task_store import tree_facts
 
     try:
-        facts = task_facts(root_drive, where="root_task_id=? OR root_task_id IS NULL", params=(root_task_id,))
+        facts = tree_facts(root_drive, root_task_id)
     except StoreBusy:
         raise
     except StoreError as exc:

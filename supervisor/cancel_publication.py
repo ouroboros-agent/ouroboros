@@ -768,7 +768,9 @@ def _finalize_cancel_intent_on_miss(
     settles ``not_found`` too, the row untouched. And it must not bury a child
     that finished: when the row names a child drive, the child's own result is
     copied back BEFORE the cancelled write, so a crash of the split-drive
-    copy-back window cannot cost a completed answer.
+    copy-back window cannot cost a completed answer. Nor does a direct restore fence
+    bury an answer the host already owes or delivered under cancel text and a
+    "no salvageable output" notice: that attempt is finalized from the answer.
     """
     from supervisor.queue_transitions import _settled_status
     from supervisor.task_lifecycle import (
@@ -871,14 +873,27 @@ def _finalize_cancel_intent_on_miss(
         existing = load_task_result(q.DRIVE_ROOT, task_id) or existing
         cost_fields = _reconstructed_cost_fields(q, task_id, existing)
         from ouroboros.store import StoreBusy, acquisition_budget
+        from ouroboros.working_checkpoint import adopt_registered_answer, registered_answer
         from supervisor.task_reaper import _deferred_reap_jobs
+        registry_root = pathlib.Path(existing.get("budget_drive_root") or q.DRIVE_ROOT)
+        # A direct restore fence keeps a positively held answer, like dead-worker recovery.
+        # Other cancel paths (including pooled restore) keep their existing outcome.
+        owner = existing.get("execution_owner")
+        adopt = (isinstance(owner, dict) and owner.get("kind") == "direct"
+                 and bool(shutdown_cancel_text(active))
+                 and registered_answer(registry_root, task_id).get("basis") in {"owed", "exhausted", "delivered"})
+        adopted: Optional[Dict[str, Any]] = None
         # Under Q the health tick hands a retained reap back to its reaper wholly before or after
         # this write: an idle one replays over it; one out for its replay keeps the slot and the write.
         try:
             with acquisition_budget(0), q._queue_lock:
                 retained = [job for job in _deferred_reap_jobs if str(job.get("task_id") or "") == task_id]
                 replaying = any(job.get("_replaying") for job in retained)
-                if not replaying:
+                if not replaying and adopt:
+                    adopted = adopt_registered_answer(q.DRIVE_ROOT, existing, task_id, cause="app_stop",
+                                                      attempt=int(existing.get("task_attempt") or 0),
+                                                      registry_root=registry_root)
+                if not replaying and not adopted:
                     stored = write_task_result(
                         q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
                         **_cancel_result_fields(
@@ -896,6 +911,18 @@ def _finalize_cancel_intent_on_miss(
         if replaying:  # the open intent returns to the watchdog, as for any reaper-owned slot
             _release_intent_claim(q, task_id, error="slot owned by the reaper's replay", intent=intent)
             return CANCEL_FAILED
+        if adopted:  # published like dead-worker recovery's adoption: no cancel text, no "no output" notice
+            if not retained:
+                from supervisor import workers
+                from supervisor.task_reaper import _finish_self_finalized_task
+                from supervisor.worker_health import terminal_task_metadata
+
+                _finish_self_finalized_task(q, workers, existing, task_id, str(existing.get("type") or "task"),
+                                            str(adopted.get("status") or ""), adopted,
+                                            terminal_task_metadata(existing.get("metadata")), unreconciled)
+            _settle_intent(q, task_id, outcome=SETTLED_ALREADY, detail="registered_answer_finalized", intent=intent)
+            q.persist_queue_snapshot(reason="cancel_finalize")
+            return CANCEL_ALREADY_SETTLED
         stored_status = str((stored or {}).get("status") or "")
         if stored_status != STATUS_CANCELLED:
             # The monotonic guard refused: something settled it while we worked.

@@ -808,6 +808,8 @@ def _emit_operation(
             # operation is the stable round identity for both terminal events.
             "round_id": str(getattr(request, "round_id", "") or entry.operation_id),
             "slot_id": str(getattr(slot, "slot_id", "") or ""),
+            # The panel this seat serves, as its wait rows name it (``review_pause.panel_activity``).
+            "model_wait_owner_id": str(getattr(getattr(entry, "operation", None), "owner_id", "") or ""),
             **extra,
         }
         if event_queue is not None:
@@ -816,6 +818,15 @@ def _emit_operation(
             from ouroboros.tools.review_helpers import emit_review_event
 
             emit_review_event(usage_ctx, {"type": "cognitive_operation", **values})
+        if phase == "started":
+            # The cue may have gone idle before this panel acquired its first seat.
+            # Both frames share the control FIFO: publish the seat before waking its reader.
+            from ouroboros.model_sleep import announce_resumed
+
+            wait = getattr(getattr(entry, "operation", None), "wait", None)
+            if wait is not None:
+                announce_resumed(SimpleNamespace(event_queue=wait.event_queue, task_id=task_id,
+                                                  current_chat_id=wait.task.get("chat_id")))
     except Exception:
         log.debug("review operation event failed", exc_info=True)
     try:

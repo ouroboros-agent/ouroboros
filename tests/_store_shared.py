@@ -82,9 +82,20 @@ def unreadable_result(monkeypatch, task_id: str, *, root=None) -> dict:
             raise store.StoreError(f"simulated unreadable row: {task_id}")
         return real_views(root, ids, versions)
 
+    from ouroboros import store_hot_facts
+
+    real_hot_rows = store_hot_facts._read_rows
+
+    def hot_rows(txn, ids):  # the typed control columns of the row are unreadable too
+        rows = real_hot_rows(txn, ids)
+        if str(task_id) in rows and broken(txn, task_id):
+            rows[str(task_id)] = store.StoreError(f"simulated unreadable row: {task_id}")
+        return rows
+
     monkeypatch.setattr(store.Txn, "body_text", body_text)
     monkeypatch.setattr(store.Txn, "row", row)
     monkeypatch.setattr(task_store, "display_documents", display_documents)
+    monkeypatch.setattr(store_hot_facts, "_read_rows", hot_rows)
     return switch
 
 

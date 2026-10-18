@@ -991,6 +991,10 @@ export function createAvailableSubagentsEditor({
                 if (index >= 0) state.setting.items.splice(index, 1);
                 markDirty({ structural: true });
                 paint();
+                // The caret moves to the entry now in this place, else to Add (DESIGN "List editors").
+                const next = state.setting.items[Math.min(index, state.setting.items.length - 1)];
+                if (next) revealRow(next._uiKey || next.subagent_id);
+                else host()?.querySelector('[data-subagent-add]')?.focus();
             });
         });
     }

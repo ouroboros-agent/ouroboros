@@ -169,7 +169,7 @@ def retain_acceptance_history(drive_root: Any, task: dict, text: str, trace: dic
     from ouroboros.utils import utc_now_iso
 
     seed = trace.get("acceptance_history_seed")
-    if not isinstance(seed, dict):
+    if not isinstance(seed, dict) or (usage or {}).get("wake_silent") is True:  # a silent wake emitted no delivery
         return {}
     if emitted_delivery_authorship(delivery, usage) == DELIVERY_AUTHOR_HOST:
         return {}

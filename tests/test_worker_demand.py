@@ -1,6 +1,7 @@
 """Elasticity through actual assignment, readiness, snapshot and reaper consumers."""
 
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -377,7 +378,8 @@ def test_unauthorized_pending_resume_never_withholds_growth_from_admissible_work
     from ouroboros import owner_pause
     from ouroboros.cancel_intents import request_cancel
     from supervisor import worker_owner_wait
-    event = {**assigning.event, "checkpoint": {**assigning.wait, "reason": "owner_pause"}}
+    event = {**assigning.event, "checkpoint": {**assigning.wait, "reason": "owner_pause",
+             "budget_paused_sec": 0.0, "sleep_started_at": time.time()}}
     worker_owner_wait.handle_owner_wait(event, workers)
     assert assigning.original.in_q.get_nowait()["phase"] == "parked"
     worker_owner_wait.handle_owner_wait({**event, "phase": "resume", "resume_reason": "control:owner_resume"}, workers)
@@ -786,7 +788,8 @@ def test_owner_pause_resume_or_stop_at_cap_keeps_the_pool_dispatching(assigning,
     from ouroboros import owner_pause
     from supervisor import worker_owner_wait
     owner_pause.install_fence(assigning.root, "owner", request_id="pause-1")
-    event = {**assigning.event, "checkpoint": {**assigning.wait, "reason": "owner_pause"}}
+    event = {**assigning.event, "checkpoint": {**assigning.wait, "reason": "owner_pause",
+             "budget_paused_sec": 0.0, "sleep_started_at": time.time()}}
     worker_owner_wait.handle_owner_wait(event, workers)
     assert assigning.original.in_q.get_nowait()["phase"] == "parked"
     workers.assign_tasks()  # the lent slot's replacement

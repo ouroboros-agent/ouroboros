@@ -52,7 +52,8 @@ There are three skill types:
 
 The **runtime ownership** of an installed skill is also tagged:
 
-- `native`: bundled with the launcher (e.g. `unix_computer_use`).
+- `native`: bundled with the launcher (e.g. `unix_computer_use` on macOS/Linux,
+  `windows_computer_use` on Windows).
 - `self_authored`: created by Ouroboros itself in the current data
   plane; marked by `.self_authored.json` and reviewed through the
   standard tri-model skill-review path.
@@ -60,14 +61,13 @@ The **runtime ownership** of an installed skill is also tagged:
 - `clawhub`: installed via the ClawHub marketplace.
 - `ouroboroshub`: installed via the official OuroborosHub catalog.
 
-User-authored or manually copied skills belong under
-`data/skills/external/<name>/`. The `native` bucket is reserved for
-launcher-seeded skills that carry a `.seed-origin` marker. That marker, not the
-directory name alone, is the ownership fact: an existing payload under
-`native/` without the marker is treated in place as user-managed `external`
-content. Ordinary top-level tasks can inspect, edit, run commands in, or
-delegate that payload without a migration. A marker-present launcher seed stays
-read/review-only, and new skills are still created under `external/`.
+Create or manually copy skills under `data/skills/external/<name>/`.
+The `native` bucket is launcher-owned only with `.seed-origin`; without it,
+payloads stay in place as user-managed `external` content, inspectable, editable,
+executable and delegable by ordinary top-level tasks without migration.
+Marker-present seeds remain read/review-only. Windows retains a legacy enabled
+Unix remote skill across later OFF/ON and updates (eligibility, not local Windows
+support or execution authority; [bootstrap rules](architecture/02-startup-onboarding-flow.md#packaged-seed-and-managed-checkout)).
 
 ## Manifest schema (`SKILL.md` frontmatter or `skill.json`)
 
@@ -82,6 +82,7 @@ description: Live weather widget    # required, short summary
 version: 0.2.1                      # required, free-form (semver recommended)
 type: extension                     # instruction | script | extension
 runtime: python3                    # script skills: python/python3/bash/node/deno/ruby/go; extension entry modules are Python plugin.py
+os: any                             # or [darwin, linux, win32]; governs new bundled offerings (legacy remote exception above)
 entry: plugin.py                    # type=extension only — relative to skill dir
 scripts:                            # type=script only
   - name: fetch.py                  # name resolves under scripts/ unless slashes/extensions
@@ -170,6 +171,30 @@ the `list_skills` index and the "Installed Skills" context section, whole in
 `list_skills(name=...)`, which also returns the `read_file` call for this
 manifest — so write it for the model, not for the human reviewer. Unknown keys or
 non-string values are refused at parse time.
+
+### Passive context snapshots (extensions only)
+
+A reviewed extension may declare `context_snapshot: {path: context-snapshot.json}`
+and the `context_snapshot` permission/grant. Its existing deterministic task or
+companion writes that relative path under its own skill state, atomically:
+`{"schema_version":1,"observed_at":"…Z","valid_until":"…Z","text":"…"}`.
+Dates must be finite timezone-aware ISO instants, observed ≤ valid and not in the
+future. The complete UTF-8 JSON file is bounded at 32768 bytes; malformed, missing,
+escaping or oversized files yield an explicit unknown, never clipped prose.
+
+Write compact deterministic facts, not instructions or relative-age counters.
+Keep changing poll timestamps out of `text`: the envelope dates date the visible
+claim. Main, project roots and consciousness receive a labelled UNTRUSTED tail
+note after compaction; children and Presence do not. No callback, model, network,
+refresh or scheduler is run by prompt preparation. Current enablement, review,
+grants, dependencies and publication must remain eligible. Revocation/expiry emits
+one withdrawal; it does not resend old facts. A changed material value appends a
+full note; timestamp-only renewal waits until the visible lease expires, then
+references that exact full text's source/text hashes with new dates. No delta
+chain or hidden memo is authority: reclaim keeps the required visible base, and
+an absent base after compaction/cold Resume causes a complete current note. This preserves the
+existing prefix, not a promise of provider cache hits. Source bytes are retained
+through observability; earlier notes remain historical, not current authority.
 
 Manifest refusals teach: every `SkillManifestError` carries the problem plus,
 where the parser knows the repair, a `fix_hint` rendered into the message
@@ -264,7 +289,8 @@ install:
 
 Bare `dependencies` entries are treated as Python packages. `pip`,
 `pipx`, `uv`, `npm`, and `node` specs are installed only after a fresh
-executable review and only under the skill's `.ouroboros_env` directory.
+executable review (a bundled native seed's launcher trust counts, so it needs
+no model review) and only under the skill's `.ouroboros_env` directory.
 Global package-manager specs remain manual setup guidance. Exact resources and
 explicit build actions use the same isolated install owner:
 
@@ -582,6 +608,7 @@ calls and runtime behaviours:
 
 | Permission | What it grants |
 |------------|----------------|
+| `context_snapshot` | Opt-in standing model context from the declared local snapshot, subject to the existing content-hash-bound grant (see Passive context snapshots). No injection or model-start authority. |
 | `net` | The skill may make outbound network calls. |
 | `fs` | The skill may write outside its state dir (review item still enforces confinement). |
 | `subprocess` | The skill may spawn child processes (review items + cwd-confinement still enforce). |
@@ -597,6 +624,12 @@ calls and runtime behaviours:
 | `inject_chat` | With the owner's `inject_chat` grant, `POST /chat/inject` accepts text, an inline image or `attachments` (`[{path, name?, mime?}]`: up to 25 regular files confined to the skill's state root, copied without the former 50 MiB cap to `data/uploads` and staged for the task; file-only messages need no text). Optional `reply_to` carries a host row or `task:<task_id>` address as a reference, never routing. The same grant lets the skill relay the owner's decision-card answer through `POST /chat/decision` (`{request_id, decision_id, option_index?, comment?}`, the `POST /api/decisions` contract). A message that carries a `client_message_id` becomes an addressable operation: the host answers with its `operation_ref` (`<chat_id>:<client_message_id>`) on 202, 200 and 504; a repeated delivery of the same message — the same words AND the same ordered attachment content (inline image and files, compared by bytes and name, not by the host's stored copy) — rejoins it instead of enqueueing again (a different message under a reused id is refused with 409); an inline image and the attachments also appear in the owner's chat bubble from the host's stored copy, while the image still reaches the model as before (inline bytes that are not a proven image are kept as an ordinary file and never sent as an image; base64 over 50 MiB decoded is refused with 413); `GET /chat/operations/{operation_ref}` reports the skill's own accepted message (`pending`, `running` with its task or turn, the durable answer, a terminal task status, or `lost` after a host restart or when the host's own acceptance write failed); and `POST /chat/cancel` (`{operation_ref, reason?}`) runs the existing cancellation owner on work that message started, answering `cancelled`, `already_terminal`, `unresolved` or `cancel_unsupported` — never a cancellation that did not happen. |
 | `presence` | A reviewed transport skill may submit authenticated non-owner conversation events to the Host Service Presence boundary and poll only their correlated late work. Requires an explicit content-hash-bound owner grant. |
 | `notify_owner` | The skill may tell the owner one thing through `POST /notify` after an explicit owner permission grant (see "Telling the owner something" below): one bounded plain sentence the host shows in the owner's chat as a System row signed with the skill's name. It wakes no model; narrower than `inject_chat`. |
+
+`chat.typing` is a start/resume/activity-change wake, not proof of an active
+reply or an exactly-once start. The bundled Telegram bridge reads the internal
+`ouroboros.gateway.reply_preparation` projection; no stable PluginAPI or Host
+Service reader is exposed to third-party skills yet. A live activity may be
+waiting, stopped or doing post-answer work.
 
 A missing permission causes the matching `register_*` call to raise
 `ExtensionRegistrationError`, surfaced as a skill load error in the
@@ -1639,8 +1672,8 @@ requires fresh reviewer approval. See ARCHITECTURE §13 for the shared runtime g
 ## Reference skills
 
 The simplest reference for each type lives in the OuroborosHub catalog
-(`razzant/OuroborosHub`); `unix_computer_use` ships bundled under
-`repo/skills/`:
+(`razzant/OuroborosHub`); `unix_computer_use` and `windows_computer_use` ship
+bundled under `repo/skills/`:
 
 - `weather` — `type: extension`, declarative form/key-value widget,
   reads no env keys.

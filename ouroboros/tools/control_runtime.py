@@ -832,13 +832,32 @@ def _effort_switch(ctx: ToolContext, requested: str) -> tuple[str, str]:
 
 def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
                  answer_sha256: str | None = None, rationale: str = "",
-                 acceptance_subject: dict | None = None, pending_review: str | None = None) -> str:
-    """Stage a local author act; the loop owns answer selection and finalization."""
+                 acceptance_subject: dict | None = None, pending_review: str | None = None,
+                 silent: bool = False) -> str:
+    """Stage an author act; only a wake's own direct turn can choose silence."""
+    allow_empty = False
+    if silent:
+        if action != "finish":
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+                text="ERROR: COMPLETION_ARGUMENT: silent requires action=finish"))
+        from ouroboros.consciousness_authority import CONSCIOUSNESS_CATEGORY, is_consciousness_origin
+        metadata = getattr(ctx, "task_metadata", None)
+        if not bool(getattr(ctx, "is_direct_chat", False)):
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+                text="ERROR: COMPLETION_ARGUMENT: silent is available only on a consciousness wake's own turn"))
+        if not (is_consciousness_origin(metadata)
+                and str((metadata or {}).get("usage_category") or "") == CONSCIOUSNESS_CATEGORY):
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+                text="ERROR: COMPLETION_ARGUMENT: silent is available only on a consciousness wake's own turn, "
+                     "not on the tasks it started or any other turn"))
+        allow_empty = True
+        if answer is None and not answer_sha256:
+            answer = ""  # silence needs no words; complete bytes given anyway stay an internal result
     return stage_completion_request(ctx, {
         "action": action, "answer": answer, "answer_sha256": answer_sha256,
         "rationale": rationale, "acceptance_subject": acceptance_subject,
-        "pending_review": pending_review,
-    })
+        "pending_review": pending_review, "wake_silent": bool(silent) or None,
+    }, allow_empty=allow_empty)
 
 
 def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "finish_task",

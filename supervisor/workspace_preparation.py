@@ -4,11 +4,15 @@ An acting child's write surface (an isolated current-tree copy, a genesis
 project, or an external workspace's Git binding) costs lock waits, Git, copy
 and index work. The supervisor event loop only claims the producer's REQUESTED
 row for one preparation token (the existing admission reservation map) and
-commits the durable ``workspace_preparation`` marker on that row; one FIFO
-thread per supervisor generation then runs the existing schedule owner with the
+commits the durable ``workspace_preparation`` marker on that row; a FIFO lane
+of the supervisor generation then runs the existing schedule owner with the
 claim (``events_schedule_task._handle_schedule_task(..., preparation=claim)``).
-Command and event draining never wait on a copy, and physical preparations stay
-serialized in acceptance order. A host that never opened
+Copies and new projects stay serialized in acceptance order on one lane; an
+existing folder's validation uses the other, so it never waits behind a copy
+(a child admitted on a folder may write it while a copy of that folder still
+waits: the copy then starts from those writes, and one landing during the copy
+is refused by its whole-tree diff, both as in the other order). Command and
+event draining wait on neither. A host that never opened
 a generation (a direct caller of the handler) keeps the historical inline path.
 Positive entry contention keeps the unaccepted event on its original transport;
 after marker acceptance, acquisition waits retain the same FIFO stack off Q.
@@ -129,12 +133,22 @@ def _process_owner() -> Dict[str, Any]:
     return dict(_OWNER)
 
 
-class PreparationGeneration:
-    """One supervisor generation's FIFO preparation owner: one daemon thread at a time.
+COPY_LANE, VALIDATION_LANE = "workspace-preparation", "workspace-preparation-validation"
+# The resolver of these surfaces only validates an existing folder and reads its
+# Git HEAD (``_resolve_subagent_constraint``): no copy, no shared worktree lock.
+_VALIDATION_SURFACES = frozenset({"external_workspace"})
 
-    ``submit`` never waits: it appends and starts the thread when none runs; the
-    thread drains jobs in order and exits when the queue is empty. Closing never
-    joins: a running copy keeps its custody until it returns.
+
+class PreparationGeneration:
+    """One supervisor generation's preparation owner: two FIFO lanes, one daemon thread each at a time.
+
+    The copy lane keeps every surface that may copy or create a write root in
+    acceptance order; the validation lane runs only claims whose surface copies
+    nothing, so an existing folder never waits behind another task's copy. A
+    claim's later cleanup joins its own lane, after its job. ``submit`` never
+    waits: it appends and starts the lane's thread when none runs; the thread
+    drains in order and exits when the lane is empty. Closing never joins: a
+    running copy keeps its custody until it returns.
     """
 
     def __init__(self, stop: Optional[Callable[[], bool]] = None):
@@ -144,8 +158,8 @@ class PreparationGeneration:
         self._closed = threading.Event()
         self._lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
-        self._jobs: collections.deque = collections.deque()
-        self._thread: Optional[threading.Thread] = None
+        self._jobs = {lane: collections.deque() for lane in (COPY_LANE, VALIDATION_LANE)}
+        self._threads: Dict[str, Optional[threading.Thread]] = dict.fromkeys(self._jobs)
 
     def closed(self) -> bool:
         """Closed explicitly, or its server generation / process stop or restart was requested."""
@@ -154,39 +168,41 @@ class PreparationGeneration:
     def close(self) -> None:
         self._closed.set()
 
-    def submit(self, job: Callable[[], None]) -> bool:
-        """Queue ``job`` behind earlier ones; False when no thread could start for it."""
+    def submit(self, job: Callable[[], None], lane: str = COPY_LANE) -> bool:
+        """Queue ``job`` behind earlier ones of its lane; False when no thread could start for it."""
         with self._lock:
-            self._jobs.append(job)
-            if self._thread is not None:
+            self._jobs[lane].append(job)
+            if self._threads[lane] is not None:
                 return True
-            thread = threading.Thread(target=self._drain, name="workspace-preparation", daemon=True)
-            self._thread = thread
+            thread = threading.Thread(target=self._drain, args=(lane,), name=lane, daemon=True)
+            self._threads[lane] = thread
             try:
                 thread.start()
             except Exception:
                 log.warning("Workspace preparation thread could not start", exc_info=True)
-                self._thread = None
-                self._jobs.clear()  # no thread ran, so the queue held only this job
+                self._threads[lane] = None
+                self._jobs[lane].clear()  # no thread ran, so the lane held only this job
                 return False
             return True
 
     def on_executor(self) -> bool:
-        return self._thread is threading.current_thread()
+        return threading.current_thread() in self._threads.values()
 
     def wait_idle(self, timeout: Optional[float] = None) -> bool:
         """Wait until nothing is queued or running (tests, diagnostics; never the event loop)."""
         with self._idle:
-            return self._idle.wait_for(lambda: self._thread is None and not self._jobs, timeout)
+            return self._idle.wait_for(
+                lambda: not any(self._threads.values()) and not any(self._jobs.values()), timeout)
 
-    def _drain(self) -> None:
+    def _drain(self, lane: str) -> None:
+        jobs = self._jobs[lane]
         while True:
             with self._lock:
-                if not self._jobs:
-                    self._thread = None
+                if not jobs:
+                    self._threads[lane] = None
                     self._idle.notify_all()
                     return
-                job = self._jobs.popleft()
+                job = jobs.popleft()
             try:
                 job()
             except Exception:
@@ -266,7 +282,7 @@ def accept(evt: Dict[str, Any], ctx: Any, route: Dict[str, Any]) -> bool:
             if landed is not True:
                 claim.unrecorded(landed)
                 return True
-            submitted = claim.submitted = claim.generation.submit(functools.partial(_run, claim))
+            submitted = claim.submitted = claim.generation.submit(functools.partial(_run, claim), claim.lane)
             if not submitted:
                 claim.refuse(_DETAILS[EXECUTOR_UNAVAILABLE], EXECUTOR_UNAVAILABLE)
             return True
@@ -332,6 +348,11 @@ class PreparationClaim:
         self.submitted = False
         self.queued_marker = self.marker(QUEUED)
         self.refusal_receipt = uuid.uuid4().hex
+
+    @property
+    def lane(self) -> str:
+        """The request's surface, normalized as its resolver reads it, picks the lane before submission."""
+        return VALIDATION_LANE if self.surface.strip().lower() in _VALIDATION_SURFACES else COPY_LANE
 
     def store_gate(self, operation: Callable[[], Any], *, controls: bool = True,
                    retryable: Optional[Callable[[], bool]] = None) -> Any:
@@ -449,7 +470,7 @@ class PreparationClaim:
         generation = self.generation
         if generation is None:
             cleanup()
-        elif (generation.on_executor() or not generation.closed()) and generation.submit(cleanup):
+        elif (generation.on_executor() or not generation.closed()) and generation.submit(cleanup, self.lane):
             return
         else:
             log.info("Refused preparation %s (%s) retains its resources for ordinary retention: "

@@ -405,7 +405,7 @@ def test_task_local_same_rung_repair_still_obeys_physical_attempt_rail(
     assert read_wire_action_records(rejected_profile) == ()
 
 
-def test_ordered_request_wire_history_survives_main_and_structured_compaction(
+def test_ordered_request_wire_history_survives_main_and_nested_usage_totals(
     tmp_path, monkeypatch,
 ):
     first = {
@@ -453,10 +453,10 @@ def test_ordered_request_wire_history_survives_main_and_structured_compaction(
 
     main_total = {}
     add_usage(main_total, usage_first)
-    compaction_total = {}
-    context_compaction._record_usage(compaction_total, usage_second)
-    add_usage(main_total, compaction_total)
-    add_usage(main_total, compaction_total)
+    nested_total = {}  # a second request's own accumulator (once the helper summarizer's), merged twice
+    add_usage(nested_total, usage_second)
+    add_usage(main_total, nested_total)
+    add_usage(main_total, nested_total)
 
     assert main_total["request_wire"] == second
     assert main_total["request_wire_history"] == [first, second]

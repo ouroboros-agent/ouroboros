@@ -665,7 +665,8 @@ def recover_aborted_update(drive_root: Any, running: Dict[str, Any], pending: Li
                                             task_attempt=batch["rows"][task_id]["attempt"],
                                             pid=getattr(batch["rows"][task_id]["proc"], "pid", None),
                                             paused_roots=queue.BUDGET_ROOT_FENCES)
-    if queue.persist_queue_snapshot(reason="update_abort_handoff") is not True:
+    # None: the saved queue this process never took into custody stays on disk as it is (durable).
+    if queue.persist_queue_snapshot(reason="update_abort_handoff") is False:
         return False
     _update_returns = {}
     return True

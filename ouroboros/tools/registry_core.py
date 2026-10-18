@@ -555,6 +555,20 @@ class ToolRegistry:
                   or entry.name in _GENERIC_VCS_TARGET_TOOLS
                   or entry.name in {"read_file", "list_files", "search_code", "query_code", "query_data"}):
                 schema = self._schema_with_matrix_roots(entry)
+            if entry.name == "review_change":
+                schema = copy.deepcopy(schema)
+                props = schema["parameters"]["properties"]
+                props["subject"]["enum"] = ["index", "worktree", "base..head"]
+                props["subject"]["description"] = "The assigned repository's staged index, worktree or base..head change."
+                props["surface"]["enum"] = ["change", "preflight"]
+                props["surface"]["description"] = "change = the panel review; preflight = one named reviewer's early look."
+                props["workspace_root"]["description"] = "An optional repository inside your assigned write root."
+                schema["description"] = (
+                    "Ask independent reviewers about a change in your assigned write root. "
+                    "This never approves, commits or integrates your work; the parent retains integration and recheck. "
+                    "Use subject=index, worktree or base..head; surface=change uses the review pool, "
+                    "preflight uses one named reviewer. The same unchanged call collects an existing paid operation."
+                )
         return {"type": "function", "function": schema}
 
     def _schema_with_matrix_roots(self, entry: ToolEntry) -> Dict[str, Any]:

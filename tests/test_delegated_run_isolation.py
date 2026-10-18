@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from ouroboros import delegate_custody as custody
+from ouroboros import delegate_custody as custody, store
 from ouroboros.store import STORE_REL
 from ouroboros.task_results import write_task_result
 from ouroboros.subagent_worktrees import (
@@ -897,7 +897,11 @@ class TestLazyCaptureAtDisposition:
         (exec_root / "tracked.txt").write_text(
             "one\ntwo\nEARLY-EDIT\nLATE-WRITE\n", encoding="utf-8")
         custody._CUSTODY.clear()
-        out = _integrate_delegated_patch(ctx, "run-lazy", "apply", "collect the orphan")
+        shown = _integrate_delegated_patch(ctx, "run-lazy", "apply", "collect the orphan")
+        assert "INTEGRATE_DELEGATED_INSPECT_CAPTURE" in shown and "LATE-WRITE" in pathlib.Path(
+            json.loads(shown.split("\n", 1)[1])["patch_artifact"]).read_text(encoding="utf-8"), shown
+        assert "LATE-WRITE" not in (target / "tracked.txt").read_text(encoding="utf-8")  # prepared, not applied
+        out = _integrate_delegated_patch(ctx, "run-lazy", "apply", "inspected")
         assert "✅ Integrated" in out, out
         applied = (target / "tracked.txt").read_text(encoding="utf-8")
         assert "LATE-WRITE" in applied and "EARLY-EDIT" in applied
@@ -1189,7 +1193,7 @@ class TestStartupGCFailClosed:
         custody._CUSTODY.clear()
         assert "gc-open" in custody.open_snapshot_ids(data)
         events, store_path = data / "logs" / "events.jsonl", data / STORE_REL
-        store_path.chmod(0o000)  # the custody rows EXIST but cannot be READ: typed unreadable
+        store_path.chmod(0o000), store.close_connections()  # the custody rows EXIST but cannot be READ
         try:
             assert custody.custody_log_unreadable(data)
             srv._prune_delegated_snapshots()
@@ -1223,7 +1227,7 @@ class TestStartupGCFailClosed:
         assert custody.record_started(data, entry)
         custody._CUSTODY.clear()
         events, store_path = data / "logs" / "events.jsonl", data / STORE_REL
-        store_path.chmod(0o000)  # the custody rows cannot be read...
+        store_path.chmod(0o000), store.close_connections()  # the custody rows cannot be read...
         events.chmod(0o000)  # ...and the chain cannot take the skip row
         try:
             with caplog.at_level(logging.ERROR, logger="server"):
@@ -1327,20 +1331,13 @@ class TestApplyIntentAmbiguity:
     of pretending "not applied"."""
 
     def _settled_run(self, tmp_path, monkeypatch, *, snapshot_id, run_id):
-        target = _seed_target(tmp_path)
-        ctx = _nanny_ctx(tmp_path, target, monkeypatch)
-        handle = provision_execution_snapshot(
-            target_root=target, task_id="t-nanny", snapshot_id=snapshot_id)
-        (pathlib.Path(handle.path) / "tracked.txt").write_text(
-            "one\ntwo\nCHILD-EDIT\n", encoding="utf-8")
-        drive = custody.custody_root(ctx)
-        entry = custody.RunCustody(
-            run_id=run_id, task_id="t-nanny", route_id="some-route",
-            snapshot_id=handle.snapshot_id, execution_root=handle.path,
-            baseline_sha=handle.baseline_sha, target_root=str(target),
-            authority_source="external_workspace_root")
-        assert custody.record_started(drive, entry)
-        custody.emit(drive, custody.SETTLED, {"run_id": run_id, "task_id": "t-nanny"})
+        """The same settled run, captured by the body before any decision: a capture prepared BY
+        a decision is returned for inspection first (#1969), which these crash tests do not probe."""
+        from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
+
+        target, ctx, handle, drive = TestCaptureHonesty._settled_run(
+            self, tmp_path, monkeypatch, snapshot_id=snapshot_id, run_id=run_id)
+        assert capture_terminal_patch_for_drive(drive, custody.replay(drive)[run_id])["status"] == "ready_with_changes"
         custody._CUSTODY.clear()
         return target, ctx, handle, drive
 

@@ -947,7 +947,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             rel_parts = fp.relative_to(root_resolved).parts
         except Exception:
             return _drop("escapes_root")
-        # runtime_data per-project store is reachable only via scoped knowledge tools.
+        # runtime_data per-project store is reachable only via project-scoped tools.
         if normalized == "runtime_data" and rel_parts and str(rel_parts[0]).casefold() == "projects":
             return _drop("project_store_scoped")
         if normalized == "user_files" and user_files_path_block_reason(ctx, fp, operation="search"):
@@ -1013,7 +1013,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             deadline_hit = True  # ran out of TIME (distinct from the file-count cap)
             break
         # Prune skipped dirs in-place. For runtime_data, also prune the top-level
-        # per-project store (reachable only via the scoped knowledge tools).
+        # per-project store (reachable only via the project-scoped tools).
         from ouroboros.code_intelligence import SKIP_DIRS
 
         # SKIP_DIRS pruning is a documented walk convention (parity with rg's

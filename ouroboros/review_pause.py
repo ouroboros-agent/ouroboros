@@ -37,6 +37,7 @@ import json
 import logging
 import pathlib
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -50,6 +51,8 @@ log = logging.getLogger(__name__)
 # How often the author's drain re-reads its own owner fence while its review
 # operation runs: a poll interval of the existing wait, not a bound.
 DETACH_POLL_SEC = 1.0
+# The author's drain mark outlives any panel window; the supervisor bounds its lease by the task.
+_DRAIN_MARK_SEC = 6 * 3600.0
 ADDRESSED_EVENT = "addressed_event"
 # This process's identity: a left-review wait restored from a checkpoint names another
 # process, whose live custody and settlement notice died with it.
@@ -306,6 +309,50 @@ def live_detached_operations(task_id: str) -> List[Dict[str, Any]]:
              "controller": dict(op.identity)} for op in operations]
 
 
+@contextmanager
+def author_drain(parent: Any, operation: Any):
+    """The author's synchronous drain of ``operation``: its own call holds the slot
+    waiting on this panel (``model_sleep.declare_in_slot_wait``), so while it lasts
+    the reply it prepares is the panel's work (``panel_activity``, DESIGN §9 typing)."""
+    ctx = getattr(parent, "tool_context", None)
+    if ctx is None or operation is None:
+        yield
+        return
+    from ouroboros import model_sleep
+
+    key = f"review:{operation.owner_id}:{uuid.uuid4().hex}"
+    model_sleep.declare_in_slot_wait(ctx, key, time.time() + _DRAIN_MARK_SEC)
+    try:
+        yield
+    finally:
+        model_sleep.end_in_slot_wait(ctx, key)
+
+
+def local_panel_seats(task_id: str) -> Tuple[set, set]:
+    """This process's open panels of ``task_id``: ``(live seats, seats waiting for model
+    access)``, each ``(owner_id, slot_id)`` as their wait rows name it. A settled seat is
+    not live, whatever its panel's roster says."""
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK
+
+    with _LOCK:
+        operations = {id(op): op for op in _LIVE.values() if op.task_id == str(task_id) and not op.closed}
+    with _ACTIVE_LOCK:
+        entries = list(_ACTIVE.values())
+    live = {(operations[id(entry.operation)].owner_id, str(getattr(entry.assignment[1], "slot_id", "") or ""))
+            for entry in entries if id(entry.operation) in operations and entry.assignment and not entry.event.is_set()}
+    waiting = {(op.owner_id, slot) for op in operations.values() for slot in op.wait.waiting_slots()}
+    return live, waiting
+
+
+def panel_activity(live: Iterable[tuple], waiting: Iterable[tuple], *, owner_id: str = "") -> Optional[bool]:
+    """Whether review work prepares the author's answer now: a live seat (of ``owner_id``'s
+    panel, else of any) that is not waiting for model access. A drained panel with no live seat
+    of its own is unknown, never work: the moments between its seats and a seat whose facts
+    are missing or unattributed look the same."""
+    seats = {seat for seat in live if not owner_id or seat[0] == owner_id}
+    return bool(seats - set(waiting)) if seats else None if owner_id else False
+
+
 def notify_when_settled(rows: List[Dict[str, Any]], notify: Callable[[int], None], *,
                         settled_keys: Iterable[str] = ()) -> bool:
     """Run ``notify(unknown)`` once EVERY seat these rows name has settled: the wave's own
@@ -469,12 +516,20 @@ def _left_attempt(record: Dict[str, Any]) -> Any:
 
     surface, task_id, retry_key = str(record["surface"]), str(record["task_id"]), str(record["retry_key"])
     attempt_no = int(record.get("attempt") or 0)
-    attempt = next((row for row in reversed(load_state(pathlib.Path(record["drive_root"])).attempts)
+    # Change attempts moved to canonical custody. Still read a pre-move legacy
+    # row if this left wave has not yet re-entered through its author's context.
+    roots = dict.fromkeys((_left_review_root(record), pathlib.Path(record["drive_root"])))
+    attempt = next((row for root in roots for row in reversed(load_state(root).attempts)
                     if row.tool_name == _LEFT_TOOLS.get(surface) and row.task_id == task_id
                     and row.review_retry_key == retry_key and attempt_no in (0, int(row.attempt or 0))), None)
     if attempt is None:
         raise LookupError("its attempt row is not in the review state")
     return attempt
+
+
+def _left_review_root(record: Dict[str, Any]) -> pathlib.Path:
+    return pathlib.Path((record.get("canonical_root") if record.get("surface") == "change" else "")
+                        or record["drive_root"])
 
 
 def _left_rows(attempt: Any) -> Iterable[Tuple[str, str, Dict[str, Any]]]:
@@ -495,7 +550,7 @@ def _left_roster_settled(record: Dict[str, Any]) -> bool:
     from ouroboros.review_custody import _row_is_pending
     from ouroboros.review_operation import recorded_review_assignment, recover_review_producer
 
-    drive = pathlib.Path(record["drive_root"])
+    drive = _left_review_root(record)
     try:
         attempt = _left_attempt(record)
         for kind, _slot_id, row in _left_rows(attempt):
@@ -541,7 +596,7 @@ def _left_review_mark(record: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.review_operation import collect_recorded_review_actor
 
     surface, task_id, retry_key = str(record["surface"]), str(record["task_id"]), str(record["retry_key"])
-    drive, attempt_no = pathlib.Path(record["drive_root"]), int(record.get("attempt") or 0)
+    drive, attempt_no = _left_review_root(record), int(record.get("attempt") or 0)
     attempt, seats, gap = None, [], ""
     try:
         attempt = _left_attempt(record)

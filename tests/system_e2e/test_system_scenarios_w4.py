@@ -109,6 +109,7 @@ from tests.system_e2e.test_system_scenarios_w3b import (
     _roster,
     _wait_step,
 )
+from tests.system_e2e.test_system_scenarios_w3a import _Again, _HoldingStubModel
 
 from devtools.benchmarks.common.server_runner import (
     _api,
@@ -164,6 +165,9 @@ def test_fake_daemon_interactive_answer_contract(tmp_path):
             assert empty.get("status") == "rejected"
             # Still pending after both refusals; the real answer delivers.
             assert pending_interactions(gateway.get_run(run_id)), "refusal consumed the question"
+            # More than three observations must not make the terminal go backwards.
+            observed = [gateway.get_run(run_id)["lastSeq"] for _ in range(8)]
+            assert observed == sorted(observed) and observed[-1] > 3
             answered = gateway.answer_interaction(run_id, iid, [
                 {"questionId": "q1", "selectedLabels": [FAKE_ANSWER_LABEL], "freeText": None}])
             assert answered.get("status") == "delivered"
@@ -171,6 +175,8 @@ def test_fake_daemon_interactive_answer_contract(tmp_path):
             # The run resumes: the next poll is terminal with settlement facts,
             # and a late duplicate answer is already_resolved, never a re-run.
             done = gateway.get_run(run_id)
+            assert done["lastSeq"] >= observed[-1]
+            assert gateway.get_run(run_id)["lastSeq"] == done["lastSeq"]
             assert (done.get("summary") or {}).get("state") == "succeeded"
             assert (done.get("summary") or {}).get("waitingOnUser") is False
             assert pending_interactions(done) == []
@@ -779,6 +785,27 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
 
 S22_DOC_PATH = "docs/notes/system_e2e_s22_evolution.md"
 S22_COMMIT_MESSAGE = "docs: system_e2e S22 evolution cycle note"
+
+
+def _s22_continue_after_review(body):
+    """Cyber's clean review is feedback, not an author decision to commit."""
+    try:
+        calls = {c["id"]: c["function"]["name"] for m in body["messages"] for c in m.get("tool_calls", [])}
+        message = next(m for m in reversed(body["messages"])
+                       if m.get("role") == "tool" and calls.get(m.get("tool_call_id")) == "commit_reviewed")
+        feedback = json.loads(message["content"].split("\n", 1)[1])
+        critic = feedback["review_outcome"]
+        if critic["status"] == "reviewing":
+            return _Again(S22_SCRIPT[2])  # collect the original wave, never buy a replacement
+        assert critic["status"] == "reviewed" and critic["phase"] == "review_only"
+        reference = feedback["review_reference"]
+    except (AssertionError, KeyError, ValueError, StopIteration) as exc:
+        return {"final": f"E2E_SCRIPT_ERROR: expected exposed S22 commit feedback: {exc}"}
+    return {"tool": "commit_reviewed", "arguments": {**S22_SCRIPT[2]["arguments"],
+            "review_reference": reference, "author_disposition": {
+                "disposition": "accepted", "rationale": "I read the completed review and accept this exact S22 note."}}}
+
+
 S22_SCRIPT = [
     {"tool": "prepare_self_change", "arguments": {"in_place": True}},
     {"tool": "write_file", "arguments": {
@@ -794,7 +821,30 @@ S22_SCRIPT = [
         "goal": "Land the S22 evolution note through the review organ in the serving checkout.",
         "scope": f"{S22_DOC_PATH} only.",
     }},
+    _s22_continue_after_review,
 ]
+
+
+@pytest.mark.parametrize("status", ["reviewing", "reviewed", "failed"])
+def test_scripted_s22_author_collects_feedback_before_an_explicit_decision(status):
+    """A default-lane check of S22's scripted author; ``test_s<N>_`` names are server scenarios."""
+    reference = {"surface": "commit", "task_id": "s22", "attempt": 1}
+    feedback = {"review_reference": reference,
+                "review_outcome": {"status": status, "phase": "review_only"}}
+    body = {"messages": [
+        {"role": "assistant", "tool_calls": [{"id": "review", "function": {"name": "commit_reviewed"}}]},
+        {"role": "tool", "tool_call_id": "review", "content": "Review feedback\n" + json.dumps(feedback)}]}
+    answer = _s22_continue_after_review(body)
+    if status == "reviewing":
+        assert isinstance(answer, _Again) and answer.step == S22_SCRIPT[2]
+    elif status == "reviewed":
+        assert answer["tool"] == "commit_reviewed"
+        assert answer["arguments"]["review_reference"] == reference
+        assert answer["arguments"]["author_disposition"]["disposition"] == "accepted"
+        assert {k: v for k, v in answer["arguments"].items()
+                if k not in {"review_reference", "author_disposition"}} == S22_SCRIPT[2]["arguments"]
+    else:
+        assert answer["final"].startswith("E2E_SCRIPT_ERROR:")
 
 
 def _campaign(data_root: pathlib.Path) -> dict:
@@ -863,7 +913,7 @@ def test_s22_absorb_kill_recovery_absorbs_once_and_never_twice(
     # ---- Generation A: the real evolution cycle, killed mid-absorb ----------
     commit_sha = ""
     transaction_id = ""
-    with ScriptedStubModel(S22_SCRIPT) as stub:
+    with _HoldingStubModel(S22_SCRIPT) as stub:
         server = start_server(clone, root, keyless_settings(stub, **settings_kwargs))
         killed = False
         try:

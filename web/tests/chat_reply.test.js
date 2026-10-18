@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatReplies } from '../modules/chat_reply.js';
+import { createChatReadingPosition } from '../modules/chat_reading_position.js';
 import { installDomDouble } from './dom_double.js';
 
 function fixture() {
@@ -17,7 +18,7 @@ function fixture() {
     doc.body.append(feed, wrap);
     const positions = [];
     const replies = createChatReplies({ chatId: 1, feed, input, key: 'ouro_chat_reply',
-        reading: () => ({ cancel() { positions.push('cancel'); }, scroll() { positions.push('scroll'); }, stick: true }) });
+        reading: () => ({ cancel() { positions.push('cancel'); }, scroll() { positions.push('scroll'); }, remember() {}, stick: true }) });
     const bubble = (role, text, { address = '', taskId = '' } = {}) => {
         const node = el('div', { className: `chat-bubble ${role}`, dataset: { ...(taskId ? { taskId } : {}) } },
             el('div', { className: 'sender', text: role === 'user' ? 'You' : 'Ouroboros' }),
@@ -33,6 +34,134 @@ function fixture() {
 }
 
 const owner = (address, text = 'please check the logs') => ({ row_address: address, role: 'user', text });
+
+test('an explicit quote landing replaces the old-width anchor before reflow; later reading owns its place', async t => {
+    const env = installDomDouble(), frames = [], prior = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = callback => frames.push(callback);
+    t.after(() => { globalThis.requestAnimationFrame = prior; env.restore(); });
+    const feed = env.el('div'), input = env.el('textarea');
+    const row = env.el('div', { dataset: { rowAddress: 'row:1@then#123456789abc' } });
+    env.doc.body.append(feed, input); feed.append(row);
+    Object.assign(feed, { clientWidth: 0, clientHeight: 300, scrollHeight: 1200, scrollTop: 0 });
+    feed.getBoundingClientRect = () => ({ top: 0 });
+    row.getBoundingClientRect = () => ({ top: 600 - feed.scrollTop });
+    const reading = createChatReadingPosition({ feed, visible: () => true, alive: () => true, ready: () => true,
+        anchors: { capture: () => ({ top: feed.scrollTop }), restore: anchor => { feed.scrollTop = anchor.top; return true; } },
+        changed() {}, afterWrite() {}, activity() {}, updateButton() {} });
+    const unbind = reading.bindGestures(() => {});
+    const replies = createChatReplies({ feed, input, reading: () => reading,
+        history: () => ({ exact: () => { feed.clientWidth = 389; return row; } }) });
+    t.after(() => { replies.destroy(); unbind(); });
+    assert.deepEqual(await replies.reveal(row.dataset.rowAddress), { state: 'found' });
+    assert.equal(env.doc.activeElement, row);
+    assert.equal(feed.scrollTop, 528);
+    reading.reflow();
+    assert.equal(feed.scrollTop, 528, 'the queued resize must keep the measured landing, not restore the opening at 0');
+    feed.emit('wheel', { deltaY: -120 });
+    feed.scrollTop = 408; reading.scroll();
+    frames.splice(0).forEach(callback => callback());
+    feed.clientWidth = 360; reading.reflow();
+    assert.equal(feed.scrollTop, 408, 'a later resize preserves the reader’s gesture, not the quote landing');
+});
+
+test('a reveal that moves nothing hands a following reader the live edge back; a gesture, newer reveal or exit decides instead', async t => {
+    const env = installDomDouble(), frames = [], prior = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = callback => frames.push(callback);
+    t.after(() => { globalThis.requestAnimationFrame = prior; env.restore(); });
+    const feed = env.el('div'), input = env.el('textarea');
+    env.doc.body.append(feed, input);
+    Object.assign(feed, { clientWidth: 400, clientHeight: 300, scrollHeight: 1200, scrollTop: 900 });
+    feed.getBoundingClientRect = () => ({ top: 0 });
+    const reading = createChatReadingPosition({ feed, visible: () => true, alive: () => true, ready: () => true,
+        anchors: { capture: () => ({ top: feed.scrollTop }), restore: anchor => { feed.scrollTop = anchor.top; return true; } },
+        changed() {}, afterWrite() {}, activity() {}, updateButton() {} });
+    const unbind = reading.bindGestures(() => {});
+    const answers = [];
+    const replies = createChatReplies({ feed, input, reading: () => reading,
+        history: () => ({ exact: () => null, reference: () => new Promise(resolve => answers.push(resolve)) }) });
+    t.after(() => { replies.destroy(); unbind(); });
+    const settle = () => { while (frames.length) frames.splice(0).forEach(callback => callback()); };
+    const arrive = () => reading.mutate(() => { feed.scrollHeight += 400; }, { remoteContent: true });
+    const address = 'row:1@then#aaaaaaaaaaaa';
+
+    let shown = replies.reveal(address);
+    assert.equal(reading.stick, false, 'an arrival does not pull the view while the read is pending');
+    arrive();
+    assert.equal(reading.nearBottom(), false);
+    answers.shift()({ state: 'unknown' });
+    assert.deepEqual(await shown, { state: 'unknown' });
+    settle();
+    assert.equal(reading.stick, true);
+    assert.equal(reading.nearBottom(), true, 'what arrived while it loaded is shown');
+    arrive();
+    assert.equal(reading.nearBottom(), true, 'and the next reply is followed, with no ↓');
+
+    shown = replies.reveal(address);
+    feed.emit('wheel', { deltaY: -120 });  // the reader turns back while it loads
+    settle();
+    answers.shift()({ state: 'unknown' });
+    assert.equal(await shown, null);
+    settle();
+    assert.equal(reading.stick, false, 'the gesture decided; the failed read does not override it');
+
+    reading.stick = true; reading.followAfterLayout(); settle();  // ↓
+    const older = replies.reveal(address), newer = replies.reveal('row:1@then#bbbbbbbbbbbb');
+    answers.shift()({ state: 'unknown' });
+    assert.equal(await older, null, 'the newer reveal superseded it');
+    assert.equal(reading.stick, false);
+    answers.shift()({ state: 'absent' });
+    assert.deepEqual(await newer, { state: 'absent' });
+    settle();
+    assert.equal(reading.stick, true, 'the newer failure keeps the intent the reader had before both');
+
+    shown = replies.reveal(address);
+    reading.cancel();  // the room left the screen (closeTransient)
+    answers.shift()({ state: 'unknown' });
+    assert.equal(await shown, null);
+    assert.equal(reading.stick, false);
+    reading.stick = true;
+    shown = replies.reveal(address);
+    answers.shift()({ state: 'unavailable', left: true });  // a page was drawn around it, without the exact row
+    assert.deepEqual(await shown, { state: 'unavailable', left: true });
+    settle();
+    assert.equal(reading.stick, false, 'the drawn page is where the reader now is');
+});
+
+test('a quote that cannot land says why; only a read that may answer differently asks to try again', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const env = installDomDouble();
+    t.after(() => env.restore());
+    env.doc.getElementById = id => env.doc.body.descendants().find(node => node.id === id) || null;
+    const feed = env.el('div'), input = env.el('textarea');
+    const bubble = env.el('div', { className: 'chat-bubble user' }, env.el('div', { className: 'sender', text: 'You' }),
+        env.el('div', { className: 'message', text: 'and this one?' }));
+    env.doc.body.append(feed, input); feed.append(bubble);
+    const answers = [];
+    const replies = createChatReplies({ feed, input, reading: () => ({ cancel() {}, scroll() {}, remember() {}, stick: false }),
+        history: () => ({ exact: () => null, async reference() {
+            const next = answers.shift();
+            if (next instanceof Error) throw next;
+            return next;
+        } }) });
+    t.after(() => replies.destroy());
+    replies.decorate(bubble, { role: 'user', reply_to: { address: 'task:work-1', role: 'assistant', kind: 'work_card', snippet: 'Work' } });
+    const typed = (status, reasonCode) => Object.assign(new Error(`HTTP ${status}`), { status, body: { reason_code: reasonCode } });
+    const said = [];
+    for (const answer of [{ state: 'moved', task_id: 'work-1' }, { state: 'unknown', error: typed(503, 'history_source_unavailable') },
+        { state: 'unknown', error: typed(503, 'migrating') }, { state: 'unknown' }, new TypeError('offline')]) {
+        answers.push(answer);
+        bubble.querySelector('.chat-quote-main').click();
+        await new Promise(resolve => setImmediate(resolve));
+        said.push(env.doc.body.querySelectorAll('.toast').at(-1)?.textContent);
+    }
+    assert.deepEqual(said, [
+        'This work is in another room.',
+        'Saved history that may hold the quoted message could not be read.',
+        'Saved history is being upgraded. Try again shortly.',
+        'Could not load the quoted message. Try again.',
+        'Could not load the quoted message. Try again.',
+    ]);
+});
 
 test('a saved row gets Reply beside Copy; a row without an address (an unsaved echo, an older host) stays as today', () => {
     const f = fixture();
@@ -121,7 +250,7 @@ test('the owner\'s reply shows his quote; an unresolved address says so; a quote
         const gone = f.bubble('user', 'and this?');
         f.feed.append(gone);
         f.replies.decorate(gone, { role: 'user', reply_to: { address: 'row:9@x#0', unresolved: true } });
-        assert.match(f.quote(gone).querySelector('.chat-quote-text').textContent, /not available/);
+        assert.match(f.quote(gone).querySelector('.chat-quote-text').textContent, /Open quoted message/);
         assert.equal(f.quote(gone).dataset.kind, 'message');
     } finally { f.close(); }
 });

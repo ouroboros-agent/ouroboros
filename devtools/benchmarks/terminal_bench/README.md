@@ -371,6 +371,11 @@ into the container, so the declared effort equals the effective one.
 Hard-won facts (verified against harbor 0.18.0 + leaderboard CI source):
 
 - **Every REWARDED trial MUST have a trajectory** (ATIF, schema `ATIF-v1.7`):
+  The converter reads narration and answers from `ouroboros-data/state/dialog.sqlite`
+  in read-only mode, addressed to the run's task/tree when the summary names it.
+  Old JSONL-only trials need an explicit `dialogue_import.run_dialogue_import(data_dir)`
+  in an Ouroboros environment before conversion. Pending, failed or invalid import
+  ranges refuse conversion; an incomplete history is never certified as a trajectory.
   the leaderboard CI check "Rewarded trials have trajectories" reads the
   trial row's `trajectory_path` (the direct `trajectory.json` upload), and
   `/judge` reviews those trajectories. Runs from adapters that emit it live

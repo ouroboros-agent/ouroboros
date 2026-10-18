@@ -665,7 +665,13 @@ def test_pre_dispatch_admission_requires_current_window_evidence(tmp_path, fake_
     spent = {"subject": {"harness": "fake-review", "subject_id": "acct"},
              "freshness": "fresh",
              "constraints": [{"used_ratio": 1.0, "resets_at": "2030-02-02T00:00:00Z"}]}
-    monkeypatch.setattr(FakeGateway, "quota_snapshots", lambda self: [dict(spent)])
+    spent["availability"] = {"state": "exhausted", "resets_at": "2030-02-02T00:00:00Z"}
+    scopes = []
+    def projection(self, *, model=None, request_kind="text", **_kwargs):
+        scopes.append((model, request_kind))
+        return {"snapshots": [dict(spent)], "absences": [], "availability_scope": {
+            "model": model, "requestKind": request_kind, "basis": "quota_block"}}
+    monkeypatch.setattr(FakeGateway, "quota_state", projection, raising=False)
     executor = AgentSessionReviewExecutor(
         ReviewAssignment(request=_agent_request(), slot=_agent_slot(),
                          call_id="c-admission", call_type="scope_review",
@@ -676,10 +682,12 @@ def test_pre_dispatch_admission_requires_current_window_evidence(tmp_path, fake_
         executor.execute()
     assert excinfo.value.reset_at == "2030-02-02T00:00:00Z"
     assert sum(len(inst.start_requests) for inst in fake_route.instances) == 0
+    assert scopes == [("fake-small", "text")]
 
     # An incomplete ratio is not an admission verdict. A fresh executor asks
     # the selected subscription engine, without another model or API fallback.
     spent["constraints"] = [{"used_ratio": 1.0}]
+    spent["availability"] = {}  # engine could not project a dated block
     custody._CUSTODY.clear()
     executor = AgentSessionReviewExecutor(
         ReviewAssignment(request=_agent_request(), slot=_agent_slot(),
@@ -736,28 +744,24 @@ def test_pre_dispatch_admission_preserves_the_pool_code(tmp_path, fake_route, mo
 
 
 def test_an_expired_cooldown_is_history_not_exhaustion():
-    """The `_exhausted_window` reader (the admission seam above) treated ANY non-empty
-    `cooldown_until` as spent. A cooldown whose instant already PASSED is a stale fact
-    the harness has not refreshed, not positive evidence of a spent window; a FUTURE
-    one still blocks, and an illegible instant keeps the conservative old reading."""
+    """Project the current engine verdict, not the raw historical cooldown date."""
     from ouroboros.subagents import _exhausted_window
 
-    def _quota(cooldown):
+    def _quota(cooldown, availability):
         class _Q:
-            def quota_snapshots(self):
-                return [{"subject": {"harness": "some-route", "subject_id": "a"},
+            def quota_state(self, **_scope):
+                return {"snapshots": [{"subject": {"harness": "some-route", "subject_id": "a"},
                          "freshness": "fresh",
+                         "availability": availability,
                          "constraints": [{"used_ratio": 0.4,
-                                          "cooldown_until": cooldown}]}]
-
-            def quota_absences(self):
-                return []
+                                          "cooldown_until": cooldown}]}], "absences": [],
+                        "availability_scope": {"model": None, "requestKind": "text", "basis": "quota_block"}}
         return _Q()
 
-    assert _exhausted_window(_quota("2020-01-01T00:00:00Z"), "some-route") == (False, "")
-    assert _exhausted_window(_quota("2099-01-01T00:00:00Z"), "some-route") == (
-        True, "2099-01-01T00:00:00Z")
-    assert _exhausted_window(_quota("soon-ish"), "some-route") == (True, "soon-ish")
+    assert _exhausted_window(_quota("2020-01-01T00:00:00Z", {"state": "available"}), "some-route") == (False, "")
+    reset = "2099-01-01T00:00:00Z"
+    assert _exhausted_window(_quota(reset, {"state": "cooldown", "resets_at": reset}), "some-route") == (True, reset)
+    assert _exhausted_window(_quota("soon-ish", {}), "some-route") == (False, "")
 
 
 class AccountedFakeLLM(FakeLLM):

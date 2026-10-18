@@ -12,6 +12,8 @@ import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import { activityWaitPhase, pausePhaseLabel, modelActivityPresentation, paintLiveDetail, taskActivityPresentation } from './task_phase_chip.js';
 import { currentLanguage, fmt, isEnglish, tr, tx } from './i18n.js';
 import { hostRowDisplayText } from './host_notice_text.js';
+import { startingStatus } from './host_starting_status.js';
+export { bootPhase, startingStatus, supervisorReady } from './host_starting_status.js';
 import {
     joinMarkdownHeadings, MARKDOWN_FENCED_CODE, accountedUpperBound,
     accountedUpperBoundWithChildren,
@@ -979,12 +981,6 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now(), on
     };
 }
 
-// В9: one /api/state body's `supervisor_ready`, null when it states nothing. Only
-// true ends Starting…; a `supervisor_error` is not readiness and is not read here.
-export function supervisorReady(data) {
-    return typeof data?.supervisor_ready === 'boolean' ? data.supervisor_ready : null;
-}
-
 /**
  * Main-thread fan-out gate for a live WS frame.
  *
@@ -1093,6 +1089,7 @@ export function computeDerivedChatStatus({
     projectWaitLabel = '',
     pendingSubmissionsCount = 0,
     supervisorStarting = false,
+    bootPhase: boot = null,
     modelActivity = null,
 } = {}) {
     const view = (kind, text, tone, showDots = false) => ({ kind, text, tone, showDots, dots: tone === 'live' ? 'moving' : tone === 'queued' ? 'still' : 'one' });
@@ -1109,7 +1106,7 @@ export function computeDerivedChatStatus({
     if (unknownActivityCount > 0) return view('online', tr('task.chip.activity_unconfirmed', 'Activity unconfirmed'), 'unknown');
     if (pausedManagedCount > 0) return view('online', pausePhaseLabel('budget_paused', pausedCause), 'held'); // never claims Running
     if (projectWaitLabel) return view('online', projectWaitLabel, 'held');
-    if (supervisorStarting) return view('starting', 'Starting…', 'starting');
+    if (supervisorStarting) return { ...view('starting', 'Starting…', 'starting'), ...startingStatus(boot) };
     return view('online', 'Online', 'online');
 }
 
@@ -1384,15 +1381,15 @@ export function unconfirmedForegroundCardIds(cards, activeIds) {
 }
 
 // В9: the host stamps a typed `ingress_accepted: true` on an owner echo only after the durable chat write, so that
-// client_message_id's bubble says `Input saved` — never that work began; `ingress_undispatched` (proven never dispatched) says
-// `Saved, not delivered.` and `ingress_pending` (the running host has not said yet) `Input saved`, each until the next fact.
+// client_message_id's bubble says `Input saved` — never that work began. `ingress_pending` keeps that note
+// provisional until dispatch is confirmed or the ended host's delivery becomes unknown.
 export function markIngressSaved(root, row) {
-    const cmid = String(row?.client_message_id || ''), state = row?.ingress_undispatched === true ? 'undispatched' : row?.ingress_pending === true ? 'pending' : '';
+    const cmid = String(row?.client_message_id || ''), state = row?.ingress_pending === true ? 'pending' : '';
     if (row?.role !== 'user' || row.ingress_accepted !== true || !cmid) return false;
     const bubble = [...root.querySelectorAll('.chat-bubble.user[data-client-message-id]')]
         .find((node) => node.dataset.clientMessageId === cmid), prior = bubble?.querySelector('[data-ingress-saved]');
-    if (!bubble || (prior && (!['undispatched', 'pending'].includes(prior.dataset.ingressSaved) || prior.dataset.ingressSaved === state))) return false;  // `Input saved` and a kept send's delivery doubt are final
-    const note = Object.assign(document.createElement('div'), { className: 'msg-pending', textContent: state === 'undispatched' ? tr('chat.saved_undispatched', 'Saved, not delivered.') : 'Input saved' });
+    if (!bubble || (prior && (prior.dataset.ingressSaved !== 'pending' || prior.dataset.ingressSaved === state))) return false;  // `Input saved` and a kept send's delivery doubt are final
+    const note = Object.assign(document.createElement('div'), { className: 'msg-pending', textContent: 'Input saved' });
     note.dataset.ingressSaved = state;
     for (const doubt of [prior, bubble.querySelector('[data-ingress-unconfirmed]')]) doubt?.remove();  // the saved row settles a "Send again" doubt
     bubble.insertBefore(note, bubble.querySelector('.msg-time'));

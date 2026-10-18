@@ -10,6 +10,8 @@ No model is called for any of it.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import os
 import time
@@ -179,6 +181,5 @@ def test_notes_reach_main_activity_and_the_live_banner(direct_server_with_data, 
             page.screenshot(path=str(evidence / "activity-narrow.png"), full_page=True)
         finally:
             browser.close()
-    rows = [json.loads(line) for line in (root / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows = dialogue_test.log_rows(root / "logs" / "chat.jsonl")
     assert [r["text"].split("\n", 1)[1] for r in rows if r.get("type") == "reminder"] == [DUE, LIVE]

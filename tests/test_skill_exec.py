@@ -7,6 +7,8 @@ trivial python3 script. No network, no real LLM calls — the
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import shlex
@@ -1447,11 +1449,7 @@ def test_stale_review_job_is_marked_interrupted(tmp_path, monkeypatch):
     assert data["interrupt_reason"] == "owner_process_exited"
     events_text = (ctx.drive_root / "logs" / "events.jsonl").read_text(encoding="utf-8")
     assert "skill_review_interrupted" in events_text
-    progress = [
-        json.loads(line)
-        for line in (ctx.drive_root / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    progress = dialogue_test.log_rows(ctx.drive_root / "logs" / "progress.jsonl")
     assert progress[-1]["task_id"] == "skill_lifecycle_review_alpha_skill-job-old"
     assert progress[-1]["lifecycle"]["status"] == "interrupted"
     assert progress[-1]["lifecycle"]["phase"] == "interrupted"

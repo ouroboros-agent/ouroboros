@@ -332,6 +332,63 @@ def task_ids(root: Any) -> List[str]:
         return txn.task_ids()
 
 
+def tree_facts(root: Any, tree_id: str, *, descendants: bool = False,
+               queue_rows: Iterable[dict] = ()) -> Dict[str, dict]:
+    """Typed membership; only underived roots need their legacy body.
+
+    Descendant selection closes over the indexed parent chain, including bridges
+    present only in the queue snapshot. Durable rows win over queue rows. The
+    caller still applies its own depth/ancestry rule to this selected superset.
+    """
+    from ouroboros.store_hot_facts import task_columns
+
+    tree_id = str(tree_id)
+    with open_store(root, write=False) as txn:
+        legacy = {}
+        for record in txn.conn.execute(
+                "SELECT t.task_id,t.status,t.parent_task_id,b.body FROM tasks AS t "
+                "JOIN task_bodies AS b ON b.task_id=t.task_id WHERE t.root_task_id IS NULL"):
+            document = json.loads(record["body"])
+            legacy[record["task_id"]] = {"task_id": record["task_id"], "status": record["status"],
+                "parent_task_id": record["parent_task_id"], "root_task_id": task_columns(document)["root_task_id"]}
+        selected = {row["task_id"]: dict(row) for row in txn.conn.execute(
+            "SELECT task_id,status,parent_task_id,root_task_id FROM tasks WHERE root_task_id=?", (tree_id,))}
+        selected.update({tid: row for tid, row in legacy.items() if row["root_task_id"] == tree_id})
+        if not descendants:
+            return selected
+        queued = {}
+        for row in queue_rows:
+            tid = str(row.get("task_id") or row.get("id") or "")
+            if tid:
+                queued.setdefault(tid, row)
+        # A queue record cannot replace a durable row, even when that row is
+        # outside the selected tree. This addressed read preserves that rule.
+        durable_queue = {row["task_id"]: dict(row) for row in txn.conn.execute(
+            "SELECT task_id,status,parent_task_id,root_task_id FROM tasks "
+            "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(list(queued)),))}
+        queued.update({tid: legacy.get(tid, row) for tid, row in durable_queue.items()})
+        anchors = {tree_id, *selected}
+        while True:
+            rows = txn.conn.execute(
+                "WITH RECURSIVE reach(id) AS (SELECT value FROM json_each(?) UNION "
+                "SELECT t.task_id FROM tasks AS t JOIN reach ON t.parent_task_id=reach.id) "
+                "SELECT task_id,status,parent_task_id,root_task_id FROM tasks "
+                "WHERE task_id IN (SELECT id FROM reach)", (json.dumps(sorted(anchors)),)).fetchall()
+            selected.update({row["task_id"]: legacy.get(row["task_id"], dict(row)) for row in rows})
+            reached = {tree_id, *selected}
+            while True:
+                extra = {tid for tid, row in queued.items() if tid not in reached and (
+                    str(row.get("root_task_id") or "") == tree_id or str(row.get("parent_task_id") or "") in reached)}
+                if not extra:
+                    break
+                reached.update(extra)
+            new = reached - anchors - selected.keys()
+            selected.update({tid: row for tid, row in queued.items() if tid in reached and tid not in selected})
+            if not new:
+                return selected
+            anchors.update(reached)
+
+
 _COLLECTION_BATCH = 64  # bounds selection/materialization and one classification commit
 DRIVE_RETENTION_BATCH = 64  # bounds directory-name selection and one classification commit
 

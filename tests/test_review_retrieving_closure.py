@@ -175,7 +175,7 @@ def test_named_closure_keeps_attachments_foreign_owner_and_two_checkpoint_genera
     unit = cc._atomic_units(messages)[0]
     first = cc._persist_reclaim_checkpoint(messages, first_request,
         SimpleNamespace(fingerprint='a' * 64, units=[]), drive_root=author, task_id=task)
-    capsule, _ = cc._capsule_message(cc._SelectedUnit(unit, 0, ''), 'first view',
+    capsule, _ = cc._capsule_message(unit, 'first view',
         [cc._part(unit.unit_id, unit.source_text)], first, first_request)
     second_messages = [capsule, *_unit('another-read', 'b')]
     second = cc._persist_reclaim_checkpoint(second_messages, _request(second_messages, 100),

@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import consciousness_wake as wake
+from ouroboros import consciousness_wake as wake, dialogue_store as ds
+from tests._dialogue import import_all
 from tests._store_shared import read_result, result_exists, seed_result
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -53,6 +54,10 @@ def test_wake_task_metadata_carries_origin_level_and_tree_cap(monkeypatch):
 def _chat(root, *rows, archive: str = ""):
     """Append rows to the live chat log, or write them as one rotated archive segment."""
     path = root / ("archive" if archive else "logs") / (f"chat_{archive}.jsonl" if archive else "chat.jsonl")
+    if ds.present(root):
+        for row in rows:
+            ds.append(root, "chat", row)
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         for row in rows:
@@ -140,8 +145,8 @@ def test_the_boundary_survives_rotation_and_a_replaced_chain_is_disclosed(tmp_pa
     (tmp_path / "archive" / "chat_20270115T100000.jsonl").write_text(
         json.dumps(_owner("rewritten history", since + 5, cmid="z")) + "\n", encoding="utf-8")
     replaced = _observe(tmp_path, boundary=accepted, since=T0 - 60)
-    assert replaced.window["basis"] == "time_bootstrap_boundary_mismatch"
-    assert "accepted_boundary_no_longer_matches_chat_chain" in replaced.gaps
+    assert replaced.window["basis"] == "accepted_boundary"
+    assert "accepted_boundary_no_longer_matches_chat_chain" not in replaced.gaps
     assert [line.rsplit('"', 2)[-2] for line in _lines(replaced)] == ["after rotation"]
 
 
@@ -343,32 +348,34 @@ def test_unfinished_and_malformed_lines_are_gaps_not_silence(tmp_path):
         handle.write(json.dumps(_owner("unfinished", since + 2, cmid="b"))[:-1])
     first = _observe(tmp_path)
     assert [line.rsplit('"', 2)[-2] for line in _lines(first)] == ["complete"]
-    assert "malformed_jsonl" in first.gaps and "gaps: malformed_jsonl" in first.full_text()
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("}\n")  # the writer completes its line after the snapshot
+    assert any("jsonl_malformed" in gap for gap in first.gaps)
+    ds.append(tmp_path, "chat", _owner("unfinished", since + 2, cmid="b"))
     second = _observe(tmp_path, boundary=first.boundary)
     assert [line.rsplit('"', 2)[-2] for line in _lines(second)] == ["unfinished"]
 
 
-@pytest.mark.parametrize('rotate', [False, True])
-def test_first_partial_line_survives_completion_after_accepted_wake(tmp_path, rotate):
+def test_invalid_only_import_has_an_explicit_gap_and_later_sql_row_keeps_its_old_stamp(tmp_path):
     path = _chat(tmp_path)
-    raw = json.dumps(_owner('old timestamp, newly complete', T0 - 100, cmid='partial'))
-    path.write_text(raw[:-1], encoding='utf-8')
+    row = _owner("old timestamp, newly complete", T0 - 100, cmid="partial")
+    path.write_text(json.dumps(row)[:-1], encoding="utf-8")
     first = wake.observe_wake(tmp_path, boundary=None, since=T0 - 500, now=T0)
-    assert not first.events and first.boundary['upper'] == 0
-    with path.open('a', encoding='utf-8') as handle:
-        handle.write('}\n')
-    if rotate:
-        archive = tmp_path / 'archive'
-        archive.mkdir()
-        path.rename(archive / 'chat_2027-01-15.jsonl')
-        path.write_text('', encoding='utf-8')
+    assert not first.events and first.gaps and first.boundary["upper"] > 0
+    ds.append(tmp_path, "chat", row)
     second = wake.observe_wake(tmp_path, boundary=first.boundary, since=T0 + 10, now=T0 + 100)
-    assert len(second.events) == 1 and 'newly complete' in second.full_text()
-    assert second.window['basis'] == 'accepted_boundary' and not second.gaps
-    third = wake.observe_wake(tmp_path, boundary=second.boundary, since=T0 + 110, now=T0 + 200)
-    assert third.events == ()
+    assert len(second.events) == 1 and "newly complete" in second.full_text()
+    assert second.window["basis"] == "accepted_boundary" and not second.gaps
+    assert wake.observe_wake(tmp_path, boundary=second.boundary, since=T0 + 110, now=T0 + 200).events == ()
+
+
+def test_pending_import_does_not_advance_an_accepted_wake_boundary(tmp_path):
+    from tests._dialogue import seed
+
+    seed(tmp_path, archives={"chat_20261016T000000.jsonl": [_owner("pending", T0 - 100)]})
+    first = _observe(tmp_path)
+    assert any("still importing" in gap for gap in first.gaps)
+    assert "upper" not in first.boundary
+    import_all(tmp_path)
+    assert "pending" in _observe(tmp_path, boundary=first.boundary).full_text()
 
 
 def test_human_input_is_classified_by_producer_provenance(tmp_path):

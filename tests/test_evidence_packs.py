@@ -524,68 +524,83 @@ class _FakeChild:
         return -9 if self.killed.is_set() else 0
 
 
-def test_packer_tick_arms_first_spawns_one_supervised_child_then_rests(root, monkeypatch):
-    from ouroboros import process_custody
+def test_maintenance_tick_spawns_one_supervised_child_then_rests(root, monkeypatch):
+    from ouroboros import maintenance, process_custody
 
     seen = []
-    report = json.dumps({"status": "completed", **dict.fromkeys(packer._COUNTERS, 0), "packed": 1, "candidates": 1,
-                         "raw": 10, "compressed": 2, "unlinked": 1}).encode()
+    report = json.dumps({"status": "completed", "jobs": {"evidence_packing": {"state": "done", "items": 1}}}).encode()
     gate = threading.Event()
 
     def fake_spawn(cmd, **kwargs):
         seen.append((cmd, kwargs))
         assert gate.wait(10)
+        maintenance.run(root)  # the child's pass, in process
         return _FakeChild(report)
 
     monkeypatch.setattr(process_custody, "spawn_supervised", fake_spawn)
     monkeypatch.setattr(process_custody, "current_custody_session_id", lambda: "sess-1")
     (root / "logs").mkdir()
     _task(root, "task-a", blobs=1)
-    unit = packer.EvidencePacker()
-    assert unit.tick(root, REPO) is False  # the boot tick only arms
+    unit = maintenance.MaintenanceChild()
     assert unit.tick(root, REPO) is True
     assert unit.tick(root, REPO) is False  # one child at a time
     gate.set()
     unit._thread.join(10)
     assert not unit._thread.is_alive() and len(seen) == 1
     cmd, kwargs = seen[0]
-    assert cmd[1:3] == ["-m", "ouroboros.evidence_packer"] and "--custody-session" in cmd
-    assert kwargs["purpose"] == "evidence_packer" and kwargs["scope"] == "session"
+    assert cmd[1:3] == ["-m", "ouroboros.maintenance"] and "--custody-session" in cmd
+    assert kwargs["purpose"] == "maintenance" and kwargs["scope"] == "session"
     assert kwargs["env"]["OUROBOROS_DATA_DIR"] == str(root) and "OUROBOROS_UNRELATED" not in kwargs["env"]
     rows = [json.loads(line) for line in (root / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()]
-    phases = [row["phase"] for row in rows if row.get("type") == "storage_pack"]
-    assert phases[:1] == ["started"] and phases[-1] == "completed"
+    assert [row["phase"] for row in rows if row.get("type") == "maintenance"] == ["started", "completed"]
+    assert [row["phase"] for row in rows if row.get("type") == "storage_pack"][-1:] == ["completed"]
+    # The pass unlinked: one more look is owed (it records the moved directories' stamps), then quiet.
+    assert maintenance.due(root) == ["evidence_packing"]
+    assert unit.tick(root, REPO) is True
+    unit._thread.join(10)
+    assert len(seen) == 2 and maintenance.due(root) == []
+    # Quiet: the facts the look recorded hold, so the next tick spawns nothing and writes no row.
+    log = (root / "logs" / "supervisor.jsonl").read_bytes()
+    monkeypatch.setattr(process_custody, "spawn_supervised", lambda *a, **k: pytest.fail("quiet root spawned"))
+    assert unit.tick(root, REPO) is True
+    unit._thread.join(10)
+    assert (root / "logs" / "supervisor.jsonl").read_bytes() == log
     unit.stop()
     assert unit.tick(root, REPO) is False
 
 
-def test_packer_tick_rests_without_candidates_and_the_sweep_remembers_evaluated_tasks(root, monkeypatch):
-    from ouroboros import process_custody
+def test_packing_job_rests_without_candidates_and_the_sweep_remembers_evaluated_tasks(root, monkeypatch):
+    from ouroboros import maintenance
 
-    monkeypatch.setattr(process_custody, "spawn_supervised", lambda *a, **k: pytest.fail("spawned without candidates"))
-    unit = packer.EvidencePacker()
-    assert unit.tick(root, REPO) is False and unit.tick(root, REPO) is True
-    unit._thread.join(10)
-    assert not unit._thread.is_alive()
+    maintenance.run_job(root, "evidence_packing")
+    assert "evidence_packing" not in maintenance.due(root)
     _task(root, "live", blobs=1, status="running")
+    assert "evidence_packing" in maintenance.due(root)  # the store moved: a pass may be owed
     assert packer.changed_tasks(root) == ["live"]
-    _run(root)  # evaluated, not settled: recorded so the next tick does not re-read it
+    _run(root)  # evaluated, not settled: recorded so the next pass does not re-read it
     assert packer.changed_tasks(root) == []
     _result(root, "live", "completed")
     assert packer.changed_tasks(root) == ["live"]  # the result changed: evaluated again
 
 
-def test_child_main_runs_a_pass_and_prints_the_report(root, monkeypatch):
+def test_child_main_runs_the_due_jobs_and_prints_the_report(root, monkeypatch):
+    from ouroboros import maintenance
+
     _task(root, "task-a", blobs=1)
-    monkeypatch.setattr(sys, "argv", ["evidence_packer", "--data-root", str(root), "--custody-session", "s"])
     from ouroboros import process_custody
     monkeypatch.setattr(process_custody, "adopt_session_id", lambda *a, **k: None)
     monkeypatch.setattr(process_custody, "start_parent_lifeline", lambda *a, **k: None)
+    monkeypatch.setattr(maintenance, "_lower_priority", lambda: None)
     import io
     out = io.StringIO()
     monkeypatch.setattr(sys, "stdout", out)
-    assert packer.main() == 0
+    assert maintenance.main(["--data-root", str(root), "--custody-session", "s"]) == 0
     report = json.loads(out.getvalue())
-    assert report["status"] == "completed" and report["packed"] == 1
-    assert packer._report_fields(out.getvalue().encode())["packed"] == 1
-    assert packer._report_fields(b"garbage") == {} and packer._report_fields(json.dumps({"status": "completed", "packed": -1}).encode()) == {}
+    assert report["status"] == "completed" and report["jobs"]["evidence_packing"]["state"] == "done"
+    assert packs.published_generations(root, "task-a")
+    fields = maintenance._report_fields(out.getvalue().encode())
+    assert fields["jobs"]["evidence_packing"] == {"state": "done", "items": 1}
+    assert maintenance._report_fields(b"garbage") == {}
+    assert maintenance._report_fields(json.dumps({"status": "completed", "jobs": {"unknown_job": {}}}).encode()) == {}
+    assert maintenance._report_fields(json.dumps(
+        {"status": "completed", "jobs": {"evidence_packing": {"state": "done", "items": -1}}}).encode()) == {}

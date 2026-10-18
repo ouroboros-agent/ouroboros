@@ -7,10 +7,11 @@ still have their documented at-least-once send/register crash gap.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-import json
 from queue import Empty
 from threading import Event
 from types import SimpleNamespace
@@ -43,7 +44,6 @@ def records(tmp_path, monkeypatch):
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 1})
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "try_get_bridge", lambda: bridge)
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda *_: None)
     monkeypatch.setattr(events_chat_delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     monkeypatch.setattr(queue, "DRIVE_ROOT", root)
     monkeypatch.setattr(queue, "RUNNING", {})
@@ -59,7 +59,7 @@ def records(tmp_path, monkeypatch):
 
 def _chat_rows(root):
     path = root / "logs" / "chat.jsonl"
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+    return dialogue_test.log_rows(path)
 
 
 def _cancelled(records):

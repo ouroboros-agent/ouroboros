@@ -22,7 +22,8 @@ from ouroboros.delegate_custody import RunCustody as _RunCustody
 # ONE refusal author for the whole delegate surface: the neutral leaf
 # `delegate_shared` (phase B's facade split), never a local twin that could drift.
 from ouroboros.delegate_registration_policy import (
-    INVESTIGATION_AUTHORITY, no_write_authority, record_persistent as _record_persistent)
+    INVESTIGATION_AUTHORITY, INVESTIGATION_NOTE, evidence_only, no_write_authority,
+    record_persistent as _record_persistent)
 from ouroboros.delegate_shared import _fail, lock_busy_facts
 from ouroboros.delegate_start_claims import (
     PAYLOAD_CUSTODY_UNREADABLE as _UNREADABLE_HOLDER, payload_busy_detail,
@@ -519,6 +520,10 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
         # A failed manifest's own typed note (unreviewable_metadata_change,
         # non-UTF-8, …) is the actionable fact — never hide it in boilerplate.
         block["note"] = str(manifest.get("note") or "") or block["note"]
+    elif evidence_only(entry):  # evidence owes no apply/reject, on every read (#1969)
+        block["note"] = INVESTIGATION_NOTE
+        if getattr(entry, "patch_disposed", "") == custody.EVIDENCE_RETAINED:
+            block["disposition"] = custody.EVIDENCE_RETAINED
     current_head = str(manifest.get("current_head") or "")
     if current_head and entry.baseline_sha and current_head != entry.baseline_sha:
         # Single-writer snapshot: a moved HEAD can only mean the run itself committed.

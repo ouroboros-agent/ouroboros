@@ -15,7 +15,7 @@ from ouroboros import delegate_custody as custody, review_checking as checking
 from ouroboros.loop_acceptance_review import acceptance_run_pending
 from ouroboros.review_dispatch import collect_task_acceptance_run, review_operation_binding
 from ouroboros.review_records import ReviewRequest, ReviewSlot
-from tests.test_review_checking_scope import ABSENT, NO_CENSUS, SETTLED
+from tests.test_review_checkout_lifecycle import ABSENT, NO_CENSUS, SETTLED, directory_source
 from tests.test_review_operation_collection import (
     PASS, TASK, _ctx, _observe, _session_run, _started, forbid_effects,  # noqa: F401
 )
@@ -35,7 +35,7 @@ def checking_run(tmp_path):
     root, subject = tmp_path / "data", tmp_path / "subject"
     subject.mkdir()
     (subject / "check.py").write_bytes(b"# original candidate\n")
-    source = checking.freeze_checking_source(subject, data_root=root)
+    source = directory_source(subject, root)  # a copied subject: a skill seat's retained view
     area = Path(checking.prepare_seat_area(root, TASK, OPERATION, source))
     (area / "check.py").write_bytes(REVIEWER_EDIT)
     (area / checking.EVIDENCE_DIRNAME).mkdir()
@@ -60,23 +60,11 @@ def _collect(root, run):
     return collect_task_acceptance_run(run, drive_root=root, usage_ctx=_ctx(root))
 
 
-def _assert_receipt(actor, area, *, released=True, scope=None):
+def _assert_receipt(actor, area):
     receipt = actor["usage"]["checking_evidence"]
     assert receipt["status"] == "retained" and receipt["gaps"] == []
-    if scope is None:
-        assert "release_basis" not in receipt and "process_scope" not in receipt
-    else:  # the weaker permission names itself beside the engine's facts, settled still false
-        assert receipt["release_basis"] == checking.RELEASE_WITHOUT_CENSUS
-        assert receipt["process_scope"] == scope and receipt["process_scope"]["settled"] is False
-    if released:
-        assert not area.exists(), "normal succeeded summary permits release after complete capture"
-        assert receipt["refresh_safe"] is True
-        assert "retention_reason" not in receipt
-    else:
-        assert area.exists(), "a terminal without the release boundary keeps its copy"
-        assert receipt["area"] == str(area)
-        assert receipt["refresh_safe"] is False
-        assert receipt["retention_reason"] == "writer_quiescence_unverified"
+    assert not area.exists(), "a terminal run's copy goes once its receipt is written"
+    assert not {"area", "refresh_safe", "retention_reason", "release_basis", "process_scope"} & set(receipt)
     evidence = Path(receipt["evidence_dir"])
     assert (evidence / "files" / "check.py").read_bytes() == REVIEWER_EDIT
     assert (evidence / "files" / checking.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == COVERAGE
@@ -102,7 +90,7 @@ def test_attach_only_terminal_collection_captures_edits_and_named_evidence(
     _started(root, run_id=RUN)
     result = _collect(root, run)
     actor = result.actors[0]
-    _assert_receipt(actor, area, released=state == "succeeded")
+    _assert_receipt(actor, area)
     assert actor["recovery_binding"] == run["actors"][0]["recovery_binding"]
     assert result.collection["facts"] == {"s": "collected"}
     assert not acceptance_run_pending(result)
@@ -142,60 +130,22 @@ def test_repeat_attach_collection_reuses_the_retained_receipt_without_recreating
 
 
 @pytest.mark.parametrize("verdict", ["PASS", "FAIL"])
-@pytest.mark.parametrize("scope", [ABSENT, None, SETTLED], ids=["absent", "null", "settled"])
-def test_unknown_process_scope_keeps_the_copy_and_collects_the_paid_verdict(
+@pytest.mark.parametrize("scope", [ABSENT, None, SETTLED, NO_CENSUS, {**NO_CENSUS, "survivors": 1}],
+                         ids=["absent", "null", "settled", "no-census", "survivor"])
+def test_any_process_scope_releases_the_copy_and_collects_the_paid_verdict(
         checking_run, monkeypatch, forbid_effects, scope, verdict):  # noqa: F811
-    """``null`` (the engine holds no readable scope record, e.g. a historical run first
-    observed through an upgraded engine) keeps the copy; an absent key (an older engine)
-    and a settled scope release it. The evidence and the paid verdict arrive either way."""
+    """The census the engine reports does not decide anything here (owner 1A, 2026-10-12):
+    the evidence is kept, the copy goes, and the paid verdict arrives from one observation."""
     root, subject, area, run = checking_run
     calls = _observe(monkeypatch, _terminal(scope=scope, text={"PASS": PASS, "FAIL": FAIL}[verdict]))
     _started(root, run_id=RUN)
     result = _collect(root, run)
     actor = result.actors[0]
-    _assert_receipt(actor, area, released=scope is not None)
+    _assert_receipt(actor, area)
     assert actor["parsed"]["verdict"] == verdict
     assert result.collection["facts"] == {"s": "collected"} and not acceptance_run_pending(result)
     assert calls == [("handshake",), ("get_run", RUN), ("close",)], "observed once, nothing bought again"
     assert (subject / "check.py").read_bytes() == b"# original candidate\n"
-
-
-@pytest.mark.parametrize("verdict", ["PASS", "FAIL"])
-def test_a_census_less_success_releases_under_the_weaker_permission_and_collects_the_paid_verdict(
-        checking_run, monkeypatch, forbid_effects, verdict):  # noqa: F811
-    """Windows (no census): the owner's compatibility choice releases the copy after its
-    complete capture; the receipt discloses the basis and the engine's facts, and the
-    verdict arrives unchanged from one observation."""
-    root, subject, area, run = checking_run
-    calls = _observe(monkeypatch, _terminal(scope=dict(NO_CENSUS), text={"PASS": PASS, "FAIL": FAIL}[verdict]))
-    _started(root, run_id=RUN)
-    result = _collect(root, run)
-    actor = result.actors[0]
-    _assert_receipt(actor, area, released=True, scope=NO_CENSUS)
-    assert actor["parsed"]["verdict"] == verdict
-    assert result.collection["facts"] == {"s": "collected"} and not acceptance_run_pending(result)
-    assert calls == [("handshake",), ("get_run", RUN), ("close",)], "observed once, nothing bought again"
-    assert (subject / "check.py").read_bytes() == b"# original candidate\n"
-
-
-@pytest.mark.parametrize("state,scope", [
-    ("failed", NO_CENSUS), ("cancelled", NO_CENSUS), ("succeeded", {**NO_CENSUS, "survivors": 1}),
-    ("succeeded", {**NO_CENSUS, "unreadable": 1}), ("succeeded", {**NO_CENSUS, "census": "failed"}),
-    ("succeeded", None),
-], ids=["failed", "cancelled", "known-survivor", "unreadable-member", "mixed-census-failed", "null"])
-def test_a_census_less_permission_never_covers_failure_cancellation_survivors_or_unknowns(
-        checking_run, monkeypatch, forbid_effects, state, scope):  # noqa: F811
-    root, _subject, area, run = checking_run
-    calls = _observe(monkeypatch, _terminal(state, scope=scope))
-    _started(root, run_id=RUN)
-    result = _collect(root, run)
-    actor = result.actors[0]
-    _assert_receipt(actor, area, released=False)
-    if state == "succeeded":
-        assert actor["parsed"]["verdict"] == "PASS", "the paid verdict is delivered unchanged"
-    else:
-        assert actor["status"] == "error" and state in actor["error"]
-    assert calls == [("handshake",), ("get_run", RUN), ("close",)]
 
 
 def test_a_receipt_captured_before_an_engine_upgrade_is_reused_as_stored(
@@ -220,7 +170,7 @@ def test_a_receipt_captured_before_an_engine_upgrade_is_reused_as_stored(
 
 
 @pytest.mark.parametrize("gap", ["special_entry", "capture_error"])
-def test_attach_collection_exposes_capture_gap_and_keeps_recoverable_area(
+def test_attach_collection_names_capture_gaps_and_keeps_only_a_failed_copy(
         checking_run, monkeypatch, forbid_effects, gap):  # noqa: F811
     root, _subject, area, run = checking_run
     _observe(monkeypatch, _terminal())
@@ -236,16 +186,16 @@ def test_attach_collection_exposes_capture_gap_and_keeps_recoverable_area(
     result = _collect(root, run)
     actor = result.actors[0]
     receipt = actor["usage"]["checking_evidence"]
-    assert receipt["status"] == ("partial" if gap == "special_entry" else "capture_failed")
-    assert receipt["area"] == str(area) and area.is_dir()
-    assert (area / "check.py").read_bytes() == REVIEWER_EDIT
-    assert (area / checking.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == COVERAGE
     assert actor["parsed"]["verdict"] == "PASS", "evidence capture does not erase the paid answer"
     assert actor["recovery_binding"] == run["actors"][0]["recovery_binding"]
-    if gap == "special_entry":
+    if gap == "special_entry":  # a named gap is a receipt: the copy goes
+        assert receipt["status"] == "partial" and not area.exists()
         assert receipt["gaps"] == [{"path": "pipe", "reason": "unsupported_entry_type"}]
-    else:
+    else:  # nothing goes without a receipt of what was kept
+        assert receipt["status"] == "capture_failed" and receipt["area"] == str(area)
         assert "fixture evidence read failed" in receipt["error"]
+        assert (area / "check.py").read_bytes() == REVIEWER_EDIT
+        assert (area / checking.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == COVERAGE
 
 
 @pytest.mark.parametrize("state", ["running", "daemon_unavailable", "unbound"])
@@ -311,14 +261,14 @@ def test_capture_exception_does_not_hide_the_paid_verdict_or_release_the_copy(
     _started(root, run_id=RUN)
     captures = []
 
-    def failed_capture(data, task, operation, *, release, process_scope=None):
-        captures.append((data, task, operation, release, process_scope))
+    def failed_capture(data, task, operation):
+        captures.append((data, task, operation))
         raise OSError("capture unavailable")
 
     monkeypatch.setattr(checking, "capture_seat_evidence", failed_capture)
     result = _collect(root, run)
     actor = result.actors[0]
-    assert captures == [(root, TASK, OPERATION, True, None)]
+    assert captures == [(root, TASK, OPERATION)]
     assert actor["parsed"]["verdict"] == "PASS"
     assert result.collection["facts"] == {"s": "collected"}
     assert actor["usage"]["checking_evidence"]["status"] == "capture_failed"

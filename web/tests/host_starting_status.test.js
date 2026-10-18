@@ -6,8 +6,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+    bootPhase,
     computeDerivedChatStatus,
     createStateSnapshotSequencer,
+    startingStatus,
     supervisorReady,
 } from '../modules/chat_activity.js';
 import { createChatInstance } from '../modules/chat.js';
@@ -15,7 +17,7 @@ import { installDom, restoreDom } from './chat_dom_fixture.js';
 
 test('the reducer says Starting… only where it would say Online', () => {
     assert.deepEqual(computeDerivedChatStatus({ supervisorStarting: true }),
-        { kind: 'starting', text: 'Starting…', tone: 'starting', showDots: false, dots: 'one' });
+        { kind: 'starting', text: 'Starting…', tone: 'starting', showDots: false, dots: 'one', title: '' });
     assert.equal(computeDerivedChatStatus({ supervisorStarting: false }).text, 'Online');
     assert.equal(computeDerivedChatStatus({}).text, 'Online', 'callers that state nothing keep Online');
     const outranks = [
@@ -223,5 +225,69 @@ test('Project panel: a late mount after a reconnect never seeds from the body be
         assert.equal(panel.status(), 'Starting…', 'the panel re-proves readiness after its own reconnect');
         await panel.settle();
         assert.equal(panel.status(), 'Starting…', "the reconnect's census read states no readiness");
+    } finally { panel.close(); }
+});
+
+// --- the boot phases (/api/state.boot, the same object as /api/health.boot) --------------
+
+const SERVING = { phase: 'serving', since: 't', dialogue_ready: false, tasks_ready: false, steps: [], jobs: {}, error: null };
+const CHAT_READY = { ...SERVING, dialogue_ready: true, steps: [{ name: 'extensions', state: 'running', started_at: 't', ended_at: null, error: null }] };
+const FAILED = { ...SERVING, phase: 'failed', error: 'current-facts store not published: failed' };
+const SOFT_FAILED = { ...CHAT_READY, steps: [{ name: 'extensions', state: 'failed', started_at: 't', ended_at: 't', error: 'ValueError: bad manifest' }] };
+
+test('bootPhase reads the typed object alone', () => {
+    assert.deepEqual(bootPhase({ boot: SERVING }), SERVING);
+    for (const body of [null, undefined, {}, { boot: null }, { boot: 'serving' }, { boot: { dialogue_ready: true } }]) {
+        assert.equal(bootPhase(body), null, `${JSON.stringify(body)} states no phase`);
+    }
+});
+
+test('the Starting… header follows the phase: starting, chat ready, failed', () => {
+    assert.deepEqual(startingStatus(null), { kind: 'starting', text: 'Starting…', title: '', showDots: false });
+    assert.deepEqual(startingStatus(SERVING), { kind: 'starting', text: 'Starting…', title: '', showDots: false });
+    assert.deepEqual(startingStatus(CHAT_READY),
+        { kind: 'starting', text: 'Chat ready, restoring background tasks', title: '', showDots: false });
+    assert.deepEqual(startingStatus(FAILED),
+        { kind: 'starting', text: 'Start failed', title: 'current-facts store not published: failed', showDots: false });
+    assert.deepEqual(startingStatus(SOFT_FAILED),
+        { kind: 'starting', text: 'Chat ready, restoring background tasks', title: 'extensions: ValueError: bad manifest', showDots: false },
+        'a fail-soft step shows its error while the start goes on');
+    assert.equal(computeDerivedChatStatus({ supervisorStarting: true, bootPhase: CHAT_READY }).text,
+        'Chat ready, restoring background tasks');
+    assert.equal(computeDerivedChatStatus({ supervisorStarting: false, bootPhase: FAILED }).text, 'Online',
+        'readiness outranks the phase: a ready supervisor is Online whatever the boot said');
+    assert.equal(computeDerivedChatStatus({ supervisorStarting: true, bootPhase: CHAT_READY, queuedManagedCount: 1 }).text,
+        'Queued', 'work keeps its own word beside the phase');
+});
+
+test('Main: the header paints the phase from the snapshot and forgets it on disconnect', async () => {
+    const chat = mountChat();
+    try {
+        chat.snapshot({ supervisor_ready: false, boot: SERVING });
+        assert.equal(chat.status(), 'Starting…');
+        chat.snapshot({ supervisor_ready: false, boot: CHAT_READY });
+        assert.equal(chat.status(), 'Chat ready, restoring background tasks');
+        assert.equal(chat.kind(), 'status-badge starting', 'still the amber starting tone: tasks are not admitted yet');
+        chat.instance.hydrateStateSnapshot({ supervisor_ready: false }, Infinity, 50);
+        assert.equal(chat.status(), 'Chat ready, restoring background tasks', 'a body without the phase changes nothing');
+        chat.snapshot({ supervisor_ready: false, boot: FAILED });
+        assert.equal(chat.status(), 'Start failed');
+        assert.equal(globalThis.document.byId.get('chat-status').title, FAILED.error, 'the cause rides the badge title');
+        chat.snapshot({ supervisor_ready: true, boot: { ...CHAT_READY, phase: 'ready', tasks_ready: true } });
+        assert.equal(chat.status(), 'Online');
+        assert.equal(globalThis.document.byId.get('chat-status').title, '');
+        chat.setConnected(false);
+        chat.setConnected(true);
+        assert.equal(chat.status(), 'Starting…', 'the host may have restarted: the phase is proven again');
+        await chat.settle();
+    } finally { chat.close(); }
+});
+
+test('Project panel: seeds the phase from the page snapshot', () => {
+    const panel = mountChat({ asPanel: true, latest: { supervisor_ready: false, boot: CHAT_READY } });
+    try {
+        assert.equal(panel.status(), 'Chat ready, restoring background tasks');
+        panel.snapshot({ supervisor_ready: true });
+        assert.equal(panel.status(), 'Online');
     } finally { panel.close(); }
 });

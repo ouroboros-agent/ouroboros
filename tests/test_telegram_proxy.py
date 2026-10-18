@@ -234,7 +234,6 @@ def _bridge_events():
             "options": [{"label": "sqlite"}, {"label": "postgres"}]}
     return [
         ("_make_outbound", {"text": "hello", "transport": {}}),
-        ("_make_typing", {"transport": {}}),
         ("_make_photo", {"image_base64": base64.b64encode(b"png").decode(), "transport": {}}),
         ("_make_video", {"video_base64": base64.b64encode(b"mp4").decode(), "transport": {}}),
         ("_make_document", {"file_base64": base64.b64encode(b"doc").decode(), "filename": "a.txt"}),
@@ -260,6 +259,7 @@ def test_every_bridge_client_carries_exactly_the_local_proxy(tmp_path, monkeypat
     asyncio.run(plugin._start_poller(api))
     for factory, event in _bridge_events():
         asyncio.run(getattr(plugin, factory)(api)(event))
+    asyncio.run(plugin._typing_cue(api)._send(42))  # the typing refresher's own sends
     assert asyncio.run(notifier._push_notification(api, 42, "done", trust_env=False)) == ("sent", None)
 
     assert [(level, message) for level, message in api.logs if level != "info"] == []
@@ -267,7 +267,7 @@ def test_every_bridge_client_carries_exactly_the_local_proxy(tmp_path, monkeypat
     for index, (token, options) in enumerate(_RecordingClient.built):
         assert token == _TOKEN
         options = dict(options)
-        if index in {1, 3, 4, 5, 6, 7}:  # mirrored rows, excluding typing and quiz-state edits
+        if index in {1, 2, 3, 4, 5, 6}:  # mirrored rows, excluding quiz-state edits and typing
             assert callable(options.pop("on_message"))
             assert options.pop("reply_to_message_id") == 0
         assert options == {"trust_env": False, "proxy": local_proxy}

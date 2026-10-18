@@ -357,17 +357,15 @@ function keptFrame(frame) {
  * history read after a reload does not show the message saved (`reconcile`) — every
  * such bubble says so and offers "Send again": the SAME frame and id, which the host
  * rejoins if it saved the message after all (never a second message) or accepts now,
- * and "Discard", which forgets only this tab's copy. A saved row the host marks
- * `ingress_undispatched` (it proved the row never reached dispatch) keeps its frame
- * and offers both too: its Send again is the one retry the host hands over. A saved row
- * marked `ingress_pending` is the running host's, between its append and its dispatch
+ * and "Discard", which forgets only this tab's copy. A saved row marked
+ * `ingress_pending` is the running host's, between its append and its dispatch
  * (or echoed before a deferred dispatch): the frame waits for the next fact. A saved row
- * with none of the three came from a host process that has since ended (a restart came
+ * with neither dispatch fact came from a host process that has since ended (a restart came
  * between): whether it reached the agent is unknown and Send again would only rejoin
  * it, so its bubble says "Saved; delivery not confirmed" and the frame is dropped; the one action it keeps is "Send as a
  * new message", which only prepares the composer with the owner's words (`compose`) and sends nothing. Bubble
- * labels (markIngressSaved): `Input saved` on `ingress_dispatched` and `ingress_pending`,
- * `Saved, not delivered.` (frame kept) on `ingress_undispatched`. `count` feeds the chat
+ * labels (markIngressSaved): `Input saved` on `ingress_dispatched` and `ingress_pending`.
+ * `count` feeds the chat
  * instance's `hasPendingWork`, which keeps a Project room holding one hidden instead of
  * destroying it. Nothing here resends by itself or deletes an upload: those stay on the host.
  */
@@ -411,7 +409,7 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
             showToast(tr('chat.send_again_offline', 'Still offline. Reconnect and send again.'), 'error');
             return;
         }
-        // The doubt waits for the next fact; a saved, undispatched row keeps its note, without actions.
+        // The doubt waits for the next fact; a pending saved row keeps its note, without actions.
         onDomWrite(() => (note.dataset.ingressUnconfirmed !== undefined ? note.remove() : clearActions(note), true));
     }
 
@@ -429,7 +427,7 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
         return button;
     }
 
-    // The doubt on its bubble, or the saved-undispatched note markIngressSaved wrote, gains the two actions.
+    // The doubt on its bubble, or a pending saved note after a disconnect, gains the two actions.
     function mark(id, bubble) {
         const saved = bubble.querySelector('[data-ingress-saved]');
         let note = saved || bubble.querySelector('[data-ingress-unconfirmed]');
@@ -491,20 +489,17 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
             const entry = frames.get(String(id || ''));
             if (entry) entry.queued = false;
         },
-        /** The host's saved row for an id (its echo or history): the only thing that ends a doubt — unless
-         *  the host proved that row never reached dispatch, which keeps the frame for its one handover, or
-         *  the running host has not yet said (`ingress_pending`), which keeps it for that word. A saved row
-         *  of a host process that has since ended (none of the three) ends it in a delivery doubt. */
+        /** The host's saved row for an id (its echo or history) ends a doubt once dispatch is confirmed.
+         *  `ingress_pending` keeps the frame waiting for that fact. A saved row of a host process that
+         *  has since ended (neither dispatch fact) ends it in a delivery doubt. */
         settle(row) {
             const id = String(row?.client_message_id || '');
             if (row?.role !== 'user' || row.ingress_accepted !== true || !frames.has(id)) return;
             const bubble = bubbleOf(id);
-            if (row.ingress_undispatched === true) {  // saved, never dispatched: the frame stays for its one handover
-                if (bubble) onDomWrite(() => mark(id, bubble));
-            } else if (row.ingress_dispatched === true) {
+            if (row.ingress_dispatched === true) {
                 forget(id);
             } else if (row.ingress_pending === true) {
-                // The running host took it and will say dispatched or undispatched: the frame waits for that,
+                // The running host took it and still owes dispatch: the frame waits for its confirmation,
                 // and a reload's first read that shows it so has answered for the kept copy (no doubt from `reconcile`).
                 frames.get(id).restored = false;
             } else if (bubble) {  // without its bubble the frame waits, so the doubt is not lost unseen

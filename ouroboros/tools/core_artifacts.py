@@ -538,13 +538,13 @@ def _quiz_host_facts(ctx: ToolContext, canonical_root: pathlib.Path, task_id: st
     """The host's one-sentence account under a root's owner card: which task asks,
     how its run started, and when the owner last wrote in this chat. Read from
     typed records only (the task record's ``run_origin`` provenance and the chat
-    log tail), never from the question text; an unrecorded fact says unknown."""
+    store), never from the question text; an unrecorded fact says unknown."""
+    from ouroboros import dialogue_store as ds
     from ouroboros.consciousness_authority import CONSCIOUSNESS_INITIATOR
     from ouroboros.deadline_utils import parse_deadline_ts as moment, utc_now
     from ouroboros.dialogue_provenance import run_origin
     from ouroboros.task_results import load_task_result
     from ouroboros.tools.followup import FOLLOWUP_SOURCE
-    from ouroboros.utils import iter_jsonl_objects
 
     def shown(when: Any) -> str:
         return when.strftime("%Y-%m-%d %H:%M UTC")
@@ -576,14 +576,26 @@ def _quiz_host_facts(ctx: ToolContext, canonical_root: pathlib.Path, task_id: st
     else:
         started = "origin unknown" + (f" (recorded source: {origin['source']})" if origin.get("source") else "")
     last = None
+    coverage = ""
     try:
-        for entry in iter_jsonl_objects(canonical_root / "logs" / "chat.jsonl", tail_bytes=512_000):
-            if entry.get("direction") == "in" and str(entry.get("chat_id")) == str(chat_id):
-                last = moment(entry.get("ts")) or last
+        before = None
+        while (entry := ds.last_inbound(canonical_root, chat_id, before=before)) is not None:
+            last = moment(entry.row.get("ts"))
+            if last is not None:
+                break
+            before = entry.seq
+        lower = entry.seq if entry else 0
+        ds.require_imported(canonical_root, "chat", lower=lower)
+        if ds.range_coverage(canonical_root, "chat", lower=lower)["gaps"]:  # a later message may be unreadable
+            raise ds.StoreError("Dialogue history has recorded invalid intervals")
+    except ds.StoreMigrating:
+        last, coverage = None, " (history is still importing)"
+    except ds.StoreError as exc:
+        last, coverage = None, f" ({exc})"
     except Exception:
         last = None
     if last is None:
-        seen = "your last message in this chat: unknown"
+        seen = "your last message in this chat: unknown" + coverage
     else:
         minutes = max(0, int((utc_now() - last).total_seconds() // 60))
         seen = f"your last message in this chat: {shown(last)} ({minutes} minutes before this question)"

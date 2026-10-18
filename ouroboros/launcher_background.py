@@ -19,7 +19,8 @@ quiet start.
 ``DesktopApi`` is the page's alert half of the window bridge (``launcher.MainApi`` inherits it): the
 attention cue, the shell's own facts, and the system notifications of ``desktop_notifications``,
 whose click opens the window and hands the page its token; it also carries the painted palette to
-the window's native caption (``launcher_appearance``).
+the window's native caption (``launcher_appearance``). On macOS the window's title bar and appearance
+follow each document it shows (``launcher_window_chrome``).
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ from ouroboros.config import read_version
 from ouroboros.desktop_autostart import BACKGROUND_ENV, keep_running_choice, set_keep_running
 from ouroboros.desktop_notifications import UNAVAILABLE, capability, native_notifier, platform_name, refused
 from ouroboros.launcher_appearance import NativeAppearance
+from ouroboros.launcher_window_chrome import WindowChrome
 from ouroboros.platform_layer import request_native_attention, signal_pid
 
 log = logging.getLogger("launcher.background")
@@ -298,6 +300,7 @@ class Background:
         self.native_ready = False
         self.indicator = cls(self) if cls is not None else None
         self.appearance = NativeAppearance()  # the window's caption tint follows its page (Windows)
+        self.chrome = WindowChrome()  # the main window's title bar follows its document (macOS)
         global _notifier
         self.notifications = _notifier = native_notifier(self.open_notification)
         self._asking = threading.Lock()
@@ -343,6 +346,7 @@ class Background:
     def attach(self, window):
         self.window = window
         self.appearance.attach(window)  # every window, indicator or not: its own before_show and close
+        self.chrome.attach(window)
         window.events.closing += self.closing
         window.events.shown += self._window_shown  # set for a hidden window too (pywebview 5.4)
         if self.indicator is not None:

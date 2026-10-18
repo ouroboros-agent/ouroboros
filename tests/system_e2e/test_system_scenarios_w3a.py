@@ -575,6 +575,18 @@ S14_ANSWER_V2 = "Final answer: the summary is complete. W3A_DONE"
 _OWNER_SOURCE_RE = re.compile(r'"owner_source_sha256": "([0-9a-f]{64})"')
 
 
+def _nominate_step(full_answer: str):
+    """A plain conversation is not production: explicitly nominate this result for review."""
+    def step(body: dict):
+        arguments = {"claim": full_answer,
+                     "goal": "Summarize the w3a acceptance smoke and finish with the W3A_DONE marker."}
+        found = _OWNER_SOURCE_RE.findall(body_text(body))
+        if found:
+            arguments["acceptance_subject"] = {"owner_source_sha256": found[-1]}
+        return {"tool": "task_acceptance_review", "arguments": arguments}
+    return step
+
+
 def _completion_step(full_answer: str, *, answer_form: str):
     """Select complete bytes or an offered answer hash after host feedback."""
     def step(body: dict) -> dict:
@@ -644,7 +656,7 @@ def test_s17_acceptance_reject_rework_accept(e2e_clone, tmp_path_factory, answer
     # Both answer forms retain V2 through separate quorum/final-slot wakes; repeated collection must
     # not buy a third panel or exhaust the script. A new hash is selectable only once the whole response was held.
     stub = _HoldingStubModel(
-        [{"final": S14_ANSWER_V1}, *([{"final": S14_ANSWER_V2}] if answer_form == "answer_sha256" else []),
+        [_nominate_step(S14_ANSWER_V1), *([{"final": S14_ANSWER_V2}] if answer_form == "answer_sha256" else []),
          _completion_step(S14_ANSWER_V2, answer_form=answer_form),
          _keep_until_acceptance_settled(S14_ANSWER_V2, wave_ordinal=2, answer_form=answer_form)],
         review_script=review_script,
@@ -692,7 +704,7 @@ def test_s17_acceptance_identical_rework_is_free_replay_refusal(
     # Explicitly select the unchanged answer after rejection; both selection
     # forms must replay its paid verdict at $0 without a new panel.
     stub = _HoldingStubModel(
-        [{"final": S14_ANSWER_V1},
+        [_nominate_step(S14_ANSWER_V1),
          _keep_until_acceptance_settled(S14_ANSWER_V1, wave_ordinal=1, answer_form=answer_form)],
         review_script=review_script,
     )

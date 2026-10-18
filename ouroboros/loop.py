@@ -54,7 +54,6 @@ from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
     handle_tool_calls,
     prune_reclaim_trace_refs,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
-    reclaim_negative_memo,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     reclaim_trace_refs,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 )
 from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts, provider_no_call_source  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
@@ -403,7 +402,7 @@ def _measure_tool_result_batch(ctx, messages, schemas, *, round_id):
     return _measure_main_context_view(
         getattr(ctx, "context_fit_plan", None), messages, schemas,
         getattr(ctx, "active_context_mode", "max"),
-        getattr(ctx, "active_effort", "medium"), round_id)
+        getattr(ctx, "active_effort", "medium"), round_id, usage=getattr(ctx, "_accumulated_usage", None))
 
 
 def _reset_turn_state(ctx: Any) -> None:
@@ -415,6 +414,7 @@ def _reset_turn_state(ctx: Any) -> None:
     ctx._presence_forced_declaration = ctx._presence_forced_pending = None
     ctx._completion_request = ctx._completion_selected = ctx._completion_observation = None
     ctx._completion_conflict, ctx._completion_held_sha256, ctx._acceptance_pending_review_choice = False, "", ""
+    ctx._owner_reply_revision = None  # no live reply of an earlier turn answers this turn's owner rows
     ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
     ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
     ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
@@ -650,7 +650,7 @@ def run_llm_loop(
                         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
                         budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling, active_use_local=active_use_local)
 
-                    messages, _compaction_usage = _run_round_compaction(
+                    messages = _run_round_compaction(
                         messages,
                         _CompactionRoundContext(
                             tools=tools, drive_root=drive_root, drive_logs=drive_logs,
@@ -658,8 +658,6 @@ def run_llm_loop(
                             event_queue=event_queue, emit_progress=emit_progress, tool_schemas=tool_schemas))
                     tools._ctx.messages = messages
                     limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
-                    if _compaction_usage:
-                        _account_compaction_usage(accumulated_usage, _compaction_usage, event_queue, task_id)
 
                     prepare_acceptance_observation(ctx, llm_trace, incoming_messages, messages, tool_schemas)
                     seal_task_transcript(messages)
@@ -708,12 +706,9 @@ def run_llm_loop(
             ctx.context_fit_plan, ctx.active_context_mode = context_fit_plan, active_context_mode
             if (msg is None and str(accumulated_usage.get("_last_llm_error_kind") or "") == "llm_output_exhausted"
                     and not provider_no_call_source(accumulated_usage, False)[0]):
-                # Output exhaustion is no outage, the primary's (no route walk) or a configured
-                # candidate's (the walk keeps its kind): no wait, no provider terminal. One host fact,
-                # then the next ordinary round decides under the existing round, time and money
-                # limits. A round still holding an unresolved attempt may start no new generation,
-                # so it keeps the recovery below (provider_no_call_source decides). The provider
-                # answered, so the recovery above already ended any wait episode.
+                # Output exhaustion is no outage (primary or configured candidate): no wait, no provider
+                # terminal; one host fact, then the next round decides under the round, time and money
+                # limits. A round holding an unresolved attempt keeps the recovery below (provider_no_call_source).
                 _append_or_merge_user_message(
                     messages, _output_exhausted_notice(accumulated_usage.get("_last_llm_output_exhausted")))
                 pending_no_tool_budget = True  # an unfinished no-tool round keeps the same budget tail (#1223)
@@ -724,6 +719,9 @@ def run_llm_loop(
                 drive_root=drive_root, drive_logs=drive_logs, task_id=task_id, model=active_model,
                 emit_progress=emit_progress, incoming_messages=incoming_messages, owner_msg_seen=_owner_msg_seen):
                 free_redial = True
+                continue
+            from ouroboros.context_renewal import renew_after_refusal
+            if msg is None and renew_after_refusal(limit_ctx, tools):  # owner Q1=A: the same task in a fresh view
                 continue
             if msg is None:
                 # Exact actor routes skip generic substitution and fail as infrastructure.
@@ -868,12 +866,9 @@ from ouroboros.loop_acceptance_review import (  # noqa: E402, F401 -- intentiona
 from ouroboros.loop_round_limits import (  # noqa: E402, F401 -- intentional public re-exports
     _CompactionRoundContext,
     _drain_incoming_messages,
-    _context_reclaim_passes,
-    _context_reclaim_materializations,
     _context_overflow_retries,
     _run_round_compaction,
     _RoundLimitContext,
-    _account_compaction_usage,
     _handle_round_limit,
     _handle_forced_finalization,
     _handle_owner_stop_finalization,
@@ -915,8 +910,6 @@ from ouroboros.loop_model_call import (  # noqa: E402, F401 -- intentional publi
     _measure_main_context_view,
     _physical_context_for_fit,
     _dispatch_round_model,
-    _run_main_reclaim,
-    _measure_after_reclaim,
     _reproject_actual_overflow_low,
     _failed_capture_is_comparable,
     _strict_context_shrink_predicate,

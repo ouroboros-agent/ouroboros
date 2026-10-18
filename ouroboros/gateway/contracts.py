@@ -12,9 +12,11 @@ from ouroboros.storage import (  # noqa: F401 -- public re-exports
 )
 from ouroboros.gateway.claudexor_contracts import (  # noqa: F401 -- public re-exports
     ClaudexorReadState, ClaudexorStatusReads, ClaudexorPassiveReadError, ClaudexorQuotaResponse,
+    ClaudexorStatusResponse,
 )
 
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
+from ouroboros.gateway.health_contracts import BootDocument, BootJob, BootStep, HealthResponse  # noqa: F401 -- public re-exports
 from ouroboros.gateway.attachment_contracts import (  # noqa: F401 -- public re-exports
     AttachmentManifestEntry, ChatAttachmentInbound, ChatAttachmentView,
 )
@@ -98,7 +100,6 @@ class ChatOutbound(ChatReferenceFields):
     ingress_accepted: NotRequired[bool]  # Canonical inbound row saved; not processing/start proof.
     ingress_dispatched: NotRequired[bool]  # This live host process accepted the row and entered its dispatch.
     ingress_pending: NotRequired[bool]  # This live host process accepted the row and has entered or refused neither yet.
-    ingress_undispatched: NotRequired[bool]  # History only: this process proved the row's write raised before dispatch.
     attachments: NotRequired[List[ChatAttachmentView]]  # owner message's attachments (same views as history)
     text_placeholder: NotRequired[bool]  # owner row whose text the host wrote (no words were sent); shown as no caption
     markdown: NotRequired[bool]
@@ -697,16 +698,6 @@ class StatusResponse(TypedDict):
     status: str
 
 
-class HealthResponse(TypedDict):
-    """Shape of ``GET /api/health``."""
-
-    status: Literal["ok"]
-    version: str
-    runtime_version: str
-    app_version: str
-    abi_version: NotRequired[str]  # schema.GATEWAY_ABI_VERSION; absent on cores older than GET /api/contract
-
-
 class EvolutionStateSnapshot(TypedDict):
     """Nested ``evolution_state`` block inside ``StateResponse``."""
 
@@ -809,6 +800,7 @@ class StateResponse(TypedDict):
     bg_consciousness_state: Dict[str, Any]
     spent_calls: Optional[int]
     supervisor_ready: bool
+    boot: NotRequired[BootDocument]  # the same boot phases as /api/health; the header paints them
     supervisor_error: Optional[str]
     runtime_mode: str
     context_mode: str
@@ -1193,31 +1185,6 @@ class TaskDetailResponse(TypedDict, total=False):
     error: str
 
 
-class ClaudexorStatusResponse(TypedDict, total=False):
-    """``GET /api/claudexor/status`` — owned-daemon lifecycle plus the daemon's
-    own catalog/account/quota truth, each stamped with its read state. Read-only;
-    never spawns the daemon (waking it is the owner-initiated POST)."""
-
-    daemon: Dict[str, Any]
-    config_dir: str
-    harnesses: List[Dict[str, Any]]
-    profiles: Dict[str, Any]
-    quota: List[Dict[str, Any]]
-    quota_absences: List[Dict[str, Any]]
-    resources: List[Dict[str, Any]]
-    resource_capabilities: Dict[str, bool]
-    resource_capabilities_read: ClaudexorReadState
-    reads: ClaudexorStatusReads
-    # UNIFIED ACCOUNT MODEL feature fact (additive-optional): True only when the read /v2/operations catalog
-    # advertises `GET /v2/account-pools` (default CLI logins become named registry rows, `harnessAccounts`
-    # empties, routing rides `profiles.accountPools`); False or absent: legacy pseudo-rows (unreadable: False).
-    unified_accounts: bool
-    # Per facet: `observed_at`, `stale`, `error`; a failed or unasked facet serves its last read (stale).
-    facets: Dict[str, Dict[str, Any]]
-    subagent_last_delegation: Dict[str, Any]
-    error: str
-
-
 class ClaudexorLoginJobResponse(TypedDict, total=False):
     """Every login operation returns one required bare ControlSetupJob as job.
     Create metadata, input ok and snapshot cursor/sequence/deviceCode stay beside
@@ -1541,6 +1508,7 @@ __all__ = [
     "FsDirsEntry", "FsDirsResponse",
     "TaskNamedOutbound",
     "ErrorResponse", "StatusResponse", "HealthResponse", "StateResponse",
+    "BootStep", "BootJob", "BootDocument",
     "ActiveDirectTurn", "ActiveChatActivity",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",

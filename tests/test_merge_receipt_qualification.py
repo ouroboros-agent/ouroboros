@@ -1,6 +1,8 @@
 """Exercise merge uncertainty and publication through registered tool/delivery consumers."""
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import dataclasses
 import json
@@ -303,19 +305,19 @@ def test_receipt_revision_is_canonical_and_idempotent_across_fact_enrichment(wor
 def bounded_receipt_history(world, monkeypatch):
     """Actual r3 delivery, late r2, deduped catch-up, then a default-quota read."""
     from ouroboros.gateway import history as history_api
-    from ouroboros.utils import append_jsonl
+    from ouroboros import dialogue_store as ds
 
     test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypatch, "delivered_first")
     progress_path = world.root / "logs/progress.jsonl"
-    raw = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+    raw = dialogue_test.log_rows(progress_path)
     receipt_events = [r for r in raw if r.get("card_row_id")]
     assert [r["card_row_revision"] for r in receipt_events] == [3, 2]
     for i in range(59):
-        append_jsonl(world.root / "logs/progress.jsonl", {
+        ds.append(world.root, "progress", {
             "type": "task_progress", "chat_id": 7, "task_id": "merge-task",
             "text": f"Ordinary activity {i}", "ts": f"2099-01-01T00:00:{i:02d}Z",
         })
-    sources = {progress_path: progress_path.read_bytes()}
+    sources = {progress_path: dialogue_test.log_bytes(progress_path)}
     selected = []
     annotate = history_api._annotate_terminal_task_truth
 
@@ -345,7 +347,7 @@ def bounded_receipt_history(world, monkeypatch):
     assert stale["card_row_revision"] == 2 and "merge: queued" in stale["text"]
     (projected,) = [r for r in payload["messages"] if r.get("card_row_id")]
     assert all(projected[k] == stale[k] for k in ("history_id", "history_position", "ts", "card_row_id"))
-    assert {path: path.read_bytes() for path in sources} == sources
+    assert {path: dialogue_test.log_bytes(path) for path in sources} == sources
     evidence = json.dumps({"payload": payload, "selected": selected[0]})
     (world.root / "cold-history.json").write_text(evidence, encoding="utf-8")
     if output := os.environ.get("OUROBOROS_UI_EVIDENCE_DIR"):
@@ -393,12 +395,12 @@ def test_bounded_history_discloses_unavailable_canonical_receipt(world, monkeypa
             record["merge_receipts"] = []
         seed_result(world.root, "merge-task", record)
     source = world.root / "logs/progress.jsonl"
-    before = source.read_bytes()
+    before = dialogue_test.log_bytes(source)
     response = asyncio.run(make_chat_history_endpoint(world.root)(SimpleNamespace(query_params={"chat_id": "7"})))
     (row,) = [r for r in json.loads(response.body)["messages"] if r.get("card_row_id")]
     assert "merge: queued" in row["text"] and "merge: merged" not in row["text"]
     assert "Current merge receipt unavailable; showing recorded event." in row["text"]
-    assert row["card_row_revision"] == 2 and source.read_bytes() == before
+    assert row["card_row_revision"] == 2 and dialogue_test.log_bytes(source) == before
 
 
 @pytest.mark.serial

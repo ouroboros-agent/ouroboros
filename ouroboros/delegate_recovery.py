@@ -342,9 +342,10 @@ def unsettled_start_ids(
 
     A review run is the review substrate's obligation, not the actor's
     delegation slot, so it never blocks the actor's own start; nor does the
-    undisposed candidate patch of the run a start is ``continuing``. Evidence-only
-    captures owe no apply debt. A readonly continuation leaves a candidate patch
-    waiting for its own disposition; it is not a fresh replacement.
+    undisposed candidate patch of the run a start is ``continuing``, nor that run
+    once its terminal is observed (its accounting finishes in the background, #1969).
+    Evidence-only captures owe no apply debt. A readonly continuation leaves a
+    candidate patch waiting for its own disposition; it is not a fresh replacement.
     """
 
     mine = str(task_id or "")
@@ -359,6 +360,7 @@ def unsettled_start_ids(
         "open_run_ids": [
             row.run_id for row in runs.values()
             if row.task_id == mine and not row.settled and not row.review_owned
+            and not (row.run_id == continuing and row.terminal_state in custody.TERMINAL_STATES)
         ],
         "pending_invocation_ids": [
             str(row.get("invocation_id") or "")

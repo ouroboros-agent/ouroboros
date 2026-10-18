@@ -36,6 +36,7 @@ from ouroboros.utils import (
     append_jsonl,
     jsonl_generation_signature,
     utc_now_iso,
+    write_text_atomic,
 )
 
 log = logging.getLogger(__name__)
@@ -510,7 +511,8 @@ def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
     path = project_workpad_path(pid)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        path.write_text(body, encoding="utf-8")
+        # Replace, never truncate in place: a failed write leaves the previous page whole.
+        write_text_atomic(path, body)
     except OSError as exc:
         return f"⚠️ TOOL_ERROR (workpad_write): {exc}"
     return f"OK: workpad[{pid}] written ({len(body)} chars)."

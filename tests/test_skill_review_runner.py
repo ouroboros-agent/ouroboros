@@ -4,6 +4,7 @@ import pathlib
 from types import SimpleNamespace
 
 import pytest
+from tests._dialogue import chat_rows
 
 import ouroboros.skill_lifecycle_queue as lifecycle_queue
 from ouroboros.skill_loader import (
@@ -534,9 +535,9 @@ def test_lifecycle_finish_writes_compact_provenance_to_chat_jsonl(tmp_path, monk
         repo_path=str(skills_root),
     )
 
-    chat_path = drive_root / "logs" / "chat.jsonl"
-    assert chat_path.exists(), "Expected chat.jsonl to be created on lifecycle finish"
-    lines = [line for line in chat_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows_stored = chat_rows(drive_root)
+    assert rows_stored, "Expected chat rows on lifecycle finish"
+    lines = [json.dumps(row, ensure_ascii=False) for row in rows_stored]
     skill_rows = [
         json.loads(line) for line in lines
         if json.loads(line).get("type") == "skill_review"
@@ -610,10 +611,7 @@ def test_lifecycle_finish_keeps_raw_only_review_private(tmp_path, monkeypatch):
         ctx, "alpha", source="test", review_impl=fake_review, repo_path=str(skills_root),
     )
 
-    rows = [
-        json.loads(line)
-        for line in (drive_root / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    rows = chat_rows(drive_root)
     assert rows[-1]["type"] == "skill_review"
     assert raw_text not in rows[-1]["text"]
     history = [
@@ -1094,7 +1092,7 @@ def _review_records(drive_root):
     return (
         rows(drive_root / "state" / "skills" / "alpha" / "review_history.jsonl"),
         [row["type"] for row in rows(drive_root / "logs" / "events.jsonl") if row["type"].startswith("skill_review_")],
-        [row for row in rows(drive_root / "logs" / "chat.jsonl") if row.get("type") == "skill_review"],
+        [row for row in chat_rows(drive_root) if row.get("type") == "skill_review"],
     )
 
 

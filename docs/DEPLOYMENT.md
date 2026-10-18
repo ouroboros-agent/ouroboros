@@ -43,6 +43,17 @@ profile per volume set; never point two containers at one data volume.
 | Entry | `python server.py` | the common launcher, `--no-ui` |
 | Volumes | data, work, `HOME` | one parent volume, or body/data/work/home |
 
+**Interpreter.** The image's Python is python-build-standalone release 20261009:
+CPython 3.10.22 and SQLite 3.53.1, the same assets
+`scripts/download_python_standalone.sh` and `scripts/download_python_standalone.ps1`
+pin for the desktop packages. It is not Debian's `python:3.10-slim` (SQLite 3.46.1).
+Desktop installs receive that interpreter only by installing the app again.
+Settings → Update replaces the repository and its packages; it does not replace
+the bundled interpreter. A managed container keeps its runtime venv on a volume.
+A venv whose interpreter no longer matches this image is left untouched, and the
+log names the recovery step: stop, move that directory aside, start again. Code
+and data stay; packages that lived only in the old venv do not.
+
 **Exposure.** Both images bind `0.0.0.0` and set no `OUROBOROS_NETWORK_PASSWORD`:
 a missing password only warns and the gate then admits every request, so a
 published port without it exposes the whole owner surface. The recipes publish on
@@ -81,6 +92,13 @@ nonzero, so `on-failure` retries it with Docker's growing delay until the cause 
 fixed; a second managed container sharing the data volume loses the launcher lock
 and exits 0. `init: true` reaps orphans the launcher or server cannot. See
 Docker's [restart policy documentation](https://docs.docker.com/engine/containers/start-containers-automatically/).
+
+**Boot health.** Each recipe probes `GET /api/health` inside the container. The
+probe succeeds while the process is alive and `boot.phase` is not `failed`,
+including before the server opens its socket. There is no start deadline: a long
+boot does not become an unhealthy container and does not by itself restart it.
+`restart: on-failure` still follows a real process exit. `boot.phase` `failed`
+marks the container unhealthy.
 
 ## Trusted Docker / Kubernetes Non-Local Binds
 

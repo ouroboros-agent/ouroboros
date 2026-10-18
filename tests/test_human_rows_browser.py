@@ -6,6 +6,8 @@ the real history endpoint over the same data root. No runtime, provider or Teleg
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import os
 from collections import deque
@@ -125,7 +127,7 @@ def test_unrelated_system_rows_keep_working_and_sending(subscription_ui, tmp_pat
     page.evaluate(FRAMES)
     assert status.inner_text().startswith("Online"), status.inner_text()
     page.screenshot(path=str(out / f"header-answered-{theme}.png"), animations="disabled")
-    stored = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines()]
+    stored = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert all(not row.get("client_message_id") for row in stored if row["direction"] == "system")
     mounted["mode"]["fault"] = ""
     for route, snapshot in mounted["held"]:
@@ -190,10 +192,10 @@ def test_reworded_host_rows_live_and_after_reload(subscription_ui, tmp_path, mon
     request_cancel(tmp_path, "t-stop", source="test")
     monkeypatch.setattr(q, "cancel_task_custody", lambda task_id, **_k: q.CANCEL_FAILED)
     before_frames = list(frames)
-    before_history = (tmp_path / "logs" / "chat.jsonl").read_bytes()
+    before_history = dialogue_test.log_bytes(tmp_path / "logs" / "chat.jsonl")
     _drive_cancel_task_event({"task_id": "t-stop"}, sender)
     assert frames == before_frames
-    assert (tmp_path / "logs" / "chat.jsonl").read_bytes() == before_history
+    assert dialogue_test.log_bytes(tmp_path / "logs" / "chat.jsonl") == before_history
     assert active_intent(tmp_path, "t-stop") is not None
     sent = _push(mounted, frames)
 

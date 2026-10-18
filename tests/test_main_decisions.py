@@ -7,6 +7,7 @@ from ouroboros.gateway.main_decisions import main_decisions_snapshot
 from ouroboros.owner_quiz import quiz_states, record_asked, record_publication, reconcile_terminal
 from ouroboros.projects_registry import create_project
 from ouroboros.startup_migrations import prepare_startup_state
+from ouroboros.store_import import run_legacy_reconcile
 from ouroboros.task_results import write_task_result
 
 
@@ -78,6 +79,7 @@ def test_store_published_before_the_question_flag_gains_it_once_at_boot(tmp_path
     record_publication(tmp_path, "task", "q", project["chat_id"])
     with store.open_store(tmp_path, write=True) as txn:  # the column set before ``owner_questions``
         txn.conn.execute("DROP INDEX tasks_has_owner_questions")
+        txn.conn.execute("DROP INDEX tasks_underived_flags")
         txn.conn.execute("ALTER TABLE tasks DROP COLUMN has_owner_questions")
         txn.set_meta("schema_version", 1)
     assert ensure_current_store(tmp_path, with_children=False)["flag_columns_added"] == ["owner_questions"]
@@ -103,7 +105,7 @@ def schema_one_write(root, document):
                          (task_id, *columns.values()))
 
 
-def test_questions_an_older_body_rewrote_or_asked_return_to_main_at_the_next_boot(tmp_path, monkeypatch):
+def test_questions_an_older_body_rewrote_or_asked_return_to_main_after_legacy_job(tmp_path, monkeypatch):
     from ouroboros import startup_migrations
     from ouroboros.owner_quiz import mark_discharged, quiz_delivery_due, record_answered
     from ouroboros.task_store import read_document
@@ -129,7 +131,8 @@ def test_questions_an_older_body_rewrote_or_asked_return_to_main_at_the_next_boo
         assert txn.meta("schema_version") == store.SCHEMA_VERSION
         assert [txn.row(tid, "has_owner_questions") for tid in ("task", "later")] == [None, None]
     report = prepare_startup_state(tmp_path)  # the return to this body
-    assert report["flag_rows_derived"] == 2 and report["question_publications"] == {"bound": 1, "unknown": 0}
+    assert report["flag_rows_derived"] == 2 and report["question_publications"] == {}
+    assert run_legacy_reconcile(tmp_path)["question_publications"] == {"bound": 1, "unknown": 0}
     assert set(obligations.members(tmp_path, "owner_questions")) == {"task", "later"}
     snapshot = main_decisions_snapshot(tmp_path, [], {})
     assert snapshot["current_questions_complete"] is True and snapshot["current_questions_gaps"] == []
@@ -161,6 +164,7 @@ def test_flag_upgrade_keeps_an_undecodable_body_owed_and_disclosed(tmp_path):
     project_task(tmp_path)
     with store.open_store(tmp_path, write=True) as txn:
         txn.conn.execute("DROP INDEX tasks_has_owner_questions")
+        txn.conn.execute("DROP INDEX tasks_underived_flags")
         txn.conn.execute("ALTER TABLE tasks DROP COLUMN has_owner_questions")
     corrupt_body(tmp_path)
     assert ensure_current_store(tmp_path, with_children=False)["flag_columns_added"] == ["owner_questions"]
@@ -302,7 +306,8 @@ def test_an_older_bodys_ask_imports_without_turning_a_current_owed_publication_u
     older_body_ask(tmp_path, "later", "older", chat_id=project["chat_id"])
     append_jsonl(tmp_path / "logs/chat.jsonl", {"direction": "out", "type": "quiz", "task_id": "later",
                  "chat_id": project["chat_id"], "quiz": {"quiz_id": "older"}})
-    assert prepare_startup_state(tmp_path)["question_publications"] == {"bound": 1, "unknown": 0}
+    assert prepare_startup_state(tmp_path)["question_publications"] == {}
+    assert run_legacy_reconcile(tmp_path)["question_publications"] == {"bound": 1, "unknown": 0}
     assert not [key for key in obligations.members(tmp_path, "unknowns") if key.startswith("question:")]
     record_publication(tmp_path, "task", "current", project["chat_id"])  # the body publishes its own ask
     mark_published(tmp_path, "task", "current")
@@ -492,7 +497,6 @@ def test_retained_descendant_question_converges_after_ancestor_conversion(tmp_pa
     keeps the publication address. This does not grant live subagents new quiz authority."""
     from ouroboros.gateway.history import _assemble_history_response
     from ouroboros.projects_registry import bind_task_to_project
-    from ouroboros.utils import append_jsonl
     from tests.test_quiz_answer import _decision_app, _post
     from tests.test_quiz_late_answer import _late_bridge, _inbox
 
@@ -505,7 +509,8 @@ def test_retained_descendant_question_converges_after_ancestor_conversion(tmp_pa
     tid = chain[-1]
     record_asked(tmp_path, tid, quiz_id="retained", question="Choose the output", options=["PDF", "HTML"], chat_id=1)
     record_publication(tmp_path, tid, "retained", 1)
-    append_jsonl(tmp_path / "logs/chat.jsonl", {"type": "quiz", "direction": "out", "chat_id": 1,
+    from ouroboros import dialogue_store as ds
+    ds.append(tmp_path, "chat", {"type": "quiz", "direction": "out", "chat_id": 1,
         "task_id": tid, "ts": "2026-10-15T00:00:00Z", "text": "Choose the output",
         "quiz": {"quiz_id": "retained", "options": ["PDF", "HTML"]}})
     bind_task_to_project(tmp_path, converted, project["id"], origin={"absent": "system"})

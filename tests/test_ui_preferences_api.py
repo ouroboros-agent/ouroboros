@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests._dialogue import advance_room_revision
 
 import asyncio
 import json
@@ -14,7 +15,7 @@ from ouroboros.gateway.router import collect_routes
 def test_ui_preferences_round_trip_and_normalization(tmp_path):
     from starlette.testclient import TestClient
 
-    from ouroboros.projects_registry import create_project, increment_project_visible_revision
+    from ouroboros.projects_registry import create_project
 
     app = Starlette(routes=collect_routes(data_dir=tmp_path))
     app.state.drive_root = tmp_path
@@ -34,9 +35,9 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
 
         create_project(tmp_path, "racer", name="Racer")
         create_project(tmp_path, "site", name="Site")
-        increment_project_visible_revision(tmp_path, project_id="racer")
-        increment_project_visible_revision(tmp_path, project_id="racer")
-        increment_project_visible_revision(tmp_path, project_id="site")
+        advance_room_revision(tmp_path, project_id="racer")
+        advance_room_revision(tmp_path, project_id="racer")
+        advance_room_revision(tmp_path, project_id="site")
 
         # Paint ACKs merge monotonically. A future value is clamped to the current
         # visible revision; stale tabs cannot move a cursor backwards.
@@ -218,11 +219,11 @@ def test_welcome_text_with_a_lone_surrogate_is_refused_and_read_as_default(tmp_p
 
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):
     from ouroboros.gateway.ui_preferences import api_ui_preferences_post
-    from ouroboros.projects_registry import create_project, increment_project_visible_revision
+    from ouroboros.projects_registry import create_project
 
     create_project(tmp_path, "race", name="Race")
     for _ in range(5):
-        increment_project_visible_revision(tmp_path, project_id="race")
+        advance_room_revision(tmp_path, project_id="race")
     barrier = threading.Barrier(2)
 
     def _post(revision: int) -> int:

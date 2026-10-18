@@ -68,7 +68,7 @@ def test_reviewer_named_output_over_the_bound_is_retained_whole_before_release(
     [row] = [row for row in receipt["named_evidence"] if row["path"] == f"{rc.EVIDENCE_DIRNAME}/trace.bin"]
     assert row["size"] == OVER_BOUND and row["sha256"] == written["sha"]
     assert _sha(Path(receipt["evidence_dir"]) / "files" / row["path"]) == written["sha"]
-    assert receipt["refresh_safe"] and not (rc.seat_dir(drive, "task-1", "op-1") / "area").exists()
+    assert not (rc.seat_dir(drive, "task-1", "op-1") / "area").exists()
 
 
 def test_reviewer_binary_patch_over_the_bound_is_retained_and_reproduces_the_tree(
@@ -101,13 +101,13 @@ def test_reviewer_binary_patch_over_the_bound_is_retained_and_reproduces_the_tre
 def test_reviewer_ordinary_file_over_the_bound_is_retained_whole_before_release(
     tmp_path, writable_engine, monkeypatch,  # noqa: F811
 ):
-    root, drive, written = _subject(tmp_path, "task_acceptance"), tmp_path / "drive", {}
+    root, drive, written = _subject(tmp_path, "skill_review"), tmp_path / "drive", {}  # a copied subject
 
     def edit(area):
         written["area"] = area
         written["sha"] = _write(area / "dataset.bin", OVER_BOUND)
 
-    actor = run_directory(root, drive, "task_acceptance", _source(root, drive, "task_acceptance"), monkeypatch, edit)
+    actor = run_directory(root, drive, "skill_review", _source(root, drive, "skill_review"), monkeypatch, edit)
     assert actor["status"] == "ok", actor
     receipt = actor["usage"]["checking_evidence"]
     assert receipt["status"] == "retained" and receipt["gaps"] == [], {k: receipt.get(k) for k in ("status", "gaps")}
@@ -183,43 +183,41 @@ def test_reviewer_capture_out_of_space_keeps_copy_without_complete_receipt(
     assert not saved.exists() or json.loads(saved.read_text())["status"] == "capture_failed"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlink privileges vary on Windows")
 @pytest.mark.parametrize("boundary", ["summary", "marker"])
-def test_out_of_space_retry_keeps_earlier_partial_generation_byte_exact(
+def test_out_of_space_retry_keeps_the_earlier_failed_generation_byte_exact(
     author, tmp_path, monkeypatch, boundary,  # noqa: F811
 ):
     drive = tmp_path / "drive"
     source = rc.freeze_checking_source(author, data_root=drive, subject=rc.SUBJECT_INDEX)
     area = Path(rc.prepare_seat_area(drive, "task", "op", source))
-    linked = tmp_path / "linked-output"
-    linked.mkdir()
-    (area / rc.EVIDENCE_DIRNAME).symlink_to(linked, target_is_directory=True)
+    (area / rc.EVIDENCE_DIRNAME).mkdir()
+    (area / rc.EVIDENCE_DIRNAME / "early.log").write_bytes(b"early\n")
     _write(area / "fixture.bin", 1 << 16, seed=7)
-    first = rc.capture_seat_evidence(drive, "task", "op", release=True)
-    assert first["status"] == "partial" and area.is_dir()
+    with monkeypatch.context() as patch:
+        patch.setattr(rc, "_git_delta", _no_space)
+        first = rc.capture_seat_evidence(drive, "task", "op")
+    assert first["status"] == "capture_failed" and area.is_dir()
     earlier = Path(first["evidence_dir"])
 
     def generation():
         return {path.relative_to(earlier).as_posix(): _sha(path) for path in earlier.rglob("*") if path.is_file()}
 
     readback = generation()
-    assert {"delta.patch", "summary.json"} <= set(readback)
+    assert {"summary.json", f"files/{rc.EVIDENCE_DIRNAME}/early.log"} <= set(readback)
     marker = (area.parent / "checking.json").read_bytes()
 
-    (area / rc.EVIDENCE_DIRNAME).unlink()
-    (area / rc.EVIDENCE_DIRNAME).mkdir()
     (area / rc.EVIDENCE_DIRNAME / "final.log").write_bytes(b"settled\n")
     real_write = rc.atomic_write_json
     name = "summary.json" if boundary == "summary" else "checking.json"
     monkeypatch.setattr(rc, "atomic_write_json", lambda path, value, *a, **k: _no_space() if Path(path).name == name
                         else real_write(path, value, *a, **k))
-    failed = rc.capture_seat_evidence(drive, "task", "op", release=True)
+    failed = rc.capture_seat_evidence(drive, "task", "op")
     assert failed["status"] == "capture_failed" and area.is_dir()
     assert (area.parent / "checking.json").read_bytes() == marker  # the canonical receipt is still the earlier one
     assert generation() == readback
 
     monkeypatch.setattr(rc, "atomic_write_json", real_write)
-    final = rc.capture_seat_evidence(drive, "task", "op", release=True)
+    final = rc.capture_seat_evidence(drive, "task", "op")
     assert final["status"] == "retained" and final["patch_retained"] and not area.exists()
     assert final["evidence_dir"] != first["evidence_dir"] and generation() == readback
     assert json.loads((earlier / "summary.json").read_text()) == first

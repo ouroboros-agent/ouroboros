@@ -49,7 +49,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 from ouroboros.config import get_image_input_mode, get_vision_caption_timeout_sec, get_vision_model, resolve_effort
 from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout_with_deadline
 from ouroboros.observability import new_call_id, persist_call
-from ouroboros.provider_models import provider_for_model, supports_vision
+from ouroboros.provider_models import image_input_from_modalities, provider_for_model, supports_vision
 from ouroboros.utils import emit_cognitive_operation_event, utc_now_iso
 from ouroboros.vision_image_limits import prepare_caption_image, prepare_route_images, refusal_identity, sent_caption_identity
 from ouroboros.config import runtime_setting
@@ -102,11 +102,8 @@ class VisionRoutingContext:
 # --- Evidence: one parser, one route scope, one store ---------------------------
 
 def _modalities(value: Any) -> Any:
-    if value is None or value == []:
-        return None
-    if isinstance(value, list) and all(isinstance(item, str) for item in value):
-        return "image" in {item.strip().lower() for item in value}
-    return _MALFORMED
+    verdict = image_input_from_modalities(value)
+    return _MALFORMED if verdict is None and value not in (None, []) else verdict
 
 
 def _strict_flag(value: Any) -> Any:
@@ -126,7 +123,7 @@ def _supported_object(value: Any) -> Any:
 def image_input_from_row(row: Any) -> Optional[bool]:
     """Image input stated by one catalog row: True/False, or None when the row is unclear.
 
-    Only a documented, unambiguous field counts: a non-empty input-modality list
+    Only a documented, unambiguous field counts: a complete input-modality list
     (``architecture.input_modalities``), a strict JSON bool in ``supports_vision``
     or ``capabilities.supports_vision``, or Anthropic's
     ``capabilities.image_input.supported``. A missing, null or empty field says
@@ -972,9 +969,6 @@ def retry_refused_image_round(ctx: Any, failed: Any) -> Optional[Tuple[Any, Any]
     sent, retry = True, None
     try:
         fit = loop._measure_round_main_fit(ctx, automatic_pass_used=False)
-        if fit is not None and (fit.measurement.route_fp, fit.measurement.round_id) in loop._context_reclaim_passes(
-                ctx.tools._ctx):  # this round already reclaimed: measure its result, never reclaim again
-            fit = loop._measure_after_reclaim(ctx)
         msg, cost = loop._dispatch_round_model(
             ctx, fit, attempt_cap=1, candidate_predicate=_without_refused_images(failed, digests),
             max_tokens=int(getattr(failed, "max_completion_tokens", 0) or 0) or None)

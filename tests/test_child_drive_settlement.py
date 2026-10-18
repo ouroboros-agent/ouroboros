@@ -212,16 +212,20 @@ def test_a_crash_between_publication_and_the_row_write_converges_without_duplica
     assert not (data / "task_results" / "artifact_versions").exists()
 
 
-def test_a_crash_after_the_drive_left_its_place_leaves_only_unserved_trash(tmp_path, monkeypatch):
+def test_a_settled_drive_leaves_only_unserved_trash_for_the_maintenance_child(tmp_path):
     data, drive, _record = _cancelled_with_capture(tmp_path)
-    monkeypatch.setattr(task_custody.shutil, "rmtree", lambda *args, **kwargs: None)
     assert _settle(data, drive)["status"] == "removed"
-    monkeypatch.undo()
     trash = data / "state" / "custody_trash"
-    assert not drive.exists() and len(list(trash.iterdir())) == 1
-    task_custody.sweep_custody_leftovers(data, min_age_sec=3600)
-    assert len(list(trash.iterdir())) == 1  # a young entry may belong to a running settlement
+    assert not drive.exists() and len(list(trash.iterdir())) == 1  # moved, not deleted, by the server
     task_custody.sweep_custody_leftovers(data, min_age_sec=0)
+    assert len(list(trash.iterdir())) == 1, "the staging sweep never touches the moved drives"
+    staging = data / "state" / "custody_staging" / "crashed-settlement"
+    staging.mkdir(parents=True)
+    task_custody.sweep_custody_leftovers(data, min_age_sec=3600)
+    assert staging.exists()  # a young entry may belong to a running settlement
+    task_custody.sweep_custody_leftovers(data, min_age_sec=0)
+    assert not staging.exists()
+    assert task_custody.remove_custody_trash(data) == {"removed": 1, "stuck": {}}
     assert list(trash.iterdir()) == []
 
 

@@ -100,7 +100,6 @@ class TestCacheAwareReservation:
 
     def test_applied_compaction_makes_the_next_reservation_cold(self, monkeypatch, tmp_path):
         from ouroboros import loop
-        from ouroboros.context_budget import ContextReclaimReceipt
 
         request = _request(task_id="compacted")
         cold = usage_accounting._reservation_cost(request)
@@ -109,25 +108,27 @@ class TestCacheAwareReservation:
             provider=request.provider, ttl_seconds=300.0,
         )
         assert usage_accounting._reservation_cost(request) < cold
-        receipt = ContextReclaimReceipt(
-            status="applied", before_transcript_sha256="a" * 64,
-            after_transcript_sha256="b" * 64, selection_fingerprint="c" * 64,
-            selected_unit_ids=("unit",), reclaimed_tokens=10, goal_reached=True,
-            checkpoint_ref={"path": "checkpoint"}, capsule_refs=(),
-        )
-        monkeypatch.setattr(
-            loop, "compact_tool_history_llm",
-            lambda *_a, **_k: ([{"role": "assistant", "content": "summary"}], receipt, {}),
-        )
-        inner = SimpleNamespace(_pending_compaction=4)
-        loop._run_round_compaction(
-            [{"role": "user", "content": "before"}],
+        from ouroboros.context_compaction import context_reclaim_transcript_sha256
+        from ouroboros.tools.compact_context import _compact_context, record_context_view
+
+        messages = [{"role": "system", "content": "core"}, {"role": "user", "content": "before"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "read", "function": {"name": "read_file", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "read", "content": "Long exact evidence " * 200}]
+        inner = SimpleNamespace(active_context_mode="max", task_id="compacted", drive_root=tmp_path)
+        record_context_view(inner, messages, [])
+        assert "requested" in _compact_context(inner, working_note="The evidence was read.", keep_unit_ids=[])
+        monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda *_a, **_kw: None)
+        rebuilt = loop._run_round_compaction(
+            messages,
             loop._CompactionRoundContext(
-                tools=SimpleNamespace(_ctx=inner), drive_root=tmp_path,
+                tools=SimpleNamespace(_ctx=inner, schemas=lambda: []), drive_root=tmp_path,
                 drive_logs=tmp_path, task_id="compacted", round_idx=2,
                 event_queue=None, emit_progress=lambda _text, *, incident=None: None,
+                tool_schemas=[], fit_candidate=lambda *_: {"accepted": True},
             ),
         )
+        assert inner._context_view_receipt["status"] == "applied"
+        assert context_reclaim_transcript_sha256(rebuilt) != context_reclaim_transcript_sha256(messages)
 
         assert usage_accounting._reservation_cost(request) == cold
 

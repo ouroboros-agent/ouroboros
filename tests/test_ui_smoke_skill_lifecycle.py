@@ -10,6 +10,12 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from tests._shared import producer_evidence_dir
+
+
+def _evidence_dir(tmp_path):
+    return producer_evidence_dir(tmp_path, "skill-lifecycle", env="OUROBOROS_UI_SCREENSHOT_DIR")
+
 
 @pytest.mark.ui_browser
 @pytest.mark.parametrize("version", ["1.2.3", "", None])
@@ -82,8 +88,7 @@ def test_marketplace_update_retries_selected_version(version, tmp_path):
             retry.click()
             retry.wait_for()
             assert len(posts) == 2
-            screenshot_dir = Path(os.environ.get("OUROBOROS_UI_SCREENSHOT_DIR", tmp_path))
-            screenshot_dir.mkdir(parents=True, exist_ok=True)
+            screenshot_dir = _evidence_dir(tmp_path)
             page.screenshot(path=str(screenshot_dir / f"update-retry-{'pinned' if version else 'latest'}.png"))
             retry.click()
             page.wait_for_function("() => window.skillEvents.some(e => e.action === 'update' && e.name === 'demo' && e.ok === true)")
@@ -207,8 +212,7 @@ def test_installed_repair_reloads_tool_route_widget_and_companion(direct_server_
                 page.goto(url + "/#widgets")
                 frame = page.frame_locator(f'[data-widget-key="{name}:main"] iframe')
                 frame.locator("#root").filter(has_text="Installed widget: " + value).wait_for(timeout=30000)
-                evidence = Path(os.environ.get("OUROBOROS_UI_SCREENSHOT_DIR", str(tmp_path)))
-                evidence.mkdir(parents=True, exist_ok=True)
+                evidence = _evidence_dir(tmp_path)
                 page.screenshot(path=str(evidence / ("repaired-widget-" + value.replace(" ", "-") + ".png")))
             assert revisions[0] != revisions[1]
             assert pids[0] != pids[1]

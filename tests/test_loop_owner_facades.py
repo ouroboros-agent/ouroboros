@@ -42,9 +42,8 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_direct_context_fence_state _run_task_acceptance_review_once"
     ),
     "loop_round_limits": (
-        "_CompactionRoundContext _drain_incoming_messages _context_reclaim_passes "
-        "_context_reclaim_materializations _context_overflow_retries "
-        "_run_round_compaction _RoundLimitContext _account_compaction_usage "
+        "_CompactionRoundContext _drain_incoming_messages _context_overflow_retries "
+        "_run_round_compaction _RoundLimitContext "
         "_handle_round_limit _handle_forced_finalization _handle_owner_stop_finalization "
         "_handle_provider_unavailable _maybe_deadline_local_finalize "
         "_maybe_early_finalize _finalize_limit_ctx"
@@ -61,7 +60,7 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_run_cross_model_fallback_chain _rebind_context_fit_plan _RoundModelCallContext "
         "_context_fit_round_id _main_context_profile _remember_main_fit "
         "_measure_round_main_fit _physical_context_for_fit _dispatch_round_model "
-        "_run_main_reclaim _measure_after_reclaim _reproject_actual_overflow_low "
+        "_reproject_actual_overflow_low "
         "_failed_capture_is_comparable _strict_context_shrink_predicate "
         "_emit_overflow_retry_skipped _call_round_model"
     ),

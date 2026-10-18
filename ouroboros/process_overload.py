@@ -1,8 +1,11 @@
-"""Sample an owned test tree and stop it before it consumes physical headroom.
+"""Sample an owned test tree and stop it when the machine runs short of physical memory.
 
-RSS is summed (shared pages may be counted more than once). This intentionally
-conservative admission/stop budget is not an OS memory/PID/file-descriptor quota.
-Rapid growth between samples can exceed it, particularly on macOS.
+RSS is summed (shared pages may be counted more than once), so tree size alone
+never stops a run: the machine's free memory, and on macOS its kernel's critical
+pressure verdict, is the signal. This is supervision, not an OS memory/PID/
+file-descriptor quota. Rapid growth between samples can outrun it, a host too
+loaded to run its probes skips the stop loudly, and an unreadable macOS pressure
+level reads as normal.
 """
 from __future__ import annotations
 
@@ -100,17 +103,22 @@ def member_memory(container, detached=None) -> list[MemberMemory]:
     return members
 
 
-def stop_reason(total: int, memory, *, limit: int, floor: int, reserve: int) -> str:
+def stop_reason(total: int, memory, *, floor: int, reserve: int) -> str:
     """Why an owned tree must stop now, or "".
 
-    A tree past its limit always stops. Under the machine's physical reserve only
-    a tree that outgrew what admission gave it stops: a normal run is never
-    killed for another program's memory pressure.
+    Only real pressure stops a tree that outgrew what admission gave it: the machine
+    is under its physical reserve, or its kernel reports critical memory pressure. A tree
+    within its admitted floor is never killed for another program's pressure, and a
+    large tree on a machine that keeps its reserve runs on (a start-of-run
+    free-memory snapshot and summed RSS both misjudge room, which killed healthy
+    two-worker runs on 7 GB hosts).
     """
-    if total > limit:
-        return "tree over its physical budget"
-    if memory is not None and memory.available_bytes < reserve and total > floor:
+    if memory is None or total <= floor:
+        return ""
+    if memory.available_bytes < reserve:
         return "machine under its reserve and tree past its admitted size"
+    if memory.pressure:
+        return "kernel reports critical memory pressure and tree past its admitted size"
     return ""
 
 
@@ -119,13 +127,10 @@ class OverloadWatch:
 
     def __init__(self, container, slots: int = 1):
         from ouroboros.config import TEST_PROCESS_SAMPLE_SEC, TEST_WORKER_PEAK_RSS_BYTES
-        from ouroboros.test_parallelism import memory_budget, physical_memory
 
-        initial = physical_memory()
         # The admitted workers and their controller always fit, so admission never
-        # starts a tree that this watch would then kill. Unknown memory leaves the floor.
+        # starts a tree that this watch would then kill.
         self.floor_bytes = (max(1, slots) + 1) * TEST_WORKER_PEAK_RSS_BYTES
-        self.limit_bytes = max(memory_budget(initial) if initial else 0, self.floor_bytes)
         self.degraded = ""
         self._container = container
         self._interval = TEST_PROCESS_SAMPLE_SEC
@@ -149,6 +154,8 @@ class OverloadWatch:
                     detached, scanned = token_members(self._container), time.monotonic()
                 members = member_memory(self._container, detached)
                 memory = physical_memory()
+                if memory is None:  # without the machine's free memory there is no pressure signal
+                    raise RuntimeError("the machine's physical memory is unreadable")
             except Exception as exc:
                 # A sample this host cannot take is skipped (said once); it never fails a
                 # healthy run or ends the watch. The tree is still owned and reaped.
@@ -157,13 +164,13 @@ class OverloadWatch:
                     print(self.degraded, file=sys.stderr, flush=True)
             else:
                 total = sum(member.rss_bytes for member in members)
-                reserve = int(memory.total_bytes * TEST_MEMORY_RESERVE_FRACTION) if memory else 0
-                why = stop_reason(total, memory, limit=self.limit_bytes, floor=self.floor_bytes, reserve=reserve)
+                reserve = int(memory.total_bytes * TEST_MEMORY_RESERVE_FRACTION)
+                why = stop_reason(total, memory, floor=self.floor_bytes, reserve=reserve)
                 if members and why:
                     largest = max(members, key=lambda member: member.rss_bytes)
                     self.diagnostic = (
-                        f"overload_stop: {why}; tree_rss={total} limit={self.limit_bytes} floor={self.floor_bytes} "
-                        f"available={memory.available_bytes if memory else 'unknown'} reserve={reserve}; "
+                        f"overload_stop: {why}; tree_rss={total} floor={self.floor_bytes} "
+                        f"available={memory.available_bytes} reserve={reserve}; "
                         f"largest pid={largest.pid} name={largest.name!r} rss={largest.rss_bytes}"
                     )
                     try:

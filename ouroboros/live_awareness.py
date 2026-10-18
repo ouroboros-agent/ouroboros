@@ -9,7 +9,7 @@ the room's RUNNING text turns, delivered through their ordinary mailbox as an
 independent task's words (``UtteranceFanout``), never as an owner directive.
 
 The room reaches the call through a post-success notification from the one
-chat writer (``message_bus.log_chat`` -> ``notify_chat_row``) plus a catch-up
+chat writer (``message_ingress.log_chat`` / ``accept_chat`` -> ``notify_chat_row``) plus a catch-up
 read of the chain for rows written between the call's admission and the
 listener's registration. Rows are deduplicated by their chain address, never by
 their words: two identical owner lines are two facts. The call's own rows (its
@@ -66,7 +66,7 @@ def row_room(row: Dict[str, Any]) -> int:
 
 
 def notify_chat_row(root: Any, record: Dict[str, Any]) -> None:
-    """Called by ``message_bus.log_chat`` once a row is on disk; never raises.
+    """Called by the chat writer (``message_ingress``) once a row is stored; never raises.
 
     The writer's own success is the only trigger: a row that was not appended
     is not a fact of the room. Listeners are copied under the lock and run

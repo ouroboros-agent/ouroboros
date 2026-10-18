@@ -748,15 +748,38 @@ def _client(args: argparse.Namespace, *, start: bool = False) -> OuroborosHTTPCl
     host = (parsed.hostname or DEFAULT_HOST).lower()
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise CLIError("--start can only launch a local loopback Ouroboros server")
-    _start_local_server(client.base_url)
-    deadline = time.time() + 30
-    while time.time() < deadline:
+    proc = _start_local_server(client.base_url)
+    return _wait_for_dialogue(client, proc)
+
+
+def _wait_for_dialogue(client: OuroborosHTTPClient, proc) -> OuroborosHTTPClient:
+    """Wait until the started server accepts owner messages (``/api/health`` answers and its
+    ``boot`` says ``dialogue_ready``; an older core without ``boot`` counts at its first answer),
+    or its boot is ``ready`` without them (no model provider configured yet).
+    No clock: the wait ends with readiness, with the boot's own ``failed`` verdict, or with the
+    server process's exit."""
+    last_phase = ""
+    while proc.poll() is None:
         try:
-            client.request("GET", "/api/health")
-            return client
+            health = client.request("GET", "/api/health")
         except CLIError:
             time.sleep(0.5)
-    raise CLIError(f"server did not become ready at {client.base_url}")
+            continue
+        boot = health.get("boot") if isinstance(health, dict) else None
+        if not isinstance(boot, dict) or boot.get("dialogue_ready") is True:
+            return client
+        if boot.get("phase") == "ready":  # no model provider yet, or the dialogue's opening failed
+            print("server ready, but its chat is not accepting messages yet: configure a model provider, "
+                  "or see the failed boot step in /api/health", file=sys.stderr, flush=True)
+            return client
+        if boot.get("phase") == "failed":
+            raise CLIError(f"server start failed at {client.base_url}: {boot.get('error') or 'unknown'}")
+        phase = str(boot.get("phase") or "")
+        if phase != last_phase:
+            print(f"server boot: {phase}", file=sys.stderr, flush=True)
+            last_phase = phase
+        time.sleep(0.5)
+    raise CLIError(f"server exited with code {proc.returncode} before it became ready at {client.base_url}")
 
 
 def _default_base_url() -> str:
@@ -775,7 +798,7 @@ def _default_base_url() -> str:
     return f"http://{DEFAULT_HOST}:{port}"
 
 
-def _start_local_server(base_url: str) -> None:
+def _start_local_server(base_url: str) -> subprocess.Popen:
     if os.environ.get("OUROBOROS_PACKAGED_CLI") == "1":
         raise CLIError("packaged CLI must launch the desktop app for --start, not source server.py")
     parsed = urllib.parse.urlparse(base_url)
@@ -784,7 +807,7 @@ def _start_local_server(base_url: str) -> None:
     cmd = [sys.executable, "-m", "ouroboros.cli", "server", "--host", host, "--port", str(port)]
     from ouroboros.platform_layer import subprocess_new_group_kwargs
 
-    subprocess.Popen(
+    return subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

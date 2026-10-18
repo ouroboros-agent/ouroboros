@@ -807,14 +807,14 @@ class _LiveCall:
     def _write_presence_heard(self, text: str, item_id: str) -> None:
         """A Presence call's correspondents' words become that conversation's dialogue rows."""
         voices, self.voices_since_caption = self.voices_since_caption, set()
-        self._record_presence_utterance("in", text, speaker_label=next(iter(voices)) if len(voices) == 1 else "")
+        self._record_presence_utterance("in", text, next(iter(voices)) if len(voices) == 1 else "", item_id)
 
-    def _record_presence_utterance(self, direction: str, text: str, *, speaker_label: str = "") -> None:
+    def _record_presence_utterance(self, direction: str, text: str, speaker_label: str = "", item_id: str = "") -> None:
         try:
             from ouroboros.presence_call import record_call_utterance
 
             if not record_call_utterance(self.drive_root, self.task, direction=direction, text=text,
-                                         speaker_label=speaker_label):
+                                         speaker_label=speaker_label, utterance_id=item_id):
                 self.counts["unrecorded"] = self.counts.get("unrecorded", 0) + 1
         except Exception:
             log.warning("live call %s could not record a Presence utterance", self.spec.call_id, exc_info=True)

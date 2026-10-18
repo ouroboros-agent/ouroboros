@@ -42,6 +42,8 @@ class _ExtensionRegistrations:
     content_hash: Optional[str] = None
     skill_dir: Optional[str] = None
     import_root: Optional[str] = None
+    runtime_identity: str = ""
+    catalog_identity: Optional[str] = None
     # ABI-9: minted at each atomic publication; stamped into the dispatch
     # surfaces (tools/routes/ws) so physical-call provenance can name the
     # exact published generation it dispatched against.
@@ -50,6 +52,10 @@ class _ExtensionRegistrations:
     # (manifest ``plugin_api`` field, or the legacy generation for
     # grandfathered field-less payloads).
     plugin_api_generation: str = ""
+    # Loaded manifest/hash identity; prompt reads use existing readiness owners
+    # over small current control files, never rehash the publisher's payload.
+    loaded_skill: Any = None
+    context_snapshot: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -153,6 +159,7 @@ class _PluginAPIConfig:
     # ABI-1: negotiated PluginAPI generation served to this extension
     # ("" -> the loader's negotiation default for grandfathered payloads).
     plugin_api_generation: str = ""
+    loaded_skill: Any = None
 
 
 # Lock-guarded registries; per-surface maps keep unload proportional to one extension.
@@ -265,6 +272,52 @@ def live_module_sources(skill_name: str) -> Optional[Dict[str, str]]:
     with _lock:
         bundle = _extensions.get(skill_name)
         return None if bundle is None else dict(bundle.module_sources)
+
+
+def snapshot() -> Dict[str, Any]:
+    """Return a read-only snapshot of live extension surfaces."""
+    with _lock:
+        return {
+            "extensions": sorted(_extensions.keys()),
+            "tools": sorted(_tools.keys()),
+            "routes": sorted(_routes.keys()),
+            "ws_handlers": sorted(_ws_handlers.keys()),
+            "ui_tabs": [
+                dict(copy.deepcopy(value), key=key)
+                for key, value in sorted(_ui_tabs.items())
+            ],
+            # Settings sections follow the same host-surfaced shape as UI tabs.
+            "settings_sections": [
+                dict(copy.deepcopy(value), key=key)
+                for key, value in sorted(_settings_sections.items())
+            ],
+        }
+
+
+def list_ws_handlers() -> Dict[str, Any]:
+    with _lock:
+        return {k: dict(v) for k, v in _ws_handlers.items()}
+
+
+def list_routes() -> Dict[str, Any]:
+    with _lock:
+        return {k: dict(v) for k, v in _routes.items()}
+
+
+def list_companion_names() -> List[str]:
+    """Return host-spawnable companion names across loaded extensions.
+
+    Excludes the ``task:`` (supervised-task) and ``worker-skip:`` markers; used by
+    the out-of-process catalog so the host can spawn the declared companions.
+    """
+    with _lock:
+        names: List[str] = []
+        for bundle in _extensions.values():
+            for raw in bundle.companion_names:
+                name = str(raw or "")
+                if name and not name.startswith(("task:", "worker-skip:")):
+                    names.append(name)
+        return names
 
 
 def get_tool_with_generation(name: str) -> tuple[Optional[Dict[str, Any]], str]:

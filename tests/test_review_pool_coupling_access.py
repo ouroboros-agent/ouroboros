@@ -78,7 +78,7 @@ def test_combined_pool_brief_preserves_rights_profile_and_frozen_subject(
                                      call_id=result["results"][0]["operation_id"] + "_response")[1]
         evidence = response["usage"]["checking_evidence"]
         assert evidence["source"]["tree"] == frozen.tree_sha
-        assert evidence["refresh_safe"] and Path(evidence["evidence_dir"], "summary.json").is_file()
+        assert evidence["status"] == "retained" and Path(evidence["evidence_dir"], "summary.json").is_file()
     assert (repo / "f.txt").read_text() == "A staged\nB unstaged\n"
 
 

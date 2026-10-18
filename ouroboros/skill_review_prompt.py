@@ -50,6 +50,7 @@ _SKILL_REVIEW_ITEMS = (
     "integration_preflight",
     "bug_hunting",
     "completion_notification",
+    "context_snapshot_discipline",
 )
 
 

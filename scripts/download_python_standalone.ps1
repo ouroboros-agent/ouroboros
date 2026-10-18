@@ -3,15 +3,15 @@
 
 $ErrorActionPreference = "Stop"
 
-$Release = "20260211"
-$PyVersion = "3.10.19"
+$Release = "20261009"
+$PyVersion = "3.10.22"
 $Dest = "python-standalone"
 $Platform = "x86_64-pc-windows-msvc"
 
 # Pinned SHA256 (from the release's SHA256SUMS): a swapped/truncated archive
 # fails here instead of becoming the packaged runtime. Update the pin when
 # bumping $Release/$PyVersion, exactly as in download_python_standalone.sh.
-$Sha256 = "b892f2c7eb0a04611688d6df7567a2745a204aac694d6d1c56c75b0717dab2d6"
+$Sha256 = "f20288c45ff11e7fe026f40ddcfb2acfe695cec18860746639e289142a589745"
 
 $Filename = "cpython-${PyVersion}+${Release}-${Platform}-install_only_stripped.tar.gz"
 $Url = "https://github.com/astral-sh/python-build-standalone/releases/download/${Release}/${Filename}"

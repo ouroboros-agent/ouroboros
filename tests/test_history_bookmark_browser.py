@@ -4,11 +4,14 @@ owner decisions 2026-07-10 and 2026-10-05)."""
 import json
 import pytest
 
+from ouroboros import dialogue_store
+from tests._shared import producer_evidence_dir
+
 from tests.test_history_continuity_browser import (
     _bookmark_place, _deep_gesture_history, _nested_full_output_history, _open_nested_full_output, _OFFSET,
 )
 from tests.test_chat_history_paging_browser import (
-    _assert_at_newest, _open, _open_project, _step, _idle, _screenshot, _FRAMES, _write, _result,
+    _append, _assert_at_newest, _open, _open_project, _step, _idle, _screenshot, _FRAMES, _result,
 )
 from tests.test_chat_history_recovery_browser import _click_project
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
@@ -24,13 +27,7 @@ def test_a_deep_place_with_an_open_review_and_line_reopens_at_the_newest_message
     from playwright.sync_api import sync_playwright
 
     root = direct_server_with_data['data_dir']
-    project, _ = _deep_gesture_history(root)
-    progress = root / 'logs/progress.jsonl'
-    rows = [json.loads(line) for line in progress.read_text().splitlines()]
-    for row in rows:
-        if row['task_id'] == 'deep-review':
-            row['content'] += ' Full retained long narration.' * 6
-    progress.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    project, _ = _deep_gesture_history(root, narration=' Full retained long narration.' * 6)
     with sync_playwright() as pw:
         browser = getattr(pw, browser_engine).launch(headless=True)
         try:
@@ -162,7 +159,7 @@ def _assert_note_readable(facts):
 def test_main_coverage_status_remains_readable_away_from_history_control(direct_server_with_data, browser_engine, theme, tmp_path):
     from playwright.sync_api import sync_playwright
 
-    _write(direct_server_with_data['data_dir'] / 'logs/chat.jsonl', [
+    _append(direct_server_with_data['data_dir'], 'chat', [
         {'direction': 'in', 'chat_id': 1, 'ts': '2026-09-01T10:00:00Z',
          'client_message_id': f'main-{index}', 'text': f'Main saved message {index:04d}'} for index in range(1400)])
     with sync_playwright() as pw:
@@ -218,15 +215,12 @@ def test_late_latest_cannot_erase_newer_physical_coverage(direct_server_with_dat
 
     root = direct_server_with_data['data_dir']
     project = create_project(root, 'latest-race', name='Latest response race')
-    log = root / 'logs/chat.jsonl'
     start = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
     def append(first, last):
-        with log.open('a') as stream:
-            for index in range(first, last):
-                stream.write(json.dumps({'direction': 'in', 'chat_id': project['chat_id'],
-                    'ts': (start + timedelta(minutes=index)).isoformat(),
-                    'client_message_id': f'race-{index}', 'text': f'Race retained message {index:04d}'}) + '\n')
+        _append(root, 'chat', [{'direction': 'in', 'chat_id': project['chat_id'],
+            'ts': (start + timedelta(minutes=index)).isoformat(),
+            'client_message_id': f'race-{index}', 'text': f'Race retained message {index:04d}'} for index in range(first, last)])
 
     append(0, 150)
     with sync_playwright() as pw:
@@ -356,11 +350,11 @@ def test_a_card_line_arrives_with_its_source_page_and_a_reopen_reads_only_the_ne
     if line_kind == 'receipt':
         old.update(role='system', system_type='host_progress', narration=False,
                    card_row='reviews', card_row_id='merge-receipt:source', card_row_revision=3)
-    _write(root / 'logs/progress.jsonl', [old, *[
+    _append(root, 'progress', [old, *[
         {'chat_id': cid, 'task_id': 'source-filler', 'ts': stamp(index + 2),
          'content': f'Archive activity {index:03d}'} for index in range(80)],
         {'chat_id': cid, 'task_id': 'source-owner', 'ts': stamp(83), 'content': 'RECENT_OWNER_PROGRESS'}])
-    _write(root / 'logs/chat.jsonl', [
+    _append(root, 'chat', [
         {'chat_id': cid, 'direction': 'in', 'ts': stamp(index),
          'client_message_id': f'source-{index}', 'text': f'Reading context {index:03d}'} for index in range(300)])
     for task in ('source-owner', 'source-filler'):
@@ -444,16 +438,12 @@ def test_a_moved_newest_window_leaves_a_reader_in_history_in_place_and_reopen_la
 
     root = direct_server_with_data['data_dir']
     project = create_project(root, 'retained-rebase', name='Retained reading page')
-    log = root / 'logs/chat.jsonl'
     start = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
     def append(first, last):
-        log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open('a') as stream:
-            for index in range(first, last):
-                stream.write(json.dumps({'direction': 'in', 'chat_id': project['chat_id'],
-                    'ts': (start + timedelta(minutes=index)).isoformat(),
-                    'client_message_id': f'rebase-{index}', 'text': f'Rebase retained message {index:04d}'}) + '\n')
+        _append(root, 'chat', [{'direction': 'in', 'chat_id': project['chat_id'],
+            'ts': (start + timedelta(minutes=index)).isoformat(),
+            'client_message_id': f'rebase-{index}', 'text': f'Rebase retained message {index:04d}'} for index in range(first, last)])
 
     append(0, 150)
     with sync_playwright() as pw:
@@ -510,12 +500,11 @@ def test_a_live_line_keeps_its_node_through_history_adoption_and_reopens_from_it
     full = 'Retained full result. ' * 320 + 'COMPOSED_FULL_RESULT_TAIL'
     lineage = {'subagent_task_id': 'adopt-child', 'parent_task_id': 'adopt-parent',
                'root_task_id': 'adopt-parent', 'delegation_role': 'subagent', 'subagent_role': 'History reader'}
-    _write(root / 'logs/chat.jsonl', [
+    _append(root, 'chat', [
         {'direction': 'in', 'chat_id': cid, 'ts': f'2026-09-01T10:{index:02d}:00Z',
          'client_message_id': f'adopt-{index}', 'text': f'Live line context {index:02d}'} for index in range(60)])
-    progress = root / 'logs/progress.jsonl'
-    _write(progress, [{'chat_id': cid, 'ts': '2026-09-01T10:30:01Z', 'task_id': 'adopt-parent', 'content': 'Parent narration'}]
-           if line_kind == 'full-result' else [])
+    _append(root, 'progress', [{'chat_id': cid, 'ts': '2026-09-01T10:30:01Z', 'task_id': 'adopt-parent', 'content': 'Parent narration'}]
+            if line_kind == 'full-result' else [])
     row = {'chat_id': cid, 'ts': '2026-09-01T10:30:02Z', 'task_id': 'adopt-child', **lineage,
            'subagent_event': 'completed', 'status': 'completed', 'content': 'Child finished',
            'result': full[:4000], 'result_truncated': True} if line_kind == 'full-result' else {
@@ -544,8 +533,7 @@ def test_a_live_line_keeps_its_node_through_history_adoption_and_reopens_from_it
             assert not live_key.startswith(('history-', 'terminal-')), live_key
             line.evaluate('n => { window.__adoptedLine = n; }')
             _bookmark_place(page, line)
-            with progress.open('a') as stream:
-                stream.write(json.dumps(row) + '\n')
+            dialogue_store.append(root, 'progress', row)
             before = page.evaluate('() => window.__historyReads.length')
             _bookmark_reconnect(page)
             page.wait_for_function('n => window.__historyReads.length > n && window.__historyReads.slice(n).every(r => r.done)', arg=before)
@@ -587,8 +575,6 @@ def test_a_live_receipt_survives_equal_replay_and_a_reopened_one_takes_only_newe
     """Live receipts of one revision keep their nodes and keys through a saved replay of the same
     revision. Closed and opened again, the room is at its newest message; its receipts come from
     the saved rows, and live frames update them in place only with a newer revision."""
-    import os
-    from pathlib import Path
     from ouroboros.merge_receipts import card_row_text
     from ouroboros.projects_registry import create_project
     from tests.ui_chat_viewport_smoke import _emit_ws_frame
@@ -597,12 +583,11 @@ def test_a_live_receipt_survives_equal_replay_and_a_reopened_one_takes_only_newe
     root = direct_server_with_data['data_dir']
     project = create_project(root, 'receipt-bookmark', name='Receipt reading place')
     cid, task_id = project['chat_id'], 'receipt-owner'
-    _write(root / 'logs/chat.jsonl', [
+    _append(root, 'chat', [
         {'direction': 'in', 'chat_id': cid, 'ts': f'2026-09-01T10:{index:02d}:00Z',
          'client_message_id': f'receipt-context-{index}', 'text': f'Receipt context {index:02d}'} for index in range(60)])
-    progress = root / 'logs/progress.jsonl'
-    _write(progress, [{'chat_id': cid, 'task_id': task_id, 'ts': '2026-09-01T10:30:00Z',
-                      'content': 'Reading the retained pull request.'}])
+    _append(root, 'progress', [{'chat_id': cid, 'task_id': task_id, 'ts': '2026-09-01T10:30:00Z',
+                                'content': 'Reading the retained pull request.'}])
     receipts = [{'receipt_id': name, 'number': 7, 'revision': 3,
                  'outcome': {'status': 'merged', 'merge_sha': 'c' * 40},
                  'coverage': {'status': 'covers_head', 'gaps': ['Retained receipt detail ' * 14]}}
@@ -632,9 +617,7 @@ def test_a_live_receipt_survives_equal_replay_and_a_reopened_one_takes_only_newe
             assert not live_key.startswith('history-')
             line.evaluate('n => { window.__readingReceipt = n; }')
             _bookmark_place(page, line, 1)
-            with progress.open('a') as stream:
-                for row in rows:
-                    stream.write(json.dumps(row) + '\n')
+            _append(root, 'progress', rows)
             before = page.evaluate('() => window.__historyReads.length')
             _bookmark_reconnect(page)
             page.wait_for_function('n => window.__historyReads.length > n && window.__historyReads.slice(n).every(r => r.done)', arg=before)
@@ -656,7 +639,7 @@ def test_a_live_receipt_survives_equal_replay_and_a_reopened_one_takes_only_newe
             assert lines.count() == 2
             assert line.get_attribute('data-live-line-key') != live_key
             _screenshot(page, tmp_path, f'receipt-bookmark-after-{browser_engine}')
-            evidence = Path(os.environ.get('HISTORY_UI_EVIDENCE_DIR') or tmp_path)
+            evidence = producer_evidence_dir(tmp_path, "history-bookmark", env='HISTORY_UI_EVIDENCE_DIR')
             (evidence / f'receipt-bookmark-{browser_engine}.json').write_text(json.dumps({
                 'live_key': live_key, 'cold_key': line.get_attribute('data-live-line-key'),
                 'card_expanded': card.get_attribute('data-expanded'),
@@ -733,7 +716,7 @@ def _retained_room(root, slug, count, **quiz):
 
     project = create_project(root, slug, name=slug.replace('-', ' ').title())
     start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-    _write(root / 'logs/chat.jsonl', [{'direction': 'in', 'chat_id': project['chat_id'], 'client_message_id': f'{slug}-{index}',
+    _append(root, 'chat', [{'direction': 'in', 'chat_id': project['chat_id'], 'client_message_id': f'{slug}-{index}',
         'ts': (start + timedelta(minutes=index)).isoformat(), 'text': f'{slug} message {index:04d}. Reading an older discussion.'}
         for index in range(count)])
     if quiz:

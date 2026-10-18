@@ -27,10 +27,10 @@ def assert_review_source(text, source):
 
 @pytest.mark.parametrize("source", ["declaration", "record"])
 def test_merge_card_stays_current_after_outbox_delivery_and_reload(request, world, monkeypatch, tmp_path, source):
+    from ouroboros import dialogue_store
     from ouroboros.gateway.history import make_chat_history_endpoint
-    from ouroboros.utils import append_jsonl
 
-    append_jsonl(world.root / "logs/progress.jsonl", {
+    dialogue_store.append(world.root, "progress", {
         "type": "task_progress", "chat_id": 7, "task_id": "merge-task",
         "text": "Reading the PR.", "ts": "2026-09-16T00:00:00Z",
     })

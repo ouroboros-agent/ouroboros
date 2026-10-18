@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from tests.candidate_checkout import candidate_checkout
+from tests._shared import producer_evidence_dir
 from tests.system_e2e.harness import (
     ArtifactOracle,
     KeylessIsolatedServer,
@@ -381,7 +382,8 @@ def test_batch1_unknown_controls_and_tool_history_reach_the_real_spa(batch1_clon
 
     from ouroboros.tool_call_log import logical_calls
 
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "evidence")
+    evidence = producer_evidence_dir(tmp_path / "evidence", "batch1-consumers",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT")
     evidence.mkdir(parents=True, exist_ok=True)
     receipt: dict = {"assertions": [], "red": []}
 

@@ -237,8 +237,9 @@ leaderboard" for the verified mechanics. Methodology-relevant consequences:
   `trajectory.json` upload; the trial row must carry `trajectory_path`). The
   adapter emits it in-container at the end of each trial; pre-existing runs
   are backfilled with `build_atif_trajectories.py` BEFORE the first upload.
-  Trajectories are derived verbatim from the recorded logs (tool calls,
-  progress narration, final answer, token/cost totals) — no synthesis. The
+  Trajectories are derived verbatim from the recorded logs (tool calls, the
+  model's progress narration, host notes as `system` steps, final answer,
+  token/cost totals) — no synthesis. The
   maintainers run an LLM judge over these trajectories (reward-hacking
   review; flagged trials are zeroed at `/apply`).
 - Submitted jobs become **public**. Because campaign runs inject provider

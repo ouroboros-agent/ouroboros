@@ -443,6 +443,9 @@ CURRENT_PRODUCER_CONTRACTS = {
     # An evidence-only investigation's capture is never integrated (#1609): its
     # refusal changes nothing and is its peers' answer, asserted live.
     "INTEGRATE_DELEGATED_INVESTIGATION_EVIDENCE": (True, "integration_blocked"),
+    # #1969: an apply that had to prepare the capture returns it for inspection;
+    # nothing is applied, recorded or released, so it is its peers' answer.
+    "INTEGRATE_DELEGATED_INSPECT_CAPTURE": (True, "integration_blocked"),
     # A reject request cannot undo direct effects already in the folder.
     # The refusal belongs to this disposition, not to the earlier write.
     "INTEGRATE_DIRECTORY_ALREADY_APPLIED": (True, "integration_blocked"),

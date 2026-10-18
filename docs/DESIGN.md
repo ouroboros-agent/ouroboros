@@ -115,6 +115,14 @@ the design bible above; neither has a decorative background.
 On Windows the desktop window keeps its ordinary system caption, buttons, Snap and
 resizing; only their light or dark tint follows the painted palette — the system
 tint, not the page's colour — and a High Contrast theme keeps its own colours.
+On macOS the main window is one surface: the page reaches the top edge under a
+transparent title bar, the real traffic lights sit level with the header row, empty
+parts of that band drag the window, and a double-click follows the Mac's setting:
+Zoom, Minimize, Do Nothing or Fill. Fill relies on an available undocumented native
+action, not an imitation by Zoom. Its appearance follows Light or Dark and inherits
+under System. In full screen the bar hides until the pointer reveals it; the setup
+and error windows and a UI that does not declare it keep the ordinary title bar. A
+browser, another OS or an older desktop app reserves nothing.
 
 Appearance belongs to a browser profile or desktop client, not an account or
 server setting. Existing saved Light/Dark choices keep their meaning. Storage
@@ -283,12 +291,13 @@ never the field's only name. Help and validation belong to that field without
 changing the alignment of neighboring controls and their actions.
 
 **Secret visibility has one meaning across Settings.** Show reveals the complete
-current value as selectable, read-only text below the unchanged editing field;
-long values wrap within the column. An edited value is shown from the local
-draft; an untouched saved value is read only when requested. A prefix or a
-configured-value placeholder is never a successful reveal. Hide removes that
-text and retains the draft. Viewing changes neither the dirty state nor the
-values submitted by Save or Test. Editing, clearing, reloading or leaving the
+current value as selectable, read-only text in the masked field's own place,
+never as a second field; long values wrap within the column. An edited value is
+shown from the local draft; an untouched saved value is read only when requested.
+A prefix or a configured-value placeholder is never a successful reveal. Hide
+brings back the unchanged masked field and its draft; typing a new value starts
+with Hide or Clear. Viewing changes neither the dirty state nor the values
+submitted by Save or Test. Clearing, renaming the entry, reloading or leaving the
 page closes the reveal, and a late read cannot reopen it. Built-in, custom,
 skill-requested and MCP header fields use the same interaction; loading Settings
 keeps saved secrets masked. Pending reads and failures are shown at the field.
@@ -432,7 +441,11 @@ derived from whatever generic opacity sits on the element.
 
 The connected Chat header says `Starting…` until a complete server-ready
 observation confirms the supervisor can assign work; a live socket alone means
-only that the UI transport is open. `Online` is reserved for a ready, idle
+only that the UI transport is open. The host's boot phases refine the word
+without changing the fact: `Chat ready, restoring background tasks` once the
+dialogue accepts messages durably while pooled work is still not admitted, and
+`Start failed` (its cause in the badge title) when the generation cannot become
+ready. `Online` is reserved for a ready, idle
 runtime; known queued, active or finalizing work keeps its own factual label. A
 durably accepted incoming message likewise proves acceptance, not that its task
 has begun or a model has read it.
@@ -993,14 +1006,13 @@ Persistent history notices are wrapping text in the room's header chrome: the
 Project status bar without an opaque strip, Main's floating header on its own
 reading backing (§5).
 
-A room always opens at its newest message: Main and every Project, however long
-ago its last message was and however much other rooms wrote since. Returning to
-a room in the same app session opens it at its newest message too, Main after a
-closed Project included (owner decisions 2026-07-10 and 2026-10-05). Only an explicit navigation to one place
-lands elsewhere: a question opened from its Main mirror, or a row of the room's
-work status, whose landing reads the page around that work as the room's history
+Main and every Project open at their newest message, regardless of age or other
+rooms' traffic. Returning in the same session does too, including Main after
+closing a Project (owner decisions 2026-07-10 and 2026-10-05). Only explicit
+navigation lands elsewhere: a question from its Main mirror, an exact quoted message, or a row of the room's
+work status. Its landing reads the bounded page around the target as the room's history
 from there on: `Load more history` continues older from it and `Scroll to latest
-message` returns to the present. A window merely shown again keeps the reader where they were.
+message` returns to the present. Showing the window again keeps the reader in place.
 
 A room's history is its own. A page is counted in the room's messages, never in
 bytes of other rooms' traffic: the newest page holds the room's newest messages,
@@ -1088,7 +1100,9 @@ the Available subagents roster, MCP servers, custom keys.
   new entry appears at the end of its own group, is scrolled into view (the
   shortest distance, without animation) and takes the caret in its first field.
   A button that stays in view while the entry it made is born off-screen has not
-  finished its job.
+  finished its job. Remove hands the caret the same way to the entry now in its
+  place (the next, else the previous), or to the add action once the group is
+  empty, never to the page.
 - A freshly added entry is an invitation, not an error. Where a list editor
   validates in the browser (today the Available subagents roster), the entry
   shows a neutral hint in its own meta line until the owner tries to save; the
@@ -1302,11 +1316,13 @@ the final's typed outcome or the durable detail. An undurable Main receipt keeps
 a dashed border and a plain warning; the binding holds. The owner's routing line
 under his message steps aside while that work's portal stands in the feed; words
 passed on to the work later keep theirs. A Continue is the same card: the
-admitted successor takes the work's place and first name, each episode one meta
-line (`Episode 1 · 17:33–18:15 · Failed: <cause>`), the current one owning the
-chip.
+admitted successor takes the work's place and first name. Each episode has its
+own name, time and past outcome; only the current one owns the chip and controls.
+Expanded ordinary cards disclose earlier Files, timeline, Reviews and children
+in collapsible sections using their original content, never duplicate cards.
+A Project portal still reaches that content through its room.
 
-**Project completion mirror.** Eligible managed/transferred Project finals reach Main as Markdown in Ouroboros's voice, host-stamped only for a model-authored final, so the browser never infers authorship; ordinary Project-native replies stay local. A long answer folds to about seven lines of complete selectable text, faded only where text is hidden; folded text has no keyboard stops. The Project reference below opens the complete answer and its delivered documents; Main has no in-place expansion or Files inventory. A nonclean final carries one compact factual limitation from recorded outcome/acceptance beside the answer, wrapping legibly at narrow widths; a clean final has no status caption. Copy copies the answer alone. Ordinary document readers, quiz materials and task-card Files stay on their existing surfaces; retained availability is not delivery or owner receipt. Full reviews, logs and progress stay in their sources. Durable rows/wire frames stay `role="system"` with unchanged plain text, so the Telegram mirror and Ouroboros's own context behave as before; no-answer endings and historical rows without an authored answer keep System voice and the Project reference. One logical identity joins retries/history and keeps one-ending-one-notification; external transport stays at-least-once.
+**Project completion mirror.** Eligible managed/transferred Project finals reach Main as Markdown in Ouroboros's voice, host-stamped only for a model-authored final, so the browser never infers authorship; ordinary Project-native replies stay local. A long answer folds to about seven lines of complete selectable text, faded only where text is hidden; folded text has no keyboard stops. The Project reference below opens the complete answer and its delivered documents; Main has no in-place expansion or Files inventory. A nonclean final carries one compact factual limitation from recorded outcome/acceptance beside the answer, wrapping legibly at narrow widths; a clean final has no status caption. Copy and Reply quote the answer alone. Ordinary document readers, quiz materials and task-card Files stay on their existing surfaces; retained availability is not delivery or owner receipt. Full reviews, logs and progress stay in their sources. Durable rows/wire frames keep System metadata and text; Reply uses the persisted visible answer without changing its address. Telegram status replies reference the work instead. Endings without an authored answer keep System voice and the Project reference. One logical identity joins retries/history and keeps one-ending-one-notification; external transport stays at-least-once.
 
 History with no current execution or known outcome keeps its expandable content under `Outcome unavailable`, without a task chip, typing or Stop. Before complete live-source reconciliation, it is `Activity unconfirmed`. Positive current activity restores only its proven controls. A delivery warning may coexist with a preserved task-acceptance PASS. Model metadata says `Last solve response`, naming the initial request only when the route changed.
 
@@ -1393,26 +1409,32 @@ file (owner choice 1C/2A/3A/4A/5A/6A with mobile first-class).
 
 ### Replies
 
-A reply is a reference: the owner says which row he means, Ouroboros decides
-what to do, and nothing routes by it. Every saved row offers Reply (beside Copy
-on a bubble, first in a root work card's action row, in the row menu), never on
-hover only. Reply stages one strip above the composer (`Replying to`, the quoted
-author, one line, ×; Esc cancels); the sent message carries only the row's
-address, and the host makes the snippet. An answerable question card answers in
-its own field. The quote panel is one component (bubble, strip, relay): above
-the text, a 2 px bar and a tint in the quoted author's ink, one line cut on a
-word (a photo leads with its thumbnail); pressing it goes to the quoted row when
-loaded. An Ouroboros answer quotes the message it answers only when that message
-is not directly above it (its own card does not count). A relay arrives in the
-work's room as one Ouroboros bubble: each owner message it passes on, in his
-complete words with where and when he wrote them (six lines, then Show all;
-files named, a captionless file by name alone), then Ouroboros's note (Telegram:
-plain text); his Main message keeps its one receipt line. The row menu
-(right-click, Shift+F10 or the ContextMenu key on the focused row, a long press
-on touch) offers the row's own doors: Reply, Copy, Open project and, on a work
-card, Resume, Pause and Stop… exactly when the card does; Esc or an outside
-press closes it, focus returning to the row. Words the owner selected keep the
-browser's menu.
+A reply names the row meant; Ouroboros decides what to do, routing nothing by it. Saved rows offer Reply beside Copy on bubbles, first in root card actions, and
+in row menus; never on hover only. Reply stages one
+composer strip (`Replying to`, quoted author, one line, ×; Esc cancels). Send
+carries only the address; the host makes the snippet. Answerable questions use their own field.
+
+One quote component serves bubbles, strips and relays: above the text, a 2 px
+bar and tint in the quoted author's ink, one line cut on a word; a photo leads
+with its thumbnail. Pressing a reply quote reveals the exact row, loading its
+bounded page in this room when present, otherwise its available home. Containing
+timelines open and scroll; the line is focused and highlighted below the header.
+A card, portal or retained copy cannot substitute. A refused or failed read
+keeps the view, and a reader following the newest message keeps following it;
+its toast says why and offers Try again only when asking again can differ. Newer
+gestures/navigation cancel it. Only the quoted row's stream is positioned: the
+other stream (narration beside an owner message, or the reverse) stays unloaded
+down that page chain until `Scroll to latest message`. Old sources read no newer
+messages. Ouroboros quotes the message it answers only when it is not directly
+above (its own card does not count).
+
+A relay is one Ouroboros bubble in the work's room: every owner's message passed
+on, complete with where/when (six lines, then Show all; files named, captionless
+files by name), then Ouroboros's note; Telegram uses plain text. Main keeps its
+one receipt line. The row menu (right-click, Shift+F10, ContextMenu on the focused
+row, long press on touch) offers Reply, Copy, Open project and a work card's
+Resume, Pause and Stop… exactly when the card does. Esc/outside press closes it
+and returns focus; selected words keep the browser's menu.
 
 ### Conversation activity block
 
@@ -1902,6 +1924,24 @@ uncertainty and unmet or unknown review obligations remain material. This phone
 projection never shortens full card reasons or rewrites outcomes. The status-only
 Main mirror follows the toggle too, but preserved intermediate content does not.
 Ordinary replies, files, questions and reply-editing Silent Mode remain independent. Unrecoverable old mirrors keep their text rather than guessing it is status-only. There is no new mode, cross-channel deduplication or retroactive rewrite.
+
+**Telegram typing means a reply is being prepared for that chat.** It is a
+native header cue, not a notification. While a reply the owner asked for is
+actively prepared and would reach a Telegram chat under the current mirror
+settings (Main and Project replies included), the bridge renews Telegram's
+typing action there, once per chat however many tasks back it, every few
+seconds at most. Ouroboros's own model and tool work counts; while that work
+waits, what it waits on counts when it works: a helper's own work, a delegated
+run the host currently observes running, or a review seat not waiting for model
+access. A running run's provider retry inside its engine carries no fact, so it
+reads as running. An intermediate message does not end the cue, and work
+resuming after a wait brings it back with no new start. By itself a question
+waiting for the owner, a wait for model access, a timer- or mail-only wait, a
+run queued or paused on its own question, Pause or Stop now renews nothing; a
+handed-off answer stops the helpers too, and background work nobody asked for
+and unknown state never count. An action already sent when the answer leaves
+may still be accepted after it, and Telegram may show the last action for up
+to five seconds more; no message, card, percentage or Stop button is added.
 
 **When the client runs.** Notifications are a property of a running client, and
 there is no push channel. On the desktop the Telegram bridge runs inside the same

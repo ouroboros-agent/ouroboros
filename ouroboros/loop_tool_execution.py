@@ -1357,15 +1357,6 @@ def reclaim_trace_refs(tool_ctx: Any) -> Dict[str, Any]:
     return refs if isinstance(refs, dict) else {}
 
 
-def reclaim_negative_memo(tool_ctx: Any) -> set:
-    """Per-task set of non-shrinking reclaim unit keys (created on demand)."""
-    memo = getattr(tool_ctx, "_context_reclaim_negative_memo", None)
-    if not isinstance(memo, set):
-        memo = set()
-        tool_ctx._context_reclaim_negative_memo = memo
-    return memo
-
-
 def prune_reclaim_trace_refs(tool_ctx: Any, messages: List[Dict[str, Any]]) -> None:
     """Drop trace refs whose tool_call_id left the transcript (post-reclaim bound)."""
     refs = getattr(tool_ctx, "_tool_trace_refs", None)

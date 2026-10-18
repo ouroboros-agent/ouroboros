@@ -20,6 +20,8 @@ read live, after reload, and after a server restart with the page left open.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import copy
 import json
 import os
@@ -30,6 +32,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._shared import producer_evidence_dir
 from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
 
@@ -97,7 +100,17 @@ def _producers(monkeypatch, data_dir: Path, repo_dir: Path) -> SimpleNamespace:
     bridge, live_sends = _Bridge(), []
     monkeypatch.setattr(message_bus, "DATA_DIR", data_dir)
     monkeypatch.setattr(message_bus, "_BRIDGE", bridge)
-    monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=live_sends.append))
+    from supervisor.event_observation import ObservedEventQueue
+
+    class _Bus(ObservedEventQueue):
+        """The supervisor's real two-lane bus (membership and atomic put included), recording each live send."""
+
+        def _put(self, item):
+            live_sends.append(item)
+            super()._put(item)
+
+    bus = _Bus()
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: bus)
     monkeypatch.setattr("ouroboros.server_owner_routing.threading", SimpleNamespace(Thread=_ImmediateThread))
     ctx = SimpleNamespace(
         DRIVE_ROOT=data_dir, PENDING=pending, RUNNING=running, WORKERS=pool, bridge=bridge,
@@ -189,7 +202,7 @@ def _seed(host, monkeypatch, data_dir: Path, tmp_path: Path) -> dict:
     refused_result = load_task_result(data_dir, refused, strict=True)
     annotations = [row for row in _rows(data_dir / "logs" / "chat_annotations.jsonl")
                    if row.get("client_message_id") == client_message_id]
-    notices = [row for row in _rows(data_dir / "logs" / "chat.jsonl")
+    notices = [row for row in dialogue_test.log_rows(data_dir / "logs" / "chat.jsonl")
                if row.get("task_id") == refused and row.get("type") == "task_not_started"]
     assert refused_result["status"] == "failed" and refused_result["admission_outcome"] == "never_admitted"
     assert refused_result["reason_code"] == "project_routing_fence_changed"
@@ -288,7 +301,7 @@ def test_never_admitted_project_refusal_stays_an_origin_receipt(
 
     server = direct_server_with_data
     url, data_dir = server["url"], server["data_dir"]
-    evidence = Path(os.environ.get("OUROBOROS_TEST_TEMP_ROOT") or tmp_path) / "admission-consumer" / engine
+    evidence = producer_evidence_dir(tmp_path / "admission-consumer" / engine, "admission-consumer-" + engine)
     evidence.mkdir(parents=True, exist_ok=True)
     print(f"ADMISSION_EVIDENCE={evidence}")
     facts: dict = {"engine": engine}
@@ -426,7 +439,7 @@ def test_never_admitted_project_refusal_stays_an_origin_receipt(
                 _wait_main(page, [*published, REPLACEMENT], timeout=180_000)
                 record("replacement_publication", {
                     "result": load_task_result(data_dir, REPLACEMENT, strict=True),
-                    "main_history": [row for row in _rows(data_dir / "logs/chat.jsonl")
+                    "main_history": [row for row in dialogue_test.log_rows(data_dir / "logs/chat.jsonl")
                                      if row.get("task_id") == REPLACEMENT],
                 })
 

@@ -157,8 +157,8 @@ def _measure_delivery(request: Any, slot: Any, text: str, *, session: bool,
         return None
 
 
-_SESSION_INTRO = ("You review as an agent session in the task workspace (read-only, or in a private checking "
-                  "copy of it when your seat holds write access).")
+_SESSION_INTRO = ("You review as an agent session over the task workspace (read-only, or from your own private "
+                  "checking folder when your seat holds write access; its checking instructions say what it holds).")
 _NATIVE_INTRO = ("You review as a bounded read-only native inspection episode; the host data root at the "
                  "pointers is readable.")
 

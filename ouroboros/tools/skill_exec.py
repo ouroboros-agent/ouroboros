@@ -1403,7 +1403,9 @@ _TOGGLE_SCHEMA = {
         "skill's review_gate to permit the current bytes (outside Cyber Pro: "
         "a current executable reviewer verdict or a qualified Advisory author "
         "acceptance of these exact bytes), any requested key or "
-        "host-permission grants, and ready isolated dependencies. "
+        "host-permission grants, and ready isolated dependencies. Enabling a trusted "
+        "launcher-seeded skill prepares its declared isolated dependencies first; "
+        "other skills require them to be ready already. "
         "For selected-skill development, interpret the real owner request: "
         "Repair and run authorizes enabling and leaving the repaired skill running. "
         "The host resolves that task's original owner message when owner_source is omitted; "
@@ -1488,7 +1490,7 @@ def get_tools() -> List[ToolEntry]:
             schema=_TOGGLE_SCHEMA,
             handler=_handle_toggle_skill,
             is_code_tool=False,
-            timeout_sec=15,
+            timeout_sec=_SKILL_REVIEW_TOOL_TIMEOUT_SEC,
         ),
         ToolEntry(
             name="skill_owner_action", schema=_OWNER_ACTION_SCHEMA,

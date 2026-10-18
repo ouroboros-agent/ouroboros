@@ -1,20 +1,24 @@
-"""Wedge detection for the supervisor generation.
+"""Boot phases and wedge detection for the server generation.
 
-The two silent-wedge predicates (a stalled supervisor loop, a heartbeat-silent
-in-process chat turn), the owner alert one of them raises, the measurements the
-loop publishes about itself, and the dedicated watchdog thread that evaluates
-both outside the loop it watches.
+The one boot document of the process (``BOOT``: phase, readiness flags, the named boot
+steps the coordinator and the supervisor init run; what ``/api/health`` and ``/api/state``
+answer as ``boot``), the boot coordinator that runs the lifespan's post-serve steps on its
+own thread, and the supervisor generation's wedge detection: the two silent-wedge
+predicates (a stalled supervisor loop, a heartbeat-silent in-process chat turn), the owner
+alert one of them raises, the measurements the loop publishes about itself, and the
+dedicated watchdog thread that evaluates both outside the loop it watches.
 """
 
 from __future__ import annotations
 
+import contextlib
 import posixpath
 import queue
 import re
 import sys
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.runtime_limits import (
@@ -85,9 +89,11 @@ def note_supervisor_ready() -> None:
 
 def run_startup_phase(liveness: list, phase: str, step: Callable[[], Any]) -> Any:
     """Run one startup step under its own visible sub-phase (a stall inside it is
-    journaled with that name), then publish ``startup`` again."""
+    journaled with that name, and the boot document shows it as a step), then publish
+    ``startup`` again."""
     liveness[1], liveness[0] = loop_phase_facts(liveness, phase), time.monotonic()
-    result = step()
+    with BOOT.step(phase):
+        result = step()
     liveness[1], liveness[0] = loop_phase_facts(liveness, "startup"), time.monotonic()
     return result
 
@@ -490,3 +496,197 @@ def _start_supervisor_liveness_watchdog(
                     wedged_tasks.add(turn_task)
 
     threading.Thread(target=_watch, name="supervisor-liveness-watchdog", daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# the boot document and the boot coordinator
+# ---------------------------------------------------------------------------
+
+PHASES = ("starting", "serving", "ready", "failed")
+STEP_STATES = ("running", "done", "failed")
+
+
+class BootDocument:
+    """The process's one boot document, the ``boot`` object of ``/api/health``.
+
+    ``phase``: ``starting`` until the HTTP socket serves (the lifespan reached its yield),
+    ``serving`` while the boot steps and the supervisor init run, ``ready`` once every boot
+    step ended and the supervisor reached readiness, ``failed`` when the generation cannot
+    become ready (the store did not publish, the supervisor init failed, the loop died).
+    ``dialogue_ready``: an owner message is accepted durably (the chat bridge is published).
+    ``tasks_ready``: pooled task starts are admitted (the supervisor's readiness latch, read
+    from the caller at snapshot time so one latch serves the API and this document).
+    ``steps``: every named boot step in the order it started, with its outcome. A failed
+    fail-soft step (an extension that did not load) is reported as such and does not fail the
+    phase; a step that ends the boot calls ``fail``. The document is per generation
+    (``reset`` at every lifespan start) and lives in memory: durable boot facts stay where
+    they are written (``supervisor.jsonl`` rows, the ``job:`` rows of the store).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._since = utc_now_iso()
+            self._serving = False
+            self._steps_done = False
+            self._dialogue_ready = False
+            self._error: Optional[str] = None
+            self._steps: Dict[str, Dict[str, Any]] = {}
+
+    def serving(self) -> None:
+        with self._lock:
+            self._serving = True
+
+    def steps_done(self) -> None:
+        with self._lock:
+            self._steps_done = True
+
+    def dialogue_ready(self, value: bool = True) -> None:
+        with self._lock:
+            self._dialogue_ready = bool(value)
+
+    def fail(self, error: str) -> None:
+        """The boot cannot reach readiness; the first cause is kept."""
+        with self._lock:
+            if not self._error:
+                self._error = str(error)
+
+    def step_started(self, name: str) -> None:
+        with self._lock:
+            self._steps[name] = {"name": name, "state": "running", "started_at": utc_now_iso(),
+                                 "ended_at": None, "error": None}
+
+    def step_ended(self, name: str, error: Optional[str] = None) -> None:
+        with self._lock:
+            row = self._steps.get(name)
+            if row is None:
+                row = self._steps[name] = {"name": name, "started_at": utc_now_iso()}
+            row.update(state="failed" if error else "done", ended_at=utc_now_iso(), error=error or None)
+
+    @contextlib.contextmanager
+    def step(self, name: str) -> Iterator[None]:
+        """Record one step around a block; an exception marks it failed and propagates."""
+        self.step_started(name)
+        try:
+            yield
+        except BaseException as exc:
+            self.step_ended(name, error=f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            self.step_ended(name)
+
+    def phase(self, *, supervisor_done: bool = False, supervisor_error: Optional[str] = None) -> str:
+        with self._lock:
+            if self._error or supervisor_error:
+                return "failed"
+            if not self._serving:
+                return "starting"
+            return "ready" if self._steps_done and supervisor_done else "serving"
+
+    def snapshot(self, root: Any = None, *, tasks_ready: bool = False, supervisor_done: bool = False,
+                 supervisor_error: Optional[str] = None, jobs: bool = True) -> Dict[str, Any]:
+        """The ``boot`` object; ``jobs`` are the store's named-job rows (``{}`` while the store
+        is unpublished or absent: a read that never imports and never waits)."""
+        phase = self.phase(supervisor_done=supervisor_done, supervisor_error=supervisor_error)
+        with self._lock:
+            document = {
+                "phase": phase,
+                "since": self._since,
+                "dialogue_ready": self._dialogue_ready,
+                "tasks_ready": bool(tasks_ready),
+                "steps": [dict(row) for row in self._steps.values()],
+                "jobs": {},
+                "error": self._error or supervisor_error or None,
+            }
+        if jobs and root is not None:
+            document["jobs"] = job_facts(root)
+        return document
+
+
+BOOT = BootDocument()
+
+
+def job_facts(root: Any) -> Dict[str, Dict[str, Any]]:
+    """``{name: {state, done, total}}`` of the store's named jobs for the health document:
+    one indexed read without waiting; an unpublished, absent or busy store reads ``{}``."""
+    from ouroboros import maintenance_jobs, store
+
+    try:
+        with store.acquisition_budget(0.0):
+            rows = maintenance_jobs.jobs(root)
+    except Exception:
+        return {}
+    return {name: {"state": row.get("state"), "done": row.get("done"), "total": row.get("total")}
+            for name, row in rows.items()}
+
+
+def boot_document(root: Any, app_state: Any = None, *, jobs: bool = True) -> Dict[str, Any]:
+    """The ``boot`` object for a gateway answer: this process's document plus the supervisor
+    facts the server attached to the app (its readiness and init-outcome latches, its error)."""
+    ready = getattr(app_state, "supervisor_ready_event", None)
+    done = getattr(app_state, "supervisor_init_done_event", None)
+    error_fn = getattr(app_state, "get_supervisor_error", None)
+    return BOOT.snapshot(
+        root, jobs=jobs,
+        tasks_ready=bool(ready is not None and ready.is_set()),
+        supervisor_done=bool(done is not None and done.is_set()),
+        supervisor_error=error_fn() if callable(error_fn) else None,
+    )
+
+
+def boot_notice(app_state: Any = None) -> str:
+    """Plain words for a chat frame that found no bridge: why the message was not saved."""
+    document = boot_document(None, app_state, jobs=False)
+    if document["phase"] == "failed":
+        return ("⚠️ Startup failed before the chat could accept messages, so this message was not saved. "
+                f"Restart Ouroboros and send it again. ({document['error']})")
+    if document["phase"] == "ready":
+        return "⚠️ The chat is not accepting messages right now; this message was not saved. Send it again in a moment."
+    return ("⚠️ The data store is still being prepared (a migration is running), so this message was not saved. "
+            "Send it again once the chat is ready.")
+
+
+BootStep = Tuple[str, Callable[[], Any]]
+
+
+def run_boot_steps(steps: Sequence[BootStep], *, stop: threading.Event, document: BootDocument = BOOT) -> None:
+    """Run the boot steps in order on the calling thread, each one recorded in the document.
+
+    A step's exception is logged and recorded as that step's failure; the next step still
+    runs (every step is fail-soft, as the lifespan ran them), so one broken extension never
+    hides the supervisor. A stop set between steps ends the walk: the generation is ending
+    and nothing more of it starts. ``steps_done`` is recorded only after the last step."""
+    for name, step in steps:
+        if stop.is_set():
+            log.info("Boot steps stopped before %s: the generation is ending", name)
+            return
+        document.step_started(name)
+        try:
+            step()
+        except Exception as exc:
+            log.error("Boot step %s failed", name, exc_info=True)
+            document.step_ended(name, error=f"{type(exc).__name__}: {exc}")
+        else:
+            document.step_ended(name)
+    document.steps_done()
+
+
+def start_boot_coordinator(steps: Sequence[BootStep], *, stop: threading.Event) -> threading.Thread:
+    """The lifespan's boot coordinator: a daemon thread running ``run_boot_steps`` while the
+    socket already serves; the lifespan owns ``stop`` and sets it at teardown."""
+    thread = threading.Thread(target=run_boot_steps, args=(steps,), kwargs={"stop": stop},
+                              daemon=True, name="boot-coordinator")
+    thread.start()
+    return thread
+
+
+def wait_event(event: threading.Event, *stops: threading.Event, poll_sec: float = 0.1) -> bool:
+    """Wait for ``event``; False as soon as any stop is set, even beside the event."""
+    while True:
+        if any(stop.is_set() for stop in stops):
+            return False
+        if event.wait(poll_sec):
+            return not any(stop.is_set() for stop in stops)

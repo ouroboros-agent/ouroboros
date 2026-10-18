@@ -1,7 +1,7 @@
-"""Supervised maintenance packer; scheduling and storage protocol: docs/PERSISTENCE.md, evidence pack row."""
+"""Evidence packing passes the maintenance child runs (``ouroboros/maintenance.py``, job ``evidence_packing``);
+storage protocol: docs/PERSISTENCE.md, evidence pack row."""
 from __future__ import annotations
 
-import argparse
 import contextlib
 import datetime
 import json
@@ -9,17 +9,14 @@ import logging
 import os
 import pathlib
 import sqlite3
-import threading
-import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from ouroboros import evidence_packs as packs, store
-from ouroboros.startup_historical_audit import _REPORT_BYTES, finish_maintenance_job, spawn_maintenance_job
 
 log = logging.getLogger(__name__)
 # ``packed`` = new generations written; ``examined`` = candidates processed; ``verified_bytes`` = raw bytes re-read.
-_COUNTERS = ("packed", "examined", "swept", "candidates", "raw", "compressed", "verified_bytes",
-             "unlinked", "kept", "busy", "faults", "archived")
+COUNTERS = ("packed", "examined", "swept", "candidates", "raw", "compressed", "verified_bytes",
+            "unlinked", "kept", "busy", "faults", "archived")
 
 
 def task_stamps(root: pathlib.Path, task_id: str, *, obligation_rows: Optional[dict] = None,
@@ -125,8 +122,9 @@ def changed_stamps(root: pathlib.Path, **census) -> Dict[str, str]:
 def packing_pending(root: pathlib.Path, stop: Callable[[], bool]) -> bool:
     """Advisory, stop-aware discovery: archives first, then only the first changed stamp.
 
-    Contended stores defer the pass. Index reconstruction belongs to the supervised
-    child, not this reader. A quiet nonempty root still needs a full stamp walk.
+    Contended stores defer the pass. Index reconstruction belongs to the pass (``run_pass``),
+    not this reader. A quiet nonempty root still needs a full stamp walk; the maintenance
+    child runs it, never the server (``ouroboros/maintenance.py``).
     """
     if stop():
         return False
@@ -169,8 +167,9 @@ def ordered_candidates(root: pathlib.Path, settled: List[str]) -> List[Tuple[str
     return [(task, raw) for task, raw, _ in recent + backfill]
 
 
-def _external_revision(root: pathlib.Path) -> list:
-    """A snapshot-validity fence, never part of a task's candidate stamp."""
+def external_revision(root: pathlib.Path) -> list:
+    """A snapshot-validity fence (the money and delivery files' identities), never part of a task's
+    candidate stamp; the maintenance dispatcher compares it to decide whether a pass may be owed."""
     from ouroboros.usage_store import STORE_REL
     from ouroboros.usage_ledger import LEDGER_REL
 
@@ -195,7 +194,7 @@ class PackSweep:
         with store.open_store(root, write=False) as txn:  # one baseline, older than every fact this pass reads
             self.duties = packs.settlement_obligations(root, txn=txn, cache=self.obligation_cache)
             self.seqs = txn.write_seqs()
-        self.external_revision = _external_revision(root)
+        self.external_revision = external_revision(root)
         self.external = packs.settlement_external(root)
         self.keep: set = set()
         self.settled: Dict[str, Optional[int]] = {}  # census-settled loose task -> its write sequence
@@ -206,7 +205,7 @@ class PackSweep:
             with store.open_store(self.root, write=False) as txn:
                 return self.current(txn)
         return (self.obligation_cache["revision"] == (str(txn.root), txn.revision())
-                and self.external_revision == _external_revision(self.root))
+                and self.external_revision == external_revision(self.root))
 
     def collect_keep(self, facts: dict) -> None:
         for task in _loose_task_ids(self.root):
@@ -222,11 +221,11 @@ class PackSweep:
         """Bring the census current outside the deletion locks (class docstring)."""
         if self.current():
             return
-        external_revision = _external_revision(self.root)
+        revision = external_revision(self.root)
         with store.open_store(self.root, write=False) as txn:
             self.duties = packs.settlement_obligations(self.root, txn=txn, cache=self.obligation_cache)
             seqs = txn.write_seqs()
-        self.external, self.external_revision = packs.settlement_external(self.root), external_revision
+        self.external, self.external_revision = packs.settlement_external(self.root), revision
         for task, seq in list(self.settled.items()):
             if seqs.get(task) == seq and task not in self.duties and all(
                     tasks is not None and task not in tasks for tasks in self.external.values()):
@@ -273,7 +272,7 @@ def run_pass(root: pathlib.Path, *, sweep=None) -> Dict[str, Any]:
     if sweep is None:
         with pack_sweep(root) as sweep:
             return run_pass(root, sweep=sweep)
-    report: Dict[str, Any] = {"status": "completed", **dict.fromkeys(_COUNTERS, 0)}
+    report: Dict[str, Any] = {"status": "completed", **dict.fromkeys(COUNTERS, 0)}
     duties, external = sweep.duties, sweep.external
     # Stamps from the census baseline (older than every fact read below): evidence that arrives during the
     # pass makes the recorded stamp stale, so the next pass selects that task again.
@@ -316,106 +315,3 @@ def run_pass(root: pathlib.Path, *, sweep=None) -> Dict[str, Any]:
         packs.record_storage_pack(root, phase="fault", task_id="", exception_class=type(exc).__name__)
     return report
 
-
-
-class EvidencePacker:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._stopped = threading.Event()
-        self._armed = False
-        self._process = None
-        self._thread: Optional[threading.Thread] = None
-
-    def tick(self, data_root: pathlib.Path, repo_dir: pathlib.Path) -> bool:
-        """Reserve one discovery thread, never on the boot tick; no filesystem walk here.
-
-        True means discovery started, not that a packing child was needed or spawned.
-        """
-        with self._lock:
-            if self._stopped.is_set() or (self._thread is not None and self._thread.is_alive()):
-                return False
-            if not self._armed:
-                self._armed = True  # the boot tick only arms the packer
-                return False
-            root = pathlib.Path(data_root)
-            self._thread = threading.Thread(target=self._run, args=(root, pathlib.Path(repo_dir)),
-                                            name="evidence-packer", daemon=True)
-            self._thread.start()
-        return True
-
-    def stop(self) -> None:
-        self._stopped.set()
-        process = self._process
-        if process is not None:
-            self._signal(process)
-
-    def live_children(self) -> list:
-        """Exit census after Stop: include an unfinished spawn until its owner returns."""
-        process, thread = self._process, self._thread
-        if process is not None and process.poll() is None:
-            return [process]
-        return [thread] if thread is not None and thread.is_alive() else []
-
-    @staticmethod
-    def _signal(process) -> None:
-        with contextlib.suppress(OSError):
-            process.kill()  # its own process group: the signal reaches only our child
-
-    def _run(self, data_root: pathlib.Path, repo_dir: pathlib.Path) -> None:
-        started = time.monotonic()
-        try:
-            try:
-                pending = packing_pending(data_root, self._stopped.is_set)
-            except Exception:
-                log.debug("Evidence pack candidate check failed", exc_info=True)
-                return
-            if not pending or self._stopped.is_set():
-                return
-            process = spawn_maintenance_job(data_root, repo_dir, "evidence_packer")
-            fields = finish_maintenance_job(self, process, data_root, started, _report_fields, packs.record_storage_pack)
-            if fields.get("packed"):
-                log.info("Evidence packs: packed %d/%d tasks, %.2f GB -> %.2f GB", fields["packed"], fields["candidates"],
-                         fields["raw"] / 1e9, fields["compressed"] / 1e9)
-        except Exception as exc:
-            packs.record_storage_pack(data_root, phase="failed", exception_class=type(exc).__name__,
-                                      duration_seconds=time.monotonic() - started)
-        finally:
-            with self._lock:
-                self._process = None
-
-
-def _report_fields(raw: bytes) -> Dict[str, Any]:
-    try:
-        value = json.loads(raw) if len(raw) <= _REPORT_BYTES else None
-        if not isinstance(value, dict) or value.get("status") not in {"completed", "unknown", "failed"}:
-            return {}
-        if any(type(value.get(key)) is not int or value[key] < 0 for key in _COUNTERS):
-            return {}
-        return {key: value[key] for key in ("status", *_COUNTERS)}
-    except (ValueError, UnicodeError, TypeError):
-        return {}
-
-
-packer = EvidencePacker()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", required=True)
-    parser.add_argument("--custody-session", default="")
-    args = parser.parse_args()
-    os.environ["OUROBOROS_DATA_DIR"] = str(pathlib.Path(args.data_root).resolve())
-    from ouroboros.process_custody import adopt_session_id, start_parent_lifeline
-
-    adopt_session_id(args.custody_session)
-    start_parent_lifeline(label="evidence_packer")
-    try:
-        report = run_pass(pathlib.Path(args.data_root))
-    except Exception as exc:
-        report = {"status": "failed", "exception_class": type(exc).__name__}
-    print(json.dumps(report, separators=(",", ":")), flush=True)
-    return 1 if report["status"] == "failed" else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

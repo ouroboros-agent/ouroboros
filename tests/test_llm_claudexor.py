@@ -84,7 +84,6 @@ def test_display_redacts_typed_details_without_mutating_custody():
     ("invalid_request", 400, True, "provider_outcome_unknown", False, "", "context_length_exceeded"),
 ])
 def test_vendor_facts_reach_shared_readers_without_changing_wrapper_custody(code, status, unknown, kind, retry, wait, vendor):
-    from ouroboros.context_compaction import _typed_context_overflow
     from ouroboros.llm_attempt import _is_structured_context_overflow_exception
     from ouroboros.loop_llm_call import classify_llm_exception
     from ouroboros.model_wait import model_wait_reason
@@ -96,7 +95,6 @@ def test_vendor_facts_reach_shared_readers_without_changing_wrapper_custody(code
     assert error.display_message and classify_llm_exception(error) == classified
     assert classified.kind == kind and classified.retry_same_request is retry
     assert model_wait_reason(error) == wait
-    assert _typed_context_overflow(error) is (kind == "context_overflow")
     assert _is_structured_context_overflow_exception(error) is (kind == "context_overflow")
     wrapper = "model_outcome_unknown" if unknown else code
     assert error.code == wrapper and error.problem == problem
@@ -107,7 +105,7 @@ def test_vendor_facts_reach_shared_readers_without_changing_wrapper_custody(code
     expected_type = vendor.strip() if not unknown and code in {"provider_failed", "invalid_request"} and isinstance(vendor, str) else ""
     assert facts[2] == (expected_type or "ClaudexorModelError")
     typed = transport.ClaudexorModelError({"code": "context_length_exceeded", "message": "Controlled refusal"})
-    assert _typed_context_overflow(typed) and classify_llm_exception(typed).kind == "context_overflow"
+    assert classify_llm_exception(typed).kind == "context_overflow"
 
 
 def result(*, outcome="completed", cash=None, knowledge="unknown", route=None, problem=None):

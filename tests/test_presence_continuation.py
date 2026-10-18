@@ -29,6 +29,7 @@ from ouroboros.review_records import ReviewSlot
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tools.registry import ToolRegistry
 from tests.test_presence_runner import _admission
+from tests._dialogue import chat_rows
 
 ANSWER = "The status report is complete: all three checks passed."
 NEW_WORDS = "Please also mention the backup window."
@@ -291,7 +292,7 @@ def test_advisory_early_release_keeps_the_author_and_never_sends_the_selection_t
 
     pointer = _read_previous_turn(h.data, KEY)  # no newer turn: the pointer names the released speech
     assert (pointer["task_id"], pointer["message"], pointer.get("open_turns")) == (initial.task_id, ANSWER, None)
-    rows = [json.loads(line) for line in (h.data / "logs" / "chat.jsonl").read_text().splitlines()]
+    rows = chat_rows(h.data)
     # Mode 0 history: the released output is logged once as authored speech, never again at the terminal.
     assert [row["text"] for row in rows if row.get("direction") == "out"] == [ANSWER]
 
@@ -487,9 +488,9 @@ def test_a_stop_after_the_wake_ends_before_a_free_conversation_is_taken_back(har
     assert quick_turn(h).text == "Noted."  # nothing stayed held
 
 
-def test_the_resuming_author_reads_across_a_rotation_of_the_chat_log(harness):
-    """Finding 3: rows land in an archived generation and in the new live one; none are lost."""
-    from supervisor.state import rotate_chat_log_if_needed
+def test_the_resuming_author_reads_sql_rows_across_a_legacy_rotation_attempt(harness):
+    """New chat rows are durable in SQL; the retired file rotator cannot hide them."""
+    from supervisor.state import rotate_jsonl_log_if_needed
 
     h = harness
     later = "And schedule the restore drill."
@@ -504,8 +505,8 @@ def test_the_resuming_author_reads_across_a_rotation_of_the_chat_log(harness):
     execution = h.start(event())
     execution.initial.result(timeout=30)
     assert quick_turn(h).text == "Noted."
-    rotate_chat_log_if_needed(h.data, max_bytes=1)
-    assert list((h.data / "archive").glob("chat_*.jsonl"))
+    rotate_jsonl_log_if_needed(h.data, "chat.jsonl", "chat", max_bytes=1)
+    assert not (h.data / "logs" / "chat.jsonl").exists()
     assert quick_turn(h, 44, later).text == "Noted."
     h.release.set()
     assert execution.result.result(timeout=60).text == ANSWER and h.calls == 2

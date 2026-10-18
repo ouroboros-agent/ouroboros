@@ -216,6 +216,8 @@ def validate_producer_invocation(root: Any, token: str, expected: dict, payload:
             and not (token or usage.get("delegated_run_id") or usage.get("delegated_run_started"))):
         return
     invocation = invocation_record(root, token) if token else None
+    if invocation is not None and invocation.get("state") == "legacy_gap":
+        raise ValueError(f"legacy_gap: {invocation['reason']}; completed producer custody needs repair")
     if not invocation or any(str(invocation.get(k) or "") != str(expected[k] or "")
                              for k in ("task_id", "root_task_id", "surface", "slot_id", "operation_id")):
         raise ValueError("completed producer has no exact delegated invocation")

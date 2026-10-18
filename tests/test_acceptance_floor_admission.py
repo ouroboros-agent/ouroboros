@@ -554,7 +554,7 @@ def test_a_stale_name_lock_is_the_readers_removal_and_the_poll_stays_known_zero(
         pending_events=[], event_queue=queue.Queue(),
     )
     root = custody.custody_root(ctx)
-    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda _path: enforced)
+    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda _path, *, known=None: enforced)
     usage_store.migrate_from_journal(root)  # the lifecycle jobs decide the tier once
     store_import.ensure_current_store(root)
     usage_store.forget(root)

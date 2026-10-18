@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 
 import pytest
 
+from tests._shared import producer_evidence_dir
+
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 WEB = Path(__file__).resolve().parents[1] / "web"
 BOOT = """<script type="module">
@@ -137,9 +139,9 @@ def project_chat(request):
 
 
 def _evidence_dir(tmp_path):
-    path = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    # An exported destination stays exactly where the operator put it; otherwise the shared
+    # channel keeps the shell screenshots and the geometry/keyboard JSON past scratch release.
+    return producer_evidence_dir(tmp_path, "project-work-card", env="OUROBOROS_BROWSER_EVIDENCE_OUT")
 
 
 def _evidence(tmp_path, chat, name):

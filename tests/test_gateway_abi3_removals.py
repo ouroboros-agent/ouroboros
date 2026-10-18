@@ -96,7 +96,8 @@ class TestTelegramChatIdRemoval:
             "text": "legacy row", "type": "", "telegram_chat_id": 5,
             "chat_id": 1,
         }
-        chat.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        from ouroboros import dialogue_store as ds
+        ds.append(tmp_path, "chat", row)
         rows, _quota = _collect_chat_rows(
             chat, tmp_path / "logs" / "archive", 10,
             lambda entry_chat, entry=None: True, {})

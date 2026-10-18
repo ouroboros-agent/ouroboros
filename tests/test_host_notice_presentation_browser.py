@@ -52,11 +52,10 @@ def _progress(task_id, text, *, narration=None):
 def test_late_review_row_reads_in_words_and_downloads_its_record(direct_server_with_data, engine):
     playwright_api = pytest.importorskip("playwright.sync_api")
 
-    from ouroboros import loop, review_projection
+    from ouroboros import dialogue_store, loop, review_projection
     from ouroboros.acceptance_settlement import _late_settlement_text, late_evidence_fact
     from ouroboros.task_results import load_task_result, write_task_result
     from supervisor import message_bus
-    from supervisor.message_bus import append_jsonl
     from tests.test_acceptance_publication import _context, _run
     from tests.ui_chat_viewport_smoke import (
         _CAPTURE_TEST_SOCKET, _OBSERVE_STATE_READS, _emit_ws_frame, _wait_socket_open_quiescent,
@@ -126,7 +125,7 @@ def test_late_review_row_reads_in_words_and_downloads_its_record(direct_server_w
 
     def write_durable_rows():
         """The rows a reload replays: the worker's progress row and the host's late row."""
-        append_jsonl(root / "logs" / "progress.jsonl", {
+        dialogue_store.append(root, "progress", {
             "ts": "2026-09-28T00:00:00+00:00", "type": "send_message", "task_id": ctx.task_id, "is_progress": True,
             "direction": "out", "chat_id": 1, "user_id": 0, "text": "💬 Checking the ledger",
             "content": "Checking the ledger", "format": "", "role": "assistant", "system_type": "", "narration": True})

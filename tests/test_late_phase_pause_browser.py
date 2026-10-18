@@ -16,6 +16,8 @@ import threading
 
 import pytest
 from starlette.applications import Starlette
+
+from ouroboros import dialogue_store
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
@@ -35,17 +37,16 @@ def _capture(page, root: pathlib.Path, name: str) -> None:
 def _history(root: pathlib.Path) -> None:
     """The delivered answer and the host-attested control marker of this root's card;
     the dialogue the late phase consolidates lives in another room."""
-    logs = root / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    (logs / "progress.jsonl").write_text(json.dumps({
+    dialogue_store.append(root, "progress", {
         "ts": "2026-08-17T10:00:00+00:00", "type": "send_message", "task_id": ROOT, "is_progress": True,
         "direction": "out", "chat_id": 1, "user_id": 1, "text": "step one", "content": "step one",
-        "cancelable": True}) + "\n", encoding="utf-8")
+        "cancelable": True})
     rows = [{"ts": f"2026-08-17T08:{index // 60:02d}:{index % 60:02d}+00:00", "direction": "in", "chat_id": 0,
              "text": f"hidden room line {index}"} for index in range(100)]
     rows += [{"ts": "2026-08-17T10:00:05+00:00", "direction": "out", "chat_id": 1, "user_id": 1,
               "text": "Already delivered answer", "task_id": ROOT, "format": "markdown"}]
-    (logs / "chat.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    for row in rows:
+        dialogue_store.append(root, "chat", row)
 
 
 def test_browser_pauses_and_resumes_late_work_with_the_delivered_answer_intact(subscription_ui, late):

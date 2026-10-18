@@ -10,6 +10,7 @@ import pytest
 
 from devtools.benchmarks.common.server_runner import _api
 from ouroboros.skill_loader import compute_content_hash
+from tests._shared import producer_evidence_dir
 from tests.candidate_checkout import candidate_checkout
 from tests.system_e2e.harness import (
     ArtifactOracle, ScriptedStubModel, keyless_settings, start_server, wait_until,
@@ -32,8 +33,7 @@ def test_repair_button_records_owner_intent_and_runs_the_installed_skill(tmp_pat
         pytest.skip("set OUROBOROS_RUN_UI_SMOKE=1")
     playwright = pytest.importorskip("playwright.sync_api")
     name = "repair_owner_probe"
-    evidence = Path(os.environ.get("OUROBOROS_UI_SCREENSHOT_DIR", str(tmp_path)))
-    evidence.mkdir(parents=True, exist_ok=True)
+    evidence = producer_evidence_dir(tmp_path, "repair-owner-intent", env="OUROBOROS_UI_SCREENSHOT_DIR")
     body = (
         "async def status(request):\n    return {'value': 'repaired'}\n"
         "def register(api):\n"

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -40,6 +41,7 @@ def _digest(path: Path) -> str:
 
 
 SIGNER = "0123456789ABCDEF0123456789ABCDEF01234567"  # synthetic SHA-1 thumbprint
+GREEN_GATES = [f"{name}=success" for name in release_proof.RELEASE_GATES]
 
 
 def _fixture_release(
@@ -130,7 +132,7 @@ def test_assemble_binds_every_asset_smoke_and_sbom(tmp_path: Path):
         generated_at="2026-08-02T00:00:00+00:00",
         android_build_result="success",
         android_attestation_result="success",
-        windows_signer_thumbprint="",
+        gate_result=GREEN_GATES, windows_signer_thumbprint="",
         github_output=tmp_path / "github-output",
         notes_output=notes,
     )
@@ -170,6 +172,10 @@ def test_assemble_binds_every_asset_smoke_and_sbom(tmp_path: Path):
             repository="razzant/ouroboros",
         ) in notes_text
     assert "v6.87.4...v6.87.5" in notes_text
+    assert evidence["workflow"]["gates"][:len(GREEN_GATES)] == [
+        {"name": name, "status": "success"} for name in release_proof.RELEASE_GATES]
+    assert evidence["workflow"]["ownerException"] is None
+    assert "passed the full test matrix" in notes_text and "Not every test job passed" not in notes_text
     commands = evidence["verification"]["attestationCommands"]
     assert len(commands) == 2
     assert all("--source-digest " + "a" * 40 in command for command in commands)
@@ -193,7 +199,7 @@ def test_prerelease_notes_link_to_the_exact_prerelease_assets(tmp_path: Path):
         generated_at="2026-08-02T00:00:00+00:00",
         android_build_result="success",
         android_attestation_result="success",
-        windows_signer_thumbprint="",
+        gate_result=GREEN_GATES, windows_signer_thumbprint="",
         github_output=None,
         notes_output=notes,
     )
@@ -223,7 +229,7 @@ def test_assemble_rejects_smoke_digest_drift(tmp_path: Path):
         generated_at="2026-08-02T00:00:00+00:00",
         android_build_result="success",
         android_attestation_result="success",
-        windows_signer_thumbprint="",
+        gate_result=GREEN_GATES, windows_signer_thumbprint="",
         github_output=None,
         notes_output=tmp_path / "notes.md",
     )
@@ -259,7 +265,7 @@ def test_unavailable_android_pair_keeps_verified_desktop_release(tmp_path, failu
         run_url="https://example.test/failed-run", previous_tag=None, generated_at=None,
         notes_output=notes, android_build_result=build_result,
         android_attestation_result=attestation_result,
-        windows_signer_thumbprint="", github_output=output)
+        gate_result=GREEN_GATES, windows_signer_thumbprint="", github_output=output)
     release_proof.command_assemble(args)
     evidence = json.loads((release_dir / "release-evidence.json").read_text(encoding="utf-8"))
     assert {row["proofId"] for row in evidence["artifacts"]} == set(release_proof.DESKTOP_DOWNLOAD_IDS)
@@ -315,7 +321,7 @@ def test_assemble_rejects_unbound_or_incomplete_smoke_receipt(
         generated_at="2026-08-02T00:00:00+00:00",
         android_build_result="success",
         android_attestation_result="success",
-        windows_signer_thumbprint="",
+        gate_result=GREEN_GATES, windows_signer_thumbprint="",
         github_output=None,
         notes_output=tmp_path / "notes.md",
     )
@@ -337,7 +343,7 @@ def test_assemble_rejects_tag_version_mismatch(tmp_path: Path):
         generated_at=None,
         android_build_result="success",
         android_attestation_result="success",
-        windows_signer_thumbprint="",
+        gate_result=GREEN_GATES, windows_signer_thumbprint="",
         github_output=None,
         notes_output=tmp_path / "notes.md",
     )
@@ -353,7 +359,7 @@ def test_verify_uploaded_requires_exact_names_sizes_and_digests(tmp_path: Path):
         run_url="https://example.test/run", previous_tag=None, generated_at=None,
         notes_output=tmp_path / "notes.md", android_build_result="success",
         android_attestation_result="success",
-        windows_signer_thumbprint="", github_output=None))
+        gate_result=GREEN_GATES, windows_signer_thumbprint="", github_output=None))
     metadata = tmp_path / "remote.json"
     metadata.write_text(json.dumps({"assets": [
         {"name": path.name, "size": path.stat().st_size, "digest": "sha256:" + _digest(path)}
@@ -679,7 +685,7 @@ def _assemble_windows(tmp_path: Path, release_dir: Path, version_file: Path, rea
         repository="razzant/ouroboros", tag="v6.87.5", commit="a" * 40,
         run_url="https://example.test/run", previous_tag=None, generated_at=None,
         notes_output=notes, android_build_result="success",
-        android_attestation_result="success", windows_signer_thumbprint=signer,
+        android_attestation_result="success", gate_result=GREEN_GATES, windows_signer_thumbprint=signer,
         github_output=None))
     evidence = json.loads((release_dir / "release-evidence.json").read_text(encoding="utf-8"))
     windows = next(row for row in evidence["artifacts"] if row["proofId"] == "windows-x64")
@@ -834,7 +840,8 @@ def test_workflow_shell_handoff_receipt_and_release_consumer(tmp_path: Path, ver
                SIGNER_THUMBPRINT=signer, SIGNER_PUBLISHER="Example Publisher" if signer else "",
                GITHUB_REF_NAME=f"v{version}", GITHUB_SHA="a" * 40, GITHUB_REPOSITORY="example/project",
                GITHUB_SERVER_URL="https://example.test", GITHUB_RUN_ID="123",
-               ANDROID_BUILD_RESULT="skipped", ANDROID_ATTESTATION_RESULT="not_run")
+               ANDROID_BUILD_RESULT="skipped", ANDROID_ATTESTATION_RESULT="not_run",
+               RELEASE_GATE_RESULTS=_gate_env(jobs))
 
     def run_step(job_id, name):
         step = next(step for step in jobs[job_id]["steps"] if step.get("name") == name)
@@ -876,3 +883,105 @@ def test_workflow_shell_handoff_receipt_and_release_consumer(tmp_path: Path, ver
     (release_dir / archive.name).write_bytes(b"replaced ZIP")
     refused = run_step("release", "Assemble release proof capsule and notes")
     assert refused.returncode != 0 and "receipt is not bound" in refused.stderr
+
+
+RED = {"full-test": "failure", "system-e2e-mock": "cancelled", "ui-smoke": "failure"}
+
+
+def _gate_env(jobs, results=None):
+    """The release step's own RELEASE_GATE_RESULTS template with each job's result (default success)."""
+    step = next(step for step in jobs["release"]["steps"]
+                if step.get("name") == "Assemble release proof capsule and notes")
+    return re.sub(r"\$\{\{ needs\.([\w-]+)\.result \}\}",
+                  lambda match: (results or {}).get(match.group(1), "success"), step["env"]["RELEASE_GATE_RESULTS"])
+
+
+@pytest.mark.parametrize(("repository", "version", "results", "refusal"), [
+    ("razzant/ouroboros", "7.7.0", RED, None),
+    ("razzant/ouroboros", "7.7.0", {}, None),
+    ("someone/private-copy", "7.7.0", RED, "full-test concluded failure"),
+    ("razzant/ouroboros", "7.7.1", RED, "full-test concluded failure"),
+    ("razzant/ouroboros", "7.7.0-rc.1", {"ui-smoke": "failure"}, "ui-smoke concluded failure"),
+    ("razzant/ouroboros", "7.7.0", {**RED, "integration-test": "failure"}, "integration-test concluded failure"),
+    ("razzant/ouroboros", "7.7.0", {"windows-proof": "cancelled"}, "windows-proof concluded cancelled"),
+    # A skipped lane produced no result; the exception covers only a concluded red one.
+    ("razzant/ouroboros", "7.7.0", {"full-test": "skipped"}, "full-test concluded skipped"),
+])
+@pytest.mark.parametrize("android_result", ["skipped", "failure"])
+def test_only_the_exact_official_v770_may_disclose_concluded_red_test_lanes(
+        tmp_path, repository, version, results, refusal, android_result):
+    release_dir, version_file, readme = _fixture_release(tmp_path, version=version)
+    notes = tmp_path / "notes.md"
+    args = argparse.Namespace(
+        directory=release_dir, version_file=version_file, readme=readme, repository=repository,
+        tag=f"v{version}", commit="a" * 40, run_url="https://example.test/run/7", previous_tag=None,
+        generated_at=None, notes_output=notes, android_build_result=android_result,
+        android_attestation_result="not_run", windows_signer_thumbprint="", github_output=None,
+        gate_result=[f"{name}={results.get(name, 'success')}" for name in release_proof.RELEASE_GATES])
+    if refusal:
+        with pytest.raises(ValueError, match=refusal):
+            release_proof.command_assemble(args)
+        assert not (release_dir / "SHA256SUMS").exists() and not notes.exists()
+        return
+    release_proof.command_assemble(args)
+    workflow = json.loads((release_dir / "release-evidence.json").read_text(encoding="utf-8"))["workflow"]
+    assert workflow["gates"][:len(GREEN_GATES)] == [
+        {"name": name, "status": results.get(name, "success")} for name in release_proof.RELEASE_GATES]
+    exception = workflow["ownerException"]
+    assert (exception["repository"], exception["tag"], exception["commit"], exception["runUrl"]) == (
+        repository, "v7.7.0", "a" * 40, args.run_url)
+    assert exception["waivedGates"] == [{"name": name, "status": status} for name, status in results.items()]
+    assert "any residual red test lanes disclosed" in exception["decision"]
+    text = notes.read_text(encoding="utf-8")
+    assert f"Android build result: {android_result}" in text
+    if results:
+        assert "Not every test job passed: `full-test` failure, `system-e2e-mock` cancelled, `ui-smoke` failure." in text
+        assert "passed the full test matrix" not in text
+        assert "Every other required release job succeeded" in text
+        assert "Every other release job succeeded" not in text
+    else:
+        assert "passed the full test matrix" in text and "Not every test job passed" not in text
+
+
+@pytest.mark.parametrize(("mutate", "message"), [
+    (lambda gates: gates[:-1], "missing release gate results"),
+    (lambda gates: [], "missing release gate results"),
+    (lambda gates: [*gates, gates[0]], "invalid release gate result"),
+    (lambda gates: ["full-test=", *gates[1:]], "invalid release gate result"),
+    (lambda gates: ["full-test=passed", *gates[1:]], "invalid release gate result"),
+    (lambda gates: [*gates, "packaged-artifact-smoke=success"], "invalid release gate result"),
+])
+def test_missing_or_unrecognised_gate_results_never_become_success(mutate, message):
+    with pytest.raises(ValueError, match=message):
+        release_proof._gate_results(mutate(list(GREEN_GATES)), owner_exception=True)
+
+
+@pytest.mark.parametrize("repository", ["razzant/ouroboros", "someone/private-copy"])
+def test_release_step_passes_actual_red_results_that_only_the_exact_tag_accepts(tmp_path, repository):
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("workflow shell execution requires bash")
+    jobs = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
+    step = next(step for step in jobs["release"]["steps"]
+                if step.get("name") == "Assemble release proof capsule and notes")
+    _fixture_release(tmp_path, version="7.7.0")[0].rename(tmp_path / "release-artifacts")
+    script = step["run"].replace("python scripts/release_proof.py", " ".join(map(shlex.quote, [
+        Path(sys.executable).as_posix(), (REPO / "scripts/release_proof.py").as_posix()])))
+    env = dict(os.environ, GITHUB_OUTPUT=str(tmp_path / "output"), WINDOWS_SIGNER_THUMBPRINT="",
+               GITHUB_REF_NAME="v7.7.0", GITHUB_SHA="a" * 40, GITHUB_REPOSITORY=repository,
+               GITHUB_SERVER_URL="https://example.test", GITHUB_RUN_ID="123",
+               ANDROID_BUILD_RESULT="skipped", ANDROID_ATTESTATION_RESULT="not_run",
+               RELEASE_GATE_RESULTS=_gate_env(jobs, RED))
+    done = subprocess.run([bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c",
+                           "git() { echo v7.6.0; }\n" + script], cwd=tmp_path, env=env,
+                          capture_output=True, text=True)
+    evidence = tmp_path / "release-artifacts" / "release-evidence.json"
+    if repository != release_proof.OWNER_EXCEPTION_REPOSITORY:
+        assert done.returncode != 0 and "full-test concluded failure" in done.stderr
+        assert not evidence.exists()
+        return
+    assert done.returncode == 0, done.stderr
+    exception = json.loads(evidence.read_text(encoding="utf-8"))["workflow"]["ownerException"]
+    assert exception["runUrl"] == "https://example.test/razzant/ouroboros/actions/runs/123"
+    assert [row["status"] for row in exception["waivedGates"]] == ["failure", "cancelled", "failure"]
+    assert "`system-e2e-mock` cancelled" in (tmp_path / "release-notes.md").read_text(encoding="utf-8")

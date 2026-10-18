@@ -36,6 +36,7 @@ from ouroboros.runtime_mode_policy import (
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
 from ouroboros.shell_parse import POSIX_SHELL_HEADS, is_absolute_path_text, recover_stringified_argv  # noqa: F401
+from ouroboros.shell_parse import inline_operand_start
 from ouroboros.tools.tool_result import _publish_process_result, _wrap_run_script_process_result
 from ouroboros.tools.verify import check_exit_masking  # noqa: F401 -- ONE exit-masking sensor shared with verify_and_record (pinned here); its disclosure lives in shell_audit
 from ouroboros.tools.registry import (
@@ -236,34 +237,34 @@ def _maybe_autocorrect_grep_backslash_pipe(cmd: List[str]) -> tuple[List[str], s
 def _literal_argv_notes(cmd: List[str]) -> str:
     """Disclosure notes for shell-syntax-looking bytes in direct argv (#447 A5).
 
-    A commit message naming ``$HOME``, an awk ``|`` field separator, a
-    ``2>/dev/null`` element — no shell runs for direct argv, so these are
-    LITERAL DATA carrying no authority question. They used to be REFUSED as
-    errors, blocking commands that would have worked; the in-file autocorrect
-    precedent applies instead: run the command and DISCLOSE what was passed
-    literally, so a genuinely mistaken spelling still explains its own cryptic
-    program error.
+    A commit message naming ``$HOME``, an awk ``|`` field separator, a ``2>/dev/null`` element — run_command
+    starts no shell for direct argv, so these are ordinary arguments carrying no authority question. They used
+    to be REFUSED as errors, blocking commands that would have worked; the in-file autocorrect precedent applies
+    instead: run the command and DISCLOSE what was passed, so a genuinely mistaken spelling still explains its
+    own cryptic program error. The operand of an explicit ``cmd /c|/k`` or PowerShell ``-c|-Command`` is that
+    interpreter's own command text, not an argument (#927); an argv element gets one note, its first category's.
     """
     def _note(subject: str, remedy: str) -> str:
-        return (
-            f"⚠️ SHELL_LITERAL_ARGV_NOTE: {subject} in the cmd array reached the "
-            "program as LITERAL data (run_command executes argv directly; "
-            f"subprocess interprets no shell syntax). {remedy}\n"
-        )
+        return (f"⚠️ SHELL_LITERAL_ARGV_NOTE: {subject} in the cmd array was passed to the program as an "
+                f"ordinary argument; run_command starts no shell for direct argv. {remedy}\n")
 
     notes: list[str] = []
-    if (pathlib.Path(cmd[0]).name.lower() if cmd else "") not in _SHELL_INTERPRETERS:
-        env_ref = next(filter(None, (_ENV_REF_PATTERN.search(arg) for arg in cmd)), None)
-        if env_ref:
-            notes.append(_note(
-                f'literal env reference "{env_ref.group(0)}"',
-                'Use ["sh", "-c", "..."] if you intended shell expansion.'))
-    if found_ops := _SHELL_OPERATORS.intersection(cmd):
+    head = pathlib.PurePath(cmd[0].replace("\\", "/")).name.lower() if cmd else ""
+    env_at, env_ref = next(((i, m) for i, a in enumerate(cmd) if head not in _SHELL_INTERPRETERS
+                            and (m := _ENV_REF_PATTERN.search(a))), (-1, None))
+    if env_ref:
+        notes.append(_note(
+            f'literal env reference "{env_ref.group(0)}"',
+            'Use ["sh", "-c", "..."] if you intended shell expansion.'))
+    shell = head.removesuffix(".exe")
+    operand = inline_operand_start(cmd, shell, strict=True) if shell in {"cmd", "powershell", "pwsh"} else 0
+    passed = cmd[:operand] if operand else cmd
+    if found_ops := _SHELL_OPERATORS.intersection(passed):
         notes.append(_note(
             f'shell operator "{sorted(found_ops)[0]}"',
             'Use ["sh", "-c", "cmd1 && cmd2"] for pipes/chaining.'))
-    # Glued redirects bypass the standalone-operator set but remain shell-looking.
-    glued = next((arg for arg in cmd if _GLUED_REDIRECT_RE.match(arg)), "")
+    glued = next((a for i, a in enumerate(passed)
+                  if i != env_at and a not in found_ops and _GLUED_REDIRECT_RE.match(a)), "")
     if glued:
         notes.append(_note(
             f'redirect-looking argument "{glued}"',

@@ -6,6 +6,8 @@ chat history row (``_record_task_facts``) and the task_done selection carry the
 projection, and the real card formatter (``review_record_card.js``) and the task card's
 Reviews section (``review_presentation.js``) print it. No hand-built projection.
 """
+
+from tests import _dialogue as dialogue_test
 import json
 import subprocess
 from pathlib import Path
@@ -72,7 +74,7 @@ def _terminal(tmp_path, task_id):
     _store_task_result(env, task, "done", {"rounds": 1, "cost": 0}, {"tool_calls": []})
     stored = load_task_result(tmp_path, task_id) or {}
     _record_task_facts(env, task, {"rounds": 1}, {"tool_calls": []}, tmp_path / "logs")
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     history = next(row for row in rows if row.get("summary_kind") == "host_task_facts" and row["task_id"] == task_id)
     return stored, _task_done_review_projection(stored, {}), history
 

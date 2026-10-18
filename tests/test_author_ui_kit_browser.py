@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests import test_widget_stream_download_ui as widget_fixture
+from tests._shared import producer_evidence_dir
 from tests.test_author_ui_kit import EXAMPLE, _copy_installed_runtime
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
@@ -56,7 +57,11 @@ def register(api):
 
 
 def _style_document(installed, document):
-    """Use each real product document's stylesheet order and real primitives."""
+    """A synthetic reference page: one product document's stylesheet links, in order, and the real primitives.
+
+    Its root has neither `ouro-ui` nor `data-theme`, so it shows the base recipes an author area receives,
+    not the product document's themed capsules.
+    """
     source = (installed / "web" / document).read_text(encoding="utf-8")
     links = "\n".join(re.findall(r'<link\b[^>]*rel="stylesheet"[^>]*>', source))
     assert '/static/ui.css' in links, "the shared layer must serve both product documents"
@@ -235,7 +240,8 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
                 assert element.get_attribute("allow") == "autoplay; fullscreen; clipboard-write"
             assert not page.locator(".widgets-card-status").all_text_contents()[0].strip()
 
-            # Compare actual renderer controls under the real two documents' CSS.
+            # Compare the author frames' controls with each synthetic reference page by the listed
+            # computed metrics: not byte identity with, nor themed parity to, the product documents.
             style_pages = [context.new_page() for _ in range(2)]
             for style_page, name in zip(style_pages, ("spa", "wizard")):
                 style_page.goto(server["url"] + "/style-" + name)
@@ -334,7 +340,8 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             failed = _frame(page, "unavailable")
             failed.get_by_text("Controls unavailable: HTTP 503", exact=True).wait_for()
             assert route.get_by_role("button", name="Preview", exact=True).is_visible()
-            evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_OUT", str(tmp_path / "evidence")))
+            evidence = producer_evidence_dir(tmp_path / "evidence", "author-ui-kit",
+                                             env="OUROBOROS_UI_EVIDENCE_OUT")
             evidence.mkdir(parents=True, exist_ok=True)
             page.evaluate("() => window.ouroTheme.set('light')")
             module.locator('html[data-theme="light"]').wait_for(state="attached")

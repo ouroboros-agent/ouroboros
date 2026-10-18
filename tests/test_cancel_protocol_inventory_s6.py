@@ -58,6 +58,9 @@ TERMINAL_WRITERS = {
     # Selects an already retained actor account; its locked projector preserves
     # CURRENT lifecycle, including terminal state, and compares the prior pointer.
     ('ouroboros/review_history_view.py::publish_review_history_view', '"running"'): 'dynamic',
+    # Names the mind's surviving notes after an applied fold; its locked projector
+    # preserves CURRENT lifecycle, including terminal state, and writes only the pointer.
+    ('ouroboros/main_context_authority.py::publish_working_notes', '"running"'): 'dynamic',
     # Create-only pooled control admission seeds running/scheduled authority;
     # an existing row is returned unchanged, including any terminal status.
     ('supervisor/queue.py::ensure_control_task_result', 'status'): 'dynamic',
@@ -153,7 +156,7 @@ TERMINAL_WRITERS = {
     # Monetary refresh projects fields under the result lock and preserves its
     # current terminal status; it cannot publish a lifecycle transition.
     ('supervisor/events_task_done.py::_refresh_terminal_task_cost', 'current["status"]'): 'dynamic',
-    ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
+    ('supervisor/queue_snapshot.py::_restore_pending', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/queue_snapshot.py::_refuse_restore_invalid_fences', 'STATUS_CANCELLED'): 'terminal',
     # Explicit calendar expiry retains pending custody until the result and delivery are durable.
     ('supervisor/queue_timeouts.py::_settle_pending_deadline', '"failed"'): 'terminal',
@@ -195,7 +198,7 @@ NO_DELIVERABLE_LANES = {
         'cancelled before it ever started: no answer exists',
     'supervisor/workers.py::_settle_cancelled_pending_row':
         'dropped before assignment; the salvage receipt belongs to custody',
-    'supervisor/queue_snapshot.py::restore_pending_from_snapshot':
+    'supervisor/queue_snapshot.py::_restore_pending':
         'restore-time reconciliation of a task cancelled while the server was down',
     'supervisor/queue_snapshot.py::_refuse_restore_invalid_fences':
         'the invalid-acceptance-fence refusal moved out of restore_pending_from_snapshot (#1196): '

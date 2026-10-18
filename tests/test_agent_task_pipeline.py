@@ -1,3 +1,5 @@
+
+from tests import _dialogue as dialogue_test
 import json
 import pathlib
 from types import SimpleNamespace
@@ -506,7 +508,7 @@ def test_stopped_direct_turn_pays_no_post_task_synthesis(tmp_path, monkeypatch):
 
     def _summary_kinds(task_id):
         chat_log = root / "logs" / "chat.jsonl"
-        rows = [json.loads(line) for line in chat_log.read_text(encoding="utf-8").splitlines()] if chat_log.exists() else []
+        rows = dialogue_test.log_rows(chat_log)
         return [row.get("summary_kind") for row in rows if row.get("type") == "task_summary" and row.get("task_id") == task_id]
 
     stopped_kinds = _summary_kinds("stopped1")  # no paid post-task worker was dispatched

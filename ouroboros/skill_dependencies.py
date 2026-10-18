@@ -146,7 +146,12 @@ def auto_install_specs_for_skill(drive_root: pathlib.Path, loaded: Any) -> List[
     return _manifest_install_specs(getattr(loaded, "manifest", None))
 
 
-def skill_deps_not_ready(drive_root: pathlib.Path, loaded: Any) -> tuple[str, str]:
+def skill_deps_not_ready(drive_root: pathlib.Path, loaded: Any, *, strict: bool = False) -> tuple[str, str]:
+    """``(status, reason)`` of unready dependencies; ``("", "")`` when ready.
+
+    A probe failure reads as ready for execution readers; ``strict`` re-raises it so a
+    caller certifying completion (the native-seed receipt) cannot mistake it for ready.
+    """
     try:
         from ouroboros.marketplace.install_specs import install_specs_hash as _specs_hash
         from ouroboros.marketplace.isolated_deps import read_deps_state
@@ -162,5 +167,7 @@ def skill_deps_not_ready(drive_root: pathlib.Path, loaded: Any) -> tuple[str, st
             return deps_status, "fingerprint"
         return "", ""
     except Exception:
+        if strict:
+            raise
         log.debug("skill deps readiness probe failed", exc_info=True)
         return "", ""

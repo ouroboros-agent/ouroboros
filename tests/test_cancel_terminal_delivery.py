@@ -6,6 +6,8 @@ live and finalize-on-miss paths, and the settled-reentry that delivers exactly o
 """
 
 from __future__ import annotations
+
+from tests import _dialogue as dialogue_test
 import hashlib
 import json
 import types
@@ -449,7 +451,7 @@ def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path, 
     )
     row = next(
         json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines()
         if line.strip()
     )
     assert f"{SALVAGE_EXCERPT_LABEL}." in row["text"]
@@ -522,7 +524,7 @@ def test_cascade_receipt_dedups_the_actual_destination_and_preserves_main(qenv, 
         {"status": "failed", "chat_id": project["chat_id"]},
     )
     terminal = next(
-        row for row in map(json.loads, (qenv.drive / "logs/chat.jsonl").read_text().splitlines())
+        row for row in map(json.loads, dialogue_test.log_text(qenv.drive / "logs/chat.jsonl").splitlines())
         if row.get("type") == "task_summary"
     )
     assert text not in terminal["text"] and SALVAGE_EXCERPT_LABEL in terminal["text"]

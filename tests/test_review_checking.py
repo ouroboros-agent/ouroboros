@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import review_checking as rc
+from tests.test_review_checkout_lifecycle import directory_source
 
 
 def _git(cwd, *args):
@@ -93,7 +94,7 @@ def test_terminal_evidence_keeps_patch_named_files_and_ignored_listing_then_rele
     (area / "build" / "out.bin").write_bytes(b"\x00\x01")
     (area / rc.EVIDENCE_DIRNAME).mkdir()
     (area / rc.EVIDENCE_DIRNAME / "log.txt").write_text("pytest: 1 failed\n")
-    evidence = rc.capture_seat_evidence(data, "task", "op-1", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "op-1")
     assert evidence["status"] == "retained" and not area.exists()
     assert "A\tnew_test.py" in evidence["changed"]
     assert all(".review-drive" not in row for row in evidence["changed"])  # host evidence is not reviewer work
@@ -101,7 +102,7 @@ def test_terminal_evidence_keeps_patch_named_files_and_ignored_listing_then_rele
     assert [row["path"] for row in evidence["named_evidence"]] == [f"{rc.EVIDENCE_DIRNAME}/log.txt"]
     patch = pathlib.Path(evidence["evidence_dir"], "delta.patch").read_bytes()
     assert b"new_test.py" in patch and b"f.txt" not in patch  # the subject itself is not the reviewer's delta
-    assert rc.capture_seat_evidence(data, "task", "op-1", release=True)["status"] == "retained"  # replayed, not recomputed
+    assert rc.capture_seat_evidence(data, "task", "op-1")["status"] == "retained"  # replayed, not recomputed
 
 
 def test_a_failed_capture_keeps_the_recoverable_copy_and_names_the_gap(author, tmp_path):
@@ -110,7 +111,7 @@ def test_a_failed_capture_keeps_the_recoverable_copy_and_names_the_gap(author, t
     area = pathlib.Path(rc.prepare_seat_area(data, "task", "op-1", source))
     os.rename(area / ".git", area / ".git-real")
     (area / ".git").symlink_to(area / ".git-real")  # a child-replaced .git is never trusted
-    evidence = rc.capture_seat_evidence(data, "task", "op-1", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "op-1")
     assert evidence["status"] == "capture_failed" and area.exists()
 
 
@@ -121,7 +122,7 @@ def test_reviewer_evidence_ignores_the_investigation_bound(author, tmp_path, mon
     area = pathlib.Path(rc.prepare_seat_area(data, "task", "op-1", source))
     (area / rc.EVIDENCE_DIRNAME).mkdir()
     (area / rc.EVIDENCE_DIRNAME / "big.log").write_text("more than four bytes")
-    evidence = rc.capture_seat_evidence(data, "task", "op-1", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "op-1")
     assert evidence["status"] == "retained" and evidence["gaps"] == []
     retained = pathlib.Path(evidence["evidence_dir"]) / "files" / rc.EVIDENCE_DIRNAME / "big.log"
     assert retained.read_text() == "more than four bytes" and not area.exists()
@@ -168,23 +169,24 @@ def test_named_evidence_is_frozen_with_the_subject_not_read_live_by_each_seat(au
     assert not (rc.seat_dir(data, "task", "op-2") / "area").exists()  # refused before any clone
 
 
-def test_an_ordinary_folder_is_one_retained_view_with_links_modes_and_empty_dirs(tmp_path):
+def test_an_ordinary_folder_is_read_in_place_and_a_view_keeps_links_modes_and_empty_dirs(tmp_path):
     folder, data = tmp_path / "plain", tmp_path / "data"
     folder.mkdir()
     (folder / "run.sh").write_text("echo hi\n")
     (folder / "run.sh").chmod(0o755)
     (folder / "empty").mkdir()
     (folder / "link").symlink_to("run.sh")
-    source = rc.freeze_checking_source(folder, data_root=data)
-    assert source["kind"] == "directory"
-    assert rc.freeze_checking_source(folder, data_root=data)["view"] == source["view"]  # unchanged folder, one view
+    assert rc.freeze_checking_source(folder, data_root=data) == {"kind": "workspace", "root": str(folder)}
+    assert not (data / "state" / "review_checkouts" / "views").exists()  # reading in place copies nothing
+    source = directory_source(folder, data)  # a skill payload's retained view still copies the folder whole
+    assert directory_source(folder, data)["view"] == source["view"]  # unchanged folder, one view
     area = pathlib.Path(rc.prepare_seat_area(data, "task", "op-1", source))
     assert os.readlink(area / "link") == "run.sh" and (area / "empty").is_dir()
     assert os.access(area / "run.sh", os.X_OK)
     (folder / "run.sh").write_text("author edit\n")
     assert (area / "run.sh").read_text() == "echo hi\n"
     (area / "result.txt").write_text("checked")
-    evidence = rc.capture_seat_evidence(data, "task", "op-1", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "op-1")
     assert evidence["changed"] == ["result.txt"] and [f["path"] for f in evidence["files"]] == ["result.txt"]
 
 
@@ -195,7 +197,7 @@ def test_directory_link_delta_compares_only_copyable_times(tmp_path, monkeypatch
     (folder / "target").write_bytes(b"original")
     for name in ("unchanged", "retargeted"):
         (folder / name).symlink_to("target")
-    source = rc.freeze_checking_source(folder, data_root=data)
+    source = directory_source(folder, data)
     area = pathlib.Path(rc.prepare_seat_area(data, "task", "op-1", source))
     (area / "retargeted").unlink()
     (area / "retargeted").symlink_to("different-target")
@@ -212,7 +214,7 @@ def test_directory_link_delta_compares_only_copyable_times(tmp_path, monkeypatch
         return info
 
     monkeypatch.setattr(pathlib.Path, "lstat", changed_link_time)
-    evidence = rc.capture_seat_evidence(data, "task", "op-1", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "op-1")
     assert evidence["status"] == "retained" and evidence["gaps"] == []
     assert evidence["changed"] == (["retargeted", "unchanged"] if link_times_supported else ["retargeted"])
     assert evidence["files"] == []  # links stay typed metadata, never dereferenced
@@ -252,14 +254,10 @@ def test_a_thread_refresh_keeps_frozen_index_and_parent_without_synthetic_commit
     (author / "f.txt").write_text("A staged\nround two\n")
     _git(author, "add", "f.txt")
     second = rc.freeze_checking_source(author, data_root=data, subject=rc.SUBJECT_INDEX)
-    with pytest.raises(rc.CheckingAreaUnavailable, match="no complete evidence capture that permits a refresh"):
-        rc.thread_seat_area(data, "task", "plan_review:t1", second, operation_id="turn-2")
-    # This synchronous test owns all writers; its capture is granted the refresh permission.
-    retained = rc.capture_seat_evidence(data, "task", "turn-1", release=True)
-    assert retained["refresh_safe"] and area.is_dir()
     with pytest.raises(rc.CheckingAreaUnavailable, match="same thread operation"):
         rc.thread_seat_area(data, "task", "plan_review:t1", second, operation_id="turn-1")
     assert rc.thread_seat_area(data, "task", "plan_review:t1", second, operation_id="turn-2") == str(area)
+    assert rc._receipt(data, "task", "turn-1")["status"] == "retained"  # captured before the refresh
     assert _git(area, "write-tree") == second["tree"]
     assert _git(area, "rev-parse", "HEAD") == second["parent"]
 
@@ -272,6 +270,9 @@ def test_instructions_name_the_copy_the_pristine_subject_and_no_apply(author, tm
     folder = {"kind": "directory", "root": "/payload", "view": "/views/x"}
     assert "reference repository stays /repo" in rc.checking_instructions("/copy", folder, "/repo")
     assert json.dumps(source)  # the frozen source is a plain, durable record
+    live = rc.checking_instructions("/seat", {"kind": "workspace", "root": "/task"}, "/task")
+    assert "live folder /task: read it in place" in live and "do not write it" in live
+    assert "starts empty" in live and "retains only .review-evidence/ as evidence" in live and "your copy's" not in live
 
 
 def test_a_rejoin_cannot_replace_the_original_checking_subject(author, tmp_path):

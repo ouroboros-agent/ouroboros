@@ -75,6 +75,11 @@ def _retain_dialogue(ctx: Any, evt: dict, mode: str) -> None:
     words = {key: evt[key] for key in fields if evt.get(key) not in (None, "", [])}
     if not words:
         return
+    if mode == "live" and kind == "send_message":
+        from ouroboros.loop_messages import owner_input_revision
+
+        # The owner rows admitted so far now have a live reply (loop_messages.owner_reply_owed).
+        ctx._owner_reply_revision = owner_input_revision(ctx)
     # Card labels, details and declared assumptions remain exact too. Binary
     # attachments and host-composed card facts are not addressed model prose.
     text = str(next(iter(words.values()))) if len(fields) == 1 else json.dumps(words, ensure_ascii=False, indent=2)

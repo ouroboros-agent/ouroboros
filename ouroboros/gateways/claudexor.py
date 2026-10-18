@@ -810,14 +810,16 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         rows = body.get("harnesses") if isinstance(body, dict) else None
         return [row for row in (rows or []) if isinstance(row, dict)]
 
-    def quota_state(self, *, view: Optional[str] = None) -> Dict[str, Any]:
+    def quota_state(self, *, view: Optional[str] = None, model: Optional[str] = None,
+                    request_kind: Optional[str] = None) -> Dict[str, Any]:
         """GET one quota epoch; pass resource or freshness selectors to the engine.
 
-        Old engines may ignore/refuse a selector; claudexor_passive owns fallback.
+        Old engines may ignore/refuse a selector; claudexor_observations owns fallback.
         """
-        from urllib.parse import urlencode
-
-        body = self._request("GET", "/v2/quota" + (f"?{urlencode({'view': view})}" if view else ""))
+        query = {key: value for key, value in (
+            ("view", view), ("model", model), ("requestKind", request_kind),
+        ) if value is not None}
+        body = self._request("GET", "/v2/quota" + (f"?{urlencode(query)}" if query else ""))
         return body if isinstance(body, dict) else {}
 
     def refresh_quota(self, *, target: Optional[Dict[str, str]] = None,
@@ -840,8 +842,7 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         return self._request("GET", f"/v2/account-resets/{quote(operation_id, safe='')}")
 
     def quota_snapshots(self) -> List[Dict[str, Any]]:
-        body = self.quota_state()
-        snapshots = body.get("snapshots") if isinstance(body, dict) else None
+        snapshots = self.quota_state().get("snapshots")
         return [row for row in (snapshots or []) if isinstance(row, dict)]
 
     def quota_absences(self) -> List[Dict[str, Any]]:
@@ -851,8 +852,7 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
         An absence is typed evidence that quota could not be read for a profile;
         route health treats that state as unknown and therefore fail-open.
         """
-        body = self.quota_state()
-        absences = body.get("absences") if isinstance(body, dict) else None
+        absences = self.quota_state().get("absences")
         return [row for row in (absences or []) if isinstance(row, dict)]
 
     def register_project(self, root: str) -> str:

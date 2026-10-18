@@ -127,6 +127,12 @@ def _start_stale_state_response_episode(page):
                 if (new URL(raw, location.href).pathname !== '/api/state') {
                     return realFetch(input, init);
                 }
+                // Settings' served-UI probe (settings.js refreshServedUi, run on every socket
+                // `open`) reads /api/state beside the sequencer and applies nothing to cards:
+                // it is not one of the page-wide reads this episode orders.
+                if ((new Error().stack || '').includes('/modules/settings.js')) {
+                    return realFetch(input, init);
+                }
                 return new Promise((resolve) => pending.push({input, init, resolve}));
             };
             window.__settleStateResponse = async (index, activities, patch = {}) => {
@@ -827,8 +833,8 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 _wait_status(page, "Online")
 
                 # A kind-stamped known subagent still gains no convergence
-                # authority; the minted parent ROOT card is now named by the
-                # card-set reconcile — hence one extra parent-root read.
+                # authority, and its frame alone mints no parent card (A5: a parent card
+                # comes only from the parent's OWN evidence) — so no parent-root read.
                 state["activities"] = []
                 page.evaluate(
                     """() => {
@@ -849,8 +855,9 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 page.wait_for_timeout(200)
                 assert page.evaluate("() => window.__taskDetailCalls") == [
                     "truth-root", "truth-root", "truth-root", "rehome-root", "active",
-                    "progress-only-root", "parent-root",
+                    "progress-only-root",
                 ]
+                assert page.locator('.chat-live-card[data-task-id="parent-root"]').count() == 0
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -1011,7 +1018,8 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                     })""",
                     project_chat,
                 )
-                _panel_status_is(page, "Working")
+                # The room's word is the card's own for post-task work (a finalizing root is not Online).
+                _panel_status_is(page, "Finalizing…")
                 # Make the next request barrier strictly newer than the live
                 # progress frame even on a millisecond-resolution browser clock.
                 page.wait_for_timeout(20)

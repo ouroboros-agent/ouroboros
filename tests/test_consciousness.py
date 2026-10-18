@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import consciousness as clock_module
+from ouroboros import dialogue_store
 from ouroboros.consciousness import (
     ARCHIVED_INBOX_REL,
     INTERVAL_STATE_KEY,
@@ -119,9 +120,8 @@ def test_boot_discloses_invalid_wake_boundary_and_uses_process_start(caplog, clo
 
 
 def _chat_row(**row):
-    with (_chat_path := row.pop("root") / "logs" / "chat.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row) + "\n")
-    return _chat_path
+    """A chat row the dialogue writers would have stored, in the canonical store."""
+    return dialogue_store.append(row.pop("root"), "chat", row)
 
 
 def test_restored_boundary_reaches_the_launched_wake_text(clock):
@@ -155,7 +155,8 @@ def test_an_accepted_wake_advances_the_observation_boundary_and_a_refused_one_do
     assert clock.clock.tick(T0 + FLOOR + 2) == "launched"
     assert '"first"' in clock.launches[-1]["text"]  # the refused window is observed again, whole
     accepted = clock.store[OBSERVATION_STATE_KEY]
-    assert accepted["task_id"] == "wake0001" and accepted["upper"] == (clock.root / "logs" / "chat.jsonl").stat().st_size
+    # The boundary is the chain coordinate the next row takes (the file size, when the chain was a file).
+    assert accepted["task_id"] == "wake0001" and accepted["upper"] == dialogue_store.stream_end(clock.root, "chat")
     # The observation was bound to the registered wake before its turn could run.
     bound = clock.launches[-1]["task"]["metadata"]["wake_observation"]
     assert bound["composition"] == {"owner_message": 1} and bound["source"]["sha256"]

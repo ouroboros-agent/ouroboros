@@ -1108,6 +1108,63 @@ def _recheck_occupant(canonical: pathlib.Path, drive: pathlib.Path, prepared: Di
         raise _Retained("call_inventory_changed")  # The next pass re-arms retention outside the queue lock.
 
 
+# Retentions a later pass would meet again until an input of the settlement changes; the rest
+# (a live or unknown owner, a busy lock, a closed generation, a race, an unreadable row, an
+# I/O error) is attempted again on the next pass.
+TRANSIENT_RETENTIONS = frozenset({"liveness_unknown", "task_live", "generation_closed", "custody_busy",
+                                   "mailbox_busy", "canonical_changed", "drive_occupant_changed",
+                                   "call_inventory_changed", "task_result_unreadable"})
+
+
+def settlement_basis(parent: pathlib.Path, task_id: str, task_dir: pathlib.Path, drive: pathlib.Path) -> list:
+    """What a retained settlement's verdict was read from, cheaply: the canonical row's signature,
+    the drive's, its store's (the database and its WAL log, where a commit lives until a
+    checkpoint), its call inventory's and both mailboxes' identities, and the release that judged
+    it. Any change makes the next pass attempt the drive again."""
+    from ouroboros import __version__
+    from ouroboros.store import log_identity
+    from ouroboros.task_store import signature
+
+    def identity(path: pathlib.Path) -> Any:
+        try:
+            stat = path.lstat()
+        except OSError as exc:
+            return type(exc).__name__
+        return [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+
+    return json.loads(json.dumps([
+        signature(parent, task_id), identity(task_dir), identity(drive / "state" / "current.sqlite"),
+        log_identity(drive / "state" / "current.sqlite"),
+        identity(drive / "observability" / "calls" / task_id), identity(_mailbox_path(parent, task_id)),
+        identity(_mailbox_path(drive, task_id)), str(__version__)], default=str))
+
+
+def rested_verdict(rested: Optional[Dict[str, Any]], parent: pathlib.Path, task_id: str, task_dir: pathlib.Path,
+                   drive: pathlib.Path) -> Optional[Dict[str, Any]]:
+    """A retained drive's durable verdict while nothing it was read from changed (``settlement_basis``):
+    the pass skips it instead of copying and hashing an unproven custody again."""
+    verdict = (rested or {}).get(task_id)
+    return verdict if verdict is not None and verdict.get("basis") == settlement_basis(parent, task_id, task_dir, drive) else None
+
+
+def forget_departed(rested: Optional[Dict[str, Any]], layout: str, names: List[str]) -> None:
+    """Verdicts of drives that left a layout go with them."""
+    for name in [key for key, verdict in (rested or {}).items() if verdict.get("layout") == layout and key not in names]:
+        del rested[name]
+
+
+def record_rest(rested: Optional[Dict[str, Any]], layout: str, parent: pathlib.Path, task_id: str,
+                task_dir: pathlib.Path, drive: pathlib.Path, outcome: Dict[str, Any]) -> None:
+    """Keep a retained drive's verdict; a removed, transiently retained or failed one owes another look."""
+    if rested is None:
+        return
+    reason = str(outcome.get("reason") or "")
+    if outcome["status"] == "removed" or reason in TRANSIENT_RETENTIONS or reason.startswith("custody_error"):
+        rested.pop(task_id, None)
+    else:
+        rested[task_id] = {"layout": layout, "reason": reason, "basis": settlement_basis(parent, task_id, task_dir, drive)}
+
+
 def settle_child_drive(canonical_root: Any, task_id: str, drive: Any, *, live: Optional[LiveProbe],
                        guard: Optional[Guard] = None, stop: Optional[Callable[[], bool]] = None,
                        admission_rollback: bool = False, report: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1172,8 +1229,7 @@ def settle_child_drive(canonical_root: Any, task_id: str, drive: Any, *, live: O
                 trash = canonical / _TRASH_DIR / f"{tid}-{uuid.uuid4().hex[:12]}"
                 trash.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(base, trash)
-        outcome.update(status="removed")
-        shutil.rmtree(trash, ignore_errors=True)
+        outcome.update(status="removed")  # the moved drive is deleted by the maintenance child (remove_custody_trash)
     except _Retained as retained:
         # A fenced write surfaces as its caller's own failure reason: a closed generation names the close.
         outcome["reason"] = "generation_closed" if closed() else str(retained)
@@ -1193,23 +1249,67 @@ def settle_child_drive(canonical_root: Any, task_id: str, drive: Any, *, live: O
     return outcome
 
 
+def _remove_entry(entry: pathlib.Path) -> None:
+    if entry.is_dir() and not entry.is_symlink():
+        shutil.rmtree(entry, ignore_errors=True)
+    else:
+        entry.unlink(missing_ok=True)
+
+
 def sweep_custody_leftovers(canonical_root: Any, *, min_age_sec: float = 3600.0) -> None:
-    """Remove trash and staging a crashed settlement left behind (older than ``min_age_sec``,
-    so a running settlement keeps its own); both are unserved and unreferenced by
-    construction: trash is a fully custodied drive, staging a private copy."""
+    """Remove the staging a crashed settlement left behind (older than ``min_age_sec``, so a
+    running settlement keeps its own); staging is a private copy, unserved and unreferenced."""
     import time
 
-    for directory in (_TRASH_DIR, _STAGING_DIR):
-        root = pathlib.Path(canonical_root) / directory
-        if not root.is_dir() or root.is_symlink():
+    root = pathlib.Path(canonical_root) / _STAGING_DIR
+    if not root.is_dir() or root.is_symlink():
+        return
+    for entry in root.iterdir():
+        try:
+            if time.time() - entry.lstat().st_mtime >= min_age_sec:
+                _remove_entry(entry)
+        except OSError:
             continue
-        for entry in root.iterdir():
-            try:
-                if time.time() - entry.lstat().st_mtime < min_age_sec:
-                    continue
-                if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry, ignore_errors=True)
-                else:
-                    entry.unlink(missing_ok=True)
-            except OSError:
-                continue
+
+
+def custody_trash_entries(canonical_root: Any) -> List[Tuple[str, List[int]]]:
+    """``(name, identity)`` of each drive a settlement moved aside (one directory read)."""
+    root = pathlib.Path(canonical_root) / _TRASH_DIR
+    entries: List[Tuple[str, List[int]]] = []
+    try:
+        if root.is_symlink():
+            return entries
+        with os.scandir(root) as listing:
+            for entry in listing:
+                with contextlib.suppress(OSError):
+                    stat = entry.stat(follow_symlinks=False)
+                    entries.append((entry.name, [stat.st_ino, stat.st_mtime_ns]))
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    return entries
+
+
+def remove_custody_trash(canonical_root: Any, *, stop: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+    """Delete the drives settlements moved aside: each was fully custodied before its move, and
+    nothing serves or references it, so no age or liveness applies. The maintenance child runs
+    this, off the serving process. Returns the count removed and each entry that survived its
+    removal (``name -> identity``: it waits for that identity to change)."""
+    report: Dict[str, Any] = {"removed": 0, "stuck": {}}
+    root = pathlib.Path(canonical_root) / _TRASH_DIR
+    try:
+        entries = [] if root.is_symlink() else list(root.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        entries = []
+    for entry in entries:
+        if stop is not None and stop():
+            break
+        with contextlib.suppress(OSError):
+            _remove_entry(entry)
+        try:
+            stat = entry.lstat()
+            report["stuck"][entry.name] = [stat.st_ino, stat.st_mtime_ns]
+        except FileNotFoundError:
+            report["removed"] += 1
+        except OSError as exc:
+            report["stuck"][entry.name] = [type(exc).__name__]
+    return report

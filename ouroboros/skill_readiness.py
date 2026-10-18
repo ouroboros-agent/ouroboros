@@ -244,6 +244,21 @@ def _skill_names_from_review_history(
     return {"names": names, "coverage": coverage}
 
 
+def _dependency_action(skill: Any, review_reason: str) -> Dict[str, str]:
+    """Where an unready dependency set is reconciled. A launcher-trusted native
+    seed has no review row to replay, so skill_review would buy a paid panel;
+    its enable runs the same post-PASS dependency step instead."""
+    from ouroboros.launcher_bootstrap import native_seed_trusted
+
+    if native_seed_trusted(skill):
+        return {"phase": "dependencies", "tool": "toggle_skill", "reason": (
+            "Launcher-trusted native seed: there is no review to replay, so skill_review would buy a "
+            "paid panel. toggle_skill enabled=true installs the declared dependencies in the same step "
+            "(restart retries them for an enabled seed); enable only where owner intent covers it, "
+            "never over an owner's OFF.")}
+    return {"phase": "dependencies", "tool": "skill_review", "reason": review_reason}
+
+
 def skill_readiness_for_execution(
     drive_root: pathlib.Path,
     skill: Any,
@@ -322,11 +337,11 @@ def skill_readiness_for_execution(
                 msg = f"deps_not_ready:{deps_status}"
                 blockers.append(msg)
                 agent_fixable.append(msg)
-                next_actions.append({"phase": "dependencies", "tool": "skill_review", "reason": "Reconcile dependencies; an unchanged matched review verdict replays without a new panel."})
+                next_actions.append(_dependency_action(skill, "Reconcile dependencies; an unchanged matched review verdict replays without a new panel."))
             elif deps_state.get("specs_hash") != install_specs_hash(auto_specs):
                 blockers.append("deps_stale")
                 agent_fixable.append("deps_stale")
-                next_actions.append({"phase": "dependencies", "tool": "skill_review", "reason": "Refresh the declared dependency fingerprint."})
+                next_actions.append(_dependency_action(skill, "Refresh the declared dependency fingerprint."))
         # G3 (capinv-447) third readiness state: manually-installed dependencies
         # are DISCLOSED, not silently dropped from the dependency list. They do
         # not hard-block (the owner may have installed them system-wide, and no

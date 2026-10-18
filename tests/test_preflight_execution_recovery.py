@@ -34,6 +34,9 @@ def test_deterministic_refusal_reaches_every_seat_without_starting_tests(
     from ouroboros.tools.git_review_cycle import _run_reviewed_stage_cycle
 
     repo = Path(staged_body["repo"])
+    # Unlike the fixture's Git helper, the real commit consumer uses repository identity.
+    shared.git(repo, "config", "user.name", "Preflight fixture")
+    shared.git(repo, "config", "user.email", "preflight@example.invalid")
     ctx = ToolContext(repo_dir=repo, drive_root=tmp_path / "gate-drive")
     if prior_proof != "absent":
         # Model a context that still owns a prior attestation. The selected gate

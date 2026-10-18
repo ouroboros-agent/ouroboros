@@ -151,9 +151,12 @@ def test_an_imported_journal_gives_the_shipped_answer(checkpoint, tmp_path, monk
     name = checkpoint["function"]
     try:
         if name == "admit_continuation":
+            from supervisor import queue_snapshot
             from tests._budget_pause_exact_helpers import _install_queue
 
             _queue, _state, workers = _install_queue(root, monkeypatch)
+            # The recorded process held the queue it had published (a Continue waits for the restore otherwise).
+            monkeypatch.setattr(queue_snapshot, "_RESTORED", {str(_queue.QUEUE_SNAPSHOT_PATH.absolute())})
             result = continuation.admit_continuation(*args, **kwargs)
             expected = checkpoint["result"]
             stable = ("ok", "held", "error", "replay", "status", "successor_task_id")

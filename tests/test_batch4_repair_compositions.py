@@ -254,9 +254,10 @@ def test_cold_consumption_propagates_retry_time_to_all_clocks(tmp_path, monkeypa
     worker = workers.WORKERS[meta["worker_id"]]
     worker.proc = SimpleNamespace(pid=77, is_alive=lambda: True)
     worker.reaping = False
-    checkpoint = {"wait_id": "warm-after-cold", "task_attempt": meta["attempt"],
-                  "source_ref": {"x": 1}, "reason": "sleep", "sleep": {"senders": ["peer"]}}
     clock[0] += 20
+    checkpoint = {"wait_id": "warm-after-cold", "task_attempt": meta["attempt"],
+                  "source_ref": {"x": 1}, "reason": "sleep", "sleep": {"senders": ["peer"]},
+                  "budget_paused_sec": ctx._budget_paused_sec, "sleep_started_at": clock[0]}
     handle_owner_wait({"task_id": "sleeper", "wait_id": checkpoint["wait_id"],
         "task_attempt": meta["attempt"], "worker_id": worker.wid, "pid": 77,
         "phase": "park", "checkpoint": checkpoint}, workers)

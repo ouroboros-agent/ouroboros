@@ -39,6 +39,7 @@ from ouroboros.configured_subagents import (
     serialize_configured_subagents,
 )
 from ouroboros.provider_models import (
+    image_input_from_modalities,
     model_has_credentials_in_settings,
 )
 from ouroboros.route_spec import ROUTE_KIND_AGENT_SESSION, ROUTE_KIND_API_MODEL, RouteSpec
@@ -697,7 +698,9 @@ def compile_model_settings(model_catalog: Sequence[Mapping[str, Any]],
     """Suggest a complete zero-key setup from exact raw-route catalog evidence.
 
     Existing usable/custom choices win. The model's backend default supplies
-    the proposal, not an invented model family or a CLI alias table.
+    the proposal, not an invented model family or a CLI alias table. Vision is
+    a row whose input modalities state image input, else blank: Auto, which
+    still tries an unknown route when an image needs one (``vision_routing``).
     """
     from ouroboros.model_slots import MODEL_ROLE_SETTINGS
     from ouroboros.settings_defaults import RETIRED_SETTING_KEYS, SETTINGS_DEFAULTS
@@ -709,8 +712,8 @@ def compile_model_settings(model_catalog: Sequence[Mapping[str, Any]],
     default = next((row for row in model_catalog if row.get("is_default") and row.get("value")), None)
     if default is None:
         return {}
-    vision = next((row for row in model_catalog if "image" in (row.get("input_modalities") or [])
-                   and row.get("value")), default)
+    vision = next((str(row["value"]) for row in model_catalog if row.get("value")
+                   and image_input_from_modalities(row.get("input_modalities")) is True), "")
     proposed = {}
     for role, key in MODEL_ROLE_SETTINGS.items():
         if role == "websearch":
@@ -720,7 +723,7 @@ def compile_model_settings(model_catalog: Sequence[Mapping[str, Any]],
         current = str(settings.get(key) or "")
         if current and current != str(SETTINGS_DEFAULTS.get(key) or ""):
             continue
-        proposed[key] = "" if role == "fallback" else str((vision if role == "vision" else default)["value"])
+        proposed[key] = {"fallback": "", "vision": vision}.get(role, str(default["value"]))
     return proposed
 
 

@@ -9,6 +9,8 @@ words and points at the exact record.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -560,7 +562,7 @@ def test_late_evidence_replays_through_the_stored_row_and_history(tmp_path):
                          record_type="acceptance_late_settlement", task_id="t1", message_meta=meta, drive_root=tmp_path)
     message_bus.log_chat("system", 1, 0, "Open delegated execution: run-x.", record_type="custody_notice",
                          task_id="t1", message_meta={**meta, "card_row": "timeline"}, drive_root=tmp_path)
-    stored = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines()]
+    stored = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert stored[0]["late_evidence"] == EVIDENCE and "late_evidence" not in stored[1]
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": "1"})))
     rows = {row["text"]: row for row in json.loads(response.body)["messages"]}

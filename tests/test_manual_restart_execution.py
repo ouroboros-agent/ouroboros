@@ -258,10 +258,14 @@ def test_warmup_is_one_background_ensure_for_a_provisioned_home_only(restart_roo
         assert owned.warm_owned_daemon() is True
         _join_warmup_thread()
     assert "warmup did not reach readiness" in caplog.text
-    # The lifespan makes exactly this call, guarded like every other real-data side effect.
+    # The boot coordinator's services step makes exactly this call, guarded like every other
+    # real-data side effect: the lifespan passes ``warm_daemon=live`` (``not pytest_default_real_data_dir``).
+    from ouroboros import server_boot
+
+    services = inspect.getsource(server_boot.start_background_services)
+    assert services.index("if warm_daemon:") < services.index("warm_owned_daemon()")
     lifespan = inspect.getsource(server.lifespan)
-    assert "warm_owned_daemon()" in lifespan
-    assert lifespan.index("if not pytest_default_real_data_dir:") < lifespan.index("warm_owned_daemon()")
+    assert "live = not pytest_default_real_data_dir" in lifespan and "warm_daemon=live" in lifespan
 
 
 @pytest.mark.serial

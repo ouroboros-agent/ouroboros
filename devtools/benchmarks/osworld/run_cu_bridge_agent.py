@@ -203,9 +203,9 @@ def _enable_skill(repo_dir: Path, data_dir: Path) -> str:
     bootstrapped data dir, and an existing native seed may be stale for this
     worktree. Re-copy the repo skill into THIS isolated bench data dir and stamp
     native trust against the current hash. Idempotent: re-copies each run so repo
-    edits are reflected. The ``net`` permission needs no owner grant, but it does
-    remove the skill from the launcher's native auto-enable class — this runner
-    therefore enables it explicitly via ``save_enabled``.
+    edits are reflected. The stamp enables it only when the data dir holds no
+    enable choice yet, so this runner records the enable explicitly via
+    ``save_enabled``.
     """
     import logging
     import shutil

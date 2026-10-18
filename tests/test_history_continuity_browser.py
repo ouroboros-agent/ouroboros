@@ -8,7 +8,7 @@ import re
 import pytest
 
 from tests.test_chat_history_paging_browser import (
-    _assert_at_newest, _open, _open_project, _step, _idle, _write, _result, _screenshot, _FRAMES,
+    _append, _assert_at_newest, _open, _open_project, _step, _idle, _result, _screenshot, _FRAMES,
 )
 from tests.test_chat_history_recovery_browser import _click_project
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
@@ -59,7 +59,7 @@ def test_deep_reopen_delay_retry_and_live_arrival(direct_server_with_data, brows
     project = create_project(root, "continuity-room", name="History continuity")
     other = create_project(root, "other-room", name="Other room")
     start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-    _write(root / "logs" / "chat.jsonl", [{
+    _append(root, "chat", [{
         "direction": "in", "chat_id": project["chat_id"],
         "ts": (start + timedelta(minutes=index)).isoformat(),
         "client_message_id": f"continuity-{index}",
@@ -272,7 +272,7 @@ def test_latest_supersedes_a_held_question_reveal_and_a_later_reveal_lands(direc
 
     root = direct_server_with_data['data_dir']
     project = create_project(root, 'navigation-room', name='Addressed history')
-    _write(root / 'logs/chat.jsonl', [{
+    _append(root, 'chat', [{
         'direction': 'in', 'chat_id': project['chat_id'],
         'ts': '2026-09-03T10:00:00Z' if index >= 1180 else '2026-09-01T10:00:00Z',
         'client_message_id': f'navigation-{index}', 'text': f'NAVIGATION_MESSAGE_{index:04d}',
@@ -369,8 +369,9 @@ _FIRST_VISIBLE = """root => {
 }"""
 
 
-def _deep_gesture_history(root):
-    """A Review card, a photo and the reading target live on the third saved page."""
+def _deep_gesture_history(root, narration=''):
+    """A Review card, a photo and the reading target live on the third saved page; ``narration``
+    lengthens each line of the Review card's own narration."""
     from ouroboros.artifacts import store_task_artifact_bytes
     from ouroboros.projects_registry import create_project
     from tests.test_chat_history_paging_browser import _result
@@ -387,13 +388,14 @@ def _deep_gesture_history(root):
     rows[425] = {'direction': 'out', 'chat_id': cid, 'ts': at(425), 'type': 'photo', 'task_id': 'gesture-media',
                  'text': 'Held photo', 'caption': 'Held photo', 'mime': 'image/png',
                  'download_url': f'/api/tasks/gesture-media/artifacts/{image_name}'}
-    _write(root / 'logs' / 'chat.jsonl', rows)
+    _append(root, 'chat', rows)
     review = {'panels': [{'panel_id': 'gesture-panel', 'surface': 'task_acceptance', 'aggregate_signal': 'PASS',
                           'transport_status': 'success', 'parse_status': 'valid',
                           'reason': 'DEEP_REVIEW_DETAIL ' + 'Reviewed evidence stays readable. ' * 12, 'actors': []}]}
-    _write(root / 'logs' / 'progress.jsonl', [
+    _append(root, 'progress', [
         *[{'ts': at(420, index), 'chat_id': cid, 'task_id': 'deep-review',
-           'content': f'Deep review narration {index}. ' + 'Inspecting retained history. ' * 6} for index in range(3)],
+           'content': f'Deep review narration {index}. ' + 'Inspecting retained history. ' * 6 + narration}
+          for index in range(3)],
         *[{'ts': at(700 + index // 2, index % 2), 'chat_id': cid, 'task_id': 'later-work',
            'content': f'Later work {index:03d}'} for index in range(200)],
     ])
@@ -428,10 +430,10 @@ def _nested_full_output_history(root, card_after=49):
     def minute(index):
         return f'2026-09-01T{10 + index // 60:02d}:{index % 60:02d}'
     at = minute(card_after)
-    _write(root / 'logs/chat.jsonl', [
+    _append(root, 'chat', [
         {'direction': 'in', 'chat_id': cid, 'ts': f'{minute(index)}:00Z',
          'client_message_id': f'nested-{index}', 'text': f'Nested context {index:03d}'} for index in range(200)])
-    _write(root / 'logs/progress.jsonl', [
+    _append(root, 'progress', [
         {'chat_id': cid, 'ts': f'{at}:30Z', 'task_id': 'nested-parent', 'content': 'Parent narration'},
         {'chat_id': cid, 'ts': f'{at}:31Z', 'task_id': 'nested-child', **lineage,
          'subagent_event': 'completed', 'status': 'completed', 'content': 'Child finished',
@@ -538,7 +540,7 @@ def test_feed_scrollbar_drag_to_the_live_edge_follows_new_replies(direct_server_
     root = direct_server_with_data['data_dir']
     project = create_project(root, 'scrollbar-room', name='Scrollbar drag')
     cid = project['chat_id']
-    _write(root / 'logs/chat.jsonl', [
+    _append(root, 'chat', [
         {'direction': 'in', 'chat_id': cid, 'ts': f'2026-09-01T10:{index:02d}:00Z',
          'client_message_id': f'drag-{index}', 'text': f'Scrollbar context {index:02d}'} for index in range(60)])
     with sync_playwright() as pw:

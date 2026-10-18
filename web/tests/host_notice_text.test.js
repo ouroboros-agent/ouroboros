@@ -18,6 +18,11 @@ const TS = '2026-10-10T12:00:00Z';
 
 test('a typed known prefix loses only its leading mark; everything else stays', () => {
     assert.equal(hostNoticeDisplayText(STARTUP, 'startup_notice'), 'Restored pending queue from snapshot: 2 tasks.');
+    assert.equal(hostNoticeDisplayText('♻️ Settling 1 task that was still running when the server stopped.', 'startup_notice'),
+        'Settling 1 task that was still running when the server stopped.');
+    assert.equal(hostNoticeDisplayText('♻️ Restored pending queue: 1 tasks.', 'startup_notice'),
+        'Restored pending queue: 1 tasks.');
+    // Recorded history keeps its old bytes and display treatment.
     assert.equal(hostNoticeDisplayText('♻️ Cancelling 1 task that was still running when the server stopped.', 'startup_notice'),
         'Cancelling 1 task that was still running when the server stopped.');
     assert.equal(hostNoticeDisplayText('⚠️ Restart skipped: dirty tree', 'restart_notice'), 'Restart skipped: dirty tree');

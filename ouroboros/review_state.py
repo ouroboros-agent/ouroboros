@@ -123,7 +123,7 @@ def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
 
 _ATTEMPT_AUTHORITY_STRING_FIELDS = frozenset({
     "ts", "status", "phase", "started_ts", "updated_ts", "finished_ts",
-    "task_id", "repo_key", "tool_name", "review_retry_key",
+    "task_id", "repo_key", "tool_name", "review_retry_key", "review_budget_repo_key",
     "review_contract_fingerprint", "block_reason", "review_owner_session_id",
 })
 _ATTEMPT_AUTHORITY_BOOL_FIELDS = frozenset({

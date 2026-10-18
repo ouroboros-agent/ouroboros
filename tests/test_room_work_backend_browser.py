@@ -39,6 +39,7 @@ import time
 
 import pytest
 
+from ouroboros import dialogue_store
 from tests import test_ui_smoke_playwright as smoke
 from tests.test_room_work_browser import ROOM_FACTS
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
@@ -154,7 +155,6 @@ def _seed_roots(data_dir, task_ids, filler=0):
 
     now = _dt.datetime.now(_dt.timezone.utc)
     (data_dir / "state").mkdir(parents=True, exist_ok=True)
-    (data_dir / "logs").mkdir(parents=True, exist_ok=True)
     chat, progress, pending = [], [], []
     for index in range(filler):
         ts = (now - _dt.timedelta(minutes=filler - index)).isoformat()
@@ -182,9 +182,9 @@ def _seed_roots(data_dir, task_ids, filler=0):
         "pending_count": len(pending), "running_count": 0, "reaping_count": 0,
         "acceptance_fences": [], "budget_root_fences": [], "pending": pending, "running": [],
     }), encoding="utf-8")
-    (data_dir / "logs" / "chat.jsonl").write_text("".join(json.dumps(row) + "\n" for row in chat), encoding="utf-8")
-    (data_dir / "logs" / "progress.jsonl").write_text("".join(json.dumps(row) + "\n" for row in progress),
-                                                      encoding="utf-8")
+    for stream, rows in (("chat", chat), ("progress", progress)):
+        for row in rows:
+            dialogue_store.append(data_dir, stream, row)
 
 
 def _http(url, method, path, body=None):

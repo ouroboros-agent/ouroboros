@@ -10,6 +10,8 @@ Uses Starlette TestClient so the full request path is exercised.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import pathlib
 import asyncio
@@ -127,6 +129,19 @@ def _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings: dict):
     monkeypatch.setattr("ouroboros.server_auth.get_configured_network_password", lambda: "")
 
 
+def _boot_step_ended(client, name: str, timeout: float = 30.0) -> None:
+    """The boot runs its steps while the socket serves: wait for one to end (``/api/health.boot``)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        steps = {row["name"]: row["state"] for row in client.get("/api/health").json()["boot"]["steps"]}
+        if steps.get(name) in {"done", "failed"}:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"boot step {name} did not end")
+
+
 def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
     import server as srv
@@ -151,8 +166,8 @@ def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monk
         lambda root, _reader, *, repo_path=None: calls.append((pathlib.Path(root), repo_path)) or {},
     )
 
-    with TestClient(srv.app):
-        pass
+    with TestClient(srv.app) as client:
+        _boot_step_ended(client, "extensions")
 
     assert calls == [(drive_root, str(repo_root))]
 
@@ -185,6 +200,7 @@ def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monk
     )
 
     with TestClient(srv.app) as client:
+        _boot_step_ended(client, "extensions")
         response = client.post("/api/settings", json={"OUROBOROS_SKILLS_REPO_PATH": str(new_repo)})
 
     assert response.status_code == 200, response.text
@@ -1852,17 +1868,13 @@ def test_lifecycle_queue_endpoint_leaves_stale_review_job_to_its_owners(tmp_path
         assert resp.status_code == 200
         assert "active" in resp.json()
         assert job_path.read_bytes() == before
-        assert not (drive_root / "logs" / "progress.jsonl").exists()
+        assert not dialogue_test.log_rows(drive_root / "logs" / "progress.jsonl")
 
         assert reconcile_stale_review_jobs(drive_root, repo_path="") == 1
         data = json.loads(job_path.read_text(encoding="utf-8"))
         assert data["status"] == "interrupted"
         assert data["interrupt_reason"] == "owner_process_exited"
-        progress = [
-            json.loads(line)
-            for line in (drive_root / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        progress = dialogue_test.log_rows(drive_root / "logs" / "progress.jsonl")
         assert progress[-1]["lifecycle"]["status"] == "interrupted"
         assert progress[-1]["task_id"] == "skill_lifecycle_review_alpha_skill-job-old"
     finally:

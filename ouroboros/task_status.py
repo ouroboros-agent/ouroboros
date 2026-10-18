@@ -270,11 +270,18 @@ def execution_owner_record(drive_root: Any, task: Dict[str, Any], kind: str) -> 
     """Bind the actual execution class to its existing task-result attempt.
 
     Assignment replaces this fact when an inline turn resumes in the pool; it
-    is ownership provenance, never a process-death or replay authorization.
+    is ownership provenance, never a process-death or replay authorization. A
+    direct turn lives only inside the server process that runs it, so its record
+    also names that process generation (``direct_roots.owner_process_ended``).
     """
-    return {"kind": kind, "data_root": str(pathlib.Path(drive_root).resolve()),
-            "task_id": str(task.get("id") or task.get("task_id") or ""),
-            "task_attempt": int(task.get("_attempt") or task.get("task_attempt") or 0)}
+    record = {"kind": kind, "data_root": str(pathlib.Path(drive_root).resolve()),
+              "task_id": str(task.get("id") or task.get("task_id") or ""),
+              "task_attempt": int(task.get("_attempt") or task.get("task_attempt") or 0)}
+    if kind == "direct":
+        from ouroboros.process_custody import current_custody_session_id
+
+        record["process"] = current_custody_session_id()
+    return record
 
 
 @lru_cache(maxsize=64)

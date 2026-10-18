@@ -30,7 +30,7 @@ def _run_panic(monkeypatch, tmp_path, *, daemon_stop, panic_request=None, diagno
     their writes cannot escape into another fixture; production does not join.
     """
     from ouroboros import server_control
-    from ouroboros.evidence_packer import packer
+    from ouroboros.maintenance import child as packer
     from ouroboros.startup_historical_audit import audit
 
     monkeypatch.setattr(audit, "stop", lambda: None)
@@ -158,7 +158,7 @@ def test_accepted_panic_completes_despite_early_failure(monkeypatch, tmp_path, f
     """
     import builtins
     from ouroboros import server_control
-    from ouroboros.evidence_packer import packer
+    from ouroboros.maintenance import child as packer
     from ouroboros.startup_historical_audit import audit
 
     calls, diagnostics = [], []
@@ -224,7 +224,7 @@ def test_accepted_panic_completes_despite_early_failure(monkeypatch, tmp_path, f
     _run_panic(monkeypatch, tmp_path, daemon_stop=lambda: True, diagnostics=diagnostics,
                children=(child,), configure=configure, ingress=fault.startswith("ingress-"))
     assert server_control._restart_stop_requested is True
-    assert not {"panic-startup-audit", "panic-evidence-packer"} & set(created_threads)
+    assert not {"panic-startup-audit", "panic-maintenance"} & set(created_threads)
     # Both maintenance stops run synchronously first; one failing never skips the other.
     first = 1 if fault.startswith("ingress-") else 0
     head = [name for name, broken in (("audit-stop", fault == "audit"), ("packer-stop", fault == "packer"))
@@ -244,12 +244,12 @@ def test_accepted_panic_completes_despite_early_failure(monkeypatch, tmp_path, f
         if fault != "executor-import":
             assert set(diagnostics[0]["requests"]) == {
                 "local-model", "daemon", "commands", "executors", "services", "companions",
-                "restart-successor", "scope-census", "child-123", "startup-audit", "evidence-packer",
+                "restart-successor", "scope-census", "child-123", "startup-audit", "maintenance",
             }
             # The installation-scope census is one more independent request; this root planted no marker.
             assert diagnostics[0]["requests"]["scope-census"] == {"requested": False, "reason": "no installation marker planted"}
     if fault in {"audit", "packer", "model", "daemon", "request-thread"}:
-        owner = {"audit": "startup-audit", "packer": "evidence-packer", "model": "local-model",
+        owner = {"audit": "startup-audit", "packer": "maintenance", "model": "local-model",
                  "daemon": "daemon", "request-thread": "commands"}[fault]
         assert diagnostics[0]["requests"][owner]["requested"] is False
         assert "injected " + fault in diagnostics[0]["requests"][owner]["error"]

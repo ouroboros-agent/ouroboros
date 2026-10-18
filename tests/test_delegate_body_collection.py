@@ -422,3 +422,20 @@ def test_directory_capture_keeps_complete_files_while_money_is_pending(tmp_path,
     assert not fresh.patch_disposed and not engine.applies and not engine.decisions
     assert held.run_id in current.runs(ctx.drive_root, "state=?", (current.HELD,))
     assert not (target / ".git").exists() and not (target / "out.bin").exists()
+
+
+def test_a_typed_capture_failure_stays_owed(tmp_path, monkeypatch, money):
+    """A capture that reports ``status: failed`` (its exception was caught inside) is a failure
+    the collector keeps owing, not a success that erases it; a later good capture clears it."""
+    from ouroboros.tools import delegate_integration
+
+    entry = started(tmp_path)
+    outcomes = iter([{"status": "failed", "note": "patch capture failed (RuntimeError: Symlink loop)"},
+                     {"status": "ready_with_changes"}])
+    monkeypatch.setattr(delegate_integration, "capture_terminal_patch_for_drive", lambda *a, **kw: next(outcomes))
+    failures = {}
+    first = body.collect_terminal(tmp_path, entry.run_id, detail=terminal(), failures=failures)
+    assert "capture:RuntimeError" in first["errors"] and "capture" in failures
+    assert first["workspace_capture"]["status"] == "failed"
+    second = body.collect_terminal(tmp_path, entry.run_id, detail=terminal(), failures=failures)
+    assert not any(error.startswith("capture:") for error in second["errors"]) and "capture" not in failures

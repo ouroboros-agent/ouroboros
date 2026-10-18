@@ -736,6 +736,7 @@ def collect_review_evidence(
     *,
     task_id: str = "",
     repo_dir: Any = None,
+    canonical_root: Any = None,
     max_attempts: int = 3,
     max_runs: int = 3,
     max_obligations: int | None = None,
@@ -751,7 +752,9 @@ def collect_review_evidence(
     ``foreign_advisory_runs`` so a reader cannot mistake them for this task's
     own work. The repository stale marker is attributed the same way: shown to
     every task on the checkout, with ``stale_task_id``/``stale_attribution``
-    naming whose mutation or review wrote it.
+    naming whose mutation or review wrote it. A split-drive task's own
+    ``review_change`` attempts are read from ``canonical_root``; an unreadable one
+    is named (``canonical_attempts_unreadable``), never read as none.
     """
     from ouroboros.review_state import (
         _LEGACY_CURRENT_REPO_KEY,
@@ -759,6 +762,7 @@ def collect_review_evidence(
         load_state,
         make_repo_key,
     )
+    from ouroboros.review_status_projection import with_canonical_change_attempts
     from ouroboros.task_continuation import list_review_continuations
 
     drive_root_path = pathlib.Path(drive_root)
@@ -776,8 +780,10 @@ def collect_review_evidence(
         repo_runs = all_runs
     own_runs, foreign_runs = _split_advisory_runs_by_owner(repo_runs, task_id)
 
+    canonical_unreadable = ""
     if task_id:
-        scoped_attempts = state.filter_attempts(task_id=task_id)
+        scoped_attempts, canonical_unreadable = with_canonical_change_attempts(
+            state.filter_attempts(task_id=task_id), canonical_root, drive_root_path, task_id)
     elif repo_key:
         scoped_attempts = state.filter_attempts(repo_key=repo_key)
     else:
@@ -828,6 +834,8 @@ def collect_review_evidence(
         "corrupt_continuations": [str(item) for item in corrupt[:3]],
         "omitted_corrupt": max(0, len(corrupt) - 3),
     }
+    if canonical_unreadable:
+        evidence["canonical_attempts_unreadable"] = canonical_unreadable
     evidence["has_evidence"] = any([
         evidence["recent_attempts"],
         evidence["recent_advisory_runs"],
@@ -839,6 +847,8 @@ def collect_review_evidence(
         evidence["commit_readiness_debts"],
         evidence["continuations"],
         evidence["corrupt_continuations"],
+        # Nor when the canonical rows it should hold could not be read.
+        bool(canonical_unreadable),
         evidence["current_repo"]["advisory_status"] not in ("", "missing"),
         # Omission counters signal truncated evidence even when visible lists are empty
         evidence["omitted_attempts"] > 0,

@@ -336,7 +336,7 @@ def test_reviewer_capture_of_a_large_tree_keeps_raw_bytes_with_one_writer(author
     files["f.txt"] = b"edited\r\n\xff"
     recorder = _Recorder(monkeypatch)
 
-    evidence = rc.capture_seat_evidence(data, "task", "bulk", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "bulk")
 
     assert evidence["status"] == "retained", evidence
     assert recorder.git("fast-import") == 1 and recorder.git("hash-object") == 0
@@ -425,7 +425,7 @@ def test_reviewer_capture_of_a_path_git_refuses_keeps_the_copy(author, tmp_path,
     monkeypatch.setattr("ouroboros.subagent_worktrees.stage_raw_payload_inventory",
                         lambda root, paths, env: stage_raw_payload_inventory(root, {*paths, _REFUSED}, env))
 
-    evidence = rc.capture_seat_evidence(data, "task", "refused", release=True)
+    evidence = rc.capture_seat_evidence(data, "task", "refused")
 
     assert evidence["status"] == "capture_failed" and "RawStagingIncomplete" in evidence["error"], evidence
     assert _REFUSED in evidence["error"] and area.is_dir()  # never released over a dropped file

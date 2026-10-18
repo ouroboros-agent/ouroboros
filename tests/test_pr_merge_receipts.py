@@ -186,6 +186,106 @@ def test_a_failed_readback_is_unknown(world):
     assert _receipts(world)[0]["outcome"] == {"status": "unknown", "reason": "readback_failed"}
 
 
+def test_a_failed_merge_request_shows_its_retained_diagnostic_on_every_call(world, monkeypatch):
+    """#1555: the bounded, redacted gh facts the receipt keeps reach the local response on the
+    first call and on the observation-only repeat; the outcome stays unknown, never 'rejected'."""
+    original = world.gh
+    denial = ("⚠️ GH_ERROR: GraphQL: demo-user does not have the correct permissions to execute "
+              "`MergePullRequest` (mergePullRequest)")
+
+    def gh(args, *a, **kw):
+        if args[:2] == ["pr", "merge"]:
+            original.calls.append(list(args))
+            return github.GhResult(False, denial, 1, None, "exit")
+        return original(args, *a, **kw)
+
+    monkeypatch.setattr(github, "_gh_run", gh)
+    first = _merge(world)
+    assert "PR_MERGE_UNKNOWN" in first and f"Merge request: failure=exit, exit_code=1: {denial}" in first
+    assert "GitHub readback: pr_state_open_after_unconfirmed_effect." in first
+    again = _merge(world)
+    assert "had no confirmed outcome" in again and "sent no new merge request" in again
+    assert f"Earlier merge request: failure=exit, exit_code=1: {denial}" in again
+    assert sum(c[:2] == ["pr", "merge"] for c in original.calls) == 1
+
+
+@pytest.mark.parametrize(("merge", "fact"), [
+    ("timeout_open", "failure=timeout: ⚠️ GH_TIMEOUT: exceeded 120s."),
+    ("refused", "failure=pre_effect, exit_code=1: ⚠️ GH_ERROR: pre-effect refusal"),
+])
+def test_different_merge_failures_read_differently(world, merge, fact):
+    world.gh.merge = merge
+    assert f"Merge request: {fact}" in _merge(world)
+
+
+def test_the_public_pr_body_never_carries_the_local_diagnostic(world):
+    world.gh.merge = "timeout_merged"
+    assert "Merge request: failure=timeout" in _merge(world, reviewed_head_sha=HEAD)
+    assert _receipts(world)[0]["publication"]["body"] == {"status": "published"}
+    assert "GH_TIMEOUT" not in world.gh.pr["body"] and "failure=" not in world.gh.pr["body"]
+
+
+def test_a_repeat_after_a_confirmed_merge_does_not_call_it_unconfirmed(world):
+    _merge(world, reviewed_head_sha=HEAD)
+    again = _merge(world, reviewed_head_sha=HEAD)
+    assert "merge: merged" in again and "sent no new merge request" in again
+    assert "already recorded" in again and "had no confirmed outcome" not in again
+    assert sum(c[:2] == ["pr", "merge"] for c in world.gh.calls) == 1
+
+
+def test_an_unreadable_pr_keeps_the_earlier_request_in_view_by_its_real_status(world, monkeypatch):
+    """#1555: this call's no-effect fact must not read as the resolution of the earlier one."""
+    original = world.gh
+
+    def unreadable(args, *a, **kw):
+        if args[:2] == ["pr", "view"]:
+            return github.GhResult(False, "⚠️ GH_ERROR: HTTP 502", 1, 502, "exit")
+        return original(args, *a, **kw)
+
+    monkeypatch.setattr(github, "_gh_run", unreadable)
+    assert "could not be read; nothing was merged" in _merge(world)  # no earlier request: unchanged
+    monkeypatch.setattr(github, "_gh_run", original)
+    world.gh.merge = "timeout_open"
+    _merge(world)
+    (earlier,) = _receipts(world)
+    monkeypatch.setattr(github, "_gh_run", unreadable)
+    out = _merge(world)
+    assert "pr_unreadable" in out and "nothing was merged" not in out and "sent no new merge request" in out
+    assert (f"the earlier merge request for {URL} is still unresolved "
+            f"(receipt_id={earlier['receipt_id']}, outcome unknown)") in out
+    assert _receipts(world) == [earlier]
+    assert sum(c[:2] == ["pr", "merge"] for c in original.calls) == 1
+
+    monkeypatch.setattr(github, "_gh_run", original)
+    world.gh.pr.update(state="MERGED", mergeCommit={"oid": MERGE})
+    _merge(world)  # observes the merge on the same receipt
+    monkeypatch.setattr(github, "_gh_run", unreadable)
+    out = _merge(world)
+    assert f"a merge of {URL} was already confirmed (receipt_id={earlier['receipt_id']})" in out
+    assert "nothing was merged" not in out and "still unresolved" not in out
+    assert sum(c[:2] == ["pr", "merge"] for c in original.calls) == 1
+
+
+def test_an_intent_without_any_outcome_is_only_read_back(world, monkeypatch):
+    """A claim another (or a crashed) call holds has no outcome yet; it is not called unconfirmed."""
+    original = world.gh
+
+    def crash_at_effect(args, *a, **kw):
+        if args[:2] == ["pr", "merge"]:
+            raise RuntimeError("worker died between intent and effect")
+        return original(args, *a, **kw)
+
+    monkeypatch.setattr(github, "_gh_run", crash_at_effect)
+    with pytest.raises(RuntimeError):
+        _merge(world)
+    assert [r["state"] for r in _receipts(world)] == ["intent_recorded"]
+    monkeypatch.setattr(github, "_gh_run", original)
+    out = _merge(world)
+    assert "holds its merge intent with no recorded outcome yet" in out and "sent no new merge request" in out
+    assert "had no confirmed outcome" not in out
+    assert not any(c[:2] == ["pr", "merge"] for c in original.calls)
+
+
 def test_an_unwritable_intent_refuses_before_any_effect(world, monkeypatch):
     monkeypatch.setattr(merge_receipts, "write_receipt", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("lock")))
     assert "merge_intent_unwritable" in _merge(world)

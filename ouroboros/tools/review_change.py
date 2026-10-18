@@ -236,7 +236,31 @@ def resolve_review_root(ctx: ToolContext, binding: Any, request: ReviewChangeReq
         raise ReviewChangeArgumentError(
             f"{start} is not inside a git repository; name a registered repository with workspace_root, or root=system_repo")
     root = pathlib.Path(top).resolve()
+    assigned = _assigned_review_root(ctx)
+    if assigned is not None and not root.is_relative_to(assigned):
+        raise ReviewChangeArgumentError(f"review_change is limited to the assigned work at {assigned}; got {root}")
     return ("system_repo" if root == _system_repo(ctx) else "active_workspace"), root
+
+
+def _assigned_review_root(ctx: ToolContext) -> Optional[pathlib.Path]:
+    """Ordinary working children may ask reviewers about their own physical work.
+
+    Read access to another registered folder grants no review authority there.
+    Cyber keeps its existing authority; a read-only child stays read-only.
+    """
+    from ouroboros.contracts.task_constraint import normalize_task_constraint
+    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+    from ouroboros.tool_access import active_tool_profile
+
+    profile = active_tool_profile(ctx)
+    if profile == "local_readonly_subagent":
+        raise ReviewChangeArgumentError("a read-only child cannot dispatch review_change")
+    if profile != "acting_subagent" or mode_has_unrestricted_agency(get_runtime_mode()):
+        return None
+    constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
+    if not constraint or not constraint.write_root:
+        raise ReviewChangeArgumentError("review_change requires an assigned write root")
+    return pathlib.Path(constraint.write_root).resolve()
 
 
 def _verify_revisions(root: pathlib.Path, request: ReviewChangeRequest) -> None:
@@ -758,7 +782,7 @@ def _cycles_exhausted(ctx: ToolContext, wave: _Wave) -> Optional[Dict[str, Any]]
     """The shared per-task-tree ceiling of (this root, ``review_change``)."""
     from ouroboros.tools.commit_gate import check_review_cycles_ceiling
 
-    probe = SimpleNamespace(drive_root=ctx.drive_root, repo_dir=str(wave.root), _current_review_tool_name=TOOL_NAME)
+    probe = SimpleNamespace(**{**vars(ctx), "repo_dir": wave.root, "_current_review_tool_name": TOOL_NAME})
     return check_review_cycles_ceiling(probe, root_task_id=wave.root_task_id)
 
 
@@ -926,6 +950,8 @@ def run_review_change(ctx: ToolContext, **args: Any) -> Dict[str, Any]:
     supplied_execution = args.pop("_preflight_execution", None)
     request = parse_request(args)
     if request.subject == "system":
+        if _assigned_review_root(ctx) is not None:
+            raise ReviewChangeArgumentError("review_change is limited to the assigned work; subject=system is unavailable")
         return run_system_review(ctx, reviewer=request.reviewers[0] if request.reviewers else "",
                                  effort=request.reviewer_effort, goal=request.goal,
                                  author_questions=request.author_questions, reason=request.reason)

@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from ouroboros.test_evidence import diagnostic_directory
+
 from tests._store_shared import seed_result
 
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
@@ -193,7 +195,12 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert no_summary.get_attribute("data-expanded") == "0"
                 # This card carries BOTH groups; the helper opens the first
                 # (Plan review), whose finding text must be readable.
-                _open_review_checkpoint(no_summary)
+                # The Plan review group is hydrated from the task detail once the card opens; the helper
+                # opens the FIRST group, so open the card here and let the Plan group arrive (first)
+                # before the helper walks the section.
+                no_summary.locator(":scope > [data-live-summary-button]").click()
+                no_summary.locator('[data-review-group^="plan:"]').wait_for(state="attached", timeout=30_000)
+                _open_review_checkpoint(no_summary, open_card=False)
                 assert no_summary.locator('[data-live-phase]').first.get_attribute("data-phase") == "warn"
                 plan_text = no_summary.inner_text()
                 assert "The migration step drops the audit ledger" in plan_text
@@ -211,7 +218,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 page.wait_for_timeout(900)  # cover the routine background history sync
                 assert no_summary.locator('.chat-live-line-repeat:not([hidden])').count() == 0
                 assert card.locator('.chat-live-line-repeat:not([hidden])').count() == 0
-                page.screenshot(path=str(data_dir.parent / "review-truth-chat.png"), full_page=True)
+                page.screenshot(path=str(diagnostic_directory(data_dir.parent, "review-checkpoint") / "review-truth-chat.png"), full_page=True)
 
                 page.click('[data-nav-page="dashboard"]')
                 page.click('[data-dashboard-tab="logs"]')
@@ -229,7 +236,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert "Reviewer fable findings omitted: 1" in log_text
                 assert log_card.locator('[data-task-phase]').inner_text() == "warn"
                 review.scroll_into_view_if_needed()
-                review.screenshot(path=str(data_dir.parent / "review-truth-logs.png"))
+                review.screenshot(path=str(diagnostic_directory(data_dir.parent, "review-checkpoint") / "review-truth-logs.png"))
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -253,11 +260,15 @@ def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_serve
 
     from ouroboros.outcomes import derive_loop_outcome
     from ouroboros.review_substrate import compact_review_projection
-    from tests.test_acceptance_author_stop import _run_stop_loop
+    from tests.test_acceptance_author_stop import _finish_tool_call, _run_stop_loop
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
     (tmp_path / "producer").mkdir()
-    run = _run_stop_loop(tmp_path / "producer", monkeypatch, ["The export endpoint ships."] * 3, stop_services=False)
+    # Produced evidence makes the Required panel run on the first answer; the author's next turn is the
+    # action-only `finish_task` (no stance), the shape the loop's finish front door now takes.
+    run = _run_stop_loop(tmp_path / "producer", monkeypatch,
+                         ["The export endpoint ships.", *[_finish_tool_call("The export endpoint ships.")] * 3],
+                         stop_services=False, produced=True)
     axes = derive_loop_outcome(run.result, run.usage, run.trace)["outcome_axes"]
     decision = axes["review"]["acceptance_decision"]
     assert decision["reason"] == "author_finish" and decision["author_disposition"]["disposition"] == ""
@@ -286,14 +297,15 @@ def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_serve
                 author_text = author.inner_text()
                 assert "Task author decision" in author_text and "Author finish" in author_text
                 assert "reviewer signal=FAIL" in author_text
-                assert "Main submitted this complete response for delivery" in author_text
+                # An action-only finish carries no rationale of its own: the record's default is the stated act.
+                assert "Explicit completion selection." in author_text and "source=finish_task" in author_text
                 assert not re.search(r"accepted|partial|solved|Author finish:", author_text, re.I), author_text
                 group = card.locator(f'[data-review-group="task_acceptance:{task_id}"]')
                 assert "FAIL" in group.locator(".chat-review-group-meta").inner_text()
                 assert "FAIL" in group.locator("[data-review-attempt] .chat-review-attempt-meta").first.inner_text()
                 assert not re.search(r"\bsolved\b", card.inner_text(), re.I)
                 card.scroll_into_view_if_needed()
-                card.screenshot(path=str(data_dir.parent / "c4-action-only-author-finish.png"))
+                card.screenshot(path=str(diagnostic_directory(data_dir.parent, "review-checkpoint") / "c4-action-only-author-finish.png"))
             finally:
                 browser.close()
     except PlaywrightError as exc:

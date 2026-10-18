@@ -47,16 +47,30 @@ DOWNLOAD_LABELS = {
     "android-arm64": "Experimental Android ARM64 USB setup (.tar.gz)",
     "android-apk": "Android publisher-signed reference APK (see setup guide)",
 }
+# The release job's needs apart from the optional Android build. The proof
+# records each job's actual GitHub conclusion; a missing one is an error,
+# never a pass.
 RELEASE_GATES = (
     "full-test",
+    "integration-test",
+    "system-e2e-mock",
+    "release-preflight",
+    "build",
+    "windows-proof",
     "marker-guards",
     "ui-smoke",
     "docker-ui-smoke",
     "docker-portable-test",
     "skill-smoke",
-    "packaged-artifact-smoke",
-    "android-build",
 )
+JOB_RESULTS = ("success", "failure", "cancelled", "skipped")
+# Owner decision of 2026-10-17: the official v7.7.0 tag alone may ship after
+# these test lanes concluded red (failed or timed out), disclosed in its proof
+# and notes, with follow-up patches. Every other gate and every other tag keeps
+# the strict bar, and ci.yml holds that tag at a verified draft.
+OWNER_EXCEPTION_REPOSITORY = "razzant/ouroboros"
+OWNER_EXCEPTION_TAG = "v7.7.0"
+OWNER_WAIVABLE_GATES = ("full-test", "system-e2e-mock", "ui-smoke")
 COMMON_SMOKE_CHECKS = frozenset(
     {
         "embedded_repo_bundle",
@@ -219,6 +233,26 @@ def _read_release_description(readme: Path, version: str) -> tuple[str, str]:
     raise ValueError(f"README Version History has no exact row for {version}")
 
 
+def _gate_results(pairs: list[str], *, owner_exception: bool) -> tuple[dict[str, str], dict[str, str]]:
+    """Return every gate's actual conclusion and the gates the owner exception waived."""
+    results: dict[str, str] = {}
+    for pair in pairs:
+        name, _, result = pair.partition("=")
+        if name not in RELEASE_GATES or name in results or result not in JOB_RESULTS:
+            raise ValueError(f"invalid release gate result: {pair!r}")
+        results[name] = result
+    missing = [name for name in RELEASE_GATES if name not in results]
+    if missing:
+        raise ValueError(f"missing release gate results: {missing}")
+    ordered = {name: results[name] for name in RELEASE_GATES}
+    waived = {name: result for name, result in ordered.items() if result != "success"}
+    for name, result in waived.items():
+        # A skipped lane produced no result at all; only a concluded red one is disclosed.
+        if not (owner_exception and name in OWNER_WAIVABLE_GATES and result in ("failure", "cancelled")):
+            raise ValueError(f"release gate {name} concluded {result}, not success")
+    return ordered, waived
+
+
 def _load_json(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -375,6 +409,7 @@ def _release_notes(
     records: Iterable[dict],
     android: dict,
     run_url: str,
+    waived: dict[str, str],
 ) -> str:
     short_commit = commit[:12]
     verify_base = (
@@ -453,11 +488,24 @@ def _release_notes(
         "",
         "## Release proof",
         "",
-        f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}).",
-        "The release workflow passed the full test matrix, UI and Docker smoke tests, skill smoke tests, and packaged artifact smoke tests before publication.",
+        f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}) "
+        f"by [this workflow run]({run_url}).",
+        # Actual job conclusions, never a fixed claim; the owner exception is stated separately.
+        (
+            "Not every test job passed: "
+            + ", ".join(f"`{name}` {result}" for name, result in waived.items())
+            + f". The project owner approved releasing {tag} alone from this commit and run with "
+            "these results disclosed; follow-up patches will address them. Every other required release job "
+            "succeeded, including required provider integration, marker guards, Docker and skill "
+            "smoke tests, the build, Windows proof and packaged artifact smoke tests."
+            if waived else
+            "The release workflow passed the full test matrix, required provider integration, "
+            "system E2E, UI and Docker smoke tests, skill smoke tests, and packaged artifact "
+            "smoke tests before publication."
+        ),
         "",
         "- `SHA256SUMS` covers every installable platform artifact, its SBOM, and its smoke receipt.",
-        "- `release-evidence.json` binds the tag, commit, workflow run, artifact hashes, SBOMs, and smoke receipts.",
+        "- `release-evidence.json` binds the tag, commit, workflow run, each release job's actual conclusion, artifact hashes, SBOMs, and smoke receipts.",
         "- Each installable platform artifact has GitHub build provenance and a CycloneDX SBOM attestation.",
         f"- Verify build provenance with `{verify_base}`.",
         f"- Verify the CycloneDX attestation with `{verify_base} --predicate-type https://cyclonedx.org/bom`.",
@@ -485,6 +533,8 @@ def command_assemble(args: argparse.Namespace) -> None:
         r"[0-9A-Fa-f]{40}", args.windows_signer_thumbprint
     ):
         raise ValueError("ESIGNER_CERT_SHA1 is set but is not a 40-hex SHA-1 thumbprint")
+    eligible = (args.repository, args.tag) == (OWNER_EXCEPTION_REPOSITORY, OWNER_EXCEPTION_TAG)
+    gates, waived = _gate_results(args.gate_result, owner_exception=eligible)
     records, android = _proof_files(
         args.directory,
         version,
@@ -502,7 +552,8 @@ def command_assemble(args: argparse.Namespace) -> None:
 
     generated_at = args.generated_at or dt.datetime.now(dt.timezone.utc).isoformat()
     evidence = {
-        "schemaVersion": 1,
+        # 2: gates carry actual job conclusions and ownerException is recorded.
+        "schemaVersion": 2,
         "kind": "build_time_release_proof",
         "product": "Ouroboros",
         "version": version,
@@ -514,8 +565,23 @@ def command_assemble(args: argparse.Namespace) -> None:
         },
         "workflow": {
             "runUrl": args.run_url,
-            "gates": [{"name": name, "status": args.android_build_result
-                       if name == "android-build" else "passed"} for name in RELEASE_GATES],
+            "gates": [
+                *({"name": name, "status": status} for name, status in gates.items()),
+                # Verified above from every selected asset's bound receipt.
+                {"name": "packaged-artifact-smoke", "status": "passed"},
+                {"name": "android-build", "status": args.android_build_result},
+            ],
+            # Eligibility is the exact official tag; waivedGates lists what it was used for.
+            "ownerException": {
+                "decision": "Owner decision of 2026-10-17: release v7.7.0 with any residual red "
+                            "test lanes disclosed; follow-up patches will address them.",
+                "repository": args.repository,
+                "tag": args.tag,
+                "commit": args.commit,
+                "runUrl": args.run_url,
+                "publication": "held at a verified draft for an explicit owner publish",
+                "waivedGates": [{"name": name, "status": status} for name, status in waived.items()],
+            } if eligible else None,
         },
         "experimentalAndroid": android,
         "generatedAt": generated_at,
@@ -549,6 +615,7 @@ def command_assemble(args: argparse.Namespace) -> None:
             records=records,
             android=android,
             run_url=args.run_url,
+            waived=waived,
         ),
         encoding="utf-8",
     )
@@ -626,6 +693,8 @@ def build_parser() -> argparse.ArgumentParser:
     assemble.add_argument("--android-attestation-result", choices=("success", "failure", "not_run"), default="not_run")
     # Required, possibly empty: the release states which Windows mode it expects.
     assemble.add_argument("--windows-signer-thumbprint", required=True)
+    # One per RELEASE_GATES job, its actual result: ``--gate-result full-test=failure``.
+    assemble.add_argument("--gate-result", action="append", default=[], metavar="JOB=RESULT")
     assemble.add_argument("--github-output", type=Path)
     assemble.set_defaults(func=command_assemble)
 

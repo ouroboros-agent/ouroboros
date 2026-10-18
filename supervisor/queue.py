@@ -92,11 +92,13 @@ def init(drive_root: pathlib.Path) -> None:
     # A previous process's direct-chat turns must not outlive it in the roster,
     # and this clear is the last moment their ids exist: the roster is taken over
     # here and handed to snapshot restore below, which fences them like any other
-    # row the stop caught.
-    from supervisor.direct_roots import take_direct_roots
+    # row the stop caught. Durable direct rows of an ENDED server process that the
+    # roster never listed (a crash before its tick rewrote the fragment) join the
+    # same handover, so no direct result outlives the process that ran it.
+    from supervisor.direct_roots import adopt_orphaned_direct_results, take_direct_roots
 
     PRIOR_DIRECT_ROOTS.clear()
-    PRIOR_DIRECT_ROOTS.update(take_direct_roots(drive_root))
+    PRIOR_DIRECT_ROOTS.update(adopt_orphaned_direct_results(drive_root, take_direct_roots(drive_root)))
 
 
 def refresh_timeouts_from_settings(settings: dict) -> None:

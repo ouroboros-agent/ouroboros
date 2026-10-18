@@ -26,7 +26,7 @@ from ouroboros.utils import (
     utc_now_iso,
 )
 from ouroboros.config import runtime_setting
-from ouroboros.store import StoreError
+from ouroboros.store import StoreError, StoreMigrating
 
 log = logging.getLogger(__name__)
 
@@ -154,22 +154,17 @@ def valid_task_result_authority_source(source: Any, task_id: Any) -> bool:
 def _automatic_predecessor_authority_projection(
     row: Dict[str, Any], source: Dict[str, Any], *, drive_root: Any,
 ) -> Dict[str, Any]:
-    """Bounded continuation envelope: every terminal fact, no body recursion.
+    """Bounded continuation envelope of the predecessor's record, digest included.
 
-    The recursion that compiled 300K+ work orders and 800K-token parent
-    prompts lived in exactly two carriers: the nested ``task_contract``
-    (which embedded the hop before, recursively) and unbounded string bodies
-    (``result``/``final_answer`` and friends). Every OTHER top-level terminal
-    fact - artifact/custody/verification/capability facts, fields this reader
-    predates - keeps inheriting whole, so authority cannot silently vanish.
-    The carriers are bounded structurally by the shared envelope producer
-    (contracts SSOT): the contract inherits its OPERATIVE core minus the
-    nested predecessor, and any field whose body outgrows the tool-result
-    budget - measured on its serialized form, so lists and dicts count -
-    rides as a typed preview beside the named pull source (the same
-    whole-or-pointer rule main_context_authority already applies to Main).
-    Digest facts are observed at binding; the complete canonical authority
-    stays in the current task store, pullable whole via the named source.
+    The shared envelope producer (contracts SSOT) bounds the two growth carriers
+    structurally: the nested ``task_contract`` inherits its OPERATIVE core minus
+    the nested predecessor, and any field whose body outgrows the tool-result
+    budget - measured on its serialized form - rides as a typed preview beside
+    the named pull source. The digest is observed at binding over the complete
+    projection. The successor's start materializes only the compact brief of
+    this envelope (``main_context_authority.project_helper_predecessor_authority``);
+    the complete canonical authority stays in the task store, pullable whole
+    via the named source.
     """
 
     from ouroboros.contracts.task_contract import bounded_continuation_envelope
@@ -233,7 +228,13 @@ def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str,
             if _text_sha256(origin_text) != str(origin_ref.get("text_sha256") or ""):
                 return _unavailable(owner_source, "retained origin text does not match its ingress checksum")
         else:
-            matching = resolve_owner_message_source(root, origin_ref)
+            try:
+                matching = resolve_owner_message_source(root, origin_ref)
+            except StoreMigrating:  # unknown yet, never absent: the start waits for the upgrade, not a crash
+                return _unavailable(owner_source, "the named owner message is in saved history that is still "
+                                                  "being upgraded; retry when the upgrade finishes")
+            except StoreError as exc:
+                return _unavailable(owner_source, f"the dialogue store could not answer: {exc}")
             if matching is None:
                 return _unavailable(
                     owner_source, "named canonical owner row is not readable and no retention-proof text is stored")
@@ -258,15 +259,20 @@ def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str,
         # A missing file reads back as ``{}``: an empty row is no predecessor either.
         if not isinstance(predecessor_row, dict) or not predecessor_row:
             return _unavailable(predecessor, "named predecessor task result is missing or unreadable")
+        from ouroboros.contracts.task_contract import task_input_sources
+        from ouroboros.main_context_authority import project_helper_predecessor_authority
+
         # The pull pointer is written LAST: a projected row field named
         # ``source`` must not clobber the authority route the pull flow and
-        # identity checks depend on.
-        task["predecessor_authority"] = {
+        # identity checks depend on. Every consumer of a predecessor gets the
+        # same compact brief; the predecessor mind's own notes follow the
+        # assignment as a foldable row, and the pointer reads the whole record.
+        task["predecessor_authority"] = project_helper_predecessor_authority({
             **_automatic_predecessor_authority_projection(
                 predecessor_row, predecessor, drive_root=root,
             ),
             "source": dict(predecessor),
-        }
+        }, declared=task_input_sources(task) == "declared")
     else:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
         previous = metadata.get("project_last_task_result")
@@ -711,7 +717,6 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
     from ouroboros.context_budget import (
         CHRONICLE_JOURNAL_WARN_BYTES,
         EVENTS_LOG_WARN_BYTES,
-        PROGRESS_LOG_WARN_BYTES,
         SCHEDULED_TASKS_WARN_BYTES,
         SKILL_REVIEW_ROOT_TASKS_WARN_BYTES,
         SUPERVISOR_LOG_WARN_BYTES,
@@ -722,20 +727,13 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
     rotation_expected = (
         "This log is expected to be rotation-bounded far below this "
         "threshold; rotation is broken or missing — investigate the "
-        "supervisor rotation tick (rotate_chat_log_if_needed pattern)."
+        "supervisor rotation tick (rotate_jsonl_log_if_needed)."
     )
     return (
         ("logs/events.jsonl", EVENTS_LOG_WARN_BYTES, rotation_expected),
         ("logs/tools.jsonl", TOOLS_LOG_WARN_BYTES, rotation_expected),
         ("logs/supervisor.jsonl", SUPERVISOR_LOG_WARN_BYTES, rotation_expected),
         ("logs/task_reflections.jsonl", TASK_REFLECTIONS_LOG_WARN_BYTES, rotation_expected),
-        (
-            "logs/progress.jsonl",
-            PROGRESS_LOG_WARN_BYTES,
-            "progress.jsonl is expected to be rotation-bounded far below this "
-            "threshold; rotation is broken or missing — investigate the "
-            "supervisor rotation tick (rotate_chat_log_if_needed pattern).",
-        ),
         (
             "state/scheduled_tasks.json",
             SCHEDULED_TASKS_WARN_BYTES,

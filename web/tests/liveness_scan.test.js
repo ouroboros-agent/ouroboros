@@ -133,7 +133,7 @@ test('the replay batch no longer bypasses the status reducer', () => {
     const calls = chatSource.match(/setStatus\(/g) || [];
     assert.equal(calls.length, 3);
     assert.match(chatSource, /const derived = deriveChatStatus\(\);\s*setStatus\(derived\);/);
-    assert.match(chatSource, /const seed = computeDerivedChatStatus\(\{ supervisorStarting: !hostReady \}\);\s*if \(ws\.isConnected\?\.\(\)\) setStatus\(seed\);/);
+    assert.match(chatSource, /const seed = computeDerivedChatStatus\(hostStart\.status\(\)\);\s*if \(ws\.isConnected\?\.\(\)\) setStatus\(seed\);/);
     assert.doesNotMatch(chatSource, /setStatus\('online', 'Online'\)/);
     // The reducer still runs unconditionally right after the replay dispatch, so
     // a replayed unfinished foreground card reaches the badge through it.

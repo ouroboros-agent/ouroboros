@@ -51,6 +51,7 @@ SEVERITY_DRIVEN_ITEMS = frozenset({
     "companion_process_safety",
     "extension_namespace_discipline",
     "widget_module_safety",
+    "context_snapshot_discipline",
 })
 
 # Backward-compatible export name for older imports.  New aggregation logic

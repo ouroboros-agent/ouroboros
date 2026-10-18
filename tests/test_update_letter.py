@@ -1089,6 +1089,9 @@ def test_boot_check_writes_the_letter_before_the_readiness_broadcast(monkeypatch
     server._boot_managed_update_tasks()
 
     assert calls == [("letter", "b" * 40), ("update_status_ready", "")]
-    # And at boot the local model server is started BEFORE the check that may need it.
-    source = pathlib.Path(server.__file__).read_text(encoding="utf-8")
+    # And at boot the local model server is started BEFORE the check that may need it (the boot
+    # coordinator's background-services step starts both).
+    from ouroboros import server_boot
+
+    source = pathlib.Path(server_boot.__file__).read_text(encoding="utf-8")
     assert source.index('name="local-model-autostart"') < source.index('name="boot-managed-update"')

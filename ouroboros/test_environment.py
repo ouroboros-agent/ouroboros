@@ -65,6 +65,25 @@ def without_launch_descriptors(env: dict) -> dict[str, str]:
 # safe_test launcher) refuses to delete a tree that contains one: retention is
 # in place, so a surviving process never loses the directory it is writing into.
 RETENTION_MARKER = "OUROBOROS_RETAINED.txt"
+SCRATCH_MARKER = "OUROBOROS_TEST_SCRATCH.txt"
+# Explicit diagnostic destinations accepted by existing test producers. They
+# carry output paths, not provider/configuration or test-selection authority.
+DIAGNOSTIC_OUTPUT_KEYS = (
+    "OUROBOROS_UI_EVIDENCE_DIR", "OUROBOROS_BROWSER_EVIDENCE_OUT",
+    "OUROBOROS_UI_EVIDENCE_OUT", "HISTORY_UI_EVIDENCE_DIR",
+    "OUROBOROS_UI_SCREENSHOT_DIR", "OUROBOROS_PUBLICATION_SCREENSHOTS", "OUROBOROS_CONTAINER_EVIDENCE",
+    "OUROBOROS_UI_SHOTS", "OUROBOROS_UI_SMOKE_SHOT_DIR", "QUIZ_BROWSER_EVIDENCE",
+)
+# Where a run writes, not what it tests: never part of a reusable proof identity.
+OUTPUT_LOCATION_KEYS = ("OUROBOROS_TEST_TEMP_ROOT", "OUROBOROS_TEST_EVIDENCE_ROOT", *DIAGNOSTIC_OUTPUT_KEYS)
+
+
+def declare_scratch(root, role: str) -> None:
+    """A fresh producer declares reproducibility, never liveness or deletion authority."""
+    if role not in {"pytest-session", "pytest-basetemp"}:
+        raise ValueError(f"unknown test scratch role: {role}")
+    with (Path(root) / SCRATCH_MARKER).open("x", encoding="utf-8") as stream:
+        stream.write(role + "\n")
 
 
 def retain_tree(root, reason: str) -> bool:
@@ -86,6 +105,18 @@ def retention_markers(root) -> list[Path]:
         if RETENTION_MARKER in files:
             found.append(Path(directory) / RETENTION_MARKER)
     return found
+
+
+def retain_diagnostic_outputs(root, env, *, cwd=None) -> None:
+    """An explicit output inside this owner's scratch keeps that tree, not a dangling path."""
+    root = Path(root).resolve()
+    child_cwd = Path(cwd or Path.cwd())
+    for key in DIAGNOSTIC_OUTPUT_KEYS:
+        value = env.get(key)
+        if value and (child_cwd / value).resolve().is_relative_to(root):
+            if not retain_tree(root, f"explicit diagnostic destination inside scratch: {key}"):
+                raise OSError(f"cannot retain selected diagnostic destination: {root}")
+            return
 
 
 def isolated_environment(root: Path, repo: Path, *, source=None, keep=(), create=True) -> dict[str, str]:

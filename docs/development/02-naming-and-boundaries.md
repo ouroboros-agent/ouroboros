@@ -89,8 +89,7 @@ competes with the task for context. It carries identity and tone, the decision l
 cross-tool policy, prohibitions and safety invariants stated once, and the memory
 contract's resident rule: active summaries stay in the whole index (people's in its outline too), archived sources remain
 addressable and explicitly listable (ARCHITECTURE §6 "Durable memory and project focus").
-A missing carrier stays a visible gap. Load-bearing floor rules stay in its preamble, the part
-overflow compaction keeps (ARCHITECTURE §6 "Context fitting, retry, and compaction").
+A missing carrier stays a visible gap.
 It never carries how a tool works: parameters, recipes, typed outcomes and "when to
 choose it" belong to the `get_tools()` schemas selected for the acting profile, so a prompt sentence
 about a schema is a drifting second copy and a new tool
@@ -181,7 +180,14 @@ Equivalent historical prose stays review-only under CHECKLISTS item 5.
 
 ### Current state first (ARCHITECTURE invariant 10)
 
-Apply ARCHITECTURE §10 invariant 10; enforcement: "Invariant: Projection over replay (hot readers of growing stores)" below.
+Apply ARCHITECTURE §10 invariant 10 (enforcement: 03 "Projection over replay"). Store transactions
+lease the shared core's per-thread connection, capture rows and end before decoding or external
+work; fork only outside them; lifecycle code quiesces users and calls `store.prepare_handoff`
+before renaming a database or handing it to an older runtime, name-tier callers holding their
+name lock (`tests/test_store_connections.py`, `tests/test_store.py`; the WAL gate both ways, FULL
+unchanged: `tests/test_store_journal.py`). Once per process is not once per installation: an
+installation fact is a durable row, and history-sized work is a named job of the maintenance
+child (`ouroboros/maintenance.py`).
 
 ### Generality and emergence (P13)
 

@@ -145,8 +145,10 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # registered materials and retention after task end. Only ask's validator requires
     # question. The exact hash below pins their union; parameter types/defaults and
     # required keys outside escalate, all other schemas and handler owners stay intact.
+    # Published question lifecycle wording changes only escalate's description and
+    # question_task_id description; the parameters and all other catalog entries remain identical.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "5db47ba14469af3dceea9d20a40257f7eccb4599b047f879e7f691bfdd856cdf"
+        "6d10eac1e0a9a6fd0c90e4f98044da5b44212ec33618ea2925f9d7918f15b749"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

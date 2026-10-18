@@ -208,6 +208,18 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             _handle_send_message(row, ctx)
             return
         delivery_id = str(evt.get("delivery_id") or "")
+        if delivery_id and not evt.get("is_progress"):
+            from supervisor.terminal_delivery import TERMINAL_MESSAGE_ID
+
+            # The task's own answer (or Stop/cascade receipt) is handed off BEFORE this send
+            # and before the worker's slow result store: post-answer work stays alive but no
+            # longer prepares a reply (DESIGN §9, Telegram typing). A copy suppressed below
+            # was handed off by its first copy.
+            match = TERMINAL_MESSAGE_ID.fullmatch(delivery_id)
+            if match is not None and match.group("task") == str(evt.get("task_id") or ""):
+                from supervisor.active_activity import mark_reply_handed_off
+
+                mark_reply_handed_off(match.group("task"), getattr(ctx, "RUNNING", None))
         publication_token = str(evt.get("terminal_projection_token") or "")
         if publication_token:
             from ouroboros.terminal_projection import main_delivery_current

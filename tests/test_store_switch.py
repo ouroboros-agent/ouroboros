@@ -43,7 +43,7 @@ def target_repo(tmp_path):
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "old")
     old = git(repo, "rev-parse", "HEAD")
-    for name in ("store.py", "usage_store.py"):
+    for name in ("store.py", "usage_store.py", "dialogue_store.py"):
         (repo / "ouroboros" / name).write_text("# new\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "new")
@@ -105,8 +105,8 @@ def test_the_intent_is_write_once_and_typed(tmp_path):
 
 def test_needs_and_the_engine_pin_come_from_the_target_tree(target_repo):
     repo, old, new = target_repo
-    assert store_switch.switch_needs(repo, old) == {"facts": True, "money": True, "handles": True}
-    assert store_switch.switch_needs(repo, new) == {"facts": False, "money": False, "handles": True}
+    assert store_switch.switch_needs(repo, old) == {"facts": True, "money": True, "handles": True, "dialogue": True}
+    assert store_switch.switch_needs(repo, new) == {"facts": False, "money": False, "handles": True, "dialogue": False}
     pin = store_switch.next_engine_pin(repo, old)
     assert pin is not None and pin.version == json.loads(
         (REPO / "ouroboros" / "claudexor_runtime_pin.json").read_text(encoding="utf-8"))["release"]["version"]
@@ -197,11 +197,12 @@ def test_the_seam_exports_consumes_the_intent_retires_the_store_and_only_then_sw
     assert seen["journal"] is True and seen["receipt"]["export"]["status"] == "completed"
     assert seen["receipt"]["steps"]["money"]["status"] == "completed"
     assert seen["receipt"]["steps"]["handles"] == {"status": "no_packs", "handles": 0, "bytes": 0, "packs": 0}
+    assert seen["receipt"]["steps"]["dialogue"] == {}, "the export step ran; this fixture root holds no dialogue store"
     assert len(seen["retired_facts"]) == 1 and len(seen["retired_money"]) == 1
     assert snapshot(root) == expected  # the files the old body reads are the ones the store imported
     assert receipt(root)["switched"]["ok"] is True
     phases = [row["phase"] for row in rows(root / "logs" / "supervisor.jsonl", "storage_switch")]
-    assert phases == ["preflight", "exporting", "money", "handles", "switching", "switched"]
+    assert phases == ["preflight", "exporting", "money", "handles", "dialogue", "switching", "switched"]
     assert json.loads((root / store_switch.PROGRESS_REL).read_text(encoding="utf-8"))["phase"] == "switched"
     assert store_switch.resume_pending_switch(root, repo_dir=repo) == {"status": "nothing_pending"}
     # the child drive's store and its own child's were retired with the canonical one

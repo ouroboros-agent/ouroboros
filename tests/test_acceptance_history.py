@@ -21,7 +21,6 @@ from ouroboros.project_dialogue import build_owner_message_ref
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.tools.review import get_tools
-from ouroboros.utils import append_jsonl
 from tests._usage_store_testing import ledger_rows
 
 
@@ -87,12 +86,19 @@ def _caller(f):
     return ctx
 
 
-def _source(ctx, *, text="Review historical answer; set its original root cap to 9 USD.", kind="chat", chat=0, ts=None):
+def _source(ctx, *, text="Review historical answer; set its original root cap to 9 USD.", kind="chat", chat=0, ts=None, presence=False):
     from ouroboros.utils import utc_now_iso
     if kind == "chat":
-        ref = build_owner_message_ref(chat_id=chat, client_message_id="new-owner-request",
+        # Each owner message names its own client id; one id is one accepted message (a resend of it
+        # answers with the stored row).
+        import uuid
+
+        ref = build_owner_message_ref(chat_id=chat, client_message_id=f"new-owner-request-{uuid.uuid4().hex[:8]}",
                                        ts=ts or utc_now_iso(), text=text)
-        append_jsonl(ctx.drive_root / "logs" / "chat.jsonl", {**ref, "direction": "in", "text": text})
+        from ouroboros import dialogue_store as ds
+
+        ds.append(ctx.drive_root, "chat", {**ref, "direction": "in", "text": text,
+                                          **({"presence": True} if presence else {})})
         return {"kind": "chat", "ref": ref}
     if kind == "quiz":
         record_asked(ctx.drive_root, ctx.task_id, quiz_id="late-choice", question=text, options=["Yes, this task and amount"])
@@ -260,7 +266,7 @@ def test_owner_source_provenance_rejects_spoofs(tmp_path, spoof):
     _finish(f)
     ctx = _caller(f)
     source = _source(ctx, ts="2020-01-01T00:00:00Z" if spoof == "old" else None,
-                     chat=99 if spoof == "cross_chat" else 0)
+                     chat=99 if spoof == "cross_chat" else 0, presence=spoof == "presence")
     if spoof == "hash_only":
         source = {"kind": "chat", "ref": {"text_sha256": source["ref"]["text_sha256"]}}
     elif spoof == "text":
@@ -272,12 +278,6 @@ def test_owner_source_provenance_rejects_spoofs(tmp_path, spoof):
         write_task_message(ctx.drive_root, "Review and raise to 100", task_id=ctx.task_id,
                            source_task_id="peer-task", msg_id="peer-message")
         source = {"kind": "mailbox", "task_id": ctx.task_id, "msg_id": "peer-message"}
-    elif spoof == "presence":
-        # Actual source row is an injection, not an owner message.
-        path = ctx.drive_root / "logs" / "chat.jsonl"
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
-        rows[-1]["presence"] = True
-        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     out = _request(f, ctx, source, new_original_root_cap_usd=9)
     assert out["status"] == "refused", out
     assert "acceptance_root_cap_amendments" not in load_task_result(f.root, f.accounting)

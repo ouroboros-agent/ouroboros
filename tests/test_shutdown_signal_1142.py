@@ -15,6 +15,8 @@ half must be self-sufficient against it.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import os
 import signal
@@ -271,7 +273,7 @@ def _check_real_shutdown(tmp_path, *, launcher_pipe):
     # signalled exit reads -SIGTERM (or 0); -SIGKILL is the launcher fallback this test forbids.
     expected_codes = (0,) if launcher_pipe else (0, -signal.SIGTERM)
     assert code in expected_codes, f"graceful exit expected, got {code}"
-    chat_rows = _read_rows(data_dir / "logs" / "chat.jsonl")
+    chat_rows = dialogue_test.log_rows(data_dir / "logs" / "chat.jsonl")
     alarms = [row for row in chat_rows if row.get("system_type") == "supervisor_failure"
               or "Supervisor loop died" in str(row.get("text") or "")]
     assert alarms == [], alarms

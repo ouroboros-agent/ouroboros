@@ -9,7 +9,6 @@ import functools
 import hashlib
 import json
 import logging
-import os
 import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -46,7 +45,7 @@ from ouroboros.task_results import (
     load_task_result,
     task_results_dir,
 )
-from ouroboros.utils import append_jsonl, atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
+from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
 from ouroboros.store import StoreError
 
 log = logging.getLogger(__name__)
@@ -552,13 +551,17 @@ def _write_unresolved_notice(drive_root: Path, task_id: str) -> None:
 
 
 def _live_task_rows(drive_root: Path, task_id: str, conversation_key: str) -> list[dict[str, Any]]:
-    """This task's rows in the live chat generation, in order; an attempt starts with its inbound row.
+    """This task's chat rows (the dialogue store's task probe), in order; an attempt starts with
+    its inbound row.
 
     A receipt addressed to another conversation (a tool send elsewhere) is not this conversation's
     delivery, however similar its text, so only receipts carrying this key are kept.
     """
+    from ouroboros import dialogue_store
+
     rows = []
-    for row in iter_jsonl_objects(Path(drive_root) / "logs" / "chat.jsonl"):
+    for stored in dialogue_store.task_rows(Path(drive_root), [task_id], stream="chat"):
+        row = stored.row
         if row.get("task_id") != task_id:
             continue
         transport = row.get("transport") if isinstance(row.get("transport"), Mapping) else {}
@@ -573,11 +576,10 @@ def _turn_sends(rows: Sequence[Mapping[str, Any]], own_start: int = 0,
     """``(confirmed v1 sends or None, parts whose latest receipt is uncertain)`` among *rows*.
 
     A later receipt for a part settles an earlier one. An attempt's rows follow its inbound row, so
-    that row in the live file means every receipt is there too and the whole task counts. Without
-    it a rotated archive may hold receipts: the sends are unknown (None), not zero, unless the
-    caller vouches that this execution's own rows (``own_start`` onwards) all landed in the
-    generation that was live when it started (``same_generation``); a rotation during the execution
-    leaves them unknown. Uncertain parts are neither confirmed nor refused, so they may have landed.
+    that row means every receipt is there too and the whole task counts. Without it the attempt's
+    trace is incomplete: the sends are unknown (None), not zero, unless the caller vouches that
+    this execution's own rows (``own_start`` onwards) all landed (``same_generation``). Uncertain
+    parts are neither confirmed nor refused, so they may have landed.
     """
     if any(row.get("direction") == "in" for row in rows):
         own_start = 0
@@ -784,10 +786,13 @@ def _log_dialogue(
     task: Mapping[str, Any],
     task_id: str,
     speaker: Mapping[str, Any] | None = None,
+    client_message_id: str = "",
 ) -> None:
     """Append one Presence dialogue row. ``speaker`` names who spoke when it is not the
     event's actor (a live call's correspondent utterance); the event identity stays the
-    turn's own, so a later replay of the same event still recognizes its rows."""
+    turn's own, so a later replay of the same event still recognizes its rows.
+    ``client_message_id`` names a row other than the event's own inbound row: the store
+    keeps one inbound row per name, so each utterance of a call carries its own."""
     from types import SimpleNamespace
     from ouroboros import chat_chain
     from ouroboros.dialogue_provenance import presence_provenance_from_task
@@ -805,7 +810,7 @@ def _log_dialogue(
         "source": f"presence:{event.provider}",
         "sender_label": str(actor.get("display_name") or actor.get("username") or ""),
         "sender_session_id": str(actor.get("platform_actor_id") or actor.get("id") or ""),
-        "client_message_id": event.source_event_id,
+        "client_message_id": client_message_id or event.source_event_id,
         "presence_event_identity": presence_event_identity(str(task["metadata"]["presence"]["binding_id"]), event),
         "transport": {
             "provider": event.provider,
@@ -829,13 +834,14 @@ def _log_dialogue(
         row["context_source_ref"] = chat_chain.retain_memory_source(
             SimpleNamespace(drive_root=drive_root, task_id=task_id), "presence-event",
             json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"), "json")
-    written = append_jsonl(
-        drive_root / "logs" / "chat.jsonl", obj=row,
-        ensure_record_boundary=(direction == "in"),  # a re-run never re-logs: this row must be parseable
-    )
-    if direction == "in" and written is False:
-        # A re-run of a lost attempt relies on the inbound row having landed (it never re-logs), so
-        # a turn whose row cannot be written fails here, before the model runs; the transport retries.
+    from ouroboros import dialogue_store
+
+    # An inbound row is a named acceptance (its source event id): a re-run that logs again rejoins
+    # the row it landed, never a second one.
+    written = dialogue_store.append_quietly(drive_root, "chat", row)
+    if direction == "in" and written is None:
+        # A re-run of a lost attempt relies on the inbound row having landed, so a turn whose row
+        # cannot be written fails here, before the model runs; the transport retries.
         raise PresenceTurnError("chat_log_unwritable", "chat")
 
 
@@ -1055,14 +1061,6 @@ def run_presence_turn(
             # positively pre-thread failure wrote no running row and reaches the normal path;
             # a later canonical terminal result wins the cached-replay check above.
             raise _refused_turn(Path(drive_root), task_id, stored, "presence_attempt_outcome_unknown")
-        def chat_generation() -> tuple[int, int] | None:  # rotation renames the live file: a new inode
-            try:
-                stat = os.stat(Path(drive_root) / "logs" / "chat.jsonl")
-            except OSError:
-                return None
-            return (stat.st_dev, stat.st_ino)
-
-        generation = chat_generation()  # the live file this execution's rows land in, read before the rows
         prior_rows = _live_task_rows(Path(drive_root), task_id, event.conversation_key)
         for prior in prior_rows:
             if prior.get("direction") == "in" and prior.get("presence_event_identity") not in (None, identity):
@@ -1086,8 +1084,6 @@ def run_presence_turn(
         if (task_id == _task_id(admission, event)
                 and not any(row.get("direction") == "in" for row in prior_rows)):
             log_dialogue(direction="in", user_id=actor_id, text=event.text or task["text"])
-        if generation is None:  # the inbound log just created the live file: that is this execution's generation
-            generation = chat_generation()
         if agent_factory is None:
             from ouroboros.agent import make_agent
 
@@ -1156,7 +1152,7 @@ def run_presence_turn(
         sends: list[str] | None = []
         if event.delivery_reporting_version:
             sends = _turn_sends(_live_task_rows(Path(drive_root), task_id, event.conversation_key), own_start,
-                                same_generation=generation is None or chat_generation() == generation)[0]
+                                same_generation=True)[0]  # the store holds every row this execution wrote
         outcome, message = _pointer_speech(terminal, result.outcome, str(row.get("message") or result.text))
         _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=outcome, message=message,
                              sends=sends or [], work_ref=result.work_ref, finished_at=utc_now_iso(),

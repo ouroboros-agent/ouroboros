@@ -22,9 +22,11 @@ _TXN_SET_ARG = {"put_row", "set_rows", "delete_row", "get_row", "replace_set"}  
 _MODULE_SET_ARG = {"add", "remove", "members", "members_in", "result_rows"}  # obligations: (root|txn, name, ...)
 _MARKER = re.compile(r"\.(?:put_row|set_rows|delete_row|get_row|replace_set)\(|^\s*(?:from|import)\s.*\bobligations\b", re.M)
 # These pass a caller's set name through or copy every set (import/export); their callers are enumerated.
-_FORWARDERS = {("ouroboros/obligations.py", name) for name in ("members_in", "members", "add", "remove", "result_rows")} | {
+_FORWARDERS = {("ouroboros/obligations.py", name) for name in ("members_in", "members", "add", "remove", "result_rows",
+                                                                  "__init__")} | {  # __init__: DutyRest reads a caller's set
     ("ouroboros/evidence_packs.py", "settlement_obligations"), ("ouroboros/store_import.py", "_reconcile_sets"),
-    ("ouroboros/store_import.py", "_build"), ("ouroboros/store_import.py", "export_facts")}
+    ("ouroboros/store_import.py", "_build"), ("ouroboros/store_import.py", "export_facts"),
+    ("ouroboros/store.py", "replace_set")}  # Txn.replace_set writes its caller's set row by row (request sets)
 
 
 def _own(scope):
@@ -38,47 +40,95 @@ def _own(scope):
 
 
 def _constants(tree) -> dict:
-    return {node.targets[0].id: node.value.value for node in tree.body
-            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)}
+    """Module-level string constants and tuples/lists of strings, each as the list of its values."""
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            items = node.value.elts if isinstance(node.value, (ast.Tuple, ast.List)) else [node.value]
+            if items and all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in items):
+                out[node.targets[0].id] = [item.value for item in items]
+    return out
 
 
 def _set_name_sites(sources: dict, constants_of):
-    """Every set name an obligations call site reaches (literals, module constants, imported constants,
-    loop tuples, f-strings over them); unresolvable sites outside the declared forwarders."""
+    """Every set name an obligations call site reaches (literals, module constants and tuples, imported constants,
+    a module's constants through its alias, f-strings over them, a local name's assignments, and a loop variable
+    through the innermost loop that binds it, unpacked by position); unresolvable sites outside the forwarders."""
     names, unresolved, forwarders = {}, [], set()
     for rel, tree in sources.items():
-        own, modules, functions, imported = _constants(tree), set(), set(_MODULE_SET_ARG) if rel == "ouroboros/obligations.py" else set(), {}
+        own, modules, functions, imported, aliases = _constants(tree), set(), set(_MODULE_SET_ARG) if rel == "ouroboros/obligations.py" else set(), {}, {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == "ouroboros":
                 modules |= {a.asname or a.name for a in node.names if a.name == "obligations"}
+                aliases.update({a.asname or a.name: f"ouroboros/{a.name}.py" for a in node.names})
             elif isinstance(node, ast.ImportFrom) and node.module == "ouroboros.obligations":
                 functions |= {a.asname or a.name for a in node.names if a.name in _MODULE_SET_ARG}
             elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("ouroboros."):
                 source = constants_of(node.module.replace(".", "/") + ".py")
                 imported.update({a.asname or a.name: source[a.name] for a in node.names if a.name in source})
         for scope in [tree, *(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))]:
-            loops = {node.target.id: [e.value for e in node.iter.elts] for node in _own(scope)
-                     if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and isinstance(node.iter, (ast.Tuple, ast.List))
-                     and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in node.iter.elts)}
+            nodes = list(_own(scope))
+            parent = {child: node for node in [scope, *nodes] for child in ast.iter_child_nodes(node)}
+            params = {a.arg for a in ast.walk(scope.args) if isinstance(a, ast.arg)} if scope is not tree else set()
+            resolving = set()  # the local names being resolved through their assignments (a cycle is not static)
 
-            def resolve(arg):
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    return [arg.value]
-                if isinstance(arg, ast.Name):
-                    found = loops.get(arg.id) or ([own[arg.id]] if arg.id in own else None)
-                    return found or ([imported[arg.id]] if arg.id in imported else None)
-                if isinstance(arg, ast.JoinedStr):
+            def values(expr, at):
+                """The strings EXPR can hold where node AT evaluates it; ``None`` when that is not static."""
+                if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+                    return [expr.value]
+                parts = None
+                if isinstance(expr, (ast.Tuple, ast.List)):
+                    parts = [values(item, at) for item in expr.elts]
+                elif isinstance(expr, ast.IfExp):
+                    parts = [values(expr.body, at), values(expr.orelse, at)]
+                elif isinstance(expr, ast.Subscript):  # an item or a slice of a known tuple: within its values
+                    return values(expr.value, at)
+                elif isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name) and expr.value.id in aliases:
+                    return constants_of(aliases[expr.value.id]).get(expr.attr)
+                elif isinstance(expr, ast.Name):
+                    return bound(expr.id, at)
+                elif isinstance(expr, ast.JoinedStr):
                     out = [""]
-                    for part in arg.values:
-                        pieces = [part.value] if isinstance(part, ast.Constant) else resolve(part.value)
+                    for part in expr.values:
+                        pieces = [part.value] if isinstance(part, ast.Constant) else values(part.value, at)
                         if pieces is None:
                             return None
                         out = [head + piece for head in out for piece in pieces]
                     return out
-                return None
+                return None if parts is None or None in parts else [value for part in parts for value in part]
 
-            for call in (n for n in _own(scope) if isinstance(n, ast.Call)):
+            def bound(name, at):
+                """A loop variable through its innermost loop, else the scope's assignments, else a module constant."""
+                if name in resolving:
+                    return None
+                node = at
+                while node in parent:
+                    node = parent[node]
+                    target = getattr(node, "target", None) if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) else None
+                    if isinstance(target, ast.Name) and target.id == name:
+                        return values(node.iter, node)
+                    if isinstance(target, (ast.Tuple, ast.List)):
+                        slots = [i for i, elt in enumerate(target.elts) if isinstance(elt, ast.Name) and elt.id == name]
+                        if slots:
+                            rows = node.iter.elts if isinstance(node.iter, (ast.Tuple, ast.List)) else None
+                            if rows is None or not all(isinstance(row, (ast.Tuple, ast.List)) and len(row.elts) == len(target.elts)
+                                                       for row in rows):
+                                return None
+                            return values(ast.Tuple(elts=[row.elts[slots[0]] for row in rows]), node)
+                if name in params:
+                    return None  # the caller's value: a forwarder
+                assigned = [node.value for node in nodes if isinstance(node, ast.Assign)
+                            and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)]
+                if assigned:
+                    resolving.add(name)
+                    try:
+                        found = [values(value, value) for value in assigned]
+                    finally:
+                        resolving.discard(name)
+                    return None if None in found else [value for part in found for value in part]
+                return own.get(name) or imported.get(name)
+
+            for call in (n for n in nodes if isinstance(n, ast.Call)):
                 func, index = call.func, None
                 if isinstance(func, ast.Attribute) and func.attr in _TXN_SET_ARG:
                     index = 0
@@ -87,7 +137,7 @@ def _set_name_sites(sources: dict, constants_of):
                     index = 1
                 if index is None:
                     continue
-                resolved = resolve(call.args[index]) if len(call.args) > index else None
+                resolved = values(call.args[index], call) if len(call.args) > index else None
                 if resolved is not None:
                     for name in resolved:
                         names.setdefault(name, set()).add(f"{rel}:{call.lineno}")
@@ -126,16 +176,29 @@ def test_every_set_name_a_writer_can_reach_is_exactly_one_duty_or_record():
     names, unresolved, forwarders = _set_name_sites(*_repo_sources())
     assert unresolved == [], "resolve the set name or declare the forwarder"
     assert forwarders == _FORWARDERS  # the allowance never outlives its code
-    # Constant-routed (WITNESS_SET) and generated (f"custody_{name}") names are reached, not only literals.
-    assert {"local_custody_witnesses", "upgrade_notices", "pause_notice_receipts",
-            "custody_marks", "custody_refused", "custody_open", "pending_drives", "unknowns"} <= set(names)
+    # Constant-routed (WITNESS_SET), module-routed (inv.EVENTS) and generated (f"custody_{name}") names are
+    # reached, not only literals.
+    assert {"local_custody_witnesses", "upgrade_notices", "pause_notice_receipts", "custody_marks", "custody_refused",
+            "custody_open", "pending_drives", "unknowns", "custody_invocations", "custody_operation_invocations",
+            "custody_event_ordinals"} <= set(names)
     assert _unclassified(set(names) | set(obligations.BOOT_SETS)) == set()
-    # The guard fires: a new set reached through a literal or a constant is unclassified.
+    # The guard fires: a new set reached through a literal, a constant, another module's constant through its
+    # alias, or a tuple a local picks from is unclassified; a loop variable names only its own loop's values;
+    # a caller's set name stays unresolved outside the declared forwarders.
     probe = {"ouroboros/new_owner.py": ast.parse(
-        "from ouroboros import obligations\nNEW = 'fresh_constant_set'\n"
-        "def write(root):\n    obligations.add(root, 'fresh_literal_set', 'id')\n    obligations.add(root, NEW, 'id')\n")}
-    probe_names, probe_unresolved, _ = _set_name_sites(probe, lambda rel: {})
-    assert _unclassified(probe_names) == {"fresh_literal_set", "fresh_constant_set"} and probe_unresolved == []
+        "from ouroboros import obligations, other as alias\nNEW = 'fresh_constant_set'\nPAIR = ('fresh_a', 'fresh_b')\n"
+        "def write(root, txn, rows, both, caller_set):\n"
+        "    obligations.add(root, 'fresh_literal_set', 'id')\n    obligations.add(root, NEW, 'id')\n"
+        "    for name in ('custody_marks',):\n        obligations.add(root, name, 'id')\n"
+        "    for name, row in ((alias.ATTR, rows),):\n        obligations.add(root, name, 'id')\n"
+        "    picked = PAIR if both else PAIR[:1]\n    for name in picked:\n        txn.set_rows(name)\n"
+        "    txn.put_row(caller_set, 'id', {})\n")}
+    probe_names, probe_unresolved, _ = _set_name_sites(
+        probe, lambda rel: {"ATTR": ["fresh_attr_set"]} if rel == "ouroboros/other.py" else {})
+    assert _unclassified(probe_names) == {"fresh_literal_set", "fresh_constant_set", "fresh_attr_set", "fresh_a", "fresh_b"}
+    assert probe_names["custody_marks"] == {"ouroboros/new_owner.py:8"}  # never the next loop's variable
+    assert probe_names["fresh_attr_set"] == {"ouroboros/new_owner.py:10"}
+    assert probe_unresolved == ["ouroboros/new_owner.py:14 txn.put_row(caller_set, 'id', {})"]
 
 
 def test_every_set_the_real_producers_store_is_classified(root):
@@ -164,7 +227,8 @@ def test_every_set_the_real_producers_store_is_classified(root):
     with store.open_store(root, write=False) as txn:
         names |= set(txn.set_names())
     assert {"custody_open", "custody_refused", "custody_marks", "delegated_runs", "upgrade_notices",
-            "pause_notice_receipts", "local_custody_witnesses", "pending_drives"} <= names
+            "pause_notice_receipts", "local_custody_witnesses", "pending_drives", "custody_invocations",
+            "custody_operation_invocations", "custody_event_ordinals"} <= names
     assert _unclassified(names) == set()
 
 
@@ -179,6 +243,25 @@ def test_a_record_row_never_blocks_settlement_but_a_duty_row_does(root, record):
     obligations.add(root, record, "owed", {"task_id": "owed"})
     assert not packs.task_settled(root, "owed") and packer.run_pass(root)["packed"] == 0
     assert pathlib.Path(refs[0]["path"]).exists()
+
+
+def test_an_answered_delegated_start_settles_its_task_beside_the_invocation_records(root):
+    """The custody reducer keeps an invocation's first request (naming its task), the operation's first request
+    and each event's order as kept facts: once the start is answered they hold nothing, and the task packs.
+    While the request is open, ``custody_open`` owes it."""
+    from ouroboros import delegate_custody as custody
+
+    refs, _ = _task(root, "asker", blobs=1)
+    assert custody.emit(root, custody.START_REQUESTED, {"invocation_id": "inv-1", "operation_id": "op-1",
+                                                        "slot_id": "slot-1", "task_id": "asker", "root_task_id": "asker"})
+    assert not packs.task_settled(root, "asker") and packer.run_pass(root)["packed"] == 0
+    assert custody.emit(root, custody.START_FAILED, {"invocation_id": "inv-1", "task_id": "asker", "definite": True})
+    with store.open_store(root, write=False) as txn:
+        assert txn.get_row("custody_open", "invocation:inv-1") is None
+        assert txn.get_row("custody_invocations", "inv-1")["request"]["task_id"] == "asker"
+        assert {"custody_operation_invocations", "custody_event_ordinals"} <= set(txn.set_names())
+    assert packs.task_settled(root, "asker")
+    assert packer.run_pass(root)["packed"] == 1 and not pathlib.Path(refs[0]["path"]).exists()
 
 
 UNDECLARED = "future_body_duty"  # declared in neither tuple: an older or newer body's own duty
@@ -256,20 +339,21 @@ def test_an_undeclared_duty_arriving_before_the_unlink_keeps_every_loose_file(ro
 def test_census_reads_the_store_once_for_every_loose_task(root, monkeypatch):
     for number in range(24):
         _task(root, f"t{number}", blobs=1, status="running" if number % 2 else "completed")
-    opened, original = [], store.connect
+    # A store transaction leases this thread's persistent connection: count the leases, not the connects.
+    leased, original = [], store.connection
 
-    def connect(path, *args, **kwargs):
+    def connection(path, *args, **kwargs):
         if pathlib.Path(path) == store.store_path(root):
-            opened.append(path)
+            leased.append(path)
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(store, "connect", connect)
+    monkeypatch.setattr(store, "connection", connection)
     assert len(packer.changed_tasks(root)) == 24
-    assert len(opened) == 1  # one short read for every row and duty, not one per task
+    assert len(leased) == 1  # one short read for every row and duty, not one per task
     with packer.pack_sweep(root) as sweep:
-        opened.clear()
+        leased.clear()
         assert len(packer.changed_stamps(root, obligation_rows=sweep.duties, external=sweep.external, seqs=sweep.seqs)) == 24
-    assert opened == []  # the child census reuses the sweep's baseline read
+    assert leased == []  # the child census reuses the sweep's baseline read
 
 
 @pytest.mark.parametrize("operation", ["changed_tasks", "run_pass"])

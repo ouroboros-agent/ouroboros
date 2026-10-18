@@ -24,6 +24,7 @@ WORKERS_ENV = "OUROBOROS_PREFLIGHT_TEST_WORKERS"
 class MemorySnapshot:
     total_bytes: int
     available_bytes: int
+    pressure: bool = False  # the kernel itself reports memory pressure (macOS)
 
 
 def _native_output(argv: Sequence[str]) -> str:
@@ -32,8 +33,21 @@ def _native_output(argv: Sequence[str]) -> str:
                           encoding="utf-8", timeout=2).stdout
 
 
+def _darwin_pressure() -> bool:
+    """The kernel's own critical verdict (levels: 1 normal, 2 warn, 4 critical). Free + inactive
+    + speculative barely moves under pressure: XNU keeps refilling the inactive queue with
+    anonymous pages that it then compresses. Warn is routine on a busy 8 GB Mac running a
+    healthy battery, so only critical counts. An unreadable level reads as normal, silently;
+    the free-memory reading still applies."""
+    try:
+        return int(_native_output(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip()) >= 4
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def physical_memory() -> Optional[MemorySnapshot]:
     """Read total and reclaimable physical memory using native OS facilities."""
+    pressure = False
     try:
         if sys.platform == "win32":
             import psutil  # The packaged Windows runtime includes psutil.
@@ -45,10 +59,12 @@ def physical_memory() -> Optional[MemorySnapshot]:
             page_size = int(re.search(r"page size of (\d+) bytes", vm).group(1))
             pages = {name.strip(): int(value.strip().rstrip("."))
                      for name, value in (line.split(":", 1) for line in vm.splitlines()[1:] if ":" in line)}
-            # Inactive/file-backed memory is reclaimable. Purgeable is already
-            # included in active/inactive, so counting it again overstates room.
+            # Admission counts inactive pages as room, anonymous ones included, which
+            # overstates it under pressure; the overload stop also reads the kernel's
+            # verdict. Purgeable is already inside active/inactive, so it is not added.
             available = page_size * sum(pages[name] for name in
                                         ("Pages free", "Pages inactive", "Pages speculative"))
+            pressure = _darwin_pressure()
         elif sys.platform.startswith("linux"):
             fields = {name: int(value.split()[0]) * 1024 for name, value in
                       (line.split(":", 1) for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines())}
@@ -69,7 +85,7 @@ def physical_memory() -> Optional[MemorySnapshot]:
             return None
         if total <= 0 or available < 0:
             return None
-        return MemorySnapshot(total, min(total, available))
+        return MemorySnapshot(total, min(total, available), pressure)
     except (OSError, ValueError, KeyError, AttributeError, ImportError, subprocess.SubprocessError):
         return None
 

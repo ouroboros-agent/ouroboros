@@ -18,6 +18,8 @@ Playwright emulation, not the native PyWebView shell or a physical phone; no rea
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import hashlib
 import importlib.util
@@ -76,9 +78,7 @@ def _phone(browser, engine: str):
 
 def _rows(data: Path) -> list[dict]:
     chat = data / "logs" / "chat.jsonl"
-    if not chat.exists():
-        return []
-    return [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return dialogue_test.log_rows(chat)
 
 
 def _inbound(data: Path) -> list[dict]:

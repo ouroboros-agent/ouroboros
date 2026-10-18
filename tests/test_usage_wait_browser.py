@@ -7,11 +7,9 @@ their production code against isolated files; there is no supervisor process.
 from __future__ import annotations
 
 import json
-import os
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -28,6 +26,7 @@ from ouroboros.model_wait import task_model_wait_scope
 from ouroboros.task_results import write_task_result
 from ouroboros.utils import append_jsonl
 from supervisor.events_worker_reports import _handle_log_event
+from tests._shared import producer_evidence_dir
 from tests.test_subscription_setup_browser import subscription_ui as subscription_ui, capture
 from tests.test_usage_lock_continuity import held_lock
 from tests._usage_store_testing import request, root as root
@@ -35,10 +34,10 @@ from tests._usage_store_testing import request, root as root
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 
 
-def test_two_native_accounting_waits_in_chat_logs_and_reload(subscription_ui, root, monkeypatch):
+def test_two_native_accounting_waits_in_chat_logs_and_reload(subscription_ui, root, monkeypatch, tmp_path):
     ui, task = subscription_ui, "accounting-wait-task"
     page, events, sockets, published = ui["page"], queue.Queue(), [], []
-    evidence = Path(os.environ["OUROBOROS_TEST_TEMP_ROOT"]) / "usage-wait-browser"
+    evidence = producer_evidence_dir(tmp_path / "usage-wait-browser", "usage-wait")
     monkeypatch.setenv("OUROBOROS_UI_EVIDENCE_DIR", str(evidence))
     task_row = {"id": task, "chat_id": 1, "type": "task", "objective": "Check accounting access"}
     write_task_result(root, task, "running", result="", chat_id=1)

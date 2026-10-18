@@ -121,38 +121,15 @@ def write_workspace_patch_artifacts(
     untracked = [rel for rel in untracked if rel not in file_baseline]
     # v6.52.2: exclude declared ephemeral scratch (run_command/run_script `scratch=[...]`) so a
     # throwaway verification file the agent forgot to delete never leaks into the workspace patch.
-    # The manifest stores {abs_path: sha256}; a file is excluded ONLY while its CURRENT content
-    # still matches the recorded scratch sha — so a LATER real file written to the same path
-    # (different content) is NOT dropped. Empty/absent/mismatched => included (no regression).
-    scratch_sha_by_rel: dict = {}
-    scratch_sha_by_abs: dict = {}
-    try:
-        _scratch_map = json.loads((artifact_dir / SCRATCH_MANIFEST_NAME).read_text(encoding="utf-8")).get("scratch")
-        if isinstance(_scratch_map, dict):
-            for _abs, _sha in _scratch_map.items():
-                try:
-                    _resolved = pathlib.Path(str(_abs)).resolve(strict=False)
-                    scratch_sha_by_abs[os.path.normcase(str(_resolved))] = str(_sha)
-                    scratch_sha_by_rel[_resolved.relative_to(root).as_posix()] = str(_sha)
-                except Exception:
-                    continue
-    except Exception:
-        scratch_sha_by_rel = {}
-        scratch_sha_by_abs = {}
+    scratch = _declared_scratch(artifact_dir, root)
     # git's binary verdict for the whole inventory in one process (two when empty
     # files need their attribute verdict; #1241); the loop below keeps its per-file
     # order and reads the verdict instead of spawning ``git diff --numstat`` per file.
     binary_verdicts = untracked_binary_verdicts(root, binary_verdict_candidates(root, untracked), warnings=diagnostics)
     for rel in untracked:
-        _want_sha = scratch_sha_by_rel.get(rel) or scratch_sha_by_abs.get(os.path.normcase(str((root / rel).resolve(strict=False))))
-        if _want_sha:
-            try:
-                _cur_sha = sha256((root / rel).read_bytes()).hexdigest()
-            except OSError:
-                _cur_sha = None
-            if _cur_sha == _want_sha:
-                excluded.append({"path": rel, "reason": "declared ephemeral scratch (v6.52.2)"})
-                continue
+        if _is_declared_scratch(root, rel, *scratch):
+            excluded.append({"path": rel, "reason": "declared ephemeral scratch (v6.52.2)"})
+            continue
         sensitive_reason = _sensitive_untracked_reason(rel)
         if sensitive_reason:
             sensitive.append({"path": rel, "reason": sensitive_reason})
@@ -345,12 +322,15 @@ def write_workspace_patch_artifacts(
         "errors": errors,
     }
     atomic_write_json(manifest_path, manifest, trailing_newline=True)
+    from ouroboros.artifacts import stream_artifact_file
+
+    # Published with its measured identity, like the patch beside it (#1969).
     artifacts = [
         {
             "kind": "workspace_patch_manifest",
             "name": "workspace_patch.json",
             "path": str(manifest_path),
-            "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
+            **stream_artifact_file(manifest_path),
             "workspace_root": str(root),
         }
     ]
@@ -364,6 +344,46 @@ def write_workspace_patch_artifacts(
             "workspace_root": str(root),
         })
     return [*artifacts, *file_outputs], manifest
+
+
+def _declared_scratch(artifact_dir: pathlib.Path, root: pathlib.Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """The declared scratch of ``artifact_dir``'s manifest as ``({rel: sha256}, {normcased abs: sha256})``.
+
+    The manifest stores {abs_path: sha256}; a file is excluded ONLY while its CURRENT content
+    still matches the recorded scratch sha — so a LATER real file written to the same path
+    (different content) is NOT dropped. Empty/absent/mismatched => included (no regression).
+    """
+    by_rel: Dict[str, str] = {}
+    by_abs: Dict[str, str] = {}
+    try:
+        scratch_map = json.loads((artifact_dir / SCRATCH_MANIFEST_NAME).read_text(encoding="utf-8")).get("scratch")
+        if isinstance(scratch_map, dict):
+            for raw_abs, sha in scratch_map.items():
+                try:
+                    resolved = pathlib.Path(str(raw_abs)).resolve(strict=False)
+                    by_abs[os.path.normcase(str(resolved))] = str(sha)
+                    by_rel[resolved.relative_to(root).as_posix()] = str(sha)
+                except Exception:
+                    continue
+    except Exception:
+        return {}, {}
+    return by_rel, by_abs
+
+
+def _is_declared_scratch(root: pathlib.Path, rel: str, by_rel: Dict[str, str], by_abs: Dict[str, str]) -> bool:
+    """Whether untracked ``rel`` is declared scratch whose current content still has its recorded sha."""
+    want_sha = by_rel.get(rel)
+    if not want_sha and by_abs:  # resolved only to match a declared scratch path
+        try:
+            want_sha = by_abs.get(os.path.normcase(str((root / rel).resolve(strict=False))))
+        except (OSError, RuntimeError):  # a link that cannot be resolved (a loop) is no scratch file
+            want_sha = None
+    if not want_sha:
+        return False
+    try:
+        return sha256((root / rel).read_bytes()).hexdigest() == want_sha
+    except OSError:
+        return False
 
 
 def _git_stdout(

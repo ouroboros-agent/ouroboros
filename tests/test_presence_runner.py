@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from tests._dialogue import chat_rows
 
 
 from ouroboros.presence_admission import PresenceAdmission
@@ -108,7 +109,7 @@ def test_runner_builds_bounded_fresh_task_and_logs_shared_dialogue(tmp_path):
     assert captured["metadata"]["inline_max_rounds"] == 10
     assert captured["metadata"]["presence"]["binding_id"] == "1" * 32
     assert captured["task_contract"]["capability_ceiling"]["digest"] == _admission().capability_ceiling.digest
-    rows = [json.loads(line) for line in (data / "logs" / "chat.jsonl").read_text().splitlines()]
+    rows = chat_rows(data)
     assert [row["direction"] for row in rows] == ["in", "out"]
     assert rows[0]["transport"]["actor"]["platform_actor_id"] == "user-7"
     assert rows[0]["presence_provenance"] == {
