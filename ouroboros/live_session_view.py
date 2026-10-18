@@ -10,7 +10,7 @@ the rest: every row whole while it fits, then the oldest tool results, tool argu
 shortened to a line, and only then the oldest rows named by count (``live_call_state`` renews
 the session before its audio outgrows it). That text rides in the session's system instruction
 (``with_call_so_far``): Gemini Live drops a spoken session's oldest turns minutes into a call,
-whatever its window and compression settings say, and keeps only its system instruction.
+whatever its window and compression settings say, keeping its system instruction (and at most the last exchange).
 """
 
 from __future__ import annotations
