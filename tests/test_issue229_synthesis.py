@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import ouroboros.context_compaction as context_compaction
 import ouroboros.llm_fallback as llm_fallback
 import ouroboros.llm_observability as llm_observability
 import ouroboros.request_wire_contract as wire_contract
