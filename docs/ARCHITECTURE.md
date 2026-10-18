@@ -1,6 +1,6 @@
 # Ouroboros v7.7.0 — Architecture & Reference
 
-This present-tense map (BIBLE P6) covers structure, operation (files, environment, state, endpoints, flows) and rationale. Replace each chapter's affected descriptions. Keep WHYs here and mechanisms in named module docstrings, so guards, review gates and lifecycles need no old commits to explain them. History belongs in README.md, tags and Git.
+This present-tense map (BIBLE P6) has three mandatory layers. **Structural:** components, modules, API endpoints, data flows and boundaries, what exists. **Operational:** the complete registry of logs, state files, configs, paths, environment variables and tool surface, where things live and how to work with them, so debugging is a search through the map, not through grep. **Rationale:** the *why* of every non-trivial decision (for example the coupling question answered by retrieval against a declared required-source manifest, or deterministic gates running before expensive model review). Replace each chapter's affected descriptions. Keep WHYs here and mechanisms in named module docstrings, so guards, review gates and lifecycles need no old commits to explain them. History belongs in README.md, tags and Git.
 
 ## Chapters
 

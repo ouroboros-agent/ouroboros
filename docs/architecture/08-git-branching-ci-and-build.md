@@ -6,7 +6,7 @@ Release topology: the branch and channel model behind three official update feed
 
 Body candidates commit on local `candidate/<task>` branches; `refs/ouroboros/candidates/*` and `refs/ouroboros/adoption/*` are private pins (§6 Own-body candidates). The serving auto-push sends the working branch and only the annotated tags reachable from it (`--follow-tags`), never `--tags`: linked worktrees share one tag namespace, so a candidate's tag is published only once its commit is on the serving line, and a candidate branch only through the explicit Git/PR tools.
 
-The local `ouroboros-stable` ref is also a recovery fallback maintained by explicit promotion; that local role does not select the QA feed. Launcher metadata is bootstrap provenance only: status, preflight, Colab bootstrap and apply resolve the selected channel and exact fetched SHA themselves, so an older frozen launcher cannot redirect updates. Stable additionally requires the shared plain release tag; QA and Development use no version comparison as an admission gate.
+The local `ouroboros-stable` ref is also a recovery fallback maintained by explicit promotion (`promote_to_stable`): a safe restart checks it out when the working branch fails its import test (`supervisor/git_ops_reset.py`); that local role does not select the QA feed. Launcher metadata is bootstrap provenance only: status, preflight, Colab bootstrap and apply resolve the selected channel and exact fetched SHA themselves, so an older frozen launcher cannot redirect updates. Stable additionally requires the shared plain release tag; QA and Development use no version comparison as an admission gate.
 
 ### CI topology
 
