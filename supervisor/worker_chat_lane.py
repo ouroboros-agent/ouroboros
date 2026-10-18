@@ -721,7 +721,8 @@ def handle_call_direct(
         return {"admitted": False, "task_id": "", "reason": "cost_accounting_unavailable"}
     if remaining <= 0:
         return {"admitted": False, "task_id": "", "reason": "budget_exhausted"}
-    metadata: Dict[str, Any] = {"live_call": spec.as_metadata(), "client_message_id": str(spec.client_message_id or "")}
+    metadata: Dict[str, Any] = {"live_call": spec.as_metadata(), "client_message_id": str(spec.client_message_id or ""),
+                                "call_admitted_at": time.time()}  # the owner's press: the call's timing counts from here
     if not spec.presence_binding_id:
         # The owner opened this call on his own surface: the owner door's stamp for a root with no logged
         # message, so the call speaks as his turn (Main notices, routing) as his typed turn would.

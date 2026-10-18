@@ -233,3 +233,37 @@ class Openings:
                    for item in items if not isinstance(item, Acks)]
         return [*content, ContextItem(text="", source="", opens_response=True),
                 *(item for item in items if isinstance(item, Acks))]
+
+
+class CallTiming:
+    """When a call's first moments happened, in ms since the owner's press (its admission), and how its
+    tool batches and its event loop kept up: the facts behind "the call takes long to start" (owner test
+    of 18.10), written with the call's checkpoint and its terminal usage. A bounded tail of batches."""
+
+    def __init__(self, admitted_at: float = 0.0, context_started_at: str = "") -> None:
+        self.admitted_at = float(admitted_at or 0.0) or time.time()
+        self.marks: Dict[str, int] = {}
+        self.batches: Deque[Dict[str, Any]] = deque(maxlen=50)
+        self.loop_lag_ms = 0
+        if context_started_at:
+            try:
+                from datetime import datetime
+
+                started = datetime.fromisoformat(str(context_started_at).replace("Z", "+00:00")).timestamp()
+                self.marks["context_started"] = max(0, round((started - self.admitted_at) * 1000))
+            except ValueError:
+                pass
+
+    def mark(self, name: str) -> None:
+        """The first time ``name`` happened in this call."""
+        if name not in self.marks:
+            self.marks[name] = max(0, round((time.time() - self.admitted_at) * 1000))
+
+    def batch(self, tools: List[str], waited_s: float, ran_s: float) -> None:
+        self.batches.append({"tools": tools, "waited_ms": round(waited_s * 1000), "ran_ms": round(ran_s * 1000)})
+
+    def lag(self, late_s: float) -> None:
+        self.loop_lag_ms = max(self.loop_lag_ms, round(max(0.0, late_s) * 1000))
+
+    def as_record(self) -> Dict[str, Any]:
+        return {"marks_ms": dict(self.marks), "batches": list(self.batches), "loop_lag_max_ms": self.loop_lag_ms}

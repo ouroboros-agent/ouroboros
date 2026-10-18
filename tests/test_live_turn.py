@@ -481,7 +481,12 @@ def test_the_surface_hears_where_the_turn_is_from_the_engine_not_from_the_audio(
     assert _wait_for(lambda: h.hub.turns[-1:] == ["idle"])
     assert not engine.sent_of(ContextItem) or all(item.source != "call_live" for item in engine.sent_of(ContextItem))
     h.stop()
-    h.finish()
+    _text, usage, _trace = h.finish()
+    # The call's first moments, counted from the owner's press, and its tool batch's wait and run.
+    timing = usage["live_call"]["timing"]
+    assert {"context_ready", "engine_opening", "session_ready", "first_response"} <= set(timing["marks_ms"])
+    assert [batch["tools"] for batch in timing["batches"]] == [["web_search"]] and timing["loop_lag_max_ms"] >= 0
+    assert h.task_row()["live_call"]["timing"]["marks_ms"]["session_ready"] >= 0
 
 
 def test_a_slow_store_write_never_stops_the_calls_audio(harness, monkeypatch):

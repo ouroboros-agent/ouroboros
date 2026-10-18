@@ -49,6 +49,7 @@ def test_the_owner_call_door_stamps_the_owner_and_names_the_room(monkeypatch):
     monkeypatch.setattr(worker_chat_lane, "_admit_chat_task", admit)
     worker_chat_lane.handle_call_direct(1, _spec())
     assert seen["metadata"]["origin_suppressed"] is True and seen["kind"] == "call"
+    assert isinstance(seen["metadata"]["call_admitted_at"], float)  # the call's timing counts from the press
     assert "open in the main chat" in seen["text"]
     seen.clear()
     worker_chat_lane.handle_call_direct(1, _spec(presence_binding_id="b" * 32))

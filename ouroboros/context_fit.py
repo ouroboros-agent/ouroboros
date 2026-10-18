@@ -698,7 +698,10 @@ def measure_main_fit(
     nano = profile.endswith("_nano")
     reserve = min(NANO_MIN_HEADROOM_TOKENS, ceiling) if nano else ceiling
     total = estimated_input + reserve
-    target = (OWNER_NANO_TARGET_TOKENS if profile == "owner_nano"
+    # The owner's Nano and Low targets bound Main's text turns. A live call's view is fitted to its realtime
+    # route instead (``live_call_route``): measured against the owner's 85k target its ~94k view would leave a
+    # tool's unasked body no room at all, so its frame is the route's window, with the same eighth.
+    target = (None if plan.call_view else OWNER_NANO_TARGET_TOKENS if profile == "owner_nano"
               else OWNER_LOW_TARGET_TOKENS if profile == "owner_low" else None)
     from ouroboros.context_anchor import floored_window
 

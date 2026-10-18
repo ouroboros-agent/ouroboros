@@ -41,7 +41,7 @@ from ouroboros.live_call_route import (call_local_schemas, call_minutes_ceiling,
                                        native_search_enabled, resolve_call_route)
 from ouroboros.live_awareness import drain_into_call
 from ouroboros.live_call_rows import CallRows
-from ouroboros.live_call_state import Acks, Openings, SessionRenewal, Spoken, narration_meta
+from ouroboros.live_call_state import Acks, CallTiming, Openings, SessionRenewal, Spoken, narration_meta
 from ouroboros.live_session_view import (
     calibration_ratio, compression_watermarks, history_view, mark_spoken, record_density_witness, renewal_bounds,
     text_estimate, with_call_so_far,
@@ -187,6 +187,9 @@ class _LiveCall:
         self.tools_lane = ToolBatchWorker(self)
         self.renewal = SessionRenewal(self)
         self.openings = Openings(self.renewal)  # what is addressed to the call waits for a completed turn
+        meta = self.task.get("metadata") if isinstance(self.task.get("metadata"), dict) else {}
+        self.timing = CallTiming(meta.get("call_admitted_at") or 0.0, context_captured_at)
+        self.timing.mark("context_ready")
         self.stateful_executor = None
         self.rooms = None
         self.fanout = None
@@ -355,7 +358,8 @@ class _LiveCall:
             "live_call": {"call_id": self.spec.call_id, "engine": self.spec.engine, "model": self.spec.model,
                           "ended": reason, "minutes": minutes, "reconnects": self.reconnects,
                           "provider_drops": self.renewal.drops,
-                          "tool_calls": self.tools_lane.tool_calls, "batches": self.tools_lane.batches, **self.counts},
+                          "tool_calls": self.tools_lane.tool_calls, "batches": self.tools_lane.batches, **self.counts,
+                          "timing": self.timing.as_record()},
         })
         label = self.spec.label or self.spec.call_id
         if failure is not None:
@@ -389,6 +393,7 @@ class _LiveCall:
         if not self.reconnecting:
             self.hub.send_state(STATE_CONNECTING)
         engine = self.llm.open_live(self.route.engine)
+        self.timing.mark("engine_opening")
         if not resume_handle:
             self.resume_handle = ""  # a fresh session's predecessor can no longer be resumed into
         # The history view holds every transcript row up to this count; context recorded
@@ -543,7 +548,9 @@ class _LiveCall:
 
     async def _tick(self) -> None:
         while not self.closing:
+            slept = time.monotonic()
             await asyncio.sleep(MAILBOX_TICK_S)
+            self.timing.lag(time.monotonic() - slept - MAILBOX_TICK_S)  # a loop held by work no frame should wait for
             await self._drain()
             now = time.monotonic()
             if (ceiling := call_minutes_ceiling(self.spec)) is not None and now - self.started >= ceiling * 60:
@@ -672,6 +679,7 @@ class _LiveCall:
                 spoken.started_at = spoken.started_at or time.monotonic()
                 spoken.audio_ms += len(event.pcm) * 500 / event.rate
                 self.hub.play(event.pcm, event.item_id)
+                self.timing.mark("first_audio")
         elif isinstance(event, Caption):
             self.hub.send_caption(event.speaker, event.text, event.final, event.item_id)
             if event.speaker == SPEAKER_OWNER:
@@ -690,6 +698,7 @@ class _LiveCall:
             self.response_open, self.current_response = True, event.response_id or event.item_id
             self._attempt_for(event.response_id or event.item_id)
             self._turn(TURN_ANSWERING)
+            self.timing.mark("first_response")
         elif isinstance(event, ResponseDone):
             # A thinking route paused inside its work keeps the turn open; a tool still owing its result
             # means the engine answers again when it arrives.
@@ -715,6 +724,7 @@ class _LiveCall:
                 asyncio.create_task(self._reconnect(f"transport_lost:{event.reason}", resume=True))
         elif isinstance(event, Ready):
             self.state, self.ready_at = STATE_LIVE, time.monotonic()
+            self.timing.mark("session_ready")
             self.hub.send_state(STATE_LIVE)
             if (fact := self.openings.live(bool(self.spec.presence_binding_id))) is not None:
                 await self._context(fact)  # the voice may greet, in its own words
@@ -935,7 +945,8 @@ class _LiveCall:
             return done
         return self.rows.checkpoint({"call_id": self.spec.call_id, "consumed_mailbox_ids": sorted(str(x) for x in self.owner_msg_seen),
                                      "executed_tool_calls": sorted(self.tools_lane.executed), "batches": self.tools_lane.batches,
-                                     "utterances": dict(self.counts), "reconnects": self.reconnects, "updated_at": utc_now_iso()})
+                                     "utterances": dict(self.counts), "reconnects": self.reconnects, "updated_at": utc_now_iso(),
+                                     "timing": self.timing.as_record()})
 
 def run_live_turn(
     messages: List[Dict[str, Any]], tools: Any, llm: Any, drive_logs: pathlib.Path,

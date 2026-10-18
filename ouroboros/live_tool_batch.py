@@ -26,6 +26,7 @@ import copy
 import functools
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -89,6 +90,7 @@ class ToolBatchWorker:
         # however they arrive; calls of no known response count one round per batch.
         self.round_origins: set = set()
         self._takes = 0  # names each take of the pending calls, for calls of no known response
+        self.asked_at: Dict[str, float] = {}  # when each call was asked for: its batch's wait (``CallTiming``)
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"call-tools-{call.task_id}")
 
     def shutdown(self) -> None:
@@ -118,6 +120,7 @@ class ToolBatchWorker:
             return
         self.claimed[tool_call.call_id] = epoch
         self.pending.append((epoch, tool_call, origin))
+        self.asked_at[tool_call.call_id] = time.monotonic()
 
     async def _record_languages(self, tool_call: ToolCall) -> None:
         """The call's own record of its recognition languages (``call_languages``), written beside the
@@ -145,6 +148,7 @@ class ToolBatchWorker:
         self.pending = [entry for entry in self.pending if entry[1].call_id not in call_ids]
         for call_id in withdrawn:  # never started: the claim is released with the request
             self.claimed.pop(call_id, None)
+            self.asked_at.pop(call_id, None)
 
     def reset_rounds(self) -> None:
         """A correspondent spoke: the autonomous round count starts again."""
@@ -188,6 +192,8 @@ class ToolBatchWorker:
                 continue
             self.running = True  # cleared by the worker thread itself, so a cancelled await never hides a running tool
             call._activity("working", ", ".join(sorted({tc.name for _epoch, tc in batch})))
+            began = time.monotonic()
+            waited = began - min(self.asked_at.pop(tc.call_id, began) for _epoch, tc in batch)
             try:
                 changes, grown = await asyncio.get_running_loop().run_in_executor(
                     self._pool, contextvars.copy_context().run, self._run_batch, [tc for _epoch, tc in batch])
@@ -199,6 +205,7 @@ class ToolBatchWorker:
                 log.warning("live call %s tool batch failed", call.spec.call_id, exc_info=True)
                 changes, grown = [], False
             call._activity("idle")
+            call.timing.batch(sorted({tc.name for _epoch, tc in batch}), waited, time.monotonic() - began)
             if not call.response_open:
                 call._turn(TURN_AWAITING)  # the results go in when idle: the engine answers them
             # The latest session that asked for each call receives its result.

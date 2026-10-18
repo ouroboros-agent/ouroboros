@@ -159,3 +159,24 @@ def test_round_fit_reads_its_own_conversation_never_the_witness_store(tmp_path, 
     anchored = loop._measure_round_main_fit(ctx, automatic_pass_used=False)
     assert anchored.measurement.measurement_basis == "fresh_route_usage"
     assert abs(anchored.measurement.measurement_density - 1.3) < 1e-6
+
+
+def test_a_call_views_frame_is_its_routes_window_not_the_owners_nano_target():
+    """N2 (consilium of 18.10): on owner Nano a call's ~94k view against T = 85k left an unasked tool body
+    no room, so every result of a call became an envelope; the call's frame is its route's window."""
+    from dataclasses import replace
+
+    from ouroboros.context_budget import OWNER_NANO_TARGET_TOKENS
+    from ouroboros.context_fit import measure_main_fit
+    from ouroboros.tool_result_delivery import frame_bounds
+
+    text_turn = _plan(preferred="nano", window=131_072)
+    call = replace(text_turn, call_view=True)
+    messages = [{"role": "system", "content": "x" * 360_000}, {"role": "user", "content": "go"}]  # ~94k tokens
+    for plan, target in ((text_turn, OWNER_NANO_TARGET_TOKENS), (call, None)):
+        fit = measure_main_fit(plan, messages, [], anchor=_ANCHOR, profile="owner_nano", rendered_mode="nano",
+                               round_id="r1")
+        assert fit.measurement.target_total_tokens == target
+    boundary, _reserve, eighth = frame_bounds(vars(measure_main_fit(
+        call, messages, [], anchor=_ANCHOR, profile="owner_nano", rendered_mode="nano", round_id="r1").measurement))
+    assert boundary == 131_072 and eighth == 16_384  # the unasked share keeps its eighth of the window
