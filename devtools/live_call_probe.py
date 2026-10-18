@@ -69,12 +69,6 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
-def json_rows(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
 def select_scenarios(value: str) -> set[str]:
     selected = set(SCENARIOS) if value == "all" else set(value.split(","))
     if not selected <= set(SCENARIOS):
@@ -444,6 +438,12 @@ class Probe:
         print(scenario + ": " + row["verdict"] + (" (native search; function path NOT_RUN)"
                                                   if row.get("route") else ""), flush=True)
 
+    def chat_rows(self) -> list[dict]:
+        """The room's rows in chain order, as the dialogue store holds them (``state/dialog.sqlite``)."""
+        from ouroboros import dialogue_store
+
+        return [entry.row for entry in dialogue_store.newest(self.root / "data", "chat", limit=1 << 40)]
+
     async def wait(self, predicate, *, timeout=None):
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while not predicate():
@@ -455,7 +455,7 @@ class Probe:
 
     async def speech_case(self, name, audio):
         since = self.evidence.note("scenario_start", scenario=name)["at"]
-        before_rows = len(json_rows(self.root / "data/logs/chat.jsonl"))
+        before_rows = len(self.chat_rows())
         await self.peer.speak(audio, name)
         if name in ("tool", "chat"):
             tool = "web_search" if name == "tool" else "send_user_message"
@@ -479,7 +479,7 @@ class Probe:
         final_items = {e["item_id"] for e in self.evidence.of("Caption", answer_after)
                        if e.get("speaker") == "ouroboros" and e.get("final")}
         await self.wait(lambda: any((r.get("spoken") or {}).get("item_id") in final_items
-                                   for r in json_rows(self.root / "data/logs/chat.jsonl")[before_rows:]))
+                                   for r in self.chat_rows()[before_rows:]))
         captions = self.evidence.of("Caption", since)
         audio_rows = self.evidence.of("peer_audio", since)
         ends = self.evidence.of("speech_end", since)
@@ -487,7 +487,7 @@ class Probe:
         return {"since": since, "captions": [c for c in captions if c.get("final")],
                 "output_bytes": sum(r["bytes"] for r in audio_rows),
                 "latency_seconds": audio_rows[0]["at"] - end if audio_rows else None,
-                "chat_rows": json_rows(self.root / "data/logs/chat.jsonl")[before_rows:], "hub_stats": self.hub.stats()}
+                "chat_rows": self.chat_rows()[before_rows:], "hub_stats": self.hub.stats()}
 
     def start(self, settings):
         from ouroboros.agent import make_agent
@@ -618,7 +618,7 @@ class Probe:
                 await self.wait(lambda: not self.peer.pending)
                 commands = [e for e in self.evidence.of("command", cut) if e["type"] == "Interrupt"]
                 flushes = [e for e in self.evidence.of("peer_control", cut) if e["message"]["type"] == "flush"]
-                rows = json_rows(self.root / "data/logs/chat.jsonl")
+                rows = self.chat_rows()
                 interrupted = [r for r in rows if (r.get("spoken") or {}).get("status") == "interrupted"]
                 continued = [e for e in self.evidence.of("peer_audio", cut) if e["item_id"] in continued_items()]
                 # Gemini truncates server-side: the host's flush, cut and continued speech are the proof.
