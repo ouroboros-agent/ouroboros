@@ -15,7 +15,7 @@ export const MAX_BUFFER_SECONDS = 600;
 // the ceiling is full; the curve lets quiet speech still move the light.
 export const LEVEL_FLOOR_DB = -55;
 export const LEVEL_CEILING_DB = -12;
-const LEVEL_CURVE = 0.6;
+export const LEVEL_CURVE = 0.6;
 // Envelope time constants (seconds): the light answers a voice at once and lets go slowly.
 export const LEVEL_ATTACK_S = 0.05;
 export const LEVEL_RELEASE_S = 0.25;

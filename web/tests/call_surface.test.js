@@ -557,13 +557,15 @@ test('the visual is one swappable contract: the wave in its slot, the glass behi
 test('the wave: whose colour from the state, its height from the voice, a pulse while preparing or thinking', () => {
     const shape = (state) => { const { colour, amp, pulse } = waveShape(state); return [colour, Number(amp.toFixed(2)), pulse]; };
     assert.deepEqual(shape({ mode: 'listen', time: 0 }), ['idle', 0.07, false]);  // a gentle low wave while listening
-    assert.deepEqual(shape({ mode: 'listen', mic: 0.7, owner: true }), ['owner', 0.7, false]);
-    assert.deepEqual(shape({ mode: 'listen', mic: 0.7, out: 0.6, voice: 'ouroboros' }), ['ouroboros', 0.6, false]);  // no echo
+    // The wave reads a voice as if its level filled at -18 dBFS (owner, 18.10): 0.7 swings as 0.77.
+    assert.deepEqual(shape({ mode: 'listen', mic: 0.7, owner: true }), ['owner', 0.77, false]);
+    assert.deepEqual(shape({ mode: 'listen', mic: 0.95, owner: true }), ['owner', 1, false]);  // loud syllables reach the top
+    assert.deepEqual(shape({ mode: 'listen', mic: 0.7, out: 0.6, voice: 'ouroboros' }), ['ouroboros', 0.66, false]);  // no echo
     assert.deepEqual(shape({ mode: 'trace' }), ['idle', 0, true]);
     assert.deepEqual(shape({ mode: 'think' }), ['ouroboros', 0, true]);
     assert.deepEqual(shape({ mode: 'error', mic: 0.9 }), ['error', 0, false]);  // still, in amber
     assert.deepEqual(shape({ mode: 'muted', mic: 0.9, owner: true }), ['idle', 0, false]);
-    assert.deepEqual(shape({ mode: 'muted', out: 0.5, voice: 'ouroboros' }), ['ouroboros', 0.5, false]);
+    assert.deepEqual(shape({ mode: 'muted', out: 0.5, voice: 'ouroboros' }), ['ouroboros', 0.55, false]);
     assert.deepEqual(shape({ mode: 'listen', mic: 0.7, owner: true, reduced: true }), ['owner', 0, false]);
     assert.deepEqual(shape({ mode: 'think', reduced: true }), ['ouroboros', 0, false]);
 });

@@ -814,7 +814,14 @@
     height: 100%;
 }
 
-/* Under the words the strands step back, so the text keeps its reading contrast. */
+/* In the chip the canvas is the whole glass (the row), not only the capsule inside the row's padding,
+   so a full voice swings without touching an edge; the keyboard view's canvas already is the row. */
+.chat-input-wrap[data-call-view="voice"] .call-visual {
+    inset: calc(-1 * var(--space-2));
+}
+
+/* A row with no room after the words (a phone) runs the wave under them, stepping back so the text keeps
+   its reading contrast; with room the wave starts after the words and --call-words stays 0. */
 .chat-input-wrap[data-call-view="voice"] .call-wave {
     -webkit-mask-image: linear-gradient(90deg, rgb(0 0 0 / 0.42) var(--call-words, 0px), #000 calc(var(--call-words, 0px) + 72px));
     mask-image: linear-gradient(90deg, rgb(0 0 0 / 0.42) var(--call-words, 0px), #000 calc(var(--call-words, 0px) + 72px));

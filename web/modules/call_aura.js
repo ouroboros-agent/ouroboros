@@ -1,7 +1,7 @@
 /** The wave in the glass: the call's light is the owner's wave, drawn inside the composer capsule's
  * frosted glass. Three strands of a sine whose envelope is zero at both ends (`STRANDS`, `waveShape`)
- * run as tapered ribbons across the capsule's width, behind the words (stepping back under them, so
- * they stay readable). One voice's colour at a time: the strands and a faint tint of the glass take
+ * run as tapered ribbons across the capsule's width, after the words (a row with no room after them,
+ * a phone's, runs them under the words, stepping back, so they stay readable). One voice's colour at a time: the strands and a faint tint of the glass take
  * the speaker's hue (owner blue, Ouroboros crimson) and change it by fading through the neutral,
  * never two hues lit together. The glass's outline breathes with the heard level, a spring of a few
  * pixels that never moves the layout. Thinking is a soft travelling pulse; working draws the strands
@@ -14,6 +14,8 @@
  * the small static sign of Talk and of the shell's mark. The light writes `--call-mic`/`--call-out`
  * on the composer and the capsule writes `data-call-light|voice|tone|view|work`.
  */
+import { LEVEL_CEILING_DB, LEVEL_CURVE, LEVEL_FLOOR_DB } from './call_worklet.js';
+
 // Three strands of the wave: [opacity, cycles across the wave, phase].
 export const STRANDS = [[1, 1.9, 0], [0.6, 2.7, 1.3], [0.35, 3.6, 2.4]];
 // The level's last half second, travelling outward from the wave's middle.
@@ -31,16 +33,23 @@ const triplet = (text, fallback) => {
 };
 
 /** What the wave shows for the light's state: whose colour, how high, a pulse or a voice. */
+// The wave reads a voice as if its level filled at -18 dBFS (the owner's choice of 18.10): an ordinary voice
+// swings wider and loud syllables reach the top. The level itself, and the voice gate it feeds, keep their
+// -12 dB ceiling (call_worklet.js), so background noise is no more "speaking" than before.
+const WAVE_CEILING_DB = -18;
+const WAVE_GAIN = ((LEVEL_CEILING_DB - LEVEL_FLOOR_DB) / (WAVE_CEILING_DB - LEVEL_FLOOR_DB)) ** LEVEL_CURVE;
+const loud = level => Math.min(1, level * WAVE_GAIN);
+
 export function waveShape({ mic = 0, out = 0, time = 0, mode = 'listen', voice = 'owner', owner = false, reduced = false }) {
     const heardOuroboros = voice === 'ouroboros' && out > 0.02;
     const colour = mode === 'error' ? 'error'
         : heardOuroboros || mode === 'think' ? 'ouroboros'
             : mode !== 'muted' && (owner || (mic > 0.08 && mic >= out)) ? 'owner' : 'idle';
     if (reduced || mode === 'error' || mode === 'still') return { colour, amp: 0, pulse: false };
-    if (mode === 'muted') return { colour, amp: heardOuroboros ? out : 0, pulse: false };
+    if (mode === 'muted') return { colour, amp: heardOuroboros ? loud(out) : 0, pulse: false };
     if (mode === 'think' || mode === 'trace') return { colour, amp: 0, pulse: true };
     const idle = mode === 'listen' ? 0.07 + 0.03 * Math.sin(time * 2.2) : 0;
-    return { colour, amp: Math.max(voice === 'ouroboros' ? out : Math.max(mic, out), idle), pulse: false };
+    return { colour, amp: Math.max(loud(voice === 'ouroboros' ? out : Math.max(mic, out)), idle), pulse: false };
 }
 
 /** Talk's sign: the three strands in miniature, still. */
@@ -88,6 +97,8 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
     let x0 = 20;
     let x1 = 240;
     let centre = 0.5;
+    let band = 190;  // the big view's free half-height between the words and the controls
+    let under = false;  // a narrow row's wave runs under the words (stepping back), not after them
     let mounted = false;
     function fit() {
         width = Math.max(24, slot.clientWidth || 0);
@@ -98,20 +109,36 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         const buttons = row.querySelector('.call-buttons')?.getBoundingClientRect?.();
         const words = row.querySelector('.call-words');
         let wordsEnd = 0;
-        if (wrap.dataset.callView === 'sheet') { x0 = 3; x1 = width - 3; } else if (big()) { x0 = 28; x1 = width - 28; } else {
+        centre = big() && (env.innerWidth || 0) >= 980 ? 0.54 : 0.5;
+        band = 190;
+        if (wrap.dataset.callView === 'sheet') { x0 = 3; x1 = width - 3; } else if (big()) {
+            x0 = 28;
+            x1 = width - 28;
+            // The wave lives in the free band between the words above it and the controls below it.
+            const top = words?.getBoundingClientRect?.().bottom || 0;
+            const bottom = buttons?.top || 0;
+            if (bottom > top + 80) {
+                centre = ((top + bottom) / 2 - (edge.top || 0)) / height;
+                band = (bottom - top) / 2 - 12;
+            }
+        } else {
             x0 = 20;
             x1 = buttons?.width ? Math.max(x0 + 40, buttons.left - edge.left - 10) : width - 20;
-            const box = words?.getBoundingClientRect?.();
-            if (box?.width) {
-                const text = Math.min(box.width, Math.max(...[...words.children].filter(child => !child.hidden)
-                    .map(child => child.scrollWidth || 0), 0) + 8);
-                wordsEnd = Math.max(0, box.left - edge.left + text);
-                // Room enough: the wave starts where the words end; else it runs under them, stepping back.
-                if (x1 - (wordsEnd + 20) >= 170) { x0 = wordsEnd + 20; wordsEnd = 0; } else x0 = 14;
+            // The words end where their right-most visible line ends: the state and its time share one row,
+            // so the widest child alone falls short by the time's width.
+            const right = Math.max(0, ...[...(words?.children || [])]
+                .filter(child => !child.hidden && child.getClientRects?.().length)
+                .map(child => child.getBoundingClientRect().right));
+            if (right) {
+                // The wave starts after the words, never under them. A row without room for a whole small
+                // wave there (a phone) keeps it under the words, stepping back, so it never disappears.
+                const end = right - edge.left + 8;
+                if (x1 - end >= 64) x0 = end + (x1 - end >= 190 ? 20 : 4);
+                else { x0 = 14; wordsEnd = end; }
             }
         }
+        under = wordsEnd > 0;
         canvas.style.setProperty('--call-words', `${Math.round(wordsEnd)}px`);
-        centre = big() && (env.innerWidth || 0) >= 980 ? 0.54 : 0.5;
         work.style.setProperty('--call-work-x', `${Math.round((x0 + x1) / 2)}px`);
         work.style.setProperty('--call-work-y', `${(centre * 100).toFixed(1)}%`);
         settle();
@@ -262,7 +289,7 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         put(row, '--call-breath', breath.toFixed(2));
         put(row, '--call-tint-owner', tint.owner.toFixed(3));
         put(row, '--call-tint-ouroboros', tint.ouroboros.toFixed(3));
-        const dots = busy > 0.55 ? '1' : '';
+        const dots = busy > 0.55 && !under ? '1' : '';  // the three dots stand only after the words
         if ((slot.dataset.work || '') !== dots) slot.dataset.work = dots;
         const sheet = wrap.dataset.callView === 'sheet';
         if (!context || !(wrap.dataset.call === 'live' || (sheet && input.mode === 'error'))) return;
@@ -272,7 +299,8 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         context.clearRect(0, 0, width, height);
         const cy = height * centre;
         const span = x1 - x0;
-        const reachPx = large ? Math.min(height * 0.3, 190) : height * (span < 200 ? 0.46 : 0.4);
+        // The chip's canvas is the whole glass: 0.4 of it is 0.6 of the capsule inside the glass's padding.
+        const reachPx = large ? Math.min(height * 0.4, band) : height * 0.4;
         const tip = large ? 0.9 : 0.7;
         if (input.mode === 'error') {
             ribbon(line(STRANDS[0], { pulse: false }, cy, 0, 1, t), colours.error, 0.95, large ? 3.2 : 2.2, tip);
